@@ -58,7 +58,11 @@ def check_exit(state: dict[str, Any]) -> ExitDecision:
     if max_iter is not None and state.get("iteration", 0) >= max_iter:
         return "STOPPED"
 
-    # 4. No untried levers left for the current bucket (floor).
+    # 4. No more buckets worth trying (floor).
+    all_buckets = set(state.get("all_bucket_ids") or [])
+    exhausted = set(state.get("exhausted_buckets") or [])
+    if all_buckets:
+        return "STOPPED" if all_buckets <= exhausted else "continue"
     candidates = state.get("candidates") or []
     tried = set(state.get("tried") or [])
     if candidates and all(c in tried for c in candidates):

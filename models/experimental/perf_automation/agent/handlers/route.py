@@ -27,6 +27,20 @@ def _bucket_query(tags: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in tags.items() if k in router.DIMENSIONS}
 
 
+def _rank_hits(hits: list[dict[str, Any]], query: dict[str, Any]) -> list[dict[str, Any]]:
+    def score(entry: dict[str, Any]) -> int:
+        s = 0
+        for dim in router.DIMENSIONS:
+            vals = entry.get(dim) or [router.WILDCARD]
+            if router.WILDCARD in vals:
+                continue
+            if query.get(dim) in vals:
+                s += 2 if dim in ("bound", "grid") else 1
+        return s
+
+    return sorted(hits, key=score, reverse=True)
+
+
 def build_route_brief(
     bucket: dict[str, Any], hits: list[dict[str, Any]], read_section: Callable[[str], str], skeleton: str = ""
 ) -> str:
@@ -62,10 +76,11 @@ def route(ctx) -> str:
     profile = ctx.current_profile()
     bucket = _select_bucket(profile["buckets"], set(ctx.state.get("exhausted_buckets", [])))
     query = _bucket_query(bucket.get("tags", {}))
-    hits = router.route(ctx.index, query)
+    hits = _rank_hits(router.route(ctx.index, query), query)
 
     ctx.state["current_bucket"] = bucket["id"]
     ctx.state["candidates"] = [h["id"] for h in hits]
+    ctx.state["all_bucket_ids"] = [b["id"] for b in profile["buckets"]]
 
     # deterministic model map, filtered to this bucket's op_class — where its ops live
     op_class = bucket.get("tags", {}).get("op_class")
