@@ -4,9 +4,9 @@ To integrate: replace a `mocks.X` entry with your real module's handler, ONE
 line at a time, and re-run `tests/test_engine.py`. The engine and every other
 handler stay untouched.
 
-  REAL today:  BEFORE_LOOP_DONE, ROUTE (M1), LOG + CHECK_EXIT (M2)
-  MOCK (TODO): SELECT, APPLY, VERIFY, REPAIR_CODE, REPAIR_PCC  (M1)
-               GATE_PCC, REMEASURE, DECIDE, COMMIT, REVERT     (M2)
+  REAL today:  BEFORE_LOOP_DONE, ROUTE, SELECT, PLAN, APPLY, VERIFY (M1)
+               GATE_PCC, REMEASURE, DECIDE, COMMIT, REVERT, LOG, CHECK_EXIT (M2)
+  MOCK (TODO): REPAIR_CODE, REPAIR_PCC  (M1)
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from . import gate_pcc as _gate_pcc
 from . import decide as _decide
 from . import remeasure as _remeasure
 from . import verify as _verify
+from . import commit as _commit
+from . import revert as _revert
 
 
 def build_handlers() -> dict:
@@ -36,8 +38,8 @@ def build_handlers() -> dict:
         states.GATE_PCC: _gate_pcc.gate_pcc,  # REAL
         states.REMEASURE: _remeasure.remeasure,  # REAL
         states.DECIDE: _decide.decide,  # REAL
-        states.COMMIT: mocks.commit,
-        states.REVERT: mocks.revert,
+        states.COMMIT: _commit.commit,  # REAL
+        states.REVERT: _revert.revert,  # REAL
         states.LOG: log_exit.log,  # REAL
         states.CHECK_EXIT: log_exit.check_exit,  # REAL
     }

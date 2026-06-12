@@ -57,3 +57,41 @@ def changed_files(repo, sha: str, pathspec=None) -> list[str]:
     if r.returncode != 0:
         raise GitError(f"git diff failed at {repo}: {r.stderr.strip()}")
     return [ln for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def checkout(repo, sha: str, pathspec=None) -> None:
+    """Restore tracked files to their state at `sha` (`git checkout <sha> -- <pathspec>`).
+
+    This is REVERT's primitive. Deliberately SCOPED and non-destructive:
+      * `pathspec` (the model dir) restricts the restore to the model — UNRELATED
+        working-tree changes elsewhere in the repo are never touched.
+      * `git checkout <sha> -- <path>` only rewrites tracked files; it never deletes
+        untracked content. If `pathspec` was untracked at `sha`, git matches nothing
+        and raises GitError — callers treat that as a safe no-op.
+    """
+    args = ["checkout", sha, "--", str(pathspec) if pathspec else "."]
+    r = _git(args, repo)
+    if r.returncode != 0:
+        raise GitError(f"git checkout {sha} -- {pathspec} failed: {r.stderr.strip()}")
+
+
+def commit(repo, message: str, pathspec=None) -> str | None:
+    """Stage + commit ONLY `pathspec` and return the new HEAD sha (COMMIT's primitive).
+
+    Scoped on purpose: `git add -- <pathspec>` then `git commit -m <msg> -- <pathspec>`
+    so a kept edit is persisted without sweeping in unrelated staged/working changes
+    elsewhere in the repo. Returns None (no commit made) when nothing is staged under
+    `pathspec`, so the caller keeps going without a spurious empty commit.
+    """
+    add = _git(["add", "--", str(pathspec) if pathspec else "."], repo)
+    if add.returncode != 0:
+        raise GitError(f"git add {pathspec} failed: {add.stderr.strip()}")
+    staged_args = ["diff", "--cached", "--name-only"] + (["--", str(pathspec)] if pathspec else [])
+    staged = _git(staged_args, repo)
+    if staged.returncode == 0 and not staged.stdout.strip():
+        return None  # nothing to commit under pathspec
+    cargs = ["commit", "-m", message] + (["--", str(pathspec)] if pathspec else [])
+    r = _git(cargs, repo)
+    if r.returncode != 0:
+        raise GitError(f"git commit failed: {r.stderr.strip()}")
+    return head_sha(repo)
