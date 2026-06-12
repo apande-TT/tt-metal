@@ -294,6 +294,11 @@ def preflight_collect(
     return n
 
 
+_DEFAULT_OP_SUPPORT_COUNT = 100000
+_MAX_OP_SUPPORT_COUNT = 2000000
+_MAX_PROFILE_ATTEMPTS = 4
+
+
 def make_run_profiled(
     tt_metal_root: str | os.PathLike[str],
     perf_test: str,
@@ -318,17 +323,33 @@ def make_run_profiled(
         profiles_dir.mkdir(parents=True, exist_ok=True)
         out_dir = profiles_dir / "tracy_out"
         log_path = profiles_dir / f"run{i}_tracy.log"
-        env = dict(os.environ)
-        env["TT_METAL_DEVICE_PROFILER"] = "1"
-        env.update(extra_env or {})
+        base_env = dict(os.environ)
+        base_env["TT_METAL_DEVICE_PROFILER"] = "1"
+        base_env.update(extra_env or {})
         cmd = build_tracy_command(perf_test, case, out_dir)
+        count = int(base_env.get("TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT") or _DEFAULT_OP_SUPPORT_COUNT)
         watermark = time.time() - 0.05
-        t_start = time.monotonic()
-        code = execute(cmd, root, env, timeout_s, log_path)
-        wall_ms = (time.monotonic() - t_start) * 1000.0
-        if code != 0:
-            tail = "\n".join(log_path.read_text().splitlines()[-15:]) if log_path.is_file() else ""
-            raise TracyRunError(f"tracy run exit {code}; log {log_path}; tail:\n{tail}")
+        wall_ms = 0.0
+        for _attempt in range(_MAX_PROFILE_ATTEMPTS):
+            env = dict(base_env)
+            env["TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT"] = str(count)
+            watermark = time.time() - 0.05
+            t_start = time.monotonic()
+            code = execute(cmd, root, env, timeout_s, log_path)
+            wall_ms = (time.monotonic() - t_start) * 1000.0
+            dropped = "markers were dropped" in (log_path.read_text() if log_path.is_file() else "")
+            if dropped and count < _MAX_OP_SUPPORT_COUNT and _attempt < _MAX_PROFILE_ATTEMPTS - 1:
+                count = min(count * 2, _MAX_OP_SUPPORT_COUNT)
+                continue
+            if dropped:
+                raise TracyRunError(
+                    f"profiler buffer still overflowing at op_support_count={count}; reduce the "
+                    f"profiled workload (fewer decode steps or signpost a region); log: {log_path}"
+                )
+            if code != 0:
+                tail = "\n".join(log_path.read_text().splitlines()[-15:]) if log_path.is_file() else ""
+                raise TracyRunError(f"tracy run exit {code}; log {log_path}; tail:\n{tail}")
+            break
 
         # layer 1: directed output (-o) — a dir only this run writes to
         found = sorted(out_dir.glob("**/ops_perf_results_*.csv"), key=lambda p: p.stat().st_mtime)
