@@ -45,7 +45,45 @@ def decide(ctx) -> str:
     )
     d["result"] = "keep" if improved else "discard"
     if not improved:
-        d["reason"] = "no_gain"
+        if d.get("op_graph_identical"):
+            d["reason"] = "edit_inert"
+            # FIXER: iterate an inert structural shard (re-invoke with evidence) instead of
+            # discarding; capped, and only while the agent keeps making a new edit (stuck-detector).
+            sig = ctx.state.get("edit_sig")
+            stuck = sig is not None and sig == ctx.state.get("prev_fixer_sig")
+            if (
+                ctx.state.get("last_was_structural")
+                and not stuck
+                and ctx.state.get("inert_fix_attempts", 0) < states.MAX_STRUCT_FIX
+            ):
+                ctx.state["prev_fixer_sig"] = sig
+                ctx.state["inert_fix_attempts"] = ctx.state.get("inert_fix_attempts", 0) + 1
+                ctx.state["inert_repair_error"] = (
+                    "Your edit applied and passed PCC, but the device op graph is BYTE-IDENTICAL "
+                    "to before your edit — your `to_memory_config` did NOT execute (the datamove "
+                    "op count is unchanged). That means the sharded tensor is NOT the input the hot "
+                    "matmul actually consumes. Re-Read your own edit and trace the variable: the "
+                    "tensor you sharded must be the SAME variable passed into the ttnn.linear/matmul "
+                    "on the executed path (not a copy, not shadowed before the call, not in a helper "
+                    "the forward doesn't run). Fix the connection so the shard reaches the matmul input."
+                )
+                ctx.state["last_decision"] = d
+                ctx.log_event(
+                    states.DECIDE,
+                    "info",
+                    f"edit_inert -> FIXER retry {ctx.state['inert_fix_attempts']}/{states.MAX_STRUCT_FIX} "
+                    "(iterate the shard, don't discard)",
+                )
+                return states.APPLY
+            ctx.log_event(
+                states.DECIDE,
+                "warn",
+                "fixer abandoned: edit unchanged from last retry (not converging)"
+                if stuck
+                else "edit_inert: post-edit op graph byte-identical to pre-edit (target not exercised)",
+            )
+        else:
+            d["reason"] = "no_gain"
     elif before:
         gain = abs(after - before) / abs(before)
         if gain > _SUSPICIOUS_GAIN:

@@ -241,3 +241,93 @@ Zero runtime overhead, smaller DRAM footprint, faster weight reads each forward.
 | CCL + matmul | fuse via `all_gather_matmul` |
 | Norm weights | TILE_WIDTH sticks, ROW_MAJOR, no padding |
 | On-device | embeddings, sampling, untilize, mask/RoPE generation |
+
+---
+
+## 11. Trace capture — eliminate host dispatch in the generation loop {#gen-trace-capture}
+<!-- route
+op_class: host_fallback
+bound: host
+regime: decode
+lever_type: structural
+-->
+
+**Fires when:** the workload is **host-bound** (the `host_overhead` bucket dominates wall
+time — `host_fraction` high). The device kernels are fine; wall time is lost to the **host
+re-issuing every op each step**. This is the single biggest generation-loop win, and it does
+NOT change the device op graph — so it is only measurable under a **wall/throughput metric**
+(`--metric wall_ms`), never `device_ms`.
+
+**The coordinated edit (capture once, replay per step):**
+```python
+# 1. device must be opened with a trace region (set in device_params / open_device):
+#    trace_region_size = <bytes>   (size the captured program needs)
+# 2. warm up once (compile kernels) OUTSIDE the trace, then capture:
+tid = ttnn.begin_trace_capture(device, cq_id=0)
+tt_out = run_decode_step(...)          # the SAME ops you already run, captured
+ttnn.end_trace_capture(device, tid, cq_id=0)
+# 3. per generated token, REPLAY with no host dispatch:
+for _ in range(num_tokens):
+    write_new_input(...)               # only the changing input is updated in-place
+    ttnn.execute_trace(device, tid, cq_id=0, blocking=False)
+```
+Current position / step index must be a **device tensor**, not a Python int, or the trace
+captures a stale constant (see §8). Inputs that change per step are written **in place** into
+the same buffers the trace reads.
+
+**FORCE-TRY:** apply it and let the **wall-time** gate + PCC gate decide. Do NOT skip as risky.
+**SELF-VERIFY:** re-read your edit and confirm it (a) opens/sets a `trace_region_size`,
+(b) brackets the step with `begin/end_trace_capture`, and (c) replays via `execute_trace` in
+the loop. A loop that still calls the eager forward each step captured nothing — inert.
+
+---
+
+## 12. Two command queues (2-CQ) — overlap I/O with compute {#gen-2cq}
+<!-- route
+op_class: host_fallback
+bound: host
+regime: decode
+lever_type: structural
+-->
+
+**Fires when:** host-bound and input/output movement serializes with compute. Open the device
+with `num_command_queues=2`; issue host→device writes (and device→host reads) on **cq 1** while
+compute runs on **cq 0**, synchronized with events:
+```python
+write_event = ttnn.record_event(device, cq_id=1)
+ttnn.wait_for_event(0, write_event)     # compute (cq 0) waits for the write (cq 1)
+# ... compute on cq 0 ...
+read_event = ttnn.record_event(device, cq_id=0)
+ttnn.wait_for_event(1, read_event)      # read (cq 1) waits for compute (cq 0)
+```
+Pairs naturally with trace (§11): trace replays compute on cq 0, cq 1 streams the next input.
+
+**FORCE-TRY + SELF-VERIFY:** confirm the device is opened with `num_command_queues=2` AND that
+reads/writes actually use `cq_id=1` with events — a second CQ that nothing uses is inert.
+Measured under the wall/throughput metric only.
+
+---
+
+## 13. Bucketed (constant-shape) decode — compile once, reuse {#gen-bucketed-decode}
+<!-- route
+op_class: host_fallback
+bound: host
+regime: decode
+lever_type: structural
+-->
+
+**Fires when:** host-bound because each new token grows the sequence by 1 → a **fresh kernel
+compile every step** (JIT cache misses dominate wall time). Fix: **pad the decode length to a
+fixed bucket** (e.g. 64/128/256) so the decoder kernels compile **once** and every step reuses
+them:
+```python
+BUCKETS = (64, 128, 256, 512)
+bucket_len = next(b for b in BUCKETS if b >= max_new_tokens)   # constant shape
+# build decoder inputs/masks at bucket_len; generate up to bucket_len, stop at EOS.
+```
+Masking must hide the padding so PCC/token output is unchanged. This is a prerequisite for
+trace (§11): a trace requires a constant shape, so bucket FIRST, then capture.
+
+**FORCE-TRY + SELF-VERIFY:** confirm the decode loop now runs at a **fixed** sequence length
+(constant shape) and that padding is masked so generated tokens match the un-bucketed run.
+PCC-gate it (output tokens must be identical); measured under the wall/throughput metric.

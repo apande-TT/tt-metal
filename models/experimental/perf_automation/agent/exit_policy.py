@@ -58,14 +58,8 @@ def check_exit(state: dict[str, Any]) -> ExitDecision:
     if max_iter is not None and state.get("iteration", 0) >= max_iter:
         return "STOPPED"
 
-    # 4. No more buckets worth trying (floor).
-    all_buckets = set(state.get("all_bucket_ids") or [])
-    exhausted = set(state.get("exhausted_buckets") or [])
-    if all_buckets:
-        return "STOPPED" if all_buckets <= exhausted else "continue"
-    candidates = state.get("candidates") or []
-    tried = set(state.get("tried") or [])
-    if candidates and all(c in tried for c in candidates):
-        return "STOPPED"
+    # 4. Per-bucket lever exhaustion is handled by the CHECK_EXIT handler, which
+    # advances to the next-slowest bucket (via exhausted_buckets) and only STOPs
+    # once ALL buckets are exhausted. So it is intentionally NOT a hard stop here.
 
     return "continue"

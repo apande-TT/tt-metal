@@ -112,24 +112,7 @@ def _validate(pathmap: dict[str, Any], model_root: Path) -> dict[str, Any]:
             "; ".join(f"{f.get('code')}: {f.get('detail')}" for f in fatal) or "no 'end_to_end' PCC entry discovered"
         )
         raise ModelFilesError(f"CANNOT CONTINUE — fatal discovery flag(s): {details}")
-    # end_to_end is the real correctness gate and must resolve to a file. Other
-    # entries (per-component gates) are optional; the discovery sub-agent is
-    # non-deterministic and sometimes emits a glob/description instead of a single
-    # file for them — drop those with a warning rather than failing the whole run.
-    pcc = {}
-    for name, v in pcc_raw.items():
-        try:
-            pcc[name] = _norm_entry(v, model_root, f"pcc entry {name!r}")
-        except ModelFilesError:
-            if name == "end_to_end":
-                raise
-            warnings.append(
-                {
-                    "level": "warning",
-                    "code": "pcc_entry_dropped",
-                    "detail": f"pcc entry {name!r} -> {v!r} is not a single file; dropped (end_to_end gate retained)",
-                }
-            )
+    pcc = {name: _norm_entry(v, model_root, f"pcc entry {name!r}") for name, v in pcc_raw.items()}
     for name, entry in pcc.items():
         thr = entry.setdefault("threshold", None)
         if thr is not None:

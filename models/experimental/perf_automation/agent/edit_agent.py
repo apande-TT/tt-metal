@@ -145,6 +145,7 @@ def make_edit_runner(
             permission_mode="bypassPermissions",
             setting_sources=[],
             max_turns=max_turns,
+            max_buffer_size=50 * 1024 * 1024,
         )
         if cwd:
             opts["cwd"] = cwd

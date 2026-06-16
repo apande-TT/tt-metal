@@ -229,3 +229,142 @@ file's per-regime sections.
 | Activation dtype | bf8b | keep native through attention; don't cast to bf16 |
 | Weights | DRAM interleaved | DRAM-sharded only for decode |
 | Reshards | minimize | fuse dtype cast; don't remove ones the next op redoes |
+
+---
+
+## 10. Shard the activation into L1 — the coordinated edit {#shard-activation-to-l1}
+<!-- route
+op_class: matmul,datamove
+memory: dram_interleaved
+lever_type: structural
+-->
+
+**Fires when:** the bucket is `memory=dram_interleaved`. That tag means every op reads
+its inputs from DRAM — the activation is never resident in L1, so the matmul stalls on the
+DRAM read and the chip streams the same data back and forth (this is also the root of a
+large `datamove` op count). This is the **highest-leverage structural win** on an encoder
+whose activation fits in 64-core L1.
+
+**THE #1 FAILURE MODE — read this first.** Setting a matmul `program_config` (block sizes,
+core grid) on an input tensor that is still `DRAM_INTERLEAVED` **does NOTHING** — the kernel
+graph is unchanged and the edit is inert. A program config is *not* a sharding op. You MUST
+change the **`memory_config` of the tensor itself**. Sharding is a property of the *tensor*,
+not the matmul call.
+
+**The edit is a COORDINATED change — all three parts, or it's a no-op:**
+
+1. **Shard the input activation into L1** *before* the matmul:
+   ```python
+   grid = device.compute_with_storage_grid_size()          # full grid — never hard-code
+   shard_cfg = ttnn.create_sharded_memory_config(
+       shape=x.shape,                                       # (B·S, H)
+       core_grid=ttnn.CoreGrid(y=grid.y, x=grid.x),
+       strategy=ttnn.ShardStrategy.BLOCK,                   # block-sharded (encoder default)
+       orientation=ttnn.ShardOrientation.ROW_MAJOR,
+   )
+   x = ttnn.to_memory_config(x, shard_cfg)                  # <-- THE op that actually shards
+   ```
+2. **Give the matmul the matching program config + full grid** (so the math runs on all cores):
+   ```python
+   ttnn.linear(x, w, bias=b,
+       program_config=ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+           compute_with_storage_grid_size=(grid.x, grid.y),
+           in0_block_w=H_tiles // grid.x,
+           out_subblock_h=1, out_subblock_w=min(4, N_tiles // grid.x),
+           per_core_M=ceil(M_tiles / grid.y), per_core_N=ceil(N_tiles / grid.x),
+           transpose_mcast=False, fused_activation=<existing activation or None>),
+       memory_config=shard_cfg,                              # keep OUTPUT sharded too
+       compute_kernel_config=<existing HiFi2/LoFi config>)
+   ```
+3. **Keep the output sharded** so the *next* op (LN / residual / next matmul) consumes it
+   without a reshard back to DRAM. Chaining the shard down the layer is what collapses the
+   `datamove` count — a single sharded matmul whose output immediately reshards to DRAM is a
+   wash.
+
+**FORCE-TRY (do not skip as "risky"):** make the full coordinated change and let the PCC gate
+decide. Do NOT ship a partial version (e.g. program-config only) to be "safe" — a partial
+shard is exactly the inert no-op above. If L1 clashes (the CB equation in §2), shrink
+`in0_block_w` / subblock or switch to `ttnn.experimental.minimal_matmul` — but still shard
+the tensor. The only acceptable reason to fall back to DRAM is a *measured* PCC failure or a
+*measured* L1 overflow, never caution.
+
+---
+
+## 11. Occupy the full core grid {#occupy-full-grid}
+<!-- route
+op_class: matmul,datamove,reduction
+grid: partial,tiny
+lever_type: structural
+-->
+
+**Fires when:** the bucket is `grid=partial` (or `tiny`) — the ops ran on fewer than all 64
+(WH) / 110+ (BH) cores, so most of the chip is idle. Almost always a *consequence* of an
+unsharded, DRAM-interleaved tensor: with no shard spec, the op gets a default/partial core
+assignment.
+
+**The fix is the same coordinated shard as §10** — you raise occupancy by *sharding the
+tensor across the full grid*, not by passing a bigger `compute_with_storage_grid_size`
+alone (that, by itself, is the inert no-op). Concretely:
+
+1. `grid = device.compute_with_storage_grid_size()` — resolve the real grid, never hard-code.
+2. Shard the input across `(grid.x, grid.y)` (see §10 step 1).
+3. Set the program config's `compute_with_storage_grid_size=(grid.x, grid.y)` and size
+   `per_core_M / per_core_N` so the work divides evenly across all cores.
+
+**FORCE-TRY:** attempt full-grid occupancy on the hottest op in the bucket; PCC-gate it.
+Verify the result by re-profiling — the bucket's `grid` tag should flip from `partial` to
+`full`. If it stays `partial`, the tensor was not actually sharded (the §10 failure mode) —
+fix the `memory_config`, don't just retune the program config.
+
+---
+
+## 12. Mixed-precision experiment — mandatory, don't skip as risky {#mixed-precision-experiment}
+<!-- route
+op_class: matmul,reduction
+fidelity: hifi4,hifi2
+lever_type: structural
+-->
+
+**Fires when:** the bucket runs at `fidelity=hifi4` (max precision, 4× the math cost) or a
+`hifi2` matmul whose weights are still bf16. High fidelity is the safe *bring-up* default,
+not a *perf* choice — the Tensix math engine runs ~2× faster at HiFi2 and ~3.6× faster at
+LoFi (see §5). A model brought up for correctness almost always leaves precision headroom on
+the table. **The "Make Fast Models Fast" lesson is explicit: skills that don't MANDATE a
+mixed-precision experiment leave this win unclaimed ("BFP8 MLP weights ... did not mandate
+mixed-precision tests").**
+
+"Mixed precision" = different ops at different precisions, each walked down to the lowest its
+PCC tolerates — NOT one global dtype. The coordinated change per matmul:
+
+1. **Weights → lower dtype where safe:** bf16 → `bfloat8_b` (often) → `bfloat4_b` (many MLP
+   matmuls). Cast the weight tensor's dtype, don't just change a kwarg.
+2. **Match the compute kernel fidelity (§5 policy):**
+   ```python
+   compute = ttnn.init_device_compute_kernel_config(
+       device.arch(),
+       math_fidelity=ttnn.MathFidelity.LoFi,    # bf8b/bf4b matmul; HiFi2 for bf16
+       math_approx_mode=False,
+       fp32_dest_acc_en=False,                   # matmul; unlocks h·w≤8 subblocks (§3)
+       packer_l1_acc=True,
+   )
+   ```
+3. **Pass it to the op** (`compute_kernel_config=compute`).
+
+**The PCC-aware policy — this is what keeps it safe (§5/§7):**
+| Op | Try | Hard floor (do NOT cross) |
+|---|---|---|
+| bf8b matmul (QKV/MLP/attn-out) | **LoFi** | — usually holds |
+| bf16 matmul | HiFi2 | LoFi rarely wins at bf16 |
+| **LayerNorm/RMSNorm/softmax reductions** | stay **HiFi2 + fp32_dest=True** | **NEVER LoFi** — compounds to FAIL over depth (§7) |
+
+So for the `reduction` bucket: drop HiFi4 → HiFi2 on *non-normalization* reductions, but keep
+norms at HiFi2 + fp32. For `matmul`: walk weights down + LoFi, PCC-gate each step.
+
+**FORCE-TRY (the deck's exact instruction):** make the precision drop and let the **full-model**
+PCC gate decide — do NOT skip it as "risky." Precision wins are the most commonly-skipped
+optimization because they *feel* risky; the whole point is the gate makes trying them free.
+
+**SELF-VERIFY:** after editing, confirm the op's `compute_kernel_config` fidelity actually
+changed (and/or the weight dtype) — a fidelity drop is a real kernel change (unlike a bare
+program_config), so this one should move the device-time number, not just the op graph.
+**Validate reductions at FULL MODEL DEPTH** (§7) — single-layer PCC lies for norms.

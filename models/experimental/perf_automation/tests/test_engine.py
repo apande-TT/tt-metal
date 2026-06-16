@@ -31,17 +31,31 @@ def _entry(anchor):
 MOCK_INDEX = [_entry("mlp-fidelity-walk"), _entry("subblock-unlock"), _entry("fuse-activation-matmul")]
 
 
+_U = {"tokens_in": 1, "tokens_out": 1, "cost_usd": 0.0, "latency_s": 0.0}
+
+
 def _fake_plan(*, lever, section, skeleton, cwd=None):
+    # anchor "x = 1" survives re-application across laps (new_string keeps it)
     return {
-        "file": "model.py",
-        "location": "x",
-        "change": "tweak",
+        "summary": "tweak",
+        "edits": [{"file": "model.py", "old_string": "x = 1", "new_string": "x = 1  # tuned"}],
         "model": "mock",
-        "usage": {"tokens_in": 1, "tokens_out": 1, "cost_usd": 0.0, "latency_s": 0.0},
+        "usage": _U,
     }
 
 
-def _fake_editor(*, lever, section, model_files, spec=None):
+def _metric(target):
+    return {
+        "name": "device_ms",
+        "unit": "ms",
+        "direction": "min",
+        "baseline": 12.091,
+        "current": 12.091,
+        "target": target,
+    }
+
+
+def _fake_editor(*, lever, section, model_files, error=None, spec=None, cwd=None):
     return {
         "files": ["model.py"],
         "summary": "mock edit",
@@ -184,16 +198,20 @@ def test_handlers_only_return_declared_transitions(tmp_path):
 
 
 def test_route_writes_decision_brief(tmp_path):
-    """ROUTE persists a route_brief with a candidate table + section texts for SELECT."""
+    """ROUTE appends a route_briefs.jsonl row with candidates + section texts for SELECT."""
+    from agent.events import read_jsonl_last
+
     ctx = _ctx(_mk_run(tmp_path))
     route_handler(ctx)
-    rel = ctx.state["route_brief"]
-    brief = (ctx.run.dir / rel).read_text()
-    assert rel.startswith("route_brief_")
-    assert "candidate levers" in brief
-    assert "| id | lever_type | file | title |" in brief  # the table header
-    assert "mlp-fidelity-walk" in brief  # a candidate id in the table
-    assert "Model map" in brief  # the filtered ast skeleton is included
+    rid = ctx.state["route_brief_id"]
+    brief = read_jsonl_last(ctx.run.dir / "route_briefs.jsonl", route_brief_id=rid)
+    assert brief is not None
+    assert brief["route_brief_id"] == rid
+    assert brief["row_type"] == "route_brief"
+    assert brief["bucket"]["id"] == "matmul"
+    assert "mlp-fidelity-walk" in [c["id"] for c in brief["candidates"]]
+    assert brief["model_map"]  # the filtered ast skeleton is included
+    assert any(s["id"] == "mlp-fidelity-walk" and s["text"] for s in brief["sections"])
 
 
 def test_engine_stop_after_route_parks_before_select(tmp_path):
@@ -202,5 +220,95 @@ def test_engine_stop_after_route_parks_before_select(tmp_path):
     ctx = _ctx(run)
     parked = engine.run(ctx, build_handlers(), stop_after={states.ROUTE})
     assert parked == states.SELECT
-    assert ctx.state.get("route_brief")  # ROUTE produced the brief
+    assert ctx.state.get("route_brief_id")  # ROUTE produced the brief
     assert ctx.state.get("git_sha_clean") is None  # APPLY never ran
+
+
+# --------------------------- repair-path integration -----------------------
+def _scripted_editor(*steps):
+    """Editor whose Nth call runs steps[N](model_py_path). Each step writes the
+    model file and returns a runner-shaped result. The last step repeats."""
+    calls = {"n": 0}
+
+    def editor(*, lever, section, model_files, error=None, spec=None, cwd=None):
+        i = min(calls["n"], len(steps) - 1)
+        calls["n"] += 1
+        return steps[i](Path(model_files[0]))
+
+    editor.calls = calls
+    return editor
+
+
+def _writes(text):
+    def step(model_py):
+        model_py.write_text(text)
+        return {
+            "files": ["model.py"],
+            "summary": "edit",
+            "model": "mock",
+            "usage": {"tokens_in": 1, "tokens_out": 1, "cost_usd": 0.0, "latency_s": 0.0},
+        }
+
+    return step
+
+
+def _role_count(run, role):
+    f = run.dir / "agent_calls.jsonl"
+    if not f.exists():
+        return 0
+    return sum(1 for ln in f.read_text().splitlines() if ln.strip() and json.loads(ln).get("role") == role)
+
+
+def test_engine_repair_code_self_heals_syntax_error(tmp_path):
+    """PLAN lands a syntactically broken edit -> VERIFY parse_error -> REPAIR_CODE
+    editor fixes it -> VERIFY ok -> ... -> DONE. (single lap via target=11.5)"""
+    run = _mk_run(tmp_path, state_overrides={"metric": _metric(11.5)})
+    ctx = _ctx(run)
+    ctx.deps["plan_runner"] = lambda **k: {
+        "summary": "break",
+        "edits": [{"file": "model.py", "old_string": "x = 1", "new_string": "def (:"}],
+        "model": "mock",
+        "usage": _U,
+    }
+    ctx.deps["edit_runner"] = _scripted_editor(_writes("x = 2\n"))  # repair editor fixes it
+    final = engine.run(ctx, build_handlers())
+    assert final == states.DONE
+    assert _role_count(run, "repair_code") == 1  # exactly one code self-heal ran
+    assert _role_count(run, "repair_pcc") == 0
+
+
+def test_engine_repair_pcc_recovers_low_pcc(tmp_path):
+    """Valid edit -> GATE_PCC pcc_low -> REPAIR_PCC -> GATE_PCC ok -> ... -> DONE."""
+    run = _mk_run(tmp_path, state_overrides={"metric": _metric(11.5)})
+    ctx = _ctx(run)  # _fake_plan emits a valid edit
+    ctx.deps["edit_runner"] = _scripted_editor(_writes("x = 1  # tuned\n"))  # repair editor (valid)
+    pcc_calls = {"n": 0}
+
+    def pcc_runner(c):
+        pcc_calls["n"] += 1
+        return {"status": "pcc_low", "pcc": 0.80} if pcc_calls["n"] == 1 else {"status": "ok", "pcc": 0.999}
+
+    ctx.deps["pcc_runner"] = pcc_runner
+    final = engine.run(ctx, build_handlers())
+    assert final == states.DONE
+    assert _role_count(run, "repair_pcc") == 1  # exactly one PCC recovery ran
+    assert _role_count(run, "repair_code") == 0
+    assert pcc_calls["n"] >= 2  # gate failed then passed
+
+
+def test_engine_repair_code_exhausts_budget_then_reverts(tmp_path):
+    """Edit can never be fixed: REPAIR_CODE runs up to MAX_CODE_FIX, then discards
+    (edit_failed) -> REVERT."""
+    run = _mk_run(tmp_path)
+    ctx = _ctx(run)
+    ctx.deps["plan_runner"] = lambda **k: {
+        "summary": "break",
+        "edits": [{"file": "model.py", "old_string": "x = 1", "new_string": "def (:"}],
+        "model": "mock",
+        "usage": _U,
+    }
+    ctx.deps["edit_runner"] = _scripted_editor(_writes("def (:\n"))  # always broken
+    final = engine.run(ctx, build_handlers())
+    assert final in states.TERMINAL
+    assert _role_count(run, "repair_code") >= states.MAX_CODE_FIX
+    assert ctx.state["last_decision"]["reason"] == "edit_failed"

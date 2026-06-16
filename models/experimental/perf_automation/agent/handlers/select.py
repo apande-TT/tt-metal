@@ -5,11 +5,13 @@ lever id from the closed candidate list. The picker is injectable
 (ctx.deps["select_runner"]) so this tests without a key; default is the live
 LEAD-model picker. Any invalid pick or API error falls back to untried[0].
 
-In:  ctx.state["candidates"], ["tried"], ["route_brief"].
+In:  ctx.state["candidates"], ["tried"], ["route_brief_id"].
 Out: ctx.state["selected_lever"], ["select_reasoning"]; counters reset. -> APPLY
 """
 
 from __future__ import annotations
+
+import json
 
 from .. import states
 
@@ -21,6 +23,9 @@ def select(ctx) -> str:
 
     ctx.state["code_fix_attempts"] = 0  # counters reset per NEW lever
     ctx.state["pcc_fix_attempts"] = 0
+    ctx.state["inert_fix_attempts"] = 0  # FIXER: shard-iteration budget, fresh per lever
+    ctx.state.pop("inert_repair_error", None)
+    ctx.state.pop("prev_fixer_sig", None)  # convergence stuck-detector: fresh per lever
 
     if not untried:
         # exhausted bucket — let CHECK_EXIT's no-untried-levers floor stop the run.
@@ -55,11 +60,13 @@ def select(ctx) -> str:
 
 
 def _read_brief(ctx) -> str:
-    rel = ctx.state.get("route_brief")
-    if not rel:
+    from ..events import read_jsonl_last
+
+    rid = ctx.state.get("route_brief_id")
+    if not rid:
         return ""
-    p = ctx.run.dir / rel
-    return p.read_text() if p.exists() else ""
+    row = read_jsonl_last(ctx.run.dir / "route_briefs.jsonl", route_brief_id=rid)
+    return json.dumps(row, indent=2, sort_keys=True) if row else ""
 
 
 def _default_runner():

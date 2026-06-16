@@ -27,7 +27,7 @@ flowchart LR
     IN["model dir<br/>+ target metric"] --> BL
     subgraph BL["BEFORE LOOP (stage 1, runs once)"]
         direction LR
-        E["environment<br/>check"] --> C["cache<br/>playbook"] --> D["discover<br/>(sub-agent)"] --> P["preflight"] --> T["tracy<br/>baseline"]
+        E["environment<br/>check"] --> C["cache<br/>playbook"] --> D["discover<br/>(sub-agent)"] --> LR["lead<br/>review"] --> P["preflight"] --> RS["resolve<br/>signposts"] --> T["tracy<br/>baseline"]
     end
     BL --> AL
     subgraph AL["AGENT LOOP (stage 2, many iterations)"]
@@ -43,6 +43,16 @@ clean Tracy profile. All of that lands in a `runs/<id>/` directory. The **Agent
 Loop** then takes that baseline and runs many short iterations against it,
 improving the metric one change at a time.
 
+The seven Before-Loop blocks, in order:
+
+- **environment check** — read the hardware (card, core grid, DRAM bandwidth) and pick the visible device(s).
+- **cache playbook** — index the `GUIDELINES/` playbook into the tag-based routing index (rebuilt only when the playbook changes).
+- **discover** — a sub-agent explores the model dir and reports its perf test + case, the PCC correctness gate + threshold, and the source files.
+- **lead review** — the lead agent checks the discovery evidence and signs off (or flags gaps) before anything else runs.
+- **preflight** — `pytest --collect-only` confirms the discovered test actually exists and collects.
+- **resolve signposts** — scan the model's `tests/` for tracy `signpost(...)` markers so REMEASURE later captures the *same* op region as the baseline; falls back to `start`/`stop` (full capture) if none exist.
+- **tracy baseline** — profile the unmodified model (median of N), tag the ops into buckets, and write `baseline_profile.json` — the fixed reference for total speedup.
+
 ## 2. How the optimization loop thinks
 
 This is the heart of it — one lap of the state machine, repeated until it exits:
@@ -50,8 +60,10 @@ This is the heart of it — one lap of the state machine, repeated until it exit
 ```mermaid
 flowchart TD
     ROUTE["ROUTE<br/>find slowest op group"] -->|"levers for that op"| SELECT
-    SELECT["🤖 SELECT<br/>pick one lever"] --> APPLY
-    APPLY["APPLY<br/>git checkpoint + edit"] --> VERIFY
+    SELECT["🤖 SELECT<br/>pick one lever"] --> PLAN
+    PLAN["🤖 PLAN<br/>emit exact edits<br/>old_string -> new_string"] --> APPLY
+    APPLY["APPLY<br/>git checkpoint +<br/>apply patch (deterministic)"] --> VERIFY
+    APPLY -->|"anchor miss"| RC
     VERIFY -->|"parses and imports"| GATE["GATE_PCC<br/>correctness"]
     VERIFY -->|"syntax / import error"| RC["🤖 REPAIR_CODE"]
     GATE -->|"PCC ok"| REM["REMEASURE<br/>median device_ms"]
@@ -72,7 +84,7 @@ flowchart TD
 
     classDef agent fill:#fde68a,stroke:#b45309,color:#000;
     classDef term fill:#bbf7d0,stroke:#15803d,color:#000;
-    class SELECT,RC,RP agent;
+    class SELECT,PLAN,RC,RP agent;
     class STOP term;
 ```
 
@@ -86,8 +98,13 @@ Walking the lap:
   that kind of op.
 - **SELECT** is the agent's one judgment call: given the candidate levers and
   what's already been tried, pick one.
-- **APPLY** records a clean git SHA (so any change is undoable), then an edit
-  sub-agent makes that single change to the model file.
+- **PLAN** turns that lever into exact `{file, old_string, new_string}` edits —
+  the lead reads the file once and copies the current code verbatim as the anchor
+  (no line numbers, which drift).
+- **APPLY** records a clean git SHA (so any change is undoable), then applies
+  PLAN's edits **deterministically** — a plain find-and-replace, no LLM. The anchor
+  must match exactly once; a stale/ambiguous anchor fails loudly and routes to
+  REPAIR_CODE (which re-edits from the real file).
 - **VERIFY** parses and imports the edit — cheap, no hardware. **GATE_PCC** runs
   the end-to-end correctness test and compares PCC to the model's threshold.
 - When something breaks, the **REPAIR** loop hands the captured error back to the
@@ -182,12 +199,13 @@ exactly these steps:
 - the **discovery sub-agent** in the Before Loop (explore the model dir, report
   what it found),
 - **SELECT** (which lever to try this iteration),
-- **PLAN** (turn the chosen lever into a localized `{file, location, change}` spec),
-- **APPLY** (the editor applies that spec to the model source),
-- **REPAIR** (fix a broken or correctness-failing edit).
+- **PLAN** (turn the chosen lever into exact `{file, old_string, new_string}` edits),
+- **REPAIR** (re-edit when an anchor doesn't match, or correctness regresses).
 
-The lead model (sonnet) does the reasoning in SELECT/PLAN; the editor runs on the
-cheaper sub tier (haiku) because APPLY is mechanical transcription of the spec.
+APPLY is **not** an LLM step: PLAN emits content-anchored edits and APPLY applies
+them with a plain, self-validating find-and-replace (no model, no line numbers). The
+lead (sonnet) reasons in SELECT/PLAN; the editor (haiku) appears only in REPAIR —
+re-editing from the real file when an anchor misses or PLAN produced no edits.
 Keeping the agent on the edges and the machinery in the middle is what makes runs
 reproducible, resumable, and cheap to test.
 
@@ -228,8 +246,9 @@ contracts, fixtures for working offline, and open questions live in
 
 ## 7. What a run writes (the JSON files)
 
-Everything a run produces lives under `runs/<id>/`, in four lifecycles that are
-never mixed — that separation is deliberate.
+Everything a run produces lives under `runs/<id>/`. There are **two checkpoint
+files** (`manifest`, `state`) and a set of **append-only `.jsonl` streams** — one
+stream per concern, **never per-iteration files**. You can `tail -f` any stream live.
 
 | file | lifecycle | what it holds |
 |---|---|---|
@@ -237,11 +256,39 @@ never mixed — that separation is deliberate.
 | `state.json` | mutable checkpoint (atomic) | the single live file, and the one resume reads. Current `state`, `iteration`, the `metric` block (name / unit / direction / baseline / current / target), counters (`cost_usd`, tokens, `code_fix_attempts`, `pcc_fix_attempts`), and the working set (`candidates`, `tried`, `selected_lever`, `git_sha_clean`). Rewritten atomically after every transition. |
 | `ledger.jsonl` | append-only | one row per experiment — the **story**: which lever, before/after, delta, PCC, kept or discarded and why, plus the agent's `hypothesis`. This is what a human (or a warm restart days later) reads to understand the run. |
 | `events.jsonl` | append-only | one row per stage entry/exit — the **execution trace**, one unified schema for both phases: `ts` (UTC ISO-8601 Z), `phase` (before_loop/loop), `stage`, `event` (start/done/info/warn), `detail`, `seconds`, `iteration`. |
-| `agent_calls.jsonl` | append-only | one row per LLM call — the **bill**: stage, role (discovery / select / repair), model, tokens in/out, cached tokens, cost, latency. Feeds the budget gate. |
+| `agent_calls.jsonl` | append-only | one row per LLM call — the **lean bill**: `agent_call_id`, `phase`, `iteration`, stage, role (discovery / select / plan / edit / repair), model, tokens in/out/cached, cost, latency. **No prompt text** (that lives in `prompts.jsonl`, joined by `agent_call_id`). Feeds the budget gate. |
+| `prompts.jsonl` | append-only | one row per LLM call carrying the **full prompt + response text** — the heavy payload kept out of the bill. Linked to its cost row by `agent_call_id`. This is where you read *what the model was actually asked and what it answered*. |
+| `route_briefs.jsonl` | append-only | one row per ROUTE — the **decision material** SELECT reads: the chosen bucket, the candidate levers, the model map, and the full playbook section texts. SELECT fetches the current row by `route_brief_id`. |
 | `profiles/baseline_profile.json` | write-once | the tagged op buckets (op_class, fidelity, grid, rank, …) + device_ms / wall_ms of the **original** model. The fixed reference for total speedup — NOT what ROUTE routes on after iteration 0. |
 | `profiles/iter_<N>_profile.json` | write-once per iteration | the re-bucketed profile of the model as edited in iteration N. When DECIDE keeps the change, COMMIT promotes this to the *current* profile (`state.current_profile`), and the next ROUTE routes on it. |
 | `profiles/*.csv` | write-once | the raw Tracy ops CSV and the tt-perf-report output, kept as evidence. |
 | `.cache/playbook_index.json` | derived cache (shared) | the routing index built from the `GUIDELINES/` tags. Content-hashed and rebuilt when the playbook changes; **not** tied to any single run. |
+
+### Reading the names — how to follow one lap
+
+The file names are simple (`<concern>.jsonl`). The *ids inside the rows* are what
+let you stitch the streams together:
+
+- **`iteration`** — which optimization lap (`0`, `1`, `2`, …). It appears in *every*
+  stream, so filtering all of them by `iteration` shows you one whole lap. The
+  **Before Loop runs once, before any lap exists**, so its rows have
+  `iteration = none` — `none` literally means "not part of a numbered lap."
+- **`agent_call_id`** — the unique id of one LLM call. The **same value** appears in
+  `agent_calls.jsonl` (what it cost) and `prompts.jsonl` (what was said), so it's how
+  you jump from "this call cost \$0.14" to "here's the exact prompt + response." Shape:
+  ```
+  <run_id> : <phase> : <iteration> : <stage> : <role> : <seq>
+  2026-06-12T12-00-50 : loop        : 0    : PLAN     : plan                : 003
+  2026-06-12T12-00-50 : before_loop : none : discover : discovery_sub_agent : 000
+  ```
+  Left to right: which run, `before_loop` or `loop`, which lap (`none` for before_loop),
+  which stage, which agent role, and a per-run sequence number.
+- **`route_brief_id`** — the id of one ROUTE's decision material, shape
+  `<run_id>:<iteration>:ROUTE`. `state.json` keeps the current `route_brief_id` so SELECT
+  can pull the matching row out of `route_briefs.jsonl`.
+
+So: **`iteration`** scopes a lap, **`agent_call_id`** drills from a cost row into the
+real prompt, **`route_brief_id`** finds what ROUTE handed SELECT.
 
 Rule of thumb: **manifest** is what we started with (read-only), **state** is where
 we are now (the one file resume needs), and the **`.jsonl`** files are append-only
@@ -266,13 +313,86 @@ agent/
   before_loop.py   stage 1 driver (environment, discovery, baseline)
   engine.py        the dispatcher that walks the state machine
   states.py        state names + transition contract + repair budgets
-  loop_context.py  the ctx seam: state, manifest, ledger, telemetry
+  loop_context.py  the ctx seam: state, manifest, telemetry (record_agent_call)
   loop.py          `python -m agent.loop` entry point
+  events.py        the ONE logging module: append_jsonl/read_jsonl_last + the
+                   events / agent_calls / prompts / route_briefs schemas
+  clock.py         utc_ts() — the single UTC timestamp source
   router.py        playbook index + tag-based lever routing
   tracy_tool.py    profile -> tt-perf-report -> tagged buckets
-  handlers/        one file per loop stage (most real; COMMIT/REVERT/REPAIR_* still mock)
-runs/<id>/         one run: state.json, manifest.json, ledger.jsonl, profiles/
+  patch.py         deterministic content-anchored edit apply (PLAN edits, no LLM)
+  handlers/        one file per loop stage. REAL: ROUTE, SELECT, PLAN, APPLY,
+                   VERIFY, REPAIR_CODE, REPAIR_PCC, GATE_PCC, REMEASURE, DECIDE,
+                   LOG/CHECK_EXIT. MOCK (teammate's task): COMMIT, REVERT.
+runs/<id>/         one run. Two checkpoints: state.json, manifest.json.
+                   Append-only streams: events.jsonl, agent_calls.jsonl,
+                   prompts.jsonl, route_briefs.jsonl, ledger.jsonl. Plus profiles/.
 GUIDELINES/        the optimization playbook (tagged sections the router reads)
 tests/             unit tests + the walking-skeleton engine test
 PLAN_AGENT_WORKFLOW.md   the full design & build plan
+```
+
+---
+
+## 10. Autonomous upgrades (eyes · structural edits · fixer · two axes)
+
+This builds on §1–§9 with the pieces that let the loop optimize a *bring-up* model
+with no human in the loop. The deterministic/agentic split (§5) is unchanged — these
+add intelligence at the edit/judgment points and keep the measure + PCC gate as the
+un-fakeable judge.
+
+### 10.1 The eyes — op→source attribution (fixes the targeting blindness)
+The op-class buckets tell you *what* is slow (matmul) but not *where* it is emitted in
+the code. The profiler measures device kernels; a kernel carries no link back to the
+Python line. So edits used to be aimed by a guess. Now, during the one exec-scope
+perf-test run, `op_attribution_plugin` wraps `ttnn.matmul/linear/...` and records the
+**model-source line** that issued each op (skipping the perf-test wrapper + the tool);
+`op_attribution.aggregate` ranks the source lines by matmul work →
+`ctx.state["hot_sources"]` (e.g. *"hot matmul @ `decoder_layer.py:338`"*). Plus
+`tracy_tool._top_ops` now keeps the per-op **fingerprint** (op + shape + memory + count
++ ms) that was previously discarded at bucketing. Both are handed to the edit agent so
+it aims at the line that actually emits the dominant matmul.
+
+### 10.2 Structural edits — `lever_type: structural`
+A shard/grid/trace change is multi-site (convert the tensor's `memory_config` to L1 +
+matching `program_config` + keep the consumer sharded). A single config kwarg on a DRAM
+tensor is a no-op. Knobs tagged `lever_type: structural` route to `structural_agent.py`
+(an LLM with Read/Edit/Grep/Glob — deliberately **no Bash**, so it can't deadlock on the
+device the profiler holds). It is fenced to the **executed files** (`exec_scoped_files`)
+and given `hot_sources`. Non-structural (config) knobs still apply via the deterministic
+patch (§5).
+
+### 10.3 The fixer — iterate an inert shard instead of discarding it
+A one-shot coordinated shard rarely connects. When `REMEASURE` finds the op graph
+**byte-identical** (`edit_inert`) on a structural lever, `DECIDE` no longer discards: it
+**keeps the edit on disk and re-invokes the agent** (`DECIDE → APPLY`) with the evidence
+("your `to_memory_config` didn't execute — the datamove count is unchanged — connect the
+sharded tensor to the matmul input"), up to `MAX_STRUCT_FIX` times. A **convergence
+stuck-detector** hashes the edit each retry: it keeps iterating only while the agent
+makes a *new* attempt and **abandons early** if it repeats the same edit. (Config-knob
+inert and `no_gain` are still discarded — there's nothing to iterate toward.)
+
+### 10.4 Two optimization axes — `--metric`
+`device_ms` optimizes the device floor (sharding/grid/fidelity/fusion). `wall_ms` adds a
+routable `host_overhead` bucket (`wall = device + host`), so the slowest-bucket router
+also targets generation-loop wins — `gen-trace-capture`, `gen-2cq`, `gen-bucketed-decode`
+(GUIDELINES §08). Under a wall metric, `edit_inert` is *not* treated as failure (a trace
+edit legitimately keeps the device op graph identical while improving wall time).
+
+### 10.5 The waste-judge — agentic stop decision
+Instead of dumbly trying every knob, after `JUDGE_STREAK_THRESHOLD` consecutive measured
+no-gains in a bucket, `progress_agent.py` (lead LLM) reasons over the **measured ledger**
+and returns continue / exhaust-this-bucket / stop. It judges only over measured results
+(never predicts an unmeasured edit), so it correctly distinguishes "the edits aren't
+landing" from "the bucket has no headroom."
+
+### New modules added for the above
+```
+agent/op_attribution_plugin.py   pytest plugin: per-op model-source capture (the eyes)
+agent/op_attribution.py          aggregate the attribution sidecar → ranked hot sources
+agent/structural_agent.py        coordinated structural-edit agent (+ self-verify)
+agent/progress_agent.py          the waste-judge
+agent/exec_scope.py              exec-trace + attribution run; fences edits to the executed path
+GUIDELINES/01_FOUNDATIONS.md     §10 shard-to-L1, §11 full-grid, §12 mixed-precision (structural)
+GUIDELINES/08_*.md               §11 trace, §12 2-CQ, §13 bucketed-decode (structural, host-bound)
 ```

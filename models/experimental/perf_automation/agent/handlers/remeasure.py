@@ -39,6 +39,24 @@ def _comparable(baseline, iter_profile, tol=0.25):
     return True, None
 
 
+def _same_op_graph(before: dict, after: dict) -> bool:
+    """True iff two profiles have a byte-identical op-class signature (same
+    buckets, same op counts, same per-bucket device_ms to 4 dp). Device kernel
+    time is deterministic, so an EFFECTIVE edit always shifts at least one
+    bucket's count or time; if nothing moves, the edited code was never
+    exercised by the perf workload (the edit targets dead/un-run code)."""
+
+    def sig(p):
+        return sorted(
+            (str(b.get("id")), int(b.get("count", 0)), round(float(b.get("device_ms", 0.0)), 4))
+            for b in (p.get("buckets") or [])
+            if b.get("id") != "host_overhead"  # host time is non-deterministic; only the device op graph defines identity
+        )
+
+    bsig, asig = sig(before), sig(after)
+    return bool(bsig) and bsig == asig
+
+
 def remeasure(ctx) -> str:
     before = ctx.state["metric"]["current"]
     runner = ctx.deps.get("measure_runner") or _default_runner()
@@ -58,11 +76,15 @@ def remeasure(ctx) -> str:
         ctx.state["last_decision"] = {"result": "discard", "reason": "measure_failed", "before": before}
         return states.REVERT
 
-    devs = [p["device_ms"] for p in profiles]
-    median_dev = statistics.median(devs)
-    after = round(median_dev, 4)
-    spread = round(max(devs) - min(devs), 4) if len(devs) > 1 else 0.0
-    rep = min(profiles, key=lambda p: abs(p["device_ms"] - median_dev))  # representative profile
+    # Track the CONFIGURED metric (device_ms | wall_ms | host_ms), not always device.
+    # wall_ms/host_ms let the loop optimize generation-loop wins (trace/2-CQ/bucketing)
+    # that don't move the device floor. Unknown metrics (fps/throughput) fall back to device.
+    metric_name = (ctx.state.get("metric") or {}).get("name", "device_ms")
+    vals = [p.get(metric_name, p["device_ms"]) for p in profiles]
+    median_val = statistics.median(vals)
+    after = round(median_val, 4)
+    spread = round(max(vals) - min(vals), 4) if len(vals) > 1 else 0.0
+    rep = min(profiles, key=lambda p: abs(p.get(metric_name, p["device_ms"]) - median_val))  # representative profile
 
     rel = f"profiles/iter_{ctx.state.get('iteration', 0):02d}_profile.json"
     (ctx.run.dir / rel).write_text(json.dumps(rep, indent=2, sort_keys=True))
@@ -75,19 +97,31 @@ def remeasure(ctx) -> str:
     except Exception:  # baseline unreadable -> skip the guard, don't block
         pass
 
+    # op_graph_identical => edit_inert ONLY for the device-floor metric. A trace /
+    # 2-CQ / bucketed-decode edit LEGITIMATELY leaves the device op graph byte-identical
+    # while improving wall/host time, so flagging it inert would wrongly discard a real
+    # generation-loop win. For wall/host metrics, let DECIDE judge on the measured number.
+    op_graph_identical = False
+    if metric_name == "device_ms":
+        try:
+            op_graph_identical = _same_op_graph(ctx.current_profile(), rep)
+        except Exception:  # missing/odd profile -> don't false-flag
+            pass
+
     ctx.state["last_decision"] = {
         "before": before,
         "after": after,
         "spread": spread,
-        "runs": len(devs),
+        "runs": len(vals),
         "pcc": (ctx.state.get("last_verdict") or {}).get("pcc"),
         "profile": rel,
         "measurement_ok": measurement_ok,
         "measurement_reason": measurement_reason,
+        "op_graph_identical": op_graph_identical,
     }
     if not measurement_ok:
         ctx.log_event(states.REMEASURE, "warn", f"profile not comparable to baseline: {measurement_reason}")
-    ctx.log_event(states.REMEASURE, "info", f"after={after} spread={spread} runs={len(devs)}")
+    ctx.log_event(states.REMEASURE, "info", f"after={after} spread={spread} runs={len(vals)}")
     return states.DECIDE
 
 

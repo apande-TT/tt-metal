@@ -89,6 +89,7 @@ def make_select_runner(
             permission_mode="bypassPermissions",
             setting_sources=[],
             max_turns=max_turns,
+            max_buffer_size=50 * 1024 * 1024,
         )
         chunks: list[str] = []
         usage: dict = {}

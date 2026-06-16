@@ -27,11 +27,20 @@ MISSING_ENV_MESSAGE = (
 
 # Model roles (PLAN section 3.1). Sub-agents use sonnet; lead model is TBD(model-lead)
 # (likely Opus 4.8) — default to sonnet until resolved. Both overridable via .env.agent.
-MODEL_ENV_KEYS = {"lead": "AGENT_MODEL_LEAD", "sub": "AGENT_MODEL_SUB", "edit": "AGENT_MODEL_EDIT"}
+MODEL_ENV_KEYS = {
+    "lead": "AGENT_MODEL_LEAD",
+    "sub": "AGENT_MODEL_SUB",
+    "edit": "AGENT_MODEL_EDIT",
+    "structural": "AGENT_MODEL_STRUCTURAL",
+}
 MODEL_DEFAULTS = {
     "sub": "anthropic/claude-sonnet-4-6",
     "lead": "anthropic/claude-sonnet-4-6",  # TBD(model-lead)
     "edit": "anthropic/claude-haiku-4-5-20251001",  # editing inherits the SUB (haiku) tier; it applies the lead's PLAN spec verbatim
+    # structural-edit agent: a COORDINATED multi-op change (shard tensor + program
+    # config + consumer) is reasoning-heavy, so it gets the lead (sonnet) tier, not
+    # the mechanical haiku editor. Override via AGENT_MODEL_STRUCTURAL.
+    "structural": "anthropic/claude-sonnet-4-6",
 }
 
 

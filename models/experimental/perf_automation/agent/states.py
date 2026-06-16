@@ -36,6 +36,9 @@ TERMINAL = frozenset({DONE, STOPPED, FAILED})
 # Repair budgets (decided 2026-06-11) ----------------------------------------
 MAX_CODE_FIX = 5  # parse / import / run-crash repairs before ABANDON
 MAX_PCC_FIX = 2  # PCC-below-threshold repairs before DISCARD
+MAX_INERT_RETRY = 6  # off-path (edit_inert) retries before giving up steering a lever
+JUDGE_STREAK_THRESHOLD = 3  # consecutive measured no-gains in a bucket before the agentic waste-judge weighs in
+MAX_STRUCT_FIX = 3  # FIXER: re-invoke the structural agent on an inert (op-graph-unchanged) shard, up to N times
 
 # Reference transition map (documentation + a test can assert handlers conform).
 # Conditional edges (verdicts, counters) are decided INSIDE the handler; this
@@ -51,7 +54,7 @@ TRANSITIONS = {
     REPAIR_PCC: [VERIFY],
     GATE_PCC: [REMEASURE, REPAIR_PCC, REPAIR_CODE, REVERT],
     REMEASURE: [DECIDE, REVERT],
-    DECIDE: [COMMIT, REVERT],
+    DECIDE: [COMMIT, REVERT, APPLY],  # APPLY = FIXER: iterate on an inert structural shard
     COMMIT: [LOG],
     REVERT: [LOG],
     LOG: [CHECK_EXIT],

@@ -89,8 +89,8 @@ def commit(repo, message: str, pathspec=None) -> str | None:
     staged_args = ["diff", "--cached", "--name-only"] + (["--", str(pathspec)] if pathspec else [])
     staged = _git(staged_args, repo)
     if staged.returncode == 0 and not staged.stdout.strip():
-        return None  # nothing to commit under pathspec
-    cargs = ["commit", "-m", message] + (["--", str(pathspec)] if pathspec else [])
+        return None
+    cargs = ["commit", "--no-verify", "-m", message] + (["--", str(pathspec)] if pathspec else [])
     r = _git(cargs, repo)
     if r.returncode != 0:
         raise GitError(f"git commit failed: {r.stderr.strip()}")

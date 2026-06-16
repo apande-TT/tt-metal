@@ -1,6 +1,7 @@
 """APPLY handler (PLAN 8.5) — REAL, resilient.
 
-Record a clean git checkpoint, then the edit sub-agent applies the lever. We do
+Record a clean git checkpoint. If PLAN produced content-anchored edits, apply
+them deterministically (no LLM). Otherwise the edit sub-agent applies the lever. We do
 NOT blindly trust the agent's self-reported file list: edits land on disk before
 the agent's final message, so if the report is empty or the agent errored, we
 fall back to `git diff` for ground truth. If nothing actually changed -> route to
@@ -12,31 +13,82 @@ Out: ctx.state["git_sha_clean"], ["last_edit"]. -> VERIFY (or REPAIR_CODE/REVERT
 
 from __future__ import annotations
 
-from .. import gitio, router, states
+from .. import gitio, patch, router, states
 
 
 def apply(ctx) -> str:
     lever = ctx.state.get("selected_lever")
     repo = gitio.repo_root(ctx.model_root())
-    clean = gitio.head_sha(repo)
-    ctx.state["git_sha_clean"] = clean  # REVERT target, recorded BEFORE editing
+    # FIXER retry: an inert structural shard re-enters APPLY to be debugged. Keep the
+    # ORIGINAL clean sha (the revert target + git-diff base) and the prior edit on disk
+    # so the agent fixes its own edit; only record a fresh clean sha on the first apply.
+    is_fixer = bool(ctx.state.get("inert_repair_error"))
+    if not is_fixer:
+        ctx.state["git_sha_clean"] = gitio.head_sha(repo)
+    clean = ctx.state.get("git_sha_clean")
 
+    spec = ctx.state.get("edit_spec")
+    edits = spec.get("edits") if isinstance(spec, dict) else None
+    is_structural = _lever_type(ctx, lever) == "structural"
+    ctx.state["last_was_structural"] = is_structural  # DECIDE's fixer gate reads this
+
+    # Fast path: PLAN gave content-anchored edits -> apply DETERMINISTICALLY, no LLM.
+    # Self-validating: a missing / non-unique anchor fails loudly and self-heals.
+    # Structural levers SKIP this: a coordinated shard (tensor memory_config + program
+    # config + consumer) is multi-site and needs the structural agent, not a one-anchor
+    # find/replace — that is exactly the half-applied 'edit_inert' failure we saw.
+    if edits and not is_structural:
+        changed, failures = patch.apply_edits(ctx.model_root(), edits)
+        if not failures:
+            ctx.state["last_edit"] = {
+                "files": changed,
+                "summary": spec.get("summary", ""),
+                "reported": changed,
+                "error": None,
+            }
+            ctx.log_event(states.APPLY, "info", f"patch applied: {len(edits)} edit(s) -> {changed}")
+            return states.VERIFY
+        # Deterministic anchors didn't match the file verbatim (whitespace/anchor
+        # drift). Instead of bailing, FALL BACK to the LLM editor below: it reads
+        # the file and applies the lever/spec with the Edit tool, which matches
+        # flexibly where the exact find-and-replace failed.
+        reason = "; ".join(f"{f['file']}: {f['reason']}" for f in failures)
+        ctx.state["last_verdict"] = {"status": "patch_failed", "error": reason}
+        ctx.log_event(states.APPLY, "warn", f"deterministic patch missed ({reason}); falling back to LLM editor")
+        # no return -> fall through to the LLM-editor block
+
+    # LLM editor: PLAN produced no structured edits, OR the deterministic patch
+    # above missed its anchors. The editor applies the lever/spec via Read+Edit.
     try:
         section = router.read_section(lever) if lever else ""
     except KeyError:
         section = ""
 
-    runner = ctx.deps.get("edit_runner") or _default_runner()
+    if is_structural:
+        runner = ctx.deps.get("structural_runner") or _default_structural_runner()
+    else:
+        runner = ctx.deps.get("edit_runner") or _default_runner()
     reported, summary, model, usage, err = [], "", "?", None, None
     prompt_text, response_text = None, None
     try:
-        result = runner(
+        # SCOPE-FENCE: a structural edit is only meaningful on the executed path, so
+        # restrict its editable files to exec_scoped_files (prevents editing dead /
+        # off-path stubs like the speech path). Non-structural keeps the full list.
+        scoped = ctx.state.get("exec_scoped_files")
+        call_kwargs = dict(
             lever=lever,
             section=section,
-            model_files=ctx.model_files(),
+            model_files=(scoped if (is_structural and scoped) else ctx.model_files()),
             spec=ctx.state.get("edit_spec"),
             cwd=str(ctx.model_root()),
         )
+        if is_structural:  # per-op targets + the op->source attribution (where the hot op lives)
+            call_kwargs["top_ops"] = ctx.state.get("top_ops") or []
+            call_kwargs["hot_sources"] = ctx.state.get("hot_sources") or []
+            err = ctx.state.pop("inert_repair_error", None)  # FIXER: feed the op-graph-unchanged evidence back
+            if err:
+                call_kwargs["error"] = err
+        result = runner(**call_kwargs)
         reported = result.get("files") or []
         summary = result.get("summary", "")
         model, usage = result.get("model", "?"), result.get("usage")
@@ -61,10 +113,40 @@ def apply(ctx) -> str:
         return states.REVERT
 
     ctx.state["last_edit"] = {"files": changed, "summary": summary, "reported": reported, "error": err}
+    ctx.state["edit_sig"] = _edit_sig(repo, clean, pathspec)
     return states.VERIFY
+
+
+def _edit_sig(repo, clean, pathspec):
+    import hashlib
+
+    try:
+        args = ["diff", clean] + (["--", str(pathspec)] if pathspec else [])
+        out = gitio._git(args, repo)
+        return hashlib.sha256((out.stdout or "").encode()).hexdigest()[:16]
+    except Exception:
+        return None
 
 
 def _default_runner():
     from ..edit_agent import make_edit_runner
 
     return make_edit_runner()
+
+
+def _default_structural_runner():
+    from ..structural_agent import make_structural_runner
+
+    return make_structural_runner()
+
+
+def _lever_type(ctx, lever):
+    """Look up the selected lever's lever_type from the playbook index.
+
+    'structural' levers route to the structural-edit agent (coordinated multi-op
+    shard) instead of the content-anchored patch / mechanical editor.
+    """
+    for e in getattr(ctx, "index", None) or []:
+        if e.get("id") == lever:
+            return e.get("lever_type")
+    return None

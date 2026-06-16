@@ -12,8 +12,6 @@ from __future__ import annotations
 
 from .. import exit_policy, states
 
-_BUCKET_MISS_LIMIT = 3
-
 
 def log(ctx) -> str:
     d = ctx.state.get("last_decision") or {}
@@ -35,30 +33,138 @@ def log(ctx) -> str:
     }
     ctx.ledger.append(row)
 
-    if lever and lever not in ctx.state.setdefault("tried", []):
-        ctx.state["tried"].append(lever)
+    if d.get("reason") == "edit_inert" and not ctx.state.get("exec_scoped_files"):
+        # REACTIVE mode only (no exec-scope): the file may be off-path. Record it
+        # and -- up to a cap -- DON'T spend the lever: retry it on an on-path file.
+        # In SCOPED mode every file already runs, so an inert edit falls through to
+        # the else branch (spend the lever, move on) -- letting the loop sweep all
+        # levers and advance through every bucket (matmul->datamove->reduction->…).
+        for f in (ctx.state.get("last_edit") or {}).get("files") or []:
+            if f not in ctx.state.setdefault("inert_files", []):
+                ctx.state["inert_files"].append(f)
+        retries = ctx.state.get("inert_retries", 0)
+        if retries < states.MAX_INERT_RETRY:
+            ctx.state["inert_retries"] = retries + 1
+        else:  # cap hit -> stop steering this lever, let SELECT move on
+            ctx.state["inert_retries"] = 0
+            if lever and lever not in ctx.state.setdefault("tried", []):
+                ctx.state["tried"].append(lever)
+    else:
+        ctx.state["inert_retries"] = 0
+        if lever and lever not in ctx.state.setdefault("tried", []):
+            ctx.state["tried"].append(lever)
+        if d.get("result") == "keep" and after is not None:
+            ctx.state["metric"]["current"] = after
 
-    bucket = ctx.state.get("current_bucket")
-    if bucket:
-        misses = ctx.state.setdefault("bucket_misses", {})
-        if d.get("result") == "keep":
-            misses[bucket] = 0
-        elif d.get("result") == "discard" and d.get("reason") == "no_gain":
-            misses[bucket] = misses.get(bucket, 0) + 1
-        cands = ctx.state.get("candidates") or []
-        tried_now = set(ctx.state.get("tried") or [])
-        spent = bool(cands) and all(c in tried_now for c in cands)
-        if misses.get(bucket, 0) >= _BUCKET_MISS_LIMIT or spent:
-            exhausted = ctx.state.setdefault("exhausted_buckets", [])
-            if bucket not in exhausted:
-                exhausted.append(bucket)
+    # Per-bucket measured history + no-gain streak — the EVIDENCE the agentic waste
+    # judge (CHECK_EXIT) reasons over. History is measured results only.
+    cur_bucket = ctx.state.get("current_bucket")
+    hist = ctx.state.setdefault("bucket_history", {}).setdefault(cur_bucket, [])
+    hist.append(
+        {
+            "lever": lever,
+            "result": d.get("result"),
+            "reason": d.get("reason"),
+            "before": before,
+            "after": after,
+            "delta": row["delta"],
+        }
+    )
+    if d.get("result") == "keep":
+        ctx.state["nogain_streak"] = 0
+    else:
+        same = ctx.state.get("streak_bucket") == cur_bucket
+        ctx.state["nogain_streak"] = (ctx.state.get("nogain_streak", 0) + 1) if same else 1
+    ctx.state["streak_bucket"] = cur_bucket
 
-    if d.get("result") == "keep" and after is not None:
-        ctx.state["metric"]["current"] = after
+    # Manual-perf TARGET visibility (the "Make Fast Models Fast" Slide-4 gap): when a
+    # --target is set, report current-vs-target each iter so the loop is chasing a number,
+    # not just sweeping knobs. The actual stop-on-target lives in exit_policy (rule 1).
+    m = ctx.state.get("metric") or {}
+    tgt = m.get("target")
+    cur = m.get("current")
+    if tgt is not None and cur is not None:
+        unit = m.get("unit", "")
+        gap = (cur - tgt) if m.get("direction", "min") == "min" else (tgt - cur)
+        pct = (gap / tgt * 100.0) if tgt else 0.0
+        status = "TARGET MET" if gap <= 0 else f"gap {gap:+.4f}{unit} ({pct:+.1f}% from target)"
+        ctx.log_event(states.LOG, "info", f"vs manual target {tgt}{unit}: current {cur:.4f}{unit} — {status}")
+
     ctx.state["iteration"] = it + 1
     return states.CHECK_EXIT
 
 
 def check_exit(ctx) -> str:
     decision = exit_policy.check_exit(ctx.state)  # "continue" | "DONE" | "STOPPED"
-    return states.ROUTE if decision == "continue" else decision
+    if decision in ("DONE", "STOPPED"):  # target met / budget / max-iter
+        return decision
+
+    # Per-bucket lever exhaustion: if every candidate for the CURRENT bucket has
+    # been tried, mark that bucket exhausted and ROUTE to the next-slowest one
+    # (ROUTE already skips exhausted_buckets). Only STOP once ALL buckets are out.
+    state = ctx.state
+    candidates = state.get("candidates") or []
+    tried = set(state.get("tried") or [])
+    untried = [c for c in candidates if c not in tried]
+
+    # AGENTIC waste decision (not a static rule): after a streak of MEASURED no-gains
+    # in this bucket, an agent reasons over the measured history and decides whether to
+    # keep spending device measurements here. Fires only while knobs remain untried
+    # (full exhaustion is handled deterministically below). Fails open to 'continue'.
+    if untried and state.get("nogain_streak", 0) >= states.JUDGE_STREAK_THRESHOLD:
+        cur = state.get("current_bucket")
+        judge = ctx.deps.get("progress_judge") or _default_judge()
+        verdict = judge(bucket=cur, untried=untried, history=(state.get("bucket_history") or {}).get(cur) or [])
+        ctx.record_agent_call(states.CHECK_EXIT, "progress", verdict.get("model", "?"), verdict.get("usage"))
+        dec = verdict.get("decision", "continue")
+        ctx.log_event(states.CHECK_EXIT, "info", f"waste-judge: {dec} — {verdict.get('reasoning', '')}")
+        state["nogain_streak"] = 0  # reset so the judge isn't re-invoked every iter
+        if dec == "stop":
+            return states.STOPPED
+        if dec == "exhaust":  # agent says this bucket is tapped -> advance like a normal exhaustion
+            exhausted = set(state.get("exhausted_buckets") or [])
+            if cur:
+                exhausted.add(cur)
+            state["exhausted_buckets"] = sorted(exhausted)
+            try:
+                allb = {b["id"] for b in (ctx.current_profile().get("buckets") or [])}
+                if (state.get("metric") or {}).get("name", "device_ms") == "device_ms":
+                    allb.discard("host_overhead")
+            except Exception:
+                allb = set()
+            if allb and exhausted >= allb:
+                ctx.log_event(states.CHECK_EXIT, "info", f"waste-judge exhausted last bucket {sorted(exhausted)}; stopping")
+                return states.STOPPED
+            ctx.log_event(states.CHECK_EXIT, "info", f"waste-judge -> advance past '{cur}' (exhausted={sorted(exhausted)})")
+            return states.ROUTE
+        # 'continue' falls through to the deterministic logic below
+
+    if candidates and all(c in tried for c in candidates):
+        cur = state.get("current_bucket")
+        exhausted = set(state.get("exhausted_buckets") or [])
+        if cur:
+            exhausted.add(cur)
+        state["exhausted_buckets"] = sorted(exhausted)
+        try:
+            all_buckets = {b["id"] for b in (ctx.current_profile().get("buckets") or [])}
+            # host_overhead is non-routable under the device-floor metric, so it must
+            # not count toward "all buckets exhausted" or the run never stops.
+            if (state.get("metric") or {}).get("name", "device_ms") == "device_ms":
+                all_buckets.discard("host_overhead")
+        except Exception:
+            all_buckets = set()
+        if all_buckets and exhausted >= all_buckets:
+            ctx.log_event(states.CHECK_EXIT, "info", f"all buckets exhausted {sorted(exhausted)}; stopping")
+            return states.STOPPED
+        ctx.log_event(
+            states.CHECK_EXIT, "info", f"bucket '{cur}' exhausted; advancing to next (exhausted={sorted(exhausted)})"
+        )
+        return states.ROUTE
+
+    return states.ROUTE
+
+
+def _default_judge():
+    from ..progress_agent import make_progress_judge_runner
+
+    return make_progress_judge_runner()

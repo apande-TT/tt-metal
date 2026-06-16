@@ -65,27 +65,6 @@ def test_check_exit_no_untried_levers():
     assert check_exit(_base(candidates=["a", "b"], tried=["a", "b"])) == "STOPPED"
 
 
-def test_check_exit_stops_when_all_buckets_exhausted():
-    assert (
-        check_exit(_base(all_bucket_ids=["reduction", "matmul"], exhausted_buckets=["reduction", "matmul"]))
-        == "STOPPED"
-    )
-
-
-def test_check_exit_continues_when_other_buckets_remain():
-    assert (
-        check_exit(
-            _base(
-                all_bucket_ids=["reduction", "matmul"],
-                exhausted_buckets=["reduction"],
-                candidates=["a", "b"],
-                tried=["a", "b"],
-            )
-        )
-        == "continue"
-    )
-
-
 def test_check_exit_otherwise_continue():
     assert check_exit(_base()) == "continue"
 

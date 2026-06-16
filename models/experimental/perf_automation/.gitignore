@@ -1,0 +1,9 @@
+# credentials — NEVER commit
+.env.agent
+.env
+# run artifacts (large; per-run)
+runs/
+.cache/
+# python bytecode
+__pycache__/
+*.pyc

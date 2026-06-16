@@ -258,11 +258,64 @@ def build_buckets(
                 "count": b["count"],
                 "tags": tags,
                 "lever_state": b["lever_state"],
+                # Per-op detail for the structural-edit agent: the K hottest INDIVIDUAL
+                # ops in this bucket (the aggregate hides which call site to target).
+                "top_ops": _top_ops(b["members"], available_cores),
             }
         )
     # Stable, useful ordering: biggest device-time bucket first.
     out.sort(key=lambda x: x["device_ms"], reverse=True)
     return out
+
+
+def _pad(v: str) -> str:
+    """'32[10]' -> '32' (the padded dim the kernel actually computes)."""
+    s = str(v or "").split("[")[0].strip()
+    return s or "?"
+
+
+def _op_shape(raw: dict) -> str:
+    """Compact matmul shape fingerprint from the per-op input dims already in the CSV.
+    e.g. in0 (M,K) @ in1 (K,N) -> '32x1024 @ 1024x1024'. The fingerprint that says
+    WHICH matmul this is (FFN 4096->1024 vs projection 1024->1024) without a human."""
+    m, k0 = _pad(raw.get("INPUT_0_Y_PAD[LOGICAL]")), _pad(raw.get("INPUT_0_X_PAD[LOGICAL]"))
+    k1, n = _pad(raw.get("INPUT_1_Y_PAD[LOGICAL]")), _pad(raw.get("INPUT_1_X_PAD[LOGICAL]"))
+    return f"{m}x{k0} @ {k1}x{n}"
+
+
+def _top_ops(members: list[dict[str, Any]], available_cores: int, k: int = 6) -> list[dict[str, Any]]:
+    """Rank the bucket's hot ops by FINGERPRINT (op + shape + memory), not as one
+    aggregate. The bucket says 'matmul 16ms / 769 ops' — useless for aiming. Grouping
+    the per-op rows (data already in the raw CSV, normally discarded) yields e.g.
+    'Matmul 1024x1024 dram ×144 = 2.28ms' vs 'Matmul 4096->1024 ×12 = 0.70ms' — the
+    distinct hot call-shapes the agent can match to code. Ranked by TOTAL device-ms.
+    """
+    groups: dict[tuple, dict[str, Any]] = {}
+    for m in members:
+        rep, raw = m.get("report", {}), m.get("raw", {})
+        shape = _op_shape(raw)
+        mem = normalize_memory(raw.get("INPUT_0_MEMORY", ""))
+        op = rep.get("OP Code", "")
+        key = (op, shape, mem)
+        g = groups.setdefault(
+            key,
+            {
+                "op_code": op,
+                "shape": shape,
+                "memory": mem,
+                "count": 0,
+                "device_ms": 0.0,
+                "cores": int(_to_float(rep.get("Cores")) or 0),
+                "grid": normalize_grid(_to_float(rep.get("Cores")) or 0.0, available_cores),
+                "fidelity": normalize_fidelity(raw.get("MATH FIDELITY", "")),
+            },
+        )
+        g["count"] += 1
+        g["device_ms"] += (_to_float(rep.get("Device Time")) or 0.0) / 1e3
+    out = sorted(groups.values(), key=lambda x: x["device_ms"], reverse=True)
+    for g in out:
+        g["device_ms"] = round(g["device_ms"], 4)
+    return out[:k]
 
 
 def _most_common(values: Sequence[str]) -> str:
@@ -318,9 +371,32 @@ def tracy_tool(
     refine(raw_dest, report_csv, start_signpost, end_signpost, id_range, arch)
 
     buckets = build_buckets(report_csv, raw_dest, available_cores)
+    wall_ms = median(walls)
+    device_ms = round(sum(b["device_ms"] for b in buckets), 4)
+    # Host overhead as a routable bucket: for a WALL-TIME metric, wall = device +
+    # host, so each bucket's ms is its share of wall and ROUTE's slowest-bucket
+    # pick naturally targets host overhead when the workload is host-bound (the
+    # trace / 2-CQ / bucketed-decode territory). ROUTE skips this bucket when the
+    # metric is device_ms (optimizing host can't move the device floor). Tags carry
+    # only the dims that route it: op_class=host_fallback, bound=host (grid/fidelity
+    # /memory omitted -> wildcard, so generation-loop knobs match regardless).
+    host_ms = round(max(0.0, wall_ms - device_ms), 4)
+    buckets.append(
+        {
+            "id": "host_overhead",
+            "device_ms": host_ms,  # its contribution to WALL time
+            "pct": (host_ms / wall_ms * 100.0) if wall_ms else 0.0,
+            "count": 0,
+            "tags": {"op_class": "host_fallback", "bound": "host", "rank": "time", "regime": "decode"},
+            "lever_state": {},
+            "top_ops": [],
+        }
+    )
     return {
-        "wall_ms": median(walls),
-        "device_ms": round(sum(b["device_ms"] for b in buckets), 4),
+        "wall_ms": wall_ms,
+        "device_ms": device_ms,
+        "host_ms": host_ms,
+        "host_fraction": round(host_ms / wall_ms, 4) if wall_ms else 0.0,
         "buckets": buckets,
         "stack_report": stack_report(buckets),
         "artifacts": {"raw_csv": str(raw_dest), "report_csv": str(report_csv)},
