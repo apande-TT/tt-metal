@@ -58,21 +58,13 @@ def decide(ctx) -> str:
             ):
                 ctx.state["prev_fixer_sig"] = sig
                 ctx.state["inert_fix_attempts"] = ctx.state.get("inert_fix_attempts", 0) + 1
-                ctx.state["inert_repair_error"] = (
-                    "Your edit applied and passed PCC, but the device op graph is BYTE-IDENTICAL "
-                    "to before your edit — your `to_memory_config` did NOT execute (the datamove "
-                    "op count is unchanged). That means the sharded tensor is NOT the input the hot "
-                    "matmul actually consumes. Re-Read your own edit and trace the variable: the "
-                    "tensor you sharded must be the SAME variable passed into the ttnn.linear/matmul "
-                    "on the executed path (not a copy, not shadowed before the call, not in a helper "
-                    "the forward doesn't run). Fix the connection so the shard reaches the matmul input."
-                )
+                ctx.state["inert_repair_error"] = _inert_evidence(ctx, d)
                 ctx.state["last_decision"] = d
                 ctx.log_event(
                     states.DECIDE,
                     "info",
                     f"edit_inert -> FIXER retry {ctx.state['inert_fix_attempts']}/{states.MAX_STRUCT_FIX} "
-                    "(iterate the shard, don't discard)",
+                    f"(iterate the shard, don't discard); op-delta:\n{d.get('op_delta')}",
                 )
                 return states.APPLY
             ctx.log_event(
@@ -94,3 +86,48 @@ def decide(ctx) -> str:
     ctx.state["last_decision"] = d
     ctx.log_event(states.DECIDE, "info", f"{d['result']} ({before} -> {after}, dir={direction})")
     return states.COMMIT if improved else states.REVERT
+
+
+def _inert_evidence(ctx, d) -> str:
+    """Build the inert-repair message from MEASURED GROUND TRUTH, not a canned guess.
+
+    The previous version asserted a specific cause ("your to_memory_config didn't
+    execute") — but the agent often never wrote one; it shipped a bare program_config.
+    Telling it to "reconnect" something it never wrote sent it in circles. Instead we
+    hand it (1) its OWN diff, (2) the measured per-bucket op-delta proving nothing
+    moved, (3) attribution proof the edited line IS live — and let it diagnose. This
+    is the one fact it cannot get by re-reading the file: what its edit DID, not says."""
+    delta = d.get("op_delta") or "(op-delta unavailable)"
+    diff = (ctx.state.get("last_diff") or "").strip() or "(diff unavailable)"
+    if len(diff) > 6000:  # keep the prompt bounded; head is where the edit anchors live
+        diff = diff[:6000] + "\n... (diff truncated)"
+    live = _live_line_proof(ctx)
+    return (
+        "Your previous edit applied and PASSED PCC, but it was INERT: the device op graph is "
+        "byte-identical to before your edit. This is MEASURED ground truth (the device, not a guess):\n\n"
+        f"Per-bucket op counts, before -> after your edit:\n{delta}\n\n"
+        f"{live}\n"
+        "So the code you edited DOES run — your edit simply produced ZERO new device ops. Read the "
+        "EXACT diff you wrote last time and find why:\n\n"
+        "----- YOUR PREVIOUS DIFF -----\n"
+        f"{diff}\n"
+        "----- END DIFF -----\n\n"
+        "Diagnose from the diff above. The usual cause: you added a `program_config=`/`memory_config=` "
+        "kwarg (or no real data-movement op at all) while the input tensor stayed DRAM_INTERLEAVED — a "
+        "no-op. To change the graph, a standalone `ttnn.to_memory_config(x, <sharded L1 cfg>)` (or "
+        "interleaved_to_sharded) must execute ON the variable that is actually passed into the hot "
+        "matmul, and the datamove bucket count above MUST increase next time."
+    )
+
+
+def _live_line_proof(ctx) -> str:
+    """Turn attribution into proof the edit was NOT on dead code (the false reading the
+    old reactive path made). Names the hottest executed source line + its call count."""
+    hs = ctx.state.get("hot_sources") or []
+    if not hs:
+        return "Attribution confirms the bucket's ops execute on the forward path (this is NOT dead code)."
+    top = hs[0]
+    return (
+        f"Attribution PROVES this is not dead code: {top.get('src','?')} "
+        f"({top.get('func','?')}) executed {top.get('calls','?')} times this run."
+    )

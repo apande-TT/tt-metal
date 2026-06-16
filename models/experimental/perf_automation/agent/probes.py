@@ -331,17 +331,27 @@ def make_run_profiled(
             tail = "\n".join(log_path.read_text().splitlines()[-15:]) if log_path.is_file() else ""
             raise TracyRunError(f"tracy run exit {code}; log {log_path}; tail:\n{tail}")
 
-        # layer 1: directed output (-o) — a dir only this run writes to
-        found = sorted(out_dir.glob("**/ops_perf_results_*.csv"), key=lambda p: p.stat().st_mtime)
-        # layer 2: stdout regex cross-check
+        # layer 1: directed output (-o). out_dir PERSISTS across iterations, so a PRIOR
+        # run's CSV is still sitting here -- filter to THIS run (mtime > watermark) or the
+        # glob can return the stale baseline. That stale-CSV reuse made every REMEASURE
+        # re-read the baseline, so real edits measured identical to baseline and were
+        # wrongly flagged inert/no-gain and reverted (the "zero gains" root cause).
+        found = sorted(
+            (p for p in out_dir.glob("**/ops_perf_results_*.csv") if p.stat().st_mtime > watermark),
+            key=lambda p: p.stat().st_mtime,
+        )
+        # layer 2: the stdout path is AUTHORITATIVE -- tracy logs the exact CSV it wrote for
+        # THIS run ("OPs csv generated at: <path>"). Trust it over the glob, which can tie or
+        # pick a touched older dir. Previously this only WARNED on a mismatch and kept the
+        # (stale) glob result; now the reported path wins whenever it exists.
         log_text = log_path.read_text() if log_path.is_file() else ""
         m = _CSV_STDOUT_RE.search(log_text)
         if m:
             reported = Path(m.group(1))
-            if found and reported.resolve() != found[-1].resolve():
-                with open(log_path, "a") as fh:
-                    fh.write(f"\n[harness] WARNING: -o glob {found[-1]} != stdout path {reported}\n")
-            elif not found and reported.is_file():
+            if reported.is_file():
+                if found and reported.resolve() != found[-1].resolve():
+                    with open(log_path, "a") as fh:
+                        fh.write(f"\n[harness] using authoritative stdout CSV {reported} over glob {found[-1]}\n")
                 found = [reported]
         # layer 3: watermark fallback in the shared area
         if not found:

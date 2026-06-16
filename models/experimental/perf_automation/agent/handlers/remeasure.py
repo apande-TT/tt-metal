@@ -50,11 +50,32 @@ def _same_op_graph(before: dict, after: dict) -> bool:
         return sorted(
             (str(b.get("id")), int(b.get("count", 0)), round(float(b.get("device_ms", 0.0)), 4))
             for b in (p.get("buckets") or [])
-            if b.get("id") != "host_overhead"  # host time is non-deterministic; only the device op graph defines identity
+            if b.get("id")
+            != "host_overhead"  # host time is non-deterministic; only the device op graph defines identity
         )
 
     bsig, asig = sig(before), sig(after)
     return bool(bsig) and bsig == asig
+
+
+def _op_delta_evidence(before: dict, after: dict) -> str:
+    """Per-bucket count/time before->after, as measured ground truth for the
+    inert-repair agent. The agent has no device; this is the ONLY way it learns
+    whether its edit changed the op graph (re-reading the file can't tell it)."""
+
+    def by_id(p):
+        return {b.get("id"): b for b in (p.get("buckets") or []) if b.get("id") != "host_overhead"}
+
+    bb, ab = by_id(before), by_id(after)
+    rows = []
+    for bid in sorted(set(bb) | set(ab)):
+        bc = bb.get(bid, {}).get("count", 0)
+        ac = ab.get(bid, {}).get("count", 0)
+        bm = round(float(bb.get(bid, {}).get("device_ms", 0.0)), 3)
+        am = round(float(ab.get(bid, {}).get("device_ms", 0.0)), 3)
+        tag = "" if (bc == ac and bm == am) else "  <-- CHANGED"
+        rows.append(f"  {bid:12s} count {bc}->{ac}   device_ms {bm}->{am}{tag}")
+    return "\n".join(rows)
 
 
 def remeasure(ctx) -> str:
@@ -102,9 +123,11 @@ def remeasure(ctx) -> str:
     # while improving wall/host time, so flagging it inert would wrongly discard a real
     # generation-loop win. For wall/host metrics, let DECIDE judge on the measured number.
     op_graph_identical = False
+    op_delta = None
     if metric_name == "device_ms":
         try:
             op_graph_identical = _same_op_graph(ctx.current_profile(), rep)
+            op_delta = _op_delta_evidence(ctx.current_profile(), rep)  # measured proof for the inert-repair agent
         except Exception:  # missing/odd profile -> don't false-flag
             pass
 
@@ -118,10 +141,17 @@ def remeasure(ctx) -> str:
         "measurement_ok": measurement_ok,
         "measurement_reason": measurement_reason,
         "op_graph_identical": op_graph_identical,
+        "op_delta": op_delta,
     }
     if not measurement_ok:
         ctx.log_event(states.REMEASURE, "warn", f"profile not comparable to baseline: {measurement_reason}")
-    ctx.log_event(states.REMEASURE, "info", f"after={after} spread={spread} runs={len(vals)}")
+    _counts = {b.get("id"): b.get("count") for b in (rep.get("buckets") or [])}
+    ctx.log_event(
+        states.REMEASURE,
+        "info",
+        f"after={after} spread={spread} runs={len(vals)} "
+        f"counts(matmul={_counts.get('matmul')},datamove={_counts.get('datamove')},eltwise={_counts.get('eltwise')})",
+    )
     return states.DECIDE
 
 

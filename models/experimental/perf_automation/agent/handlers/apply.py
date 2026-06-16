@@ -113,19 +113,30 @@ def apply(ctx) -> str:
         return states.REVERT
 
     ctx.state["last_edit"] = {"files": changed, "summary": summary, "reported": reported, "error": err}
-    ctx.state["edit_sig"] = _edit_sig(repo, clean, pathspec)
+    diff_text = _edit_diff(repo, clean, pathspec)
+    ctx.state["last_diff"] = diff_text  # GROUND TRUTH for the inert-repair agent (what it ACTUALLY wrote)
+    ctx.state["edit_sig"] = _sig(diff_text)
     return states.VERIFY
 
 
-def _edit_sig(repo, clean, pathspec):
-    import hashlib
-
+def _edit_diff(repo, clean, pathspec):
+    """The exact `git diff` the edit produced — fed back verbatim to the structural
+    agent on an inert retry so it diagnoses from what it ACTUALLY wrote, not from a
+    canned guess about what it wrote (the agent's own summary is unreliable)."""
     try:
         args = ["diff", clean] + (["--", str(pathspec)] if pathspec else [])
         out = gitio._git(args, repo)
-        return hashlib.sha256((out.stdout or "").encode()).hexdigest()[:16]
+        return out.stdout or ""
     except Exception:
+        return ""
+
+
+def _sig(diff_text):
+    import hashlib
+
+    if diff_text is None:
         return None
+    return hashlib.sha256(diff_text.encode()).hexdigest()[:16]
 
 
 def _default_runner():

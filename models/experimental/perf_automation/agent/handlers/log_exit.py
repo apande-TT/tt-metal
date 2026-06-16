@@ -33,12 +33,17 @@ def log(ctx) -> str:
     }
     ctx.ledger.append(row)
 
-    if d.get("reason") == "edit_inert" and not ctx.state.get("exec_scoped_files"):
-        # REACTIVE mode only (no exec-scope): the file may be off-path. Record it
-        # and -- up to a cap -- DON'T spend the lever: retry it on an on-path file.
-        # In SCOPED mode every file already runs, so an inert edit falls through to
-        # the else branch (spend the lever, move on) -- letting the loop sweep all
-        # levers and advance through every bucket (matmul->datamove->reduction->…).
+    edited_on_live_line = _edited_files_are_live(ctx)
+    if d.get("reason") == "edit_inert" and not ctx.state.get("exec_scoped_files") and not edited_on_live_line:
+        # REACTIVE mode only (no exec-scope) AND the edit was NOT on a known-live line:
+        # the file may genuinely be off-path. Record it and -- up to a cap -- DON'T spend
+        # the lever: retry it on an on-path file. In SCOPED mode every file already runs,
+        # so an inert edit falls through to the else branch (spend the lever, move on).
+        #
+        # CRITICAL: if attribution proved the edited line IS executed, inert means the
+        # EDIT was a no-op, NOT that the file is dead -- so we do NOT come here (the
+        # DECIDE fixer already fed the agent the measured op-delta + its own diff). Blaming
+        # file location there was the misdiagnosis that churned the lever 6x for nothing.
         for f in (ctx.state.get("last_edit") or {}).get("files") or []:
             if f not in ctx.state.setdefault("inert_files", []):
                 ctx.state["inert_files"].append(f)
@@ -133,13 +138,19 @@ def check_exit(ctx) -> str:
             except Exception:
                 allb = set()
             if allb and exhausted >= allb:
-                ctx.log_event(states.CHECK_EXIT, "info", f"waste-judge exhausted last bucket {sorted(exhausted)}; stopping")
+                ctx.log_event(
+                    states.CHECK_EXIT, "info", f"waste-judge exhausted last bucket {sorted(exhausted)}; stopping"
+                )
                 return states.STOPPED
-            ctx.log_event(states.CHECK_EXIT, "info", f"waste-judge -> advance past '{cur}' (exhausted={sorted(exhausted)})")
+            ctx.log_event(
+                states.CHECK_EXIT, "info", f"waste-judge -> advance past '{cur}' (exhausted={sorted(exhausted)})"
+            )
             return states.ROUTE
         # 'continue' falls through to the deterministic logic below
 
-    if candidates and all(c in tried for c in candidates):
+    # Exhaust the bucket when all its candidates are tried OR it has no candidates
+    # at all (a no-hit bucket the playbook can't optimize — never leave it routable).
+    if not candidates or all(c in tried for c in candidates):
         cur = state.get("current_bucket")
         exhausted = set(state.get("exhausted_buckets") or [])
         if cur:
@@ -162,6 +173,28 @@ def check_exit(ctx) -> str:
         return states.ROUTE
 
     return states.ROUTE
+
+
+def _edited_files_are_live(ctx) -> bool:
+    """True iff a file the edit touched also appears in attribution's hot_sources
+    (the executed-and-hot lines). If so, an inert result is a no-op EDIT, not a dead
+    FILE -- so the reactive 'wrong file, retry elsewhere' path must NOT fire."""
+    edited = (ctx.state.get("last_edit") or {}).get("files") or []
+    if not edited:
+        return False
+    live_files = set()
+    for h in ctx.state.get("hot_sources") or []:
+        src = (h.get("src") or "").split(":")[0]  # strip :lineno
+        if src:
+            live_files.add(src)
+    for f in edited:
+        base = f.replace("\\", "/").rsplit("/", 1)[-1]
+        if any(
+            lf.replace("\\", "/").endswith("/" + base) or lf.replace("\\", "/").rsplit("/", 1)[-1] == base
+            for lf in live_files
+        ):
+            return True
+    return False
 
 
 def _default_judge():
