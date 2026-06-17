@@ -368,3 +368,42 @@ optimization because they *feel* risky; the whole point is the gate makes trying
 changed (and/or the weight dtype) — a fidelity drop is a real kernel change (unlike a bare
 program_config), so this one should move the device-time number, not just the op graph.
 **Validate reductions at FULL MODEL DEPTH** (§7) — single-layer PCC lies for norms.
+
+## 13. Activation dtype walk — shrink bytes MOVED on the memory-bound path {#dtype-walk-activations}
+<!-- route
+op_class: datamove,eltwise,matmul
+lever_type: structural
+-->
+
+**Complements §12 (do not confuse):** §12 (`mixed-precision-experiment`) walks *matmul/reduction
+WEIGHT* dtype + compute fidelity. THIS lever walks the *ACTIVATION* tensors that flow *between*
+ops — the data that `datamove` ops (reshape/transpose/reshard/tilize) physically move and that
+`eltwise`/`matmul` consume. On a **datamove-dominant** model (Mamba/SSD, conv-as-shift-select,
+heavy reshapes) the biggest bucket is movement, and movement time = **bytes moved**, so halving
+the activation data-format ~halves it. §12 never touches this path.
+
+**Fires when:** a `datamove` or `eltwise` bucket holds significant time, or a `matmul`/op the
+roofline tags `bound_by=memory` (bytes/DRAM-bw floor dominates, not FLOPs). The roofline's
+per-op `bytes` + `bound_by=memory` is the signal that *fewer bytes* — not more cores — is the win.
+
+**The change (a TENSOR data-format change, not a kwarg):**
+1. **Carry activations in a smaller format between ops:** bf16 → `bfloat8_b` (usually safe) →
+   `bfloat4_b` (where the gap is large and PCC tolerates). Set it on the *producing* op's output
+   dtype / via `ttnn.to_memory_config`/`ttnn.typecast` so the tensor that gets reshaped/transposed/
+   resharded is physically smaller. Each step halves (bf16→bf8b ~1.9×, →bf4b ~3.5×) the bytes the
+   datamove op moves.
+2. **Remove redundant up-casts:** if an op up-casts to bf16/fp32 only to be moved then down-cast,
+   keep it low through the movement.
+3. **Walk DOWN per tensor, PCC-gate each step:** start bf8b; if the full-model PCC holds and the
+   gap is still large, try bf4b; if PCC fails, REPAIR_PCC backs off one step. Lowest PCC-safe wins.
+
+**Hard floors (do NOT cross — §7):** never push **normalization** activations or **KV-cache /
+attention scores** below bf8b (compounds to FAIL over depth); never bf4b a tensor feeding a
+softmax/reduction. Weights are §12's job, not this lever's.
+
+**FORCE-TRY:** make the activation down-cast and let the **full-model** PCC gate decide — this is
+the most-skipped win on memory-bound models. The gate makes trying it free.
+
+**SELF-VERIFY (this one is measurable):** after the edit, the `datamove`/affected bucket's **`bytes`
+and device-ms must drop** (the roofline captures per-op bytes) — if bytes are unchanged you only
+changed a kwarg, not the tensor's stored format; fix it. Validate at FULL MODEL DEPTH (§7).
