@@ -15,10 +15,34 @@ import json
 from typing import Any, Callable
 
 # Arch peak facts (PLAN section 4.3): WH 288 GB/s, BH 512 GB/s; worker grids.
+# peak_tflops_per_core = matrix-engine peak per core per MATH_FIDELITY (tech_reports/
+# matrix_engine + GEMM_FLOPS): the ROOFLINE compute ceiling. Per-core × full grid =
+# chip peak (BH ~580 TFLOPS measured @ LoFi). clock_ghz from GEMM_FLOPS (BH 1.35, WH 1.0).
 ARCH_FACTS: dict[str, dict[str, Any]] = {
-    "wormhole": {"arch": "wormhole", "grid_x": 8, "grid_y": 8, "dram_bw_gbps": 288.0},
-    "wormhole_b0": {"arch": "wormhole", "grid_x": 8, "grid_y": 8, "dram_bw_gbps": 288.0},
-    "blackhole": {"arch": "blackhole", "grid_x": 13, "grid_y": 10, "dram_bw_gbps": 512.0},
+    "wormhole": {
+        "arch": "wormhole",
+        "grid_x": 8,
+        "grid_y": 8,
+        "dram_bw_gbps": 288.0,
+        "clock_ghz": 1.0,
+        "peak_tflops_per_core": {"lofi": 4.0, "hifi2": 2.0, "hifi3": 1.33, "hifi4": 1.0},
+    },
+    "wormhole_b0": {
+        "arch": "wormhole",
+        "grid_x": 8,
+        "grid_y": 8,
+        "dram_bw_gbps": 288.0,
+        "clock_ghz": 1.0,
+        "peak_tflops_per_core": {"lofi": 4.0, "hifi2": 2.0, "hifi3": 1.33, "hifi4": 1.0},
+    },
+    "blackhole": {
+        "arch": "blackhole",
+        "grid_x": 13,
+        "grid_y": 10,
+        "dram_bw_gbps": 512.0,
+        "clock_ghz": 1.35,
+        "peak_tflops_per_core": {"lofi": 5.4, "hifi2": 2.7, "hifi3": 1.8, "hifi4": 1.35},
+    },
 }
 
 

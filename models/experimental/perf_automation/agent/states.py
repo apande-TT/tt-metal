@@ -40,6 +40,13 @@ MAX_INERT_RETRY = 6  # off-path (edit_inert) retries before giving up steering a
 JUDGE_STREAK_THRESHOLD = 3  # consecutive measured no-gains in a bucket before the agentic waste-judge weighs in
 MAX_STRUCT_FIX = 3  # FIXER: re-invoke the structural agent on an inert (op-graph-unchanged) shard, up to N times
 
+# Sentinel lever id used when a hot bucket has NO matching playbook lever: instead of
+# skipping the bucket (which left conv/scan/moe/other un-optimized), ROUTE emits this as
+# the candidate and APPLY routes it to the THINKING structural agent to optimize the
+# bucket's hottest op from first principles (roofline gap + primitive menu). This is the
+# model-agnostic path — the playbook becomes a prior, not a requirement.
+FROM_PRINCIPLES = "auto-principles"
+
 # Reference transition map (documentation + a test can assert handlers conform).
 # Conditional edges (verdicts, counters) are decided INSIDE the handler; this
 # lists every state a handler may legally return.

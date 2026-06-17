@@ -283,6 +283,37 @@ def _op_shape(raw: dict) -> str:
     return f"{m}x{k0} @ {k1}x{n}"
 
 
+# bytes/element per ttnn dtype (block-float tiles carry a shared exponent -> fractional:
+# bf8_b tile=1088B/1024elem=1.0625, bf4_b=576/1024=0.5625). Used for the MEMORY roofline.
+_DTYPE_BYTES = {
+    "FLOAT32": 4.0,
+    "FLOAT16": 2.0,
+    "BFLOAT16": 2.0,
+    "BFLOAT8_B": 1.0625,
+    "BFLOAT4_B": 0.5625,
+    "UINT32": 4.0,
+    "INT32": 4.0,
+    "UINT16": 2.0,
+    "UINT8": 1.0,
+    "INT8": 1.0,
+}
+
+
+def _tensor_bytes(raw: dict, prefix: str) -> float:
+    """Bytes of one tensor from its padded dims × dtype-bytes (0 if absent/unknown)."""
+    y, x = _pad(raw.get(f"{prefix}_Y_PAD[LOGICAL]")), _pad(raw.get(f"{prefix}_X_PAD[LOGICAL]"))
+    if y == "?" or x == "?":
+        return 0.0
+    bpe = _DTYPE_BYTES.get(str(raw.get(f"{prefix}_DATATYPE", "")).strip().upper())
+    return (int(y) * int(x) * bpe) if bpe else 0.0
+
+
+def _op_bytes(raw: dict) -> float:
+    """Bytes MOVED by one op = inputs read + output written (DRAM/L1 traffic), from the
+    dtype+dims already in the CSV. Feeds the memory-bound roofline (bytes / bandwidth)."""
+    return sum(_tensor_bytes(raw, p) for p in ("INPUT_0", "INPUT_1", "INPUT_2", "OUTPUT_0"))
+
+
 def _top_ops(members: list[dict[str, Any]], available_cores: int, k: int = 6) -> list[dict[str, Any]]:
     """Rank the bucket's hot ops by FINGERPRINT (op + shape + memory), not as one
     aggregate. The bucket says 'matmul 16ms / 769 ops' — useless for aiming. Grouping
@@ -305,6 +336,7 @@ def _top_ops(members: list[dict[str, Any]], available_cores: int, k: int = 6) ->
                 "memory": mem,
                 "count": 0,
                 "device_ms": 0.0,
+                "bytes": 0.0,  # TOTAL bytes moved over all occurrences (for the memory roofline)
                 "cores": int(_to_float(rep.get("Cores")) or 0),
                 "grid": normalize_grid(_to_float(rep.get("Cores")) or 0.0, available_cores),
                 "fidelity": normalize_fidelity(raw.get("MATH FIDELITY", "")),
@@ -312,6 +344,7 @@ def _top_ops(members: list[dict[str, Any]], available_cores: int, k: int = 6) ->
         )
         g["count"] += 1
         g["device_ms"] += (_to_float(rep.get("Device Time")) or 0.0) / 1e3
+        g["bytes"] += _op_bytes(raw)
     out = sorted(groups.values(), key=lambda x: x["device_ms"], reverse=True)
     for g in out:
         g["device_ms"] = round(g["device_ms"], 4)

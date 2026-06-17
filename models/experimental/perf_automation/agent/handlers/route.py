@@ -24,6 +24,12 @@ def _select_bucket(buckets: list[dict[str, Any]], exhausted: set[str], metric: s
     if metric == "device_ms":
         pool = [b for b in pool if b["id"] != "host_overhead"]
     pool = pool or [b for b in buckets if b["id"] != "host_overhead"] or buckets
+    # GAP-DRIVEN: prefer the bucket with the most ATTAINABLE speedup (Σ gap-to-roofline,
+    # set by roofline.annotate_profile) over raw device_ms — a bucket already near its
+    # hardware floor has little to give even if its absolute ms is large. Fall back to
+    # device_ms whenever rooflines are unavailable (older profiles / annotate failed).
+    if metric == "device_ms" and any(b.get("gap_ms") is not None for b in pool):
+        return max(pool, key=lambda b: (b.get("gap_ms") or 0.0))
     return max(pool, key=lambda b: b.get("device_ms", 0.0))
 
 
@@ -65,13 +71,38 @@ def build_route_brief(
 def route(ctx) -> str:
     exec_scope.ensure_scope(ctx)  # one-time: restrict edit targets to the executed path
     profile = ctx.current_profile()
+    # Annotate buckets with gap-to-roofline so _select_bucket can rank by ATTAINABLE
+    # speedup. Best-effort: any failure leaves gap_ms unset and routing falls back to device_ms.
+    try:
+        from .. import roofline
+
+        env = (
+            (ctx.manifest or {}).get("env", {})
+            if isinstance(ctx.manifest, dict)
+            else getattr(ctx, "manifest", {}).get("env", {})
+        )
+        roofline.annotate_profile(profile, env or {})
+    except Exception as exc:  # roofline is an optimization, never a hard dependency
+        ctx.log_event(states.ROUTE, "warn", f"roofline annotate skipped: {exc}")
     metric_name = (ctx.state.get("metric") or {}).get("name", "device_ms")
-    bucket = _select_bucket(profile["buckets"], set(ctx.state.get("exhausted_buckets", [])), metric_name)
+    all_ids = {b["id"] for b in (profile.get("buckets") or [])}
+    exhausted = set(ctx.state.get("exhausted_buckets", []))
+    # Pick the highest-gap (else slowest) bucket. If the playbook has a matching lever,
+    # use it (the prior). If NOT — instead of skipping the bucket (which left conv/scan/
+    # moe/other un-optimized and made the tool transformer-only) — emit the FROM_PRINCIPLES
+    # sentinel so APPLY routes the bucket's hottest op to the THINKING structural agent.
+    # The sentinel is a normal candidate: it gets tried, then marked tried, so the bucket
+    # still exhausts and the loop advances (no livelock).
+    bucket = _select_bucket(profile["buckets"], exhausted, metric_name)
     query = _bucket_query(bucket.get("tags", {}))
     hits = router.route(ctx.index, query)
+    candidates = [h["id"] for h in hits]
+    if not candidates:
+        candidates = [states.FROM_PRINCIPLES]
+        ctx.log_event(states.ROUTE, "info", f"bucket '{bucket['id']}' has no playbook lever -> from-principles agent")
 
     ctx.state["current_bucket"] = bucket["id"]
-    ctx.state["candidates"] = [h["id"] for h in hits]
+    ctx.state["candidates"] = candidates
     # Per-op targets for the structural-edit agent (the hottest individual ops in
     # this bucket); empty on older profiles that predate top_ops.
     ctx.state["top_ops"] = bucket.get("top_ops", [])

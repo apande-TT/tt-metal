@@ -329,6 +329,21 @@ def before_loop(
     # wall_ms = harness clock incl. compile/setup (reference only);
     # fps / tok_s still TBD(wall-metric-source).
     baseline = profile["device_ms"] if metric_name == "device_ms" else profile["wall_ms"]
+    # ROOFLINE auto-target: if no manual --target, set the target to the summed hardware
+    # floor (Σ ideal_ms) so the loop chases the LIMIT, not just "smaller than baseline".
+    # Only for device_ms (the roofline is a device-time floor). Best-effort; manual --target
+    # always wins; falls back to None (open-ended improvement) if the roofline can't compute.
+    target = config.get("target")
+    if target is None and metric_name == "device_ms":
+        try:
+            from . import roofline
+
+            r = roofline.compute_rooflines(profile, env)
+            if r.get("total_ideal_ms"):
+                target = round(r["total_ideal_ms"], 4)
+                print(f"      roofline auto-target: Σideal={target} ms (Σgap={r.get('total_gap_ms')} ms)", flush=True)
+        except Exception as exc:
+            print(f"      roofline auto-target skipped: {exc}", flush=True)
     Checkpoint(run.state_path).save(
         {
             "run_id": run.run_id,
@@ -340,7 +355,7 @@ def before_loop(
                 "direction": config.get("direction", "min"),
                 "baseline": baseline,
                 "current": baseline,
-                "target": config.get("target"),
+                "target": target,
             },
             "max_iter": config.get("max_iter", 25),
             "budget_usd": config.get("budget_usd", 5.0),

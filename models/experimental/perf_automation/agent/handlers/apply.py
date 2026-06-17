@@ -29,7 +29,11 @@ def apply(ctx) -> str:
 
     spec = ctx.state.get("edit_spec")
     edits = spec.get("edits") if isinstance(spec, dict) else None
-    is_structural = _lever_type(ctx, lever) == "structural"
+    # FROM_PRINCIPLES (a bucket with no playbook lever) routes to the THINKING structural
+    # agent too — it optimizes the hottest op from first principles (roofline gap + menu),
+    # no playbook section required. This is what makes the tool model-agnostic.
+    is_from_principles = lever == states.FROM_PRINCIPLES
+    is_structural = is_from_principles or _lever_type(ctx, lever) == "structural"
     ctx.state["last_was_structural"] = is_structural  # DECIDE's fixer gate reads this
 
     # Fast path: PLAN gave content-anchored edits -> apply DETERMINISTICALLY, no LLM.
