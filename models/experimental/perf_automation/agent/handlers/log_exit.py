@@ -75,11 +75,16 @@ def log(ctx) -> str:
             "delta": row["delta"],
         }
     )
+    # Streak counts ONLY MEASURED no-gains (an edit that ran on-device and didn't help).
+    # already_applied / edit_inert / measure_failed / edit_failed never ran a real
+    # measurement, so they are NOT evidence the bucket is tapped -- counting them let the
+    # waste-judge bail after a few no-op levers with most levers/buckets still untried.
     if d.get("result") == "keep":
         ctx.state["nogain_streak"] = 0
-    else:
+    elif d.get("reason") == "no_gain":
         same = ctx.state.get("streak_bucket") == cur_bucket
         ctx.state["nogain_streak"] = (ctx.state.get("nogain_streak", 0) + 1) if same else 1
+    # else (no-op / non-measured result): leave the streak unchanged
     ctx.state["streak_bucket"] = cur_bucket
 
     # Manual-perf TARGET visibility (the "Make Fast Models Fast" Slide-4 gap): when a
@@ -124,9 +129,12 @@ def check_exit(ctx) -> str:
         dec = verdict.get("decision", "continue")
         ctx.log_event(states.CHECK_EXIT, "info", f"waste-judge: {dec} — {verdict.get('reasoning', '')}")
         state["nogain_streak"] = 0  # reset so the judge isn't re-invoked every iter
-        if dec == "stop":
-            return states.STOPPED
-        if dec == "exhaust":  # agent says this bucket is tapped -> advance like a normal exhaustion
+        # The waste-judge may SKIP a tapped bucket (advance to the next-slowest) but must
+        # NEVER end the whole run while other buckets still have headroom -- that early-quit
+        # left datamove/reduction (40% of device time) completely unexplored. Both 'stop' and
+        # 'exhaust' therefore exhaust THIS bucket and advance; the run stops ONLY when every
+        # bucket is exhausted (full sweep matmul->datamove->reduction->eltwise).
+        if dec in ("stop", "exhaust"):
             exhausted = set(state.get("exhausted_buckets") or [])
             if cur:
                 exhausted.add(cur)
@@ -139,7 +147,7 @@ def check_exit(ctx) -> str:
                 allb = set()
             if allb and exhausted >= allb:
                 ctx.log_event(
-                    states.CHECK_EXIT, "info", f"waste-judge exhausted last bucket {sorted(exhausted)}; stopping"
+                    states.CHECK_EXIT, "info", f"waste-judge: all buckets exhausted {sorted(exhausted)}; stopping"
                 )
                 return states.STOPPED
             ctx.log_event(
