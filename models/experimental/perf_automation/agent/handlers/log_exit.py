@@ -104,9 +104,47 @@ def log(ctx) -> str:
     return states.CHECK_EXIT
 
 
+def _emit_residual(ctx) -> None:
+    """END-OF-RUN certification (once): how far the final profile is from its ttnn-reachable
+    roofline floor + where the gap lives. Lets the run SAY 'nothing ttnn-reachable left' vs
+    just 'ran out of levers'. Best-effort; written to runs/<id>/residual_report.json + logged."""
+    if ctx.state.get("_residual_emitted"):
+        return
+    ctx.state["_residual_emitted"] = True
+    try:
+        import json as _json
+
+        from .. import roofline
+
+        env = (ctx.manifest or {}).get("env", {}) if isinstance(ctx.manifest, dict) else {}
+        rep = roofline.residual_report(ctx.current_profile(), env or {})
+        (ctx.run.dir / "residual_report.json").write_text(_json.dumps(rep, indent=2, sort_keys=True))
+        top = rep.get("open_ops") or []
+        verdict = (
+            "AT ttnn-floor (no reachable gain left in modeled hot ops)"
+            if rep.get("at_floor")
+            else f"{rep.get('residual_gap_ms')}ms above modeled floor across {rep.get('n_open')} open op(s)"
+        )
+        head = (
+            f"; biggest open: {top[0].get('op_code')} [{top[0].get('shape')}] "
+            f"gap {top[0].get('gap_ms')}ms bound_by={top[0].get('bound_by')}"
+            if top
+            else ""
+        )
+        ctx.log_event(
+            states.CHECK_EXIT,
+            "info",
+            f"RESIDUAL vs roofline: measured {rep.get('total_device_ms')}ms, modeled floor "
+            f"{rep.get('modeled_floor_ms')}ms -> {verdict}{head}",
+        )
+    except Exception as exc:
+        ctx.log_event(states.CHECK_EXIT, "warn", f"residual report skipped: {exc}")
+
+
 def check_exit(ctx) -> str:
     decision = exit_policy.check_exit(ctx.state)  # "continue" | "DONE" | "STOPPED"
     if decision in ("DONE", "STOPPED"):  # target met / budget / max-iter
+        _emit_residual(ctx)
         return decision
 
     # Per-bucket lever exhaustion: if every candidate for the CURRENT bucket has
@@ -149,6 +187,7 @@ def check_exit(ctx) -> str:
                 ctx.log_event(
                     states.CHECK_EXIT, "info", f"waste-judge: all buckets exhausted {sorted(exhausted)}; stopping"
                 )
+                _emit_residual(ctx)
                 return states.STOPPED
             ctx.log_event(
                 states.CHECK_EXIT, "info", f"waste-judge -> advance past '{cur}' (exhausted={sorted(exhausted)})"
@@ -174,6 +213,7 @@ def check_exit(ctx) -> str:
             all_buckets = set()
         if all_buckets and exhausted >= all_buckets:
             ctx.log_event(states.CHECK_EXIT, "info", f"all buckets exhausted {sorted(exhausted)}; stopping")
+            _emit_residual(ctx)
             return states.STOPPED
         ctx.log_event(
             states.CHECK_EXIT, "info", f"bucket '{cur}' exhausted; advancing to next (exhausted={sorted(exhausted)})"

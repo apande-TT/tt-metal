@@ -77,6 +77,7 @@ def box_facts(box_name: str, mesh: tuple[int, int] | None = None) -> dict[str, A
     base = dict(ARCH_FACTS.get(arch, ARCH_FACTS["blackhole"]))  # peak_tflops/dram_bw/clock by arch
     gx, gy = BOX_COMPUTE_GRID.get(box.name, (base.get("grid_x", 13), base.get("grid_y", 10)))
     mesh_chips = int(mesh[0]) * int(mesh[1])
+    per_chip_dram_bw = base.get("dram_bw_gbps", 0.0)
     base.update(
         {
             "card": box.name,
@@ -85,7 +86,12 @@ def box_facts(box_name: str, mesh: tuple[int, int] | None = None) -> dict[str, A
             "grid_y": gy,
             "mesh_shape": list(mesh),
             "mesh_chips": mesh_chips,
-            "worker_cores": gx * gy * mesh_chips,  # roofline compute floor = full mesh, not one chip
+            "worker_cores": gx * gy * mesh_chips,  # roofline COMPUTE floor = full mesh, not one chip
+            # AGGREGATE DRAM bandwidth across the mesh for the MEMORY floor. Valid when data is
+            # sharded across chips (tensor/data-parallel) — the common multi-chip case. For a
+            # fully REPLICATED model this overstates effective bw (a noted simplification).
+            "dram_bw_gbps": per_chip_dram_bw * mesh_chips,
+            "dram_bw_per_chip_gbps": per_chip_dram_bw,
             "eth_link_gbps": box.eth_link_gbps,
             "hbm_total_gb": box.total_hbm_gb,
         }
