@@ -362,6 +362,16 @@ def before_loop(
                 print(f"      roofline auto-target: Σideal={target} ms (Σgap={r.get('total_gap_ms')} ms)", flush=True)
         except Exception as exc:
             print(f"      roofline auto-target skipped: {exc}", flush=True)
+    elif target is None and metric_name in ("wall_ms", "host_ms"):
+        # HOST-AXIS roofline: with perfect trace + multi-CQ overlap, wall time floors at the
+        # DEVICE time (host dispatch fully hidden behind compute). So the wall target is the
+        # measured device_ms. This is what makes the loop chase the host limit (via the
+        # gen-trace/2cq/bucketed levers the host_overhead bucket already routes to) instead of
+        # just "smaller than baseline". For host_ms the floor is ~0 (all host is removable).
+        dev = profile.get("device_ms")
+        if metric_name == "wall_ms" and dev:
+            target = round(dev, 4)
+            print(f"      host-axis target: wall floor = device_ms {target} ms (host fully overlapped)", flush=True)
     Checkpoint(run.state_path).save(
         {
             "run_id": run.run_id,
