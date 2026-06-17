@@ -46,6 +46,53 @@ ARCH_FACTS: dict[str, dict[str, Any]] = {
 }
 
 
+# Per-BOX compute grid override (tt-hw-planner's registry carries chips/arch/mesh but
+# NOT grid_x/grid_y). Blackhole SKUs differ: p300c=13x10=130 (ARCH_FACTS default),
+# QB2's p150c=11x10=110. Keyed by box name; falls back to ARCH_FACTS[arch] grid.
+BOX_COMPUTE_GRID: dict[str, tuple[int, int]] = {
+    "QB2": (11, 10),
+}
+
+
+def box_facts(box_name: str, mesh: tuple[int, int] | None = None) -> dict[str, Any]:
+    """Roofline facts for a DECLARED box+mesh (the --box/--mesh flag), REUSING
+    tt-hw-planner's hardware registry (no duplicate board table). Returns the arch
+    peak facts with worker_cores = (mesh chips) × (per-chip grid) and the mesh/eth
+    facts for the CCL roofline. Raises EnvironmentError_ on an unknown box or a mesh
+    that isn't canonical for it. Guarded import: if tt-hw-planner is absent, the
+    caller keeps the single-chip ARCH_FACTS path."""
+    try:
+        from scripts.tt_hw_planner.hardware import HARDWARE
+    except Exception as exc:  # tt-hw-planner not importable -> caller falls back
+        raise EnvironmentError_(f"tt-hw-planner hardware registry unavailable: {exc}") from exc
+
+    box = next((b for b in HARDWARE if b.name.lower() == (box_name or "").lower()), None)
+    if box is None:
+        raise EnvironmentError_(f"unknown box {box_name!r}; known: {[b.name for b in HARDWARE]}")
+    mesh = mesh or box.default_mesh or (box.mesh_shapes[0] if box.mesh_shapes else (1, 1))
+    if box.mesh_shapes and tuple(mesh) not in [tuple(m) for m in box.mesh_shapes]:
+        raise EnvironmentError_(f"mesh {tuple(mesh)} not canonical for {box.name}; valid: {box.mesh_shapes}")
+
+    arch = box.arch.lower()
+    base = dict(ARCH_FACTS.get(arch, ARCH_FACTS["blackhole"]))  # peak_tflops/dram_bw/clock by arch
+    gx, gy = BOX_COMPUTE_GRID.get(box.name, (base.get("grid_x", 13), base.get("grid_y", 10)))
+    mesh_chips = int(mesh[0]) * int(mesh[1])
+    base.update(
+        {
+            "card": box.name,
+            "arch": arch,
+            "grid_x": gx,
+            "grid_y": gy,
+            "mesh_shape": list(mesh),
+            "mesh_chips": mesh_chips,
+            "worker_cores": gx * gy * mesh_chips,  # roofline compute floor = full mesh, not one chip
+            "eth_link_gbps": box.eth_link_gbps,
+            "hbm_total_gb": box.total_hbm_gb,
+        }
+    )
+    return base
+
+
 class EnvironmentError_(Exception):
     """Raised when the snapshot is unparseable or the arch is unknown."""
 

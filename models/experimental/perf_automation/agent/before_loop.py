@@ -177,6 +177,24 @@ def before_loop(
 
     stages.start("environment_check")
     env = environment_check(env_probe)
+    # Declared box/mesh (--box QB2 --mesh 2x2): override the single-chip env with the
+    # REAL mesh facts (worker_cores = mesh chips × per-chip grid) so the roofline target
+    # is calibrated to the hardware actually used. Reuses tt-hw-planner's registry; on any
+    # failure we keep the auto-detected single-chip env (never block the run).
+    box = config.get("box")
+    if box:
+        try:
+            from .environment import box_facts
+
+            mesh = config.get("mesh")
+            env = box_facts(box, tuple(mesh) if mesh else None)
+            print(
+                f"      box={env['card']} mesh={env.get('mesh_shape')} -> worker_cores={env['worker_cores']}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"      WARN --box {box}: {exc}; using auto-detected single-chip env", file=sys.stderr, flush=True)
     stages.done(f"{env['card']} · {env['arch']} · {env['worker_cores']} cores")
 
     devices = str(config.get("devices") or "single")
@@ -405,6 +423,12 @@ def main(argv: list[str] | None = None) -> int:
         default="single",
         help="single (default: TT_METAL_VISIBLE_DEVICES=0) | all | " "explicit ids like '0,1'",
     )
+    ap.add_argument(
+        "--box",
+        help="declared TT box for roofline calibration (e.g. QB2, T3K, Galaxy) — reuses "
+        "tt-hw-planner's hardware registry; sets worker_cores = mesh chips × per-chip grid",
+    )
+    ap.add_argument("--mesh", help="mesh shape for --box, e.g. '2x2' (default: the box's canonical mesh)")
     ap.add_argument("--mock-env", action="store_true")
     ap.add_argument("--mock-model-files", action="store_true")
     ap.add_argument("--mock-tracy", action="store_true")
@@ -432,8 +456,15 @@ def main(argv: list[str] | None = None) -> int:
             "case",
             "devices",
             "input",
+            "box",
         )
     }
+    # --mesh '2x2' -> (2, 2) for box_facts (parsed here so the manifest stores a clean tuple)
+    if args.mesh:
+        try:
+            config["mesh"] = tuple(int(x) for x in args.mesh.lower().replace(",", "x").split("x") if x)
+        except Exception:
+            ap.error(f"--mesh {args.mesh!r} must look like '2x2'")
     if args.input and args.case:
         ap.error("--input and -k are mutually exclusive (use one)")
 
