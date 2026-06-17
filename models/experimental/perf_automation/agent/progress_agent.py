@@ -48,8 +48,11 @@ def _fmt_history(history: list[dict]) -> str:
     for r in history:
         d = r.get("delta")
         dl = f"{d:+.4f}" if isinstance(d, (int, float)) else "  --  "
+        # `or '?'` (not get-default): a KEEP row carries reason=None as a PRESENT key, so
+        # get('reason','?') returns None and f"{None:<12}" raises TypeError — the crash that
+        # killed the nemotron run at the waste-judge. Coerce None -> '?' for all three.
         lines.append(
-            f"  - {r.get('lever','?'):<28} {r.get('result','?'):<8} {r.get('reason','?'):<12} "
+            f"  - {(r.get('lever') or '?'):<28} {(r.get('result') or '?'):<8} {(r.get('reason') or '?'):<12} "
             f"Δ {dl} (before {r.get('before')} -> after {r.get('after')})"
         )
     return "\n".join(lines)
