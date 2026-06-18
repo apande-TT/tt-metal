@@ -85,6 +85,7 @@ def apply(ctx) -> str:
             model_files=(scoped if (is_structural and scoped) else ctx.model_files()),
             spec=ctx.state.get("edit_spec"),
             cwd=str(ctx.model_root()),
+            attempt=ctx.state.get("code_fix_attempts", 0),  # ladder rung 0 = haiku (first edit)
         )
         if is_structural:  # per-op targets + the op->source attribution (where the hot op lives)
             call_kwargs["top_ops"] = ctx.state.get("top_ops") or []

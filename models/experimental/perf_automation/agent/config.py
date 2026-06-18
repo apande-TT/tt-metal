@@ -100,6 +100,27 @@ def get_model(role: str, config: dict[str, str] | None = None) -> str:
     return MODEL_DEFAULTS[role]
 
 
+# Edit-model escalation ladder (cheap-first): APPLY uses rung 0; each REPAIR_CODE attempt
+# climbs one rung. haiku -> sonnet -> opus. Spend the cheap model on the easy edits and
+# only escalate to the expensive one when the edit keeps failing. Per-rung override via
+# .env.agent (AGENT_MODEL_EDIT_1/2/3); the top rung is reused once the ladder is exhausted.
+EDIT_LADDER_ENV_KEYS = ("AGENT_MODEL_EDIT_1", "AGENT_MODEL_EDIT_2", "AGENT_MODEL_EDIT_3")
+EDIT_LADDER_DEFAULTS = (
+    "anthropic/claude-haiku-4-5-20251001",
+    "anthropic/claude-sonnet-4-6",
+    "anthropic/claude-opus-4-8",
+)
+
+
+def get_edit_model(attempt: int, config: dict[str, str] | None = None) -> str:
+    """Model for the Nth edit attempt on a lever: rung 0 (APPLY) -> haiku, rung 1 (first
+    repair) -> sonnet, rung 2+ (later repairs) -> opus. Per-rung override via
+    AGENT_MODEL_EDIT_{1,2,3} in .env.agent; capped at the top rung once exhausted."""
+    config = config or {}
+    rung = max(0, min(int(attempt), len(EDIT_LADDER_DEFAULTS) - 1))
+    return config.get(EDIT_LADDER_ENV_KEYS[rung]) or EDIT_LADDER_DEFAULTS[rung]
+
+
 # Vars injected into the SDK process env. The ANTHROPIC_* creds plus the POC
 # wiring: small-fast model (haiku-class internal calls must hit a model the
 # proxy serves) and telemetry/autoupdater opt-outs.

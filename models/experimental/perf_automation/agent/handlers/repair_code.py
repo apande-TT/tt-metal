@@ -42,6 +42,9 @@ def repair_code(ctx) -> str:
             model_files=ctx.model_files(),
             error=_error_detail(ctx),
             cwd=str(ctx.model_root()),
+            # Climb the escalation ladder: this repair is one rung above the prior attempt
+            # (repair 1 -> sonnet, repair 2+ -> opus). code_fix_attempts is bumped below.
+            attempt=ctx.state.get("code_fix_attempts", 0) + 1,
         )
         model, usage = result.get("model", "?"), result.get("usage")
         prompt_text, response_text = result.get("prompt"), result.get("response")

@@ -122,10 +122,9 @@ def make_structural_runner(
     Result parsing is LENIENT: APPLY uses git-diff as ground truth, so a missing/!JSON
     final message yields files=[] rather than raising.
     """
-    from .config import apply_agent_env, get_model
+    from .config import apply_agent_env, get_edit_model
 
     resolved = apply_agent_env(env_agent_path)
-    model = get_model("structural", resolved)
 
     def runner(
         *,
@@ -137,7 +136,11 @@ def make_structural_runner(
         error: str | None = None,
         spec: dict | None = None,
         cwd: str | None = None,
+        attempt: int = 0,
     ) -> dict:
+        # Escalation ladder: APPLY (attempt 0) -> haiku, repair 1 -> sonnet, repair 2+ -> opus.
+        model = get_edit_model(attempt, resolved)
+
         from claude_agent_sdk import (
             AssistantMessage,
             ClaudeAgentOptions,

@@ -71,6 +71,30 @@ def build_prompt(model_root: str | Path) -> str:
     return PROMPT_TEMPLATE.format(root=str(model_root))
 
 
+def _normalize_relpath(root: Path, rel: Any) -> Any:
+    """Resolve a discovery-emitted path to a MODEL-ROOT-RELATIVE one, tolerating the two
+    shapes the (non-deterministic) discovery agent emits interchangeably:
+      * a pytest node id (path::test_fn) — keep the node suffix, normalize the file part;
+      * a REPO-relative path that re-includes the model-dir prefix
+        ('models/demos/<model>/tests/x.py') instead of model-relative ('tests/x.py') —
+        which would otherwise double the prefix under model_root and fail (the nemotron
+        flake). Strip everything up to and including the model-dir name.
+    Returns the normalized string if a file resolves, else the original (so _require_file
+    raises with the agent's literal path)."""
+    if not isinstance(rel, str):
+        return rel
+    file_part, sep, node = rel.partition("::")
+    parts = Path(file_part).parts
+    candidates = [file_part]
+    if root.name in parts:  # repo-relative path that re-includes the model dir
+        idx = len(parts) - 1 - list(reversed(parts)).index(root.name)
+        candidates.append(str(Path(*parts[idx + 1 :])) if idx + 1 < len(parts) else "")
+    for cand in candidates:
+        if cand and (root / cand).is_file():
+            return cand + (sep + node if sep else "")
+    return rel
+
+
 def _require_file(root: Path, rel: Any, what: str) -> None:
     """Accept plain paths AND pytest node ids (path::test_fn) — agents often
     return the more precise form; validate the file part only."""
@@ -89,6 +113,7 @@ def _norm_entry(value: Any, root: Path, what: str) -> dict[str, str]:
             entry["threshold"] = value["threshold"]
     else:
         raise ModelFilesError(f"{what} must be a path string or {{path, note}}")
+    entry["path"] = _normalize_relpath(root, entry["path"])  # tolerate repo-relative / node-id forms
     _require_file(root, entry["path"], what)
     return entry
 

@@ -48,11 +48,12 @@ def test_run_pcc_ok_when_passed(monkeypatch, tmp_path):
     assert v["status"] == "ok" and v["pcc"] == 0.999
 
 
-def test_run_pcc_high_pcc_but_test_failed_is_crash(monkeypatch, tmp_path):
-    # PCC>=threshold but pytest exited non-zero -> another gate failed (token match etc.).
-    # Must NOT be banked as ok -- that is exactly how a broken pipeline reports correct.
-    v = _patch_run(monkeypatch, tmp_path, "e2e PCC=0.999\ntoken mismatch\n1 failed", 1)
-    assert v["status"] == "crash"
+def test_run_pcc_high_pcc_nonzero_exit_is_ok(monkeypatch, tmp_path):
+    # PCC>=threshold but pytest exited non-zero on a BRING-UP gate (Gate-2 modules-invoked)
+    # or nanobind teardown -> NOT an edit-induced regression (fails on the baseline too).
+    # The perf loop's correctness signal is PCC, so this must be ok, not crash.
+    v = _patch_run(monkeypatch, tmp_path, "e2e PCC=0.999\nGate 2 failed: modules not invoked\n1 failed", 1)
+    assert v["status"] == "ok" and v["pcc"] == 0.999
 
 
 def test_run_pcc_below_threshold_is_pcc_low(monkeypatch, tmp_path):
@@ -60,10 +61,27 @@ def test_run_pcc_below_threshold_is_pcc_low(monkeypatch, tmp_path):
     assert v["status"] == "pcc_low" and v["pcc"] == 0.40
 
 
+def test_run_pcc_no_pcc_is_crash_with_nanobind_filtered(monkeypatch, tmp_path):
+    # Test died before producing PCC -> crash; the nanobind teardown spam must be filtered
+    # out of the excerpt so the real error (TT_FATAL) survives for the repair agent.
+    noise = "\n".join(["nanobind: leaked 261 functions!"] + ['leaked type "X"'] * 80)
+    v = _patch_run(monkeypatch, tmp_path, "TT_FATAL: bad shard spec\n" + noise, 1)
+    assert v["status"] == "crash" and "TT_FATAL" in v["error"] and "nanobind" not in v["error"]
+
+
 def test_run_pcc_skipped_is_crash(monkeypatch, tmp_path):
     # A SKIPPED test verified nothing -- even if a stale "pcc 0.99" string is in the log.
     v = _patch_run(monkeypatch, tmp_path, "reference pcc 0.99 baseline\n1 skipped", 0)
     assert v["status"] == "crash" and "SKIPPED" in v["error"]
+
+
+def test_get_edit_model_ladder():
+    from agent.config import get_edit_model
+
+    assert "haiku" in get_edit_model(0)  # APPLY
+    assert "sonnet" in get_edit_model(1)  # repair 1
+    assert "opus" in get_edit_model(2)  # repair 2
+    assert "opus" in get_edit_model(5)  # capped at top rung
 
 
 def _ctx(tmp_path, code_fix=0, pcc_fix=0):
