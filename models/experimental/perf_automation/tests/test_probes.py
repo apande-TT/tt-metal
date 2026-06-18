@@ -11,11 +11,38 @@ from agent.probes import (
     TracyRunError,
     board_to_arch,
     build_tracy_command,
+    detect_perf_crash,
     _extract_json_object,
     make_run_profiled,
     preflight_collect,
     sdk_model_files_runner,
 )
+
+
+def test_detect_perf_crash_tt_fatal():
+    log = "TT_FATAL: Data type must be BFLOAT16 and is FLOAT32\n=== 1 failed in 28s ==="
+    assert detect_perf_crash(log) and "TT_FATAL" in detect_perf_crash(log)
+
+
+def test_detect_perf_crash_error_class():
+    # pytest collection/fixture failure prints "N errors", never "failed".
+    log = "E   RuntimeError: device hang\n=== 1 error in 5s ==="
+    assert detect_perf_crash(log) is not None
+
+
+def test_detect_perf_crash_abort_segfault():
+    log = "terminate called after throwing an instance of 'std::runtime_error'\n=== 1 failed ==="
+    assert detect_perf_crash(log) is not None
+
+
+def test_detect_perf_crash_benign_perf_assert_is_not_a_crash():
+    # The model ran fully, only the perf-threshold assert failed -> valid measurement, NOT a crash.
+    log = "E   assert 88.1 < 85.0  # perf regression\n=== 1 failed in 30s ==="
+    assert detect_perf_crash(log) is None
+
+
+def test_detect_perf_crash_clean_pass_is_none():
+    assert detect_perf_crash("e2e PCC=0.99\n=== 1 passed in 30s ===") is None
 
 
 def test_board_to_arch():

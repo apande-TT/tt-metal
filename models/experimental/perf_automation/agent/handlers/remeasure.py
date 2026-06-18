@@ -13,6 +13,7 @@ import json
 import statistics
 
 from .. import states
+from ..opclass import STRUCTURAL_OP_CLASSES
 from ..probes import PerfRunFailed
 
 
@@ -37,6 +38,20 @@ def _comparable(baseline, iter_profile, tol=0.25):
         iter_ids = {b.get("id") for b in (iter_profile.get("buckets") or [])}
         if dom and dom not in iter_ids:
             return False, f"dominant_bucket_missing: baseline '{dom}' absent in iter profile"
+    # Per-bucket vanish: a STRUCTURAL compute class (matmul/attention/embedding/conv) that
+    # ran in the baseline but runs ZERO times now is a partial/crashed capture, not a win --
+    # you cannot make a model do zero matmuls. This catches what the total-count (+/-25%) and
+    # dominant-bucket checks miss: a LOW-count but essential op (a single SDPA, count 1)
+    # silently dropping to 0 while the total stays within tolerance (the nemotron
+    # attn-score-dtype bug: attention 1->0, total 3443->3436 = 0.998x, banked as a -2.2% win).
+    icounts = {b.get("id"): int(b.get("count", 0)) for b in (iter_profile.get("buckets") or [])}
+    for b in baseline.get("buckets") or []:
+        bid = b.get("id")
+        if bid in STRUCTURAL_OP_CLASSES and int(b.get("count", 0)) > 0 and icounts.get(bid, 0) == 0:
+            return False, (
+                f"structural_bucket_vanished: '{bid}' ran {int(b.get('count', 0))}x in baseline, "
+                f"0x now -- partial/crashed capture, not an optimization"
+            )
     return True, None
 
 

@@ -62,6 +62,16 @@ SIGNPOST_CODES = frozenset({"start", "stop"})
 # The closed set of classes the parser can emit (for coverage lint, section 4.5 rule 6).
 EMITTABLE_OP_CLASSES = frozenset([cls for _, cls in OP_CLASS_MAP] + [UNCLASSIFIED])
 
+# Op classes a performance edit can NEVER legitimately reduce to ZERO: the model
+# fundamentally needs them (you cannot optimize a transformer down to zero matmuls, nor a
+# model with attention down to zero SDPA ops). If a structural class that ran in the
+# baseline runs zero times after an edit, the capture is partial/crashed -- not a win.
+# Fusable classes (reduction/eltwise/datamove/ccl/other) are intentionally EXCLUDED so that
+# legitimate fusion optimizations (norm-into-matmul, activation epilogue, reshard removal)
+# are not false-rejected. General across model families; the comparability + baseline guards
+# use this to catch an essential op silently vanishing (the nemotron attn-score-dtype bug).
+STRUCTURAL_OP_CLASSES = frozenset({"matmul", "attention", "embedding", "conv_pool"})
+
 
 def base_op_code(op_code: str) -> str:
     """Strip the shape suffix tt-perf-report appends (e.g. 'Matmul... 512 x 1024')."""

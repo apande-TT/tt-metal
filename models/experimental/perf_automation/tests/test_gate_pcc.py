@@ -15,6 +15,57 @@ def test_parse_pcc_extracts_value():
     assert parse_pcc("no number here") is None
 
 
+# --- run_pcc HONORS the pytest verdict, not just the scraped float (hole ③) ---------------
+class _FakeCtx:
+    def __init__(self, tmp_path):
+        self._root = tmp_path
+        self.manifest = {
+            "pathmap": {"pcc": {"end_to_end": {"path": "t.py", "threshold": 0.95}}},
+            "config": {},
+        }
+
+    def model_root(self):
+        return self._root
+
+
+def _patch_run(monkeypatch, tmp_path, stdout, returncode):
+    import subprocess
+
+    from agent import gitio, pcc_runner
+
+    monkeypatch.setattr(gitio, "repo_root", lambda p: tmp_path)
+
+    class _R:
+        def __init__(self):
+            self.stdout, self.stderr, self.returncode = stdout, "", returncode
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _R())
+    return pcc_runner.run_pcc(_FakeCtx(tmp_path))
+
+
+def test_run_pcc_ok_when_passed(monkeypatch, tmp_path):
+    v = _patch_run(monkeypatch, tmp_path, "e2e PCC=0.999\n1 passed", 0)
+    assert v["status"] == "ok" and v["pcc"] == 0.999
+
+
+def test_run_pcc_high_pcc_but_test_failed_is_crash(monkeypatch, tmp_path):
+    # PCC>=threshold but pytest exited non-zero -> another gate failed (token match etc.).
+    # Must NOT be banked as ok -- that is exactly how a broken pipeline reports correct.
+    v = _patch_run(monkeypatch, tmp_path, "e2e PCC=0.999\ntoken mismatch\n1 failed", 1)
+    assert v["status"] == "crash"
+
+
+def test_run_pcc_below_threshold_is_pcc_low(monkeypatch, tmp_path):
+    v = _patch_run(monkeypatch, tmp_path, "e2e PCC=0.40\n1 failed", 1)
+    assert v["status"] == "pcc_low" and v["pcc"] == 0.40
+
+
+def test_run_pcc_skipped_is_crash(monkeypatch, tmp_path):
+    # A SKIPPED test verified nothing -- even if a stale "pcc 0.99" string is in the log.
+    v = _patch_run(monkeypatch, tmp_path, "reference pcc 0.99 baseline\n1 skipped", 0)
+    assert v["status"] == "crash" and "SKIPPED" in v["error"]
+
+
 def _ctx(tmp_path, code_fix=0, pcc_fix=0):
     run = Run.create(tmp_path / "runs", config={"config": {}, "pathmap": {}}, run_id="G")
     run.state_path.write_text(

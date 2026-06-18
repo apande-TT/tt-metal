@@ -26,6 +26,7 @@ from .checkpoint import Checkpoint
 from .events import write_event
 from .environment import environment_check
 from .model_files import read_model_files
+from .opclass import STRUCTURAL_OP_CLASSES
 from .router import build_index, cache_playbook
 from .run import Run
 from .tracy_tool import profile_model, stack_report
@@ -337,6 +338,20 @@ def before_loop(
     )
     # Persist the tagged buckets for the loop: ROUTE reads this, not the CSVs.
     (Path(run.profiles_dir) / "baseline_profile.json").write_text(json.dumps(profile, indent=2, sort_keys=True))
+    # Refuse to anchor the ENTIRE run on a partial/degenerate baseline. A crash is already
+    # caught (make_run_profiled -> detect_perf_crash); this catches the NON-crash partial
+    # (profiler-marker overflow dropping ops with no exception). A real capture of any model
+    # runs at least one structural compute op (matmul/attention/embedding/conv); a baseline
+    # with zero of them, or zero device time, is garbage -- and every later comparison against
+    # it would be meaningless (an iter that is ALSO partial would look "comparable" to it).
+    _bk = {b.get("id"): int(b.get("count", 0)) for b in (profile.get("buckets") or [])}
+    _struct_ops = sum(c for i, c in _bk.items() if i in STRUCTURAL_OP_CLASSES)
+    if profile.get("device_ms", 0) <= 0 or _struct_ops == 0:
+        raise RuntimeError(
+            f"baseline capture looks partial/degenerate (device_ms={profile.get('device_ms')}, "
+            f"structural ops={_struct_ops}, buckets={_bk}); refusing to optimize against it. "
+            f"Inspect {run.profiles_dir}/run0_tracy.log for a crash or profiler-marker overflow."
+        )
     stages.done(
         f"device {profile['device_ms']:.3f} ms · wall {profile['wall_ms']:.0f} ms "
         f"· {len(profile['buckets'])} buckets"

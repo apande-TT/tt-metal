@@ -27,6 +27,38 @@ def test_comparable_dominant_missing():
     assert not ok and "dominant_bucket_missing" in reason
 
 
+def test_comparable_structural_bucket_vanished():
+    # The nemotron attn-score-dtype bug: the single SDPA op (attention, count 1) crashes out,
+    # total op count barely moves (3443->3436 = 0.998x, within +/-25%) and the dominant bucket
+    # (datamove) is still present -> the old guard PASSED it as a -2.2% "win". Must now reject.
+    base = _prof(
+        [
+            {"id": "datamove", "count": 1742, "device_ms": 40.0},
+            {"id": "matmul", "count": 559, "device_ms": 30.0},
+            {"id": "eltwise", "count": 1124, "device_ms": 20.0},
+            {"id": "attention", "count": 1, "device_ms": 0.7},
+        ]
+    )
+    it = _prof(
+        [
+            {"id": "datamove", "count": 1740, "device_ms": 39.0},
+            {"id": "matmul", "count": 557, "device_ms": 29.0},
+            {"id": "eltwise", "count": 1123, "device_ms": 20.0},
+            # attention vanished (1 -> 0)
+        ]
+    )
+    ok, reason = _comparable(base, it)
+    assert not ok and "structural_bucket_vanished" in reason and "attention" in reason
+
+
+def test_comparable_fusable_bucket_drop_not_rejected():
+    # A LEGIT fusion can zero out a FUSABLE class (e.g. all reductions fused into matmul
+    # epilogues). That must NOT be rejected -- only structural classes are guarded.
+    base = _prof([{"id": "matmul", "count": 96, "device_ms": 6.7}, {"id": "reduction", "count": 20, "device_ms": 2.0}])
+    it = _prof([{"id": "matmul", "count": 96, "device_ms": 6.0}])  # reduction fused away
+    assert _comparable(base, it) == (True, None)
+
+
 class _Ctx:
     def __init__(self, last_decision, direction="min"):
         self.state = {"last_decision": last_decision, "metric": {"direction": direction}}

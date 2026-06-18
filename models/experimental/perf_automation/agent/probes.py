@@ -196,18 +196,27 @@ class PerfRunFailed(TracyRunError):
 # A device-op runtime crash (the edit broke the model), distinct from a benign
 # perf-threshold AssertionError (the model ran fully — valid measurement). TT_FATAL is
 # the unambiguous device-op abort; a ttnn-op RuntimeError (decorators.py) is the wrapper.
-_CRASH_RE = re.compile(r"(TT_FATAL[^\n]*|TT_THROW[^\n]*|E\s+RuntimeError:[^\n]*)")
-_TEST_FAILED_RE = re.compile(r"=+\s*(\d+)\s+failed", re.IGNORECASE)
+# Device-op / runtime crash signatures, distinct from a benign perf-threshold AssertionError
+# (the model ran fully -> valid measurement). Broadened beyond TT_FATAL to cover C++ aborts,
+# segfaults, and TT_ASSERT that surface in the log even though `python -m tracy` exits 0.
+_CRASH_RE = re.compile(
+    r"(TT_FATAL[^\n]*|TT_THROW[^\n]*|TT_ASSERT[^\n]*|E\s+RuntimeError:[^\n]*"
+    r"|Segmentation fault[^\n]*|terminate called[^\n]*|libc\+\+abi[^\n]*|Aborted[^\n]*|core dumped[^\n]*)"
+)
+# pytest end-of-run summary: BOTH "failed" and "error" (collection/fixture errors print as
+# "N errors", never "failed") mark a non-passing run.
+_TEST_FAILED_RE = re.compile(r"=+\s*(\d+)\s+(?:failed|error)", re.IGNORECASE)
 
 
 def detect_perf_crash(log_text: str) -> str | None:
     """If the profiled run crashed in a device op, return the error excerpt; else None.
-    Requires BOTH a pytest failure AND a device-op crash signature, so a model that ran
-    fully but failed only a perf-threshold assert is NOT treated as a crash."""
+    Requires BOTH a pytest failure/error AND a crash signature, so a model that ran fully but
+    failed only a perf-threshold assert is NOT treated as a crash. `tracy -m pytest` exits 0
+    even on inner failure, so a non-zero exit can't be relied on -- the log is the evidence."""
     if not log_text:
         return None
     fm = _TEST_FAILED_RE.search(log_text)
-    failed = bool(fm and int(fm.group(1)) > 0) or ("FAILED " in log_text and "TT_FATAL" in log_text)
+    failed = bool(fm and int(fm.group(1)) > 0) or ("FAILED " in log_text and _CRASH_RE.search(log_text) is not None)
     if not failed:
         return None
     cm = _CRASH_RE.search(log_text)

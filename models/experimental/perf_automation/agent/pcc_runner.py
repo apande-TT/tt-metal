@@ -49,7 +49,31 @@ def run_pcc(ctx) -> dict:
         )
     except Exception as exc:  # timeout, OS error, etc.
         return {"status": "crash", "error": str(exc)}
-    pcc = parse_pcc((r.stdout or "") + (r.stderr or ""))
+    out = (r.stdout or "") + (r.stderr or "")
+    pcc = parse_pcc(out)
+
+    # A SKIPPED e2e test verified NOTHING -- never accept it as correct just because a stale
+    # "pcc=..." string happened to be in the log (the seamless SKIP-mislabel pattern).
+    if re.search(r"\b[1-9]\d*\s+skipped\b", out, re.IGNORECASE) and not re.search(r"\b[1-9]\d*\s+passed\b", out):
+        return {"status": "crash", "error": "e2e PCC test SKIPPED (correctness NOT verified): " + out.strip()[-800:]}
+
     if pcc is None:
-        return {"status": "crash", "error": ((r.stdout or "") + (r.stderr or "")).strip()[-800:]}
-    return {"status": "ok", "pcc": pcc} if pcc >= threshold else {"status": "pcc_low", "pcc": pcc}
+        return {"status": "crash", "error": out.strip()[-800:]}
+
+    # HONOR THE TEST'S OWN VERDICT -- do not just trust the scraped PCC float. The e2e test
+    # asserts MORE than logits PCC (no runtime fallbacks, all modules invoked, exact token
+    # match). If pytest exited non-zero while PCC>=threshold, one of those OTHER gates failed
+    # -- the model is numerically close but wrong (e.g. wrong tokens). Banking that as "ok" is
+    # exactly how a broken pipeline gets reported correct. A below-threshold PCC is the ONE
+    # expected non-zero exit -> pcc_low (repairable); anything else is a real failure.
+    if r.returncode != 0 and pcc >= threshold:
+        return {
+            "status": "crash",
+            "error": (
+                "e2e test FAILED a correctness gate despite PCC>=threshold "
+                "(token-match / modules-invoked / runtime-fallback): " + out.strip()[-800:]
+            ),
+        }
+    return (
+        {"status": "ok", "pcc": pcc} if (r.returncode == 0 and pcc >= threshold) else {"status": "pcc_low", "pcc": pcc}
+    )
