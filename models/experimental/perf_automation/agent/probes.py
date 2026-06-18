@@ -180,6 +180,40 @@ class TracyRunError(Exception):
     """Stage-1 crash: nonzero exit, timeout, or no usable CSV produced."""
 
 
+class PerfRunFailed(TracyRunError):
+    """The profiled perf test CRASHED at runtime (a ttnn op TT_FATAL/RuntimeError
+    during the forward) — NOT a flaky/partial measurement. `python -m tracy -m pytest`
+    exits 0 even when the inner test fails, so the partial CSV would otherwise be
+    mistaken for an `op_count_mismatch` measurement. Carries `.error` (the device-op
+    error) so REMEASURE can route it to REPAIR_CODE and the agent fixes its own edit."""
+
+    def __init__(self, error: str, log_path=None):
+        super().__init__(f"perf test crashed at runtime: {error}")
+        self.error = error
+        self.log_path = log_path
+
+
+# A device-op runtime crash (the edit broke the model), distinct from a benign
+# perf-threshold AssertionError (the model ran fully — valid measurement). TT_FATAL is
+# the unambiguous device-op abort; a ttnn-op RuntimeError (decorators.py) is the wrapper.
+_CRASH_RE = re.compile(r"(TT_FATAL[^\n]*|TT_THROW[^\n]*|E\s+RuntimeError:[^\n]*)")
+_TEST_FAILED_RE = re.compile(r"=+\s*(\d+)\s+failed", re.IGNORECASE)
+
+
+def detect_perf_crash(log_text: str) -> str | None:
+    """If the profiled run crashed in a device op, return the error excerpt; else None.
+    Requires BOTH a pytest failure AND a device-op crash signature, so a model that ran
+    fully but failed only a perf-threshold assert is NOT treated as a crash."""
+    if not log_text:
+        return None
+    fm = _TEST_FAILED_RE.search(log_text)
+    failed = bool(fm and int(fm.group(1)) > 0) or ("FAILED " in log_text and "TT_FATAL" in log_text)
+    if not failed:
+        return None
+    cm = _CRASH_RE.search(log_text)
+    return cm.group(1).strip() if cm else None
+
+
 class PreflightError(Exception):
     """The discovered perf test selects zero tests (the S512 trap)."""
 
@@ -330,6 +364,13 @@ def make_run_profiled(
         if code != 0:
             tail = "\n".join(log_path.read_text().splitlines()[-15:]) if log_path.is_file() else ""
             raise TracyRunError(f"tracy run exit {code}; log {log_path}; tail:\n{tail}")
+        # `python -m tracy -m pytest` exits 0 even when the inner test FAILS, so a device-op
+        # crash (the edit broke the model) leaves a PARTIAL CSV that would be misread as an
+        # op_count_mismatch measurement. Detect the runtime crash here and raise PerfRunFailed
+        # (carries the error) so REMEASURE routes it to REPAIR_CODE and the agent fixes its edit.
+        crash = detect_perf_crash(log_path.read_text() if log_path.is_file() else "")
+        if crash:
+            raise PerfRunFailed(crash, log_path)
 
         # layer 1: directed output (-o). out_dir PERSISTS across iterations, so a PRIOR
         # run's CSV is still sitting here -- filter to THIS run (mtime > watermark) or the

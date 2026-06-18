@@ -13,6 +13,7 @@ import json
 import statistics
 
 from .. import states
+from ..probes import PerfRunFailed
 
 
 def _op_count(profile):
@@ -84,6 +85,23 @@ def remeasure(ctx) -> str:
 
     try:
         profiles = runner(ctx)
+    except PerfRunFailed as exc:  # the EDIT crashed the perf run (device-op TT_FATAL) -> repairable
+        # Not a flaky measurement: the edit produced code that crashes at runtime (tracy exits 0
+        # even so, leaving a partial CSV that would be misread as op_count_mismatch). Route to
+        # REPAIR_CODE with the real device error so the agent fixes its own edit — exactly like a
+        # GATE_PCC crash. Capped by MAX_CODE_FIX; on exhaustion, discard (edit_failed) -> REVERT.
+        ctx.state["last_verdict"] = {"status": "crash", "error": exc.error}
+        if ctx.state.get("code_fix_attempts", 0) < states.MAX_CODE_FIX:
+            ctx.log_event(states.REMEASURE, "warn", f"perf run crashed (repairable): {exc.error}")
+            return states.REPAIR_CODE
+        ctx.state["last_decision"] = {
+            "result": "discard",
+            "reason": "edit_failed",
+            "before": before,
+            "error": exc.error,
+        }
+        ctx.log_event(states.REMEASURE, "warn", f"perf run crashed, repair budget exhausted: {exc.error}")
+        return states.REVERT
     except Exception as exc:  # infra flake, not an edit bug
         ctx.state["last_decision"] = {
             "result": "discard",

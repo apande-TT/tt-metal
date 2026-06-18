@@ -60,7 +60,7 @@ TRANSITIONS = {
     REPAIR_CODE: [VERIFY],
     REPAIR_PCC: [VERIFY],
     GATE_PCC: [REMEASURE, REPAIR_PCC, REPAIR_CODE, REVERT],
-    REMEASURE: [DECIDE, REVERT],
+    REMEASURE: [DECIDE, REVERT, REPAIR_CODE],  # REPAIR_CODE = the edit crashed the perf run (device-op TT_FATAL)
     DECIDE: [COMMIT, REVERT, APPLY],  # APPLY = FIXER: iterate on an inert structural shard
     COMMIT: [LOG],
     REVERT: [LOG],
