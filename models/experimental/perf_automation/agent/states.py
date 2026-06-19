@@ -35,6 +35,7 @@ TERMINAL = frozenset({DONE, STOPPED, FAILED})
 
 # Repair budgets (decided 2026-06-11) ----------------------------------------
 MAX_CODE_FIX = 5  # parse / import / run-crash repairs before ABANDON
+MAX_CODE_FIX_PRINCIPLES = 8  # off-menu invents WHAT *and* places WHERE in one budget -> larger
 MAX_PCC_FIX = 2  # PCC-below-threshold repairs before DISCARD
 MAX_INERT_RETRY = 6  # off-path (edit_inert) retries before giving up steering a lever
 JUDGE_STREAK_THRESHOLD = 3  # consecutive measured no-gains in a bucket before the agentic waste-judge weighs in
@@ -46,6 +47,15 @@ MAX_STRUCT_FIX = 3  # FIXER: re-invoke the structural agent on an inert (op-grap
 # bucket's hottest op from first principles (roofline gap + primitive menu). This is the
 # model-agnostic path — the playbook becomes a prior, not a requirement.
 FROM_PRINCIPLES = "auto-principles"
+
+
+def code_fix_budget(lever: str | None) -> int:
+    """Repair budget for the selected lever. From-principles (off-menu) must INVENT the fix
+    (WHAT) and PLACE it (WHERE) within one budget, whereas a known lever only places a proven
+    recipe — so off-menu gets a larger budget so WHAT-discovery doesn't starve WHERE-placement.
+    (Phase-1 of the two-phase 'B' design; the diagnose/place split is a later refinement.)"""
+    return MAX_CODE_FIX_PRINCIPLES if lever == FROM_PRINCIPLES else MAX_CODE_FIX
+
 
 # Reference transition map (documentation + a test can assert handlers conform).
 # Conditional edges (verdicts, counters) are decided INSIDE the handler; this

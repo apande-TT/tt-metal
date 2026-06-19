@@ -184,3 +184,39 @@ def test_index_cache_invalidates_on_content_change(tmp_path):
     ids2 = [e["id"] for e in idx2]
     assert "sec-b" in ids2
     assert json.loads(cache.read_text())["hash"] != hash1
+
+
+# ---- ROUTE handler: off-menu (from-principles) is ALWAYS offered, not just on empty bucket ----
+def test_route_handler_always_offers_from_principles(tmp_path):
+    """Even when the bucket HAS matching playbook levers, FROM_PRINCIPLES must be appended
+    to the candidate list so the brain can choose to reason freely (levers exist but none
+    fits — the nemotron/Tilize case)."""
+    from agent import states
+    from agent.handlers.route import route as route_handler
+    from agent.loop_context import LoopContext
+    from agent.run import Run
+
+    run = Run.create(tmp_path / "runs", config={"config": {}, "pathmap": {}}, run_id="R")
+    prof = {
+        "device_ms": 10.0,
+        "wall_ms": 10.0,
+        "buckets": [
+            {
+                "id": "matmul",
+                "device_ms": 8.0,
+                "count": 5,
+                "tags": {"op_class": "matmul", "rank": "time", "bound": "flop"},
+                "top_ops": [],
+            }
+        ],
+    }
+    (run.profiles_dir / "baseline_profile.json").write_text(json.dumps(prof))
+    run.state_path.write_text(json.dumps({"state": "ROUTE", "exec_scope_done": True, "iteration": 0, "cost_usd": 0.0}))
+    ctx = LoopContext.from_run(run, index=build_index())
+
+    nxt = route_handler(ctx)
+    cands = ctx.state["candidates"]
+    assert nxt == states.SELECT
+    assert states.FROM_PRINCIPLES in cands, "from-principles must always be a candidate"
+    # matmul has real levers -> candidates must be levers PLUS from-principles (not fallback-only)
+    assert len(cands) > 1, f"expected real levers + from-principles, got {cands}"

@@ -47,6 +47,16 @@ def select(ctx) -> str:
             model = result.get("model", "?")
             usage = result.get("usage")
             prompt_text, response_text = result.get("prompt"), result.get("response")
+            # COVERAGE: prune levers the brain judged irrelevant — mark them tried so the loop
+            # never grinds through them. (Reversible-on-dead-end is a later refinement; for now
+            # a pruned lever stays pruned, like any tried lever.)
+            skipped = [s for s in (result.get("skip") or []) if s in untried and s != chosen]
+            if skipped:
+                tlist = ctx.state.setdefault("tried", [])
+                for s in skipped:
+                    if s not in tlist:
+                        tlist.append(s)
+                ctx.log_event(states.SELECT, "info", f"pruned (judged irrelevant to bottleneck): {skipped}")
         else:
             ctx.log_event(states.SELECT, "warn", f"invalid pick {result.get('lever')!r}; fallback {untried[0]}")
     except Exception as exc:  # graceful fallback (PLAN 8.3)

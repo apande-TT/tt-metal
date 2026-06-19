@@ -55,7 +55,7 @@ def _metric(target):
     }
 
 
-def _fake_editor(*, lever, section, model_files, error=None, spec=None, cwd=None):
+def _fake_editor(*, lever, section, model_files, error=None, spec=None, cwd=None, **kwargs):
     return {
         "files": ["model.py"],
         "summary": "mock edit",
@@ -230,7 +230,7 @@ def _scripted_editor(*steps):
     model file and returns a runner-shaped result. The last step repeats."""
     calls = {"n": 0}
 
-    def editor(*, lever, section, model_files, error=None, spec=None, cwd=None):
+    def editor(*, lever, section, model_files, error=None, spec=None, cwd=None, **kwargs):
         i = min(calls["n"], len(steps) - 1)
         calls["n"] += 1
         return steps[i](Path(model_files[0]))

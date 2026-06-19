@@ -59,7 +59,7 @@ def verify(ctx) -> str:
 
     if verdict["status"] == "ok":
         return states.GATE_PCC
-    if ctx.state.get("code_fix_attempts", 0) < states.MAX_CODE_FIX:
+    if ctx.state.get("code_fix_attempts", 0) < states.code_fix_budget(ctx.state.get("selected_lever")):
         return states.REPAIR_CODE
     ctx.state["last_decision"] = {"result": "discard", "reason": "edit_failed", "error": verdict.get("error")}
     return states.REVERT

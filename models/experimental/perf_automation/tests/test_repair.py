@@ -47,7 +47,7 @@ def _ctx(tmp_path, state, editor):
 def test_repair_code_passes_error_and_bumps_counter(tmp_path):
     seen = {}
 
-    def editor(*, lever, section, model_files, error=None, spec=None, cwd=None):
+    def editor(*, lever, section, model_files, error=None, spec=None, cwd=None, **kwargs):
         seen["error"], seen["lever"], seen["cwd"] = error, lever, cwd
         return {
             "files": ["model.py"],
@@ -83,7 +83,7 @@ def test_repair_code_survives_editor_exception(tmp_path):
 def test_repair_pcc_passes_pcc_detail_and_bumps_pcc_counter(tmp_path):
     seen = {}
 
-    def editor(*, lever, section, model_files, error=None, spec=None, cwd=None):
+    def editor(*, lever, section, model_files, error=None, spec=None, cwd=None, **kwargs):
         seen["error"] = error
         return {
             "files": ["model.py"],

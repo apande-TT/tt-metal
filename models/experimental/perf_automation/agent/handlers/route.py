@@ -98,8 +98,13 @@ def route(ctx) -> str:
     hits = router.route(ctx.index, query)
     candidates = [h["id"] for h in hits]
     if not candidates:
-        candidates = [states.FROM_PRINCIPLES]
-        ctx.log_event(states.ROUTE, "info", f"bucket '{bucket['id']}' has no playbook lever -> from-principles agent")
+        ctx.log_event(states.ROUTE, "info", f"bucket '{bucket['id']}' has no playbook lever -> from-principles only")
+    # Off-menu (from-principles) is ALWAYS a standing option, not just an empty-bucket
+    # fallback. The brain may reason from first principles even when the bucket HAS levers
+    # but none targets the dominant op (e.g. datamove dominated by Tilize, which no
+    # shard/dtype lever addresses). The playbook is a PRIOR, not a requirement.
+    if states.FROM_PRINCIPLES not in candidates:
+        candidates = candidates + [states.FROM_PRINCIPLES]
 
     ctx.state["current_bucket"] = bucket["id"]
     ctx.state["candidates"] = candidates

@@ -106,7 +106,7 @@ def remeasure(ctx) -> str:
         # REPAIR_CODE with the real device error so the agent fixes its own edit — exactly like a
         # GATE_PCC crash. Capped by MAX_CODE_FIX; on exhaustion, discard (edit_failed) -> REVERT.
         ctx.state["last_verdict"] = {"status": "crash", "error": exc.error}
-        if ctx.state.get("code_fix_attempts", 0) < states.MAX_CODE_FIX:
+        if ctx.state.get("code_fix_attempts", 0) < states.code_fix_budget(ctx.state.get("selected_lever")):
             ctx.log_event(states.REMEASURE, "warn", f"perf run crashed (repairable): {exc.error}")
             return states.REPAIR_CODE
         ctx.state["last_decision"] = {

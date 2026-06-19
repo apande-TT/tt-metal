@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
+from . import states
+
 
 class SelectError(Exception):
     """The agent's choice was malformed or not a valid untried candidate."""
@@ -22,12 +24,20 @@ PROMPT_TEMPLATE = (
     "You are the lead optimization agent choosing ONE change to try next.\n\n"
     "{brief}\n\n"
     "Already tried this run (do NOT pick these): {tried}\n"
-    "Choose EXACTLY ONE lever id from this list (and no other): {candidates}\n"
-    "Pick the lever most likely to cut the bottleneck's device time while keeping "
-    "the model numerically correct. Prefer a single-shot lever before a search "
-    "lever when both look promising.\n"
-    'Respond with ONE JSON object only: {{"lever": <id from the list>, '
-    '"reasoning": <one sentence: why this lever for this bottleneck>}}.'
+    "Choose EXACTLY ONE id from this list (and no other): {candidates}\n"
+    "The listed levers are PRIORS, not a requirement. Look at the bottleneck's hottest ops "
+    "(`top_ops` in the brief) and pick the lever most likely to cut THAT op's device time while "
+    "keeping the model numerically correct. Prefer a single-shot lever over a search lever when "
+    "both fit.\n"
+    "IMPORTANT: if NO listed lever actually targets the dominant op (e.g. the cost is layout "
+    "conversion / a tensor-format mismatch that none of the levers address), choose "
+    "'{from_principles}' to reason from first principles instead of forcing a poor-fit lever.\n"
+    "COVERAGE: you may also list ids you judge clearly IRRELEVANT to this bottleneck in `skip` "
+    "— they'll be pruned so the loop doesn't waste device runs grinding through them. Skip only "
+    "levers you're confident don't target the dominant op; when unsure, leave them unskipped.\n"
+    'Respond with ONE JSON object only: {{"lever": <id to try now>, '
+    '"skip": [<ids to prune, may be empty>], '
+    '"reasoning": <one sentence: why this for this bottleneck>}}.'
 )
 
 
@@ -36,6 +46,7 @@ def build_select_prompt(brief: str, candidates: list[str], tried: list[str]) -> 
         brief=brief or "(no brief available)",
         tried=", ".join(tried) or "(none)",
         candidates=", ".join(candidates),
+        from_principles=states.FROM_PRINCIPLES,
     )
 
 
@@ -51,7 +62,11 @@ def _validate_choice(raw: Any, candidates: list[str], tried: list[str]) -> dict:
         raise SelectError(f"chosen lever {lever!r} is not in the candidate list")
     if lever in set(tried):
         raise SelectError(f"chosen lever {lever!r} was already tried")
-    return {"lever": lever, "reasoning": str(obj.get("reasoning", ""))}
+    # COVERAGE: optional skip-list — levers the brain judges irrelevant, to be pruned. Keep only
+    # valid candidates that aren't the chosen lever (silently drop junk; never let it block).
+    raw_skip = obj.get("skip") or []
+    skip = [s for s in raw_skip if s in candidates and s != lever] if isinstance(raw_skip, list) else []
+    return {"lever": lever, "reasoning": str(obj.get("reasoning", "")), "skip": skip}
 
 
 def make_select_runner(
