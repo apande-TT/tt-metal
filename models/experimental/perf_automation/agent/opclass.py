@@ -62,15 +62,19 @@ SIGNPOST_CODES = frozenset({"start", "stop"})
 # The closed set of classes the parser can emit (for coverage lint, section 4.5 rule 6).
 EMITTABLE_OP_CLASSES = frozenset([cls for _, cls in OP_CLASS_MAP] + [UNCLASSIFIED])
 
-# Op classes a performance edit can NEVER legitimately reduce to ZERO: the model
-# fundamentally needs them (you cannot optimize a transformer down to zero matmuls, nor a
-# model with attention down to zero SDPA ops). If a structural class that ran in the
-# baseline runs zero times after an edit, the capture is partial/crashed -- not a win.
-# Fusable classes (reduction/eltwise/datamove/ccl/other) are intentionally EXCLUDED so that
-# legitimate fusion optimizations (norm-into-matmul, activation epilogue, reshard removal)
-# are not false-rejected. General across model families; the comparability + baseline guards
-# use this to catch an essential op silently vanishing (the nemotron attn-score-dtype bug).
 STRUCTURAL_OP_CLASSES = frozenset({"matmul", "attention", "embedding", "conv_pool"})
+
+
+LAYOUT_CONVERSION_OPS = frozenset({"Tilize", "Untilize"})
+
+
+def is_layout_conversion(op_code: str, in_layout: str = "", out_layout: str = "") -> bool:
+    """True if this op exists only to change tensor layout (tilize/untilize or differing in/out layout)."""
+    base = base_op_code(op_code)
+    if any(n in base for n in LAYOUT_CONVERSION_OPS):
+        return True
+    i, o = (in_layout or "").strip().upper(), (out_layout or "").strip().upper()
+    return bool(i and o and i != o)
 
 
 def base_op_code(op_code: str) -> str:

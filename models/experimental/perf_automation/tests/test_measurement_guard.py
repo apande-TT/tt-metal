@@ -17,20 +17,26 @@ def test_comparable_opcount_collapse():
     base = _prof([{"id": "matmul", "count": 96, "device_ms": 6.7}, {"id": "reduction", "count": 50, "device_ms": 2.0}])
     it = _prof([{"id": "other", "count": 1, "device_ms": 0.1}, {"id": "datamove", "count": 9, "device_ms": 0.09}])
     ok, reason = _comparable(base, it)
-    assert not ok and "op_count_mismatch" in reason
+    assert not ok and "structural_op_dropped" in reason and "matmul" in reason
+
+
+def test_comparable_partial_drops_structural_not_to_zero():
+    base = _prof(
+        [{"id": "matmul", "count": 559, "device_ms": 30.0}, {"id": "datamove", "count": 1742, "device_ms": 40.0}]
+    )
+    it = _prof([{"id": "matmul", "count": 60, "device_ms": 3.0}, {"id": "datamove", "count": 200, "device_ms": 5.0}])
+    ok, reason = _comparable(base, it)
+    assert not ok and "structural_op_dropped" in reason and "matmul" in reason
 
 
 def test_comparable_dominant_missing():
-    base = _prof([{"id": "matmul", "count": 50, "device_ms": 6.7}, {"id": "eltwise", "count": 50, "device_ms": 0.1}])
-    it = _prof([{"id": "eltwise", "count": 95, "device_ms": 0.1}])
+    base = _prof([{"id": "datamove", "count": 50, "device_ms": 6.7}, {"id": "matmul", "count": 50, "device_ms": 5.0}])
+    it = _prof([{"id": "matmul", "count": 48, "device_ms": 5.0}])
     ok, reason = _comparable(base, it)
     assert not ok and "dominant_bucket_missing" in reason
 
 
 def test_comparable_structural_bucket_vanished():
-    # The nemotron attn-score-dtype bug: the single SDPA op (attention, count 1) crashes out,
-    # total op count barely moves (3443->3436 = 0.998x, within +/-25%) and the dominant bucket
-    # (datamove) is still present -> the old guard PASSED it as a -2.2% "win". Must now reject.
     base = _prof(
         [
             {"id": "datamove", "count": 1742, "device_ms": 40.0},
@@ -44,19 +50,43 @@ def test_comparable_structural_bucket_vanished():
             {"id": "datamove", "count": 1740, "device_ms": 39.0},
             {"id": "matmul", "count": 557, "device_ms": 29.0},
             {"id": "eltwise", "count": 1123, "device_ms": 20.0},
-            # attention vanished (1 -> 0)
         ]
     )
     ok, reason = _comparable(base, it)
-    assert not ok and "structural_bucket_vanished" in reason and "attention" in reason
+    assert not ok and "structural_op_dropped" in reason and "attention" in reason
 
 
 def test_comparable_fusable_bucket_drop_not_rejected():
-    # A LEGIT fusion can zero out a FUSABLE class (e.g. all reductions fused into matmul
-    # epilogues). That must NOT be rejected -- only structural classes are guarded.
     base = _prof([{"id": "matmul", "count": 96, "device_ms": 6.7}, {"id": "reduction", "count": 20, "device_ms": 2.0}])
-    it = _prof([{"id": "matmul", "count": 96, "device_ms": 6.0}])  # reduction fused away
+    it = _prof([{"id": "matmul", "count": 96, "device_ms": 6.0}])
     assert _comparable(base, it) == (True, None)
+
+
+def test_comparable_valid_layout_coherence_reduction_accepted():
+    base = _prof(
+        [
+            {"id": "datamove", "count": 1742, "device_ms": 57.0},
+            {"id": "matmul", "count": 559, "device_ms": 27.0},
+            {"id": "eltwise", "count": 1124, "device_ms": 5.0},
+            {"id": "attention", "count": 18, "device_ms": 1.0},
+        ]
+    )
+    it = _prof(
+        [
+            {"id": "datamove", "count": 200, "device_ms": 8.0},
+            {"id": "matmul", "count": 559, "device_ms": 27.0},
+            {"id": "eltwise", "count": 1124, "device_ms": 5.0},
+            {"id": "attention", "count": 18, "device_ms": 1.0},
+        ]
+    )
+    assert _comparable(base, it) == (True, None)
+
+
+def test_comparable_op_count_inflated_rejected():
+    base = _prof([{"id": "matmul", "count": 100, "device_ms": 6.7}, {"id": "datamove", "count": 100, "device_ms": 5.0}])
+    it = _prof([{"id": "matmul", "count": 100, "device_ms": 6.7}, {"id": "datamove", "count": 400, "device_ms": 20.0}])
+    ok, reason = _comparable(base, it)
+    assert not ok and "op_count_inflated" in reason
 
 
 class _Ctx:

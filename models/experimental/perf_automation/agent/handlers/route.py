@@ -17,17 +17,11 @@ from .. import exec_scope, model_map, router, states
 
 
 def _select_bucket(buckets: list[dict[str, Any]], exhausted: set[str], metric: str = "device_ms") -> dict[str, Any]:
-    """Top remaining bucket by ms. For the device-floor metric, the host_overhead
-    bucket is NOT routable (optimizing host can't move device_ms); for a wall/host
-    metric it competes like any other (wall = device + host, biggest share wins)."""
+    """Top remaining bucket by attainable speedup (gap-to-roofline, else device ms); host_overhead is not routable for the device metric."""
     pool = [b for b in buckets if b["id"] not in exhausted]
     if metric == "device_ms":
         pool = [b for b in pool if b["id"] != "host_overhead"]
     pool = pool or [b for b in buckets if b["id"] != "host_overhead"] or buckets
-    # GAP-DRIVEN: prefer the bucket with the most ATTAINABLE speedup (Σ gap-to-roofline,
-    # set by roofline.annotate_profile) over raw device_ms — a bucket already near its
-    # hardware floor has little to give even if its absolute ms is large. Fall back to
-    # device_ms whenever rooflines are unavailable (older profiles / annotate failed).
     if metric == "device_ms" and any(b.get("gap_ms") is not None for b in pool):
         return max(pool, key=lambda b: (b.get("gap_ms") or 0.0))
     return max(pool, key=lambda b: b.get("device_ms", 0.0))
@@ -69,10 +63,8 @@ def build_route_brief(
 
 
 def route(ctx) -> str:
-    exec_scope.ensure_scope(ctx)  # one-time: restrict edit targets to the executed path
+    exec_scope.ensure_scope(ctx)
     profile = ctx.current_profile()
-    # Annotate buckets with gap-to-roofline so _select_bucket can rank by ATTAINABLE
-    # speedup. Best-effort: any failure leaves gap_ms unset and routing falls back to device_ms.
     try:
         from .. import roofline
 
@@ -82,34 +74,22 @@ def route(ctx) -> str:
             else getattr(ctx, "manifest", {}).get("env", {})
         )
         roofline.annotate_profile(profile, env or {})
-    except Exception as exc:  # roofline is an optimization, never a hard dependency
+    except Exception as exc:
         ctx.log_event(states.ROUTE, "warn", f"roofline annotate skipped: {exc}")
     metric_name = (ctx.state.get("metric") or {}).get("name", "device_ms")
     all_ids = {b["id"] for b in (profile.get("buckets") or [])}
     exhausted = set(ctx.state.get("exhausted_buckets", []))
-    # Pick the highest-gap (else slowest) bucket. If the playbook has a matching lever,
-    # use it (the prior). If NOT — instead of skipping the bucket (which left conv/scan/
-    # moe/other un-optimized and made the tool transformer-only) — emit the FROM_PRINCIPLES
-    # sentinel so APPLY routes the bucket's hottest op to the THINKING structural agent.
-    # The sentinel is a normal candidate: it gets tried, then marked tried, so the bucket
-    # still exhausts and the loop advances (no livelock).
     bucket = _select_bucket(profile["buckets"], exhausted, metric_name)
     query = _bucket_query(bucket.get("tags", {}))
     hits = router.route(ctx.index, query)
     candidates = [h["id"] for h in hits]
     if not candidates:
         ctx.log_event(states.ROUTE, "info", f"bucket '{bucket['id']}' has no playbook lever -> from-principles only")
-    # Off-menu (from-principles) is ALWAYS a standing option, not just an empty-bucket
-    # fallback. The brain may reason from first principles even when the bucket HAS levers
-    # but none targets the dominant op (e.g. datamove dominated by Tilize, which no
-    # shard/dtype lever addresses). The playbook is a PRIOR, not a requirement.
     if states.FROM_PRINCIPLES not in candidates:
         candidates = candidates + [states.FROM_PRINCIPLES]
 
     ctx.state["current_bucket"] = bucket["id"]
     ctx.state["candidates"] = candidates
-    # Per-op targets for the structural-edit agent (the hottest individual ops in
-    # this bucket); empty on older profiles that predate top_ops.
     ctx.state["top_ops"] = bucket.get("top_ops", [])
 
     # deterministic model map, filtered to this bucket's op_class — where its ops live
@@ -121,17 +101,11 @@ def route(ctx) -> str:
     except Exception:
         skeleton = ""
 
-    # append structured decision material to the single route_briefs.jsonl stream;
-    # SELECT reads its row back by route_brief_id (state below points at it).
+    # persist the decision material for SELECT (and for a human to inspect)
     from ..events import append_jsonl
 
     route_brief_id = f"{ctx.run.run_id}:{ctx.state.get('iteration', 0)}:ROUTE"
     payload = build_route_brief(bucket, hits, router.read_section, skeleton)
-    # ROUTE-AS-EVIDENCE: surface the FULL bucket landscape (every bottleneck, ranked by gap),
-    # not just the one bucket the deterministic ranker picked. SELECT reads this, so the brain
-    # chooses its lever / off-menu move informed by where ALL the device time is — e.g. it can
-    # see datamove dominates and pick auto-principles to reason about it, rather than being blind
-    # to everything but the router's single pick. (Deterministic gap-rank still sets attack order.)
     payload["bucket_landscape"] = [
         {
             "id": b.get("id"),
@@ -139,11 +113,15 @@ def route(ctx) -> str:
             "gap_ms": b.get("gap_ms"),
             "pct": b.get("pct"),
             "count": b.get("count"),
+            "layout_churn_ms": b.get("layout_churn_ms"),
+            "layout_churn_count": b.get("layout_churn_count"),
         }
         for b in sorted(
             profile.get("buckets") or [], key=lambda b: -((b.get("gap_ms") or 0.0) or b.get("device_ms", 0.0))
         )
     ]
+    if profile.get("layout_churn"):
+        payload["layout_churn"] = profile["layout_churn"]
     payload.update(
         {
             "route_brief_id": route_brief_id,

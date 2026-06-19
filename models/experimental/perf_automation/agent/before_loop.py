@@ -178,10 +178,6 @@ def before_loop(
 
     stages.start("environment_check")
     env = environment_check(env_probe)
-    # Declared box/mesh (--box QB2 --mesh 2x2): override the single-chip env with the
-    # REAL mesh facts (worker_cores = mesh chips × per-chip grid) so the roofline target
-    # is calibrated to the hardware actually used. Reuses tt-hw-planner's registry; on any
-    # failure we keep the auto-detected single-chip env (never block the run).
     box = config.get("box")
     if box:
         try:
@@ -338,12 +334,6 @@ def before_loop(
     )
     # Persist the tagged buckets for the loop: ROUTE reads this, not the CSVs.
     (Path(run.profiles_dir) / "baseline_profile.json").write_text(json.dumps(profile, indent=2, sort_keys=True))
-    # Refuse to anchor the ENTIRE run on a partial/degenerate baseline. A crash is already
-    # caught (make_run_profiled -> detect_perf_crash); this catches the NON-crash partial
-    # (profiler-marker overflow dropping ops with no exception). A real capture of any model
-    # runs at least one structural compute op (matmul/attention/embedding/conv); a baseline
-    # with zero of them, or zero device time, is garbage -- and every later comparison against
-    # it would be meaningless (an iter that is ALSO partial would look "comparable" to it).
     _bk = {b.get("id"): int(b.get("count", 0)) for b in (profile.get("buckets") or [])}
     _struct_ops = sum(c for i, c in _bk.items() if i in STRUCTURAL_OP_CLASSES)
     if profile.get("device_ms", 0) <= 0 or _struct_ops == 0:
@@ -359,9 +349,6 @@ def before_loop(
 
     metric_name = config.get("metric") or "device_ms"
     if metric_name == "auto":
-        # STRATEGIST: choose the axis (device vs host) from the baseline breakdown, instead of a
-        # hardcoded flag. This ACTIVATES the already-built host levers (trace/2-CQ/bucketed) when
-        # host overhead dominates wall time. Safe: any failure falls back to device_ms.
         try:
             from .strategist import choose_axis, make_axis_runner
 
@@ -375,10 +362,6 @@ def before_loop(
     # wall_ms = harness clock incl. compile/setup (reference only);
     # fps / tok_s still TBD(wall-metric-source).
     baseline = profile["device_ms"] if metric_name == "device_ms" else profile["wall_ms"]
-    # ROOFLINE auto-target: if no manual --target, set the target to the summed hardware
-    # floor (Σ ideal_ms) so the loop chases the LIMIT, not just "smaller than baseline".
-    # Only for device_ms (the roofline is a device-time floor). Best-effort; manual --target
-    # always wins; falls back to None (open-ended improvement) if the roofline can't compute.
     target = config.get("target")
     if target is None and metric_name == "device_ms":
         try:
@@ -391,11 +374,6 @@ def before_loop(
         except Exception as exc:
             print(f"      roofline auto-target skipped: {exc}", flush=True)
     elif target is None and metric_name in ("wall_ms", "host_ms"):
-        # HOST-AXIS roofline: with perfect trace + multi-CQ overlap, wall time floors at the
-        # DEVICE time (host dispatch fully hidden behind compute). So the wall target is the
-        # measured device_ms. This is what makes the loop chase the host limit (via the
-        # gen-trace/2cq/bucketed levers the host_overhead bucket already routes to) instead of
-        # just "smaller than baseline". For host_ms the floor is ~0 (all host is removable).
         dev = profile.get("device_ms")
         if metric_name == "wall_ms" and dev:
             target = round(dev, 4)
@@ -497,7 +475,6 @@ def main(argv: list[str] | None = None) -> int:
             "box",
         )
     }
-    # --mesh '2x2' -> (2, 2) for box_facts (parsed here so the manifest stores a clean tuple)
     if args.mesh:
         try:
             config["mesh"] = tuple(int(x) for x in args.mesh.lower().replace(",", "x").split("x") if x)

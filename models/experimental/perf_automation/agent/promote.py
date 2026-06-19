@@ -1,16 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Promote / learning loop — turn a VERIFIED from-principles win into a reusable playbook lever.
+"""Promote / learning loop — turn a verified from-principles win into a reusable provisional playbook lever."""
 
-The chain: the brain reasons out a fix OFF-MENU (from-principles) -> the deterministic gate proves
-it (correct + faster + KEPT) -> this module generalizes that proven win, via an LLM, into a new
-playbook section (route tags + recipe) written to GUIDELINES/LEARNED_<slug>.md, which the router
-auto-indexes on the NEXT run (build_index globs *.md). The learned lever is marked PROVISIONAL with
-`learned_on: <model>`; it graduates to trusted once it lands a gain on a DIFFERENT model
-(cross-model validation that it's general, not overfit). This is how the tool *creates* levers
-instead of only using the hand-written ones — and the create->verify->implement order is enforced:
-a lever is only ever written from an already-gate-verified win, never a guess.
-"""
 from __future__ import annotations
 
 import re
@@ -41,8 +32,7 @@ PROMPT = (
 
 
 def should_promote(ctx) -> bool:
-    """Promote only a KEPT, faster, OFF-MENU win — the proven novel fix worth generalizing.
-    (COMMIT already implies kept+faster; we additionally require it was from-principles.)"""
+    """Promote only a kept, faster, from-principles (off-menu) win."""
     if ctx.state.get("selected_lever") != states.FROM_PRINCIPLES:
         return False
     d = ctx.state.get("last_decision") or {}
@@ -104,9 +94,7 @@ def build_promote_prompt(win: dict) -> str:
 
 
 def write_provisional_lever(section_text: str, slug: str, guidelines_dir: Path, learned_on: str) -> Path:
-    """Write a PROVISIONAL learned lever. Filename LEARNED_<slug>.md sits in GUIDELINES/ so the
-    router's build_index (globs *.md) picks it up on the next run. A provisional banner records the
-    model it was learned on; graduate_lever() flips it once a 2nd model confirms it."""
+    """Write a provisional learned lever to GUIDELINES/LEARNED_<slug>.md (router auto-indexes it next run)."""
     guidelines_dir = Path(guidelines_dir)
     path = guidelines_dir / f"LEARNED_{slug}.md"
     banner = (
@@ -166,14 +154,13 @@ def make_promote_runner(
 
 
 def promote_win(ctx, runner: Callable[[str], str] | None = None, guidelines_dir: Path | None = None) -> Path | None:
-    """Generalize a kept from-principles win into a provisional learned lever. Returns the written
-    path, or None if not applicable / on any failure (best-effort — never breaks the loop)."""
+    """Generalize a kept from-principles win into a provisional learned lever; returns the path or None."""
     if not should_promote(ctx):
         return None
     runner = runner or (ctx.deps.get("promote_runner") if hasattr(ctx, "deps") else None) or make_promote_runner()
     win = _win_from_ctx(ctx)
     section = runner(build_promote_prompt(win))
-    if not section or "{#" not in section:  # must contain a route anchor to be a valid lever
+    if not section or "{#" not in section:
         return None
     from . import router
 

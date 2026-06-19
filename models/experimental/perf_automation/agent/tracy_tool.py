@@ -23,7 +23,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from .opclass import SIGNPOST_CODES, base_op_code, classify_op
+from .opclass import SIGNPOST_CODES, base_op_code, classify_op, is_layout_conversion
 
 # ---- thresholds (PLAN section 4.3) ----
 DISPATCH_GAP_NS = 6_500.0  # 6.5 us median op-to-op gap -> gappy
@@ -240,6 +240,15 @@ def build_buckets(
     out: list[dict[str, Any]] = []
     for b in buckets:
         rep_cores = max(b["_cores"]) if b["_cores"] else 0.0
+        churn_ms = 0.0
+        churn_n = 0
+        for m in b["members"]:
+            rep, raw = m["report"], m["raw"]
+            if is_layout_conversion(
+                rep.get("OP Code", ""), raw.get("INPUT_0_LAYOUT", ""), raw.get("OUTPUT_0_LAYOUT", "")
+            ):
+                churn_ms += (_to_float(rep.get("Device Time")) or 0.0) / 1e3
+                churn_n += 1
         tags = {
             "op_class": b["id"],
             "bound": _most_common(b["_bounds"]),
@@ -258,8 +267,8 @@ def build_buckets(
                 "count": b["count"],
                 "tags": tags,
                 "lever_state": b["lever_state"],
-                # Per-op detail for the structural-edit agent: the K hottest INDIVIDUAL
-                # ops in this bucket (the aggregate hides which call site to target).
+                "layout_churn_ms": round(churn_ms, 4),
+                "layout_churn_count": churn_n,
                 "top_ops": _top_ops(b["members"], available_cores),
             }
         )
@@ -275,16 +284,12 @@ def _pad(v: str) -> str:
 
 
 def _op_shape(raw: dict) -> str:
-    """Compact matmul shape fingerprint from the per-op input dims already in the CSV.
-    e.g. in0 (M,K) @ in1 (K,N) -> '32x1024 @ 1024x1024'. The fingerprint that says
-    WHICH matmul this is (FFN 4096->1024 vs projection 1024->1024) without a human."""
+    """Compact matmul shape fingerprint from the per-op input dims (e.g. '32x1024 @ 1024x1024')."""
     m, k0 = _pad(raw.get("INPUT_0_Y_PAD[LOGICAL]")), _pad(raw.get("INPUT_0_X_PAD[LOGICAL]"))
     k1, n = _pad(raw.get("INPUT_1_Y_PAD[LOGICAL]")), _pad(raw.get("INPUT_1_X_PAD[LOGICAL]"))
     return f"{m}x{k0} @ {k1}x{n}"
 
 
-# bytes/element per ttnn dtype (block-float tiles carry a shared exponent -> fractional:
-# bf8_b tile=1088B/1024elem=1.0625, bf4_b=576/1024=0.5625). Used for the MEMORY roofline.
 _DTYPE_BYTES = {
     "FLOAT32": 4.0,
     "FLOAT16": 2.0,
@@ -309,18 +314,12 @@ def _tensor_bytes(raw: dict, prefix: str) -> float:
 
 
 def _op_bytes(raw: dict) -> float:
-    """Bytes MOVED by one op = inputs read + output written (DRAM/L1 traffic), from the
-    dtype+dims already in the CSV. Feeds the memory-bound roofline (bytes / bandwidth)."""
+    """Bytes moved by one op = inputs read + output written (DRAM/L1 traffic)."""
     return sum(_tensor_bytes(raw, p) for p in ("INPUT_0", "INPUT_1", "INPUT_2", "OUTPUT_0"))
 
 
 def _top_ops(members: list[dict[str, Any]], available_cores: int, k: int = 6) -> list[dict[str, Any]]:
-    """Rank the bucket's hot ops by FINGERPRINT (op + shape + memory), not as one
-    aggregate. The bucket says 'matmul 16ms / 769 ops' — useless for aiming. Grouping
-    the per-op rows (data already in the raw CSV, normally discarded) yields e.g.
-    'Matmul 1024x1024 dram ×144 = 2.28ms' vs 'Matmul 4096->1024 ×12 = 0.70ms' — the
-    distinct hot call-shapes the agent can match to code. Ranked by TOTAL device-ms.
-    """
+    """Rank the bucket's hot ops by fingerprint (op + shape + memory) by total device-ms, top k."""
     groups: dict[tuple, dict[str, Any]] = {}
     for m in members:
         rep, raw = m.get("report", {}), m.get("raw", {})
@@ -336,7 +335,7 @@ def _top_ops(members: list[dict[str, Any]], available_cores: int, k: int = 6) ->
                 "memory": mem,
                 "count": 0,
                 "device_ms": 0.0,
-                "bytes": 0.0,  # TOTAL bytes moved over all occurrences (for the memory roofline)
+                "bytes": 0.0,
                 "cores": int(_to_float(rep.get("Cores")) or 0),
                 "grid": normalize_grid(_to_float(rep.get("Cores")) or 0.0, available_cores),
                 "fidelity": normalize_fidelity(raw.get("MATH FIDELITY", "")),
@@ -357,12 +356,23 @@ def _most_common(values: Sequence[str]) -> str:
     return max(set(values), key=values.count)
 
 
-def stack_report(buckets: list[dict[str, Any]]) -> str:
+def stack_report(buckets: list[dict[str, Any]], layout_churn: dict[str, Any] | None = None) -> str:
     """Human-readable stack the agent reads at SELECT (PLAN section 4.4)."""
     lines = [f"{'bucket':<12} {'ms':>8} {'pct':>6} {'count':>6}  tags"]
     for b in buckets:
         tag_str = " ".join(f"{k}={v}" for k, v in b["tags"].items())
-        lines.append(f"{b['id']:<12} {b['device_ms']:>8.3f} {b['pct']:>5.1f}% {b['count']:>6}  {tag_str}")
+        churn = (
+            f"  [layout-churn {b['layout_churn_count']}× = {b['layout_churn_ms']:.3f}ms]"
+            if b.get("layout_churn_count")
+            else ""
+        )
+        lines.append(f"{b['id']:<12} {b['device_ms']:>8.3f} {b['pct']:>5.1f}% {b['count']:>6}  {tag_str}{churn}")
+    if layout_churn and layout_churn.get("count"):
+        lines.append(
+            f"\nlayout coherence: {layout_churn['count']} pure layout-conversion ops "
+            f"= {layout_churn['device_ms']:.3f}ms ({layout_churn['pct_device']:.1f}% of device time) -- "
+            f"redundant if producers emit the consumer's layout (see #layout-coherence)."
+        )
     return "\n".join(lines)
 
 
@@ -406,18 +416,11 @@ def tracy_tool(
     buckets = build_buckets(report_csv, raw_dest, available_cores)
     wall_ms = median(walls)
     device_ms = round(sum(b["device_ms"] for b in buckets), 4)
-    # Host overhead as a routable bucket: for a WALL-TIME metric, wall = device +
-    # host, so each bucket's ms is its share of wall and ROUTE's slowest-bucket
-    # pick naturally targets host overhead when the workload is host-bound (the
-    # trace / 2-CQ / bucketed-decode territory). ROUTE skips this bucket when the
-    # metric is device_ms (optimizing host can't move the device floor). Tags carry
-    # only the dims that route it: op_class=host_fallback, bound=host (grid/fidelity
-    # /memory omitted -> wildcard, so generation-loop knobs match regardless).
     host_ms = round(max(0.0, wall_ms - device_ms), 4)
     buckets.append(
         {
             "id": "host_overhead",
-            "device_ms": host_ms,  # its contribution to WALL time
+            "device_ms": host_ms,
             "pct": (host_ms / wall_ms * 100.0) if wall_ms else 0.0,
             "count": 0,
             "tags": {"op_class": "host_fallback", "bound": "host", "rank": "time", "regime": "decode"},
@@ -425,13 +428,21 @@ def tracy_tool(
             "top_ops": [],
         }
     )
+    churn_ms = round(sum(b.get("layout_churn_ms", 0.0) for b in buckets), 4)
+    churn_n = sum(b.get("layout_churn_count", 0) for b in buckets)
+    layout_churn = {
+        "device_ms": churn_ms,
+        "count": churn_n,
+        "pct_device": round(churn_ms / device_ms * 100.0, 1) if device_ms else 0.0,
+    }
     return {
         "wall_ms": wall_ms,
         "device_ms": device_ms,
         "host_ms": host_ms,
         "host_fraction": round(host_ms / wall_ms, 4) if wall_ms else 0.0,
+        "layout_churn": layout_churn,
         "buckets": buckets,
-        "stack_report": stack_report(buckets),
+        "stack_report": stack_report(buckets, layout_churn),
         "artifacts": {"raw_csv": str(raw_dest), "report_csv": str(report_csv)},
     }
 

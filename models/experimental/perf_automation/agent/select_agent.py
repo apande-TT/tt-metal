@@ -62,8 +62,6 @@ def _validate_choice(raw: Any, candidates: list[str], tried: list[str]) -> dict:
         raise SelectError(f"chosen lever {lever!r} is not in the candidate list")
     if lever in set(tried):
         raise SelectError(f"chosen lever {lever!r} was already tried")
-    # COVERAGE: optional skip-list — levers the brain judges irrelevant, to be pruned. Keep only
-    # valid candidates that aren't the chosen lever (silently drop junk; never let it block).
     raw_skip = obj.get("skip") or []
     skip = [s for s in raw_skip if s in candidates and s != lever] if isinstance(raw_skip, list) else []
     return {"lever": lever, "reasoning": str(obj.get("reasoning", "")), "skip": skip}

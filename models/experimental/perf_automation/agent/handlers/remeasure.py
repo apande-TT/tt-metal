@@ -22,52 +22,42 @@ def _op_count(profile):
 
 
 def _comparable(baseline, iter_profile, tol=0.25):
-    """Is the iter profile structurally comparable to the baseline? Guards
-    against trusting a partial/garbage capture (e.g. tracy logging 27 ops
-    instead of 308 -> a false 22x 'win'). Returns (ok, reason)."""
+    """Is the iter profile a trustworthy measurement of the same model (structural op counts stable, not a partial capture)? Returns (ok, reason)."""
     b_ops = _op_count(baseline)
     if b_ops == 0:
         return True, None  # no baseline op count -> nothing to compare against
     i_ops = _op_count(iter_profile)
     ratio = i_ops / b_ops
-    if not (1 - tol) <= ratio <= (1 + tol):
-        return False, f"op_count_mismatch: iter {i_ops} vs baseline {b_ops} ops ({ratio:.2f}x)"
-    bbuckets = baseline.get("buckets") or []
-    if bbuckets:
-        dom = max(bbuckets, key=lambda b: b.get("device_ms", 0)).get("id")
-        iter_ids = {b.get("id") for b in (iter_profile.get("buckets") or [])}
-        if dom and dom not in iter_ids:
-            return False, f"dominant_bucket_missing: baseline '{dom}' absent in iter profile"
-    # Per-bucket vanish: a STRUCTURAL compute class (matmul/attention/embedding/conv) that
-    # ran in the baseline but runs ZERO times now is a partial/crashed capture, not a win --
-    # you cannot make a model do zero matmuls. This catches what the total-count (+/-25%) and
-    # dominant-bucket checks miss: a LOW-count but essential op (a single SDPA, count 1)
-    # silently dropping to 0 while the total stays within tolerance (the nemotron
-    # attn-score-dtype bug: attention 1->0, total 3443->3436 = 0.998x, banked as a -2.2% win).
+    if ratio > (1 + tol):
+        return False, f"op_count_inflated: iter {i_ops} vs baseline {b_ops} ops ({ratio:.2f}x)"
+
     icounts = {b.get("id"): int(b.get("count", 0)) for b in (iter_profile.get("buckets") or [])}
     for b in baseline.get("buckets") or []:
         bid = b.get("id")
-        if bid in STRUCTURAL_OP_CLASSES and int(b.get("count", 0)) > 0 and icounts.get(bid, 0) == 0:
-            return False, (
-                f"structural_bucket_vanished: '{bid}' ran {int(b.get('count', 0))}x in baseline, "
-                f"0x now -- partial/crashed capture, not an optimization"
-            )
+        bc = int(b.get("count", 0))
+        if bid in STRUCTURAL_OP_CLASSES and bc > 0:
+            ic = icounts.get(bid, 0)
+            if ic < (1 - tol) * bc:
+                return False, (
+                    f"structural_op_dropped: '{bid}' {bc}->{ic} ops (<{1 - tol:.0%} of baseline) -- "
+                    f"partial/crashed capture (lost the forward tail), not a fusion"
+                )
+    bbuckets = baseline.get("buckets") or []
+    if bbuckets:
+        dom = max(bbuckets, key=lambda b: b.get("device_ms", 0)).get("id")
+        if dom and dom not in icounts:
+            return False, f"dominant_bucket_missing: baseline '{dom}' absent in iter profile"
     return True, None
 
 
 def _same_op_graph(before: dict, after: dict) -> bool:
-    """True iff two profiles have a byte-identical op-class signature (same
-    buckets, same op counts, same per-bucket device_ms to 4 dp). Device kernel
-    time is deterministic, so an EFFECTIVE edit always shifts at least one
-    bucket's count or time; if nothing moves, the edited code was never
-    exercised by the perf workload (the edit targets dead/un-run code)."""
+    """True iff two profiles have a byte-identical op-class signature (an inert edit never exercised by the workload)."""
 
     def sig(p):
         return sorted(
             (str(b.get("id")), int(b.get("count", 0)), round(float(b.get("device_ms", 0.0)), 4))
             for b in (p.get("buckets") or [])
-            if b.get("id")
-            != "host_overhead"  # host time is non-deterministic; only the device op graph defines identity
+            if b.get("id") != "host_overhead"
         )
 
     bsig, asig = sig(before), sig(after)
@@ -75,9 +65,7 @@ def _same_op_graph(before: dict, after: dict) -> bool:
 
 
 def _op_delta_evidence(before: dict, after: dict) -> str:
-    """Per-bucket count/time before->after, as measured ground truth for the
-    inert-repair agent. The agent has no device; this is the ONLY way it learns
-    whether its edit changed the op graph (re-reading the file can't tell it)."""
+    """Per-bucket count/time before->after, as measured ground truth for the inert-repair agent."""
 
     def by_id(p):
         return {b.get("id"): b for b in (p.get("buckets") or []) if b.get("id") != "host_overhead"}
@@ -100,11 +88,7 @@ def remeasure(ctx) -> str:
 
     try:
         profiles = runner(ctx)
-    except PerfRunFailed as exc:  # the EDIT crashed the perf run (device-op TT_FATAL) -> repairable
-        # Not a flaky measurement: the edit produced code that crashes at runtime (tracy exits 0
-        # even so, leaving a partial CSV that would be misread as op_count_mismatch). Route to
-        # REPAIR_CODE with the real device error so the agent fixes its own edit — exactly like a
-        # GATE_PCC crash. Capped by MAX_CODE_FIX; on exhaustion, discard (edit_failed) -> REVERT.
+    except PerfRunFailed as exc:
         ctx.state["last_verdict"] = {"status": "crash", "error": exc.error}
         if ctx.state.get("code_fix_attempts", 0) < states.code_fix_budget(ctx.state.get("selected_lever")):
             ctx.log_event(states.REMEASURE, "warn", f"perf run crashed (repairable): {exc.error}")
@@ -130,9 +114,6 @@ def remeasure(ctx) -> str:
         ctx.state["last_decision"] = {"result": "discard", "reason": "measure_failed", "before": before}
         return states.REVERT
 
-    # Track the CONFIGURED metric (device_ms | wall_ms | host_ms), not always device.
-    # wall_ms/host_ms let the loop optimize generation-loop wins (trace/2-CQ/bucketing)
-    # that don't move the device floor. Unknown metrics (fps/throughput) fall back to device.
     metric_name = (ctx.state.get("metric") or {}).get("name", "device_ms")
     vals = [p.get(metric_name, p["device_ms"]) for p in profiles]
     median_val = statistics.median(vals)
@@ -151,17 +132,13 @@ def remeasure(ctx) -> str:
     except Exception:  # baseline unreadable -> skip the guard, don't block
         pass
 
-    # op_graph_identical => edit_inert ONLY for the device-floor metric. A trace /
-    # 2-CQ / bucketed-decode edit LEGITIMATELY leaves the device op graph byte-identical
-    # while improving wall/host time, so flagging it inert would wrongly discard a real
-    # generation-loop win. For wall/host metrics, let DECIDE judge on the measured number.
     op_graph_identical = False
     op_delta = None
     if metric_name == "device_ms":
         try:
             op_graph_identical = _same_op_graph(ctx.current_profile(), rep)
-            op_delta = _op_delta_evidence(ctx.current_profile(), rep)  # measured proof for the inert-repair agent
-        except Exception:  # missing/odd profile -> don't false-flag
+            op_delta = _op_delta_evidence(ctx.current_profile(), rep)
+        except Exception:
             pass
 
     ctx.state["last_decision"] = {

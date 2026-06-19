@@ -1,14 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Strategist — picks WHICH AXIS to optimize (device vs host/wall) from the baseline breakdown.
+"""Strategist — picks which axis to optimize (device vs host/wall) from the baseline breakdown."""
 
-Today the metric is a hardcoded --metric flag, so the tool always aims at device_ms even when
-host overhead is 99%+ of wall time (kernels are then a rounding error and optimizing them is
-invisible). The host axis (trace / 2-CQ / bucketed-decode levers) is ALREADY built and routable;
-this is the piece that *activates* it — an agent reads the wall/device/host breakdown and chooses
-the axis, instead of a human picking the flag. Deterministic, safe fallback: device_ms (the
-historical default) on any error or junk output, so this never breaks an existing run.
-"""
 from __future__ import annotations
 
 import json
@@ -52,8 +45,7 @@ def build_axis_prompt(profile: dict) -> str:
 
 
 def choose_axis(profile: dict, runner: Callable[[str], object]) -> str:
-    """Return the metric to optimize ('device_ms' | 'wall_ms'). `runner(prompt)` returns the
-    agent's JSON (dict or text). Any error / unrecognized axis -> device_ms (safe default)."""
+    """Return the metric to optimize ('device_ms' | 'wall_ms'); any error or unrecognized axis falls back to device_ms."""
     try:
         out = runner(build_axis_prompt(profile))
         if isinstance(out, dict):
@@ -81,7 +73,7 @@ def make_axis_runner(
         from claude_agent_sdk import (
             AssistantMessage,
             ClaudeAgentOptions,
-            ResultMessage,  # noqa: F401  (parity with other runners)
+            ResultMessage,  # noqa: F401
             TextBlock,
             query,
         )

@@ -138,6 +138,38 @@ form (no DRAM round-trips anywhere in the encoder).
 
 ---
 
+## 7b. Eliminate redundant layout conversions — make producers emit the consumer's layout {#layout-coherence}
+<!-- route
+op_class: datamove
+rank: time,count
+lever_type: structural
+-->
+
+A `Tilize`/`Untilize` (or any op whose `INPUT_0_LAYOUT != OUTPUT_0_LAYOUT`) does **no math** — it
+exists only because a producer emitted a layout the consumer can't accept. The profile surfaces
+this as `layout_churn` (count + ms + % of device time) and per-bucket `[layout-churn N× = X ms]`.
+When that share is large, it is the single biggest **reducible** device cost — unlike matmul/attention
+it can go to ~zero, because the conversion is pure plumbing, not compute.
+
+**Fires when:** the datamove bucket carries a high `layout_churn` share (many `Tilize`/`Untilize`
+ops, often ≈ one per matmul — a tell-tale that each op round-trips ROW_MAJOR↔TILE).
+
+Recipe — drive each hot conversion to its source and remove it:
+1. For each hot `Tilize`/`Untilize` in `top_ops`, find the **producer** op feeding it.
+2. Make the producer emit the layout (and `memory_config`/`dtype`) the consumer needs directly:
+   - pass `output_layout=ttnn.TILE_LAYOUT` / the consumer's `memory_config` on the producing op
+     (matmul, reshard, `to_memory_config`, eltwise) instead of a standalone convert after it;
+   - keep tensors in `TILE_LAYOUT` end-to-end; only un-tilize at a genuine ROW_MAJOR boundary
+     (host readback, an op that truly requires row-major), once, not repeatedly.
+3. If a convert is unavoidable, ride it on a reshard/cast you already do (see §3) rather than as
+   its own op.
+
+Each removed conversion saves its full device time **plus** ~0.6 µs dispatch. The win shows up as
+the datamove bucket shrinking while matmul/attention counts stay fixed — exactly the
+fusable-only reduction the comparability guard now accepts as a real win (not a partial capture).
+
+---
+
 ## 8. When fusion does NOT help
 
 | Situation | Why |
