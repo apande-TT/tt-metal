@@ -127,6 +127,23 @@ def route(ctx) -> str:
 
     route_brief_id = f"{ctx.run.run_id}:{ctx.state.get('iteration', 0)}:ROUTE"
     payload = build_route_brief(bucket, hits, router.read_section, skeleton)
+    # ROUTE-AS-EVIDENCE: surface the FULL bucket landscape (every bottleneck, ranked by gap),
+    # not just the one bucket the deterministic ranker picked. SELECT reads this, so the brain
+    # chooses its lever / off-menu move informed by where ALL the device time is — e.g. it can
+    # see datamove dominates and pick auto-principles to reason about it, rather than being blind
+    # to everything but the router's single pick. (Deterministic gap-rank still sets attack order.)
+    payload["bucket_landscape"] = [
+        {
+            "id": b.get("id"),
+            "device_ms": round(float(b.get("device_ms", 0.0)), 3),
+            "gap_ms": b.get("gap_ms"),
+            "pct": b.get("pct"),
+            "count": b.get("count"),
+        }
+        for b in sorted(
+            profile.get("buckets") or [], key=lambda b: -((b.get("gap_ms") or 0.0) or b.get("device_ms", 0.0))
+        )
+    ]
     payload.update(
         {
             "route_brief_id": route_brief_id,

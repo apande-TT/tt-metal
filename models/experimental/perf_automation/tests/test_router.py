@@ -220,3 +220,37 @@ def test_route_handler_always_offers_from_principles(tmp_path):
     assert states.FROM_PRINCIPLES in cands, "from-principles must always be a candidate"
     # matmul has real levers -> candidates must be levers PLUS from-principles (not fallback-only)
     assert len(cands) > 1, f"expected real levers + from-principles, got {cands}"
+
+
+def test_route_handler_emits_bucket_landscape(tmp_path):
+    """ROUTE-as-evidence: the brief must carry the FULL bucket landscape (all bottlenecks),
+    not just the one bucket the deterministic ranker picked."""
+    import json as _json
+
+    from agent.handlers.route import route as route_handler
+    from agent.loop_context import LoopContext
+    from agent.run import Run
+
+    run = Run.create(tmp_path / "runs", config={"config": {}, "pathmap": {}}, run_id="RL")
+    prof = {
+        "device_ms": 10.0,
+        "wall_ms": 10.0,
+        "buckets": [
+            {"id": "datamove", "device_ms": 6.0, "count": 50, "tags": {"op_class": "datamove"}, "top_ops": []},
+            {
+                "id": "matmul",
+                "device_ms": 4.0,
+                "count": 5,
+                "tags": {"op_class": "matmul", "rank": "time", "bound": "flop"},
+                "top_ops": [],
+            },
+        ],
+    }
+    (run.profiles_dir / "baseline_profile.json").write_text(_json.dumps(prof))
+    run.state_path.write_text(_json.dumps({"state": "ROUTE", "exec_scope_done": True, "iteration": 0, "cost_usd": 0.0}))
+    ctx = LoopContext.from_run(run, index=build_index())
+
+    route_handler(ctx)
+    brief = _json.loads([l for l in (run.dir / "route_briefs.jsonl").read_text().splitlines()][-1])
+    land = brief.get("bucket_landscape")
+    assert land and {b["id"] for b in land} == {"datamove", "matmul"}  # ALL buckets present, not just the picked one

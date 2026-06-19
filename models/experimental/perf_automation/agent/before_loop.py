@@ -357,7 +357,20 @@ def before_loop(
         f"· {len(profile['buckets'])} buckets"
     )
 
-    metric_name = config.get("metric", "device_ms")
+    metric_name = config.get("metric") or "device_ms"
+    if metric_name == "auto":
+        # STRATEGIST: choose the axis (device vs host) from the baseline breakdown, instead of a
+        # hardcoded flag. This ACTIVATES the already-built host levers (trace/2-CQ/bucketed) when
+        # host overhead dominates wall time. Safe: any failure falls back to device_ms.
+        try:
+            from .strategist import choose_axis, make_axis_runner
+
+            metric_name = choose_axis(profile, make_axis_runner())
+            print(f"      strategist chose axis -> metric={metric_name}", flush=True)
+        except Exception as exc:
+            metric_name = "device_ms"
+            print(f"      strategist failed ({exc}); falling back to metric=device_ms", flush=True)
+        config["metric"] = metric_name
     # device_ms = sum of profiled device-kernel time (the optimization target);
     # wall_ms = harness clock incl. compile/setup (reference only);
     # fps / tok_s still TBD(wall-metric-source).
@@ -426,7 +439,7 @@ def before_loop(
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="agent.before_loop", description=__doc__)
     ap.add_argument("model_root", help="model directory — everything else is discovered")
-    ap.add_argument("--metric", default="device_ms", choices=sorted(METRIC_UNITS))
+    ap.add_argument("--metric", default="device_ms", choices=[*sorted(METRIC_UNITS), "auto"])
     ap.add_argument("--direction", default="min", choices=["min", "max"])
     ap.add_argument("--target", type=float)
     ap.add_argument("--max-iter", type=int, default=25)
