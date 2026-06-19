@@ -46,4 +46,17 @@ def commit(ctx) -> str:
     except gitio.GitError as exc:
         ctx.log_event(states.COMMIT, "warn", f"commit skipped: {exc}")
 
+    # PROMOTE / LEARNING LOOP: a kept FROM_PRINCIPLES win is a *proven* novel optimization the
+    # playbook didn't have — generalize it into a reusable provisional lever for future runs/models.
+    # Best-effort: any failure is logged and the loop continues (never block a committed win).
+    if lever == states.FROM_PRINCIPLES:
+        try:
+            from ..promote import promote_win
+
+            path = promote_win(ctx)
+            if path:
+                ctx.log_event(states.COMMIT, "info", f"promoted from-principles win -> provisional lever {path.name}")
+        except Exception as exc:
+            ctx.log_event(states.COMMIT, "warn", f"promote skipped: {exc}")
+
     return states.LOG
