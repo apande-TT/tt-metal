@@ -124,6 +124,17 @@ HARDWARE: List[Box] = [
         notes="8x Wormhole eth-mesh (LoudBox). Mature LLM box; canonical TP=[1,8].",
     ),
     Box(
+        name="p150",
+        arch="Blackhole",
+        chips=1,
+        hbm_per_chip_gb=32.0,
+        mesh_shapes=[(1, 1)],
+        eth_link_gbps=0.0,
+        default_mesh=(1, 1),
+        notes="Single Blackhole (p150c), 32 GB. Single-chip BH analog of N150; "
+        "maps to the 'P150' device label. Sub-16B LLMs, small CNNs, embeddings.",
+    ),
+    Box(
         name="QB2",
         arch="Blackhole",
         chips=4,
