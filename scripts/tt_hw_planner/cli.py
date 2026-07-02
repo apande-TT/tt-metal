@@ -1588,8 +1588,10 @@ def _check_demo_environment_compat(
                 common_src = ""
             if "apply_chat_template" in common_src and (
                 "_normalize_token_result_to_list" not in common_src
+                and "_chat_template_ids" not in common_src
                 and 'hasattr(result, "input_ids")' not in common_src
                 and 'hasattr(encoded, "input_ids")' not in common_src
+                and 'hasattr(encoded, "ids")' not in common_src
             ):
                 problems.append(
                     "models/tt_transformers/tt/common.py calls "

@@ -109,3 +109,29 @@ def test_grid_checks_still_fire_for_multichip_mesh() -> None:
 
     _ok, problems = _check_demo_environment_compat(mesh="1,8")
     assert _grid_problems(problems), "grid checks must still fire for a multi-chip mesh"
+
+
+# ─── common.py apply_chat_template normalization (stale marker) ─────
+
+
+def test_common_py_normalization_is_recognized() -> None:
+    """common.py already normalizes apply_chat_template output via the
+    `_chat_template_ids` helper. The gate's detection markers were stale
+    (only recognized `_normalize_token_result_to_list` / `input_ids`
+    hasattr), producing a false positive. The gate must NOT flag common.py
+    when the normalization helper is present."""
+    from scripts.tt_hw_planner.cli import _check_demo_environment_compat
+
+    _ok, problems = _check_demo_environment_compat()
+    common_flags = [p for p in problems if "common.py" in p and "apply_chat_template" in p]
+    assert not common_flags, f"common.py normalization must be recognized; got: {common_flags}"
+
+
+def test_gate_passes_for_single_chip_p150() -> None:
+    """End-to-end: on this repo, a canonical single-chip 1x1 mesh (p150)
+    must clear the env gate — grid checks skipped (mesh-aware) and the
+    common.py normalization recognized."""
+    from scripts.tt_hw_planner.cli import _check_demo_environment_compat
+
+    ok, problems = _check_demo_environment_compat(mesh="1,1")
+    assert ok, f"p150 (1x1) must clear the env gate; residual problems: {problems}"
