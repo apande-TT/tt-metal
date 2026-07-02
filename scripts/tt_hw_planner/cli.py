@@ -1385,8 +1385,50 @@ def _enforce_memory_fit_or_abort(
     return 2
 
 
+def _pinned_transformers_version() -> Optional[str]:
+    """Read the exact `transformers == X` pin from the repo's
+    requirements-dev.txt — the single source of truth for the version
+    the codebase is written against (currently 5.10.2, "For TT-Transformers
+    Qwen3 support"). The env gate must never install a version BELOW this.
+
+    Returns the version string (e.g. "5.10.2"), or None if the pin can't
+    be found (in which case the gate stays conservative and won't pip)."""
+    import re as _re
+
+    req = BRINGUP_ROOT() / "tt_metal" / "python_env" / "requirements-dev.txt"
+    try:
+        text = req.read_text()
+    except Exception:
+        return None
+    m = _re.search(r"^\s*transformers\s*==\s*([0-9][0-9A-Za-z.\-]*)", text, _re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def _env_gate_remedy(*, installed: str, pinned: Optional[str]) -> Tuple[str, str]:
+    """Decide how the env-compat gate should respond to detected problems,
+    keyed on the repo's transformers PIN — NOT on an LLM guess.
+
+    Contract:
+      * pin known AND installed != pin  -> ("install_pin", pin): restore the
+        pinned version. This repairs a drifted env (e.g. 4.49.0 -> 5.10.2)
+        and, crucially, never installs a version BELOW the pin — the exact
+        failure that broke bring-up (an LLM-proposed `transformers<4.50`
+        downgrade left the env unable to load the model at all).
+      * installed already == pin, or pin unknown -> ("source_abort", pin):
+        remaining problems are source-level (missing helpers, unpatched 5.x
+        call sites). pip cannot fix those; patch the source / re-apply
+        overlays instead.
+    """
+    if pinned and installed != pinned:
+        return "install_pin", pinned
+    return "source_abort", pinned or ""
+
+
 def _check_demo_environment_compat(
-    *, demo_module_path: str = "models.tt_transformers.demo.simple_text_demo"
+    *,
+    demo_module_path: str = "models.tt_transformers.demo.simple_text_demo",
+    mesh: Optional[str] = None,
+    box: Optional[str] = None,
 ) -> Tuple[bool, List[str]]:
     """2026-05-23 environment pre-check: validate that the demo path
     the tool is about to invoke can actually run with the installed
@@ -1428,8 +1470,21 @@ def _check_demo_environment_compat(
     except (ValueError, IndexError):
         major = 0
 
+    # The dispatch-core grid checks below describe a risk that only
+    # materializes on NON-canonical meshes (their own example is BH
+    # QB2 1x4). A single-chip 1x1 mesh (e.g. p150, N150) is the canonical
+    # base case — skip those checks there so a lone-chip bring-up isn't
+    # blocked by a grid concern that cannot apply to it.
+    _single_chip = False
+    if mesh:
+        try:
+            _mr, _mc = _parse_mesh(mesh)
+            _single_chip = (_mr * _mc) == 1
+        except Exception:
+            _single_chip = False
+
     mc_path_for_grid = BRINGUP_ROOT() / "models" / "tt_transformers" / "tt" / "model_config.py"
-    if mc_path_for_grid.is_file():
+    if (not _single_chip) and mc_path_for_grid.is_file():
         try:
             mc_src_grid = mc_path_for_grid.read_text()
         except Exception:
@@ -8379,105 +8434,94 @@ def _cmd_up_core(args) -> int:
         if backend_quality_rc is not None:
             return backend_quality_rc
 
-    env_ok_early, env_problems_early = _check_demo_environment_compat()
+    env_ok_early, env_problems_early = _check_demo_environment_compat(mesh=getattr(args, "mesh", None), box=BOX)
     if not env_ok_early:
         sep_e = "=" * 72
         print()
         print(sep_e)
-        # Distinguish the two failure modes the check can produce:
-        #   (a) transformers version mismatch (a package-level issue
-        #       the LLM env-fix CAN resolve via pip install)
-        #   (b) source-level issues in tt_metal (missing helpers,
-        #       hard-coded grids) that ONLY a code fix or an overlay
-        #       re-apply will resolve — pip install can't help here
-        # The banner used to claim "transformers... assumes 4.x APIs"
-        # for both, which was wrong for (b) and led the LLM to refuse
-        # to propose a pip command.
-        _has_pkg_issue = any(line.startswith("transformers==") for line in env_problems_early)
+        # Remedy is keyed on the repo's transformers PIN, not an LLM guess:
+        #   * env drifted off the pin -> install the pinned version
+        #     (deterministic; NEVER below the pin). This is the fix for the
+        #     old bug where an LLM proposed `transformers<4.50`, downgrading
+        #     the env into a state that couldn't even load the model.
+        #   * env already on the pin  -> remaining problems are source-level
+        #     (missing helpers / unpatched 5.x call sites); pip cannot help,
+        #     so abort with patch guidance.
+        try:
+            import transformers as _tf_mod
+
+            _installed_tf = getattr(_tf_mod, "__version__", "") or ""
+        except Exception:
+            _installed_tf = ""
+        _pinned_tf = _pinned_transformers_version()
+        _action, _target = _env_gate_remedy(installed=_installed_tf, pinned=_pinned_tf)
         _has_src_issue = any(
-            ("model_config.py" in line or "models/" in line) and not line.startswith("transformers==")
+            ("model_config.py" in line or "common.py" in line or "llama_models.py" in line)
+            and not line.startswith("transformers==")
             for line in env_problems_early
         )
-        if _has_pkg_issue and not _has_src_issue:
-            print("  ENVIRONMENT INCOMPATIBLE -- transformers version mismatch (package-level)")
-        elif _has_src_issue and not _has_pkg_issue:
+
+        if _action == "install_pin":
+            print(
+                f"  ENVIRONMENT INCOMPATIBLE -- transformers {_installed_tf or '(unknown)'} " f"!= repo pin {_target}"
+            )
+        elif _has_src_issue:
             print("  ENVIRONMENT INCOMPATIBLE -- tt_metal source-level issues (NOT a package mismatch)")
         else:
-            print("  ENVIRONMENT INCOMPATIBLE -- pre-flight check failed (mixed package + source issues)")
+            print("  ENVIRONMENT INCOMPATIBLE -- pre-flight check failed")
         print(sep_e)
         for line in env_problems_early:
             print(f"  - {line}" if not line.startswith("transformers==") else f"  {line}")
         print()
-        # If ALL problems are source-level (no transformers== line),
-        # explain that pip install can't fix this and skip the LLM
-        # env-fix step entirely — it would just waste an agent
-        # invocation (the LLM correctly refuses every time).
-        if _has_src_issue and not _has_pkg_issue:
+
+        if _action == "source_abort":
+            # On (or without) the repo pin, a pip install cannot resolve
+            # these — they are source-level. Never downgrade below the pin.
             print(
-                "  These are source-level issues in tt_metal (missing helpers, drifted code).\n"
-                "  pip install CANNOT resolve them. To fix:\n"
+                "  Installed transformers"
+                + (f" ({_installed_tf})" if _installed_tf else "")
+                + " already matches the repo pin"
+                + (f" ({_pinned_tf})" if _pinned_tf else " (no pin found)")
+                + " — these are source-level\n"
+                "  issues in tt_metal (missing helpers, unpatched 5.x call sites).\n"
+                "  pip install CANNOT resolve them, and the gate will NOT downgrade\n"
+                "  transformers below the pin. To fix:\n"
                 "    1. Re-apply the relevant overlays (check `_shared` overlay scope), OR\n"
                 "    2. Apply the listed source patches to the working tree.\n"
             )
             print(sep_e)
             return 2
 
-        # Skip auto-fix if operator opted out or we already tried.
+        # _action == "install_pin": restore the repo-pinned version (never below it).
         _no_env_fix = getattr(args, "no_env_fix", False)
         _already_tried = bool(os.environ.get(_ENV_FIX_ATTEMPTED_FLAG))
         if _no_env_fix or _already_tried:
-            print("  To resolve manually, install package versions compatible with the codebase.")
+            print(f"  To resolve manually: pip install transformers=={_target}")
             if _no_env_fix:
                 print("  (--no-env-fix is set; not auto-installing.)")
             if _already_tried:
-                print(
-                    "  (auto-fix already attempted in this invocation; the proposed install didn't resolve the issue.)"
-                )
+                print("  (auto-fix already attempted in this invocation; the pin install didn't take.)")
             print(sep_e)
             return 2
 
-        # LLM-driven fix: ask the LLM to look at the actual problems +
-        # the live `pip freeze` and propose the right install command.
-        # Falls back to manual banner if the LLM can't be reached or
-        # returns nothing valid — never silently does the wrong thing.
-        from ._cli_helpers.env_fix import run_llm_env_fix, run_pip_install
+        from ._cli_helpers.env_fix import run_pip_install
 
-        print("  Asking LLM to diagnose and propose a fix...")
+        print(f"  Restoring the repo-pinned transformers=={_target} " f"(installed: {_installed_tf or 'unknown'})...")
         print(sep_e)
-        proposal = run_llm_env_fix(
-            env_problems=list(env_problems_early),
-            work_dir=Path.cwd(),
-        )
-        if proposal is None:
-            print()
-            print(sep_e)
-            print(
-                "  Could not obtain a fix proposal from the LLM (agent unreachable, no verdict, or rejected for safety)."
-            )
-            print("  To resolve manually, install package versions compatible with the codebase.")
-            print(sep_e)
-            return 2
-
-        print()
-        print(sep_e)
-        print(f"  LLM proposes: {proposal.pip_command_str}")
-        if proposal.reasoning:
-            print(f"  Reasoning:    {proposal.reasoning}")
-        print(sep_e)
-        _ok, _log = run_pip_install(proposal.pip_args)
+        _ok, _log = run_pip_install([f"transformers=={_target}"])
         if not _ok:
             print()
             print(sep_e)
-            print("  Proposed install FAILED. pip output tail:")
+            print("  Pin install FAILED. pip output tail:")
             for line in _log.splitlines()[-15:]:
                 print(f"      {line}")
             print()
-            print(f"  Manual fix: {proposal.pip_command_str}")
+            print(f"  Manual fix: pip install transformers=={_target}")
             print(sep_e)
             return 2
         print()
         print(sep_e)
-        print("  Install complete. Re-executing this command with the new environment...")
+        print("  Install complete. Re-executing this command with the pinned environment...")
         print(sep_e)
         sys.stdout.flush()
         sys.stderr.flush()
@@ -8587,9 +8631,10 @@ def _cmd_up_core(args) -> int:
         if vars(args).get("_escalated_already"):
             _already_supported = False
     if _already_supported:
-        env_ok, env_problems = _check_demo_environment_compat()
+        env_ok, env_problems = _check_demo_environment_compat(mesh=getattr(args, "mesh", None), box=BOX)
         if not env_ok:
             sep = "=" * 72
+            _pin = _pinned_transformers_version()
             print()
             print(sep)
             print("  ENVIRONMENT INCOMPATIBLE -- aborting before demo run")
@@ -8597,17 +8642,14 @@ def _cmd_up_core(args) -> int:
             for line in env_problems:
                 print(f"  - {line}" if not line.startswith("transformers==") else f"  {line}")
             print()
-            print("  Options to unblock (pick ONE):")
-            print()
-            print("    1. Downgrade transformers to the version the repo")
-            print("       was written against:")
-            print("           pip install 'transformers<5.0'")
-            print()
-            print("    2. Patch the listed files to support transformers 5.x")
-            print("       (mostly try/except import aliases and ")
-            print("        rope_parameters fallbacks; see today's patches in")
-            print("        models/common/llama_models.py and")
-            print("        models/tt_transformers/tt/{model_config,common}.py).")
+            print("  These are source-level: patch the listed files to support")
+            print(f"  the repo-pinned transformers=={_pin or '(see requirements-dev.txt)'}")
+            print("  (try/except import aliases, rope_parameters fallbacks, and")
+            print("   apply_chat_template return-type normalization; see")
+            print("   models/common/llama_models.py and")
+            print("   models/tt_transformers/tt/{model_config,common}.py).")
+            print("  Do NOT downgrade transformers below the pin — it breaks")
+            print("  Qwen3 support and can leave the env unable to load models.")
             print()
             print(sep)
             return 2

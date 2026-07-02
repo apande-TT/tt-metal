@@ -3722,9 +3722,13 @@ def test_audit_bug_6_env_compat_check_fires_before_scaffold_path() -> None:
     fn_idx = src.find("def cmd_up(")
     block = src[fn_idx : fn_idx + 40000]
 
-    env_check_calls = [i for i in range(len(block)) if block.startswith("_check_demo_environment_compat()", i)]
+    # Match the call with or without args — the early gate now passes
+    # mesh/box so the dispatch-core grid checks can be skipped for a
+    # canonical single-chip mesh (2026-07). The invariant is that the
+    # check fires before scaffold, not its exact argument list.
+    env_check_calls = [i for i in range(len(block)) if block.startswith("_check_demo_environment_compat(", i)]
     assert len(env_check_calls) >= 1, (
-        "cmd_up must call _check_demo_environment_compat() at least "
+        "cmd_up must call _check_demo_environment_compat(...) at least "
         "once in the main body (not just the supported-model branch)"
     )
 
