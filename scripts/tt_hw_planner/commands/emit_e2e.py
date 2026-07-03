@@ -117,6 +117,15 @@ _G1_TORCH_DELEGATION = (
     r"_get_torch_submodule\s*\(",
 )
 
+# G5 (opt-in) host-sampling signatures: the generation loop sampling on the HOST in torch, which reads
+# logits back per token and blocks trace + 2CQ. G1 (native stubs) does NOT catch these — they live in the
+# pipeline's decode loop, not the module forwards.
+_G5_HOST_SAMPLING = (
+    r"torch\.argmax\s*\(",
+    r"torch\.multinomial\s*\(",
+    r"torch\.topk\s*\(",
+)
+
 
 def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
     """Model-agnostic gate runner: G1 native, G2/G3 (run tests/e2e), G4 demo/ structure. Returns (ok, reasons)."""
@@ -152,6 +161,28 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
             nonnative.append(p.stem)
     if nonnative:
         reasons.append("G1: stub(s) delegate to the torch reference (not native ttnn): " + ", ".join(nonnative[:8]))
+
+    # G5 — fully-on-device / host-free decode. OPT-IN (E2E_REQUIRE_ON_DEVICE=1), DEFAULT OFF so existing
+    # runs are byte-identical. G1 proves the module forwards are native, but the pipeline's generation loop
+    # can still sample on the HOST (torch.argmax/topk/multinomial) + read logits back per token, which keeps
+    # the model from being trace + 2CQ capable. When required, flag host sampling in tt/ so "done" means
+    # trace-ready, not just correct. Waivable via E2E_ALLOW_HOST_DECODE=1 for genuinely host-bound models.
+    if os.environ.get("E2E_REQUIRE_ON_DEVICE") == "1" and os.environ.get("E2E_ALLOW_HOST_DECODE") != "1":
+        tt_dir = demo_dir / "tt"
+        host_hits = []
+        for p in sorted(tt_dir.glob("*.py")) if tt_dir.is_dir() else []:
+            try:
+                src = p.read_text(errors="ignore")
+            except Exception:  # noqa: BLE001
+                continue
+            if any(re.search(pat, src) for pat in _G5_HOST_SAMPLING):
+                host_hits.append(p.stem)
+        if host_hits:
+            reasons.append(
+                "G5 on-device: pipeline samples on the HOST (torch.argmax/topk/multinomial) — decode is not "
+                "fully on-device, so trace + 2CQ is blocked: " + ", ".join(host_hits[:8]) + " (move sampling "
+                "on-device with ttnn; set E2E_ALLOW_HOST_DECODE=1 to waive for a genuinely host-bound model)"
+            )
 
     py = sys.executable
     for parent in [Path.cwd(), *demo_dir.parents]:
