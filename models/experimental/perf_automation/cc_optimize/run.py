@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -273,9 +274,26 @@ def _fullpipe_e2e(repo_root: Path, mcp_env: dict, devices: str, label: str) -> f
     return ms
 
 
-def _run_op_sigs(repo_root: Path, mcp_env: dict, devices: str, node: str, case, k: int) -> set | None:
+_HOST_XFER_OPS = ("from_torch", "to_torch", "from_device", "to_device")
+
+
+def _parse_facts(raw: str, sigs: set | None) -> dict:
+    """Extract the UNIVERSAL scorecard facts from an op-sig probe run: TP/DP + shard state (from the
+    pipeline's MeshDevice line) and whether the step round-trips to host (host-transfer ops in the op
+    set) — the latter is the trace+2CQ gate. Model-agnostic: reads the op stream, not a per-model map."""
+    facts = {"dp": 1, "tp": 1, "shard_active": False, "host_ops": [], "n_op_types": len(sigs or ())}
+    m = re.search(r"DP=(\d+)\s+TP=(\d+)", raw or "")
+    if m:
+        facts["dp"], facts["tp"] = int(m.group(1)), int(m.group(2))
+    if "shard_active=True" in (raw or ""):
+        facts["shard_active"] = True
+    facts["host_ops"] = sorted({s.split("(")[0] for s in (sigs or set()) if any(h in s for h in _HOST_XFER_OPS)})
+    return facts
+
+
+def _run_op_sigs(repo_root: Path, mcp_env: dict, devices: str, node: str, case, k: int):
     """Run the perf test forward at TT_PERF_LAYERS=k (no tracy, 1 decode token) through the generic
-    _op_sig_probe and return the SET of distinct ttnn op signatures it saw. None on failure."""
+    _op_sig_probe. Returns (sigs_set_or_None, raw_stdout_stderr)."""
     env = cc_env(repo_root, devices)
     env.update(mcp_env)
     env["TT_PERF_LAYERS"] = str(k)
@@ -287,31 +305,35 @@ def _run_op_sigs(repo_root: Path, mcp_env: dict, devices: str, node: str, case, 
     try:
         r = subprocess.run(cmd, cwd=str(repo_root / PERF_DIR), env=env, capture_output=True, text=True, timeout=1800)
     except Exception:  # noqa: BLE001
-        return None
-    for line in ((r.stdout or "") + "\n" + (r.stderr or "")).splitlines():
+        return None, ""
+    raw = (r.stdout or "") + "\n" + (r.stderr or "")
+    sigs = None
+    for line in raw.splitlines():
         if line.startswith("PERF_OP_SIGS="):
             try:
-                return set(json.loads(line.split("=", 1)[1]))
+                sigs = set(json.loads(line.split("=", 1)[1]))
             except Exception:  # noqa: BLE001
-                return None
-    return None
+                sigs = None
+    return sigs, raw
 
 
-def _coverage_layers(repo_root: Path, mcp_env: dict, devices: str, node, case, n_layers: int = 52) -> int | None:
+def _coverage_layers(repo_root: Path, mcp_env: dict, devices: str, node, case, n_layers: int = 52):
     """MODEL-AGNOSTIC profiling-window sizing: grow TT_PERF_LAYERS until the set of distinct ttnn op
     signatures SATURATES (a deeper window adds no new op type) — so the tracy 2-layer-style slice actually
     covers EVERY block type, not just whatever falls in the first N layers. Homogeneous models saturate at
     1-2; heterogeneous ones (mamba/attention/MoE interleaved) grow until all types appear. No per-model
-    layer maps. Returns the saturated layer count, or None to fall back to the fixed cap. Disable via
-    PERF_MCP_COVERAGE_SIZING=0."""
+    layer maps. Returns (layer_count_or_None, facts) — facts from the deepest probe feed the scorecard.
+    Disable via PERF_MCP_COVERAGE_SIZING=0."""
+    facts: dict = {}
     if os.environ.get("PERF_MCP_COVERAGE_SIZING", "1") != "1" or not node:
-        return None
+        return None, facts
     results: list = []
     for k in (2, 4, 8, 16):
         k = min(k, n_layers)
-        sigs = _run_op_sigs(repo_root, mcp_env, devices, node, case, k)
+        sigs, raw = _run_op_sigs(repo_root, mcp_env, devices, node, case, k)
         if sigs is None:
             break
+        facts = _parse_facts(raw, sigs)  # deepest successful probe wins
         print(f"  [optimize/cc] coverage probe: {k} layer(s) -> {len(sigs)} distinct op signatures")
         results.append((k, sigs))
         if k >= n_layers:
@@ -320,14 +342,52 @@ def _coverage_layers(repo_root: Path, mcp_env: dict, devices: str, node, case, n
         # layer 5, or something rarer even later), and stopping at the first plateau would silently miss
         # it. Probe the whole bounded schedule so coverage up to the cap is real.
     if not results:
-        return None
+        return None, facts
     max_sigs = max((s for _, s in results), key=len)
     if results[-1][1] == max_sigs and len(results) >= 2 and results[-2][1] != max_sigs and results[-1][0] >= n_layers:
         print("  [optimize/cc] coverage still growing at the depth cap — op coverage may be incomplete")
     for k, s in results:  # smallest window that already covers every op type seen
         if s == max_sigs:
-            return k
-    return results[-1][0]
+            return k, facts
+    return results[-1][0], facts
+
+
+def _print_scorecard(devices: str, manifest: dict, pipe: dict, facts: dict, before_ms, after_ms) -> None:
+    """End-of-run scorecard. UNIVERSAL fields (hardware, TP/DP, fully-on-device, batch, users) print for
+    ANY model; token-throughput fields (TTFT / T/S/U / T/S / ISL / OSL) are class-specific and print only
+    when the model is autoregressive AND fully on-device, else N/A with the reason. Best-effort, never fails."""
+    try:
+        env = (manifest or {}).get("env", {}) or {}
+        arch = env.get("arch") or "?"
+        chips = env.get("device_count") or env.get("mesh_chips") or _chip_count(devices)
+        dp, tp = facts.get("dp", 1), facts.get("tp", 1)
+        host_ops = facts.get("host_ops", [])
+        on_device = not host_ops
+        batch = int(os.environ.get("TT_PERF_BATCH", "1") or "1")
+        isl = os.environ.get("TT_PERF_SEQ_LEN") or "(default)"
+        osl = os.environ.get("TT_PERF_MAX_NEW_TOKENS") or "4"
+        L = ["  ┌─ optimize scorecard — pipeline: %s" % pipe.get("task", "?")]
+        L.append("  │ hardware          : %s  x%s chip(s)" % (arch, chips))
+        L.append(
+            "  │ parallelism       : TP=%s x DP=%s  (%s)"
+            % (tp, dp, "sharded mesh" if facts.get("shard_active") else "single-chip / replicated")
+        )
+        if on_device:
+            L.append("  │ fully on device   : YES  (trace + 2CQ possible)")
+        else:
+            L.append("  │ fully on device   : NO   -> trace + 2CQ blocked; host round-trips: %s" % ", ".join(host_ops))
+        L.append("  │ batch / users     : %s" % batch)
+        reason = "not fully on-device" if not on_device else "needs a trace-capturable decode step"
+        for name in ("TTFT", "T/S/U", "T/S"):
+            L.append("  │ %-16s : N/A  (%s)" % (name, reason))
+        L.append("  │ ISL / OSL         : %s / %s  (tokens; N/A for non-token models)" % (isl, osl))
+        if before_ms and after_ms:
+            d = (before_ms - after_ms) / before_ms * 100.0
+            L.append("  │ full-model e2e    : %.1f -> %.1f ms  (%+.1f%%)" % (before_ms, after_ms, d))
+        L.append("  └─")
+        print("\n".join(L))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [optimize/cc] scorecard skipped ({exc})")
 
 
 def _git(repo_root: Path, *args: str) -> str:
@@ -393,7 +453,7 @@ def optimize_pipeline(
         pass
     cfg = _mcp_config(repo_root, manifest_path, pipe, devices, kernel_log)
     _cov_env = cfg["mcpServers"]["perf-mcp"]["env"]
-    _cov = _coverage_layers(repo_root, _cov_env, devices, pipe.get("perf_test"), pipe.get("case"))
+    _cov, _cov_facts = _coverage_layers(repo_root, _cov_env, devices, pipe.get("perf_test"), pipe.get("case"))
     if _cov:
         _cov_env["TT_PERF_LAYERS"] = str(_cov)
         print(f"  [optimize/cc] coverage-sized profiling window: TT_PERF_LAYERS={_cov} (covers all block types)")
@@ -438,6 +498,11 @@ def optimize_pipeline(
             f"  [optimize/cc] FULL-model end-to-end (ALL 52 layers): BEFORE {before_ms:.1f} ms -> "
             f"AFTER {after_ms:.1f} ms  ({d:+.1f}% {'faster' if d >= 0 else 'SLOWER'})"
         )
+    try:
+        _mf = json.loads(Path(manifest_path).read_text())
+    except Exception:  # noqa: BLE001
+        _mf = {}
+    _print_scorecard(devices, _mf, pipe, _cov_facts, before_ms, after_ms)
     _emit_summary(repo_root, kernel_log, model_name, task, metric, start_sha)
     return {"task": task, "rounds": rounds, "can_stop": can_stop, "halted": halted}
 
