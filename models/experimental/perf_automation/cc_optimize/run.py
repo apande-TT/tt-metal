@@ -273,6 +273,63 @@ def _fullpipe_e2e(repo_root: Path, mcp_env: dict, devices: str, label: str) -> f
     return ms
 
 
+def _run_op_sigs(repo_root: Path, mcp_env: dict, devices: str, node: str, case, k: int) -> set | None:
+    """Run the perf test forward at TT_PERF_LAYERS=k (no tracy, 1 decode token) through the generic
+    _op_sig_probe and return the SET of distinct ttnn op signatures it saw. None on failure."""
+    env = cc_env(repo_root, devices)
+    env.update(mcp_env)
+    env["TT_PERF_LAYERS"] = str(k)
+    env["TT_PERF_MAX_NEW_TOKENS"] = "1"
+    env.pop("TT_METAL_DEVICE_PROFILER", None)
+    cmd = [_python_bin(repo_root), str(repo_root / CC_DIR / "_op_sig_probe.py"), node]
+    if case:
+        cmd.append(case)
+    try:
+        r = subprocess.run(cmd, cwd=str(repo_root / PERF_DIR), env=env, capture_output=True, text=True, timeout=1800)
+    except Exception:  # noqa: BLE001
+        return None
+    for line in ((r.stdout or "") + "\n" + (r.stderr or "")).splitlines():
+        if line.startswith("PERF_OP_SIGS="):
+            try:
+                return set(json.loads(line.split("=", 1)[1]))
+            except Exception:  # noqa: BLE001
+                return None
+    return None
+
+
+def _coverage_layers(repo_root: Path, mcp_env: dict, devices: str, node, case, n_layers: int = 52) -> int | None:
+    """MODEL-AGNOSTIC profiling-window sizing: grow TT_PERF_LAYERS until the set of distinct ttnn op
+    signatures SATURATES (a deeper window adds no new op type) — so the tracy 2-layer-style slice actually
+    covers EVERY block type, not just whatever falls in the first N layers. Homogeneous models saturate at
+    1-2; heterogeneous ones (mamba/attention/MoE interleaved) grow until all types appear. No per-model
+    layer maps. Returns the saturated layer count, or None to fall back to the fixed cap. Disable via
+    PERF_MCP_COVERAGE_SIZING=0."""
+    if os.environ.get("PERF_MCP_COVERAGE_SIZING", "1") != "1" or not node:
+        return None
+    results: list = []
+    for k in (2, 4, 8, 16):
+        k = min(k, n_layers)
+        sigs = _run_op_sigs(repo_root, mcp_env, devices, node, case, k)
+        if sigs is None:
+            break
+        print(f"  [optimize/cc] coverage probe: {k} layer(s) -> {len(sigs)} distinct op signatures")
+        results.append((k, sigs))
+        if k >= n_layers:
+            break
+        # NO early stop on a plateau: a block type can first appear many layers in (e.g. attention at
+        # layer 5, or something rarer even later), and stopping at the first plateau would silently miss
+        # it. Probe the whole bounded schedule so coverage up to the cap is real.
+    if not results:
+        return None
+    max_sigs = max((s for _, s in results), key=len)
+    if results[-1][1] == max_sigs and len(results) >= 2 and results[-2][1] != max_sigs and results[-1][0] >= n_layers:
+        print("  [optimize/cc] coverage still growing at the depth cap — op coverage may be incomplete")
+    for k, s in results:  # smallest window that already covers every op type seen
+        if s == max_sigs:
+            return k
+    return results[-1][0]
+
+
 def _git(repo_root: Path, *args: str) -> str:
     try:
         return subprocess.run(["git", "-C", str(repo_root), *args], capture_output=True, text=True).stdout.strip()
@@ -335,6 +392,11 @@ def optimize_pipeline(
     except OSError:
         pass
     cfg = _mcp_config(repo_root, manifest_path, pipe, devices, kernel_log)
+    _cov_env = cfg["mcpServers"]["perf-mcp"]["env"]
+    _cov = _coverage_layers(repo_root, _cov_env, devices, pipe.get("perf_test"), pipe.get("case"))
+    if _cov:
+        _cov_env["TT_PERF_LAYERS"] = str(_cov)
+        print(f"  [optimize/cc] coverage-sized profiling window: TT_PERF_LAYERS={_cov} (covers all block types)")
     cfg_path = repo_root / CC_DIR / f".mcp_config_{model_name}_{task}.json"
     cfg_path.write_text(json.dumps(cfg, indent=2))
     prompt = _PROMPT.format(model=model_name, task=task, metric=metric)
