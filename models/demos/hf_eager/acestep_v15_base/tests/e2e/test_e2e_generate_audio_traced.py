@@ -62,5 +62,7 @@ def test_e2e_generate_audio_traced(device_params, device):
     assert not fallbacks, f"Gate 1 FAILED: runtime torch fallbacks present: {fallbacks}"
     assert achieved_pcc >= PCC_TARGET, f"Gate 3 FAILED: traced e2e PCC {achieved_pcc} < {PCC_TARGET}"
 
+    if pipe._traced_audio_path is not None:
+        pipe._traced_audio_path.release()
     if pipe._traced_decoder is not None:
         pipe._traced_decoder.release()

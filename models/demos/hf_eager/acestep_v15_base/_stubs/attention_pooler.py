@@ -358,6 +358,11 @@ class AttentionPooler:
         self._num_key_value_heads = cfg.num_key_value_heads
         self._head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
         self._rope_theta = cfg.rope_theta
+        self._pool_window_size = getattr(cfg, "pool_window_size", 5)
+        # Precompute RoPE for the fixed (pool_window_size + 1) sequence length so
+        # forward never calls ttnn.from_torch (required for trace capture).
+        rope_seq_len = self._pool_window_size + 1
+        self.w_rope_cos, self.w_rope_sin = self._build_rope_tables(rope_seq_len)
 
     def _apply_embed_tokens(self, x):
         return ttnn.linear(x, self.w_embed_tokens_weight, bias=self.w_embed_tokens_bias)
@@ -438,12 +443,7 @@ class AttentionPooler:
         return ttnn.rms_norm(x, epsilon=self._eps, weight=self.w_layers_1_post_attention_layernorm_weight)
 
     # ---- op-NEW: RoPE (Qwen3RotaryEmbedding + apply_rotary_pos_emb) ----
-    def _compute_rope_cos_sin(self, seq_len):
-        # Position embeddings are a fixed function of (seq_len, head_dim, rope_theta) —
-        # not of the input tensor's values — so building the table with torch on the
-        # host and shipping it to device via ttnn.from_torch is just weight loading,
-        # exactly like every other constant tensor in __init__; the actual forward
-        # math (mul/add against q/k) all happens on-device in ttnn.
+    def _build_rope_tables(self, seq_len):
         head_dim = self._head_dim
         inv_freq = 1.0 / (self._rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         positions = torch.arange(seq_len, dtype=torch.float32)
@@ -454,6 +454,12 @@ class AttentionPooler:
         cos_t = ttnn.from_torch(cos, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
         sin_t = ttnn.from_torch(sin, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
         return cos_t, sin_t
+
+    def _compute_rope_cos_sin(self, seq_len):
+        expected = self._pool_window_size + 1
+        if seq_len != expected:
+            raise ValueError(f"attention_pooler RoPE expects seq_len={expected}, got {seq_len}")
+        return self.w_rope_cos, self.w_rope_sin
 
     def _rotate_half(self, x, head_dim):
         half = head_dim // 2

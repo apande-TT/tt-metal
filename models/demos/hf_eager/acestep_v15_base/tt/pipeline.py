@@ -27,6 +27,7 @@ from .subsystem_audio_tokenizer import AudioTokenizerTT
 from .subsystem_condition_encoder import ConditionEncoderTT
 from .subsystem_decoder import DecoderTT
 from .subsystem_detokenizer import DetokenizerTT
+from .traced_audio_path import TracedAudioPath2CQ
 from .traced_decoder import TracedDecoder2CQ
 
 
@@ -39,6 +40,7 @@ class AceStepPipelineTT:
         self.audio_tokenizer = AudioTokenizerTT(device, hf_model)  # Call B (4 stubs)
         self.detokenizer = DetokenizerTT(device, hf_model)  # Call D (1 stub)
         self.decoder = DecoderTT(device, hf_model)  # Call C (4 stubs)
+        self._traced_audio_path: TracedAudioPath2CQ | None = None
         self._traced_decoder: TracedDecoder2CQ | None = None
 
     @torch.no_grad()
@@ -81,15 +83,34 @@ class AceStepPipelineTT:
         )
         _evt("encoder", False)
 
+        x_patched, _ = tokenize_preprocess(src_latents, silence_latent, attention_mask, pool_window_size)
+
+        traced_audio_path = None
+        if traced:
+            if self._traced_audio_path is None:
+                self._traced_audio_path = TracedAudioPath2CQ(
+                    self.audio_tokenizer,
+                    self.detokenizer,
+                    use_2cq=use_2cq,
+                )
+            traced_audio_path = self._traced_audio_path
+            if not traced_audio_path.is_captured:
+                traced_audio_path.capture(x_patched=x_patched)
+
         # --- Call B: audio tokenizer (pooler + residual_fsq[+fsq]) ---
         _evt("tokenizer", True)
-        x_patched, _ = tokenize_preprocess(src_latents, silence_latent, attention_mask, pool_window_size)
-        quantized, indices = self.audio_tokenizer(x_patched)
+        if traced_audio_path is not None:
+            lm_hints_25hz, quantized = traced_audio_path(x_patched)
+            indices = None
+        else:
+            quantized, indices = self.audio_tokenizer(x_patched)
+            lm_hints_25hz = None
         _evt("tokenizer", False)
 
         # --- Call D: detokenizer (fed Call B's real quantized output) ---
         _evt("detokenizer", True)
-        lm_hints_25hz = self.detokenizer(quantized)
+        if lm_hints_25hz is None:
+            lm_hints_25hz = self.detokenizer(quantized)
         context_latents = assemble_context_latents(lm_hints_25hz, src_latents, chunk_masks, is_covers)
         _evt("detokenizer", False)
 
