@@ -232,8 +232,9 @@ def _baseline_fullpipe(repo_root: Path, mcp_env: dict, devices: str) -> None:
     """Run the full-pipeline end-to-end gate ONCE at baseline (ALL 52 layers, no tracy) so the true
     end-to-end time is printed + recorded before the loop starts — the agent's own gate calls are not
     guaranteed (it can bank wins without calling it). This seeds the best-so-far and gives a visible
-    end-to-end number up front. Skippable via PERF_MCP_FULLPIPE_BASELINE=0. Best-effort; never fails."""
-    if os.environ.get("PERF_MCP_FULLPIPE_BASELINE", "1") != "1":
+    end-to-end number up front. DEFAULT OFF (PERF_MCP_FULLPIPE_BASELINE=1 to enable) because a full-depth
+    end-to-end on a repeat-prefill pipeline is minutes-long and would block the loop. Best-effort; never fails."""
+    if os.environ.get("PERF_MCP_FULLPIPE_BASELINE", "0") != "1":
         return
     code = (
         "import sys; sys.path.insert(0, sys.argv[1]); import perf_mcp as P; "

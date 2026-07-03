@@ -538,6 +538,7 @@ def _run_full_pipeline_ms():
     env["TT_METAL_HOME"] = repo
     env["PYTHONPATH"] = repo
     env["TT_PERF_LAYERS"] = "0"
+    env["TT_PERF_MAX_NEW_TOKENS"] = os.environ.get("PERF_MCP_FULLPIPE_TOKENS", "1")
     env.setdefault("TT_PERF_TRACE", "1")
     env.pop("TT_METAL_DEVICE_PROFILER", None)
     cmd = [sys.executable, "-m", "pytest", "-o", "timeout=0", "-s", node]
