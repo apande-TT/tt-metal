@@ -153,6 +153,11 @@ class TtNemotronHMOE:
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
+        try:
+            _g = self.device.compute_with_storage_grid_size()
+            self._grid = ttnn.CoreGrid(y=_g.y, x=_g.x)
+        except Exception:
+            self._grid = None
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -270,12 +275,12 @@ class TtNemotronHMOE:
         # weight-multiply dispatch storm into a handful of full-grid ops. Math
         # is identical to the dense per-expert sum.
         hs_rep = ttnn.repeat(hs_bf, [Eloc, 1, 1])                                  # (Eloc,M,H) [B==1]
-        up = ttnn.matmul(hs_rep, self._up_stack, compute_kernel_config=self.ckc)   # (Eloc,M,inter)
+        up = ttnn.matmul(hs_rep, self._up_stack, compute_kernel_config=self.ckc, core_grid=self._grid)   # (Eloc,M,inter)
         ttnn.deallocate(hs_rep)
         act = ttnn.relu(up)
         ttnn.deallocate(up)
         act = ttnn.multiply(act, act)                                              # relu2
-        down = ttnn.matmul(act, self._dn_stack, compute_kernel_config=self.ckc)     # (Eloc,M,H)
+        down = ttnn.matmul(act, self._dn_stack, compute_kernel_config=self.ckc, core_grid=self._grid)     # (Eloc,M,H)
         ttnn.deallocate(act)
         down_f = ttnn.typecast(down, ttnn.float32)                                 # (Eloc,M,H)
         ttnn.deallocate(down)
