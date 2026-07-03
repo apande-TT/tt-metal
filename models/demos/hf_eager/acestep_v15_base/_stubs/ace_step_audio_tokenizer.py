@@ -62,6 +62,7 @@ LLM_GAPs (op-NEW — still need synthesis):
 
 HF reference: transformers/src/transformers/models/acestep/modeling_acestep.py
 Op counts: total=32  op-REUSE=22  op-ADAPT=0  op-NEW=10"""
+
 from __future__ import annotations
 
 import torch
@@ -389,7 +390,6 @@ class AceStepAudioTokenizer:
         rope_dim = 128
         rope_base = 10000.0
         seq_len = 10
-        num_heads = 16
 
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim))
         t = torch.arange(seq_len, dtype=torch.float32)
