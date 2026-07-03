@@ -19,7 +19,7 @@ from pathlib import Path
 
 PERF_DIR = "models/experimental/perf_automation"
 CC_DIR = PERF_DIR + "/cc_optimize"
-DEFAULT_MAX_ROUNDS = 20
+DEFAULT_MAX_ROUNDS = 10
 
 _ALLOWED_TOOLS = [
     "mcp__perf-mcp__profile_model",
