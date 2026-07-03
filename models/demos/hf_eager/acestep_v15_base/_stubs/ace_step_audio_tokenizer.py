@@ -390,6 +390,7 @@ class AceStepAudioTokenizer:
         rope_dim = 128
         rope_base = 10000.0
         seq_len = 10
+        num_heads = 16
 
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim))
         t = torch.arange(seq_len, dtype=torch.float32)
