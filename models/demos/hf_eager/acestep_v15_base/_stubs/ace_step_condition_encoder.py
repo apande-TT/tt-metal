@@ -1150,17 +1150,58 @@ class AceStepConditionEncoder:
         x = ttnn.add(residual, mlp_out)
         return x
 
-    def _pack_sequences(self, hidden1, hidden2, mask1_torch, mask2_torch):
-        hidden_cat = ttnn.concat([hidden1, hidden2], dim=1)
+    @staticmethod
+    def _compute_pack_perm(mask1_torch, mask2_torch):
+        """Host-side sort/permutation bookkeeping for sequence packing (trace-safe)."""
         mask_cat_torch = torch.cat([mask1_torch, mask2_torch], dim=1).to(torch.float32)
-        b, l = mask_cat_torch.shape
+        l = mask_cat_torch.shape[1]
         sort_idx = mask_cat_torch.argsort(dim=1, descending=True, stable=True)
         perm = torch.eye(l, dtype=torch.float32)[sort_idx].to(torch.bfloat16)
         lengths = (mask_cat_torch > 0).sum(dim=1)
         new_mask_torch = torch.arange(l, dtype=torch.long).unsqueeze(0) < lengths.unsqueeze(1)
-        perm_tt = ttnn.from_torch(perm, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
-        hidden_packed = ttnn.matmul(perm_tt, hidden_cat)
-        return hidden_packed, new_mask_torch
+        return perm, new_mask_torch
+
+    @staticmethod
+    def _timbre_mask_from_order(refer_audio_order_mask, batch_rows: int) -> torch.Tensor:
+        if refer_audio_order_mask is None:
+            return torch.ones(batch_rows, 1, dtype=torch.long)
+        order_mask_t = refer_audio_order_mask.reshape(-1).to(torch.long)
+        out_batch = int(order_mask_t.max().item()) + 1
+        counts = torch.bincount(order_mask_t, minlength=out_batch)
+        max_count = int(counts.max().item())
+        return (torch.arange(max_count, dtype=torch.long).unsqueeze(0) < counts.unsqueeze(1)).to(torch.long)
+
+    def _apply_pack(self, hidden1, hidden2, perm_tt):
+        hidden_cat = ttnn.concat([hidden1, hidden2], dim=1)
+        return ttnn.matmul(perm_tt, hidden_cat)
+
+    def _pack_sequences(self, hidden1, hidden2, mask1_torch, mask2_torch, *, perm_tt=None):
+        perm_torch, new_mask_torch = self._compute_pack_perm(mask1_torch, mask2_torch)
+        if perm_tt is None:
+            perm_tt = ttnn.from_torch(perm_torch, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+        hidden_packed = self._apply_pack(hidden1, hidden2, perm_tt)
+        return hidden_packed, new_mask_torch, perm_torch
+
+    def forward_traced(
+        self,
+        text_tt: ttnn.Tensor,
+        lyric_tt: ttnn.Tensor,
+        refer_tt: ttnn.Tensor,
+        perm1_tt: ttnn.Tensor,
+        perm2_tt: ttnn.Tensor,
+    ) -> ttnn.Tensor:
+        """Pure-device condition encoder forward for trace capture (perm matrices pre-uploaded)."""
+        text_proj = self._apply_text_projector(text_tt)
+
+        lyric_embed = self._lyric_stub(inputs_embeds=lyric_tt, attention_mask=None)
+        if isinstance(lyric_embed, tuple):
+            lyric_embed = lyric_embed[0]
+
+        timbre_pooled, _ = self._timbre_stub(refer_tt, refer_audio_order_mask=None)
+
+        packed1 = self._apply_pack(lyric_embed, timbre_pooled, perm1_tt)
+        packed2 = self._apply_pack(packed1, text_proj, perm2_tt)
+        return packed2
 
     def _apply_text_projector(self, x):
         return ttnn.linear(x, self.w_text_projector_weight)
@@ -1494,18 +1535,18 @@ class AceStepConditionEncoder:
 
         text_proj = self._apply_text_projector(text_tt)
 
-        lyric_out = self._lyric_stub(inputs_embeds=lyric_hidden_states, attention_mask=lyric_attention_mask)
+        lyric_out = self._lyric_stub(inputs_embeds=lyric_tt, attention_mask=lyric_attention_mask)
         lyric_embed = getattr(lyric_out, "last_hidden_state", lyric_out)
         if isinstance(lyric_embed, tuple):
             lyric_embed = lyric_embed[0]
 
-        timbre_pooled, timbre_mask_torch = self._timbre_stub(
-            refer_audio_acoustic_hidden_states_packed, refer_audio_order_mask
-        )
+        timbre_pooled, timbre_mask_torch = self._timbre_stub(refer_audio_tt, refer_audio_order_mask)
         timbre_mask_torch = timbre_mask_torch.to(torch.float32)
+        if lyric_mask_torch is not None:
+            lyric_mask_torch = lyric_mask_torch.to(torch.float32)
 
-        packed1, mask1_torch = self._pack_sequences(lyric_embed, timbre_pooled, lyric_mask_torch, timbre_mask_torch)
-        packed2, mask2_torch = self._pack_sequences(packed1, text_proj, mask1_torch, text_mask_torch)
+        packed1, mask1_torch, _ = self._pack_sequences(lyric_embed, timbre_pooled, lyric_mask_torch, timbre_mask_torch)
+        packed2, mask2_torch, _ = self._pack_sequences(packed1, text_proj, mask1_torch, text_mask_torch)
 
         attention_mask = ttnn.from_torch(
             mask2_torch.to(torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device

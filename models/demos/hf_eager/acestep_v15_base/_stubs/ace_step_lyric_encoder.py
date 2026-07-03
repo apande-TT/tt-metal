@@ -1108,7 +1108,8 @@ class AceStepLyricEncoder:
         # 1. Project embeddings: [B, T, 1024] -> [B, T, 2048] (Linear + bias).
         hidden = self._apply_embed_tokens(inputs_embeds)
 
-        cos, sin = self._rope_tables_torch(seq_len)
+        # Device-resident RoPE tables (cached at init by seq_len) — trace-safe.
+        cos, sin = self._rope_tables(seq_len)
 
         for layer_idx in range(len(self._layer_stubs)):
             hidden = self._layer_stubs[layer_idx](
