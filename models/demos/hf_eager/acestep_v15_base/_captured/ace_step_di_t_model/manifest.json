@@ -1,0 +1,92 @@
+{
+  "component": "ace_step_di_t_model",
+  "submodule_path": "decoder",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "hidden_states": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          50,
+          64
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "timestep": {
+        "kind": "tensor",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "timestep_r": {
+        "kind": "tensor",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "attention_mask": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          50
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "encoder_hidden_states": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          109,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "encoder_attention_mask": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          109
+        ],
+        "dtype": "torch.bool"
+      },
+      "context_latents": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          50,
+          128
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "use_cache": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "False"
+      }
+    }
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          50,
+          64
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "none"
+      }
+    ]
+  }
+}

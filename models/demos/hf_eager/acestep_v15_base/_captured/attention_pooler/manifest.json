@@ -1,0 +1,32 @@
+{
+  "component": "attention_pooler",
+  "submodule_path": "tokenizer.attention_pooler",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          10,
+          5,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      10,
+      2048
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

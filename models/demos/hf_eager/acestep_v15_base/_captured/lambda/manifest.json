@@ -1,0 +1,31 @@
+{
+  "component": "lambda",
+  "submodule_path": "decoder.proj_in.0",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          50,
+          192
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      192,
+      50
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

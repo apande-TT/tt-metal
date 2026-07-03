@@ -1,0 +1,42 @@
+{
+  "component": "timestep_embedding",
+  "submodule_path": "decoder.time_embed",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          6,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  }
+}

@@ -1,0 +1,1068 @@
+{
+  "component": "ace_step_condition_encoder",
+  "class_name": "AceStepConditionEncoder",
+  "module_function": "ace_step_condition_encoder",
+  "pre_bound": [
+    {
+      "name": "text_projector",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_text_projector"
+    },
+    {
+      "name": "lyric_encoder.embed_tokens",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_embed_tokens"
+    },
+    {
+      "name": "lyric_encoder.layers.0.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_0_self_attn_q_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.0.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_0_self_attn_k_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.0.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_0_self_attn_v_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.0.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_0_self_attn_o_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.0.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_0_mlp_gate_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.0.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_0_mlp_up_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.0.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_0_mlp_down_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.0.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_lyric_encoder_layers_0_mlp_act_fn"
+    },
+    {
+      "name": "lyric_encoder.layers.1.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_1_self_attn_q_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.1.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_1_self_attn_k_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.1.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_1_self_attn_v_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.1.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_1_self_attn_o_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.1.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_1_mlp_gate_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.1.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_1_mlp_up_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.1.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_1_mlp_down_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.1.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_lyric_encoder_layers_1_mlp_act_fn"
+    },
+    {
+      "name": "lyric_encoder.layers.2.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_2_self_attn_q_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.2.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_2_self_attn_k_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.2.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_2_self_attn_v_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.2.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_2_self_attn_o_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.2.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_2_mlp_gate_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.2.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_2_mlp_up_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.2.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_2_mlp_down_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.2.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_lyric_encoder_layers_2_mlp_act_fn"
+    },
+    {
+      "name": "lyric_encoder.layers.3.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_3_self_attn_q_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.3.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_3_self_attn_k_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.3.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_3_self_attn_v_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.3.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_3_self_attn_o_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.3.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_3_mlp_gate_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.3.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_3_mlp_up_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.3.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_3_mlp_down_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.3.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_lyric_encoder_layers_3_mlp_act_fn"
+    },
+    {
+      "name": "lyric_encoder.layers.4.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_4_self_attn_q_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.4.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_4_self_attn_k_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.4.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_4_self_attn_v_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.4.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_4_self_attn_o_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.4.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_4_mlp_gate_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.4.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_4_mlp_up_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.4.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_4_mlp_down_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.4.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_lyric_encoder_layers_4_mlp_act_fn"
+    },
+    {
+      "name": "lyric_encoder.layers.5.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_5_self_attn_q_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.5.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_5_self_attn_k_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.5.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_5_self_attn_v_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.5.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_5_self_attn_o_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.5.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_5_mlp_gate_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.5.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_5_mlp_up_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.5.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_5_mlp_down_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.5.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_lyric_encoder_layers_5_mlp_act_fn"
+    },
+    {
+      "name": "lyric_encoder.layers.6.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_6_self_attn_q_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.6.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_6_self_attn_k_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.6.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_6_self_attn_v_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.6.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_6_self_attn_o_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.6.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_6_mlp_gate_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.6.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_6_mlp_up_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.6.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_6_mlp_down_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.6.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_lyric_encoder_layers_6_mlp_act_fn"
+    },
+    {
+      "name": "lyric_encoder.layers.7.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_7_self_attn_q_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.7.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_7_self_attn_k_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.7.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_7_self_attn_v_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.7.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_7_self_attn_o_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.7.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_7_mlp_gate_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.7.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_7_mlp_up_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.7.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lyric_encoder_layers_7_mlp_down_proj"
+    },
+    {
+      "name": "lyric_encoder.layers.7.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_lyric_encoder_layers_7_mlp_act_fn"
+    },
+    {
+      "name": "timbre_encoder.embed_tokens",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_embed_tokens"
+    },
+    {
+      "name": "timbre_encoder.layers.0.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_0_self_attn_q_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.0.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_0_self_attn_k_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.0.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_0_self_attn_v_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.0.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_0_self_attn_o_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.0.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_0_mlp_gate_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.0.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_0_mlp_up_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.0.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_0_mlp_down_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.0.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_timbre_encoder_layers_0_mlp_act_fn"
+    },
+    {
+      "name": "timbre_encoder.layers.1.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_1_self_attn_q_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.1.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_1_self_attn_k_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.1.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_1_self_attn_v_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.1.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_1_self_attn_o_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.1.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_1_mlp_gate_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.1.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_1_mlp_up_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.1.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_1_mlp_down_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.1.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_timbre_encoder_layers_1_mlp_act_fn"
+    },
+    {
+      "name": "timbre_encoder.layers.2.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_2_self_attn_q_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.2.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_2_self_attn_k_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.2.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_2_self_attn_v_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.2.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_2_self_attn_o_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.2.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_2_mlp_gate_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.2.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_2_mlp_up_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.2.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_2_mlp_down_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.2.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_timbre_encoder_layers_2_mlp_act_fn"
+    },
+    {
+      "name": "timbre_encoder.layers.3.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_3_self_attn_q_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.3.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_3_self_attn_k_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.3.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_3_self_attn_v_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.3.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_3_self_attn_o_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.3.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_3_mlp_gate_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.3.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_3_mlp_up_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.3.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_timbre_encoder_layers_3_mlp_down_proj"
+    },
+    {
+      "name": "timbre_encoder.layers.3.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_timbre_encoder_layers_3_mlp_act_fn"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "lyric_encoder.norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.rotary_emb",
+      "class": "Qwen3RotaryEmbedding",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.0.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.0.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.0.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.0.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.1.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.1.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.1.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.1.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.2.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.2.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.2.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.2.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.3.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.3.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.3.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.3.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.4.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.4.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.4.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.4.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.5.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.5.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.5.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.5.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.6.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.6.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.6.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.6.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.7.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.7.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.7.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "lyric_encoder.layers.7.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.rotary_emb",
+      "class": "Qwen3RotaryEmbedding",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.0.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.0.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.0.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.0.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.1.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.1.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.1.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.1.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.2.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.2.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.2.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.2.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.3.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.3.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.3.input_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "timbre_encoder.layers.3.post_attention_layernorm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_text_projector(x) -> ttnn.linear  (in=1024, out=2048, bias=False)",
+    "self._apply_lyric_encoder_embed_tokens(x) -> ttnn.linear  (in=1024, out=2048, bias=True)",
+    "self._apply_lyric_encoder_layers_0_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_0_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_0_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_0_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_0_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_0_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_0_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_0_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_lyric_encoder_layers_1_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_1_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_1_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_1_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_1_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_1_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_1_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_1_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_lyric_encoder_layers_2_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_2_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_2_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_2_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_2_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_2_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_2_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_2_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_lyric_encoder_layers_3_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_3_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_3_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_3_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_3_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_3_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_3_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_3_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_lyric_encoder_layers_4_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_4_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_4_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_4_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_4_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_4_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_4_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_4_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_lyric_encoder_layers_5_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_5_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_5_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_5_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_5_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_5_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_5_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_5_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_lyric_encoder_layers_6_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_6_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_6_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_6_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_6_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_6_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_6_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_6_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_lyric_encoder_layers_7_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_7_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_7_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_lyric_encoder_layers_7_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_7_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_7_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_lyric_encoder_layers_7_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_lyric_encoder_layers_7_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_timbre_encoder_embed_tokens(x) -> ttnn.linear  (in=64, out=2048, bias=True)",
+    "self._apply_timbre_encoder_layers_0_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_0_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_timbre_encoder_layers_0_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_timbre_encoder_layers_0_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_0_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_timbre_encoder_layers_0_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_timbre_encoder_layers_0_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_0_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_timbre_encoder_layers_1_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_1_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_timbre_encoder_layers_1_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_timbre_encoder_layers_1_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_1_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_timbre_encoder_layers_1_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_timbre_encoder_layers_1_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_1_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_timbre_encoder_layers_2_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_2_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_timbre_encoder_layers_2_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_timbre_encoder_layers_2_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_2_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_timbre_encoder_layers_2_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_timbre_encoder_layers_2_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_2_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_timbre_encoder_layers_3_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_3_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_timbre_encoder_layers_3_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_timbre_encoder_layers_3_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_3_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_timbre_encoder_layers_3_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_timbre_encoder_layers_3_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_timbre_encoder_layers_3_mlp_act_fn(x) -> ttnn.silu"
+  ],
+  "counts": {
+    "op-REUSE": 99,
+    "op-ADAPT": 0,
+    "op-NEW": 52
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "component": "residual_f_s_q",
+  "class_name": "ResidualFSQ",
+  "module_function": "residual_f_s_q",
+  "pre_bound": [
+    {
+      "name": "project_in",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_project_in"
+    },
+    {
+      "name": "project_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_project_out"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "layers.0.project_in",
+      "class": "Identity",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.project_out",
+      "class": "Identity",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_project_in(x) -> ttnn.linear  (in=2048, out=6, bias=True)",
+    "self._apply_project_out(x) -> ttnn.linear  (in=6, out=2048, bias=True)"
+  ],
+  "counts": {
+    "op-REUSE": 4,
+    "op-ADAPT": 0,
+    "op-NEW": 0
+  }
+}

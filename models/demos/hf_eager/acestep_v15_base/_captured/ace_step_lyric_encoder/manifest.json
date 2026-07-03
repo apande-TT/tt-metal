@@ -1,0 +1,44 @@
+{
+  "component": "ace_step_lyric_encoder",
+  "submodule_path": "encoder.lyric_encoder",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "inputs_embeds": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          58,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "attention_mask": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          58
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    }
+  },
+  "output": {
+    "kind": "dict",
+    "items": {
+      "last_hidden_state": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          58,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    }
+  }
+}

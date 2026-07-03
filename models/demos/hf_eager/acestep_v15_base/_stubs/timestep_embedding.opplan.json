@@ -1,0 +1,55 @@
+{
+  "component": "timestep_embedding",
+  "class_name": "TimestepEmbedding",
+  "module_function": "timestep_embedding",
+  "pre_bound": [
+    {
+      "name": "linear_1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_linear_1"
+    },
+    {
+      "name": "act1",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_act1"
+    },
+    {
+      "name": "linear_2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_linear_2"
+    },
+    {
+      "name": "act2",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_act2"
+    },
+    {
+      "name": "time_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_time_proj"
+    }
+  ],
+  "llm_gaps": [],
+  "palette": [
+    "self._apply_linear_1(x) -> ttnn.linear  (in=256, out=2048, bias=True)",
+    "self._apply_act1(x) -> ttnn.silu",
+    "self._apply_linear_2(x) -> ttnn.linear  (in=2048, out=2048, bias=True)",
+    "self._apply_act2(x) -> ttnn.silu",
+    "self._apply_time_proj(x) -> ttnn.linear  (in=2048, out=12288, bias=True)"
+  ],
+  "counts": {
+    "op-REUSE": 5,
+    "op-ADAPT": 0,
+    "op-NEW": 0
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "component": "f_s_q",
+  "submodule_path": "tokenizer.quantizer.layers.0",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          10,
+          6
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          10,
+          6
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          10
+        ],
+        "dtype": "torch.int32"
+      }
+    ]
+  }
+}

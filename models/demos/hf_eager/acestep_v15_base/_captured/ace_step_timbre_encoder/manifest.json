@@ -1,0 +1,51 @@
+{
+  "component": "ace_step_timbre_encoder",
+  "submodule_path": "encoder.timbre_encoder",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "refer_audio_acoustic_hidden_states_packed": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          100,
+          64
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "refer_audio_order_mask": {
+        "kind": "tensor",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int64"
+      }
+    }
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1
+        ],
+        "dtype": "torch.int64"
+      }
+    ]
+  }
+}

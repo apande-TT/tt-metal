@@ -1,0 +1,85 @@
+{
+  "component": "ace_step_condition_encoder",
+  "submodule_path": "encoder",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "text_hidden_states": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          50,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "text_attention_mask": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          50
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "lyric_hidden_states": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          58,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "lyric_attention_mask": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          58
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "refer_audio_acoustic_hidden_states_packed": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          100,
+          64
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "refer_audio_order_mask": {
+        "kind": "tensor",
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int64"
+      }
+    }
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          109,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          109
+        ],
+        "dtype": "torch.bool"
+      }
+    ]
+  }
+}

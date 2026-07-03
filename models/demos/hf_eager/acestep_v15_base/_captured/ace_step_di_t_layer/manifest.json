@@ -1,0 +1,125 @@
+{
+  "component": "ace_step_di_t_layer",
+  "submodule_path": "decoder.layers.0",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          25,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tuple",
+        "items": [
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              25,
+              128
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              25,
+              128
+            ],
+            "dtype": "torch.bfloat16"
+          }
+        ]
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          6,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1,
+          25,
+          25
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          25
+        ],
+        "dtype": "torch.int64"
+      },
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "False"
+      },
+      {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "False"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          25
+        ],
+        "dtype": "torch.int64"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          109,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1,
+          25,
+          109
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          25,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  }
+}

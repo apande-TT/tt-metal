@@ -1,0 +1,3288 @@
+{
+  "component": "ace_step_di_t_model",
+  "class_name": "AceStepDiTModel",
+  "module_function": "ace_step_di_t_model",
+  "pre_bound": [
+    {
+      "name": "layers.0.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_q_proj"
+    },
+    {
+      "name": "layers.0.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_k_proj"
+    },
+    {
+      "name": "layers.0.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_v_proj"
+    },
+    {
+      "name": "layers.0.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_o_proj"
+    },
+    {
+      "name": "layers.0.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.0.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.0.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.0.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.0.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_mlp_gate_proj"
+    },
+    {
+      "name": "layers.0.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_mlp_up_proj"
+    },
+    {
+      "name": "layers.0.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_mlp_down_proj"
+    },
+    {
+      "name": "layers.0.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_0_mlp_act_fn"
+    },
+    {
+      "name": "layers.1.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_q_proj"
+    },
+    {
+      "name": "layers.1.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_k_proj"
+    },
+    {
+      "name": "layers.1.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_v_proj"
+    },
+    {
+      "name": "layers.1.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_o_proj"
+    },
+    {
+      "name": "layers.1.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.1.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.1.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.1.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.1.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_mlp_gate_proj"
+    },
+    {
+      "name": "layers.1.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_mlp_up_proj"
+    },
+    {
+      "name": "layers.1.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_mlp_down_proj"
+    },
+    {
+      "name": "layers.1.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_1_mlp_act_fn"
+    },
+    {
+      "name": "layers.2.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_q_proj"
+    },
+    {
+      "name": "layers.2.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_k_proj"
+    },
+    {
+      "name": "layers.2.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_v_proj"
+    },
+    {
+      "name": "layers.2.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_o_proj"
+    },
+    {
+      "name": "layers.2.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.2.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.2.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.2.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.2.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_mlp_gate_proj"
+    },
+    {
+      "name": "layers.2.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_mlp_up_proj"
+    },
+    {
+      "name": "layers.2.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_mlp_down_proj"
+    },
+    {
+      "name": "layers.2.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_2_mlp_act_fn"
+    },
+    {
+      "name": "layers.3.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_q_proj"
+    },
+    {
+      "name": "layers.3.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_k_proj"
+    },
+    {
+      "name": "layers.3.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_v_proj"
+    },
+    {
+      "name": "layers.3.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_o_proj"
+    },
+    {
+      "name": "layers.3.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.3.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.3.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.3.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.3.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_mlp_gate_proj"
+    },
+    {
+      "name": "layers.3.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_mlp_up_proj"
+    },
+    {
+      "name": "layers.3.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_mlp_down_proj"
+    },
+    {
+      "name": "layers.3.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_3_mlp_act_fn"
+    },
+    {
+      "name": "layers.4.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_q_proj"
+    },
+    {
+      "name": "layers.4.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_k_proj"
+    },
+    {
+      "name": "layers.4.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_v_proj"
+    },
+    {
+      "name": "layers.4.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_o_proj"
+    },
+    {
+      "name": "layers.4.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.4.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.4.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.4.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.4.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_mlp_gate_proj"
+    },
+    {
+      "name": "layers.4.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_mlp_up_proj"
+    },
+    {
+      "name": "layers.4.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_mlp_down_proj"
+    },
+    {
+      "name": "layers.4.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_4_mlp_act_fn"
+    },
+    {
+      "name": "layers.5.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_q_proj"
+    },
+    {
+      "name": "layers.5.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_k_proj"
+    },
+    {
+      "name": "layers.5.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_v_proj"
+    },
+    {
+      "name": "layers.5.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_o_proj"
+    },
+    {
+      "name": "layers.5.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.5.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.5.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.5.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.5.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_mlp_gate_proj"
+    },
+    {
+      "name": "layers.5.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_mlp_up_proj"
+    },
+    {
+      "name": "layers.5.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_mlp_down_proj"
+    },
+    {
+      "name": "layers.5.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_5_mlp_act_fn"
+    },
+    {
+      "name": "layers.6.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_q_proj"
+    },
+    {
+      "name": "layers.6.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_k_proj"
+    },
+    {
+      "name": "layers.6.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_v_proj"
+    },
+    {
+      "name": "layers.6.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_o_proj"
+    },
+    {
+      "name": "layers.6.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.6.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.6.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.6.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.6.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_mlp_gate_proj"
+    },
+    {
+      "name": "layers.6.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_mlp_up_proj"
+    },
+    {
+      "name": "layers.6.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_mlp_down_proj"
+    },
+    {
+      "name": "layers.6.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_6_mlp_act_fn"
+    },
+    {
+      "name": "layers.7.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_q_proj"
+    },
+    {
+      "name": "layers.7.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_k_proj"
+    },
+    {
+      "name": "layers.7.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_v_proj"
+    },
+    {
+      "name": "layers.7.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_o_proj"
+    },
+    {
+      "name": "layers.7.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.7.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.7.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.7.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.7.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_mlp_gate_proj"
+    },
+    {
+      "name": "layers.7.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_mlp_up_proj"
+    },
+    {
+      "name": "layers.7.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_mlp_down_proj"
+    },
+    {
+      "name": "layers.7.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_7_mlp_act_fn"
+    },
+    {
+      "name": "layers.8.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_q_proj"
+    },
+    {
+      "name": "layers.8.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_k_proj"
+    },
+    {
+      "name": "layers.8.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_v_proj"
+    },
+    {
+      "name": "layers.8.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_o_proj"
+    },
+    {
+      "name": "layers.8.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.8.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.8.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.8.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.8.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_mlp_gate_proj"
+    },
+    {
+      "name": "layers.8.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_mlp_up_proj"
+    },
+    {
+      "name": "layers.8.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_mlp_down_proj"
+    },
+    {
+      "name": "layers.8.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_8_mlp_act_fn"
+    },
+    {
+      "name": "layers.9.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_q_proj"
+    },
+    {
+      "name": "layers.9.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_k_proj"
+    },
+    {
+      "name": "layers.9.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_v_proj"
+    },
+    {
+      "name": "layers.9.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_o_proj"
+    },
+    {
+      "name": "layers.9.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.9.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.9.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.9.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.9.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_mlp_gate_proj"
+    },
+    {
+      "name": "layers.9.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_mlp_up_proj"
+    },
+    {
+      "name": "layers.9.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_mlp_down_proj"
+    },
+    {
+      "name": "layers.9.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_9_mlp_act_fn"
+    },
+    {
+      "name": "layers.10.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_q_proj"
+    },
+    {
+      "name": "layers.10.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_k_proj"
+    },
+    {
+      "name": "layers.10.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_v_proj"
+    },
+    {
+      "name": "layers.10.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_o_proj"
+    },
+    {
+      "name": "layers.10.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.10.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.10.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.10.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.10.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_mlp_gate_proj"
+    },
+    {
+      "name": "layers.10.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_mlp_up_proj"
+    },
+    {
+      "name": "layers.10.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_mlp_down_proj"
+    },
+    {
+      "name": "layers.10.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_10_mlp_act_fn"
+    },
+    {
+      "name": "layers.11.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_q_proj"
+    },
+    {
+      "name": "layers.11.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_k_proj"
+    },
+    {
+      "name": "layers.11.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_v_proj"
+    },
+    {
+      "name": "layers.11.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_o_proj"
+    },
+    {
+      "name": "layers.11.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.11.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.11.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.11.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.11.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_mlp_gate_proj"
+    },
+    {
+      "name": "layers.11.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_mlp_up_proj"
+    },
+    {
+      "name": "layers.11.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_mlp_down_proj"
+    },
+    {
+      "name": "layers.11.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_11_mlp_act_fn"
+    },
+    {
+      "name": "layers.12.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_q_proj"
+    },
+    {
+      "name": "layers.12.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_k_proj"
+    },
+    {
+      "name": "layers.12.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_v_proj"
+    },
+    {
+      "name": "layers.12.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_o_proj"
+    },
+    {
+      "name": "layers.12.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.12.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.12.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.12.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.12.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_mlp_gate_proj"
+    },
+    {
+      "name": "layers.12.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_mlp_up_proj"
+    },
+    {
+      "name": "layers.12.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_mlp_down_proj"
+    },
+    {
+      "name": "layers.12.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_12_mlp_act_fn"
+    },
+    {
+      "name": "layers.13.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_q_proj"
+    },
+    {
+      "name": "layers.13.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_k_proj"
+    },
+    {
+      "name": "layers.13.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_v_proj"
+    },
+    {
+      "name": "layers.13.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_o_proj"
+    },
+    {
+      "name": "layers.13.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.13.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.13.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.13.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.13.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_mlp_gate_proj"
+    },
+    {
+      "name": "layers.13.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_mlp_up_proj"
+    },
+    {
+      "name": "layers.13.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_mlp_down_proj"
+    },
+    {
+      "name": "layers.13.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_13_mlp_act_fn"
+    },
+    {
+      "name": "layers.14.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_q_proj"
+    },
+    {
+      "name": "layers.14.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_k_proj"
+    },
+    {
+      "name": "layers.14.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_v_proj"
+    },
+    {
+      "name": "layers.14.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_o_proj"
+    },
+    {
+      "name": "layers.14.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.14.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.14.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.14.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.14.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_mlp_gate_proj"
+    },
+    {
+      "name": "layers.14.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_mlp_up_proj"
+    },
+    {
+      "name": "layers.14.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_mlp_down_proj"
+    },
+    {
+      "name": "layers.14.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_14_mlp_act_fn"
+    },
+    {
+      "name": "layers.15.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_q_proj"
+    },
+    {
+      "name": "layers.15.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_k_proj"
+    },
+    {
+      "name": "layers.15.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_v_proj"
+    },
+    {
+      "name": "layers.15.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_o_proj"
+    },
+    {
+      "name": "layers.15.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.15.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.15.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.15.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.15.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_mlp_gate_proj"
+    },
+    {
+      "name": "layers.15.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_mlp_up_proj"
+    },
+    {
+      "name": "layers.15.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_mlp_down_proj"
+    },
+    {
+      "name": "layers.15.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_15_mlp_act_fn"
+    },
+    {
+      "name": "layers.16.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_q_proj"
+    },
+    {
+      "name": "layers.16.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_k_proj"
+    },
+    {
+      "name": "layers.16.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_v_proj"
+    },
+    {
+      "name": "layers.16.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_o_proj"
+    },
+    {
+      "name": "layers.16.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.16.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.16.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.16.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.16.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_mlp_gate_proj"
+    },
+    {
+      "name": "layers.16.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_mlp_up_proj"
+    },
+    {
+      "name": "layers.16.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_mlp_down_proj"
+    },
+    {
+      "name": "layers.16.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_16_mlp_act_fn"
+    },
+    {
+      "name": "layers.17.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_q_proj"
+    },
+    {
+      "name": "layers.17.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_k_proj"
+    },
+    {
+      "name": "layers.17.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_v_proj"
+    },
+    {
+      "name": "layers.17.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_o_proj"
+    },
+    {
+      "name": "layers.17.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.17.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.17.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.17.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.17.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_mlp_gate_proj"
+    },
+    {
+      "name": "layers.17.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_mlp_up_proj"
+    },
+    {
+      "name": "layers.17.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_mlp_down_proj"
+    },
+    {
+      "name": "layers.17.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_17_mlp_act_fn"
+    },
+    {
+      "name": "layers.18.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_q_proj"
+    },
+    {
+      "name": "layers.18.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_k_proj"
+    },
+    {
+      "name": "layers.18.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_v_proj"
+    },
+    {
+      "name": "layers.18.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_o_proj"
+    },
+    {
+      "name": "layers.18.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.18.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.18.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.18.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.18.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_mlp_gate_proj"
+    },
+    {
+      "name": "layers.18.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_mlp_up_proj"
+    },
+    {
+      "name": "layers.18.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_mlp_down_proj"
+    },
+    {
+      "name": "layers.18.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_18_mlp_act_fn"
+    },
+    {
+      "name": "layers.19.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_q_proj"
+    },
+    {
+      "name": "layers.19.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_k_proj"
+    },
+    {
+      "name": "layers.19.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_v_proj"
+    },
+    {
+      "name": "layers.19.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_o_proj"
+    },
+    {
+      "name": "layers.19.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.19.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.19.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.19.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.19.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_mlp_gate_proj"
+    },
+    {
+      "name": "layers.19.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_mlp_up_proj"
+    },
+    {
+      "name": "layers.19.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_mlp_down_proj"
+    },
+    {
+      "name": "layers.19.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_19_mlp_act_fn"
+    },
+    {
+      "name": "layers.20.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_q_proj"
+    },
+    {
+      "name": "layers.20.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_k_proj"
+    },
+    {
+      "name": "layers.20.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_v_proj"
+    },
+    {
+      "name": "layers.20.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_o_proj"
+    },
+    {
+      "name": "layers.20.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.20.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.20.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.20.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.20.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_mlp_gate_proj"
+    },
+    {
+      "name": "layers.20.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_mlp_up_proj"
+    },
+    {
+      "name": "layers.20.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_mlp_down_proj"
+    },
+    {
+      "name": "layers.20.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_20_mlp_act_fn"
+    },
+    {
+      "name": "layers.21.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_q_proj"
+    },
+    {
+      "name": "layers.21.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_k_proj"
+    },
+    {
+      "name": "layers.21.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_v_proj"
+    },
+    {
+      "name": "layers.21.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_o_proj"
+    },
+    {
+      "name": "layers.21.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.21.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.21.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.21.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.21.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_mlp_gate_proj"
+    },
+    {
+      "name": "layers.21.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_mlp_up_proj"
+    },
+    {
+      "name": "layers.21.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_mlp_down_proj"
+    },
+    {
+      "name": "layers.21.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_21_mlp_act_fn"
+    },
+    {
+      "name": "layers.22.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_q_proj"
+    },
+    {
+      "name": "layers.22.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_k_proj"
+    },
+    {
+      "name": "layers.22.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_v_proj"
+    },
+    {
+      "name": "layers.22.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_o_proj"
+    },
+    {
+      "name": "layers.22.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.22.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.22.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.22.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.22.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_mlp_gate_proj"
+    },
+    {
+      "name": "layers.22.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_mlp_up_proj"
+    },
+    {
+      "name": "layers.22.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_mlp_down_proj"
+    },
+    {
+      "name": "layers.22.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_22_mlp_act_fn"
+    },
+    {
+      "name": "layers.23.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_q_proj"
+    },
+    {
+      "name": "layers.23.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_k_proj"
+    },
+    {
+      "name": "layers.23.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_v_proj"
+    },
+    {
+      "name": "layers.23.self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_o_proj"
+    },
+    {
+      "name": "layers.23.cross_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_cross_attn_q_proj"
+    },
+    {
+      "name": "layers.23.cross_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_cross_attn_k_proj"
+    },
+    {
+      "name": "layers.23.cross_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_cross_attn_v_proj"
+    },
+    {
+      "name": "layers.23.cross_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_cross_attn_o_proj"
+    },
+    {
+      "name": "layers.23.mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_mlp_gate_proj"
+    },
+    {
+      "name": "layers.23.mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_mlp_up_proj"
+    },
+    {
+      "name": "layers.23.mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_mlp_down_proj"
+    },
+    {
+      "name": "layers.23.mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_23_mlp_act_fn"
+    },
+    {
+      "name": "time_embed.linear_1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_time_embed_linear_1"
+    },
+    {
+      "name": "time_embed.act1",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_time_embed_act1"
+    },
+    {
+      "name": "time_embed.linear_2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_time_embed_linear_2"
+    },
+    {
+      "name": "time_embed.act2",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_time_embed_act2"
+    },
+    {
+      "name": "time_embed.time_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_time_embed_time_proj"
+    },
+    {
+      "name": "time_embed_r.linear_1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_time_embed_r_linear_1"
+    },
+    {
+      "name": "time_embed_r.act1",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_time_embed_r_act1"
+    },
+    {
+      "name": "time_embed_r.linear_2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_time_embed_r_linear_2"
+    },
+    {
+      "name": "time_embed_r.act2",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_time_embed_r_act2"
+    },
+    {
+      "name": "time_embed_r.time_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_time_embed_r_time_proj"
+    },
+    {
+      "name": "condition_embedder",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_condition_embedder"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "rotary_emb",
+      "class": "Qwen3RotaryEmbedding",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.self_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.self_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.self_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.cross_attn_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.cross_attn.q_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.cross_attn.k_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.mlp_norm",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "proj_in.0",
+      "class": "Lambda",
+      "notes": ""
+    },
+    {
+      "name": "proj_in.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "proj_in.2",
+      "class": "Lambda",
+      "notes": ""
+    },
+    {
+      "name": "norm_out",
+      "class": "Qwen3RMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "proj_out.0",
+      "class": "Lambda",
+      "notes": ""
+    },
+    {
+      "name": "proj_out.1",
+      "class": "ConvTranspose1d",
+      "notes": ""
+    },
+    {
+      "name": "proj_out.2",
+      "class": "Lambda",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_layers_0_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_0_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_0_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_0_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_0_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_0_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_0_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_0_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_0_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_0_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_0_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_0_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_1_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_1_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_1_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_1_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_1_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_1_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_1_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_1_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_1_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_1_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_1_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_1_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_2_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_2_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_2_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_2_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_2_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_2_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_2_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_2_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_2_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_2_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_2_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_2_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_3_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_3_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_3_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_3_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_3_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_3_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_3_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_3_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_3_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_3_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_3_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_3_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_4_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_4_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_4_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_4_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_4_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_4_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_4_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_4_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_4_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_4_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_4_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_4_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_5_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_5_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_5_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_5_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_5_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_5_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_5_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_5_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_5_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_5_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_5_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_5_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_6_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_6_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_6_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_6_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_6_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_6_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_6_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_6_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_6_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_6_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_6_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_6_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_7_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_7_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_7_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_7_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_7_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_7_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_7_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_7_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_7_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_7_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_7_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_7_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_8_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_8_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_8_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_8_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_8_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_8_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_8_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_8_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_8_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_8_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_8_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_8_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_9_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_9_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_9_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_9_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_9_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_9_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_9_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_9_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_9_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_9_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_9_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_9_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_10_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_10_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_10_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_10_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_10_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_10_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_10_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_10_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_10_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_10_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_10_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_10_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_11_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_11_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_11_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_11_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_11_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_11_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_11_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_11_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_11_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_11_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_11_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_11_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_12_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_12_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_12_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_12_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_12_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_12_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_12_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_12_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_12_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_12_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_12_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_12_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_13_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_13_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_13_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_13_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_13_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_13_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_13_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_13_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_13_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_13_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_13_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_13_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_14_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_14_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_14_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_14_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_14_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_14_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_14_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_14_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_14_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_14_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_14_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_14_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_15_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_15_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_15_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_15_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_15_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_15_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_15_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_15_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_15_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_15_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_15_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_15_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_16_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_16_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_16_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_16_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_16_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_16_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_16_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_16_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_16_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_16_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_16_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_16_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_17_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_17_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_17_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_17_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_17_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_17_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_17_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_17_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_17_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_17_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_17_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_17_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_18_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_18_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_18_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_18_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_18_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_18_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_18_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_18_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_18_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_18_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_18_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_18_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_19_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_19_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_19_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_19_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_19_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_19_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_19_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_19_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_19_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_19_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_19_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_19_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_20_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_20_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_20_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_20_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_20_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_20_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_20_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_20_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_20_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_20_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_20_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_20_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_21_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_21_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_21_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_21_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_21_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_21_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_21_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_21_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_21_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_21_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_21_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_21_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_22_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_22_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_22_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_22_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_22_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_22_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_22_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_22_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_22_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_22_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_22_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_22_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_23_self_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_23_self_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_23_self_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_23_self_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_23_cross_attn_q_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_23_cross_attn_k_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_23_cross_attn_v_proj(x) -> ttnn.linear  (in=2048, out=1024, bias=False)",
+    "self._apply_layers_23_cross_attn_o_proj(x) -> ttnn.linear  (in=2048, out=2048, bias=False)",
+    "self._apply_layers_23_mlp_gate_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_23_mlp_up_proj(x) -> ttnn.linear  (in=2048, out=6144, bias=False)",
+    "self._apply_layers_23_mlp_down_proj(x) -> ttnn.linear  (in=6144, out=2048, bias=False)",
+    "self._apply_layers_23_mlp_act_fn(x) -> ttnn.silu",
+    "self._apply_time_embed_linear_1(x) -> ttnn.linear  (in=256, out=2048, bias=True)",
+    "self._apply_time_embed_act1(x) -> ttnn.silu",
+    "self._apply_time_embed_linear_2(x) -> ttnn.linear  (in=2048, out=2048, bias=True)",
+    "self._apply_time_embed_act2(x) -> ttnn.silu",
+    "self._apply_time_embed_time_proj(x) -> ttnn.linear  (in=2048, out=12288, bias=True)",
+    "self._apply_time_embed_r_linear_1(x) -> ttnn.linear  (in=256, out=2048, bias=True)",
+    "self._apply_time_embed_r_act1(x) -> ttnn.silu",
+    "self._apply_time_embed_r_linear_2(x) -> ttnn.linear  (in=2048, out=2048, bias=True)",
+    "self._apply_time_embed_r_act2(x) -> ttnn.silu",
+    "self._apply_time_embed_r_time_proj(x) -> ttnn.linear  (in=2048, out=12288, bias=True)",
+    "self._apply_condition_embedder(x) -> ttnn.linear  (in=2048, out=2048, bias=True)"
+  ],
+  "counts": {
+    "op-REUSE": 299,
+    "op-ADAPT": 1,
+    "op-NEW": 175
+  }
+}

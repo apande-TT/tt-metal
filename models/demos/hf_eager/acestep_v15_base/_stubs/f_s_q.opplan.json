@@ -1,0 +1,24 @@
+{
+  "component": "f_s_q",
+  "class_name": "FSQ",
+  "module_function": "f_s_q",
+  "pre_bound": [],
+  "llm_gaps": [
+    {
+      "name": "project_in",
+      "class": "Identity",
+      "notes": ""
+    },
+    {
+      "name": "project_out",
+      "class": "Identity",
+      "notes": ""
+    }
+  ],
+  "palette": [],
+  "counts": {
+    "op-REUSE": 2,
+    "op-ADAPT": 0,
+    "op-NEW": 0
+  }
+}

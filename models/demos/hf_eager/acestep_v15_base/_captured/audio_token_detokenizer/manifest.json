@@ -1,0 +1,31 @@
+{
+  "component": "audio_token_detokenizer",
+  "submodule_path": "detokenizer",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          10,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      50,
+      64
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}
