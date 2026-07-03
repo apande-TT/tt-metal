@@ -228,25 +228,26 @@ def _gate_status(repo_root: Path, mcp_env: dict, devices: str) -> dict:
     return {"can_stop": "CANSTOP=True" in out, "halt": "HALT=True" in out, "reason": reason}
 
 
-def _baseline_fullpipe(repo_root: Path, mcp_env: dict, devices: str) -> None:
-    """Run the full-pipeline end-to-end gate ONCE at baseline (ALL 52 layers, no tracy) so the true
-    end-to-end time is printed + recorded before the loop starts — the agent's own gate calls are not
-    guaranteed (it can bank wins without calling it). This seeds the best-so-far and gives a visible
-    end-to-end number up front. DEFAULT OFF (PERF_MCP_FULLPIPE_BASELINE=1 to enable) because a full-depth
-    end-to-end on a repeat-prefill pipeline is minutes-long and would block the loop. Best-effort; never fails."""
-    if os.environ.get("PERF_MCP_FULLPIPE_BASELINE", "0") != "1":
-        return
+def _fullpipe_e2e(repo_root: Path, mcp_env: dict, devices: str, label: str) -> float | None:
+    """Measure the FULL-model end-to-end (ALL 52 layers, no tracy, prefill + 1 decode) ONCE and print it
+    with `label` (BEFORE / AFTER). Returns end_to_end_ms or None. This is the whole-model SCOREBOARD, run
+    only at the two BOOKENDS of a pipeline's optimization (start + right before stop) — never per iteration
+    — so a real before/after full-model speedup is reported without the per-step cost. The device_ms loop
+    metric is the fast 2-layer STEERING signal; this is the verdict. Disable via PERF_MCP_FULLPIPE_E2E=0."""
+    if os.environ.get("PERF_MCP_FULLPIPE_E2E", "1") != "1":
+        return None
     code = (
         "import sys; sys.path.insert(0, sys.argv[1]); import perf_mcp as P; "
         "g=P.check_full_pipeline_latency\n"
         "for a in ('fn','func','_fn','__wrapped__'):\n"
         "    if hasattr(g,a): g=getattr(g,a); break\n"
         "r=g()\n"
-        "print('FULLPIPE_BASELINE=' + str(r))"
+        "print('FULLPIPE_MS=' + str(r.get('full_pipeline_ms')))"
     )
     env = cc_env(repo_root, devices)
     env.update(mcp_env)
-    print("  [optimize/cc] measuring full-pipeline end-to-end baseline (ALL layers, no tracy — one slow run)...")
+    print(f"  [optimize/cc] measuring FULL-model end-to-end ({label}) — ALL 52 layers, no tracy (one slow run, minutes)...")
+    ms = None
     try:
         r = subprocess.run(
             [_python_bin(repo_root), "-c", code, str(repo_root / CC_DIR)],
@@ -257,11 +258,19 @@ def _baseline_fullpipe(repo_root: Path, mcp_env: dict, devices: str) -> None:
             timeout=5400,
         )
     except Exception as exc:  # noqa: BLE001
-        print(f"  [optimize/cc] full-pipeline baseline skipped ({exc})")
-        return
+        print(f"  [optimize/cc] FULL-model end-to-end ({label}) skipped ({exc})")
+        return None
     for line in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines():
-        if "[full-pipeline-gate]" in line or line.startswith("FULLPIPE_BASELINE="):
+        if line.startswith("FULLPIPE_MS="):
+            try:
+                ms = float(line.split("=", 1)[1])
+            except Exception:  # noqa: BLE001
+                ms = None
+        if "[full-pipeline-gate]" in line:
             print("  [optimize/cc] " + line.strip())
+    if ms is not None:
+        print(f"  [optimize/cc] FULL-model end-to-end ({label}) = {ms:.1f} ms  (ALL 52 layers, prefill + 1 decode)")
+    return ms
 
 
 def _git(repo_root: Path, *args: str) -> str:
@@ -331,7 +340,7 @@ def optimize_pipeline(
     prompt = _PROMPT.format(model=model_name, task=task, metric=metric)
     start_sha = _git(repo_root, "rev-parse", "HEAD")
     mcp_env = cfg["mcpServers"]["perf-mcp"]["env"]
-    _baseline_fullpipe(repo_root, mcp_env, devices)
+    before_ms = _fullpipe_e2e(repo_root, mcp_env, devices, "BEFORE")
     rounds, can_stop, halted = 0, False, False
     while rounds < max_rounds:
         st = _gate_status(repo_root, mcp_env, devices)
@@ -360,6 +369,13 @@ def optimize_pipeline(
             env=cc_env(repo_root, devices),
         )
         rounds += 1
+    after_ms = _fullpipe_e2e(repo_root, mcp_env, devices, "AFTER")
+    if before_ms and after_ms:
+        d = (before_ms - after_ms) / before_ms * 100.0
+        print(
+            f"  [optimize/cc] FULL-model end-to-end (ALL 52 layers): BEFORE {before_ms:.1f} ms -> "
+            f"AFTER {after_ms:.1f} ms  ({d:+.1f}% {'faster' if d >= 0 else 'SLOWER'})"
+        )
     _emit_summary(repo_root, kernel_log, model_name, task, metric, start_sha)
     return {"task": task, "rounds": rounds, "can_stop": can_stop, "halted": halted}
 
