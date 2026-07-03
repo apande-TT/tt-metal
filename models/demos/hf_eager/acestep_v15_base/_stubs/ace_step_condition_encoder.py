@@ -326,6 +326,13 @@ class AceStepConditionEncoder:
     def __init__(self, device, torch_module):
         self.device = device
         self._torch_module = torch_module
+
+        from models.demos.hf_eager.acestep_v15_base._stubs.ace_step_lyric_encoder import build as _lyric_build
+        from models.demos.hf_eager.acestep_v15_base._stubs.ace_step_timbre_encoder import build as _timbre_build
+
+        self._lyric_stub = _lyric_build(device, torch_module.lyric_encoder)
+        self._timbre_stub = _timbre_build(device, torch_module.timbre_encoder)
+
         sd = torch_module.state_dict()
         # op-REUSE: text_projector  (Linear 1024 -> 2048, bias=False)
         self.w_text_projector_weight = ttnn.from_torch(
@@ -1487,41 +1494,15 @@ class AceStepConditionEncoder:
 
         text_proj = self._apply_text_projector(text_tt)
 
-        lyric_seq_len = (
-            lyric_hidden_states.shape[1]
-            if isinstance(lyric_hidden_states, ttnn.Tensor)
-            else lyric_hidden_states.shape[1]
+        lyric_out = self._lyric_stub(inputs_embeds=lyric_hidden_states, attention_mask=lyric_attention_mask)
+        lyric_embed = getattr(lyric_out, "last_hidden_state", lyric_out)
+        if isinstance(lyric_embed, tuple):
+            lyric_embed = lyric_embed[0]
+
+        timbre_pooled, timbre_mask_torch = self._timbre_stub(
+            refer_audio_acoustic_hidden_states_packed, refer_audio_order_mask
         )
-        lyric_embed = self._apply_lyric_encoder_embed_tokens(lyric_tt)
-        lyric_cos, lyric_sin = self._rope_tables(lyric_seq_len)
-        lyric_embed = self._process_lyric_encoder_layer_0(lyric_embed, lyric_cos, lyric_sin)
-        lyric_embed = self._process_lyric_encoder_layer_1(lyric_embed, lyric_cos, lyric_sin)
-        lyric_embed = self._process_lyric_encoder_layer_2(lyric_embed, lyric_cos, lyric_sin)
-        lyric_embed = self._process_lyric_encoder_layer_3(lyric_embed, lyric_cos, lyric_sin)
-        lyric_embed = self._process_lyric_encoder_layer_4(lyric_embed, lyric_cos, lyric_sin)
-        lyric_embed = self._process_lyric_encoder_layer_5(lyric_embed, lyric_cos, lyric_sin)
-        lyric_embed = self._process_lyric_encoder_layer_6(lyric_embed, lyric_cos, lyric_sin)
-        lyric_embed = self._process_lyric_encoder_layer_7(lyric_embed, lyric_cos, lyric_sin)
-        lyric_embed = self._rms_norm(lyric_embed, self._get_weight("lyric_encoder.norm.weight", self._HIDDEN_SIZE))
-
-        timbre_seq_len = (
-            refer_audio_acoustic_hidden_states_packed.shape[1]
-            if isinstance(refer_audio_acoustic_hidden_states_packed, ttnn.Tensor)
-            else refer_audio_acoustic_hidden_states_packed.shape[1]
-        )
-        timbre_embed = self._apply_timbre_encoder_embed_tokens(refer_audio_tt)
-        timbre_cos, timbre_sin = self._rope_tables(timbre_seq_len)
-        timbre_embed = self._process_timbre_encoder_layer_0(timbre_embed, timbre_cos, timbre_sin)
-        timbre_embed = self._process_timbre_encoder_layer_1(timbre_embed, timbre_cos, timbre_sin)
-        timbre_embed = self._process_timbre_encoder_layer_2(timbre_embed, timbre_cos, timbre_sin)
-        timbre_embed = self._process_timbre_encoder_layer_3(timbre_embed, timbre_cos, timbre_sin)
-        timbre_embed = self._rms_norm(timbre_embed, self._get_weight("timbre_encoder.norm.weight", self._HIDDEN_SIZE))
-
-        b = timbre_embed.shape[0]
-        timbre_pooled = ttnn.slice(timbre_embed, [0, 0, 0], [b, 1, self._HIDDEN_SIZE])
-
-        out_batch = int(refer_audio_order_mask.max().item()) + 1
-        timbre_mask_torch = torch.ones((out_batch, 1), dtype=torch.float32)
+        timbre_mask_torch = timbre_mask_torch.to(torch.float32)
 
         packed1, mask1_torch = self._pack_sequences(lyric_embed, timbre_pooled, lyric_mask_torch, timbre_mask_torch)
         packed2, mask2_torch = self._pack_sequences(packed1, text_proj, mask1_torch, text_mask_torch)

@@ -33,6 +33,7 @@ import torch
 import transformers
 
 import ttnn
+from models.demos.hf_eager.acestep_v15_base._stubs.f_s_q import build as _fsq_build
 
 HF_MODEL_ID = "ACE-Step/acestep-v15-base"
 _CANDIDATE_SUBMODULE_PATHS = ["tokenizer.quantizer"]
@@ -139,18 +140,33 @@ class ResidualFSQ:
             sd["project_out.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
 
-        # FSQ quantization constants from layers[0] (num_quantizers=1)
-        fsq_layer = torch_module.layers[0]
-        _levels = fsq_layer._levels.detach().to(torch.float32).reshape(1, 1, -1)
-        _basis = fsq_layer._basis.detach().to(torch.float32).reshape(1, 1, -1)
-        _a = (_levels - 1.0) / 2.0
-        _b = _a + 0.5
-        _s = 2.0 / (_levels - 1.0)
+        # Delegate the single per-layer FSQ quantization (num_quantizers == 1)
+        # to the f_s_q leaf stub built on quantizer.layers[0].
+        self._fsq_stub = _fsq_build(device, torch_module.layers[0])
 
-        self.w_a = ttnn.from_torch(_a, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_b = ttnn.from_torch(_b, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_s = ttnn.from_torch(_s, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_basis = ttnn.from_torch(_basis, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+        # ResidualFSQ soft (tanh) clamp on the project_in output, applied before
+        # the per-layer FSQ hard clamp/quantize: x = tanh(x / cv) * cv, with
+        # cv = 1 + 1/(levels-1) per codebook dim. Read off the module's own
+        # non-persistent buffer for exactness.
+        _cv = torch_module.soft_clamp_input_value.detach().to(torch.float32).reshape(1, 1, -1)
+        self.w_clamp_value = ttnn.from_torch(_cv, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_inv_clamp_value = ttnn.from_torch(1.0 / _cv, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+
+    def _mm_cfg(self):
+        return ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+
+    def _lin_f32(self, x, weight, bias, compute_kernel_config):
+        return ttnn.linear(
+            x,
+            ttnn.typecast(weight, ttnn.float32),
+            bias=ttnn.typecast(bias, ttnn.float32),
+            compute_kernel_config=compute_kernel_config,
+        )
 
     def _apply_project_in(self, x):
         return ttnn.linear(x, self.w_project_in_weight, bias=self.w_project_in_bias)
@@ -161,34 +177,32 @@ class ResidualFSQ:
     def __call__(self, *args, **kwargs):
         x = args[0] if args else kwargs.get("z", None)
 
-        # Project down to codebook dimension (2048 -> 6)
-        z = self._apply_project_in(x)
+        # Run project_in / soft-clamp / project_out in float32 with HiFi4 dest
+        # accumulation: the FSQ floor() at the tail is a step function, so the
+        # pre-quantization activation must track the fp32 reference to well
+        # within a bin width or codes flip and project_out smears the error.
+        mm = self._mm_cfg()
+        x = ttnn.typecast(x, ttnn.float32)
 
-        # FSQ quantization (symmetry-preserving bound with hard clamp)
-        # Do arithmetic in float32 to match HF reference and prevent
-        # rounding from crossing floor() decision boundaries
-        z = ttnn.typecast(z, ttnn.float32)
-        c = ttnn.clamp(z, -1.0, 1.0)
+        # project_in: 2048 -> 6
+        z = self._lin_f32(x, self.w_project_in_weight, self.w_project_in_bias, mm)
 
-        # bracket = floor((L-1)*(c+1)/2 + 0.5) = floor(a*c + b)
-        bracket = ttnn.multiply(c, self.w_a)
-        bracket = ttnn.add(bracket, self.w_b)
-        bracket = ttnn.floor(bracket)
+        # ResidualFSQ tanh soft-clamp before the per-layer FSQ layer.
+        z = ttnn.mul(z, self.w_inv_clamp_value)
+        z = ttnn.tanh(z)
+        z = ttnn.mul(z, self.w_clamp_value)
 
-        # codes = (2/(L-1)) * bracket - 1 = s*bracket - 1
-        codes = ttnn.multiply(bracket, self.w_s)
-        codes = ttnn.subtract(codes, 1.0)
+        # Per-layer FSQ quantization via the f_s_q leaf stub (num_quantizers==1,
+        # scale==levels**0==1, so residual bookkeeping collapses to identity).
+        # The f_s_q stub consumes the projected codes [1, 10, 6] as a ttnn tensor
+        # (it upcasts to fp32 internally) and returns (codes[1,10,6], idx[1,10]).
+        codes, idx = self._fsq_stub(z)
 
-        # indices = round(sum over last dim of bracket * basis)
-        # Reduce to (B, N) then unsqueeze to (B, N, 1) to match output contract
-        weighted = ttnn.multiply(bracket, self.w_basis)
-        idx = ttnn.sum(weighted, dim=-1)
-        idx = ttnn.round(idx)
-        idx = ttnn.typecast(idx, ttnn.int32)
+        # indices -> (B, N, 1) to honour the ResidualFSQ return contract.
         idx = ttnn.unsqueeze(idx, dim=-1)
 
-        # Project back to output dimension (6 -> 2048)
-        reconstructed = self._apply_project_out(codes)
+        # project_out: 6 -> 2048
+        reconstructed = self._lin_f32(codes, self.w_project_out_weight, self.w_project_out_bias, mm)
 
         return (reconstructed, idx)
 

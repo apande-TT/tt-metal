@@ -253,6 +253,11 @@ class AceStepLyricEncoder:
     def __init__(self, device, torch_module):
         self.device = device
         self._torch_module = torch_module
+
+        from models.demos.hf_eager.acestep_v15_base._stubs.ace_step_encoder_layer import build as _enc_layer_build
+
+        self._layer_stubs = [_enc_layer_build(device, torch_module.layers[i]) for i in range(len(torch_module.layers))]
+
         sd = torch_module.state_dict()
         # op-REUSE: embed_tokens  (Linear 1024 -> 2048, bias=True)
         self.w_embed_tokens_weight = ttnn.from_torch(
@@ -968,6 +973,16 @@ class AceStepLyricEncoder:
             setattr(self, cache_attr, cached)
         return cached
 
+    def _rope_tables_torch(self, seq_len):
+        head_dim = self._HEAD_DIM
+        inv_freq = 1.0 / (self._ROPE_THETA ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        positions = torch.arange(seq_len, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos = emb.cos().to(torch.bfloat16).reshape(1, seq_len, head_dim)
+        sin = emb.sin().to(torch.bfloat16).reshape(1, seq_len, head_dim)
+        return cos, sin
+
     def _apply_rope(self, x, cos, sin):
         b, h, t, d = x.shape[0], x.shape[1], x.shape[2], x.shape[3]
         half = d // 2
@@ -1093,14 +1108,12 @@ class AceStepLyricEncoder:
         # 1. Project embeddings: [B, T, 1024] -> [B, T, 2048] (Linear + bias).
         hidden = self._apply_embed_tokens(inputs_embeds)
 
-        # 2. Rotary tables (theta=1e6), shared across every layer.
-        cos, sin = self._rope_tables(seq_len)
+        cos, sin = self._rope_tables_torch(seq_len)
 
-        # 3. Stack of bidirectional Qwen3-style encoder layers
-        #    (num_lyric_encoder_hidden_layers = 8).
-        num_layers = 8
-        for layer_idx in range(num_layers):
-            hidden = self._encoder_layer(hidden, layer_idx, cos, sin)
+        for layer_idx in range(len(self._layer_stubs)):
+            hidden = self._layer_stubs[layer_idx](
+                hidden_states=hidden, position_embeddings=(cos, sin), attention_mask=None
+            )[0]
 
         # 4. Final RMSNorm -> last_hidden_state [B, T, 2048].
         hidden = self._rms_norm(hidden, self._get_weight("norm.weight", self._HIDDEN_SIZE))

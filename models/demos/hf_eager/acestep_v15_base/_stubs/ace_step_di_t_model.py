@@ -508,6 +508,7 @@ Op counts: total=475  op-REUSE=299  op-ADAPT=1  op-NEW=175"""
 
 from __future__ import annotations
 
+import importlib
 import math
 
 import torch
@@ -517,6 +518,27 @@ import ttnn
 
 HF_MODEL_ID = "ACE-Step/acestep-v15-base"
 _CANDIDATE_SUBMODULE_PATHS = ["decoder"]
+
+
+def _install_hifi4_defaults(ckc):
+    names = ("linear", "rms_norm", "matmul", "softmax")
+    orig = {n: getattr(ttnn, n) for n in names}
+
+    def _wrap(fn):
+        def _inner(*a, **k):
+            k.setdefault("compute_kernel_config", ckc)
+            return fn(*a, **k)
+
+        return _inner
+
+    for n in names:
+        setattr(ttnn, n, _wrap(orig[n]))
+    return orig
+
+
+def _restore_ttnn_defaults(orig):
+    for n, fn in orig.items():
+        setattr(ttnn, n, fn)
 
 
 def _log_runtime_fallback(helper, kind, reason):
@@ -3027,6 +3049,16 @@ class AceStepDiTModel:
             sd["condition_embedder.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
 
+        from models.demos.hf_eager.acestep_v15_base._stubs.ace_step_di_t_layer import build as _dit_layer_build
+        from models.demos.hf_eager.acestep_v15_base._stubs.timestep_embedding import build as _timestep_build
+
+        _lambda_mod = importlib.import_module("models.demos.hf_eager.acestep_v15_base._stubs.lambda")
+        _lambda_build = _lambda_mod.build
+        self._time_embed_stub = _timestep_build(device, torch_module.time_embed)
+        self._time_embed_r_stub = _timestep_build(device, torch_module.time_embed_r)
+        self._lambda_stub = _lambda_build(device, torch_module.proj_in[0])
+        self._layer_stubs = [_dit_layer_build(device, torch_module.layers[i]) for i in range(len(torch_module.layers))]
+
     def _apply_layers_0_self_attn_q_proj(self, x):
         return self._lin(x, self.w_layers_0_self_attn_q_proj_weight)
 
@@ -4014,6 +4046,8 @@ class AceStepDiTModel:
 
     def _apply_proj_in(self, x, patch_size):
         w_tt, b_tt, k = self._get_conv_proj_in()
+        x = self._lambda_stub(x)
+        x = self._lambda_stub(x)
         b_, t_, c_ = list(x.shape)
         x = ttnn.reshape(x, (b_, t_ // patch_size, patch_size * c_))
         return self._lin(x, w_tt, bias=b_tt)
@@ -4039,7 +4073,14 @@ class AceStepDiTModel:
         b_, tp_, _ = list(y.shape)
         return ttnn.reshape(y, (b_, tp_ * patch_size, out_c))
 
-    def __call__(
+    def __call__(self, *args, **kwargs):
+        _orig_ops = _install_hifi4_defaults(self._ckc)
+        try:
+            return self._forward(*args, **kwargs)
+        finally:
+            _restore_ttnn_defaults(_orig_ops)
+
+    def _forward(
         self,
         hidden_states=None,
         timestep=None,
@@ -4095,24 +4136,13 @@ class AceStepDiTModel:
         # the post-patchify sequence length here is well under `sliding_window`,
         # every attention op below is plain bidirectional (no mask, not causal).
 
-        # --- timestep embeddings (TimestepEmbedding for t and (t - t_r)) ---
-        t_sin = self._apply_sinusoidal_time_embedding(timestep, dim=256)
-        t_out = self._apply_time_embed_linear_1(t_sin)
-        t_out = self._apply_time_embed_act1(t_out)
-        temb_t = self._apply_time_embed_linear_2(t_out)
-        timestep_proj_t = self._apply_time_embed_time_proj(self._apply_time_embed_act2(temb_t))
-
+        # --- timestep embeddings (delegated to the timestep_embedding leaf stubs) ---
+        temb_t, timestep_proj_t = self._time_embed_stub(timestep)
         t_diff = ttnn.subtract(timestep, timestep_r)
-        tr_sin = self._apply_sinusoidal_time_embedding(t_diff, dim=256)
-        tr_out = self._apply_time_embed_r_linear_1(tr_sin)
-        tr_out = self._apply_time_embed_r_act1(tr_out)
-        temb_r = self._apply_time_embed_r_linear_2(tr_out)
-        timestep_proj_r = self._apply_time_embed_r_time_proj(self._apply_time_embed_r_act2(temb_r))
+        temb_r, timestep_proj_r = self._time_embed_r_stub(t_diff)
 
-        temb = ttnn.add(temb_t, temb_r)  # (B, hidden)
-        timestep_proj_flat = ttnn.add(timestep_proj_t, timestep_proj_r)  # (B, 6*hidden)
-        b0 = list(timestep_proj_flat.shape)[0]
-        timestep_proj = ttnn.reshape(timestep_proj_flat, (b0, 6, hidden_size))
+        temb = ttnn.add(temb_t, temb_r)
+        timestep_proj = ttnn.add(timestep_proj_t, timestep_proj_r)
 
         # --- patchify: concat(context_latents, hidden_states) -> proj_in ---
         x = ttnn.concat([context_latents, hidden_states], dim=-1)
@@ -4129,87 +4159,23 @@ class AceStepDiTModel:
         enc_seq_len = list(enc.shape)[1]
         cos_tt, sin_tt = self._get_rotary_embeddings(seq_len)
 
+        cos_torch = ttnn.to_torch(cos_tt)
+        sin_torch = ttnn.to_torch(sin_tt)
+        enc_torch = ttnn.to_torch(enc)
+        timestep_proj_torch = ttnn.to_torch(timestep_proj)
+
         for layer_idx in range(num_layers):
-            prefix = f"layers.{layer_idx}"
-
-            sst = self._extra_weight(f"{prefix}.scale_shift_table")  # (1, 6, hidden)
-            mod = ttnn.add(sst, timestep_proj)
-            shift_msa = ttnn.slice(mod, [0, 0, 0], [b_, 1, hidden_size])
-            scale_msa = ttnn.slice(mod, [0, 1, 0], [b_, 2, hidden_size])
-            gate_msa = ttnn.slice(mod, [0, 2, 0], [b_, 3, hidden_size])
-            c_shift_msa = ttnn.slice(mod, [0, 3, 0], [b_, 4, hidden_size])
-            c_scale_msa = ttnn.slice(mod, [0, 4, 0], [b_, 5, hidden_size])
-            c_gate_msa = ttnn.slice(mod, [0, 5, 0], [b_, 6, hidden_size])
-
-            # --- self-attention with AdaLN ---
-            norm_hs = self._apply_rms_norm(hs, f"{prefix}.self_attn_norm.weight", eps)
-            norm_hs = ttnn.add(ttnn.multiply(norm_hs, ttnn.add(scale_msa, 1.0)), shift_msa)
-
-            q = getattr(self, f"_apply_layers_{layer_idx}_self_attn_q_proj")(norm_hs)
-            k = getattr(self, f"_apply_layers_{layer_idx}_self_attn_k_proj")(norm_hs)
-            v = getattr(self, f"_apply_layers_{layer_idx}_self_attn_v_proj")(norm_hs)
-
-            q = ttnn.reshape(q, (b_, seq_len, num_heads, head_dim))
-            q = self._apply_rms_norm(q, f"{prefix}.self_attn.q_norm.weight", eps)
-            q = ttnn.permute(q, (0, 2, 1, 3))
-
-            k = ttnn.reshape(k, (b_, seq_len, num_kv_heads, head_dim))
-            k = self._apply_rms_norm(k, f"{prefix}.self_attn.k_norm.weight", eps)
-            k = ttnn.permute(k, (0, 2, 1, 3))
-
-            v = ttnn.reshape(v, (b_, seq_len, num_kv_heads, head_dim))
-            v = ttnn.permute(v, (0, 2, 1, 3))
-
-            q = ttnn.experimental.rotary_embedding_hf(q, cos_tt, sin_tt, is_decode_mode=False)
-            k = ttnn.experimental.rotary_embedding_hf(k, cos_tt, sin_tt, is_decode_mode=False)
-
-            attn = ttnn.transformer.scaled_dot_product_attention(
-                q, k, v, is_causal=False, scale=attn_scale, compute_kernel_config=self._ckc
+            layer_out = self._layer_stubs[layer_idx](
+                hidden_states=hs,
+                position_embeddings=(cos_torch, sin_torch),
+                temb=timestep_proj_torch,
+                attention_mask=None,
+                position_ids=None,
+                encoder_hidden_states=enc_torch,
+                encoder_attention_mask=None,
+                use_cache=False,
             )
-            attn = ttnn.permute(attn, (0, 2, 1, 3))
-            attn = ttnn.reshape(attn, (b_, seq_len, num_heads * head_dim))
-            attn_out = getattr(self, f"_apply_layers_{layer_idx}_self_attn_o_proj")(attn)
-
-            hs = ttnn.add(hs, ttnn.multiply(attn_out, gate_msa))
-
-            # --- cross-attention (plain residual, no AdaLN gate) ---
-            norm_hs2 = self._apply_rms_norm(hs, f"{prefix}.cross_attn_norm.weight", eps)
-
-            qc = getattr(self, f"_apply_layers_{layer_idx}_cross_attn_q_proj")(norm_hs2)
-            kc = getattr(self, f"_apply_layers_{layer_idx}_cross_attn_k_proj")(enc)
-            vc = getattr(self, f"_apply_layers_{layer_idx}_cross_attn_v_proj")(enc)
-
-            qc = ttnn.reshape(qc, (b_, seq_len, num_heads, head_dim))
-            qc = self._apply_rms_norm(qc, f"{prefix}.cross_attn.q_norm.weight", eps)
-            qc = ttnn.permute(qc, (0, 2, 1, 3))
-
-            kc = ttnn.reshape(kc, (b_, enc_seq_len, num_kv_heads, head_dim))
-            kc = self._apply_rms_norm(kc, f"{prefix}.cross_attn.k_norm.weight", eps)
-            kc = ttnn.permute(kc, (0, 2, 1, 3))
-
-            vc = ttnn.reshape(vc, (b_, enc_seq_len, num_kv_heads, head_dim))
-            vc = ttnn.permute(vc, (0, 2, 1, 3))
-
-            cattn = ttnn.transformer.scaled_dot_product_attention(
-                qc, kc, vc, is_causal=False, scale=attn_scale, compute_kernel_config=self._ckc
-            )
-            cattn = ttnn.permute(cattn, (0, 2, 1, 3))
-            cattn = ttnn.reshape(cattn, (b_, seq_len, num_heads * head_dim))
-            cattn_out = getattr(self, f"_apply_layers_{layer_idx}_cross_attn_o_proj")(cattn)
-
-            hs = ttnn.add(hs, cattn_out)
-
-            # --- MLP with AdaLN ---
-            norm_hs3 = self._apply_rms_norm(hs, f"{prefix}.mlp_norm.weight", eps)
-            norm_hs3 = ttnn.add(ttnn.multiply(norm_hs3, ttnn.add(c_scale_msa, 1.0)), c_shift_msa)
-
-            gate = getattr(self, f"_apply_layers_{layer_idx}_mlp_gate_proj")(norm_hs3)
-            up = getattr(self, f"_apply_layers_{layer_idx}_mlp_up_proj")(norm_hs3)
-            gate = getattr(self, f"_apply_layers_{layer_idx}_mlp_act_fn")(gate)
-            ffn = ttnn.multiply(gate, up)
-            ffn = getattr(self, f"_apply_layers_{layer_idx}_mlp_down_proj")(ffn)
-
-            hs = ttnn.add(hs, ttnn.multiply(ffn, c_gate_msa))
+            hs = layer_out[0]
 
         # --- output head: adaptive norm_out + de-patchify ---
         top_sst = self._extra_weight("scale_shift_table")  # (1, 2, hidden)
