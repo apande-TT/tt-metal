@@ -4159,19 +4159,14 @@ class AceStepDiTModel:
         enc_seq_len = list(enc.shape)[1]
         cos_tt, sin_tt = self._get_rotary_embeddings(seq_len)
 
-        cos_torch = ttnn.to_torch(cos_tt)
-        sin_torch = ttnn.to_torch(sin_tt)
-        enc_torch = ttnn.to_torch(enc)
-        timestep_proj_torch = ttnn.to_torch(timestep_proj)
-
         for layer_idx in range(num_layers):
             layer_out = self._layer_stubs[layer_idx](
                 hidden_states=hs,
-                position_embeddings=(cos_torch, sin_torch),
-                temb=timestep_proj_torch,
+                position_embeddings=(cos_tt, sin_tt),
+                temb=timestep_proj,
                 attention_mask=None,
                 position_ids=None,
-                encoder_hidden_states=enc_torch,
+                encoder_hidden_states=enc,
                 encoder_attention_mask=None,
                 use_cache=False,
             )

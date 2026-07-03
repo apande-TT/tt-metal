@@ -254,6 +254,13 @@ class AceStepDiTLayer:
         else:
             self._head_dim = int(sd["self_attn.q_norm.weight"].shape[-1])
 
+        sst = sd["scale_shift_table"].contiguous()
+        self.w_scale_shift_table = ttnn.from_torch(sst, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        hidden = int(sst.shape[-1])
+        self.w_scale_shift_table_chunks = [
+            ttnn.slice(self.w_scale_shift_table, [0, i, 0], [1, i + 1, hidden]) for i in range(6)
+        ]
+
         # op-REUSE: mlp.act_fn  (SILU)
 
     def _apply_self_attn_q_proj(self, x):
@@ -331,6 +338,26 @@ class AceStepDiTLayer:
             device=self.device,
         )
 
+    def _slice_temb_chunk(self, temb, index: int):
+        if isinstance(temb, ttnn.Tensor):
+            hidden = list(temb.shape)[2]
+            return ttnn.slice(temb, [0, index, 0], [1, index + 1, hidden])
+        return self._to_tt(temb[:, index : index + 1, :])
+
+    def _prepare_rope_tables(self, cos_t, sin_t):
+        if isinstance(cos_t, ttnn.Tensor):
+            if len(list(cos_t.shape)) == 4:
+                return cos_t, sin_t
+            seq_len = list(cos_t.shape)[1]
+            return (
+                ttnn.reshape(cos_t, (1, 1, seq_len, self._head_dim)),
+                ttnn.reshape(sin_t, (1, 1, seq_len, self._head_dim)),
+            )
+        return (
+            self._to_tt(cos_t.reshape(1, 1, -1, self._head_dim)),
+            self._to_tt(sin_t.reshape(1, 1, -1, self._head_dim)),
+        )
+
     def _apply_rope(self, x, cos, sin):
         """Rotary position embedding (HF Qwen3 convention).
 
@@ -397,15 +424,11 @@ class AceStepDiTLayer:
 
         # ---- AdaLN modulation coefficients: scale_shift_table + temb ----
         # HF: (self.scale_shift_table + temb).chunk(6, dim=1) yields the six
-        # (1, 1, hidden) modulation vectors. scale_shift_table is a (1, 6, hidden)
-        # leaf parameter; temb is a (1, 6, hidden) *input*. Both are torch objects
-        # (never ttnn), so slicing them into the 6 chunks is pure indexing; the
-        # add and every downstream op run on-device in ttnn.
-        sst = self._torch_module.scale_shift_table
+        # (1, 1, hidden) modulation vectors.
         mods = []
         for i in range(6):
-            a = self._to_tt(sst[:, i : i + 1, :])
-            b = self._to_tt(temb[:, i : i + 1, :])
+            a = self.w_scale_shift_table_chunks[i]
+            b = self._slice_temb_chunk(temb, i)
             mods.append(ttnn.add(a, b))
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = mods
 
@@ -416,8 +439,7 @@ class AceStepDiTLayer:
         cos_tt = sin_tt = None
         if position_embeddings is not None:
             cos_t, sin_t = position_embeddings
-            cos_tt = self._to_tt(cos_t.reshape(1, 1, -1, self._head_dim))
-            sin_tt = self._to_tt(sin_t.reshape(1, 1, -1, self._head_dim))
+            cos_tt, sin_tt = self._prepare_rope_tables(cos_t, sin_t)
 
         self_mask_tt = self._to_tt(attention_mask) if isinstance(attention_mask, (torch.Tensor, ttnn.Tensor)) else None
 

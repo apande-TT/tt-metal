@@ -12,21 +12,14 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.demos.hf_eager.acestep_v15_base.tt.common import (
-    assemble_context_latents,
-    build_inputs,
-    load_hf_model,
-    ode_timesteps,
-    prepare_noise,
-    tokenize_preprocess,
-)
+from models.demos.hf_eager.acestep_v15_base.tt.common import build_inputs, load_hf_model
 from models.demos.hf_eager.acestep_v15_base.tt.pipeline import AceStepPipelineTT
-from models.tt_dit.pipelines.events import PipelineEventCallback, SectionEnd, SectionStart, null_callback
+from models.demos.hf_eager.acestep_v15_base.tt.traced_decoder import _device_supports_2cq
+from models.tt_dit.pipelines.events import PipelineEventCallback, null_callback
 from models.tt_dit.pipelines.pipeline_api import PipelineAPIMixin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence as AbcSequence
-
 
 _DEFAULT_CHECKPOINT = "ACE-Step/acestep-v15-base"
 
@@ -46,7 +39,8 @@ class AceStepPipeline(PipelineAPIMixin):
     """Host-side ACE-Step v1.5 pipeline.
 
     v0 scope: text+lyric+timbre conditioning (captured inputs) → flow-matching
-    DiT denoising → ``target_latents`` only (no VAE waveform yet).
+    DiT denoising (trace + 2-CQ on the decoder hot path when ``traced=True``) →
+    ``target_latents`` only (no VAE waveform yet).
 
     Delegates subsystem math to the graduated hf_eager TT stubs via
     ``AceStepPipelineTT``; this module adds tt_dit config/device wiring and
@@ -84,6 +78,17 @@ class AceStepPipeline(PipelineAPIMixin):
         )
         return cls(device=mesh_device, config=config)
 
+    @staticmethod
+    def _use_2cq(device: ttnn.Device | ttnn.MeshDevice, traced: bool) -> bool:
+        return traced and _device_supports_2cq(device)
+
+    @staticmethod
+    def _event_callback(on_event: PipelineEventCallback):
+        def _forward(section_event):
+            on_event(section_event)
+
+        return _forward
+
     @torch.no_grad()
     def __call__(
         self,
@@ -94,8 +99,7 @@ class AceStepPipeline(PipelineAPIMixin):
         seed: int = 0,
         traced: bool = True,
         on_event: PipelineEventCallback | None = None,
-    ) -> torch.Tensor:
-        del traced  # v0: hf_eager stubs do not expose tt_dit tracing yet.
+    ):
         on_event = on_event if on_event is not None else null_callback
 
         if negative_prompts is not None and self._config.cfg_enabled:
@@ -106,61 +110,17 @@ class AceStepPipeline(PipelineAPIMixin):
 
         infer_steps = num_inference_steps if num_inference_steps is not None else self._config.num_inference_steps
         inputs = build_inputs(seed=seed if seed else None)
-        pool_window_size = self._config.pool_window_size
+        use_2cq = self._use_2cq(self._device, traced)
+        if traced:
+            logger.debug(f"ACE-Step denoising: traced=True use_2cq={use_2cq}")
 
-        src_latents = inputs["src_latents"]
-        silence_latent = inputs["silence_latent"]
-        attention_mask = inputs["attention_mask"]
-        chunk_masks = inputs["chunk_masks"]
-        is_covers = inputs["is_covers"]
-        bsz = src_latents.shape[0]
-
-        on_event(SectionStart("total"))
-
-        on_event(SectionStart("encoder"))
-        encoder_hidden_states, encoder_attention_mask = self._inner.condition_encoder(
-            text_hidden_states=inputs["text_hidden_states"],
-            text_attention_mask=inputs["text_attention_mask"],
-            lyric_hidden_states=inputs["lyric_hidden_states"],
-            lyric_attention_mask=inputs["lyric_attention_mask"],
-            refer_audio_acoustic_hidden_states_packed=inputs["refer_audio_acoustic_hidden_states_packed"],
-            refer_audio_order_mask=inputs["refer_audio_order_mask"],
+        result = self._inner.generate(
+            inputs,
+            infer_steps=infer_steps,
+            seed=seed if seed else None,
+            pool_window_size=self._config.pool_window_size,
+            traced=traced,
+            use_2cq=use_2cq,
+            on_event=self._event_callback(on_event),
         )
-        on_event(SectionEnd("encoder"))
-
-        on_event(SectionStart("tokenizer"))
-        x_patched, _ = tokenize_preprocess(src_latents, silence_latent, attention_mask, pool_window_size)
-        quantized, _indices = self._inner.audio_tokenizer(x_patched)
-        on_event(SectionEnd("tokenizer"))
-
-        on_event(SectionStart("detokenizer"))
-        lm_hints_25hz = self._inner.detokenizer(quantized)
-        context_latents = assemble_context_latents(lm_hints_25hz, src_latents, chunk_masks, is_covers)
-        on_event(SectionEnd("detokenizer"))
-
-        noise = prepare_noise(context_latents, seed)
-        t = ode_timesteps(infer_steps)
-        xt = noise
-
-        on_event(SectionStart("denoising"))
-        for i in range(infer_steps):
-            on_event(SectionStart(f"denoising_step_{i}"))
-            t_curr, t_prev = t[i], t[i + 1]
-            t_curr_tensor = t_curr * torch.ones((bsz,), dtype=torch.float32)
-            vt = self._inner.decoder(
-                hidden_states=xt,
-                timestep=t_curr_tensor,
-                timestep_r=t_curr_tensor,
-                attention_mask=attention_mask,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                context_latents=context_latents,
-            )
-            dt = t_curr - t_prev
-            xt = xt - vt.to(torch.float32) * dt
-            on_event(SectionEnd(f"denoising_step_{i}"))
-        on_event(SectionEnd("denoising"))
-
-        on_event(SectionEnd("total"))
-
-        return xt
+        return result["target_latents"]

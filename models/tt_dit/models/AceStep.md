@@ -20,13 +20,15 @@ Performance is measured as seconds per audio-latent generation on a fixed e2e ga
 
 ### P150 (Blackhole, 1×1 mesh)
 
-Measured 2026-07-03 on `sjc-snva-tp100` (tt_dit `AceStepPipeline`, JIT warm):
+Measured 2026-07-03 on `sjc-snva-tp100` (tt_dit `AceStepPipeline`, trace + 2-CQ, JIT warm):
 
 | System | Mesh | Infer Steps | Total (s) | Denoise (s) | Steps/s | Gen/s |
 |--------|------|-------------|-----------|-------------|---------|-------|
-| P150   | 1×1  | 4           | 0.407     | 0.339       | 11.8    | 2.46  |
+| P150   | 1×1  | 4           | 0.189     | 0.138       | 28.9    | 5.30  |
 
-Stage means (seconds): encoder 0.036, tokenizer 0.022, detokenizer 0.010, denoise/step 0.085.
+Prior eager baseline (no trace): total 0.407 s, denoise/step 0.085 s, 2.46 gen/s.
+
+Stage means (seconds, trace + 2-CQ): encoder 0.024, tokenizer 0.012, detokenizer 0.010, denoise/step 0.035.
 
 Regression targets in the perf test allow ~20% slack above these baselines.
 

@@ -55,9 +55,12 @@ Single Tenstorrent p150 device; serialize on-device runs with `flock`.
 
 ```bash
 cd /local/ttuser/dvartanians/ace/tt-metal
-# e2e gate
+# e2e gate (eager decoder)
 flock /tmp/tt_ace_device.lock ./python_env/bin/python -m pytest \
     models/demos/hf_eager/acestep_v15_base/tests/e2e/test_e2e_generate_audio.py -s
+# e2e gate with trace + 2-CQ on the DiT decoder hot path
+flock /tmp/tt_ace_device.lock ./python_env/bin/python -m pytest \
+    models/demos/hf_eager/acestep_v15_base/tests/e2e/test_e2e_generate_audio_traced.py -s
 # demo
 flock /tmp/tt_ace_device.lock ./python_env/bin/python -m \
     models.demos.hf_eager.acestep_v15_base.demo.demo_generate_audio --infer-steps 2

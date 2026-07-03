@@ -29,6 +29,7 @@ from models.demos.hf_eager.acestep_v15_base.tt.common import (
     tokenize_preprocess,
 )
 from models.demos.hf_eager.acestep_v15_base.tt.pipeline import AceStepPipelineTT
+from models.demos.hf_eager.acestep_v15_base.tt.traced_decoder import _device_supports_2cq
 from models.perf.benchmarking_utils import BenchmarkData, BenchmarkProfiler
 
 from ....pipelines.acestep.pipeline_acestep import AceStepPipeline
@@ -41,14 +42,14 @@ SEED = GATE_CONFIG["seed"]
 
 
 def get_expected_metrics(mesh_device):
-    """P150 (1x1) baselines captured 2026-07-03; targets include ~20% slack."""
+    """P150 (1x1) baselines captured 2026-07-03 with trace + 2-CQ; targets include ~20% slack."""
     if tuple(mesh_device.shape) == (1, 1):
         return {
-            "encoder_time": 0.05,
-            "tokenizer_time": 0.03,
-            "detokenizer_time": 0.015,
-            "denoising_steps_time": 0.40,
-            "total_time": 0.50,
+            "encoder_time": 0.03,
+            "tokenizer_time": 0.02,
+            "detokenizer_time": 0.012,
+            "denoising_steps_time": 0.17,
+            "total_time": 0.23,
         }
     raise AssertionError(f"Unknown mesh device for performance comparison: {mesh_device.shape}")
 
@@ -256,7 +257,7 @@ def _print_stats_table(
 )
 @pytest.mark.parametrize(
     "device_params",
-    [{"l1_small_size": 24576}],
+    [{"l1_small_size": 24576, "num_command_queues": 2, "trace_region_size": 50_000_000}],
     indirect=True,
 )
 def test_acestep_pipeline_performance(
@@ -273,7 +274,7 @@ def test_acestep_pipeline_performance(
     backend = "tt_dit AceStepPipeline" if use_tt_dit else "hf_eager AceStepPipelineTT"
 
     logger.info(f"  Inference steps: {num_inference_steps}")
-    logger.info(f"  Backend: {backend}")
+    logger.info(f"  Backend: {backend} (traced=True, 2cq={_device_supports_2cq(mesh_device)})")
     logger.info(f"  Mesh shape: {mesh_device.shape}")
 
     torch.manual_seed(SEED)
