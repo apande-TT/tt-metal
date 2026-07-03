@@ -628,6 +628,7 @@ def run_cc_optimize(
     case=None,
     pcc_test=None,
     baseline_only: bool = False,
+    e2e_only: bool = False,
     max_rounds: int = DEFAULT_MAX_ROUNDS,
     sync_catalog: bool = False,
     catalog_remote: str = "origin",
@@ -665,6 +666,17 @@ def run_cc_optimize(
     pipes = pipelines_from_manifest(manifest, model_rel)
     is_mm = manifest.get("pathmap", {}).get("is_multimodal")
     print(f"  [optimize/cc] discovered pipelines: {[p['task'] for p in pipes]} (multimodal={is_mm})")
+    if e2e_only:
+        # measure-only: run the full-model end-to-end (ALL 52 layers) ONCE per pipeline and print it, no
+        # optimization. Use when a prior run stopped/was killed before its AFTER bookend fired — just to
+        # get the number. Forces PERF_MCP_FULLPIPE_E2E on regardless of any disable env.
+        os.environ["PERF_MCP_FULLPIPE_E2E"] = "1"
+        for pipe in pipes:
+            kernel_log = f"/tmp/cc_kernlog_{model_name}_{pipe['task']}.json"
+            mcp_env = _mcp_config(repo_root, manifest_path, pipe, devices, kernel_log)["mcpServers"]["perf-mcp"]["env"]
+            print(f"  [optimize/cc] === full-model end-to-end MEASURE (no optimization): {pipe['task']} ===")
+            _fullpipe_e2e(repo_root, mcp_env, devices, "MEASURE")
+        return {"pipelines": pipes, "is_multimodal": is_mm, "results": [], "e2e_only": True}
     if baseline_only or not pipes:
         return {"pipelines": pipes, "is_multimodal": is_mm, "results": []}
     results = []
