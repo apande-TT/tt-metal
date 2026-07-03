@@ -303,7 +303,9 @@ def _run_op_sigs(repo_root: Path, mcp_env: dict, devices: str, node: str, case, 
     if case:
         cmd.append(case)
     try:
-        r = subprocess.run(cmd, cwd=str(repo_root / PERF_DIR), env=env, capture_output=True, text=True, timeout=1800)
+        # cwd MUST be the repo root: the perf-test node is a repo-root-relative path, so running from
+        # anywhere else makes pytest collect 0 tests -> 0 ops -> a silent, wrong fallback.
+        r = subprocess.run(cmd, cwd=str(repo_root), env=env, capture_output=True, text=True, timeout=1800)
     except Exception:  # noqa: BLE001
         return None, ""
     raw = (r.stdout or "") + "\n" + (r.stderr or "")
@@ -314,6 +316,8 @@ def _run_op_sigs(repo_root: Path, mcp_env: dict, devices: str, node: str, case, 
                 sigs = set(json.loads(line.split("=", 1)[1]))
             except Exception:  # noqa: BLE001
                 sigs = None
+    if not sigs:  # 0 signatures == the forward never dispatched an op (collection miss / crash), NOT
+        return None, raw  # a saturated 0-type model -> treat as probe FAILURE so coverage falls back honestly
     return sigs, raw
 
 
@@ -362,7 +366,8 @@ def _print_scorecard(devices: str, manifest: dict, pipe: dict, facts: dict, befo
         chips = env.get("device_count") or env.get("mesh_chips") or _chip_count(devices)
         dp, tp = facts.get("dp", 1), facts.get("tp", 1)
         host_ops = facts.get("host_ops", [])
-        on_device = not host_ops
+        probed = bool(facts) and facts.get("n_op_types", 0) > 0
+        on_device = probed and not host_ops
         batch = int(os.environ.get("TT_PERF_BATCH", "1") or "1")
         isl = os.environ.get("TT_PERF_SEQ_LEN") or "(default)"
         osl = os.environ.get("TT_PERF_MAX_NEW_TOKENS") or "4"
@@ -372,12 +377,14 @@ def _print_scorecard(devices: str, manifest: dict, pipe: dict, facts: dict, befo
             "  │ parallelism       : TP=%s x DP=%s  (%s)"
             % (tp, dp, "sharded mesh" if facts.get("shard_active") else "single-chip / replicated")
         )
-        if on_device:
+        if not probed:
+            L.append("  │ fully on device   : UNKNOWN  (op-coverage probe did not run)")
+        elif on_device:
             L.append("  │ fully on device   : YES  (trace + 2CQ possible)")
         else:
             L.append("  │ fully on device   : NO   -> trace + 2CQ blocked; host round-trips: %s" % ", ".join(host_ops))
         L.append("  │ batch / users     : %s" % batch)
-        reason = "not fully on-device" if not on_device else "needs a trace-capturable decode step"
+        reason = "probe did not run" if not probed else ("not fully on-device" if not on_device else "needs a trace-capturable decode step")
         for name in ("TTFT", "T/S/U", "T/S"):
             L.append("  │ %-16s : N/A  (%s)" % (name, reason))
         L.append("  │ ISL / OSL         : %s / %s  (tokens; N/A for non-token models)" % (isl, osl))
