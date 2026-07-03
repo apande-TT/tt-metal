@@ -662,7 +662,15 @@ def termination_check() -> dict:
     last_text_map = st.get("last_failure_text", {}) or {}
     harness_skip_reasons = st.get("harness_skip_reason", {}) or {}
     loader_resolvable = _rlr.is_enabled() and not _rlr.has_loader(_DEMO_DIR)
-    terminal = set(st.get("fallback") or []) | set(st.get("harness_skipped") or [])
+    # Guard 2 (on-device required): a CPU-fallback component is normally TERMINAL (accepted -> can_stop).
+    # When E2E_REQUIRE_ON_DEVICE=1 (and not waived), do NOT accept fallback as terminal — the component
+    # must graduate NATIVE, closing the CPU-fallback escape at the module gate. Default (unset) = original.
+    _require_on_device = (
+        os.environ.get("E2E_REQUIRE_ON_DEVICE") == "1" and os.environ.get("E2E_ALLOW_HOST_DECODE") != "1"
+    )
+    terminal = set(st.get("harness_skipped") or [])
+    if not _require_on_device:
+        terminal |= set(st.get("fallback") or [])
     work, needs_cap = [], []
     for c in comps:
         if _grad_for_run(c) or c in terminal:
