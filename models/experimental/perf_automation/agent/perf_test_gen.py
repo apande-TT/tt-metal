@@ -25,8 +25,22 @@ import ttnn
 
 PERF_MAX_NEW_TOKENS = int(os.environ.get("TT_PERF_MAX_NEW_TOKENS", "4"))
 PERF_FLUSH_EVERY = int(os.environ.get("TT_PERF_FLUSH_EVERY", "32"))
+# perf-only depth cap: profile a few blocks so a deep model's marker stream (x mesh chips) does not
+# overflow / bloat the profiler; pipelines that read TT_PERF_LAYERS honor it, others ignore it. This
+# is set in-process here so ONLY the perf run is capped (the correctness/e2e gate runs the full model).
+os.environ.setdefault("TT_PERF_LAYERS", "2")
 
-@pytest.mark.parametrize("device_params", [{"l1_small_size": 24576}], indirect=True)
+# Trace-replay per-token latency (GPU-comparable T/S/U). MODEL-AGNOSTIC + OFF-BY-DEFAULT-SAFE:
+# TT_PERF_TRACE=1 (default) adds trace_region_size + num_command_queues to the device open so the
+# per-token block below CAN capture a device trace; TT_PERF_TRACE=0 restores the plain eager open
+# (exactly the old behavior -> guaranteed non-breaking escape hatch for tight-memory models).
+_PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
+_DEV_PARAMS = {"l1_small_size": 24576}
+if _PERF_TRACE:
+    _DEV_PARAMS["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "23887872"))
+    _DEV_PARAMS["num_command_queues"] = int(os.environ.get("TT_PERF_NUM_CQ", "1"))  # set 2 for the 2CQ overlap path
+
+@pytest.mark.parametrize("device_params", [_DEV_PARAMS], indirect=True)
 def test_<task>_perf(device_params, device):
     # 1) build the pipeline EXACTLY as demo/demo_<task>.py does
     # 2) drain the device profiler every PERF_FLUSH_EVERY ops. MODEL-AGNOSTIC: wrap EVERY ttnn
@@ -59,6 +73,28 @@ def test_<task>_perf(device_params, device):
         for _mod, _n, _f in _orig: setattr(_mod, _n, _f)
     print("FORWARD_WALL_MS=%.4f" % ((time.monotonic() - _fw0) * 1000.0))
     assert out is not None   # perf only — NO PCC
+
+    # ---- clean, GPU-comparable per-token latency via trace-replay (GENERIC + guarded) ----
+    # ONE generic adapter (agent/perf_adapter.PipelineDecodeAdapter) wraps the SAME pipeline build:
+    # measure_adapter captures one decode step as a device trace + replays it -> prints
+    # TRACE_PER_TOKEN_MS (parsed by the tool into per_token_ms + tokens_per_sec_per_user for a GPU
+    # side-by-side). There is NO per-model adapter here. The clean number appears only when the built
+    # pipeline exposes a trace-capturable `decode_step(state)` (fixed shape, on-device sample, no host
+    # reads) -- produced by the structural decode lever / emit-e2e, not written here. A repeat-prefill
+    # pipeline has no decode_step, so setup raises, the guard swallows it, and FORWARD_WALL_MS stands.
+    if _PERF_TRACE:
+        try:
+            from models.experimental.perf_automation.agent.trace_replay import measure_adapter
+            from models.experimental.perf_automation.agent.perf_adapter import PipelineDecodeAdapter
+
+            def _build_for_perf(dev):
+                # build the pipeline EXACTLY as above / as the demo does, on `dev`. Lift from the demo.
+                ...
+            _prompt_ids = ...   # a SMALL prompt (e.g. the demo's, capped) fed to decode_prefill
+            _adapter = PipelineDecodeAdapter(_build_for_perf, _prompt_ids, batch=1)
+            measure_adapter(_adapter, device, mode="auto")   # prints TRACE_PER_TOKEN_MS=<ms>
+        except Exception as _te:  # noqa: BLE001
+            print("TRACE_REPLAY_SKIPPED=%r" % (_te,), flush=True)
 """
 
 
@@ -214,10 +250,25 @@ def generate_perf_test(
         "the host blocks in ttnn.synchronize_device for many minutes, stalling the run. If the source "
         "defines a large seq constant, OVERRIDE it with a small value here (env-overridable, small default). "
         "A perf profile only needs a representative dispatch-dense pass, not the max shape.\n"
+        '- KEEP the skeleton\'s `os.environ.setdefault("TT_PERF_LAYERS", ...)` line VERBATIM near the top. '
+        "It caps profiled depth for deep (many-layer) models so the device profiler's marker buffer does "
+        "not overflow (worse on a multi-chip mesh, where markers scale x chips). It is set in-process so "
+        "ONLY this perf run is capped; a pipeline that does not read TT_PERF_LAYERS simply ignores it. Do "
+        "NOT hard-require it and do NOT gate on it — just carry it through.\n"
         "- NO PCC / correctness assertions (this is perf only) — just assert the pipeline produced output.\n"
         "- TIME THE FORWARD: keep the skeleton's time.monotonic() bracket around the bounded forward and "
         'the final print("FORWARD_WALL_MS=...") VERBATIM — the harness reads it as an independent '
         "end-to-end check on the profiler capture. Do not remove or rename it.\n"
+        "- KEEP the skeleton's trace-replay block VERBATIM in structure: the `_PERF_TRACE`/`_DEV_PARAMS` "
+        "device-param gate near the top AND the trailing `if _PERF_TRACE:` measure_adapter block. This is a "
+        "MODEL-AGNOSTIC, GPU-comparable per-token latency (TRACE_PER_TOKEN_MS). Do NOT write a per-model "
+        "adapter class — the tool ships the generic PipelineDecodeAdapter. Your ONLY job in that block is to "
+        "fill `_build_for_perf(dev)` so it builds the pipeline EXACTLY as this test/demo builds it (lift the "
+        "same imports + build args, using `dev`), and set `_prompt_ids` to a SMALL prompt. Leave everything "
+        "else in the block verbatim. The clean number is emitted automatically IFF the built pipeline exposes "
+        "a trace-capturable `decode_step(state)`; if its decode is repeat-prefill (re-runs the growing "
+        "sequence / host argmax), the adapter raises, the guard falls back to FORWARD_WALL_MS, and that is "
+        "fine. Never delete the block, never let it fail the test.\n"
         "- Lift the imports + build args straight from the demo above.\n\n"
         f"Use this structural skeleton (adapt the build+run to the demo):\n{_SKELETON_REF}\n"
     )
