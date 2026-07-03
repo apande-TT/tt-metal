@@ -165,6 +165,18 @@ _BACKENDS: List[FamilyBackend] = [
     ),
     FamilyBackend(
         category="TTS",
+        name="ACE-Step v1.5 (tt_dit flow-matching)",
+        demo_path="models/tt_dit/pipelines/acestep",
+        routing_mode="template",
+        canonical_hf_id="ACE-Step/acestep-v15-base",
+        notes="Purpose-built tt_dit pipeline for ACE-Step flow-matching DiT; " "NOT the generic hf_eager CPU runner.",
+        model_type_keys=["acestep"],
+        pipeline_tags=["text-to-audio", "text-to-speech"],
+        smoke_test_entry="models/tt_dit/tests/models/acestep/test_pipeline_acestep.py",
+        use_module_tree=True,
+    ),
+    FamilyBackend(
+        category="TTS",
         name="hf_eager universal (TTS)",
         demo_path="models/demos/hf_eager/demo.py",
         routing_mode="generic",

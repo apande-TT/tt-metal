@@ -461,12 +461,13 @@ def extract_hf_context(
             "transformers is not importable from the active env. " "Run `source python_env/bin/activate` first."
         ) from exc
 
-    try:
-        model = transformers.AutoModel.from_pretrained(
-            model_id, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True
-        )
+    from scripts.tt_hw_planner.agentic.probe import load_hf_model_cascade
+
+    model, loader_or_err = load_hf_model_cascade(model_id, torch_dtype="bfloat16", verbose=False)
+    if model is not None:
         model.eval()
-    except (ValueError, KeyError, OSError, ImportError) as exc:
+    if model is None:
+        exc = OSError(loader_or_err or "hf load failed")
         installed = getattr(transformers, "__version__", "unknown")
         if not fetch_upstream:
             raise LLMError(

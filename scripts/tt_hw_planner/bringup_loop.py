@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .bringup import REPO_ROOT
+from .capture_inputs import HF_MODEL_LOADER_SOURCE_FOR_TEMPLATE as HF_MODEL_LOADER_SOURCE
 from .discovery import BRINGUP_ROOT, safe_relative_to_root
 from .family_backends import DEFAULT_TEMPLATE_PYTEST_EXCLUDE_K
 
@@ -85,7 +86,8 @@ def _shape_to_torch_randn(new_shape: Dict[str, object]) -> str:
     return "torch.randn(1, 64, 64)"
 
 
-_PCC_TEST_TEMPLATE = '''# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+_PCC_TEST_TEMPLATE = (
+    '''# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 
@@ -463,37 +465,16 @@ class _Omit:
 _OMIT = _Omit()
 
 
+'''
+    + HF_MODEL_LOADER_SOURCE
+    + '''
+
+
 def _build_torch_reference():
-    # AutoModelForCausalLM-first fallback: HF causal-LM models
-    # (Llama / Qwen / Mistral / DeepSeek / Phi / Gemma / ...) follow
-    # the `XxxForCausalLM(model: XxxModel)` structure. `AutoModel.from_pretrained`
-    # returns the INNER `XxxModel` (no LM head); captured submodule paths
-    # typically reference the OUTER `XxxForCausalLM` (e.g. `model.layers.0`).
-    # The path mismatch causes `_resolve` to land on a bare `nn.Module`
-    # whose `_forward_unimplemented` raises TypeError on every kwarg.
-    # Mirror the multi-class fallback pattern already established in
-    # `agentic/probe.py:159`, `output_validation.py:830-965`, and
-    # `activation_diff.py:1163-1171` so the PCC test harness resolves
-    # the same class the capture step used.
-    model = None
-    _last_err = None
-    for _cls_name in ("AutoModelForCausalLM", "AutoModel"):
-        try:
-            _cls = getattr(transformers, _cls_name)
-        except AttributeError:
-            continue
-        try:
-            model = _cls.from_pretrained(HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True)
-            break
-        except Exception as _e:
-            _last_err = _e
-            continue
-    if model is None:
-        raise RuntimeError(
-            f"Could not load {{HF_MODEL_ID}} via AutoModelForCausalLM or "
-            f"AutoModel; last error: {{type(_last_err).__name__}}: {{_last_err}}"
-        )
-    model.eval()
+    # load_hf_model_cascade handles custom AutoModel repos (e.g. ACE-Step)
+    # that fail meta-device init under raw AutoModel.from_pretrained, and
+    # still cascades through AutoModelForCausalLM / AutoModel variants.
+    model = _load_hf_model()
     torch_module = None
     resolved_path = None
     # BUG-2 FIX: if capture-inputs recorded a submodule_path in the manifest,
@@ -787,6 +768,7 @@ def test_{component_safe}(device_params, device):
         f"{{HF_MODEL_ID}} (primary arg `{{primary_name}}`)"
     )
 '''
+)
 
 
 @dataclass
@@ -1471,7 +1453,8 @@ _FALLBACK_COERCE_TO_TORCH = """def _coerce_to_torch(x):
 """
 
 
-_AUTOFILL_TORCH_TEMPLATE = '''# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+_AUTOFILL_TORCH_TEMPLATE = (
+    '''# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 
@@ -1501,6 +1484,11 @@ _CANDIDATE_SUBMODULE_PATHS = {submodule_candidates!r}
 _cache: dict = {{}}
 
 
+'''
+    + HF_MODEL_LOADER_SOURCE
+    + '''
+
+
 def _resolve(obj, dotted: str):
     cur = obj
     for tok in dotted.replace("[", ".").replace("]", "").split("."):
@@ -1527,27 +1515,7 @@ def _resolve(obj, dotted: str):
 def _get_torch_submodule():
     if "module" in _cache:
         return _cache["module"]
-    # AutoModelForCausalLM-first fallback (same rationale as
-    # _PCC_TEST_TEMPLATE._build_torch_reference); see comment there.
-    model = None
-    _last_err = None
-    for _cls_name in ("AutoModelForCausalLM", "AutoModel"):
-        try:
-            _cls = getattr(transformers, _cls_name)
-        except AttributeError:
-            continue
-        try:
-            model = _cls.from_pretrained(HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True)
-            break
-        except Exception as _e:
-            _last_err = _e
-            continue
-    if model is None:
-        raise RuntimeError(
-            f"Could not load {{HF_MODEL_ID}} via AutoModelForCausalLM or "
-            f"AutoModel; last error: {{type(_last_err).__name__}}: {{_last_err}}"
-        )
-    model.eval()
+    model = _load_hf_model()
     resolved = None
     for path in _CANDIDATE_SUBMODULE_PATHS:
         try:
@@ -1574,6 +1542,7 @@ def {component_safe}(*args, **kwargs):
     kwargs = {{k: _coerce_to_torch(v) for k, v in kwargs.items()}}
     return _get_torch_submodule()(*args, **kwargs)
 '''
+)
 
 
 def _render_autofill_stub(
@@ -1928,37 +1897,13 @@ def autofill_stubs(
 
     hf_model: Any = None
     if op_synth:
-        # Cascade the AutoModel class to match generate_hf_reference's
-        # loader. Plain `AutoModel.from_pretrained` does NOT register
-        # custom (trust_remote_code) configs like Phi3Config; only the
-        # task-specific factories (AutoModelForCausalLM,
-        # AutoModelForImageTextToText) do. Without the cascade, every
-        # trust_remote_code LM (Phi-3.5, etc.) silently falls back to
-        # the torch-wrapper autofill, losing the op-synth path.
-        import transformers as _tf_mod
+        from scripts.tt_hw_planner.agentic.probe import load_hf_model_cascade
 
-        _hf_load_classes = []
-        for _attr in ("AutoModelForCausalLM", "AutoModelForImageTextToText", "AutoModel"):
-            _cls = getattr(_tf_mod, _attr, None)
-            if _cls is not None:
-                _hf_load_classes.append((_attr, _cls))
-        _last_exc: Optional[BaseException] = None
-        for _cls_name, _cls in _hf_load_classes:
-            try:
-                hf_model = _cls.from_pretrained(
-                    model_id, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True
-                )
-                hf_model.eval()
-                _last_exc = None
-                break
-            except Exception as _exc:
-                _last_exc = _exc
-                continue
-        if hf_model is None and _last_exc is not None:
+        hf_model, _loader_or_err = load_hf_model_cascade(model_id, torch_dtype="bfloat16", verbose=False)
+        if hf_model is None:
             print(
                 f"  [op-synth] could not load HF model {model_id!r} "
-                f"({type(_last_exc).__name__}: {_last_exc}); tried "
-                f"{', '.join(n for n, _ in _hf_load_classes)}. Falling back "
+                f"({_loader_or_err}); falling back "
                 f"to torch-wrapper autofill for every NEW component.",
                 flush=True,
             )
@@ -2207,7 +2152,8 @@ def _emit_autofill_smoke_test(
     return test_path
 
 
-_MIXED_EXEC_DEMO_TEMPLATE = '''# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+_MIXED_EXEC_DEMO_TEMPLATE = (
+    '''# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 """End-to-end mixed-execution demo for `{model_id}`.
@@ -2247,6 +2193,11 @@ HF_MODEL_ID = "{model_id}"
 # parent and child graduate, the parent's TT forward subsumes the child.
 # Each tuple is (submodule_path, stub_import_path, display_name).
 WIRED_COMPONENTS = {wired_components_literal}
+
+
+'''
+    + HF_MODEL_LOADER_SOURCE
+    + '''
 
 
 def _tokenize_path(dotted: str):
@@ -2332,27 +2283,7 @@ def _set_submodule(model, dotted: str, new_module):
 
 
 def _build_hf_model():
-    # AutoModelForCausalLM-first fallback (see _PCC_TEST_TEMPLATE
-    # ._build_torch_reference for rationale).
-    model = None
-    _last_err = None
-    for _cls_name in ("AutoModelForCausalLM", "AutoModel"):
-        try:
-            _cls = getattr(transformers, _cls_name)
-        except AttributeError:
-            continue
-        try:
-            model = _cls.from_pretrained(HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True)
-            break
-        except Exception as _e:
-            _last_err = _e
-            continue
-    if model is None:
-        raise RuntimeError(
-            f"Could not load {{HF_MODEL_ID}}: {{type(_last_err).__name__}}: {{_last_err}}"
-        )
-    model.eval()
-    return model
+    return _load_hf_model()
 
 
 def _build_ttnn_port(device, stub_import_path, torch_module):
@@ -2509,6 +2440,7 @@ if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__ + "::test_demo", "-svv"]))
 '''
+)
 
 
 def _component_op_count(demo_dir: Path, component_safe: str) -> int:

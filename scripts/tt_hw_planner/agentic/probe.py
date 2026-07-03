@@ -156,10 +156,30 @@ def load_hf_model_cascade(
     except Exception:
         pass
     from scripts.tt_hw_planner.activation_diff import _torch_dtype_from_string
+    from scripts.tt_hw_planner.hf_model_loader import (
+        is_meta_tensor_load_error,
+        load_via_auto_map_cpu_init,
+        try_load_via_auto_map,
+    )
 
     dtype = _torch_dtype_from_string(torch_dtype) or torch.bfloat16
+
+    try:
+        auto_model, auto_loader = try_load_via_auto_map(
+            model_id,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            verbose=verbose,
+        )
+        if auto_model is not None:
+            return auto_model, auto_loader
+    except Exception as exc:
+        last_auto_exc: Optional[BaseException] = exc
+    else:
+        last_auto_exc = None
+
     hf_model = None
-    last_exc: Optional[BaseException] = None
+    last_exc: Optional[BaseException] = last_auto_exc
     used_loader: Optional[str] = None
     for loader in (
         "AutoModelForCausalLM",
@@ -187,6 +207,17 @@ def load_hf_model_cascade(
             break
         except Exception as exc:
             last_exc = exc
+            if loader == "AutoModel" and is_meta_tensor_load_error(exc):
+                try:
+                    hf_model, used_loader = load_via_auto_map_cpu_init(
+                        model_id,
+                        torch_dtype=dtype,
+                        trust_remote_code=True,
+                        verbose=verbose,
+                    )
+                    break
+                except Exception as cpu_exc:
+                    last_exc = cpu_exc
             if verbose:
                 print(
                     f"  [hf-loader] {loader} failed: {type(exc).__name__}: {exc}",
@@ -244,7 +275,26 @@ def iter_hf_model_variants(
         pass
     from scripts.tt_hw_planner.activation_diff import _torch_dtype_from_string
 
+    from scripts.tt_hw_planner.hf_model_loader import try_load_via_auto_map
+
     dtype = _torch_dtype_from_string(torch_dtype) or torch.float32
+
+    try:
+        auto_model, auto_loader = try_load_via_auto_map(
+            model_id,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            verbose=verbose,
+        )
+        if auto_model is not None:
+            key = type(auto_model).__name__
+            seen_classes: set = {key}
+            yield auto_model, auto_loader or "AutoModel"
+            # Custom auto_map models expose one topology; skip generic cascade.
+            return
+    except Exception:
+        pass
+
     loaders = (
         "AutoModelForCausalLM",
         "AutoModelForSpeechSeq2Seq",
@@ -255,7 +305,7 @@ def iter_hf_model_variants(
         "AutoModelForImageClassification",
         "AutoModel",
     )
-    seen_classes: set = set()
+    seen_classes = set()
     for loader in loaders:
         if _t.monotonic() - start > timeout_s - 5:
             break

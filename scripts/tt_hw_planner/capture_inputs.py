@@ -497,17 +497,29 @@ def capture_real_inputs(
 
         try:
             from .capture_drivers import try_capture_drivers as _try_capture_drivers
+            from .capture_drivers.acestep import is_acestep_model as _is_acestep
+            from .capture_drivers.acestep import run_acestep_capture_drivers as _run_acestep_drivers
             from .auto_capture_driver_onboard import (
                 load_learned_drivers as _load_learned_drivers,
             )
         except Exception:
             _try_capture_drivers = None
+            _is_acestep = None
+            _run_acestep_drivers = None
             _load_learned_drivers = None
 
         if _load_learned_drivers is not None:
             _loaded = _load_learned_drivers()
             if _loaded and verbose:
                 print(f"  [capture] loaded {len(_loaded)} learned driver(s)", file=sys.stderr)
+
+        if _is_acestep is not None and _run_acestep_drivers is not None and _is_acestep(model):
+            _ok_ace, _ace_attempts = _run_acestep_drivers(model)
+            for _line in _ace_attempts:
+                if verbose:
+                    print(f"  [capture] acestep-driver: {_line}", file=sys.stderr)
+            if _ok_ace:
+                forward_errors.append("acestep-driver: ok")
 
         _generic_attempts: List[str] = []
         if _try_capture_drivers is not None:
@@ -764,6 +776,100 @@ def capture_real_inputs(
     return out
 
 
+HF_MODEL_LOADER_MARKER = "# HF_MODEL_LOADER_INJECTED_V1"
+
+HF_MODEL_LOADER_SOURCE = '''
+# HF_MODEL_LOADER_INJECTED_V1
+def _load_hf_model():
+    """Load the HF reference model via the planner cascade (handles custom
+    AutoModel repos like ACE-Step that fail meta-device init)."""
+    from scripts.tt_hw_planner.agentic.probe import load_hf_model_cascade
+
+    model, loader_or_err = load_hf_model_cascade(
+        HF_MODEL_ID,
+        torch_dtype="bfloat16",
+        verbose=False,
+    )
+    if model is None:
+        raise RuntimeError(
+            f"Could not load {HF_MODEL_ID} via load_hf_model_cascade; "
+            f"last error: {loader_or_err}"
+        )
+    model.eval()
+    return model
+'''
+
+HF_MODEL_LOADER_SOURCE_FOR_TEMPLATE = HF_MODEL_LOADER_SOURCE.replace("{HF_MODEL_ID}", "{{HF_MODEL_ID}}").replace(
+    "{loader_or_err}", "{{loader_or_err}}"
+)
+
+# Legacy blocks emitted by older scaffolds — replaced by ``model = _load_hf_model()``.
+LEGACY_AUTO_MODEL_LOAD_BLOCKS = (
+    """    model = None
+    _last_err = None
+    for _cls_name in ("AutoModelForCausalLM", "AutoModel"):
+        try:
+            _cls = getattr(transformers, _cls_name)
+        except AttributeError:
+            continue
+        try:
+            model = _cls.from_pretrained(HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True)
+            break
+        except Exception as _e:
+            _last_err = _e
+            continue
+    if model is None:
+        raise RuntimeError(
+            f"Could not load {HF_MODEL_ID} via AutoModelForCausalLM or "
+            f"AutoModel; last error: {type(_last_err).__name__}: {_last_err}"
+        )
+    model.eval()""",
+    """    model = None
+    _last_err = None
+    for _cls_name in ("AutoModelForCausalLM", "AutoModel"):
+        try:
+            _cls = getattr(transformers, _cls_name)
+        except AttributeError:
+            continue
+        try:
+            model = _cls.from_pretrained(HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True)
+            break
+        except Exception as _e:
+            _last_err = _e
+            continue
+    if model is None:
+        raise RuntimeError(
+            f"Could not load {HF_MODEL_ID}: {type(_last_err).__name__}: {_last_err}"
+        )
+    model.eval()""",
+)
+
+_LEGACY_AUTO_MODEL_LOAD_REPLACEMENT = "    model = _load_hf_model()"
+
+
+def upgrade_test_to_use_hf_model_cascade(test_path: Path) -> bool:
+    """Idempotently replace raw ``AutoModel.from_pretrained`` loops in a
+    generated PCC test with ``load_hf_model_cascade`` via ``_load_hf_model``.
+    Returns True if the file was modified."""
+    if not test_path.is_file():
+        return False
+    src = test_path.read_text(errors="ignore")
+    modified = False
+    if HF_MODEL_LOADER_MARKER not in src:
+        anchor = "def _build_torch_reference():"
+        if anchor not in src:
+            return False
+        src = src.replace(anchor, HF_MODEL_LOADER_SOURCE.lstrip() + "\n\n" + anchor, 1)
+        modified = True
+    for legacy in LEGACY_AUTO_MODEL_LOAD_BLOCKS:
+        if legacy in src:
+            src = src.replace(legacy, _LEGACY_AUTO_MODEL_LOAD_REPLACEMENT, 1)
+            modified = True
+    if modified:
+        test_path.write_text(src)
+    return modified
+
+
 CAPTURE_LOADER_SOURCE = '''
 def _captured_submodule_path(component_name):
     """Read the submodule_path the capture step hooked when it saved
@@ -1010,6 +1116,18 @@ def upgrade_all_tests_in_demo(demo_dir: Path) -> List[Tuple[str, bool]]:
         except Exception as exc:
             print(
                 f"  [capture] l1_small_size upgrade failed for " f"{tp.name}: {exc}",
+                file=sys.stderr,
+            )
+        try:
+            if upgrade_test_to_use_hf_model_cascade(tp):
+                modified_any = True
+                print(
+                    f"  [capture] {tp.name}: wired _load_hf_model() "
+                    f"(load_hf_model_cascade) for ACE-Step-style repos."
+                )
+        except Exception as exc:
+            print(
+                f"  [capture] hf_model_cascade upgrade failed for " f"{tp.name}: {exc}",
                 file=sys.stderr,
             )
         out.append((tp.name, modified_any))

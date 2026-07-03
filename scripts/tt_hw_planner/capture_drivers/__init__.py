@@ -485,3 +485,9 @@ def try_capture_drivers(model: Any, pixel_values: Any) -> Tuple[bool, List[str]]
     attempts.append(f"introspected_forward: {err}")
 
     return False, attempts
+
+
+from . import acestep as _acestep  # noqa: E402, F401
+
+is_acestep_model = _acestep.is_acestep_model
+run_acestep_capture_drivers = _acestep.run_acestep_capture_drivers

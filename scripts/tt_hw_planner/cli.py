@@ -203,10 +203,17 @@ def _can_load_with_transformers(model_id: str) -> Tuple[bool, str]:
         return False, "transformers is not importable in this env"
     try:
         transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        return True, ""
     except Exception as exc:
         installed = getattr(transformers, "__version__", "unknown")
         return False, f"transformers (v{installed}) can't load `{model_id}`: {exc}"
+
+    from scripts.tt_hw_planner.hf_model_loader import verify_hf_model_instantiable
+
+    ok, msg = verify_hf_model_instantiable(model_id)
+    if ok:
+        return True, ""
+    installed = getattr(transformers, "__version__", "unknown")
+    return False, f"transformers (v{installed}) can't load `{model_id}`: {msg}"
 
 
 def _purge_transformers_modules() -> None:
