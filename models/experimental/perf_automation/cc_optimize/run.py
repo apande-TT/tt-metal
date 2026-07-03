@@ -228,6 +228,41 @@ def _gate_status(repo_root: Path, mcp_env: dict, devices: str) -> dict:
     return {"can_stop": "CANSTOP=True" in out, "halt": "HALT=True" in out, "reason": reason}
 
 
+def _baseline_fullpipe(repo_root: Path, mcp_env: dict, devices: str) -> None:
+    """Run the full-pipeline end-to-end gate ONCE at baseline (ALL 52 layers, no tracy) so the true
+    end-to-end time is printed + recorded before the loop starts — the agent's own gate calls are not
+    guaranteed (it can bank wins without calling it). This seeds the best-so-far and gives a visible
+    end-to-end number up front. Skippable via PERF_MCP_FULLPIPE_BASELINE=0. Best-effort; never fails."""
+    if os.environ.get("PERF_MCP_FULLPIPE_BASELINE", "1") != "1":
+        return
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import perf_mcp as P; "
+        "g=P.check_full_pipeline_latency\n"
+        "for a in ('fn','func','_fn','__wrapped__'):\n"
+        "    if hasattr(g,a): g=getattr(g,a); break\n"
+        "r=g()\n"
+        "print('FULLPIPE_BASELINE=' + str(r))"
+    )
+    env = cc_env(repo_root, devices)
+    env.update(mcp_env)
+    print("  [optimize/cc] measuring full-pipeline end-to-end baseline (ALL layers, no tracy — one slow run)...")
+    try:
+        r = subprocess.run(
+            [_python_bin(repo_root), "-c", code, str(repo_root / CC_DIR)],
+            cwd=str(repo_root / PERF_DIR),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5400,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [optimize/cc] full-pipeline baseline skipped ({exc})")
+        return
+    for line in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines():
+        if "[full-pipeline-gate]" in line or line.startswith("FULLPIPE_BASELINE="):
+            print("  [optimize/cc] " + line.strip())
+
+
 def _git(repo_root: Path, *args: str) -> str:
     try:
         return subprocess.run(["git", "-C", str(repo_root), *args], capture_output=True, text=True).stdout.strip()
@@ -295,6 +330,7 @@ def optimize_pipeline(
     prompt = _PROMPT.format(model=model_name, task=task, metric=metric)
     start_sha = _git(repo_root, "rev-parse", "HEAD")
     mcp_env = cfg["mcpServers"]["perf-mcp"]["env"]
+    _baseline_fullpipe(repo_root, mcp_env, devices)
     rounds, can_stop, halted = 0, False, False
     while rounds < max_rounds:
         st = _gate_status(repo_root, mcp_env, devices)

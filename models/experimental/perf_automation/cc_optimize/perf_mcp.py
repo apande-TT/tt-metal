@@ -568,6 +568,37 @@ def _run_full_pipeline_ms():
     return None, None, "no TRACE_PER_TOKEN_MS or FORWARD_WALL_MS in output (workload did not run full-pipeline)"
 
 
+_FULLPIPE_GATE_LOG = Path(tempfile.gettempdir()) / "perf_mcp_fullpipe_gate.log"
+
+
+def _emit_fullpipe(result: dict) -> dict:
+    m = result.get("method")
+    src = "trace_replay" if m == "trace" else ("eager_wall" if m == "eager" else "n/a")
+    parts = [
+        "[full-pipeline-gate]",
+        "status=%s" % result.get("status"),
+        "end_to_end_ms=%s" % result.get("full_pipeline_ms"),
+        "via=%s" % src,
+    ]
+    if result.get("best_ms") is not None:
+        parts.append("best_ms=%s" % result.get("best_ms"))
+    if result.get("delta_pct") is not None:
+        parts.append("delta_pct=%s" % result.get("delta_pct"))
+    if result.get("target_ms") is not None:
+        parts.append("target_ms=%s gap_ms=%s" % (result.get("target_ms"), result.get("gap_to_target_ms")))
+    if result.get("error"):
+        parts.append("error=%s" % str(result.get("error"))[:140])
+    line = " ".join(parts)
+    sys.stderr.write(line + "\n")
+    sys.stderr.flush()
+    try:
+        with open(_FULLPIPE_GATE_LOG, "a") as _f:
+            _f.write(line + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+    return result
+
+
 @mcp.tool()
 def check_full_pipeline_latency() -> dict:
     """Measure end-to-end latency and gate it as a CONVERGENCE gate toward the target (a GPU number if
@@ -581,11 +612,14 @@ def check_full_pipeline_latency() -> dict:
     status 'ok' = moved toward target or held (accept); status 'diverged' = got slower than best-so-far
     by more than the tolerance (reject — revert it). E.g. target=1ms: 10->8 is ok, 10->12 is diverged; 8
     is accepted even though it is not 1. Best-so-far ratchets down on every improvement. Run alongside
-    check_pcc before banking any win. Returns {status, full_pipeline_ms, method, metric, best_ms?,
-    delta_pct?, target_ms?, gap_to_target_ms?, reached_target?}."""
+    check_pcc before banking any win. Each check prints a `[full-pipeline-gate]` line (status,
+    end_to_end_ms, via=trace_replay|eager_wall, best/delta/target) to stderr and appends it to
+    $TMPDIR/perf_mcp_fullpipe_gate.log so the gated end-to-end time is visible every iteration.
+    Returns {status, full_pipeline_ms, method, metric, best_ms?, delta_pct?, target_ms?,
+    gap_to_target_ms?, reached_target?}."""
     ms, method, err = _run_full_pipeline_ms()
     if ms is None:
-        return {"status": "crash", "error": err}
+        return _emit_fullpipe({"status": "crash", "error": err})
     metric = "trace_per_token_ms" if method == "trace" else "eager_full_pipeline_ms"
     tgt = _FULLPIPE_TARGET_MS if _FULLPIPE_TARGET_MS > 0 else None
     tgt_fields = {}
@@ -604,27 +638,31 @@ def check_full_pipeline_latency() -> dict:
     best = float(base.get("full_pipeline_ms", 0.0) or 0.0)
     if base.get("method", "eager") != method or best <= 0:
         _FULLPIPE_BASELINE_PATH.write_text(json.dumps({"full_pipeline_ms": ms, "method": method}))
-        return {
-            "status": "ok",
-            "full_pipeline_ms": round(ms, 4),
-            "method": method,
-            "metric": metric,
-            "note": "best-so-far recorded",
-            **tgt_fields,
-        }
+        return _emit_fullpipe(
+            {
+                "status": "ok",
+                "full_pipeline_ms": round(ms, 4),
+                "method": method,
+                "metric": metric,
+                "note": "best-so-far recorded",
+                **tgt_fields,
+            }
+        )
     delta_pct = round((ms - best) / best * 100.0, 2) if best > 0 else None
     diverged = ms > best * (1.0 + _FULLPIPE_TOL)
     if ms < best:
         _FULLPIPE_BASELINE_PATH.write_text(json.dumps({"full_pipeline_ms": ms, "method": method}))
-    return {
-        "status": "diverged" if diverged else "ok",
-        "full_pipeline_ms": round(ms, 4),
-        "best_ms": round(best, 4),
-        "delta_pct": delta_pct,
-        "method": method,
-        "metric": metric,
-        **tgt_fields,
-    }
+    return _emit_fullpipe(
+        {
+            "status": "diverged" if diverged else "ok",
+            "full_pipeline_ms": round(ms, 4),
+            "best_ms": round(best, 4),
+            "delta_pct": delta_pct,
+            "method": method,
+            "metric": metric,
+            **tgt_fields,
+        }
+    )
 
 
 @mcp.tool()
