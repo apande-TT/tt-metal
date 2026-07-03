@@ -181,14 +181,17 @@ LLM_GAPs (op-NEW — still need synthesis):
 
 HF reference: transformers/src/transformers/models/acestep/modeling_acestep.py
 Op counts: total=151  op-REUSE=99  op-ADAPT=0  op-NEW=52"""
-from __future__ import annotations
-import torch
-import ttnn
-import transformers
-import math
 
-HF_MODEL_ID = 'ACE-Step/acestep-v15-base'
-_CANDIDATE_SUBMODULE_PATHS = ['encoder']
+from __future__ import annotations
+
+import torch
+import transformers
+
+import ttnn
+
+HF_MODEL_ID = "ACE-Step/acestep-v15-base"
+_CANDIDATE_SUBMODULE_PATHS = ["encoder"]
+
 
 def _log_runtime_fallback(helper, kind, reason):
     """Append a structured CPU-fallback event for the planner reporter.
@@ -199,8 +202,12 @@ def _log_runtime_fallback(helper, kind, reason):
     before each pytest invocation and consumes it afterwards.
     """
     try:
-        import sys as _sys, json as _json, os as _os, time as _time
+        import json as _json
+        import os as _os
+        import sys as _sys
+        import time as _time
         from pathlib import Path as _Path
+
         _sys.stderr.write("[%s_CPU_FALLBACK] %s: %s\n" % (kind.upper(), helper, reason))
         log_env = _os.environ.get("TT_HW_PLANNER_RUNTIME_FALLBACK_LOG")
         if log_env:
@@ -223,59 +230,60 @@ def _log_runtime_fallback(helper, kind, reason):
 
 
 _LLM_GAPS = [
-    {'name': 'lyric_encoder.norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.rotary_emb', 'class': 'Qwen3RotaryEmbedding', 'notes': ''},
-    {'name': 'lyric_encoder.layers.0.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.0.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.0.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.0.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.1.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.1.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.1.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.1.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.2.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.2.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.2.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.2.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.3.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.3.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.3.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.3.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.4.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.4.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.4.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.4.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.5.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.5.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.5.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.5.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.6.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.6.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.6.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.6.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.7.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.7.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.7.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'lyric_encoder.layers.7.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.rotary_emb', 'class': 'Qwen3RotaryEmbedding', 'notes': ''},
-    {'name': 'timbre_encoder.layers.0.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.0.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.0.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.0.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.1.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.1.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.1.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.1.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.2.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.2.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.2.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.2.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.3.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.3.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.3.input_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'timbre_encoder.layers.3.post_attention_layernorm', 'class': 'Qwen3RMSNorm', 'notes': ''},
+    {"name": "lyric_encoder.norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.rotary_emb", "class": "Qwen3RotaryEmbedding", "notes": ""},
+    {"name": "lyric_encoder.layers.0.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.0.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.0.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.0.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.1.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.1.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.1.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.1.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.2.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.2.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.2.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.2.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.3.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.3.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.3.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.3.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.4.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.4.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.4.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.4.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.5.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.5.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.5.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.5.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.6.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.6.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.6.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.6.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.7.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.7.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.7.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "lyric_encoder.layers.7.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.rotary_emb", "class": "Qwen3RotaryEmbedding", "notes": ""},
+    {"name": "timbre_encoder.layers.0.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.0.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.0.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.0.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.1.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.1.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.1.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.1.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.2.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.2.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.2.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.2.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.3.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.3.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.3.input_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "timbre_encoder.layers.3.post_attention_layernorm", "class": "Qwen3RMSNorm", "notes": ""},
 ]
+
 
 def _resolve(obj, dotted):
     cur = obj
@@ -288,11 +296,14 @@ def _resolve(obj, dotted):
             cur = getattr(cur, tok)
     return cur
 
+
 def _coerce_to_torch(x):
     try:
         import ttnn as _ttnn
+
         if isinstance(x, _ttnn.Tensor):
             import torch as _torch
+
             t = _ttnn.to_torch(x)
             if t.is_floating_point():
                 if t.dtype != _torch.float32:
@@ -310,295 +321,738 @@ def _coerce_to_torch(x):
         return {k: _coerce_to_torch(v) for k, v in x.items()}
     return x
 
+
 class AceStepConditionEncoder:
     def __init__(self, device, torch_module):
         self.device = device
         self._torch_module = torch_module
         sd = torch_module.state_dict()
         # op-REUSE: text_projector  (Linear 1024 -> 2048, bias=False)
-        self.w_text_projector_weight = ttnn.from_torch(sd['text_projector.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_text_projector_weight = ttnn.from_torch(
+            sd["text_projector.weight"].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
 
         # op-REUSE: lyric_encoder.embed_tokens  (Linear 1024 -> 2048, bias=True)
-        self.w_lyric_encoder_embed_tokens_weight = ttnn.from_torch(sd['lyric_encoder.embed_tokens.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_lyric_encoder_embed_tokens_bias = ttnn.from_torch(sd['lyric_encoder.embed_tokens.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_embed_tokens_weight = ttnn.from_torch(
+            sd["lyric_encoder.embed_tokens.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
+        self.w_lyric_encoder_embed_tokens_bias = ttnn.from_torch(
+            sd["lyric_encoder.embed_tokens.bias"].reshape(1, -1),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.0.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_0_self_attn_q_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.0.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_0_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.0.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.0.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_0_self_attn_k_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.0.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_0_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.0.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.0.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_0_self_attn_v_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.0.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_0_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.0.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.0.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_0_self_attn_o_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.0.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_0_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.0.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.0.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_0_mlp_gate_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.0.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_0_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.0.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.0.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_0_mlp_up_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.0.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_0_mlp_up_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.0.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.0.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_0_mlp_down_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.0.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_0_mlp_down_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.0.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.0.mlp.act_fn  (SILU)
 
         # op-REUSE: lyric_encoder.layers.1.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_1_self_attn_q_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.1.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_1_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.1.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.1.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_1_self_attn_k_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.1.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_1_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.1.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.1.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_1_self_attn_v_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.1.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_1_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.1.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.1.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_1_self_attn_o_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.1.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_1_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.1.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.1.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_1_mlp_gate_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.1.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_1_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.1.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.1.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_1_mlp_up_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.1.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_1_mlp_up_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.1.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.1.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_1_mlp_down_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.1.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_1_mlp_down_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.1.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.1.mlp.act_fn  (SILU)
 
         # op-REUSE: lyric_encoder.layers.2.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_2_self_attn_q_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.2.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_2_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.2.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.2.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_2_self_attn_k_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.2.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_2_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.2.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.2.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_2_self_attn_v_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.2.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_2_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.2.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.2.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_2_self_attn_o_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.2.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_2_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.2.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.2.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_2_mlp_gate_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.2.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_2_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.2.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.2.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_2_mlp_up_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.2.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_2_mlp_up_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.2.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.2.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_2_mlp_down_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.2.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_2_mlp_down_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.2.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.2.mlp.act_fn  (SILU)
 
         # op-REUSE: lyric_encoder.layers.3.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_3_self_attn_q_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.3.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_3_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.3.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.3.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_3_self_attn_k_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.3.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_3_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.3.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.3.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_3_self_attn_v_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.3.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_3_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.3.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.3.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_3_self_attn_o_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.3.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_3_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.3.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.3.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_3_mlp_gate_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.3.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_3_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.3.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.3.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_3_mlp_up_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.3.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_3_mlp_up_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.3.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.3.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_3_mlp_down_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.3.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_3_mlp_down_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.3.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.3.mlp.act_fn  (SILU)
 
         # op-REUSE: lyric_encoder.layers.4.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_4_self_attn_q_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.4.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_4_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.4.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.4.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_4_self_attn_k_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.4.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_4_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.4.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.4.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_4_self_attn_v_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.4.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_4_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.4.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.4.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_4_self_attn_o_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.4.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_4_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.4.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.4.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_4_mlp_gate_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.4.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_4_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.4.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.4.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_4_mlp_up_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.4.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_4_mlp_up_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.4.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.4.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_4_mlp_down_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.4.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_4_mlp_down_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.4.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.4.mlp.act_fn  (SILU)
 
         # op-REUSE: lyric_encoder.layers.5.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_5_self_attn_q_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.5.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_5_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.5.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.5.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_5_self_attn_k_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.5.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_5_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.5.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.5.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_5_self_attn_v_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.5.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_5_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.5.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.5.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_5_self_attn_o_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.5.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_5_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.5.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.5.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_5_mlp_gate_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.5.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_5_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.5.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.5.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_5_mlp_up_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.5.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_5_mlp_up_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.5.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.5.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_5_mlp_down_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.5.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_5_mlp_down_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.5.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.5.mlp.act_fn  (SILU)
 
         # op-REUSE: lyric_encoder.layers.6.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_6_self_attn_q_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.6.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_6_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.6.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.6.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_6_self_attn_k_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.6.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_6_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.6.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.6.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_6_self_attn_v_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.6.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_6_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.6.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.6.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_6_self_attn_o_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.6.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_6_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.6.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.6.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_6_mlp_gate_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.6.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_6_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.6.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.6.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_6_mlp_up_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.6.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_6_mlp_up_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.6.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.6.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_6_mlp_down_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.6.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_6_mlp_down_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.6.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.6.mlp.act_fn  (SILU)
 
         # op-REUSE: lyric_encoder.layers.7.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_7_self_attn_q_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.7.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_7_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.7.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.7.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_7_self_attn_k_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.7.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_7_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.7.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.7.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_lyric_encoder_layers_7_self_attn_v_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.7.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_7_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.7.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.7.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_7_self_attn_o_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.7.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_7_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.7.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.7.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_7_mlp_gate_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.7.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_7_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.7.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.7.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_lyric_encoder_layers_7_mlp_up_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.7.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_7_mlp_up_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.7.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.7.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_lyric_encoder_layers_7_mlp_down_proj_weight = ttnn.from_torch(sd['lyric_encoder.layers.7.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_lyric_encoder_layers_7_mlp_down_proj_weight = ttnn.from_torch(
+            sd["lyric_encoder.layers.7.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: lyric_encoder.layers.7.mlp.act_fn  (SILU)
 
         # op-REUSE: timbre_encoder.embed_tokens  (Linear 64 -> 2048, bias=True)
-        self.w_timbre_encoder_embed_tokens_weight = ttnn.from_torch(sd['timbre_encoder.embed_tokens.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_timbre_encoder_embed_tokens_bias = ttnn.from_torch(sd['timbre_encoder.embed_tokens.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_embed_tokens_weight = ttnn.from_torch(
+            sd["timbre_encoder.embed_tokens.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
+        self.w_timbre_encoder_embed_tokens_bias = ttnn.from_torch(
+            sd["timbre_encoder.embed_tokens.bias"].reshape(1, -1),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.0.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_0_self_attn_q_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.0.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_0_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.0.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.0.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_timbre_encoder_layers_0_self_attn_k_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.0.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_0_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.0.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.0.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_timbre_encoder_layers_0_self_attn_v_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.0.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_0_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.0.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.0.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_0_self_attn_o_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.0.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_0_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.0.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.0.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_timbre_encoder_layers_0_mlp_gate_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.0.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_0_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.0.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.0.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_timbre_encoder_layers_0_mlp_up_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.0.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_0_mlp_up_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.0.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.0.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_0_mlp_down_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.0.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_0_mlp_down_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.0.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.0.mlp.act_fn  (SILU)
 
         # op-REUSE: timbre_encoder.layers.1.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_1_self_attn_q_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.1.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_1_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.1.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.1.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_timbre_encoder_layers_1_self_attn_k_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.1.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_1_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.1.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.1.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_timbre_encoder_layers_1_self_attn_v_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.1.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_1_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.1.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.1.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_1_self_attn_o_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.1.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_1_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.1.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.1.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_timbre_encoder_layers_1_mlp_gate_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.1.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_1_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.1.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.1.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_timbre_encoder_layers_1_mlp_up_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.1.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_1_mlp_up_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.1.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.1.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_1_mlp_down_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.1.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_1_mlp_down_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.1.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.1.mlp.act_fn  (SILU)
 
         # op-REUSE: timbre_encoder.layers.2.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_2_self_attn_q_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.2.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_2_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.2.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.2.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_timbre_encoder_layers_2_self_attn_k_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.2.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_2_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.2.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.2.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_timbre_encoder_layers_2_self_attn_v_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.2.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_2_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.2.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.2.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_2_self_attn_o_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.2.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_2_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.2.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.2.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_timbre_encoder_layers_2_mlp_gate_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.2.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_2_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.2.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.2.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_timbre_encoder_layers_2_mlp_up_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.2.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_2_mlp_up_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.2.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.2.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_2_mlp_down_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.2.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_2_mlp_down_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.2.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.2.mlp.act_fn  (SILU)
 
         # op-REUSE: timbre_encoder.layers.3.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_3_self_attn_q_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.3.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_3_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.3.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.3.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_timbre_encoder_layers_3_self_attn_k_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.3.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_3_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.3.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.3.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_timbre_encoder_layers_3_self_attn_v_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.3.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_3_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.3.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.3.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_3_self_attn_o_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.3.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_3_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.3.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.3.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_timbre_encoder_layers_3_mlp_gate_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.3.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_3_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.3.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.3.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_timbre_encoder_layers_3_mlp_up_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.3.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_3_mlp_up_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.3.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.3.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_timbre_encoder_layers_3_mlp_down_proj_weight = ttnn.from_torch(sd['timbre_encoder.layers.3.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_timbre_encoder_layers_3_mlp_down_proj_weight = ttnn.from_torch(
+            sd["timbre_encoder.layers.3.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: timbre_encoder.layers.3.mlp.act_fn  (SILU)
 
@@ -998,19 +1452,46 @@ class AceStepConditionEncoder:
     def _apply_timbre_encoder_layers_3_mlp_act_fn(self, x):
         return ttnn.silu(x)
 
-    def __call__(self, text_hidden_states=None, text_attention_mask=None,
-                 lyric_hidden_states=None, lyric_attention_mask=None,
-                 refer_audio_acoustic_hidden_states_packed=None, refer_audio_order_mask=None):
+    def __call__(
+        self,
+        text_hidden_states=None,
+        text_attention_mask=None,
+        lyric_hidden_states=None,
+        lyric_attention_mask=None,
+        refer_audio_acoustic_hidden_states_packed=None,
+        refer_audio_order_mask=None,
+    ):
         text_mask_torch = text_attention_mask
         lyric_mask_torch = lyric_attention_mask
 
-        text_tt = text_hidden_states if isinstance(text_hidden_states, ttnn.Tensor) else ttnn.from_torch(text_hidden_states, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
-        lyric_tt = lyric_hidden_states if isinstance(lyric_hidden_states, ttnn.Tensor) else ttnn.from_torch(lyric_hidden_states, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
-        refer_audio_tt = refer_audio_acoustic_hidden_states_packed if isinstance(refer_audio_acoustic_hidden_states_packed, ttnn.Tensor) else ttnn.from_torch(refer_audio_acoustic_hidden_states_packed, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+        text_tt = (
+            text_hidden_states
+            if isinstance(text_hidden_states, ttnn.Tensor)
+            else ttnn.from_torch(text_hidden_states, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+        )
+        lyric_tt = (
+            lyric_hidden_states
+            if isinstance(lyric_hidden_states, ttnn.Tensor)
+            else ttnn.from_torch(lyric_hidden_states, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+        )
+        refer_audio_tt = (
+            refer_audio_acoustic_hidden_states_packed
+            if isinstance(refer_audio_acoustic_hidden_states_packed, ttnn.Tensor)
+            else ttnn.from_torch(
+                refer_audio_acoustic_hidden_states_packed,
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.device,
+            )
+        )
 
         text_proj = self._apply_text_projector(text_tt)
 
-        lyric_seq_len = lyric_hidden_states.shape[1] if isinstance(lyric_hidden_states, ttnn.Tensor) else lyric_hidden_states.shape[1]
+        lyric_seq_len = (
+            lyric_hidden_states.shape[1]
+            if isinstance(lyric_hidden_states, ttnn.Tensor)
+            else lyric_hidden_states.shape[1]
+        )
         lyric_embed = self._apply_lyric_encoder_embed_tokens(lyric_tt)
         lyric_cos, lyric_sin = self._rope_tables(lyric_seq_len)
         lyric_embed = self._process_lyric_encoder_layer_0(lyric_embed, lyric_cos, lyric_sin)
@@ -1023,7 +1504,11 @@ class AceStepConditionEncoder:
         lyric_embed = self._process_lyric_encoder_layer_7(lyric_embed, lyric_cos, lyric_sin)
         lyric_embed = self._rms_norm(lyric_embed, self._get_weight("lyric_encoder.norm.weight", self._HIDDEN_SIZE))
 
-        timbre_seq_len = refer_audio_acoustic_hidden_states_packed.shape[1] if isinstance(refer_audio_acoustic_hidden_states_packed, ttnn.Tensor) else refer_audio_acoustic_hidden_states_packed.shape[1]
+        timbre_seq_len = (
+            refer_audio_acoustic_hidden_states_packed.shape[1]
+            if isinstance(refer_audio_acoustic_hidden_states_packed, ttnn.Tensor)
+            else refer_audio_acoustic_hidden_states_packed.shape[1]
+        )
         timbre_embed = self._apply_timbre_encoder_embed_tokens(refer_audio_tt)
         timbre_cos, timbre_sin = self._rope_tables(timbre_seq_len)
         timbre_embed = self._process_timbre_encoder_layer_0(timbre_embed, timbre_cos, timbre_sin)
@@ -1049,7 +1534,9 @@ class AceStepConditionEncoder:
 
     def _process_lyric_encoder_layer_0(self, x, cos, sin):
         return self._encoder_layer(
-            x, "lyric_encoder", 0,
+            x,
+            "lyric_encoder",
+            0,
             self._apply_lyric_encoder_layers_0_self_attn_q_proj,
             self._apply_lyric_encoder_layers_0_self_attn_k_proj,
             self._apply_lyric_encoder_layers_0_self_attn_v_proj,
@@ -1058,12 +1545,15 @@ class AceStepConditionEncoder:
             self._apply_lyric_encoder_layers_0_mlp_up_proj,
             self._apply_lyric_encoder_layers_0_mlp_down_proj,
             self._apply_lyric_encoder_layers_0_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
 
     def _process_lyric_encoder_layer_1(self, x, cos, sin):
         return self._encoder_layer(
-            x, "lyric_encoder", 1,
+            x,
+            "lyric_encoder",
+            1,
             self._apply_lyric_encoder_layers_1_self_attn_q_proj,
             self._apply_lyric_encoder_layers_1_self_attn_k_proj,
             self._apply_lyric_encoder_layers_1_self_attn_v_proj,
@@ -1072,12 +1562,15 @@ class AceStepConditionEncoder:
             self._apply_lyric_encoder_layers_1_mlp_up_proj,
             self._apply_lyric_encoder_layers_1_mlp_down_proj,
             self._apply_lyric_encoder_layers_1_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
 
     def _process_lyric_encoder_layer_2(self, x, cos, sin):
         return self._encoder_layer(
-            x, "lyric_encoder", 2,
+            x,
+            "lyric_encoder",
+            2,
             self._apply_lyric_encoder_layers_2_self_attn_q_proj,
             self._apply_lyric_encoder_layers_2_self_attn_k_proj,
             self._apply_lyric_encoder_layers_2_self_attn_v_proj,
@@ -1086,12 +1579,15 @@ class AceStepConditionEncoder:
             self._apply_lyric_encoder_layers_2_mlp_up_proj,
             self._apply_lyric_encoder_layers_2_mlp_down_proj,
             self._apply_lyric_encoder_layers_2_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
 
     def _process_lyric_encoder_layer_3(self, x, cos, sin):
         return self._encoder_layer(
-            x, "lyric_encoder", 3,
+            x,
+            "lyric_encoder",
+            3,
             self._apply_lyric_encoder_layers_3_self_attn_q_proj,
             self._apply_lyric_encoder_layers_3_self_attn_k_proj,
             self._apply_lyric_encoder_layers_3_self_attn_v_proj,
@@ -1100,12 +1596,15 @@ class AceStepConditionEncoder:
             self._apply_lyric_encoder_layers_3_mlp_up_proj,
             self._apply_lyric_encoder_layers_3_mlp_down_proj,
             self._apply_lyric_encoder_layers_3_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
 
     def _process_lyric_encoder_layer_4(self, x, cos, sin):
         return self._encoder_layer(
-            x, "lyric_encoder", 4,
+            x,
+            "lyric_encoder",
+            4,
             self._apply_lyric_encoder_layers_4_self_attn_q_proj,
             self._apply_lyric_encoder_layers_4_self_attn_k_proj,
             self._apply_lyric_encoder_layers_4_self_attn_v_proj,
@@ -1114,12 +1613,15 @@ class AceStepConditionEncoder:
             self._apply_lyric_encoder_layers_4_mlp_up_proj,
             self._apply_lyric_encoder_layers_4_mlp_down_proj,
             self._apply_lyric_encoder_layers_4_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
 
     def _process_lyric_encoder_layer_5(self, x, cos, sin):
         return self._encoder_layer(
-            x, "lyric_encoder", 5,
+            x,
+            "lyric_encoder",
+            5,
             self._apply_lyric_encoder_layers_5_self_attn_q_proj,
             self._apply_lyric_encoder_layers_5_self_attn_k_proj,
             self._apply_lyric_encoder_layers_5_self_attn_v_proj,
@@ -1128,12 +1630,15 @@ class AceStepConditionEncoder:
             self._apply_lyric_encoder_layers_5_mlp_up_proj,
             self._apply_lyric_encoder_layers_5_mlp_down_proj,
             self._apply_lyric_encoder_layers_5_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
 
     def _process_lyric_encoder_layer_6(self, x, cos, sin):
         return self._encoder_layer(
-            x, "lyric_encoder", 6,
+            x,
+            "lyric_encoder",
+            6,
             self._apply_lyric_encoder_layers_6_self_attn_q_proj,
             self._apply_lyric_encoder_layers_6_self_attn_k_proj,
             self._apply_lyric_encoder_layers_6_self_attn_v_proj,
@@ -1142,12 +1647,15 @@ class AceStepConditionEncoder:
             self._apply_lyric_encoder_layers_6_mlp_up_proj,
             self._apply_lyric_encoder_layers_6_mlp_down_proj,
             self._apply_lyric_encoder_layers_6_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
 
     def _process_lyric_encoder_layer_7(self, x, cos, sin):
         return self._encoder_layer(
-            x, "lyric_encoder", 7,
+            x,
+            "lyric_encoder",
+            7,
             self._apply_lyric_encoder_layers_7_self_attn_q_proj,
             self._apply_lyric_encoder_layers_7_self_attn_k_proj,
             self._apply_lyric_encoder_layers_7_self_attn_v_proj,
@@ -1156,12 +1664,15 @@ class AceStepConditionEncoder:
             self._apply_lyric_encoder_layers_7_mlp_up_proj,
             self._apply_lyric_encoder_layers_7_mlp_down_proj,
             self._apply_lyric_encoder_layers_7_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
 
     def _process_timbre_encoder_layer_0(self, x, cos, sin):
         return self._encoder_layer(
-            x, "timbre_encoder", 0,
+            x,
+            "timbre_encoder",
+            0,
             self._apply_timbre_encoder_layers_0_self_attn_q_proj,
             self._apply_timbre_encoder_layers_0_self_attn_k_proj,
             self._apply_timbre_encoder_layers_0_self_attn_v_proj,
@@ -1170,12 +1681,15 @@ class AceStepConditionEncoder:
             self._apply_timbre_encoder_layers_0_mlp_up_proj,
             self._apply_timbre_encoder_layers_0_mlp_down_proj,
             self._apply_timbre_encoder_layers_0_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
 
     def _process_timbre_encoder_layer_1(self, x, cos, sin):
         return self._encoder_layer(
-            x, "timbre_encoder", 1,
+            x,
+            "timbre_encoder",
+            1,
             self._apply_timbre_encoder_layers_1_self_attn_q_proj,
             self._apply_timbre_encoder_layers_1_self_attn_k_proj,
             self._apply_timbre_encoder_layers_1_self_attn_v_proj,
@@ -1184,12 +1698,15 @@ class AceStepConditionEncoder:
             self._apply_timbre_encoder_layers_1_mlp_up_proj,
             self._apply_timbre_encoder_layers_1_mlp_down_proj,
             self._apply_timbre_encoder_layers_1_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
 
     def _process_timbre_encoder_layer_2(self, x, cos, sin):
         return self._encoder_layer(
-            x, "timbre_encoder", 2,
+            x,
+            "timbre_encoder",
+            2,
             self._apply_timbre_encoder_layers_2_self_attn_q_proj,
             self._apply_timbre_encoder_layers_2_self_attn_k_proj,
             self._apply_timbre_encoder_layers_2_self_attn_v_proj,
@@ -1198,12 +1715,15 @@ class AceStepConditionEncoder:
             self._apply_timbre_encoder_layers_2_mlp_up_proj,
             self._apply_timbre_encoder_layers_2_mlp_down_proj,
             self._apply_timbre_encoder_layers_2_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
 
     def _process_timbre_encoder_layer_3(self, x, cos, sin):
         return self._encoder_layer(
-            x, "timbre_encoder", 3,
+            x,
+            "timbre_encoder",
+            3,
             self._apply_timbre_encoder_layers_3_self_attn_q_proj,
             self._apply_timbre_encoder_layers_3_self_attn_k_proj,
             self._apply_timbre_encoder_layers_3_self_attn_v_proj,
@@ -1212,18 +1732,24 @@ class AceStepConditionEncoder:
             self._apply_timbre_encoder_layers_3_mlp_up_proj,
             self._apply_timbre_encoder_layers_3_mlp_down_proj,
             self._apply_timbre_encoder_layers_3_mlp_act_fn,
-            cos, sin,
+            cos,
+            sin,
         )
+
 
 def build(device, torch_module):
     return AceStepConditionEncoder(device, torch_module)
 
+
 _instance = None
+
 
 def ace_step_condition_encoder(*args, **kwargs):
     global _instance
     if _instance is None:
-        model = transformers.AutoModel.from_pretrained(HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True)
+        model = transformers.AutoModel.from_pretrained(
+            HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True
+        )
         model.eval()
         torch_sub = None
         for path in _CANDIDATE_SUBMODULE_PATHS:
@@ -1233,6 +1759,6 @@ def ace_step_condition_encoder(*args, **kwargs):
             except (AttributeError, IndexError, KeyError, TypeError):
                 continue
         if torch_sub is None:
-            raise RuntimeError('partial-stub: could not resolve `ace_step_condition_encoder`')
+            raise RuntimeError("partial-stub: could not resolve `ace_step_condition_encoder`")
         _instance = build(ttnn.open_device(device_id=0), torch_sub)
     return _instance(*args, **kwargs)

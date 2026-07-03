@@ -1,0 +1,21 @@
+{
+  "iter": 1,
+  "stub_path": "models/demos/hf_eager/acestep_v15_base/_stubs/lambda.py",
+  "stub_hash": "fc107b76a213",
+  "exemplar_used": "(none)",
+  "model_used": "opus",
+  "ops_used": [
+    "from_torch",
+    "manage_config",
+    "to_torch"
+  ],
+  "sharding_strategy": [],
+  "failure_class": "OTHER",
+  "failure_signature": "Bring-up not complete: tests passed only because the listed components delegate to torch on CPU. Continue iterating on the non-skipped components below.",
+  "traceback_excerpt": "Components still CPU-wrapping (PCC trivially passes via torch==torch):\n  - ace_step_audio_tokenizer  [AUTOFILL STUB]  (/local/ttuser/dvartanians/ace/tt-metal/models/demos/hf_eager/acestep_v15_base/_stubs/ace_step_audio_tokenizer.py)\n  - ace_step_encoder_layer  [AUTOFILL STUB]  (/local/ttuser/dvartanians/ace/tt-metal/models/demos/hf_eager/acestep_v15_base/_stubs/ace_step_encoder_layer.py)\n  - lambda  [TORCH WRAPPER]  (/local/ttuser/dvartanians/ace/tt-metal/models/demos/hf_eager/acestep_v15_base/_stubs/lambda.py)",
+  "diagnosis": "failure class=OTHER; see traceback",
+  "next_step": "re-read the traceback carefully and address the specific error",
+  "failing_line": 0,
+  "failing_line_excerpt": "",
+  "agent_result_text": ""
+}

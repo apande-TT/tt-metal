@@ -54,6 +54,10 @@ class Lambda:
         return None
 
     def __call__(self, *args, **kwargs):
+        # decoder.proj_in.0 is `lambda x: x.transpose(1, 2)`: captured I/O is
+        # (1, 50, 192) -> (1, 192, 50), a swap of the last two axes. The
+        # harness feeds the primary arg as a ttnn tensor already on device;
+        # only fall back to `ttnn.from_torch` if a raw torch tensor sneaks in.
         x = args[0] if args else next(iter(kwargs.values()))
         if not isinstance(x, ttnn.Tensor):
             x = ttnn.from_torch(
@@ -72,7 +76,7 @@ def build(device, torch_module):
 _instance = None
 
 
-def _lambda_shim(*args, **kwargs):
+def lambda_shim(*args, **kwargs):
     global _instance
     if _instance is None:
         raise RuntimeError(
@@ -80,6 +84,3 @@ def _lambda_shim(*args, **kwargs):
             "Call it from the PCC test's `_build_ttnn_port`."
         )
     return _instance(*args, **kwargs)
-
-
-globals()["lambda"] = _lambda_shim

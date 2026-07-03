@@ -505,14 +505,19 @@ LLM_GAPs (op-NEW — still need synthesis):
 
 HF reference: transformers/src/transformers/models/acestep/modeling_acestep.py
 Op counts: total=475  op-REUSE=299  op-ADAPT=1  op-NEW=175"""
+
 from __future__ import annotations
+
 import math
+
 import torch
-import ttnn
 import transformers
 
-HF_MODEL_ID = 'ACE-Step/acestep-v15-base'
-_CANDIDATE_SUBMODULE_PATHS = ['decoder']
+import ttnn
+
+HF_MODEL_ID = "ACE-Step/acestep-v15-base"
+_CANDIDATE_SUBMODULE_PATHS = ["decoder"]
+
 
 def _log_runtime_fallback(helper, kind, reason):
     """Append a structured CPU-fallback event for the planner reporter.
@@ -523,8 +528,12 @@ def _log_runtime_fallback(helper, kind, reason):
     before each pytest invocation and consumes it afterwards.
     """
     try:
-        import sys as _sys, json as _json, os as _os, time as _time
+        import json as _json
+        import os as _os
+        import sys as _sys
+        import time as _time
         from pathlib import Path as _Path
+
         _sys.stderr.write("[%s_CPU_FALLBACK] %s: %s\n" % (kind.upper(), helper, reason))
         log_env = _os.environ.get("TT_HW_PLANNER_RUNTIME_FALLBACK_LOG")
         if log_env:
@@ -547,183 +556,184 @@ def _log_runtime_fallback(helper, kind, reason):
 
 
 _LLM_GAPS = [
-    {'name': 'rotary_emb', 'class': 'Qwen3RotaryEmbedding', 'notes': ''},
-    {'name': 'layers.0.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.0.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.0.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.0.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.0.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.0.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.0.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.1.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.1.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.1.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.1.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.1.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.1.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.1.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.2.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.2.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.2.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.2.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.2.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.2.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.2.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.3.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.3.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.3.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.3.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.3.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.3.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.3.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.4.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.4.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.4.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.4.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.4.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.4.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.4.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.5.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.5.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.5.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.5.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.5.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.5.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.5.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.6.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.6.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.6.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.6.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.6.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.6.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.6.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.7.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.7.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.7.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.7.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.7.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.7.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.7.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.8.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.8.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.8.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.8.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.8.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.8.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.8.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.9.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.9.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.9.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.9.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.9.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.9.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.9.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.10.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.10.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.10.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.10.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.10.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.10.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.10.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.11.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.11.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.11.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.11.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.11.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.11.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.11.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.12.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.12.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.12.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.12.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.12.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.12.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.12.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.13.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.13.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.13.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.13.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.13.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.13.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.13.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.14.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.14.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.14.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.14.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.14.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.14.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.14.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.15.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.15.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.15.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.15.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.15.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.15.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.15.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.16.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.16.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.16.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.16.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.16.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.16.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.16.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.17.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.17.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.17.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.17.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.17.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.17.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.17.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.18.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.18.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.18.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.18.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.18.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.18.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.18.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.19.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.19.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.19.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.19.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.19.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.19.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.19.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.20.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.20.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.20.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.20.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.20.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.20.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.20.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.21.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.21.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.21.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.21.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.21.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.21.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.21.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.22.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.22.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.22.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.22.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.22.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.22.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.22.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.23.self_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.23.self_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.23.self_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.23.cross_attn_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.23.cross_attn.q_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.23.cross_attn.k_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'layers.23.mlp_norm', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'proj_in.0', 'class': 'Lambda', 'notes': ''},
-    {'name': 'proj_in.1', 'class': 'Conv1d', 'notes': ''},
-    {'name': 'proj_in.2', 'class': 'Lambda', 'notes': ''},
-    {'name': 'norm_out', 'class': 'Qwen3RMSNorm', 'notes': ''},
-    {'name': 'proj_out.0', 'class': 'Lambda', 'notes': ''},
-    {'name': 'proj_out.1', 'class': 'ConvTranspose1d', 'notes': ''},
-    {'name': 'proj_out.2', 'class': 'Lambda', 'notes': ''},
+    {"name": "rotary_emb", "class": "Qwen3RotaryEmbedding", "notes": ""},
+    {"name": "layers.0.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.0.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.0.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.0.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.0.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.0.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.0.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.1.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.1.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.1.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.1.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.1.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.1.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.1.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.2.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.2.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.2.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.2.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.2.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.2.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.2.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.3.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.3.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.3.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.3.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.3.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.3.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.3.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.4.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.4.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.4.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.4.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.4.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.4.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.4.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.5.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.5.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.5.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.5.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.5.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.5.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.5.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.6.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.6.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.6.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.6.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.6.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.6.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.6.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.7.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.7.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.7.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.7.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.7.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.7.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.7.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.8.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.8.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.8.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.8.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.8.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.8.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.8.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.9.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.9.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.9.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.9.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.9.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.9.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.9.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.10.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.10.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.10.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.10.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.10.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.10.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.10.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.11.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.11.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.11.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.11.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.11.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.11.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.11.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.12.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.12.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.12.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.12.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.12.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.12.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.12.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.13.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.13.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.13.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.13.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.13.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.13.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.13.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.14.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.14.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.14.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.14.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.14.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.14.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.14.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.15.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.15.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.15.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.15.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.15.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.15.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.15.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.16.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.16.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.16.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.16.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.16.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.16.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.16.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.17.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.17.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.17.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.17.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.17.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.17.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.17.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.18.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.18.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.18.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.18.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.18.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.18.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.18.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.19.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.19.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.19.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.19.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.19.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.19.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.19.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.20.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.20.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.20.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.20.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.20.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.20.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.20.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.21.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.21.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.21.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.21.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.21.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.21.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.21.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.22.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.22.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.22.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.22.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.22.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.22.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.22.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.23.self_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.23.self_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.23.self_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.23.cross_attn_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.23.cross_attn.q_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.23.cross_attn.k_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "layers.23.mlp_norm", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "proj_in.0", "class": "Lambda", "notes": ""},
+    {"name": "proj_in.1", "class": "Conv1d", "notes": ""},
+    {"name": "proj_in.2", "class": "Lambda", "notes": ""},
+    {"name": "norm_out", "class": "Qwen3RMSNorm", "notes": ""},
+    {"name": "proj_out.0", "class": "Lambda", "notes": ""},
+    {"name": "proj_out.1", "class": "ConvTranspose1d", "notes": ""},
+    {"name": "proj_out.2", "class": "Lambda", "notes": ""},
 ]
+
 
 def _resolve(obj, dotted):
     cur = obj
@@ -736,11 +746,14 @@ def _resolve(obj, dotted):
             cur = getattr(cur, tok)
     return cur
 
+
 def _coerce_to_torch(x):
     try:
         import ttnn as _ttnn
+
         if isinstance(x, _ttnn.Tensor):
             import torch as _torch
+
             t = _ttnn.to_torch(x)
             # Bug Y fix (2026-05-23 live-run sam2-hiera-tiny)
             if t.is_floating_point():
@@ -759,6 +772,7 @@ def _coerce_to_torch(x):
         return {k: _coerce_to_torch(v) for k, v in x.items()}
     return x
 
+
 class AceStepDiTModel:
     def __init__(self, device, torch_module):
         self.device = device
@@ -775,880 +789,2243 @@ class AceStepDiTModel:
         self._torch_module = torch_module
         sd = torch_module.state_dict()
         # op-REUSE: layers.0.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_0_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.0.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_0_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.0.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.0.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_0_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.0.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_0_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.0.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.0.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_0_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.0.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_0_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.0.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.0.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_0_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.0.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_0_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.0.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.0.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_0_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.0.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_0_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.0.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.0.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_0_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.0.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_0_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.0.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.0.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_0_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.0.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_0_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.0.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.0.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_0_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.0.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_0_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.0.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.0.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_0_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.0.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_0_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.0.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.0.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_0_mlp_up_proj_weight = ttnn.from_torch(sd['layers.0.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_0_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.0.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.0.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_0_mlp_down_proj_weight = ttnn.from_torch(sd['layers.0.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_0_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.0.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.0.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.1.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_1_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.1.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_1_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.1.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.1.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_1_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.1.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_1_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.1.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.1.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_1_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.1.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_1_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.1.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.1.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_1_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.1.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_1_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.1.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.1.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_1_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.1.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_1_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.1.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.1.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_1_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.1.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_1_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.1.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.1.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_1_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.1.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_1_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.1.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.1.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_1_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.1.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_1_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.1.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.1.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_1_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.1.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_1_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.1.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.1.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_1_mlp_up_proj_weight = ttnn.from_torch(sd['layers.1.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_1_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.1.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.1.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_1_mlp_down_proj_weight = ttnn.from_torch(sd['layers.1.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_1_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.1.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.1.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.2.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_2_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.2.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_2_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.2.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.2.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_2_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.2.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_2_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.2.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.2.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_2_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.2.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_2_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.2.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.2.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_2_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.2.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_2_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.2.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.2.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_2_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.2.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_2_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.2.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.2.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_2_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.2.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_2_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.2.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.2.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_2_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.2.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_2_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.2.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.2.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_2_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.2.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_2_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.2.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.2.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_2_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.2.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_2_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.2.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.2.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_2_mlp_up_proj_weight = ttnn.from_torch(sd['layers.2.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_2_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.2.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.2.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_2_mlp_down_proj_weight = ttnn.from_torch(sd['layers.2.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_2_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.2.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.2.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.3.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_3_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.3.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_3_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.3.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.3.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_3_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.3.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_3_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.3.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.3.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_3_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.3.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_3_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.3.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.3.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_3_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.3.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_3_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.3.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.3.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_3_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.3.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_3_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.3.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.3.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_3_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.3.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_3_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.3.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.3.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_3_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.3.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_3_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.3.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.3.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_3_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.3.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_3_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.3.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.3.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_3_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.3.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_3_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.3.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.3.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_3_mlp_up_proj_weight = ttnn.from_torch(sd['layers.3.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_3_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.3.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.3.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_3_mlp_down_proj_weight = ttnn.from_torch(sd['layers.3.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_3_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.3.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.3.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.4.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_4_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.4.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_4_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.4.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.4.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_4_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.4.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_4_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.4.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.4.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_4_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.4.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_4_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.4.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.4.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_4_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.4.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_4_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.4.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.4.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_4_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.4.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_4_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.4.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.4.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_4_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.4.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_4_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.4.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.4.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_4_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.4.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_4_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.4.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.4.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_4_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.4.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_4_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.4.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.4.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_4_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.4.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_4_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.4.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.4.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_4_mlp_up_proj_weight = ttnn.from_torch(sd['layers.4.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_4_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.4.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.4.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_4_mlp_down_proj_weight = ttnn.from_torch(sd['layers.4.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_4_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.4.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.4.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.5.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_5_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.5.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_5_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.5.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.5.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_5_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.5.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_5_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.5.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.5.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_5_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.5.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_5_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.5.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.5.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_5_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.5.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_5_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.5.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.5.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_5_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.5.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_5_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.5.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.5.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_5_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.5.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_5_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.5.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.5.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_5_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.5.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_5_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.5.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.5.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_5_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.5.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_5_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.5.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.5.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_5_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.5.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_5_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.5.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.5.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_5_mlp_up_proj_weight = ttnn.from_torch(sd['layers.5.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_5_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.5.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.5.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_5_mlp_down_proj_weight = ttnn.from_torch(sd['layers.5.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_5_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.5.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.5.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.6.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_6_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.6.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_6_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.6.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.6.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_6_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.6.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_6_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.6.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.6.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_6_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.6.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_6_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.6.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.6.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_6_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.6.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_6_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.6.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.6.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_6_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.6.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_6_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.6.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.6.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_6_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.6.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_6_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.6.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.6.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_6_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.6.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_6_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.6.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.6.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_6_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.6.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_6_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.6.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.6.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_6_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.6.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_6_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.6.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.6.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_6_mlp_up_proj_weight = ttnn.from_torch(sd['layers.6.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_6_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.6.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.6.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_6_mlp_down_proj_weight = ttnn.from_torch(sd['layers.6.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_6_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.6.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.6.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.7.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_7_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.7.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_7_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.7.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.7.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_7_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.7.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_7_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.7.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.7.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_7_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.7.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_7_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.7.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.7.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_7_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.7.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_7_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.7.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.7.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_7_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.7.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_7_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.7.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.7.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_7_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.7.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_7_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.7.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.7.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_7_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.7.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_7_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.7.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.7.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_7_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.7.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_7_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.7.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.7.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_7_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.7.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_7_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.7.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.7.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_7_mlp_up_proj_weight = ttnn.from_torch(sd['layers.7.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_7_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.7.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.7.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_7_mlp_down_proj_weight = ttnn.from_torch(sd['layers.7.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_7_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.7.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.7.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.8.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_8_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.8.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_8_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.8.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.8.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_8_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.8.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_8_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.8.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.8.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_8_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.8.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_8_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.8.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.8.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_8_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.8.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_8_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.8.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.8.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_8_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.8.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_8_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.8.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.8.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_8_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.8.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_8_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.8.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.8.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_8_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.8.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_8_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.8.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.8.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_8_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.8.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_8_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.8.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.8.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_8_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.8.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_8_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.8.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.8.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_8_mlp_up_proj_weight = ttnn.from_torch(sd['layers.8.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_8_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.8.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.8.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_8_mlp_down_proj_weight = ttnn.from_torch(sd['layers.8.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_8_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.8.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.8.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.9.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_9_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.9.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_9_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.9.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.9.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_9_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.9.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_9_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.9.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.9.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_9_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.9.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_9_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.9.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.9.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_9_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.9.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_9_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.9.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.9.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_9_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.9.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_9_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.9.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.9.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_9_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.9.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_9_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.9.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.9.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_9_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.9.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_9_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.9.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.9.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_9_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.9.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_9_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.9.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.9.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_9_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.9.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_9_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.9.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.9.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_9_mlp_up_proj_weight = ttnn.from_torch(sd['layers.9.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_9_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.9.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.9.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_9_mlp_down_proj_weight = ttnn.from_torch(sd['layers.9.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_9_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.9.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.9.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.10.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_10_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.10.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_10_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.10.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.10.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_10_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.10.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_10_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.10.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.10.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_10_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.10.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_10_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.10.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.10.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_10_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.10.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_10_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.10.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.10.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_10_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.10.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_10_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.10.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.10.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_10_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.10.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_10_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.10.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.10.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_10_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.10.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_10_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.10.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.10.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_10_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.10.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_10_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.10.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.10.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_10_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.10.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_10_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.10.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.10.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_10_mlp_up_proj_weight = ttnn.from_torch(sd['layers.10.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_10_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.10.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.10.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_10_mlp_down_proj_weight = ttnn.from_torch(sd['layers.10.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_10_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.10.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.10.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.11.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_11_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.11.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_11_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.11.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.11.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_11_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.11.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_11_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.11.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.11.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_11_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.11.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_11_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.11.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.11.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_11_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.11.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_11_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.11.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.11.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_11_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.11.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_11_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.11.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.11.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_11_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.11.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_11_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.11.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.11.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_11_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.11.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_11_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.11.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.11.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_11_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.11.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_11_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.11.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.11.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_11_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.11.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_11_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.11.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.11.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_11_mlp_up_proj_weight = ttnn.from_torch(sd['layers.11.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_11_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.11.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.11.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_11_mlp_down_proj_weight = ttnn.from_torch(sd['layers.11.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_11_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.11.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.11.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.12.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_12_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.12.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_12_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.12.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.12.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_12_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.12.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_12_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.12.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.12.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_12_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.12.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_12_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.12.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.12.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_12_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.12.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_12_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.12.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.12.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_12_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.12.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_12_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.12.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.12.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_12_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.12.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_12_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.12.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.12.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_12_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.12.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_12_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.12.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.12.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_12_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.12.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_12_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.12.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.12.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_12_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.12.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_12_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.12.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.12.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_12_mlp_up_proj_weight = ttnn.from_torch(sd['layers.12.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_12_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.12.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.12.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_12_mlp_down_proj_weight = ttnn.from_torch(sd['layers.12.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_12_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.12.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.12.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.13.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_13_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.13.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_13_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.13.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.13.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_13_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.13.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_13_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.13.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.13.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_13_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.13.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_13_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.13.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.13.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_13_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.13.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_13_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.13.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.13.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_13_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.13.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_13_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.13.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.13.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_13_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.13.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_13_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.13.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.13.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_13_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.13.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_13_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.13.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.13.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_13_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.13.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_13_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.13.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.13.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_13_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.13.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_13_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.13.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.13.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_13_mlp_up_proj_weight = ttnn.from_torch(sd['layers.13.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_13_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.13.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.13.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_13_mlp_down_proj_weight = ttnn.from_torch(sd['layers.13.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_13_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.13.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.13.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.14.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_14_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.14.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_14_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.14.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.14.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_14_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.14.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_14_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.14.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.14.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_14_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.14.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_14_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.14.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.14.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_14_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.14.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_14_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.14.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.14.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_14_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.14.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_14_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.14.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.14.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_14_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.14.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_14_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.14.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.14.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_14_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.14.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_14_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.14.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.14.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_14_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.14.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_14_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.14.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.14.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_14_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.14.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_14_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.14.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.14.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_14_mlp_up_proj_weight = ttnn.from_torch(sd['layers.14.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_14_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.14.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.14.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_14_mlp_down_proj_weight = ttnn.from_torch(sd['layers.14.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_14_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.14.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.14.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.15.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_15_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.15.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_15_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.15.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.15.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_15_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.15.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_15_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.15.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.15.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_15_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.15.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_15_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.15.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.15.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_15_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.15.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_15_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.15.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.15.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_15_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.15.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_15_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.15.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.15.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_15_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.15.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_15_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.15.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.15.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_15_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.15.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_15_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.15.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.15.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_15_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.15.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_15_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.15.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.15.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_15_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.15.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_15_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.15.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.15.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_15_mlp_up_proj_weight = ttnn.from_torch(sd['layers.15.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_15_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.15.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.15.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_15_mlp_down_proj_weight = ttnn.from_torch(sd['layers.15.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_15_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.15.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.15.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.16.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_16_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.16.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_16_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.16.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.16.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_16_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.16.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_16_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.16.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.16.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_16_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.16.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_16_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.16.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.16.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_16_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.16.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_16_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.16.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.16.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_16_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.16.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_16_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.16.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.16.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_16_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.16.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_16_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.16.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.16.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_16_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.16.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_16_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.16.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.16.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_16_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.16.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_16_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.16.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.16.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_16_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.16.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_16_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.16.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.16.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_16_mlp_up_proj_weight = ttnn.from_torch(sd['layers.16.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_16_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.16.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.16.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_16_mlp_down_proj_weight = ttnn.from_torch(sd['layers.16.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_16_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.16.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.16.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.17.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_17_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.17.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_17_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.17.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.17.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_17_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.17.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_17_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.17.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.17.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_17_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.17.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_17_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.17.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.17.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_17_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.17.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_17_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.17.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.17.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_17_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.17.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_17_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.17.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.17.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_17_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.17.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_17_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.17.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.17.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_17_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.17.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_17_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.17.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.17.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_17_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.17.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_17_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.17.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.17.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_17_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.17.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_17_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.17.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.17.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_17_mlp_up_proj_weight = ttnn.from_torch(sd['layers.17.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_17_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.17.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.17.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_17_mlp_down_proj_weight = ttnn.from_torch(sd['layers.17.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_17_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.17.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.17.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.18.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_18_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.18.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_18_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.18.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.18.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_18_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.18.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_18_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.18.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.18.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_18_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.18.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_18_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.18.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.18.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_18_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.18.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_18_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.18.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.18.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_18_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.18.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_18_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.18.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.18.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_18_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.18.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_18_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.18.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.18.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_18_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.18.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_18_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.18.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.18.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_18_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.18.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_18_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.18.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.18.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_18_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.18.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_18_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.18.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.18.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_18_mlp_up_proj_weight = ttnn.from_torch(sd['layers.18.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_18_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.18.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.18.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_18_mlp_down_proj_weight = ttnn.from_torch(sd['layers.18.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_18_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.18.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.18.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.19.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_19_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.19.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_19_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.19.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.19.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_19_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.19.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_19_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.19.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.19.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_19_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.19.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_19_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.19.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.19.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_19_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.19.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_19_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.19.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.19.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_19_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.19.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_19_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.19.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.19.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_19_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.19.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_19_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.19.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.19.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_19_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.19.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_19_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.19.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.19.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_19_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.19.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_19_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.19.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.19.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_19_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.19.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_19_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.19.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.19.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_19_mlp_up_proj_weight = ttnn.from_torch(sd['layers.19.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_19_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.19.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.19.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_19_mlp_down_proj_weight = ttnn.from_torch(sd['layers.19.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_19_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.19.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.19.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.20.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_20_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.20.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_20_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.20.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.20.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_20_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.20.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_20_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.20.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.20.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_20_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.20.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_20_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.20.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.20.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_20_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.20.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_20_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.20.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.20.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_20_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.20.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_20_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.20.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.20.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_20_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.20.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_20_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.20.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.20.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_20_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.20.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_20_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.20.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.20.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_20_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.20.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_20_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.20.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.20.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_20_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.20.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_20_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.20.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.20.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_20_mlp_up_proj_weight = ttnn.from_torch(sd['layers.20.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_20_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.20.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.20.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_20_mlp_down_proj_weight = ttnn.from_torch(sd['layers.20.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_20_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.20.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.20.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.21.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_21_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.21.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_21_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.21.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.21.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_21_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.21.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_21_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.21.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.21.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_21_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.21.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_21_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.21.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.21.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_21_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.21.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_21_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.21.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.21.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_21_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.21.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_21_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.21.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.21.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_21_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.21.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_21_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.21.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.21.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_21_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.21.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_21_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.21.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.21.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_21_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.21.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_21_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.21.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.21.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_21_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.21.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_21_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.21.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.21.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_21_mlp_up_proj_weight = ttnn.from_torch(sd['layers.21.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_21_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.21.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.21.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_21_mlp_down_proj_weight = ttnn.from_torch(sd['layers.21.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_21_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.21.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.21.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.22.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_22_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.22.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_22_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.22.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.22.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_22_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.22.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_22_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.22.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.22.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_22_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.22.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_22_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.22.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.22.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_22_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.22.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_22_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.22.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.22.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_22_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.22.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_22_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.22.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.22.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_22_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.22.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_22_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.22.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.22.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_22_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.22.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_22_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.22.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.22.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_22_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.22.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_22_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.22.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.22.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_22_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.22.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_22_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.22.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.22.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_22_mlp_up_proj_weight = ttnn.from_torch(sd['layers.22.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_22_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.22.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.22.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_22_mlp_down_proj_weight = ttnn.from_torch(sd['layers.22.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_22_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.22.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.22.mlp.act_fn  (SILU)
 
         # op-REUSE: layers.23.self_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_23_self_attn_q_proj_weight = ttnn.from_torch(sd['layers.23.self_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_23_self_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.23.self_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.23.self_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_23_self_attn_k_proj_weight = ttnn.from_torch(sd['layers.23.self_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_23_self_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.23.self_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.23.self_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_23_self_attn_v_proj_weight = ttnn.from_torch(sd['layers.23.self_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_23_self_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.23.self_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.23.self_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_23_self_attn_o_proj_weight = ttnn.from_torch(sd['layers.23.self_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_23_self_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.23.self_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.23.cross_attn.q_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_23_cross_attn_q_proj_weight = ttnn.from_torch(sd['layers.23.cross_attn.q_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_23_cross_attn_q_proj_weight = ttnn.from_torch(
+            sd["layers.23.cross_attn.q_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.23.cross_attn.k_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_23_cross_attn_k_proj_weight = ttnn.from_torch(sd['layers.23.cross_attn.k_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_23_cross_attn_k_proj_weight = ttnn.from_torch(
+            sd["layers.23.cross_attn.k_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.23.cross_attn.v_proj  (Linear 2048 -> 1024, bias=False)
-        self.w_layers_23_cross_attn_v_proj_weight = ttnn.from_torch(sd['layers.23.cross_attn.v_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_23_cross_attn_v_proj_weight = ttnn.from_torch(
+            sd["layers.23.cross_attn.v_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.23.cross_attn.o_proj  (Linear 2048 -> 2048, bias=False)
-        self.w_layers_23_cross_attn_o_proj_weight = ttnn.from_torch(sd['layers.23.cross_attn.o_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_23_cross_attn_o_proj_weight = ttnn.from_torch(
+            sd["layers.23.cross_attn.o_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.23.mlp.gate_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_23_mlp_gate_proj_weight = ttnn.from_torch(sd['layers.23.mlp.gate_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_23_mlp_gate_proj_weight = ttnn.from_torch(
+            sd["layers.23.mlp.gate_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.23.mlp.up_proj  (Linear 2048 -> 6144, bias=False)
-        self.w_layers_23_mlp_up_proj_weight = ttnn.from_torch(sd['layers.23.mlp.up_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_23_mlp_up_proj_weight = ttnn.from_torch(
+            sd["layers.23.mlp.up_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.23.mlp.down_proj  (Linear 6144 -> 2048, bias=False)
-        self.w_layers_23_mlp_down_proj_weight = ttnn.from_torch(sd['layers.23.mlp.down_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_layers_23_mlp_down_proj_weight = ttnn.from_torch(
+            sd["layers.23.mlp.down_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: layers.23.mlp.act_fn  (SILU)
 
         # op-REUSE: time_embed.linear_1  (Linear 256 -> 2048, bias=True)
-        self.w_time_embed_linear_1_weight = ttnn.from_torch(sd['time_embed.linear_1.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_time_embed_linear_1_bias = ttnn.from_torch(sd['time_embed.linear_1.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_time_embed_linear_1_weight = ttnn.from_torch(
+            sd["time_embed.linear_1.weight"].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_time_embed_linear_1_bias = ttnn.from_torch(
+            sd["time_embed.linear_1.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
 
         # op-REUSE: time_embed.act1  (SILU)
 
         # op-REUSE: time_embed.linear_2  (Linear 2048 -> 2048, bias=True)
-        self.w_time_embed_linear_2_weight = ttnn.from_torch(sd['time_embed.linear_2.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_time_embed_linear_2_bias = ttnn.from_torch(sd['time_embed.linear_2.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_time_embed_linear_2_weight = ttnn.from_torch(
+            sd["time_embed.linear_2.weight"].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_time_embed_linear_2_bias = ttnn.from_torch(
+            sd["time_embed.linear_2.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
 
         # op-REUSE: time_embed.act2  (SILU)
 
         # op-REUSE: time_embed.time_proj  (Linear 2048 -> 12288, bias=True)
-        self.w_time_embed_time_proj_weight = ttnn.from_torch(sd['time_embed.time_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_time_embed_time_proj_bias = ttnn.from_torch(sd['time_embed.time_proj.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_time_embed_time_proj_weight = ttnn.from_torch(
+            sd["time_embed.time_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
+        self.w_time_embed_time_proj_bias = ttnn.from_torch(
+            sd["time_embed.time_proj.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
 
         # op-REUSE: time_embed_r.linear_1  (Linear 256 -> 2048, bias=True)
-        self.w_time_embed_r_linear_1_weight = ttnn.from_torch(sd['time_embed_r.linear_1.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_time_embed_r_linear_1_bias = ttnn.from_torch(sd['time_embed_r.linear_1.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_time_embed_r_linear_1_weight = ttnn.from_torch(
+            sd["time_embed_r.linear_1.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
+        self.w_time_embed_r_linear_1_bias = ttnn.from_torch(
+            sd["time_embed_r.linear_1.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
 
         # op-REUSE: time_embed_r.act1  (SILU)
 
         # op-REUSE: time_embed_r.linear_2  (Linear 2048 -> 2048, bias=True)
-        self.w_time_embed_r_linear_2_weight = ttnn.from_torch(sd['time_embed_r.linear_2.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_time_embed_r_linear_2_bias = ttnn.from_torch(sd['time_embed_r.linear_2.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_time_embed_r_linear_2_weight = ttnn.from_torch(
+            sd["time_embed_r.linear_2.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
+        self.w_time_embed_r_linear_2_bias = ttnn.from_torch(
+            sd["time_embed_r.linear_2.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
 
         # op-REUSE: time_embed_r.act2  (SILU)
 
         # op-REUSE: time_embed_r.time_proj  (Linear 2048 -> 12288, bias=True)
-        self.w_time_embed_r_time_proj_weight = ttnn.from_torch(sd['time_embed_r.time_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_time_embed_r_time_proj_bias = ttnn.from_torch(sd['time_embed_r.time_proj.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_time_embed_r_time_proj_weight = ttnn.from_torch(
+            sd["time_embed_r.time_proj.weight"].T.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
+        self.w_time_embed_r_time_proj_bias = ttnn.from_torch(
+            sd["time_embed_r.time_proj.bias"].reshape(1, -1),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
 
         # op-REUSE: condition_embedder  (Linear 2048 -> 2048, bias=True)
-        self.w_condition_embedder_weight = ttnn.from_torch(sd['condition_embedder.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_condition_embedder_bias = ttnn.from_torch(sd['condition_embedder.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_condition_embedder_weight = ttnn.from_torch(
+            sd["condition_embedder.weight"].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_condition_embedder_bias = ttnn.from_torch(
+            sd["condition_embedder.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
 
     def _apply_layers_0_self_attn_q_proj(self, x):
         return self._lin(x, self.w_layers_0_self_attn_q_proj_weight)
@@ -2556,7 +3933,7 @@ class AceStepDiTModel:
         return ttnn.linear(x, weight, bias=bias, compute_kernel_config=self._ckc)
 
     def _extra_weight(self, key, transform=None):
-        cache = getattr(self, '_extra_weight_cache', None)
+        cache = getattr(self, "_extra_weight_cache", None)
         if cache is None:
             cache = {}
             self._extra_weight_cache = cache
@@ -2565,7 +3942,9 @@ class AceStepDiTModel:
             t = sd[key]
             if transform is not None:
                 t = transform(t)
-            cache[key] = ttnn.from_torch(t.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+            cache[key] = ttnn.from_torch(
+                t.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
+            )
         return cache[key]
 
     def _apply_rms_norm(self, x, weight_key, eps):
@@ -2573,7 +3952,7 @@ class AceStepDiTModel:
         return ttnn.rms_norm(x, weight=w, epsilon=eps, compute_kernel_config=self._ckc)
 
     def _get_rotary_embeddings(self, seq_len):
-        cache = getattr(self, '_rope_cache', None)
+        cache = getattr(self, "_rope_cache", None)
         if cache is None:
             cache = {}
             self._rope_cache = cache
@@ -2581,8 +3960,8 @@ class AceStepDiTModel:
             config = self._torch_module.config
             hidden_size = config.hidden_size
             num_heads = config.num_attention_heads
-            head_dim = getattr(config, 'head_dim', hidden_size // num_heads)
-            theta = float(getattr(config, 'rope_theta', 10000.0))
+            head_dim = getattr(config, "head_dim", hidden_size // num_heads)
+            theta = float(getattr(config, "rope_theta", 10000.0))
             inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
             positions = torch.arange(seq_len, dtype=torch.float32)
             freqs = torch.outer(positions, inv_freq)
@@ -2595,7 +3974,7 @@ class AceStepDiTModel:
         return cache[seq_len]
 
     def _get_sinusoidal_freqs(self, half_dim, max_period=10000.0):
-        cache = getattr(self, '_sinusoidal_freq_cache', None)
+        cache = getattr(self, "_sinusoidal_freq_cache", None)
         if cache is None:
             cache = {}
             self._sinusoidal_freq_cache = cache
@@ -2618,15 +3997,15 @@ class AceStepDiTModel:
         return ttnn.concat([ttnn.cos(args), ttnn.sin(args)], dim=-1)
 
     def _get_conv_proj_in(self):
-        cache = getattr(self, '_proj_in_cache', None)
+        cache = getattr(self, "_proj_in_cache", None)
         if cache is None:
             sd = self._torch_module.state_dict()
-            w = sd['proj_in.1.weight']  # Conv1d weight: (out_channels, in_channels, kernel)
+            w = sd["proj_in.1.weight"]  # Conv1d weight: (out_channels, in_channels, kernel)
             out_c, in_c, k = w.shape
             # kernel == stride, no overlap -> patch-conv is equivalent to a
             # linear layer over (kernel * in_channels) reshaped input.
             w_lin = w.permute(0, 2, 1).reshape(out_c, k * in_c).T.contiguous()
-            b = sd['proj_in.1.bias'].reshape(1, -1)
+            b = sd["proj_in.1.bias"].reshape(1, -1)
             w_tt = ttnn.from_torch(w_lin, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
             b_tt = ttnn.from_torch(b, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
             cache = (w_tt, b_tt, k)
@@ -2640,13 +4019,13 @@ class AceStepDiTModel:
         return self._lin(x, w_tt, bias=b_tt)
 
     def _get_conv_proj_out(self):
-        cache = getattr(self, '_proj_out_cache', None)
+        cache = getattr(self, "_proj_out_cache", None)
         if cache is None:
             sd = self._torch_module.state_dict()
-            w = sd['proj_out.1.weight']  # ConvTranspose1d weight: (in_channels, out_channels, kernel)
+            w = sd["proj_out.1.weight"]  # ConvTranspose1d weight: (in_channels, out_channels, kernel)
             in_c, out_c, k = w.shape
             w_lin = w.permute(0, 2, 1).reshape(in_c, k * out_c).contiguous()
-            bias = sd['proj_out.1.bias']
+            bias = sd["proj_out.1.bias"]
             bias_tiled = bias.repeat(k).reshape(1, -1)
             w_tt = ttnn.from_torch(w_lin, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
             b_tt = ttnn.from_torch(bias_tiled, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
@@ -2660,37 +4039,54 @@ class AceStepDiTModel:
         b_, tp_, _ = list(y.shape)
         return ttnn.reshape(y, (b_, tp_ * patch_size, out_c))
 
-    def __call__(self, hidden_states=None, timestep=None, timestep_r=None, attention_mask=None,
-                 encoder_hidden_states=None, encoder_attention_mask=None, context_latents=None,
-                 use_cache=False, **kwargs):
+    def __call__(
+        self,
+        hidden_states=None,
+        timestep=None,
+        timestep_r=None,
+        attention_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        context_latents=None,
+        use_cache=False,
+        **kwargs,
+    ):
         device = self.device
         config = self._torch_module.config
         hidden_size = config.hidden_size
         num_heads = config.num_attention_heads
         num_kv_heads = config.num_key_value_heads
-        head_dim = getattr(config, 'head_dim', hidden_size // num_heads)
+        head_dim = getattr(config, "head_dim", hidden_size // num_heads)
         patch_size = config.patch_size
         eps = config.rms_norm_eps
         num_layers = config.num_hidden_layers
-        attn_scale = head_dim ** -0.5
+        attn_scale = head_dim**-0.5
 
         if hidden_states is None:
-            hidden_states = kwargs.get('hidden_states')
+            hidden_states = kwargs.get("hidden_states")
 
         if isinstance(hidden_states, torch.Tensor):
             hidden_states = ttnn.from_torch(hidden_states, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
         if isinstance(encoder_hidden_states, torch.Tensor):
-            encoder_hidden_states = ttnn.from_torch(encoder_hidden_states, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+            encoder_hidden_states = ttnn.from_torch(
+                encoder_hidden_states, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            )
 
         if isinstance(context_latents, torch.Tensor):
-            context_latents = ttnn.from_torch(context_latents, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+            context_latents = ttnn.from_torch(
+                context_latents, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            )
 
         if isinstance(timestep, torch.Tensor):
-            timestep = ttnn.from_torch(timestep.reshape(-1, 1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+            timestep = ttnn.from_torch(
+                timestep.reshape(-1, 1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            )
 
         if isinstance(timestep_r, torch.Tensor):
-            timestep_r = ttnn.from_torch(timestep_r.reshape(-1, 1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+            timestep_r = ttnn.from_torch(
+                timestep_r.reshape(-1, 1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+            )
 
         # NOTE: the HF reference unconditionally overwrites both `attention_mask`
         # and `encoder_attention_mask` to `None` before building its internal
@@ -2734,9 +4130,9 @@ class AceStepDiTModel:
         cos_tt, sin_tt = self._get_rotary_embeddings(seq_len)
 
         for layer_idx in range(num_layers):
-            prefix = f'layers.{layer_idx}'
+            prefix = f"layers.{layer_idx}"
 
-            sst = self._extra_weight(f'{prefix}.scale_shift_table')  # (1, 6, hidden)
+            sst = self._extra_weight(f"{prefix}.scale_shift_table")  # (1, 6, hidden)
             mod = ttnn.add(sst, timestep_proj)
             shift_msa = ttnn.slice(mod, [0, 0, 0], [b_, 1, hidden_size])
             scale_msa = ttnn.slice(mod, [0, 1, 0], [b_, 2, hidden_size])
@@ -2746,19 +4142,19 @@ class AceStepDiTModel:
             c_gate_msa = ttnn.slice(mod, [0, 5, 0], [b_, 6, hidden_size])
 
             # --- self-attention with AdaLN ---
-            norm_hs = self._apply_rms_norm(hs, f'{prefix}.self_attn_norm.weight', eps)
+            norm_hs = self._apply_rms_norm(hs, f"{prefix}.self_attn_norm.weight", eps)
             norm_hs = ttnn.add(ttnn.multiply(norm_hs, ttnn.add(scale_msa, 1.0)), shift_msa)
 
-            q = getattr(self, f'_apply_layers_{layer_idx}_self_attn_q_proj')(norm_hs)
-            k = getattr(self, f'_apply_layers_{layer_idx}_self_attn_k_proj')(norm_hs)
-            v = getattr(self, f'_apply_layers_{layer_idx}_self_attn_v_proj')(norm_hs)
+            q = getattr(self, f"_apply_layers_{layer_idx}_self_attn_q_proj")(norm_hs)
+            k = getattr(self, f"_apply_layers_{layer_idx}_self_attn_k_proj")(norm_hs)
+            v = getattr(self, f"_apply_layers_{layer_idx}_self_attn_v_proj")(norm_hs)
 
             q = ttnn.reshape(q, (b_, seq_len, num_heads, head_dim))
-            q = self._apply_rms_norm(q, f'{prefix}.self_attn.q_norm.weight', eps)
+            q = self._apply_rms_norm(q, f"{prefix}.self_attn.q_norm.weight", eps)
             q = ttnn.permute(q, (0, 2, 1, 3))
 
             k = ttnn.reshape(k, (b_, seq_len, num_kv_heads, head_dim))
-            k = self._apply_rms_norm(k, f'{prefix}.self_attn.k_norm.weight', eps)
+            k = self._apply_rms_norm(k, f"{prefix}.self_attn.k_norm.weight", eps)
             k = ttnn.permute(k, (0, 2, 1, 3))
 
             v = ttnn.reshape(v, (b_, seq_len, num_kv_heads, head_dim))
@@ -2767,58 +4163,62 @@ class AceStepDiTModel:
             q = ttnn.experimental.rotary_embedding_hf(q, cos_tt, sin_tt, is_decode_mode=False)
             k = ttnn.experimental.rotary_embedding_hf(k, cos_tt, sin_tt, is_decode_mode=False)
 
-            attn = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=False, scale=attn_scale, compute_kernel_config=self._ckc)
+            attn = ttnn.transformer.scaled_dot_product_attention(
+                q, k, v, is_causal=False, scale=attn_scale, compute_kernel_config=self._ckc
+            )
             attn = ttnn.permute(attn, (0, 2, 1, 3))
             attn = ttnn.reshape(attn, (b_, seq_len, num_heads * head_dim))
-            attn_out = getattr(self, f'_apply_layers_{layer_idx}_self_attn_o_proj')(attn)
+            attn_out = getattr(self, f"_apply_layers_{layer_idx}_self_attn_o_proj")(attn)
 
             hs = ttnn.add(hs, ttnn.multiply(attn_out, gate_msa))
 
             # --- cross-attention (plain residual, no AdaLN gate) ---
-            norm_hs2 = self._apply_rms_norm(hs, f'{prefix}.cross_attn_norm.weight', eps)
+            norm_hs2 = self._apply_rms_norm(hs, f"{prefix}.cross_attn_norm.weight", eps)
 
-            qc = getattr(self, f'_apply_layers_{layer_idx}_cross_attn_q_proj')(norm_hs2)
-            kc = getattr(self, f'_apply_layers_{layer_idx}_cross_attn_k_proj')(enc)
-            vc = getattr(self, f'_apply_layers_{layer_idx}_cross_attn_v_proj')(enc)
+            qc = getattr(self, f"_apply_layers_{layer_idx}_cross_attn_q_proj")(norm_hs2)
+            kc = getattr(self, f"_apply_layers_{layer_idx}_cross_attn_k_proj")(enc)
+            vc = getattr(self, f"_apply_layers_{layer_idx}_cross_attn_v_proj")(enc)
 
             qc = ttnn.reshape(qc, (b_, seq_len, num_heads, head_dim))
-            qc = self._apply_rms_norm(qc, f'{prefix}.cross_attn.q_norm.weight', eps)
+            qc = self._apply_rms_norm(qc, f"{prefix}.cross_attn.q_norm.weight", eps)
             qc = ttnn.permute(qc, (0, 2, 1, 3))
 
             kc = ttnn.reshape(kc, (b_, enc_seq_len, num_kv_heads, head_dim))
-            kc = self._apply_rms_norm(kc, f'{prefix}.cross_attn.k_norm.weight', eps)
+            kc = self._apply_rms_norm(kc, f"{prefix}.cross_attn.k_norm.weight", eps)
             kc = ttnn.permute(kc, (0, 2, 1, 3))
 
             vc = ttnn.reshape(vc, (b_, enc_seq_len, num_kv_heads, head_dim))
             vc = ttnn.permute(vc, (0, 2, 1, 3))
 
-            cattn = ttnn.transformer.scaled_dot_product_attention(qc, kc, vc, is_causal=False, scale=attn_scale, compute_kernel_config=self._ckc)
+            cattn = ttnn.transformer.scaled_dot_product_attention(
+                qc, kc, vc, is_causal=False, scale=attn_scale, compute_kernel_config=self._ckc
+            )
             cattn = ttnn.permute(cattn, (0, 2, 1, 3))
             cattn = ttnn.reshape(cattn, (b_, seq_len, num_heads * head_dim))
-            cattn_out = getattr(self, f'_apply_layers_{layer_idx}_cross_attn_o_proj')(cattn)
+            cattn_out = getattr(self, f"_apply_layers_{layer_idx}_cross_attn_o_proj")(cattn)
 
             hs = ttnn.add(hs, cattn_out)
 
             # --- MLP with AdaLN ---
-            norm_hs3 = self._apply_rms_norm(hs, f'{prefix}.mlp_norm.weight', eps)
+            norm_hs3 = self._apply_rms_norm(hs, f"{prefix}.mlp_norm.weight", eps)
             norm_hs3 = ttnn.add(ttnn.multiply(norm_hs3, ttnn.add(c_scale_msa, 1.0)), c_shift_msa)
 
-            gate = getattr(self, f'_apply_layers_{layer_idx}_mlp_gate_proj')(norm_hs3)
-            up = getattr(self, f'_apply_layers_{layer_idx}_mlp_up_proj')(norm_hs3)
-            gate = getattr(self, f'_apply_layers_{layer_idx}_mlp_act_fn')(gate)
+            gate = getattr(self, f"_apply_layers_{layer_idx}_mlp_gate_proj")(norm_hs3)
+            up = getattr(self, f"_apply_layers_{layer_idx}_mlp_up_proj")(norm_hs3)
+            gate = getattr(self, f"_apply_layers_{layer_idx}_mlp_act_fn")(gate)
             ffn = ttnn.multiply(gate, up)
-            ffn = getattr(self, f'_apply_layers_{layer_idx}_mlp_down_proj')(ffn)
+            ffn = getattr(self, f"_apply_layers_{layer_idx}_mlp_down_proj")(ffn)
 
             hs = ttnn.add(hs, ttnn.multiply(ffn, c_gate_msa))
 
         # --- output head: adaptive norm_out + de-patchify ---
-        top_sst = self._extra_weight('scale_shift_table')  # (1, 2, hidden)
+        top_sst = self._extra_weight("scale_shift_table")  # (1, 2, hidden)
         temb_unsq = ttnn.reshape(temb, (b_, 1, hidden_size))
         mod_out = ttnn.add(top_sst, temb_unsq)
         shift = ttnn.slice(mod_out, [0, 0, 0], [b_, 1, hidden_size])
         scale_out = ttnn.slice(mod_out, [0, 1, 0], [b_, 2, hidden_size])
 
-        hs = self._apply_rms_norm(hs, 'norm_out.weight', eps)
+        hs = self._apply_rms_norm(hs, "norm_out.weight", eps)
         hs = ttnn.add(ttnn.multiply(hs, ttnn.add(scale_out, 1.0)), shift)
 
         out = self._apply_proj_out(hs, patch_size)
@@ -2828,15 +4228,20 @@ class AceStepDiTModel:
 
         return (out, None)
 
+
 def build(device, torch_module):
     return AceStepDiTModel(device, torch_module)
 
+
 _instance = None
+
 
 def ace_step_di_t_model(*args, **kwargs):
     global _instance
     if _instance is None:
-        model = transformers.AutoModel.from_pretrained(HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True)
+        model = transformers.AutoModel.from_pretrained(
+            HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True
+        )
         model.eval()
         torch_sub = None
         for path in _CANDIDATE_SUBMODULE_PATHS:
@@ -2846,6 +4251,6 @@ def ace_step_di_t_model(*args, **kwargs):
             except (AttributeError, IndexError, KeyError, TypeError):
                 continue
         if torch_sub is None:
-            raise RuntimeError('partial-stub: could not resolve `ace_step_di_t_model`')
+            raise RuntimeError("partial-stub: could not resolve `ace_step_di_t_model`")
         _instance = build(ttnn.open_device(device_id=0), torch_sub)
     return _instance(*args, **kwargs)

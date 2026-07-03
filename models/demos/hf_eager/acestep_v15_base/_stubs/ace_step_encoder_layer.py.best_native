@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import torch
 import transformers
-
 import ttnn
 
 HF_MODEL_ID = "ACE-Step/acestep-v15-base"

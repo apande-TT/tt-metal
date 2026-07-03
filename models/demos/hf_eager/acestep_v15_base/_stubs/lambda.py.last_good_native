@@ -1,15 +1,12 @@
 import torch
-
 import ttnn
 
 
 def _coerce_to_torch(x):
     try:
         import ttnn as _ttnn
-
         if isinstance(x, _ttnn.Tensor):
             import torch as _torch
-
             t = _ttnn.to_torch(x)
             # Bug Y fix (2026-05-23 live-run sam2-hiera-tiny)
             if t.is_floating_point():
@@ -37,7 +34,7 @@ class Lambda:
     def _pick_tensor(self, value):
         if torch.is_tensor(value):
             return value
-        if hasattr(value, "last_hidden_state") and torch.is_tensor(value.last_hidden_state):
+        if hasattr(value, 'last_hidden_state') and torch.is_tensor(value.last_hidden_state):
             return value.last_hidden_state
         if isinstance(value, dict):
             for v in value.values():
@@ -76,8 +73,8 @@ def _lambda_shim(*args, **kwargs):
     global _instance
     if _instance is None:
         raise RuntimeError(
-            "Synthesized TTNN module requires `build(device, torch_module)`. "
-            "Call it from the PCC test's `_build_ttnn_port`."
+            'Synthesized TTNN module requires `build(device, torch_module)`. '
+            'Call it from the PCC test\'s `_build_ttnn_port`.'
         )
     return _instance(*args, **kwargs)
 

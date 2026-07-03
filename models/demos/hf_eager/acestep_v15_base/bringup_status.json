@@ -1,14 +1,14 @@
 {
   "new_model_id": "ACE-Step/acestep-v15-base",
   "new_model_type": "acestep",
-  "sibling_hf_id": null,
-  "sibling_model_type": null,
+  "sibling_hf_id": "ACE-Step/acestep-v15-base",
+  "sibling_model_type": "acestep",
   "backend": {
-    "name": "hf_eager universal (TTS)",
-    "demo_path": "models/demos/hf_eager/demo.py"
+    "name": "ACE-Step v1.5 (tt_dit flow-matching)",
+    "demo_path": "models/tt_dit/pipelines/acestep"
   },
   "counts": {
-    "REUSE": 6,
+    "REUSE": 4,
     "ADAPT": 0,
     "NEW": 13
   },
@@ -32,50 +32,6 @@
   ],
   "components": [
     {
-      "name": "attention",
-      "kind": "attention",
-      "status": "REUSE",
-      "new_shape": {
-        "hidden_size": 2048,
-        "num_hidden_layers": 24,
-        "num_attention_heads": 16,
-        "num_key_value_heads": 8,
-        "intermediate_size": 6144,
-        "hidden_act": "silu",
-        "patch_size": 2,
-        "vocab_size": 64003,
-        "max_position_embeddings": 32768
-      },
-      "sibling_shape": {},
-      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
-      "hf_reference": null,
-      "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0.",
-      "submodule_path": null,
-      "class_name": null
-    },
-    {
-      "name": "mlp",
-      "kind": "mlp",
-      "status": "REUSE",
-      "new_shape": {
-        "hidden_size": 2048,
-        "num_hidden_layers": 24,
-        "num_attention_heads": 16,
-        "num_key_value_heads": 8,
-        "intermediate_size": 6144,
-        "hidden_act": "silu",
-        "patch_size": 2,
-        "vocab_size": 64003,
-        "max_position_embeddings": 32768
-      },
-      "sibling_shape": {},
-      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
-      "hf_reference": null,
-      "notes": "reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh.",
-      "submodule_path": null,
-      "class_name": null
-    },
-    {
       "name": "ace_step_di_t_model",
       "kind": "AceStepDiTModel",
       "status": "NEW",
@@ -83,7 +39,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=475 sample_paths=['decoder'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=1 leaves=475 sample_paths=['decoder']",
       "submodule_path": "decoder",
       "class_name": "AceStepDiTModel"
     },
@@ -95,7 +51,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=24 leaves=456 sample_paths=['decoder.layers.0', 'decoder.layers.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=24 leaves=456 sample_paths=['decoder.layers.0', 'decoder.layers.1']",
       "submodule_path": "decoder.layers.0",
       "class_name": "AceStepDiTLayer"
     },
@@ -107,7 +63,7 @@
       "sibling_shape": {},
       "tt_reuse_target": "models/tt_transformers/tt/attention.py",
       "hf_reference": null,
-      "notes": "[supplemental module-tree pass] reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=64 leaves=384 sample_paths=['decoder.layers.0.self_attn', 'decoder.layers.0.cross_attn'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=64 leaves=384 sample_paths=['decoder.layers.0.self_attn', 'decoder.layers.0.cross_attn']",
       "submodule_path": "decoder.layers.0.self_attn",
       "class_name": "AceStepAttention"
     },
@@ -119,7 +75,7 @@
       "sibling_shape": {},
       "tt_reuse_target": "models/common/rmsnorm.py",
       "hf_reference": null,
-      "notes": "[supplemental module-tree pass] reuse_registry: rmsnorm_text -> models/common/rmsnorm.py::RMSNorm (REUSE). derived from compatibility.py BUILDING_BLOCKS 'RMSNorm (text)'. ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip. | module-tree: occ=237 leaves=237 sample_paths=['decoder.layers.0.self_attn_norm', 'decoder.layers.0.self_attn.q_norm'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "reuse_registry: rmsnorm_text -> models/common/rmsnorm.py::RMSNorm (REUSE). derived from compatibility.py BUILDING_BLOCKS 'RMSNorm (text)'. ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip. | module-tree: occ=237 leaves=237 sample_paths=['decoder.layers.0.self_attn_norm', 'decoder.layers.0.self_attn.q_norm']",
       "submodule_path": "decoder.layers.0.self_attn_norm",
       "class_name": "Qwen3RMSNorm"
     },
@@ -131,7 +87,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=16 leaves=192 sample_paths=['encoder.lyric_encoder.layers.0', 'encoder.lyric_encoder.layers.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=16 leaves=192 sample_paths=['encoder.lyric_encoder.layers.0', 'encoder.lyric_encoder.layers.1']",
       "submodule_path": "encoder.lyric_encoder.layers.0",
       "class_name": "AceStepEncoderLayer"
     },
@@ -143,7 +99,7 @@
       "sibling_shape": {},
       "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
       "hf_reference": null,
-      "notes": "[supplemental module-tree pass] reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | module-tree: occ=40 leaves=160 sample_paths=['decoder.layers.0.mlp', 'decoder.layers.1.mlp'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | module-tree: occ=40 leaves=160 sample_paths=['decoder.layers.0.mlp', 'decoder.layers.1.mlp']",
       "submodule_path": "decoder.layers.0.mlp",
       "class_name": "Qwen3MLP"
     },
@@ -155,7 +111,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=151 sample_paths=['encoder'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=1 leaves=151 sample_paths=['encoder']",
       "submodule_path": "encoder",
       "class_name": "AceStepConditionEncoder"
     },
@@ -167,7 +123,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=99 sample_paths=['encoder.lyric_encoder'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=1 leaves=99 sample_paths=['encoder.lyric_encoder']",
       "submodule_path": "encoder.lyric_encoder",
       "class_name": "AceStepLyricEncoder"
     },
@@ -179,7 +135,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=51 sample_paths=['encoder.timbre_encoder'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=1 leaves=51 sample_paths=['encoder.timbre_encoder']",
       "submodule_path": "encoder.timbre_encoder",
       "class_name": "AceStepTimbreEncoder"
     },
@@ -191,7 +147,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=32 sample_paths=['tokenizer'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=1 leaves=32 sample_paths=['tokenizer']",
       "submodule_path": "tokenizer",
       "class_name": "AceStepAudioTokenizer"
     },
@@ -203,7 +159,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=28 sample_paths=['detokenizer'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=1 leaves=28 sample_paths=['detokenizer']",
       "submodule_path": "detokenizer",
       "class_name": "AudioTokenDetokenizer"
     },
@@ -215,7 +171,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=27 sample_paths=['tokenizer.attention_pooler'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=1 leaves=27 sample_paths=['tokenizer.attention_pooler']",
       "submodule_path": "tokenizer.attention_pooler",
       "class_name": "AttentionPooler"
     },
@@ -227,7 +183,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=2 leaves=10 sample_paths=['decoder.time_embed', 'decoder.time_embed_r'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=2 leaves=10 sample_paths=['decoder.time_embed', 'decoder.time_embed_r']",
       "submodule_path": "decoder.time_embed",
       "class_name": "TimestepEmbedding"
     },
@@ -239,7 +195,7 @@
       "sibling_shape": {},
       "tt_reuse_target": "models/tt_transformers/tt/rope.py",
       "hf_reference": null,
-      "notes": "[supplemental module-tree pass] reuse_registry: standard_rope -> models/tt_transformers/tt/rope.py::RotaryEmbedding (REUSE). derived from compatibility.py BUILDING_BLOCKS 'Standard RoPE'. | module-tree: occ=5 leaves=5 sample_paths=['decoder.rotary_emb', 'encoder.lyric_encoder.rotary_emb'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "reuse_registry: standard_rope -> models/tt_transformers/tt/rope.py::RotaryEmbedding (REUSE). derived from compatibility.py BUILDING_BLOCKS 'Standard RoPE'. | module-tree: occ=5 leaves=5 sample_paths=['decoder.rotary_emb', 'encoder.lyric_encoder.rotary_emb']",
       "submodule_path": "decoder.rotary_emb",
       "class_name": "Qwen3RotaryEmbedding"
     },
@@ -251,7 +207,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=4 leaves=4 sample_paths=['decoder.proj_in.0', 'decoder.proj_in.2'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=4 leaves=4 sample_paths=['decoder.proj_in.0', 'decoder.proj_in.2']",
       "submodule_path": "decoder.proj_in.0",
       "class_name": "Lambda"
     },
@@ -263,7 +219,7 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=4 sample_paths=['tokenizer.quantizer'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=1 leaves=4 sample_paths=['tokenizer.quantizer']",
       "submodule_path": "tokenizer.quantizer",
       "class_name": "ResidualFSQ"
     },
@@ -275,12 +231,10 @@
       "sibling_shape": {},
       "tt_reuse_target": null,
       "hf_reference": "transformers/src/transformers/models/acestep/modeling_acestep.py",
-      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=2 sample_paths=['tokenizer.quantizer.layers.0'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "notes": "module-tree: occ=1 leaves=2 sample_paths=['tokenizer.quantizer.layers.0']",
       "submodule_path": "tokenizer.quantizer.layers.0",
       "class_name": "FSQ"
     }
   ],
-  "notes": [
-    "Sibling config could not be fetched; classification falls back to NEW for components without a clear file match. Set HF_TOKEN or pre-download `None` and re-run for a sharper diff."
-  ]
+  "notes": []
 }

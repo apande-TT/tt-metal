@@ -36,14 +36,19 @@ LLM_GAPs (op-NEW — still need synthesis):
 
 HF reference: transformers/src/transformers/models/acestep/modeling_acestep.py
 Op counts: total=5  op-REUSE=5  op-ADAPT=0  op-NEW=0"""
+
 from __future__ import annotations
+
 import math
+
 import torch
-import ttnn
 import transformers
 
-HF_MODEL_ID = 'ACE-Step/acestep-v15-base'
-_CANDIDATE_SUBMODULE_PATHS = ['decoder.time_embed']
+import ttnn
+
+HF_MODEL_ID = "ACE-Step/acestep-v15-base"
+_CANDIDATE_SUBMODULE_PATHS = ["decoder.time_embed"]
+
 
 def _log_runtime_fallback(helper, kind, reason):
     """Append a structured CPU-fallback event for the planner reporter.
@@ -54,8 +59,12 @@ def _log_runtime_fallback(helper, kind, reason):
     before each pytest invocation and consumes it afterwards.
     """
     try:
-        import sys as _sys, json as _json, os as _os, time as _time
+        import json as _json
+        import os as _os
+        import sys as _sys
+        import time as _time
         from pathlib import Path as _Path
+
         _sys.stderr.write("[%s_CPU_FALLBACK] %s: %s\n" % (kind.upper(), helper, reason))
         log_env = _os.environ.get("TT_HW_PLANNER_RUNTIME_FALLBACK_LOG")
         if log_env:
@@ -77,8 +86,8 @@ def _log_runtime_fallback(helper, kind, reason):
         pass
 
 
-_LLM_GAPS = [
-]
+_LLM_GAPS = []
+
 
 def _resolve(obj, dotted):
     cur = obj
@@ -91,11 +100,14 @@ def _resolve(obj, dotted):
             cur = getattr(cur, tok)
     return cur
 
+
 def _coerce_to_torch(x):
     try:
         import ttnn as _ttnn
+
         if isinstance(x, _ttnn.Tensor):
             import torch as _torch
+
             t = _ttnn.to_torch(x)
             # Bug Y fix (2026-05-23 live-run sam2-hiera-tiny)
             if t.is_floating_point():
@@ -114,26 +126,39 @@ def _coerce_to_torch(x):
         return {k: _coerce_to_torch(v) for k, v in x.items()}
     return x
 
+
 class TimestepEmbedding:
     def __init__(self, device, torch_module):
         self.device = device
         self._torch_module = torch_module
         sd = torch_module.state_dict()
         # op-REUSE: linear_1  (Linear 256 -> 2048, bias=True)
-        self.w_linear_1_weight = ttnn.from_torch(sd['linear_1.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_linear_1_bias = ttnn.from_torch(sd['linear_1.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_linear_1_weight = ttnn.from_torch(
+            sd["linear_1.weight"].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_linear_1_bias = ttnn.from_torch(
+            sd["linear_1.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
 
         # op-REUSE: act1  (SILU)
 
         # op-REUSE: linear_2  (Linear 2048 -> 2048, bias=True)
-        self.w_linear_2_weight = ttnn.from_torch(sd['linear_2.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_linear_2_bias = ttnn.from_torch(sd['linear_2.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_linear_2_weight = ttnn.from_torch(
+            sd["linear_2.weight"].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_linear_2_bias = ttnn.from_torch(
+            sd["linear_2.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
 
         # op-REUSE: act2  (SILU)
 
         # op-REUSE: time_proj  (Linear 2048 -> 12288, bias=True)
-        self.w_time_proj_weight = ttnn.from_torch(sd['time_proj.weight'].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-        self.w_time_proj_bias = ttnn.from_torch(sd['time_proj.bias'].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.w_time_proj_weight = ttnn.from_torch(
+            sd["time_proj.weight"].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_time_proj_bias = ttnn.from_torch(
+            sd["time_proj.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
 
     def _apply_linear_1(self, x):
         return ttnn.linear(x, self.w_linear_1_weight, bias=self.w_linear_1_bias)
@@ -213,15 +238,20 @@ class TimestepEmbedding:
 
         return (temb, timestep_proj)
 
+
 def build(device, torch_module):
     return TimestepEmbedding(device, torch_module)
 
+
 _instance = None
+
 
 def timestep_embedding(*args, **kwargs):
     global _instance
     if _instance is None:
-        model = transformers.AutoModel.from_pretrained(HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True)
+        model = transformers.AutoModel.from_pretrained(
+            HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True
+        )
         model.eval()
         torch_sub = None
         for path in _CANDIDATE_SUBMODULE_PATHS:
@@ -231,6 +261,6 @@ def timestep_embedding(*args, **kwargs):
             except (AttributeError, IndexError, KeyError, TypeError):
                 continue
         if torch_sub is None:
-            raise RuntimeError('partial-stub: could not resolve `timestep_embedding`')
+            raise RuntimeError("partial-stub: could not resolve `timestep_embedding`")
         _instance = build(ttnn.open_device(device_id=0), torch_sub)
     return _instance(*args, **kwargs)

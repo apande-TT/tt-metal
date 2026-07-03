@@ -125,7 +125,7 @@ class FSQ:
     def __init__(self, device, torch_module):
         self.device = device
         self._torch_module = torch_module
-        torch_module.state_dict()
+        sd = torch_module.state_dict()
         # --- Finite Scalar Quantization constants (per codebook-dim) ---
         # `tokenizer.quantizer.layers.0` is a vector_quantize_pytorch.FSQ
         # constructed by ResidualFSQ with preserve_symmetry=True and

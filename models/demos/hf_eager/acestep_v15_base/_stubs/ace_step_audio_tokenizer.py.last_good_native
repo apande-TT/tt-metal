@@ -85,9 +85,10 @@ Op counts: total=32  op-REUSE=22  op-ADAPT=0  op-NEW=10"""
 
 from __future__ import annotations
 
+import math
+
 import torch
 import transformers
-
 import ttnn
 
 HF_MODEL_ID = "ACE-Step/acestep-v15-base"
@@ -479,9 +480,7 @@ class AceStepAudioTokenizer:
         # ResidualFSQ module's own non-persistent buffer for exactness.
         _clamp_value = torch_module.quantizer.soft_clamp_input_value.detach().to(torch.float32).reshape(1, 1, -1)
         _inv_clamp_value = 1.0 / _clamp_value
-        self.w_fsq_clamp_value = ttnn.from_torch(
-            _clamp_value, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device
-        )
+        self.w_fsq_clamp_value = ttnn.from_torch(_clamp_value, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
         self.w_fsq_inv_clamp_value = ttnn.from_torch(
             _inv_clamp_value, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device
         )
@@ -680,7 +679,9 @@ class AceStepAudioTokenizer:
         x = ttnn.reshape(x, (BT, P, hidden_size))
 
         # ---- attention_pooler: embed patches, prepend CLS-like special token ----
-        x = self._lin_f32(x, self.w_attention_pooler_embed_tokens_weight, self.w_attention_pooler_embed_tokens_bias, mm)
+        x = self._lin_f32(
+            x, self.w_attention_pooler_embed_tokens_weight, self.w_attention_pooler_embed_tokens_bias, mm
+        )
 
         special = ttnn.typecast(self.w_attention_pooler_special_token, ttnn.float32)
         special = ttnn.repeat(special, ttnn.Shape([BT, 1, 1]))
