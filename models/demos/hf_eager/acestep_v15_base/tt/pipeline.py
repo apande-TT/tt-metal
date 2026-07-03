@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import torch
 
-from .common import assemble_context_latents, ode_timesteps, prepare_noise, tokenize_preprocess
+from .common import assemble_context_latents, ode_timesteps, prepare_noise, to_torch, tokenize_preprocess
 from .subsystem_audio_tokenizer import AudioTokenizerTT
 from .subsystem_condition_encoder import ConditionEncoderTT
 from .subsystem_decoder import DecoderTT
@@ -30,6 +30,7 @@ from .subsystem_detokenizer import DetokenizerTT
 from .traced_audio_path import TracedAudioPath2CQ
 from .traced_condition_encoder import TracedConditionEncoder2CQ
 from .traced_decoder import TracedDecoder2CQ
+from .traced_pipeline import bind_decoder_constants, run_encoder_audio_overlap
 
 
 class AceStepPipelineTT:
@@ -73,9 +74,12 @@ class AceStepPipelineTT:
 
         _evt("total", True)
 
-        # --- Call A: condition encoder (text + lyric[+encoder_layer] + timbre) ---
-        _evt("encoder", True)
         traced_condition_encoder = None
+        traced_audio_path = None
+        use_2cq_resolved = use_2cq if use_2cq is not None else traced
+
+        x_patched, _ = tokenize_preprocess(src_latents, silence_latent, attention_mask, pool_window_size)
+
         if traced:
             if self._traced_condition_encoder is None:
                 self._traced_condition_encoder = TracedConditionEncoder2CQ(
@@ -93,30 +97,6 @@ class AceStepPipelineTT:
                     refer_audio_order_mask=inputs["refer_audio_order_mask"],
                 )
 
-        if traced_condition_encoder is not None:
-            encoder_hidden_states, encoder_attention_mask = traced_condition_encoder(
-                text_hidden_states=inputs["text_hidden_states"],
-                text_attention_mask=inputs["text_attention_mask"],
-                lyric_hidden_states=inputs["lyric_hidden_states"],
-                lyric_attention_mask=inputs["lyric_attention_mask"],
-                refer_audio_acoustic_hidden_states_packed=inputs["refer_audio_acoustic_hidden_states_packed"],
-                refer_audio_order_mask=inputs["refer_audio_order_mask"],
-            )
-        else:
-            encoder_hidden_states, encoder_attention_mask = self.condition_encoder(
-                text_hidden_states=inputs["text_hidden_states"],
-                text_attention_mask=inputs["text_attention_mask"],
-                lyric_hidden_states=inputs["lyric_hidden_states"],
-                lyric_attention_mask=inputs["lyric_attention_mask"],
-                refer_audio_acoustic_hidden_states_packed=inputs["refer_audio_acoustic_hidden_states_packed"],
-                refer_audio_order_mask=inputs["refer_audio_order_mask"],
-            )
-        _evt("encoder", False)
-
-        x_patched, _ = tokenize_preprocess(src_latents, silence_latent, attention_mask, pool_window_size)
-
-        traced_audio_path = None
-        if traced:
             if self._traced_audio_path is None:
                 self._traced_audio_path = TracedAudioPath2CQ(
                     self.audio_tokenizer,
@@ -127,22 +107,80 @@ class AceStepPipelineTT:
             if not traced_audio_path.is_captured:
                 traced_audio_path.capture(x_patched=x_patched)
 
-        # --- Call B: audio tokenizer (pooler + residual_fsq[+fsq]) ---
-        _evt("tokenizer", True)
-        if traced_audio_path is not None:
-            lm_hints_25hz, quantized = traced_audio_path(x_patched)
-            indices = None
-        else:
-            quantized, indices = self.audio_tokenizer(x_patched)
-            lm_hints_25hz = None
-        _evt("tokenizer", False)
+        overlap_prefill = (
+            traced
+            and use_2cq_resolved
+            and traced_condition_encoder is not None
+            and traced_audio_path is not None
+            and traced_condition_encoder.use_2cq
+            and traced_audio_path.use_2cq
+        )
 
-        # --- Call D: detokenizer (fed Call B's real quantized output) ---
-        _evt("detokenizer", True)
-        if lm_hints_25hz is None:
+        encoder_hidden_states_tt = None
+        if overlap_prefill:
+            _evt("encoder", True)
+            (
+                encoder_hidden_states_tt,
+                encoder_attention_mask,
+                lm_hints_25hz,
+                quantized,
+            ) = run_encoder_audio_overlap(
+                traced_condition_encoder,
+                traced_audio_path,
+                text_hidden_states=inputs["text_hidden_states"],
+                text_attention_mask=inputs["text_attention_mask"],
+                lyric_hidden_states=inputs["lyric_hidden_states"],
+                lyric_attention_mask=inputs["lyric_attention_mask"],
+                refer_audio_acoustic_hidden_states_packed=inputs["refer_audio_acoustic_hidden_states_packed"],
+                refer_audio_order_mask=inputs["refer_audio_order_mask"],
+                x_patched=x_patched,
+            )
+            _evt("encoder", False)
+            _evt("tokenizer", True)
+            _evt("tokenizer", False)
+            _evt("detokenizer", True)
+            context_latents = assemble_context_latents(lm_hints_25hz, src_latents, chunk_masks, is_covers)
+            _evt("detokenizer", False)
+            encoder_hidden_states = to_torch(encoder_hidden_states_tt, self.device).to(torch.float32)
+        elif traced_condition_encoder is not None:
+            _evt("encoder", True)
+            encoder_hidden_states, encoder_attention_mask = traced_condition_encoder(
+                text_hidden_states=inputs["text_hidden_states"],
+                text_attention_mask=inputs["text_attention_mask"],
+                lyric_hidden_states=inputs["lyric_hidden_states"],
+                lyric_attention_mask=inputs["lyric_attention_mask"],
+                refer_audio_acoustic_hidden_states_packed=inputs["refer_audio_acoustic_hidden_states_packed"],
+                refer_audio_order_mask=inputs["refer_audio_order_mask"],
+            )
+            _evt("encoder", False)
+
+            _evt("tokenizer", True)
+            lm_hints_25hz, quantized = traced_audio_path(x_patched)
+            _evt("tokenizer", False)
+
+            _evt("detokenizer", True)
+            context_latents = assemble_context_latents(lm_hints_25hz, src_latents, chunk_masks, is_covers)
+            _evt("detokenizer", False)
+        else:
+            _evt("encoder", True)
+            encoder_hidden_states, encoder_attention_mask = self.condition_encoder(
+                text_hidden_states=inputs["text_hidden_states"],
+                text_attention_mask=inputs["text_attention_mask"],
+                lyric_hidden_states=inputs["lyric_hidden_states"],
+                lyric_attention_mask=inputs["lyric_attention_mask"],
+                refer_audio_acoustic_hidden_states_packed=inputs["refer_audio_acoustic_hidden_states_packed"],
+                refer_audio_order_mask=inputs["refer_audio_order_mask"],
+            )
+            _evt("encoder", False)
+
+            _evt("tokenizer", True)
+            quantized, _indices = self.audio_tokenizer(x_patched)
+            _evt("tokenizer", False)
+
+            _evt("detokenizer", True)
             lm_hints_25hz = self.detokenizer(quantized)
-        context_latents = assemble_context_latents(lm_hints_25hz, src_latents, chunk_masks, is_covers)
-        _evt("detokenizer", False)
+            context_latents = assemble_context_latents(lm_hints_25hz, src_latents, chunk_masks, is_covers)
+            _evt("detokenizer", False)
 
         # --- Call C: flow-matching ODE loop over the DiT decoder ---
         noise = prepare_noise(context_latents, seed)
@@ -158,11 +196,21 @@ class AceStepPipelineTT:
             traced_decoder = self._traced_decoder
             if not traced_decoder.is_captured:
                 t0 = t[0] * torch.ones((bsz,), dtype=torch.float32)
-                traced_decoder.capture(
-                    encoder_hidden_states=encoder_hidden_states,
+                capture_kwargs = {
+                    "context_latents": context_latents,
+                    "sample_hidden_states": xt,
+                    "sample_timestep": t0,
+                }
+                if encoder_hidden_states_tt is not None:
+                    capture_kwargs["encoder_hidden_states_tt"] = encoder_hidden_states_tt
+                else:
+                    capture_kwargs["encoder_hidden_states"] = encoder_hidden_states
+                traced_decoder.capture(**capture_kwargs)
+            elif encoder_hidden_states_tt is not None:
+                bind_decoder_constants(
+                    traced_decoder,
+                    encoder_hidden_states_tt=encoder_hidden_states_tt,
                     context_latents=context_latents,
-                    sample_hidden_states=xt,
-                    sample_timestep=t0,
                 )
 
         _evt("denoising", True)
@@ -191,7 +239,6 @@ class AceStepPipelineTT:
             dt = t_curr - t_prev
             xt = xt - vt * dt
             _evt(f"denoising_step_{i}", False)
-            # Generated denoising state after step i (x_1..x_N; x_N == target_latents).
             per_step_xt.append(xt)
         _evt("denoising", False)
 

@@ -87,6 +87,32 @@ class TracedAudioPath2CQ:
 
         self._captured = True
 
+    def prefetch_input(self, x_patched: torch.Tensor) -> None:
+        """Start H2D prefetch on CQ_IO (may overlap with another stage on CQ_OPS)."""
+        if not self.use_2cq:
+            return
+        self._prefetch_input(x_patched)
+
+    def run_trace_and_read(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Complete audio-path trace after prefetch and read outputs to host."""
+        if not self.use_2cq:
+            raise RuntimeError("run_trace_and_read requires use_2cq; use __call__ for single-CQ")
+
+        inputs = self._tracer.inputs
+        ttnn.wait_for_event(self.CQ_OPS, self._write_event)
+        ttnn.copy(self._x_patched_dram, inputs[0])
+        self._op_event = ttnn.record_event(self.device, self.CQ_OPS)
+        lm_hints_tt, quantized_tt = self._tracer(
+            inputs[0],
+            traced=True,
+            tracer_cq_id=self.CQ_OPS,
+            tracer_blocking_execution=False,
+        )
+
+        ttnn.synchronize_device(self.device)
+        self._op_event = ttnn.record_event(self.device, self.CQ_OPS)
+        return to_torch(lm_hints_tt, self.device), to_torch(quantized_tt, self.device)
+
     def __call__(self, x_patched: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if not self._captured:
             raise RuntimeError("TracedAudioPath2CQ.capture() must run before inference")
@@ -113,6 +139,8 @@ class TracedAudioPath2CQ:
             )
 
         ttnn.synchronize_device(self.device)
+        if self.use_2cq:
+            self._op_event = ttnn.record_event(self.device, self.CQ_OPS)
         return to_torch(lm_hints_tt, self.device), to_torch(quantized_tt, self.device)
 
     def release(self) -> None:

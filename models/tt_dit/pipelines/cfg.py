@@ -199,3 +199,58 @@ def distribute_cfg(
         case _:
             msg = f"unsupported number of submeshes: expected 1 or 2, got {len(devices)}"
             raise ValueError(msg)
+
+
+# ---------------------------------------------------------------------------
+# Host-side CFG helpers (ACE-Step Phase 3 prep)
+#
+# ACE-Step production uses APG/ADG on host after a batched DiT forward. Plain
+# ``CFGCombiner`` (``ttnn.lerp``) is the device-side primitive for Flux/SD3.5;
+# for ACE-Step the denoise loop will:
+#   1. Batch cond+null on device (HF order: cond first, null second).
+#   2. ``to_torch`` velocities, ``split_hf_cfg_batch``, then
+#      ``apply_acestep_guidance`` from ``acestep/apg_guidance.py``.
+#   3. Euler step on host latents.
+#
+# Batch-order note: ``CFGCombiner`` assumes *uncond first, cond second* (see
+# ``_SingleCombiner``). HF ACE-Step ``generate_audio`` uses *cond first, null
+# second*. Use the split helpers below — do not mix conventions.
+# ---------------------------------------------------------------------------
+
+
+def combine_cfg_host(
+    cond: torch.Tensor,
+    uncond: torch.Tensor,
+    cfg_scale: float,
+) -> torch.Tensor:
+    """Plain CFG on host tensors. Mirrors ``ttnn.lerp(uncond, cond, cfg_scale)``."""
+    return uncond + cfg_scale * (cond - uncond)
+
+
+def split_hf_cfg_batch(
+    batched: torch.Tensor,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a 2×-batched tensor in HF ACE-Step order: (cond, uncond)."""
+    return batched[:batch_size], batched[batch_size:]
+
+
+def split_cfg_combiner_batch(
+    batched: torch.Tensor,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a 2×-batched tensor in ``CFGCombiner`` order: (uncond, cond)."""
+    return batched[batch_size:], batched[:batch_size]
+
+
+def double_batch_for_cfg(x: torch.Tensor) -> torch.Tensor:
+    """Duplicate a single-batch tensor for batched cond+null DiT (HF ``torch.cat([xt, xt])``)."""
+    return torch.cat([x, x], dim=0)
+
+
+def merge_encoder_for_cfg(
+    encoder_hidden_states: torch.Tensor,
+    null_condition_emb: torch.Tensor,
+) -> torch.Tensor:
+    """Build doubled encoder states: cond rows first, null-condition rows second."""
+    return torch.cat([encoder_hidden_states, null_condition_emb.expand_as(encoder_hidden_states)], dim=0)

@@ -40,6 +40,8 @@ class TracedConditionEncoder2CQ:
         self._refer_dram: ttnn.Tensor | None = None
         self._perm1_dram: ttnn.Tensor | None = None
         self._perm2_dram: ttnn.Tensor | None = None
+        self._enc_out_dram: ttnn.Tensor | None = None
+        self._last_out_tt: ttnn.Tensor | None = None
         self._op_event = None
         self._write_event = None
         self._captured = False
@@ -84,7 +86,7 @@ class TracedConditionEncoder2CQ:
         if self.use_2cq:
             self._op_event = ttnn.record_event(self.device, self.CQ_OPS)
 
-        self._tracer(
+        out_tt = self._tracer(
             text_tt,
             lyric_tt,
             refer_tt,
@@ -134,7 +136,82 @@ class TracedConditionEncoder2CQ:
             )
             self._op_event = ttnn.record_event(self.device, self.CQ_OPS)
 
+        self._enc_out_dram = ttnn.allocate_tensor_on_device(
+            out_tt.shape,
+            out_tt.dtype,
+            out_tt.layout,
+            self.device,
+            ttnn.DRAM_MEMORY_CONFIG,
+        )
+
         self._captured = True
+
+    def run_prefill_and_trace(
+        self,
+        *,
+        text_hidden_states: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+        lyric_hidden_states: torch.Tensor,
+        lyric_attention_mask: torch.Tensor,
+        refer_audio_acoustic_hidden_states_packed: torch.Tensor,
+        refer_audio_order_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Launch encoder trace (non-blocking when 2-CQ enabled). Returns CPU attention mask."""
+        if not self._captured:
+            raise RuntimeError("TracedConditionEncoder2CQ.capture() must run before inference")
+
+        perm1, perm2, encoder_attention_mask = self._compute_perms_and_mask(
+            text_attention_mask,
+            lyric_attention_mask,
+            refer_audio_order_mask,
+            refer_audio_acoustic_hidden_states_packed.shape[0],
+        )
+
+        if self.use_2cq:
+            self._prefetch_inputs(
+                text_hidden_states,
+                lyric_hidden_states,
+                refer_audio_acoustic_hidden_states_packed,
+                perm1,
+                perm2,
+            )
+            inputs = self._tracer.inputs
+            ttnn.wait_for_event(self.CQ_OPS, self._write_event)
+            ttnn.copy(self._text_dram, inputs[0])
+            ttnn.copy(self._lyric_dram, inputs[1])
+            ttnn.copy(self._refer_dram, inputs[2])
+            ttnn.copy(self._perm1_dram, inputs[3])
+            ttnn.copy(self._perm2_dram, inputs[4])
+            self._op_event = ttnn.record_event(self.device, self.CQ_OPS)
+            self._last_out_tt = self._tracer(
+                inputs[0],
+                inputs[1],
+                inputs[2],
+                inputs[3],
+                inputs[4],
+                traced=True,
+                tracer_cq_id=self.CQ_OPS,
+                tracer_blocking_execution=False,
+            )
+        else:
+            self._last_out_tt = self._tracer(
+                from_torch(text_hidden_states, self.device),
+                from_torch(lyric_hidden_states, self.device),
+                from_torch(refer_audio_acoustic_hidden_states_packed, self.device),
+                from_torch(perm1, self.device),
+                from_torch(perm2, self.device),
+                traced=True,
+                tracer_cq_id=self.CQ_OPS,
+                tracer_blocking_execution=True,
+            )
+
+        return encoder_attention_mask.bool()
+
+    def finish_trace_to_device(self) -> ttnn.Tensor:
+        """Wait for encoder trace and copy output into the device-resident staging buffer."""
+        ttnn.synchronize_device(self.device)
+        ttnn.copy(self._last_out_tt, self._enc_out_dram)
+        return self._enc_out_dram
 
     def __call__(
         self,
@@ -194,6 +271,8 @@ class TracedConditionEncoder2CQ:
             )
 
         ttnn.synchronize_device(self.device)
+        if self.use_2cq:
+            self._op_event = ttnn.record_event(self.device, self.CQ_OPS)
         encoder_hidden_states = to_torch(out_tt, self.device).to(torch.float32)
         return encoder_hidden_states, encoder_attention_mask.bool()
 

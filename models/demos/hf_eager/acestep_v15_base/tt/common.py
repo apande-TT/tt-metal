@@ -71,57 +71,42 @@ def _captured_dir():
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_captured")
 
 
-def build_inputs(seed: int = None, dtype=torch.float32, use_captured: bool = True):
-    """Deterministic e2e inputs.
+def _load_captured_inputs(dtype=torch.float32):
+    """Load Source-B captured tensors (text + audio-side fields)."""
+    import os
 
-    Per the task ("input exactly as collected from Sources A+B"), by default the
-    conditioning tensors are the REAL captured Source-B tensors: text/lyric/refer
-    embeddings from _captured/ace_step_condition_encoder (the upstream
-    processor/text-encoder/feature-extractor outputs), src_latents reconstructed
-    by un-patchifying the _captured/ace_step_audio_tokenizer input, and
-    chunk_masks read from the _captured/ace_step_di_t_model context_latents. This
-    feeds every stage ~its per-component captured input, so the chained TTNN
-    pipeline is exercised on the same distribution each stub graduated against.
-    Falls back to seeded randn if the captures are absent. Fed IDENTICALLY to the
-    HF golden chain and the TT pipeline."""
+    from einops import rearrange
+
     cfg = GATE_CONFIG
-    if seed is None:
-        seed = cfg["seed"]
     B, L, D = cfg["batch"], cfg["seq_len_latent"], cfg["audio_acoustic_hidden_dim"]
+    cap = _captured_dir()
+    ce = torch.load(os.path.join(cap, "ace_step_condition_encoder", "kwargs.pt"), weights_only=False)
+    tok_in = torch.load(os.path.join(cap, "ace_step_audio_tokenizer", "args.pt"), weights_only=False)[0]
+    dit = torch.load(os.path.join(cap, "ace_step_di_t_model", "kwargs.pt"), weights_only=False)
 
-    if use_captured:
-        try:
-            import os
+    def f(x):
+        return x.to(dtype) if isinstance(x, torch.Tensor) and x.is_floating_point() else x
 
-            from einops import rearrange
+    src_latents = rearrange(tok_in, "n t p d -> n (t p) d").to(dtype)
+    chunk_masks = dit["context_latents"][..., D:].to(dtype)
+    return {
+        "text_hidden_states": f(ce["text_hidden_states"]),
+        "text_attention_mask": f(ce["text_attention_mask"]),
+        "lyric_hidden_states": f(ce["lyric_hidden_states"]),
+        "lyric_attention_mask": f(ce["lyric_attention_mask"]),
+        "refer_audio_acoustic_hidden_states_packed": f(ce["refer_audio_acoustic_hidden_states_packed"]),
+        "refer_audio_order_mask": ce["refer_audio_order_mask"].to(torch.int64),
+        "src_latents": src_latents,
+        "chunk_masks": chunk_masks,
+        "silence_latent": torch.zeros(B, L, D, dtype=dtype),
+        "attention_mask": torch.ones(B, L, dtype=dtype),
+        "is_covers": torch.tensor([cfg["is_covers"]] * B, dtype=torch.int64),
+    }
 
-            cap = _captured_dir()
-            ce = torch.load(os.path.join(cap, "ace_step_condition_encoder", "kwargs.pt"), weights_only=False)
-            tok_in = torch.load(os.path.join(cap, "ace_step_audio_tokenizer", "args.pt"), weights_only=False)[0]
-            dit = torch.load(os.path.join(cap, "ace_step_di_t_model", "kwargs.pt"), weights_only=False)
 
-            def f(x):
-                return x.to(dtype) if isinstance(x, torch.Tensor) and x.is_floating_point() else x
-
-            src_latents = rearrange(tok_in, "n t p d -> n (t p) d").to(dtype)
-            chunk_masks = dit["context_latents"][..., D:].to(dtype)
-            inputs = {
-                "text_hidden_states": f(ce["text_hidden_states"]),
-                "text_attention_mask": f(ce["text_attention_mask"]),
-                "lyric_hidden_states": f(ce["lyric_hidden_states"]),
-                "lyric_attention_mask": f(ce["lyric_attention_mask"]),
-                "refer_audio_acoustic_hidden_states_packed": f(ce["refer_audio_acoustic_hidden_states_packed"]),
-                "refer_audio_order_mask": ce["refer_audio_order_mask"].to(torch.int64),
-                "src_latents": src_latents,
-                "chunk_masks": chunk_masks,
-                "silence_latent": torch.zeros(B, L, D, dtype=dtype),
-                "attention_mask": torch.ones(B, L, dtype=dtype),
-                "is_covers": torch.tensor([cfg["is_covers"]] * B, dtype=torch.int64),
-            }
-            return inputs
-        except Exception as e:
-            print(f"[common] captured inputs unavailable ({e}); falling back to seeded randn", flush=True)
-
+def _seeded_randn_inputs(seed: int, dtype=torch.float32):
+    cfg = GATE_CONFIG
+    B, L, D = cfg["batch"], cfg["seq_len_latent"], cfg["audio_acoustic_hidden_dim"]
     g = torch.Generator().manual_seed(seed)
 
     def rnd(*shape):
@@ -140,6 +125,70 @@ def build_inputs(seed: int = None, dtype=torch.float32, use_captured: bool = Tru
         "attention_mask": torch.ones(B, L, dtype=dtype),
         "is_covers": torch.tensor([cfg["is_covers"]] * B, dtype=torch.int64),
     }
+
+
+def build_inputs(
+    seed: int = None,
+    dtype=torch.float32,
+    use_captured: bool = True,
+    prompts=None,
+    lyrics=None,
+    *,
+    audio_duration: float | None = None,
+):
+    """Deterministic e2e inputs.
+
+    Per the task ("input exactly as collected from Sources A+B"), by default the
+    conditioning tensors are the REAL captured Source-B tensors: text/lyric/refer
+    embeddings from _captured/ace_step_condition_encoder (the upstream
+    processor/text-encoder/feature-extractor outputs), src_latents reconstructed
+    by un-patchifying the _captured/ace_step_audio_tokenizer input, and
+    chunk_masks read from the _captured/ace_step_di_t_model context_latents. This
+    feeds every stage ~its per-component captured input, so the chained TTNN
+    pipeline is exercised on the same distribution each stub graduated against.
+    Falls back to seeded randn if the captures are absent. Fed IDENTICALLY to the
+    HF golden chain and the TT pipeline.
+
+    When ``use_captured=False``, text/lyric tensors come from live
+    ``prompts``/``lyrics`` via ``text_encode.encode_text_conditioning``; audio-side
+    fields (refer/src_latents/chunk_masks) still prefer captures until Phase 2B."""
+    cfg = GATE_CONFIG
+    if seed is None:
+        seed = cfg["seed"]
+
+    if use_captured:
+        try:
+            return _load_captured_inputs(dtype=dtype)
+        except Exception as e:
+            print(f"[common] captured inputs unavailable ({e}); falling back to seeded randn", flush=True)
+        return _seeded_randn_inputs(seed, dtype=dtype)
+
+    try:
+        inputs = _load_captured_inputs(dtype=dtype)
+    except Exception as e:
+        print(f"[common] live-text mode: audio captures unavailable ({e}); using seeded randn", flush=True)
+        inputs = _seeded_randn_inputs(seed, dtype=dtype)
+
+    from models.tt_dit.pipelines.acestep.text_encode import encode_text_conditioning, have_text_encoder_weights
+
+    if not have_text_encoder_weights():
+        raise RuntimeError(
+            "use_captured=False requires Qwen3-Embedding-0.6B weights. "
+            "Download ACE-Step/Ace-Step1.5 or set ACESTEP_TEXT_ENCODER_PATH."
+        )
+
+    if audio_duration is None:
+        audio_duration = cfg["seq_len_latent"] / 25.0
+
+    live_text = encode_text_conditioning(
+        prompts=prompts,
+        lyrics=lyrics,
+        batch_size=cfg["batch"],
+        dtype=dtype,
+        audio_duration=audio_duration,
+    )
+    inputs.update(live_text)
+    return inputs
 
 
 def tokenize_preprocess(x, silence_latent, attention_mask, pool_window_size):

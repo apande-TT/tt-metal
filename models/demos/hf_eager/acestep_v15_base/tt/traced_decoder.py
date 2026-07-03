@@ -55,7 +55,8 @@ class TracedDecoder2CQ:
     def capture(
         self,
         *,
-        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        encoder_hidden_states_tt: ttnn.Tensor | None = None,
         context_latents: torch.Tensor,
         sample_hidden_states: torch.Tensor,
         sample_timestep: torch.Tensor,
@@ -64,7 +65,19 @@ class TracedDecoder2CQ:
         if self._captured:
             return
 
-        self._enc_tt = from_torch(encoder_hidden_states, self.device)
+        if encoder_hidden_states_tt is not None:
+            self._enc_tt = ttnn.allocate_tensor_on_device(
+                encoder_hidden_states_tt.shape,
+                encoder_hidden_states_tt.dtype,
+                encoder_hidden_states_tt.layout,
+                self.device,
+                ttnn.DRAM_MEMORY_CONFIG,
+            )
+            ttnn.copy(encoder_hidden_states_tt, self._enc_tt)
+        elif encoder_hidden_states is not None:
+            self._enc_tt = from_torch(encoder_hidden_states, self.device)
+        else:
+            raise ValueError("capture requires encoder_hidden_states or encoder_hidden_states_tt")
         self._ctx_tt = from_torch(context_latents, self.device)
 
         sample_t = sample_timestep.reshape(-1, 1).to(torch.bfloat16)
@@ -111,6 +124,18 @@ class TracedDecoder2CQ:
 
         self._captured = True
 
+    def bind_encoder_hidden_states(self, encoder_hidden_states_tt: ttnn.Tensor) -> None:
+        """D2D copy of encoder output into the trace constant binding (no host round trip)."""
+        if self._enc_tt is None:
+            raise RuntimeError("TracedDecoder2CQ.capture() must run before bind_encoder_hidden_states")
+        ttnn.copy(encoder_hidden_states_tt, self._enc_tt)
+
+    def bind_context_latents(self, context_latents_tt: ttnn.Tensor) -> None:
+        """D2D copy of context latents into the trace constant binding."""
+        if self._ctx_tt is None:
+            raise RuntimeError("TracedDecoder2CQ.capture() must run before bind_context_latents")
+        ttnn.copy(context_latents_tt, self._ctx_tt)
+
     def __call__(
         self,
         hidden_states: torch.Tensor,
@@ -153,6 +178,8 @@ class TracedDecoder2CQ:
             )
 
         ttnn.synchronize_device(self.device)
+        if self.use_2cq:
+            self._op_event = ttnn.record_event(self.device, self.CQ_OPS)
         return to_torch(out_tt, self.device).to(torch.float32)
 
     def release(self) -> None:
