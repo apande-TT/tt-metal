@@ -4,7 +4,7 @@
 
 [ACE-Step](https://huggingface.co/ACE-Step/acestep-v15-base) is a flow-matching diffusion transformer (DiT) for text-to-audio / music generation. Conditioning includes text, lyrics, and optional reference-audio timbre.
 
-The tt_dit pipeline (`models/tt_dit/pipelines/acestep/pipeline_acestep.py`) is under active bring-up. Until it is wired end-to-end, the performance test exercises the graduated hf_eager TTNN pipeline (`models/demos/hf_eager/acestep_v15_base/tt/pipeline.py`) with the same stage timing hooks used by other tt_dit perf tests.
+The tt_dit pipeline (`models/tt_dit/pipelines/acestep/pipeline_acestep.py`) delegates to the graduated hf_eager TTNN stubs and emits profiler sections for perf reporting.
 
 ## Performance
 
@@ -20,11 +20,15 @@ Performance is measured as seconds per audio-latent generation on a fixed e2e ga
 
 ### P150 (Blackhole, 1×1 mesh)
 
-| System | Mesh | Infer Steps | Current Performance | Target Performance |
-|--------|------|-------------|---------------------|--------------------|
-| P150   | 1×1  | 4           | TBD                 | TBD                |
+Measured 2026-07-03 on `sjc-snva-tp100` (tt_dit `AceStepPipeline`, JIT warm):
 
-> Baselines will be filled after the first on-device perf run on P150.
+| System | Mesh | Infer Steps | Total (s) | Denoise (s) | Steps/s | Gen/s |
+|--------|------|-------------|-----------|-------------|---------|-------|
+| P150   | 1×1  | 4           | 0.407     | 0.339       | 11.8    | 2.46  |
+
+Stage means (seconds): encoder 0.036, tokenizer 0.022, detokenizer 0.010, denoise/step 0.085.
+
+Regression targets in the perf test allow ~20% slack above these baselines.
 
 ## Prerequisites
 
@@ -58,7 +62,7 @@ ACE-STEP v1.5 PIPELINE PERFORMANCE RESULTS
 ================================================================================
 Model: ACE-Step/acestep-v15-base
 Inference Steps: 4
-Backend: hf_eager AceStepPipelineTT
+Backend: tt_dit AceStepPipeline
 Mesh Shape: (1, 1)
 --------------------------------------------------------------------------------
 Condition Encoder         | Mean:   0.1234s | Std:   0.0012s | Min:   0.1220s | Max:   0.1250s

@@ -31,7 +31,7 @@ from models.demos.hf_eager.acestep_v15_base.tt.common import (
 from models.demos.hf_eager.acestep_v15_base.tt.pipeline import AceStepPipelineTT
 from models.perf.benchmarking_utils import BenchmarkData, BenchmarkProfiler
 
-from ....pipelines.acestep.pipeline_acestep import AceStepPipeline, AceStepPipelineConfig
+from ....pipelines.acestep.pipeline_acestep import AceStepPipeline
 from ....pipelines.events import profiler_event_callback
 
 INFER_STEPS = GATE_CONFIG["infer_steps"]
@@ -41,14 +41,14 @@ SEED = GATE_CONFIG["seed"]
 
 
 def get_expected_metrics(mesh_device):
-    """Placeholder targets until P150 baselines are captured."""
+    """P150 (1x1) baselines captured 2026-07-03; targets include ~20% slack."""
     if tuple(mesh_device.shape) == (1, 1):
         return {
-            "encoder_time": 999.0,
-            "tokenizer_time": 999.0,
-            "detokenizer_time": 999.0,
-            "denoising_steps_time": 999.0,
-            "total_time": 999.0,
+            "encoder_time": 0.05,
+            "tokenizer_time": 0.03,
+            "detokenizer_time": 0.015,
+            "denoising_steps_time": 0.40,
+            "total_time": 0.50,
         }
     raise AssertionError(f"Unknown mesh device for performance comparison: {mesh_device.shape}")
 
@@ -283,10 +283,8 @@ def test_acestep_pipeline_performance(
     hf_pipe = None if use_tt_dit else AceStepPipelineTT(mesh_device, hf_model)
     tt_dit_pipe = (
         AceStepPipeline.create_pipeline(
-            AceStepPipelineConfig(
-                checkpoint_name="ACE-Step/acestep-v15-base",
-                num_inference_steps=num_inference_steps,
-            )
+            mesh_device,
+            num_inference_steps=num_inference_steps,
         )
         if use_tt_dit
         else None
