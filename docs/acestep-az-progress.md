@@ -21,6 +21,8 @@ Started: 2026-07-03
 - **Trace capture hang (Phase 6 only):** hangs at `capturing trace...` — do **not** block Phases 2–5. Debug in `m0-trace` window.
 - **Device reset:** after killing hung trace test, run `tt-smi -r 0` before device tests.
 
+**Agent resume guide:** `docs/acestep-az-agent-resume.md`
+
 ## Plan update (2026-07-03)
 
 - Decoupled trace from critical path per `docs/acestep-az-phases-summary.md`

@@ -1,5 +1,7 @@
 # ACE-Step A→Z — Agent deployment matrix
 
+**Resume from checkpoint:** see `docs/acestep-az-agent-resume.md` (checkpoint state, copy-paste agent prompts, gate commands).
+
 **Rule:** Only one job may hold `flock /tmp/tt_ace_device.lock` at a time.
 
 ## Parallel-safe (run now)
