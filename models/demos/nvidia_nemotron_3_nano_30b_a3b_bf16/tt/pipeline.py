@@ -350,9 +350,11 @@ class NemotronHPipeline:
         capture pass free_carry=False so the persistent carry buffers the captured
         ops read are not deallocated mid-region."""
         M = self.M
+        _perf = int(os.environ.get("TT_PERF_LAYERS", "0") or "0")
+        _n_layers = min(M._N_LAYERS, _perf) if _perf > 0 else M._N_LAYERS
         h = self._embed_to_fp32(tok_ids)  # (1,1,hidden) fp32
         pos_t, ar_row, ar_col = self._pos_t, self._ar_row, self._ar_col
-        for i in range(M._N_LAYERS):
+        for i in range(_n_layers):
             if i in M._MAMBA_LAYERS and i == M._MAMBA_LAYERS[0]:
                 st = self._dec_state[i]  # ("block", ssm, conv)
                 _, inst = self._children[i]
