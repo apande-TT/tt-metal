@@ -321,6 +321,16 @@ class NemotronHPipeline:
             out = ttnn.to_torch(logits).to(torch.float32).reshape(-1)
         return out[: self.vocab]
 
+    def _argmax(self, logits):
+        """Multi-core last-dim argmax. ttnn.argmax runs SINGLE-CORE on a
+        TILE-layout input but MULTI-CORE on ROW_MAJOR for a rank-1 reduction;
+        untilizing the wide (vocab=131072) logits first lets the argmax fan out
+        across the grid. Output is identical uint32 (zero PCC risk)."""
+        rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+        tok = ttnn.argmax(rm, dim=-1)
+        ttnn.deallocate(rm)
+        return tok
+
     def _read_token(self, tok):
         """Read a single on-device argmax token id back to a python int (for the
         results list / PCC gate). The token FED to the next step stays on device."""
@@ -454,7 +464,7 @@ class NemotronHPipeline:
         step_logits = []
         for step in range(n_new):
             step_logits.append(self._read_logits(logits))
-            tok = ttnn.argmax(logits, dim=-1)  # (1,1) uint32, ON DEVICE
+            tok = self._argmax(logits)  # (1,1) uint32, ON DEVICE
             ttnn.deallocate(logits)
             nxt = self._read_token(tok)
             new_ids.append(nxt)
@@ -490,7 +500,7 @@ class NemotronHPipeline:
         h = self._run_layers(h, capture=True, ctx=ctx)
         logits = self._logits_from_h(h)
         ttnn.deallocate(h)
-        tok = ttnn.argmax(logits, dim=-1)
+        tok = self._argmax(logits)
         ttnn.deallocate(logits)
         kw = dict(dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
         if self._is_mesh:
@@ -594,13 +604,13 @@ def trace_capture_selftest(n_prompt=5):
         h = pipe._run_layers(h, capture=True, ctx=ctx)
         logits = pipe._logits_from_h(h)
         ttnn.deallocate(h)
-        tok = ttnn.argmax(logits, dim=-1)
+        tok = self._argmax(logits)
         ttnn.deallocate(logits)
 
         # warm: compile every decode kernel OUTSIDE the trace region
         logits = pipe._decode_step(tok, free_carry=True)
         ttnn.deallocate(tok)
-        tok = ttnn.argmax(logits, dim=-1)
+        tok = self._argmax(logits)
         ttnn.deallocate(logits)
         ttnn.synchronize_device(dev)
 
