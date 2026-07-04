@@ -113,16 +113,16 @@ class TtNemotronHMOE:
                 up_stack,
                 dtype=ttnn.bfloat16,
                 layout=ttnn.TILE_LAYOUT,
-                device=dev,
                 mesh_mapper=ttnn.ShardTensor2dMesh(dev, mesh_shape=_mesh_shape, dims=(None, 0)),
             )
+            up_sh = ttnn.to_device(up_sh, dev)
             dn_sh = ttnn.from_torch(
                 dn_stack,
                 dtype=ttnn.bfloat16,
                 layout=ttnn.TILE_LAYOUT,
-                device=dev,
                 mesh_mapper=ttnn.ShardTensor2dMesh(dev, mesh_shape=_mesh_shape, dims=(None, 0)),
             )
+            dn_sh = ttnn.to_device(dn_sh, dev)
             for e in range(Eloc):
                 self._up.append(ttnn.reshape(ttnn.slice(up_sh, [e, 0, 0], [e + 1, _hid, _inter]), [_hid, _inter]))
                 self._down.append(ttnn.reshape(ttnn.slice(dn_sh, [e, 0, 0], [e + 1, _inter, _hid]), [_inter, _hid]))
