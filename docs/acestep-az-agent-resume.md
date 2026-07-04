@@ -410,8 +410,17 @@ flock /tmp/tt_ace_device.lock $PY -m pytest \
 ```bash
 bash docs/acestep-az-phase7c-run.sh
 # Fast gate: 8s / 4 steps / 1.7B → /tmp/az_phase7c_tt_lm_1.7b_8s.wav
+# Signoff 2026-07-04: 3 passed (e2e waveform + tokenizer PCC + weights resolve)
 # All variants: ACESTEP_RUN_PHASE7C_VARIANTS=1 bash docs/acestep-az-phase7c-run.sh
 # Production listen: ACESTEP_RUN_PHASE7C_PROD=1 bash docs/acestep-az-phase7c-run.sh
+```
+
+### Phase 8 — traced full stack (LM + DiT + TT VAE)
+
+```bash
+bash docs/acestep-az-phase8-run.sh
+# → /tmp/az_phase8_traced_lm.wav (4 steps smoke; CFG off when traced)
+# Signoff 2026-07-04: 1 passed; e2e_s≈70s @ 8s audio (perf stretch remains)
 ```
 
 ### Phase 6 — trace (deferred)

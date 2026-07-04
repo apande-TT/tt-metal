@@ -13,8 +13,8 @@ Started: 2026-07-03
 | 4 TT VAE | ✅ done | — | PCC gate + e2e TT VAE waveform test |
 | 5 Full TT A→Z demo | ✅ signoff run | — | `bash docs/acestep-az-phase5-run.sh` → `/tmp/az_phase5_signoff.wav` |
 | 6 Trace + perf (DiT) | ⏳ deferred | — | DiT stack only; use `docs/acestep-m0-trace-run.sh` |
-| 7 5Hz LM planner | 🔄 7C device gate | 7A/7B done | `bash docs/acestep-az-phase7-run.sh` (demo) · `bash docs/acestep-az-phase7c-run.sh` (pytest gate) |
-| 8 Trace + perf (full) | ⏳ deferred | — | LM + DiT + TT VAE traced; < 2 s target |
+| 7 5Hz LM planner | ✅ 7C signoff | `24de6caa37` + logits squeeze | `bash docs/acestep-az-phase7c-run.sh` — 3 passed 2026-07-04 |
+| 8 Trace + perf (full) | ✅ smoke signoff | traced DiT + TT LM + TT VAE | `bash docs/acestep-az-phase8-run.sh` — e2e 70.2s @ 8s/4 steps |
 
 ## Revisit / blockers
 
@@ -57,7 +57,18 @@ Started: 2026-07-03
 - Killed stalled pytest (trace capture hang); device lock FREE
 - tmux: added `m0-trace` window; refreshed all window banners
 
-### 2026-07-03 — Parallel agents deployed
+### 2026-07-04 — Phase 7C device signoff PASS
+
+- Fix: squeeze TT prefill logits `[B,1,V]` → `[B,V]` in `lm_planner_tt._next_token_from_logits`
+- Gate: `ACESTEP_RUN_PHASE7C=1 bash docs/acestep-az-phase7c-run.sh` — **3 passed**, 3 skipped (~212s)
+- Phase 8 traced full-stack gate started: `bash docs/acestep-az-phase8-run.sh`
+
+### 2026-07-04 — Phase 8 traced full-stack PASS (smoke)
+
+- Fix: set `quantized = lm_quantized` in traced+LM path (`pipeline.py`)
+- Gate: `ACESTEP_RUN_PHASE8=1 bash docs/acestep-az-phase8-run.sh` — **1 passed** (~108s)
+- Output: `/tmp/az_phase8_traced_lm.wav` — `PHASE8_SIGNOFF e2e_s=70.23 latent_gen_s=33.80 vae_decode_s=36.43`
+- Perf target (<2s vs A100) not met; functional traced stack verified
 
 - 5 parallel agents: 2A, 2B, 3 prep, 4, 5 prep (no shared files)
 - Integration agent: pipeline_acestep.py + test_e2e_live_inputs_acestep.py

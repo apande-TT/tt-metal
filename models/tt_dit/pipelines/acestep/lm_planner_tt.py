@@ -160,6 +160,8 @@ def _next_token_from_logits(
     processor: Any | None,
     input_ids: torch.Tensor,
 ) -> torch.Tensor:
+    if logits.ndim == 3 and logits.shape[1] == 1:
+        logits = logits.squeeze(1)
     if logits.ndim == 1:
         logits = logits.unsqueeze(0)
     scores = logits.float()
