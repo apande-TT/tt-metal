@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 
 import torch
+from loguru import logger
 
 import ttnn
 
@@ -141,6 +142,8 @@ def build_inputs(
     *,
     audio_duration: float | None = None,
     instruction: str | None = None,
+    mesh_device: ttnn.Device | ttnn.MeshDevice | None = None,
+    use_tt_text_encode: bool | None = None,
 ):
     """Deterministic e2e inputs.
 
@@ -176,6 +179,7 @@ def build_inputs(
         inputs = _seeded_randn_inputs(seed, dtype=dtype)
 
     from models.tt_dit.pipelines.acestep.text_encode import encode_text_conditioning, have_text_encoder_weights
+    from models.tt_dit.pipelines.acestep.text_encode_tt import default_use_tt_text_encode
 
     if not have_text_encoder_weights():
         raise RuntimeError(
@@ -186,14 +190,31 @@ def build_inputs(
     if audio_duration is None:
         audio_duration = cfg["seq_len_latent"] / 25.0
 
-    live_text = encode_text_conditioning(
-        prompts=prompts,
-        lyrics=lyrics,
-        batch_size=cfg["batch"],
-        dtype=dtype,
-        audio_duration=audio_duration,
-        instruction=instruction,
-    )
+    if use_tt_text_encode is None:
+        use_tt_text_encode = default_use_tt_text_encode()
+
+    if use_tt_text_encode and mesh_device is not None:
+        from models.tt_dit.pipelines.acestep.text_encode_tt import encode_text_conditioning_tt
+
+        logger.info("build_inputs: TT Qwen3-Embedding text encode (Phase 2C)")
+        live_text = encode_text_conditioning_tt(
+            mesh_device,
+            prompts=prompts,
+            lyrics=lyrics,
+            batch_size=cfg["batch"],
+            dtype=dtype,
+            audio_duration=audio_duration,
+            instruction=instruction,
+        )
+    else:
+        live_text = encode_text_conditioning(
+            prompts=prompts,
+            lyrics=lyrics,
+            batch_size=cfg["batch"],
+            dtype=dtype,
+            audio_duration=audio_duration,
+            instruction=instruction,
+        )
     inputs.update(live_text)
     return inputs
 

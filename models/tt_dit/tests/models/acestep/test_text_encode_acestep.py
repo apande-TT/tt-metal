@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import ttnn
 from models.common.utility_functions import comp_pcc
 from models.demos.hf_eager.acestep_v15_base.tt.common import GATE_CONFIG, build_inputs
 from models.tt_dit.pipelines.acestep.text_encode import (
@@ -16,6 +17,7 @@ from models.tt_dit.pipelines.acestep.text_encode import (
     format_prompt_and_lyrics,
     have_text_encoder_weights,
 )
+from models.tt_dit.pipelines.acestep.text_encode_tt import encode_text_conditioning_tt
 
 PCC_TARGET = 0.99
 
@@ -88,3 +90,34 @@ def test_build_inputs_live_text_replaces_captures() -> None:
     assert live["lyric_hidden_states"].shape[-1] == GATE_CONFIG["text_hidden_dim"]
     assert live["text_hidden_states"].shape[0] == GATE_CONFIG["batch"]
     assert live["lyric_hidden_states"].shape[0] == GATE_CONFIG["batch"]
+
+
+@pytest.mark.skipif(not have_text_encoder_weights(), reason="Qwen3-Embedding-0.6B weights not on disk")
+@pytest.mark.parametrize("prompt,lyrics", FIXED_CASES)
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 32768}], indirect=True)
+def test_encode_text_conditioning_tt_matches_host(device, prompt: str, lyrics: str) -> None:
+    """Phase 2C gate: TT Qwen3-Embedding vs host golden on device."""
+    if ttnn.get_num_devices() == 0:
+        pytest.skip("No Tenstorrent device available")
+
+    audio_duration = GATE_CONFIG["seq_len_latent"] / 25.0
+    host = encode_text_conditioning(
+        prompts=prompt,
+        lyrics=lyrics,
+        batch_size=1,
+        dtype=torch.float32,
+        audio_duration=audio_duration,
+    )
+    tt_out = encode_text_conditioning_tt(
+        device,
+        prompts=prompt,
+        lyrics=lyrics,
+        batch_size=1,
+        dtype=torch.float32,
+        audio_duration=audio_duration,
+    )
+
+    for key in ("text_hidden_states", "lyric_hidden_states", "text_attention_mask", "lyric_attention_mask"):
+        ok, value = comp_pcc(host[key], tt_out[key], PCC_TARGET)
+        print(f"TEXT_ENCODE_TT_PCC {key}: {value:.6f}", flush=True)
+        assert ok, f"TT {key} PCC {value:.6f} < {PCC_TARGET}"

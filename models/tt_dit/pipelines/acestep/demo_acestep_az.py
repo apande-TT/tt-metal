@@ -36,6 +36,7 @@ from loguru import logger
 import ttnn
 from models.demos.hf_eager.acestep_v15_base.tt.vae_host import save_wav
 from models.tt_dit.pipelines.acestep.pipeline_acestep import AceStepPipeline
+from models.tt_dit.pipelines.acestep.text_encode_tt import default_use_tt_text_encode
 
 LOG_PATH = "/tmp/acestep_agent_5.log"
 DEFAULT_DEVICE_ID = 0
@@ -102,6 +103,12 @@ def _parse_args() -> argparse.Namespace:
         default=7.0,
         help="Classifier-free guidance scale (HF default: 7.0; use 1.0 to disable CFG)",
     )
+    parser.add_argument(
+        "--use-tt-text-encode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="TT Qwen3-Embedding on device (Phase 2C; default from ACESTEP_USE_TT_TEXT_ENCODE)",
+    )
     parser.add_argument("--seed", type=int, default=1234, help="RNG seed")
     parser.add_argument("--device-id", type=int, default=DEFAULT_DEVICE_ID, help="TT device id")
     return parser.parse_args()
@@ -149,6 +156,9 @@ def _run_pipeline(args: argparse.Namespace) -> dict:
             cfg_enabled=args.guidance_scale > 1.0,
             audio_duration=args.audio_duration,
             shift=args.shift,
+            use_tt_text_encode=(
+                args.use_tt_text_encode if args.use_tt_text_encode is not None else default_use_tt_text_encode()
+            ),
         )
 
         t0 = time.perf_counter()

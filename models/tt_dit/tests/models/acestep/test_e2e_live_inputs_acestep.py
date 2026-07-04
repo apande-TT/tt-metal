@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import math
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -262,6 +264,62 @@ def test_pipeline_live_inputs_prod_cfg_waveform(device: ttnn.Device, fixture_wav
     assert isinstance(waveform, torch.Tensor)
     assert waveform.shape[1] == 2
     assert torch.isfinite(waveform).all()
+
+
+PHASE3_PROD_WAV = "/tmp/acestep_phase3_prod_30s_cfg7.wav"
+PHASE3_PROD_STEPS = int(os.environ.get("ACESTEP_PHASE3_INFER_STEPS", "30"))
+PHASE3_PROD_DURATION = float(os.environ.get("ACESTEP_PHASE3_AUDIO_DURATION", "30"))
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 24576}], indirect=True)
+def test_pipeline_live_inputs_prod_cfg_30s_waveform(device: ttnn.Device, fixture_wav, hf_model) -> None:
+    """Phase 3 signoff: 30 s cover + CFG/APG @ guidance_scale=7 → listenable WAV."""
+    if os.environ.get("ACESTEP_RUN_PHASE3_PROD", "0") not in ("1", "true", "yes"):
+        pytest.skip("Set ACESTEP_RUN_PHASE3_PROD=1 to run the 30-step CFG quality gate (slow)")
+
+    if ttnn.get_num_devices() == 0:
+        pytest.skip("No Tenstorrent device available")
+
+    if not have_text_encoder_weights():
+        pytest.skip("Qwen3-Embedding-0.6B weights not on disk")
+
+    try:
+        pipe = AceStepPipeline.create_pipeline(
+            mesh_device=device,
+            num_inference_steps=PHASE3_PROD_STEPS,
+            guidance_scale=7.0,
+            audio_duration=PHASE3_PROD_DURATION,
+            shift=3.0,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"ACE-Step HF weights unavailable: {exc}")
+
+    t0 = time.perf_counter()
+    result = pipe(
+        prompts=[LIVE_PROMPT],
+        lyrics=LIVE_LYRICS,
+        reference_audio=str(fixture_wav),
+        num_inference_steps=PHASE3_PROD_STEPS,
+        seed=SEED,
+        traced=False,
+        return_waveform=True,
+    )
+    e2e_s = time.perf_counter() - t0
+
+    assert isinstance(result, dict)
+    waveform = result["waveform"]
+    assert isinstance(waveform, torch.Tensor)
+    assert waveform.shape[1] == 2
+    assert torch.isfinite(waveform).all()
+
+    from models.demos.hf_eager.acestep_v15_base.tt.vae_host import save_wav
+
+    save_wav(PHASE3_PROD_WAV, waveform)
+    print(
+        f"PHASE3_PROD infer_steps={PHASE3_PROD_STEPS} guidance_scale=7.0 "
+        f"audio_duration={PHASE3_PROD_DURATION}s e2e_s={e2e_s:.2f} wav={PHASE3_PROD_WAV}",
+        flush=True,
+    )
 
 
 # Phase 3.4 long-sequence gates live in test_phase34_long_seq.py

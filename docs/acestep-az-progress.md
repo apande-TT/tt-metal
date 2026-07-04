@@ -8,8 +8,8 @@ Started: 2026-07-03
 |-------|--------|--------|-------|
 | 1 G0 Baseline | ✅ soft PASS | — | tests 1–3 PASS; trace removed from gate |
 | 2 Live inputs | ✅ done | — | host text_encode + ref audio + pipeline |
-| 2C TT text encode | ⏳ planned | — | Qwen3-Embedding-0.6B via `tt_transformers` |
-| 3 Prod sampler | 🔄 prep done | — | apg_guidance.py + cfg helpers; loop wiring pending |
+| 2C TT text encode | ✅ done | — | Qwen3-Embedding-0.6B via `tt_transformers`; PCC ≥0.99 |
+| 3 Prod sampler | 🔄 gate run | — | 30-step CFG demo OK; listen `/tmp/az_prod_30s_cfg7.wav` |
 | 4 TT VAE | 🔄 code fixes | — | **priority 1** — oobleck_layers; device PCC gate pending |
 | 5 Full TT A→Z demo | 🔄 skeleton | — | TT text+DiT+VAE; `demo_acestep_az.py` |
 | 6 Trace + perf (DiT) | ⏳ deferred | — | DiT stack only; use `docs/acestep-m0-trace-run.sh` |

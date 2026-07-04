@@ -20,6 +20,7 @@ from models.demos.hf_eager.acestep_v15_base.tt.vae_host import DEFAULT_OUTPUT_DU
 from models.tt_dit.pipelines.acestep.apg_guidance import AceStepGuidanceConfig
 from models.tt_dit.pipelines.acestep.audio_decode import decode_latents_to_waveform, default_use_tt_vae
 from models.tt_dit.pipelines.acestep.text_encode import COVER_DIT_INSTRUCTION
+from models.tt_dit.pipelines.acestep.text_encode_tt import default_use_tt_text_encode
 from models.tt_dit.pipelines.events import PipelineEventCallback, null_callback
 from models.tt_dit.pipelines.pipeline_api import PipelineAPIMixin
 
@@ -65,6 +66,7 @@ class AceStepPipelineConfig:
     shift: float = 1.0
     sample_rate: int = 48000
     pool_window_size: int = 5
+    use_tt_text_encode: bool = False
 
 
 class AceStepPipeline(PipelineAPIMixin):
@@ -105,7 +107,10 @@ class AceStepPipeline(PipelineAPIMixin):
         shift: float = 1.0,
         sample_rate: int = 48000,
         pool_window_size: int = 5,
+        use_tt_text_encode: bool | None = None,
     ) -> AceStepPipeline:
+        if use_tt_text_encode is None:
+            use_tt_text_encode = default_use_tt_text_encode()
         config = AceStepPipelineConfig(
             checkpoint_name=checkpoint_name,
             cfg_enabled=cfg_enabled,
@@ -116,6 +121,7 @@ class AceStepPipeline(PipelineAPIMixin):
             shift=shift,
             sample_rate=sample_rate,
             pool_window_size=pool_window_size,
+            use_tt_text_encode=use_tt_text_encode,
         )
         return cls(device=mesh_device, config=config)
 
@@ -145,6 +151,8 @@ class AceStepPipeline(PipelineAPIMixin):
         seed: int,
         hf_model,
         audio_duration: float = DEFAULT_OUTPUT_DURATION_SEC,
+        mesh_device: ttnn.Device | ttnn.MeshDevice | None = None,
+        use_tt_text_encode: bool | None = None,
     ) -> dict:
         """Assemble DiT inputs from captured, live text, and/or reference audio."""
         ref_tensors = None
@@ -175,6 +183,8 @@ class AceStepPipeline(PipelineAPIMixin):
                 lyrics=lyrics,
                 audio_duration=audio_duration,
                 instruction=text_instruction,
+                mesh_device=mesh_device,
+                use_tt_text_encode=use_tt_text_encode,
             )
         else:
             _log_device_progress("prepare_inputs: captured hf_eager conditioning")
@@ -228,6 +238,8 @@ class AceStepPipeline(PipelineAPIMixin):
             seed=seed,
             hf_model=self._hf_model,
             audio_duration=self._config.audio_duration,
+            mesh_device=self._device,
+            use_tt_text_encode=self._config.use_tt_text_encode,
         )
         use_2cq = self._use_2cq(self._device, traced)
         if traced:
