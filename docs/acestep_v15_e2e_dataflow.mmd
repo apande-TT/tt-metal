@@ -1,0 +1,96 @@
+flowchart TB
+    subgraph INPUTS["Inputs (host preprocessing)"]
+        CAP["Caption / prompt<br/>IN: raw text string<br/>OUT: —"]
+        LYR["Lyrics<br/>IN: raw lyric text<br/>OUT: —"]
+        REF["Reference audio<br/>IN: PCM WAV optional<br/>OUT: —"]
+    end
+
+    subgraph TEXTENC["Text encoder — Qwen3-Embedding-0.6B (host)"]
+        TE["Embed caption + lyrics<br/>IN: caption, lyrics strings<br/>OUT: text_hidden, lyric_hidden"]
+    end
+
+    CAP --> TE
+    LYR --> TE
+    TE --> TH["text_hidden<br/>OUT: B,T_text,1024"]
+    TE --> LH["lyric_hidden<br/>OUT: B,T_lyric,1024"]
+
+    REF --> VAE_ENC["VAE encoder Oobleck<br/>IN: PCM B,2,samples 48kHz<br/>OUT: acoustic latents B,64,T"]
+    VAE_ENC --> REFH["refer_audio packed<br/>OUT: B,T_ref,64"]
+
+    subgraph OPTIONAL["Optional — acestep-5Hz-lm"]
+        LM["LM planner 0.6B/1.7B/4B<br/>IN: text, structure prompt<br/>OUT: discrete audio codes"]
+        LM --> HINTS["precomputed hints<br/>OUT: lm_hints_25Hz or audio_codes"]
+    end
+
+    subgraph CALL_A["Call A — Condition encoder"]
+        A1["text projector<br/>IN: text_hidden B,T_t,1024<br/>OUT: projected B,T_t,2048"]
+        A2["Lyric encoder 8L<br/>IN: lyric_hidden B,T_l,1024<br/>OUT: lyric enc B,T_l,2048"]
+        A3["Timbre encoder 4L<br/>IN: refer_audio B,T_r,64<br/>OUT: timbre B,T_r,2048"]
+        A4["pack sequences<br/>IN: text, lyric, timbre tensors<br/>OUT: encoder_hidden, mask"]
+    end
+
+    TH --> A1
+    LH --> A2
+    REFH --> A3
+    A1 --> A4
+    A2 --> A4
+    A3 --> A4
+    A4 --> ENC["encoder cond<br/>OUT: hidden B,109,2048<br/>OUT: mask B,109"]
+
+    subgraph CALL_B["Call B — Audio tokenizer + FSQ"]
+        B1["rearrange / pool window<br/>IN: src_latents B,T,64<br/>OUT: patches B,T/5,5,64"]
+        POOL["Attention pooler<br/>IN: patches B,T/5,5,64<br/>OUT: hidden B,T/5,2048"]
+        FSQ["ResidualFSQ + FSQ<br/>IN: hidden B,T/5,2048<br/>OUT: quantized B,T/5,2048"]
+    end
+
+    SRC["src_latents input<br/>IN: provided B,T,64 @25Hz<br/>OUT: same to Call B"] --> B1
+    B1 --> POOL --> FSQ
+    FSQ --> QNT["quantized codes<br/>OUT: B,T/5,2048 ~5Hz"]
+
+    subgraph CALL_D["Call D — Detokenizer"]
+        DET["AudioTokenDetokenizer<br/>IN: quantized B,T/5,2048<br/>OUT: lm_hints_25Hz B,T,64"]
+    end
+
+    QNT --> DET
+    DET --> LM25["lm_hints_25Hz<br/>OUT: B,T,64 @25Hz"]
+    HINTS -.->|optional override| LM25
+
+    MERGE["select src prime<br/>IN: src_latents, lm_hints, is_cover<br/>OUT: src prime B,T,64"]
+    LM25 --> MERGE
+    SRC --> MERGE
+    MASK["chunk_masks<br/>IN: mask B,T,64<br/>OUT: same to context"] --> CTX
+    MERGE --> CTX["context_latents<br/>IN: src prime, chunk_masks<br/>OUT: B,T,128"]
+
+    subgraph DENOISE["Flow-matching ODE loop host ~30 steps"]
+        NOISE["prepare_noise<br/>IN: context_latents, seed<br/>OUT: noise B,T,64"]
+        NOISE --> XT["xt state<br/>IN: noise<br/>OUT: xt B,T,64 per step"]
+        LOOP["ODE Euler update<br/>IN: xt, vt, dt<br/>OUT: xt next B,T,64"]
+    end
+
+    CTX --> NOISE
+
+    subgraph CALL_C["Call C — DiT decoder 24L"]
+        C0["Conv1d patchify<br/>IN: xt B,T,64 + context<br/>OUT: patched hidden"]
+        C1["Timestep + 6x AdaLN<br/>IN: t scalar<br/>OUT: modulation"]
+        C2["24x DiT layer<br/>IN: hidden, encoder_hidden, t<br/>OUT: hidden B,T,64"]
+        C3["ConvTranspose unpatchify<br/>IN: hidden<br/>OUT: velocity vt B,T,64"]
+    end
+
+    ENC --> CALL_C
+    CTX --> CALL_C
+    XT --> LOOP
+    LOOP -->|"each step"| C0
+    C0 --> C1 --> C2 --> C3
+    C3 --> VT["velocity vt<br/>OUT: B,T,64"]
+    VT --> LOOP
+    LOOP --> TL["target_latents<br/>OUT: B,T,64 @25Hz"]
+
+    subgraph VAE["VAE decode AutoencoderOobleck separate ckpt"]
+        TPOSE["transpose<br/>IN: B,T,64<br/>OUT: B,64,T"]
+        DEC["Oobleck decoder<br/>IN: B,64,T latents<br/>OUT: B,2,T*1920 samples"]
+        NORM["peak normalize<br/>IN: PCM float<br/>OUT: PCM ~-1 dBFS"]
+    end
+
+    TL --> TPOSE --> DEC --> NORM
+    NORM --> WAV["stereo waveform<br/>OUT: B,2,samples 48kHz"]
+    WAV --> OUT["WAV file / playback<br/>IN: PCM<br/>OUT: audio out"]
