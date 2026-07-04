@@ -67,7 +67,7 @@ def _stage_untracked_data(repo_root: Path, rel: Path, wt: Path) -> None:
     staged = []
     for line in out.stdout.splitlines():
         entry = line.strip().rstrip("/")
-        if not entry:
+        if not entry or Path(entry).name == "__pycache__":
             continue
         src = repo_root / entry
         if not src.is_dir():

@@ -27,9 +27,10 @@ chunked SSD reduces to the quadratic ("attention") form within one chunk:
 Then gated grouped-RMSNorm and out_proj. Everything stays on device.
 """
 from __future__ import annotations
-import torch
-import ttnn
 
+import torch
+
+import ttnn
 from models.demos.wormhole.mamba.tt.mamba_ssm import TtMambaSSM  # kept per ADAPT requirement
 
 
@@ -37,14 +38,14 @@ class TtNemotronHMamba2Mixer:
     def __init__(self, device, torch_module) -> None:
         self.device = device
 
-        self.num_heads = int(torch_module.num_heads)            # 64
-        self.head_dim = int(torch_module.head_dim)              # 64
+        self.num_heads = int(torch_module.num_heads)  # 64
+        self.head_dim = int(torch_module.head_dim)  # 64
         self.intermediate_size = int(torch_module.intermediate_size)  # 4096
         self.ssm_state_size = int(torch_module.ssm_state_size)  # 128
-        self.n_groups = int(torch_module.n_groups)              # 8
-        self.chunk_size = int(torch_module.chunk_size)          # 128
-        self.hidden_size = int(torch_module.hidden_size)        # 2688
-        self.conv_dim = int(torch_module.conv_dim)              # 6144
+        self.n_groups = int(torch_module.n_groups)  # 8
+        self.chunk_size = int(torch_module.chunk_size)  # 128
+        self.hidden_size = int(torch_module.hidden_size)  # 2688
+        self.conv_dim = int(torch_module.conv_dim)  # 6144
         self.time_step_limit = tuple(torch_module.time_step_limit)
         # norm config
         norm = torch_module.norm
@@ -55,11 +56,11 @@ class TtNemotronHMamba2Mixer:
         H = self.num_heads
 
         # FULL (unsharded) Mamba2 dims used to build the weight reordering.
-        Hf, HD, Nn = self.num_heads, self.head_dim, self.ssm_state_size    # 64,64,128
-        Gf = self.n_groups                                                 # 8
-        INTERf = self.intermediate_size                                    # 4096
-        GGNf = Gf * Nn                                                     # 1024
-        reps = Hf // Gf                                                    # 8
+        Hf, HD, Nn = self.num_heads, self.head_dim, self.ssm_state_size  # 64,64,128
+        Gf = self.n_groups  # 8
+        INTERf = self.intermediate_size  # 4096
+        GGNf = Gf * Nn  # 1024
+        reps = Hf // Gf  # 8
 
         # ---- tensor-parallel (head-parallel) config -----------------------
         # ONLY shard under the shard runner; the single-device .last_good_native
@@ -72,6 +73,7 @@ class TtNemotronHMamba2Mixer:
         # box fabric only trains on the full mesh, so the run lands on a 2-D
         # MeshShape(DP,TP): shard the TP (last) axis, replicate the DP axis.
         import os as _os
+
         dev = self.device
         try:
             _is_mesh = isinstance(dev, ttnn.MeshDevice)
@@ -89,7 +91,7 @@ class TtNemotronHMamba2Mixer:
         INTERl, GGNl = Hl * HD, Gl * Nn
 
         # ---- depthwise causal conv1d weights, decomposed per tap ----
-        w_conv = sd["conv1d.weight"].squeeze(1).float()        # (6144, K)
+        w_conv = sd["conv1d.weight"].squeeze(1).float()  # (6144, K)
         self.conv_k = int(w_conv.shape[1])
         K = self.conv_k
         cb = sd.get("conv1d.bias")
@@ -104,29 +106,29 @@ class TtNemotronHMamba2Mixer:
             for d in range(TP):
                 hs, he = d * Hl, (d + 1) * Hl
                 gs, ge = d * Gl, (d + 1) * Gl
-                incol += list(range(hs * HD, he * HD))                                     # gate
-                incol += list(range(INTERf + hs * HD, INTERf + he * HD))                   # x
-                incol += list(range(2 * INTERf + gs * Nn, 2 * INTERf + ge * Nn))           # B
+                incol += list(range(hs * HD, he * HD))  # gate
+                incol += list(range(INTERf + hs * HD, INTERf + he * HD))  # x
+                incol += list(range(2 * INTERf + gs * Nn, 2 * INTERf + ge * Nn))  # B
                 incol += list(range(2 * INTERf + GGNf + gs * Nn, 2 * INTERf + GGNf + ge * Nn))  # C
-                incol += list(range(2 * INTERf + 2 * GGNf + hs, 2 * INTERf + 2 * GGNf + he))    # dt
+                incol += list(range(2 * INTERf + 2 * GGNf + hs, 2 * INTERf + 2 * GGNf + he))  # dt
                 # conv operates on conv_dim = [x(INTER) | B(GGN) | C(GGN)] channels.
-                cvcol += list(range(hs * HD, he * HD))                                     # x
-                cvcol += list(range(INTERf + gs * Nn, INTERf + ge * Nn))                   # B
-                cvcol += list(range(INTERf + GGNf + gs * Nn, INTERf + GGNf + ge * Nn))     # C
+                cvcol += list(range(hs * HD, he * HD))  # x
+                cvcol += list(range(INTERf + gs * Nn, INTERf + ge * Nn))  # B
+                cvcol += list(range(INTERf + GGNf + gs * Nn, INTERf + GGNf + ge * Nn))  # C
             incol = torch.tensor(incol, dtype=torch.long)
             cvcol = torch.tensor(cvcol, dtype=torch.long)
 
-            Win = sd["in_proj.weight"].t().contiguous().float()[:, incol]     # (2688, 10304)
-            self._w_in = self._shd(Win, 1)                                    # col-parallel
+            Win = sd["in_proj.weight"].t().contiguous().float()[:, incol]  # (2688, 10304)
+            self._w_in = self._shd(Win, 1)  # col-parallel
             # out_proj row-parallel: heads are contiguous in d_inner, so a plain
             # dim-0 split lines each chip's input rows up with its heads' y.
             self._w_out = self._shd(sd["out_proj.weight"].t().contiguous().float(), 0)
 
-            w_conv_r = w_conv[cvcol]                                          # (conv_dim, K) reordered
+            w_conv_r = w_conv[cvcol]  # (conv_dim, K) reordered
             self._conv_taps = [self._shd(w_conv_r[:, K - 1 - s].reshape(1, 1, -1), 2) for s in range(K)]
             self._conv_bias = self._shd(cb.float()[cvcol].reshape(1, 1, -1), 2) if cb is not None else None
 
-            A = -torch.exp(sd["A_log"].float())                              # (H,)
+            A = -torch.exp(sd["A_log"].float())  # (H,)
             self._A = self._shd(A.reshape(1, Hf, 1, 1), 1)
             self._D = self._shd(sd["D"].float().reshape(1, Hf, 1, 1), 1)
             self._dt_bias = self._shd(sd["dt_bias"].float().reshape(1, 1, Hf), 2)
@@ -137,12 +139,12 @@ class TtNemotronHMamba2Mixer:
             P = torch.zeros(GGNl, Hl * Nn, dtype=torch.float32)
             for h in range(Hl):
                 g = h // reps
-                P[g * Nn:(g + 1) * Nn, h * Nn:(h + 1) * Nn] = torch.eye(Nn, dtype=torch.float32)
+                P[g * Nn : (g + 1) * Nn, h * Nn : (h + 1) * Nn] = torch.eye(Nn, dtype=torch.float32)
             self._P = self._dev(P)
         else:
             # ---- big projection weights (stored pre-transposed: [in, out]) ----
-            self._w_in = self._dev(sd["in_proj.weight"].t().contiguous().float())     # (2688, 10304)
-            self._w_out = self._dev(sd["out_proj.weight"].t().contiguous().float())   # (4096, 2688)
+            self._w_in = self._dev(sd["in_proj.weight"].t().contiguous().float())  # (2688, 10304)
+            self._w_out = self._dev(sd["out_proj.weight"].t().contiguous().float())  # (4096, 2688)
             # tap s shifts the sequence by s (x[t-s]); its weight column is K-1-s.
             self._conv_taps = [self._dev(w_conv[:, K - 1 - s].reshape(1, 1, self.conv_dim)) for s in range(K)]
             self._conv_bias = self._dev(cb.float().reshape(1, 1, self.conv_dim)) if cb is not None else None
@@ -150,9 +152,9 @@ class TtNemotronHMamba2Mixer:
             P = torch.zeros(G * N, H * N, dtype=torch.float32)
             for h in range(H):
                 g = h // reps
-                P[g * N:(g + 1) * N, h * N:(h + 1) * N] = torch.eye(N, dtype=torch.float32)
+                P[g * N : (g + 1) * N, h * N : (h + 1) * N] = torch.eye(N, dtype=torch.float32)
             self._P = self._dev(P)
-            A = -torch.exp(sd["A_log"].float())                    # (H,)
+            A = -torch.exp(sd["A_log"].float())  # (H,)
             self._A = self._dev(A.reshape(1, H, 1, 1))
             self._D = self._dev(sd["D"].float().reshape(1, H, 1, 1))
             self._dt_bias = self._dev(sd["dt_bias"].float().reshape(1, 1, H))
@@ -198,7 +200,10 @@ class TtNemotronHMamba2Mixer:
         if self._is_mesh():
             try:
                 return ttnn.from_torch(
-                    torch_tensor, dtype=ttnn.float32, layout=layout, device=self.device,
+                    torch_tensor,
+                    dtype=ttnn.float32,
+                    layout=layout,
+                    device=self.device,
                     mesh_mapper=ttnn.ReplicateTensorToMesh(self.device),
                 )
             except Exception:
@@ -209,7 +214,10 @@ class TtNemotronHMamba2Mixer:
         """Upload an fp32 torch weight sharded along `dim` on the TP (last) mesh
         axis and replicated on the DP axis (2-D MeshShape(DP,TP))."""
         return ttnn.from_torch(
-            torch_tensor, dtype=ttnn.float32, layout=layout, device=self.device,
+            torch_tensor,
+            dtype=ttnn.float32,
+            layout=layout,
+            device=self.device,
             mesh_mapper=ttnn.ShardTensor2dMesh(self.device, mesh_shape=self._mesh_shape, dims=(None, dim)),
         )
 
@@ -250,7 +258,7 @@ class TtNemotronHMamba2Mixer:
             return c
         H = self.num_heads
         # tril including diagonal, broadcast to all heads -> cumsum matrix
-        tril2d = torch.tril(torch.ones(T, T, dtype=torch.float32))            # (T,T)
+        tril2d = torch.tril(torch.ones(T, T, dtype=torch.float32))  # (T,T)
         tril = tril2d.reshape(1, 1, T, T).expand(1, H, T, T).contiguous()
         # ones row used to broadcast cumulative sums across columns
         ones_row = torch.ones(1, H, 1, T, dtype=torch.float32)
@@ -283,6 +291,12 @@ class TtNemotronHMamba2Mixer:
 
     # ----------------------------- forward ---------------------------- #
     def __call__(self, hidden_states, **kwargs):
+        # `return_state=True` additionally returns the decode carry:
+        #   (out, ssm_state (B,H,HD,N) fp32, conv_tail (B,K-1,conv_dim) fp32)
+        # so a subsequent single-token `decode_step` can continue the SSD scan
+        # from the end of this (prefill) sequence with a persistent recurrent
+        # state -- no re-scan of the prompt per token.
+        return_state = bool(kwargs.get("return_state", False))
         hs = self._fp32(hidden_states)
         if hs.layout != ttnn.TILE_LAYOUT:
             hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
@@ -301,6 +315,13 @@ class TtNemotronHMamba2Mixer:
         hbc = ttnn.slice(proj, [0, 0, I], [B, T, I + self.conv_dim])
         dt = ttnn.slice(proj, [0, 0, I + self.conv_dim], [B, T, I + self.conv_dim + H])
         ttnn.deallocate(proj)
+
+        # Persistent conv carry: the last K-1 PRE-conv [x|B|C] vectors, which the
+        # single-token decode conv reads as its left context.
+        conv_tail = None
+        if return_state:
+            k1 = self.conv_k - 1
+            conv_tail = ttnn.clone(ttnn.slice(hbc, [0, T - k1, 0], [B, T, self.conv_dim]))
 
         # 3. depthwise causal conv1d via shift-matmul + per-tap channel scale
         conv_acc = None
@@ -335,41 +356,44 @@ class TtNemotronHMamba2Mixer:
                     pass
 
         # 6. expand B/C groups->heads via P-matrix matmul, then reshape to heads
-        Be = ttnn.matmul(Bf, self._P, compute_kernel_config=self.ckc)   # (B, T, H*N)
-        Ce = ttnn.matmul(Cf, self._P, compute_kernel_config=self.ckc)   # (B, T, H*N)
+        Be = ttnn.matmul(Bf, self._P, compute_kernel_config=self.ckc)  # (B, T, H*N)
+        Ce = ttnn.matmul(Cf, self._P, compute_kernel_config=self.ckc)  # (B, T, H*N)
         ttnn.deallocate(Bf)
         ttnn.deallocate(Cf)
-        X = self._to_heads(Xf, B, T, H, HD)        # (B, H, T, HD)
+        X = self._to_heads(Xf, B, T, H, HD)  # (B, H, T, HD)
         ttnn.deallocate(Xf)
-        Bh = self._to_heads(Be, B, T, H, N)        # (B, H, T, N)
-        Ch = self._to_heads(Ce, B, T, H, N)        # (B, H, T, N)
+        Bh = self._to_heads(Be, B, T, H, N)  # (B, H, T, N)
+        Ch = self._to_heads(Ce, B, T, H, N)  # (B, H, T, N)
         ttnn.deallocate(Be)
         ttnn.deallocate(Ce)
-        dt_h = self._to_heads(dt, B, T, H, 1)      # (B, H, T, 1)
+        dt_h = self._to_heads(dt, B, T, H, 1)  # (B, H, T, 1)
         ttnn.deallocate(dt)
+        Bh_keep = ttnn.clone(Bh) if return_state else None
 
         # 7. discretized X and D residual
-        X_disc = ttnn.multiply(X, dt_h)            # (B, H, T, HD)
-        D_res = ttnn.multiply(X, self._D)          # (B, H, T, HD)
+        X_disc = ttnn.multiply(X, dt_h)  # (B, H, T, HD)
+        D_res = ttnn.multiply(X, self._D)  # (B, H, T, HD)
         ttnn.deallocate(X)
+        X_disc_keep = ttnn.clone(X_disc) if return_state else None
 
         # 8. decay matrix L = exp(causal-segsum(A_h * dt))
-        a = ttnn.multiply(dt_h, self._A)           # (B, H, T, 1)
+        a = ttnn.multiply(dt_h, self._A)  # (B, H, T, 1)
         ttnn.deallocate(dt_h)
-        A_cum = ttnn.matmul(consts["tril"], a, compute_kernel_config=self.ckc)   # (B, H, T, 1)
+        A_cum = ttnn.matmul(consts["tril"], a, compute_kernel_config=self.ckc)  # (B, H, T, 1)
         ttnn.deallocate(a)
+        A_cum_keep = ttnn.clone(A_cum) if return_state else None
         A_cum_t = ttnn.matmul(A_cum, consts["ones_row"], compute_kernel_config=self.ckc)  # (B,H,T,T): [.,t,s]=cum[t]
         ttnn.deallocate(A_cum)
         A_cum_s = ttnn.transpose(A_cum_t, -2, -1)  # [.,t,s] = cum[s]
-        Dmat = ttnn.subtract(A_cum_t, A_cum_s)     # cum[t]-cum[s]
+        Dmat = ttnn.subtract(A_cum_t, A_cum_s)  # cum[t]-cum[s]
         ttnn.deallocate(A_cum_t)
         ttnn.deallocate(A_cum_s)
-        Dmat = ttnn.add(Dmat, consts["neg"])       # mask s>t to -inf
-        L = ttnn.exp(Dmat)                         # (B, H, T, T)
+        Dmat = ttnn.add(Dmat, consts["neg"])  # mask s>t to -inf
+        L = ttnn.exp(Dmat)  # (B, H, T, T)
         ttnn.deallocate(Dmat)
 
         # 9. CB[h] = C[h] @ B[h]^T  (per head)
-        BhT = ttnn.transpose(Bh, -2, -1)           # (B, H, N, T)
+        BhT = ttnn.transpose(Bh, -2, -1)  # (B, H, N, T)
         CB_h = ttnn.matmul(Ch, BhT, compute_kernel_config=self.ckc)  # (B, H, T, T)
         ttnn.deallocate(BhT)
         ttnn.deallocate(Bh)
@@ -379,7 +403,7 @@ class TtNemotronHMamba2Mixer:
         M = ttnn.multiply(CB_h, L)
         ttnn.deallocate(CB_h)
         ttnn.deallocate(L)
-        Y = ttnn.matmul(M, X_disc, compute_kernel_config=self.ckc)   # (B, H, T, HD)
+        Y = ttnn.matmul(M, X_disc, compute_kernel_config=self.ckc)  # (B, H, T, HD)
         ttnn.deallocate(M)
         ttnn.deallocate(X_disc)
         Y = ttnn.add(Y, D_res)
@@ -388,7 +412,7 @@ class TtNemotronHMamba2Mixer:
         # 11. back to (B, T, I)
         Y_rm = ttnn.to_layout(Y, ttnn.ROW_MAJOR_LAYOUT)
         ttnn.deallocate(Y)
-        Y_rm = ttnn.permute(Y_rm, (0, 2, 1, 3))    # (B, T, H, HD)
+        Y_rm = ttnn.permute(Y_rm, (0, 2, 1, 3))  # (B, T, H, HD)
         Y_rm = ttnn.reshape(Y_rm, [B, T, I])
         y = ttnn.to_layout(Y_rm, ttnn.TILE_LAYOUT)
 
@@ -416,7 +440,128 @@ class TtNemotronHMamba2Mixer:
         ttnn.deallocate(y)
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
-        return ttnn.typecast(out, ttnn.bfloat16)
+        out = ttnn.typecast(out, ttnn.bfloat16)
+        if not return_state:
+            return out
+
+        # Final recurrent SSM state after the T prompt tokens:
+        #   state[h,hd,n] = sum_s exp(A_cum[T-1]-A_cum[s]) * X_disc[h,s,hd] * B[h,s,n]
+        # (X_disc = dt*x already), exactly the carry the sequential scan would
+        # hold; a single-token decode_step continues from here.
+        a_last = ttnn.slice(A_cum_keep, [0, 0, T - 1, 0], [B, H, T, 1])  # (B,H,1,1)
+        coeff = ttnn.exp(ttnn.subtract(a_last, A_cum_keep))  # (B,H,T,1)
+        ttnn.deallocate(a_last)
+        ttnn.deallocate(A_cum_keep)
+        Xw = ttnn.multiply(X_disc_keep, coeff)  # (B,H,T,HD)
+        ttnn.deallocate(X_disc_keep)
+        ttnn.deallocate(coeff)
+        XwT = ttnn.transpose(Xw, -2, -1)  # (B,H,HD,T)
+        ttnn.deallocate(Xw)
+        ssm_state = ttnn.matmul(XwT, Bh_keep, compute_kernel_config=self.ckc)  # (B,H,HD,N)
+        ttnn.deallocate(XwT)
+        ttnn.deallocate(Bh_keep)
+        return out, ssm_state, conv_tail
+
+    # ----------------------------- decode ----------------------------- #
+    def decode_step(self, hidden_states, ssm_state, conv_tail):
+        """Single-token SSD recurrence continuing from (ssm_state, conv_tail).
+
+        hidden_states: (B,1,hidden). Returns (out (B,1,hidden) bf16,
+        new_ssm_state (B,H,HD,N) fp32, new_conv_tail (B,K-1,conv_dim) fp32).
+        Mirrors the proven sequential scan: state = state*exp(dt*A) + (dt*x)⊗B,
+        y = sum_n(state*C) + D*x -- mathematically identical to the chunked
+        prefill above, so it matches the same golden."""
+        H, HD, N = self.num_heads, self.head_dim, self.ssm_state_size
+        I = self.intermediate_size
+        G = self.n_groups
+        K = self.conv_k
+        hs = self._fp32(hidden_states)
+        if hs.layout != ttnn.TILE_LAYOUT:
+            hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
+        B = list(hs.shape)[0]
+
+        proj = ttnn.matmul(hs, self._w_in, compute_kernel_config=self.ckc)  # (B,1,10304)
+        gate = ttnn.slice(proj, [0, 0, 0], [B, 1, I])
+        hbc_t = ttnn.slice(proj, [0, 0, I], [B, 1, I + self.conv_dim])  # (B,1,conv_dim) pre-conv
+        dt = ttnn.slice(proj, [0, 0, I + self.conv_dim], [B, 1, I + self.conv_dim + H])
+        ttnn.deallocate(proj)
+
+        # depthwise causal conv over [conv_tail (K-1) | current]: window[-1-s] = x[t-s]
+        window = ttnn.concat([conv_tail, hbc_t], dim=1)  # (B,K,conv_dim)
+        conv_acc = self._conv_bias if self._conv_bias is not None else None
+        for s in range(K):
+            xs = ttnn.slice(window, [0, K - 1 - s, 0], [B, K - s, self.conv_dim])  # x[t-s] (B,1,conv_dim)
+            term = ttnn.multiply(xs, self._conv_taps[s])
+            ttnn.deallocate(xs)
+            conv_acc = term if conv_acc is None else ttnn.add(conv_acc, term)
+        # advance the conv carry: drop the oldest, keep the last K-1 pre-conv vecs
+        new_conv_tail = ttnn.clone(ttnn.slice(window, [0, 1, 0], [B, K, self.conv_dim]))
+        ttnn.deallocate(window)
+        ttnn.deallocate(hbc_t)
+        hbc = ttnn.silu(conv_acc)
+        ttnn.deallocate(conv_acc)
+
+        Xf = ttnn.slice(hbc, [0, 0, 0], [B, 1, I])
+        Bf = ttnn.slice(hbc, [0, 0, I], [B, 1, I + G * N])
+        Cf = ttnn.slice(hbc, [0, 0, I + G * N], [B, 1, I + 2 * G * N])
+        ttnn.deallocate(hbc)
+
+        dt = ttnn.add(dt, self._dt_bias)
+        dt = self._softplus(dt)
+
+        Be = ttnn.matmul(Bf, self._P, compute_kernel_config=self.ckc)  # (B,1,H*N)
+        Ce = ttnn.matmul(Cf, self._P, compute_kernel_config=self.ckc)
+        ttnn.deallocate(Bf)
+        ttnn.deallocate(Cf)
+        x_t = ttnn.reshape(self._to_heads(Xf, B, 1, H, HD), [B, H, HD, 1])  # (B,H,HD,1)
+        ttnn.deallocate(Xf)
+        B_t = ttnn.reshape(self._to_heads(Be, B, 1, H, N), [B, H, 1, N])  # (B,H,1,N)
+        C_t = ttnn.reshape(self._to_heads(Ce, B, 1, H, N), [B, H, 1, N])  # (B,H,1,N)
+        ttnn.deallocate(Be)
+        ttnn.deallocate(Ce)
+        dt_t = ttnn.reshape(self._to_heads(dt, B, 1, H, 1), [B, H, 1, 1])  # (B,H,1,1)
+        ttnn.deallocate(dt)
+
+        dA = ttnn.exp(ttnn.multiply(dt_t, self._A))  # (B,H,1,1)
+        dtx = ttnn.multiply(dt_t, x_t)  # (B,H,HD,1)
+        ttnn.deallocate(dt_t)
+        dBx = ttnn.multiply(dtx, B_t)  # (B,H,HD,N)
+        ttnn.deallocate(dtx)
+        ttnn.deallocate(B_t)
+        new_state = ttnn.add(ttnn.multiply(ssm_state, dA), dBx)  # (B,H,HD,N)
+        ttnn.deallocate(dA)
+        ttnn.deallocate(dBx)
+        y = ttnn.sum(ttnn.multiply(new_state, C_t), dim=-1)  # (B,H,HD)
+        ttnn.deallocate(C_t)
+        D_res = ttnn.multiply(ttnn.reshape(x_t, [B, H, HD]), ttnn.reshape(self._D, [1, H, 1]))
+        ttnn.deallocate(x_t)
+        y = ttnn.add(y, D_res)  # (B,H,HD)
+        ttnn.deallocate(D_res)
+        y = ttnn.reshape(y, [B, 1, I])
+
+        # gated grouped RMSNorm (norm_before_gate=False)
+        g_silu = ttnn.silu(gate)
+        ttnn.deallocate(gate)
+        y = ttnn.multiply(y, g_silu)
+        ttnn.deallocate(g_silu)
+        gs = self.norm_group_size
+        ng = I // gs
+        y_rm = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT)
+        y_g = ttnn.reshape(y_rm, [B, ng, gs])
+        y_g = ttnn.to_layout(y_g, ttnn.TILE_LAYOUT)
+        y_n = ttnn.rms_norm(y_g, weight=self._norm_ones, epsilon=self.norm_eps, compute_kernel_config=self.ckc)
+        ttnn.deallocate(y_g)
+        y_n_rm = ttnn.to_layout(y_n, ttnn.ROW_MAJOR_LAYOUT)
+        y_n_rm = ttnn.reshape(y_n_rm, [B, 1, I])
+        y = ttnn.to_layout(y_n_rm, ttnn.TILE_LAYOUT)
+        y = ttnn.multiply(y, self._norm_w_full)
+
+        out = ttnn.matmul(y, self._w_out, compute_kernel_config=self.ckc)  # (B,1,hidden)
+        ttnn.deallocate(y)
+        if self._shard:
+            out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
+        out = ttnn.typecast(out, ttnn.bfloat16)
+        return out, new_state, new_conv_tail
 
 
 # Module-level `build` — primary test entry point.

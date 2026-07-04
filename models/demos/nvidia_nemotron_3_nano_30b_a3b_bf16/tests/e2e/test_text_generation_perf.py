@@ -1,9 +1,8 @@
 import os
 import time
-import sys
 
-import torch
 import pytest
+import torch
 
 import ttnn
 from models.demos.nvidia_nemotron_3_nano_30b_a3b_bf16.tt import pipeline as pl
@@ -27,6 +26,7 @@ PERF_SEQ_LEN = int(os.environ.get("TT_PERF_SEQ_LEN", "128"))
 PERF_PROMPT = "The capital of France is"
 
 
+@pytest.mark.timeout(900)
 def test_text_generation_perf():
     # 1) build the pipeline EXACTLY as demo/demo_text_generation.py does
     tok = AutoTokenizer.from_pretrained(pl.HF_MODEL_ID, trust_remote_code=True)
@@ -76,7 +76,12 @@ def test_text_generation_perf():
     _fw0 = time.monotonic()
     try:
         pipe = pl.build_pipeline(device, model, compose=True)
-        print(f"[perf] mesh={is_mesh} shard_active={pipe.shard_active}", flush=True)
+        # Cap the profiled depth by setting the attribute DIRECTLY rather than
+        # trusting the TT_PERF_LAYERS env var: the module-scoped e2e fixture pops
+        # that var for the whole pytest session, so relying on it here would run
+        # all 52 layers under the profiler drain and blow the timeout.
+        pipe.M._N_LAYERS = min(int(os.environ.get("TT_PERF_LAYERS", "2") or "2"), pipe.M._N_LAYERS)
+        print(f"[perf] mesh={is_mesh} shard_active={pipe.shard_active} perf_layers={pipe.M._N_LAYERS}", flush=True)
         # run the pipeline BOUNDED: cap decode via PERF_MAX_NEW_TOKENS
         new_ids, _ = pipe.generate(input_ids, PERF_MAX_NEW_TOKENS, eos_token_id=eos)
         out = new_ids

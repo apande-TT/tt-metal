@@ -42,9 +42,10 @@ by a (tokens, n_experts) routing matrix that is zero for unselected experts
 (mathematically identical to the sparse HF loop).
 """
 from __future__ import annotations
-import torch
-import ttnn
 
+import torch
+
+import ttnn
 from models.tt_transformers.tt.mixtral_moe import TtMoeLayer  # kept per ADAPT requirement
 
 
@@ -80,6 +81,7 @@ class TtNemotronHMOE:
         # 128-expert sum. The shared expert (replicated) is added once AFTER the
         # reduce. The math is identical to the dense single-device golden.
         import os as _os
+
         dev = self.device
         try:
             _is_mesh = isinstance(dev, ttnn.MeshDevice)
@@ -108,17 +110,24 @@ class TtNemotronHMOE:
             )
             _hid, _inter = up_stack.shape[1], up_stack.shape[2]
             up_sh = ttnn.from_torch(
-                up_stack, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT,
+                up_stack,
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=dev,
                 mesh_mapper=ttnn.ShardTensor2dMesh(dev, mesh_shape=_mesh_shape, dims=(None, 0)),
             )
-            up_sh = ttnn.to_device(up_sh, dev)
             dn_sh = ttnn.from_torch(
-                dn_stack, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT,
+                dn_stack,
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=dev,
                 mesh_mapper=ttnn.ShardTensor2dMesh(dev, mesh_shape=_mesh_shape, dims=(None, 0)),
             )
-            dn_sh = ttnn.to_device(dn_sh, dev)
-            self._up_stack = up_sh
-            self._dn_stack = dn_sh
+            for e in range(Eloc):
+                self._up.append(ttnn.reshape(ttnn.slice(up_sh, [e, 0, 0], [e + 1, _hid, _inter]), [_hid, _inter]))
+                self._down.append(ttnn.reshape(ttnn.slice(dn_sh, [e, 0, 0], [e + 1, _inter, _hid]), [_inter, _hid]))
+            ttnn.deallocate(up_sh)
+            ttnn.deallocate(dn_sh)
             # per-chip expert selector: sel[d] is a one-hot [E, Eloc] that maps the
             # replicated full router weights W (.,.,E) to this chip's Eloc columns
             # via a matmul; sharded on dim0 so chip d gets sel[d].
@@ -127,19 +136,17 @@ class TtNemotronHMOE:
                 for j in range(Eloc):
                     sel[d, d * Eloc + j, j] = 1.0
             self._sel = ttnn.from_torch(
-                sel, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev,
+                sel,
+                dtype=ttnn.float32,
+                layout=ttnn.TILE_LAYOUT,
+                device=dev,
                 mesh_mapper=ttnn.ShardTensor2dMesh(dev, mesh_shape=_mesh_shape, dims=(None, 0)),
             )
             self._Eloc = Eloc
         else:
-            up_stack = torch.stack(
-                [sd[f"experts.{e}.up_proj.weight"].t().contiguous() for e in range(E)], 0
-            ).to(torch.bfloat16)
-            dn_stack = torch.stack(
-                [sd[f"experts.{e}.down_proj.weight"].t().contiguous() for e in range(E)], 0
-            ).to(torch.bfloat16)
-            self._up_stack = self._upload(up_stack, ttnn.bfloat8_b)
-            self._dn_stack = self._upload(dn_stack, ttnn.bfloat8_b)
+            for e in range(E):
+                self._up.append(self._devw(sd[f"experts.{e}.up_proj.weight"].t().contiguous()))
+                self._down.append(self._devw(sd[f"experts.{e}.down_proj.weight"].t().contiguous()))
             self._sel = None
             self._Eloc = E
 
@@ -153,11 +160,6 @@ class TtNemotronHMOE:
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
-        try:
-            _g = self.device.compute_with_storage_grid_size()
-            self._grid = ttnn.CoreGrid(y=_g.y, x=_g.x)
-        except Exception:
-            self._grid = None
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -176,15 +178,16 @@ class TtNemotronHMOE:
     def _upload(self, torch_tensor, dtype, layout=ttnn.TILE_LAYOUT):
         if self._is_mesh():
             try:
-                t = ttnn.from_torch(
-                    torch_tensor, dtype=dtype, layout=layout,
+                return ttnn.from_torch(
+                    torch_tensor,
+                    dtype=dtype,
+                    layout=layout,
+                    device=self.device,
                     mesh_mapper=ttnn.ReplicateTensorToMesh(self.device),
                 )
-                return ttnn.to_device(t, self.device)
             except Exception:
                 pass
-        t = ttnn.from_torch(torch_tensor, dtype=dtype, layout=layout)
-        return ttnn.to_device(t, self.device)
+        return ttnn.from_torch(torch_tensor, dtype=dtype, layout=layout, device=self.device)
 
     def _dev(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
         """fp32 constant, mesh-replicated."""
@@ -212,47 +215,47 @@ class TtNemotronHMOE:
 
         # ---------------- router (fp32) ----------------
         logits = ttnn.matmul(hs, self._gate_w, compute_kernel_config=self.ckc)  # (B,T,E)
-        scores = ttnn.sigmoid(logits)                                           # (B,T,E) fp32
+        scores = ttnn.sigmoid(logits)  # (B,T,E) fp32
         ttnn.deallocate(logits)
-        choice = ttnn.add(scores, self._bias)                                   # selection scores (B,T,E)
+        choice = ttnn.add(scores, self._bias)  # selection scores (B,T,E)
 
         # Top-k selection via a FULLY-FP32 ALL-PAIRS RANK (NOT bf16 ttnn.topk).
         # Measured: bf16 topk's threshold rounds the 6th/7th-of-128 boundary
         # scores equal -> over/under-selects -> PCC caps ~0.979. The rank
         # count is exact in fp32. rank_i = #{j : choice_j > choice_i}; the
         # top_k experts are those with rank < top_k.
-        bb = ttnn.reshape(choice, [B, T, 1, E])          # (B,T,1,E): [.,.,0,j]=choice_j
-        b_full = ttnn.repeat(bb, [1, 1, E, 1])           # (B,T,E,E): [.,.,i,j]=choice_j
+        bb = ttnn.reshape(choice, [B, T, 1, E])  # (B,T,1,E): [.,.,0,j]=choice_j
+        b_full = ttnn.repeat(bb, [1, 1, E, 1])  # (B,T,E,E): [.,.,i,j]=choice_j
         ttnn.deallocate(bb)
-        a_full = ttnn.transpose(b_full, 2, 3)            # (B,T,E,E): [.,.,i,j]=choice_i
-        gt = ttnn.gt(b_full, a_full)                      # [.,.,i,j] = choice_j > choice_i
+        a_full = ttnn.transpose(b_full, 2, 3)  # (B,T,E,E): [.,.,i,j]=choice_i
+        gt = ttnn.gt(b_full, a_full)  # [.,.,i,j] = choice_j > choice_i
         ttnn.deallocate(b_full)
         ttnn.deallocate(a_full)
         gt_f = ttnn.typecast(gt, ttnn.float32)
         ttnn.deallocate(gt)
-        rank = ttnn.sum(gt_f, dim=3)                      # (B,T,E): rank_i = #{j: choice_j>choice_i}
+        rank = ttnn.sum(gt_f, dim=3)  # (B,T,E): rank_i = #{j: choice_j>choice_i}
         ttnn.deallocate(gt_f)
         if list(rank.shape)[-1] != E:
             rank = ttnn.reshape(rank, [B, T, E])
-        mask = ttnn.lt(rank, float(self.top_k))          # (B,T,E) 1.0/0.0
+        mask = ttnn.lt(rank, float(self.top_k))  # (B,T,E) 1.0/0.0
         ttnn.deallocate(rank)
         ttnn.deallocate(choice)
         if mask.dtype != ttnn.float32:
             mask = ttnn.typecast(mask, ttnn.float32)
 
         # gather weights from `scores` (NOT choice), normalize over the top-k, scale
-        selected = ttnn.multiply(scores, mask)                                 # (B,T,E)
+        selected = ttnn.multiply(scores, mask)  # (B,T,E)
         ttnn.deallocate(scores)
         ttnn.deallocate(mask)
         if self.norm_topk_prob:
-            denom = ttnn.sum(selected, dim=-1, keepdim=True)                   # (B,T,1)
+            denom = ttnn.sum(selected, dim=-1, keepdim=True)  # (B,T,1)
             denom = ttnn.add(denom, 1e-20)
             W = ttnn.multiply(selected, ttnn.reciprocal(denom))
             ttnn.deallocate(selected)
             ttnn.deallocate(denom)
         else:
             W = selected
-        W = ttnn.multiply(W, self.routed_scaling_factor)                       # (B,T,E) fp32
+        W = ttnn.multiply(W, self.routed_scaling_factor)  # (B,T,E) fp32
 
         # Under expert-parallel, project the replicated full W (.,.,E) down to
         # THIS chip's Eloc routing columns (sel[d] one-hot) so the local loop
@@ -267,34 +270,26 @@ class TtNemotronHMOE:
         # HF sums the top-k weighted expert outputs in fp32 (topk_weights.dtype),
         # so accumulate in fp32; bf16 expert weights/matmuls with HiFi4 fp32 acc.
         hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
-        Eloc = self._Eloc
-        M = B * T
-        # Batched expert matmuls: evaluate all Eloc local experts as two 3D
-        # (batch=Eloc) matmuls instead of an Eloc-long python loop of tiny
-        # per-expert matmuls. Collapses the per-expert matmul + relu2 + slice +
-        # weight-multiply dispatch storm into a handful of full-grid ops. Math
-        # is identical to the dense per-expert sum.
-        hs_rep = ttnn.repeat(hs_bf, [Eloc, 1, 1])                                  # (Eloc,M,H) [B==1]
-        up = ttnn.matmul(hs_rep, self._up_stack, compute_kernel_config=self.ckc, core_grid=self._grid)   # (Eloc,M,inter)
-        ttnn.deallocate(hs_rep)
-        act = ttnn.relu(up)
-        ttnn.deallocate(up)
-        act = ttnn.multiply(act, act)                                              # relu2
-        down = ttnn.matmul(act, self._dn_stack, compute_kernel_config=self.ckc, core_grid=self._grid)     # (Eloc,M,H)
-        ttnn.deallocate(act)
-        down_f = ttnn.typecast(down, ttnn.float32)                                 # (Eloc,M,H)
-        ttnn.deallocate(down)
-        # per-expert routing weights: W_use (B,T,Eloc) -> (Eloc,M,1)
-        w = ttnn.reshape(W_use, [M, Eloc])
+        out = None
+        for e in range(self._Eloc):
+            up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self.ckc)  # (B,T,inter) bf16
+            act = ttnn.relu(up)
+            ttnn.deallocate(up)
+            act = ttnn.multiply(act, act)  # relu2
+            down = ttnn.matmul(act, self._down[e], compute_kernel_config=self.ckc)  # (B,T,hidden) bf16
+            ttnn.deallocate(act)
+            down_f = ttnn.typecast(down, ttnn.float32)
+            ttnn.deallocate(down)
+            we = ttnn.slice(W_use, [0, 0, e], [B, T, e + 1])  # (B,T,1) fp32
+            contrib = ttnn.multiply(down_f, we, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(down_f)
+            ttnn.deallocate(we)
+            if out is None:
+                out = contrib
+            else:
+                out = ttnn.add(out, contrib, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                ttnn.deallocate(contrib)
         ttnn.deallocate(W_use)
-        w = ttnn.transpose(w, 0, 1)                                                # (Eloc,M)
-        w = ttnn.reshape(w, [Eloc, M, 1])
-        contrib = ttnn.multiply(down_f, w, memory_config=ttnn.DRAM_MEMORY_CONFIG)   # (Eloc,M,H)
-        ttnn.deallocate(down_f)
-        ttnn.deallocate(w)
-        out = ttnn.sum(contrib, dim=0, keepdim=True)                               # (1,M,H)
-        ttnn.deallocate(contrib)
-        out = ttnn.reshape(out, [B, T, self.hidden_size])
 
         # Sum each chip's partial expert mixture into the full 128-expert result
         # (every chip on the TP axis then holds the complete routed sum).
@@ -312,7 +307,7 @@ class TtNemotronHMOE:
         s_down_f = ttnn.typecast(s_down, ttnn.float32)
         ttnn.deallocate(s_down)
 
-        out = ttnn.add(out, s_down_f)                                           # (B,T,hidden) fp32
+        out = ttnn.add(out, s_down_f)  # (B,T,hidden) fp32
         ttnn.deallocate(s_down_f)
         return out
 

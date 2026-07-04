@@ -85,6 +85,10 @@ def mesh_pipe():
     """Open the 4-chip TP=2 x DP=2 mesh (FABRIC_1D + shard runner) ONCE, build the
     HF reference + the shared TTNN pipeline, and hand both to the tests. Closed at
     module teardown. Falls back to a single device if the mesh cannot be opened."""
+    # The correctness/e2e gate must run the FULL model. The perf test modules
+    # set TT_PERF_LAYERS at import time (a profiling depth cap) which leaks into
+    # this same pytest process; clear it so the compose loop runs all 52 layers.
+    os.environ.pop("TT_PERF_LAYERS", None)
     compose = _compose()
     dev, is_mesh = pl.open_pipeline_mesh(l1_small_size=24576)
     hf = _load_hf()
@@ -100,8 +104,14 @@ def mesh_pipe():
         pl.close_pipeline_mesh(dev, is_mesh)
 
 
+@pytest.mark.timeout(3600)
 def test_e2e_prefill(mesh_pipe):
-    """Fast Gate-3 proxy: ONE prefill forward, first-token logits PCC vs golden."""
+    """Fast Gate-3 proxy: ONE prefill forward, first-token logits PCC vs golden.
+
+    Overrides the repo-wide 300s pytest.ini timeout: this test triggers the
+    module-scoped fixture that opens the TP=4 mesh and builds the full 30B
+    backbone RESIDENT (all layer weights uploaded once at init), which alone is
+    minutes of host->device transfer. The PCC gate is unchanged."""
     compose = _compose()
     _reset_runtime_fallbacks()
     ids, new_ids, step_logits = _load_golden()
@@ -117,8 +127,14 @@ def test_e2e_prefill(mesh_pipe):
     assert ok, f"first-token logits PCC {pcc} < {PCC_TARGET} (compose={compose})"
 
 
+@pytest.mark.timeout(3600)
 def test_e2e_generate(mesh_pipe):
-    """Full gate: capped greedy decode, per-step logits PCC + token match + Gate 1/2."""
+    """Full gate: capped greedy decode, per-step logits PCC + token match + Gate 1/2.
+
+    Overrides the repo-wide 300s pytest.ini timeout: this runs the FULL 52-layer
+    30B model with lazy per-layer weight load/evict, N times with no KV cache
+    (full recompute per decode step), so the honest wall-clock is minutes. The
+    PCC/token gate is unchanged — only the time budget is widened."""
     compose = _compose()
     N = int(os.environ.get("TT_E2E_N", "5"))
     _reset_runtime_fallbacks()

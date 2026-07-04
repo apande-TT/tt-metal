@@ -16,6 +16,7 @@ gappy when median op-to-op gap > 6.5 microseconds (medians only, never sums).
 from __future__ import annotations
 
 import csv
+import math
 import re
 import shutil
 import statistics
@@ -50,13 +51,7 @@ def warm_wall_ms(walls: Sequence[float]) -> float:
 
 
 _FORWARD_WALL_RE = re.compile(r"FORWARD_WALL_MS=([0-9]+\.?[0-9]*)")
-# clean per-token WALL latency from a trace-replay harness (agent/trace_replay.py). This is the
-# GPU-comparable steady-state step cost (host dispatch collapsed by the device trace), unlike
-# wall_ms (whole harness) — TBD(wall-metric-source) closed by this sentinel channel.
 _PER_TOKEN_RE = re.compile(r"TRACE_PER_TOKEN_MS=([0-9]+\.?[0-9]*)")
-# the perf test's trace-replay block prints this when the pipeline has NO trace-capturable decode
-# step (repeat-prefill / host-argmax decode) — the generic "this model needs the structural decode
-# lever before a clean per-token number is possible" signal.
 _TRACE_SKIP_RE = re.compile(r"TRACE_REPLAY_SKIPPED=")
 
 
@@ -268,9 +263,10 @@ def refine(
 
 def _to_float(value: str) -> float | None:
     try:
-        return float(value)
+        f = float(value)
     except (TypeError, ValueError):
         return None
+    return None if math.isnan(f) else f
 
 
 def _raw_index(raw_csv: str | Path) -> dict[int, dict[str, str]]:
@@ -531,13 +527,9 @@ def tracy_tool(
     return {
         "wall_ms": wall_ms,
         "forward_wall_ms": forward_wall_ms(profiles_dir, runs),
-        # clean per-token wall (trace-replay) + GPU-comparable throughput; None until a harness
-        # emits TRACE_PER_TOKEN_MS via agent/trace_replay.measure_per_token.
         "per_token_ms": pt_ms,
         "tokens_per_sec_per_user": tput["tokens_per_sec_per_user"],
         "tokens_per_sec": tput["tokens_per_sec"],
-        # 'traced' | 'repeat_prefill' | 'off' — repeat_prefill flags a model that needs the
-        # structural decode lever (cached step) before a clean per-token number is possible.
         "decode_status": decode_trace_status(profiles_dir, runs),
         "device_ms": device_ms,
         "host_ms": host_ms,
