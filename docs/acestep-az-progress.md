@@ -13,7 +13,7 @@ Started: 2026-07-03
 | 4 TT VAE | ✅ done | — | PCC gate + e2e TT VAE waveform test |
 | 5 Full TT A→Z demo | ✅ signoff run | — | `bash docs/acestep-az-phase5-run.sh` → `/tmp/az_phase5_signoff.wav` |
 | 6 Trace + perf (DiT) | ⏳ deferred | — | DiT stack only; use `docs/acestep-m0-trace-run.sh` |
-| 7 5Hz LM planner | 🔄 7B on TT | Host 7A done; TT Qwen3 via `lm_planner_tt.py` + device prefill/generation gates | `bash docs/acestep-az-phase7-run.sh` → `/tmp/az_lm_tt.wav` |
+| 7 5Hz LM planner | 🔄 7C device gate | 7A/7B done | `bash docs/acestep-az-phase7-run.sh` (demo) · `bash docs/acestep-az-phase7c-run.sh` (pytest gate) |
 | 8 Trace + perf (full) | ⏳ deferred | — | LM + DiT + TT VAE traced; < 2 s target |
 
 ## Revisit / blockers

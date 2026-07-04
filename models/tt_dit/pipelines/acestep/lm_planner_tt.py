@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -21,6 +21,12 @@ from models.tt_dit.pipelines.acestep.lm_planner import (
     parse_audio_code_string,
     parse_lm_output,
     resolve_lm_planner_path,
+)
+from models.tt_dit.pipelines.acestep.lm_planner_constrained import (
+    configure_codes_phase,
+    configure_cot_phase,
+    create_constrained_processor,
+    default_use_constrained_decoding,
 )
 from models.tt_transformers.tt.common import PagedAttentionConfig, create_tt_model, num_blocks_in_seq, sample_host
 from models.tt_transformers.tt.generator import Generator
@@ -59,9 +65,31 @@ class _TTLMState:
     page_table: torch.Tensor
     tokenizer: object
     weight_path: str
+    constrained_processor: Any | None = None
+    max_num_blocks: int = 1024
+
+
+@dataclass
+class _TTGenerationSession:
+    state: _TTLMState
+    token_ids: list[int] = field(default_factory=list)
+    prompt_len: int = 0
 
 
 _STATE_BY_DEVICE: dict[int, _TTLMState] = {}
+
+
+def release_tt_lm_session(mesh_device: ttnn.Device | ttnn.MeshDevice) -> None:
+    """Drop cached TT LM weights/KV for this device (tests / isolation)."""
+    _STATE_BY_DEVICE.pop(id(mesh_device), None)
+
+
+def _get_constrained_processor(state: _TTLMState) -> Any | None:
+    if not default_use_constrained_decoding():
+        return None
+    if state.constrained_processor is None:
+        state.constrained_processor = create_constrained_processor(state.tokenizer)
+    return state.constrained_processor
 
 
 def _load_tt_lm(
@@ -101,8 +129,6 @@ def _load_tt_lm(
             os.environ["HF_MODEL"] = prev_hf_model
 
     page_table = _build_page_table(_TT_MAX_SEQ_LEN, max_num_blocks=max_num_blocks)
-    from transformers import AutoTokenizer
-
     tokenizer = AutoTokenizer.from_pretrained(weight_path, trust_remote_code=True)
     generator = Generator([tt_model], [model_args], mesh_device, tokenizer=tokenizer)
     state = _TTLMState(
@@ -112,42 +138,85 @@ def _load_tt_lm(
         page_table=page_table,
         tokenizer=tokenizer,
         weight_path=weight_path,
+        max_num_blocks=max_num_blocks,
     )
     _STATE_BY_DEVICE[cache_key] = state
     return state
 
 
-def _next_token_from_logits(logits: torch.Tensor, *, temperature: float) -> torch.Tensor:
+def _begin_session(mesh_device: ttnn.Device | ttnn.MeshDevice, *, model: str | None) -> _TTGenerationSession:
+    state = _load_tt_lm(mesh_device, model=model)
+    return _TTGenerationSession(state=state)
+
+
+def _reset_kv(state: _TTLMState) -> None:
+    state.page_table = _build_page_table(_TT_MAX_SEQ_LEN, max_num_blocks=state.max_num_blocks)
+
+
+def _next_token_from_logits(
+    logits: torch.Tensor,
+    *,
+    temperature: float,
+    processor: Any | None,
+    input_ids: torch.Tensor,
+) -> torch.Tensor:
     if logits.ndim == 1:
         logits = logits.unsqueeze(0)
-    _, token = sample_host(logits, temperature=temperature, top_p=0.08, on_host=True)
+    scores = logits.float()
+    if processor is not None:
+        scores = processor(input_ids, scores)
+    if temperature <= 0:
+        token = scores.argmax(dim=-1, keepdim=True).to(torch.int64)
+    else:
+        _, token = sample_host(scores, temperature=temperature, top_p=0.08, on_host=True)
+        token = token.to(torch.int64)
     if token.ndim == 1:
         token = token.unsqueeze(-1)
-    return token.to(torch.int64)
+    return token
 
 
-def _generate_text_tt(
-    mesh_device: ttnn.Device | ttnn.MeshDevice,
+def _generate_phase(
+    session: _TTGenerationSession,
     *,
-    model: str | None,
     formatted_prompt: str,
     max_new_tokens: int,
     temperature: float,
+    generation_phase: str,
+    target_duration: float | None,
     stop_suffix: str | None = None,
-    seed: int | None = None,
+    stop_at_reasoning: bool = False,
+    continue_kv: bool = False,
 ) -> str:
-    if seed is not None:
-        torch.manual_seed(int(seed))
+    processor = _get_constrained_processor(session.state)
+    if processor is not None:
+        if generation_phase == "codes":
+            configure_codes_phase(processor, enabled=True, target_duration=target_duration)
+        else:
+            configure_cot_phase(processor, enabled=True, stop_at_reasoning=stop_at_reasoning)
 
-    state = _load_tt_lm(mesh_device, model=model)
-    try:
-        tokenizer = state.tokenizer
-        generator = state.generator
-        prompt_tokens = tokenizer(formatted_prompt, return_tensors="pt").input_ids
+    state = session.state
+    tokenizer = state.tokenizer
+    prompt_tokens = tokenizer(formatted_prompt, return_tensors="pt").input_ids
+    prompt_list = prompt_tokens[0].tolist()
+    eos_id = tokenizer.eos_token_id
+
+    if continue_kv and session.token_ids and prompt_list == session.token_ids:
+        _log_progress(
+            f"lm_planner_tt: KV reuse — continuing decode at pos={len(session.token_ids)} " f"phase={generation_phase}"
+        )
+        out_tok = torch.tensor([[session.token_ids[-1]]], dtype=torch.long)
+        current_pos = torch.tensor([len(session.token_ids) - 1])
+        generated_start = len(session.token_ids)
+        decode_steps = max_new_tokens
+        reset_batch_next = True
+    else:
+        _reset_kv(state)
         seq_len = int(prompt_tokens.shape[1])
-        eos_id = tokenizer.eos_token_id
+        session.token_ids = prompt_list.copy()
+        session.prompt_len = seq_len
+        generated_start = seq_len
 
-        logits = generator.prefill_forward_text(
+        logits = state.generator.prefill_forward_text(
             prompt_tokens,
             page_table=state.page_table,
             kv_cache=[state.kv_cache],
@@ -155,42 +224,71 @@ def _generate_text_tt(
             enable_trace=False,
             warmup_prefill=True,
         )
-        out_tok = _next_token_from_logits(logits, temperature=temperature)
-        generated_ids = prompt_tokens[0].tolist() + [int(out_tok.reshape(-1)[0].item())]
-
+        input_ids = torch.tensor([session.token_ids], dtype=torch.long)
+        out_tok = _next_token_from_logits(
+            logits,
+            temperature=temperature,
+            processor=processor,
+            input_ids=input_ids,
+        )
+        token_id = int(out_tok.reshape(-1)[0].item())
+        if processor is not None:
+            processor.update_state(token_id)
+        session.token_ids.append(token_id)
         current_pos = torch.tensor([seq_len])
-        prompt_for_decode = prompt_tokens
+        decode_steps = max(0, max_new_tokens - 1)
+        reset_batch_next = True
 
-        for iteration in range(1, max_new_tokens):
-            logits, _log_probs = generator.decode_forward(
-                out_tok.reshape(1, 1),
-                current_pos,
-                enable_trace=False,
-                page_table=state.page_table,
-                kv_cache=[state.kv_cache],
-                reset_batch=(iteration == 1),
-                sampling_params=None,
-                prompt_tokens=prompt_for_decode,
-                output_tokens=out_tok.reshape(1, 1),
-            )
-            out_tok = _next_token_from_logits(logits, temperature=temperature)
-            token_id = int(out_tok.reshape(-1)[0].item())
-            generated_ids.append(token_id)
-            current_pos = current_pos + 1
-
-            if eos_id is not None and token_id == eos_id:
-                break
-
-            new_text = tokenizer.decode(generated_ids[seq_len:], skip_special_tokens=False)
-            if stop_suffix and stop_suffix in new_text:
-                break
-
-        new_text = tokenizer.decode(generated_ids[seq_len:], skip_special_tokens=False)
+        new_text = tokenizer.decode(session.token_ids[generated_start:], skip_special_tokens=False)
+        if eos_id is not None and token_id == eos_id:
+            return _trim_stop_suffix(new_text, stop_suffix)
+        if processor is not None and processor.state.name == "COMPLETED":
+            return _trim_stop_suffix(new_text, stop_suffix)
         if stop_suffix and stop_suffix in new_text:
-            new_text = new_text.split(stop_suffix, 1)[0] + stop_suffix
-        return new_text
-    finally:
-        _STATE_BY_DEVICE.pop(id(mesh_device), None)
+            return _trim_stop_suffix(new_text, stop_suffix)
+
+    for decode_idx in range(decode_steps):
+        logits, _log_probs = state.generator.decode_forward(
+            out_tok.reshape(1, 1),
+            current_pos,
+            enable_trace=False,
+            page_table=state.page_table,
+            kv_cache=[state.kv_cache],
+            reset_batch=reset_batch_next,
+            sampling_params=None,
+            prompt_tokens=prompt_tokens,
+            output_tokens=out_tok.reshape(1, 1),
+        )
+        reset_batch_next = False
+        input_ids = torch.tensor([session.token_ids], dtype=torch.long)
+        out_tok = _next_token_from_logits(
+            logits,
+            temperature=temperature,
+            processor=processor,
+            input_ids=input_ids,
+        )
+        token_id = int(out_tok.reshape(-1)[0].item())
+        if processor is not None:
+            processor.update_state(token_id)
+        session.token_ids.append(token_id)
+        current_pos = current_pos + 1
+
+        if eos_id is not None and token_id == eos_id:
+            break
+        if processor is not None and processor.state.name == "COMPLETED":
+            break
+        new_text = tokenizer.decode(session.token_ids[generated_start:], skip_special_tokens=False)
+        if stop_suffix and stop_suffix in new_text:
+            break
+
+    new_text = tokenizer.decode(session.token_ids[generated_start:], skip_special_tokens=False)
+    return _trim_stop_suffix(new_text, stop_suffix)
+
+
+def _trim_stop_suffix(text: str, stop_suffix: str | None) -> str:
+    if stop_suffix and stop_suffix in text:
+        return text.split(stop_suffix, 1)[0] + stop_suffix
+    return text
 
 
 @torch.no_grad()
@@ -201,21 +299,22 @@ def prefill_last_token_logits_tt(
     model: str | None = None,
 ) -> torch.Tensor:
     """Return TT prefill logits for the last prompt token ``[vocab]``."""
-    state = _load_tt_lm(mesh_device, model=model)
     try:
-        prompt_tokens = state.tokenizer(formatted_prompt, return_tensors="pt").input_ids
+        session = _begin_session(mesh_device, model=model)
+        _reset_kv(session.state)
+        prompt_tokens = session.state.tokenizer(formatted_prompt, return_tensors="pt").input_ids
         seq_len = int(prompt_tokens.shape[1])
-        logits = state.generator.prefill_forward_text(
+        logits = session.state.generator.prefill_forward_text(
             prompt_tokens,
-            page_table=state.page_table,
-            kv_cache=[state.kv_cache],
+            page_table=session.state.page_table,
+            kv_cache=[session.state.kv_cache],
             prompt_lens=torch.tensor([seq_len]),
             enable_trace=False,
             warmup_prefill=True,
         )
         return logits.reshape(-1).float().cpu()
     finally:
-        _STATE_BY_DEVICE.pop(id(mesh_device), None)
+        release_tt_lm_session(mesh_device)
 
 
 @torch.no_grad()
@@ -229,17 +328,22 @@ def generate_audio_codes_tt(
     temperature: float = 0.85,
     seed: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Two-phase TT LM planner: CoT metadata then audio code tokens."""
-    tokenizer = AutoTokenizer.from_pretrained(resolve_lm_planner_path(model=model), trust_remote_code=True)
+    """Two-phase TT LM planner: CoT metadata then audio code tokens (single model session)."""
+    if seed is not None:
+        torch.manual_seed(int(seed))
+
+    session = _begin_session(mesh_device, model=model)
+    tokenizer = session.state.tokenizer
     cot_prompt = build_formatted_prompt_cot(tokenizer, caption, lyrics)
-    cot_text = _generate_text_tt(
-        mesh_device,
-        model=model,
+    cot_text = _generate_phase(
+        session,
         formatted_prompt=cot_prompt,
         max_new_tokens=512,
         temperature=temperature,
+        generation_phase="cot",
+        target_duration=None,
         stop_suffix=_STOP_REASONING_TAG,
-        seed=seed,
+        stop_at_reasoning=True,
     )
     if _STOP_REASONING_TAG not in cot_text:
         cot_text = cot_text.rstrip() + f"\n{_STOP_REASONING_TAG}"
@@ -247,18 +351,29 @@ def generate_audio_codes_tt(
 
     codes_prompt = build_formatted_prompt_codes(tokenizer, caption, lyrics, cot_text)
     target_codes = _target_code_count(audio_duration=audio_duration, metadata=metadata)
-    codes_text = _generate_text_tt(
-        mesh_device,
-        model=model,
+    codes_duration = audio_duration if audio_duration is not None and audio_duration > 0 else None
+    if codes_duration is None and metadata.get("duration"):
+        try:
+            codes_duration = float(metadata["duration"])
+        except (TypeError, ValueError):
+            codes_duration = None
+
+    codes_prompt_ids = tokenizer(codes_prompt, return_tensors="pt").input_ids[0].tolist()
+    can_continue = bool(session.token_ids) and codes_prompt_ids == session.token_ids
+
+    codes_text = _generate_phase(
+        session,
         formatted_prompt=codes_prompt,
         max_new_tokens=min(target_codes + 32, 512),
         temperature=temperature,
-        seed=(seed + 1) if seed is not None else None,
+        generation_phase="codes",
+        target_duration=codes_duration,
+        continue_kv=can_continue,
     )
     _, audio_codes = parse_lm_output(codes_text)
     audio_codes = _fit_code_string(audio_codes, target_codes)
     _log_progress(
         f"lm_planner_tt: generated {len(parse_audio_code_string(audio_codes))} codes "
-        f"(target={target_codes}) metadata_keys={list(metadata.keys())}"
+        f"(target={target_codes}) kv_reuse={can_continue} metadata_keys={list(metadata.keys())}"
     )
     return audio_codes, metadata

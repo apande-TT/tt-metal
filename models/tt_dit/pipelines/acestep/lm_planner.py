@@ -6,6 +6,19 @@
 Generates discrete ``audio_codes`` from caption/lyrics via ``acestep-5Hz-lm-*``,
 maps them through the HF quantizer → TT detokenizer path (skipping Call B tokenizer).
 
+**Variant selection** (see `awesome-ace-step` LM table):
+
+| Variant | Use case |
+|---------|----------|
+| ``0.6B`` | Fast iteration / CI smoke when weights are cached |
+| ``1.7B`` | **Default production** — balance of quality and latency |
+| ``4B`` | Highest quality when VRAM/time budget allows |
+
+CLI: ``--lm-model {0.6B,1.7B,4B}`` · env: ``ACESTEP_LM_PLANNER_MODEL=acestep-5Hz-lm-1.7B``
+
+Constrained decoding (ACE-Step FSM, on by default): ``ACESTEP_USE_CONSTRAINED_LM_DECODING=1``
+Uses ``MetadataConstrainedLogitsProcessor`` for CoT metadata + audio-code phases on host and TT.
+
 Upstream reference: ``ace-step/ACE-Step-1.5`` ``LLMHandler`` + ``AudioCodesMixin``.
 """
 from __future__ import annotations
@@ -260,9 +273,114 @@ class _HostLMState:
     model: Any
     tokenizer: Any
     weight_path: str
+    constrained_processor: Any | None = None
 
 
 _STATE: _HostLMState | None = None
+
+
+def _get_constrained_processor(state: _HostLMState) -> Any | None:
+    from models.tt_dit.pipelines.acestep.lm_planner_constrained import (
+        create_constrained_processor,
+        default_use_constrained_decoding,
+    )
+
+    if not default_use_constrained_decoding():
+        return None
+    if state.constrained_processor is None:
+        state.constrained_processor = create_constrained_processor(state.tokenizer)
+    return state.constrained_processor
+
+
+def _sample_next_token(logits: torch.Tensor, *, temperature: float) -> torch.Tensor:
+    if temperature <= 0:
+        return logits.argmax(dim=-1, keepdim=True)
+    scaled = logits / max(temperature, 1e-5)
+    probs = torch.softmax(scaled, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+
+
+def _generate_text(
+    state: _HostLMState,
+    formatted_prompt: str,
+    *,
+    max_new_tokens: int,
+    temperature: float,
+    stop_suffix: str | None = None,
+    seed: int | None = None,
+    generation_phase: str = "cot",
+    target_duration: float | None = None,
+    stop_at_reasoning: bool = False,
+) -> str:
+    from models.tt_dit.pipelines.acestep.lm_planner_constrained import configure_codes_phase, configure_cot_phase
+
+    tokenizer = state.tokenizer
+    model = state.model
+    processor = _get_constrained_processor(state)
+    if processor is not None:
+        if generation_phase == "codes":
+            configure_codes_phase(processor, enabled=True, target_duration=target_duration)
+        else:
+            configure_cot_phase(processor, enabled=True, stop_at_reasoning=stop_at_reasoning)
+
+    inputs = tokenizer(formatted_prompt, return_tensors="pt")
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+
+    if seed is not None:
+        torch.manual_seed(int(seed))
+
+    generated_ids = input_ids.clone()
+    past_key_values = None
+    eos_id = tokenizer.eos_token_id
+    prompt_len = int(input_ids.shape[1])
+
+    with torch.inference_mode():
+        for _ in range(max_new_tokens):
+            if past_key_values is None:
+                model_input = generated_ids
+                model_mask = attention_mask
+            else:
+                model_input = generated_ids[:, -1:]
+                model_mask = attention_mask[:, -1:]
+
+            outputs = model(
+                input_ids=model_input,
+                attention_mask=model_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            next_logits = outputs.logits[:, -1, :].float()
+            if processor is not None:
+                next_logits = processor(generated_ids, next_logits)
+            next_token = _sample_next_token(next_logits, temperature=temperature)
+            if processor is not None:
+                processor.update_state(int(next_token.item()))
+
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones_like(next_token, dtype=attention_mask.dtype)],
+                dim=1,
+            )
+            past_key_values = outputs.past_key_values
+
+            token_id = int(next_token.item())
+            if eos_id is not None and token_id == eos_id:
+                break
+            if processor is not None and processor.state.name == "COMPLETED":
+                break
+
+            new_text = tokenizer.decode(generated_ids[0, prompt_len:], skip_special_tokens=False)
+            if stop_suffix and stop_suffix in new_text:
+                break
+
+    new_tokens = generated_ids[0, prompt_len:]
+    text = tokenizer.decode(new_tokens, skip_special_tokens=False)
+    if stop_suffix and stop_suffix in text:
+        text = text.split(stop_suffix, 1)[0] + stop_suffix
+    return text
 
 
 def _load_host_lm(*, model: str | None = None) -> _HostLMState:
@@ -285,43 +403,6 @@ def _load_host_lm(*, model: str | None = None) -> _HostLMState:
     return _STATE
 
 
-def _generate_text(
-    state: _HostLMState,
-    formatted_prompt: str,
-    *,
-    max_new_tokens: int,
-    temperature: float,
-    stop_suffix: str | None = None,
-    seed: int | None = None,
-) -> str:
-    tokenizer = state.tokenizer
-    model = state.model
-    inputs = tokenizer(formatted_prompt, return_tensors="pt")
-    input_ids = inputs["input_ids"]
-    attention_mask = inputs.get("attention_mask")
-
-    gen_kwargs: dict[str, Any] = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": temperature > 0,
-        "temperature": max(temperature, 1e-5),
-        "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-    }
-    if attention_mask is not None:
-        gen_kwargs["attention_mask"] = attention_mask
-    if seed is not None:
-        torch.manual_seed(int(seed))
-
-    with torch.inference_mode():
-        output_ids = model.generate(input_ids, **gen_kwargs)
-
-    new_tokens = output_ids[0, input_ids.shape[1] :]
-    text = tokenizer.decode(new_tokens, skip_special_tokens=False)
-    if stop_suffix and stop_suffix in text:
-        text = text.split(stop_suffix, 1)[0] + stop_suffix
-    return text
-
-
 @torch.no_grad()
 def generate_audio_codes_host(
     *,
@@ -342,6 +423,8 @@ def generate_audio_codes_host(
         temperature=temperature,
         stop_suffix=_STOP_REASONING_TAG,
         seed=seed,
+        generation_phase="cot",
+        stop_at_reasoning=True,
     )
     if _STOP_REASONING_TAG not in cot_text:
         cot_text = cot_text.rstrip() + f"\n{_STOP_REASONING_TAG}"
@@ -349,12 +432,20 @@ def generate_audio_codes_host(
 
     codes_prompt = build_formatted_prompt_codes(state.tokenizer, caption, lyrics, cot_text)
     target_codes = _target_code_count(audio_duration=audio_duration, metadata=metadata)
+    codes_duration = audio_duration if audio_duration is not None and audio_duration > 0 else None
+    if codes_duration is None and metadata.get("duration"):
+        try:
+            codes_duration = float(metadata["duration"])
+        except (TypeError, ValueError):
+            codes_duration = None
     codes_text = _generate_text(
         state,
         codes_prompt,
         max_new_tokens=min(target_codes + 32, 512),
         temperature=temperature,
-        seed=(seed + 1) if seed is not None else None,
+        seed=seed,
+        generation_phase="codes",
+        target_duration=codes_duration,
     )
     _, audio_codes = parse_lm_output(codes_text)
     audio_codes = _fit_code_string(audio_codes, target_codes)

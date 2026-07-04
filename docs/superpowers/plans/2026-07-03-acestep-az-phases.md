@@ -544,7 +544,10 @@ Phase 7A (host LM)         Phase 7B (tt_transformers Qwen3)
 ```bash
 flock /tmp/tt_ace_device.lock $PY -m pytest \
   models/tt_dit/tests/models/acestep/test_e2e_lm_planner_acestep.py \
-  -s -v --timeout=3600   # add in Phase 7
+  -s -v --timeout=7200
+
+bash docs/acestep-az-phase7c-run.sh
+# Production listen signoff: ACESTEP_RUN_PHASE7C_PROD=1 bash docs/acestep-az-phase7c-run.sh
 
 bash docs/acestep-az-phase7-run.sh
 # Or inline:

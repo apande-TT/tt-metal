@@ -405,6 +405,15 @@ flock /tmp/tt_ace_device.lock $PY -m pytest \
   -s -v --timeout=3600
 ```
 
+### Phase 7C — e2e + quality gate
+
+```bash
+bash docs/acestep-az-phase7c-run.sh
+# Fast gate: 8s / 4 steps / 1.7B → /tmp/az_phase7c_tt_lm_1.7b_8s.wav
+# All variants: ACESTEP_RUN_PHASE7C_VARIANTS=1 bash docs/acestep-az-phase7c-run.sh
+# Production listen: ACESTEP_RUN_PHASE7C_PROD=1 bash docs/acestep-az-phase7c-run.sh
+```
+
 ### Phase 6 — trace (deferred)
 
 ```bash
