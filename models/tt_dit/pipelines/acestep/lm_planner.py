@@ -19,6 +19,8 @@ from typing import Any
 
 import torch
 
+import ttnn
+
 DEFAULT_LM_INSTRUCTION = "Generate audio semantic tokens based on the given conditions:"
 AUDIO_CODE_MAX = 63999
 _CODES_PER_SECOND = 5  # 5 Hz planner @ 25 Hz latent frames / pool_window_size=5
@@ -48,6 +50,13 @@ def _log_progress(message: str) -> None:
 
 def default_use_lm_planner() -> bool:
     value = os.environ.get("ACESTEP_USE_LM_PLANNER")
+    if value is not None:
+        return value.strip().lower() in ("1", "true", "yes")
+    return False
+
+
+def default_use_tt_lm_planner() -> bool:
+    value = os.environ.get("ACESTEP_USE_TT_LM_PLANNER")
     if value is not None:
         return value.strip().lower() in ("1", "true", "yes")
     return False
@@ -354,6 +363,43 @@ def generate_audio_codes_host(
         f"(target={target_codes}) metadata_keys={list(metadata.keys())}"
     )
     return audio_codes, metadata
+
+
+@torch.no_grad()
+def generate_audio_codes(
+    *,
+    caption: str,
+    lyrics: str = "",
+    audio_duration: float | None = None,
+    model: str | None = None,
+    temperature: float = 0.85,
+    seed: int | None = None,
+    mesh_device: ttnn.Device | ttnn.MeshDevice | None = None,
+    use_tt: bool | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Generate audio codes on TT when ``use_tt`` and ``mesh_device`` are set, else host."""
+    if use_tt is None:
+        use_tt = default_use_tt_lm_planner()
+    if use_tt and mesh_device is not None:
+        from models.tt_dit.pipelines.acestep.lm_planner_tt import generate_audio_codes_tt
+
+        return generate_audio_codes_tt(
+            mesh_device,
+            caption=caption,
+            lyrics=lyrics,
+            audio_duration=audio_duration,
+            model=model,
+            temperature=temperature,
+            seed=seed,
+        )
+    return generate_audio_codes_host(
+        caption=caption,
+        lyrics=lyrics,
+        audio_duration=audio_duration,
+        model=model,
+        temperature=temperature,
+        seed=seed,
+    )
 
 
 def audio_codes_to_indices_tensor(

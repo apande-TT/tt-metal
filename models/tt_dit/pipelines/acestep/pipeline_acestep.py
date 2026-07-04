@@ -22,7 +22,8 @@ from models.tt_dit.pipelines.acestep.audio_decode import decode_latents_to_wavef
 from models.tt_dit.pipelines.acestep.lm_planner import (
     default_lm_variant,
     default_use_lm_planner,
-    generate_audio_codes_host,
+    default_use_tt_lm_planner,
+    generate_audio_codes,
     lm_planner_sets_is_covers,
     parse_audio_code_string,
 )
@@ -76,6 +77,7 @@ class AceStepPipelineConfig:
     use_tt_text_encode: bool = False
     use_lm_planner: bool = False
     lm_model: str = "1.7B"
+    use_tt_lm_planner: bool = False
 
 
 class AceStepPipeline(PipelineAPIMixin):
@@ -119,11 +121,14 @@ class AceStepPipeline(PipelineAPIMixin):
         use_tt_text_encode: bool | None = None,
         use_lm_planner: bool | None = None,
         lm_model: str | None = None,
+        use_tt_lm_planner: bool | None = None,
     ) -> AceStepPipeline:
         if use_tt_text_encode is None:
             use_tt_text_encode = default_use_tt_text_encode()
         if use_lm_planner is None:
             use_lm_planner = default_use_lm_planner()
+        if use_tt_lm_planner is None:
+            use_tt_lm_planner = default_use_tt_lm_planner()
         if lm_model is None:
             lm_model = default_lm_variant()
         config = AceStepPipelineConfig(
@@ -139,6 +144,7 @@ class AceStepPipeline(PipelineAPIMixin):
             use_tt_text_encode=use_tt_text_encode,
             use_lm_planner=use_lm_planner,
             lm_model=lm_model,
+            use_tt_lm_planner=use_tt_lm_planner,
         )
         return cls(device=mesh_device, config=config)
 
@@ -173,6 +179,7 @@ class AceStepPipeline(PipelineAPIMixin):
         use_lm_planner: bool = False,
         lm_model: str = "1.7B",
         lm_seed: int | None = None,
+        use_tt_lm_planner: bool = False,
     ) -> dict:
         """Assemble DiT inputs from captured, live text, and/or reference audio."""
         ref_tensors = None
@@ -225,17 +232,19 @@ class AceStepPipeline(PipelineAPIMixin):
             caption = prompts[0] if isinstance(prompts, (list, tuple)) else str(prompts)
             lyric_text = lyrics if isinstance(lyrics, str) else (lyrics[0] if lyrics else "")
             _log_device_progress(
-                f"prepare_inputs: lm_planner model={lm_model} caption_len={len(caption)} "
-                f"audio_duration={audio_duration:.1f}s"
+                f"prepare_inputs: lm_planner model={lm_model} tt={use_tt_lm_planner} "
+                f"caption_len={len(caption)} audio_duration={audio_duration:.1f}s"
             )
             from models.tt_dit.pipelines.acestep.lm_planner import audio_codes_to_lm_quantized
 
-            code_str, lm_metadata = generate_audio_codes_host(
+            code_str, lm_metadata = generate_audio_codes(
                 caption=caption,
                 lyrics=lyric_text,
                 audio_duration=audio_duration,
                 model=lm_model,
                 seed=lm_seed,
+                mesh_device=mesh_device,
+                use_tt=use_tt_lm_planner,
             )
             inputs["lm_quantized"] = audio_codes_to_lm_quantized(
                 hf_model,
@@ -297,6 +306,7 @@ class AceStepPipeline(PipelineAPIMixin):
             use_lm_planner=self._config.use_lm_planner,
             lm_model=self._config.lm_model,
             lm_seed=seed,
+            use_tt_lm_planner=self._config.use_tt_lm_planner,
         )
         use_2cq = self._use_2cq(self._device, traced)
         if traced:

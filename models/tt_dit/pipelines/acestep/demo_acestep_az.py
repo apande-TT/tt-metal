@@ -39,7 +39,11 @@ from loguru import logger
 
 import ttnn
 from models.demos.hf_eager.acestep_v15_base.tt.vae_host import save_wav
-from models.tt_dit.pipelines.acestep.lm_planner import default_lm_variant, default_use_lm_planner
+from models.tt_dit.pipelines.acestep.lm_planner import (
+    default_lm_variant,
+    default_use_lm_planner,
+    default_use_tt_lm_planner,
+)
 from models.tt_dit.pipelines.acestep.pipeline_acestep import AceStepPipeline
 from models.tt_dit.pipelines.acestep.text_encode_tt import default_use_tt_text_encode
 
@@ -127,6 +131,12 @@ def _parse_args() -> argparse.Namespace:
         choices=["0.6B", "1.7B", "4B"],
         help="LM planner variant (default: 1.7B or ACESTEP_LM_PLANNER_MODEL)",
     )
+    parser.add_argument(
+        "--use-tt-lm-planner",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run 5Hz LM on TT device via tt_transformers (Phase 7B; default from ACESTEP_USE_TT_LM_PLANNER)",
+    )
     parser.add_argument("--seed", type=int, default=1234, help="RNG seed")
     parser.add_argument("--device-id", type=int, default=DEFAULT_DEVICE_ID, help="TT device id")
     return parser.parse_args()
@@ -159,16 +169,18 @@ def _run_pipeline(args: argparse.Namespace) -> dict:
     try:
         use_tt = args.use_tt_text_encode if args.use_tt_text_encode is not None else default_use_tt_text_encode()
         use_lm = args.use_lm_planner if args.use_lm_planner is not None else default_use_lm_planner()
+        use_tt_lm = args.use_tt_lm_planner if args.use_tt_lm_planner is not None else default_use_tt_lm_planner()
         use_vae = args.use_tt_vae if args.use_tt_vae is not None else True
         lm_model = args.lm_model if args.lm_model is not None else default_lm_variant()
         logger.info(
             "Opening AceStepPipeline (infer_steps={}, traced={}, use_tt_vae={}, use_tt_text_encode={}, "
-            "use_lm_planner={}, lm_model={}, guidance_scale={}, audio_duration={}s, shift={})",
+            "use_lm_planner={}, use_tt_lm_planner={}, lm_model={}, guidance_scale={}, audio_duration={}s, shift={})",
             args.infer_steps,
             args.traced,
             use_vae,
             use_tt,
             use_lm,
+            use_tt_lm,
             lm_model,
             args.guidance_scale,
             args.audio_duration,
@@ -186,6 +198,7 @@ def _run_pipeline(args: argparse.Namespace) -> dict:
             ),
             use_lm_planner=use_lm,
             lm_model=lm_model,
+            use_tt_lm_planner=use_tt_lm if use_lm else False,
         )
 
         t0 = time.perf_counter()
