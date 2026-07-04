@@ -1,30 +1,54 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Phase 5 CLI — ACE-Step A→Z demo: prompt + lyrics + reference WAV → music WAV.
+"""Phase 5/7 CLI — ACE-Step A→Z demo: prompt + lyrics + reference WAV → music WAV.
 
-Full TT hot path (Phase 5 signoff): **TT Qwen3 text** + **TT DiT** + **TT Oobleck VAE**;
-host reference encode only; tokenizer B+D (no LM planner). Production defaults:
-``--infer-steps 30``, ``--guidance-scale 7.0``, ``--audio-duration 30``, ``--shift 3.0``.
+Production defaults: ``--infer-steps 30``, ``--guidance-scale 7.0``, ``--audio-duration 30``,
+``--shift 3.0``. Production prompt + lyrics (Phase 5 signoff):
+
+- **Prompt:** ``smooth jazz pop, female lead vocal, warm piano, soft drums, lounge, 90 bpm``
+- **Lyrics:** ``[verse]`` / ``City lights are fading slow`` … (full text in run scripts below)
 
 Run (device gate — serialize with ``flock /tmp/tt_ace_device.lock``):
 
+**Phase 5** — TT text + TT DiT + TT VAE; tokenizer B+D (no LM):
+
     bash docs/acestep-az-phase5-run.sh
 
-Or:
+**Phase 7** — full production stack; TT ``acestep-5Hz-lm-1.7B`` replaces Call B:
+
+    bash docs/acestep-az-phase7-run.sh
+
+Or inline (same inputs as the run scripts):
 
     cd /local/ttuser/dvartanians/ace/tt-metal
     export TT_METAL_HOME=$(pwd) PYTHONPATH=$(pwd) ARCH_NAME=blackhole
+    export ACESTEP_PIPELINE_DIR=/local/ttuser/gtobar/acestep_pipeline
+    read -r -d '' LYRICS <<'EOF' || true
+    [verse]
+    City lights are fading slow
+    Warm piano starts to glow
+    Soft drums keep the time so low
+    In this lounge where feelings flow
+    [chorus]
+    Stay with me tonight
+    Under neon light
+    Smooth jazz in the air
+    Like we haven't got a care
+    EOF
     flock /tmp/tt_ace_device.lock ./python_env/bin/python -m \\
         models.tt_dit.pipelines.acestep.demo_acestep_az \\
         --prompt "smooth jazz pop, female lead vocal, warm piano, soft drums, lounge, 90 bpm" \\
-        --lyrics "..." \\
+        --lyrics "$LYRICS" \\
         --reference /tmp/ref_kaazoom_25s.wav \\
         --output /tmp/az_phase5_signoff.wav \\
-        --infer-steps 30 --guidance-scale 7.0 --audio-duration 30 --shift 3.0 \\
+        --infer-steps 30 --guidance-scale 7.0 --audio-duration 30 --shift 3.0 --seed 42 \\
         --use-tt-vae --use-tt-text-encode --no-traced
 
-Agent log: ``/tmp/acestep_agent_5.log``
+Add ``--use-lm-planner --use-tt-lm-planner --lm-model 1.7B`` and ``--output /tmp/az_lm_tt.wav``
+for the Phase 7 production path.
+
+Agent logs: ``/tmp/acestep_agent_5.log`` (Phase 5), ``/tmp/acestep_agent_7.log`` (Phase 7)
 """
 
 from __future__ import annotations

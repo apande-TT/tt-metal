@@ -40,9 +40,22 @@ cd "$REPO"
 export TT_METAL_HOME="$REPO" PYTHONPATH="$REPO" ARCH_NAME=blackhole
 PY="$REPO/python_env/bin/python"
 
+read -r -d '' LYRICS <<'EOF' || true
+[verse]
+City lights are fading slow
+Warm piano starts to glow
+Soft drums keep the time so low
+In this lounge where feelings flow
+[chorus]
+Stay with me tonight
+Under neon light
+Smooth jazz in the air
+Like we haven't got a care
+EOF
+
 flock /tmp/tt_ace_device.lock $PY -m models.tt_dit.pipelines.acestep.demo_acestep_az \
   --prompt "smooth jazz pop, female lead vocal, warm piano, soft drums, lounge, 90 bpm" \
-  --lyrics "..." \
+  --lyrics "$LYRICS" \
   --reference /tmp/ref_kaazoom_25s.wav \
   --output /tmp/az_nocfg_8s_shift3.wav \
   --audio-duration 30 --infer-steps 8 --guidance-scale 1.0 --shift 3.0 --seed 42
@@ -347,19 +360,48 @@ flock /tmp/tt_ace_device.lock $PY -m pytest \
 ### Phase 5 — full demo signoff
 
 ```bash
-export ACESTEP_USE_TT_VAE=1
-flock /tmp/tt_ace_device.lock $PY -m models.tt_dit.pipelines.acestep.demo_acestep_az \
-  --prompt "..." --lyrics "..." --reference /path/to/ref.wav \
-  --output /tmp/az_final.wav --infer-steps 30 --guidance-scale 7.0 \
-  --audio-duration 30 --seed 42
+bash docs/acestep-az-phase5-run.sh
+# → /tmp/az_phase5_signoff.wav
 ```
 
-### Phase 7 — LM planner (when tests exist)
+Or inline:
 
 ```bash
-export ACESTEP_USE_TT_VAE=1 ACESTEP_USE_LM_PLANNER=1 ACESTEP_LM_PLANNER_MODEL=acestep-5Hz-lm-1.7B
+export ACESTEP_USE_TT_VAE=1
+read -r -d '' LYRICS <<'EOF' || true
+[verse]
+City lights are fading slow
+Warm piano starts to glow
+Soft drums keep the time so low
+In this lounge where feelings flow
+[chorus]
+Stay with me tonight
+Under neon light
+Smooth jazz in the air
+Like we haven't got a care
+EOF
+flock /tmp/tt_ace_device.lock $PY -m models.tt_dit.pipelines.acestep.demo_acestep_az \
+  --prompt "smooth jazz pop, female lead vocal, warm piano, soft drums, lounge, 90 bpm" \
+  --lyrics "$LYRICS" \
+  --reference /tmp/ref_kaazoom_25s.wav \
+  --output /tmp/az_phase5_signoff.wav \
+  --infer-steps 30 --guidance-scale 7.0 --shift 3.0 \
+  --audio-duration 30 --seed 42 \
+  --use-tt-vae --use-tt-text-encode --no-traced
+```
+
+### Phase 7 — full production demo (TT LM planner)
+
+```bash
+bash docs/acestep-az-phase7-run.sh
+# → /tmp/az_lm_tt.wav
+```
+
+Device gates (prefill + generation smoke):
+
+```bash
 flock /tmp/tt_ace_device.lock $PY -m pytest \
-  models/tt_dit/tests/models/acestep/test_e2e_lm_planner_acestep.py \
+  models/tt_dit/tests/models/acestep/test_lm_planner_tt_acestep.py \
   -s -v --timeout=3600
 ```
 

@@ -385,10 +385,26 @@ flock /tmp/tt_ace_device.lock $PY -m pytest \
 
 ```bash
 export ACESTEP_USE_TT_VAE=1 ACESTEP_SAVE_WAV=1
+read -r -d '' LYRICS <<'EOF' || true
+[verse]
+City lights are fading slow
+Warm piano starts to glow
+Soft drums keep the time so low
+In this lounge where feelings flow
+[chorus]
+Stay with me tonight
+Under neon light
+Smooth jazz in the air
+Like we haven't got a care
+EOF
 flock /tmp/tt_ace_device.lock $PY -m \
   models.tt_dit.pipelines.acestep.demo_acestep_az \
-  --prompt "..." --reference /path/to/ref.wav --output /tmp/az_final.wav \
-  --infer-steps 30
+  --prompt "smooth jazz pop, female lead vocal, warm piano, soft drums, lounge, 90 bpm" \
+  --lyrics "$LYRICS" \
+  --reference /tmp/ref_kaazoom_25s.wav \
+  --output /tmp/az_phase5_signoff.wav \
+  --infer-steps 30 --guidance-scale 7.0 --shift 3.0 --audio-duration 30 --seed 42 \
+  --use-tt-vae --use-tt-text-encode --no-traced
 ```
 
 ### Manual gate (you) — interim functional demo done
@@ -530,11 +546,30 @@ flock /tmp/tt_ace_device.lock $PY -m pytest \
   models/tt_dit/tests/models/acestep/test_e2e_lm_planner_acestep.py \
   -s -v --timeout=3600   # add in Phase 7
 
-export ACESTEP_USE_TT_VAE=1 ACESTEP_USE_LM_PLANNER=1 ACESTEP_LM_PLANNER_MODEL=acestep-5Hz-lm-1.7B
+bash docs/acestep-az-phase7-run.sh
+# Or inline:
+read -r -d '' LYRICS <<'EOF' || true
+[verse]
+City lights are fading slow
+Warm piano starts to glow
+Soft drums keep the time so low
+In this lounge where feelings flow
+[chorus]
+Stay with me tonight
+Under neon light
+Smooth jazz in the air
+Like we haven't got a care
+EOF
+export ACESTEP_USE_TT_VAE=1 ACESTEP_PIPELINE_DIR=/local/ttuser/gtobar/acestep_pipeline
 flock /tmp/tt_ace_device.lock $PY -m \
   models.tt_dit.pipelines.acestep.demo_acestep_az \
-  --prompt "..." --reference /path/to/ref.wav --output /tmp/az_lm.wav \
-  --use-lm-planner --lm-model 1.7B --infer-steps 30
+  --prompt "smooth jazz pop, female lead vocal, warm piano, soft drums, lounge, 90 bpm" \
+  --lyrics "$LYRICS" \
+  --reference /tmp/ref_kaazoom_25s.wav \
+  --output /tmp/az_lm_tt.wav \
+  --use-lm-planner --use-tt-lm-planner --lm-model 1.7B \
+  --infer-steps 30 --guidance-scale 7.0 --shift 3.0 --audio-duration 30 --seed 42 \
+  --use-tt-vae --use-tt-text-encode --no-traced
 ```
 
 ### Manual gate (you) — full production stack done
