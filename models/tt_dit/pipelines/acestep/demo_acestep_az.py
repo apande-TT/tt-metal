@@ -3,22 +3,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """Phase 5 CLI — ACE-Step A→Z demo: prompt + lyrics + reference WAV → music WAV.
 
-Bring-up phases and gates are summarized in ``docs/acestep-az-phases-summary.md``.
-This entrypoint targets Phase 5 (full functional demo, ``traced=False`` by default).
-Live prompt/lyrics/reference conditioning (Phases 2A/2B) are wired through
-``pipeline_acestep.py``; TT Oobleck VAE on device is the default.
+Full TT hot path (Phase 5 signoff): **TT Qwen3 text** + **TT DiT** + **TT Oobleck VAE**;
+host reference encode only; tokenizer B+D (no LM planner). Production defaults:
+``--infer-steps 30``, ``--guidance-scale 7.0``, ``--audio-duration 30``, ``--shift 3.0``.
 
 Run (device gate — serialize with ``flock /tmp/tt_ace_device.lock``):
+
+    bash docs/acestep-az-phase5-run.sh
+
+Or:
 
     cd /local/ttuser/dvartanians/ace/tt-metal
     export TT_METAL_HOME=$(pwd) PYTHONPATH=$(pwd) ARCH_NAME=blackhole
     flock /tmp/tt_ace_device.lock ./python_env/bin/python -m \\
         models.tt_dit.pipelines.acestep.demo_acestep_az \\
-        --prompt "upbeat electronic track" \\
-        --lyrics "instrumental, no vocals" \\
-        --reference /path/to/ref.wav \\
-        --output /tmp/az_final.wav \\
-        --infer-steps 4
+        --prompt "smooth jazz pop, female lead vocal, warm piano, soft drums, lounge, 90 bpm" \\
+        --lyrics "..." \\
+        --reference /tmp/ref_kaazoom_25s.wav \\
+        --output /tmp/az_phase5_signoff.wav \\
+        --infer-steps 30 --guidance-scale 7.0 --audio-duration 30 --shift 3.0 \\
+        --use-tt-vae --use-tt-text-encode --no-traced
 
 Agent log: ``/tmp/acestep_agent_5.log``
 """
@@ -35,6 +39,7 @@ from loguru import logger
 
 import ttnn
 from models.demos.hf_eager.acestep_v15_base.tt.vae_host import save_wav
+from models.tt_dit.pipelines.acestep.lm_planner import default_lm_variant, default_use_lm_planner
 from models.tt_dit.pipelines.acestep.pipeline_acestep import AceStepPipeline
 from models.tt_dit.pipelines.acestep.text_encode_tt import default_use_tt_text_encode
 
@@ -109,6 +114,19 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="TT Qwen3-Embedding on device (Phase 2C; default from ACESTEP_USE_TT_TEXT_ENCODE)",
     )
+    parser.add_argument(
+        "--use-lm-planner",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="5Hz LM planner replaces Call B tokenizer (Phase 7; default from ACESTEP_USE_LM_PLANNER)",
+    )
+    parser.add_argument(
+        "--lm-model",
+        type=str,
+        default=None,
+        choices=["0.6B", "1.7B", "4B"],
+        help="LM planner variant (default: 1.7B or ACESTEP_LM_PLANNER_MODEL)",
+    )
     parser.add_argument("--seed", type=int, default=1234, help="RNG seed")
     parser.add_argument("--device-id", type=int, default=DEFAULT_DEVICE_ID, help="TT device id")
     return parser.parse_args()
@@ -139,12 +157,19 @@ def _run_pipeline(args: argparse.Namespace) -> dict:
 
     device = ttnn.open_device(device_id=args.device_id, **DEVICE_PARAMS)
     try:
+        use_tt = args.use_tt_text_encode if args.use_tt_text_encode is not None else default_use_tt_text_encode()
+        use_lm = args.use_lm_planner if args.use_lm_planner is not None else default_use_lm_planner()
+        use_vae = args.use_tt_vae if args.use_tt_vae is not None else True
+        lm_model = args.lm_model if args.lm_model is not None else default_lm_variant()
         logger.info(
-            "Opening AceStepPipeline (infer_steps={}, traced={}, use_tt_vae={}, guidance_scale={}, "
-            "audio_duration={}s, shift={})",
+            "Opening AceStepPipeline (infer_steps={}, traced={}, use_tt_vae={}, use_tt_text_encode={}, "
+            "use_lm_planner={}, lm_model={}, guidance_scale={}, audio_duration={}s, shift={})",
             args.infer_steps,
             args.traced,
-            args.use_tt_vae,
+            use_vae,
+            use_tt,
+            use_lm,
+            lm_model,
             args.guidance_scale,
             args.audio_duration,
             args.shift,
@@ -159,6 +184,8 @@ def _run_pipeline(args: argparse.Namespace) -> dict:
             use_tt_text_encode=(
                 args.use_tt_text_encode if args.use_tt_text_encode is not None else default_use_tt_text_encode()
             ),
+            use_lm_planner=use_lm,
+            lm_model=lm_model,
         )
 
         t0 = time.perf_counter()

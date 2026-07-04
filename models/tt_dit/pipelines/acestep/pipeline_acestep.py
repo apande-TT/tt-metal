@@ -19,6 +19,13 @@ from models.demos.hf_eager.acestep_v15_base.tt.traced_decoder import _device_sup
 from models.demos.hf_eager.acestep_v15_base.tt.vae_host import DEFAULT_OUTPUT_DURATION_SEC, encode_reference_audio
 from models.tt_dit.pipelines.acestep.apg_guidance import AceStepGuidanceConfig
 from models.tt_dit.pipelines.acestep.audio_decode import decode_latents_to_waveform, default_use_tt_vae
+from models.tt_dit.pipelines.acestep.lm_planner import (
+    default_lm_variant,
+    default_use_lm_planner,
+    generate_audio_codes_host,
+    lm_planner_sets_is_covers,
+    parse_audio_code_string,
+)
 from models.tt_dit.pipelines.acestep.text_encode import COVER_DIT_INSTRUCTION
 from models.tt_dit.pipelines.acestep.text_encode_tt import default_use_tt_text_encode
 from models.tt_dit.pipelines.events import PipelineEventCallback, null_callback
@@ -67,6 +74,8 @@ class AceStepPipelineConfig:
     sample_rate: int = 48000
     pool_window_size: int = 5
     use_tt_text_encode: bool = False
+    use_lm_planner: bool = False
+    lm_model: str = "1.7B"
 
 
 class AceStepPipeline(PipelineAPIMixin):
@@ -108,9 +117,15 @@ class AceStepPipeline(PipelineAPIMixin):
         sample_rate: int = 48000,
         pool_window_size: int = 5,
         use_tt_text_encode: bool | None = None,
+        use_lm_planner: bool | None = None,
+        lm_model: str | None = None,
     ) -> AceStepPipeline:
         if use_tt_text_encode is None:
             use_tt_text_encode = default_use_tt_text_encode()
+        if use_lm_planner is None:
+            use_lm_planner = default_use_lm_planner()
+        if lm_model is None:
+            lm_model = default_lm_variant()
         config = AceStepPipelineConfig(
             checkpoint_name=checkpoint_name,
             cfg_enabled=cfg_enabled,
@@ -122,6 +137,8 @@ class AceStepPipeline(PipelineAPIMixin):
             sample_rate=sample_rate,
             pool_window_size=pool_window_size,
             use_tt_text_encode=use_tt_text_encode,
+            use_lm_planner=use_lm_planner,
+            lm_model=lm_model,
         )
         return cls(device=mesh_device, config=config)
 
@@ -153,6 +170,9 @@ class AceStepPipeline(PipelineAPIMixin):
         audio_duration: float = DEFAULT_OUTPUT_DURATION_SEC,
         mesh_device: ttnn.Device | ttnn.MeshDevice | None = None,
         use_tt_text_encode: bool | None = None,
+        use_lm_planner: bool = False,
+        lm_model: str = "1.7B",
+        lm_seed: int | None = None,
     ) -> dict:
         """Assemble DiT inputs from captured, live text, and/or reference audio."""
         ref_tensors = None
@@ -199,6 +219,40 @@ class AceStepPipeline(PipelineAPIMixin):
                 f"output_duration_sec={ref_tensors['audio_duration_sec']:.2f}"
             )
 
+        if use_lm_planner:
+            if not prompts:
+                raise ValueError("use_lm_planner requires live prompts (caption)")
+            caption = prompts[0] if isinstance(prompts, (list, tuple)) else str(prompts)
+            lyric_text = lyrics if isinstance(lyrics, str) else (lyrics[0] if lyrics else "")
+            _log_device_progress(
+                f"prepare_inputs: lm_planner model={lm_model} caption_len={len(caption)} "
+                f"audio_duration={audio_duration:.1f}s"
+            )
+            from models.tt_dit.pipelines.acestep.lm_planner import audio_codes_to_lm_quantized
+
+            code_str, lm_metadata = generate_audio_codes_host(
+                caption=caption,
+                lyrics=lyric_text,
+                audio_duration=audio_duration,
+                model=lm_model,
+                seed=lm_seed,
+            )
+            inputs["lm_quantized"] = audio_codes_to_lm_quantized(
+                hf_model,
+                code_str,
+                dtype=inputs["src_latents"].dtype,
+            )
+            inputs["lm_audio_codes"] = code_str
+            inputs["lm_metadata"] = lm_metadata
+            if lm_planner_sets_is_covers():
+                batch = inputs["src_latents"].shape[0]
+                inputs["is_covers"] = torch.ones(batch, dtype=torch.int64)
+                _log_device_progress("prepare_inputs: lm_planner enabled is_covers=1 for semantic hint swap")
+            _log_device_progress(
+                f"prepare_inputs: lm_codes={len(parse_audio_code_string(code_str))} "
+                f"lm_quantized={tuple(inputs['lm_quantized'].shape)}"
+            )
+
         return inputs
 
     @torch.no_grad()
@@ -240,6 +294,9 @@ class AceStepPipeline(PipelineAPIMixin):
             audio_duration=self._config.audio_duration,
             mesh_device=self._device,
             use_tt_text_encode=self._config.use_tt_text_encode,
+            use_lm_planner=self._config.use_lm_planner,
+            lm_model=self._config.lm_model,
+            lm_seed=seed,
         )
         use_2cq = self._use_2cq(self._device, traced)
         if traced:

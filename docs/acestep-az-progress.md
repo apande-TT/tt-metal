@@ -9,9 +9,9 @@ Started: 2026-07-03
 | 1 G0 Baseline | ✅ soft PASS | — | tests 1–3 PASS; trace removed from gate |
 | 2 Live inputs | ✅ done | — | host text_encode + ref audio + pipeline |
 | 2C TT text encode | ✅ done | — | Qwen3-Embedding-0.6B via `tt_transformers`; PCC ≥0.99 |
-| 3 Prod sampler | 🔄 gate run | — | 30-step CFG demo OK; listen `/tmp/az_prod_30s_cfg7.wav` |
-| 4 TT VAE | 🔄 code fixes | — | **priority 1** — oobleck_layers; device PCC gate pending |
-| 5 Full TT A→Z demo | 🔄 skeleton | — | TT text+DiT+VAE; `demo_acestep_az.py` |
+| 3 Prod sampler | ✅ done | — | 30-step CFG + APG; `/tmp/az_prod_30s_cfg7.wav` |
+| 4 TT VAE | ✅ done | — | PCC gate + e2e TT VAE waveform test |
+| 5 Full TT A→Z demo | ✅ signoff run | — | `bash docs/acestep-az-phase5-run.sh` → `/tmp/az_phase5_signoff.wav` |
 | 6 Trace + perf (DiT) | ⏳ deferred | — | DiT stack only; use `docs/acestep-m0-trace-run.sh` |
 | 7 5Hz LM planner | ⏳ planned | — | Qwen3 ×3: 0.6B / **1.7B** / 4B via `tt_transformers`; see [awesome-ace-step](https://github.com/ace-step/awesome-ace-step) |
 | 8 Trace + perf (full) | ⏳ deferred | — | LM + DiT + TT VAE traced; < 2 s target |

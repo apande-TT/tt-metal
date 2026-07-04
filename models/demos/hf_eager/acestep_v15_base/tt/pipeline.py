@@ -66,6 +66,7 @@ class AceStepPipelineTT:
         attention_mask = inputs["attention_mask"]
         chunk_masks = inputs["chunk_masks"]
         is_covers = inputs["is_covers"]
+        lm_quantized = inputs.get("lm_quantized")
         bsz = src_latents.shape[0]
 
         def _evt(name, start: bool) -> None:
@@ -82,6 +83,11 @@ class AceStepPipelineTT:
         use_2cq_resolved = use_2cq if use_2cq is not None else traced
 
         x_patched, _ = tokenize_preprocess(src_latents, silence_latent, attention_mask, pool_window_size)
+
+        if traced and lm_quantized is not None:
+            raise NotImplementedError("LM planner with traced=True is Phase 8; use traced=False")
+
+        use_lm_quantized = lm_quantized is not None
 
         if traced:
             if self._traced_condition_encoder is None:
@@ -176,14 +182,23 @@ class AceStepPipelineTT:
             )
             _evt("encoder", False)
 
-            _evt("tokenizer", True)
-            quantized, _indices = self.audio_tokenizer(x_patched)
-            _evt("tokenizer", False)
+            if use_lm_quantized:
+                _evt("tokenizer", True)
+                _evt("tokenizer", False)
+                _evt("detokenizer", True)
+                quantized = lm_quantized
+                lm_hints_25hz = self.detokenizer(quantized)
+                context_latents = assemble_context_latents(lm_hints_25hz, src_latents, chunk_masks, is_covers)
+                _evt("detokenizer", False)
+            else:
+                _evt("tokenizer", True)
+                quantized, _indices = self.audio_tokenizer(x_patched)
+                _evt("tokenizer", False)
 
-            _evt("detokenizer", True)
-            lm_hints_25hz = self.detokenizer(quantized)
-            context_latents = assemble_context_latents(lm_hints_25hz, src_latents, chunk_masks, is_covers)
-            _evt("detokenizer", False)
+                _evt("detokenizer", True)
+                lm_hints_25hz = self.detokenizer(quantized)
+                context_latents = assemble_context_latents(lm_hints_25hz, src_latents, chunk_masks, is_covers)
+                _evt("detokenizer", False)
 
         # --- Call C: flow-matching ODE loop over the DiT decoder ---
         use_cfg = guidance_config is not None and guidance_config.guidance_scale > 1.0
