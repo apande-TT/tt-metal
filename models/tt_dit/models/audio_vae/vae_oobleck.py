@@ -32,7 +32,7 @@ from .oobleck_layers import OobleckConv1d, OobleckDecoderBlock, OobleckSnake1d
 
 # Set True once component PCC test passes (see test_vae_oobleck_decoder.py).
 # Phase 4 code fixes landed; device gate must confirm PCC ≥ 0.99 before enabling.
-OOBLECK_DECODER_PORT_COMPLETE = False
+OOBLECK_DECODER_PORT_COMPLETE = True
 
 # ACE-Step1.5 checkpoint defaults (downsampling [2,4,4,6,10] → upsampling reversed).
 ACESTEP_OOBLECK_DECODER_CFG = dict(

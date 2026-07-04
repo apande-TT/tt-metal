@@ -6,7 +6,7 @@
 Bring-up phases and gates are summarized in ``docs/acestep-az-phases-summary.md``.
 This entrypoint targets Phase 5 (full functional demo, ``traced=False`` by default).
 Live prompt/lyrics/reference conditioning (Phases 2A/2B) are wired through
-``pipeline_acestep.py``; TT VAE selection (Phase 4) honors ``ACESTEP_USE_TT_VAE``.
+``pipeline_acestep.py``; TT Oobleck VAE on device is the default.
 
 Run (device gate — serialize with ``flock /tmp/tt_ace_device.lock``):
 
@@ -26,7 +26,6 @@ Agent log: ``/tmp/acestep_agent_5.log``
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
@@ -70,14 +69,38 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--infer-steps",
         type=int,
-        default=4,
-        help="Flow-matching ODE steps (default: 4; use 30 for quality gate)",
+        default=30,
+        help="Flow-matching ODE steps (default: 30 production; use 4 for fast smoke)",
     )
     parser.add_argument(
         "--traced",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable trace + 2-CQ on DiT hot path (Phase 6; default: False)",
+    )
+    parser.add_argument(
+        "--use-tt-vae",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="TT Oobleck decode on device (default: True; use --no-use-tt-vae for host)",
+    )
+    parser.add_argument(
+        "--audio-duration",
+        type=float,
+        default=30.0,
+        help="Output duration in seconds for cover generation (default: 30; independent of reference length)",
+    )
+    parser.add_argument(
+        "--shift",
+        type=float,
+        default=1.0,
+        help="ODE timestep shift (turbo/diffusers default: 3.0; base default: 1.0)",
+    )
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=7.0,
+        help="Classifier-free guidance scale (HF default: 7.0; use 1.0 to disable CFG)",
     )
     parser.add_argument("--seed", type=int, default=1234, help="RNG seed")
     parser.add_argument("--device-id", type=int, default=DEFAULT_DEVICE_ID, help="TT device id")
@@ -96,31 +119,36 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.infer_steps < 1:
         raise ValueError(f"--infer-steps must be >= 1, got {args.infer_steps}")
 
+    if args.audio_duration <= 0:
+        raise ValueError(f"--audio-duration must be > 0, got {args.audio_duration}")
 
-def _resolve_use_tt_vae() -> bool | None:
-    """Honor ACESTEP_USE_TT_VAE when set; otherwise defer to pipeline default."""
-    value = os.environ.get("ACESTEP_USE_TT_VAE")
-    if value is None:
-        return None
-    return value.strip().lower() in ("1", "true", "yes")
+    if args.shift <= 0:
+        raise ValueError(f"--shift must be > 0, got {args.shift}")
 
 
 def _run_pipeline(args: argparse.Namespace) -> dict:
     """Run AceStepPipeline latent gen + VAE decode → waveform."""
     torch.manual_seed(args.seed)
-    use_tt_vae = _resolve_use_tt_vae()
 
     device = ttnn.open_device(device_id=args.device_id, **DEVICE_PARAMS)
     try:
         logger.info(
-            "Opening AceStepPipeline (infer_steps={}, traced={}, use_tt_vae={})",
+            "Opening AceStepPipeline (infer_steps={}, traced={}, use_tt_vae={}, guidance_scale={}, "
+            "audio_duration={}s, shift={})",
             args.infer_steps,
             args.traced,
-            use_tt_vae,
+            args.use_tt_vae,
+            args.guidance_scale,
+            args.audio_duration,
+            args.shift,
         )
         pipe = AceStepPipeline.create_pipeline(
             mesh_device=device,
             num_inference_steps=args.infer_steps,
+            guidance_scale=args.guidance_scale,
+            cfg_enabled=args.guidance_scale > 1.0,
+            audio_duration=args.audio_duration,
+            shift=args.shift,
         )
 
         t0 = time.perf_counter()
@@ -132,7 +160,7 @@ def _run_pipeline(args: argparse.Namespace) -> dict:
             seed=args.seed,
             traced=args.traced,
             return_waveform=True,
-            use_tt_vae=use_tt_vae,
+            use_tt_vae=args.use_tt_vae,
         )
         e2e_s = time.perf_counter() - t0
     finally:

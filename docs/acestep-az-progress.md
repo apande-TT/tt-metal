@@ -7,11 +7,14 @@ Started: 2026-07-03
 | Phase | Status | Commit | Notes |
 |-------|--------|--------|-------|
 | 1 G0 Baseline | ✅ soft PASS | — | tests 1–3 PASS; trace removed from gate |
-| 2 Live inputs | ✅ done | — | text_encode + ref audio + pipeline wired; CPU+device tests pass |
+| 2 Live inputs | ✅ done | — | host text_encode + ref audio + pipeline |
+| 2C TT text encode | ⏳ planned | — | Qwen3-Embedding-0.6B via `tt_transformers` |
 | 3 Prod sampler | 🔄 prep done | — | apg_guidance.py + cfg helpers; loop wiring pending |
-| 4 TT VAE | 🔄 code fixes | — | oobleck_layers fixes; device PCC gate pending |
-| 5 Full A→Z demo | 🔄 skeleton | — | demo_acestep_az.py; live inputs wired |
-| 6 Trace + perf | ⏳ deferred | — | last; use `docs/acestep-m0-trace-run.sh` |
+| 4 TT VAE | 🔄 code fixes | — | **priority 1** — oobleck_layers; device PCC gate pending |
+| 5 Full TT A→Z demo | 🔄 skeleton | — | TT text+DiT+VAE; `demo_acestep_az.py` |
+| 6 Trace + perf (DiT) | ⏳ deferred | — | DiT stack only; use `docs/acestep-m0-trace-run.sh` |
+| 7 5Hz LM planner | ⏳ planned | — | Qwen3 ×3: 0.6B / **1.7B** / 4B via `tt_transformers`; see [awesome-ace-step](https://github.com/ace-step/awesome-ace-step) |
+| 8 Trace + perf (full) | ⏳ deferred | — | LM + DiT + TT VAE traced; < 2 s target |
 
 ## Revisit / blockers
 
@@ -22,7 +25,10 @@ Started: 2026-07-03
 
 - Decoupled trace from critical path per `docs/acestep-az-phases-summary.md`
 - Phase 1 gate = G0 only (3 tests, no traced perf)
-- Phase 6 added for trace + 2-CQ + A100 perf signoff
+- Phase 6 = DiT trace + 2-CQ + A100 perf signoff
+- **Phase 7 added:** all three **`acestep-5Hz-lm-{0.6B,1.7B,4B}`** planners ([awesome-ace-step](https://github.com/ace-step/awesome-ace-step)) — reuse **`tt_transformers` Qwen3**; `--lm-model` selects variant
+- Phase 8 = full-stack trace + perf (< 2 s with LM on TT)
+- **Efficient full-TT plan:** reuse `tt_transformers` Qwen3; remaining order **4 → 3 → 2C → 5 → 7**; Phase 5 = TT text + TT DiT + TT VAE (host ref encode only)
 
 ## Session log
 

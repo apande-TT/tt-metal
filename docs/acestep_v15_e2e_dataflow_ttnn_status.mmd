@@ -17,7 +17,7 @@ flowchart TB
 
     subgraph PREFLIGHT["Preflight host once per generation — blue glue"]
         direction TB
-        TE["Qwen3-Embedding-0.6B<br/>IN: caption lyrics OUT: text_hidden lyric_hidden<br/>STATUS: tt_transformers exists NOT wired live"]
+        TE["Qwen3-Embedding-0.6B<br/>IN: caption lyrics OUT: text_hidden lyric_hidden<br/>STATUS: host done Phase 2A; TT via tt_transformers Phase 2C"]
         VAE_ENC["Oobleck VAE encoder<br/>IN: PCM OUT: refer_audio B,T,64<br/>STATUS: NOT on TT in e2e"]
         BUILD["build_inputs today<br/>IN: _captured tensors OUT: TH LH REFH src_latents masks<br/>NOTE: prompts ignored until live preflight wired"]
         B0["tokenize_preprocess einops<br/>IN: src_latents OUT: patches B0 host only"]
@@ -92,12 +92,15 @@ flowchart TB
     EULER --> XT
     EULER --> TL["target_latents B,T,64 OUT of loop"]
 
-    subgraph OPTIONAL["Optional production extras — red not in v0 e2e"]
-        LM["acestep-5Hz-lm planner"]
-        CFG["CFG 2x DiT forward per step"]
-        APG["APG ADG guidance"]
+    subgraph OPTIONAL["Production extras — Phase 7 plus Phase 3"]
+        LM["acestep-5Hz-lm Qwen3 planner<br/>variants: 0.6B 1.7B default 4B<br/>OUT: audio_codes<br/>STATUS: Phase 7 tt_transformers Qwen3ForCausalLM"]
+        CFG["CFG 2x DiT forward per step<br/>STATUS: Phase 3"]
+        APG["APG ADG guidance<br/>STATUS: Phase 3 host math"]
     end
 
+    CAP -.-> LM
+    LYR -.-> LM
+    LM -.-> POOL
     LM -.-> LM25
     CFG -.-> TRACE_C
     APG -.-> EULER
@@ -121,7 +124,7 @@ flowchart TB
         P2["P150 trace plus 2CQ latents only about 0.19s at 4 steps"]
         P3["Production about 30 ODE steps plus CFG doubles DiT per step"]
         P4["Nvidia A100 full stack text plus ref audio to WAV under 2s reference"]
-        P5["TT target full A-Z traced under 2s after live preflight plus TT VAE plus prod steps"]
+        P5["TT target full A-Z traced under 2s Phase 8 after LM plus TT VAE plus prod steps"]
     end
 
     classDef rawInput fill:#9e9e9e,stroke:#616161,color:#ffffff
@@ -136,7 +139,9 @@ flowchart TB
     class BUILD,TH,LH,REFH,SRC,MASK,B0,MERGE,CTX,NOISE,XT,EULER,TPOSE,NORM,WAV hostGlue
     class A1,A2,A3,A4,ENC,POOL,DET,LM25,C2,VT,TL,TRACE_A,TRACE_BD,TRACE_C ttnnDone
     class DEC_TT ttnnPart
-    class TE,VAE_ENC,LM,CFG,APG notWired
+    class TE hostDone
+    class VAE_ENC,LM notWired
+    class CFG,APG notWired
     class DEC_HOST hostDone
     class P1,P2,P3,P4,P5 perfNote
     class L0 rawInput

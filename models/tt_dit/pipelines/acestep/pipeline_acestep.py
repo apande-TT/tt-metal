@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -17,8 +16,10 @@ import ttnn
 from models.demos.hf_eager.acestep_v15_base.tt.common import build_inputs, load_hf_model
 from models.demos.hf_eager.acestep_v15_base.tt.pipeline import AceStepPipelineTT
 from models.demos.hf_eager.acestep_v15_base.tt.traced_decoder import _device_supports_2cq
-from models.demos.hf_eager.acestep_v15_base.tt.vae_host import encode_reference_audio
-from models.tt_dit.pipelines.acestep.audio_decode import decode_latents_to_waveform
+from models.demos.hf_eager.acestep_v15_base.tt.vae_host import DEFAULT_OUTPUT_DURATION_SEC, encode_reference_audio
+from models.tt_dit.pipelines.acestep.apg_guidance import AceStepGuidanceConfig
+from models.tt_dit.pipelines.acestep.audio_decode import decode_latents_to_waveform, default_use_tt_vae
+from models.tt_dit.pipelines.acestep.text_encode import COVER_DIT_INSTRUCTION
 from models.tt_dit.pipelines.events import PipelineEventCallback, null_callback
 from models.tt_dit.pipelines.pipeline_api import PipelineAPIMixin
 
@@ -57,7 +58,11 @@ class AceStepPipelineConfig:
 
     checkpoint_name: str = _DEFAULT_CHECKPOINT
     cfg_enabled: bool = True
-    num_inference_steps: int = 4
+    guidance_scale: float = 7.0
+    use_adg: bool = False
+    num_inference_steps: int = 30
+    audio_duration: float = DEFAULT_OUTPUT_DURATION_SEC
+    shift: float = 1.0
     sample_rate: int = 48000
     pool_window_size: int = 5
 
@@ -93,14 +98,22 @@ class AceStepPipeline(PipelineAPIMixin):
         *,
         checkpoint_name: str = _DEFAULT_CHECKPOINT,
         cfg_enabled: bool = True,
-        num_inference_steps: int = 4,
+        guidance_scale: float = 7.0,
+        use_adg: bool = False,
+        num_inference_steps: int = 30,
+        audio_duration: float = DEFAULT_OUTPUT_DURATION_SEC,
+        shift: float = 1.0,
         sample_rate: int = 48000,
         pool_window_size: int = 5,
     ) -> AceStepPipeline:
         config = AceStepPipelineConfig(
             checkpoint_name=checkpoint_name,
             cfg_enabled=cfg_enabled,
+            guidance_scale=guidance_scale,
+            use_adg=use_adg,
             num_inference_steps=num_inference_steps,
+            audio_duration=audio_duration,
+            shift=shift,
             sample_rate=sample_rate,
             pool_window_size=pool_window_size,
         )
@@ -121,8 +134,7 @@ class AceStepPipeline(PipelineAPIMixin):
     def _resolve_use_tt_vae(use_tt_vae: bool | None) -> bool:
         if use_tt_vae is not None:
             return use_tt_vae
-        value = os.environ.get("ACESTEP_USE_TT_VAE", "0")
-        return value.strip().lower() in ("1", "true", "yes")
+        return default_use_tt_vae()
 
     @staticmethod
     def _prepare_inputs(
@@ -132,35 +144,49 @@ class AceStepPipeline(PipelineAPIMixin):
         reference_audio: str | None,
         seed: int,
         hf_model,
+        audio_duration: float = DEFAULT_OUTPUT_DURATION_SEC,
     ) -> dict:
         """Assemble DiT inputs from captured, live text, and/or reference audio."""
+        ref_tensors = None
+        text_instruction = None
+        if reference_audio:
+            _log_device_progress(
+                f"prepare_inputs: reference_audio={reference_audio} output_duration={audio_duration:.1f}s"
+            )
+            ref_tensors = encode_reference_audio(
+                reference_audio,
+                hf_model=hf_model,
+                seed=seed,
+                output_duration_sec=audio_duration,
+                use_same_for_src=False,
+            )
+            text_instruction = COVER_DIT_INSTRUCTION
+
         use_live_text = bool(prompts)
         if use_live_text:
             _log_device_progress(
-                f"prepare_inputs: live text (prompts={len(prompts)}, lyrics={'set' if lyrics else 'default'})"
+                f"prepare_inputs: live text (prompts={len(prompts)}, lyrics={'set' if lyrics else 'default'}, "
+                f"audio_duration={audio_duration:.1f}s, cover={text_instruction is not None})"
             )
             inputs = build_inputs(
                 seed=seed if seed else None,
                 use_captured=False,
                 prompts=prompts,
                 lyrics=lyrics,
+                audio_duration=audio_duration,
+                instruction=text_instruction,
             )
         else:
             _log_device_progress("prepare_inputs: captured hf_eager conditioning")
             inputs = build_inputs(seed=seed if seed else None)
 
-        if reference_audio:
-            _log_device_progress(f"prepare_inputs: reference_audio={reference_audio}")
-            ref_tensors = encode_reference_audio(
-                reference_audio,
-                hf_model=hf_model,
-                seed=seed,
-            )
+        if ref_tensors is not None:
             for key in _REFERENCE_INPUT_KEYS:
                 inputs[key] = ref_tensors[key]
             _log_device_progress(
                 f"prepare_inputs: is_covers={inputs['is_covers'].tolist()} "
-                f"src_latents={tuple(inputs['src_latents'].shape)}"
+                f"src_latents={tuple(inputs['src_latents'].shape)} "
+                f"output_duration_sec={ref_tensors['audio_duration_sec']:.2f}"
             )
 
         return inputs
@@ -182,16 +208,26 @@ class AceStepPipeline(PipelineAPIMixin):
     ):
         on_event = on_event if on_event is not None else null_callback
 
-        if negative_prompts is not None and self._config.cfg_enabled:
-            logger.warning("ACE-Step v0: negative_prompts ignored (CFG not wired yet)")
+        if negative_prompts is not None:
+            logger.warning("ACE-Step: negative_prompts ignored; CFG uses learned null_condition_emb")
 
         infer_steps = num_inference_steps if num_inference_steps is not None else self._config.num_inference_steps
+        guidance_config = None
+        if self._config.cfg_enabled and self._config.guidance_scale > 1.0 and not traced:
+            guidance_config = AceStepGuidanceConfig(
+                guidance_scale=self._config.guidance_scale,
+                use_adg=self._config.use_adg,
+            )
+        elif self._config.cfg_enabled and self._config.guidance_scale > 1.0 and traced:
+            logger.warning("CFG/APG disabled when traced=True (Phase 6)")
+
         inputs = self._prepare_inputs(
             prompts=prompts,
             lyrics=lyrics,
             reference_audio=reference_audio,
             seed=seed,
             hf_model=self._hf_model,
+            audio_duration=self._config.audio_duration,
         )
         use_2cq = self._use_2cq(self._device, traced)
         if traced:
@@ -202,9 +238,11 @@ class AceStepPipeline(PipelineAPIMixin):
             infer_steps=infer_steps,
             seed=seed if seed else None,
             pool_window_size=self._config.pool_window_size,
+            shift=self._config.shift,
             traced=traced,
             use_2cq=use_2cq,
             on_event=self._event_callback(on_event),
+            guidance_config=guidance_config,
         )
         target_latents = result["target_latents"]
         if not return_waveform:

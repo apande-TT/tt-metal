@@ -26,8 +26,7 @@ run_dev "2/3 traced latents perf (4 steps)" \
   models/tt_dit/tests/models/acestep/test_e2e_perf_traced_acestep.py \
   -k 1x1 -s -v --timeout=3600
 
-export ACESTEP_USE_TT_VAE=0 ACESTEP_SAVE_WAV=1
-run_dev "3/3 traced music perf (4 steps, host VAE)" \
+run_dev "3/3 traced music perf (4 steps)" \
   models/tt_dit/tests/models/acestep/test_e2e_music_perf_traced_acestep.py \
   -k 1x1 -s -v --timeout=3600
 

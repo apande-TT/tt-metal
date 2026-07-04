@@ -207,6 +207,68 @@ def _build_cover_chunk_masks(
     return torch.ones(batch_size, latent_length, ACOUSTIC_DIM, dtype=dtype)
 
 
+_learned_silence_latent: torch.Tensor | None = None
+DEFAULT_OUTPUT_DURATION_SEC = 30.0
+
+
+def resolve_silence_latent_path() -> str:
+    env_path = os.environ.get("ACESTEP_SILENCE_LATENT_PATH")
+    if env_path:
+        if not os.path.isfile(env_path):
+            raise FileNotFoundError(f"ACESTEP_SILENCE_LATENT_PATH is not a file: {env_path}")
+        return env_path
+
+    patterns = (
+        "~/.cache/huggingface/hub/models--ACE-Step--acestep-v15-xl-turbo-diffusers/snapshots/*/condition_encoder/diffusion_pytorch_model.safetensors",
+        "~/.cache/huggingface/hub/models--ACE-Step--acestep-v15-base-diffusers/snapshots/*/condition_encoder/diffusion_pytorch_model.safetensors",
+    )
+    for pattern in patterns:
+        matches = sorted(glob.glob(os.path.expanduser(pattern)))
+        if matches:
+            return matches[-1]
+    raise FileNotFoundError(
+        "Learned silence_latent not found. Download ACE-Step/acestep-v15-xl-turbo-diffusers "
+        "or set ACESTEP_SILENCE_LATENT_PATH to a condition_encoder safetensors file."
+    )
+
+
+def load_learned_silence_latent(*, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Load the VAE-encoded silence buffer used for cover/text2music src context."""
+    global _learned_silence_latent
+    if _learned_silence_latent is not None:
+        return _learned_silence_latent.to(dtype=dtype)
+
+    from safetensors import safe_open
+
+    path = resolve_silence_latent_path()
+    with safe_open(path, framework="pt") as sf:
+        if "silence_latent" not in sf.keys():
+            raise KeyError(f"silence_latent not found in {path}")
+        tensor = sf.get_tensor("silence_latent").to(dtype=dtype)
+    _learned_silence_latent = tensor
+    _log_phase2b(f"load_learned_silence_latent shape={tuple(tensor.shape)} from {path}")
+    return tensor
+
+
+def _slice_learned_silence_latent(
+    learned: torch.Tensor,
+    latent_length: int,
+    *,
+    batch_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Slice or tile learned silence to ``[B, latent_length, 64]`` (diffusers cover src)."""
+    sl = learned.to(dtype=dtype)
+    if sl.ndim != 3 or sl.shape[-1] != ACOUSTIC_DIM:
+        raise ValueError(f"expected learned silence [1, T, {ACOUSTIC_DIM}], got {tuple(sl.shape)}")
+    if sl.shape[1] >= latent_length:
+        src = sl[:, :latent_length, :]
+    else:
+        repeats = (latent_length + sl.shape[1] - 1) // sl.shape[1]
+        src = sl.repeat(1, repeats, 1)[:, :latent_length, :]
+    return src.expand(batch_size, -1, -1).contiguous()
+
+
 @torch.no_grad()
 def encode_reference_audio(
     wav_path: str,
@@ -216,26 +278,24 @@ def encode_reference_audio(
     batch_size: int = 1,
     task_type: str = "cover",
     seed: int = 0,
-    use_same_for_src: bool = True,
+    use_same_for_src: bool = False,
+    output_duration_sec: float | None = None,
     dtype: torch.dtype = torch.float32,
 ) -> dict[str, Any]:
     """Encode a reference WAV into cover-mode ``generate_audio`` tensors.
 
-    Uses host torch Oobleck VAE for acoustic latents. Cover ``src_latents`` also
-    run through the HF audio tokenizer/detokenizer (requires ``hf_model``).
+    Default (``use_same_for_src=False``): official reference-only cover — timbre from
+    the WAV, ``src_latents`` from learned ``silence_latent``, output length from
+    ``output_duration_sec`` (default 30s). Matches diffusers ``AceStepPipeline``
+    when only ``reference_audio`` is passed.
 
-    Returns a dict with:
-      - refer_audio_acoustic_hidden_states_packed [B, T_ref, 64]
-      - refer_audio_order_mask [B]
-      - src_latents [B, T, 64]
-      - chunk_masks [B, T, 64]
-      - attention_mask [B, T]
-      - silence_latent [B, T, 64] (zeros placeholder for live path)
-      - is_covers [B] int64
-      - latent_length int
-      - audio_duration_sec float
+    ``use_same_for_src=True``: also derive cover ``src_latents`` from the same WAV
+    (src-audio cover / repaint-style conditioning).
     """
-    _log_phase2b(f"encode_reference_audio start wav={wav_path} task={task_type} seed={seed}")
+    _log_phase2b(
+        f"encode_reference_audio start wav={wav_path} task={task_type} seed={seed} "
+        f"use_same_for_src={use_same_for_src}"
+    )
 
     owned_vae = vae is None
     if owned_vae:
@@ -244,8 +304,7 @@ def encode_reference_audio(
     generator = torch.Generator().manual_seed(int(seed))
     audio = load_wav(wav_path)
     lps = latents_per_second(vae)
-    audio_duration_sec = audio.shape[-1] / DEFAULT_SAMPLE_RATE
-    latent_length = math.ceil(audio_duration_sec * lps)
+    ref_duration_sec = audio.shape[-1] / DEFAULT_SAMPLE_RATE
 
     refer_audio, refer_order_mask = _prepare_reference_latents(
         audio,
@@ -254,6 +313,8 @@ def encode_reference_audio(
         dtype=dtype,
         generator=generator,
     )
+
+    learned_silence = load_learned_silence_latent(dtype=dtype)
 
     if task_type == "cover" and use_same_for_src:
         if hf_model is None:
@@ -266,16 +327,26 @@ def encode_reference_audio(
             dtype=dtype,
             generator=generator,
         )
+        audio_duration_sec = ref_duration_sec
+        silence_latent = learned_silence.expand(batch_size, -1, -1).contiguous()
     else:
-        src_latents = _vae_encode_audio(vae, audio.unsqueeze(0), generator=generator, dtype=dtype)
-        latent_length = src_latents.shape[1]
-        if src_latents.shape[0] == 1:
-            src_latents = src_latents.expand(batch_size, -1, -1).contiguous()
+        audio_duration_sec = output_duration_sec if output_duration_sec is not None else DEFAULT_OUTPUT_DURATION_SEC
+        latent_length = math.ceil(audio_duration_sec * lps)
+        src_latents = _slice_learned_silence_latent(
+            learned_silence,
+            latent_length,
+            batch_size=batch_size,
+            dtype=dtype,
+        )
+        silence_latent = learned_silence.expand(batch_size, -1, -1).contiguous()
 
     chunk_masks = _build_cover_chunk_masks(batch_size, latent_length, dtype=dtype)
     attention_mask = torch.ones(batch_size, latent_length, dtype=dtype)
-    silence_latent = torch.zeros(batch_size, latent_length, ACOUSTIC_DIM, dtype=dtype)
-    is_covers = torch.ones(batch_size, dtype=torch.int64)
+    # Reference-only cover: raw silence src (diffusers path) — do NOT run LM-hint swap.
+    # Src-audio cover (use_same_for_src): is_covers=1 replaces src with tokenize→detokenize hints.
+    is_covers = (
+        torch.ones(batch_size, dtype=torch.int64) if use_same_for_src else torch.zeros(batch_size, dtype=torch.int64)
+    )
 
     result = {
         "refer_audio_acoustic_hidden_states_packed": refer_audio,
@@ -287,12 +358,13 @@ def encode_reference_audio(
         "is_covers": is_covers,
         "latent_length": latent_length,
         "audio_duration_sec": audio_duration_sec,
+        "ref_duration_sec": ref_duration_sec,
     }
 
     _log_phase2b(
         "encode_reference_audio done "
         f"refer={tuple(refer_audio.shape)} src={tuple(src_latents.shape)} "
-        f"chunk_masks={tuple(chunk_masks.shape)} T={latent_length}"
+        f"chunk_masks={tuple(chunk_masks.shape)} T={latent_length} dur={audio_duration_sec:.1f}s"
     )
     return result
 
@@ -321,6 +393,14 @@ def save_wav(path: str, waveform: torch.Tensor, sample_rate: int = DEFAULT_SAMPL
     audio = waveform.detach().cpu().float()
     if audio.shape[0] != 1:
         raise ValueError(f"save_wav supports batch size 1, got {audio.shape[0]}")
+
+    # Match diffusers AceStepPipeline post-decode loudness (peak clip + -1 dBFS).
+    peak = audio.abs().amax(dim=(1, 2), keepdim=True)
+    if torch.any(peak > 1.0):
+        audio = audio / peak.clamp(min=1.0)
+    target_amp = 10.0 ** (-1.0 / 20.0)
+    peak = audio.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1e-6)
+    audio = audio * (target_amp / peak)
 
     stereo = audio[0].T.contiguous().numpy()
 

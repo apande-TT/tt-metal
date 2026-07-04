@@ -3059,6 +3059,12 @@ class AceStepDiTModel:
         self._lambda_stub = _lambda_build(device, torch_module.proj_in[0])
         self._layer_stubs = [_dit_layer_build(device, torch_module.layers[i]) for i in range(len(torch_module.layers))]
 
+        config = torch_module.config
+        self._layer_attn_types = list(getattr(config, "layer_types", ["full_attention"] * len(torch_module.layers)))
+        self._use_sliding_window = bool(getattr(config, "use_sliding_window", False))
+        self._sliding_window = int(getattr(config, "sliding_window", 128))
+        self._attn_mask_cache: dict[tuple, ttnn.Tensor] = {}
+
     def _apply_layers_0_self_attn_q_proj(self, x):
         return self._lin(x, self.w_layers_0_self_attn_q_proj_weight)
 
@@ -4073,6 +4079,34 @@ class AceStepDiTModel:
         b_, tp_, _ = list(y.shape)
         return ttnn.reshape(y, (b_, tp_ * patch_size, out_c))
 
+    def _mask_to_tt(self, mask_torch: torch.Tensor) -> ttnn.Tensor:
+        return ttnn.from_torch(
+            mask_torch.to(torch.bfloat16).contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+        )
+
+    def _get_sliding_self_attn_mask(self, seq_len: int):
+        """Bidirectional sliding-window self-attention mask for one patchified seq length."""
+        if not self._use_sliding_window:
+            return None
+        key = (seq_len, self._sliding_window)
+        if key not in self._attn_mask_cache:
+            from models.demos.hf_eager.acestep_v15_base.tt.mask_utils import create_4d_mask
+
+            mask = create_4d_mask(
+                seq_len=seq_len,
+                dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+                attention_mask=None,
+                sliding_window=self._sliding_window,
+                is_sliding_window=True,
+                is_causal=False,
+            )
+            self._attn_mask_cache[key] = self._mask_to_tt(mask)
+        return self._attn_mask_cache[key]
+
     def __call__(self, *args, **kwargs):
         _orig_ops = _install_hifi4_defaults(self._ckc)
         try:
@@ -4129,12 +4163,10 @@ class AceStepDiTModel:
                 timestep_r.reshape(-1, 1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
             )
 
-        # NOTE: the HF reference unconditionally overwrites both `attention_mask`
-        # and `encoder_attention_mask` to `None` before building its internal
-        # 4D masks (see AceStepDiTModel.forward), so the incoming padding masks
-        # never actually influence the computation. Combined with the fact that
-        # the post-patchify sequence length here is well under `sliding_window`,
-        # every attention op below is plain bidirectional (no mask, not causal).
+        # NOTE: HF AceStepDiTModel.forward clears incoming padding masks and builds
+        # internal 4D masks from config.layer_types. At T=50 (patchified seq=25)
+        # sliding_window=128 is a no-op; at T=750 (patchified seq=375) half the
+        # layers require bidirectional sliding-window masks to match HF.
 
         # --- timestep embeddings (delegated to the timestep_embedding leaf stubs) ---
         temb_t, timestep_proj_t = self._time_embed_stub(timestep)
@@ -4158,13 +4190,20 @@ class AceStepDiTModel:
         seq_len = list(hs.shape)[1]
         enc_seq_len = list(enc.shape)[1]
         cos_tt, sin_tt = self._get_rotary_embeddings(seq_len)
+        sliding_mask_tt = self._get_sliding_self_attn_mask(seq_len)
 
         for layer_idx in range(num_layers):
+            attn_type = self._layer_attn_types[layer_idx]
+            if attn_type == "sliding_attention" and sliding_mask_tt is not None:
+                layer_self_mask = sliding_mask_tt
+            else:
+                layer_self_mask = None
+
             layer_out = self._layer_stubs[layer_idx](
                 hidden_states=hs,
                 position_embeddings=(cos_tt, sin_tt),
                 temb=timestep_proj,
-                attention_mask=None,
+                attention_mask=layer_self_mask,
                 position_ids=None,
                 encoder_hidden_states=enc,
                 encoder_attention_mask=None,

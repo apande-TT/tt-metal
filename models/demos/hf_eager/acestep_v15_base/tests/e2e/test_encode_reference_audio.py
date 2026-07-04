@@ -125,6 +125,7 @@ def test_encode_reference_audio_shapes(fixture_wav, hf_model, vae):
         hf_model=hf_model,
         vae=vae,
         seed=SEED,
+        use_same_for_src=True,
     )
 
     assert out["refer_audio_acoustic_hidden_states_packed"].shape == (1, 750, 64)
@@ -146,6 +147,7 @@ def test_encode_reference_audio_pcc_vs_hf_golden(fixture_wav, hf_model, vae):
         hf_model=hf_model,
         vae=vae,
         seed=SEED,
+        use_same_for_src=True,
     )
     golden = _hf_golden_encode(fixture_wav, hf_model, vae, seed=SEED)
 

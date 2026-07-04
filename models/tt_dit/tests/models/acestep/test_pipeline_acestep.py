@@ -16,7 +16,11 @@ def test_pipeline_acestep_runs_on_device(device: ttnn.Device) -> None:
         pytest.skip("No Tenstorrent device available")
 
     try:
-        pipe = AceStepPipeline.create_pipeline(mesh_device=device)
+        pipe = AceStepPipeline.create_pipeline(
+            mesh_device=device,
+            num_inference_steps=2,
+            guidance_scale=1.0,
+        )
     except RuntimeError as exc:
         pytest.skip(f"ACE-Step HF weights unavailable: {exc}")
 

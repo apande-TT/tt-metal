@@ -38,6 +38,13 @@ def fold_weight_norm_state(state: dict[str, torch.Tensor], *, conv_prefix: str =
         state[f"{conv_prefix}bias"] = state.pop("bias")
 
 
+def _ensure_row_major(x_BTC: ttnn.Tensor) -> ttnn.Tensor:
+    """Elementwise ops (Snake) may emit TILE; conv path requires ROW_MAJOR."""
+    if x_BTC.layout != ttnn.ROW_MAJOR_LAYOUT:
+        x_BTC = ttnn.to_layout(x_BTC, ttnn.ROW_MAJOR_LAYOUT)
+    return x_BTC
+
+
 def _trim_t_to_length(x_BTC: ttnn.Tensor, target_len: int) -> ttnn.Tensor:
     """Center-trim ``x_BTC`` along T to ``target_len`` (handles odd excess)."""
     t = int(x_BTC.shape[1])
@@ -93,7 +100,7 @@ class OobleckSnake1d(Module):
                 state[f"snake.{name}"] = state.pop(name)
 
     def forward(self, x_BTC: ttnn.Tensor) -> ttnn.Tensor:
-        return self.snake(x_BTC)
+        return _ensure_row_major(self.snake(x_BTC))
 
 
 class OobleckConv1d(Module):
@@ -192,7 +199,7 @@ class OobleckConvTranspose1d(Module):
             state["conv.bias"] = state.pop("conv.bias")
 
     def forward(self, x_BTC: ttnn.Tensor) -> ttnn.Tensor:
-        assert x_BTC.layout == ttnn.ROW_MAJOR_LAYOUT
+        x_BTC = _ensure_row_major(x_BTC)
         t_in = int(x_BTC.shape[1])
         expected_t = t_in * self.stride
 

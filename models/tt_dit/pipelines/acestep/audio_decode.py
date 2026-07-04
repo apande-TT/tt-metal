@@ -22,6 +22,16 @@ if TYPE_CHECKING:
 _DEFAULT_SAMPLE_RATE = 48_000
 
 
+def default_use_tt_vae() -> bool:
+    """Default to TT Oobleck on device. Set ``ACESTEP_USE_TT_VAE=0`` for host fallback."""
+    import os
+
+    value = os.environ.get("ACESTEP_USE_TT_VAE")
+    if value is not None:
+        return value.strip().lower() in ("1", "true", "yes")
+    return True
+
+
 def decode_latents_to_waveform(
     device: ttnn.Device | ttnn.MeshDevice,
     latents_BTC: torch.Tensor,
@@ -96,7 +106,7 @@ def save_waveform_if_requested(
     path: str = "/tmp/acestep_phase_c.wav",
     sample_rate: int = _DEFAULT_SAMPLE_RATE,
 ) -> None:
-    """Persist waveform when ``ACESTEP_SAVE_WAV=1`` (used by Phase C perf test)."""
+    """Persist waveform to ``path`` (used by e2e / perf tests)."""
     from models.demos.hf_eager.acestep_v15_base.tt.vae_host import save_wav
 
     save_wav(path, waveform, sample_rate=sample_rate)

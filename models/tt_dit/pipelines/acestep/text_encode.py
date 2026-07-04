@@ -25,6 +25,7 @@ import torch
 
 SFT_GEN_PROMPT = "# Instruction\n{}\n\n# Caption\n{}\n\n# Metas\n{}<|endoftext|>\n"
 DEFAULT_DIT_INSTRUCTION = "Fill the audio semantic mask based on the given conditions:"
+COVER_DIT_INSTRUCTION = "Generate audio semantic tokens based on the given conditions:"
 
 TEXT_ENCODER_SUBDIR = "Qwen3-Embedding-0.6B"
 DEFAULT_MAX_TEXT_LEN = 256

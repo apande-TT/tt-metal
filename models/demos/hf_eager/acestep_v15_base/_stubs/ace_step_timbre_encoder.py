@@ -434,6 +434,12 @@ class AceStepTimbreEncoder:
 
         # op-REUSE: layers.3.mlp.act_fn  (SILU)
 
+        config = torch_module.config
+        self._layer_attn_types = [layer.attention_type for layer in torch_module.layers]
+        self._use_sliding_window = bool(getattr(config, "use_sliding_window", False))
+        self._sliding_window = int(getattr(config, "sliding_window", 128))
+        self._attn_mask_cache: dict[tuple, ttnn.Tensor] = {}
+
     # ---- op-NEW gap helpers (RMSNorm / RoPE / attention) ----
     _RMS_EPS = 1e-6
     _ROPE_THETA = 1000000.0
@@ -455,6 +461,33 @@ class AceStepTimbreEncoder:
 
     def _rms_norm(self, x, weight):
         return ttnn.rms_norm(x, epsilon=self._RMS_EPS, weight=weight)
+
+    def _mask_to_tt(self, mask_torch: torch.Tensor) -> ttnn.Tensor:
+        return ttnn.from_torch(
+            mask_torch.to(torch.bfloat16).contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+        )
+
+    def _get_sliding_self_attn_mask(self, seq_len: int):
+        if not self._use_sliding_window:
+            return None
+        key = (seq_len, self._sliding_window)
+        if key not in self._attn_mask_cache:
+            from models.demos.hf_eager.acestep_v15_base.tt.mask_utils import create_4d_mask
+
+            mask = create_4d_mask(
+                seq_len=seq_len,
+                dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+                attention_mask=None,
+                sliding_window=self._sliding_window,
+                is_sliding_window=True,
+                is_causal=False,
+            )
+            self._attn_mask_cache[key] = self._mask_to_tt(mask)
+        return self._attn_mask_cache[key]
 
     def _rope_tables(self, seq_len):
         cache_attr = f"_rope_cache_{seq_len}"
@@ -502,7 +535,7 @@ class AceStepTimbreEncoder:
             return x
         return ttnn.repeat_interleave(x, n_rep, dim=1)
 
-    def _self_attention(self, x, q_fn, k_fn, v_fn, o_fn, q_norm_w, k_norm_w, cos, sin):
+    def _self_attention(self, x, q_fn, k_fn, v_fn, o_fn, q_norm_w, k_norm_w, cos, sin, attn_mask_tt=None):
         head_dim = self._HEAD_DIM
         # Project + reshape into heads. Qwen3 applies q_norm/k_norm on the
         # head_dim axis (before RoPE); RMSNorm over the last axis is invariant
@@ -526,14 +559,16 @@ class AceStepTimbreEncoder:
         k_t = ttnn.transpose(k, 2, 3)  # (b, 16, 128, t)
         scores = ttnn.matmul(q, k_t)  # (b, 16, t, t)
         scores = ttnn.multiply(scores, self._SCALING)
-        # Bidirectional, non-causal, no padding mask (attention_mask is all-ones
-        # and sliding_window >= seq_len -> full attention -> mask is a no-op).
+        if attn_mask_tt is not None:
+            scores = ttnn.add(scores, attn_mask_tt)
         probs = ttnn.softmax(scores, dim=-1)  # (b, 16, t, t)
         attn = ttnn.matmul(probs, v)  # (b, 16, t, 128)
         attn = self._merge_heads(attn, self._NUM_HEADS, head_dim)  # (b, t, 2048)
         return o_fn(attn)
 
-    def _encoder_layer(self, x, layer_idx, q_fn, k_fn, v_fn, o_fn, gate_fn, up_fn, down_fn, act_fn, cos, sin):
+    def _encoder_layer(
+        self, x, layer_idx, q_fn, k_fn, v_fn, o_fn, gate_fn, up_fn, down_fn, act_fn, cos, sin, attn_mask_tt=None
+    ):
         q_norm_w = self._get_weight(f"layers.{layer_idx}.self_attn.q_norm.weight", self._HEAD_DIM)
         k_norm_w = self._get_weight(f"layers.{layer_idx}.self_attn.k_norm.weight", self._HEAD_DIM)
         in_ln_w = self._get_weight(f"layers.{layer_idx}.input_layernorm.weight", self._HIDDEN_SIZE)
@@ -541,7 +576,7 @@ class AceStepTimbreEncoder:
 
         residual = x
         h = self._rms_norm(x, in_ln_w)
-        attn_out = self._self_attention(h, q_fn, k_fn, v_fn, o_fn, q_norm_w, k_norm_w, cos, sin)
+        attn_out = self._self_attention(h, q_fn, k_fn, v_fn, o_fn, q_norm_w, k_norm_w, cos, sin, attn_mask_tt)
         x = ttnn.add(residual, attn_out)
 
         residual = x
@@ -688,9 +723,12 @@ class AceStepTimbreEncoder:
 
         # 2. Shared rotary tables (theta=1e6).
         cos, sin = self._rope_tables(seq_len)
+        sliding_mask_tt = self._get_sliding_self_attn_mask(seq_len)
 
         # 3. Qwen3 encoder layers (pre-norm attn + SwiGLU MLP, GQA via repeat_kv).
         for layer_idx in range(4):
+            attn_type = self._layer_attn_types[layer_idx]
+            layer_mask = sliding_mask_tt if attn_type == "sliding_attention" else None
             timbre_embed = self._encoder_layer(
                 timbre_embed,
                 layer_idx,
@@ -704,6 +742,7 @@ class AceStepTimbreEncoder:
                 getattr(self, f"_apply_layers_{layer_idx}_mlp_act_fn"),
                 cos,
                 sin,
+                layer_mask,
             )
 
         # 4. HF: hidden_states = self.norm(hidden_states)

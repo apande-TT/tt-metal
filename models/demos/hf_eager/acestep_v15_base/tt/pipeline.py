@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import torch
 
-from .common import assemble_context_latents, ode_timesteps, prepare_noise, to_torch, tokenize_preprocess
+from .common import assemble_context_latents, ode_timesteps, prepare_noise, resolve, to_torch, tokenize_preprocess
 from .subsystem_audio_tokenizer import AudioTokenizerTT
 from .subsystem_condition_encoder import ConditionEncoderTT
 from .subsystem_decoder import DecoderTT
@@ -38,6 +38,7 @@ class AceStepPipelineTT:
 
     def __init__(self, device, hf_model):
         self.device = device
+        self.hf_model = hf_model
         self.condition_encoder = ConditionEncoderTT(device, hf_model)  # Call A (4 stubs)
         self.audio_tokenizer = AudioTokenizerTT(device, hf_model)  # Call B (4 stubs)
         self.detokenizer = DetokenizerTT(device, hf_model)  # Call D (1 stub)
@@ -54,9 +55,11 @@ class AceStepPipelineTT:
         seed=1234,
         pool_window_size=5,
         *,
+        shift: float = 1.0,
         traced: bool = False,
         use_2cq: bool | None = None,
         on_event=None,
+        guidance_config=None,
     ):
         src_latents = inputs["src_latents"]
         silence_latent = inputs["silence_latent"]
@@ -183,14 +186,22 @@ class AceStepPipelineTT:
             _evt("detokenizer", False)
 
         # --- Call C: flow-matching ODE loop over the DiT decoder ---
-        noise = prepare_noise(context_latents, seed)
-        t = ode_timesteps(infer_steps)
-        xt = noise
-        per_step_vt = []
-        per_step_xt = []
+        use_cfg = guidance_config is not None and guidance_config.guidance_scale > 1.0
+        if traced and use_cfg:
+            raise NotImplementedError("CFG/APG with traced=True is Phase 6; use traced=False for Phase 3.")
 
-        traced_decoder = None
+        null_condition_emb = None
+        if use_cfg:
+            null_condition_emb = resolve(self.hf_model, "null_condition_emb").detach().float()
+
         if traced:
+            noise = prepare_noise(context_latents, seed)
+            t = ode_timesteps(infer_steps, shift=shift)
+            xt = noise
+            per_step_vt = []
+            per_step_xt = []
+
+            traced_decoder = None
             if self._traced_decoder is None:
                 self._traced_decoder = TracedDecoder2CQ(self.decoder, use_2cq=use_2cq)
             traced_decoder = self._traced_decoder
@@ -213,34 +224,68 @@ class AceStepPipelineTT:
                     context_latents=context_latents,
                 )
 
-        _evt("denoising", True)
-        for i in range(infer_steps):
-            t_curr, t_prev = t[i], t[i + 1]
-            t_curr_tensor = t_curr * torch.ones((bsz,), dtype=torch.float32)
-            _evt(f"denoising_step_{i}", True)
-            if traced_decoder is not None:
+            _evt("denoising", True)
+            for i in range(infer_steps):
+                t_curr, t_prev = t[i], t[i + 1]
+                t_curr_tensor = t_curr * torch.ones((bsz,), dtype=torch.float32)
+                _evt(f"denoising_step_{i}", True)
                 vt = traced_decoder(
                     xt,
                     timestep=t_curr_tensor,
                     timestep_r=t_curr_tensor,
                 )
-            else:
-                vt = self.decoder(
-                    hidden_states=xt,
-                    timestep=t_curr_tensor,
-                    timestep_r=t_curr_tensor,
+                per_step_vt.append(vt)
+                dt = t_curr - t_prev
+                xt = xt - vt * dt
+                _evt(f"denoising_step_{i}", False)
+                per_step_xt.append(xt)
+            _evt("denoising", False)
+        else:
+            from models.tt_dit.pipelines.acestep.denoise import run_flow_matching_ode
+
+            def _decoder_forward(
+                hidden_states,
+                *,
+                timestep,
+                timestep_r,
+                attention_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                context_latents,
+            ):
+                out = self.decoder(
+                    hidden_states=hidden_states,
+                    timestep=timestep,
+                    timestep_r=timestep_r,
                     attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
                     context_latents=context_latents,
                 )
-                vt = vt.to(torch.float32)
-            per_step_vt.append(vt)
-            dt = t_curr - t_prev
-            xt = xt - vt * dt
-            _evt(f"denoising_step_{i}", False)
-            per_step_xt.append(xt)
-        _evt("denoising", False)
+                return out
+
+            def _on_step_start(i, _t_curr, _t_prev):
+                _evt(f"denoising_step_{i}", True)
+
+            def _on_step_end(i):
+                _evt(f"denoising_step_{i}", False)
+
+            _evt("denoising", True)
+            xt, per_step_vt, per_step_xt, noise = run_flow_matching_ode(
+                decoder=_decoder_forward,
+                context_latents=context_latents,
+                attention_mask=attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                infer_steps=infer_steps,
+                seed=seed,
+                guidance_config=guidance_config,
+                null_condition_emb=null_condition_emb,
+                shift=shift,
+                on_step_start=_on_step_start,
+                on_step_end=_on_step_end,
+            )
+            _evt("denoising", False)
 
         _evt("total", False)
 

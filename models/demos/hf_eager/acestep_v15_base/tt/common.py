@@ -38,6 +38,11 @@ GATE_CONFIG = {
     "is_covers": 1,
 }
 
+# Phase 3.4: production-length cover (30 s @ 25 Hz latent frames).
+LONG_SEQ_DURATION_SEC = 30.0
+LONG_SEQ_LATENT_FRAMES = 750
+LONG_SEQ_PCC_TARGET = 0.95
+
 
 def load_hf_model(dtype: str = "bfloat16"):
     """Load the ACE-Step reference model via the planner loader cascade.
@@ -135,6 +140,7 @@ def build_inputs(
     lyrics=None,
     *,
     audio_duration: float | None = None,
+    instruction: str | None = None,
 ):
     """Deterministic e2e inputs.
 
@@ -186,6 +192,7 @@ def build_inputs(
         batch_size=cfg["batch"],
         dtype=dtype,
         audio_duration=audio_duration,
+        instruction=instruction,
     )
     inputs.update(live_text)
     return inputs
@@ -297,9 +304,9 @@ def to_torch(ttnn_tensor, device):
     return ttnn.to_torch(ttnn_tensor)
 
 
-def pcc(golden: torch.Tensor, actual: torch.Tensor):
+def pcc(golden: torch.Tensor, actual: torch.Tensor, target: float = 0.99):
     """Pearson correlation of two tensors, flattened; matches comp_pcc's metric."""
     from models.common.utility_functions import comp_pcc
 
-    ok, value = comp_pcc(golden.to(torch.float32), actual.to(torch.float32), 0.99)
+    ok, value = comp_pcc(golden.to(torch.float32), actual.to(torch.float32), target)
     return ok, value
