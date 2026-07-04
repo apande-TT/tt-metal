@@ -321,16 +321,6 @@ class NemotronHPipeline:
             out = ttnn.to_torch(logits).to(torch.float32).reshape(-1)
         return out[: self.vocab]
 
-    def _argmax_vocab(self, logits):
-        """Vocab-dim argmax. ttnn.argmax runs SINGLE-CORE on a TILE input but
-        MULTI-CORE on ROW_MAJOR for the last-dim reduction, so untilize first —
-        the 131072-wide reduction is memory-bound and a single core is the
-        grid=tiny bottleneck. Same uint32 ROW_MAJOR output either way."""
-        rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-        tok = ttnn.argmax(rm, dim=-1)
-        ttnn.deallocate(rm)
-        return tok
-
     def _read_token(self, tok):
         """Read a single on-device argmax token id back to a python int (for the
         results list / PCC gate). The token FED to the next step stays on device."""
@@ -464,7 +454,7 @@ class NemotronHPipeline:
         step_logits = []
         for step in range(n_new):
             step_logits.append(self._read_logits(logits))
-            tok = self._argmax_vocab(logits)  # (1,1) uint32, ON DEVICE
+            tok = ttnn.argmax(logits, dim=-1)  # (1,1) uint32, ON DEVICE
             ttnn.deallocate(logits)
             nxt = self._read_token(tok)
             new_ids.append(nxt)
@@ -500,7 +490,7 @@ class NemotronHPipeline:
         h = self._run_layers(h, capture=True, ctx=ctx)
         logits = self._logits_from_h(h)
         ttnn.deallocate(h)
-        tok = self._argmax_vocab(logits)
+        tok = ttnn.argmax(logits, dim=-1)
         ttnn.deallocate(logits)
         kw = dict(dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
         if self._is_mesh:
@@ -522,6 +512,45 @@ class NemotronHPipeline:
         command queue 1, so the input upload overlaps the traced decode step on CQ0.
         Presence of this method is what flips the engine into the trace+2CQ path."""
         ttnn.copy_host_to_device_tensor(state["host_tok"], state["tok"], cq_id=1)
+
+    def prefill_trace_setup(self, input_ids):
+        """Prepare a host-op-free prefill forward for clean trace+2CQ measurement: pre-upload
+        the prompt into a PERSISTENT device buffer and pre-allocate the position / arange tensors,
+        so prefill_trace_step is pure-device (trace-capturable) and prefill_write_inputs can
+        re-stage the prompt on CQ1 (overlapping the traced prefill on CQ0)."""
+        self._ensure_children()
+        if not torch.is_tensor(input_ids):
+            input_ids = torch.tensor(input_ids, dtype=torch.int64).reshape(1, -1)
+        P = int(input_ids.shape[1])
+        self._pf_P = P
+        self._pf_ctx = ((P + 8 + 8 + 31) // 32) * 32
+        self._pf_ids = self._prompt_to_device(input_ids)
+        kw = dict(dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
+        if self._is_mesh:
+            kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self.device)
+        self._pf_host_ids = ttnn.from_torch(input_ids.to(torch.int32), **kw)
+        ar = ttnn.typecast(ttnn.arange(0, self._pf_ctx, 1, device=self.device), ttnn.float32)
+        self._pf_ar_row = ttnn.reshape(ar, (1, 1, 1, self._pf_ctx))
+        self._pf_ar_col = ttnn.reshape(ar, (1, 1, self._pf_ctx, 1))
+        self._pf_pos = self._const_scalar(float(P))
+
+    def prefill_trace_step(self):
+        """One device-only prefill forward over the pre-uploaded prompt (trace-capturable):
+        embed the resident prompt buffer, run all layers seeding the decode caches, produce the
+        first-token logits. Re-runs cleanly for timing (re-seeds the caches each replay)."""
+        self._dec_state = {}
+        self._pos_t, self._ar_row, self._ar_col = self._pf_pos, self._pf_ar_row, self._pf_ar_col
+        h = self._embed_to_fp32(self._pf_ids)
+        h = self._run_layers(h, capture=True, ctx=self._pf_ctx)
+        logits = self._logits_from_h(h)
+        ttnn.deallocate(h)
+        ttnn.deallocate(logits)
+
+    def prefill_write_inputs(self):
+        """Perf/2CQ contract: stage the prompt into the persistent buffer on command queue 1, so
+        the prompt upload overlaps the traced prefill forward on CQ0 (the prompt is a bigger H2D
+        than a decode token, so the overlap matters more)."""
+        ttnn.copy_host_to_device_tensor(self._pf_host_ids, self._pf_ids, cq_id=1)
 
 
 def build_pipeline(device, hf_model, compose=True):
@@ -565,13 +594,13 @@ def trace_capture_selftest(n_prompt=5):
         h = pipe._run_layers(h, capture=True, ctx=ctx)
         logits = pipe._logits_from_h(h)
         ttnn.deallocate(h)
-        tok = pipe._argmax_vocab(logits)
+        tok = ttnn.argmax(logits, dim=-1)
         ttnn.deallocate(logits)
 
         # warm: compile every decode kernel OUTSIDE the trace region
         logits = pipe._decode_step(tok, free_carry=True)
         ttnn.deallocate(tok)
-        tok = pipe._argmax_vocab(logits)
+        tok = ttnn.argmax(logits, dim=-1)
         ttnn.deallocate(logits)
         ttnn.synchronize_device(dev)
 

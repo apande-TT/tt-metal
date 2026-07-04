@@ -90750,15 +90750,30 @@ class NemotronHModel:
         attn = ttnn.transformer.scaled_dot_product_attention(q, kr, vr, is_causal=True)
         attn = ttnn.reshape(ttnn.permute(attn, (0, 2, 1, 3)), (1, lq, self._A_HEADS * self._A_HDIM))
         out = self._lin(attn, self._g_ow[i])
-        pad = ttnn.zeros(
-            (1, self._KV_HEADS, ctx - lq, self._A_HDIM),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=self.device,
-        )
+        # The KV-cache pad is a fixed-shape zeros constant (depends only on the
+        # sequence length and ctx, both fixed for a given trace); build it ONCE
+        # per shape and reuse so the prefill forward stays host-op-free and the
+        # trace region has no HOST->DEVICE write. concat/clone only read `pad`.
+        pad = self._pf_kv_pad(ctx, lq)
         kcache = ttnn.concat([kh, pad], dim=2)
         vcache = ttnn.concat([vh, ttnn.clone(pad)], dim=2)
         return out, kcache, vcache
+
+    def _pf_kv_pad(self, ctx, lq):
+        cache = getattr(self, "_pf_kv_pad_cache", None)
+        if cache is None:
+            cache = self._pf_kv_pad_cache = {}
+        key = (ctx, lq)
+        pad = cache.get(key)
+        if pad is None:
+            pad = ttnn.zeros(
+                (1, self._KV_HEADS, ctx - lq, self._A_HDIM),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.device,
+            )
+            cache[key] = pad
+        return pad
 
     def _attn_decode(self, i, x_t, kcache, vcache, pos_t, ar_row, ar_col):
         # Single-token attention over the fixed KV cache. Masked in-cache write of
