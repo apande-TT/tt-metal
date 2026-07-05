@@ -45,6 +45,10 @@ def _to_ttnn_bf8(t, device):
     return ttnn.from_torch(t, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
 
 
+def _to_ttnn_bf4(t, device):
+    return ttnn.from_torch(t, dtype=ttnn.bfloat4_b, layout=ttnn.TILE_LAYOUT, device=device)
+
+
 class SeamlessM4TEncoder:
     def __init__(self, device, torch_module):
         self.device = device
@@ -89,9 +93,9 @@ class SeamlessM4TEncoder:
                 "sa_o_b": _to_ttnn(sd["self_attn.out_proj.bias"].reshape(1, -1), device),
                 "ffn_ln_w": _to_ttnn(sd["ffn_layer_norm.weight"], device),
                 "ffn_ln_b": _to_ttnn(sd["ffn_layer_norm.bias"], device),
-                "ffn_fc1_w": _to_ttnn_bf8(sd["ffn.fc1.weight"].T.contiguous(), device),
+                "ffn_fc1_w": _to_ttnn_bf4(sd["ffn.fc1.weight"].T.contiguous(), device),
                 "ffn_fc1_b": _to_ttnn(sd["ffn.fc1.bias"].reshape(1, -1), device),
-                "ffn_fc2_w": _to_ttnn_bf8(sd["ffn.fc2.weight"].T.contiguous(), device),
+                "ffn_fc2_w": _to_ttnn_bf4(sd["ffn.fc2.weight"].T.contiguous(), device),
                 "ffn_fc2_b": _to_ttnn(sd["ffn.fc2.bias"].reshape(1, -1), device),
             }
             self.layers_w.append(wl)
