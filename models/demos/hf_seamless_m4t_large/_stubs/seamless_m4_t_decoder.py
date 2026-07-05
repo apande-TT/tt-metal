@@ -145,6 +145,107 @@ def _tp_fracture_assessment() -> str:
     return "single-chip; ShardTensorToMesh / all_gather / reduce_scatter not applicable"
 
 
+def _ttl_fused_ffn_kernel():  # pragma: no cover
+    """tt-lang kernel for FFN fusion (fc1 -> ReLU -> fc2). Target op:
+    MatmulDeviceOperation 32x8192x1024 (fc2 down-projection).
+
+    GUIDELINES/11 identifies the FFN as the HIGHEST-VALUE tt-lang fusion:
+    two sequential linears with an activation between — TTNN runs them as
+    three ops and MUST materialize the [m, 8192] intermediate in DRAM
+    between them. A fused kernel keeps that intermediate in L1 and never
+    round-trips it, saving 2 * m * 8192 * dtype_bytes of DRAM traffic.
+
+    Structure (adapted from GUIDELINES/11 FFN fusion recipe):
+    - grid=(gy, gx) full core grid, m-tile parallelism across cores
+    - per core slice:
+        1) k1-reduction: h_row = relu(W1 @ x_row + b1) accumulated into an
+           L1 DFB (dfb_h) — never written to DRAM
+        2) k2-reduction (over hidden=8192): y_row = W2 @ h_row + b2, read
+           straight from dfb_h L1
+        3) write only the final [m, 1024] tile to DRAM
+    - I/O contract preserved: bfloat16 activations in/out, bf8_b weights,
+      fp32 accumulate inside the reductions
+
+    ttl is sim-only in this environment; the executed path is the existing
+    fc1(activation='relu', memory_config=ttnn.L1_MEMORY_CONFIG) -> fc2
+    fallback (GUIDELINES/05 mlp-l1-handoff). The L1 handoff realises the
+    SAME 'intermediate stays in L1' invariant that this kernel body would
+    hard-code — the visible perf gain has already been banked in commits
+    d759ba743c5 / 8e9798a3180 (ReLU-fused fc1 + L1 handoff on encoder+
+    decoder).
+    """
+    if not _TTL_KERNEL_AVAILABLE:
+        return None
+    import ttl  # type: ignore
+
+    TILE = 32
+
+    @ttl.operation(grid=(8, 8))
+    def fused_ffn(x, w1, b1, w2, b2, y):
+        m_tiles = x.shape[0] // TILE
+        hidden_tiles = w1.shape[1] // TILE  # = 8192 / 32 = 256
+        in_tiles = x.shape[1] // TILE  # = 32
+        out_tiles = w2.shape[1] // TILE  # = 32
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        w1_dfb = ttl.make_dataflow_buffer_like(w1, shape=(1, 1), block_count=2)
+        b1_dfb = ttl.make_dataflow_buffer_like(b1, shape=(1, 1), block_count=2)
+        h_row_dfb = ttl.make_dataflow_buffer_like(w1, shape=(1, hidden_tiles), block_count=2)
+        w2_dfb = ttl.make_dataflow_buffer_like(w2, shape=(1, 1), block_count=2)
+        b2_dfb = ttl.make_dataflow_buffer_like(b2, shape=(1, 1), block_count=2)
+        acc1_dfb = ttl.make_dataflow_buffer_like(w1, shape=(1, 1), block_count=2)
+        acc2_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
+        y_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
+
+        @ttl.datamovement()
+        def read():
+            for mt in range(m_tiles):
+                for ht in range(hidden_tiles):
+                    with b1_dfb.reserve() as bb:
+                        ttl.copy(b1[0, ht], bb).wait()
+                    for kt in range(in_tiles):
+                        with x_dfb.reserve() as xb, w1_dfb.reserve() as wb:
+                            ttl.copy(x[mt, kt], xb).wait()
+                            ttl.copy(w1[kt, ht], wb).wait()
+                for nt in range(out_tiles):
+                    with b2_dfb.reserve() as bb:
+                        ttl.copy(b2[0, nt], bb).wait()
+                    for ht in range(hidden_tiles):
+                        with w2_dfb.reserve() as wb:
+                            ttl.copy(w2[ht, nt], wb).wait()
+
+        @ttl.compute()
+        def compute():
+            for _ in range(m_tiles):
+                for ht in range(hidden_tiles):
+                    with acc1_dfb.reserve() as acc0:
+                        acc0.store(ttl.block.fill(0, shape=acc0.shape))
+                    for _ in range(in_tiles):
+                        with x_dfb.wait() as xb, w1_dfb.wait() as wb, acc1_dfb.wait() as pre:
+                            with acc1_dfb.reserve() as acc:
+                                acc.store(pre + xb @ wb)
+                    with b1_dfb.wait() as bb, acc1_dfb.wait() as acc, h_row_dfb.reserve() as hb:
+                        hb[0, ht].store(ttl.math.relu(acc + bb))
+                for nt in range(out_tiles):
+                    with acc2_dfb.reserve() as acc0:
+                        acc0.store(ttl.block.fill(0, shape=acc0.shape))
+                    for ht in range(hidden_tiles):
+                        with h_row_dfb.wait() as hb, w2_dfb.wait() as wb, acc2_dfb.wait() as pre:
+                            with acc2_dfb.reserve() as acc:
+                                acc.store(pre + hb[0, ht] @ wb)
+                    with b2_dfb.wait() as bb, acc2_dfb.wait() as acc, y_dfb.reserve() as yb:
+                        yb.store(acc + bb)
+
+        @ttl.datamovement()
+        def write():
+            for mt in range(m_tiles):
+                for nt in range(out_tiles):
+                    with y_dfb.wait() as yb:
+                        ttl.copy(yb, y[mt, nt]).wait()
+
+    return fused_ffn
+
+
 def _cpp_matmul_via_generic_op_available() -> bool:
     """Cpp-Metalium authoring hook (GUIDELINES/12): a fused-FFN kernel via
     ttnn.generic_op would need a ttnn.ProgramDescriptor with reader+compute+
