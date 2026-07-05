@@ -1,0 +1,45 @@
+{
+  "model": "mistralai/Voxtral-Mini-3B-2507",
+  "model_type": "voxtral (VoxtralForConditionalGeneration = Whisper audio encoder + multi-modal projector + Llama-3 text decoder)",
+  "task_family": "audio-conditioned text generation (audio understanding / transcription-style). Reference golden = VoxtralForConditionalGeneration.generate().",
+  "sources": {
+    "A_hf_hub": "config.json (audio d_model=1280, 32 enc layers, 20 heads, mel=128, max_source_positions=1500; text hidden=3072, 30 layers, 32 q-heads / 8 kv-heads, head_dim=128, intermediate=8192, silu, rope_theta=1e8, vocab=131072; projector gelu 5120->3072; audio_token_id=24), AutoProcessor (VoxtralProcessor: WhisperFeatureExtractor sr=16000 -> input_features (1,128,3000)), and model.generate() as golden.",
+    "B_bringup": "models/demos/hf_eager/voxtral_mini_3b_2507 : bringup_status.json (7 NEW graduated + 7 REUSE), _stubs/*.py (graduated single-device native TTNN bodies with build(device, torch_submodule) + callable), tests/pcc/*.py."
+  },
+  "graduated_modules_source_B": [
+    {"name": "voxtral_encoder", "submodule_path": "audio_tower", "role": "audio encoder monolith (conv stem + pos + 32 Whisper layers + final LN)", "stub_call": "enc(input_features_tt (1,128,3000) bf16/TILE) -> last_hidden_state (1,1500,1280)", "pcc_graduated": 0.9984},
+    {"name": "voxtral_encoder_layer", "submodule_path": "audio_tower.layers.0", "role": "single Whisper encoder layer (subsumed by voxtral_encoder)", "stub_call": "layer(hidden (1,T,1280)) -> (1,T,1280)", "pcc_graduated": 0.99999},
+    {"name": "avg_pool1d", "submodule_path": "audio_tower.avg_pooler", "role": "AvgPool1d(2,stride=2) — DEFINED in VoxtralEncoder but NOT CALLED by its forward in transformers 5.8.1/4.54 (dead submodule); downsampling is instead done by get_audio_features via reshape(-1,5120)", "stub_call": "pool(x (N,C,L)) -> (N,C,L//2)", "pcc_graduated": 0.99999},
+    {"name": "voxtral_multi_modal_projector", "submodule_path": "multi_modal_projector", "role": "linear_1(5120->3072)->gelu->linear_2(3072->3072)", "stub_call": "proj(audio_features (375,5120) bf16/TILE) -> (375,3072)", "pcc_graduated": 0.9999},
+    {"name": "llama_for_causal_l_m", "submodule_path": "language_model", "role": "text decoder head: embed_tokens + 30 Llama layers (GQA + real RoPE + causal mask) + final RMSNorm + lm_head. Returns logits.", "stub_call": "clm(inputs_embeds (1,T,3072) bf16/TILE) -> logits (1,T,131072); also clm._apply_model_embed_tokens(ids uint32/ROW_MAJOR) -> embeds (1,T,3072)", "pcc_graduated": 0.9995},
+    {"name": "llama_model", "submodule_path": "language_model.model", "role": "text decoder body (30 layers + final RMSNorm, no lm_head) — subsumed by llama_for_causal_l_m", "stub_call": "lm(inputs_embeds (1,T,3072)) -> hidden (1,T,3072)"},
+    {"name": "llama_decoder_layer", "submodule_path": "language_model.model.layers.0", "role": "single Llama decoder layer (subsumed by llama_model)", "stub_call": "dl(hidden (1,T,3072), position_embeddings=(cos,sin)) -> (1,T,3072)", "pcc_graduated": 0.99999}
+  ],
+  "reuse_modules_not_graduated": ["attention", "mlp", "voxtral_attention", "llama_attention", "llama_m_l_p", "llama_r_m_s_norm", "llama_rotary_embedding"],
+  "task_heads": [
+    {
+      "id": "Call_1",
+      "name": "voxtral_audio_understanding",
+      "description": "Single end-to-end head: audio waveform -> mel features -> TT audio encoder -> reshape -> TT projector -> masked_scatter of audio embeds into TT text token embeddings at audio_token_id(24) positions -> TT Llama causal LM greedy decode. Voxtral has ONE generative task family, so ONE task head covers all 7 graduated modules; there is no second independent head.",
+      "real_input": "AutoProcessor.feature_extractor on a real 16 kHz waveform -> input_features (1,128,3000); input_ids = [bos] + [audio_token_id]*375 + tokenizer(prompt). IDENTICAL input_ids+input_features fed to BOTH the TT pipeline and the HF golden.",
+      "real_output": "generated text token ids (greedy), decoded to text.",
+      "parity_chain_stubs": ["voxtral_encoder", "voxtral_multi_modal_projector", "llama_for_causal_l_m"],
+      "coverage_of_nested_and_dead_stubs": "voxtral_encoder_layer, llama_model, llama_decoder_layer are strictly nested inside the two monoliths (a single non-redundant forward can only run ONE granularity per subtree); avg_pool1d is dead code in the HF forward. To satisfy Gate 2 (every graduated stub INVOKED on real pipeline tensors) WITHOUT injecting any reference tensor into the parity chain, these four are invoked as VERIFIED EQUIVALENCE stages on the SAME real tensors the parity chain produces, each compared to its exact torch submodule (PCC logged), their outputs NOT fed back into the parity chain: voxtral_encoder_layer <- real TT conv+pos (layer-0 input, recomputed via the encoder's own conv/pos helpers) vs torch audio_tower.layers[0]; avg_pool1d <- real TT encoder output (N,C,L) vs torch audio_tower.avg_pooler; llama_model <- real merged inputs_embeds vs torch language_model.model; llama_decoder_layer <- real merged inputs_embeds + real RoPE vs torch language_model.model.layers[0]."
+    }
+  ],
+  "gates": {
+    "gate1_real_ttnn": "Every routed graduated stub is the graduated native TTNN body (LIVE _stubs/<name>.py == .last_good_native), invoked via build(device, torch_submodule); no torch fallback. Verified by asserting _runtime_fallbacks.jsonl records no *_CPU_FALLBACK for any routed stub during the e2e run.",
+    "gate2_all_invoked": "All 7 graduated stubs execute on real device tensors during the e2e run (3 in the parity chain, 4 as verified-equivalence stages). Test asserts an 'invoked' set == the 7 stub names.",
+    "gate3_pcc": "PRIMARY: e2e prefill last-token logits PCC (TT vs HF golden) >= 0.95. BEHAVIORAL: TT greedy tokens vs HF greedy tokens (both capped to max_new_tokens=N) match, with per-step last-logit PCC reported. Achieved PCC printed on its own line before the assert on every run."
+  },
+  "validation_metric": "comp_pcc (models.common.utility_functions) on logits; token-id exact match for the greedy sequence.",
+  "behavioral_proof": "TT and HF, given identical (input_ids, input_features), produce the same greedy next-token(s); decoded TT text is emitted by the demo.",
+  "self_validation_plan": "1) per-stage torch-vs-TT PCC for encoder, projector, causal_lm prefill logits; 2) verified-equivalence PCC for the 4 nested/dead stubs; 3) end-to-end prefill logits PCC + N-step greedy token match vs model.generate(max_new_tokens=N). N small (default 8) so both sides are fast (HF uses KV cache ~0.5s/token; TT recomputes full seq each step).",
+  "structure": {
+    "tt/pipeline.py": "the ONE shared chained forward (build_pipeline + run_e2e + build_inputs) imported by both demo and test",
+    "demo/demo_transcribe.py": "python -m ...demo.demo_transcribe : real input -> TT pipeline -> decoded text",
+    "tests/e2e/test_e2e_voxtral.py": "Gate 1/2/3 asserts",
+    "README.md": "what/how/PCC numbers"
+  },
+  "env": "cd /home/ttuser/tt-metal; TT_METAL_HOME=/home/ttuser/tt-metal PYTHONPATH=/home/ttuser/tt-metal-pr46283:/home/ttuser/tt-metal /home/ttuser/tt-metal/python_env/bin/python -m pytest <test> -s ; device opened with l1_small_size=24576 (conv)."
+}

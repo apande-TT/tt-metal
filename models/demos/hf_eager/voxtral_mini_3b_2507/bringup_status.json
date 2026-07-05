@@ -1,0 +1,212 @@
+{
+  "new_model_id": "mistralai/Voxtral-Mini-3B-2507",
+  "new_model_type": "voxtral",
+  "sibling_hf_id": null,
+  "sibling_model_type": null,
+  "backend": {
+    "name": "hf_eager universal (catch-all)",
+    "demo_path": "models/demos/hf_eager/demo.py"
+  },
+  "counts": {
+    "REUSE": 7,
+    "ADAPT": 0,
+    "NEW": 7
+  },
+  "common_reuse": [
+    {
+      "purpose": "LayerNorm / RMSNorm",
+      "path": "models/common/rmsnorm.py"
+    },
+    {
+      "purpose": "LightweightModule base",
+      "path": "models/common/lightweightmodule.py"
+    },
+    {
+      "purpose": "Tensor helpers",
+      "path": "models/common/tensor_utils.py"
+    },
+    {
+      "purpose": "Generic utility funcs",
+      "path": "models/common/utility_functions.py"
+    }
+  ],
+  "components": [
+    {
+      "name": "attention",
+      "kind": "attention",
+      "status": "REUSE",
+      "new_shape": {
+        "hidden_size": 3072,
+        "vocab_size": 131072
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0.",
+      "submodule_path": null,
+      "class_name": null
+    },
+    {
+      "name": "mlp",
+      "kind": "mlp",
+      "status": "REUSE",
+      "new_shape": {
+        "hidden_size": 3072,
+        "vocab_size": 131072
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh.",
+      "submodule_path": null,
+      "class_name": null
+    },
+    {
+      "name": "llama_for_causal_l_m",
+      "kind": "LlamaForCausalLM",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/voxtral/modeling_voxtral.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=304 sample_paths=['language_model'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model",
+      "class_name": "LlamaForCausalLM"
+    },
+    {
+      "name": "llama_model",
+      "kind": "LlamaModel",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/voxtral/modeling_voxtral.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=303 sample_paths=['language_model.model'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model.model",
+      "class_name": "LlamaModel"
+    },
+    {
+      "name": "llama_decoder_layer",
+      "kind": "LlamaDecoderLayer",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/voxtral/modeling_voxtral.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=30 leaves=300 sample_paths=['language_model.model.layers.0', 'language_model.model.layers.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model.model.layers.0",
+      "class_name": "LlamaDecoderLayer"
+    },
+    {
+      "name": "voxtral_encoder",
+      "kind": "VoxtralEncoder",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/voxtral/modeling_voxtral.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=293 sample_paths=['audio_tower'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "audio_tower",
+      "class_name": "VoxtralEncoder"
+    },
+    {
+      "name": "voxtral_encoder_layer",
+      "kind": "VoxtralEncoderLayer",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/voxtral/modeling_voxtral.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=32 leaves=288 sample_paths=['audio_tower.layers.0', 'audio_tower.layers.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "audio_tower.layers.0",
+      "class_name": "VoxtralEncoderLayer"
+    },
+    {
+      "name": "voxtral_attention",
+      "kind": "VoxtralAttention",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=32 leaves=128 sample_paths=['audio_tower.layers.0.self_attn', 'audio_tower.layers.1.self_attn'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "audio_tower.layers.0.self_attn",
+      "class_name": "VoxtralAttention"
+    },
+    {
+      "name": "llama_attention",
+      "kind": "LlamaAttention",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=30 leaves=120 sample_paths=['language_model.model.layers.0.self_attn', 'language_model.model.layers.1.self_attn'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model.model.layers.0.self_attn",
+      "class_name": "LlamaAttention"
+    },
+    {
+      "name": "llama_m_l_p",
+      "kind": "LlamaMLP",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | module-tree: occ=30 leaves=120 sample_paths=['language_model.model.layers.0.mlp', 'language_model.model.layers.1.mlp'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model.model.layers.0.mlp",
+      "class_name": "LlamaMLP"
+    },
+    {
+      "name": "llama_r_m_s_norm",
+      "kind": "LlamaRMSNorm",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/common/rmsnorm.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: rmsnorm_text -> models/common/rmsnorm.py::RMSNorm (REUSE). derived from compatibility.py BUILDING_BLOCKS 'RMSNorm (text)'. ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip. | module-tree: occ=61 leaves=61 sample_paths=['language_model.model.layers.0.input_layernorm', 'language_model.model.layers.0.post_attention_layernorm'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model.model.layers.0.input_layernorm",
+      "class_name": "LlamaRMSNorm"
+    },
+    {
+      "name": "voxtral_multi_modal_projector",
+      "kind": "VoxtralMultiModalProjector",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/voxtral/modeling_voxtral.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=3 sample_paths=['multi_modal_projector'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "multi_modal_projector",
+      "class_name": "VoxtralMultiModalProjector"
+    },
+    {
+      "name": "avg_pool1d",
+      "kind": "AvgPool1d",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/voxtral/modeling_voxtral.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=1 sample_paths=['audio_tower.avg_pooler'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "audio_tower.avg_pooler",
+      "class_name": "AvgPool1d"
+    },
+    {
+      "name": "llama_rotary_embedding",
+      "kind": "LlamaRotaryEmbedding",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/rope.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: standard_rope -> models/tt_transformers/tt/rope.py::RotaryEmbedding (REUSE). derived from compatibility.py BUILDING_BLOCKS 'Standard RoPE'. | module-tree: occ=1 leaves=1 sample_paths=['language_model.model.rotary_emb'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model.model.rotary_emb",
+      "class_name": "LlamaRotaryEmbedding"
+    }
+  ],
+  "notes": [
+    "Sibling config could not be fetched; classification falls back to NEW for components without a clear file match. Set HF_TOKEN or pre-download `None` and re-run for a sharper diff."
+  ]
+}

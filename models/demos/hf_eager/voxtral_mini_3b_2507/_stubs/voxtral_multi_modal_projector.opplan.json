@@ -1,0 +1,39 @@
+{
+  "component": "voxtral_multi_modal_projector",
+  "class_name": "VoxtralMultiModalProjector",
+  "module_function": "voxtral_multi_modal_projector",
+  "pre_bound": [
+    {
+      "name": "linear_1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_linear_1"
+    },
+    {
+      "name": "act",
+      "class": "GELUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.gelu",
+      "helper": "_apply_act"
+    },
+    {
+      "name": "linear_2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_linear_2"
+    }
+  ],
+  "llm_gaps": [],
+  "palette": [
+    "self._apply_linear_1(x) -> ttnn.linear  (in=5120, out=3072, bias=False)",
+    "self._apply_act(x) -> ttnn.gelu",
+    "self._apply_linear_2(x) -> ttnn.linear  (in=3072, out=3072, bias=False)"
+  ],
+  "counts": {
+    "op-REUSE": 3,
+    "op-ADAPT": 0,
+    "op-NEW": 0
+  }
+}

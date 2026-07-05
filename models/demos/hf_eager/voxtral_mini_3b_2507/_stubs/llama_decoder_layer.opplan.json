@@ -1,0 +1,90 @@
+{
+  "component": "llama_decoder_layer",
+  "class_name": "LlamaDecoderLayer",
+  "module_function": "llama_decoder_layer",
+  "pre_bound": [
+    {
+      "name": "self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_q_proj"
+    },
+    {
+      "name": "self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_k_proj"
+    },
+    {
+      "name": "self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_v_proj"
+    },
+    {
+      "name": "self_attn.o_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_o_proj"
+    },
+    {
+      "name": "mlp.gate_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_mlp_gate_proj"
+    },
+    {
+      "name": "mlp.up_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_mlp_up_proj"
+    },
+    {
+      "name": "mlp.down_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_mlp_down_proj"
+    },
+    {
+      "name": "mlp.act_fn",
+      "class": "SiLUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_mlp_act_fn"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "input_layernorm",
+      "class": "LlamaRMSNorm",
+      "notes": ""
+    },
+    {
+      "name": "post_attention_layernorm",
+      "class": "LlamaRMSNorm",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_self_attn_q_proj(x) -> ttnn.linear  (in=3072, out=4096, bias=False)",
+    "self._apply_self_attn_k_proj(x) -> ttnn.linear  (in=3072, out=1024, bias=False)",
+    "self._apply_self_attn_v_proj(x) -> ttnn.linear  (in=3072, out=1024, bias=False)",
+    "self._apply_self_attn_o_proj(x) -> ttnn.linear  (in=4096, out=3072, bias=False)",
+    "self._apply_mlp_gate_proj(x) -> ttnn.linear  (in=3072, out=8192, bias=False)",
+    "self._apply_mlp_up_proj(x) -> ttnn.linear  (in=3072, out=8192, bias=False)",
+    "self._apply_mlp_down_proj(x) -> ttnn.linear  (in=8192, out=3072, bias=False)",
+    "self._apply_mlp_act_fn(x) -> ttnn.silu"
+  ],
+  "counts": {
+    "op-REUSE": 8,
+    "op-ADAPT": 0,
+    "op-NEW": 2
+  }
+}

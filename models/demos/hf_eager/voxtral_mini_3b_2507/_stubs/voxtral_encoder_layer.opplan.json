@@ -1,0 +1,87 @@
+{
+  "component": "voxtral_encoder_layer",
+  "class_name": "VoxtralEncoderLayer",
+  "module_function": "voxtral_encoder_layer",
+  "pre_bound": [
+    {
+      "name": "self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_k_proj"
+    },
+    {
+      "name": "self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_v_proj"
+    },
+    {
+      "name": "self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_q_proj"
+    },
+    {
+      "name": "self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_out_proj"
+    },
+    {
+      "name": "self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_self_attn_layer_norm"
+    },
+    {
+      "name": "activation_fn",
+      "class": "GELUActivation",
+      "kind": "activation",
+      "ttnn_target": "ttnn.gelu",
+      "helper": "_apply_activation_fn"
+    },
+    {
+      "name": "fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_fc1"
+    },
+    {
+      "name": "fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_fc2"
+    },
+    {
+      "name": "final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_final_layer_norm"
+    }
+  ],
+  "llm_gaps": [],
+  "palette": [
+    "self._apply_self_attn_k_proj(x) -> ttnn.linear  (in=1280, out=1280, bias=False)",
+    "self._apply_self_attn_v_proj(x) -> ttnn.linear  (in=1280, out=1280, bias=True)",
+    "self._apply_self_attn_q_proj(x) -> ttnn.linear  (in=1280, out=1280, bias=True)",
+    "self._apply_self_attn_out_proj(x) -> ttnn.linear  (in=1280, out=1280, bias=True)",
+    "self._apply_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1280], eps=1e-05)",
+    "self._apply_activation_fn(x) -> ttnn.gelu",
+    "self._apply_fc1(x) -> ttnn.linear  (in=1280, out=5120, bias=True)",
+    "self._apply_fc2(x) -> ttnn.linear  (in=5120, out=1280, bias=True)",
+    "self._apply_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1280], eps=1e-05)"
+  ],
+  "counts": {
+    "op-REUSE": 9,
+    "op-ADAPT": 0,
+    "op-NEW": 0
+  }
+}
