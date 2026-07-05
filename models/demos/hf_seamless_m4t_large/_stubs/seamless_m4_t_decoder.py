@@ -193,6 +193,20 @@ class SeamlessM4TDecoder:
         self.scaling = self.head_size**-0.5
         self.num_layers = len(torch_module.layers)
         self.eps = 1e-05
+        # LN compute-kernel config: HiFi2 + fp32 dst accumulation is the
+        # published floor for layer_norm at 24-layer depth (GUIDELINES/02
+        # norm-fidelity-fp32). Default ttnn.layer_norm runs at HiFi4 which
+        # costs ~2x compute per launch; on a dispatch-bound reduction bucket
+        # cutting the per-launch compute still helps because launch overhead
+        # is only part of the wall time. fp32_dest_acc_en=True is MANDATORY
+        # for LN — False drops PCC to ~0.89 over depth.
+        self._ln_compute = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
 
         self.embed_tokens_weight = torch_module.embed_tokens.weight.detach().to(torch.float32)
         self.embed_tokens_padding_idx = torch_module.embed_tokens.padding_idx
@@ -343,18 +357,18 @@ class SeamlessM4TDecoder:
         w = self.layers_w[i]
 
         residual = x_ttnn
-        h = ttnn.layer_norm(x_ttnn, epsilon=self.eps, weight=w["sa_ln_w"], bias=w["sa_ln_b"])
+        h = ttnn.layer_norm(x_ttnn, epsilon=self.eps, weight=w["sa_ln_w"], bias=w["sa_ln_b"], compute_kernel_config=self._ln_compute)
         h = self._self_attn(h, attn_mask, w)
         h = ttnn.add(h, residual)
 
         if enc_ttnn is not None:
             residual = h
-            h = ttnn.layer_norm(h, epsilon=self.eps, weight=w["ca_ln_w"], bias=w["ca_ln_b"])
+            h = ttnn.layer_norm(h, epsilon=self.eps, weight=w["ca_ln_w"], bias=w["ca_ln_b"], compute_kernel_config=self._ln_compute)
             h = self._cross_attn(h, enc_ttnn, w)
             h = ttnn.add(h, residual)
 
         residual = h
-        h = ttnn.layer_norm(h, epsilon=self.eps, weight=w["ffn_ln_w"], bias=w["ffn_ln_b"])
+        h = ttnn.layer_norm(h, epsilon=self.eps, weight=w["ffn_ln_w"], bias=w["ffn_ln_b"], compute_kernel_config=self._ln_compute)
         h = ttnn.linear(
             h,
             w["ffn_fc1_w"],
@@ -389,7 +403,7 @@ class SeamlessM4TDecoder:
         for i in range(self.num_layers):
             x_ttnn = self._apply_layer(i, x_ttnn, attn_mask, enc_ttnn)
 
-        x_ttnn = ttnn.layer_norm(x_ttnn, epsilon=self.eps, weight=self.w_top_ln_w, bias=self.w_top_ln_b)
+        x_ttnn = ttnn.layer_norm(x_ttnn, epsilon=self.eps, weight=self.w_top_ln_w, bias=self.w_top_ln_b, compute_kernel_config=self._ln_compute)
         return x_ttnn
 
 
