@@ -333,7 +333,7 @@ class Pipeline:
         text_lm = self.hf_model.lm_head
         self.text_lm_weight = ttnn.from_torch(
             text_lm.weight.detach().t().contiguous().to(torch.bfloat16),
-            dtype=ttnn.bfloat16,
+            dtype=ttnn.bfloat8_b,
             layout=ttnn.TILE_LAYOUT,
             device=self.device,
         )
