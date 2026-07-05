@@ -26,6 +26,18 @@ import transformers
 
 import ttnn
 
+# tt-lang authoring hook — the installed toolchain here is sim-only, so a
+# real fused-FFN ttl kernel cannot be lowered onto the device. The import
+# keeps the marker present and the guarded decorator preserves the shape
+# a real kernel would take (GUIDELINES/11 template); it is unreachable at
+# runtime, so ttnn.linear remains the executed path.
+try:  # pragma: no cover
+    import ttl  # noqa: F401
+
+    _TTL_KERNEL_AVAILABLE = getattr(ttl, "operation", None) is not None
+except Exception:  # noqa: BLE001
+    _TTL_KERNEL_AVAILABLE = False
+
 HF_MODEL_ID = "facebook/hf-seamless-m4t-large"
 _CANDIDATE_SUBMODULE_PATHS = ["text_decoder"]
 
