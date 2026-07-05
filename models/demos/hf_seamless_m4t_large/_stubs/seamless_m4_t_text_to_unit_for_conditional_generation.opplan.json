@@ -1,0 +1,1382 @@
+{
+  "component": "seamless_m4_t_text_to_unit_for_conditional_generation",
+  "class_name": "SeamlessM4TTextToUnitForConditionalGeneration",
+  "module_function": "seamless_m4_t_text_to_unit_for_conditional_generation",
+  "pre_bound": [
+    {
+      "name": "model.encoder.layers.0.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_0_self_attn_k_proj"
+    },
+    {
+      "name": "model.encoder.layers.0.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_0_self_attn_v_proj"
+    },
+    {
+      "name": "model.encoder.layers.0.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_0_self_attn_q_proj"
+    },
+    {
+      "name": "model.encoder.layers.0.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_0_self_attn_out_proj"
+    },
+    {
+      "name": "model.encoder.layers.0.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_0_self_attn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layers.0.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_0_ffn_fc1"
+    },
+    {
+      "name": "model.encoder.layers.0.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_0_ffn_fc2"
+    },
+    {
+      "name": "model.encoder.layers.0.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_encoder_layers_0_ffn_act"
+    },
+    {
+      "name": "model.encoder.layers.0.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_0_ffn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layers.1.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_1_self_attn_k_proj"
+    },
+    {
+      "name": "model.encoder.layers.1.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_1_self_attn_v_proj"
+    },
+    {
+      "name": "model.encoder.layers.1.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_1_self_attn_q_proj"
+    },
+    {
+      "name": "model.encoder.layers.1.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_1_self_attn_out_proj"
+    },
+    {
+      "name": "model.encoder.layers.1.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_1_self_attn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layers.1.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_1_ffn_fc1"
+    },
+    {
+      "name": "model.encoder.layers.1.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_1_ffn_fc2"
+    },
+    {
+      "name": "model.encoder.layers.1.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_encoder_layers_1_ffn_act"
+    },
+    {
+      "name": "model.encoder.layers.1.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_1_ffn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layers.2.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_2_self_attn_k_proj"
+    },
+    {
+      "name": "model.encoder.layers.2.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_2_self_attn_v_proj"
+    },
+    {
+      "name": "model.encoder.layers.2.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_2_self_attn_q_proj"
+    },
+    {
+      "name": "model.encoder.layers.2.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_2_self_attn_out_proj"
+    },
+    {
+      "name": "model.encoder.layers.2.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_2_self_attn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layers.2.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_2_ffn_fc1"
+    },
+    {
+      "name": "model.encoder.layers.2.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_2_ffn_fc2"
+    },
+    {
+      "name": "model.encoder.layers.2.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_encoder_layers_2_ffn_act"
+    },
+    {
+      "name": "model.encoder.layers.2.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_2_ffn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layers.3.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_3_self_attn_k_proj"
+    },
+    {
+      "name": "model.encoder.layers.3.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_3_self_attn_v_proj"
+    },
+    {
+      "name": "model.encoder.layers.3.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_3_self_attn_q_proj"
+    },
+    {
+      "name": "model.encoder.layers.3.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_3_self_attn_out_proj"
+    },
+    {
+      "name": "model.encoder.layers.3.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_3_self_attn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layers.3.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_3_ffn_fc1"
+    },
+    {
+      "name": "model.encoder.layers.3.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_3_ffn_fc2"
+    },
+    {
+      "name": "model.encoder.layers.3.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_encoder_layers_3_ffn_act"
+    },
+    {
+      "name": "model.encoder.layers.3.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_3_ffn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layers.4.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_4_self_attn_k_proj"
+    },
+    {
+      "name": "model.encoder.layers.4.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_4_self_attn_v_proj"
+    },
+    {
+      "name": "model.encoder.layers.4.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_4_self_attn_q_proj"
+    },
+    {
+      "name": "model.encoder.layers.4.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_4_self_attn_out_proj"
+    },
+    {
+      "name": "model.encoder.layers.4.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_4_self_attn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layers.4.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_4_ffn_fc1"
+    },
+    {
+      "name": "model.encoder.layers.4.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_4_ffn_fc2"
+    },
+    {
+      "name": "model.encoder.layers.4.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_encoder_layers_4_ffn_act"
+    },
+    {
+      "name": "model.encoder.layers.4.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_4_ffn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layers.5.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_5_self_attn_k_proj"
+    },
+    {
+      "name": "model.encoder.layers.5.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_5_self_attn_v_proj"
+    },
+    {
+      "name": "model.encoder.layers.5.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_5_self_attn_q_proj"
+    },
+    {
+      "name": "model.encoder.layers.5.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_5_self_attn_out_proj"
+    },
+    {
+      "name": "model.encoder.layers.5.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_5_self_attn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layers.5.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_5_ffn_fc1"
+    },
+    {
+      "name": "model.encoder.layers.5.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_encoder_layers_5_ffn_fc2"
+    },
+    {
+      "name": "model.encoder.layers.5.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_encoder_layers_5_ffn_act"
+    },
+    {
+      "name": "model.encoder.layers.5.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layers_5_ffn_layer_norm"
+    },
+    {
+      "name": "model.encoder.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_encoder_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.0.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_0_self_attn_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.0.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_0_self_attn_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.0.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_0_self_attn_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.0.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_0_self_attn_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.0.activation_fn",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_0_activation_fn"
+    },
+    {
+      "name": "model.decoder.layers.0.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_0_self_attn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.0.cross_attention.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_0_cross_attention_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.0.cross_attention.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_0_cross_attention_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.0.cross_attention.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_0_cross_attention_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.0.cross_attention.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_0_cross_attention_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.0.cross_attention_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_0_cross_attention_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.0.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_0_ffn_fc1"
+    },
+    {
+      "name": "model.decoder.layers.0.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_0_ffn_fc2"
+    },
+    {
+      "name": "model.decoder.layers.0.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_0_ffn_act"
+    },
+    {
+      "name": "model.decoder.layers.0.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_0_ffn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.1.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_1_self_attn_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.1.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_1_self_attn_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.1.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_1_self_attn_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.1.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_1_self_attn_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.1.activation_fn",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_1_activation_fn"
+    },
+    {
+      "name": "model.decoder.layers.1.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_1_self_attn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.1.cross_attention.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_1_cross_attention_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.1.cross_attention.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_1_cross_attention_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.1.cross_attention.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_1_cross_attention_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.1.cross_attention.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_1_cross_attention_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.1.cross_attention_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_1_cross_attention_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.1.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_1_ffn_fc1"
+    },
+    {
+      "name": "model.decoder.layers.1.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_1_ffn_fc2"
+    },
+    {
+      "name": "model.decoder.layers.1.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_1_ffn_act"
+    },
+    {
+      "name": "model.decoder.layers.1.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_1_ffn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.2.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_2_self_attn_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.2.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_2_self_attn_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.2.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_2_self_attn_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.2.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_2_self_attn_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.2.activation_fn",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_2_activation_fn"
+    },
+    {
+      "name": "model.decoder.layers.2.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_2_self_attn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.2.cross_attention.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_2_cross_attention_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.2.cross_attention.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_2_cross_attention_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.2.cross_attention.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_2_cross_attention_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.2.cross_attention.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_2_cross_attention_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.2.cross_attention_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_2_cross_attention_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.2.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_2_ffn_fc1"
+    },
+    {
+      "name": "model.decoder.layers.2.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_2_ffn_fc2"
+    },
+    {
+      "name": "model.decoder.layers.2.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_2_ffn_act"
+    },
+    {
+      "name": "model.decoder.layers.2.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_2_ffn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.3.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_3_self_attn_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.3.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_3_self_attn_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.3.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_3_self_attn_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.3.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_3_self_attn_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.3.activation_fn",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_3_activation_fn"
+    },
+    {
+      "name": "model.decoder.layers.3.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_3_self_attn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.3.cross_attention.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_3_cross_attention_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.3.cross_attention.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_3_cross_attention_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.3.cross_attention.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_3_cross_attention_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.3.cross_attention.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_3_cross_attention_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.3.cross_attention_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_3_cross_attention_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.3.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_3_ffn_fc1"
+    },
+    {
+      "name": "model.decoder.layers.3.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_3_ffn_fc2"
+    },
+    {
+      "name": "model.decoder.layers.3.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_3_ffn_act"
+    },
+    {
+      "name": "model.decoder.layers.3.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_3_ffn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.4.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_4_self_attn_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.4.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_4_self_attn_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.4.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_4_self_attn_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.4.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_4_self_attn_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.4.activation_fn",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_4_activation_fn"
+    },
+    {
+      "name": "model.decoder.layers.4.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_4_self_attn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.4.cross_attention.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_4_cross_attention_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.4.cross_attention.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_4_cross_attention_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.4.cross_attention.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_4_cross_attention_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.4.cross_attention.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_4_cross_attention_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.4.cross_attention_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_4_cross_attention_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.4.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_4_ffn_fc1"
+    },
+    {
+      "name": "model.decoder.layers.4.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_4_ffn_fc2"
+    },
+    {
+      "name": "model.decoder.layers.4.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_4_ffn_act"
+    },
+    {
+      "name": "model.decoder.layers.4.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_4_ffn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.5.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_5_self_attn_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.5.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_5_self_attn_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.5.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_5_self_attn_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.5.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_5_self_attn_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.5.activation_fn",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_5_activation_fn"
+    },
+    {
+      "name": "model.decoder.layers.5.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_5_self_attn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.5.cross_attention.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_5_cross_attention_k_proj"
+    },
+    {
+      "name": "model.decoder.layers.5.cross_attention.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_5_cross_attention_v_proj"
+    },
+    {
+      "name": "model.decoder.layers.5.cross_attention.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_5_cross_attention_q_proj"
+    },
+    {
+      "name": "model.decoder.layers.5.cross_attention.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_5_cross_attention_out_proj"
+    },
+    {
+      "name": "model.decoder.layers.5.cross_attention_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_5_cross_attention_layer_norm"
+    },
+    {
+      "name": "model.decoder.layers.5.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_5_ffn_fc1"
+    },
+    {
+      "name": "model.decoder.layers.5.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_model_decoder_layers_5_ffn_fc2"
+    },
+    {
+      "name": "model.decoder.layers.5.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_model_decoder_layers_5_ffn_act"
+    },
+    {
+      "name": "model.decoder.layers.5.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layers_5_ffn_layer_norm"
+    },
+    {
+      "name": "model.decoder.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_model_decoder_layer_norm"
+    },
+    {
+      "name": "lm_head",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_lm_head"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "model.encoder.layers.0.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.0.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.0.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.1.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.1.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.1.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.2.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.2.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.2.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.3.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.3.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.3.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.4.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.4.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.4.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.5.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.5.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.encoder.layers.5.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.embed_tokens",
+      "class": "SeamlessM4TScaledWordEmbedding",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.embed_positions",
+      "class": "SeamlessM4TSinusoidalPositionalEmbedding",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.0.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.0.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.0.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.1.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.1.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.1.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.2.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.2.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.2.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.3.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.3.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.3.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.4.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.4.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.4.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.5.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.5.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "model.decoder.layers.5.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_model_encoder_layers_0_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_0_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_0_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_0_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_0_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layers_0_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_encoder_layers_0_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_0_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_encoder_layers_0_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layers_1_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_1_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_1_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_1_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_1_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layers_1_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_encoder_layers_1_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_1_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_encoder_layers_1_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layers_2_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_2_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_2_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_2_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_2_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layers_2_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_encoder_layers_2_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_2_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_encoder_layers_2_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layers_3_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_3_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_3_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_3_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_3_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layers_3_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_encoder_layers_3_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_3_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_encoder_layers_3_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layers_4_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_4_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_4_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_4_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_4_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layers_4_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_encoder_layers_4_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_4_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_encoder_layers_4_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layers_5_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_5_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_5_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_5_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_5_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layers_5_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_encoder_layers_5_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_encoder_layers_5_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_encoder_layers_5_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_encoder_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_0_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_0_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_0_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_0_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_0_activation_fn(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_0_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_0_cross_attention_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_0_cross_attention_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_0_cross_attention_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_0_cross_attention_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_0_cross_attention_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_0_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_decoder_layers_0_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_0_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_0_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_1_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_1_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_1_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_1_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_1_activation_fn(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_1_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_1_cross_attention_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_1_cross_attention_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_1_cross_attention_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_1_cross_attention_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_1_cross_attention_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_1_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_decoder_layers_1_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_1_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_1_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_2_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_2_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_2_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_2_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_2_activation_fn(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_2_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_2_cross_attention_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_2_cross_attention_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_2_cross_attention_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_2_cross_attention_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_2_cross_attention_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_2_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_decoder_layers_2_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_2_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_2_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_3_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_3_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_3_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_3_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_3_activation_fn(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_3_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_3_cross_attention_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_3_cross_attention_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_3_cross_attention_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_3_cross_attention_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_3_cross_attention_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_3_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_decoder_layers_3_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_3_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_3_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_4_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_4_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_4_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_4_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_4_activation_fn(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_4_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_4_cross_attention_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_4_cross_attention_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_4_cross_attention_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_4_cross_attention_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_4_cross_attention_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_4_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_decoder_layers_4_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_4_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_4_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_5_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_5_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_5_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_5_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_5_activation_fn(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_5_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_5_cross_attention_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_5_cross_attention_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_5_cross_attention_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_5_cross_attention_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_5_cross_attention_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layers_5_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_model_decoder_layers_5_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_model_decoder_layers_5_ffn_act(x) -> ttnn.relu",
+    "self._apply_model_decoder_layers_5_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_model_decoder_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_lm_head(x) -> ttnn.linear  (in=1024, out=10082, bias=False)"
+  ],
+  "counts": {
+    "op-REUSE": 183,
+    "op-ADAPT": 0,
+    "op-NEW": 2
+  }
+}

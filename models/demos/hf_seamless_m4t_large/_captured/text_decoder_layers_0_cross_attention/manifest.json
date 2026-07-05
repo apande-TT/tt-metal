@@ -1,0 +1,61 @@
+{
+  "component": "text_decoder_layers_0_cross_attention",
+  "submodule_path": "text_decoder.layers.0.cross_attention",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "hidden_states": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "encoder_hidden_states": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "past_key_values": {
+        "kind": "scalar",
+        "type": "EncoderDecoderCache",
+        "repr": "EncoderDecoderCache(self_attention_cache=DynamicCache(layers=[DynamicLayer, DynamicLayer, DynamicLayer, DynamicLayer, Dy"
+      },
+      "attention_mask": {
+        "kind": "none"
+      },
+      "output_attentions": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "False"
+      }
+    }
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "none"
+      }
+    ]
+  }
+}

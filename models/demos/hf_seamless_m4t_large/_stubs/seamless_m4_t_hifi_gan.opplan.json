@@ -1,0 +1,499 @@
+{
+  "component": "seamless_m4_t_hifi_gan",
+  "class_name": "SeamlessM4THifiGan",
+  "module_function": "seamless_m4_t_hifi_gan",
+  "pre_bound": [],
+  "llm_gaps": [
+    {
+      "name": "conv_pre",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "upsampler.0",
+      "class": "ConvTranspose1d",
+      "notes": ""
+    },
+    {
+      "name": "upsampler.1",
+      "class": "ConvTranspose1d",
+      "notes": ""
+    },
+    {
+      "name": "upsampler.2",
+      "class": "ConvTranspose1d",
+      "notes": ""
+    },
+    {
+      "name": "upsampler.3",
+      "class": "ConvTranspose1d",
+      "notes": ""
+    },
+    {
+      "name": "upsampler.4",
+      "class": "ConvTranspose1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.0.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.0.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.0.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.0.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.0.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.0.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.1.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.1.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.1.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.1.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.1.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.1.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.2.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.2.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.2.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.2.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.2.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.2.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.3.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.3.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.3.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.3.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.3.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.3.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.4.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.4.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.4.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.4.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.4.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.4.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.5.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.5.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.5.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.5.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.5.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.5.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.6.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.6.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.6.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.6.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.6.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.6.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.7.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.7.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.7.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.7.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.7.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.7.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.8.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.8.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.8.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.8.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.8.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.8.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.9.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.9.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.9.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.9.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.9.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.9.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.10.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.10.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.10.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.10.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.10.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.10.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.11.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.11.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.11.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.11.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.11.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.11.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.12.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.12.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.12.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.12.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.12.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.12.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.13.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.13.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.13.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.13.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.13.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.13.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.14.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.14.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.14.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.14.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.14.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "resblocks.14.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "conv_post",
+      "class": "Conv1d",
+      "notes": ""
+    }
+  ],
+  "palette": [],
+  "counts": {
+    "op-REUSE": 0,
+    "op-ADAPT": 92,
+    "op-NEW": 5
+  }
+}

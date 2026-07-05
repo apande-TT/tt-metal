@@ -1,0 +1,57 @@
+{
+  "component": "seamless_m4_t_decoder",
+  "submodule_path": "text_decoder",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "input_ids": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17
+        ],
+        "dtype": "torch.int64"
+      },
+      "encoder_hidden_states": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "encoder_attention_mask": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16
+        ],
+        "dtype": "torch.int64"
+      }
+    }
+  },
+  "output": {
+    "kind": "dict",
+    "items": {
+      "last_hidden_state": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "past_key_values": {
+        "kind": "scalar",
+        "type": "EncoderDecoderCache",
+        "repr": "EncoderDecoderCache(self_attention_cache=DynamicCache(layers=[DynamicLayer, DynamicLayer, DynamicLayer, DynamicLayer, Dy"
+      }
+    }
+  }
+}

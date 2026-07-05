@@ -1,0 +1,30 @@
+{
+  "component": "seamless_m4_t_sinusoidal_positional_embedding",
+  "submodule_path": "text_encoder.embed_positions",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16
+        ],
+        "dtype": "torch.int64"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      16,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

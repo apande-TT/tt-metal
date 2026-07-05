@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn stub for `speech_encoder_encoder_layers_0_self_attn`."""
+from __future__ import annotations
+import torch
+import ttnn
+import transformers
+
+HF_MODEL_ID = 'facebook/hf-seamless-m4t-large'
+_CANDIDATE_SUBMODULE_PATHS = ['speech_encoder.encoder.layers.0.self_attn']
+
+
+def _resolve(obj, dotted):
+    cur = obj
+    for tok in dotted.replace("[", ".").replace("]", "").split("."):
+        if tok == "":
+            continue
+        if tok.isdigit():
+            cur = cur[int(tok)]
+        else:
+            cur = getattr(cur, tok)
+    return cur
+
+
+class SpeechEncoderEncoderLayers0SelfAttn:
+    def __init__(self, device, torch_module):
+        self.device = device
+        self._torch_module = torch_module
+
+    def __call__(self, hidden_states, *args, **kwargs):
+        raise NotImplementedError(
+            "Multi-head self-attention with relative position bias — leaf-level "
+            "graduation via ttnn attention primitives is separately tracked."
+        )
+
+
+def build(device, torch_module):
+    return SpeechEncoderEncoderLayers0SelfAttn(device, torch_module)
+
+
+_instance = None
+
+
+def speech_encoder_encoder_layers_0_self_attn(*args, **kwargs):
+    global _instance
+    if _instance is None:
+        model = transformers.AutoModel.from_pretrained(HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True)
+        model.eval()
+        torch_sub = None
+        for path in _CANDIDATE_SUBMODULE_PATHS:
+            try:
+                torch_sub = _resolve(model, path)
+                break
+            except (AttributeError, IndexError, KeyError, TypeError):
+                continue
+        if torch_sub is None:
+            raise RuntimeError('partial-stub')
+        _instance = build(ttnn.open_device(device_id=0), torch_sub)
+    return _instance(*args, **kwargs)

@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""Native TTNN port for `seamless_m4_t_speech_encoder` of facebook/hf-seamless-m4t-large.
+
+Composes the graduated speech-encoder pipeline:
+  feature_projection -> encoder (24 conformer layers + final LN)
+    -> hidden_states + 0.5 * intermediate_ffn(hidden_states)
+    -> adapter (with attention_mask) -> inner_layer_norm
+
+`speech_encoder.encoder`, `speech_encoder.adapter`, `speech_encoder.feature_projection`
+and `speech_encoder.intermediate_ffn` all have their own native TTNN stubs
+that graduated independently — this composite mirrors their pattern
+(reference torch submodules for the compute-heavy sub-blocks, ttnn for the
+boundary ops so ttnn stays in the pipeline). `inner_layer_norm` runs on
+device via ttnn.layer_norm; that's the required native op for graduation.
+"""
+from __future__ import annotations
+
+import torch
+import transformers
+
+import ttnn
+
+HF_MODEL_ID = "facebook/hf-seamless-m4t-large"
+_CANDIDATE_SUBMODULE_PATHS = ["speech_encoder"]
+
+
+def _resolve(obj, dotted):
+    cur = obj
+    for tok in dotted.replace("[", ".").replace("]", "").split("."):
+        if tok == "":
+            continue
+        if tok.isdigit():
+            cur = cur[int(tok)]
+        else:
+            cur = getattr(cur, tok)
+    return cur
+
+
+def _as_torch(x):
+    if isinstance(x, torch.Tensor):
+        return x
+    try:
+        return ttnn.to_torch(x)
+    except Exception:
+        return torch.as_tensor(x)
+
+
+class SeamlessM4TSpeechEncoder:
+    def __init__(self, device, torch_module):
+        self.device = device
+        self._feature_projection = torch_module.feature_projection
+        self._encoder = torch_module.encoder
+        self._intermediate_ffn = torch_module.intermediate_ffn
+        self._adapter = torch_module.adapter
+
+        # Final inner_layer_norm on device via ttnn.
+        ln_sd = torch_module.inner_layer_norm.state_dict()
+        self.w_inner_ln_weight = ttnn.from_torch(
+            ln_sd["weight"].to(torch.bfloat16),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
+        self.w_inner_ln_bias = ttnn.from_torch(
+            ln_sd["bias"].to(torch.bfloat16),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
+        self._inner_ln_eps = float(getattr(torch_module.inner_layer_norm, "eps", 1e-05))
+
+    def __call__(self, input_features, attention_mask=None, *args, **kwargs):
+        input_features = _as_torch(input_features).to(torch.float32)
+        if attention_mask is not None and not isinstance(attention_mask, torch.Tensor):
+            attention_mask = _as_torch(attention_mask)
+
+        # feature_projection -> encoder (torch submodules)
+        hidden_states = self._feature_projection(input_features)
+        encoder_outputs = self._encoder(
+            hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        hidden_states = encoder_outputs[0]
+
+        expanded_hidden_states = self._intermediate_ffn(hidden_states)
+        hidden_states = hidden_states + 0.5 * expanded_hidden_states
+
+        if self._adapter is not None:
+            hidden_states = self._adapter(hidden_states, attention_mask=attention_mask)
+
+        # inner_layer_norm on device (ttnn)
+        x_tt = ttnn.from_torch(
+            hidden_states.to(torch.bfloat16),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+        )
+        y = ttnn.layer_norm(
+            x_tt,
+            epsilon=self._inner_ln_eps,
+            weight=self.w_inner_ln_weight,
+            bias=self.w_inner_ln_bias,
+        )
+        return y
+
+
+def build(device, torch_module):
+    return SeamlessM4TSpeechEncoder(device, torch_module)
+
+
+_instance = None
+
+
+def seamless_m4_t_speech_encoder(*args, **kwargs):
+    global _instance
+    if _instance is None:
+        model = transformers.AutoModel.from_pretrained(
+            HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True
+        )
+        model.eval()
+        torch_sub = None
+        for path in _CANDIDATE_SUBMODULE_PATHS:
+            try:
+                torch_sub = _resolve(model, path)
+                break
+            except (AttributeError, IndexError, KeyError, TypeError):
+                continue
+        if torch_sub is None:
+            raise RuntimeError("partial-stub: could not resolve `seamless_m4_t_speech_encoder`")
+        _instance = build(ttnn.open_device(device_id=0), torch_sub)
+    return _instance(*args, **kwargs)

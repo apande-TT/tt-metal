@@ -1,0 +1,167 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""Native TTNN port for `seamless_m4_t_encoder_layer` of facebook/hf-seamless-m4t-large.
+
+Implements `SeamlessM4TEncoderLayer.forward`:
+  LN -> self_attn (q*scaling, k, v, MHA with (bsz, 1, tgt, src) mask, out_proj)
+    -> residual add
+  LN -> ffn (linear -> relu -> linear) -> residual add
+
+Q/K/V/O and FFN linears run as ttnn.linear on device; softmax/reshape math
+round-trips through host torch (bmm with (bsz*heads, tgt, src) layout to
+match the HF reference exactly).
+
+HF reference: transformers/src/transformers/models/seamless_m4t/modeling_seamless_m4t.py
+"""
+from __future__ import annotations
+
+import torch
+import transformers
+
+import ttnn
+
+HF_MODEL_ID = "facebook/hf-seamless-m4t-large"
+_CANDIDATE_SUBMODULE_PATHS = ["text_encoder.layers.0"]
+
+
+def _resolve(obj, dotted):
+    cur = obj
+    for tok in dotted.replace("[", ".").replace("]", "").split("."):
+        if tok == "":
+            continue
+        if tok.isdigit():
+            cur = cur[int(tok)]
+        else:
+            cur = getattr(cur, tok)
+    return cur
+
+
+def _to_ttnn(t, device):
+    return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+
+class SeamlessM4TEncoderLayer:
+    def __init__(self, device, torch_module):
+        self.device = device
+        self.embed_dim = torch_module.self_attn.embed_dim
+        self.num_heads = torch_module.self_attn.num_heads
+        self.head_dim = torch_module.self_attn.head_dim
+        self.scaling = torch_module.self_attn.scaling
+        self.eps = 1e-05
+
+        sd = torch_module.state_dict()
+
+        self.w = {
+            "sa_ln_w": _to_ttnn(sd["self_attn_layer_norm.weight"], device),
+            "sa_ln_b": _to_ttnn(sd["self_attn_layer_norm.bias"], device),
+            "sa_q_w": _to_ttnn(sd["self_attn.q_proj.weight"].T.contiguous(), device),
+            "sa_q_b": _to_ttnn(sd["self_attn.q_proj.bias"].reshape(1, -1), device),
+            "sa_k_w": _to_ttnn(sd["self_attn.k_proj.weight"].T.contiguous(), device),
+            "sa_k_b": _to_ttnn(sd["self_attn.k_proj.bias"].reshape(1, -1), device),
+            "sa_v_w": _to_ttnn(sd["self_attn.v_proj.weight"].T.contiguous(), device),
+            "sa_v_b": _to_ttnn(sd["self_attn.v_proj.bias"].reshape(1, -1), device),
+            "sa_o_w": _to_ttnn(sd["self_attn.out_proj.weight"].T.contiguous(), device),
+            "sa_o_b": _to_ttnn(sd["self_attn.out_proj.bias"].reshape(1, -1), device),
+            "ffn_ln_w": _to_ttnn(sd["ffn_layer_norm.weight"], device),
+            "ffn_ln_b": _to_ttnn(sd["ffn_layer_norm.bias"], device),
+            "ffn_fc1_w": _to_ttnn(sd["ffn.fc1.weight"].T.contiguous(), device),
+            "ffn_fc1_b": _to_ttnn(sd["ffn.fc1.bias"].reshape(1, -1), device),
+            "ffn_fc2_w": _to_ttnn(sd["ffn.fc2.weight"].T.contiguous(), device),
+            "ffn_fc2_b": _to_ttnn(sd["ffn.fc2.bias"].reshape(1, -1), device),
+        }
+
+    def _self_attn(self, x_ttnn, attention_mask):
+        q = ttnn.linear(x_ttnn, self.w["sa_q_w"], bias=self.w["sa_q_b"])
+        k = ttnn.linear(x_ttnn, self.w["sa_k_w"], bias=self.w["sa_k_b"])
+        v = ttnn.linear(x_ttnn, self.w["sa_v_w"], bias=self.w["sa_v_b"])
+
+        q_t = ttnn.to_torch(q).to(torch.float32) * self.scaling
+        k_t = ttnn.to_torch(k).to(torch.float32)
+        v_t = ttnn.to_torch(v).to(torch.float32)
+
+        bsz, tgt_len, _ = q_t.shape
+        src_len = k_t.shape[1]
+        q_t = (
+            q_t.view(bsz, tgt_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .reshape(bsz * self.num_heads, tgt_len, self.head_dim)
+        )
+        k_t = (
+            k_t.view(bsz, src_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .reshape(bsz * self.num_heads, src_len, self.head_dim)
+        )
+        v_t = (
+            v_t.view(bsz, src_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .reshape(bsz * self.num_heads, src_len, self.head_dim)
+        )
+
+        attn_weights = torch.bmm(q_t, k_t.transpose(1, 2))
+
+        if attention_mask is not None:
+            if not isinstance(attention_mask, torch.Tensor):
+                attention_mask = ttnn.to_torch(attention_mask)
+            am = attention_mask.to(attn_weights.dtype)
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + am
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        out = torch.bmm(attn_weights, v_t)
+        out = (
+            out.view(bsz, self.num_heads, tgt_len, self.head_dim)
+            .transpose(1, 2)
+            .reshape(bsz, tgt_len, self.embed_dim)
+            .contiguous()
+        )
+
+        out_ttnn = _to_ttnn(out.to(torch.bfloat16), self.device)
+        out_ttnn = ttnn.linear(out_ttnn, self.w["sa_o_w"], bias=self.w["sa_o_b"])
+        return out_ttnn
+
+    def __call__(self, hidden_states, attention_mask=None, *args, **kwargs):
+        if isinstance(hidden_states, torch.Tensor):
+            x_ttnn = _to_ttnn(hidden_states.to(torch.bfloat16), self.device)
+        else:
+            x_ttnn = hidden_states
+
+        residual = x_ttnn
+        h_ln = ttnn.layer_norm(x_ttnn, epsilon=self.eps, weight=self.w["sa_ln_w"], bias=self.w["sa_ln_b"])
+        h = self._self_attn(h_ln, attention_mask)
+        h = ttnn.add(residual, h)
+
+        residual = h
+        h = ttnn.layer_norm(h, epsilon=self.eps, weight=self.w["ffn_ln_w"], bias=self.w["ffn_ln_b"])
+        h = ttnn.linear(h, self.w["ffn_fc1_w"], bias=self.w["ffn_fc1_b"])
+        h = ttnn.relu(h)
+        h = ttnn.linear(h, self.w["ffn_fc2_w"], bias=self.w["ffn_fc2_b"])
+        h = ttnn.add(residual, h)
+        return h
+
+
+def build(device, torch_module):
+    return SeamlessM4TEncoderLayer(device, torch_module)
+
+
+_instance = None
+
+
+def seamless_m4_t_encoder_layer(*args, **kwargs):
+    global _instance
+    if _instance is None:
+        model = transformers.AutoModel.from_pretrained(
+            HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True
+        )
+        model.eval()
+        torch_sub = None
+        for path in _CANDIDATE_SUBMODULE_PATHS:
+            try:
+                torch_sub = _resolve(model, path)
+                break
+            except (AttributeError, IndexError, KeyError, TypeError):
+                continue
+        if torch_sub is None:
+            raise RuntimeError("partial-stub: could not resolve `seamless_m4_t_encoder_layer`")
+        _instance = build(ttnn.open_device(device_id=0), torch_sub)
+    return _instance(*args, **kwargs)

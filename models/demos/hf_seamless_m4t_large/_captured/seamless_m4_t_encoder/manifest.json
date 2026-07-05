@@ -1,0 +1,289 @@
+{
+  "component": "seamless_m4_t_encoder",
+  "submodule_path": "text_encoder",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "input_features": {
+        "kind": "none"
+      },
+      "attention_mask": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16
+        ],
+        "dtype": "torch.int64"
+      },
+      "output_hidden_states": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "True"
+      },
+      "output_attentions": {
+        "kind": "none"
+      },
+      "return_dict": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "True"
+      },
+      "input_ids": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16
+        ],
+        "dtype": "torch.int64"
+      }
+    }
+  },
+  "output": {
+    "kind": "dict",
+    "items": {
+      "last_hidden_state": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "hidden_states": {
+        "kind": "tuple",
+        "items": [
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              1,
+              16,
+              1024
+            ],
+            "dtype": "torch.bfloat16"
+          }
+        ]
+      }
+    }
+  }
+}

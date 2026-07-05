@@ -1,0 +1,572 @@
+{
+  "component": "seamless_m4_t_code_hifi_gan",
+  "class_name": "SeamlessM4TCodeHifiGan",
+  "module_function": "seamless_m4_t_code_hifi_gan",
+  "pre_bound": [
+    {
+      "name": "dur_predictor.activation_function",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_dur_predictor_activation_function"
+    },
+    {
+      "name": "dur_predictor.ln1",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_dur_predictor_ln1"
+    },
+    {
+      "name": "dur_predictor.ln2",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_dur_predictor_ln2"
+    },
+    {
+      "name": "dur_predictor.proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_dur_predictor_proj"
+    },
+    {
+      "name": "unit_embedding",
+      "class": "Embedding",
+      "kind": "embedding",
+      "ttnn_target": "ttnn.embedding",
+      "helper": "_apply_unit_embedding"
+    },
+    {
+      "name": "speaker_embedding",
+      "class": "Embedding",
+      "kind": "embedding",
+      "ttnn_target": "ttnn.embedding",
+      "helper": "_apply_speaker_embedding"
+    },
+    {
+      "name": "language_embedding",
+      "class": "Embedding",
+      "kind": "embedding",
+      "ttnn_target": "ttnn.embedding",
+      "helper": "_apply_language_embedding"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "dur_predictor.conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "dur_predictor.dropout_module",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "dur_predictor.conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.conv_pre",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.upsampler.0",
+      "class": "ConvTranspose1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.upsampler.1",
+      "class": "ConvTranspose1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.upsampler.2",
+      "class": "ConvTranspose1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.upsampler.3",
+      "class": "ConvTranspose1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.upsampler.4",
+      "class": "ConvTranspose1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.0.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.0.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.0.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.0.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.0.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.0.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.1.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.1.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.1.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.1.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.1.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.1.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.2.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.2.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.2.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.2.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.2.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.2.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.3.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.3.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.3.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.3.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.3.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.3.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.4.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.4.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.4.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.4.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.4.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.4.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.5.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.5.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.5.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.5.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.5.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.5.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.6.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.6.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.6.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.6.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.6.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.6.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.7.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.7.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.7.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.7.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.7.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.7.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.8.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.8.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.8.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.8.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.8.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.8.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.9.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.9.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.9.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.9.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.9.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.9.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.10.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.10.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.10.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.10.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.10.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.10.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.11.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.11.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.11.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.11.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.11.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.11.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.12.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.12.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.12.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.12.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.12.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.12.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.13.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.13.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.13.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.13.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.13.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.13.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.14.convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.14.convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.14.convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.14.convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.14.convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.resblocks.14.convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "hifi_gan.conv_post",
+      "class": "Conv1d",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_dur_predictor_activation_function(x) -> ttnn.relu",
+    "self._apply_dur_predictor_ln1(x) -> ttnn.layer_norm  (shape=[1280], eps=1e-05)",
+    "self._apply_dur_predictor_ln2(x) -> ttnn.layer_norm  (shape=[1280], eps=1e-05)",
+    "self._apply_dur_predictor_proj(x) -> ttnn.linear  (in=1280, out=1, bias=True)",
+    "self._apply_unit_embedding(indices) -> ttnn.embedding  (n=10000, dim=1280)",
+    "self._apply_speaker_embedding(indices) -> ttnn.embedding  (n=200, dim=256)",
+    "self._apply_language_embedding(indices) -> ttnn.embedding  (n=36, dim=256)"
+  ],
+  "counts": {
+    "op-REUSE": 8,
+    "op-ADAPT": 94,
+    "op-NEW": 5
+  }
+}

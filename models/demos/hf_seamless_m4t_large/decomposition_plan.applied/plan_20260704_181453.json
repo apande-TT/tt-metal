@@ -1,0 +1,20 @@
+[
+  {
+    "parent_name": "seamless_m4_t_encoder_layer",
+    "parent_path": "text_encoder.layers.0",
+    "children": [
+      {
+        "name": "ffn",
+        "submodule_path": "text_encoder.layers.0.ffn",
+        "class_name": "SeamlessM4TFeedForwardNetwork",
+        "leaf_count": 4
+      },
+      {
+        "name": "self_attn",
+        "submodule_path": "text_encoder.layers.0.self_attn",
+        "class_name": "SeamlessM4TAttention",
+        "leaf_count": 4
+      }
+    ]
+  }
+]

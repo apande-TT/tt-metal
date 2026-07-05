@@ -1,0 +1,20 @@
+[
+  {
+    "parent_name": "seamless_m4_t_code_hifi_gan",
+    "parent_path": "vocoder",
+    "children": [
+      {
+        "name": "hifi_gan",
+        "submodule_path": "vocoder.hifi_gan",
+        "class_name": "SeamlessM4THifiGan",
+        "leaf_count": 97
+      },
+      {
+        "name": "dur_predictor",
+        "submodule_path": "vocoder.dur_predictor",
+        "class_name": "SeamlessM4TVariancePredictor",
+        "leaf_count": 7
+      }
+    ]
+  }
+]

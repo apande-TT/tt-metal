@@ -1,0 +1,20 @@
+[
+  {
+    "parent_name": "seamless_m4_t_text_to_unit_model",
+    "parent_path": "t2u_model.model",
+    "children": [
+      {
+        "name": "decoder",
+        "submodule_path": "t2u_model.model.decoder",
+        "class_name": "SeamlessM4TDecoder",
+        "leaf_count": 111
+      },
+      {
+        "name": "encoder",
+        "submodule_path": "t2u_model.model.encoder",
+        "class_name": "SeamlessM4TEncoder",
+        "leaf_count": 73
+      }
+    ]
+  }
+]

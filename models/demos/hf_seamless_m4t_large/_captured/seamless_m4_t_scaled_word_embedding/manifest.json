@@ -1,0 +1,30 @@
+{
+  "component": "seamless_m4_t_scaled_word_embedding",
+  "submodule_path": "text_encoder.embed_tokens",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16
+        ],
+        "dtype": "torch.int64"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      16,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

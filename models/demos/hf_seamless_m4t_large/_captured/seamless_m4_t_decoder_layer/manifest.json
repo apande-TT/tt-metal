@@ -1,0 +1,80 @@
+{
+  "component": "seamless_m4_t_decoder_layer",
+  "submodule_path": "text_decoder.layers.0",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1,
+          17,
+          17
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "encoder_attention_mask": {
+        "kind": "none"
+      },
+      "past_key_values": {
+        "kind": "scalar",
+        "type": "EncoderDecoderCache",
+        "repr": "EncoderDecoderCache(self_attention_cache=DynamicCache(layers=[DynamicLayer, DynamicLayer, DynamicLayer, DynamicLayer, Dy"
+      },
+      "output_attentions": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "False"
+      },
+      "use_cache": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "True"
+      }
+    }
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "none"
+      },
+      {
+        "kind": "none"
+      }
+    ]
+  }
+}

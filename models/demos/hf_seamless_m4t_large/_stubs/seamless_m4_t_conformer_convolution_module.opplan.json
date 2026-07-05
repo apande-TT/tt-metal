@@ -1,0 +1,62 @@
+{
+  "component": "seamless_m4_t_conformer_convolution_module",
+  "class_name": "SeamlessM4TConformerConvolutionModule",
+  "module_function": "seamless_m4_t_conformer_convolution_module",
+  "pre_bound": [
+    {
+      "name": "layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layer_norm"
+    },
+    {
+      "name": "activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_activation"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "dropout",
+      "class": "Dropout",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_activation(x) -> ttnn.silu"
+  ],
+  "counts": {
+    "op-REUSE": 3,
+    "op-ADAPT": 3,
+    "op-NEW": 2
+  }
+}

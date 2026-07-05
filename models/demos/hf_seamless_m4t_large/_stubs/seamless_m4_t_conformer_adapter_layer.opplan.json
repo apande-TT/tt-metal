@@ -1,0 +1,131 @@
+{
+  "component": "seamless_m4_t_conformer_adapter_layer",
+  "class_name": "SeamlessM4TConformerAdapterLayer",
+  "module_function": "seamless_m4_t_conformer_adapter_layer",
+  "pre_bound": [
+    {
+      "name": "residual_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_residual_layer_norm"
+    },
+    {
+      "name": "self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_self_attn_layer_norm"
+    },
+    {
+      "name": "self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_linear_q"
+    },
+    {
+      "name": "self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_linear_k"
+    },
+    {
+      "name": "self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_linear_v"
+    },
+    {
+      "name": "self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_linear_out"
+    },
+    {
+      "name": "ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_ffn_layer_norm"
+    },
+    {
+      "name": "ffn.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_ffn_intermediate_dense"
+    },
+    {
+      "name": "ffn.intermediate_act_fn",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_ffn_intermediate_act_fn"
+    },
+    {
+      "name": "ffn.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_ffn_output_dense"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "residual_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "activation",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "self_attn_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "ffn.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "ffn.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_residual_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_ffn_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_ffn_intermediate_act_fn(x) -> ttnn.relu",
+    "self._apply_ffn_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)"
+  ],
+  "counts": {
+    "op-REUSE": 14,
+    "op-ADAPT": 2,
+    "op-NEW": 1
+  }
+}

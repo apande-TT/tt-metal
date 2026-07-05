@@ -1,0 +1,31 @@
+{
+  "component": "seamless_m4_t_conformer_rel_positional_embedding",
+  "submodule_path": "speech_encoder.encoder.embed_positions",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          64,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      127,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

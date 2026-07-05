@@ -1,0 +1,59 @@
+{
+  "component": "text_decoder_layers_0_self_attn",
+  "submodule_path": "text_decoder.layers.0.self_attn",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "hidden_states": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "past_key_values": {
+        "kind": "scalar",
+        "type": "EncoderDecoderCache",
+        "repr": "EncoderDecoderCache(self_attention_cache=DynamicCache(layers=[DynamicLayer, DynamicLayer, DynamicLayer, DynamicLayer, Dy"
+      },
+      "attention_mask": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1,
+          17,
+          17
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "output_attentions": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "False"
+      }
+    }
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "none"
+      }
+    ]
+  }
+}

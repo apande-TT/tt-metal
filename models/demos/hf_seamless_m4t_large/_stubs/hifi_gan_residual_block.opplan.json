@@ -1,0 +1,44 @@
+{
+  "component": "hifi_gan_residual_block",
+  "class_name": "HifiGanResidualBlock",
+  "module_function": "hifi_gan_residual_block",
+  "pre_bound": [],
+  "llm_gaps": [
+    {
+      "name": "convs1.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "convs1.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "convs1.2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "convs2.0",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "convs2.1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "convs2.2",
+      "class": "Conv1d",
+      "notes": ""
+    }
+  ],
+  "palette": [],
+  "counts": {
+    "op-REUSE": 0,
+    "op-ADAPT": 6,
+    "op-NEW": 0
+  }
+}

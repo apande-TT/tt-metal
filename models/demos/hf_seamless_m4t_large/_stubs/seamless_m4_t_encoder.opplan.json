@@ -1,0 +1,2122 @@
+{
+  "component": "seamless_m4_t_encoder",
+  "class_name": "SeamlessM4TEncoder",
+  "module_function": "seamless_m4_t_encoder",
+  "pre_bound": [
+    {
+      "name": "layers.0.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_k_proj"
+    },
+    {
+      "name": "layers.0.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_v_proj"
+    },
+    {
+      "name": "layers.0.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_q_proj"
+    },
+    {
+      "name": "layers.0.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_out_proj"
+    },
+    {
+      "name": "layers.0.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_0_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.0.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_ffn_fc1"
+    },
+    {
+      "name": "layers.0.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_ffn_fc2"
+    },
+    {
+      "name": "layers.0.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_0_ffn_act"
+    },
+    {
+      "name": "layers.0.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_0_ffn_layer_norm"
+    },
+    {
+      "name": "layers.1.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_k_proj"
+    },
+    {
+      "name": "layers.1.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_v_proj"
+    },
+    {
+      "name": "layers.1.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_q_proj"
+    },
+    {
+      "name": "layers.1.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_out_proj"
+    },
+    {
+      "name": "layers.1.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_1_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.1.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_ffn_fc1"
+    },
+    {
+      "name": "layers.1.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_ffn_fc2"
+    },
+    {
+      "name": "layers.1.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_1_ffn_act"
+    },
+    {
+      "name": "layers.1.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_1_ffn_layer_norm"
+    },
+    {
+      "name": "layers.2.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_k_proj"
+    },
+    {
+      "name": "layers.2.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_v_proj"
+    },
+    {
+      "name": "layers.2.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_q_proj"
+    },
+    {
+      "name": "layers.2.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_out_proj"
+    },
+    {
+      "name": "layers.2.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_2_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.2.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_ffn_fc1"
+    },
+    {
+      "name": "layers.2.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_ffn_fc2"
+    },
+    {
+      "name": "layers.2.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_2_ffn_act"
+    },
+    {
+      "name": "layers.2.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_2_ffn_layer_norm"
+    },
+    {
+      "name": "layers.3.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_k_proj"
+    },
+    {
+      "name": "layers.3.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_v_proj"
+    },
+    {
+      "name": "layers.3.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_q_proj"
+    },
+    {
+      "name": "layers.3.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_out_proj"
+    },
+    {
+      "name": "layers.3.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_3_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.3.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_ffn_fc1"
+    },
+    {
+      "name": "layers.3.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_ffn_fc2"
+    },
+    {
+      "name": "layers.3.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_3_ffn_act"
+    },
+    {
+      "name": "layers.3.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_3_ffn_layer_norm"
+    },
+    {
+      "name": "layers.4.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_k_proj"
+    },
+    {
+      "name": "layers.4.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_v_proj"
+    },
+    {
+      "name": "layers.4.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_q_proj"
+    },
+    {
+      "name": "layers.4.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_out_proj"
+    },
+    {
+      "name": "layers.4.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_4_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.4.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_ffn_fc1"
+    },
+    {
+      "name": "layers.4.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_ffn_fc2"
+    },
+    {
+      "name": "layers.4.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_4_ffn_act"
+    },
+    {
+      "name": "layers.4.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_4_ffn_layer_norm"
+    },
+    {
+      "name": "layers.5.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_k_proj"
+    },
+    {
+      "name": "layers.5.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_v_proj"
+    },
+    {
+      "name": "layers.5.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_q_proj"
+    },
+    {
+      "name": "layers.5.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_out_proj"
+    },
+    {
+      "name": "layers.5.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_5_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.5.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_ffn_fc1"
+    },
+    {
+      "name": "layers.5.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_ffn_fc2"
+    },
+    {
+      "name": "layers.5.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_5_ffn_act"
+    },
+    {
+      "name": "layers.5.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_5_ffn_layer_norm"
+    },
+    {
+      "name": "layers.6.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_k_proj"
+    },
+    {
+      "name": "layers.6.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_v_proj"
+    },
+    {
+      "name": "layers.6.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_q_proj"
+    },
+    {
+      "name": "layers.6.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_out_proj"
+    },
+    {
+      "name": "layers.6.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_6_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.6.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_ffn_fc1"
+    },
+    {
+      "name": "layers.6.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_ffn_fc2"
+    },
+    {
+      "name": "layers.6.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_6_ffn_act"
+    },
+    {
+      "name": "layers.6.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_6_ffn_layer_norm"
+    },
+    {
+      "name": "layers.7.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_k_proj"
+    },
+    {
+      "name": "layers.7.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_v_proj"
+    },
+    {
+      "name": "layers.7.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_q_proj"
+    },
+    {
+      "name": "layers.7.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_out_proj"
+    },
+    {
+      "name": "layers.7.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_7_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.7.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_ffn_fc1"
+    },
+    {
+      "name": "layers.7.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_ffn_fc2"
+    },
+    {
+      "name": "layers.7.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_7_ffn_act"
+    },
+    {
+      "name": "layers.7.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_7_ffn_layer_norm"
+    },
+    {
+      "name": "layers.8.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_k_proj"
+    },
+    {
+      "name": "layers.8.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_v_proj"
+    },
+    {
+      "name": "layers.8.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_q_proj"
+    },
+    {
+      "name": "layers.8.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_out_proj"
+    },
+    {
+      "name": "layers.8.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_8_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.8.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_ffn_fc1"
+    },
+    {
+      "name": "layers.8.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_ffn_fc2"
+    },
+    {
+      "name": "layers.8.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_8_ffn_act"
+    },
+    {
+      "name": "layers.8.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_8_ffn_layer_norm"
+    },
+    {
+      "name": "layers.9.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_k_proj"
+    },
+    {
+      "name": "layers.9.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_v_proj"
+    },
+    {
+      "name": "layers.9.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_q_proj"
+    },
+    {
+      "name": "layers.9.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_out_proj"
+    },
+    {
+      "name": "layers.9.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_9_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.9.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_ffn_fc1"
+    },
+    {
+      "name": "layers.9.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_ffn_fc2"
+    },
+    {
+      "name": "layers.9.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_9_ffn_act"
+    },
+    {
+      "name": "layers.9.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_9_ffn_layer_norm"
+    },
+    {
+      "name": "layers.10.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_k_proj"
+    },
+    {
+      "name": "layers.10.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_v_proj"
+    },
+    {
+      "name": "layers.10.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_q_proj"
+    },
+    {
+      "name": "layers.10.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_out_proj"
+    },
+    {
+      "name": "layers.10.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_10_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.10.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_ffn_fc1"
+    },
+    {
+      "name": "layers.10.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_ffn_fc2"
+    },
+    {
+      "name": "layers.10.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_10_ffn_act"
+    },
+    {
+      "name": "layers.10.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_10_ffn_layer_norm"
+    },
+    {
+      "name": "layers.11.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_k_proj"
+    },
+    {
+      "name": "layers.11.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_v_proj"
+    },
+    {
+      "name": "layers.11.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_q_proj"
+    },
+    {
+      "name": "layers.11.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_out_proj"
+    },
+    {
+      "name": "layers.11.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_11_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.11.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_ffn_fc1"
+    },
+    {
+      "name": "layers.11.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_ffn_fc2"
+    },
+    {
+      "name": "layers.11.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_11_ffn_act"
+    },
+    {
+      "name": "layers.11.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_11_ffn_layer_norm"
+    },
+    {
+      "name": "layers.12.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_k_proj"
+    },
+    {
+      "name": "layers.12.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_v_proj"
+    },
+    {
+      "name": "layers.12.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_q_proj"
+    },
+    {
+      "name": "layers.12.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_out_proj"
+    },
+    {
+      "name": "layers.12.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_12_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.12.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_ffn_fc1"
+    },
+    {
+      "name": "layers.12.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_ffn_fc2"
+    },
+    {
+      "name": "layers.12.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_12_ffn_act"
+    },
+    {
+      "name": "layers.12.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_12_ffn_layer_norm"
+    },
+    {
+      "name": "layers.13.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_k_proj"
+    },
+    {
+      "name": "layers.13.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_v_proj"
+    },
+    {
+      "name": "layers.13.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_q_proj"
+    },
+    {
+      "name": "layers.13.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_out_proj"
+    },
+    {
+      "name": "layers.13.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_13_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.13.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_ffn_fc1"
+    },
+    {
+      "name": "layers.13.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_ffn_fc2"
+    },
+    {
+      "name": "layers.13.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_13_ffn_act"
+    },
+    {
+      "name": "layers.13.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_13_ffn_layer_norm"
+    },
+    {
+      "name": "layers.14.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_k_proj"
+    },
+    {
+      "name": "layers.14.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_v_proj"
+    },
+    {
+      "name": "layers.14.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_q_proj"
+    },
+    {
+      "name": "layers.14.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_out_proj"
+    },
+    {
+      "name": "layers.14.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_14_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.14.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_ffn_fc1"
+    },
+    {
+      "name": "layers.14.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_ffn_fc2"
+    },
+    {
+      "name": "layers.14.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_14_ffn_act"
+    },
+    {
+      "name": "layers.14.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_14_ffn_layer_norm"
+    },
+    {
+      "name": "layers.15.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_k_proj"
+    },
+    {
+      "name": "layers.15.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_v_proj"
+    },
+    {
+      "name": "layers.15.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_q_proj"
+    },
+    {
+      "name": "layers.15.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_out_proj"
+    },
+    {
+      "name": "layers.15.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_15_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.15.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_ffn_fc1"
+    },
+    {
+      "name": "layers.15.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_ffn_fc2"
+    },
+    {
+      "name": "layers.15.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_15_ffn_act"
+    },
+    {
+      "name": "layers.15.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_15_ffn_layer_norm"
+    },
+    {
+      "name": "layers.16.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_k_proj"
+    },
+    {
+      "name": "layers.16.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_v_proj"
+    },
+    {
+      "name": "layers.16.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_q_proj"
+    },
+    {
+      "name": "layers.16.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_out_proj"
+    },
+    {
+      "name": "layers.16.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_16_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.16.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_ffn_fc1"
+    },
+    {
+      "name": "layers.16.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_ffn_fc2"
+    },
+    {
+      "name": "layers.16.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_16_ffn_act"
+    },
+    {
+      "name": "layers.16.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_16_ffn_layer_norm"
+    },
+    {
+      "name": "layers.17.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_k_proj"
+    },
+    {
+      "name": "layers.17.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_v_proj"
+    },
+    {
+      "name": "layers.17.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_q_proj"
+    },
+    {
+      "name": "layers.17.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_out_proj"
+    },
+    {
+      "name": "layers.17.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_17_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.17.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_ffn_fc1"
+    },
+    {
+      "name": "layers.17.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_ffn_fc2"
+    },
+    {
+      "name": "layers.17.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_17_ffn_act"
+    },
+    {
+      "name": "layers.17.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_17_ffn_layer_norm"
+    },
+    {
+      "name": "layers.18.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_k_proj"
+    },
+    {
+      "name": "layers.18.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_v_proj"
+    },
+    {
+      "name": "layers.18.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_q_proj"
+    },
+    {
+      "name": "layers.18.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_out_proj"
+    },
+    {
+      "name": "layers.18.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_18_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.18.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_ffn_fc1"
+    },
+    {
+      "name": "layers.18.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_ffn_fc2"
+    },
+    {
+      "name": "layers.18.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_18_ffn_act"
+    },
+    {
+      "name": "layers.18.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_18_ffn_layer_norm"
+    },
+    {
+      "name": "layers.19.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_k_proj"
+    },
+    {
+      "name": "layers.19.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_v_proj"
+    },
+    {
+      "name": "layers.19.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_q_proj"
+    },
+    {
+      "name": "layers.19.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_out_proj"
+    },
+    {
+      "name": "layers.19.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_19_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.19.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_ffn_fc1"
+    },
+    {
+      "name": "layers.19.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_ffn_fc2"
+    },
+    {
+      "name": "layers.19.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_19_ffn_act"
+    },
+    {
+      "name": "layers.19.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_19_ffn_layer_norm"
+    },
+    {
+      "name": "layers.20.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_k_proj"
+    },
+    {
+      "name": "layers.20.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_v_proj"
+    },
+    {
+      "name": "layers.20.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_q_proj"
+    },
+    {
+      "name": "layers.20.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_out_proj"
+    },
+    {
+      "name": "layers.20.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_20_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.20.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_ffn_fc1"
+    },
+    {
+      "name": "layers.20.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_ffn_fc2"
+    },
+    {
+      "name": "layers.20.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_20_ffn_act"
+    },
+    {
+      "name": "layers.20.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_20_ffn_layer_norm"
+    },
+    {
+      "name": "layers.21.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_k_proj"
+    },
+    {
+      "name": "layers.21.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_v_proj"
+    },
+    {
+      "name": "layers.21.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_q_proj"
+    },
+    {
+      "name": "layers.21.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_out_proj"
+    },
+    {
+      "name": "layers.21.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_21_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.21.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_ffn_fc1"
+    },
+    {
+      "name": "layers.21.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_ffn_fc2"
+    },
+    {
+      "name": "layers.21.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_21_ffn_act"
+    },
+    {
+      "name": "layers.21.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_21_ffn_layer_norm"
+    },
+    {
+      "name": "layers.22.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_k_proj"
+    },
+    {
+      "name": "layers.22.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_v_proj"
+    },
+    {
+      "name": "layers.22.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_q_proj"
+    },
+    {
+      "name": "layers.22.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_out_proj"
+    },
+    {
+      "name": "layers.22.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_22_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.22.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_ffn_fc1"
+    },
+    {
+      "name": "layers.22.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_ffn_fc2"
+    },
+    {
+      "name": "layers.22.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_22_ffn_act"
+    },
+    {
+      "name": "layers.22.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_22_ffn_layer_norm"
+    },
+    {
+      "name": "layers.23.self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_k_proj"
+    },
+    {
+      "name": "layers.23.self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_v_proj"
+    },
+    {
+      "name": "layers.23.self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_q_proj"
+    },
+    {
+      "name": "layers.23.self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_out_proj"
+    },
+    {
+      "name": "layers.23.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_23_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.23.ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_ffn_fc1"
+    },
+    {
+      "name": "layers.23.ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_ffn_fc2"
+    },
+    {
+      "name": "layers.23.ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_layers_23_ffn_act"
+    },
+    {
+      "name": "layers.23.ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_23_ffn_layer_norm"
+    },
+    {
+      "name": "layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layer_norm"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "embed_tokens",
+      "class": "SeamlessM4TScaledWordEmbedding",
+      "notes": ""
+    },
+    {
+      "name": "embed_positions",
+      "class": "SeamlessM4TSinusoidalPositionalEmbedding",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_layers_0_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_0_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_0_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_0_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_0_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_0_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_0_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_0_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_0_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_1_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_1_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_1_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_1_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_1_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_1_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_1_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_1_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_1_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_2_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_2_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_2_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_2_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_2_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_2_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_2_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_2_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_2_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_3_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_3_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_3_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_3_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_3_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_3_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_3_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_3_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_3_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_4_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_4_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_4_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_4_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_4_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_4_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_4_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_4_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_4_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_5_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_5_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_5_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_5_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_5_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_5_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_5_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_5_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_5_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_6_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_6_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_6_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_6_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_6_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_6_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_6_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_6_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_6_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_7_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_7_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_7_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_7_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_7_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_7_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_7_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_7_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_7_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_8_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_8_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_8_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_8_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_8_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_8_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_8_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_8_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_8_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_9_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_9_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_9_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_9_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_9_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_9_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_9_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_9_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_9_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_10_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_10_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_10_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_10_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_10_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_10_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_10_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_10_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_10_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_11_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_11_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_11_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_11_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_11_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_11_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_11_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_11_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_11_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_12_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_12_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_12_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_12_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_12_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_12_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_12_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_12_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_12_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_13_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_13_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_13_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_13_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_13_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_13_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_13_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_13_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_13_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_14_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_14_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_14_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_14_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_14_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_14_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_14_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_14_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_14_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_15_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_15_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_15_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_15_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_15_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_15_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_15_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_15_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_15_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_16_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_16_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_16_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_16_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_16_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_16_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_16_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_16_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_16_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_17_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_17_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_17_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_17_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_17_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_17_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_17_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_17_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_17_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_18_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_18_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_18_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_18_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_18_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_18_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_18_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_18_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_18_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_19_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_19_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_19_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_19_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_19_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_19_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_19_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_19_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_19_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_20_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_20_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_20_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_20_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_20_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_20_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_20_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_20_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_20_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_21_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_21_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_21_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_21_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_21_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_21_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_21_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_21_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_21_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_22_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_22_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_22_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_22_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_22_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_22_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_22_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_22_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_22_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_23_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_23_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_23_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_23_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_23_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_23_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_layers_23_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_layers_23_ffn_act(x) -> ttnn.relu",
+    "self._apply_layers_23_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)"
+  ],
+  "counts": {
+    "op-REUSE": 289,
+    "op-ADAPT": 0,
+    "op-NEW": 2
+  }
+}

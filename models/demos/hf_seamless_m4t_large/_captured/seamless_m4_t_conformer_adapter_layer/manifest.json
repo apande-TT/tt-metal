@@ -1,0 +1,39 @@
+{
+  "component": "seamless_m4_t_conformer_adapter_layer",
+  "submodule_path": "speech_encoder.adapter.layers.0",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          64,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          64
+        ],
+        "dtype": "torch.int64"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      9,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "component": "seamless_m4_t_code_hifi_gan",
+  "submodule_path": "vocoder",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "input_ids": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16
+        ],
+        "dtype": "torch.int64"
+      },
+      "spkr_id": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1
+        ],
+        "dtype": "torch.int64"
+      },
+      "lang_id": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1
+        ],
+        "dtype": "torch.int64"
+      }
+    }
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [],
+        "dtype": "torch.int64"
+      }
+    ]
+  }
+}

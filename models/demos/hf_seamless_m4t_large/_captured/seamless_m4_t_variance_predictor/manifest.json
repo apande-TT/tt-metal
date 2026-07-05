@@ -1,0 +1,30 @@
+{
+  "component": "seamless_m4_t_variance_predictor",
+  "submodule_path": "vocoder.dur_predictor",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          1280
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      16
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

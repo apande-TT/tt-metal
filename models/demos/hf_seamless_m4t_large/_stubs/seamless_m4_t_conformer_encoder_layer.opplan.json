@@ -1,0 +1,212 @@
+{
+  "component": "seamless_m4_t_conformer_encoder_layer",
+  "class_name": "SeamlessM4TConformerEncoderLayer",
+  "module_function": "seamless_m4_t_conformer_encoder_layer",
+  "pre_bound": [
+    {
+      "name": "ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_ffn1_layer_norm"
+    },
+    {
+      "name": "ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_ffn1_intermediate_dense"
+    },
+    {
+      "name": "ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_ffn1_output_dense"
+    },
+    {
+      "name": "self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_self_attn_layer_norm"
+    },
+    {
+      "name": "self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_linear_q"
+    },
+    {
+      "name": "self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_linear_k"
+    },
+    {
+      "name": "self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_linear_v"
+    },
+    {
+      "name": "self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_linear_out"
+    },
+    {
+      "name": "self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_linear_pos"
+    },
+    {
+      "name": "conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_conv_module_layer_norm"
+    },
+    {
+      "name": "conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_conv_module_activation"
+    },
+    {
+      "name": "ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_ffn2_layer_norm"
+    },
+    {
+      "name": "ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_ffn2_intermediate_dense"
+    },
+    {
+      "name": "ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_ffn2_output_dense"
+    },
+    {
+      "name": "final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_final_layer_norm"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)"
+  ],
+  "counts": {
+    "op-REUSE": 24,
+    "op-ADAPT": 3,
+    "op-NEW": 2
+  }
+}

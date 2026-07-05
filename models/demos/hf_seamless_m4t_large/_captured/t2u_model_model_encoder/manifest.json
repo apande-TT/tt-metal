@@ -1,0 +1,59 @@
+{
+  "component": "t2u_model_model_encoder",
+  "submodule_path": "t2u_model.model.encoder",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "inputs_embeds": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "attention_mask": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "output_attentions": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "False"
+      },
+      "output_hidden_states": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "False"
+      },
+      "return_dict": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "True"
+      }
+    }
+  },
+  "output": {
+    "kind": "dict",
+    "items": {
+      "last_hidden_state": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    }
+  }
+}

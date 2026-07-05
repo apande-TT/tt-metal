@@ -1,0 +1,55 @@
+{
+  "component": "speech_encoder_adapter_layers_0_self_attn",
+  "submodule_path": "speech_encoder.adapter.layers.0.self_attn",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          9,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "attention_mask": {
+        "kind": "none"
+      },
+      "output_attentions": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "False"
+      }
+    }
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          9,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          9,
+          9
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "findings": [
+    {
+      "op": "ttnn.topk (sampling)",
+      "field": "vocab_size",
+      "value": 256102,
+      "constraint": "multi-core top-k requires vocab to be a power of 2 AND < 65536; else falls back to single-core",
+      "passes": false,
+      "severity": "warn",
+      "fix": "No action needed - kernel will use the single-core path. Decode throughput will be lower.",
+      "source": "ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp"
+    }
+  ]
+}

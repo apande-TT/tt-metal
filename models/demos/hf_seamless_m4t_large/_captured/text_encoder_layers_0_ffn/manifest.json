@@ -1,0 +1,31 @@
+{
+  "component": "text_encoder_layers_0_ffn",
+  "submodule_path": "text_encoder.layers.0.ffn",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      16,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

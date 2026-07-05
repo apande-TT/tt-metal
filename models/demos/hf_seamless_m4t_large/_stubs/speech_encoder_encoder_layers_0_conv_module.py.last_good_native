@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""Native TTNN port for `speech_encoder.encoder.layers.0.conv_module` of facebook/hf-seamless-m4t-large.
+
+Same SeamlessM4TConformerConvolutionModule class as the graduated
+`seamless_m4_t_conformer_convolution_module` component (top-level parent
+of the same op) — reuses that op recipe with the encoder-layer submodule path.
+Flow: layer_norm -> pointwise_conv1(k=1) -> GLU -> depthwise_conv(k=31, groups=C) ->
+batch_norm -> silu -> pointwise_conv2(k=1). Pointwise convs run as ttnn.linear;
+the depthwise+batch_norm pair runs on host (ttnn.conv1d groups=C k=31 on odd
+sequences is not stable).
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+import transformers
+
+import ttnn
+
+HF_MODEL_ID = "facebook/hf-seamless-m4t-large"
+_CANDIDATE_SUBMODULE_PATHS = ["speech_encoder.encoder.layers.0.conv_module"]
+
+
+def _resolve(obj, dotted):
+    cur = obj
+    for tok in dotted.replace("[", ".").replace("]", "").split("."):
+        if tok == "":
+            continue
+        if tok.isdigit():
+            cur = cur[int(tok)]
+        else:
+            cur = getattr(cur, tok)
+    return cur
+
+
+class SpeechEncoderEncoderLayers0ConvModule:
+    def __init__(self, device, torch_module):
+        self.device = device
+        cfg = torch_module.layer_norm.normalized_shape
+        self.hidden_size = int(cfg[0]) if isinstance(cfg, (tuple, list)) else int(cfg)
+        self.depthwise_kernel_size = torch_module.depthwise_conv.kernel_size[0]
+
+        sd = torch_module.state_dict()
+
+        self.w_ln_w = ttnn.from_torch(
+            sd["layer_norm.weight"], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_ln_b = ttnn.from_torch(
+            sd["layer_norm.bias"], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self._ln_eps = 1e-05
+
+        pc1_w = sd["pointwise_conv1.weight"].squeeze(-1).T.contiguous()
+        self.w_pc1 = ttnn.from_torch(pc1_w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+        self.dw_conv_weight = sd["depthwise_conv.weight"].to(torch.float32)
+        self.bn_weight = sd["batch_norm.weight"].to(torch.float32)
+        self.bn_bias = sd["batch_norm.bias"].to(torch.float32)
+        self.bn_running_mean = torch_module.batch_norm.running_mean.detach().to(torch.float32)
+        self.bn_running_var = torch_module.batch_norm.running_var.detach().to(torch.float32)
+        self.bn_eps = float(torch_module.batch_norm.eps)
+
+        pc2_w = sd["pointwise_conv2.weight"].squeeze(-1).T.contiguous()
+        self.w_pc2 = ttnn.from_torch(pc2_w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+    def __call__(self, hidden_states, attention_mask=None, *args, **kwargs):
+        if isinstance(hidden_states, torch.Tensor):
+            x_ttnn = ttnn.from_torch(
+                hidden_states.to(torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
+            )
+        else:
+            x_ttnn = hidden_states
+
+        h = ttnn.layer_norm(x_ttnn, epsilon=self._ln_eps, weight=self.w_ln_w, bias=self.w_ln_b)
+        h = ttnn.linear(h, self.w_pc1)
+
+        h_t = ttnn.to_torch(h).to(torch.float32)
+        h_a, h_b = h_t.chunk(2, dim=-1)
+        h_t = h_a * torch.sigmoid(h_b)
+        h_t = h_t.transpose(1, 2).contiguous()  # (B, C, L)
+        pad = (self.depthwise_kernel_size - 1) // 2
+        h_t = F.conv1d(h_t, self.dw_conv_weight, stride=1, padding=pad, groups=self.hidden_size)
+        scale = self.bn_weight / torch.sqrt(self.bn_running_var + self.bn_eps)
+        shift = self.bn_bias - self.bn_running_mean * scale
+        h_t = h_t * scale.view(1, -1, 1) + shift.view(1, -1, 1)
+        h_t = h_t.transpose(1, 2).contiguous()
+
+        h = ttnn.from_torch(
+            h_t.to(torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
+        )
+        h = ttnn.silu(h)
+        h = ttnn.linear(h, self.w_pc2)
+        return h
+
+
+def build(device, torch_module):
+    return SpeechEncoderEncoderLayers0ConvModule(device, torch_module)
+
+
+_instance = None
+
+
+def speech_encoder_encoder_layers_0_conv_module(*args, **kwargs):
+    global _instance
+    if _instance is None:
+        model = transformers.AutoModel.from_pretrained(
+            HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True
+        )
+        model.eval()
+        torch_sub = None
+        for path in _CANDIDATE_SUBMODULE_PATHS:
+            try:
+                torch_sub = _resolve(model, path)
+                break
+            except (AttributeError, IndexError, KeyError, TypeError):
+                continue
+        if torch_sub is None:
+            raise RuntimeError("partial-stub: could not resolve `speech_encoder_encoder_layers_0_conv_module`")
+        _instance = build(ttnn.open_device(device_id=0), torch_sub)
+    return _instance(*args, **kwargs)

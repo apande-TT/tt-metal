@@ -1,0 +1,63 @@
+{
+  "component": "seamless_m4_t_variance_predictor",
+  "class_name": "SeamlessM4TVariancePredictor",
+  "module_function": "seamless_m4_t_variance_predictor",
+  "pre_bound": [
+    {
+      "name": "activation_function",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_activation_function"
+    },
+    {
+      "name": "ln1",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_ln1"
+    },
+    {
+      "name": "ln2",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_ln2"
+    },
+    {
+      "name": "proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_proj"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "dropout_module",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "conv2",
+      "class": "Conv1d",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_activation_function(x) -> ttnn.relu",
+    "self._apply_ln1(x) -> ttnn.layer_norm  (shape=[1280], eps=1e-05)",
+    "self._apply_ln2(x) -> ttnn.layer_norm  (shape=[1280], eps=1e-05)",
+    "self._apply_proj(x) -> ttnn.linear  (in=1280, out=1, bias=True)"
+  ],
+  "counts": {
+    "op-REUSE": 5,
+    "op-ADAPT": 2,
+    "op-NEW": 0
+  }
+}

@@ -1,0 +1,4738 @@
+{
+  "component": "seamless_m4_t_conformer_encoder",
+  "class_name": "SeamlessM4TConformerEncoder",
+  "module_function": "seamless_m4_t_conformer_encoder",
+  "pre_bound": [
+    {
+      "name": "layers.0.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_0_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.0.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.0.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_0_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.0.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_ffn1_output_dense"
+    },
+    {
+      "name": "layers.0.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_0_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.0.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_linear_q"
+    },
+    {
+      "name": "layers.0.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_linear_k"
+    },
+    {
+      "name": "layers.0.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_linear_v"
+    },
+    {
+      "name": "layers.0.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_linear_out"
+    },
+    {
+      "name": "layers.0.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.0.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_0_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.0.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_0_conv_module_activation"
+    },
+    {
+      "name": "layers.0.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_0_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.0.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.0.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_0_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.0.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_0_ffn2_output_dense"
+    },
+    {
+      "name": "layers.0.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_0_final_layer_norm"
+    },
+    {
+      "name": "layers.1.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_1_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.1.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.1.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_1_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.1.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_ffn1_output_dense"
+    },
+    {
+      "name": "layers.1.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_1_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.1.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_linear_q"
+    },
+    {
+      "name": "layers.1.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_linear_k"
+    },
+    {
+      "name": "layers.1.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_linear_v"
+    },
+    {
+      "name": "layers.1.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_linear_out"
+    },
+    {
+      "name": "layers.1.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.1.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_1_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.1.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_1_conv_module_activation"
+    },
+    {
+      "name": "layers.1.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_1_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.1.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.1.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_1_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.1.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_1_ffn2_output_dense"
+    },
+    {
+      "name": "layers.1.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_1_final_layer_norm"
+    },
+    {
+      "name": "layers.2.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_2_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.2.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.2.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_2_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.2.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_ffn1_output_dense"
+    },
+    {
+      "name": "layers.2.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_2_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.2.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_linear_q"
+    },
+    {
+      "name": "layers.2.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_linear_k"
+    },
+    {
+      "name": "layers.2.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_linear_v"
+    },
+    {
+      "name": "layers.2.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_linear_out"
+    },
+    {
+      "name": "layers.2.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.2.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_2_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.2.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_2_conv_module_activation"
+    },
+    {
+      "name": "layers.2.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_2_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.2.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.2.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_2_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.2.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_2_ffn2_output_dense"
+    },
+    {
+      "name": "layers.2.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_2_final_layer_norm"
+    },
+    {
+      "name": "layers.3.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_3_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.3.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.3.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_3_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.3.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_ffn1_output_dense"
+    },
+    {
+      "name": "layers.3.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_3_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.3.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_linear_q"
+    },
+    {
+      "name": "layers.3.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_linear_k"
+    },
+    {
+      "name": "layers.3.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_linear_v"
+    },
+    {
+      "name": "layers.3.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_linear_out"
+    },
+    {
+      "name": "layers.3.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.3.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_3_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.3.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_3_conv_module_activation"
+    },
+    {
+      "name": "layers.3.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_3_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.3.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.3.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_3_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.3.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_3_ffn2_output_dense"
+    },
+    {
+      "name": "layers.3.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_3_final_layer_norm"
+    },
+    {
+      "name": "layers.4.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_4_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.4.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.4.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_4_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.4.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_ffn1_output_dense"
+    },
+    {
+      "name": "layers.4.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_4_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.4.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_linear_q"
+    },
+    {
+      "name": "layers.4.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_linear_k"
+    },
+    {
+      "name": "layers.4.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_linear_v"
+    },
+    {
+      "name": "layers.4.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_linear_out"
+    },
+    {
+      "name": "layers.4.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.4.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_4_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.4.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_4_conv_module_activation"
+    },
+    {
+      "name": "layers.4.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_4_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.4.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.4.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_4_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.4.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_4_ffn2_output_dense"
+    },
+    {
+      "name": "layers.4.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_4_final_layer_norm"
+    },
+    {
+      "name": "layers.5.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_5_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.5.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.5.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_5_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.5.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_ffn1_output_dense"
+    },
+    {
+      "name": "layers.5.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_5_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.5.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_linear_q"
+    },
+    {
+      "name": "layers.5.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_linear_k"
+    },
+    {
+      "name": "layers.5.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_linear_v"
+    },
+    {
+      "name": "layers.5.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_linear_out"
+    },
+    {
+      "name": "layers.5.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.5.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_5_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.5.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_5_conv_module_activation"
+    },
+    {
+      "name": "layers.5.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_5_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.5.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.5.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_5_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.5.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_5_ffn2_output_dense"
+    },
+    {
+      "name": "layers.5.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_5_final_layer_norm"
+    },
+    {
+      "name": "layers.6.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_6_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.6.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.6.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_6_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.6.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_ffn1_output_dense"
+    },
+    {
+      "name": "layers.6.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_6_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.6.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_linear_q"
+    },
+    {
+      "name": "layers.6.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_linear_k"
+    },
+    {
+      "name": "layers.6.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_linear_v"
+    },
+    {
+      "name": "layers.6.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_linear_out"
+    },
+    {
+      "name": "layers.6.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.6.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_6_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.6.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_6_conv_module_activation"
+    },
+    {
+      "name": "layers.6.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_6_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.6.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.6.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_6_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.6.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_6_ffn2_output_dense"
+    },
+    {
+      "name": "layers.6.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_6_final_layer_norm"
+    },
+    {
+      "name": "layers.7.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_7_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.7.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.7.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_7_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.7.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_ffn1_output_dense"
+    },
+    {
+      "name": "layers.7.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_7_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.7.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_linear_q"
+    },
+    {
+      "name": "layers.7.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_linear_k"
+    },
+    {
+      "name": "layers.7.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_linear_v"
+    },
+    {
+      "name": "layers.7.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_linear_out"
+    },
+    {
+      "name": "layers.7.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.7.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_7_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.7.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_7_conv_module_activation"
+    },
+    {
+      "name": "layers.7.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_7_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.7.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.7.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_7_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.7.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_7_ffn2_output_dense"
+    },
+    {
+      "name": "layers.7.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_7_final_layer_norm"
+    },
+    {
+      "name": "layers.8.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_8_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.8.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.8.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_8_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.8.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_ffn1_output_dense"
+    },
+    {
+      "name": "layers.8.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_8_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.8.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_linear_q"
+    },
+    {
+      "name": "layers.8.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_linear_k"
+    },
+    {
+      "name": "layers.8.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_linear_v"
+    },
+    {
+      "name": "layers.8.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_linear_out"
+    },
+    {
+      "name": "layers.8.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.8.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_8_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.8.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_8_conv_module_activation"
+    },
+    {
+      "name": "layers.8.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_8_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.8.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.8.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_8_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.8.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_8_ffn2_output_dense"
+    },
+    {
+      "name": "layers.8.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_8_final_layer_norm"
+    },
+    {
+      "name": "layers.9.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_9_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.9.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.9.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_9_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.9.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_ffn1_output_dense"
+    },
+    {
+      "name": "layers.9.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_9_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.9.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_linear_q"
+    },
+    {
+      "name": "layers.9.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_linear_k"
+    },
+    {
+      "name": "layers.9.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_linear_v"
+    },
+    {
+      "name": "layers.9.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_linear_out"
+    },
+    {
+      "name": "layers.9.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.9.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_9_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.9.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_9_conv_module_activation"
+    },
+    {
+      "name": "layers.9.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_9_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.9.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.9.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_9_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.9.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_9_ffn2_output_dense"
+    },
+    {
+      "name": "layers.9.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_9_final_layer_norm"
+    },
+    {
+      "name": "layers.10.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_10_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.10.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.10.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_10_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.10.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_ffn1_output_dense"
+    },
+    {
+      "name": "layers.10.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_10_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.10.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_linear_q"
+    },
+    {
+      "name": "layers.10.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_linear_k"
+    },
+    {
+      "name": "layers.10.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_linear_v"
+    },
+    {
+      "name": "layers.10.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_linear_out"
+    },
+    {
+      "name": "layers.10.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.10.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_10_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.10.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_10_conv_module_activation"
+    },
+    {
+      "name": "layers.10.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_10_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.10.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.10.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_10_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.10.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_10_ffn2_output_dense"
+    },
+    {
+      "name": "layers.10.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_10_final_layer_norm"
+    },
+    {
+      "name": "layers.11.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_11_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.11.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.11.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_11_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.11.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_ffn1_output_dense"
+    },
+    {
+      "name": "layers.11.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_11_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.11.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_linear_q"
+    },
+    {
+      "name": "layers.11.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_linear_k"
+    },
+    {
+      "name": "layers.11.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_linear_v"
+    },
+    {
+      "name": "layers.11.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_linear_out"
+    },
+    {
+      "name": "layers.11.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.11.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_11_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.11.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_11_conv_module_activation"
+    },
+    {
+      "name": "layers.11.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_11_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.11.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.11.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_11_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.11.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_11_ffn2_output_dense"
+    },
+    {
+      "name": "layers.11.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_11_final_layer_norm"
+    },
+    {
+      "name": "layers.12.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_12_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.12.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.12.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_12_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.12.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_ffn1_output_dense"
+    },
+    {
+      "name": "layers.12.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_12_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.12.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_linear_q"
+    },
+    {
+      "name": "layers.12.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_linear_k"
+    },
+    {
+      "name": "layers.12.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_linear_v"
+    },
+    {
+      "name": "layers.12.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_linear_out"
+    },
+    {
+      "name": "layers.12.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.12.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_12_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.12.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_12_conv_module_activation"
+    },
+    {
+      "name": "layers.12.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_12_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.12.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.12.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_12_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.12.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_12_ffn2_output_dense"
+    },
+    {
+      "name": "layers.12.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_12_final_layer_norm"
+    },
+    {
+      "name": "layers.13.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_13_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.13.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.13.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_13_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.13.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_ffn1_output_dense"
+    },
+    {
+      "name": "layers.13.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_13_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.13.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_linear_q"
+    },
+    {
+      "name": "layers.13.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_linear_k"
+    },
+    {
+      "name": "layers.13.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_linear_v"
+    },
+    {
+      "name": "layers.13.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_linear_out"
+    },
+    {
+      "name": "layers.13.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.13.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_13_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.13.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_13_conv_module_activation"
+    },
+    {
+      "name": "layers.13.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_13_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.13.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.13.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_13_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.13.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_13_ffn2_output_dense"
+    },
+    {
+      "name": "layers.13.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_13_final_layer_norm"
+    },
+    {
+      "name": "layers.14.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_14_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.14.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.14.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_14_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.14.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_ffn1_output_dense"
+    },
+    {
+      "name": "layers.14.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_14_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.14.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_linear_q"
+    },
+    {
+      "name": "layers.14.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_linear_k"
+    },
+    {
+      "name": "layers.14.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_linear_v"
+    },
+    {
+      "name": "layers.14.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_linear_out"
+    },
+    {
+      "name": "layers.14.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.14.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_14_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.14.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_14_conv_module_activation"
+    },
+    {
+      "name": "layers.14.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_14_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.14.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.14.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_14_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.14.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_14_ffn2_output_dense"
+    },
+    {
+      "name": "layers.14.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_14_final_layer_norm"
+    },
+    {
+      "name": "layers.15.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_15_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.15.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.15.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_15_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.15.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_ffn1_output_dense"
+    },
+    {
+      "name": "layers.15.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_15_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.15.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_linear_q"
+    },
+    {
+      "name": "layers.15.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_linear_k"
+    },
+    {
+      "name": "layers.15.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_linear_v"
+    },
+    {
+      "name": "layers.15.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_linear_out"
+    },
+    {
+      "name": "layers.15.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.15.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_15_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.15.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_15_conv_module_activation"
+    },
+    {
+      "name": "layers.15.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_15_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.15.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.15.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_15_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.15.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_15_ffn2_output_dense"
+    },
+    {
+      "name": "layers.15.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_15_final_layer_norm"
+    },
+    {
+      "name": "layers.16.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_16_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.16.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.16.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_16_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.16.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_ffn1_output_dense"
+    },
+    {
+      "name": "layers.16.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_16_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.16.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_linear_q"
+    },
+    {
+      "name": "layers.16.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_linear_k"
+    },
+    {
+      "name": "layers.16.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_linear_v"
+    },
+    {
+      "name": "layers.16.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_linear_out"
+    },
+    {
+      "name": "layers.16.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.16.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_16_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.16.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_16_conv_module_activation"
+    },
+    {
+      "name": "layers.16.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_16_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.16.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.16.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_16_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.16.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_16_ffn2_output_dense"
+    },
+    {
+      "name": "layers.16.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_16_final_layer_norm"
+    },
+    {
+      "name": "layers.17.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_17_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.17.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.17.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_17_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.17.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_ffn1_output_dense"
+    },
+    {
+      "name": "layers.17.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_17_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.17.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_linear_q"
+    },
+    {
+      "name": "layers.17.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_linear_k"
+    },
+    {
+      "name": "layers.17.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_linear_v"
+    },
+    {
+      "name": "layers.17.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_linear_out"
+    },
+    {
+      "name": "layers.17.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.17.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_17_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.17.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_17_conv_module_activation"
+    },
+    {
+      "name": "layers.17.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_17_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.17.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.17.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_17_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.17.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_17_ffn2_output_dense"
+    },
+    {
+      "name": "layers.17.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_17_final_layer_norm"
+    },
+    {
+      "name": "layers.18.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_18_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.18.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.18.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_18_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.18.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_ffn1_output_dense"
+    },
+    {
+      "name": "layers.18.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_18_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.18.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_linear_q"
+    },
+    {
+      "name": "layers.18.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_linear_k"
+    },
+    {
+      "name": "layers.18.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_linear_v"
+    },
+    {
+      "name": "layers.18.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_linear_out"
+    },
+    {
+      "name": "layers.18.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.18.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_18_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.18.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_18_conv_module_activation"
+    },
+    {
+      "name": "layers.18.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_18_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.18.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.18.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_18_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.18.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_18_ffn2_output_dense"
+    },
+    {
+      "name": "layers.18.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_18_final_layer_norm"
+    },
+    {
+      "name": "layers.19.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_19_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.19.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.19.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_19_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.19.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_ffn1_output_dense"
+    },
+    {
+      "name": "layers.19.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_19_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.19.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_linear_q"
+    },
+    {
+      "name": "layers.19.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_linear_k"
+    },
+    {
+      "name": "layers.19.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_linear_v"
+    },
+    {
+      "name": "layers.19.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_linear_out"
+    },
+    {
+      "name": "layers.19.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.19.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_19_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.19.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_19_conv_module_activation"
+    },
+    {
+      "name": "layers.19.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_19_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.19.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.19.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_19_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.19.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_19_ffn2_output_dense"
+    },
+    {
+      "name": "layers.19.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_19_final_layer_norm"
+    },
+    {
+      "name": "layers.20.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_20_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.20.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.20.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_20_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.20.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_ffn1_output_dense"
+    },
+    {
+      "name": "layers.20.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_20_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.20.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_linear_q"
+    },
+    {
+      "name": "layers.20.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_linear_k"
+    },
+    {
+      "name": "layers.20.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_linear_v"
+    },
+    {
+      "name": "layers.20.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_linear_out"
+    },
+    {
+      "name": "layers.20.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.20.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_20_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.20.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_20_conv_module_activation"
+    },
+    {
+      "name": "layers.20.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_20_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.20.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.20.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_20_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.20.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_20_ffn2_output_dense"
+    },
+    {
+      "name": "layers.20.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_20_final_layer_norm"
+    },
+    {
+      "name": "layers.21.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_21_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.21.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.21.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_21_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.21.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_ffn1_output_dense"
+    },
+    {
+      "name": "layers.21.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_21_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.21.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_linear_q"
+    },
+    {
+      "name": "layers.21.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_linear_k"
+    },
+    {
+      "name": "layers.21.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_linear_v"
+    },
+    {
+      "name": "layers.21.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_linear_out"
+    },
+    {
+      "name": "layers.21.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.21.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_21_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.21.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_21_conv_module_activation"
+    },
+    {
+      "name": "layers.21.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_21_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.21.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.21.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_21_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.21.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_21_ffn2_output_dense"
+    },
+    {
+      "name": "layers.21.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_21_final_layer_norm"
+    },
+    {
+      "name": "layers.22.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_22_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.22.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.22.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_22_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.22.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_ffn1_output_dense"
+    },
+    {
+      "name": "layers.22.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_22_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.22.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_linear_q"
+    },
+    {
+      "name": "layers.22.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_linear_k"
+    },
+    {
+      "name": "layers.22.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_linear_v"
+    },
+    {
+      "name": "layers.22.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_linear_out"
+    },
+    {
+      "name": "layers.22.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.22.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_22_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.22.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_22_conv_module_activation"
+    },
+    {
+      "name": "layers.22.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_22_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.22.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.22.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_22_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.22.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_22_ffn2_output_dense"
+    },
+    {
+      "name": "layers.22.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_22_final_layer_norm"
+    },
+    {
+      "name": "layers.23.ffn1_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_23_ffn1_layer_norm"
+    },
+    {
+      "name": "layers.23.ffn1.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_ffn1_intermediate_dense"
+    },
+    {
+      "name": "layers.23.ffn1.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_23_ffn1_intermediate_act_fn"
+    },
+    {
+      "name": "layers.23.ffn1.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_ffn1_output_dense"
+    },
+    {
+      "name": "layers.23.self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_23_self_attn_layer_norm"
+    },
+    {
+      "name": "layers.23.self_attn.linear_q",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_linear_q"
+    },
+    {
+      "name": "layers.23.self_attn.linear_k",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_linear_k"
+    },
+    {
+      "name": "layers.23.self_attn.linear_v",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_linear_v"
+    },
+    {
+      "name": "layers.23.self_attn.linear_out",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_linear_out"
+    },
+    {
+      "name": "layers.23.self_attn.linear_pos",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_self_attn_linear_pos"
+    },
+    {
+      "name": "layers.23.conv_module.layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_23_conv_module_layer_norm"
+    },
+    {
+      "name": "layers.23.conv_module.activation",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_23_conv_module_activation"
+    },
+    {
+      "name": "layers.23.ffn2_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_23_ffn2_layer_norm"
+    },
+    {
+      "name": "layers.23.ffn2.intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_ffn2_intermediate_dense"
+    },
+    {
+      "name": "layers.23.ffn2.intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_layers_23_ffn2_intermediate_act_fn"
+    },
+    {
+      "name": "layers.23.ffn2.output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_layers_23_ffn2_output_dense"
+    },
+    {
+      "name": "layers.23.final_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layers_23_final_layer_norm"
+    },
+    {
+      "name": "layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_layer_norm"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "embed_positions",
+      "class": "SeamlessM4TConformerRelPositionalEmbedding",
+      "notes": ""
+    },
+    {
+      "name": "dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.0.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.1.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.2.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.3.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.4.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.5.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.6.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.7.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.8.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.9.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.10.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.11.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.12.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.13.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.14.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.15.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.16.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.17.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.18.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.19.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.20.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.21.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.22.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.ffn1.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.ffn1.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.self_attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.self_attn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.conv_module.pointwise_conv1",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.conv_module.glu",
+      "class": "GLU",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.conv_module.depthwise_conv",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.conv_module.batch_norm",
+      "class": "BatchNorm1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.conv_module.pointwise_conv2",
+      "class": "Conv1d",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.conv_module.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.ffn2.intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "layers.23.ffn2.output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_layers_0_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_0_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_0_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_0_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_0_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_0_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_0_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_0_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_0_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_0_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_0_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_0_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_0_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_0_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_0_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_0_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_0_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_1_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_1_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_1_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_1_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_1_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_1_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_1_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_1_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_1_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_1_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_1_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_1_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_1_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_1_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_1_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_1_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_1_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_2_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_2_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_2_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_2_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_2_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_2_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_2_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_2_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_2_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_2_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_2_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_2_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_2_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_2_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_2_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_2_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_2_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_3_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_3_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_3_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_3_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_3_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_3_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_3_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_3_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_3_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_3_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_3_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_3_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_3_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_3_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_3_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_3_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_3_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_4_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_4_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_4_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_4_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_4_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_4_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_4_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_4_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_4_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_4_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_4_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_4_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_4_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_4_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_4_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_4_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_4_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_5_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_5_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_5_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_5_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_5_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_5_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_5_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_5_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_5_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_5_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_5_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_5_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_5_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_5_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_5_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_5_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_5_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_6_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_6_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_6_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_6_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_6_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_6_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_6_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_6_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_6_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_6_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_6_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_6_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_6_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_6_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_6_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_6_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_6_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_7_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_7_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_7_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_7_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_7_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_7_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_7_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_7_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_7_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_7_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_7_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_7_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_7_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_7_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_7_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_7_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_7_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_8_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_8_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_8_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_8_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_8_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_8_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_8_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_8_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_8_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_8_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_8_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_8_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_8_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_8_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_8_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_8_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_8_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_9_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_9_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_9_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_9_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_9_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_9_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_9_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_9_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_9_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_9_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_9_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_9_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_9_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_9_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_9_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_9_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_9_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_10_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_10_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_10_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_10_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_10_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_10_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_10_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_10_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_10_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_10_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_10_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_10_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_10_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_10_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_10_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_10_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_10_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_11_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_11_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_11_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_11_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_11_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_11_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_11_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_11_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_11_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_11_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_11_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_11_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_11_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_11_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_11_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_11_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_11_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_12_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_12_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_12_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_12_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_12_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_12_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_12_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_12_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_12_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_12_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_12_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_12_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_12_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_12_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_12_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_12_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_12_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_13_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_13_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_13_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_13_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_13_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_13_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_13_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_13_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_13_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_13_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_13_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_13_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_13_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_13_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_13_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_13_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_13_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_14_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_14_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_14_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_14_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_14_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_14_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_14_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_14_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_14_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_14_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_14_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_14_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_14_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_14_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_14_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_14_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_14_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_15_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_15_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_15_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_15_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_15_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_15_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_15_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_15_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_15_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_15_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_15_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_15_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_15_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_15_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_15_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_15_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_15_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_16_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_16_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_16_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_16_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_16_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_16_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_16_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_16_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_16_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_16_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_16_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_16_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_16_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_16_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_16_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_16_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_16_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_17_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_17_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_17_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_17_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_17_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_17_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_17_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_17_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_17_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_17_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_17_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_17_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_17_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_17_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_17_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_17_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_17_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_18_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_18_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_18_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_18_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_18_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_18_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_18_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_18_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_18_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_18_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_18_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_18_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_18_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_18_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_18_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_18_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_18_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_19_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_19_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_19_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_19_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_19_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_19_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_19_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_19_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_19_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_19_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_19_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_19_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_19_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_19_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_19_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_19_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_19_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_20_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_20_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_20_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_20_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_20_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_20_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_20_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_20_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_20_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_20_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_20_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_20_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_20_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_20_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_20_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_20_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_20_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_21_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_21_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_21_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_21_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_21_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_21_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_21_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_21_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_21_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_21_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_21_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_21_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_21_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_21_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_21_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_21_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_21_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_22_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_22_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_22_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_22_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_22_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_22_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_22_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_22_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_22_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_22_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_22_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_22_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_22_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_22_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_22_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_22_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_22_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_23_ffn1_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_23_ffn1_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_23_ffn1_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_23_ffn1_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_23_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_23_self_attn_linear_q(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_23_self_attn_linear_k(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_23_self_attn_linear_v(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_23_self_attn_linear_out(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_layers_23_self_attn_linear_pos(x) -> ttnn.linear  (in=1024, out=1024, bias=False)",
+    "self._apply_layers_23_conv_module_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_23_conv_module_activation(x) -> ttnn.silu",
+    "self._apply_layers_23_ffn2_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layers_23_ffn2_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_layers_23_ffn2_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_layers_23_ffn2_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)",
+    "self._apply_layers_23_final_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)"
+  ],
+  "counts": {
+    "op-REUSE": 578,
+    "op-ADAPT": 72,
+    "op-NEW": 49
+  }
+}

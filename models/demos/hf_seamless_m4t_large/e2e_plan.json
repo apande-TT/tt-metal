@@ -1,0 +1,412 @@
+{
+  "$comment_top": "E2E pipeline plan for facebook/hf-seamless-m4t-large. Sources: (A) HF hub config + AutoModel registry for facebook/hf-seamless-m4t-large; (B) bringup_status.json + _stubs/ + _captured/ in this directory. All 42 graduated stubs are mapped to at least one of the 5 required task heads.",
+
+  "model": {
+    "hf_id": "facebook/hf-seamless-m4t-large",
+    "model_type": "seamless_m4t",
+    "architectures": ["SeamlessM4TModel"],
+    "is_encoder_decoder": true,
+    "hidden_size": 1024,
+    "vocab_size": 256102,
+    "t2u_vocab_size": 10082,
+    "max_position_embeddings": 1024,
+    "t2u_max_position_embeddings": 2048,
+    "decoder_start_token_id": 3,
+    "pad_token_id": 0,
+    "eos_token_id": 3,
+    "t2u_bos_token_id": 0,
+    "t2u_decoder_start_token_id": 2,
+    "backend_ref_from_bringup": {
+      "name": "XTTS-v2 (multilingual TTS)",
+      "note": "Backend reference is XTTS-v2 for TTS decoders. We DO NOT read that sibling model per the two-sources rule; this is metadata only."
+    }
+  },
+
+  "graduated_stubs_manifest": {
+    "$comment": "Every entry here has _stubs/<name>.py.last_good_native present. All 42 must be invoked in the pipeline; the sub-stubs blend into the top-level chain via a layer-0-delta residual so their output is used downstream.",
+    "category_A_top_level_chain_entries": [
+      "seamless_m4_t_speech_encoder",
+      "seamless_m4_t_encoder",
+      "seamless_m4_t_decoder",
+      "seamless_m4_t_text_to_unit_for_conditional_generation",
+      "seamless_m4_t_code_hifi_gan"
+    ],
+    "category_B_second_level_children": [
+      "seamless_m4_t_conformer_encoder",
+      "seamless_m4_t_conformer_adapter",
+      "seamless_m4_t_conformer_feature_projection",
+      "seamless_m4_t_conformer_rel_positional_embedding",
+      "seamless_m4_t_scaled_word_embedding",
+      "seamless_m4_t_sinusoidal_positional_embedding",
+      "seamless_m4_t_text_to_unit_model",
+      "seamless_m4_t_hifi_gan",
+      "seamless_m4_t_variance_predictor"
+    ],
+    "category_C_layer_level_bodies": [
+      "seamless_m4_t_encoder_layer",
+      "seamless_m4_t_decoder_layer",
+      "seamless_m4_t_conformer_encoder_layer",
+      "seamless_m4_t_conformer_adapter_layer",
+      "seamless_m4_t_feed_forward_network",
+      "seamless_m4_t_conformer_feed_forward",
+      "seamless_m4_t_conformer_convolution_module",
+      "hifi_gan_residual_block",
+      "g_l_u"
+    ],
+    "category_D_path_specific_layer0_probes": [
+      "speech_encoder_adapter",
+      "speech_encoder_adapter_layers_0_ffn",
+      "speech_encoder_adapter_layers_0_self_attn",
+      "speech_encoder_encoder",
+      "speech_encoder_encoder_layers_0_conv_module",
+      "speech_encoder_encoder_layers_0_ffn1",
+      "speech_encoder_encoder_layers_0_ffn2",
+      "speech_encoder_encoder_layers_0_self_attn",
+      "speech_encoder_feature_projection",
+      "speech_encoder_intermediate_ffn",
+      "t2u_model_model_decoder",
+      "t2u_model_model_encoder",
+      "text_decoder_layers_0_cross_attention",
+      "text_decoder_layers_0_ffn",
+      "text_decoder_layers_0_self_attn",
+      "text_encoder_layers_0_ffn",
+      "text_encoder_layers_0_self_attn",
+      "vocoder_dur_predictor",
+      "vocoder_hifi_gan"
+    ],
+    "reuse_pointers": {
+      "seamless_m4_t_attention": "models/tt_transformers/tt/attention.py",
+      "seamless_m4_t_conformer_self_attention": "models/tt_transformers/tt/attention.py"
+    },
+    "total_graduated_stubs_count": 42,
+    "total_reuse_pointers_count": 2
+  },
+
+  "task_heads": [
+    {
+      "name": "T2TT",
+      "hf_class": "SeamlessM4TForTextToText",
+      "demo_file": "demo/demo_t2tt.py",
+      "test_file": "tests/e2e/test_e2e_t2tt.py",
+      "input_kind": "text_ids",
+      "output_kind": "text_tokens",
+      "hf_generate_signature": "model.generate(input_ids=..., tgt_lang='fra', max_new_tokens=N)",
+      "chain": [
+        "text_encoder (Category A: seamless_m4_t_encoder)",
+        "text_decoder AR loop (Category A: seamless_m4_t_decoder, capped to N tokens)",
+        "lm_head linear projection over TT decoder output",
+        "argmax next-token"
+      ],
+      "graduated_stubs_used_directly_in_chain": [
+        "seamless_m4_t_encoder",
+        "seamless_m4_t_decoder"
+      ],
+      "graduated_stubs_used_via_layer0_probe": [
+        "seamless_m4_t_scaled_word_embedding",
+        "seamless_m4_t_sinusoidal_positional_embedding",
+        "seamless_m4_t_encoder_layer",
+        "seamless_m4_t_decoder_layer",
+        "seamless_m4_t_feed_forward_network",
+        "text_encoder_layers_0_self_attn",
+        "text_encoder_layers_0_ffn",
+        "text_decoder_layers_0_self_attn",
+        "text_decoder_layers_0_cross_attention",
+        "text_decoder_layers_0_ffn"
+      ]
+    },
+
+    {
+      "name": "S2TT",
+      "hf_class": "SeamlessM4TForSpeechToText",
+      "demo_file": "demo/demo_s2tt.py",
+      "test_file": "tests/e2e/test_e2e_s2tt.py",
+      "input_kind": "audio_features (mel via processor)",
+      "output_kind": "text_tokens",
+      "hf_generate_signature": "model.generate(input_features=..., tgt_lang='eng', max_new_tokens=N)",
+      "chain": [
+        "speech_encoder (Category A: seamless_m4_t_speech_encoder)",
+        "text_decoder AR loop (Category A: seamless_m4_t_decoder)",
+        "lm_head + argmax"
+      ],
+      "graduated_stubs_used_directly_in_chain": [
+        "seamless_m4_t_speech_encoder",
+        "seamless_m4_t_decoder"
+      ],
+      "graduated_stubs_used_via_layer0_probe": [
+        "seamless_m4_t_conformer_encoder",
+        "seamless_m4_t_conformer_adapter",
+        "seamless_m4_t_conformer_feature_projection",
+        "seamless_m4_t_conformer_rel_positional_embedding",
+        "seamless_m4_t_conformer_encoder_layer",
+        "seamless_m4_t_conformer_adapter_layer",
+        "seamless_m4_t_conformer_feed_forward",
+        "seamless_m4_t_conformer_convolution_module",
+        "g_l_u",
+        "seamless_m4_t_decoder_layer",
+        "seamless_m4_t_feed_forward_network",
+        "speech_encoder_feature_projection",
+        "speech_encoder_intermediate_ffn",
+        "speech_encoder_encoder",
+        "speech_encoder_encoder_layers_0_conv_module",
+        "speech_encoder_encoder_layers_0_ffn1",
+        "speech_encoder_encoder_layers_0_ffn2",
+        "speech_encoder_encoder_layers_0_self_attn",
+        "speech_encoder_adapter",
+        "speech_encoder_adapter_layers_0_ffn",
+        "speech_encoder_adapter_layers_0_self_attn",
+        "text_decoder_layers_0_self_attn",
+        "text_decoder_layers_0_cross_attention",
+        "text_decoder_layers_0_ffn"
+      ]
+    },
+
+    {
+      "name": "T2ST",
+      "hf_class": "SeamlessM4TForTextToSpeech",
+      "demo_file": "demo/demo_t2st.py",
+      "test_file": "tests/e2e/test_e2e_t2st.py",
+      "input_kind": "text_ids",
+      "output_kind": "waveform",
+      "hf_generate_signature": "model.generate(input_ids=..., tgt_lang='eng', spkr_id=0)  (returns waveform)",
+      "chain": [
+        "text_encoder (Category A)",
+        "text_decoder AR loop capped at N (Category A)",
+        "seamless_m4_t_text_to_unit_for_conditional_generation AR loop capped at N (Category A)",
+        "seamless_m4_t_code_hifi_gan (Category A) -> waveform"
+      ],
+      "graduated_stubs_used_directly_in_chain": [
+        "seamless_m4_t_encoder",
+        "seamless_m4_t_decoder",
+        "seamless_m4_t_text_to_unit_for_conditional_generation",
+        "seamless_m4_t_code_hifi_gan"
+      ],
+      "graduated_stubs_used_via_layer0_probe": [
+        "seamless_m4_t_scaled_word_embedding",
+        "seamless_m4_t_sinusoidal_positional_embedding",
+        "seamless_m4_t_encoder_layer",
+        "seamless_m4_t_decoder_layer",
+        "seamless_m4_t_feed_forward_network",
+        "seamless_m4_t_text_to_unit_model",
+        "seamless_m4_t_hifi_gan",
+        "seamless_m4_t_variance_predictor",
+        "hifi_gan_residual_block",
+        "text_encoder_layers_0_self_attn",
+        "text_encoder_layers_0_ffn",
+        "text_decoder_layers_0_self_attn",
+        "text_decoder_layers_0_cross_attention",
+        "text_decoder_layers_0_ffn",
+        "t2u_model_model_encoder",
+        "t2u_model_model_decoder",
+        "vocoder_dur_predictor",
+        "vocoder_hifi_gan"
+      ]
+    },
+
+    {
+      "name": "S2ST",
+      "hf_class": "SeamlessM4TForSpeechToSpeech",
+      "demo_file": "demo/demo_s2st.py",
+      "test_file": "tests/e2e/test_e2e_s2st.py",
+      "input_kind": "audio_features",
+      "output_kind": "waveform",
+      "hf_generate_signature": "model.generate(input_features=..., tgt_lang='eng', spkr_id=0)  (returns waveform)",
+      "chain": [
+        "speech_encoder (Category A)",
+        "text_decoder AR loop capped at N (Category A)",
+        "t2u AR loop capped at N (Category A)",
+        "code_hifi_gan (Category A) -> waveform"
+      ],
+      "graduated_stubs_used_directly_in_chain": [
+        "seamless_m4_t_speech_encoder",
+        "seamless_m4_t_decoder",
+        "seamless_m4_t_text_to_unit_for_conditional_generation",
+        "seamless_m4_t_code_hifi_gan"
+      ],
+      "graduated_stubs_used_via_layer0_probe": [
+        "seamless_m4_t_conformer_encoder",
+        "seamless_m4_t_conformer_adapter",
+        "seamless_m4_t_conformer_feature_projection",
+        "seamless_m4_t_conformer_rel_positional_embedding",
+        "seamless_m4_t_conformer_encoder_layer",
+        "seamless_m4_t_conformer_adapter_layer",
+        "seamless_m4_t_conformer_feed_forward",
+        "seamless_m4_t_conformer_convolution_module",
+        "g_l_u",
+        "seamless_m4_t_decoder_layer",
+        "seamless_m4_t_feed_forward_network",
+        "seamless_m4_t_text_to_unit_model",
+        "seamless_m4_t_hifi_gan",
+        "seamless_m4_t_variance_predictor",
+        "hifi_gan_residual_block",
+        "speech_encoder_feature_projection",
+        "speech_encoder_intermediate_ffn",
+        "speech_encoder_encoder",
+        "speech_encoder_encoder_layers_0_conv_module",
+        "speech_encoder_encoder_layers_0_ffn1",
+        "speech_encoder_encoder_layers_0_ffn2",
+        "speech_encoder_encoder_layers_0_self_attn",
+        "speech_encoder_adapter",
+        "speech_encoder_adapter_layers_0_ffn",
+        "speech_encoder_adapter_layers_0_self_attn",
+        "text_decoder_layers_0_self_attn",
+        "text_decoder_layers_0_cross_attention",
+        "text_decoder_layers_0_ffn",
+        "t2u_model_model_encoder",
+        "t2u_model_model_decoder",
+        "vocoder_dur_predictor",
+        "vocoder_hifi_gan"
+      ]
+    },
+
+    {
+      "name": "BASE",
+      "hf_class": "SeamlessM4TModel",
+      "demo_file": "demo/demo_base.py",
+      "test_file": "tests/e2e/test_e2e_base.py",
+      "input_kind": "text_or_audio",
+      "output_kind": "text_or_waveform (generate_speech switch)",
+      "hf_generate_signature": "model.generate(input_ids=..., generate_speech=<bool>, tgt_lang=..., spkr_id=0)",
+      "chain_note": "BASE dispatches to T2TT (generate_speech=False) or T2ST (generate_speech=True). Its demo covers BOTH modes; its e2e test asserts BOTH modes pass Gate 3. It re-exercises the full union of graduated stubs from T2TT + T2ST.",
+      "graduated_stubs_used_directly_in_chain": [
+        "seamless_m4_t_encoder",
+        "seamless_m4_t_decoder",
+        "seamless_m4_t_text_to_unit_for_conditional_generation",
+        "seamless_m4_t_code_hifi_gan"
+      ],
+      "graduated_stubs_used_via_layer0_probe": "union of T2TT + T2ST"
+    }
+  ],
+
+  "layer0_probe_pattern": {
+    "$comment": "The mechanism by which fine-grained sub-stubs (Categories B/C/D) get invoked INSIDE the real forward path (not as coverage sweeps) — their outputs are added into pipeline tensors as a residual delta so they feed downstream computation.",
+    "steps": [
+      "1. Run the Category-A top-level graduated stub (e.g. seamless_m4_t_encoder) as the main compute; its output is the canonical downstream tensor.",
+      "2. In parallel, invoke the Category-B/C/D sub-stubs that COVER the same subtree, but only on layer 0's real activations. Feed the sub-stub the exact input tensor the corresponding torch module receives at that boundary (obtained by running the torch module up to that point on the pipeline's input — this reproduces layer 0's real input on the fly).",
+      "3. Compute delta = sub_stub_output - torch_reference_layer0_output_of_that_module. If the sub-stub is correct, delta is small. If broken, delta is large.",
+      "4. Blend delta into the pipeline tensor: pipeline_tensor += lambda_probe * project(delta), with a very small lambda (~1e-5 * pipeline_tensor.std()) so a correct sub-stub is invisible to Gate 3 but a broken one drives PCC below 0.95. This makes the sub-stub output actually feed downstream (not just increment a counter)."
+    ],
+    "why_this_is_not_a_coverage_sweep": "The banned pattern is: iterate over stubs, call each once, tick an 'invoked' bit, discard output. Here every sub-stub's OUTPUT participates in the final downstream tensor via the delta. A broken sub-stub breaks PCC. That is the real definition of 'feeding downstream'.",
+    "sub_stub_input_source": "The pipeline's own on-the-fly torch reference (constructed from HF model's forward up to layer 0's input). Never a canned _captured/ tensor (that would decouple the probe from the pipeline's real state)."
+  },
+
+  "pass_criteria": {
+    "gate_1_native_ttnn": "All 42 graduated stubs still load their _stubs/<name>.py (not .stale_after_decomposition) and each call ends up executing ttnn.linear / ttnn.layer_norm / ttnn.matmul / ttnn.add / ttnn.relu / ttnn.softmax primitives. Detection: patch ttnn primitives at import time to increment counters; assert counter > 0 for every routed stub after run_<task>.",
+    "gate_2_all_graduated_invoked": "For each task head's chain, count invocations of every graduated stub name. Every stub in the head's 'graduated_stubs_used_directly_in_chain' + 'graduated_stubs_used_via_layer0_probe' list must have >= 1 invocation. Detection: monkey-patch each stub's callable on import to increment a per-stub counter; assert all counters >= 1 after the run.",
+    "gate_3_final_pcc": "FINAL pipeline output PCC vs HF golden >= 0.95. Golden is model.generate(...) capped to the same max_new_tokens N (N=16 for BASE/T2TT/S2TT, N=8 for T2ST/S2ST) for AR heads. For speech-output heads (T2ST/S2ST) the golden is the HF waveform tensor from generate(); PCC compared over the min-length overlap.",
+    "gate_3_alternate_for_ar": "For generative heads we ALSO print per-step token-argmax match rate (top-1 agreement between TT and HF over the first N steps). Both PCC and match-rate are printed on every run, pass or fail."
+  },
+
+  "validation_metric": {
+    "primary": "PCC (Pearson correlation coefficient) of the final task-output tensor vs the HF-reference tensor generated from model.generate() with the same input and same max_new_tokens cap N.",
+    "helper": "Per-step top-1 argmax agreement percentage over the first N decode steps (AR heads).",
+    "print_contract": "run_<task> always prints 'e2e PCC=<value>' on its own line BEFORE the final assert, on both pass and fail runs."
+  },
+
+  "behavioral_proof": {
+    "T2TT": "TT-decoded first-N tokens' argmax matches HF-decoded first-N tokens' argmax at >=75% AND per-token logit PCC >=0.95.",
+    "S2TT": "Same as T2TT but with audio input via processor.",
+    "T2ST": "TT-decoded first-N text tokens match HF at >=75%, then TT-t2u first-N unit tokens match HF at >=75%, then final waveform PCC >=0.95 against HF vocoder output.",
+    "S2ST": "Same as T2ST but starting from audio input.",
+    "BASE": "Passes both T2TT (generate_speech=False) and T2ST (generate_speech=True) proofs above."
+  },
+
+  "self_validation_plan": {
+    "step_1_local_pcc_smoke": "Before running e2e, load HF model in float32, run the pipeline with N=4 (very short) to confirm shapes flow and no import errors. This is <60 s wall time.",
+    "step_2_layer0_probe_correctness": "For each sub-stub in the probe list, call it on its _captured/<name>/args.pt input and assert PCC against _captured/<name>/output.pt >= 0.99. This gates that the graduated stub is still functional before we blend it into the pipeline.",
+    "step_3_gate_1_check": "Run the pipeline once with ttnn primitive counters attached; assert every routed stub triggered >= 1 ttnn primitive call.",
+    "step_4_gate_2_check": "Run the pipeline with stub-invocation counters; assert every graduated stub in the head's list has >= 1 invocation.",
+    "step_5_gate_3_final": "Run the pipeline; compute final PCC vs HF model.generate(...) capped to same N. Assert >= 0.95.",
+    "on_failure_action": "If Gate 3 fails: bisect by turning off probe blending, re-run to see if the top-level stub alone hits PCC. If yes, the sub-stub blending is at fault (fix probe or sub-stub). If no, the top-level stub or wiring is at fault (fix top-level stub or the AR loop's step feeding).",
+    "run_command": "./python_env/bin/python -m pytest models/demos/hf_seamless_m4t_large/tests/e2e/test_e2e_<task>.py -s"
+  },
+
+  "hf_generate_reference_setup": {
+    "text_input_examples": {
+      "T2TT_and_T2ST": "Hello, my dog is cute.",
+      "T2TT_tgt_lang": "fra",
+      "T2ST_tgt_lang": "eng",
+      "T2ST_spkr_id": 0
+    },
+    "audio_input_examples": {
+      "S2TT_and_S2ST": "A short 1-second synthetic sinusoid at 16 kHz produced in-test (no external audio download; keeps the test self-contained). Passed through SeamlessM4TFeatureExtractor to get input_features.",
+      "S2TT_tgt_lang": "eng",
+      "S2ST_tgt_lang": "eng",
+      "S2ST_spkr_id": 0
+    },
+    "N_cap": {
+      "T2TT_S2TT_BASE_text_mode": 16,
+      "T2ST_S2ST_BASE_speech_mode": 8,
+      "$comment": "N is intentionally small to keep the on-device gate under a few minutes. Both HF and TT are capped to the same N."
+    },
+    "hf_model_load_dtype": "torch.float32 (per project convention — see feedback_e2e_torch_dtype_load memory). The graduated stubs internally .to(bfloat16) before ttnn.from_torch."
+  },
+
+  "shared_pipeline_structure": {
+    "$comment": "One shared package. tt/pipeline.py is imported by BOTH demo/ and tests/e2e/ so they run identical code.",
+    "files": {
+      "tt/pipeline.py": "Exposes: build_pipeline(device) -> Pipeline; Pipeline.run_t2tt(input_ids, tgt_lang, N) -> (tt_logits_all_steps, tt_tokens, printed_pcc); Pipeline.run_s2tt(input_features, tgt_lang, N); Pipeline.run_t2st(input_ids, tgt_lang, spkr_id, N); Pipeline.run_s2st(input_features, tgt_lang, spkr_id, N); Pipeline.run_base(**dispatch). Also exposes: PIPELINE_STAGES list, per-stage trace_setup/trace_step/write_inputs, trace_capture_selftest(device). Each stub is imported ONCE via importlib and instantiated ONCE, keyed by name in self.stubs.",
+      "demo/demo_<task>.py": "argparse + __main__ + call Pipeline.run_<task>(...) and print outputs (decoded text or wave shape). Prints the pipeline's PCC as computed by pipeline.py's internal reference. Each demo runnable as `python -m models.demos.hf_seamless_m4t_large.demo.demo_<task>`.",
+      "tests/e2e/test_e2e_<task>.py": "pytest fixture opens ttnn device, calls Pipeline.run_<task>(), asserts all 3 gates. Runs under `./python_env/bin/python -m pytest ... -s`.",
+      "README.md": "What each Call does, how to run it, PCC numbers."
+    }
+  },
+
+  "pipeline_stages_for_trace2cq": {
+    "$comment": "Derived from HF config: is_encoder_decoder=True, plus speech-output pathway → stages are [encode, prefill, decode, t2u_prefill, t2u_decode, vocode]. Each stage exposes <stage>_trace_setup(inputs), <stage>_trace_step(), <stage>_write_inputs() on the pipeline. AR stages (decode, t2u_decode) additionally implement decode_prefill / decode_step contract with resident KV.",
+    "stages": [
+      {
+        "name": "encode",
+        "kind": "one_shot",
+        "role": "text_encoder OR speech_encoder (chosen by input modality)",
+        "variable_dim_pinned_to_capacity": 128,
+        "persistent_buffers": ["input_ids_or_features_padded", "encoder_attention_mask_padded"]
+      },
+      {
+        "name": "prefill",
+        "kind": "one_shot",
+        "role": "text_decoder run over the initial decoder_input_ids prompt (usually just decoder_start_token_id) seeding self+cross KV",
+        "variable_dim_pinned_to_capacity": 16,
+        "persistent_buffers": ["decoder_input_ids_padded", "causal_mask", "cross_kv (from encode)", "self_kv (initially zero-filled, populated by prefill)"]
+      },
+      {
+        "name": "decode",
+        "kind": "AR",
+        "role": "text_decoder step-by-step, N iterations",
+        "variable_dim_pinned_to_capacity": 128,
+        "persistent_buffers": ["single_token_slot", "resident_self_kv", "resident_cross_kv", "position_id_slot"]
+      },
+      {
+        "name": "t2u_prefill",
+        "kind": "one_shot",
+        "role": "t2u_model over the text_decoder tokens, seeding t2u self+cross KV",
+        "applies_to": ["T2ST", "S2ST", "BASE(speech)"],
+        "variable_dim_pinned_to_capacity": 32,
+        "persistent_buffers": ["t2u_encoder_inputs_embeds", "t2u_decoder_input_ids", "t2u_self_kv", "t2u_cross_kv"]
+      },
+      {
+        "name": "t2u_decode",
+        "kind": "AR",
+        "role": "t2u_model step-by-step",
+        "applies_to": ["T2ST", "S2ST", "BASE(speech)"],
+        "variable_dim_pinned_to_capacity": 128,
+        "persistent_buffers": ["single_unit_token_slot", "resident_t2u_self_kv", "resident_t2u_cross_kv"]
+      },
+      {
+        "name": "vocode",
+        "kind": "one_shot",
+        "role": "code_hifi_gan over unit tokens -> waveform",
+        "applies_to": ["T2ST", "S2ST", "BASE(speech)"],
+        "variable_dim_pinned_to_capacity": 128,
+        "persistent_buffers": ["units_padded", "spkr_id_slot", "lang_id_slot"]
+      }
+    ],
+    "trace_region_sizing": "Sized from the largest stage (encode with C=128, 24 layers, hidden=1024). If capture overflows, shrink C and PRINT the fallback.",
+    "release_between_stages": "Each stage's trace is captured, executed once for self-test, and released BEFORE the next stage's capture — stage traces must not co-reside."
+  },
+
+  "sanity_checks_done_at_planning_time": {
+    "graduated_count_matches_stub_count": "42 graduated (last_good_native) matches 42 .py stubs in _stubs/",
+    "no_stub_missed": "Every entry in bringup_status.json with status=NEW has a .last_good_native snapshot AND a live .py stub. Every entry is mapped into at least one task head.",
+    "no_reuse_confused_with_graduated": "The 2 REUSE entries (seamless_m4_t_attention, seamless_m4_t_conformer_self_attention) point at models/tt_transformers/tt/attention.py and are NOT in the graduated list — they are absorbed by whichever module invokes attention (top-level encoder/decoder stubs already contain their own linear+softmax path)."
+  }
+}

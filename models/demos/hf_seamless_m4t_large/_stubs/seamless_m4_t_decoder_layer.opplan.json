@@ -1,0 +1,151 @@
+{
+  "component": "seamless_m4_t_decoder_layer",
+  "class_name": "SeamlessM4TDecoderLayer",
+  "module_function": "seamless_m4_t_decoder_layer",
+  "pre_bound": [
+    {
+      "name": "self_attn.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_k_proj"
+    },
+    {
+      "name": "self_attn.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_v_proj"
+    },
+    {
+      "name": "self_attn.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_q_proj"
+    },
+    {
+      "name": "self_attn.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_self_attn_out_proj"
+    },
+    {
+      "name": "activation_fn",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_activation_fn"
+    },
+    {
+      "name": "self_attn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_self_attn_layer_norm"
+    },
+    {
+      "name": "cross_attention.k_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_cross_attention_k_proj"
+    },
+    {
+      "name": "cross_attention.v_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_cross_attention_v_proj"
+    },
+    {
+      "name": "cross_attention.q_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_cross_attention_q_proj"
+    },
+    {
+      "name": "cross_attention.out_proj",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_cross_attention_out_proj"
+    },
+    {
+      "name": "cross_attention_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_cross_attention_layer_norm"
+    },
+    {
+      "name": "ffn.fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_ffn_fc1"
+    },
+    {
+      "name": "ffn.fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_ffn_fc2"
+    },
+    {
+      "name": "ffn.act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_ffn_act"
+    },
+    {
+      "name": "ffn_layer_norm",
+      "class": "LayerNorm",
+      "kind": "layer_norm",
+      "ttnn_target": "ttnn.layer_norm",
+      "helper": "_apply_ffn_layer_norm"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "attn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "ffn.dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "ffn_dropout",
+      "class": "Dropout",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_self_attn_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_self_attn_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_self_attn_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_self_attn_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_activation_fn(x) -> ttnn.relu",
+    "self._apply_self_attn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_cross_attention_k_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_cross_attention_v_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_cross_attention_q_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_cross_attention_out_proj(x) -> ttnn.linear  (in=1024, out=1024, bias=True)",
+    "self._apply_cross_attention_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)",
+    "self._apply_ffn_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_ffn_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_ffn_act(x) -> ttnn.relu",
+    "self._apply_ffn_layer_norm(x) -> ttnn.layer_norm  (shape=[1024], eps=1e-05)"
+  ],
+  "counts": {
+    "op-REUSE": 18,
+    "op-ADAPT": 0,
+    "op-NEW": 0
+  }
+}

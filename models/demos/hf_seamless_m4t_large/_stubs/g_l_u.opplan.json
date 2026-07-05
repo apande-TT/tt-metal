@@ -1,0 +1,19 @@
+{
+  "component": "g_l_u",
+  "class_name": "GLU",
+  "module_function": "g_l_u",
+  "pre_bound": [],
+  "llm_gaps": [
+    {
+      "name": "<root>",
+      "class": "GLU",
+      "notes": ""
+    }
+  ],
+  "palette": [],
+  "counts": {
+    "op-REUSE": 0,
+    "op-ADAPT": 0,
+    "op-NEW": 1
+  }
+}

@@ -1,0 +1,32 @@
+[
+  {
+    "parent_name": "seamless_m4_t_speech_encoder",
+    "parent_path": "speech_encoder",
+    "children": [
+      {
+        "name": "encoder",
+        "submodule_path": "speech_encoder.encoder",
+        "class_name": "SeamlessM4TConformerEncoder",
+        "leaf_count": 699
+      },
+      {
+        "name": "adapter",
+        "submodule_path": "speech_encoder.adapter",
+        "class_name": "SeamlessM4TConformerAdapter",
+        "leaf_count": 17
+      },
+      {
+        "name": "intermediate_ffn",
+        "submodule_path": "speech_encoder.intermediate_ffn",
+        "class_name": "SeamlessM4TConformerFeedForward",
+        "leaf_count": 5
+      },
+      {
+        "name": "feature_projection",
+        "submodule_path": "speech_encoder.feature_projection",
+        "class_name": "SeamlessM4TConformerFeatureProjection",
+        "leaf_count": 3
+      }
+    ]
+  }
+]

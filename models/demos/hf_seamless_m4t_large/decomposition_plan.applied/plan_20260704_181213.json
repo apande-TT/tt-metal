@@ -1,0 +1,26 @@
+[
+  {
+    "parent_name": "seamless_m4_t_decoder_layer",
+    "parent_path": "text_decoder.layers.0",
+    "children": [
+      {
+        "name": "cross_attention",
+        "submodule_path": "text_decoder.layers.0.cross_attention",
+        "class_name": "SeamlessM4TAttention",
+        "leaf_count": 4
+      },
+      {
+        "name": "ffn",
+        "submodule_path": "text_decoder.layers.0.ffn",
+        "class_name": "SeamlessM4TFeedForwardNetwork",
+        "leaf_count": 4
+      },
+      {
+        "name": "self_attn",
+        "submodule_path": "text_decoder.layers.0.self_attn",
+        "class_name": "SeamlessM4TAttention",
+        "leaf_count": 4
+      }
+    ]
+  }
+]

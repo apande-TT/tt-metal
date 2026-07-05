@@ -1,0 +1,31 @@
+{
+  "component": "hifi_gan_residual_block",
+  "submodule_path": "vocoder.hifi_gan.resblocks.0",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          256,
+          80
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      256,
+      80
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

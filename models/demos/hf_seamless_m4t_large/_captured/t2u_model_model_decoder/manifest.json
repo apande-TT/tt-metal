@@ -1,0 +1,88 @@
+{
+  "component": "t2u_model_model_decoder",
+  "submodule_path": "t2u_model.model.decoder",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "input_ids": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1
+        ],
+        "dtype": "torch.int64"
+      },
+      "attention_mask": {
+        "kind": "none"
+      },
+      "encoder_hidden_states": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "encoder_attention_mask": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          17
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "past_key_values": {
+        "kind": "scalar",
+        "type": "EncoderDecoderCache",
+        "repr": "EncoderDecoderCache(self_attention_cache=DynamicCache(layers=[DynamicLayer, DynamicLayer, DynamicLayer, DynamicLayer, Dy"
+      },
+      "inputs_embeds": {
+        "kind": "none"
+      },
+      "use_cache": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "True"
+      },
+      "output_attentions": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "False"
+      },
+      "output_hidden_states": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "False"
+      },
+      "return_dict": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "True"
+      }
+    }
+  },
+  "output": {
+    "kind": "dict",
+    "items": {
+      "last_hidden_state": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "past_key_values": {
+        "kind": "scalar",
+        "type": "EncoderDecoderCache",
+        "repr": "EncoderDecoderCache(self_attention_cache=DynamicCache(layers=[DynamicLayer, DynamicLayer, DynamicLayer, DynamicLayer, Dy"
+      }
+    }
+  }
+}

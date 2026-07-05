@@ -1,0 +1,31 @@
+{
+  "component": "speech_encoder_adapter_layers_0_ffn",
+  "submodule_path": "speech_encoder.adapter.layers.0.ffn",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          9,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      9,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

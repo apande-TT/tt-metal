@@ -1,0 +1,30 @@
+{
+  "component": "vocoder_hifi_gan",
+  "submodule_path": "vocoder.hifi_gan",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1792,
+          16
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      5120
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

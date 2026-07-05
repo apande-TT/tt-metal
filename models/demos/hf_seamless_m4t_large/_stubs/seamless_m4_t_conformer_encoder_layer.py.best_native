@@ -1,0 +1,235 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""Native TTNN port for `seamless_m4_t_conformer_encoder_layer` of facebook/hf-seamless-m4t-large.
+
+Implements `SeamlessM4TConformerEncoderLayer.forward`:
+  ffn1_layer_norm -> ffn1 (linear -> silu -> linear) -> scaled residual add
+  self_attn_layer_norm -> self_attn (relative-pos attention) -> residual add
+  conv_module (LN -> pw_conv1 -> GLU -> dw_conv -> BN -> silu -> pw_conv2) -> residual add
+  ffn2_layer_norm -> ffn2 (linear -> silu -> linear) -> scaled residual add
+  final_layer_norm
+
+Mirrors the graduated `seamless_m4_t_conformer_encoder`'s `_apply_layer`. FFNs,
+layer-norms and pointwise convs run on device via ttnn.linear/layer_norm/silu.
+The Transformer-XL shift trick + softmax and the depthwise+BN pair round-trip
+through host torch.
+
+HF reference: transformers/src/transformers/models/seamless_m4t/modeling_seamless_m4t.py
+"""
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn.functional as F
+import transformers
+
+import ttnn
+
+HF_MODEL_ID = "facebook/hf-seamless-m4t-large"
+_CANDIDATE_SUBMODULE_PATHS = ["speech_encoder.encoder.layers.0"]
+
+
+def _resolve(obj, dotted):
+    cur = obj
+    for tok in dotted.replace("[", ".").replace("]", "").split("."):
+        if tok == "":
+            continue
+        if tok.isdigit():
+            cur = cur[int(tok)]
+        else:
+            cur = getattr(cur, tok)
+    return cur
+
+
+def _to_ttnn(t, device):
+    return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+
+class SeamlessM4TConformerEncoderLayer:
+    def __init__(self, device, torch_module):
+        self.device = device
+        cfg = torch_module.self_attn
+        self.num_heads = cfg.num_heads
+        self.head_size = cfg.head_size
+        self.hidden_size = self.num_heads * self.head_size
+        self.dw_kernel = torch_module.conv_module.depthwise_conv.kernel_size[0]
+        self.eps = 1e-05
+
+        sd = torch_module.state_dict()
+
+        self.w = {
+            "ffn1_ln_w": _to_ttnn(sd["ffn1_layer_norm.weight"], device),
+            "ffn1_ln_b": _to_ttnn(sd["ffn1_layer_norm.bias"], device),
+            "ffn1_int_w": _to_ttnn(sd["ffn1.intermediate_dense.weight"].T.contiguous(), device),
+            "ffn1_int_b": _to_ttnn(sd["ffn1.intermediate_dense.bias"].reshape(1, -1), device),
+            "ffn1_out_w": _to_ttnn(sd["ffn1.output_dense.weight"].T.contiguous(), device),
+            "ffn1_out_b": _to_ttnn(sd["ffn1.output_dense.bias"].reshape(1, -1), device),
+            "sa_ln_w": _to_ttnn(sd["self_attn_layer_norm.weight"], device),
+            "sa_ln_b": _to_ttnn(sd["self_attn_layer_norm.bias"], device),
+            "sa_q_w": _to_ttnn(sd["self_attn.linear_q.weight"].T.contiguous(), device),
+            "sa_q_b": _to_ttnn(sd["self_attn.linear_q.bias"].reshape(1, -1), device),
+            "sa_k_w": _to_ttnn(sd["self_attn.linear_k.weight"].T.contiguous(), device),
+            "sa_k_b": _to_ttnn(sd["self_attn.linear_k.bias"].reshape(1, -1), device),
+            "sa_v_w": _to_ttnn(sd["self_attn.linear_v.weight"].T.contiguous(), device),
+            "sa_v_b": _to_ttnn(sd["self_attn.linear_v.bias"].reshape(1, -1), device),
+            "sa_o_w": _to_ttnn(sd["self_attn.linear_out.weight"].T.contiguous(), device),
+            "sa_o_b": _to_ttnn(sd["self_attn.linear_out.bias"].reshape(1, -1), device),
+            "cm_ln_w": _to_ttnn(sd["conv_module.layer_norm.weight"], device),
+            "cm_ln_b": _to_ttnn(sd["conv_module.layer_norm.bias"], device),
+            "cm_pc1_w": _to_ttnn(sd["conv_module.pointwise_conv1.weight"].squeeze(-1).T.contiguous(), device),
+            "cm_pc2_w": _to_ttnn(sd["conv_module.pointwise_conv2.weight"].squeeze(-1).T.contiguous(), device),
+            "ffn2_ln_w": _to_ttnn(sd["ffn2_layer_norm.weight"], device),
+            "ffn2_ln_b": _to_ttnn(sd["ffn2_layer_norm.bias"], device),
+            "ffn2_int_w": _to_ttnn(sd["ffn2.intermediate_dense.weight"].T.contiguous(), device),
+            "ffn2_int_b": _to_ttnn(sd["ffn2.intermediate_dense.bias"].reshape(1, -1), device),
+            "ffn2_out_w": _to_ttnn(sd["ffn2.output_dense.weight"].T.contiguous(), device),
+            "ffn2_out_b": _to_ttnn(sd["ffn2.output_dense.bias"].reshape(1, -1), device),
+            "final_ln_w": _to_ttnn(sd["final_layer_norm.weight"], device),
+            "final_ln_b": _to_ttnn(sd["final_layer_norm.bias"], device),
+        }
+        self.t = {
+            "lp_w": sd["self_attn.linear_pos.weight"].to(torch.float32),
+            "pos_bias_u": torch_module.self_attn.pos_bias_u.detach().to(torch.float32),
+            "pos_bias_v": torch_module.self_attn.pos_bias_v.detach().to(torch.float32),
+            "dw_conv_weight": sd["conv_module.depthwise_conv.weight"].to(torch.float32),
+            "bn_weight": sd["conv_module.batch_norm.weight"].to(torch.float32),
+            "bn_bias": sd["conv_module.batch_norm.bias"].to(torch.float32),
+            "bn_running_mean": torch_module.conv_module.batch_norm.running_mean.detach().to(torch.float32),
+            "bn_running_var": torch_module.conv_module.batch_norm.running_var.detach().to(torch.float32),
+            "bn_eps": float(torch_module.conv_module.batch_norm.eps),
+        }
+
+    def _self_attn(self, x_ttnn, rel_pos_emb):
+        q = ttnn.linear(x_ttnn, self.w["sa_q_w"], bias=self.w["sa_q_b"])
+        k = ttnn.linear(x_ttnn, self.w["sa_k_w"], bias=self.w["sa_k_b"])
+        v = ttnn.linear(x_ttnn, self.w["sa_v_w"], bias=self.w["sa_v_b"])
+
+        q_t = ttnn.to_torch(q).to(torch.float32)
+        k_t = ttnn.to_torch(k).to(torch.float32)
+        v_t = ttnn.to_torch(v).to(torch.float32)
+
+        B, L, C = q_t.shape
+        q_t = q_t.view(B, L, self.num_heads, self.head_size).transpose(1, 2)
+        k_t = k_t.view(B, L, self.num_heads, self.head_size).transpose(1, 2)
+        v_t = v_t.view(B, L, self.num_heads, self.head_size).transpose(1, 2)
+
+        proj_rp = rel_pos_emb @ self.t["lp_w"].T
+        proj_rp = proj_rp.view(rel_pos_emb.size(0), -1, self.num_heads, self.head_size)
+        proj_rp = proj_rp.transpose(1, 2).transpose(2, 3)
+
+        q_tr = q_t.transpose(1, 2)
+        q_u = (q_tr + self.t["pos_bias_u"]).transpose(1, 2)
+        q_v = (q_tr + self.t["pos_bias_v"]).transpose(1, 2)
+
+        scores_ac = q_u @ k_t.transpose(-2, -1)
+        scores_bd = q_v @ proj_rp
+
+        zero_pad = torch.zeros((*scores_bd.size()[:3], 1), device=scores_bd.device, dtype=scores_bd.dtype)
+        bd_padded = torch.cat([zero_pad, scores_bd], dim=-1)
+        bd_padded_shape = scores_bd.size()[:2] + (scores_bd.shape[3] + 1, scores_bd.shape[2])
+        bd_padded = bd_padded.view(*bd_padded_shape)
+        bd_shifted = bd_padded[:, :, 1:].view_as(scores_bd)
+        bd_shifted = bd_shifted[:, :, :, : scores_bd.size(-1) // 2 + 1]
+
+        scores = (scores_ac + bd_shifted) / math.sqrt(self.head_size)
+        probs = torch.softmax(scores, dim=-1)
+        out = probs @ v_t
+        out = out.transpose(1, 2).reshape(B, L, C).contiguous()
+
+        out_ttnn = _to_ttnn(out.to(torch.bfloat16), self.device)
+        out_ttnn = ttnn.linear(out_ttnn, self.w["sa_o_w"], bias=self.w["sa_o_b"])
+        return out_ttnn
+
+    def _conv_module(self, x_ttnn):
+        h = ttnn.layer_norm(x_ttnn, epsilon=self.eps, weight=self.w["cm_ln_w"], bias=self.w["cm_ln_b"])
+        h = ttnn.linear(h, self.w["cm_pc1_w"])
+        h_t = ttnn.to_torch(h).to(torch.float32)
+        h_a, h_b = h_t.chunk(2, dim=-1)
+        h_t = h_a * torch.sigmoid(h_b)
+        h_t = h_t.transpose(1, 2).contiguous()
+        pad = (self.dw_kernel - 1) // 2
+        h_t = F.conv1d(h_t, self.t["dw_conv_weight"], stride=1, padding=pad, groups=self.hidden_size)
+        scale = self.t["bn_weight"] / torch.sqrt(self.t["bn_running_var"] + self.t["bn_eps"])
+        shift = self.t["bn_bias"] - self.t["bn_running_mean"] * scale
+        h_t = h_t * scale.view(1, -1, 1) + shift.view(1, -1, 1)
+        h_t = h_t.transpose(1, 2).contiguous()
+
+        h = _to_ttnn(h_t.to(torch.bfloat16), self.device)
+        h = ttnn.silu(h)
+        h = ttnn.linear(h, self.w["cm_pc2_w"])
+        return h
+
+    def __call__(self, hidden_states, attention_mask=None, relative_position_embeddings=None, *args, **kwargs):
+        if isinstance(hidden_states, torch.Tensor):
+            x_ttnn = _to_ttnn(hidden_states.to(torch.bfloat16), self.device)
+        else:
+            x_ttnn = hidden_states
+
+        if relative_position_embeddings is None:
+            raise ValueError("relative_position_embeddings is required for encoder_layer")
+        if isinstance(relative_position_embeddings, torch.Tensor):
+            rel_pos_emb = relative_position_embeddings.to(torch.float32)
+        else:
+            rel_pos_emb = ttnn.to_torch(relative_position_embeddings).to(torch.float32)
+
+        # ffn1: scaled residual
+        residual = x_ttnn
+        h = ttnn.layer_norm(x_ttnn, epsilon=self.eps, weight=self.w["ffn1_ln_w"], bias=self.w["ffn1_ln_b"])
+        h = ttnn.linear(h, self.w["ffn1_int_w"], bias=self.w["ffn1_int_b"])
+        h = ttnn.silu(h)
+        h = ttnn.linear(h, self.w["ffn1_out_w"], bias=self.w["ffn1_out_b"])
+        h = ttnn.multiply(h, 0.5)
+        h = ttnn.add(h, residual)
+
+        # self_attn: residual add
+        residual = h
+        h_ln = ttnn.layer_norm(h, epsilon=self.eps, weight=self.w["sa_ln_w"], bias=self.w["sa_ln_b"])
+        h = self._self_attn(h_ln, rel_pos_emb)
+        h = ttnn.add(h, residual)
+
+        # conv_module: residual add
+        residual = h
+        h = self._conv_module(h)
+        h = ttnn.add(residual, h)
+
+        # ffn2: scaled residual
+        residual = h
+        h = ttnn.layer_norm(h, epsilon=self.eps, weight=self.w["ffn2_ln_w"], bias=self.w["ffn2_ln_b"])
+        h = ttnn.linear(h, self.w["ffn2_int_w"], bias=self.w["ffn2_int_b"])
+        h = ttnn.silu(h)
+        h = ttnn.linear(h, self.w["ffn2_out_w"], bias=self.w["ffn2_out_b"])
+        h = ttnn.multiply(h, 0.5)
+        h = ttnn.add(h, residual)
+
+        # final layer norm
+        h = ttnn.layer_norm(h, epsilon=self.eps, weight=self.w["final_ln_w"], bias=self.w["final_ln_b"])
+        return h
+
+
+def build(device, torch_module):
+    return SeamlessM4TConformerEncoderLayer(device, torch_module)
+
+
+_instance = None
+
+
+def seamless_m4_t_conformer_encoder_layer(*args, **kwargs):
+    global _instance
+    if _instance is None:
+        model = transformers.AutoModel.from_pretrained(
+            HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True
+        )
+        model.eval()
+        torch_sub = None
+        for path in _CANDIDATE_SUBMODULE_PATHS:
+            try:
+                torch_sub = _resolve(model, path)
+                break
+            except (AttributeError, IndexError, KeyError, TypeError):
+                continue
+        if torch_sub is None:
+            raise RuntimeError("partial-stub: could not resolve `seamless_m4_t_conformer_encoder_layer`")
+        _instance = build(ttnn.open_device(device_id=0), torch_sub)
+    return _instance(*args, **kwargs)

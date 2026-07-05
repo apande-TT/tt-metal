@@ -1,0 +1,32 @@
+[
+  {
+    "parent_name": "seamless_m4_t_conformer_encoder_layer",
+    "parent_path": "speech_encoder.encoder.layers.0",
+    "children": [
+      {
+        "name": "conv_module",
+        "submodule_path": "speech_encoder.encoder.layers.0.conv_module",
+        "class_name": "SeamlessM4TConformerConvolutionModule",
+        "leaf_count": 8
+      },
+      {
+        "name": "self_attn",
+        "submodule_path": "speech_encoder.encoder.layers.0.self_attn",
+        "class_name": "SeamlessM4TConformerSelfAttention",
+        "leaf_count": 6
+      },
+      {
+        "name": "ffn1",
+        "submodule_path": "speech_encoder.encoder.layers.0.ffn1",
+        "class_name": "SeamlessM4TConformerFeedForward",
+        "leaf_count": 5
+      },
+      {
+        "name": "ffn2",
+        "submodule_path": "speech_encoder.encoder.layers.0.ffn2",
+        "class_name": "SeamlessM4TConformerFeedForward",
+        "leaf_count": 5
+      }
+    ]
+  }
+]

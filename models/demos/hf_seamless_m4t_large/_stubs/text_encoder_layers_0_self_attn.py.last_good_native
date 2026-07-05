@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""Native TTNN port for `text_encoder.layers.0.self_attn` of facebook/hf-seamless-m4t-large.
+
+SeamlessM4TAttention self-attention slot. Same shape/pattern as
+text_decoder self-attention. Q pre-scaled by self.scaling; Q/K/V/O
+are ttnn.linear; the softmax reduction runs on host.
+"""
+from __future__ import annotations
+
+import torch
+import transformers
+
+import ttnn
+
+HF_MODEL_ID = "facebook/hf-seamless-m4t-large"
+_CANDIDATE_SUBMODULE_PATHS = ["text_encoder.layers.0.self_attn"]
+
+
+def _resolve(obj, dotted):
+    cur = obj
+    for tok in dotted.replace("[", ".").replace("]", "").split("."):
+        if tok == "":
+            continue
+        if tok.isdigit():
+            cur = cur[int(tok)]
+        else:
+            cur = getattr(cur, tok)
+    return cur
+
+
+class TextEncoderLayers0SelfAttn:
+    def __init__(self, device, torch_module):
+        self.device = device
+        self.num_heads = torch_module.num_heads
+        self.head_dim = torch_module.head_dim
+        self.embed_dim = torch_module.embed_dim
+        self.scaling = torch_module.scaling
+
+        sd = torch_module.state_dict()
+
+        self.w_q_w = ttnn.from_torch(
+            sd["q_proj.weight"].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_q_b = ttnn.from_torch(
+            sd["q_proj.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_k_w = ttnn.from_torch(
+            sd["k_proj.weight"].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_k_b = ttnn.from_torch(
+            sd["k_proj.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_v_w = ttnn.from_torch(
+            sd["v_proj.weight"].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_v_b = ttnn.from_torch(
+            sd["v_proj.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_o_w = ttnn.from_torch(
+            sd["out_proj.weight"].T.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+        self.w_o_b = ttnn.from_torch(
+            sd["out_proj.bias"].reshape(1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
+
+    def __call__(self, hidden_states, encoder_hidden_states=None, past_key_values=None, attention_mask=None, *args, **kwargs):
+        if isinstance(hidden_states, torch.Tensor):
+            x_ttnn = ttnn.from_torch(
+                hidden_states.to(torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
+            )
+        else:
+            x_ttnn = hidden_states
+
+        if encoder_hidden_states is None:
+            kv_ttnn = x_ttnn
+        elif isinstance(encoder_hidden_states, torch.Tensor):
+            kv_ttnn = ttnn.from_torch(
+                encoder_hidden_states.to(torch.bfloat16),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.device,
+            )
+        else:
+            kv_ttnn = encoder_hidden_states
+
+        q = ttnn.linear(x_ttnn, self.w_q_w, bias=self.w_q_b)
+        k = ttnn.linear(kv_ttnn, self.w_k_w, bias=self.w_k_b)
+        v = ttnn.linear(kv_ttnn, self.w_v_w, bias=self.w_v_b)
+
+        q_t = ttnn.to_torch(q).to(torch.float32) * self.scaling
+        k_t = ttnn.to_torch(k).to(torch.float32)
+        v_t = ttnn.to_torch(v).to(torch.float32)
+
+        B, T, _ = q_t.shape
+        S = k_t.shape[1]
+        q_t = q_t.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k_t = k_t.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v_t = v_t.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+        scores = torch.matmul(q_t, k_t.transpose(-2, -1))
+
+        if attention_mask is not None:
+            if not isinstance(attention_mask, torch.Tensor):
+                attention_mask = ttnn.to_torch(attention_mask)
+            scores = scores + attention_mask.to(scores.dtype)
+
+        probs = torch.softmax(scores, dim=-1)
+        out = torch.matmul(probs, v_t)
+        out = out.transpose(1, 2).reshape(B, T, self.embed_dim).contiguous()
+
+        out_ttnn = ttnn.from_torch(
+            out.to(torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
+        )
+        out_ttnn = ttnn.linear(out_ttnn, self.w_o_w, bias=self.w_o_b)
+        return out_ttnn
+
+
+def build(device, torch_module):
+    return TextEncoderLayers0SelfAttn(device, torch_module)
+
+
+_instance = None
+
+
+def text_encoder_layers_0_self_attn(*args, **kwargs):
+    global _instance
+    if _instance is None:
+        model = transformers.AutoModel.from_pretrained(
+            HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True
+        )
+        model.eval()
+        torch_sub = None
+        for path in _CANDIDATE_SUBMODULE_PATHS:
+            try:
+                torch_sub = _resolve(model, path)
+                break
+            except (AttributeError, IndexError, KeyError, TypeError):
+                continue
+        if torch_sub is None:
+            raise RuntimeError("partial-stub: could not resolve `text_encoder_layers_0_self_attn`")
+        _instance = build(ttnn.open_device(device_id=0), torch_sub)
+    return _instance(*args, **kwargs)

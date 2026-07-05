@@ -1,0 +1,50 @@
+{
+  "component": "seamless_m4_t_conformer_feed_forward",
+  "class_name": "SeamlessM4TConformerFeedForward",
+  "module_function": "seamless_m4_t_conformer_feed_forward",
+  "pre_bound": [
+    {
+      "name": "intermediate_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_intermediate_dense"
+    },
+    {
+      "name": "intermediate_act_fn",
+      "class": "SiLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.silu",
+      "helper": "_apply_intermediate_act_fn"
+    },
+    {
+      "name": "output_dense",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_output_dense"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "intermediate_dropout",
+      "class": "Dropout",
+      "notes": ""
+    },
+    {
+      "name": "output_dropout",
+      "class": "Dropout",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_intermediate_dense(x) -> ttnn.linear  (in=1024, out=4096, bias=True)",
+    "self._apply_intermediate_act_fn(x) -> ttnn.silu",
+    "self._apply_output_dense(x) -> ttnn.linear  (in=4096, out=1024, bias=True)"
+  ],
+  "counts": {
+    "op-REUSE": 5,
+    "op-ADAPT": 0,
+    "op-NEW": 0
+  }
+}

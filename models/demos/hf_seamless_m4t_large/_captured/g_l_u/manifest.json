@@ -1,0 +1,31 @@
+{
+  "component": "g_l_u",
+  "submodule_path": "speech_encoder.encoder.layers.0.conv_module.glu",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          2048,
+          64
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      1024,
+      64
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

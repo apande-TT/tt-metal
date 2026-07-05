@@ -1,0 +1,45 @@
+{
+  "component": "seamless_m4_t_feed_forward_network",
+  "class_name": "SeamlessM4TFeedForwardNetwork",
+  "module_function": "seamless_m4_t_feed_forward_network",
+  "pre_bound": [
+    {
+      "name": "fc1",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_fc1"
+    },
+    {
+      "name": "fc2",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply_fc2"
+    },
+    {
+      "name": "act",
+      "class": "ReLU",
+      "kind": "activation",
+      "ttnn_target": "ttnn.relu",
+      "helper": "_apply_act"
+    }
+  ],
+  "llm_gaps": [
+    {
+      "name": "dropout",
+      "class": "Dropout",
+      "notes": ""
+    }
+  ],
+  "palette": [
+    "self._apply_fc1(x) -> ttnn.linear  (in=1024, out=8192, bias=True)",
+    "self._apply_fc2(x) -> ttnn.linear  (in=8192, out=1024, bias=True)",
+    "self._apply_act(x) -> ttnn.relu"
+  ],
+  "counts": {
+    "op-REUSE": 4,
+    "op-ADAPT": 0,
+    "op-NEW": 0
+  }
+}

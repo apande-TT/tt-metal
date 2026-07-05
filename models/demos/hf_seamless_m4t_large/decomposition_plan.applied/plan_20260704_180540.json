@@ -1,0 +1,20 @@
+[
+  {
+    "parent_name": "seamless_m4_t_conformer_adapter_layer",
+    "parent_path": "speech_encoder.adapter.layers.0",
+    "children": [
+      {
+        "name": "ffn",
+        "submodule_path": "speech_encoder.adapter.layers.0.ffn",
+        "class_name": "SeamlessM4TConformerFeedForward",
+        "leaf_count": 5
+      },
+      {
+        "name": "self_attn",
+        "submodule_path": "speech_encoder.adapter.layers.0.self_attn",
+        "class_name": "SeamlessM4TConformerSelfAttention",
+        "leaf_count": 5
+      }
+    ]
+  }
+]

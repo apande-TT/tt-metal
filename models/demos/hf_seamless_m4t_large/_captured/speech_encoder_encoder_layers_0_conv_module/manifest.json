@@ -1,0 +1,35 @@
+{
+  "component": "speech_encoder_encoder_layers_0_conv_module",
+  "submodule_path": "speech_encoder.encoder.layers.0.conv_module",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          64,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "attention_mask": {
+        "kind": "none"
+      }
+    }
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      64,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}
