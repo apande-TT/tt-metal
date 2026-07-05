@@ -90788,9 +90788,8 @@ class NemotronHModel:
         k_t = ttnn.permute(ttnn.reshape(k, (1, 1, self._KV_HEADS, self._A_HDIM)), (0, 2, 1, 3))
         v_t = ttnn.permute(ttnn.reshape(v, (1, 1, self._KV_HEADS, self._A_HDIM)), (0, 2, 1, 3))
         p = ttnn.typecast(ttnn.eq(ar_col, pos_t), ttnn.bfloat16)
-        one_m_p = ttnn.add(ttnn.multiply(p, -1.0), 1.0)
-        kcache = ttnn.add(ttnn.multiply(kcache, one_m_p), ttnn.multiply(k_t, p))
-        vcache = ttnn.add(ttnn.multiply(vcache, one_m_p), ttnn.multiply(v_t, p))
+        kcache = ttnn.where(p, k_t, kcache)  # scatter k_t into row pos_t (1 op vs mul+mul+add full-cache blend)
+        vcache = ttnn.where(p, v_t, vcache)
         KVH, KVG, HD = self._KV_HEADS, self._KV_GROUPS, self._A_HDIM
         scale = HD**-0.5
         # GQA without materializing repeated K/V: group q heads by kv head and
