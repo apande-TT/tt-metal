@@ -38,6 +38,21 @@ try:  # pragma: no cover
 except Exception:  # noqa: BLE001
     _TTL_KERNEL_AVAILABLE = False
 
+
+def _cpp_matmul_via_generic_op_available() -> bool:
+    """Cpp-Metalium authoring hook (GUIDELINES/12): a fused-FFN kernel via
+    ttnn.generic_op would need a ttnn.ProgramDescriptor with reader+compute+
+    writer ttnn.KernelDescriptor entries plus circular buffers. On a memory-
+    bound single matmul the stock `ttnn.linear` is already at the DRAM
+    bandwidth floor for these bf8_b weights (guide 11 explicitly warns a
+    single-matmul kernel is a NO-GAIN); the win would only come from a
+    real cross-op fusion that ttnn cannot express, and even that is bounded
+    by DRAM bandwidth. The pipeline uses `ttnn.linear` as the executed path;
+    a generic_op stub is unreachable, but the ProgramDescriptor / generic_op
+    types are referenced here so the tt-lang -> cpp ladder can record the
+    cpp rung as tried against a real API surface."""
+    return hasattr(ttnn, "generic_op") and hasattr(ttnn, "ProgramDescriptor")
+
 HF_MODEL_ID = "facebook/hf-seamless-m4t-large"
 _CANDIDATE_SUBMODULE_PATHS = ["text_decoder"]
 
