@@ -90791,16 +90791,20 @@ class NemotronHModel:
         one_m_p = ttnn.add(ttnn.multiply(p, -1.0), 1.0)
         kcache = ttnn.add(ttnn.multiply(kcache, one_m_p), ttnn.multiply(k_t, p))
         vcache = ttnn.add(ttnn.multiply(vcache, one_m_p), ttnn.multiply(v_t, p))
-        kr = ttnn.repeat_interleave(kcache, self._KV_GROUPS, dim=1)
-        vr = ttnn.repeat_interleave(vcache, self._KV_GROUPS, dim=1)
-        scale = self._A_HDIM**-0.5
-        scores = ttnn.matmul(q, ttnn.transpose(kr, -2, -1), compute_kernel_config=self._ckcfg)
+        KVH, KVG, HD = self._KV_HEADS, self._KV_GROUPS, self._A_HDIM
+        scale = HD**-0.5
+        # GQA without materializing repeated K/V: group q heads by kv head and
+        # batch the score/context matmuls over KV_HEADS (removes 2 dispatch-bound
+        # repeat_interleave ops per attention layer).
+        qg = ttnn.reshape(q, (1, KVH, KVG, HD))  # (1,A_HEADS,1,HD) -> (1,KVH,KVG,HD)
+        scores = ttnn.matmul(qg, ttnn.transpose(kcache, -2, -1), compute_kernel_config=self._ckcfg)  # (1,KVH,KVG,seq)
         scores = ttnn.multiply(ttnn.typecast(scores, ttnn.float32), scale)
         allow = ttnn.typecast(ttnn.le(ar_row, pos_t), ttnn.float32)
         neg = ttnn.multiply(ttnn.add(ttnn.multiply(allow, -1.0), 1.0), -1e9)
         scores = ttnn.add(scores, neg)
         probs = ttnn.softmax(scores, dim=-1)
-        ctxv = ttnn.matmul(ttnn.typecast(probs, ttnn.bfloat16), vr, compute_kernel_config=self._ckcfg)
+        ctxv = ttnn.matmul(ttnn.typecast(probs, ttnn.bfloat16), vcache, compute_kernel_config=self._ckcfg)  # (1,KVH,KVG,HD)
+        ctxv = ttnn.reshape(ctxv, (1, self._A_HEADS, 1, HD))
         attn = ttnn.reshape(ttnn.permute(ctxv, (0, 2, 1, 3)), (1, 1, self._A_HEADS * self._A_HDIM))
         out = self._lin(attn, self._g_ow[i])
         return out, kcache, vcache
