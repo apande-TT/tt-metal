@@ -546,14 +546,10 @@ class TtNemotronHMamba2Mixer:
         ttnn.deallocate(g_silu)
         gs = self.norm_group_size
         ng = I // gs
-        y_rm = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT)
-        y_g = ttnn.reshape(y_rm, [B, ng, gs])
-        y_g = ttnn.to_layout(y_g, ttnn.TILE_LAYOUT)
+        y_g = ttnn.reshape(y, [B, ng, gs])  # gs=512 tile-aligned -> TILE-native reshape, no RM round-trip
         y_n = ttnn.rms_norm(y_g, weight=self._norm_ones, epsilon=self.norm_eps, compute_kernel_config=self.ckc)
         ttnn.deallocate(y_g)
-        y_n_rm = ttnn.to_layout(y_n, ttnn.ROW_MAJOR_LAYOUT)
-        y_n_rm = ttnn.reshape(y_n_rm, [B, 1, I])
-        y = ttnn.to_layout(y_n_rm, ttnn.TILE_LAYOUT)
+        y = ttnn.reshape(y_n, [B, 1, I])
         y = ttnn.multiply(y, self._norm_w_full)
 
         out = ttnn.matmul(y, self._w_out, compute_kernel_config=self.ckc)  # (B,1,hidden)
