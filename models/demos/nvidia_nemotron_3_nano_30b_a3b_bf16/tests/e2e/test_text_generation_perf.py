@@ -1,5 +1,15 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Performance test for the 'text_generation' pipeline of nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.
+
+Builds and runs the SHARED chained TTNN pipeline EXACTLY as demo/demo_text_generation.py does
+(tt/pipeline.py) fully IN-PROCESS so tracy can profile every device op. Perf only -- no PCC.
+"""
+from __future__ import annotations
+
 import os
 import time
+
 import pytest
 import torch
 
@@ -28,39 +38,39 @@ if _PERF_TRACE:
     _DEV_PARAMS["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "120000000"))
     _DEV_PARAMS["num_command_queues"] = int(os.environ.get("TT_PERF_NUM_CQ", "2"))  # 2 = trace+2CQ overlap path
 
-# small representative prompt/seq for perf (do NOT use production/max shapes under tracy)
-PERF_PROMPT = os.environ.get("TT_PERF_PROMPT", "The capital of France is")
-
-
-def _open_pipeline_device():
-    # Self-open the mesh EXACTLY as the demo does (pl.open_pipeline_mesh). When TT_PERF_TRACE is set,
-    # try to thread trace_region_size / num_command_queues through the SAME open so the trace block can
-    # capture a device trace on the identical sharded topology; fall back to the plain open otherwise.
-    if _PERF_TRACE:
-        try:
-            return pl.open_pipeline_mesh(
-                l1_small_size=24576,
-                trace_region_size=int(os.environ.get("TT_PERF_TRACE_REGION", "120000000")),
-                num_command_queues=int(os.environ.get("TT_PERF_NUM_CQ", "2")),
-            )
-        except TypeError:
-            pass
-    return pl.open_pipeline_mesh(l1_small_size=24576)
-
 
 def test_text_generation_perf():
-    # 1) build the pipeline EXACTLY as demo/demo_text_generation.py does (self-open mesh -> match topology)
-    tok = AutoTokenizer.from_pretrained(pl.HF_MODEL_ID, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        pl.HF_MODEL_ID, trust_remote_code=True, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
-    )
-    model.eval()
-    eos = int(getattr(model.config, "eos_token_id", 2))
+    # ---- device open: MATCH THE DEMO exactly (self-open the mesh via pl.open_pipeline_mesh). ----
+    # The pipeline is tensor-parallel on a mesh; a single `device` fixture would silently disable
+    # sharding (shard_active=False) and profile the wrong single-chip config. When TT_PERF_TRACE is
+    # set we try to thread trace_region_size / num_command_queues through the same open; if the open
+    # does not accept them we fall back to the plain open exactly as the demo does.
+    device = None
+    is_mesh = False
+    if _PERF_TRACE:
+        try:
+            device, is_mesh = pl.open_pipeline_mesh(
+                l1_small_size=_DEV_PARAMS["l1_small_size"],
+                trace_region_size=_DEV_PARAMS["trace_region_size"],
+                num_command_queues=_DEV_PARAMS["num_command_queues"],
+            )
+        except TypeError:
+            device = None
+    if device is None:
+        device, is_mesh = pl.open_pipeline_mesh(l1_small_size=_DEV_PARAMS["l1_small_size"])
 
-    input_ids = tok(PERF_PROMPT, return_tensors="pt")["input_ids"]
-
-    device, is_mesh = _open_pipeline_device()
     try:
+        # 1) build the pipeline EXACTLY as demo/demo_text_generation.py does
+        tok = AutoTokenizer.from_pretrained(pl.HF_MODEL_ID, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            pl.HF_MODEL_ID, trust_remote_code=True, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
+        )
+        model.eval()
+        eos = int(getattr(model.config, "eos_token_id", 2))
+
+        prompt = os.environ.get("TT_PERF_PROMPT", "The capital of France is")
+        input_ids = tok(prompt, return_tensors="pt")["input_ids"]
+
         pipe = pl.build_pipeline(device, model, compose=True)
         print(f"[perf] mesh={is_mesh} shard_active={pipe.shard_active}", flush=True)
 
@@ -78,7 +88,7 @@ def test_text_generation_perf():
                 counter[0] += 1
                 if PERF_FLUSH_EVERY and counter[0] % PERF_FLUSH_EVERY == 0:
                     try:
-                        ttnn.ReadDeviceProfiler(device)  # 'device' = mesh_device on multi-chip
+                        ttnn.ReadDeviceProfiler(device)
                     except Exception:
                         pass
                 return r
@@ -89,13 +99,14 @@ def test_text_generation_perf():
         for _mod in [_m for _m in _mods if _m is not None]:
             for _n in dir(_mod):
                 _op = getattr(_mod, _n, None)
-                if type(_op).__name__ == "FastOperation":  # every dispatched ttnn op, by type
+                if type(_op).__name__ == "FastOperation":
                     _orig.append((_mod, _n, _op))
                     setattr(_mod, _n, _draining(_op))
 
         _fw0 = time.monotonic()
         try:
-            out, _ = pipe.generate(input_ids, PERF_MAX_NEW_TOKENS, eos_token_id=eos)
+            new_ids, _ = pipe.generate(input_ids, PERF_MAX_NEW_TOKENS, eos_token_id=eos)
+            out = new_ids
             try:
                 ttnn.ReadDeviceProfiler(device)
             except Exception:
@@ -104,29 +115,36 @@ def test_text_generation_perf():
             for _mod, _n, _f in _orig:
                 setattr(_mod, _n, _f)
         print("FORWARD_WALL_MS=%.4f" % ((time.monotonic() - _fw0) * 1000.0))
-        assert out is not None  # perf only — NO PCC
+        assert out is not None  # perf only -- NO PCC
 
         # ---- clean, GPU-comparable per-token latency via trace-replay (GENERIC + guarded) ----
-        # ONE generic adapter (agent/perf_adapter.PipelineDecodeAdapter) wraps the SAME pipeline build:
-        # measure_adapter captures one decode step as a device trace + replays it -> prints
-        # TRACE_PER_TOKEN_MS (parsed by the tool into per_token_ms + tokens_per_sec_per_user for a GPU
-        # side-by-side). There is NO per-model adapter here. The clean number appears only when the built
-        # pipeline exposes a trace-capturable `decode_step(state)` (fixed shape, on-device sample, no host
-        # reads) -- produced by the structural decode lever / emit-e2e, not written here. A repeat-prefill
-        # pipeline has no decode_step, so setup raises, the guard swallows it, and FORWARD_WALL_MS stands.
         if _PERF_TRACE:
             try:
                 from models.experimental.perf_automation.agent.trace_replay import measure_adapter
                 from models.experimental.perf_automation.agent.perf_adapter import PipelineDecodeAdapter
 
-                # REUSE the already-resident pipeline (its 52 layer children are built once at
-                # init) instead of building a second full copy — a 30B second build would OOM
-                # the tight 4-chip residency. And run the FULL model here: Section A profiled a
-                # TT_PERF_LAYERS-capped forward for device_ms, but decode_step loops all 52 layers,
-                # so the trace prefill must seed all 52 (uncap for this steady-state measurement).
-                os.environ["TT_PERF_LAYERS"] = "0"
-                _adapter = PipelineDecodeAdapter(lambda _dev: pipe, input_ids, batch=1)
-                measure_adapter(_adapter, device, mode="auto")  # prints TRACE_PER_TOKEN_MS / TRACE_REPLAY_PATH
+                os.environ["TT_PERF_LAYERS"] = "0"  # trace the FULL model (depth cap above may have capped it)
+
+                def _build_for_perf(dev):
+                    # REUSE the pipeline built in step 1 (return that same object). Do NOT build a
+                    # second copy: a 2nd full build of a large resident model OOMs the mesh, and its
+                    # layer children are already resident.
+                    return pipe
+
+                _prompt_ids = input_ids
+                _adapter = PipelineDecodeAdapter(_build_for_perf, _prompt_ids, batch=1)
+                measure_adapter(_adapter, device, mode="auto")  # prints TRACE_PER_TOKEN_MS=<ms>
+
+                if hasattr(pipe, "prefill_trace_step") and os.environ.get("TT_PERF_PREFILL_TRACE") == "1":
+                    from models.experimental.perf_automation.agent.trace_replay import measure_prefill
+
+                    pipe.prefill_trace_setup(_prompt_ids)
+                    measure_prefill(
+                        device,
+                        pipe.prefill_trace_step,
+                        write_inputs=getattr(pipe, "prefill_write_inputs", None),
+                        mode="auto",
+                    )
             except Exception as _te:  # noqa: BLE001
                 print("TRACE_REPLAY_SKIPPED=%r" % (_te,), flush=True)
     finally:

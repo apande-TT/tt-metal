@@ -281,14 +281,14 @@ class TtNemotronHMOE:
             down_f = ttnn.typecast(down, ttnn.float32)
             ttnn.deallocate(down)
             we = ttnn.slice(W_use, [0, 0, e], [B, T, e + 1])  # (B,T,1) fp32
-            contrib = ttnn.multiply(down_f, we, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            if out is None:
+                out = ttnn.multiply(down_f, we, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            else:
+                new_out = ttnn.mac(down_f, we, out, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # down_f*we + out, fused FMA
+                ttnn.deallocate(out)
+                out = new_out
             ttnn.deallocate(down_f)
             ttnn.deallocate(we)
-            if out is None:
-                out = contrib
-            else:
-                out = ttnn.add(out, contrib, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-                ttnn.deallocate(contrib)
         ttnn.deallocate(W_use)
 
         # Sum each chip's partial expert mixture into the full 128-expert result

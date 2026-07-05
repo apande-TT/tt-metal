@@ -528,15 +528,13 @@ class TtNemotronHMamba2Mixer:
         dBx = ttnn.multiply(dtx, B_t)  # (B,H,HD,N)
         ttnn.deallocate(dtx)
         ttnn.deallocate(B_t)
-        new_state = ttnn.add(ttnn.multiply(ssm_state, dA), dBx)  # (B,H,HD,N)
+        new_state = ttnn.mac(ssm_state, dA, dBx)  # ssm_state*dA + dBx (B,H,HD,N), fused FMA
         ttnn.deallocate(dA)
         ttnn.deallocate(dBx)
         y = ttnn.sum(ttnn.multiply(new_state, C_t), dim=-1)  # (B,H,HD)
         ttnn.deallocate(C_t)
-        D_res = ttnn.multiply(ttnn.reshape(x_t, [B, H, HD]), ttnn.reshape(self._D, [1, H, 1]))
+        y = ttnn.mac(ttnn.reshape(x_t, [B, H, HD]), ttnn.reshape(self._D, [1, H, 1]), y)  # x*D + y, fused FMA
         ttnn.deallocate(x_t)
-        y = ttnn.add(y, D_res)  # (B,H,HD)
-        ttnn.deallocate(D_res)
         y = ttnn.reshape(y, [B, 1, I])
 
         # gated grouped RMSNorm (norm_before_gate=False)
