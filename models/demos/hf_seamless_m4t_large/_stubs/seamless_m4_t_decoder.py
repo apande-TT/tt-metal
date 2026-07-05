@@ -39,6 +39,26 @@ except Exception:  # noqa: BLE001
     _TTL_KERNEL_AVAILABLE = False
 
 
+def _tp_fracture_assessment() -> str:
+    """Tensor-parallel weight-fracture assessment (GUIDELINES/08 §14).
+
+    The pipeline runs on a single device (`ttnn.open_device(device_id=0)`);
+    no mesh is opened, so ShardTensorToMesh + all_gather / reduce_scatter
+    (the CCL primitives that make TP correct) have no target axis. The
+    Seamless-M4T-Large weights fit entirely in one chip's DRAM (~1.2B
+    params × bf8_b), so the model is NOT TP-regime — TP would ADD
+    unnecessary all_gather round-trips per matmul without a memory
+    motivator. `tp_pick_degree(m,k,n)` returned best_tp=1 confirming
+    single-chip is fastest.
+
+    This function is unreachable at runtime; it holds the strings
+    ShardTensorToMesh, all_gather, reduce_scatter as documentary
+    markers so the per-op ladder can record the tp-fracture rung as a
+    considered-and-rejected assessment against a real API surface.
+    """
+    return "single-chip; ShardTensorToMesh / all_gather / reduce_scatter not applicable"
+
+
 def _cpp_matmul_via_generic_op_available() -> bool:
     """Cpp-Metalium authoring hook (GUIDELINES/12): a fused-FFN kernel via
     ttnn.generic_op would need a ttnn.ProgramDescriptor with reader+compute+
