@@ -38,7 +38,7 @@ def test_s2st_perf():
     open_kwargs = {}
     if _PERF_TRACE:
         open_kwargs["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "23887872"))
-        open_kwargs["num_command_queues"] = int(os.environ.get("TT_PERF_NUM_CQ", "1"))
+        open_kwargs["num_command_queues"] = int(os.environ.get("TT_PERF_NUM_CQ", "2"))
     device = ttnn.open_device(device_id=0, **open_kwargs)
     try:
         # drain the device profiler every PERF_FLUSH_EVERY ops. MODEL-AGNOSTIC: wrap EVERY ttnn

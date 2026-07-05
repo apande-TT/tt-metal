@@ -41,6 +41,14 @@ def _to_ttnn(t, device):
     return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
 
+def _to_ttnn_bf8(t, device):
+    return ttnn.from_torch(t, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
+
+
+def _to_ttnn_bf4(t, device):
+    return ttnn.from_torch(t, dtype=ttnn.bfloat4_b, layout=ttnn.TILE_LAYOUT, device=device)
+
+
 class SeamlessM4TTextToUnitForConditionalGeneration:
     def __init__(self, device, torch_module):
         self.device = device
@@ -60,6 +68,15 @@ class SeamlessM4TTextToUnitForConditionalGeneration:
         self.dec_scaling = self.dec_head_size**-0.5
         self.dec_num_layers = len(dec.layers)
         self.eps = 1e-05
+        # LN compute-kernel config: HiFi2 + fp32 dst (GUIDELINES/02
+        # norm-fidelity-fp32).
+        self._ln_compute = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
 
         self.enc_layers_w = []
         for layer in enc.layers:
@@ -68,19 +85,20 @@ class SeamlessM4TTextToUnitForConditionalGeneration:
                 {
                     "sa_ln_w": _to_ttnn(sd["self_attn_layer_norm.weight"], device),
                     "sa_ln_b": _to_ttnn(sd["self_attn_layer_norm.bias"], device),
-                    "sa_q_w": _to_ttnn(sd["self_attn.q_proj.weight"].T.contiguous(), device),
+                    # attention Q/K/V/O at bf8_b (learned floor); MLP fc1/fc2 at bf4_b
+                    "sa_q_w": _to_ttnn_bf8(sd["self_attn.q_proj.weight"].T.contiguous(), device),
                     "sa_q_b": _to_ttnn(sd["self_attn.q_proj.bias"].reshape(1, -1), device),
-                    "sa_k_w": _to_ttnn(sd["self_attn.k_proj.weight"].T.contiguous(), device),
+                    "sa_k_w": _to_ttnn_bf8(sd["self_attn.k_proj.weight"].T.contiguous(), device),
                     "sa_k_b": _to_ttnn(sd["self_attn.k_proj.bias"].reshape(1, -1), device),
-                    "sa_v_w": _to_ttnn(sd["self_attn.v_proj.weight"].T.contiguous(), device),
+                    "sa_v_w": _to_ttnn_bf8(sd["self_attn.v_proj.weight"].T.contiguous(), device),
                     "sa_v_b": _to_ttnn(sd["self_attn.v_proj.bias"].reshape(1, -1), device),
-                    "sa_o_w": _to_ttnn(sd["self_attn.out_proj.weight"].T.contiguous(), device),
+                    "sa_o_w": _to_ttnn_bf8(sd["self_attn.out_proj.weight"].T.contiguous(), device),
                     "sa_o_b": _to_ttnn(sd["self_attn.out_proj.bias"].reshape(1, -1), device),
                     "ffn_ln_w": _to_ttnn(sd["ffn_layer_norm.weight"], device),
                     "ffn_ln_b": _to_ttnn(sd["ffn_layer_norm.bias"], device),
-                    "ffn_fc1_w": _to_ttnn(sd["ffn.fc1.weight"].T.contiguous(), device),
+                    "ffn_fc1_w": _to_ttnn_bf4(sd["ffn.fc1.weight"].T.contiguous(), device),
                     "ffn_fc1_b": _to_ttnn(sd["ffn.fc1.bias"].reshape(1, -1), device),
-                    "ffn_fc2_w": _to_ttnn(sd["ffn.fc2.weight"].T.contiguous(), device),
+                    "ffn_fc2_w": _to_ttnn_bf4(sd["ffn.fc2.weight"].T.contiguous(), device),
                     "ffn_fc2_b": _to_ttnn(sd["ffn.fc2.bias"].reshape(1, -1), device),
                 }
             )
@@ -101,29 +119,29 @@ class SeamlessM4TTextToUnitForConditionalGeneration:
                 {
                     "sa_ln_w": _to_ttnn(sd["self_attn_layer_norm.weight"], device),
                     "sa_ln_b": _to_ttnn(sd["self_attn_layer_norm.bias"], device),
-                    "sa_q_w": _to_ttnn(sd["self_attn.q_proj.weight"].T.contiguous(), device),
+                    "sa_q_w": _to_ttnn_bf8(sd["self_attn.q_proj.weight"].T.contiguous(), device),
                     "sa_q_b": _to_ttnn(sd["self_attn.q_proj.bias"].reshape(1, -1), device),
-                    "sa_k_w": _to_ttnn(sd["self_attn.k_proj.weight"].T.contiguous(), device),
+                    "sa_k_w": _to_ttnn_bf8(sd["self_attn.k_proj.weight"].T.contiguous(), device),
                     "sa_k_b": _to_ttnn(sd["self_attn.k_proj.bias"].reshape(1, -1), device),
-                    "sa_v_w": _to_ttnn(sd["self_attn.v_proj.weight"].T.contiguous(), device),
+                    "sa_v_w": _to_ttnn_bf8(sd["self_attn.v_proj.weight"].T.contiguous(), device),
                     "sa_v_b": _to_ttnn(sd["self_attn.v_proj.bias"].reshape(1, -1), device),
-                    "sa_o_w": _to_ttnn(sd["self_attn.out_proj.weight"].T.contiguous(), device),
+                    "sa_o_w": _to_ttnn_bf8(sd["self_attn.out_proj.weight"].T.contiguous(), device),
                     "sa_o_b": _to_ttnn(sd["self_attn.out_proj.bias"].reshape(1, -1), device),
                     "ca_ln_w": _to_ttnn(sd["cross_attention_layer_norm.weight"], device),
                     "ca_ln_b": _to_ttnn(sd["cross_attention_layer_norm.bias"], device),
-                    "ca_q_w": _to_ttnn(sd["cross_attention.q_proj.weight"].T.contiguous(), device),
+                    "ca_q_w": _to_ttnn_bf8(sd["cross_attention.q_proj.weight"].T.contiguous(), device),
                     "ca_q_b": _to_ttnn(sd["cross_attention.q_proj.bias"].reshape(1, -1), device),
-                    "ca_k_w": _to_ttnn(sd["cross_attention.k_proj.weight"].T.contiguous(), device),
+                    "ca_k_w": _to_ttnn_bf8(sd["cross_attention.k_proj.weight"].T.contiguous(), device),
                     "ca_k_b": _to_ttnn(sd["cross_attention.k_proj.bias"].reshape(1, -1), device),
-                    "ca_v_w": _to_ttnn(sd["cross_attention.v_proj.weight"].T.contiguous(), device),
+                    "ca_v_w": _to_ttnn_bf8(sd["cross_attention.v_proj.weight"].T.contiguous(), device),
                     "ca_v_b": _to_ttnn(sd["cross_attention.v_proj.bias"].reshape(1, -1), device),
-                    "ca_o_w": _to_ttnn(sd["cross_attention.out_proj.weight"].T.contiguous(), device),
+                    "ca_o_w": _to_ttnn_bf8(sd["cross_attention.out_proj.weight"].T.contiguous(), device),
                     "ca_o_b": _to_ttnn(sd["cross_attention.out_proj.bias"].reshape(1, -1), device),
                     "ffn_ln_w": _to_ttnn(sd["ffn_layer_norm.weight"], device),
                     "ffn_ln_b": _to_ttnn(sd["ffn_layer_norm.bias"], device),
-                    "ffn_fc1_w": _to_ttnn(sd["ffn.fc1.weight"].T.contiguous(), device),
+                    "ffn_fc1_w": _to_ttnn_bf4(sd["ffn.fc1.weight"].T.contiguous(), device),
                     "ffn_fc1_b": _to_ttnn(sd["ffn.fc1.bias"].reshape(1, -1), device),
-                    "ffn_fc2_w": _to_ttnn(sd["ffn.fc2.weight"].T.contiguous(), device),
+                    "ffn_fc2_w": _to_ttnn_bf4(sd["ffn.fc2.weight"].T.contiguous(), device),
                     "ffn_fc2_b": _to_ttnn(sd["ffn.fc2.bias"].reshape(1, -1), device),
                 }
             )
@@ -132,7 +150,7 @@ class SeamlessM4TTextToUnitForConditionalGeneration:
         self.dec_top_ln_b = _to_ttnn(dec_top["layer_norm.bias"], device)
 
         lm_sd = torch_module.lm_head.state_dict()
-        self.w_lm_head = _to_ttnn(lm_sd["weight"].T.contiguous(), device)
+        self.w_lm_head = _to_ttnn_bf8(lm_sd["weight"].T.contiguous(), device)
         self.w_lm_head_bias = _to_ttnn(lm_sd["bias"].reshape(1, -1), device) if "bias" in lm_sd else None
 
     def _self_attn(self, x_ttnn, w, num_heads, head_size, scaling, mask=None):
@@ -185,12 +203,12 @@ class SeamlessM4TTextToUnitForConditionalGeneration:
     def _apply_enc_layer(self, i, x_ttnn):
         w = self.enc_layers_w[i]
         residual = x_ttnn
-        h = ttnn.layer_norm(x_ttnn, epsilon=self.eps, weight=w["sa_ln_w"], bias=w["sa_ln_b"])
+        h = ttnn.layer_norm(x_ttnn, epsilon=self.eps, weight=w["sa_ln_w"], bias=w["sa_ln_b"], compute_kernel_config=self._ln_compute)
         h = self._self_attn(h, w, self.enc_num_heads, self.enc_head_size, self.enc_scaling)
         h = ttnn.add(h, residual)
 
         residual = h
-        h = ttnn.layer_norm(h, epsilon=self.eps, weight=w["ffn_ln_w"], bias=w["ffn_ln_b"])
+        h = ttnn.layer_norm(h, epsilon=self.eps, weight=w["ffn_ln_w"], bias=w["ffn_ln_b"], compute_kernel_config=self._ln_compute)
         h = ttnn.linear(h, w["ffn_fc1_w"], bias=w["ffn_fc1_b"])
         h = ttnn.relu(h)
         h = ttnn.linear(h, w["ffn_fc2_w"], bias=w["ffn_fc2_b"])
@@ -200,17 +218,17 @@ class SeamlessM4TTextToUnitForConditionalGeneration:
     def _apply_dec_layer(self, i, x_ttnn, enc_ttnn, attn_mask):
         w = self.dec_layers_w[i]
         residual = x_ttnn
-        h = ttnn.layer_norm(x_ttnn, epsilon=self.eps, weight=w["sa_ln_w"], bias=w["sa_ln_b"])
+        h = ttnn.layer_norm(x_ttnn, epsilon=self.eps, weight=w["sa_ln_w"], bias=w["sa_ln_b"], compute_kernel_config=self._ln_compute)
         h = self._self_attn(h, w, self.dec_num_heads, self.dec_head_size, self.dec_scaling, mask=attn_mask)
         h = ttnn.add(h, residual)
 
         residual = h
-        h = ttnn.layer_norm(h, epsilon=self.eps, weight=w["ca_ln_w"], bias=w["ca_ln_b"])
+        h = ttnn.layer_norm(h, epsilon=self.eps, weight=w["ca_ln_w"], bias=w["ca_ln_b"], compute_kernel_config=self._ln_compute)
         h = self._cross_attn(h, enc_ttnn, w, self.dec_num_heads, self.dec_head_size, self.dec_scaling)
         h = ttnn.add(h, residual)
 
         residual = h
-        h = ttnn.layer_norm(h, epsilon=self.eps, weight=w["ffn_ln_w"], bias=w["ffn_ln_b"])
+        h = ttnn.layer_norm(h, epsilon=self.eps, weight=w["ffn_ln_w"], bias=w["ffn_ln_b"], compute_kernel_config=self._ln_compute)
         h = ttnn.linear(h, w["ffn_fc1_w"], bias=w["ffn_fc1_b"])
         h = ttnn.relu(h)
         h = ttnn.linear(h, w["ffn_fc2_w"], bias=w["ffn_fc2_b"])
@@ -252,7 +270,7 @@ class SeamlessM4TTextToUnitForConditionalGeneration:
         enc_ttnn = _to_ttnn(inputs_embeds.to(torch.bfloat16), self.device)
         for i in range(self.enc_num_layers):
             enc_ttnn = self._apply_enc_layer(i, enc_ttnn)
-        enc_ttnn = ttnn.layer_norm(enc_ttnn, epsilon=self.eps, weight=self.enc_top_ln_w, bias=self.enc_top_ln_b)
+        enc_ttnn = ttnn.layer_norm(enc_ttnn, epsilon=self.eps, weight=self.enc_top_ln_w, bias=self.enc_top_ln_b, compute_kernel_config=self._ln_compute)
 
         # Decoder embed + position
         embedded = torch.nn.functional.embedding(
@@ -269,7 +287,7 @@ class SeamlessM4TTextToUnitForConditionalGeneration:
         dec_ttnn = _to_ttnn(dec_hidden.to(torch.bfloat16), self.device)
         for i in range(self.dec_num_layers):
             dec_ttnn = self._apply_dec_layer(i, dec_ttnn, enc_ttnn, attn_mask)
-        dec_ttnn = ttnn.layer_norm(dec_ttnn, epsilon=self.eps, weight=self.dec_top_ln_w, bias=self.dec_top_ln_b)
+        dec_ttnn = ttnn.layer_norm(dec_ttnn, epsilon=self.eps, weight=self.dec_top_ln_w, bias=self.dec_top_ln_b, compute_kernel_config=self._ln_compute)
 
         # LM head projection
         if self.w_lm_head_bias is not None:

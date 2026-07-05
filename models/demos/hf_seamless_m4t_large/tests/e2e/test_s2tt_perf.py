@@ -33,7 +33,7 @@ _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
 _DEV_PARAMS = {"l1_small_size": 24576}
 if _PERF_TRACE:
     _DEV_PARAMS["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "23887872"))
-    _DEV_PARAMS["num_command_queues"] = int(os.environ.get("TT_PERF_NUM_CQ", "1"))
+    _DEV_PARAMS["num_command_queues"] = int(os.environ.get("TT_PERF_NUM_CQ", "2"))
 
 
 def _synth_audio(seconds: float = PERF_AUDIO_SECONDS, sr: int = PERF_SR) -> torch.Tensor:
