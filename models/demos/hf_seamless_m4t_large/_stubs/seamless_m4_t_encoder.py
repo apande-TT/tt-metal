@@ -138,8 +138,13 @@ class SeamlessM4TEncoder:
 
         residual = h
         h = ttnn.layer_norm(h, epsilon=self.eps, weight=w["ffn_ln_w"], bias=w["ffn_ln_b"])
-        h = ttnn.linear(h, w["ffn_fc1_w"], bias=w["ffn_fc1_b"])
-        h = ttnn.relu(h)
+        h = ttnn.linear(
+            h,
+            w["ffn_fc1_w"],
+            bias=w["ffn_fc1_b"],
+            activation="relu",
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
         h = ttnn.linear(h, w["ffn_fc2_w"], bias=w["ffn_fc2_b"])
         h = ttnn.add(h, residual)
         return h
