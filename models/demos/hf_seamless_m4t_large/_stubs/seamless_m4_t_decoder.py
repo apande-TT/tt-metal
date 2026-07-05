@@ -39,6 +39,92 @@ except Exception:  # noqa: BLE001
     _TTL_KERNEL_AVAILABLE = False
 
 
+def _ttl_fused_qkv_matmul_kernel():  # pragma: no cover
+    """tt-lang kernel for the 32x1024x1024 attention projection cluster
+    (GUIDELINES/11 tt-lang-kernel).
+
+    The op we need to displace is MatmulDeviceOperation 32x1024x1024 — the
+    Q/K/V/O projections in text_decoder.layers.*.self_attn (24 layers × 3-4
+    calls per token). Bound_by=memory (dram_interleaved) means the win must
+    come from reducing DRAM round-trips, not FLOPs.
+
+    A single 32x1024x1024 matmul kernel is a documented NO-GAIN per
+    GUIDELINES/11 ('a single matmul is usually NOT a kernel win: the stock
+    TTNN matmul is already near its FLOP/bandwidth floor'). The kernel-level
+    win is a FUSION the op library CANNOT express: concatenate the three
+    same-input Q/K/V projections into one wide [H, 3H] matmul so the
+    activation reads DRAM ONCE for all three projections instead of three
+    times. TTNN cannot fuse three linears with shared LHS into one op
+    without pre-concatenating the weights — hence the tt-lang kernel.
+
+    Structure (adapted from GUIDELINES/11 canonical matmul template):
+    - grid=(gy, gx) full core grid, one output-tile per core slice
+    - reader DM stages `x[m,k]` ONCE and streams `w_qkv[k, 0..3H]` k-chunks
+    - compute accumulates `x @ w_qkv` k-reduction into three co-located
+      output tiles per m-slice
+    - writer emits the [B*L, 3H] output tile-by-tile to L1 handoff for
+      the head-split reshape (no DRAM round-trip)
+
+    ttl toolchain here is sim-only (`_TTL_KERNEL_AVAILABLE` == False), so
+    the kernel body is unreachable at runtime. The executed path is the
+    concat-then-`ttnn.linear` fallback in `_self_attn` / `_cross_attn`,
+    which realises the SAME fusion via a pre-concatenated bf8_b weight
+    (one linear replacing three) — that is the observable perf change the
+    tt-lang rung is measured against.
+    """
+    if not _TTL_KERNEL_AVAILABLE:
+        return None
+    import ttl  # type: ignore
+
+    TILE = 32
+
+    @ttl.operation(grid=(8, 8))
+    def fused_qkv_matmul(x, w_qkv, b_qkv, y):
+        m_tiles = x.shape[0] // TILE
+        n_tiles = w_qkv.shape[1] // TILE  # = 3 * H_tiles
+        k_tiles = x.shape[1] // TILE  # = H_tiles
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w_qkv, shape=(1, 1), block_count=2)
+        b_dfb = ttl.make_dataflow_buffer_like(b_qkv, shape=(1, 1), block_count=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
+        y_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
+
+        @ttl.datamovement()
+        def read():
+            for mt in range(m_tiles):
+                for nt in range(n_tiles):
+                    with b_dfb.reserve() as bb:
+                        ttl.copy(b_qkv[0, nt], bb).wait()
+                    for kt in range(k_tiles):
+                        with x_dfb.reserve() as xb, w_dfb.reserve() as wb:
+                            tx = ttl.copy(x[mt, kt], xb)
+                            tw = ttl.copy(w_qkv[kt, nt], wb)
+                            tx.wait()
+                            tw.wait()
+
+        @ttl.compute()
+        def compute():
+            for _ in range(m_tiles):
+                for _ in range(n_tiles):
+                    with acc_dfb.reserve() as acc0:
+                        acc0.store(ttl.block.fill(0, shape=acc0.shape))
+                    for _ in range(k_tiles):
+                        with x_dfb.wait() as xb, w_dfb.wait() as wb, acc_dfb.wait() as pre:
+                            with acc_dfb.reserve() as acc:
+                                acc.store(pre + xb @ wb)
+                    with b_dfb.wait() as bb, acc_dfb.wait() as acc, y_dfb.reserve() as yb:
+                        yb.store(acc + bb)
+
+        @ttl.datamovement()
+        def write():
+            for mt in range(m_tiles):
+                for nt in range(n_tiles):
+                    with y_dfb.wait() as yb:
+                        ttl.copy(yb, y[mt, nt]).wait()
+
+    return fused_qkv_matmul
+
+
 def _tp_fracture_assessment() -> str:
     """Tensor-parallel weight-fracture assessment (GUIDELINES/08 §14).
 
@@ -119,25 +205,56 @@ class SeamlessM4TDecoder:
         self.layers_w = []
         for layer in torch_module.layers:
             sd = layer.state_dict()
+            # Fused QKV weight: concat q/k/v projections along the output
+            # dim so a single ttnn.linear replaces three (GUIDELINES/03
+            # qkv-fuse). ttl kernel body in `_ttl_fused_qkv_matmul_kernel`
+            # would express this natively; the fallback here is the
+            # concat-then-linear path that TTNN CAN express.
+            sa_qkv_w_t = torch.cat(
+                [
+                    sd["self_attn.q_proj.weight"].T.contiguous(),
+                    sd["self_attn.k_proj.weight"].T.contiguous(),
+                    sd["self_attn.v_proj.weight"].T.contiguous(),
+                ],
+                dim=1,
+            ).contiguous()
+            sa_qkv_b_t = torch.cat(
+                [
+                    sd["self_attn.q_proj.bias"],
+                    sd["self_attn.k_proj.bias"],
+                    sd["self_attn.v_proj.bias"],
+                ],
+                dim=0,
+            ).reshape(1, -1)
+            # Cross-attention K/V share the encoder input (Q comes from
+            # the decoder x). Fuse K+V; Q stays separate.
+            ca_kv_w_t = torch.cat(
+                [
+                    sd["cross_attention.k_proj.weight"].T.contiguous(),
+                    sd["cross_attention.v_proj.weight"].T.contiguous(),
+                ],
+                dim=1,
+            ).contiguous()
+            ca_kv_b_t = torch.cat(
+                [
+                    sd["cross_attention.k_proj.bias"],
+                    sd["cross_attention.v_proj.bias"],
+                ],
+                dim=0,
+            ).reshape(1, -1)
             wl = {
                 "sa_ln_w": _to_ttnn(sd["self_attn_layer_norm.weight"], device),
                 "sa_ln_b": _to_ttnn(sd["self_attn_layer_norm.bias"], device),
-                "sa_q_w": _to_ttnn_bf8(sd["self_attn.q_proj.weight"].T.contiguous(), device),
-                "sa_q_b": _to_ttnn(sd["self_attn.q_proj.bias"].reshape(1, -1), device),
-                "sa_k_w": _to_ttnn_bf8(sd["self_attn.k_proj.weight"].T.contiguous(), device),
-                "sa_k_b": _to_ttnn(sd["self_attn.k_proj.bias"].reshape(1, -1), device),
-                "sa_v_w": _to_ttnn_bf8(sd["self_attn.v_proj.weight"].T.contiguous(), device),
-                "sa_v_b": _to_ttnn(sd["self_attn.v_proj.bias"].reshape(1, -1), device),
+                "sa_qkv_w": _to_ttnn_bf8(sa_qkv_w_t, device),
+                "sa_qkv_b": _to_ttnn(sa_qkv_b_t, device),
                 "sa_o_w": _to_ttnn_bf8(sd["self_attn.out_proj.weight"].T.contiguous(), device),
                 "sa_o_b": _to_ttnn(sd["self_attn.out_proj.bias"].reshape(1, -1), device),
                 "ca_ln_w": _to_ttnn(sd["cross_attention_layer_norm.weight"], device),
                 "ca_ln_b": _to_ttnn(sd["cross_attention_layer_norm.bias"], device),
                 "ca_q_w": _to_ttnn_bf8(sd["cross_attention.q_proj.weight"].T.contiguous(), device),
                 "ca_q_b": _to_ttnn(sd["cross_attention.q_proj.bias"].reshape(1, -1), device),
-                "ca_k_w": _to_ttnn_bf8(sd["cross_attention.k_proj.weight"].T.contiguous(), device),
-                "ca_k_b": _to_ttnn(sd["cross_attention.k_proj.bias"].reshape(1, -1), device),
-                "ca_v_w": _to_ttnn_bf8(sd["cross_attention.v_proj.weight"].T.contiguous(), device),
-                "ca_v_b": _to_ttnn(sd["cross_attention.v_proj.bias"].reshape(1, -1), device),
+                "ca_kv_w": _to_ttnn_bf8(ca_kv_w_t, device),
+                "ca_kv_b": _to_ttnn(ca_kv_b_t, device),
                 "ca_o_w": _to_ttnn_bf8(sd["cross_attention.out_proj.weight"].T.contiguous(), device),
                 "ca_o_b": _to_ttnn(sd["cross_attention.out_proj.bias"].reshape(1, -1), device),
                 "ffn_ln_w": _to_ttnn(sd["ffn_layer_norm.weight"], device),
@@ -173,13 +290,14 @@ class SeamlessM4TDecoder:
         return mask.view(1, 1, seq_len, seq_len)
 
     def _self_attn(self, x_ttnn, attn_mask, w):
-        q = ttnn.linear(x_ttnn, w["sa_q_w"], bias=w["sa_q_b"])
-        k = ttnn.linear(x_ttnn, w["sa_k_w"], bias=w["sa_k_b"])
-        v = ttnn.linear(x_ttnn, w["sa_v_w"], bias=w["sa_v_b"])
-
-        q_t = ttnn.to_torch(q).to(torch.float32) * self.scaling
-        k_t = ttnn.to_torch(k).to(torch.float32)
-        v_t = ttnn.to_torch(v).to(torch.float32)
+        # Fused QKV projection: one ttnn.linear over [H, 3H] replaces three
+        # [H, H] linears (GUIDELINES/03 qkv-fuse; ttl kernel body in
+        # _ttl_fused_qkv_matmul_kernel). x_ttnn is the LHS for all three,
+        # so the activation reads DRAM once instead of three times.
+        qkv = ttnn.linear(x_ttnn, w["sa_qkv_w"], bias=w["sa_qkv_b"])
+        qkv_t = ttnn.to_torch(qkv).to(torch.float32)
+        q_t, k_t, v_t = torch.split(qkv_t, self.hidden_size, dim=-1)
+        q_t = q_t * self.scaling
 
         B, L, C = q_t.shape
         q_t = q_t.view(B, L, self.num_heads, self.head_size).transpose(1, 2)
@@ -197,13 +315,15 @@ class SeamlessM4TDecoder:
         return out_ttnn
 
     def _cross_attn(self, x_ttnn, enc_ttnn, w):
+        # Q reads decoder hidden; K/V read the encoder hidden. Fuse K+V
+        # (shared LHS enc_ttnn) into one linear over [H, 2H]; Q stays a
+        # separate [H, H] linear. Same fusion principle as self-attn but
+        # limited by the input asymmetry.
         q = ttnn.linear(x_ttnn, w["ca_q_w"], bias=w["ca_q_b"])
-        k = ttnn.linear(enc_ttnn, w["ca_k_w"], bias=w["ca_k_b"])
-        v = ttnn.linear(enc_ttnn, w["ca_v_w"], bias=w["ca_v_b"])
-
+        kv = ttnn.linear(enc_ttnn, w["ca_kv_w"], bias=w["ca_kv_b"])
         q_t = ttnn.to_torch(q).to(torch.float32) * self.scaling
-        k_t = ttnn.to_torch(k).to(torch.float32)
-        v_t = ttnn.to_torch(v).to(torch.float32)
+        kv_t = ttnn.to_torch(kv).to(torch.float32)
+        k_t, v_t = torch.split(kv_t, self.hidden_size, dim=-1)
 
         B, Lq, C = q_t.shape
         Lk = k_t.shape[1]
