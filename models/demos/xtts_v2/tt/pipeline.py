@@ -305,26 +305,31 @@ def forward_on_device(device, model, text="hello world.", language="en", ref_wav
     ttnn.from_torch — so the forward's op stream carries no host-transfer op),
     sampling + the autoregressive token feed run on device, and NO intermediate is
     copied back to host — the returned tensors live on device. Host work is confined
-    to SETUP (feature extraction + a fixed HF prefix seed, the allowed
-    <stage>_trace_setup pattern) and is pure torch (invisible to the device op
-    stream). `run_tts` wraps this with reference goldens + PCC for the correctness
-    gate; the forward-only e2e test drives this directly to prove on-device residency.
+    to SETUP (`_build_pipeline_state`: feature extraction + integer id bookkeeping +
+    weight build) and is pure torch (invisible to the device op stream). The decode
+    prefix embedding is built ON DEVICE inside the forward from the TT conditioning
+    latent + text embedding (no host-built prefix). `run_tts` wraps this with
+    reference goldens + PCC; the forward-only e2e test drives it for residency;
+    `host_op_selftest` observes the resident forward to prove zero host aten ops.
     """
     _restore_cache = _install_resident_upload_cache()
     try:
-        return _forward_on_device_impl(device, model, text, language, ref_wav_22k, N,
-                                       repetition_penalty, collect)
+        st = _build_pipeline_state(device, model, text, language, ref_wav_22k, N, repetition_penalty)
+        return _resident_forward(st, collect)
     finally:
         _restore_cache()
 
 
-def _forward_on_device_impl(device, model, text, language, ref_wav_22k, N, repetition_penalty, collect):
+def _build_pipeline_state(device, model, text, language, ref_wav_22k, N, repetition_penalty):
+    """SETUP: all host work (feature extraction, integer id bookkeeping, weight build,
+    device uploads, interp-matrix warm). Returns a state dict of device tensors + built
+    stub forwards. NOTHING here runs inside the observed forward — so any host aten op
+    it fires (padding, mel/FFT, tensor creation) is outside the on-device gate."""
     gpt = model.gpt
     mel_norms = model.mel_stats.detach().cpu().float()
     if ref_wav_22k is None:
         ref_wav_22k = default_reference_wav()
 
-    # ── SETUP (host / torch; HF allowed for fixed-input seeding) ──────────────
     ins = make_reference_inputs(model, text, language, ref_wav_22k, mel_norms)
     text_tokens = ins["text_tokens"]
     code_stride = int(gpt.code_stride_len)
@@ -332,13 +337,17 @@ def _forward_on_device_impl(device, model, text, language, ref_wav_22k, N, repet
     exp_len = torch.tensor([N * code_stride])
     start_audio = int(gpt.start_audio_token)
     stop_audio = int(gpt.stop_audio_token)
+    start_text = int(gpt.start_text_token)
+    stop_text = int(gpt.stop_text_token)
     V = int(gpt.gpt_inference.lm_head[1].weight.shape[0])
-    # Seed the (fixed) decoder prefix from the HF conditioning latent — a persistent
-    # buffer snapshotted into the inference stub at build time (host-free thereafter).
-    with torch.no_grad():
-        cond_seed = _hf_cond_latent(model, ins["mel_chunk"]).to(torch.float32)   # [1,32,1024]
-        gpt_inputs = gpt.compute_embeddings(cond_seed, text_tokens)
-    prefix_len = int(gpt.gpt_inference.cached_prefix_emb.shape[1])
+
+    # Integer id bookkeeping (host, input-encoding) — pad text ids exactly as the
+    # reference compute_embeddings/GPT.forward do: [start_text, tokens…, stop_text].
+    import torch.nn.functional as F
+
+    ptext = F.pad(text_tokens, (0, 1), value=stop_text)
+    ptext = F.pad(ptext, (1, 0), value=start_text)                    # [1, Lt]
+    padded_text_ids_tt = _tt_ids(ptext, device)                      # device uint32
 
     # ── build the graduated native stubs (weights uploaded via as_tensor) ─────
     se_fwd = _build("res_net_speaker_encoder")(device, _resolve(model, "hifigan_decoder.speaker_encoder"))
@@ -349,53 +358,103 @@ def _forward_on_device_impl(device, model, text, language, ref_wav_22k, N, repet
     gpt_fwd = _build("g_p_t")(device, gpt)
     hifi_fwd = _build("hifi_decoder")(device, _resolve(model, "hifigan_decoder"))
 
-    # on-device penalty constants (bf16 identity table for one-hot via ttnn.embedding)
+    # on-device prefix-embedding weights: text token table + text position stub. The
+    # prefix (cond_latent ⊕ text_emb) is then assembled ON DEVICE in the forward.
+    lpe_text = _build("learned_position_embeddings")(device, gpt.text_pos_embedding)
+    text_emb_w = ttnn.as_tensor(
+        gpt.text_embedding.weight.detach().contiguous().to(torch.bfloat16),
+        dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    model_dim = int(gpt.text_embedding.weight.shape[1])
+
+    # Warm the HiFi-GAN interp matrix (the one-off host F.interpolate) for the known
+    # horizon so the vocode forward reads only the cached device matrix (host-free).
+    _warm = getattr(hifi_fwd, "warm_interp", None)
+    if _warm is not None:
+        _warm(N)
+
+    # ── device inputs + on-device penalty constants ───────────────────────────
+    wav16_tt = _tt(ins["wav_16k"], layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+    mel_tt = _tt(ins["mel_chunk"], device=device)                     # [1,80,S]
+    gen_ids_init = _tt_ids(torch.tensor([[start_audio]], dtype=torch.int32), device)
+    start_tok = _tt_ids(torch.tensor([[start_audio]], dtype=torch.int32), device)
+    stop_toks = _tt_ids(torch.full((1, 3 + 1), stop_audio, dtype=torch.int32), device)
     eye_v = _tt(torch.eye(V), dtype=ttnn.bfloat16, device=device)
     _base = torch.zeros(1, V, dtype=torch.float32)
     _base[0, 1] = 1.0                                     # prefix placeholder id == 1 (see compute_embeddings)
     base_mask = _tt(_base, dtype=ttnn.bfloat16, device=device)
 
+    return {
+        "device": device, "N": N, "V": V, "repetition_penalty": repetition_penalty,
+        "model_dim": model_dim,
+        "se_fwd": se_fwd, "cond_fwd": cond_fwd, "perc_fwd": perc_fwd, "drop_fwd": drop_fwd,
+        "infer_fwd": infer_fwd, "gpt_fwd": gpt_fwd, "hifi_fwd": hifi_fwd,
+        "lpe_text": lpe_text, "text_emb_w": text_emb_w,
+        "wav16_tt": wav16_tt, "mel_tt": mel_tt, "padded_text_ids_tt": padded_text_ids_tt,
+        "gen_ids_init": gen_ids_init, "start_tok": start_tok, "stop_toks": stop_toks,
+        "eye_v": eye_v, "base_mask": base_mask,
+        # host-side references for the golden/PCC layer (used by run_tts, NOT the forward)
+        "ins": ins, "text_tokens": text_tokens, "text_len": text_len, "exp_len": exp_len,
+    }
+
+
+def _resident_forward(st, collect=False):
+    """The PURE-TTNN forward: reads ONLY device tensors from `st`, fires zero host
+    aten ops. speaker encode -> conditioning -> ON-DEVICE prefix embedding -> AR
+    greedy decode (on-device sampling + token feed) -> latents -> HiFi-GAN vocode."""
+    device, N, V = st["device"], st["N"], st["V"]
+
     # ── Stage A: speaker encoder -> d-vector g [1,512,1] (l2-norm on device) ──
-    wav16 = _tt(ins["wav_16k"], layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
-    g = _l2norm_device(se_fwd(wav16))                     # ttnn [1,512,1]
+    g = _l2norm_device(st["se_fwd"](st["wav16_tt"]))                  # ttnn [1,512,1]
 
     # ── Stage B: conditioning -> cond_latent [1,32,1024] ──────────────────────
-    mel_tt = _tt(ins["mel_chunk"], device=device)                     # [1,80,S]
-    conds = ttnn.permute(cond_fwd(mel_tt), (0, 2, 1))                 # [1,S,1024]
-    cond_lat = drop_fwd(perc_fwd(conds))                             # [1,32,1024] (dropout=identity)
+    conds = ttnn.permute(st["cond_fwd"](st["mel_tt"]), (0, 2, 1))     # [1,S,1024]
+    cond_lat = st["drop_fwd"](st["perc_fwd"](conds))                 # [1,32,1024] (dropout=identity)
+
+    # ── Prefix embedding, ON DEVICE (mirrors GPT.compute_embeddings) ──────────
+    #   emb = text_embedding(text_ids) + text_pos_embedding(text_ids)
+    #   prefix = cat([cond_latent, emb], dim=1)
+    ptext_tt = st["padded_text_ids_tt"]
+    Lt = int(ptext_tt.shape[1])
+    tok = ttnn.embedding(ptext_tt, st["text_emb_w"], layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+    pos = st["lpe_text"](ptext_tt)                                   # float32 [Lt, D]
+    pos = ttnn.typecast(ttnn.reshape(pos, [1, Lt, st["model_dim"]]), ttnn.bfloat16)
+    text_emb = ttnn.add(tok, pos)                                    # [1, Lt, D] bf16
+    cond_bf = cond_lat if cond_lat.get_dtype() == ttnn.bfloat16 else ttnn.typecast(cond_lat, ttnn.bfloat16)
+    prefix_emb = ttnn.concat([cond_bf, text_emb], dim=1)             # [1, 32+Lt, D]
 
     # ── Stage C: on-device autoregressive greedy decode -> codes ──────────────
-    gen_ids = _tt_ids(torch.tensor([[start_audio]], dtype=torch.int32), device)   # [1,1] uint32
+    gen_ids = st["gen_ids_init"]
     step_logits = []
     for _ in range(N):
-        logits = infer_fwd(gen_ids_tt=gen_ids)                        # [1, seq, V]
+        logits = st["infer_fwd"](gen_ids_tt=gen_ids, prefix_emb_tt=prefix_emb)   # [1, seq, V]
         seq = int(logits.shape[1])
         last = ttnn.reshape(ttnn.slice(logits, [0, seq - 1, 0], [1, seq, V]), [1, V])
         ttnn.deallocate(logits)
         if collect:
             step_logits.append(last)
-        nxt = _select_next_on_device(last, gen_ids, base_mask, eye_v, repetition_penalty)
+        nxt = _select_next_on_device(last, gen_ids, st["base_mask"], st["eye_v"], st["repetition_penalty"])
         if not collect:
             ttnn.deallocate(last)
         gen_ids = ttnn.concat([gen_ids, nxt], dim=1)                  # grow on device
     codes = ttnn.slice(gen_ids, [0, 1], [1, N + 1])                  # drop start_audio -> [1,N]
 
     # ── Stage D: latents (device codes -> mel ids on device, self-fed) ────────
-    start_tok = _tt_ids(torch.tensor([[start_audio]], dtype=torch.int32), device)
-    stop_toks = _tt_ids(torch.full((1, 3 + 1), stop_audio, dtype=torch.int32), device)
-    audio_ids = ttnn.concat([start_tok, codes, stop_toks], dim=1)    # [1, N+5] = start, codes, stop*4
-    lat = gpt_fwd(
-        text_inputs=text_tokens, text_lengths=text_len, wav_lengths=exp_len,
-        audio_ids_tt=audio_ids, cond_latents_tt=cond_lat,
+    audio_ids = ttnn.concat([st["start_tok"], codes, st["stop_toks"]], dim=1)  # [1, N+5]
+    lat = st["gpt_fwd"](
+        text_inputs=st["text_tokens"], text_lengths=st["text_len"], wav_lengths=st["exp_len"],
+        audio_ids_tt=audio_ids, cond_latents_tt=cond_lat, text_ids_tt=ptext_tt,
     )                                                                 # [1, N, 1024]
 
     # ── Stage E: vocode -> waveform (device) ──────────────────────────────────
-    wav = hifi_fwd(lat, g=g)                                          # [1, S, 1]
+    wav = st["hifi_fwd"](lat, g=g)                                    # [1, S, 1]
 
+    prefix_len = int(prefix_emb.shape[1])
     return {
         "waveform": wav, "codes": codes, "latents": lat, "g": g, "cond_lat": cond_lat,
-        "step_logits": step_logits, "gpt_inputs": gpt_inputs, "prefix_len": prefix_len,
-        "ins": ins, "text_len": text_len, "exp_len": exp_len, "N": N,
+        "prefix_emb": prefix_emb, "prefix_len": prefix_len, "step_logits": step_logits,
+        "ins": st["ins"], "text_len": st["text_len"], "exp_len": st["exp_len"], "N": N,
     }
 
 
@@ -429,11 +488,19 @@ def run_tts(device, model, text="hello world.", language="en", ref_wav_22k=None,
     cond_hf = _hf_cond_latent(model, ins["mel_chunk"])
     res["cond_latent_pcc"] = comp_pcc(cond_hf, cond_latent_tt, 0.95)[1]
 
-    # ── Stage C ── AR codes + per-step logits vs HF golden (same seeded prefix)
+    # ── Stage C ── AR codes + per-step logits vs HF golden (seeded with the SAME
+    #    on-device-built prefix the TT decode used — TT->reference direction, like the
+    #    latents/vocode goldens below — so the gate measures TT transformer numerics,
+    #    not a TT-vs-HF prefix difference).
     codes_tt = _th(fo["codes"]).round().to(torch.long)                 # [1,N]
     res["codes_tt"] = codes_tt
     tt_step_logits = [_th(l).reshape(1, -1) for l in fo["step_logits"]]
-    codes_hf, logits_hf = _hf_ar_golden(model, fo["gpt_inputs"], fo["prefix_len"],
+    prefix_host = _th(fo["prefix_emb"]).to(torch.float32)              # [1, prefix_len, D]
+    prefix_len = int(prefix_host.shape[1])
+    gpt.gpt_inference.store_prefix_emb(prefix_host)                    # golden reads cached_prefix_emb
+    gpt_inputs = torch.full((1, prefix_len + 1), 1, dtype=torch.long)  # placeholder ids (id 1)
+    gpt_inputs[:, -1] = int(gpt.start_audio_token)
+    codes_hf, logits_hf = _hf_ar_golden(model, gpt_inputs, prefix_len,
                                         n_steps=int(codes_tt.shape[1]), repetition_penalty=repetition_penalty)
     k = min(codes_tt.shape[1], codes_hf.shape[1])
     res["ar_token_match"] = float((codes_tt[0, :k] == codes_hf[0, :k]).float().mean()) if k else 0.0
@@ -893,17 +960,39 @@ def trace_capture_selftest(device=None):
 
 
 def host_op_selftest():
-    import torch as _torch
+    """AUTHORITATIVE fully-on-device check: run the REAL TT forward under a
+    TorchDispatchMode observer and assert it fires ZERO host aten ops.
+
+    Input ENCODING (tokenize, mel/FFT feature extraction) + integer id bookkeeping +
+    one-time weight build all happen in `_build_pipeline_state` OUTSIDE the observed
+    region. The observed region is `_resident_forward` — the model math from encoded
+    inputs to waveform, EVERY stage incl. the on-device prefix embedding — which is
+    pure ttnn (ttnn ops do not dispatch through torch). Any aten op seen inside is
+    host compute the ttnn-crossing (from_torch) checks cannot see; there must be none.
+    """
+    import os as _os
 
     from scripts.tt_hw_planner.host_op_observer import observe_host_ops, verdict
 
-    model = _load_reference_model()
-    gpt = model.gpt
-    ins = make_reference_inputs(
-        model, "hello world.", "en", default_reference_wav(), model.mel_stats.detach().cpu().float()
-    )
-    with observe_host_ops() as ops:
-        with _torch.no_grad():
-            cond_seed = _hf_cond_latent(model, ins["mel_chunk"]).to(_torch.float32)
-            gpt.compute_embeddings(cond_seed, ins["text_tokens"])
-    return verdict(list(ops))
+    n = int(_os.environ.get("XTTS_HOSTOP_N", _os.environ.get("TT_PERF_MAX_NEW_TOKENS", "6")))
+    device = ttnn.open_device(device_id=0, l1_small_size=24576)
+    _restore_cache = _install_resident_upload_cache()
+    try:
+        model = _load_reference_model()
+        # SETUP — everything host runs here, outside the observed region.
+        st = _build_pipeline_state(device, model, "hello world.", "en", None, n, 5.0)
+        # WARM — one unobserved pass to materialize every shape-dependent constant
+        # (per-length causal masks, HiFi-GAN interp matrix) into the stubs' PERSISTENT
+        # device caches. This is exactly the "pre-upload shape-dependent constants into
+        # persistent device buffers OUTSIDE" step; the stub forwards (hence caches) are
+        # reused, so the observed pass reads only resident buffers.
+        _resident_forward(st, collect=False)
+        # OBSERVED — the resident forward must now fire no host aten ops.
+        with observe_host_ops() as ops:
+            _resident_forward(st, collect=False)
+        v = verdict(list(ops))
+        print(f"host_op_selftest: on_device={v['on_device']} n_host_ops={v['n_host_ops']} {v['reason']}")
+        return v
+    finally:
+        _restore_cache()
+        ttnn.close_device(device)
