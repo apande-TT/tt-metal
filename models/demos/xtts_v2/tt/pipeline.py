@@ -939,9 +939,14 @@ def _load_reference_model():
     return mod.load_reference_model("coqui/XTTS-v2")
 
 
-def build_pipeline(device, model, text=None, language=None, capacity=64):
-    """Return the resident, stage-exposing Pipeline object for the perf/2CQ harness."""
-    return Pipeline(device, model, capacity=capacity)
+def build_pipeline(device, model=None, **kwargs):
+    """Return the resident, stage-exposing Pipeline object for the perf/2CQ harness.
+
+    Absorbs any demo call args (text, language, N, …) via **kwargs so the generated perf
+    test can call it however it builds the demo; only `capacity` is honored."""
+    if model is None:
+        model = _load_reference_model()
+    return Pipeline(device, model, capacity=int(kwargs.get("capacity", 64)))
 
 
 def trace_capture_selftest(device=None):
