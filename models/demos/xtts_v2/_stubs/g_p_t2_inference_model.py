@@ -97,10 +97,6 @@ def build(device, torch_module):
 
     model_dim = int(m.embeddings.weight.shape[1])
 
-    # Prefix embedding. The on-device pipeline computes it resident and hands it in per
-    # call as `prefix_emb_tt` (see forward), so the build-time snapshot is needed ONLY by
-    # the PCC harness, which seeds it statefully via store_prefix_emb -> cached_prefix_emb.
-    # Snapshot it lazily: absent (perf / e2e path) -> None, and forward uses prefix_emb_tt.
     prefix_tt = None
     prefix_len = 0
     _cached = getattr(m, "cached_prefix_emb", None)
@@ -142,8 +138,6 @@ def build(device, torch_module):
         pos = ttnn.typecast(pos, ttnn.bfloat16)
         gen_emb = ttnn.add(tok, pos)                     # [1, gen_len, D]
 
-        # On-device path hands the resident prefix in as `prefix_emb_tt`; the PCC harness
-        # relies on the stateful build-time snapshot (prefix_tt) instead.
         prefix = kwargs.get("prefix_emb_tt")
         if prefix is None:
             prefix = prefix_tt

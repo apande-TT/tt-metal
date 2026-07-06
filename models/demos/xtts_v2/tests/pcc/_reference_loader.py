@@ -89,11 +89,6 @@ def load_reference_model(model_id: str):
     )
     model.eval()
 
-    # `gpt.gpt_inference` (GPT2InferenceModel) carries a stateful prefix embedding:
-    # `store_prefix_emb(emb)` stashes the seeded prefix into `cached_prefix_emb`, which
-    # the ttnn port snapshots at build time and the AR golden reads back. Native Coqui
-    # has no such method, so bind it here (idempotent, on the class) — one definition
-    # shared by every consumer: the pipeline golden and the PCC harness.
     _gi_cls = type(model.gpt.gpt_inference)
     if not hasattr(_gi_cls, "store_prefix_emb"):
         def _store_prefix_emb(self, emb):

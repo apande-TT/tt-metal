@@ -939,6 +939,11 @@ def _load_reference_model():
     return mod.load_reference_model("coqui/XTTS-v2")
 
 
+def build_pipeline(device, model, text=None, language=None, capacity=64):
+    """Return the resident, stage-exposing Pipeline object for the perf/2CQ harness."""
+    return Pipeline(device, model, capacity=capacity)
+
+
 def trace_capture_selftest(device=None):
     """Module-level entry the trace+2CQ probe calls with NO args: open a device with
     a trace region + 2 command queues, build the Pipeline, and capture one host-free
