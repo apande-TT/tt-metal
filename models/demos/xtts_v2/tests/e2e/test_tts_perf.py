@@ -1,11 +1,10 @@
-import importlib.util as ilu
 import os
 import time
+import importlib.util as ilu
 
 import pytest
-import torch
-
 import ttnn
+
 from models.demos.xtts_v2.tt import pipeline as P
 
 HF_MODEL_ID = "coqui/XTTS-v2"
@@ -17,15 +16,19 @@ PERF_FLUSH_EVERY = int(os.environ.get("TT_PERF_FLUSH_EVERY", "32"))
 # is set in-process here so ONLY the perf run is capped (the correctness/e2e gate runs the full model).
 os.environ.setdefault("TT_PERF_LAYERS", "2")
 
-# small representative text prompt — perf needs a dispatch-dense pass, NOT the demo's production shape
+# perf-only input cap: keep every forward at a small, dispatch-dense sequence length. Do NOT reuse the
+# model's production/max shapes (a max-seq forward under tracy stalls in synchronize_device for minutes).
+PERF_SEQ = int(os.environ.get("TT_PERF_SEQ", "128"))
 PERF_TEXT = os.environ.get("TT_PERF_TEXT", "hello world.")
 PERF_LANGUAGE = os.environ.get("TT_PERF_LANGUAGE", "en")
 
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
+_TRACE_REGION = int(os.environ.get("TT_PERF_TRACE_REGION", "23887872"))
+_NUM_CQ = int(os.environ.get("TT_PERF_NUM_CQ", "2"))
 
 
 def _load_reference():
-    # mirror demo/demo_tts.py::_load_reference exactly, resolving the loader relative to THIS file
+    # Match demo/demo_tts.py exactly: load the HF/Coqui reference via tests/pcc/_reference_loader.py.
     here = os.path.dirname(os.path.abspath(__file__))
     rl = os.path.normpath(os.path.join(here, "..", "pcc", "_reference_loader.py"))
     spec = ilu.spec_from_file_location("_reference_loader", rl)
@@ -35,17 +38,22 @@ def _load_reference():
 
 
 def test_tts_perf():
+    import torch
+
     torch.manual_seed(0)
 
-    # DEVICE OPEN — the demo SELF-OPENS a single device via ttnn.open_device(device_id=0, l1_small_size=24576).
-    # Lift that exact open into the test; add trace_region_size / num_command_queues when TT_PERF_TRACE.
+    # DEVICE OPEN — the demo self-opens the device (ttnn.open_device), so we lift that exact call
+    # here (NOT a pytest device fixture) and close it in a finally. When TT_PERF_TRACE is set, thread
+    # trace_region_size / num_command_queues through that same self-open so the eager forward and the
+    # trace replay run on the identical device config.
     _open_kwargs = {"device_id": 0, "l1_small_size": 24576}
     if _PERF_TRACE:
-        _open_kwargs["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "23887872"))
-        _open_kwargs["num_command_queues"] = int(os.environ.get("TT_PERF_NUM_CQ", "2"))
+        _open_kwargs["trace_region_size"] = _TRACE_REGION
+        _open_kwargs["num_command_queues"] = _NUM_CQ
     device = ttnn.open_device(**_open_kwargs)
 
     try:
+        # build the pipeline EXACTLY as demo/demo_tts.py does
         model = _load_reference()
 
         # drain the device profiler every PERF_FLUSH_EVERY ops. MODEL-AGNOSTIC: wrap EVERY ttnn
@@ -66,22 +74,27 @@ def test_tts_perf():
                     except Exception:
                         pass
                 return r
-
             return inner
 
         _mods = [ttnn] + [getattr(ttnn, _m, None) for _m in ("transformer", "experimental")]
         for _mod in [_m for _m in _mods if _m is not None]:
             for _n in dir(_mod):
                 _op = getattr(_mod, _n, None)
-                if type(_op).__name__ == "FastOperation":
+                if type(_op).__name__ == "FastOperation":  # every dispatched ttnn op, by type
                     _orig.append((_mod, _n, _op))
                     setattr(_mod, _n, _draining(_op))
 
         _fw0 = time.monotonic()
         try:
-            # run the pipeline EXACTLY as demo/demo_tts.py does, but BOUNDED: cap the AR decode
-            # horizon N via PERF_MAX_NEW_TOKENS and use a small text prompt.
-            out = P.run_tts(device, model, text=PERF_TEXT, language=PERF_LANGUAGE, N=PERF_MAX_NEW_TOKENS)
+            # run the pipeline BOUNDED: cap the AR decode horizon N via PERF_MAX_NEW_TOKENS and keep
+            # the text prompt small — a representative dispatch-dense pass, not a max-shape stress run.
+            out = P.run_tts(
+                device,
+                model,
+                text=PERF_TEXT,
+                language=PERF_LANGUAGE,
+                N=PERF_MAX_NEW_TOKENS,
+            )
             try:
                 ttnn.ReadDeviceProfiler(device)
             except Exception:
@@ -95,15 +108,21 @@ def test_tts_perf():
         if _PERF_TRACE:
             try:
                 from models.experimental.perf_automation.agent.trace_replay import measure_adapter
-                from models.experimental.perf_automation.agent.perf_adapter import PipelineDecodeAdapter
+                from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter
 
                 def _build_for_perf(dev):
-                    # build the pipeline EXACTLY as this test builds it, on the passed-in device
-                    _m = _load_reference()
-                    return P.run_tts(dev, _m, text=PERF_TEXT, language=PERF_LANGUAGE, N=PERF_MAX_NEW_TOKENS)
+                    # Return the RESIDENT, stage-exposing Pipeline object the trace engine binds to
+                    # (PIPELINE_STAGES + per-stage <stage>_trace_setup/_trace_step/_write_inputs and
+                    # the decode contract) — NOT a run-once closure, which exposes none of those and
+                    # makes measure_adapter skip. Built on the passed-in device.
+                    _model = _load_reference()
+                    return P.Pipeline(dev, _model, capacity=64)
 
-                _prompt_ids = [1, 2, 3]
-                _adapter = PipelineDecodeAdapter(_build_for_perf, _prompt_ids, batch=1)
+                _prompt_ids = list(range(min(PERF_SEQ, 16)))
+                # Stage adapter profiles WHATEVER emit-e2e emitted: every PIPELINE_STAGES entry gets
+                # traced (+2CQ where the stage stages its inputs). Falls back to the single decode
+                # contract for pipelines that expose only decode_step.
+                _adapter = PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=1)
                 measure_adapter(_adapter, device, mode="auto")
             except Exception as _te:  # noqa: BLE001
                 print("TRACE_REPLAY_SKIPPED=%r" % (_te,), flush=True)

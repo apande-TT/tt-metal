@@ -97,13 +97,20 @@ def build(device, torch_module):
 
     model_dim = int(m.embeddings.weight.shape[1])
 
-    # Snapshot the stateful prefix embedding stored via store_prefix_emb().
-    prefix_torch = m.cached_prefix_emb.detach().contiguous().to(torch.bfloat16)
-    prefix_len = int(prefix_torch.shape[1])
-    prefix_tt = ttnn.as_tensor(
-        prefix_torch, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device,
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-    )
+    # Prefix embedding. The on-device pipeline computes it resident and hands it in per
+    # call as `prefix_emb_tt` (see forward), so the build-time snapshot is needed ONLY by
+    # the PCC harness, which seeds it statefully via store_prefix_emb -> cached_prefix_emb.
+    # Snapshot it lazily: absent (perf / e2e path) -> None, and forward uses prefix_emb_tt.
+    prefix_tt = None
+    prefix_len = 0
+    _cached = getattr(m, "cached_prefix_emb", None)
+    if _cached is not None:
+        prefix_torch = _cached.detach().contiguous().to(torch.bfloat16)
+        prefix_len = int(prefix_torch.shape[1])
+        prefix_tt = ttnn.as_tensor(
+            prefix_torch, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
 
     def forward(_primary=None, *args, **kwargs):
         import torch as _torch
@@ -135,7 +142,17 @@ def build(device, torch_module):
         pos = ttnn.typecast(pos, ttnn.bfloat16)
         gen_emb = ttnn.add(tok, pos)                     # [1, gen_len, D]
 
-        emb = ttnn.concat([prefix_tt, gen_emb], dim=1)   # [1, prefix_len+gen_len, D]
+        # On-device path hands the resident prefix in as `prefix_emb_tt`; the PCC harness
+        # relies on the stateful build-time snapshot (prefix_tt) instead.
+        prefix = kwargs.get("prefix_emb_tt")
+        if prefix is None:
+            prefix = prefix_tt
+        if prefix is None:
+            raise RuntimeError(
+                "g_p_t2_inference_model: no prefix embedding — pass prefix_emb_tt, or call "
+                "store_prefix_emb(...) on the torch module before build()"
+            )
+        emb = ttnn.concat([prefix, gen_emb], dim=1)      # [1, prefix_len+gen_len, D]
 
         hidden = gpt2_forward(emb)
         normed = ttnn.layer_norm(hidden, epsilon=_LN_EPS, weight=lnf_w, bias=lnf_b)
