@@ -55,9 +55,12 @@ def build(device, torch_module):
             # Push a time-identity through the exact reference interpolation chain
             # to materialize the [t_in, t_out] linear resampling map.
             x = torch.eye(t_in).unsqueeze(0)                                  # [1, t_in, t_in]
-            mm = F.interpolate(x, scale_factor=[ar_mel / hop], mode="linear").squeeze(1)
+            # keep 3-D (N=1, C=t_in, L) through both interpolates; squeeze only the N dim at the
+            # end. A prior .squeeze(1) collapsed C when t_in==1, breaking the second interpolate.
+            mm = F.interpolate(x, scale_factor=[ar_mel / hop], mode="linear")
             if out_sr != in_sr:
-                mm = F.interpolate(mm, scale_factor=[out_sr / in_sr], mode="linear").squeeze(0)
+                mm = F.interpolate(mm, scale_factor=[out_sr / in_sr], mode="linear")
+            mm = mm.squeeze(0)
             # float32 resampling map: the interpolation matmul is the vocoder's
             # precision-sensitive front (bf16 here measurably lowered e2e PCC).
             _m_cache[t_in] = ttnn.as_tensor(
