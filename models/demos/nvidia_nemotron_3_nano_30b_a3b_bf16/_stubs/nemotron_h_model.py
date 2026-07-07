@@ -9392,9 +9392,14 @@ class NemotronHModel:
         self._torch_module = torch_module
         sd = torch_module.state_dict()
         # op-REUSE: embeddings  (Embedding 131072 x 2688)
-        self.w_embeddings_weight = ttnn.from_torch(
-            sd["embeddings.weight"], dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device
-        )
+        _emb_kw = dict(dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+        try:
+            _is_mesh_dev = isinstance(device, ttnn.MeshDevice)
+        except AttributeError:
+            _is_mesh_dev = False
+        if _is_mesh_dev:
+            _emb_kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(device)
+        self.w_embeddings_weight = ttnn.from_torch(sd["embeddings.weight"], **_emb_kw)
         # The op-synth __init__ body below eagerly materializes ~8995 device
         # tensors (incl. 23 MoE layers x 128 experts ~ 30B params) which cannot
         # sit on one chip; that path is dead. Keep only the host state_dict + an
@@ -90802,7 +90807,9 @@ class NemotronHModel:
         neg = ttnn.multiply(ttnn.add(ttnn.multiply(allow, -1.0), 1.0), -1e9)
         scores = ttnn.add(scores, neg)
         probs = ttnn.softmax(scores, dim=-1)
-        ctxv = ttnn.matmul(ttnn.typecast(probs, ttnn.bfloat16), vcache, compute_kernel_config=self._ckcfg)  # (1,KVH,KVG,HD)
+        ctxv = ttnn.matmul(
+            ttnn.typecast(probs, ttnn.bfloat16), vcache, compute_kernel_config=self._ckcfg
+        )  # (1,KVH,KVG,HD)
         ctxv = ttnn.reshape(ctxv, (1, self._A_HEADS, 1, HD))
         attn = ttnn.reshape(ttnn.permute(ctxv, (0, 2, 1, 3)), (1, 1, self._A_HEADS * self._A_HDIM))
         out = self._lin(attn, self._g_ow[i])
