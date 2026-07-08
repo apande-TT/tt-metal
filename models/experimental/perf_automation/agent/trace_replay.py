@@ -136,3 +136,58 @@ def measure_adapter(adapter, device, mode: str = "auto") -> float:
         flush=True,
     )
     return per_token_ms
+
+
+def measure_prefill(device, step_fn, write_inputs=None, mode: str = "auto") -> float:
+    """Trace-replay prefill (TTFT) latency. Prints PREFILL_TRACE_MS=<ms>; returns ms.
+
+    Mirror of measure_adapter for the prefill phase. Caller pre-runs any one-shot
+    setup (e.g. pipeline.prefill_trace_setup(input_ids)) so step_fn is host-op-free.
+
+    step_fn      no-arg callable running one full prefill forward on device
+    write_inputs no-arg callable staging the prompt on CQ1 (enables 2CQ); may be None
+    mode         "auto" (2CQ iff write_inputs and ncq>=2), "trace"/"1cq", or "2cq"
+    """
+    has_2cq_hook = callable(write_inputs)
+    if mode in ("trace", "1cq"):
+        want_2cq = False
+    elif mode == "2cq":
+        want_2cq = True
+    else:  # auto
+        want_2cq = has_2cq_hook
+    ncq = _num_command_queues(device)
+    if want_2cq and ncq is not None and ncq < 2:
+        want_2cq = False
+
+    for _ in range(_WARMUP_ITERS):
+        step_fn()
+    ttnn.synchronize_device(device)
+    tid = ttnn.begin_trace_capture(device, cq_id=0)
+    step_fn()
+    ttnn.end_trace_capture(device, tid, cq_id=0)
+    ttnn.synchronize_device(device)
+
+    iters = max(1, int(os.environ.get("TT_PREFILL_REPLAY_ITERS", "8")))
+    try:
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            if want_2cq:
+                write_inputs()
+                ev = ttnn.record_event(device, 1)
+                ttnn.wait_for_event(0, ev)
+            ttnn.execute_trace(device, tid, cq_id=0, blocking=False)
+        ttnn.synchronize_device(device)
+        per_iter_ms = ((time.perf_counter() - t0) / iters) * 1000.0
+        path = "trace+2cq" if want_2cq else "trace+1cq"
+    finally:
+        try:
+            ttnn.release_trace(device, tid)
+        except Exception:
+            pass
+
+    print("PREFILL_TRACE_MS=%.4f" % per_iter_ms, flush=True)
+    print(
+        "PREFILL_REPLAY_PATH=%s warmup=%d iters=%d" % (path, _WARMUP_ITERS, iters),
+        flush=True,
+    )
+    return per_iter_ms

@@ -54,6 +54,13 @@ def test_text_generation_perf():
         # CAP the input size small: never profile a max-shape forward under tracy.
         if input_ids.shape[-1] > PERF_SEQ_LEN:
             input_ids = input_ids[:, :PERF_SEQ_LEN]
+        # Also build a PERF_SEQ_LEN-tiled prompt for the trace-replay TTFT measurement below
+        # (published ISL/OSL row). The FORWARD_WALL_MS section keeps the short prompt because
+        # its profiler-drain wrapper on a 52-layer prefill at ISL=128 is impractically slow.
+        long_input_ids = input_ids
+        if long_input_ids.shape[-1] < PERF_SEQ_LEN:
+            reps = (PERF_SEQ_LEN + long_input_ids.shape[-1] - 1) // long_input_ids.shape[-1]
+            long_input_ids = long_input_ids.repeat(1, reps)[:, :PERF_SEQ_LEN]
 
         pipe = pl.build_pipeline(device, model, compose=True)
         print(f"[perf] mesh={is_mesh} shard_active={pipe.shard_active}", flush=True)
@@ -121,7 +128,7 @@ def test_text_generation_perf():
                     # already resident.
                     return pipe
 
-                _prompt_ids = input_ids  # SMALL prompt fed to decode_prefill
+                _prompt_ids = long_input_ids  # PERF_SEQ_LEN-tiled prompt so TTFT is measured at published ISL
                 _adapter = PipelineDecodeAdapter(_build_for_perf, _prompt_ids, batch=1)
                 measure_adapter(_adapter, device, mode="auto")  # prints TRACE_PER_TOKEN_MS=<ms>
                 # PREFILL clean-trace bookend (availability-gated): if the pipeline exposes a
