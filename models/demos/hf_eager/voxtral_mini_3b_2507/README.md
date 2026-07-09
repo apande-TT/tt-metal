@@ -156,11 +156,19 @@ TTFT **353.75 → 105.82 ms (3.34×)**.
 | 12 | bf4_b MLP weights | precision | **~1.08× (2.95 ms/tok) — DROPPED (corrupts a token)** |
 | 13 | On-device KV cache (opt-in, added here) | structural | **3.48× at real ctx (124.7 → 35.8 ms/tok)** |
 
-## Kernels (tt-metal C++ / tt-lang) & knobs
+## Code authored, kernels used & knobs
 
-This is a **pure-TTNN Python port** — it authors **no new C++ kernels**; it
-composes existing tt-metal device kernels (C++/tt-lang, under `ttnn/cpp/.../device/kernels`)
-via ttnn ops, and tunes their knobs. Hot-path ops → device kernels:
+The auto-bring-up tool **wrote ttnn (Python) code** — the native forward-pass
+bodies (`_stubs/*.py`) for the **7 NEW components** (`voxtral_encoder`,
+`voxtral_encoder_layer`, `avg_pool1d`, `voxtral_multi_modal_projector`,
+`llama_for_causal_l_m`, `llama_model`, `llama_decoder_layer`), composing ttnn ops
+and applying the fusion/dtype/fidelity tuning. The 7 REUSE components import
+existing tt modules unchanged (ADAPT=0 for this model).
+
+It authored **no device kernels** — no custom C++, **no tt-lang**. The ttnn ops
+its Python code calls run on **stock tt-metal C++ LLK kernels** (SFPI +
+`compute_kernel_api`, under `ttnn/cpp/.../device/kernels`, JIT-built by
+`riscv-tt-elf-g++`). Hot-path ops → the tt-metal kernels they invoke:
 
 | ttnn op | device kernel |
 |---|---|
