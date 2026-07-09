@@ -552,9 +552,9 @@ class TtNemotronHMamba2Mixer:
 
         out = ttnn.matmul(y, self._w_out, compute_kernel_config=self.ckc)  # (B,1,hidden)
         ttnn.deallocate(y)
-        out = ttnn.typecast(out, ttnn.bfloat16)  # communicate collective in bf16 (result is bf16 anyway) -> half CCL bytes
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
+        out = ttnn.typecast(out, ttnn.bfloat16)
         return out, new_state, new_conv_tail
 
 
