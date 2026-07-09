@@ -23,6 +23,7 @@ torch path is always taken.
 """
 
 import contextlib
+import importlib.machinery
 import sys
 import types
 
@@ -98,6 +99,11 @@ def _install_mamba_ssm_shim():
         m = types.ModuleType(name)
         m._tt_shim = True
         m.__path__ = []  # mark as a package so submodule imports resolve
+        # A real ModuleSpec so transformers' _is_package_available -> find_spec
+        # returns a spec (not None, not ValueError); importlib.metadata.version
+        # then raises PackageNotFoundError -> is_*_available() == False, so the
+        # modeling file takes its pure-torch fallback (fast path stays disabled).
+        m.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
         return m
 
     mamba_ssm = _mk("mamba_ssm")
