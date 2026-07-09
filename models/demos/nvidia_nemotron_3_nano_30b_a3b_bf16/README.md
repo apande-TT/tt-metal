@@ -228,21 +228,44 @@ device_ms → T/S/U methodology and the campaign write-up.
 ## Optimization wins
 
 Seven commits landed against the initial single-chip submission, all preserving
-end-to-end logits PCC 0.9983 vs the HF reference:
+end-to-end logits PCC 0.9983 vs the HF reference. **All seven were measured on
+single-chip (TP=1)** via `tests/e2e/test_perf.py`'s plain pytest `device` fixture
+(`ttnn.CreateDevice`) — this fixture never opens a mesh and never sets
+`TT_HW_PLANNER_SHARD_RUN`, so every stub's `self._shard` flag is `False` for this
+measurement, regardless of the topology reported elsewhere in this README. That's
+a valid methodology **only** for optimizations whose changed code has no
+shard-conditional branch — five of the seven qualify:
 
-| # | Commit | Change | Reported gain |
+| # | Commit | Change | Reported gain (single-chip, valid) |
 |---|---|---|---|
-| 1 | `b8f2345` | Multi-core vocab argmax (untilize logits to ROW_MAJOR before `ttnn.argmax`) | `device_ms 231.0 → 213.6` (−7.5%) |
-| 2 | `986dd6f` | Host-tilize stacked MoE expert weights (removes on-device Tilize of up/down expert stacks) | `device_ms 213.6 → 168.0` (−21.4%) |
-| 3 | `cf7b381` | Eliminate GQA `repeat_interleave` in decode attention (KV-heads-batched matmul) | per-token `126.35 → 123.45 ms` (−2.3%), t/s 7.91 → 8.10 |
-| 4 | `8df4d98` | Communicate mamba `out_proj` all_reduce in bf16 (was fp32) — halves CCL bytes on the TP link | per-token `126.35 → 123.18 ms` |
-| 5 | `dd21def` | TILE-native reshape for mamba grouped-RMSNorm (drops 4 layout round-trips per mamba layer, 92 op launches/token) | per-token `123.19 → 119.98 ms` (−2.6%), t/s 8.11 → 8.33 |
-| 6 | `757ec86` | Fuse FMA eltwise in mamba SSM state update + MoE expert accumulation (`ttnn.mac`) — removes ~760 add ops/token | `device_ms 168.01 → 167.95` |
-| 7 | `dc0abea` | Replace attention KV-cache masked-blend write with `ttnn.where` scatter — collapses 3 broadcast BinaryNg ops to 1 `ttnn.where` per k/v × 6 attn layers | `device_ms 168.005 → 167.896` |
+| 1 | `b8f2345` | Multi-core vocab argmax (untilize logits to ROW_MAJOR before `ttnn.argmax`) — operates on the replicated `lm_head` output, no shard branch | `device_ms 231.0 → 213.6` (−7.5%) |
+| 3 | `cf7b381` | Eliminate GQA `repeat_interleave` in decode attention (KV-heads-batched matmul) — attention is REUSE, never shard-conditional | per-token `126.35 → 123.45 ms` (−2.3%), t/s 7.91 → 8.10 |
+| 5 | `dd21def` | TILE-native reshape for mamba grouped-RMSNorm (drops 4 layout round-trips per mamba layer, 92 op launches/token) — shared mixer code, runs on whatever local size the chip has | per-token `123.19 → 119.98 ms` (−2.6%), t/s 8.11 → 8.33 |
+| 6 | `757ec86` | Fuse FMA eltwise in mamba SSM state update + MoE expert accumulation (`ttnn.mac`) — removes ~760 add ops/token; confirmed shared code, no shard branch | `device_ms 168.01 → 167.95` |
+| 7 | `dc0abea` | Replace attention KV-cache masked-blend write with `ttnn.where` scatter — collapses 3 broadcast BinaryNg ops to 1 `ttnn.where` per k/v × 6 attn layers; attention, no shard branch | `device_ms 168.005 → 167.896` |
 
-Aggregate: `device_ms 877.5 → 359.2 ms` (2.44×), delivered while preserving
-per-step logits PCC. Numbers above come from the commit messages of the wins as
-landed on this branch.
+**The other two commits (#2, #4) touched code that was entirely inside `if
+self._shard:` — that code could not execute on the single-chip harness that
+reported their numbers. Re-testing the same code directly on the real 4-chip
+mesh showed the claimed mechanism did not hold, so both have been reverted:**
+
+| # | Commit | Claimed change | Reported single-chip number (code didn't run) | Direct re-test on real 4-chip mesh | Status |
+|---|---|---|---|---|---|
+| 2 | `986dd6f` | Host-tilize stacked MoE expert weights (claimed: removes on-device Tilize) | `device_ms 213.6 → 168.0` (−21.4%) — unexplained; the single-chip `else:` branch was untouched | Measured directly: on-device tilize 59.5 ms/iter vs host-tilize 1086.0 ms/iter — host-tilize is ~18× SLOWER, not faster. On-device tilize benefits from 4 chips tiling their own ¼ shard in parallel on hardware tilize units; host-tilize serially tiled the full 128-expert stack on CPU before any sharding. | **Reverted.** `_stubs/nemotron_h_m_o_e.py` upload is back to `device=dev` on-device tilize. Re-verified: PCC 0.9999 on the real mesh. |
+| 4 | `8df4d98` | bf16 (not fp32) all-reduce for mamba `out_proj` (claimed: halves CCL bytes on the TP link) | `device_ms 168.02 → 167.85` — the `all_reduce` call is `if self._shard: ...`, didn't execute on single-chip | Measured directly on a decode-shaped (1,1,2688) tensor: fp32 all_reduce 0.197 ms/iter vs bf16 0.224 ms/iter — bf16 is ~14% slower. At this tensor size the collective is dispatch/latency-bound, not bandwidth-bound, so halving bytes doesn't help and the extra `typecast` adds pure overhead. | **Reverted.** `_stubs/nemotron_h_mamba2_mixer.py`'s `decode_step` is back to all_reduce-then-typecast (fp32 collective). Re-verified via full e2e run: exact token match vs. HF golden across all 5 decode steps. |
+
+**Aggregate `device_ms 877.5 → 359.2 ms` (2.44×) overstated the actual win** — it
+included wins #2 and #4's deltas, which were unexplained on single-chip and shown
+to be net-negative when actually run on the mesh. Both are now reverted; the
+soundly-verified `device_ms` contribution going forward is wins #1, #3, #5, #6, #7
+only. Production T/S/U should improve marginally as a result (win #4's revert
+alone saves ~0.6 ms/token: 23 Mamba layers × ~0.027 ms/call).
+
+**Separately, the production trace+2CQ path (measured on the real 4-chip mesh,
+TP=4/DP=1, after an unrelated embedding mesh_mapper fix on 07-07) gives:
+T/S/U = 8.52, decode 117.43 ms/token, TTFT 179.14 ms.** This is the only number
+in this document actually measured on the sharded topology end-to-end; the
+per-op numbers above are single-chip dev-iteration signal, not a mesh benchmark.
 
 ## Known open optimizations
 
