@@ -100,18 +100,26 @@ Every precision was tested on the 3 real clips. Correctness is judged on the
 **content** tokens (real speech); the short clip's tail tokens are over-generated
 past end-of-speech and diverge at every precision (handled by EOS-stop).
 
-| Decoder matmul weights        | Content correct?                    | Decode/token (trace+2CQ) | T/S/U | Verdict |
-|-------------------------------|-------------------------------------|--------------------------|-------|---------|
-| bf16 (all)                    | ✅ all clips                        | 55.24 ms                 | 18.10 | correct but ~1.5× slower |
-| bf8_b + bf4_b (original)      | ✅ all content                      | 34.79 ms                 | 28.75 | fast (reference) |
-| **all bf8_b (fp8) — shipped** | ✅ all content                      | 37.74 ms                 | 26.50 | **chosen: correct + fast, no bf4 fragility** |
-| all bf4_b                     | ❌ 1 content slip (`Stuff`→`stuff`) | 33.04 ms                 | 30.26 | fastest but corrupts a content token |
+| Decoder matmul weights        | Prefill PCC (real audio)†     | Content correct?                    | Decode/token (trace+2CQ) | T/S/U | Verdict |
+|-------------------------------|-------------------------------|-------------------------------------|--------------------------|-------|---------|
+| bf16 (all)                    | 0.9988 / 0.9992 / 0.9995      | ✅ all clips                        | 55.24 ms                 | 18.10 | correct but ~1.5× slower |
+| bf8_b + bf4_b (original)      | 0.9635 / 0.9296 / 0.9809      | ✅ all content                      | 34.79 ms                 | 28.75 | fast (reference) |
+| **all bf8_b (fp8) — shipped** | 0.9840 / 0.9931 / 0.9973      | ✅ all content                      | 37.74 ms                 | 26.50 | **chosen: correct + fast, no bf4 fragility** |
+| all bf4_b                     | 0.8722 / 0.7942 / 0.8930      | ❌ 1 content slip (`Stuff`→`stuff`) | 33.04 ms                 | 30.26 | fastest but corrupts a content token |
+
+† Per-clip prefill last-token logits PCC vs HF (clip 1 / clip 2 / clip 3).
+
+**PCC is not the correctness gate here — token match is.** Note the values are
+well below 1.0 yet the tokens are correct (e.g. bf8+bf4 at 0.93–0.98, all-fp8 at
+0.98–0.997 → all content tokens right), and all-bf4 at 0.79–0.89 still transcribes
+but slips one token. On real speech the correct token's margin is large, so even
+a modest PCC lands the right argmax; on a synthetic tone the logits are near-tied,
+so the same PCC flips tokens — which is why the earlier synthetic "0/6" was an
+artifact, not a real-audio failure.
 
 Takeaway: **all-bf8_b (fp8)** is the sweet spot — every real-speech content token
 correct while staying fast. bf4_b buys ~5% more speed but corrupts content on
-low-margin audio; bf16 is correct but ~1.5× slower. (The earlier synthetic-tone
-"0/6" was an artifact of near-tied logits on meaningless audio, **not** a
-real-audio failure — which is why correctness is measured on real speech here.)
+low-margin audio; bf16 is correct but ~1.5× slower.
 
 ### KV cache (real-context decode)
 
