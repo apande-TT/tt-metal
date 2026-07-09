@@ -81,36 +81,41 @@ def load_processor():
 # --------------------------------------------------------------------------- #
 # Real input construction (Sources A+B). Both TT and HF receive identical input.
 # --------------------------------------------------------------------------- #
-def build_inputs(processor, model, seconds: float = 8.0, prompt: str = "\nWhat is said in the audio?"):
-    """Real processor input from a deterministic 16 kHz waveform.
+def build_inputs(processor, model, audio=None, seconds: float = 2.0, language: str = "en", prompt=None):
+    """Voxtral transcription-request inputs (the model's TRAINED input format).
 
-    Returns (input_ids (1,T) long, input_features (1,128,3000) float32,
-    n_audio_tokens, audio_token_id, prompt).
+    Uses `processor.apply_transcription_request(...)`, which wraps the audio in the
+    correct control tokens. Hand-building `[bos] + [audio]*N + text_prompt` (the old
+    path) is NOT Voxtral's format and yields garbage even from the HF reference on
+    real audio — see the transcription tests.
+
+    `audio`: 16 kHz mono waveform (np.ndarray). If None, a deterministic synthetic
+    tone is used so the parity test stays reproducible (audio content is irrelevant
+    to TT-vs-HF parity). `prompt` is accepted for backward-compat and ignored
+    (transcription is driven by `language`, not free text).
+
+    Requires `mistral_common`, `pydantic_extra_types`, `pycountry` (deps of
+    apply_transcription_request). Returns
+    (input_ids (1,T) long, input_features (1,128,3000) f32, n_audio_tokens, audio_token_id, language).
     """
-    fe = processor.feature_extractor
-    sr = int(getattr(fe, "sampling_rate", 16000))
-    t = np.arange(int(seconds * sr)) / sr
-    # deterministic non-trivial waveform (sum of tones) — parity is vs HF on the
-    # SAME input, so the audio content is irrelevant to correctness.
-    wav = (0.1 * np.sin(2 * np.pi * 220.0 * t) + 0.05 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
-    feat = fe([wav], sampling_rate=sr, return_tensors="pt")
-    input_features = feat.input_features.to(torch.float32)
+    sr = 16000
+    if audio is None:
+        t = np.arange(int(seconds * sr)) / sr
+        audio = (0.1 * np.sin(2 * np.pi * 220.0 * t) + 0.05 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
 
-    cfg = model.config
-    # audio encoder output length: conv2 halves the 3000-frame mel -> 1500;
-    # get_audio_features reshapes (1,1500,1280) -> (-1, 5120), i.e. 4 frames/token.
-    msp = cfg.audio_config.max_source_positions  # 1500
-    d_model = cfg.audio_config.hidden_size  # 1280
-    inter = cfg.audio_config.intermediate_size  # 5120
-    n_audio = (msp * d_model) // inter  # 375
-    atid = cfg.audio_token_id  # 24
-
-    tok = processor.tokenizer
-    tail = tok(prompt, add_special_tokens=False).input_ids
-    bos = tok.bos_token_id
-    ids = [bos] + [atid] * n_audio + tail
-    input_ids = torch.tensor([ids], dtype=torch.long)
-    return input_ids, input_features, n_audio, atid, prompt
+    inp = processor.apply_transcription_request(
+        audio=audio,
+        model_id=HF_MODEL_ID,
+        language=language,
+        sampling_rate=sr,
+        format=["wav"],
+        return_tensors="pt",
+    )
+    input_ids = inp["input_ids"]
+    input_features = inp["input_features"].to(torch.float32)
+    atid = model.config.audio_token_id
+    n_audio = int((input_ids[0] == atid).sum())
+    return input_ids, input_features, n_audio, atid, language
 
 
 # --------------------------------------------------------------------------- #
@@ -301,10 +306,14 @@ class VoxtralTTPipeline:
         ttnn.copy_host_to_device_tensor(self._pf_host_feats, self._pf_feats, cq_id=1)  # feats upload on CQ1
 
     # ---- text path (parity decode) + text-side verification stages ---- #
-    def run(self, input_ids, input_features, max_new_tokens=8):
+    def run(self, input_ids, input_features, max_new_tokens=8, stop_at_eos=False, use_kv_cache=False):
         dev = self.device
         model = self.model
         atid = model.config.audio_token_id
+        _eos = getattr(model.config, "eos_token_id", None)
+        if _eos is None and hasattr(model.config, "text_config"):
+            _eos = getattr(model.config.text_config, "eos_token_id", None)
+        eos_ids = set(_eos) if isinstance(_eos, (list, tuple)) else ({_eos} if _eos is not None else set())
 
         audio_embeds = self._run_audio(input_features)
 
@@ -325,14 +334,34 @@ class VoxtralTTPipeline:
         embeds_buf = _to_tt(prefill_merged, dev)  # resident (1,L,3072)
         tt_tokens, tt_step_logits = [], []
         n_steps = max_new_tokens
+        self.invoked.add("llama_for_causal_l_m")
+
+        # KV-cache path: prefill once (populates per-layer K/V), then each step
+        # processes only the ONE new token against the cache (M=1 matmuls) instead
+        # of re-running the whole growing sequence. Numerically identical math.
+        logits_tt = clm.prefill(embeds_buf) if use_kv_cache else None
+
         for _step in range(n_steps):
-            logits_tt = clm(embeds_buf)  # (1,L,131072)
-            self.invoked.add("llama_for_causal_l_m")
+            if not use_kv_cache:
+                logits_tt = clm(embeds_buf)  # (1,L,131072) — full-sequence recompute
             last = _tt_to_torch(logits_tt)[0, -1]  # (V,) float32 — measurement
             tt_step_logits.append(last)
             nxt_tt = self._next_token_on_device(clm, logits_tt)  # (1,1) uint32, on device
-            tt_tokens.append(int(_tt_to_torch(nxt_tt).reshape(-1)[0]))
-            embeds_buf = self._append_token(clm, embeds_buf, nxt_tt)
+            nxt = int(_tt_to_torch(nxt_tt).reshape(-1)[0])
+            tt_tokens.append(nxt)
+            # Stop once end-of-speech is reached. Beyond the audio content the
+            # tokens are low-confidence (no audio to anchor them) and diverge from
+            # the reference at ANY precision (bf16 included) — see transcription
+            # tests. Off by default so the fixed-N parity test is unaffected.
+            if stop_at_eos and nxt in eos_ids:
+                break
+            if _step == n_steps - 1:
+                break
+            if use_kv_cache:
+                nxt_emb = ttnn.to_layout(clm._apply_model_embed_tokens(nxt_tt), ttnn.TILE_LAYOUT)  # (1,1,H)
+                logits_tt = clm.decode_step(nxt_emb)
+            else:
+                embeds_buf = self._append_token(clm, embeds_buf, nxt_tt)
         del clm
         gc.collect()
 

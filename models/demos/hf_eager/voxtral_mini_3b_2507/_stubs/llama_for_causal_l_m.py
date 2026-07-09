@@ -2305,7 +2305,10 @@ class LlamaForCausalLM:
             return ttnn.from_torch(t.T.contiguous(), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
 
         def _w4(t):
-            return ttnn.from_torch(t.T.contiguous(), dtype=ttnn.bfloat4_b, layout=ttnn.TILE_LAYOUT, device=device)
+            # NOTE: bf4_b was found to corrupt content tokens on short/low-margin
+            # audio (e.g. capitalized sentence-initial word); use bf8_b for the MLP
+            # gate/up too. All matmul weights are now bf8_b ("all-fp8").
+            return ttnn.from_torch(t.T.contiguous(), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
 
         for i in range(self.num_layers):
             qw = sd[f"model.layers.{i}.self_attn.q_proj.weight"]
@@ -2368,7 +2371,7 @@ class LlamaForCausalLM:
         x = ttnn.reshape(x, (1, t, n_heads, self.head_dim))
         return ttnn.transpose(x, 1, 2)
 
-    def _decoder_layer(self, i, hidden_states, mask, cos, sin):
+    def _decoder_layer(self, i, hidden_states, mask, cos, sin, capture=False):
         # hidden_states (residual stream) is fp32.
         residual = hidden_states
         h = self._rms_norm(hidden_states, self.ln_input[i])  # bf16
@@ -2381,6 +2384,11 @@ class LlamaForCausalLM:
         )
         q = ttnn.experimental.rotary_embedding_hf(q, cos, sin)
         k = ttnn.experimental.rotary_embedding_hf(k, cos, sin)
+        if capture:
+            # KV-cache prefill: stash the RoPE'd K and V (1, n_kv, T0, head_dim) for
+            # incremental decode. Deep-copied off the graph so later ops don't alias.
+            self._kv_k[i] = ttnn.clone(k)
+            self._kv_v[i] = ttnn.clone(v)
         attn = ttnn.transformer.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=self.scaling, compute_kernel_config=self.compute_kernel_config
         )
@@ -3138,6 +3146,128 @@ class LlamaForCausalLM:
 
     def _apply_lm_head(self, x):
         return ttnn.linear(x, self.w_lm_head_weight)
+
+    # ---------------- KV-cache incremental decode (opt-in) ---------------- #
+    # Default __call__ recomputes the whole growing sequence every step (O(context)
+    # per token). These methods keep a resident per-layer K/V cache so decode
+    # processes only the ONE new token (M=1 matmuls) and attends it against the
+    # cache. Numerically identical math -> token-identical to the no-cache path.
+    def reset_kv_cache(self):
+        self._kv_k = [None] * self.num_layers
+        self._kv_v = [None] * self.num_layers
+        self._cache_len = 0
+
+    def _rope_at(self, pos):
+        cos, sin = self._rope_cos_sin(pos + 1)
+        d = cos.shape[-1]
+        cos1 = ttnn.slice(cos, [0, 0, pos, 0], [1, 1, pos + 1, d])
+        sin1 = ttnn.slice(sin, [0, 0, pos, 0], [1, 1, pos + 1, d])
+        return cos1, sin1
+
+    def prefill(self, inputs_embeds):
+        """Run the full prompt once, populate the K/V cache, return last-token logits."""
+        self.reset_kv_cache()
+        x = ttnn.typecast(inputs_embeds, ttnn.float32)
+        T = int(x.shape[1])
+        cos, sin = self._rope_cos_sin(T)
+        for i in range(self.num_layers):
+            x = self._decoder_layer(i, x, None, cos, sin, capture=True)
+        self._cache_len = T
+        x = ttnn.slice(x, [0, T - 1, 0], [1, T, x.shape[2]])
+        x = self._rms_norm(x, self.w_model_norm)
+        return self._lin(x, self.w_lm_head_weight)
+
+    def _decoder_layer_decode(self, i, hidden_states, cos1, sin1, grow=True):
+        # hidden_states: (1,1,H) fp32 — the single new token.
+        # grow=True: append K/V to the cache (correct autoregressive decode).
+        # grow=False: attend the FIXED pre-allocated cache without growing it
+        #             (host-op-free, fixed-shape -> trace-capturable perf step).
+        residual = hidden_states
+        h = self._rms_norm(hidden_states, self.ln_input[i])  # (1,1,H) bf16
+        qkv = ttnn.typecast(self._lin(h, self.w_qkv[i]), ttnn.bfloat16)
+        qkv = ttnn.reshape(qkv, (1, 1, 1, qkv.shape[-1]))
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            qkv, num_heads=self.num_heads, num_kv_heads=self.num_kv_heads, transpose_k_heads=False
+        )
+        q = ttnn.experimental.rotary_embedding_hf(q, cos1, sin1)  # (1,nh,1,hd)
+        k = ttnn.experimental.rotary_embedding_hf(k, cos1, sin1)  # (1,nkv,1,hd)
+        if grow:
+            self._kv_k[i] = ttnn.concat([self._kv_k[i], k], dim=2)
+            self._kv_v[i] = ttnn.concat([self._kv_v[i], v], dim=2)
+        kc, vc = self._kv_k[i], self._kv_v[i]  # (1,nkv,L,hd)
+        attn = ttnn.transformer.scaled_dot_product_attention(
+            q, kc, vc, is_causal=False, scale=self.scaling, compute_kernel_config=self.compute_kernel_config
+        )
+        attn = ttnn.experimental.nlp_concat_heads(attn)  # (1,1,1,nh*hd)
+        attn = ttnn.reshape(attn, (1, 1, self.num_heads * self.head_dim))
+        attn = self._lin(attn, getattr(self, f"w_model_layers_{i}_self_attn_o_proj_weight"))
+        hidden_states = ttnn.add(residual, ttnn.typecast(attn, ttnn.float32))
+
+        residual = hidden_states
+        h = self._rms_norm(hidden_states, self.ln_post[i])  # bf16
+        gate = ttnn.silu(
+            ttnn.linear(
+                h,
+                getattr(self, f"w_model_layers_{i}_mlp_gate_proj_weight"),
+                compute_kernel_config=self.mm_compute_kernel_config,
+                dtype=ttnn.bfloat8_b,
+            )
+        )
+        up = ttnn.linear(
+            h,
+            getattr(self, f"w_model_layers_{i}_mlp_up_proj_weight"),
+            compute_kernel_config=self.mm_compute_kernel_config,
+            dtype=ttnn.bfloat8_b,
+        )
+        h = self._lin(
+            ttnn.mul(gate, up, dtype=ttnn.bfloat8_b), getattr(self, f"w_model_layers_{i}_mlp_down_proj_weight")
+        )
+        return ttnn.add(residual, ttnn.typecast(h, ttnn.float32))
+
+    def decode_step(self, inputs_embed_1tok):
+        """Process ONE new token (1,1,H) using the cache; return its logits."""
+        pos = self._cache_len
+        cos1, sin1 = self._rope_at(pos)
+        x = ttnn.typecast(inputs_embed_1tok, ttnn.float32)
+        for i in range(self.num_layers):
+            x = self._decoder_layer_decode(i, x, cos1, sin1)
+        self._cache_len += 1
+        x = self._rms_norm(x, self.w_model_norm)
+        return self._lin(x, self.w_lm_head_weight)
+
+    def alloc_fixed_cache(self, ctx_len):
+        """Pre-allocate a FIXED (non-growing) per-layer K/V cache of length ctx_len,
+        for the trace-capturable representative perf decode step."""
+        import torch as _torch
+
+        self._kv_k, self._kv_v = [], []
+        for _ in range(self.num_layers):
+            self._kv_k.append(
+                ttnn.from_torch(
+                    _torch.zeros(1, self.num_kv_heads, ctx_len, self.head_dim),
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.device,
+                )
+            )
+            self._kv_v.append(
+                ttnn.from_torch(
+                    _torch.zeros(1, self.num_kv_heads, ctx_len, self.head_dim),
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.device,
+                )
+            )
+        self._cache_len = ctx_len
+
+    def decode_step_perf(self, inputs_embed_1tok, cos1, sin1):
+        """Representative M=1 decode step vs a FIXED cache — no growth, no host ops
+        (RoPE passed in precomputed) -> trace-capturable for perf measurement."""
+        x = ttnn.typecast(inputs_embed_1tok, ttnn.float32)
+        for i in range(self.num_layers):
+            x = self._decoder_layer_decode(i, x, cos1, sin1, grow=False)
+        x = self._rms_norm(x, self.w_model_norm)
+        return self._lin(x, self.w_lm_head_weight)
 
     def __call__(self, *args, **kwargs):
         # Driven via `inputs_embeds` (the harness drops input_ids so we skip the

@@ -1,0 +1,5 @@
+# Extra deps for the Voxtral transcription-request input format
+# (transformers.VoxtralProcessor.apply_transcription_request).
+mistral_common
+pydantic_extra_types
+pycountry
