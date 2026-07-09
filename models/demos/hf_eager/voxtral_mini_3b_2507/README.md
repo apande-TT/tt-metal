@@ -130,6 +130,64 @@ decode is **124.69 ms/tok (8.0 tok/s)**. An opt-in on-device KV cache
 token against a resident K/V cache — **35.80 ms/tok (27.9 tok/s), 3.48× faster**
 at real context — with token-identical output.
 
+## Optimization wins & measured speedup
+
+13 wins in two groups. Speedups are given at the granularity actually measured:
+the structural fusions were **not** ablated one-by-one, so they are reported as a
+single "structural bundle" figure; items I isolated are called out. Decode =
+ms/tok, trace+2CQ. Aggregate graduated→fp8: **78.99 → 37.74 ms/tok (2.09×)**;
+TTFT **353.75 → 105.82 ms (3.34×)**.
+
+| # | Win | Group | Speedup |
+|---|-----|-------|---------|
+| 1 | Fused QKV projection | structural | bundle |
+| 2 | Fused single-kernel head split | structural | bundle |
+| 3 | FlashAttention-2 SDPA (GQA) | structural | bundle |
+| 4 | Fused HF RoPE | structural | bundle |
+| 5 | GELU fused into fc1 (encoder) | structural | bundle |
+| 6 | Last-position-only logits | structural | bundle |
+| 7 | Trace-clean forward + trace capture | structural | bundle |
+| 8 | 2 command queues (2CQ) | structural | **~1.00× at batch=1** (decode_2cq ≈ decode_only) |
+| — | **structural bundle (1–8, at bf16)** | — | **78.99 → 55.24 ms/tok = 1.43×** |
+| 9 | bf8_b weights (fp8) | precision | part of quant bucket |
+| 10 | bf8_b MLP activations | precision | part of quant bucket |
+| 11 | LoFi math fidelity (matmuls) | precision | part of quant bucket |
+| — | **quantization bucket (bf16→fp8)** | — | **55.24 → 37.74 ms/tok = 1.46×** |
+| 12 | bf4_b MLP weights | precision | **~1.08× (2.95 ms/tok) — DROPPED (corrupts a token)** |
+| 13 | On-device KV cache (opt-in, added here) | structural | **3.48× at real ctx (124.7 → 35.8 ms/tok)** |
+
+## Kernels (tt-metal C++ / tt-lang) & knobs
+
+This is a **pure-TTNN Python port** — it authors **no new C++ kernels**; it
+composes existing tt-metal device kernels (C++/tt-lang, under `ttnn/cpp/.../device/kernels`)
+via ttnn ops, and tunes their knobs. Hot-path ops → device kernels:
+
+| ttnn op | device kernel |
+|---|---|
+| `ttnn.linear` / `ttnn.matmul` (QKV, o_proj, MLP, lm_head) | matmul |
+| `ttnn.transformer.scaled_dot_product_attention[_decode]` | `sdpa` (FlashAttention-2, GQA) |
+| `ttnn.experimental.nlp_create_qkv_heads` / `nlp_concat_heads` | head split / concat |
+| `ttnn.experimental.rotary_embedding_hf` | RoPE |
+| `ttnn.rms_norm` | `layernorm`/rmsnorm |
+| `ttnn.silu` / `ttnn.gelu` | `eltwise_sfpu` (SFPU) |
+| `ttnn.mul` / `ttnn.add` | `eltwise_binary` |
+| `ttnn.argmax` | reduction (ROW_MAJOR → multi-core) |
+| `ttnn.embedding` / `concat` / `slice` / `reshape` / `to_layout` / `typecast` | data-movement |
+
+Knobs (the tunables that produced the results above):
+
+| Knob | Value | Effect |
+|---|---|---|
+| `math_fidelity` | HiFi4 (norm/SDPA), **LoFi** (proj/MLP matmuls) | accuracy ↔ matmul speed |
+| weight dtype | **bf8_b (fp8)** — bf4_b dropped, bf16 optional | DRAM bandwidth |
+| activation dtype | bf8_b (wide MLP intermediates) | DRAM bandwidth |
+| `fp32_dest_acc_en` / `packer_l1_acc` | True / True | fp32 accumulation on the residual stream |
+| `l1_small_size` | 24576 | audio conv scratch |
+| `trace_region_size` | 200000000 | trace-capture buffer |
+| `num_command_queues` | 2 (2CQ) | overlap host token-upload with compute |
+| tensor layout | TILE (compute), ROW_MAJOR (argmax/embedding) | kernel dispatch / multi-core reduction |
+| `use_kv_cache` | opt-in | O(1) vs O(context) per-token decode |
+
 ## Run
 
 ```bash
