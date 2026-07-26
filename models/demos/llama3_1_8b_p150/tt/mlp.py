@@ -170,6 +170,21 @@ class MLP(LightweightModule):
 
         ff1_3_out_mem_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if full_grid_ff1_3 else ff1_3_input_mem_config
 
+        # L1 island for the ff1/ff3 -> SILU mul -> ff2 chain in prefill. The weights cannot be
+        # made L1-resident (w1/w3 are ~33 MB each per layer), but the [seq, hidden] intermediates
+        # can: keeping them in L1 removes three DRAM round-trips per MLP (ff1 and ff3 write, the
+        # mul reads both and writes, ff2 reads) at no cost to the weight reads. Bounded to short
+        # prompts so long prefill -- whose intermediates are many times larger -- keeps the DRAM
+        # path; w1_out/w3_out are freed right after the mul, so the island peaks at three of them.
+        prefill_l1_island = (
+            mode == Mode.PREFILL
+            and not TG
+            and self.prefetcher is None
+            and seq_len <= self.args.prefill_len_cutoff
+        )
+        if prefill_l1_island:
+            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+
         x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
 
         # ff1/ff3 are DRAM-bandwidth bound, and their bf4_b weights are already at the dtype
