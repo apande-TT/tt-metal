@@ -67,8 +67,12 @@ def build_pipeline(
         page_params = {"page_block_size": 32, "page_max_num_blocks_per_dp": 1024}
 
     if num_layers is None:
-        _perf_layers = os.environ.get("TT_PERF_LAYERS")
-        num_layers = int(_perf_layers) if _perf_layers else None
+        # TT_PERF_LAYERS=0 means ALL layers. The env value is a non-empty string, so a plain
+        # truthiness test accepts "0" and int() turns it into a literal 0 -> a ZERO-layer model with
+        # no KV cache, which dies in get_block_size(kv_cache[0][0]) before any work happens. The
+        # builder's own "all layers" sentinel is None, so 0 must map to None, not to 0.
+        _perf_layers = int(os.environ.get("TT_PERF_LAYERS") or 0)
+        num_layers = _perf_layers if _perf_layers > 0 else None
 
     if optimizations is None:
         optimizations = lambda model_args: DecodersPrecision.performance(model_args.n_layers, model_args.model_name)
