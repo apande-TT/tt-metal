@@ -1,7 +1,7 @@
 {
-  "trace_1cq": false,
-  "trace_1cq_path": null,
+  "trace_1cq": true,
+  "trace_1cq_path": "trace+1cq+trace_tokens_per_sec=41.62+batch=1+warmup=3+iters=16",
   "trace_2cq": false,
   "trace_2cq_path": null,
-  "eager_terminal": true
+  "eager_terminal": false
 }

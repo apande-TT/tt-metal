@@ -213,4 +213,56 @@ def _attach_decode_contract(generator) -> None:
     generator.decode_prefill = decode_prefill
     generator.decode_step = decode_step
     generator.trace_path = trace_path
+
+    # ---- PIPELINE_STAGES: per-stage trace steering -------------------------------------------
+    # PipelineStageAdapter walks PIPELINE_STAGES and traces each `<name>_trace_step` SEPARATELY,
+    # reporting TRACE_STAGE_MS[<name>]. Without it the adapter falls back to one "decode" stage, so
+    # trace_replay yields a single number and cannot say WHICH part of the model is expensive --
+    # leaving knob selection to the 2-layer tracy window, whose proportions are skewed (a
+    # once-per-model op such as the LM-head TopK keeps full weight while 50 of 52 layers vanish).
+    #
+    # Attached to the OBJECT, not the module: the adapter reads PIPELINE_STAGES off the pipeline it
+    # built, falling back to the module where its CLASS is defined -- which is tt_transformers'
+    # Generator, not this file. A module-level constant here would never be seen.
+    #
+    # Each hook is ZERO-ARG (trace_replay calls `stage.step()`); state is held in a closure so the
+    # step is a pure device-side unit of work with no host round-trip inside the traced region.
+    # The adapter calls a setup hook as `setup(None)`, so each stage must be self-contained: it
+    # supplies its own prompt rather than expecting one to be threaded in.
+    _DEFAULT_PROMPT_IDS = [128000, 791, 6864, 315, 9822, 374]  # "The capital of France is"
+    _stage_state = {}
+
+    def _staged_prompt():
+        return _normalize_prompt_ids(generator, _stage_state.get("prompt_ids") or _DEFAULT_PROMPT_IDS)
+
+    def prefill_trace_setup(_inputs=None):
+        if _inputs is not None and not isinstance(_inputs, dict):
+            _stage_state["prompt_ids"] = _inputs
+
+    def prefill_trace_step():
+        prompt = _staged_prompt()
+        return generator.prefill_forward_text(
+            prompt,
+            page_table=generator.page_table,
+            kv_cache=generator.tt_kv_cache,
+            prompt_lens=[int(prompt.shape[1])] * int(prompt.shape[0]),
+            sampling_params=_greedy_sampling_params(generator),
+            warmup_prefill=True,
+            enable_trace=True,
+        )
+
+    def decode_trace_setup(_inputs=None):
+        if _inputs is not None and not isinstance(_inputs, dict):
+            _stage_state["prompt_ids"] = _inputs
+        # one prefill establishes the KV cache + first token; the traced step is decode ONLY
+        _stage_state["decode"] = decode_prefill(_stage_state.get("prompt_ids") or _DEFAULT_PROMPT_IDS)
+
+    def decode_trace_step():
+        _stage_state["decode"] = decode_step(_stage_state["decode"])
+
+    generator.PIPELINE_STAGES = ["prefill", "decode"]
+    generator.prefill_trace_setup = prefill_trace_setup
+    generator.prefill_trace_step = prefill_trace_step
+    generator.decode_trace_setup = decode_trace_setup
+    generator.decode_trace_step = decode_trace_step
     generator.self_traced = True
