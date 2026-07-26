@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-26 16:19:39 UTC · 5 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-26 16:32:05 UTC · 10 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -9,44 +9,50 @@ Optimization summary — llama3_1_8b_p150 · main (device_ms)
 optimizing… — baseline->final speedup is finalized when the module converges (per-attempt detail below is live)
 
 Roofline & utilization
-  modeled floor       : 475.11 ms   (Σ per-op roofline floors)
-  achievable (60-80%) : 593.88 - 791.84 ms
-  measured            : 1137.34 ms
-  at-floor            : 42%   (662.23 ms reachable headroom)
+  modeled floor       : 471.23 ms   (Σ per-op roofline floors)
+  achievable (60-80%) : 589.04 - 785.39 ms
+  measured            : 1133.83 ms
+  at-floor            : 42%   (662.60 ms reachable headroom)
   status              : BELOW_BAND — keep optimizing
   (tok/s/u — N/A: not an LLM decode pipeline)
 
 Op breakdown — device time by op class (latest profile · what to target, ranked):
 op class         device_ms      %   count  bound  dominant op (shape)
 ---------------------------------------------------------------------------------------------------
-reduction          1089.08  50.7%    1979   slow  TopKDeviceOperation
-matmul              860.96  40.1%    4984   slow  MatmulDeviceOperation 128 x 4096 x 14336
-attention            90.64   4.2%    2448   slow  NlpCreateHeadsDeviceOperation
-host_overhead        69.49   3.2%       0   host  
-eltwise              43.68   2.0%    2815   slow  BinaryNgDeviceOperation
-datamove             42.21   2.0%    6532   slow  NLPConcatHeadsDeviceOperation
-other                21.07   1.0%    2380   slow  NLPCreateQKVHeadsDecodeDeviceOperation
-embedding             1.88   0.1%     107   slow  EmbeddingsDeviceOperation
+matmul              837.84  73.9%    4984   slow  MatmulDeviceOperation 128 x 4096 x 14336
+reduction           105.06   9.3%    2081   slow  LayerNormDeviceOperation
+attention            90.54   8.0%    2448   slow  NlpCreateHeadsDeviceOperation
+datamove             44.29   3.9%    6608   slow  NLPConcatHeadsDeviceOperation
+eltwise              32.78   2.9%    2815   slow  BinaryNgDeviceOperation
+host_overhead        23.30   2.1%       0   host  
+other                21.43   1.9%    2380   slow  NLPCreateQKVHeadsDecodeDeviceOperation
+embedding             1.88   0.2%     107   slow  EmbeddingsDeviceOperation
 
-op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp         best ms
-------------------------------------------------------------------------------------------------------------------
-MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —                 —
-TopKDeviceOperation                ✓win      —         —         —         —         —         —           1168.12
+op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
+----------------------------------------------------------------------------------------------------------------------------
+LayerNormDeviceOperation           ·try      —         —         —         —         —         —         —           1133.83
+MatmulDeviceOperation              ✓win      —         ✓win      ✓win      —         —         —         ·try        1133.83
+TopKDeviceOperation                ✓win      —         —         —         —         —         —         —           1168.12
 
 
 Per-attempt detail (every optimization tried — win OR fail — with gain vs baseline and WHY):
 op                                        lever        ms  gain vs base  result     why tried / why it won or failed
 --------------------------------------------------------------------------------------------------------------------
 MatmulDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: power-of-2 chunked TopK so on-device sampling runs MULTI-CORE The single-device sampling path (multi_step_reduction, mesh
-TopKDeviceOperation                        grid   1168.12    +981.39 ms  ✓ win      Tried the full-grid knob on TopK because grid=tiny meant the whole 64128-wide vocab reduction ran on ONE core; select_program_factory only picks the multi-core factory when the reduced width is a powe
-MatmulDeviceOperation                      grid   2149.51      +0.00 ms  · no gain  Tried full-grid occupancy on prefill ff1/ff3 because only 32 of ~130 cores are busy: M_tiles=4 caps the 2D-mcast at 4 row-blocks and per_core_N=56 is pinned to the 8 DRAM weight shards, so 4x8=32. Coo
+TopKDeviceOperation                        grid   1168.12     -34.29 ms  ✓ win      Tried the full-grid knob on TopK because grid=tiny meant the whole 64128-wide vocab reduction ran on ONE core; select_program_factory only picks the multi-core factory when the reduced width is a powe
+MatmulDeviceOperation                      grid   2149.51   -1015.68 ms  · no gain  Tried full-grid occupancy on prefill ff1/ff3 because only 32 of ~130 cores are busy: M_tiles=4 caps the 2D-mcast at 4 row-blocks and per_core_N=56 is pinned to the 8 DRAM weight shards, so 4x8=32. Coo
 MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: carry the MLP [seq, hidden] activations as bfloat8_b The roofline tags all three MLP matmuls memory-bound, and the ff1/ff3
-MatmulDeviceOperation                     dtype   1137.34   +1012.18 ms  ✓ win      Op is DRAM-bandwidth bound, so fewer bytes is the lever — but the WEIGHTS are already at the floor (performance preset pins FF1_FF3 to bfp4 and w2 to bfp8), so the only bytes left to cut were the acti
+MatmulDeviceOperation                     dtype   1137.34      -3.51 ms  ✓ win      Op is DRAM-bandwidth bound, so fewer bytes is the lever — but the WEIGHTS are already at the floor (performance preset pins FF1_FF3 to bfp4 and w2 to bfp8), so the only bytes left to cut were the acti
+MatmulDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: keep the prefill MLP intermediates in an L1 island The MLP's DRAM traffic is dominated by weight reads that cannot be made
+MatmulDeviceOperation                     shard   1133.83      +0.00 ms  ✓ win      Tried the shard rung to cut this memory-bound op's DRAM reads. The WEIGHT cannot be sharded into L1 at all — w1/w3 are ~33 MB each per layer x32 layers vs ~195 MB of total L1 — so the reachable part i
+MatmulDeviceOperation               tp-fracture   1133.83      +0.00 ms  · no gain  Tried the tp-fracture rung because the op is still memory-bound after grid/dtype/shard. tp_pick_degree(128,4096,14336) returned best_tp=1 -- KEEP SINGLE-CHIP. That is the correct answer here regardles
+LayerNormDeviceOperation                   grid   1133.83      +0.00 ms  · no gain  Tried full-grid occupancy on the prefill RMSNorm: it runs INTERLEAVED, which parallelises over ROWS only, so at seq=128 there are just 4 tile-rows of work and it lands on a handful of cores (grid=tiny
+MatmulDeviceOperation               tp-fracture   1133.83      +0.00 ms  · no gain  Tried tp-fracture on prefill ff1/ff3 (128x4096x14336) because it stays bound_by=memory after grid/dtype/shard all resolved. tp_pick_degree(128,4096,14336) MEASURED best_tp=1 -> keep single-chip, and t
 
 Code changes — every attempt (win or fail):
 ===========================================
 
-[#2] TopKDeviceOperation · grid · win  +981.39 ms
+[#2] TopKDeviceOperation · grid · win  -34.29 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model.py b/models/demos/llama3_1_8b_p150/tt/model.py
     index e19e919f4c..7343dd1574 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model.py
@@ -89,7 +95,7 @@ Code changes — every attempt (win or fail):
     +TopK calls fall back to ``TopKSingleCoreProgramFactory`` -- the whole vocabulary is
     ... (truncated, 213 more lines)
 
-[#3] MatmulDeviceOperation · grid · no gain  +0.00 ms
+[#3] MatmulDeviceOperation · grid · no gain  -1015.68 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model.py b/models/demos/llama3_1_8b_p150/tt/model.py
     index e19e919f4c..7343dd1574 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model.py
@@ -132,7 +138,7 @@ Code changes — every attempt (win or fail):
     +TopK calls fall back to ``TopKSingleCoreProgramFactory`` -- the whole vocabulary is
     ... (truncated, 213 more lines)
 
-[#5] MatmulDeviceOperation · dtype · win  +1012.18 ms
+[#5] MatmulDeviceOperation · dtype · win  -3.51 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 3b2320d524..c8d736bcb6 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -175,8 +181,121 @@ Code changes — every attempt (win or fail):
                      program_config=pc_2,
     ... (truncated, 2 more lines)
 
+[#7] MatmulDeviceOperation · shard · win  +0.00 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index c8d736bcb6..04ee07f287 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -170,6 +170,21 @@ class MLP(LightweightModule):
+     
+             ff1_3_out_mem_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if full_grid_ff1_3 else ff1_3_input_mem_config
+     
+    +        # L1 island for the ff1/ff3 -> SILU mul -> ff2 chain in prefill. The weights cannot be
+    +        # made L1-resident (w1/w3 are ~33 MB each per layer), but the [seq, hidden] intermediates
+    +        # can: keeping them in L1 removes three DRAM round-trips per MLP (ff1 and ff3 write, the
+    +        # mul reads both and writes, ff2 reads) at no cost to the weight reads. Bounded to short
+    +        # prompts so long prefill -- whose intermediates are many times larger -- keeps the DRAM
+    +        # path; w1_out/w3_out are freed right after the mul, so the island peaks at three of them.
+    +        prefill_l1_island = (
+    +            mode == Mode.PREFILL
+    +            and not TG
+    +            and self.prefetcher is None
+    +            and seq_len <= self.args.prefill_len_cutoff
+    +        )
+    +        if prefill_l1_island:
+    +            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+    +
+             x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+     
+             # ff1/ff3 are DRAM-bandwidth bound, and their bf4_b weights are already at the dtype
+
+[#8] MatmulDeviceOperation · tp-fracture · no gain  +0.00 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index c8d736bcb6..04ee07f287 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -170,6 +170,21 @@ class MLP(LightweightModule):
+     
+             ff1_3_out_mem_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if full_grid_ff1_3 else ff1_3_input_mem_config
+     
+    +        # L1 island for the ff1/ff3 -> SILU mul -> ff2 chain in prefill. The weights cannot be
+    +        # made L1-resident (w1/w3 are ~33 MB each per layer), but the [seq, hidden] intermediates
+    +        # can: keeping them in L1 removes three DRAM round-trips per MLP (ff1 and ff3 write, the
+    +        # mul reads both and writes, ff2 reads) at no cost to the weight reads. Bounded to short
+    +        # prompts so long prefill -- whose intermediates are many times larger -- keeps the DRAM
+    +        # path; w1_out/w3_out are freed right after the mul, so the island peaks at three of them.
+    +        prefill_l1_island = (
+    +            mode == Mode.PREFILL
+    +            and not TG
+    +            and self.prefetcher is None
+    +            and seq_len <= self.args.prefill_len_cutoff
+    +        )
+    +        if prefill_l1_island:
+    +            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+    +
+             x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+     
+             # ff1/ff3 are DRAM-bandwidth bound, and their bf4_b weights are already at the dtype
+
+[#9] LayerNormDeviceOperation · grid · no gain  +0.00 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index c8d736bcb6..04ee07f287 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -170,6 +170,21 @@ class MLP(LightweightModule):
+     
+             ff1_3_out_mem_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if full_grid_ff1_3 else ff1_3_input_mem_config
+     
+    +        # L1 island for the ff1/ff3 -> SILU mul -> ff2 chain in prefill. The weights cannot be
+    +        # made L1-resident (w1/w3 are ~33 MB each per layer), but the [seq, hidden] intermediates
+    +        # can: keeping them in L1 removes three DRAM round-trips per MLP (ff1 and ff3 write, the
+    +        # mul reads both and writes, ff2 reads) at no cost to the weight reads. Bounded to short
+    +        # prompts so long prefill -- whose intermediates are many times larger -- keeps the DRAM
+    +        # path; w1_out/w3_out are freed right after the mul, so the island peaks at three of them.
+    +        prefill_l1_island = (
+    +            mode == Mode.PREFILL
+    +            and not TG
+    +            and self.prefetcher is None
+    +            and seq_len <= self.args.prefill_len_cutoff
+    +        )
+    +        if prefill_l1_island:
+    +            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+    +
+             x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+     
+             # ff1/ff3 are DRAM-bandwidth bound, and their bf4_b weights are already at the dtype
+
+[#10] MatmulDeviceOperation · tp-fracture · no gain  +0.00 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index c8d736bcb6..04ee07f287 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -170,6 +170,21 @@ class MLP(LightweightModule):
+     
+             ff1_3_out_mem_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if full_grid_ff1_3 else ff1_3_input_mem_config
+     
+    +        # L1 island for the ff1/ff3 -> SILU mul -> ff2 chain in prefill. The weights cannot be
+    +        # made L1-resident (w1/w3 are ~33 MB each per layer), but the [seq, hidden] intermediates
+    +        # can: keeping them in L1 removes three DRAM round-trips per MLP (ff1 and ff3 write, the
+    +        # mul reads both and writes, ff2 reads) at no cost to the weight reads. Bounded to short
+    +        # prompts so long prefill -- whose intermediates are many times larger -- keeps the DRAM
+    +        # path; w1_out/w3_out are freed right after the mul, so the island peaks at three of them.
+    +        prefill_l1_island = (
+    +            mode == Mode.PREFILL
+    +            and not TG
+    +            and self.prefetcher is None
+    +            and seq_len <= self.args.prefill_len_cutoff
+    +        )
+    +        if prefill_l1_island:
+    +            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+    +
+             x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+     
+             # ff1/ff3 are DRAM-bandwidth bound, and their bf4_b weights are already at the dtype
+
 Limitations / suggested manual next steps:
-- (none flagged automatically — see the per-op device report for remaining headroom.)
+- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
+  -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
   trace+1CQ perf:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_main_perf.py::test_main_perf -svv
