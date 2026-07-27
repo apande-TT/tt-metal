@@ -53,6 +53,34 @@ def max_prefill_chunk_size_cutoff(sequence_length, max_prefill_chunk_size):
     return sequence_length > max_prefill_chunk_size
 
 
+def _sampling_params_are_greedy(sampling_params) -> bool:
+    """Is every row of ``sampling_params`` plain greedy (argmax) sampling?
+
+    Used to decide whether prefill warmup can skip the non-greedy sampling sweep. Conservative by
+    construction: anything unrecognised, absent, or per-row inconsistent reads as NOT greedy, so the
+    full sweep still runs and the only cost of being wrong is the warmup we were trying to avoid.
+    ``temperature=0`` is the greedy request form (``format_sampling_params`` rewrites it to
+    k=1 / p=0 / temp=1); log-probs and penalties both pull the request off the argmax path.
+    """
+    if sampling_params is None:
+        return False
+
+    def _all(name, *allowed):
+        value = getattr(sampling_params, name, None)
+        values = value if isinstance(value, (list, tuple)) else [value]
+        return bool(values) and all(v in allowed for v in values)
+
+    if not _all("temperature", 0, 0.0):
+        return False
+    if not _all("enable_log_probs", None, False):
+        return False
+    return (
+        _all("presence_penalty", None, 0, 0.0)
+        and _all("frequency_penalty", None, 0, 0.0)
+        and _all("repetition_penalty", None, 1, 1.0)
+    )
+
+
 def _deepseek_kvdbg_enabled() -> bool:
     return os.getenv("DEEPSEEK_KVDBG", "").lower() in ("1", "true", "yes", "y")
 
@@ -565,10 +593,18 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 and getattr(self.model[0], "sampling", None) is not None
             )
 
+            # Warm up only the sampling shapes the caller is actually asking for. The default sweep
+            # pre-captures four non-greedy permutations (temperature=1.0 / top_k=10 / top_p=0.9 x
+            # penalties x log_probs), and every one of those runs the top-k path -- which on this
+            # 128256-vocab single-device config means a single-core ttnn.topk at ~10ms per call. When
+            # the request that triggered warmup is greedy, those traces are pure warmup cost for
+            # request shapes that never arrive; a later non-greedy request still works, it just pays
+            # its own one-time capture on first use.
             self.warmup_model_prefill(
                 kv_cache=kv_cache,
                 enable_trace=enable_trace,
                 can_sample_on_device=on_device_sampling_enabled,
+                greedy_only=_sampling_params_are_greedy(sampling_params),
             )
 
         batch_size, batch_seq_len = tokens.shape

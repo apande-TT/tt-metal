@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 01:00:30 UTC · 4 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 01:08:55 UTC · 6 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 2464.18 ms
-  at-floor            : 22%   (1926.95 ms reachable headroom)
+  measured            : 1537.69 ms
+  at-floor            : 35%   (1000.46 ms reachable headroom)
   status              : BELOW_BAND — keep optimizing
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -31,8 +31,8 @@ embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp         best ms
 ------------------------------------------------------------------------------------------------------------------
-TopKDeviceOperation                ✓win      —         —         —         —         —         —                 —
-TopKDeviceOperation                ·try      —         —         ·try      —         —         —           2464.16
+TopKDeviceOperation                ✓win      —         —         ✓win      —         —         —                 —
+TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —           1537.69
 
 
 Per-attempt detail (every optimization tried — win OR fail — with gain vs baseline and WHY):
@@ -42,6 +42,8 @@ TopKDeviceOperation                        grid         —             —  ✓
 TopKDeviceOperation                        grid   2464.16      +0.02 ms  · no gain  TopK is grid=tiny (1 core, ~10ms/call, 1120ms = 45% of device time), so I handed it an explicit full compute-grid sub_core_grid_topk via ModelArgs. No gain: 2464.18->2464.16ms. Root cause is factory S
 TopKDeviceOperation                       shard   2464.18      +0.00 ms  · no gain  TopK is memory-bound on a DRAM-interleaved sampling chain, so I width-sharded the top-k values/indices into L1 via DECODE_SAMPLING_INPUT_MEMCFG (the designed hook, copied from the llama3_70b_galaxy co
 TopKDeviceOperation                       shard   2464.18      +0.00 ms  · no gain  Second shard variant: same L1 lever but the whole 2x32 gathered row as ONE shard, on the theory that splitting it across 2 cores was desynchronising the device-offset add. Also reverted -- PCC 9.4% To
+TopKDeviceOperation                       shard         —             —  ✓ win      committed: llama3_1_8b_p150: let greedy decode take the argmax sampling path format_sampling_params already normalises temperature=0 rows to k=1 / p=0
+TopKDeviceOperation                  structural   1537.69    +926.49 ms  ✓ win      Hypothesis: TopK's 1120ms is not a tunable cost but REDUNDANT WORK -- decode is greedy (temperature=0), and greedy needs only an argmax, not top-k/top-p/RNG. format_sampling_params already normalises 
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -120,9 +122,32 @@ Code changes — every attempt (win or fail):
                  logger.info(f"MLP grid: {self.mlp_core_grid}")
                  logger.info(f"MLP prefill grids @ 32: w1/w3: {self.mlp1_3_grid(32)}, w2: {self.mlp2_grid(32)}")
 
+[#6] TopKDeviceOperation · structural · win  +926.49 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index d960555193..751e024cbd 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1071,7 +1071,16 @@ class ModelArgs:
+                     "rs_memory_config": ttnn.DRAM_MEMORY_CONFIG,
+                 }
+                 default_sampling_force_argmax = {
+    -                "allow_force_argmax": False,
+    +                # Greedy rows (temperature=0) normalise to k=1 / p=0 / temp=1, which the sampler can
+    +                # serve with a single untilize+argmax instead of the top-k/top-p/RNG chain. That
+    +                # matters a lot here: this vocab is 128256, the [1, 1]-mesh sampler splits it into
+    +                # 2x64128 before TopK, and 64128 is not a power of two -- so ttnn.topk falls off its
+    +                # multi-core factory onto the single-core bitonic one and burns ~10ms per call on ONE
+    +                # core. Allowing the argmax path deletes both TopK calls (and the concat / typecast /
+    +                # offset-add / untilize / manual_seed / sampling tail behind them). Non-greedy
+    +                # requests still take the full path -- the sampler re-derives this per reset_params
+    +                # and re-captures its trace when the mode flips.
+    +                "allow_force_argmax": True,
+                     "num_links": 1,
+                     "chunks_per_sync": 10,
+                     "num_workers_per_link": 2,
+
 Limitations / suggested manual next steps:
-- 1 op(s) tried but no lever beat baseline: TopKDeviceOperation
-  -> inspect the per-op device report and consider a hand-written kernel or a structural change.
+- (none flagged automatically — see the per-op device report for remaining headroom.)
 
 Reproduce:
   trace+1CQ perf:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_main_perf.py::test_main_perf -svv
