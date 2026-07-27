@@ -963,6 +963,20 @@ class Attention(LightweightModule):
         ttnn.deallocate(x_11SH)
 
         # split qkv into heads
+        # L1 island for the head split. This op is pure data movement and memory-bound: it reads
+        # the fused [S, (nq + 2*nkv) * head_dim] activation and writes three head-major views of
+        # it, and at short prefill every one of those trips is to DRAM. Q/K/V total
+        # S * 6144 * 2 B (1.5 MB at S=128), so the whole set fits interleaved L1 comfortably, and
+        # the immediate consumers -- q_norm/k_norm, then rotary_embedding -- read it straight back.
+        # The op's non-sharded factory requires an INTERLEAVED output config, so this is L1
+        # interleaved rather than a shard spec; the sharded factory is not reachable here (its
+        # output shard spec is fixed at {TILE_HEIGHT, head_dim}, i.e. seq_len == 32 only).
+        # Bounded to short prefill so long prompts keep the DRAM path.
+        create_heads_mem_config = (
+            ttnn.L1_MEMORY_CONFIG
+            if (not self.TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff)
+            else ttnn.DRAM_MEMORY_CONFIG
+        )
         (
             q_heads_1QSD_pre_rot,
             k_heads_1KSD_pre_rot,
@@ -972,7 +986,7 @@ class Attention(LightweightModule):
             num_heads=self.n_local_heads,
             num_kv_heads=self.n_local_kv_heads,
             transpose_k_heads=False,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=create_heads_mem_config,
         )
 
         norm_config = self.args.get_norm_config("attn", Mode.PREFILL, None)
