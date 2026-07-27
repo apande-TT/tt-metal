@@ -75,7 +75,14 @@ class MLP(LightweightModule):
             )
             return result
 
-        # Sharded weights
+        # Sharded weights. These dims ARE the tensor-parallel fracture (GUIDELINES/08 section 7):
+        # w1/w3 are column-fractured on the output dim and w2 row-fractured on the contraction dim,
+        # so the cross-device reduction lands after the down-projection -- which is why tt_all_reduce
+        # sits on w2's output below and not on w1/w3's. On a 1x1 mesh (cluster_shape [1,1]) the
+        # ShardTensor2dMesh mapper is a no-op and tt_all_reduce short-circuits, so the whole scheme
+        # costs nothing here; it is the reason tp_pick_degree returns best_tp=1 for these matmuls
+        # rather than there being no TP support. TP remains the one lever that would cut the ~99 MB
+        # of MLP weight bytes read per layer per token, and it needs more than one chip.
         w1_dims = (-1, -2) if args.is_galaxy else (-2, -1)
         w2_dims = (-2, -1) if args.is_galaxy else (-1, -2)
 
