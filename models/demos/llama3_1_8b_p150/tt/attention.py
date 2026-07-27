@@ -540,23 +540,46 @@ class Attention(LightweightModule):
         return q_heads_1BQD, k_heads_1BKD
 
     def _mllama_rope_prefill(self, q_heads_1QSD_pre_rot, k_heads_1KSD_pre_rot, rot_mats):
-        q_heads_1QSD = ttnn.experimental.rotary_embedding_llama(
-            q_heads_1QSD_pre_rot,
-            rot_mats[0],
-            rot_mats[1],
-            self.transformation_mats["prefill"],
-            is_decode_mode=False,
-        )
+        # HEADS-AS-BATCH. The prefill rope factory parallelises over batch x seq-tiles ONLY and
+        # walks n_heads INSIDE each core (num_rows_per_core = sin_cos_rows_per_core * n_heads),
+        # so at batch 1 it pins itself to min(cores, seq_len/32) cores -- four of the P150's 110
+        # at seq_len 128, no matter how many heads there are. A [1, H, S, D] tiled tensor and a
+        # [H, 1, S, D] one have identical physical tile ordering, so folding heads into the BATCH
+        # dim is a metadata-only reshape that hands the factory H x min(cores/H, S_t) work units
+        # instead of S_t. cos/sin are head-broadcast ([1, 1, S, D]), which the op still accepts
+        # (it requires cos.shape[1] == input.shape[1] or 1, and both are 1 after the reshape).
+        def _rope(x):
+            heads = x.shape[1]
+            as_batch = ttnn.reshape(x, [heads, 1, x.shape[2], x.shape[3]])
+            out = ttnn.experimental.rotary_embedding_llama(
+                as_batch,
+                rot_mats[0],
+                rot_mats[1],
+                self.transformation_mats["prefill"],
+                is_decode_mode=False,
+            )
+            return ttnn.reshape(out, [1, heads, out.shape[2], out.shape[3]])
 
-        k_heads_1KSD = ttnn.experimental.rotary_embedding_llama(
-            k_heads_1KSD_pre_rot,
-            rot_mats[0],
-            rot_mats[1],
-            self.transformation_mats["prefill"],
-            is_decode_mode=False,
-        )
+        _heads_as_batch = not self.TG and rot_mats[0].shape[1] == 1
+        if not _heads_as_batch:
+            return (
+                ttnn.experimental.rotary_embedding_llama(
+                    q_heads_1QSD_pre_rot,
+                    rot_mats[0],
+                    rot_mats[1],
+                    self.transformation_mats["prefill"],
+                    is_decode_mode=False,
+                ),
+                ttnn.experimental.rotary_embedding_llama(
+                    k_heads_1KSD_pre_rot,
+                    rot_mats[0],
+                    rot_mats[1],
+                    self.transformation_mats["prefill"],
+                    is_decode_mode=False,
+                ),
+            )
 
-        return q_heads_1QSD, k_heads_1KSD
+        return _rope(q_heads_1QSD_pre_rot), _rope(k_heads_1KSD_pre_rot)
 
     def _hf_rope_prefill(self, q_heads_1QSD_pre_rot, k_heads_1KSD_pre_rot, rot_mats):
         if q_heads_1QSD_pre_rot.dtype != ttnn.bfloat16:

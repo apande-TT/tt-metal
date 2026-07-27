@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 06:51:12 UTC · 95 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 06:52:22 UTC · 97 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -38,7 +38,7 @@ MatmulDeviceOperation              ✓win      —         ✓win      —      
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
-MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      —         ✓win         745.01
+MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ✓win      ·try      ✓win         745.01
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
@@ -143,6 +143,8 @@ MatmulDeviceOperation               tp-fracture         —             —  ✓
 MatmulDeviceOperation               tp-fracture    745.01   +1719.17 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide ShardTensorToMesh + CCL plumbing. Hypothesis: if decode QKV is still DRAM-bandwidth bound after every single-chip lever, split
 MatmulDeviceOperation                structural    745.01   +1719.17 ms  · no gain  none: walked the whole decode QKV chain hunting reducible work and every candidate is already applied or structurally absent. (1) RECOMPUTE -> CACHE is already done: decode is not repeat_prefill, it r
 MatmulDeviceOperation                   tt-lang    745.01   +1719.17 ms  · no gain  Measured the tt-lang matmul on THIS op's own shape rather than inheriting the sibling MLP verdicts, since M and the K/N ratio both differ -- extended tt/ttl_ff2_matmul.py's (M,K,N) sweep with (32, 409
+MatmulDeviceOperation                   tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: measure both kernel rungs on the decode QKV shape The tt-lang and C++ Metalium rungs had only ever been measured on the ML
+MatmulDeviceOperation                       cpp    745.01   +1719.17 ms  · no gain  Same discipline as the tt-lang rung: do not inherit the MLP verdicts, measure the C++ Metalium reader/compute/writer triple (tt/cpp_mm_generic.py + tt/kernels/*.cpp, driven through ttnn.generic_op wit
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2325,6 +2327,49 @@ Code changes — every attempt (win or fail):
      
      
      @ttl.operation(grid=(GRID_Y, GRID_X))
+
+[#97] MatmulDeviceOperation · cpp · no gain  +1719.17 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    index 27cae9296a..e2c1fbd8cb 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    @@ -6,6 +6,7 @@ Kept as the record of the cpp rung for every hot dense matmul in the MLP:
+       * `MatmulDeviceOperation 128 x 14336 x  4096` -- the short-prefill ff2 down-projection
+       * `MatmulDeviceOperation  32 x 14336 x  4096` -- the DECODE ff2 down-projection (per-token path)
+       * `MatmulDeviceOperation  32 x  4096 x 14336` -- the DECODE ff1/ff3 up-projection (per-token path)
+    +  * `MatmulDeviceOperation  32 x  4096 x  6144` -- the DECODE fused QKV projection (per-token path)
+     
+     Drives the repo's own programming-example kernel triple (tt_metal/programming_examples/matmul/
+     matmul_multi_core: reader / mm / writer, copied into tt/kernels/) through ttnn.generic_op, with
+    @@ -14,10 +15,11 @@ the output tiles partitioned across the entire compute grid.
+     MEASURED on the real shapes, on the full 11x10 P150 grid:
+     
+         M    K      N        PCC        generic_op    ttnn.linear     verdict
+    -    128  4096   14336    0.999039    3.561 ms      0.332 ms       10.7x SLOWER
+    -    128  14336  4096     0.993591    3.119 ms      0.358 ms        8.7x SLOWER
+    -     32  14336  4096     0.993562    0.919 ms      0.296 ms        3.1x SLOWER
+    -     32  4096   14336    0.999022    1.039 ms      0.309 ms        3.4x SLOWER
+    +    128  4096   14336    0.999015    3.562 ms      0.333 ms       10.7x SLOWER
+    +    128  14336  4096     0.993626    3.113 ms      0.358 ms        8.7x SLOWER
+    +     32  14336  4096     0.993630    0.916 ms      0.294 ms        3.1x SLOWER
+    +     32  4096   14336    0.999003    1.041 ms      0.309 ms        3.4x SLOWER
+    +     32  4096    6144    0.999014    0.344 ms      0.139 ms        2.5x SLOWER
+     
+     Every kernel is CORRECT and every one loses. The cause is dataflow, not tuning: this reader fetches
+     every A tile again for each output tile, so A is re-read Nt times from DRAM, while ttnn's production
+    @@ -46,7 +48,7 @@ from ttnn._ttnn.program_descriptor import VectorUInt32 as _VU32
+     TILE = 32
+     # (M, K, N) of every op this rung was measured for: the ff1/ff3 up-projection, then ff2's
+     # down-projection at the short-prefill and the DECODE row counts.
+    -SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336)]
+    +SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336), (32, 4096, 6144)]
+     ROOT = "/tmp/tt_hw_planner_llama3_1_8b_p150_1785111170/models/demos/llama3_1_8b_p150/tt/kernels"
+     
+     
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    index d126d0c5d2..cc46767225 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    ... (truncated, 32 more lines)
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
