@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 20:21:13 UTC · 148 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 20:33:59 UTC · 150 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -34,9 +34,10 @@ Block-level timing (per-stage trace) — latest lever on BinaryNgDeviceOperation
   LayerNormDeviceOperation     52.02 ms  ##....................
   BinaryNg [128,14336] bf8_b gate mul (kernel-blocked: bf8_b pack)      8.23 ms  ......................
   BinaryNg [32,14336] bf8_b decode gate mul (kernel-blocked: bf8_b pack)      3.50 ms  ......................
-  BinaryNg [128,4096] post-attn add (kernel-blocked: mixed dtype)      1.30 ms  ......................
-  BinaryNg [128,4096] post-MLP add, stock 3.70us/call on 110 cores      1.30 ms  ......................
-    same add, tt-lang kernel 4.87us/call on 64 cores (reverted)      1.71 ms  ......................
+  BinaryNg [128,4096] post-MLP add, stock 3.67us/call @110 cores      1.29 ms  ......................
+    same add, C++ Metalium 3.87us/call @110 cores (parity, reverted)      1.36 ms  ......................
+    same add, tt-lang 4.87us/call @64 cores (1.32x, reverted)      1.71 ms  ......................
+  BinaryNg [128,4096] post-attn add (kernel-blocked: mixed dtype)      1.29 ms  ......................
   BinaryNg [32,4096] decode residual adds      1.03 ms  ......................
   GenericOpDeviceOperation (tt-lang split+rope + concat)      6.83 ms  ......................
   SDPAOperation (prefill)      4.80 ms  ......................
@@ -44,7 +45,7 @@ Block-level timing (per-stage trace) — latest lever on BinaryNgDeviceOperation
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
 ArgMaxDeviceOperation              ✓win      —         —         ✓win      ✓win      —         —         —                 —
-BinaryNgDeviceOperation            ·try      —         —         ✓win      ·try      ✓win      —         —            648.17
+BinaryNgDeviceOperation            ·try      —         —         ✓win      ·try      ✓win      ✓win      —            648.17
 GenericOpDeviceOperation           ✓win      —         —         —         —         —         —         —                 —
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
@@ -214,6 +215,8 @@ BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no g
 BinaryNgDeviceOperation                 tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log. Also required for the kernel-marker scan: with a dirty tr
 BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no gain  Re-recorded against a clean tree so the evidence scan runs whole-model-dir and sees tt/ttl_residual_add.py (the first record was diff-scoped by a dirty RUN_REPORT and flagged UNSUPPORTED). Authored tt
 BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no gain  Re-recorded against a genuinely clean tree so the evidence scan runs whole-model-dir and sees tt/ttl_residual_add.py (the first two records were diff-scoped and flagged UNSUPPORTED -- a committed kern
+BinaryNgDeviceOperation                     cpp         —             —  ✓ win      committed: llama3_1_8b_p150: record the C++ Metalium eltwise-add rung and why it ties tt/cpp_add_generic.py + tt/kernels/{dataflow/reader_add_partition
+BinaryNgDeviceOperation                     cpp    647.82   +1816.36 ms  · no gain  Authored tt/cpp_add_generic.py + tt/kernels/{dataflow/reader_add_partitioned,compute/add_tiles_stream}.cpp -- a real Metalium reader/compute/writer triple through ttnn.generic_op, adapted from the rep
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -3297,6 +3300,49 @@ Code changes — every attempt (win or fail):
     +H_T * W_HALVES exceeds the board's 10). A lone eltwise op moves a fixed number of bytes, so losing
     +42% of the cores cannot be bought back -- exactly the case GUIDELINES/11 names when it warns that a
     ... (truncated, 122 more lines)
+
+[#150] BinaryNgDeviceOperation · cpp · no gain  +1816.36 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_add_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_add_generic.py
+    new file mode 100644
+    index 0000000000..a3ed3bd601
+    --- /dev/null
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_add_generic.py
+    @@ -0,0 +1,176 @@
+    +"""C++ Metalium eltwise add via ttnn.generic_op -- AUTHORED, MEASURED, and NOT WIRED IN.
+    +
+    +Kept as the record of the cpp rung for `BinaryNgDeviceOperation`.
+    +
+    +WHICH instance. Same reasoning as the tt-lang rung (tt/ttl_residual_add.py): of this op's five
+    +shapes only the post-MLP residual add, [128, 4096] bf16, is available to a hand kernel. The two
+    +SILU gate multiplies -- the LARGEST at 8.23 ms and 3.50 ms -- are bf8_b, and the post-attention add
+    +is mixed bf16/bf8_b; a generic_op CB carries one data_format per buffer index, so neither is
+    +expressible without changing the op's dtype contract, which GUIDELINES/12 forbids.
+    +
+    +Drives a real reader/compute/writer triple through ttnn.generic_op, adapted from the repo's own
+    +tt_metal/programming_examples/eltwise_binary (kernels copied into tt/kernels/ and generalised from
+    +"one core walks page 0..n" to "each core owns a [start, start+n) slice"), with the output tiles
+    +partitioned across the entire 11x10 compute grid -- i.e. the SAME 110 cores the stock op gets, which
+    +is the one thing the tt-lang rung could not have (its 2-D node grid topped out at 64).
+    +
+    +MEASURED in the model against the stock ttnn.add it replaces (352 calls each, same shape/dtype and
+    +the same 110 cores):
+    +
+    +    correctness   e2e PCC 0.985099, unchanged from the stock op
+    +    cpp kernel    3.87 us/call
+    +    stock ttnn    3.67 us/call
+    +    whole model   648.17 -> 647.82 ms (BinaryNg -1.47 ms, GenericOp +1.37 ms)
+    +
+    +So it lands at PARITY -- 5% slower per call, and a whole-model delta of 0.05% that is inside
+    +run-to-run noise. Not wired in, because the per-call number at equal core count is the honest signal
+    +and it does not beat the stock op.
+    +
+    +Worth recording WHY this is the interesting result of the two kernel rungs. The tt-lang attempt on
+    +the same add was 4.87 us/call, and it was slower for a specific reason: `ttl.node` is 2-D, so its
+    +decomposition of a 4x128 tile grid could reach only 64 of the board's 110 cores. generic_op has no
+    +such restriction -- the host hands each core an explicit tile slice -- so this kernel runs the same
+    +110 cores as the stock op, and the gap duly closes from 1.32x to 1.05x. That isolates the cause: the
+    +tt-lang loss was OCCUPANCY, not code quality, and once occupancy is equalised a hand-written
+    ... (truncated, 240 more lines)
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
