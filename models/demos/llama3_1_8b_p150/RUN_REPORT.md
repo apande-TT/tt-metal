@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 11:27:22 UTC · 112 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 12:56:30 UTC · 115 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 714.94 ms
-  at-floor            : 75%   (177.71 ms reachable headroom)
+  measured            : 713.16 ms
+  at-floor            : 75%   (175.94 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -29,9 +29,26 @@ datamove             51.53   2.1%    7141   slow  NLPConcatHeadsDeviceOperation
 other                24.10   1.0%    2618   slow  NLPCreateQKVHeadsDecodeDeviceOperation
 embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
+Block-level timing (per-stage trace) — latest lever on ArgMaxDeviceOperation:
+  MatmulDeviceOperation 128 x 4096 x 14336 (prefill ff1/ff3)    135.69 ms  ######################  <- hottest
+  MatmulDeviceOperation 32 x 4096 x 14336 (decode ff1/ff3)     92.45 ms  ###############.......
+  MatmulDeviceOperation 32 x 14336 x 4096 (decode ff2)     78.83 ms  #############.........
+  MatmulDeviceOperation 128 x 14336 x 4096 (prefill ff2)     73.64 ms  ############..........
+  MatmulDeviceOperation 32 x 4096 x 16032 (LM head)     63.14 ms  ##########............
+  LayerNormDeviceOperation     51.94 ms  ########..............
+  MatmulDeviceOperation 32 x 4096 x 6144 (decode QKV)     35.48 ms  ######................
+  MatmulDeviceOperation 128 x 4096 x 6144 (prefill QKV)     34.03 ms  ######................
+  ArgMaxDeviceOperation     32.66 ms  #####................. · True
+  MatmulDeviceOperation 128 x 4096 x 4096 (prefill wo)     29.02 ms  #####.................
+  MatmulDeviceOperation 32 x 4096 x 4096 (decode wo)     25.31 ms  ####..................
+  BinaryNgDeviceOperation     18.95 ms  ###...................
+  GenericOpDeviceOperation (tt-lang head split/concat)      7.19 ms  #.....................
+  RotaryEmbeddingLlamaDeviceOperation      7.03 ms  #.....................
+  SDPAOperation      6.96 ms  #.....................
+
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
-ArgMaxDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
+ArgMaxDeviceOperation              ✓win      —         —         ✓win      ·wedge    —         —         —                 —
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
@@ -163,6 +180,9 @@ ArgMaxDeviceOperation                      grid         —             —  ✓
 ArgMaxDeviceOperation                      grid    714.94   +1749.24 ms  · no gain  Read the factory before reaching for a knob, and the grid turns out to be ALREADY full. ttnn.argmax takes the multi-core factory here (input is row-major after untilize, dim == rank-1), and with sub_c
 ArgMaxDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Final checkpoint of the live lever log for this round. Device hit a board-level PCIe faul
 ArgMaxDeviceOperation                      grid         —             —  · wedged   wedged: round killed (UNPRODUCTIVE 10800s — agent watchdog judged the round stuck (no real progress))
+ArgMaxDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: keep the prefill logits in L1 for the argmax `_apply_norm_and_lm_head` pushed the lm_head output straight back to DRAM, so
+ArgMaxDeviceOperation                     shard    713.16   +1751.02 ms  ✓ win      Read the op before reaching for a shard spec, and it decided the whole rung: argmax_device_operation.cpp TT_FATALs unless the input memory_layout is INTERLEAVED, so a width/height shard is architectur
+ArgMaxDeviceOperation                structural         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2607,6 +2627,43 @@ Code changes — every attempt (win or fail):
                      "allow_force_argmax": True,
                      "num_links": 1,
                      "chunks_per_sync": 10,
+
+[#114] ArgMaxDeviceOperation · shard · win  +1751.02 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model.py b/models/demos/llama3_1_8b_p150/tt/model.py
+    index e19e919f4c..0d4df8171b 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model.py
+    @@ -3,6 +3,8 @@
+     # SPDX-License-Identifier: Apache-2.0
+     
+     
+    +import math
+    +
+     import torch
+     from tqdm import tqdm
+     
+    @@ -261,7 +263,20 @@ class Transformer(LightweightModule):
+             if lm_head_input_mem_cfg.is_sharded():
+                 x = ttnn.interleaved_to_sharded(x, lm_head_input_mem_cfg)
+             logits = self.lm_head(x)
+    -        logits = ttnn.to_memory_config(logits, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    +        # Keep the prefill logits where lm_head already put them (L1 interleaved) instead of
+    +        # spilling them to DRAM. The consumer is on-device sampling, whose force-argmax path is
+    +        # `untilize -> ttnn.argmax`, and BOTH of those read this tensor straight through: the
+    +        # profile shows untilize at 47.8 us/call from DRAM vs 31.4 us from L1, and argmax at
+    +        # 737 us vs 715 us, on top of the 4.4 MB L1->DRAM copy this line itself pays. argmax
+    +        # FATALs on any non-INTERLEAVED input, so L1-interleaved is the only shard the op will
+    +        # accept -- a width/height shard is architecturally closed here.
+    +        # [1, 1, 32, vocab] at bf8_b is ~4.4 MB, comfortably inside the interleaved-L1 budget;
+    +        # fall back to DRAM if a wider vocab or a batched-prefill variant makes it big.
+    +        logits_elems = math.prod(int(d) for d in logits.shape)
+    +        if logits_elems * 2 > 16 * 1024 * 1024:  # bf16-equivalent bytes; bf8_b is ~half this
+    +            logits = ttnn.to_memory_config(logits, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    +        elif logits.memory_config() != ttnn.L1_MEMORY_CONFIG:
+    +            logits = ttnn.to_memory_config(logits, memory_config=ttnn.L1_MEMORY_CONFIG)
+             return logits
+     
+         def process_hidden_states_after_prefill_trace(self, hidden_states, last_token_idx):
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation

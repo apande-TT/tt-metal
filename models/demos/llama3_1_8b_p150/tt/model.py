@@ -19,6 +19,7 @@ from models.demos.llama3_1_8b_p150.tt.distributed_norm import DistributedNorm
 from models.demos.llama3_1_8b_p150.tt.embedding import Embedding, ScaledEmbedding
 from models.demos.llama3_1_8b_p150.tt.lm_head import LMHead
 from models.demos.llama3_1_8b_p150.tt.model_config import TensorGroup
+from models.demos.llama3_1_8b_p150.tt import sampling_unpadded_argmax as unpadded_argmax
 from models.demos.llama3_1_8b_p150.tt.rope import HfRotarySetup, RotarySetup
 
 
@@ -163,6 +164,10 @@ class Transformer(LightweightModule):
                 mesh_device=mesh_device,
                 tt_ccl=self.tt_ccl,
             )
+            # TTSampling rounds the request batch up to a 32-row tile because the LOGITS are
+            # tile-layout. Its force-argmax path untilizes first, though, and ROW_MAJOR has no
+            # such constraint -- so the argmax reduction can skip the padding rows entirely.
+            unpadded_argmax.install(self.sampling, args)
         else:
             self.sampling = None
 
