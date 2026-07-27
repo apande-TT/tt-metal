@@ -31,12 +31,21 @@ import ttnn
 import ttl
 
 TILE = 32
-# seq_len 128 -> 4 seq tiles, one per grid row; 32 heads / 8 grid columns -> 4 heads per column.
-GRID_X, GRID_Y = 8, 4
-N_HEADS, HEAD_DIM = 32, 128
+# GRID RUNG. The work has THREE dimensions -- head (32) x seq tile (4) x dim tile (4) -- but
+# `ttl.node` is 2-D, so a division-free mapping can carry only two of them and every division-free
+# choice lands on 32 of the P150's 110 cores (head groups must divide 32 and fit in <=11 columns,
+# i.e. 8; the other axis is then seq(4) or dim(4)). Getting past 32 therefore needs ONE coordinate
+# to carry two work dimensions, which needs a constant divide on the node coord. So: y carries
+# (seq tile, dim half) as cy = dim_half * SEQ_T + s, giving 8 rows and 64 cores at 8 tiles each.
+# If the compiler will not lower `//`/`%` on a node coord this falls back to the 4-row form.
 SEQ_LEN = 128
-
+N_HEADS, HEAD_DIM = 32, 128
 HD_T = HEAD_DIM // TILE
+SEQ_T = SEQ_LEN // TILE
+DIM_HALVES = 2
+HALF_T = HD_T // DIM_HALVES
+
+GRID_X, GRID_Y = 8, SEQ_T * DIM_HALVES
 HEADS_PER_COL = N_HEADS // GRID_X
 
 
@@ -51,15 +60,17 @@ def ttl_concat_heads(x: ttnn.Tensor, y: ttnn.Tensor) -> None:
     in_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
     out_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
 
-    per_core_tiles = HEADS_PER_COL * HD_T
+    per_core_tiles = HEADS_PER_COL * HALF_T
 
     @ttl.datamovement()
     def read():
         cx, cy = ttl.node(dims=2)
+        st = cy % SEQ_T
+        c0 = (cy // SEQ_T) * HALF_T
         for hh in range(HEADS_PER_COL):
-            for c in range(HD_T):
+            for c in range(HALF_T):
                 with in_dfb.reserve() as blk:
-                    ttl.copy(x[(cx * HEADS_PER_COL + hh) * seq_tiles + cy, c], blk).wait()
+                    ttl.copy(x[(cx * HEADS_PER_COL + hh) * seq_tiles + st, c0 + c], blk).wait()
 
     # TTNN interop requires exactly one compute + two data-movement kernels (a core has two NOCs),
     # so the gather runs reader -> compute passthrough -> writer rather than DM straight to DM.
@@ -73,10 +84,12 @@ def ttl_concat_heads(x: ttnn.Tensor, y: ttnn.Tensor) -> None:
     @ttl.datamovement()
     def write():
         cx, cy = ttl.node(dims=2)
+        st = cy % SEQ_T
+        c0 = (cy // SEQ_T) * HALF_T
         for hh in range(HEADS_PER_COL):
-            for c in range(HD_T):
+            for c in range(HALF_T):
                 with out_dfb.wait() as blk:
-                    ttl.copy(blk, y[cy, (cx * HEADS_PER_COL + hh) * HD_T + c]).wait()
+                    ttl.copy(blk, y[st, (cx * HEADS_PER_COL + hh) * HD_T + c0 + c]).wait()
 
 
 def supports(attn_output, num_heads, head_dim) -> bool:

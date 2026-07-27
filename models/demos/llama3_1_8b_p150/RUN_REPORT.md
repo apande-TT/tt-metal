@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 18:26:37 UTC · 133 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 18:56:35 UTC · 135 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 661.00 ms
-  at-floor            : 81%   (123.78 ms reachable headroom)
+  measured            : 656.91 ms
+  at-floor            : 82%   (119.68 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -29,21 +29,22 @@ datamove             51.53   2.1%    7141   slow  NLPConcatHeadsDeviceOperation
 other                24.10   1.0%    2618   slow  NLPCreateQKVHeadsDecodeDeviceOperation
 embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
-Block-level timing (per-stage trace) — latest lever on SDPAOperation:
-  MatmulDeviceOperation 128 x 4096 x 14336 (prefill ff1/ff3)    135.69 ms  ###################### · True  <- hottest
-  MatmulDeviceOperation 32 x 4096 x 14336 (decode ff1/ff3)     92.45 ms  ###############.......
-  MatmulDeviceOperation 32 x 14336 x 4096 (decode ff2)     78.83 ms  #############.........
-  MatmulDeviceOperation 128 x 14336 x 4096 (prefill ff2)     73.64 ms  ############..........
+Block-level timing (per-stage trace) — latest lever on RotaryEmbeddingLlamaDeviceOperatio:
+  MatmulDeviceOperation 128 x 4096 x 14336 (prefill ff1/ff3)    135.72 ms  ###################### · True  <- hottest
+  MatmulDeviceOperation 32 x 4096 x 14336 (decode ff1/ff3)     92.46 ms  ###############.......
+  MatmulDeviceOperation 32 x 14336 x 4096 (decode ff2)     78.84 ms  #############.........
+  MatmulDeviceOperation 128 x 14336 x 4096 (prefill ff2)     73.62 ms  ############..........
   LayerNormDeviceOperation     51.94 ms  ########..............
-  MatmulDeviceOperation 32 x 4096 x 16032 (LM head)     43.66 ms  #######...............
+  MatmulDeviceOperation 32 x 4096 x 16032 (LM head)     43.65 ms  #######...............
   MatmulDeviceOperation 32 x 4096 x 6144 (decode QKV)     35.48 ms  ######................
-  MatmulDeviceOperation 128 x 4096 x 6144 (prefill QKV)     34.03 ms  ######................
-  MatmulDeviceOperation 128 x 4096 x 4096 (prefill wo)     29.02 ms  #####.................
+  MatmulDeviceOperation 128 x 4096 x 6144 (prefill QKV)     34.01 ms  ######................
+  MatmulDeviceOperation 128 x 4096 x 4096 (prefill wo)     29.17 ms  #####.................
   MatmulDeviceOperation 32 x 4096 x 4096 (decode wo)     25.31 ms  ####..................
   BinaryNgDeviceOperation     18.95 ms  ###...................
-  GenericOpDeviceOperation (tt-lang head split/concat)      7.19 ms  #.....................
-  RotaryEmbeddingLlamaDeviceOperation      7.03 ms  #.....................
-  SDPAOperation      6.96 ms  #.....................
+  GenericOpDeviceOperation (tt-lang split+rope, was split only)      9.30 ms  ##....................
+  SDPAOperation      4.84 ms  #.....................
+  RotaryEmbeddingLlamaDeviceOperation (prefill rope: fused away)      0.00 ms  ......................
+  RotaryEmbeddingLlamaFusedQKDeviceOperation (decode rope)      0.85 ms  ......................
   ArgMaxDeviceOperation      1.19 ms  ......................
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
@@ -59,7 +60,7 @@ MatmulDeviceOperation              ✓win      —         ✓win      ·try    
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ✓win      ·try      ✓win         745.01
 NLPConcatHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            714.94
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
-RotaryEmbeddingLlamaDeviceOperatio ✓win      —         —         —         —         —         —         —                 —
+RotaryEmbeddingLlamaDeviceOperatio ✓win      —         —         —         ✓win      —         —         —                 —
 SDPAOperation                      ✓win      —         —         —         —         —         —         —                 —
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
@@ -202,6 +203,8 @@ MatmulDeviceOperation                       cpp    662.92   +1801.26 ms  · no g
 MatmulDeviceOperation                   tt-lang    662.92   +1801.26 ms  · no gain  CORRECTION to the earlier tt-lang record for this op, which claimed the kernel "is so slow the 225 s correctness run TIMES OUT". That inference is CONFOUNDED and I withdraw it: the device wedged durin
 SDPAOperation                              grid         —             —  ✓ win      committed: llama3_1_8b_p150: size the prefill SDPA chunk+grid to the work, not to 8x8 The prefill SDPA factory flattens attention into B*n_local_heads*
 SDPAOperation                              grid    661.00   +1803.18 ms  ✓ win      Hypothesis from READING the prefill SDPA program factory rather than guessing a grid: it flattens work into B*n_local_heads*ceil(seq/q_chunk) Q-chunks and pair-distributes them for causal attention, s
+RotaryEmbeddingLlamaDeviceOperatio   structural         —             —  ✓ win      committed: llama3_1_8b_p150: fold the prefill rope into the tt-lang head-split kernel The prefill rope was DISPATCH bound, not compute bound: 736 launc
+RotaryEmbeddingLlamaDeviceOperatio   structural    656.91   +1807.27 ms  ✓ win      Found real reducible work: this op is DISPATCH bound (736 prefill launches x 9.55 us vs a 1.21 us roofline -- a [32,1,128,128] rotation is only ~8 tiles/core, so nearly all of it is fixed launch cost 
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2941,6 +2944,49 @@ Code changes — every attempt (win or fail):
     +                q_chunk > ttnn.TILE_SIZE
     +                and q_chunk % (2 * ttnn.TILE_SIZE) == 0
     ... (truncated, 17 more lines)
+
+[#135] RotaryEmbeddingLlamaDeviceOperatio · structural · win  +1807.27 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index 29cd6c48a9..99f360cb07 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -317,6 +317,13 @@ class Attention(LightweightModule):
+             else:
+                 self.k_norm = lambda x, mode, norm_config: x
+     
+    +        # Whether q_norm/k_norm are identity. The fused split+rope kernel does the rotation inside
+    +        # the head split, i.e. BEFORE where these norms sit in the chain, so it is only a legal
+    +        # substitution when there are no norms to reorder past (llama has none; qwen3 does).
+    +        self.qk_norm_is_identity = (
+    +            f"{q_norm_str}.weight" not in state_dict and f"{k_norm_str}.weight" not in state_dict
+    +        )
+    +
+             # For ring topology we can use all gather matmul for wo
+             self.use_fused_all_gather_matmul = self.args.use_fused_all_gather_matmul
+             pt_wo = state_dict[f"{wo_str}.weight"].transpose(-1, -2).unsqueeze(0).unsqueeze(0)
+    @@ -1037,39 +1044,79 @@ class Attention(LightweightModule):
+                     xqkv_fused, self.n_local_heads, self.n_local_kv_heads, self.head_dim
+                 )
+             )
+    -        if _use_ttl_heads:
+    -            (
+    -                q_heads_1QSD_pre_rot,
+    -                k_heads_1KSD_pre_rot,
+    -                v_heads_1VSD,
+    -            ) = ttl_create_qkv_heads.create_qkv_heads_ttl(xqkv_fused, create_heads_mem_config)
+    -        else:
+    +        # structural rung for RotaryEmbeddingLlamaDeviceOperation: the prefill rope is DISPATCH
+    +        # bound (736 launches x 9.55 us against a 1.21 us roofline -- a [32,1,128,128] rotation is
+    +        # only ~8 tiles per core, so almost all of the 9.55 us is fixed launch cost). No knob
+    +        # removes a fixed cost, so remove the LAUNCHES: the rotation is tile-local (x*cos +
+    +        # (x @ trans_mat)*sin, one 32x32 trans tile per tile, cos/sin head-broadcast), and the
+    +        # head-split kernel already streams every Q/K tile through its compute stage -- so the
+    +        # rotate rides along in the slot the split already pays for and the two rope dispatches
+    +        # disappear. Only legal while q_norm/k_norm are identity (see qk_norm_is_identity).
+    +        _fused_rope = (
+    +            _use_ttl_heads
+    +            and self.qk_norm_is_identity
+    ... (truncated, 335 more lines)
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation

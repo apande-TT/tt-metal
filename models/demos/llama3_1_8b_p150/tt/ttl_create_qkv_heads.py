@@ -31,13 +31,21 @@ import ttnn
 import ttl
 
 TILE = 32
-# seq_len 128 -> 4 seq tiles, one per grid row; 32 Q heads / 8 grid columns -> 4 Q heads per
-# column, plus one K and one V head each (8 KV heads == 8 columns).
-GRID_Y, GRID_X = 4, 8
 N_Q_HEADS, N_KV_HEADS, HEAD_DIM = 32, 8, 128
 SEQ_LEN = 128
 
 HD_T = HEAD_DIM // TILE  # tiles spanned by one head
+SEQ_T = SEQ_LEN // TILE
+
+# GRID RUNG. The work is THREE-dimensional -- head x seq tile x dim tile -- but `ttl.node` is 2-D.
+# The x axis is pinned to the 8 KV heads (each column owns one K/V head plus its group of 4 Q
+# heads), so a division-free mapping can only put seq OR dim on y and lands on 32 of the P150's
+# 110 cores. The compiler DOES lower a constant `//`/`%` on a node coord, so y carries BOTH:
+# cy = dim_half * SEQ_T + seq_tile, which is 8 rows / 64 cores at 12 tiles each instead of 24.
+# y cannot go further (SEQ_T * HD_T = 16 exceeds the 10 rows the board has).
+DIM_HALVES = 2
+HALF_T = HD_T // DIM_HALVES
+GRID_Y, GRID_X = SEQ_T * DIM_HALVES, 8
 Q_PER_COL = N_Q_HEADS // GRID_X
 
 
@@ -54,22 +62,24 @@ def ttl_create_heads(x: ttnn.Tensor, q: ttnn.Tensor, k: ttnn.Tensor, v: ttnn.Ten
     in_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
     out_dfb = ttl.make_dataflow_buffer_like(q, shape=(1, 1), block_count=2)
 
-    # Tiles each core moves: its Q heads, then one K head, then one V head -- all HD_T wide.
-    per_core_tiles = (Q_PER_COL + 2) * HD_T
+    # Tiles each core moves: its Q heads, one K head and one V head, each over its HALF_T dim tiles.
+    per_core_tiles = (Q_PER_COL + 2) * HALF_T
 
     @ttl.datamovement()
     def read():
         cx, cy = ttl.node(dims=2)
+        st = cy % SEQ_T
+        c0 = (cy // SEQ_T) * HALF_T
         for hh in range(Q_PER_COL):
-            for c in range(HD_T):
+            for c in range(HALF_T):
                 with in_dfb.reserve() as blk:
-                    ttl.copy(x[cy, (cx * Q_PER_COL + hh) * HD_T + c], blk).wait()
-        for c in range(HD_T):
+                    ttl.copy(x[st, (cx * Q_PER_COL + hh) * HD_T + c0 + c], blk).wait()
+        for c in range(HALF_T):
             with in_dfb.reserve() as blk:
-                ttl.copy(x[cy, (N_Q_HEADS + cx) * HD_T + c], blk).wait()
-        for c in range(HD_T):
+                ttl.copy(x[st, (N_Q_HEADS + cx) * HD_T + c0 + c], blk).wait()
+        for c in range(HALF_T):
             with in_dfb.reserve() as blk:
-                ttl.copy(x[cy, (N_Q_HEADS + N_KV_HEADS + cx) * HD_T + c], blk).wait()
+                ttl.copy(x[st, (N_Q_HEADS + N_KV_HEADS + cx) * HD_T + c0 + c], blk).wait()
 
     @ttl.compute()
     def passthrough():
@@ -81,16 +91,18 @@ def ttl_create_heads(x: ttnn.Tensor, q: ttnn.Tensor, k: ttnn.Tensor, v: ttnn.Ten
     @ttl.datamovement()
     def write():
         cx, cy = ttl.node(dims=2)
+        st = cy % SEQ_T
+        c0 = (cy // SEQ_T) * HALF_T
         for hh in range(Q_PER_COL):
-            for c in range(HD_T):
+            for c in range(HALF_T):
                 with out_dfb.wait() as blk:
-                    ttl.copy(blk, q[(cx * Q_PER_COL + hh) * seq_tiles + cy, c]).wait()
-        for c in range(HD_T):
+                    ttl.copy(blk, q[(cx * Q_PER_COL + hh) * seq_tiles + st, c0 + c]).wait()
+        for c in range(HALF_T):
             with out_dfb.wait() as blk:
-                ttl.copy(blk, k[cx * seq_tiles + cy, c]).wait()
-        for c in range(HD_T):
+                ttl.copy(blk, k[cx * seq_tiles + st, c0 + c]).wait()
+        for c in range(HALF_T):
             with out_dfb.wait() as blk:
-                ttl.copy(blk, v[cx * seq_tiles + cy, c]).wait()
+                ttl.copy(blk, v[cx * seq_tiles + st, c0 + c]).wait()
 
 
 @ttl.operation(grid=(GRID_X, GRID_Y))
@@ -130,7 +142,7 @@ def ttl_create_heads_rope(
     out_dfb = ttl.make_dataflow_buffer_like(q, shape=(1, 1), block_count=2)
 
     # Per core: this column's Q heads plus its one K head are rotated; its V head is pass-through.
-    pass_tiles = HD_T
+    pass_tiles = HALF_T
 
     # DIM-TILE OUTER, HEAD INNER. A core's cos/sin tile depends only on (seq_tile, dim_tile), and
     # its seq_tile is fixed by cy -- so all Q_PER_COL+1 rotated heads at a given dim tile share ONE
@@ -140,26 +152,28 @@ def ttl_create_heads_rope(
     @ttl.datamovement()
     def read():
         cx, cy = ttl.node(dims=2)
-        for c in range(HD_T):
+        st = cy % SEQ_T
+        c0 = (cy // SEQ_T) * HALF_T
+        for c in range(HALF_T):
             with cos_dfb.reserve() as cb, sin_dfb.reserve() as sb, trans_dfb.reserve() as tb:
-                t1 = ttl.copy(cos[cy, c], cb)
-                t2 = ttl.copy(sin[cy, c], sb)
+                t1 = ttl.copy(cos[st, c0 + c], cb)
+                t2 = ttl.copy(sin[st, c0 + c], sb)
                 t3 = ttl.copy(trans[0, 0], tb)
                 t1.wait()
                 t2.wait()
                 t3.wait()
             for hh in range(Q_PER_COL):
                 with in_dfb.reserve() as blk:
-                    ttl.copy(x[cy, (cx * Q_PER_COL + hh) * HD_T + c], blk).wait()
+                    ttl.copy(x[st, (cx * Q_PER_COL + hh) * HD_T + c0 + c], blk).wait()
             with in_dfb.reserve() as blk:
-                ttl.copy(x[cy, (N_Q_HEADS + cx) * HD_T + c], blk).wait()
-        for c in range(HD_T):
+                ttl.copy(x[st, (N_Q_HEADS + cx) * HD_T + c0 + c], blk).wait()
+        for c in range(HALF_T):
             with in_dfb.reserve() as blk:
-                ttl.copy(x[cy, (N_Q_HEADS + N_KV_HEADS + cx) * HD_T + c], blk).wait()
+                ttl.copy(x[st, (N_Q_HEADS + N_KV_HEADS + cx) * HD_T + c0 + c], blk).wait()
 
     @ttl.compute()
     def rotate():
-        for _ in range(HD_T):
+        for _ in range(HALF_T):
             with cos_dfb.wait() as cb, sin_dfb.wait() as sb, trans_dfb.wait() as tb:
                 for _ in range(Q_PER_COL + 1):
                     with in_dfb.wait() as ib:
@@ -176,15 +190,17 @@ def ttl_create_heads_rope(
     @ttl.datamovement()
     def write():
         cx, cy = ttl.node(dims=2)
-        for c in range(HD_T):
+        st = cy % SEQ_T
+        c0 = (cy // SEQ_T) * HALF_T
+        for c in range(HALF_T):
             for hh in range(Q_PER_COL):
                 with out_dfb.wait() as blk:
-                    ttl.copy(blk, q[(cx * Q_PER_COL + hh) * seq_tiles + cy, c]).wait()
+                    ttl.copy(blk, q[(cx * Q_PER_COL + hh) * seq_tiles + st, c0 + c]).wait()
             with out_dfb.wait() as blk:
-                ttl.copy(blk, k[cx * seq_tiles + cy, c]).wait()
-        for c in range(HD_T):
+                ttl.copy(blk, k[cx * seq_tiles + st, c0 + c]).wait()
+        for c in range(HALF_T):
             with out_dfb.wait() as blk:
-                ttl.copy(blk, v[cx * seq_tiles + cy, c]).wait()
+                ttl.copy(blk, v[cx * seq_tiles + st, c0 + c]).wait()
 
 
 def supports(xqkv_fused, num_heads, num_kv_heads, head_dim) -> bool:
