@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 05:56:32 UTC · 78 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 06:07:20 UTC · 80 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 781.95 ms
-  at-floor            : 69%   (244.72 ms reachable headroom)
+  measured            : 758.37 ms
+  at-floor            : 71%   (221.14 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -38,7 +38,7 @@ MatmulDeviceOperation              ✓win      —         —         —      
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
-NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      —         —         —            955.25
+NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 host_overhead                      —         —         —         —         —         —         —         ✓win              —
@@ -125,6 +125,8 @@ NlpCreateHeadsDeviceOperation             shard         —             —  ✓
 NlpCreateHeadsDeviceOperation             shard    865.93   +1598.25 ms  ✓ win      Hypothesis: this op has no weights and is pure memory-bound data movement, so the shard lever here means removing DRAM round-trips on the tensors it writes -- it emits three head-major views of the fu
 NlpCreateHeadsDeviceOperation        structural         —             —  ✓ win      committed: llama3_1_8b_p150: skip the prefill warmup when it duplicates the request Warmup was already narrowed (in earlier commits) to the sampling sh
 NlpCreateHeadsDeviceOperation        structural    781.95   +1682.23 ms  ✓ win      Hunted for reducible work behind this op rather than its per-call cost, and found the call COUNT was double what the workload needs. Earlier commits narrowed prefill warmup to the sampling shapes and 
+NlpCreateHeadsDeviceOperation           tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: tt-lang kernel for the prefill QKV head split The stock nlp_create_qkv_heads sizes its cores from num_blocks = batch*seq_l
+NlpCreateHeadsDeviceOperation           tt-lang    758.37   +1705.81 ms  ✓ win      Hypothesis: a kernel is the RIGHT rung here because the knob rungs are closed by construction, not by tuning -- the stock op sizes cores from num_blocks = batch*seq_len/TILE_HEIGHT (one work unit per 
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2004,6 +2006,49 @@ Code changes — every attempt (win or fail):
     +            if _warmup_is_duplicate:
     +                logger.info(
     ... (truncated, 16 more lines)
+
+[#80] NlpCreateHeadsDeviceOperation · tt-lang · win  +1705.81 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index e4e19d7461..c4ed5954c9 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -7,6 +7,7 @@ import math
+     import torch
+     
+     import ttnn
+    +from models.demos.llama3_1_8b_p150.tt import ttl_create_qkv_heads
+     from models.common.lightweightmodule import LightweightModule
+     from models.common.rmsnorm import RMSNorm
+     from models.common.utility_functions import nearest_32
+    @@ -977,17 +978,35 @@ class Attention(LightweightModule):
+                 if (not self.TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff)
+                 else ttnn.DRAM_MEMORY_CONFIG
+             )
+    -        (
+    -            q_heads_1QSD_pre_rot,
+    -            k_heads_1KSD_pre_rot,
+    -            v_heads_1VSD,
+    -        ) = ttnn.experimental.nlp_create_qkv_heads(
+    -            xqkv_fused,
+    -            num_heads=self.n_local_heads,
+    -            num_kv_heads=self.n_local_kv_heads,
+    -            transpose_k_heads=False,
+    -            memory_config=create_heads_mem_config,
+    +        # tt-lang rung: the stock op's core count is baked into its factory (one work unit per
+    +        # input row-tile -> 4 cores here), so the only way past it is a kernel whose work
+    +        # decomposition differs. ttl_create_qkv_heads parallelises over (seq_tile x head) and
+    +        # measures 0.0555 ms/call vs the stock op's 0.0810 at this shape, PCC 1.000000.
+    +        _use_ttl_heads = (
+    +            not self.TG
+    +            and self.prefetcher is None
+    +            and ttl_create_qkv_heads.supports(
+    +                xqkv_fused, self.n_local_heads, self.n_local_kv_heads, self.head_dim
+    +            )
+             )
+    +        if _use_ttl_heads:
+    +            (
+    +                q_heads_1QSD_pre_rot,
+    ... (truncated, 219 more lines)
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
