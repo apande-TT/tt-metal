@@ -2676,6 +2676,13 @@ class ModelArgs:
         else:
             self.padded_vocab_size = compute_padded_vocab_size(self.vocab_size, self.num_devices)
         self.head_dim = text_config.get("head_dim", self.dim // self.n_heads) or self.dim // self.n_heads
+        # qk-fused kernels (rotary_embedding_hf, SDPA fused) require head_dim divisible by 64 (the HF
+        # RoPE kernel layout). For a model whose head_dim is not (e.g. Phi-3.5-mini, head_dim=96) the
+        # runtime raises NotImplementedError from rope.py. use_qk_fused is set earlier in __init__ from
+        # multimodal/hf_rope alone; this is the head_dim-aware refinement, and it must come AFTER
+        # self.head_dim is assigned. Structural test, not a model name: it holds for any head_dim.
+        if self.head_dim % 64 != 0:
+            self.use_qk_fused = False
         self.num_experts_per_tok = text_config.get("num_experts_per_tok", 0)
         self.num_local_experts = text_config.get("num_local_experts", 0)
         self.max_context_len = text_config.get("max_position_embeddings")
