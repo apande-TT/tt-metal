@@ -224,7 +224,15 @@ class ModelOptimizations:
             )
         else:
             settings = {
-                "TensorPrecision": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4},
+                # FF1/FF3 already ride bf4_b here, but FF2 was left on the BFP8 default -- so the
+                # down-projection reads twice the weight bytes of the two projections feeding it,
+                # on both the prefill and the decode path (it is the same resident tensor). ff2 is
+                # DRAM-bandwidth bound in the roofline, and w2 is ~29 MB per layer at bf8_b, so
+                # halving it is the largest remaining dtype lever in the MLP.
+                "TensorPrecision": {
+                    TensorGroup.FF1_FF3: PrecisionSetting.BFP4,
+                    TensorGroup.FF2: PrecisionSetting.BFP4,
+                },
                 "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI},
             }
             if model_name.startswith("Phi-3-mini"):  # TODO: Only do this for N150

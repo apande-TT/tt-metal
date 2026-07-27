@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 02:09:02 UTC · 19 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 02:41:44 UTC · 25 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 1144.58 ms
-  at-floor            : 47%   (607.35 ms reachable headroom)
+  measured            : 1092.12 ms
+  at-floor            : 49%   (554.89 ms reachable headroom)
   status              : BELOW_BAND — keep optimizing
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -31,7 +31,9 @@ embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
-MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1138.67
+MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
+MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
+MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —           1092.12
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 
@@ -58,6 +60,12 @@ MatmulDeviceOperation                structural   1144.58   +1319.60 ms  · no g
 MatmulDeviceOperation                   tt-lang   1144.58   +1319.60 ms  · no gain  Authored tt/ttl_gated_ffn.py: a real multi-core tt-lang kernel computing silu(x@w1)*(x@w3) in ONE op so both [seq,hidden] intermediates stay in L1 -- the exact fusion GUIDELINES/11 names as highest-va
 MatmulDeviceOperation                   tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: record the tt-lang gated-FFN kernel and why it loses tt/ttl_gated_ffn.py is a real multi-core tt-lang kernel computing sil
 MatmulDeviceOperation                       cpp   1144.57   +1319.61 ms  · no gain  Authored tt/cpp_mm_generic.py + tt/kernels/{compute/mm_gated_ffn,dataflow/reader_mm_partitioned,dataflow/writer_mm_partitioned}.cpp: a real C++ Metalium reader/compute/writer triple (adapted from the 
+MatmulDeviceOperation                       cpp         —             —  ✓ win      committed: llama3_1_8b_p150: record the C++ Metalium matmul rung and why it loses tt/cpp_mm_generic.py drives a real Metalium reader/compute/writer tri
+MatmulDeviceOperation                      grid   1135.53   +1328.65 ms  · no gain  ff2's K is the hidden dim, 448 tiles -- the longest reduction in the model -- but matmul_config derives in0_block_w from find_largest_divisor(), which hard-caps at 8, so K is walked in 56 blocks and t
+MatmulDeviceOperation                      grid   1101.85   +1362.33 ms  · no gain  Reused catalogued prior art (commit d8cd69d734, reverted by the from-scratch baseline): use_minimal_qkv_prefill_matmul() claims every seq_len>128, so the 2D-mcast branch only ever sees M<=4 tiles, yet
+MatmulDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: size the short-prefill QKV and ff2 matmul configs to the work Two program-config levers on the prefill matmuls, both cases
+MatmulDeviceOperation                      grid   1092.12   +1372.06 ms  ✓ win      COMMITTED (supersedes the earlier reverted record of the same lever). Re-applied the catalogued QKV short-prefill config together with the ff2 in0_block_w blocking, after proving the full-pipeline gat
+MatmulDeviceOperation                      grid   1092.12   +1372.06 ms  ✓ win      COMMITTED (supersedes the earlier reverted record). ff2's in0_block_w was hard-capped at 8 by find_largest_divisor(), so its 448-tile K -- the longest reduction in the model -- was walked in 56 blocks
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -530,6 +538,178 @@ Code changes — every attempt (win or fail):
     +import torch
     +
     ... (truncated, 119 more lines)
+
+[#21] MatmulDeviceOperation · grid · no gain  +1328.65 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 751e024cbd..aebca824f3 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1365,14 +1365,37 @@ class ModelArgs:
+                         compute_with_storage_grid_size=ttnn.CoreCoord(grid[0], grid[1]),
+                     )
+                 else:
+    +                _m = min(seq_len, self.prefill_len_cutoff)  # 512 if BH, 1024 if WH
+    +                _k = self.hidden_dim // (self.cluster_shape[1] if self.is_galaxy else 1)
+    +                _grid = self.mlp2_grid(seq_len)
+    +                _per_core_N = (
+    +                    math.ceil(self.dim / (ttnn.TILE_SIZE * self.dram_shard_grid_width))
+    +                    if not self.is_galaxy
+    +                    else None
+    +                )
+    +                # ff2's K is the hidden dim -- 448 tiles, by far the longest reduction in the model.
+    +                # matmul_config derives in0_block_w from find_largest_divisor(), which hard-caps at
+    +                # 8, so K is walked in 56 separate blocks and the mcast/packer sync is re-paid every
+    +                # one of them. On a matmul the roofline tags memory-bound that is pure overhead.
+    +                # Take the largest block that still divides the per-row K AND leaves the in1 CB
+    +                # inside L1: the CB is in0_block_w x per_core_N tiles, double-buffered, bfp8
+    +                # (~1088 B/tile), against a 1.57 MB budget.
+    +                if not self.is_galaxy and _per_core_N:
+    +                    _k_per_row = _k // ttnn.TILE_SIZE // _grid[1]
+    +                    _budget_tiles = int(0.5 * 1_572_864 / (2 * 1088 * _per_core_N))
+    +                    _in0_block_w = max(
+    +                        (b for b in range(1, _k_per_row + 1) if _k_per_row % b == 0 and b <= _budget_tiles),
+    +                        default=1,
+    +                    )
+    +                    return self.matmul_config(
+    +                        m=_m, k=_k, n=self.dim, grid_size=_grid, per_core_N=_per_core_N, in0_block_w=_in0_block_w
+    +                    )
+                     return self.matmul_config(
+    -                    m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
+    -                    k=self.hidden_dim // (self.cluster_shape[1] if self.is_galaxy else 1),
+    +                    m=_m,
+    +                    k=_k,
+                         n=self.dim,
+    -                    grid_size=self.mlp2_grid(seq_len),
+    ... (truncated, 8 more lines)
+
+[#22] MatmulDeviceOperation · grid · no gain  +1362.33 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 751e024cbd..7a779d12ab 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1662,6 +1662,43 @@ class ModelArgs:
+                         N_block_size=8,
+                         compute_with_storage_grid_size=ttnn.CoreCoord(8, 10) if is_blackhole() else ttnn.CoreCoord(8, 8),
+                     )
+    +            elif is_blackhole() and self.device_name != "P100":
+    +                # SHORT prefill only: use_minimal_qkv_prefill_matmul() already claims every
+    +                # seq_len > 128, so M here is at most 4 tiles. The legacy config below spent
+    +                # that on a hard-coded (8, 10) grid with per_core_M=1 -- only M_tiles x 8 =
+    +                # 32 of the device's ~130 cores ever ran -- and walked K in 128 SINGLE-tile
+    +                # steps with a 1x1 subblock (the FIXME). Both are pure loss on a QKV matmul
+    +                # the roofline tags memory-bound: 128 one-tile K steps read the bfp8 weight
+    +                # in the smallest possible blocks and re-pay the mcast/packer sync each step.
+    +                # Size the config to the actual work instead: one core ROW per M tile, N
+    +                # spread over the widest real device column count that divides it, K walked
+    +                # in 8-tile blocks, and the largest subblock HIFI2 allows.
+    +                m_tiles = max(1, math.ceil(seq_len / ttnn.TILE_SIZE))
+    +                n_tiles = math.ceil(self.qkv_size / self.cluster_shape[1] / ttnn.TILE_SIZE)
+    +                k_tiles = self.dim // ttnn.TILE_SIZE
+    +                # Exact blocking: num_blocks_y must equal grid_y and num_blocks_x grid_x.
+    +                grid_y = min(m_tiles, self.max_grid_size.y)
+    +                per_core_M = math.ceil(m_tiles / grid_y)
+    +                grid_x = max(x for x in range(1, self.max_grid_size.x + 1) if n_tiles % x == 0)
+    +                per_core_N = n_tiles // grid_x
+    +                # LI_QKV_PREFILL runs HIFI2, which sets fp32_dest_acc_en=True, so Blackhole
+    +                # caps out_subblock_h * out_subblock_w at 4 (not 8).
+    +                out_subblock_h = max(h for h in range(1, 5) if per_core_M % h == 0)
+    +                out_subblock_w = max(w for w in range(1, (4 // out_subblock_h) + 1) if per_core_N % w == 0)
+    +                # in1 CB = in0_block_w * per_core_N * 2 (double-buffered) bfp8 tiles; 8 x 16 x 2
+    +                # x 1088 B ~= 278 KB, comfortably inside the 1.57 MB L1 budget.
+    +                in0_block_w = max(b for b in (8, 4, 2, 1) if k_tiles % b == 0)
+    +                return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+    +                    compute_with_storage_grid_size=(grid_x, grid_y),
+    +                    in0_block_w=in0_block_w,
+    +                    out_subblock_h=out_subblock_h,
+    +                    out_subblock_w=out_subblock_w,
+    +                    per_core_M=per_core_M,
+    ... (truncated, 8 more lines)
+
+[#24] MatmulDeviceOperation · grid · win  +1372.06 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 751e024cbd..cb75ce7a86 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1365,14 +1365,37 @@ class ModelArgs:
+                         compute_with_storage_grid_size=ttnn.CoreCoord(grid[0], grid[1]),
+                     )
+                 else:
+    +                _m = min(seq_len, self.prefill_len_cutoff)  # 512 if BH, 1024 if WH
+    +                _k = self.hidden_dim // (self.cluster_shape[1] if self.is_galaxy else 1)
+    +                _grid = self.mlp2_grid(seq_len)
+    +                _per_core_N = (
+    +                    math.ceil(self.dim / (ttnn.TILE_SIZE * self.dram_shard_grid_width))
+    +                    if not self.is_galaxy
+    +                    else None
+    +                )
+    +                # ff2's K is the hidden dim -- 448 tiles, by far the longest reduction in the model.
+    +                # matmul_config derives in0_block_w from find_largest_divisor(), which hard-caps at
+    +                # 8, so K is walked in 56 separate blocks and the mcast/packer sync is re-paid every
+    +                # one of them. On a matmul the roofline tags memory-bound that is pure overhead.
+    +                # Take the largest block that still divides the per-row K AND leaves the in1 CB
+    +                # inside L1: the CB is in0_block_w x per_core_N tiles, double-buffered, bfp8
+    +                # (~1088 B/tile), against a 1.57 MB budget.
+    +                if not self.is_galaxy and _per_core_N:
+    +                    _k_per_row = _k // ttnn.TILE_SIZE // _grid[1]
+    +                    _budget_tiles = int(0.5 * 1_572_864 / (2 * 1088 * _per_core_N))
+    +                    _in0_block_w = max(
+    +                        (b for b in range(1, _k_per_row + 1) if _k_per_row % b == 0 and b <= _budget_tiles),
+    +                        default=1,
+    +                    )
+    +                    return self.matmul_config(
+    +                        m=_m, k=_k, n=self.dim, grid_size=_grid, per_core_N=_per_core_N, in0_block_w=_in0_block_w
+    +                    )
+                     return self.matmul_config(
+    -                    m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
+    -                    k=self.hidden_dim // (self.cluster_shape[1] if self.is_galaxy else 1),
+    +                    m=_m,
+    +                    k=_k,
+                         n=self.dim,
+    -                    grid_size=self.mlp2_grid(seq_len),
+    ... (truncated, 52 more lines)
+
+[#25] MatmulDeviceOperation · grid · win  +1372.06 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 751e024cbd..cb75ce7a86 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1365,14 +1365,37 @@ class ModelArgs:
+                         compute_with_storage_grid_size=ttnn.CoreCoord(grid[0], grid[1]),
+                     )
+                 else:
+    +                _m = min(seq_len, self.prefill_len_cutoff)  # 512 if BH, 1024 if WH
+    +                _k = self.hidden_dim // (self.cluster_shape[1] if self.is_galaxy else 1)
+    +                _grid = self.mlp2_grid(seq_len)
+    +                _per_core_N = (
+    +                    math.ceil(self.dim / (ttnn.TILE_SIZE * self.dram_shard_grid_width))
+    +                    if not self.is_galaxy
+    +                    else None
+    +                )
+    +                # ff2's K is the hidden dim -- 448 tiles, by far the longest reduction in the model.
+    +                # matmul_config derives in0_block_w from find_largest_divisor(), which hard-caps at
+    +                # 8, so K is walked in 56 separate blocks and the mcast/packer sync is re-paid every
+    +                # one of them. On a matmul the roofline tags memory-bound that is pure overhead.
+    +                # Take the largest block that still divides the per-row K AND leaves the in1 CB
+    +                # inside L1: the CB is in0_block_w x per_core_N tiles, double-buffered, bfp8
+    +                # (~1088 B/tile), against a 1.57 MB budget.
+    +                if not self.is_galaxy and _per_core_N:
+    +                    _k_per_row = _k // ttnn.TILE_SIZE // _grid[1]
+    +                    _budget_tiles = int(0.5 * 1_572_864 / (2 * 1088 * _per_core_N))
+    +                    _in0_block_w = max(
+    +                        (b for b in range(1, _k_per_row + 1) if _k_per_row % b == 0 and b <= _budget_tiles),
+    +                        default=1,
+    +                    )
+    +                    return self.matmul_config(
+    +                        m=_m, k=_k, n=self.dim, grid_size=_grid, per_core_N=_per_core_N, in0_block_w=_in0_block_w
+    +                    )
+                     return self.matmul_config(
+    -                    m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
+    -                    k=self.hidden_dim // (self.cluster_shape[1] if self.is_galaxy else 1),
+    +                    m=_m,
+    +                    k=_k,
+                         n=self.dim,
+    -                    grid_size=self.mlp2_grid(seq_len),
+    ... (truncated, 52 more lines)
 
 Limitations / suggested manual next steps:
 - (none flagged automatically — see the per-op device report for remaining headroom.)
