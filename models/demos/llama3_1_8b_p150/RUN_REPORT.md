@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 13:05:44 UTC · 117 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 15:30:17 UTC · 123 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 682.47 ms
-  at-floor            : 79%   (145.25 ms reachable headroom)
+  measured            : 662.92 ms
+  at-floor            : 81%   (125.69 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -29,22 +29,22 @@ datamove             51.53   2.1%    7141   slow  NLPConcatHeadsDeviceOperation
 other                24.10   1.0%    2618   slow  NLPCreateQKVHeadsDecodeDeviceOperation
 embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
-Block-level timing (per-stage trace) — latest lever on ArgMaxDeviceOperation:
-  MatmulDeviceOperation 128 x 4096 x 14336 (prefill ff1/ff3)    135.69 ms  ######################  <- hottest
+Block-level timing (per-stage trace) — latest lever on MatmulDeviceOperation:
+  MatmulDeviceOperation 128 x 4096 x 14336 (prefill ff1/ff3)    135.69 ms  ###################### · True  <- hottest
   MatmulDeviceOperation 32 x 4096 x 14336 (decode ff1/ff3)     92.45 ms  ###############.......
   MatmulDeviceOperation 32 x 14336 x 4096 (decode ff2)     78.83 ms  #############.........
   MatmulDeviceOperation 128 x 14336 x 4096 (prefill ff2)     73.64 ms  ############..........
-  MatmulDeviceOperation 32 x 4096 x 16032 (LM head)     63.14 ms  ##########............
   LayerNormDeviceOperation     51.94 ms  ########..............
+  MatmulDeviceOperation 32 x 4096 x 16032 (LM head)     43.66 ms  #######...............
   MatmulDeviceOperation 32 x 4096 x 6144 (decode QKV)     35.48 ms  ######................
   MatmulDeviceOperation 128 x 4096 x 6144 (prefill QKV)     34.03 ms  ######................
-  ArgMaxDeviceOperation      2.30 ms  ......................
   MatmulDeviceOperation 128 x 4096 x 4096 (prefill wo)     29.02 ms  #####.................
   MatmulDeviceOperation 32 x 4096 x 4096 (decode wo)     25.31 ms  ####..................
   BinaryNgDeviceOperation     18.95 ms  ###...................
   GenericOpDeviceOperation (tt-lang head split/concat)      7.19 ms  #.....................
   RotaryEmbeddingLlamaDeviceOperation      7.03 ms  #.....................
   SDPAOperation      6.96 ms  #.....................
+  ArgMaxDeviceOperation      1.19 ms  ......................
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
@@ -55,7 +55,7 @@ MatmulDeviceOperation              ·try      —         ✓win      ·try     
 MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —           1092.12
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
-MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
+MatmulDeviceOperation              ✓win      —         ✓win      ·try      —         —         —         ·try         662.92
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ✓win      ·try      ✓win         745.01
 NLPConcatHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            714.94
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
@@ -185,6 +185,12 @@ ArgMaxDeviceOperation                     shard    713.16   +1751.02 ms  ✓ win
 ArgMaxDeviceOperation                structural         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
 ArgMaxDeviceOperation                structural         —             —  ✓ win      committed: llama3_1_8b_p150: argmax only the live batch rows, not the padding TTSampling rounds the request batch up to a 32-row tile because the LOGIT
 ArgMaxDeviceOperation                structural    682.47   +1781.71 ms  ✓ win      Hypothesis: the reducible work is PADDING, not per-element cost. TTSampling.__init__ does max_batch_size = max(32, roundup(raw_batch,32)) because the LOGITS are tile-layout, but the force-argmax path 
+MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: put the LM head weight on bf4_b The output projection is the single largest weight in the model ([dim, padded_vocab] = 409
+MatmulDeviceOperation                     dtype    662.92   +1801.26 ms  ✓ win      Hypothesis: this op is DRAM-bw bound (profiler tags it DRAM, 101 cores, 171 us/call) and the LM head is the single largest weight in the model -- [dim, padded_vocab] = 4096 x 128256, ~70 MB at bf8_b. 
+MatmulDeviceOperation                     shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: NOC0 is hung on PCIe device ID 1.
+MatmulDeviceOperation                     shard    662.92   +1801.26 ms  · no gain  Hypothesis and the arithmetic that bounds it: this op is DRAM-bw bound, so the only shard that can help is one that REMOVES BYTES, i.e. L1 residency -- and the measured rate says there is almost nothi
+MatmulDeviceOperation                     shard    662.92   +1801.26 ms  · no gain  Hypothesis bounded by arithmetic first: this op is DRAM-bw bound, so only a BYTE-REMOVING shard (L1 residency) can help -- and each vocab split already reads 4096 x 16032 bf4_b = 36.9 MB in 121 us = ~
+MatmulDeviceOperation               tp-fracture    662.92   +1801.26 ms  · no gain  Hypothesis: if the LM head is still DRAM-bandwidth bound after every single-chip lever, splitting the 295 MB output-projection weight across chips would divide the bytes each chip fetches. tp_pick_deg
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2709,6 +2715,178 @@ Code changes — every attempt (win or fail):
     +compute all 32. It is NOT required for the argmax, because the force-argmax path untilizes
     +first and a ROW_MAJOR tensor has no such constraint. The profile shows the op paying for the
     ... (truncated, 107 more lines)
+
+[#119] MatmulDeviceOperation · dtype · win  +1801.26 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index eeb42ce095..7f72b1c0b6 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -101,13 +101,17 @@ class LMHead(LightweightModule):
+     
+                     # The cache key must encode the memory config: a cached DRAM-width-sharded weight
+                     # reloaded for the interleaved path (or vice versa) silently feeds the matmul an
+    -                # operand whose shard spec its program config does not expect.
+    +                # operand whose shard spec its program config does not expect. It must encode the
+    +                # DTYPE for the same reason -- `as_tensor` returns the cached tensor as it was
+    +                # stored, so without this a bf8_b cache is reloaded unchanged and a dtype change
+    +                # here is a silent no-op.
+                     _layout_tag = "_ilv" if (mode == 0 and self.full_grid) else ""
+    +                _dtype_tag = f"_{str(dtype).rsplit('.', 1)[-1].lower()}"
+                     cache_file_name = (
+                         None
+                         if args.dummy_weights
+                         else weight_cache_path
+    -                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}"
+    +                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}{_dtype_tag}"
+                     )
+     
+                     def pad_to_power_of_2(n):
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model.py b/models/demos/llama3_1_8b_p150/tt/model.py
+    index b2d1ee38fc..3f5dfc99ff 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model.py
+    @@ -142,11 +142,18 @@ class Transformer(LightweightModule):
+                 TG=args.is_galaxy,
+             )
+     
+    +        # The output projection is the single largest weight in the model
+    +        # ([dim, padded_vocab] = 4096 x 128256, ~70 MB at bf8_b) and its matmul is
+    +        # DRAM-bandwidth bound, so the bytes it reads ARE its runtime. Every decoder weight
+    +        # already rides bf4_b under `performance()`; the LM head was left on the model-wide
+    +        # bf8_b default purely because it is built outside the decoder precision config.
+    +        # Overridable via ModelArgs for accuracy-first configs.
+    +        lm_head_weight_dtype = getattr(args, "lm_head_weight_dtype", None) or ttnn.bfloat4_b
+             self.lm_head = LMHead(
+    ... (truncated, 8 more lines)
+
+[#121] MatmulDeviceOperation · shard · no gain  +1801.26 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index eeb42ce095..7f72b1c0b6 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -101,13 +101,17 @@ class LMHead(LightweightModule):
+     
+                     # The cache key must encode the memory config: a cached DRAM-width-sharded weight
+                     # reloaded for the interleaved path (or vice versa) silently feeds the matmul an
+    -                # operand whose shard spec its program config does not expect.
+    +                # operand whose shard spec its program config does not expect. It must encode the
+    +                # DTYPE for the same reason -- `as_tensor` returns the cached tensor as it was
+    +                # stored, so without this a bf8_b cache is reloaded unchanged and a dtype change
+    +                # here is a silent no-op.
+                     _layout_tag = "_ilv" if (mode == 0 and self.full_grid) else ""
+    +                _dtype_tag = f"_{str(dtype).rsplit('.', 1)[-1].lower()}"
+                     cache_file_name = (
+                         None
+                         if args.dummy_weights
+                         else weight_cache_path
+    -                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}"
+    +                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}{_dtype_tag}"
+                     )
+     
+                     def pad_to_power_of_2(n):
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model.py b/models/demos/llama3_1_8b_p150/tt/model.py
+    index b2d1ee38fc..3f5dfc99ff 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model.py
+    @@ -142,11 +142,18 @@ class Transformer(LightweightModule):
+                 TG=args.is_galaxy,
+             )
+     
+    +        # The output projection is the single largest weight in the model
+    +        # ([dim, padded_vocab] = 4096 x 128256, ~70 MB at bf8_b) and its matmul is
+    +        # DRAM-bandwidth bound, so the bytes it reads ARE its runtime. Every decoder weight
+    +        # already rides bf4_b under `performance()`; the LM head was left on the model-wide
+    +        # bf8_b default purely because it is built outside the decoder precision config.
+    +        # Overridable via ModelArgs for accuracy-first configs.
+    +        lm_head_weight_dtype = getattr(args, "lm_head_weight_dtype", None) or ttnn.bfloat4_b
+             self.lm_head = LMHead(
+    ... (truncated, 8 more lines)
+
+[#122] MatmulDeviceOperation · shard · no gain  +1801.26 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index eeb42ce095..7f72b1c0b6 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -101,13 +101,17 @@ class LMHead(LightweightModule):
+     
+                     # The cache key must encode the memory config: a cached DRAM-width-sharded weight
+                     # reloaded for the interleaved path (or vice versa) silently feeds the matmul an
+    -                # operand whose shard spec its program config does not expect.
+    +                # operand whose shard spec its program config does not expect. It must encode the
+    +                # DTYPE for the same reason -- `as_tensor` returns the cached tensor as it was
+    +                # stored, so without this a bf8_b cache is reloaded unchanged and a dtype change
+    +                # here is a silent no-op.
+                     _layout_tag = "_ilv" if (mode == 0 and self.full_grid) else ""
+    +                _dtype_tag = f"_{str(dtype).rsplit('.', 1)[-1].lower()}"
+                     cache_file_name = (
+                         None
+                         if args.dummy_weights
+                         else weight_cache_path
+    -                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}"
+    +                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}{_dtype_tag}"
+                     )
+     
+                     def pad_to_power_of_2(n):
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model.py b/models/demos/llama3_1_8b_p150/tt/model.py
+    index b2d1ee38fc..3f5dfc99ff 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model.py
+    @@ -142,11 +142,18 @@ class Transformer(LightweightModule):
+                 TG=args.is_galaxy,
+             )
+     
+    +        # The output projection is the single largest weight in the model
+    +        # ([dim, padded_vocab] = 4096 x 128256, ~70 MB at bf8_b) and its matmul is
+    +        # DRAM-bandwidth bound, so the bytes it reads ARE its runtime. Every decoder weight
+    +        # already rides bf4_b under `performance()`; the LM head was left on the model-wide
+    +        # bf8_b default purely because it is built outside the decoder precision config.
+    +        # Overridable via ModelArgs for accuracy-first configs.
+    +        lm_head_weight_dtype = getattr(args, "lm_head_weight_dtype", None) or ttnn.bfloat4_b
+             self.lm_head = LMHead(
+    ... (truncated, 8 more lines)
+
+[#123] MatmulDeviceOperation · tp-fracture · no gain  +1801.26 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index eeb42ce095..7f72b1c0b6 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -101,13 +101,17 @@ class LMHead(LightweightModule):
+     
+                     # The cache key must encode the memory config: a cached DRAM-width-sharded weight
+                     # reloaded for the interleaved path (or vice versa) silently feeds the matmul an
+    -                # operand whose shard spec its program config does not expect.
+    +                # operand whose shard spec its program config does not expect. It must encode the
+    +                # DTYPE for the same reason -- `as_tensor` returns the cached tensor as it was
+    +                # stored, so without this a bf8_b cache is reloaded unchanged and a dtype change
+    +                # here is a silent no-op.
+                     _layout_tag = "_ilv" if (mode == 0 and self.full_grid) else ""
+    +                _dtype_tag = f"_{str(dtype).rsplit('.', 1)[-1].lower()}"
+                     cache_file_name = (
+                         None
+                         if args.dummy_weights
+                         else weight_cache_path
+    -                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}"
+    +                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}{_dtype_tag}"
+                     )
+     
+                     def pad_to_power_of_2(n):
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model.py b/models/demos/llama3_1_8b_p150/tt/model.py
+    index b2d1ee38fc..3f5dfc99ff 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model.py
+    @@ -142,11 +142,18 @@ class Transformer(LightweightModule):
+                 TG=args.is_galaxy,
+             )
+     
+    +        # The output projection is the single largest weight in the model
+    +        # ([dim, padded_vocab] = 4096 x 128256, ~70 MB at bf8_b) and its matmul is
+    +        # DRAM-bandwidth bound, so the bytes it reads ARE its runtime. Every decoder weight
+    +        # already rides bf4_b under `performance()`; the LM head was left on the model-wide
+    +        # bf8_b default purely because it is built outside the decoder precision config.
+    +        # Overridable via ModelArgs for accuracy-first configs.
+    +        lm_head_weight_dtype = getattr(args, "lm_head_weight_dtype", None) or ttnn.bfloat4_b
+             self.lm_head = LMHead(
+    ... (truncated, 8 more lines)
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
