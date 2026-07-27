@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 06:39:14 UTC · 88 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 06:47:39 UTC · 91 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 749.85 ms
-  at-floor            : 72%   (212.62 ms reachable headroom)
+  measured            : 745.01 ms
+  at-floor            : 72%   (207.78 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -38,7 +38,7 @@ MatmulDeviceOperation              ✓win      —         ✓win      —      
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
-MatmulDeviceOperation              ·try      —         ✓win      —         —         —         —         —            754.36
+MatmulDeviceOperation              ·try      —         ✓win      ✓win      —         —         —         ·try         745.01
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
@@ -136,6 +136,9 @@ MatmulDeviceOperation                      grid    754.36   +1709.82 ms  · no g
 MatmulDeviceOperation                      grid    754.36   +1709.82 ms  · no gain  Hypothesis: decode QKV is grid=partial because find_grid() sorts candidate core counts by distance from a hard-coded target=32 -- correct on a 64-core Wormhole, but on a 110-core P150 it picks 32 core
 MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: write the decode QKV output as bf8_b wqkv reached the bf4_b weight floor in the previous commit, so the only dtype bytes l
 MatmulDeviceOperation                     dtype    749.94   +1714.24 ms  ✓ win      Hypothesis via the catalogued matmul-coherence lever: wqkv hit the bf4_b weight floor in the previous commit, so the only dtype bytes left on this DRAM-bw-bound matmul are the ones it WRITES. Found th
+MatmulDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: keep the decode QKV output sharded into the head split Both operands of this matmul were already L1 width-sharded and its
+MatmulDeviceOperation                     shard    745.01   +1719.17 ms  ✓ win      Hypothesis: the usual shard targets were already spent on this op -- both operands are L1 width-sharded and the 13 MB/layer bf4_b weight can never be L1-resident (the only residency path is the DramPr
+MatmulDeviceOperation               tp-fracture    745.01   +1719.17 ms  · no gain  Hypothesis: if decode QKV is still DRAM-bandwidth bound after every single-chip lever, splitting the wqkv read across chips would divide the bytes each chip fetches. tp_pick_degree(32, 4096, 6144) ret
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2209,6 +2212,78 @@ Code changes — every attempt (win or fail):
                  global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
                  sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
              )
+
+[#90] MatmulDeviceOperation · shard · win  +1719.17 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index 76b944f93e..aa99bba560 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -605,6 +605,17 @@ class Attention(LightweightModule):
+             if not self.TG and self.prefetcher is None and self.activation_dtype is None:
+                 _qkv_decode_out_dtype = ttnn.bfloat8_b
+     
+    +        # SHARD RUNG (A/B against the bf8_b store above). Both operands of this matmul are
+    +        # already L1 width-sharded and the 13 MB/layer bf4_b weight can never be L1-resident, so
+    +        # the only sharding left to change is the HANDOFF: today the output is width-sharded in
+    +        # L1 and then sharded_to_interleaved'd before the head split. Keeping it sharded deletes
+    +        # that reshard from the per-token chain -- but nlp_create_qkv_heads_decode requires bf16,
+    +        # and the reshard is currently what does the bf8_b -> bf16 upcast, so this trades the
+    +        # store saving for the reshard. Which side wins is a measurement.
+    +        _keep_qkv_sharded = not self.TG and self.prefetcher is None
+    +        if _keep_qkv_sharded:
+    +            _qkv_decode_out_dtype = ttnn.bfloat16
+    +
+             xqkv_fused_sharded = ttnn.linear(
+                 x_sharded,
+                 self.wqkv,
+    @@ -649,7 +660,10 @@ class Attention(LightweightModule):
+                 )
+             else:
+                 # bfloat16 is required by nlp_create_qkv_heads_decode
+    -            if self.prefetcher is None:
+    +            if _keep_qkv_sharded:
+    +                # Already bf16 and L1 width-sharded -- hand it straight to the head split.
+    +                xqkv_fused = xqkv_fused_sharded
+    +            elif self.prefetcher is None:
+                     xqkv_fused = ttnn.sharded_to_interleaved(xqkv_fused_sharded, ttnn.L1_MEMORY_CONFIG, ttnn.bfloat16)
+                     ttnn.deallocate(xqkv_fused_sharded)
+                 else:
+
+[#91] MatmulDeviceOperation · tp-fracture · no gain  +1719.17 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index 76b944f93e..aa99bba560 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -605,6 +605,17 @@ class Attention(LightweightModule):
+             if not self.TG and self.prefetcher is None and self.activation_dtype is None:
+                 _qkv_decode_out_dtype = ttnn.bfloat8_b
+     
+    +        # SHARD RUNG (A/B against the bf8_b store above). Both operands of this matmul are
+    +        # already L1 width-sharded and the 13 MB/layer bf4_b weight can never be L1-resident, so
+    +        # the only sharding left to change is the HANDOFF: today the output is width-sharded in
+    +        # L1 and then sharded_to_interleaved'd before the head split. Keeping it sharded deletes
+    +        # that reshard from the per-token chain -- but nlp_create_qkv_heads_decode requires bf16,
+    +        # and the reshard is currently what does the bf8_b -> bf16 upcast, so this trades the
+    +        # store saving for the reshard. Which side wins is a measurement.
+    +        _keep_qkv_sharded = not self.TG and self.prefetcher is None
+    +        if _keep_qkv_sharded:
+    +            _qkv_decode_out_dtype = ttnn.bfloat16
+    +
+             xqkv_fused_sharded = ttnn.linear(
+                 x_sharded,
+                 self.wqkv,
+    @@ -649,7 +660,10 @@ class Attention(LightweightModule):
+                 )
+             else:
+                 # bfloat16 is required by nlp_create_qkv_heads_decode
+    -            if self.prefetcher is None:
+    +            if _keep_qkv_sharded:
+    +                # Already bf16 and L1 width-sharded -- hand it straight to the head split.
+    +                xqkv_fused = xqkv_fused_sharded
+    +            elif self.prefetcher is None:
+                     xqkv_fused = ttnn.sharded_to_interleaved(xqkv_fused_sharded, ttnn.L1_MEMORY_CONFIG, ttnn.bfloat16)
+                     ttnn.deallocate(xqkv_fused_sharded)
+                 else:
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
