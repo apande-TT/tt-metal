@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 02:41:44 UTC · 25 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 02:50:09 UTC · 27 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 1092.12 ms
-  at-floor            : 49%   (554.89 ms reachable headroom)
+  measured            : 1063.78 ms
+  at-floor            : 51%   (526.55 ms reachable headroom)
   status              : BELOW_BAND — keep optimizing
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -31,7 +31,7 @@ embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
-MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
+MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —                 —
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —           1092.12
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
@@ -66,6 +66,8 @@ MatmulDeviceOperation                      grid   1101.85   +1362.33 ms  · no g
 MatmulDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: size the short-prefill QKV and ff2 matmul configs to the work Two program-config levers on the prefill matmuls, both cases
 MatmulDeviceOperation                      grid   1092.12   +1372.06 ms  ✓ win      COMMITTED (supersedes the earlier reverted record of the same lever). Re-applied the catalogued QKV short-prefill config together with the ff2 in0_block_w blocking, after proving the full-pipeline gat
 MatmulDeviceOperation                      grid   1092.12   +1372.06 ms  ✓ win      COMMITTED (supersedes the earlier reverted record). ff2's in0_block_w was hard-capped at 8 by find_largest_divisor(), so its 448-tile K -- the longest reduction in the model -- was walked in 56 blocks
+MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: put the FF2 down-projection weights on bf4_b performance() already rides bf4_b for FF1/FF3 but left FF2 on the BFP8 defaul
+MatmulDeviceOperation                     dtype   1063.78   +1400.40 ms  ✓ win      Hypothesis: ff2 is DRAM-bw bound and performance() had already put FF1/FF3 on bf4_b but left FF2 on the BFP8 default, so the down-projection read 2x the weight bytes of the two projections feeding it 
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -710,6 +712,29 @@ Code changes — every attempt (win or fail):
                          n=self.dim,
     -                    grid_size=self.mlp2_grid(seq_len),
     ... (truncated, 52 more lines)
+
+[#27] MatmulDeviceOperation · dtype · win  +1400.40 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index cb75ce7a86..8b557ec23c 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -224,7 +224,15 @@ class ModelOptimizations:
+                 )
+             else:
+                 settings = {
+    -                "TensorPrecision": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4},
+    +                # FF1/FF3 already ride bf4_b here, but FF2 was left on the BFP8 default -- so the
+    +                # down-projection reads twice the weight bytes of the two projections feeding it,
+    +                # on both the prefill and the decode path (it is the same resident tensor). ff2 is
+    +                # DRAM-bandwidth bound in the roofline, and w2 is ~29 MB per layer at bf8_b, so
+    +                # halving it is the largest remaining dtype lever in the MLP.
+    +                "TensorPrecision": {
+    +                    TensorGroup.FF1_FF3: PrecisionSetting.BFP4,
+    +                    TensorGroup.FF2: PrecisionSetting.BFP4,
+    +                },
+                     "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI},
+                 }
+                 if model_name.startswith("Phi-3-mini"):  # TODO: Only do this for N150
 
 Limitations / suggested manual next steps:
 - (none flagged automatically — see the per-op device report for remaining headroom.)

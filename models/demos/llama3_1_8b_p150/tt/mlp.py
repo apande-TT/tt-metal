@@ -180,6 +180,16 @@ class MLP(LightweightModule):
         if mode == Mode.PREFILL and not TG:
             ff1_3_out_dtype = ttnn.bfloat8_b
 
+        # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+        # layer and can never be L1-resident, but the [seq, hidden] intermediates can, and that is
+        # what ff2 READS: landing ff1/ff3 in L1 removes three DRAM round-trips per MLP (ff1 and ff3
+        # write, the mul reads both and writes, ff2 reads that). ttnn.mul inherits w1_out's memory
+        # config, so one change carries the whole chain. Bounded to prompts at or under
+        # prefill_len_cutoff; w1_out/w3_out are freed right after the mul, so the island peaks at
+        # three intermediates -- ~1.95 MB each at bf8_b for seq_len=128.
+        if mode == Mode.PREFILL and not TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff:
+            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+
         x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
 
         w1_out = ttnn.linear(
