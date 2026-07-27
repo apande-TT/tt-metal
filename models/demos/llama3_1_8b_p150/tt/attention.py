@@ -1315,12 +1315,18 @@ class Attention(LightweightModule):
             else attn_output_11SH
         )
 
+        # wo writes straight into the residual stream's memory space. At short prefill that stream
+        # lives in L1, and landing this output in DRAM instead would make the residual add copy it
+        # back in -- which measured as 1149 CopyDeviceOperation calls / +4.20 ms, more than the
+        # 3.03 ms the L1 residual saved. The residual config is the single source of truth.
+        wo_out_mem_config = self.args.get_residual_mem_config(Mode.PREFILL, self.prefetcher, int(seq_len))
+
         output_11SH = ttnn.linear(
             attn_output_11SH_sharded,
             self.wo,
             compute_kernel_config=self.li_o_prefill_compute_kernel_cfg,
             dtype=self.activation_dtype or ttnn.bfloat8_b,
-            memory_config=wo_prefill_output_mem_config,
+            memory_config=wo_out_mem_config,
             program_config=self.args.get_attn_wo_program_config(Mode.PREFILL, seq_len, None),
         )
 

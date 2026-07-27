@@ -922,8 +922,16 @@ class Transformer(LightweightModule):
                     self.args.get_residual_mem_config(mode, self.prefetcher),
                     activation_dtype,
                 )
-            elif activation_dtype is not None and x.dtype != activation_dtype:
-                x = ttnn.typecast(x, activation_dtype)
+            else:
+                if activation_dtype is not None and x.dtype != activation_dtype:
+                    x = ttnn.typecast(x, activation_dtype)
+                # The decoder asserts its input already sits in the residual memory config, so when
+                # short prefill puts the residual stream in L1 the FIRST layer's input (straight off
+                # the embedding, in DRAM) has to be moved there. Layers 2..N are already L1 because
+                # the previous layer's residual add wrote it, and to_memory_config is a no-op then.
+                _residual_cfg = self.args.get_residual_mem_config(mode, self.prefetcher, int(x.shape[-2]))
+                if x.memory_config() != _residual_cfg:
+                    x = ttnn.to_memory_config(x, _residual_cfg)
 
             # vLLM hybrid kv-cache-groups: each attention layer gets its own
             # paged pool (sliding-window vs full-attention have different

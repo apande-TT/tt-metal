@@ -1225,8 +1225,15 @@ class ModelArgs:
     # RESIDUAL MEMORY CONFIGS
     # =========================================================================
     @lru_cache(maxsize=None)
-    def get_residual_mem_config(self, mode: Mode, prefetcher: Prefetcher = None):
-        """Get the memory config for decode residual tensors."""
+    def get_residual_mem_config(self, mode: Mode, prefetcher: Prefetcher = None, seq_len: int = None):
+        """Get the memory config for decode residual tensors.
+
+        seq_len (PREFILL only): at short prefill the residual stream is small enough to live in L1,
+        which is the shard rung for the two residual BinaryNg adds -- they are the model's only
+        DRAM-resident eltwise (352 + 352 calls, 6.23 ms at ~8.9 us each) and everything they touch
+        is a [seq, dim] activation, so L1 residency removes the DRAM round-trip on both operands and
+        the result. Left in DRAM for long prefill, where [seq, dim] no longer fits.
+        """
         if mode == Mode.DECODE:
             if prefetcher is not None:
                 num_residual_worker_cores = 32 if self.num_devices == 4 else 16
@@ -1257,6 +1264,13 @@ class ModelArgs:
                     use_height_and_width_as_shard_shape=True,
                 )
         elif mode == Mode.PREFILL:
+            if (
+                seq_len is not None
+                and seq_len <= self.prefill_len_cutoff
+                and not self.is_galaxy
+                and prefetcher is None
+            ):
+                return ttnn.L1_MEMORY_CONFIG
             return ttnn.DRAM_MEMORY_CONFIG
         else:
             raise ValueError(f"Invalid mode: {mode}")

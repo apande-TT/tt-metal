@@ -338,6 +338,10 @@ class MLP(LightweightModule):
         )
 
         ff2_input_mem_config = self.args.get_mlp_ff2_mem_config(mode, self.prefetcher)
+        if mode == Mode.PREFILL:
+            # Same reason as wo in attention: ff2's output IS the next residual add's operand, so it
+            # must land wherever the residual stream lives or the add pays a copy to bring it there.
+            ff2_input_mem_config = self.args.get_residual_mem_config(mode, self.prefetcher, int(seq_len))
         w2_in_sharded = w2_in
 
         if seq_len > 128 and mode != Mode.DECODE:

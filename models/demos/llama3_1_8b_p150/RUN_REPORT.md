@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 18:56:35 UTC · 135 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 19:40:40 UTC · 140 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 656.91 ms
-  at-floor            : 82%   (119.68 ms reachable headroom)
+  measured            : 653.69 ms
+  at-floor            : 82%   (116.46 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -29,27 +29,20 @@ datamove             51.53   2.1%    7141   slow  NLPConcatHeadsDeviceOperation
 other                24.10   1.0%    2618   slow  NLPCreateQKVHeadsDecodeDeviceOperation
 embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
-Block-level timing (per-stage trace) — latest lever on RotaryEmbeddingLlamaDeviceOperatio:
-  MatmulDeviceOperation 128 x 4096 x 14336 (prefill ff1/ff3)    135.72 ms  ###################### · True  <- hottest
-  MatmulDeviceOperation 32 x 4096 x 14336 (decode ff1/ff3)     92.46 ms  ###############.......
-  MatmulDeviceOperation 32 x 14336 x 4096 (decode ff2)     78.84 ms  #############.........
-  MatmulDeviceOperation 128 x 14336 x 4096 (prefill ff2)     73.62 ms  ############..........
-  LayerNormDeviceOperation     51.94 ms  ########..............
-  MatmulDeviceOperation 32 x 4096 x 16032 (LM head)     43.65 ms  #######...............
-  MatmulDeviceOperation 32 x 4096 x 6144 (decode QKV)     35.48 ms  ######................
-  MatmulDeviceOperation 128 x 4096 x 6144 (prefill QKV)     34.01 ms  ######................
-  MatmulDeviceOperation 128 x 4096 x 4096 (prefill wo)     29.17 ms  #####.................
-  MatmulDeviceOperation 32 x 4096 x 4096 (decode wo)     25.31 ms  ####..................
-  BinaryNgDeviceOperation     18.95 ms  ###...................
-  GenericOpDeviceOperation (tt-lang split+rope, was split only)      9.30 ms  ##....................
-  SDPAOperation      4.84 ms  #.....................
-  RotaryEmbeddingLlamaDeviceOperation (prefill rope: fused away)      0.00 ms  ......................
-  RotaryEmbeddingLlamaFusedQKDeviceOperation (decode rope)      0.85 ms  ......................
-  ArgMaxDeviceOperation      1.19 ms  ......................
+Block-level timing (per-stage trace) — latest lever on BinaryNgDeviceOperation:
+  BinaryNg [128,14336] bf8_b L1 interleaved, 110 cores (kept)      8.23 ms  ###########........... · True
+  BinaryNg same op, L1 width-shard 64 cores (tried)     11.27 ms  ###############.......
+  BinaryNg same op, L1 block-shard 32 cores (tried)     16.30 ms  ######################  <- hottest
+  BinaryNg [128,4096] bf16 DRAM (prefill residual add)      3.33 ms  ####..................
+  BinaryNg [32,14336] bf8_b L1-width-sharded (decode gate mul)      3.50 ms  #####.................
+  BinaryNg [128,4096] bf16 x bf8_b DRAM (prefill residual add)      2.90 ms  ####..................
+  BinaryNg [32,4096] bf16 L1-width-sharded (decode residual adds)      1.03 ms  #.....................
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
 ArgMaxDeviceOperation              ✓win      —         —         ✓win      ✓win      —         —         —                 —
+BinaryNgDeviceOperation            ·try      —         —         —         —         —         —         —            660.60
+GenericOpDeviceOperation           ✓win      —         —         —         —         —         —         —                 —
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
@@ -61,7 +54,7 @@ MatmulDeviceOperation              ·try      —         ✓win      ✓win    
 NLPConcatHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            714.94
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
 RotaryEmbeddingLlamaDeviceOperatio ✓win      —         —         —         ✓win      —         —         —                 —
-SDPAOperation                      ✓win      —         —         —         —         —         —         —                 —
+SDPAOperation                      ✓win      —         —         —         ·try      —         —         —            655.73
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 host_overhead                      —         —         —         —         —         —         —         ✓win              —
@@ -205,6 +198,11 @@ SDPAOperation                              grid         —             —  ✓
 SDPAOperation                              grid    661.00   +1803.18 ms  ✓ win      Hypothesis from READING the prefill SDPA program factory rather than guessing a grid: it flattens work into B*n_local_heads*ceil(seq/q_chunk) Q-chunks and pair-distributes them for causal attention, s
 RotaryEmbeddingLlamaDeviceOperatio   structural         —             —  ✓ win      committed: llama3_1_8b_p150: fold the prefill rope into the tt-lang head-split kernel The prefill rope was DISPATCH bound, not compute bound: 736 launc
 RotaryEmbeddingLlamaDeviceOperatio   structural    656.91   +1807.27 ms  ✓ win      Found real reducible work: this op is DISPATCH bound (736 prefill launches x 9.55 us vs a 1.21 us roofline -- a [32,1,128,128] rotation is only ~8 tiles/core, so nearly all of it is fixed launch cost 
+GenericOpDeviceOperation                   grid         —             —  ✓ win      committed: llama3_1_8b_p150: widen both tt-lang kernels from 32 to 64 cores Both kernels were pinned at 32 of the P150's 110 cores, and not by tuning.
+GenericOpDeviceOperation                   grid    653.69   +1810.49 ms  ✓ win      Hypothesis: this op is the model's own two tt-lang kernels (fused QKV split+rope, and concat-heads) and both were tagged grid=partial for a STRUCTURAL reason, not a tuning one -- their work is three-d
+SDPAOperation                        structural    655.73   +1808.45 ms  · no gain  Hunted reducible work around this dispatch-bound SDPA (368 calls x 13.14us vs a 1.33us roofline, 64 cores, seq 128) and measured TWO candidates, both rejected -- the evidence is the value here. (1) FU
+BinaryNgDeviceOperation                    grid    660.60   +1803.58 ms  · no gain  Read the program factory and the profile before reaching for a knob, and together they decided the rung: for an INTERLEAVED operand binary_ng calls split_work_to_cores over the whole device grid, so t
+BinaryNgDeviceOperation                    grid    671.92   +1792.26 ms  · no gain  Second grid geometry on the same dominant SILU-gate multiply, chosen because BLOCK sharding splits the HEIGHT as well as the width and so can in principle address cores a width split cannot. It cannot
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2988,8 +2986,180 @@ Code changes — every attempt (win or fail):
     +            and self.qk_norm_is_identity
     ... (truncated, 335 more lines)
 
+[#137] GenericOpDeviceOperation · grid · win  +1810.49 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    index 31e6d95100..81c0fcecb2 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    @@ -31,12 +31,21 @@ import ttnn
+     import ttl
+     
+     TILE = 32
+    -# seq_len 128 -> 4 seq tiles, one per grid row; 32 heads / 8 grid columns -> 4 heads per column.
+    -GRID_X, GRID_Y = 8, 4
+    -N_HEADS, HEAD_DIM = 32, 128
+    +# GRID RUNG. The work has THREE dimensions -- head (32) x seq tile (4) x dim tile (4) -- but
+    +# `ttl.node` is 2-D, so a division-free mapping can carry only two of them and every division-free
+    +# choice lands on 32 of the P150's 110 cores (head groups must divide 32 and fit in <=11 columns,
+    +# i.e. 8; the other axis is then seq(4) or dim(4)). Getting past 32 therefore needs ONE coordinate
+    +# to carry two work dimensions, which needs a constant divide on the node coord. So: y carries
+    +# (seq tile, dim half) as cy = dim_half * SEQ_T + s, giving 8 rows and 64 cores at 8 tiles each.
+    +# If the compiler will not lower `//`/`%` on a node coord this falls back to the 4-row form.
+     SEQ_LEN = 128
+    -
+    +N_HEADS, HEAD_DIM = 32, 128
+     HD_T = HEAD_DIM // TILE
+    +SEQ_T = SEQ_LEN // TILE
+    +DIM_HALVES = 2
+    +HALF_T = HD_T // DIM_HALVES
+    +
+    +GRID_X, GRID_Y = 8, SEQ_T * DIM_HALVES
+     HEADS_PER_COL = N_HEADS // GRID_X
+     
+     
+    @@ -51,15 +60,17 @@ def ttl_concat_heads(x: ttnn.Tensor, y: ttnn.Tensor) -> None:
+         in_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+         out_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
+     
+    -    per_core_tiles = HEADS_PER_COL * HD_T
+    +    per_core_tiles = HEADS_PER_COL * HALF_T
+     
+         @ttl.datamovement()
+         def read():
+             cx, cy = ttl.node(dims=2)
+    ... (truncated, 182 more lines)
+
+[#138] SDPAOperation · structural · no gain  +1808.45 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    index 31e6d95100..81c0fcecb2 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    @@ -31,12 +31,21 @@ import ttnn
+     import ttl
+     
+     TILE = 32
+    -# seq_len 128 -> 4 seq tiles, one per grid row; 32 heads / 8 grid columns -> 4 heads per column.
+    -GRID_X, GRID_Y = 8, 4
+    -N_HEADS, HEAD_DIM = 32, 128
+    +# GRID RUNG. The work has THREE dimensions -- head (32) x seq tile (4) x dim tile (4) -- but
+    +# `ttl.node` is 2-D, so a division-free mapping can carry only two of them and every division-free
+    +# choice lands on 32 of the P150's 110 cores (head groups must divide 32 and fit in <=11 columns,
+    +# i.e. 8; the other axis is then seq(4) or dim(4)). Getting past 32 therefore needs ONE coordinate
+    +# to carry two work dimensions, which needs a constant divide on the node coord. So: y carries
+    +# (seq tile, dim half) as cy = dim_half * SEQ_T + s, giving 8 rows and 64 cores at 8 tiles each.
+    +# If the compiler will not lower `//`/`%` on a node coord this falls back to the 4-row form.
+     SEQ_LEN = 128
+    -
+    +N_HEADS, HEAD_DIM = 32, 128
+     HD_T = HEAD_DIM // TILE
+    +SEQ_T = SEQ_LEN // TILE
+    +DIM_HALVES = 2
+    +HALF_T = HD_T // DIM_HALVES
+    +
+    +GRID_X, GRID_Y = 8, SEQ_T * DIM_HALVES
+     HEADS_PER_COL = N_HEADS // GRID_X
+     
+     
+    @@ -51,15 +60,17 @@ def ttl_concat_heads(x: ttnn.Tensor, y: ttnn.Tensor) -> None:
+         in_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+         out_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
+     
+    -    per_core_tiles = HEADS_PER_COL * HD_T
+    +    per_core_tiles = HEADS_PER_COL * HALF_T
+     
+         @ttl.datamovement()
+         def read():
+             cx, cy = ttl.node(dims=2)
+    ... (truncated, 182 more lines)
+
+[#139] BinaryNgDeviceOperation · grid · no gain  +1803.58 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    index 31e6d95100..81c0fcecb2 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    @@ -31,12 +31,21 @@ import ttnn
+     import ttl
+     
+     TILE = 32
+    -# seq_len 128 -> 4 seq tiles, one per grid row; 32 heads / 8 grid columns -> 4 heads per column.
+    -GRID_X, GRID_Y = 8, 4
+    -N_HEADS, HEAD_DIM = 32, 128
+    +# GRID RUNG. The work has THREE dimensions -- head (32) x seq tile (4) x dim tile (4) -- but
+    +# `ttl.node` is 2-D, so a division-free mapping can carry only two of them and every division-free
+    +# choice lands on 32 of the P150's 110 cores (head groups must divide 32 and fit in <=11 columns,
+    +# i.e. 8; the other axis is then seq(4) or dim(4)). Getting past 32 therefore needs ONE coordinate
+    +# to carry two work dimensions, which needs a constant divide on the node coord. So: y carries
+    +# (seq tile, dim half) as cy = dim_half * SEQ_T + s, giving 8 rows and 64 cores at 8 tiles each.
+    +# If the compiler will not lower `//`/`%` on a node coord this falls back to the 4-row form.
+     SEQ_LEN = 128
+    -
+    +N_HEADS, HEAD_DIM = 32, 128
+     HD_T = HEAD_DIM // TILE
+    +SEQ_T = SEQ_LEN // TILE
+    +DIM_HALVES = 2
+    +HALF_T = HD_T // DIM_HALVES
+    +
+    +GRID_X, GRID_Y = 8, SEQ_T * DIM_HALVES
+     HEADS_PER_COL = N_HEADS // GRID_X
+     
+     
+    @@ -51,15 +60,17 @@ def ttl_concat_heads(x: ttnn.Tensor, y: ttnn.Tensor) -> None:
+         in_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+         out_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
+     
+    -    per_core_tiles = HEADS_PER_COL * HD_T
+    +    per_core_tiles = HEADS_PER_COL * HALF_T
+     
+         @ttl.datamovement()
+         def read():
+             cx, cy = ttl.node(dims=2)
+    ... (truncated, 182 more lines)
+
+[#140] BinaryNgDeviceOperation · grid · no gain  +1792.26 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    index 31e6d95100..81c0fcecb2 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    @@ -31,12 +31,21 @@ import ttnn
+     import ttl
+     
+     TILE = 32
+    -# seq_len 128 -> 4 seq tiles, one per grid row; 32 heads / 8 grid columns -> 4 heads per column.
+    -GRID_X, GRID_Y = 8, 4
+    -N_HEADS, HEAD_DIM = 32, 128
+    +# GRID RUNG. The work has THREE dimensions -- head (32) x seq tile (4) x dim tile (4) -- but
+    +# `ttl.node` is 2-D, so a division-free mapping can carry only two of them and every division-free
+    +# choice lands on 32 of the P150's 110 cores (head groups must divide 32 and fit in <=11 columns,
+    +# i.e. 8; the other axis is then seq(4) or dim(4)). Getting past 32 therefore needs ONE coordinate
+    +# to carry two work dimensions, which needs a constant divide on the node coord. So: y carries
+    +# (seq tile, dim half) as cy = dim_half * SEQ_T + s, giving 8 rows and 64 cores at 8 tiles each.
+    +# If the compiler will not lower `//`/`%` on a node coord this falls back to the 4-row form.
+     SEQ_LEN = 128
+    -
+    +N_HEADS, HEAD_DIM = 32, 128
+     HD_T = HEAD_DIM // TILE
+    +SEQ_T = SEQ_LEN // TILE
+    +DIM_HALVES = 2
+    +HALF_T = HD_T // DIM_HALVES
+    +
+    +GRID_X, GRID_Y = 8, SEQ_T * DIM_HALVES
+     HEADS_PER_COL = N_HEADS // GRID_X
+     
+     
+    @@ -51,15 +60,17 @@ def ttl_concat_heads(x: ttnn.Tensor, y: ttnn.Tensor) -> None:
+         in_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+         out_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
+     
+    -    per_core_tiles = HEADS_PER_COL * HD_T
+    +    per_core_tiles = HEADS_PER_COL * HALF_T
+     
+         @ttl.datamovement()
+         def read():
+             cx, cy = ttl.node(dims=2)
+    ... (truncated, 182 more lines)
+
 Limitations / suggested manual next steps:
-- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
+- 2 op(s) tried but no lever beat baseline: BinaryNgDeviceOperation, LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
