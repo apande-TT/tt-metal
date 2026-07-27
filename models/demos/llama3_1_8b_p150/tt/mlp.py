@@ -177,7 +177,13 @@ class MLP(LightweightModule):
         # trips. Prefill only: decode's intermediate is 32 rows, too small for this to pay for the
         # precision, and decode is the steady-state path.
         ff1_3_out_dtype = ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16
-        if mode == Mode.PREFILL and not TG:
+        if not TG:
+            # Narrow (per-tensor) form of the activation dtype walk. A model-wide
+            # TensorGroup.ACTIVATION=BFP8 destroys accuracy because it also lands on the residual
+            # stream, the norm inputs and the KV cache; these two tensors are fenced off from all of
+            # that -- they feed nothing but the SILU mul, whose output ff2 then reads. Applies in
+            # DECODE as well as PREFILL: decode's intermediate is only 32 rows, but it is written
+            # twice, read twice and paid on EVERY token.
             ff1_3_out_dtype = ttnn.bfloat8_b
 
         # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per

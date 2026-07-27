@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 03:01:01 UTC · 34 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 03:28:38 UTC · 38 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -31,9 +31,10 @@ embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
-MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ·try        1061.00
+MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —           1092.12
+MatmulDeviceOperation              ·try      —         ·try      —         —         —         —         —           1060.95
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 
@@ -75,6 +76,10 @@ MatmulDeviceOperation               tp-fracture   1061.00   +1403.18 ms  · no g
 MatmulDeviceOperation                structural   1061.00   +1403.18 ms  · no gain  none: investigated ff2's surroundings for reducible work and found none left. (1) Its output all-reduce is already a no-op here -- tt_all_reduce short-circuits and returns the input unchanged when mes
 MatmulDeviceOperation                   tt-lang   1061.00   +1403.18 ms  · no gain  Authored tt/ttl_ff2_matmul.py: a multi-core tt-lang matmul measured on ff2's OWN shape (128x14336x4096, 8x8 grid, 128 N-tiles / 64 cores = 2 each exact, K reduced in-core via an accumulator DFB ping-p
 MatmulDeviceOperation                       cpp   1061.00   +1403.18 ms  · no gain  Ran the authored C++ Metalium generic_op triple (tt/cpp_mm_generic.py + tt/kernels/*.cpp) on ff2's OWN shape (128x14336x4096) across the full 11x10 grid: CORRECT at PCC 0.993625 but 3.113ms/call vs 0.
+MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: record the ff2-shape kernel rungs tt/ttl_ff2_matmul.py measures the tt-lang rung on ff2's OWN shape rather than inheriting
+MatmulDeviceOperation                      grid   1061.12   +1403.06 ms  · no gain  find_grid_k_n hard-codes max_rows=max_cols=8 (a Wormhole 8x8 assumption) and it is what sizes the DRAM-sharded DECODE matmuls, so on an 11x10 P150 it discards 40%+ of the chip before its divisibility 
+MatmulDeviceOperation                      grid   1063.96   +1400.22 ms  · no gain  Decode ff2 (m=32 -> the per-token path) is DRAM-sharded on mlp2_core_grid, so I attacked the two grid-sizing helpers that pick its core count: find_grid_k_n hard-coded Wormhole 8x8, and find_grid both
+MatmulDeviceOperation                     dtype   1060.95   +1403.23 ms  · no gain  Decode ff2's WEIGHT is already at the bf4_b floor (commit 67acf99 flipped all 896 w2 instances, decode included), so the only dtype bytes left on this DRAM-bw-bound matmul are the ACTIVATIONS flowing 
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -881,8 +886,117 @@ Code changes — every attempt (win or fail):
      
              w1_out = ttnn.linear(
 
+[#36] MatmulDeviceOperation · grid · no gain  +1403.06 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 8b557ec23c..260115d3e2 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -3362,8 +3362,13 @@ class ModelArgs:
+             Raises:
+                 AssertionError: If it's not possible to find such a grid configuration.
+             """
+    -        max_rows = 8
+    -        max_cols = 8  # Maximum number of rows or columns
+    +        # Resolve the REAL compute grid rather than assuming Wormhole's 8x8 (GUIDELINES #1). On a
+    +        # P150 that is 11x10 = 110 cores, so the old hard-coded cap threw away more than 40% of the
+    +        # chip before the divisibility search even started -- and this helper is what sizes the
+    +        # DRAM-sharded DECODE matmuls, i.e. the per-token path.
+    +        grid = self.mesh_device.compute_with_storage_grid_size() if self.mesh_device is not None else None
+    +        max_rows = grid.y if grid is not None else 8
+    +        max_cols = grid.x if grid is not None else 8
+             max_cores = max_rows * max_cols  # Maximum number of cores
+     
+             # Find all possible numbers of cores that divide N and are less than or equal to max_cores
+
+[#37] MatmulDeviceOperation · grid · no gain  +1400.22 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    new file mode 100644
+    index 0000000000..9c141024a1
+    --- /dev/null
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    @@ -0,0 +1,122 @@
+    +"""tt-lang matmul on the ff2 shape -- AUTHORED, MEASURED, and NOT WIRED IN.
+    +
+    +Kept as the record of the tt-lang rung for `MatmulDeviceOperation 128 x 14336 x 4096`, measured on
+    +ff2's OWN shape rather than reusing the w1/w3 result. Each core owns a strip of the N tiles
+    +(128 N-tiles / 64 cores = 2 each, exact); K is reduced in-core with an accumulator DFB ping-pong
+    +seeded from the first partial product (ttl 1.0.1 has no block.fill).
+    +
+    +MEASURED on M=128, K=14336, N=4096, 8x8 grid:
+    +
+    +    correctness   PCC 0.999682   (the kernel is right)
+    +    ttl matmul    2.961 ms/call
+    +    ttnn.linear   0.364 ms/call  -> 8.1x SLOWER
+    +
+    +The C++ Metalium rung was measured on the same shape via tt/cpp_mm_generic.py: PCC 0.993625,
+    +3.113 ms vs 0.362 ms -> 8.6x slower.
+    +
+    +Unlike w1/w3 there is no fusion available here either: ff2's output feeds a residual add and (on a
+    +multi-device mesh) a CCL, and its input round-trip is already removed by the L1 island in mlp.py. So
+    +a hand kernel has nothing to add beyond dataflow it cannot win on -- each core re-reads every A tile
+    +per output tile, while ttnn's matmul multicasts in0 across a core row and blocks K.
+    +
+    +Run directly to reproduce.
+    +"""
+    +import time
+    +
+    +import torch
+    +
+    +import ttnn
+    +import ttl
+    +
+    +TILE = 32
+    +M, K, N = 128, 14336, 4096
+    +GRID_X, GRID_Y = 8, 8
+    +
+    ... (truncated, 88 more lines)
+
+[#38] MatmulDeviceOperation · dtype · no gain  +1403.23 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    new file mode 100644
+    index 0000000000..9c141024a1
+    --- /dev/null
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    @@ -0,0 +1,122 @@
+    +"""tt-lang matmul on the ff2 shape -- AUTHORED, MEASURED, and NOT WIRED IN.
+    +
+    +Kept as the record of the tt-lang rung for `MatmulDeviceOperation 128 x 14336 x 4096`, measured on
+    +ff2's OWN shape rather than reusing the w1/w3 result. Each core owns a strip of the N tiles
+    +(128 N-tiles / 64 cores = 2 each, exact); K is reduced in-core with an accumulator DFB ping-pong
+    +seeded from the first partial product (ttl 1.0.1 has no block.fill).
+    +
+    +MEASURED on M=128, K=14336, N=4096, 8x8 grid:
+    +
+    +    correctness   PCC 0.999682   (the kernel is right)
+    +    ttl matmul    2.961 ms/call
+    +    ttnn.linear   0.364 ms/call  -> 8.1x SLOWER
+    +
+    +The C++ Metalium rung was measured on the same shape via tt/cpp_mm_generic.py: PCC 0.993625,
+    +3.113 ms vs 0.362 ms -> 8.6x slower.
+    +
+    +Unlike w1/w3 there is no fusion available here either: ff2's output feeds a residual add and (on a
+    +multi-device mesh) a CCL, and its input round-trip is already removed by the L1 island in mlp.py. So
+    +a hand kernel has nothing to add beyond dataflow it cannot win on -- each core re-reads every A tile
+    +per output tile, while ttnn's matmul multicasts in0 across a core row and blocks K.
+    +
+    +Run directly to reproduce.
+    +"""
+    +import time
+    +
+    +import torch
+    +
+    +import ttnn
+    +import ttl
+    +
+    +TILE = 32
+    +M, K, N = 128, 14336, 4096
+    +GRID_X, GRID_Y = 8, 8
+    +
+    ... (truncated, 88 more lines)
+
 Limitations / suggested manual next steps:
-- (none flagged automatically — see the per-op device report for remaining headroom.)
+- 1 op(s) tried but no lever beat baseline: MatmulDeviceOperation
+  -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
   trace+1CQ perf:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_main_perf.py::test_main_perf -svv
