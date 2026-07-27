@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 05:05:38 UTC · 67 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 05:11:03 UTC · 69 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -36,7 +36,7 @@ MatmulDeviceOperation              ✓win      —         ✓win      ✓win   
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —           1092.12
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
-MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ·try      ·try      ·try         891.98
+MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ·try         891.98
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 host_overhead                      —         —         —         —         —         —         —         ✓win              —
@@ -112,6 +112,8 @@ MatmulDeviceOperation                     shard    892.05   +1572.13 ms  · no g
 MatmulDeviceOperation               tp-fracture    892.04   +1572.14 ms  · no gain  tp_pick_degree(32, 4096, 14336) returned best_tp=1 -- keep decode ff1/ff3 single-chip. Same two reasons as the sibling ff2 op: the on-mesh sweep is disabled by default because it opens a NESTED mesh d
 MatmulDeviceOperation                   tt-lang    892.04   +1572.14 ms  · no gain  Measured the tt-lang kernel on this op's OWN shape rather than inheriting the ff2 verdict, since M and the K/N ratio both differ. Extended tt/ttl_ff2_matmul.py to sweep (M,K,N) triples; the multi-core
 MatmulDeviceOperation                       cpp    892.04   +1572.14 ms  · no gain  Measured the C++ Metalium reader/compute/writer triple (via ttnn.generic_op, output tiles partitioned across the full 11x10 grid) on this op's OWN shape. On 32x4096x14336: PCC 0.999022, 1.039 ms/call 
+MatmulDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: measure both kernel rungs on the decode ff1/ff3 shape too Both hand-kernel scripts now sweep (M, K, N) triples and cover e
+MatmulDeviceOperation               tp-fracture    892.11   +1572.07 ms  · no gain  tp_pick_degree(32, 4096, 14336) returned best_tp=1 -- keep decode ff1/ff3 single-chip. Two reasons. The on-mesh sweep is disabled by default because it opens a NESTED mesh device and toggles fabric co
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -1742,6 +1744,49 @@ Code changes — every attempt (win or fail):
     ... (truncated, 114 more lines)
 
 [#67] MatmulDeviceOperation · cpp · no gain  +1572.14 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    index c98a9b6ae9..27cae9296a 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    @@ -5,6 +5,7 @@ Kept as the record of the cpp rung for every hot dense matmul in the MLP:
+       * `MatmulDeviceOperation 128 x  4096 x 14336` -- the short-prefill ff1/ff3 up-projection
+       * `MatmulDeviceOperation 128 x 14336 x  4096` -- the short-prefill ff2 down-projection
+       * `MatmulDeviceOperation  32 x 14336 x  4096` -- the DECODE ff2 down-projection (per-token path)
+    +  * `MatmulDeviceOperation  32 x  4096 x 14336` -- the DECODE ff1/ff3 up-projection (per-token path)
+     
+     Drives the repo's own programming-example kernel triple (tt_metal/programming_examples/matmul/
+     matmul_multi_core: reader / mm / writer, copied into tt/kernels/) through ttnn.generic_op, with
+    @@ -13,9 +14,10 @@ the output tiles partitioned across the entire compute grid.
+     MEASURED on the real shapes, on the full 11x10 P150 grid:
+     
+         M    K      N        PCC        generic_op    ttnn.linear     verdict
+    -    128  4096   14336    0.998986    3.565 ms      0.328 ms       10.9x SLOWER
+    -    128  14336  4096     0.993626    3.118 ms      0.357 ms        8.7x SLOWER
+    -     32  14336  4096     0.993594    0.916 ms      0.292 ms        3.1x SLOWER
+    +    128  4096   14336    0.999039    3.561 ms      0.332 ms       10.7x SLOWER
+    +    128  14336  4096     0.993591    3.119 ms      0.358 ms        8.7x SLOWER
+    +     32  14336  4096     0.993562    0.919 ms      0.296 ms        3.1x SLOWER
+    +     32  4096   14336    0.999022    1.039 ms      0.309 ms        3.4x SLOWER
+     
+     Every kernel is CORRECT and every one loses. The cause is dataflow, not tuning: this reader fetches
+     every A tile again for each output tile, so A is re-read Nt times from DRAM, while ttnn's production
+    @@ -44,7 +46,7 @@ from ttnn._ttnn.program_descriptor import VectorUInt32 as _VU32
+     TILE = 32
+     # (M, K, N) of every op this rung was measured for: the ff1/ff3 up-projection, then ff2's
+     # down-projection at the short-prefill and the DECODE row counts.
+    -SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096)]
+    +SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336)]
+     ROOT = "/tmp/tt_hw_planner_llama3_1_8b_p150_1785111170/models/demos/llama3_1_8b_p150/tt/kernels"
+     
+     
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    index 296b46a632..d126d0c5d2 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    @@ -1,35 +1,40 @@
+    ... (truncated, 114 more lines)
+
+[#69] MatmulDeviceOperation · tp-fracture · no gain  +1572.07 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index c98a9b6ae9..27cae9296a 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
