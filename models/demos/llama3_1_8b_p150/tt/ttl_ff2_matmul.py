@@ -1,35 +1,40 @@
-"""tt-lang matmul on the ff2 shapes -- AUTHORED, MEASURED, and NOT WIRED IN.
+"""tt-lang matmul on the hot MLP shapes -- AUTHORED, MEASURED, and NOT WIRED IN.
 
-Kept as the record of the tt-lang rung for BOTH ff2 shapes, each measured on its OWN shape rather
-than inheriting the w1/w3 result:
+Kept as the record of the tt-lang rung for each op, measured on its OWN shape rather than inheriting
+a sibling's result:
 
-  * `MatmulDeviceOperation 128 x 14336 x 4096` -- the short-prefill down-projection
-  * `MatmulDeviceOperation  32 x 14336 x 4096` -- the DECODE down-projection (the per-token path)
+  * `MatmulDeviceOperation 128 x 14336 x 4096` -- short-prefill ff2 down-projection
+  * `MatmulDeviceOperation  32 x 14336 x 4096` -- DECODE ff2 down-projection (per-token path)
+  * `MatmulDeviceOperation  32 x  4096 x 14336` -- DECODE ff1/ff3 up-projection (per-token path)
 
-Each core owns a strip of the N tiles (128 N-tiles / 64 cores = 2 each, exact); K is reduced in-core
-with an accumulator DFB ping-pong seeded from the first partial product (ttl 1.0.1 has no
-block.fill). Only M differs between the two runs, so the same kernel serves both.
+Each core owns a strip of the N tiles; K is reduced in-core with an accumulator DFB ping-pong seeded
+from the first partial product (ttl 1.0.1 has no block.fill). The same kernel serves every shape.
 
-MEASURED on K=14336, N=4096, 8x8 grid:
+MEASURED on an 8x8 grid:
 
-    M=128   PCC 0.999692   ttl 2.957 ms/call   vs ttnn.linear 0.358 ms/call  -> 8.3x SLOWER
-    M= 32   PCC 0.999695   ttl 0.816 ms/call   vs ttnn.linear 0.300 ms/call  -> 2.7x SLOWER
+    M    K      N        PCC         ttl        ttnn.linear    verdict
+    128  14336  4096     0.999691    2.974 ms    0.359 ms      8.3x SLOWER
+     32  14336  4096     0.999692    0.816 ms    0.295 ms      2.8x SLOWER
+     32   4096  14336    0.999929    0.687 ms    0.316 ms      2.2x SLOWER
 
 The C++ Metalium rung was measured on the same shapes via tt/cpp_mm_generic.py.
 
-Why the hand kernel cannot win here: the loss is dataflow, not math. This kernel re-reads every A
-tile once per output tile, so each A tile is pulled per_core_n times on every core, while ttnn's
-matmul multicasts in0 across a core row and blocks K. The two rows above show the shapes of the two
-costs cleanly. This kernel's work is m_tiles x per_core_n x k_tiles per core, so it scales with M:
-2.957 -> 0.816 ms when M drops 128 -> 32 (~3.6x, i.e. nearly linear). ttnn barely moves, 0.358 ->
-0.300 ms, because it is bound by the 33 MB w2 weight stream, which is independent of M. So the gap
-NARROWS from 8.3x to 2.7x at the decode shape -- but a kernel that is still 2.7x slower than the
-stock op is not a win, and the direction of travel is against it: the remaining ttnn time is almost
-entirely DRAM weight bandwidth, which no arrangement of compute kernels can reduce. There is no
-fusion left to buy the difference back either: ff2's output feeds a residual add (and a CCL on a
-multi-device mesh), and its input round-trip is already removed by the L1 island in mlp.py.
+Every kernel is CORRECT and every one loses. The loss is dataflow, not math: this kernel re-reads
+every A tile once per output tile, so each A tile is pulled per_core_n times on every core, while
+ttnn's matmul multicasts in0 across a core row and blocks K.
 
-Run directly to reproduce both rows.
+The three rows separate the two costs cleanly. This kernel's work is m_tiles x per_core_n x k_tiles
+per core, so it scales with M -- 2.974 -> 0.816 ms when M drops 128 -> 32, nearly linear. ttnn barely
+moves (0.359 -> 0.295) because it is bound by the weight stream, which does not depend on M. So the
+gap narrows from 8.3x to ~2x at the decode shapes and then STOPS: what is left in the ttnn number is
+DRAM weight bandwidth, and no arrangement of compute kernels reduces bytes moved. Closing even the
+remaining 2.2x would require reimplementing ttnn's mcast matmul, which is what the stock op is.
+
+No fusion is left to buy the difference back either: ff2's input round-trip is already removed by the
+L1 island in mlp.py, and the gate+up fusion was measured and rejected separately
+(tt/gated_mlp_fusion_probe.py).
+
+Run directly to reproduce the table.
 """
 import time
 
@@ -39,8 +44,9 @@ import ttnn
 import ttl
 
 TILE = 32
-K, N = 14336, 4096
 GRID_X, GRID_Y = 8, 8
+# (M, K, N) triples this rung was measured for.
+SHAPES = [(128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336)]
 
 
 @ttl.operation(grid=(GRID_Y, GRID_X))
@@ -94,7 +100,7 @@ def ttl_mm(a: ttnn.Tensor, b: ttnn.Tensor, y: ttnn.Tensor) -> None:
                     ttl.copy(yb, y[mt, n_base + j]).wait()
 
 
-def measure(device, m):
+def measure(device, m, K, N):
     ta = torch.randn(m, K, dtype=torch.bfloat16) * 0.02
     tb = torch.randn(K, N, dtype=torch.bfloat16) * 0.02
     golden = ta.float() @ tb.float()
@@ -106,7 +112,8 @@ def measure(device, m):
 
     ttl_mm(a, b, y)
     got = ttnn.to_torch(y).float()
-    print("TTL_FF2_M%d_PCC=%.6f" % (m, torch.corrcoef(torch.stack([golden.flatten(), got.flatten()]))[0, 1].item()))
+    tag = "%dx%dx%d" % (m, K, N)
+    print("TTL_MM_%s_PCC=%.6f" % (tag, torch.corrcoef(torch.stack([golden.flatten(), got.flatten()]))[0, 1].item()))
 
     def run_ttl():
         ttl_mm(a, b, y)
@@ -114,7 +121,7 @@ def measure(device, m):
     def run_ttnn():
         ttnn.deallocate(ttnn.linear(a, b))
 
-    for label, fn in (("TTL_FF2_M%d_MS" % m, run_ttl), ("TTNN_FF2_M%d_MS" % m, run_ttnn)):
+    for label, fn in (("TTL_MM_%s_MS" % tag, run_ttl), ("TTNN_MM_%s_MS" % tag, run_ttnn)):
         fn()
         ttnn.synchronize_device(device)
         t0 = time.monotonic()
@@ -127,8 +134,8 @@ def measure(device, m):
 def main():
     device = ttnn.open_mesh_device(ttnn.MeshShape(1, 1), l1_small_size=24576)
     try:
-        for m in (128, 32):  # short-prefill shape, then the DECODE (per-token) shape
-            measure(device, m)
+        for m, k, n in SHAPES:
+            measure(device, m, k, n)
     finally:
         ttnn.close_mesh_device(device)
 

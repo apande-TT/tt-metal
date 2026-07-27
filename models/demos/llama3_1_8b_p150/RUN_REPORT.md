@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 04:49:48 UTC · 60 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 05:05:38 UTC · 67 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -36,7 +36,7 @@ MatmulDeviceOperation              ✓win      —         ✓win      ✓win   
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —           1092.12
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
-MatmulDeviceOperation              ·try      —         ·try      —         ·try      —         —         —            891.43
+MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ·try      ·try      ·try         891.98
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 host_overhead                      —         —         —         —         —         —         —         ✓win              —
@@ -105,6 +105,13 @@ MatmulDeviceOperation                      grid    891.98   +1572.20 ms  · no g
 MatmulDeviceOperation                      grid    892.07   +1572.11 ms  · no gain  Second grid attempt, going after the helper that actually picks this op's core grid rather than the matmul variant. find_grid_k_n hard-codes max_rows=max_cols=8 (a Wormhole assumption) and it is what 
 MatmulDeviceOperation                     dtype    891.43   +1572.75 ms  · no gain  w1/w3 are already at the bf4_b weight floor, so the only dtype step left on this op is its OUTPUT, which I had just walked bf16 -> bf8_b in c9b2d04. Took the last available step, bf8_b -> bf4_b, on th
 MatmulDeviceOperation                structural    891.98   +1572.20 ms  · no gain  The real structural candidate for this op is the GATE+UP MATMUL FUSION, and I measured it rather than refactoring on faith. w1 (gate) and w3 (up) are both [dim, hidden], both read the SAME activation,
+MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: measure and reject the gate+up matmul fusion w1 (gate) and w3 (up) are both [dim, hidden], both read the same activation,
+MatmulDeviceOperation                     shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
+MatmulDeviceOperation                     shard    892.04   +1572.14 ms  · no gain  Two things to record. First, the WEIGHT side is architecturally closed, same arithmetic as decode ff2: the only L1-residency path is the DramPrefetcher global CB, and is_prefetcher_supported() is Fals
+MatmulDeviceOperation                     shard    892.05   +1572.13 ms  · no gain  Second shard attempt, on the OUTPUT side of the op rather than its input, and deliberately chosen as a variant known to be trace-safe (the equivalent edit completed cleanly on the ff2 rung, unlike the
+MatmulDeviceOperation               tp-fracture    892.04   +1572.14 ms  · no gain  tp_pick_degree(32, 4096, 14336) returned best_tp=1 -- keep decode ff1/ff3 single-chip. Same two reasons as the sibling ff2 op: the on-mesh sweep is disabled by default because it opens a NESTED mesh d
+MatmulDeviceOperation                   tt-lang    892.04   +1572.14 ms  · no gain  Measured the tt-lang kernel on this op's OWN shape rather than inheriting the ff2 verdict, since M and the K/N ratio both differ. Extended tt/ttl_ff2_matmul.py to sweep (M,K,N) triples; the multi-core
+MatmulDeviceOperation                       cpp    892.04   +1572.14 ms  · no gain  Measured the C++ Metalium reader/compute/writer triple (via ttnn.generic_op, output tiles partitioned across the full 11x10 grid) on this op's OWN shape. On 32x4096x14336: PCC 0.999022, 1.039 ms/call 
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -1588,8 +1595,197 @@ Code changes — every attempt (win or fail):
                  # the request that triggered warmup is greedy, those traces are pure warmup cost for
     ... (truncated, 21 more lines)
 
+[#63] MatmulDeviceOperation · shard · no gain  +1572.14 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index e7c3ef31df..d37ba04690 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -196,7 +196,12 @@ class MLP(LightweightModule):
+             if mode == Mode.PREFILL and not TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff:
+                 ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+     
+    -        x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+    +        # In DECODE the DRAM-sharded ff1/ff3 matmul wants its in0 L1-width-sharded across
+    +        # mlp_core_grid. That is what ff_norm is configured to emit, but relying on the producer to
+    +        # have picked the same grid is exactly the coordinated-shard failure mode in GUIDELINES #10:
+    +        # if the two ever disagree the matmul reshards internally, once per layer per token, and
+    +        # nothing in the source says so. Ask for it explicitly -- a no-op when they already agree.
+    +        x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if mode == Mode.DECODE else x
+     
+             w1_out = ttnn.linear(
+                 x_sharded,
+    @@ -225,7 +230,10 @@ class MLP(LightweightModule):
+                 else None,
+             )
+             ttnn.deallocate(x)
+    -        if mode == Mode.DECODE and full_grid_ff1_3:
+    +        # Only free the reshard if one actually happened -- when the configs already agree
+    +        # to_memory_config hands back x itself, and freeing it again after ttnn.deallocate(x) above
+    +        # is a double free.
+    +        if mode == Mode.DECODE and x_sharded is not x:
+                 ttnn.deallocate(x_sharded)
+     
+             if TG:
+
+[#64] MatmulDeviceOperation · shard · no gain  +1572.13 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 8b557ec23c..b8b64325ee 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1422,7 +1422,20 @@ class ModelArgs:
+                         use_height_and_width_as_shard_shape=True,
+                     )
+                 else:
+    -                return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
+    +                # Pin ff1/ff3's decode output to an EXPLICIT width shard on ff2's core grid instead of
+    +                # the generic L1_WIDTH_SHARDED config, which carries no shard spec and leaves the
+    +                # grid to be inferred from whichever producer wrote the tensor. Naming the grid means
+    +                # the ff1/ff3 -> SILU mul -> ff2 chain provably shares one core set end to end.
+    +                return ttnn.create_sharded_memory_config(
+    +                    shape=(
+    +                        self.tile_padded_batch_rows,
+    +                        self.hidden_dim // self.cluster_shape[1] // self.mlp2_core_grid.num_cores,
+    +                    ),
+    +                    core_grid=self.mlp2_core_grid,
+    +                    strategy=ttnn.ShardStrategy.WIDTH,
+    +                    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+    +                    use_height_and_width_as_shard_shape=True,
+    +                )
+             elif mode == Mode.PREFILL:
+                 return ttnn.DRAM_MEMORY_CONFIG
+             else:
+
+[#65] MatmulDeviceOperation · tp-fracture · no gain  +1572.14 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    index c98a9b6ae9..6da7db8484 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    @@ -44,7 +44,7 @@ from ttnn._ttnn.program_descriptor import VectorUInt32 as _VU32
+     TILE = 32
+     # (M, K, N) of every op this rung was measured for: the ff1/ff3 up-projection, then ff2's
+     # down-projection at the short-prefill and the DECODE row counts.
+    -SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096)]
+    +SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336)]
+     ROOT = "/tmp/tt_hw_planner_llama3_1_8b_p150_1785111170/models/demos/llama3_1_8b_p150/tt/kernels"
+     
+     
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    index 296b46a632..a66112d895 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    @@ -39,8 +39,9 @@ import ttnn
+     import ttl
+     
+     TILE = 32
+    -K, N = 14336, 4096
+     GRID_X, GRID_Y = 8, 8
+    +# (M, K, N) triples this rung was measured for.
+    +SHAPES = [(128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336)]
+     
+     
+     @ttl.operation(grid=(GRID_Y, GRID_X))
+    @@ -94,7 +95,7 @@ def ttl_mm(a: ttnn.Tensor, b: ttnn.Tensor, y: ttnn.Tensor) -> None:
+                         ttl.copy(yb, y[mt, n_base + j]).wait()
+     
+     
+    -def measure(device, m):
+    +def measure(device, m, K, N):
+         ta = torch.randn(m, K, dtype=torch.bfloat16) * 0.02
+         tb = torch.randn(K, N, dtype=torch.bfloat16) * 0.02
+         golden = ta.float() @ tb.float()
+    @@ -106,7 +107,8 @@ def measure(device, m):
+     
+         ttl_mm(a, b, y)
+    ... (truncated, 27 more lines)
+
+[#66] MatmulDeviceOperation · tt-lang · no gain  +1572.14 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    index c98a9b6ae9..27cae9296a 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    @@ -5,6 +5,7 @@ Kept as the record of the cpp rung for every hot dense matmul in the MLP:
+       * `MatmulDeviceOperation 128 x  4096 x 14336` -- the short-prefill ff1/ff3 up-projection
+       * `MatmulDeviceOperation 128 x 14336 x  4096` -- the short-prefill ff2 down-projection
+       * `MatmulDeviceOperation  32 x 14336 x  4096` -- the DECODE ff2 down-projection (per-token path)
+    +  * `MatmulDeviceOperation  32 x  4096 x 14336` -- the DECODE ff1/ff3 up-projection (per-token path)
+     
+     Drives the repo's own programming-example kernel triple (tt_metal/programming_examples/matmul/
+     matmul_multi_core: reader / mm / writer, copied into tt/kernels/) through ttnn.generic_op, with
+    @@ -13,9 +14,10 @@ the output tiles partitioned across the entire compute grid.
+     MEASURED on the real shapes, on the full 11x10 P150 grid:
+     
+         M    K      N        PCC        generic_op    ttnn.linear     verdict
+    -    128  4096   14336    0.998986    3.565 ms      0.328 ms       10.9x SLOWER
+    -    128  14336  4096     0.993626    3.118 ms      0.357 ms        8.7x SLOWER
+    -     32  14336  4096     0.993594    0.916 ms      0.292 ms        3.1x SLOWER
+    +    128  4096   14336    0.999039    3.561 ms      0.332 ms       10.7x SLOWER
+    +    128  14336  4096     0.993591    3.119 ms      0.358 ms        8.7x SLOWER
+    +     32  14336  4096     0.993562    0.919 ms      0.296 ms        3.1x SLOWER
+    +     32  4096   14336    0.999022    1.039 ms      0.309 ms        3.4x SLOWER
+     
+     Every kernel is CORRECT and every one loses. The cause is dataflow, not tuning: this reader fetches
+     every A tile again for each output tile, so A is re-read Nt times from DRAM, while ttnn's production
+    @@ -44,7 +46,7 @@ from ttnn._ttnn.program_descriptor import VectorUInt32 as _VU32
+     TILE = 32
+     # (M, K, N) of every op this rung was measured for: the ff1/ff3 up-projection, then ff2's
+     # down-projection at the short-prefill and the DECODE row counts.
+    -SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096)]
+    +SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336)]
+     ROOT = "/tmp/tt_hw_planner_llama3_1_8b_p150_1785111170/models/demos/llama3_1_8b_p150/tt/kernels"
+     
+     
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    index 296b46a632..d126d0c5d2 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    @@ -1,35 +1,40 @@
+    ... (truncated, 114 more lines)
+
+[#67] MatmulDeviceOperation · cpp · no gain  +1572.14 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    index c98a9b6ae9..27cae9296a 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    @@ -5,6 +5,7 @@ Kept as the record of the cpp rung for every hot dense matmul in the MLP:
+       * `MatmulDeviceOperation 128 x  4096 x 14336` -- the short-prefill ff1/ff3 up-projection
+       * `MatmulDeviceOperation 128 x 14336 x  4096` -- the short-prefill ff2 down-projection
+       * `MatmulDeviceOperation  32 x 14336 x  4096` -- the DECODE ff2 down-projection (per-token path)
+    +  * `MatmulDeviceOperation  32 x  4096 x 14336` -- the DECODE ff1/ff3 up-projection (per-token path)
+     
+     Drives the repo's own programming-example kernel triple (tt_metal/programming_examples/matmul/
+     matmul_multi_core: reader / mm / writer, copied into tt/kernels/) through ttnn.generic_op, with
+    @@ -13,9 +14,10 @@ the output tiles partitioned across the entire compute grid.
+     MEASURED on the real shapes, on the full 11x10 P150 grid:
+     
+         M    K      N        PCC        generic_op    ttnn.linear     verdict
+    -    128  4096   14336    0.998986    3.565 ms      0.328 ms       10.9x SLOWER
+    -    128  14336  4096     0.993626    3.118 ms      0.357 ms        8.7x SLOWER
+    -     32  14336  4096     0.993594    0.916 ms      0.292 ms        3.1x SLOWER
+    +    128  4096   14336    0.999039    3.561 ms      0.332 ms       10.7x SLOWER
+    +    128  14336  4096     0.993591    3.119 ms      0.358 ms        8.7x SLOWER
+    +     32  14336  4096     0.993562    0.919 ms      0.296 ms        3.1x SLOWER
+    +     32  4096   14336    0.999022    1.039 ms      0.309 ms        3.4x SLOWER
+     
+     Every kernel is CORRECT and every one loses. The cause is dataflow, not tuning: this reader fetches
+     every A tile again for each output tile, so A is re-read Nt times from DRAM, while ttnn's production
+    @@ -44,7 +46,7 @@ from ttnn._ttnn.program_descriptor import VectorUInt32 as _VU32
+     TILE = 32
+     # (M, K, N) of every op this rung was measured for: the ff1/ff3 up-projection, then ff2's
+     # down-projection at the short-prefill and the DECODE row counts.
+    -SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096)]
+    +SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336)]
+     ROOT = "/tmp/tt_hw_planner_llama3_1_8b_p150_1785111170/models/demos/llama3_1_8b_p150/tt/kernels"
+     
+     
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    index 296b46a632..d126d0c5d2 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    @@ -1,35 +1,40 @@
+    ... (truncated, 114 more lines)
+
 Limitations / suggested manual next steps:
-- 2 op(s) tried but no lever beat baseline: LayerNormDeviceOperation, MatmulDeviceOperation
+- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
