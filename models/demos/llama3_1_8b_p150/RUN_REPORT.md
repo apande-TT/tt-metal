@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 06:47:39 UTC · 91 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 06:51:12 UTC · 95 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -38,7 +38,7 @@ MatmulDeviceOperation              ✓win      —         ✓win      —      
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
-MatmulDeviceOperation              ·try      —         ✓win      ✓win      —         —         —         ·try         745.01
+MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      —         ✓win         745.01
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
@@ -139,6 +139,10 @@ MatmulDeviceOperation                     dtype    749.94   +1714.24 ms  ✓ win
 MatmulDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: keep the decode QKV output sharded into the head split Both operands of this matmul were already L1 width-sharded and its
 MatmulDeviceOperation                     shard    745.01   +1719.17 ms  ✓ win      Hypothesis: the usual shard targets were already spent on this op -- both operands are L1 width-sharded and the 13 MB/layer bf4_b weight can never be L1-resident (the only residency path is the DramPr
 MatmulDeviceOperation               tp-fracture    745.01   +1719.17 ms  · no gain  Hypothesis: if decode QKV is still DRAM-bandwidth bound after every single-chip lever, splitting the wqkv read across chips would divide the bytes each chip fetches. tp_pick_degree(32, 4096, 6144) ret
+MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log. Also needed for the marker scan: with a dirty tree, recor
+MatmulDeviceOperation               tp-fracture    745.01   +1719.17 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide ShardTensorToMesh + CCL plumbing. Hypothesis: if decode QKV is still DRAM-bandwidth bound after every single-chip lever, split
+MatmulDeviceOperation                structural    745.01   +1719.17 ms  · no gain  none: walked the whole decode QKV chain hunting reducible work and every candidate is already applied or structurally absent. (1) RECOMPUTE -> CACHE is already done: decode is not repeat_prefill, it r
+MatmulDeviceOperation                   tt-lang    745.01   +1719.17 ms  · no gain  Measured the tt-lang matmul on THIS op's own shape rather than inheriting the sibling MLP verdicts, since M and the K/N ratio both differ -- extended tt/ttl_ff2_matmul.py's (M,K,N) sweep with (32, 409
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2284,6 +2288,43 @@ Code changes — every attempt (win or fail):
                      xqkv_fused = ttnn.sharded_to_interleaved(xqkv_fused_sharded, ttnn.L1_MEMORY_CONFIG, ttnn.bfloat16)
                      ttnn.deallocate(xqkv_fused_sharded)
                  else:
+
+[#95] MatmulDeviceOperation · tt-lang · no gain  +1719.17 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    index d126d0c5d2..cc46767225 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    @@ -6,6 +6,7 @@ a sibling's result:
+       * `MatmulDeviceOperation 128 x 14336 x 4096` -- short-prefill ff2 down-projection
+       * `MatmulDeviceOperation  32 x 14336 x 4096` -- DECODE ff2 down-projection (per-token path)
+       * `MatmulDeviceOperation  32 x  4096 x 14336` -- DECODE ff1/ff3 up-projection (per-token path)
+    +  * `MatmulDeviceOperation  32 x  4096 x  6144` -- DECODE fused QKV projection (per-token path)
+     
+     Each core owns a strip of the N tiles; K is reduced in-core with an accumulator DFB ping-pong seeded
+     from the first partial product (ttl 1.0.1 has no block.fill). The same kernel serves every shape.
+    @@ -13,9 +14,10 @@ from the first partial product (ttl 1.0.1 has no block.fill). The same kernel se
+     MEASURED on an 8x8 grid:
+     
+         M    K      N        PCC         ttl        ttnn.linear    verdict
+    -    128  14336  4096     0.999691    2.974 ms    0.359 ms      8.3x SLOWER
+    -     32  14336  4096     0.999692    0.816 ms    0.295 ms      2.8x SLOWER
+    -     32   4096  14336    0.999929    0.687 ms    0.316 ms      2.2x SLOWER
+    +    128  14336  4096     0.999706    2.991 ms    0.360 ms      8.3x SLOWER
+    +     32  14336  4096     0.999689    0.813 ms    0.293 ms      2.8x SLOWER
+    +     32   4096  14336    0.999918    0.680 ms    0.309 ms      2.2x SLOWER
+    +     32   4096   6144    0.999913    0.324 ms    0.145 ms      2.2x SLOWER
+     
+     The C++ Metalium rung was measured on the same shapes via tt/cpp_mm_generic.py.
+     
+    @@ -46,7 +48,7 @@ import ttl
+     TILE = 32
+     GRID_X, GRID_Y = 8, 8
+     # (M, K, N) triples this rung was measured for.
+    -SHAPES = [(128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336)]
+    +SHAPES = [(128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336), (32, 4096, 6144)]
+     
+     
+     @ttl.operation(grid=(GRID_Y, GRID_X))
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation

@@ -6,6 +6,7 @@ a sibling's result:
   * `MatmulDeviceOperation 128 x 14336 x 4096` -- short-prefill ff2 down-projection
   * `MatmulDeviceOperation  32 x 14336 x 4096` -- DECODE ff2 down-projection (per-token path)
   * `MatmulDeviceOperation  32 x  4096 x 14336` -- DECODE ff1/ff3 up-projection (per-token path)
+  * `MatmulDeviceOperation  32 x  4096 x  6144` -- DECODE fused QKV projection (per-token path)
 
 Each core owns a strip of the N tiles; K is reduced in-core with an accumulator DFB ping-pong seeded
 from the first partial product (ttl 1.0.1 has no block.fill). The same kernel serves every shape.
@@ -13,9 +14,10 @@ from the first partial product (ttl 1.0.1 has no block.fill). The same kernel se
 MEASURED on an 8x8 grid:
 
     M    K      N        PCC         ttl        ttnn.linear    verdict
-    128  14336  4096     0.999691    2.974 ms    0.359 ms      8.3x SLOWER
-     32  14336  4096     0.999692    0.816 ms    0.295 ms      2.8x SLOWER
-     32   4096  14336    0.999929    0.687 ms    0.316 ms      2.2x SLOWER
+    128  14336  4096     0.999706    2.991 ms    0.360 ms      8.3x SLOWER
+     32  14336  4096     0.999689    0.813 ms    0.293 ms      2.8x SLOWER
+     32   4096  14336    0.999918    0.680 ms    0.309 ms      2.2x SLOWER
+     32   4096   6144    0.999913    0.324 ms    0.145 ms      2.2x SLOWER
 
 The C++ Metalium rung was measured on the same shapes via tt/cpp_mm_generic.py.
 
@@ -46,7 +48,7 @@ import ttl
 TILE = 32
 GRID_X, GRID_Y = 8, 8
 # (M, K, N) triples this rung was measured for.
-SHAPES = [(128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336)]
+SHAPES = [(128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336), (32, 4096, 6144)]
 
 
 @ttl.operation(grid=(GRID_Y, GRID_X))

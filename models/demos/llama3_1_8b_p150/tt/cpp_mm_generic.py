@@ -6,6 +6,7 @@ Kept as the record of the cpp rung for every hot dense matmul in the MLP:
   * `MatmulDeviceOperation 128 x 14336 x  4096` -- the short-prefill ff2 down-projection
   * `MatmulDeviceOperation  32 x 14336 x  4096` -- the DECODE ff2 down-projection (per-token path)
   * `MatmulDeviceOperation  32 x  4096 x 14336` -- the DECODE ff1/ff3 up-projection (per-token path)
+  * `MatmulDeviceOperation  32 x  4096 x  6144` -- the DECODE fused QKV projection (per-token path)
 
 Drives the repo's own programming-example kernel triple (tt_metal/programming_examples/matmul/
 matmul_multi_core: reader / mm / writer, copied into tt/kernels/) through ttnn.generic_op, with
@@ -14,10 +15,11 @@ the output tiles partitioned across the entire compute grid.
 MEASURED on the real shapes, on the full 11x10 P150 grid:
 
     M    K      N        PCC        generic_op    ttnn.linear     verdict
-    128  4096   14336    0.999039    3.561 ms      0.332 ms       10.7x SLOWER
-    128  14336  4096     0.993591    3.119 ms      0.358 ms        8.7x SLOWER
-     32  14336  4096     0.993562    0.919 ms      0.296 ms        3.1x SLOWER
-     32  4096   14336    0.999022    1.039 ms      0.309 ms        3.4x SLOWER
+    128  4096   14336    0.999015    3.562 ms      0.333 ms       10.7x SLOWER
+    128  14336  4096     0.993626    3.113 ms      0.358 ms        8.7x SLOWER
+     32  14336  4096     0.993630    0.916 ms      0.294 ms        3.1x SLOWER
+     32  4096   14336    0.999003    1.041 ms      0.309 ms        3.4x SLOWER
+     32  4096    6144    0.999014    0.344 ms      0.139 ms        2.5x SLOWER
 
 Every kernel is CORRECT and every one loses. The cause is dataflow, not tuning: this reader fetches
 every A tile again for each output tile, so A is re-read Nt times from DRAM, while ttnn's production
@@ -46,7 +48,7 @@ from ttnn._ttnn.program_descriptor import VectorUInt32 as _VU32
 TILE = 32
 # (M, K, N) of every op this rung was measured for: the ff1/ff3 up-projection, then ff2's
 # down-projection at the short-prefill and the DECODE row counts.
-SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336)]
+SHAPES = [(128, 4096, 14336), (128, 14336, 4096), (32, 14336, 4096), (32, 4096, 14336), (32, 4096, 6144)]
 ROOT = "/tmp/tt_hw_planner_llama3_1_8b_p150_1785111170/models/demos/llama3_1_8b_p150/tt/kernels"
 
 
