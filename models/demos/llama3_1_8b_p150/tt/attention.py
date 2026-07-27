@@ -7,7 +7,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.llama3_1_8b_p150.tt import ttl_create_qkv_heads
+from models.demos.llama3_1_8b_p150.tt import ttl_concat_heads, ttl_create_qkv_heads
 from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
 from models.common.utility_functions import nearest_32
@@ -1217,10 +1217,22 @@ class Attention(LightweightModule):
         ###
         # Output matmul
         ###
-        attn_output_11SH = ttnn.experimental.nlp_concat_heads(
-            attn_output_1QSD,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
+        # tt-lang rung, and the mirror of the head-split kernel at the other end of attention.
+        # The stock op's core count is baked into its factory (num_blocks = batch * seq_len / 32,
+        # heads never enter the split -> 4 cores here), and its sharded factory is measured-unsafe
+        # at this shape. ttl_concat_heads parallelises over (seq_tile x head) instead and measures
+        # 0.0430 ms/call vs the stock op's 0.0572 at this shape, PCC 1.000000.
+        if (
+            not self.TG
+            and self.prefetcher is None
+            and ttl_concat_heads.supports(attn_output_1QSD, self.n_local_heads, self.head_dim)
+        ):
+            attn_output_11SH = ttl_concat_heads.concat_heads_ttl(attn_output_1QSD, ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            attn_output_11SH = ttnn.experimental.nlp_concat_heads(
+                attn_output_1QSD,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
         ttnn.deallocate(attn_output_1QSD)
 
         # For batched prefill, reshape to concatenate batch dimension into sequence

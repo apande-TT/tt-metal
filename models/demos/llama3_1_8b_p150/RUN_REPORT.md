@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 07:37:25 UTC · 102 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 07:39:29 UTC · 105 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -39,7 +39,7 @@ MatmulDeviceOperation              ·try      —         ✓win      ·try     
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ✓win      ·try      ✓win         745.01
-NLPConcatHeadsDeviceOperation      ·try      —         —         ·try      —         —         —         —            729.90
+NLPConcatHeadsDeviceOperation      ·try      —         —         ✓win      ·try      —         —         —            729.90
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
 RotaryEmbeddingLlamaDeviceOperatio ✓win      —         —         —         —         —         —         —                 —
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
@@ -152,6 +152,9 @@ RotaryEmbeddingLlamaDeviceOperatio         grid    729.90   +1734.28 ms  ✓ win
 NLPConcatHeadsDeviceOperation              grid    729.90   +1734.28 ms  · no gain  Hypothesis from reading the program factory: the INTERLEAVED path derives cores from num_blocks = batch * seq_len / TILE_HEIGHT, so heads (dim 1) never enter the split and at batch 1 / seq_len 128 it 
 NLPConcatHeadsDeviceOperation              grid    729.90   +1734.28 ms  · no gain  Third and final grid variant on this op; the sharded factory is measured-blocked at this shape. Recap: the interleaved factory sets cores from num_blocks = batch * seq_len / TILE_HEIGHT, so heads neve
 NLPConcatHeadsDeviceOperation             shard    729.99   +1734.19 ms  · no gain  Hypothesis: the INPUT side of this op is measured-unsafe (three head-sharded variants at the grid rung either scrambled the output or hung), but the OUTPUT side is free -- the interleaved factory only
+NLPConcatHeadsDeviceOperation             shard         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT
+NLPConcatHeadsDeviceOperation             shard    729.99   +1734.19 ms  · no gain  Hypothesis: the INPUT side of this op is measured-unsafe (three head-sharded variants at the grid rung either scrambled the output to 25.6% top-1 or hung the gate), but the OUTPUT side is free -- the 
+NLPConcatHeadsDeviceOperation        structural    729.90   +1734.28 ms  · no gain  none: hunted for reducible work around the prefill concat and found none left. (1) The op is NOT removable: SDPA emits head-major [1, H, S, D] and the wo projection requires heads contiguous in the WI
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2536,7 +2539,7 @@ Code changes — every attempt (win or fail):
              ttnn.deallocate(attn_output_1QSD)
 
 Limitations / suggested manual next steps:
-- 2 op(s) tried but no lever beat baseline: LayerNormDeviceOperation, NLPConcatHeadsDeviceOperat
+- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
