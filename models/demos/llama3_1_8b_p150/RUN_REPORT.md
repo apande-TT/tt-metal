@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 02:00:16 UTC · 17 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 02:09:02 UTC · 19 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -31,7 +31,7 @@ embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
-MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ·try      —         ·try        1138.67
+MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1138.67
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 
@@ -56,6 +56,8 @@ MatmulDeviceOperation                     shard   1145.94   +1318.24 ms  · no g
 MatmulDeviceOperation               tp-fracture   1144.58   +1319.60 ms  · no gain  tp_pick_degree(128, 4096, 14336) returned best_tp=1, i.e. keep this matmul single-chip: the on-mesh TP sweep is disabled by default because it opens a NESTED mesh device and toggles fabric config whil
 MatmulDeviceOperation                structural   1144.58   +1319.60 ms  · no gain  Found real reducible work: get_padded_prefill_len hard-floors at 128, so this benchmark's 6-token prompt pays a FULL 128-token prefill -- 4x the matmul work a 32-row (one tile) prefill would need, on 
 MatmulDeviceOperation                   tt-lang   1144.58   +1319.60 ms  · no gain  Authored tt/ttl_gated_ffn.py: a real multi-core tt-lang kernel computing silu(x@w1)*(x@w3) in ONE op so both [seq,hidden] intermediates stay in L1 -- the exact fusion GUIDELINES/11 names as highest-va
+MatmulDeviceOperation                   tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: record the tt-lang gated-FFN kernel and why it loses tt/ttl_gated_ffn.py is a real multi-core tt-lang kernel computing sil
+MatmulDeviceOperation                       cpp   1144.57   +1319.61 ms  · no gain  Authored tt/cpp_mm_generic.py + tt/kernels/{compute/mm_gated_ffn,dataflow/reader_mm_partitioned,dataflow/writer_mm_partitioned}.cpp: a real C++ Metalium reader/compute/writer triple (adapted from the 
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -485,6 +487,49 @@ Code changes — every attempt (win or fail):
                  core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
                  compute_kernel_config=li_ff1_3_compute_kernel_cfg,
                  program_config=pc_3,
+
+[#19] MatmulDeviceOperation · cpp · no gain  +1319.61 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_gated_ffn.py b/models/demos/llama3_1_8b_p150/tt/ttl_gated_ffn.py
+    new file mode 100644
+    index 0000000000..fb4ee7fb2e
+    --- /dev/null
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_gated_ffn.py
+    @@ -0,0 +1,153 @@
+    +"""tt-lang kernel for the prefill gated FFN -- AUTHORED, MEASURED, and NOT WIRED IN.
+    +
+    +Kept as the record of the tt-lang rung for `MatmulDeviceOperation 128 x 4096 x 14336`.
+    +
+    +`ttl_gated_ffn` computes y = silu(x @ w1) * (x @ w3) in ONE kernel, so both [seq, hidden]
+    +intermediates stay in L1 and never round-trip to DRAM -- the fusion GUIDELINES/11 names as the
+    +highest-value tt-lang target, and one ttnn cannot express (ttnn.linear(activation=...) fuses an
+    +activation into ONE matmul, not across two). Each core owns a strip of the N tiles; K is reduced
+    +in-core with an accumulator DFB ping-pong (ttl 1.0.1 has no block.fill, so the accumulator is
+    +seeded from the first partial product rather than zeroed).
+    +
+    +MEASURED on the real shape (M=128, K=4096, N=14336) on an 8x8 grid, against the stock
+    +ttnn.linear/linear/mul chain it replaces:
+    +
+    +    correctness   PCC 0.999833   (the kernel is right)
+    +    fused ttl     4.065 ms/call
+    +    stock ttnn    0.714 ms/call  -> the kernel is 5.7x SLOWER
+    +
+    +So it is deliberately not on the hot path. Two reasons it loses, both structural:
+    +  * It streams single tiles (DFB shape (1,1)) and re-reads each x tile once per N column, while
+    +    ttnn's 2D-mcast matmul broadcasts each in0 tile across a whole core row. The intermediate
+    +    traffic the fusion saves (~6 MB/layer) is dwarfed by the ~88 MB/layer of weight reads it
+    +    cannot avoid -- which is also why the pure-TTNN version of the same idea (an L1 island for
+    +    the intermediates) measured only -0.5% device time and failed the production gate.
+    +  * It requires bf16 operands. Production w1/w3 are bf4_b in a DRAM-sharded memory config, and
+    +    tt-lang cannot index those; converting them to bf16 would 4x the weight bytes and break the
+    +    op's dtype contract, which GUIDELINES/11 forbids.
+    +
+    +Run directly (`python -m ...tt.ttl_gated_ffn`) to reproduce the numbers above.
+    +"""
+    +import time
+    +
+    +import torch
+    +
+    ... (truncated, 119 more lines)
 
 Limitations / suggested manual next steps:
 - (none flagged automatically — see the per-op device report for remaining headroom.)
