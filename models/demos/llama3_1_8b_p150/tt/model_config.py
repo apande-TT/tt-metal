@@ -1071,7 +1071,16 @@ class ModelArgs:
                 "rs_memory_config": ttnn.DRAM_MEMORY_CONFIG,
             }
             default_sampling_force_argmax = {
-                "allow_force_argmax": False,
+                # Greedy rows (temperature=0) normalise to k=1 / p=0 / temp=1, which the sampler can
+                # serve with a single untilize+argmax instead of the top-k/top-p/RNG chain. That
+                # matters a lot here: this vocab is 128256, the [1, 1]-mesh sampler splits it into
+                # 2x64128 before TopK, and 64128 is not a power of two -- so ttnn.topk falls off its
+                # multi-core factory onto the single-core bitonic one and burns ~10ms per call on ONE
+                # core. Allowing the argmax path deletes both TopK calls (and the concat / typecast /
+                # offset-add / untilize / manual_seed / sampling tail behind them). Non-greedy
+                # requests still take the full path -- the sampler re-derives this per reset_params
+                # and re-captures its trace when the mode flips.
+                "allow_force_argmax": True,
                 "num_links": 1,
                 "chunks_per_sync": 10,
                 "num_workers_per_link": 2,
