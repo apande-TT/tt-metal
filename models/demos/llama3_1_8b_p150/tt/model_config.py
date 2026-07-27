@@ -1598,8 +1598,51 @@ class ModelArgs:
             if seq_len >= 2048
             else min(64, chunk_start_idx & -chunk_start_idx)
         )
+        # Occupancy. The prefill SDPA factory flattens the work into
+        #     total_q_chunks = B * n_local_heads * ceil(seq_len / q_chunk)
+        # and, for causal attention with an even chunk count, hands out PAIRS (one light +
+        # one heavy chunk per core) so the triangular load balances. The number of cores it
+        # can keep busy is therefore capped by that chunk/pair count, NOT by the grid it is
+        # handed: at seq_len=128 the 64-token default gives 2 chunks/head, so 32 heads
+        # produce 64 chunks = 32 pairs = 32 busy cores however wide the grid is. That is why
+        # the profiler tags this op grid=partial, and no program_config grid alone can fix it.
+        #
+        # Two coupled corrections, and they must move together:
+        #   1. Halve q_chunk (never below one tile) until the busy-core cap covers the grid --
+        #      this is what creates work for the idle half of the chip.
+        #   2. Size the grid to that cap instead of a hard-coded Wormhole 8x8. Surplus cores
+        #      are not free (they are still launched and still join the op's barriers), and
+        #      long prefill is the opposite case -- there the 8x8 was leaving 46 of the P150's
+        #      110 cores unused.
+        grid = getattr(self, "max_grid_size", None)
+        if grid is None:  # no device (e.g. test_torch.py) -- keep the historical 8x8
+            grid = ttnn.CoreGrid(y=8, x=8)
+        sdpa_grid = (min(8, grid.x), min(8, grid.y))
+        if chunk_start_idx is None or chunk_start_idx == 0:
+            heads = max(1, getattr(self, "n_local_heads", self.n_heads))
+            max_cores = grid.x * grid.y
+
+            def _busy_cap(qc):
+                q_num_chunks = max(1, -(-seq_len // qc))
+                total = heads * q_num_chunks
+                return max(1, total // 2 if q_num_chunks % 2 == 0 else total)
+
+            while (
+                q_chunk > ttnn.TILE_SIZE
+                and q_chunk % (2 * ttnn.TILE_SIZE) == 0
+                and seq_len % q_chunk == 0
+                and _busy_cap(q_chunk) < max_cores
+            ):
+                q_chunk //= 2
+            cap = _busy_cap(q_chunk)
+            best = max(
+                ((gx * gy, gx, gy) for gx in range(1, grid.x + 1) for gy in range(1, grid.y + 1) if gx * gy <= cap),
+                default=(0, 0, 0),
+            )
+            if best[0] > 0:
+                sdpa_grid = (best[1], best[2])
         return ttnn.SDPAProgramConfig(
-            compute_with_storage_grid_size=(8, 8),
+            compute_with_storage_grid_size=sdpa_grid,
             exp_approx_mode=False,
             q_chunk_size=q_chunk,
             k_chunk_size=k_chunk,
