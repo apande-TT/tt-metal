@@ -170,32 +170,12 @@ class MLP(LightweightModule):
 
         ff1_3_out_mem_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if full_grid_ff1_3 else ff1_3_input_mem_config
 
-        # L1 island for the ff1/ff3 -> SILU mul -> ff2 chain in prefill. The weights cannot be
-        # made L1-resident (w1/w3 are ~33 MB each per layer), but the [seq, hidden] intermediates
-        # can: keeping them in L1 removes three DRAM round-trips per MLP (ff1 and ff3 write, the
-        # mul reads both and writes, ff2 reads) at no cost to the weight reads. Bounded to short
-        # prompts so long prefill -- whose intermediates are many times larger -- keeps the DRAM
-        # path; w1_out/w3_out are freed right after the mul, so the island peaks at three of them.
-        prefill_l1_island = (
-            mode == Mode.PREFILL
-            and not TG
-            and self.prefetcher is None
-            and seq_len <= self.args.prefill_len_cutoff
-        )
-        if prefill_l1_island:
-            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
-
         x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
 
-        # ff1/ff3 are DRAM-bandwidth bound, and their bf4_b weights are already at the dtype
-        # floor -- so the remaining bytes to cut are the activations they WRITE. The [seq,
-        # hidden] output is the widest tensor in the block and is consumed only by the SILU
-        # mul, whose own output is bfloat8_b already, so carrying it as bf16 just moves twice
-        # the bytes for a precision that is discarded one op later.
         w1_out = ttnn.linear(
             x_sharded,
             self.w1,
-            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat8_b,
+            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
             program_config=pc_1,
@@ -208,7 +188,7 @@ class MLP(LightweightModule):
         w3_out = ttnn.linear(
             x_sharded,
             self.w3,
-            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat8_b,
+            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
             program_config=pc_3,
@@ -339,10 +319,7 @@ class MLP(LightweightModule):
                 w2_in_sharded,
                 self.w2,
                 compute_kernel_config=li_ff2_compute_kernel_cfg,
-                # Same activation walk as ff1/ff3 above: ff2 reads a [seq, hidden] activation
-                # and is DRAM-bound, so keep the block output at bfloat8_b rather than
-                # widening back to bf16 on the way into the residual add.
-                dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat8_b,
+                dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat16,
                 program_config=pc_2,
                 memory_config=ff2_input_mem_config,
                 core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_2 else None,

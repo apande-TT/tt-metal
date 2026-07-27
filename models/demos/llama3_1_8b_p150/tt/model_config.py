@@ -1653,43 +1653,6 @@ class ModelArgs:
                     N_block_size=8,
                     compute_with_storage_grid_size=ttnn.CoreCoord(8, 10) if is_blackhole() else ttnn.CoreCoord(8, 8),
                 )
-            elif is_blackhole() and self.device_name != "P100":
-                # SHORT prefill only: use_minimal_qkv_prefill_matmul() already claims every
-                # seq_len > 128, so M here is at most 4 tiles. The legacy config below spent
-                # that on a hard-coded (8, 10) grid with per_core_M=1 -- only M_tiles x 8 =
-                # 32 of the device's ~130 cores ever ran -- and walked K in 128 SINGLE-tile
-                # steps with a 1x1 subblock (the FIXME). Both are pure loss on a QKV matmul
-                # the roofline tags memory-bound: 128 one-tile K steps read the bfp8 weight
-                # in the smallest possible blocks and re-pay the mcast/packer sync each step.
-                # Size the config to the actual work instead: one core ROW per M tile, N
-                # spread over the widest real device column count that divides it, K walked
-                # in 8-tile blocks, and the largest subblock HIFI2 allows.
-                m_tiles = max(1, math.ceil(seq_len / ttnn.TILE_SIZE))
-                n_tiles = math.ceil(self.qkv_size / self.cluster_shape[1] / ttnn.TILE_SIZE)
-                k_tiles = self.dim // ttnn.TILE_SIZE
-                # Exact blocking: num_blocks_y must equal grid_y and num_blocks_x grid_x.
-                grid_y = min(m_tiles, self.max_grid_size.y)
-                per_core_M = math.ceil(m_tiles / grid_y)
-                grid_x = max(x for x in range(1, self.max_grid_size.x + 1) if n_tiles % x == 0)
-                per_core_N = n_tiles // grid_x
-                # LI_QKV_PREFILL runs HIFI2, which sets fp32_dest_acc_en=True, so Blackhole
-                # caps out_subblock_h * out_subblock_w at 4 (not 8).
-                out_subblock_h = max(h for h in range(1, 5) if per_core_M % h == 0)
-                out_subblock_w = max(w for w in range(1, (4 // out_subblock_h) + 1) if per_core_N % w == 0)
-                # in1 CB = in0_block_w * per_core_N * 2 (double-buffered) bfp8 tiles; 8 x 16 x 2
-                # x 1088 B ~= 278 KB, comfortably inside the 1.57 MB L1 budget.
-                in0_block_w = max(b for b in (8, 4, 2, 1) if k_tiles % b == 0)
-                return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-                    compute_with_storage_grid_size=(grid_x, grid_y),
-                    in0_block_w=in0_block_w,
-                    out_subblock_h=out_subblock_h,
-                    out_subblock_w=out_subblock_w,
-                    per_core_M=per_core_M,
-                    per_core_N=per_core_N,
-                    transpose_mcast=False,
-                    fused_activation=None,
-                    fuse_batch=seq_len <= self.MAX_QKV_MM_SEQ_LEN,
-                )
             else:
                 return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
                     compute_with_storage_grid_size=(8, 10) if is_blackhole() else (8, 8),

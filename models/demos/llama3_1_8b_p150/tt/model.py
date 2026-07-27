@@ -9,6 +9,7 @@ from tqdm import tqdm
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
+from models.common.sampling.generator import SamplingGenerator
 from models.demos.llama3_1_8b_p150.tt.ccl import TT_CCL
 from models.demos.llama3_1_8b_p150.tt.common import Mode, copy_host_to_device
 from models.demos.llama3_1_8b_p150.tt.decoder import TransformerBlock
@@ -17,7 +18,6 @@ from models.demos.llama3_1_8b_p150.tt.embedding import Embedding, ScaledEmbeddin
 from models.demos.llama3_1_8b_p150.tt.lm_head import LMHead
 from models.demos.llama3_1_8b_p150.tt.model_config import TensorGroup
 from models.demos.llama3_1_8b_p150.tt.rope import HfRotarySetup, RotarySetup
-from models.demos.llama3_1_8b_p150.tt.sampling_multicore_topk import SamplingGenerator
 
 
 class Transformer(LightweightModule):
