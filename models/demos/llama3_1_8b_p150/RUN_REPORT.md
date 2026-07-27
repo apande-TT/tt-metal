@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 03:56:31 UTC · 46 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 04:23:41 UTC · 54 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -31,10 +31,11 @@ embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
+LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —           1092.12
-MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ·try      ·try      ·try        1057.68
+MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 
@@ -88,6 +89,14 @@ MatmulDeviceOperation               tp-fracture   1057.72   +1406.46 ms  · no g
 MatmulDeviceOperation                structural   1057.72   +1406.46 ms  · no gain  Hunted for reducible work and found a real candidate, then DISPROVED it -- the answer is worth more than the lever. A full-depth op-signature probe showed ff2 is not uniformly at the bf4_b floor: 62 i
 MatmulDeviceOperation                   tt-lang   1057.72   +1406.46 ms  · no gain  Hypothesis: the 128-row tt-lang result should NOT be assumed to carry to the decode shape, because M=32 is a quarter of the work and the two costs scale differently -- so I re-measured the kernel on f
 MatmulDeviceOperation                       cpp   1057.72   +1406.46 ms  · no gain  Same reasoning as the tt-lang rung: do not inherit the 128-row verdict, measure the C++ Metalium kernel on ff2's OWN decode shape. Parameterised tt/cpp_mm_generic.py (reader/compute/writer triple adap
+MatmulDeviceOperation                   tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: measure both kernel rungs on the DECODE ff2 shape The tt-lang and C++ Metalium rungs for ff2 had only ever been measured a
+LayerNormDeviceOperation                   grid         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
+LayerNormDeviceOperation                   grid   1057.73   +1406.45 ms  · no gain  Hypothesis, and the profile backs it precisely: of LayerNorm's 68.4 ms, 54.5 ms is 832 instances running on FOUR cores, DRAM_INTERLEAVED. The interleaved rms_norm kernel parallelises ONLY over the inp
+LayerNormDeviceOperation                   grid   1057.73   +1406.45 ms  · no gain  Second grid attempt on the same 4-core prefill norm, changing the PLUMBING rather than the occupancy target, to test whether the first attempt's trace crash came from the way the sharded result was ha
+LayerNormDeviceOperation                  shard   1058.09   +1406.09 ms  · no gain  Third distinct attempt on this op, and the only trace-safe form of 'shard it into L1' left. Sharding the ACTIVATION is already measured-blocked (two plumbings, both crash trace capture with cq_id 0 ou
+LayerNormDeviceOperation                  shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
+LayerNormDeviceOperation                  shard   1057.73   +1406.45 ms  · no gain  Second shard attempt, different mechanism, and it isolated the real blocker. Rather than sharding the norm (already measured-blocked), I moved the tensor the norm READS: made the short-prefill residua
+LayerNormDeviceOperation             structural   1057.73   +1406.45 ms  · no gain  none: hunted for reducible work behind the 832 four-core prefill norms and every candidate is either already applied or a known dead end. (1) The 832 instances are NOT 26 redundant prefills inside the
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -1220,8 +1229,203 @@ Code changes — every attempt (win or fail):
     +The decode row is the one worth reading twice. Dropping M from 128 to 32 shrinks THIS kernel ~3.4x
     ... (truncated, 245 more lines)
 
+[#49] LayerNormDeviceOperation · grid · no gain  +1406.45 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py b/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    index 81444f48f0..5aae30235b 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    @@ -80,6 +80,23 @@ class DistributedNorm(LightweightModule):
+     
+             input_mem_cfg = sharded_output_config if mode == Mode.DECODE else ttnn.DRAM_MEMORY_CONFIG
+     
+    +        # PREFILL: the interleaved rms_norm kernel parallelises over TILE ROWS only, so a short
+    +        # prompt runs it on `rows_t` cores (4 for a 128-token prefill). Block-shard the activation
+    +        # instead so the sharded kernel can also split the embedding dim across grid columns.
+    +        # get_prefill_norm_shard_config returns None whenever that would not raise the core count
+    +        # (long prefill) or would not divide evenly, so the interleaved path stays the default.
+    +        prefill_shard = None
+    +        if mode == Mode.PREFILL and not self.args.is_multichip:
+    +            rows = 1
+    +            for d in x.shape[:-1]:
+    +                rows *= d
+    +            if rows % ttnn.TILE_SIZE == 0:
+    +                prefill_shard = self.args.get_prefill_norm_shard_config(rows // ttnn.TILE_SIZE)
+    +        if prefill_shard is not None:
+    +            input_mem_cfg = prefill_shard["mem_config"]
+    +            norm_config = dict(norm_config or {})
+    +            norm_config["sharded_program_config"] = prefill_shard["program_config"]
+    +
+             # Distributed norm already performs a gather
+             if self.args.is_multichip and not self.args.is_distributed_norm(mode):
+                 x = ttnn.experimental.all_gather_async(
+    @@ -105,8 +122,14 @@ class DistributedNorm(LightweightModule):
+             else:
+                 x = ttnn.to_memory_config(x, input_mem_cfg)
+     
+    +        # out_sharded stays False for the prefill shard: RMSNorm then hands back an interleaved
+    +        # tensor, so every downstream consumer sees exactly the layout it saw before.
+             x = self.norm(
+    -            x, mode=mode, in_sharded=(mode == Mode.DECODE), out_sharded=(mode == Mode.DECODE), norm_config=norm_config
+    +            x,
+    +            mode=mode,
+    +            in_sharded=(mode == Mode.DECODE or prefill_shard is not None),
+    +            out_sharded=(mode == Mode.DECODE),
+    ... (truncated, 65 more lines)
+
+[#50] LayerNormDeviceOperation · grid · no gain  +1406.45 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py b/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    index 81444f48f0..be3ccd5cfe 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    @@ -80,6 +80,25 @@ class DistributedNorm(LightweightModule):
+     
+             input_mem_cfg = sharded_output_config if mode == Mode.DECODE else ttnn.DRAM_MEMORY_CONFIG
+     
+    +        # PREFILL: the interleaved rms_norm kernel parallelises over TILE ROWS only, so a short
+    +        # prompt pins it to `rows_t` cores -- 4 of 110 for a 128-token prefill. Width-shard the
+    +        # activation so the sharded kernel can split the embedding dim across cores as well.
+    +        # This variant keeps the norm's OUTPUT sharded and converts back once via output_mem_config,
+    +        # instead of letting RMSNorm call sharded_to_interleaved on the way out.
+    +        prefill_shard = None
+    +        if mode == Mode.PREFILL and not self.args.is_multichip:
+    +            rows = 1
+    +            for d in x.shape[:-1]:
+    +                rows *= d
+    +            if rows % ttnn.TILE_SIZE == 0:
+    +                prefill_shard = self.args.get_prefill_norm_shard_config(rows // ttnn.TILE_SIZE)
+    +        if prefill_shard is not None:
+    +            input_mem_cfg = prefill_shard["mem_config"]
+    +            norm_config = dict(norm_config or {})
+    +            norm_config["sharded_program_config"] = prefill_shard["program_config"]
+    +            norm_config["sharded_output_config"] = prefill_shard["mem_config"]
+    +            norm_config["output_mem_config"] = ttnn.DRAM_MEMORY_CONFIG
+    +
+             # Distributed norm already performs a gather
+             if self.args.is_multichip and not self.args.is_distributed_norm(mode):
+                 x = ttnn.experimental.all_gather_async(
+    @@ -105,9 +124,8 @@ class DistributedNorm(LightweightModule):
+             else:
+                 x = ttnn.to_memory_config(x, input_mem_cfg)
+     
+    -        x = self.norm(
+    -            x, mode=mode, in_sharded=(mode == Mode.DECODE), out_sharded=(mode == Mode.DECODE), norm_config=norm_config
+    -        )
+    +        sharded = mode == Mode.DECODE or prefill_shard is not None
+    +        x = self.norm(x, mode=mode, in_sharded=sharded, out_sharded=sharded, norm_config=norm_config)
+     
+    ... (truncated, 2 more lines)
+
+[#51] LayerNormDeviceOperation · shard · no gain  +1406.09 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/decoder.py b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    index 067ea19c0a..9ebbfda6d6 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/decoder.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    @@ -127,6 +127,7 @@ class TransformerBlock(LightweightModule):
+                     state_dict_prefix=args.get_state_dict_prefix("", layer_num),
+                     weight_cache_path=None if args.dummy_weights else weight_cache_path,
+                     weight_dtype=ttnn.bfloat16,
+    +                weight_memory_config=ttnn.L1_MEMORY_CONFIG,
+                     weight_key="attention_norm",
+                     is_distributed=self.args.is_distributed_norm,
+                     add_unit_offset=self.args.rms_norm_add_unit_offset,
+    @@ -149,6 +150,7 @@ class TransformerBlock(LightweightModule):
+                     state_dict_prefix=args.get_state_dict_prefix("", layer_num),
+                     weight_cache_path=None if args.dummy_weights else weight_cache_path,
+                     weight_dtype=ttnn.bfloat16,
+    +                weight_memory_config=ttnn.L1_MEMORY_CONFIG,
+                     weight_key="ffn_norm",
+                     is_distributed=self.args.is_distributed_norm,
+                     add_unit_offset=self.args.rms_norm_add_unit_offset,
+    @@ -173,6 +175,7 @@ class TransformerBlock(LightweightModule):
+                         state_dict_prefix=args.get_state_dict_prefix("", layer_num),
+                         weight_cache_path=None if args.dummy_weights else weight_cache_path,
+                         weight_dtype=ttnn.bfloat16,
+    +                weight_memory_config=ttnn.L1_MEMORY_CONFIG,
+                         weight_key="pre_feedforward_layernorm",
+                         is_distributed=self.args.is_distributed_norm,
+                         ccl_topology=self.args.ccl_topology(),
+    @@ -201,6 +204,7 @@ class TransformerBlock(LightweightModule):
+                         state_dict_prefix=args.get_state_dict_prefix("", layer_num),
+                         weight_cache_path=None if args.dummy_weights else weight_cache_path,
+                         weight_dtype=ttnn.bfloat16,
+    +                weight_memory_config=ttnn.L1_MEMORY_CONFIG,
+                         weight_key="post_feedforward_layernorm",
+                         is_distributed=self.args.is_distributed_norm,
+                         ccl_topology=self.args.ccl_topology(),
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model.py b/models/demos/llama3_1_8b_p150/tt/model.py
+    index e19e919f4c..01cf18039d 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model.py
+    ... (truncated, 8 more lines)
+
+[#53] LayerNormDeviceOperation · shard · no gain  +1406.45 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 8b557ec23c..177fe419a3 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1238,6 +1238,15 @@ class ModelArgs:
+                         use_height_and_width_as_shard_shape=True,
+                     )
+             elif mode == Mode.PREFILL:
+    +            # Keep the SHORT-prefill residual stream L1-resident. The norm at the top of every block
+    +            # reads this tensor and is memory-bound on it, and the residual adds read/write it twice
+    +            # more per block, so its home matters more than its size suggests. At or below the
+    +            # prefill cutoff it is only dim * seq * 2 B (1 MB at seq 128), which L1 holds easily; a
+    +            # longer prefill stays in DRAM because the tensor grows with seq while L1 does not.
+    +            # This is distinct from sharding the norm itself: the tensor is simply BORN in L1, so
+    +            # there is no runtime reshard to trace.
+    +            if not self.is_galaxy and self.dim * self.prefill_len_cutoff * 2 <= 4 * 1024 * 1024:
+    +                return ttnn.L1_MEMORY_CONFIG
+                 return ttnn.DRAM_MEMORY_CONFIG
+             else:
+                 raise ValueError(f"Invalid mode: {mode}")
+
+[#54] LayerNormDeviceOperation · structural · no gain  +1406.45 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    index fa9e629a74..c98a9b6ae9 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    @@ -1,28 +1,38 @@
+     """C++ Metalium matmul via ttnn.generic_op -- AUTHORED, MEASURED, and NOT WIRED IN.
+     
+    -Kept as the record of the cpp rung for `MatmulDeviceOperation 128 x 4096 x 14336`.
+    +Kept as the record of the cpp rung for every hot dense matmul in the MLP:
+    +
+    +  * `MatmulDeviceOperation 128 x  4096 x 14336` -- the short-prefill ff1/ff3 up-projection
+    +  * `MatmulDeviceOperation 128 x 14336 x  4096` -- the short-prefill ff2 down-projection
+    +  * `MatmulDeviceOperation  32 x 14336 x  4096` -- the DECODE ff2 down-projection (per-token path)
+     
+     Drives the repo's own programming-example kernel triple (tt_metal/programming_examples/matmul/
+     matmul_multi_core: reader / mm / writer, copied into tt/kernels/) through ttnn.generic_op, with
+     the output tiles partitioned across the entire compute grid.
+     
+    -MEASURED on the real shape (M=128, K=4096, N=14336) on the full 11x10 P150 grid:
+    +MEASURED on the real shapes, on the full 11x10 P150 grid:
+    +
+    +    M    K      N        PCC        generic_op    ttnn.linear     verdict
+    +    128  4096   14336    0.998986    3.565 ms      0.328 ms       10.9x SLOWER
+    +    128  14336  4096     0.993626    3.118 ms      0.357 ms        8.7x SLOWER
+    +     32  14336  4096     0.993594    0.916 ms      0.292 ms        3.1x SLOWER
+     
+    -    correctness   PCC 0.999040   (the kernel is right)
+    -    generic_op    3.573 ms/call
+    -    ttnn.linear   0.331 ms/call  -> the kernel is 10.8x SLOWER
+    +Every kernel is CORRECT and every one loses. The cause is dataflow, not tuning: this reader fetches
+    +every A tile again for each output tile, so A is re-read Nt times from DRAM, while ttnn's production
+    +matmul multicasts each in0 tile across a whole core row and blocks K, moving a small fraction of the
+    +bytes. Beating it would mean reimplementing that mcast matmul -- which is what the stock op already is.
+     
+    -Same root cause as the tt-lang attempt in ttl_gated_ffn.py, and it is a dataflow property, not a
+    -tuning miss: this reader fetches every A tile again for each output tile, so A is re-read Nt times
+    -from DRAM. ttnn's production matmul multicasts each in0 tile across a whole core row and blocks K,
+    -so it moves a small fraction of the bytes. Beating it would mean reimplementing that mcast matmul --
+    -which is what the stock op already is.
+    +The decode row is the one worth reading twice. Dropping M from 128 to 32 shrinks THIS kernel ~3.4x
+    ... (truncated, 245 more lines)
+
 Limitations / suggested manual next steps:
-- (none flagged automatically — see the per-op device report for remaining headroom.)
+- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
+  -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
   trace+1CQ perf:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_main_perf.py::test_main_perf -svv

@@ -162,12 +162,32 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
 
         return ret
 
-    def warmup_model_prefill(self, kv_cache, enable_trace, can_sample_on_device, greedy_only: bool = False):
+    def warmup_model_prefill(
+        self, kv_cache, enable_trace, can_sample_on_device, greedy_only: bool = False, only_seq_lens=None
+    ):
         if self.already_warmed_up_prefill:
             return
         self.already_warmed_up_prefill = True
 
         sequence_lengths_to_warmup = self.model_args[0].get_warmup_prefill_supported_seq_lens()
+        # Warm up only the PREFILL LENGTH the caller is actually asking for. The default sweep runs a
+        # full real prefill at every padded length up to capped_warmup_seq_len -- 128, 256, 512, 1024
+        # -- so a request whose prompt pads to 128 still pays a 256-, a 512- AND a 1024-token prefill,
+        # i.e. ~15x the token-work of the request that triggered it, all of it for prompt shapes that
+        # never arrive. This is the same argument as the sampling-shape narrowing above, on the
+        # sequence-length axis instead: a later longer prompt still works, it just pays its own
+        # one-time capture on first use.
+        if only_seq_lens:
+            wanted = sorted({int(s) for s in only_seq_lens})
+            kept = [s for s in sequence_lengths_to_warmup if s in wanted]
+            if kept:
+                skipped = [s for s in sequence_lengths_to_warmup if s not in wanted]
+                if skipped:
+                    logger.info(
+                        f"Prefill warmup narrowed to {kept}; skipping {skipped} "
+                        "(no request has asked for those lengths yet)"
+                    )
+                sequence_lengths_to_warmup = kept
         warmup_batch_sizes = (1,)
 
         skip_sequence_lengths = False
@@ -600,11 +620,22 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             # the request that triggered warmup is greedy, those traces are pure warmup cost for
             # request shapes that never arrive; a later non-greedy request still works, it just pays
             # its own one-time capture on first use.
+            # Same narrowing on the sequence-length axis: hand warmup the padded prefill length(s)
+            # THIS request will actually use, derived from the prompt we are about to run.
+            _warm_lens = None
+            try:
+                _req_lens = prompt_lens if prompt_lens is not None else [int(tokens.shape[1])]
+                if not isinstance(_req_lens, list):
+                    _req_lens = _req_lens.tolist()
+                _warm_lens = {get_padded_prefill_len(int(n)) for n in _req_lens}
+            except Exception:  # noqa: BLE001 -- never let the narrowing break a real prefill
+                _warm_lens = None
             self.warmup_model_prefill(
                 kv_cache=kv_cache,
                 enable_trace=enable_trace,
                 can_sample_on_device=on_device_sampling_enabled,
                 greedy_only=_sampling_params_are_greedy(sampling_params),
+                only_seq_lens=_warm_lens,
             )
 
         batch_size, batch_seq_len = tokens.shape
