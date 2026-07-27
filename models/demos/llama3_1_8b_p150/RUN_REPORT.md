@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 02:50:09 UTC · 27 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 03:01:01 UTC · 34 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 1063.78 ms
-  at-floor            : 51%   (526.55 ms reachable headroom)
+  measured            : 1061.00 ms
+  at-floor            : 51%   (523.77 ms reachable headroom)
   status              : BELOW_BAND — keep optimizing
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -31,7 +31,7 @@ embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
-MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —                 —
+MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ·try        1061.00
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —           1092.12
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
@@ -68,6 +68,13 @@ MatmulDeviceOperation                      grid   1092.12   +1372.06 ms  ✓ win
 MatmulDeviceOperation                      grid   1092.12   +1372.06 ms  ✓ win      COMMITTED (supersedes the earlier reverted record). ff2's in0_block_w was hard-capped at 8 by find_largest_divisor(), so its 448-tile K -- the longest reduction in the model -- was walked in 56 blocks
 MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: put the FF2 down-projection weights on bf4_b performance() already rides bf4_b for FF1/FF3 but left FF2 on the BFP8 defaul
 MatmulDeviceOperation                     dtype   1063.78   +1400.40 ms  ✓ win      Hypothesis: ff2 is DRAM-bw bound and performance() had already put FF1/FF3 on bf4_b but left FF2 on the BFP8 default, so the down-projection read 2x the weight bytes of the two projections feeding it 
+MatmulDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: keep the short-prefill MLP intermediates in an L1 island The MLP's DRAM traffic is dominated by weight reads that can neve
+MatmulDeviceOperation                     shard   1061.00   +1403.18 ms  ✓ win      Reused the catalogued L1-island lever, this time aimed at ff2 (which READS the intermediate) rather than at the producing matmul: ff1/ff3 outputs land in L1 so the ff1/ff3 -> mul -> ff2 chain never ro
+MatmulDeviceOperation               tp-fracture   1061.00   +1403.18 ms  · no gain  tp_pick_degree(128, 14336, 4096) returned best_tp=1 -- keep single-chip. Same reason as the other matmul: the on-mesh TP sweep is disabled by default because it opens a nested mesh device and toggles 
+MatmulDeviceOperation               tp-fracture   1061.00   +1403.18 ms  · no gain  tp_pick_degree(128, 14336, 4096) returned best_tp=1 -- keep w2 single-chip. The on-mesh TP sweep is disabled by default because it opens a nested mesh device and toggles fabric config while a mesh is 
+MatmulDeviceOperation                structural   1061.00   +1403.18 ms  · no gain  none: investigated ff2's surroundings for reducible work and found none left. (1) Its output all-reduce is already a no-op here -- tt_all_reduce short-circuits and returns the input unchanged when mes
+MatmulDeviceOperation                   tt-lang   1061.00   +1403.18 ms  · no gain  Authored tt/ttl_ff2_matmul.py: a multi-core tt-lang matmul measured on ff2's OWN shape (128x14336x4096, 8x8 grid, 128 N-tiles / 64 cores = 2 each exact, K reduced in-core via an accumulator DFB ping-p
+MatmulDeviceOperation                       cpp   1061.00   +1403.18 ms  · no gain  Ran the authored C++ Metalium generic_op triple (tt/cpp_mm_generic.py + tt/kernels/*.cpp) on ff2's OWN shape (128x14336x4096) across the full 11x10 grid: CORRECT at PCC 0.993625 but 3.113ms/call vs 0.
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -735,6 +742,144 @@ Code changes — every attempt (win or fail):
                      "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI},
                  }
                  if model_name.startswith("Phi-3-mini"):  # TODO: Only do this for N150
+
+[#29] MatmulDeviceOperation · shard · win  +1403.18 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 346435f1ba..4bc19dc82c 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -180,6 +180,16 @@ class MLP(LightweightModule):
+             if mode == Mode.PREFILL and not TG:
+                 ff1_3_out_dtype = ttnn.bfloat8_b
+     
+    +        # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+    +        # layer and can never be L1-resident, but the [seq, hidden] intermediates can, and that is
+    +        # what ff2 READS: landing ff1/ff3 in L1 removes three DRAM round-trips per MLP (ff1 and ff3
+    +        # write, the mul reads both and writes, ff2 reads that). ttnn.mul inherits w1_out's memory
+    +        # config, so one change carries the whole chain. Bounded to prompts at or under
+    +        # prefill_len_cutoff; w1_out/w3_out are freed right after the mul, so the island peaks at
+    +        # three intermediates -- ~1.95 MB each at bf8_b for seq_len=128.
+    +        if mode == Mode.PREFILL and not TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff:
+    +            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+    +
+             x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+     
+             w1_out = ttnn.linear(
+
+[#30] MatmulDeviceOperation · tp-fracture · no gain  +1403.18 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 346435f1ba..4bc19dc82c 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -180,6 +180,16 @@ class MLP(LightweightModule):
+             if mode == Mode.PREFILL and not TG:
+                 ff1_3_out_dtype = ttnn.bfloat8_b
+     
+    +        # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+    +        # layer and can never be L1-resident, but the [seq, hidden] intermediates can, and that is
+    +        # what ff2 READS: landing ff1/ff3 in L1 removes three DRAM round-trips per MLP (ff1 and ff3
+    +        # write, the mul reads both and writes, ff2 reads that). ttnn.mul inherits w1_out's memory
+    +        # config, so one change carries the whole chain. Bounded to prompts at or under
+    +        # prefill_len_cutoff; w1_out/w3_out are freed right after the mul, so the island peaks at
+    +        # three intermediates -- ~1.95 MB each at bf8_b for seq_len=128.
+    +        if mode == Mode.PREFILL and not TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff:
+    +            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+    +
+             x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+     
+             w1_out = ttnn.linear(
+
+[#31] MatmulDeviceOperation · tp-fracture · no gain  +1403.18 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 346435f1ba..4bc19dc82c 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -180,6 +180,16 @@ class MLP(LightweightModule):
+             if mode == Mode.PREFILL and not TG:
+                 ff1_3_out_dtype = ttnn.bfloat8_b
+     
+    +        # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+    +        # layer and can never be L1-resident, but the [seq, hidden] intermediates can, and that is
+    +        # what ff2 READS: landing ff1/ff3 in L1 removes three DRAM round-trips per MLP (ff1 and ff3
+    +        # write, the mul reads both and writes, ff2 reads that). ttnn.mul inherits w1_out's memory
+    +        # config, so one change carries the whole chain. Bounded to prompts at or under
+    +        # prefill_len_cutoff; w1_out/w3_out are freed right after the mul, so the island peaks at
+    +        # three intermediates -- ~1.95 MB each at bf8_b for seq_len=128.
+    +        if mode == Mode.PREFILL and not TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff:
+    +            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+    +
+             x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+     
+             w1_out = ttnn.linear(
+
+[#32] MatmulDeviceOperation · structural · no gain  +1403.18 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 346435f1ba..4bc19dc82c 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -180,6 +180,16 @@ class MLP(LightweightModule):
+             if mode == Mode.PREFILL and not TG:
+                 ff1_3_out_dtype = ttnn.bfloat8_b
+     
+    +        # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+    +        # layer and can never be L1-resident, but the [seq, hidden] intermediates can, and that is
+    +        # what ff2 READS: landing ff1/ff3 in L1 removes three DRAM round-trips per MLP (ff1 and ff3
+    +        # write, the mul reads both and writes, ff2 reads that). ttnn.mul inherits w1_out's memory
+    +        # config, so one change carries the whole chain. Bounded to prompts at or under
+    +        # prefill_len_cutoff; w1_out/w3_out are freed right after the mul, so the island peaks at
+    +        # three intermediates -- ~1.95 MB each at bf8_b for seq_len=128.
+    +        if mode == Mode.PREFILL and not TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff:
+    +            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+    +
+             x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+     
+             w1_out = ttnn.linear(
+
+[#33] MatmulDeviceOperation · tt-lang · no gain  +1403.18 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 346435f1ba..4bc19dc82c 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -180,6 +180,16 @@ class MLP(LightweightModule):
+             if mode == Mode.PREFILL and not TG:
+                 ff1_3_out_dtype = ttnn.bfloat8_b
+     
+    +        # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+    +        # layer and can never be L1-resident, but the [seq, hidden] intermediates can, and that is
+    +        # what ff2 READS: landing ff1/ff3 in L1 removes three DRAM round-trips per MLP (ff1 and ff3
+    +        # write, the mul reads both and writes, ff2 reads that). ttnn.mul inherits w1_out's memory
+    +        # config, so one change carries the whole chain. Bounded to prompts at or under
+    +        # prefill_len_cutoff; w1_out/w3_out are freed right after the mul, so the island peaks at
+    +        # three intermediates -- ~1.95 MB each at bf8_b for seq_len=128.
+    +        if mode == Mode.PREFILL and not TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff:
+    +            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+    +
+             x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+     
+             w1_out = ttnn.linear(
+
+[#34] MatmulDeviceOperation · cpp · no gain  +1403.18 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 346435f1ba..4bc19dc82c 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -180,6 +180,16 @@ class MLP(LightweightModule):
+             if mode == Mode.PREFILL and not TG:
+                 ff1_3_out_dtype = ttnn.bfloat8_b
+     
+    +        # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+    +        # layer and can never be L1-resident, but the [seq, hidden] intermediates can, and that is
+    +        # what ff2 READS: landing ff1/ff3 in L1 removes three DRAM round-trips per MLP (ff1 and ff3
+    +        # write, the mul reads both and writes, ff2 reads that). ttnn.mul inherits w1_out's memory
+    +        # config, so one change carries the whole chain. Bounded to prompts at or under
+    +        # prefill_len_cutoff; w1_out/w3_out are freed right after the mul, so the island peaks at
+    +        # three intermediates -- ~1.95 MB each at bf8_b for seq_len=128.
+    +        if mode == Mode.PREFILL and not TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff:
+    +            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+    +
+             x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+     
+             w1_out = ttnn.linear(
 
 Limitations / suggested manual next steps:
 - (none flagged automatically — see the per-op device report for remaining headroom.)
