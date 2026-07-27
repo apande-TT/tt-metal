@@ -1101,6 +1101,12 @@ class ModelArgs:
                 # offset-add / untilize / manual_seed / sampling tail behind them). Non-greedy
                 # requests still take the full path -- the sampler re-derives this per reset_params
                 # and re-captures its trace when the mode flips.
+                #
+                # NOTE on the argmax core grid: ModelArgs deliberately does NOT define
+                # `sub_core_grids`. TTSampling reads it with getattr(args, "sub_core_grids", None),
+                # and leaving it None is what lets ttnn.argmax fall through to
+                # split_work_to_cores over the FULL compute grid. Defining it here would NARROW
+                # the sampling ops, not widen them.
                 "allow_force_argmax": True,
                 "num_links": 1,
                 "chunks_per_sync": 10,

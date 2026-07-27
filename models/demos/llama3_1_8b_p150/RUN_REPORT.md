@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 07:39:29 UTC · 105 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 08:15:08 UTC · 108 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 729.90 ms
-  at-floor            : 74%   (192.67 ms reachable headroom)
+  measured            : 714.94 ms
+  at-floor            : 75%   (177.71 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -31,6 +31,7 @@ embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
+ArgMaxDeviceOperation              ·wedge    —         —         —         —         —         —         —                 —
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
@@ -39,7 +40,7 @@ MatmulDeviceOperation              ·try      —         ✓win      ·try     
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ✓win      ·try      ✓win         745.01
-NLPConcatHeadsDeviceOperation      ·try      —         —         ✓win      ·try      —         —         —            729.90
+NLPConcatHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            714.94
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
 RotaryEmbeddingLlamaDeviceOperatio ✓win      —         —         —         —         —         —         —                 —
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
@@ -155,6 +156,9 @@ NLPConcatHeadsDeviceOperation             shard    729.99   +1734.19 ms  · no g
 NLPConcatHeadsDeviceOperation             shard         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT
 NLPConcatHeadsDeviceOperation             shard    729.99   +1734.19 ms  · no gain  Hypothesis: the INPUT side of this op is measured-unsafe (three head-sharded variants at the grid rung either scrambled the output to 25.6% top-1 or hung the gate), but the OUTPUT side is free -- the 
 NLPConcatHeadsDeviceOperation        structural    729.90   +1734.28 ms  · no gain  none: hunted for reducible work around the prefill concat and found none left. (1) The op is NOT removable: SDPA emits head-major [1, H, S, D] and the wo projection requires heads contiguous in the WI
+NLPConcatHeadsDeviceOperation        structural         —             —  ✓ win      committed: llama3_1_8b_p150: tt-lang kernel for the prefill concat-heads The mirror of tt/ttl_create_qkv_heads.py at the other end of attention: that k
+NLPConcatHeadsDeviceOperation           tt-lang    714.94   +1749.24 ms  ✓ win      Hypothesis: a kernel is the right rung because the knob rungs proved the parallelisation is baked into the op, not merely untuned -- the interleaved factory sizes cores from num_blocks = batch*seq_len
+ArgMaxDeviceOperation                      grid         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: Read 0xffffffff over PCIe ID 3: the board should be reset.
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2538,8 +2542,51 @@ Code changes — every attempt (win or fail):
              )
              ttnn.deallocate(attn_output_1QSD)
 
+[#107] NLPConcatHeadsDeviceOperation · tt-lang · win  +1749.24 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b6b453fdc9..29cd6c48a9 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -7,7 +7,7 @@ import math
+     import torch
+     
+     import ttnn
+    -from models.demos.llama3_1_8b_p150.tt import ttl_create_qkv_heads
+    +from models.demos.llama3_1_8b_p150.tt import ttl_concat_heads, ttl_create_qkv_heads
+     from models.common.lightweightmodule import LightweightModule
+     from models.common.rmsnorm import RMSNorm
+     from models.common.utility_functions import nearest_32
+    @@ -1217,10 +1217,22 @@ class Attention(LightweightModule):
+             ###
+             # Output matmul
+             ###
+    -        attn_output_11SH = ttnn.experimental.nlp_concat_heads(
+    -            attn_output_1QSD,
+    -            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    -        )
+    +        # tt-lang rung, and the mirror of the head-split kernel at the other end of attention.
+    +        # The stock op's core count is baked into its factory (num_blocks = batch * seq_len / 32,
+    +        # heads never enter the split -> 4 cores here), and its sharded factory is measured-unsafe
+    +        # at this shape. ttl_concat_heads parallelises over (seq_tile x head) instead and measures
+    +        # 0.0430 ms/call vs the stock op's 0.0572 at this shape, PCC 1.000000.
+    +        if (
+    +            not self.TG
+    +            and self.prefetcher is None
+    +            and ttl_concat_heads.supports(attn_output_1QSD, self.n_local_heads, self.head_dim)
+    +        ):
+    +            attn_output_11SH = ttl_concat_heads.concat_heads_ttl(attn_output_1QSD, ttnn.DRAM_MEMORY_CONFIG)
+    +        else:
+    +            attn_output_11SH = ttnn.experimental.nlp_concat_heads(
+    +                attn_output_1QSD,
+    +                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    +            )
+             ttnn.deallocate(attn_output_1QSD)
+     
+             # For batched prefill, reshape to concatenate batch dimension into sequence
+    ... (truncated, 153 more lines)
+
 Limitations / suggested manual next steps:
-- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
+- 2 op(s) tried but no lever beat baseline: ArgMaxDeviceOperation, LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
