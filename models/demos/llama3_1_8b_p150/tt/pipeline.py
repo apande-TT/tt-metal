@@ -161,7 +161,7 @@ def _attach_decode_contract(generator) -> None:
     harness times the native step rather than wrapping it in its own capture.
     """
 
-    def decode_prefill(input_ids):
+    def decode_prefill(input_ids, enable_trace: bool = True):
         prompt = _normalize_prompt_ids(generator, input_ids)
         batch_size, _ = prompt.shape
         sampling_params = _greedy_sampling_params(generator)
@@ -174,7 +174,7 @@ def _attach_decode_contract(generator) -> None:
             prompt_lens=decoding_pos,
             sampling_params=sampling_params,
             warmup_prefill=True,
-            enable_trace=True,
+            enable_trace=enable_trace,
         )
         if sampling_params is not None and isinstance(prefill_out, tuple):
             prefilled_token, _ = prefill_out
@@ -190,11 +190,11 @@ def _attach_decode_contract(generator) -> None:
             "generated": [],
         }
 
-    def decode_step(state):
+    def decode_step(state, enable_trace: bool = True):
         out = generator.decode_forward(
             state["out_tok"],
             state["current_pos"],
-            enable_trace=True,
+            enable_trace=enable_trace,
             page_table=generator.page_table,
             kv_cache=generator.tt_kv_cache,
             reset_batch=(state["iteration"] == 0),
