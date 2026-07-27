@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 05:46:47 UTC · 76 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 05:56:32 UTC · 78 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 865.93 ms
-  at-floor            : 62%   (328.70 ms reachable headroom)
+  measured            : 781.95 ms
+  at-floor            : 69%   (244.72 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -38,7 +38,7 @@ MatmulDeviceOperation              ✓win      —         —         —      
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
-NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      —         —         —         —            955.25
+NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      —         —         —            955.25
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 host_overhead                      —         —         —         —         —         —         —         ✓win              —
@@ -123,6 +123,8 @@ MatmulDeviceOperation                      grid    867.62   +1596.56 ms  ✓ win
 NlpCreateHeadsDeviceOperation              grid    955.25   +1508.93 ms  · no gain  Hypothesis: this op is grid=tiny because its stock interleaved program factory sizes cores from num_blocks = batch*seq_len/TILE_HEIGHT (one work unit per input row-tile) -- at batch 1 / seq_len 128 th
 NlpCreateHeadsDeviceOperation             shard         —             —  ✓ win      committed: llama3_1_8b_p150: land the prefill head split in L1 nlp_create_qkv_heads is pure data movement and memory-bound: it reads the fused [S, (nq
 NlpCreateHeadsDeviceOperation             shard    865.93   +1598.25 ms  ✓ win      Hypothesis: this op has no weights and is pure memory-bound data movement, so the shard lever here means removing DRAM round-trips on the tensors it writes -- it emits three head-major views of the fu
+NlpCreateHeadsDeviceOperation        structural         —             —  ✓ win      committed: llama3_1_8b_p150: skip the prefill warmup when it duplicates the request Warmup was already narrowed (in earlier commits) to the sampling sh
+NlpCreateHeadsDeviceOperation        structural    781.95   +1682.23 ms  ✓ win      Hunted for reducible work behind this op rather than its per-call cost, and found the call COUNT was double what the workload needs. Earlier commits narrowed prefill warmup to the sampling shapes and 
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -1959,6 +1961,49 @@ Code changes — every attempt (win or fail):
              )
      
              norm_config = self.args.get_norm_config("attn", Mode.PREFILL, None)
+
+[#78] NlpCreateHeadsDeviceOperation · structural · win  +1682.23 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/generator.py b/models/demos/llama3_1_8b_p150/tt/generator.py
+    index 01da3ce7f2..19e57ec6e8 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/generator.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/generator.py
+    @@ -630,13 +630,45 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
+                     _warm_lens = {get_padded_prefill_len(int(n)) for n in _req_lens}
+                 except Exception:  # noqa: BLE001 -- never let the narrowing break a real prefill
+                     _warm_lens = None
+    -            self.warmup_model_prefill(
+    -                kv_cache=kv_cache,
+    -                enable_trace=enable_trace,
+    -                can_sample_on_device=on_device_sampling_enabled,
+    -                greedy_only=_sampling_params_are_greedy(sampling_params),
+    -                only_seq_lens=_warm_lens,
+    +            # ...and once that narrowing leaves ONLY the length this very call is about to run,
+    +            # the warmup prefill is a straight duplicate of the request behind it: same padded
+    +            # length, same layers, same ops, and its mock-token KV writes are immediately
+    +            # overwritten by the real prefill. Every prefill op therefore ran TWICE.
+    +            #
+    +            # Nothing needs it. Prefill trace capture is lazy -- `_easy_trace_text_prefill` does
+    +            # `if self.trace_id_prefill[trace_key] is None: self._capture_trace_prefill(...)` -- and
+    +            # the sampling trace captures the same way, so the real call compiles and captures for
+    +            # itself. Skipping only trades a one-time HOST compile onto the first request; the
+    +            # DEVICE work it removes is pure redundancy.
+    +            #
+    +            # Only skip the exact-duplicate case. A warmup covering any length this request will
+    +            # not run still has something to pre-build, so it still runs.
+    +            _this_call_lens = None
+    +            try:
+    +                _this_call_lens = {get_padded_prefill_len(int(tokens.shape[1]))}
+    +            except Exception:  # noqa: BLE001 -- never let the narrowing break a real prefill
+    +                _this_call_lens = None
+    +            _warmup_is_duplicate = (
+    +                _warm_lens is not None
+    +                and _this_call_lens is not None
+    +                and _warm_lens == _this_call_lens
+    +                and int(tokens.shape[0]) == 1
+                 )
+    +            if _warmup_is_duplicate:
+    +                logger.info(
+    ... (truncated, 16 more lines)
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation

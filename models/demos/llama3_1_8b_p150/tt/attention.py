@@ -7,6 +7,7 @@ import math
 import torch
 
 import ttnn
+from models.demos.llama3_1_8b_p150.tt import ttl_create_qkv_heads
 from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
 from models.common.utility_functions import nearest_32
@@ -977,17 +978,35 @@ class Attention(LightweightModule):
             if (not self.TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff)
             else ttnn.DRAM_MEMORY_CONFIG
         )
-        (
-            q_heads_1QSD_pre_rot,
-            k_heads_1KSD_pre_rot,
-            v_heads_1VSD,
-        ) = ttnn.experimental.nlp_create_qkv_heads(
-            xqkv_fused,
-            num_heads=self.n_local_heads,
-            num_kv_heads=self.n_local_kv_heads,
-            transpose_k_heads=False,
-            memory_config=create_heads_mem_config,
+        # tt-lang rung: the stock op's core count is baked into its factory (one work unit per
+        # input row-tile -> 4 cores here), so the only way past it is a kernel whose work
+        # decomposition differs. ttl_create_qkv_heads parallelises over (seq_tile x head) and
+        # measures 0.0555 ms/call vs the stock op's 0.0810 at this shape, PCC 1.000000.
+        _use_ttl_heads = (
+            not self.TG
+            and self.prefetcher is None
+            and ttl_create_qkv_heads.supports(
+                xqkv_fused, self.n_local_heads, self.n_local_kv_heads, self.head_dim
+            )
         )
+        if _use_ttl_heads:
+            (
+                q_heads_1QSD_pre_rot,
+                k_heads_1KSD_pre_rot,
+                v_heads_1VSD,
+            ) = ttl_create_qkv_heads.create_qkv_heads_ttl(xqkv_fused, create_heads_mem_config)
+        else:
+            (
+                q_heads_1QSD_pre_rot,
+                k_heads_1KSD_pre_rot,
+                v_heads_1VSD,
+            ) = ttnn.experimental.nlp_create_qkv_heads(
+                xqkv_fused,
+                num_heads=self.n_local_heads,
+                num_kv_heads=self.n_local_kv_heads,
+                transpose_k_heads=False,
+                memory_config=create_heads_mem_config,
+            )
 
         norm_config = self.args.get_norm_config("attn", Mode.PREFILL, None)
         q_heads_1QSD_pre_rot = self.q_norm(q_heads_1QSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
