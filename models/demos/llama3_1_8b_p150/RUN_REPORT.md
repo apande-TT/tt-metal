@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 04:23:41 UTC · 54 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 04:49:48 UTC · 60 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,9 +12,9 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 1057.72 ms
-  at-floor            : 51%   (520.49 ms reachable headroom)
-  status              : BELOW_BAND — keep optimizing
+  measured            : 891.98 ms
+  at-floor            : 60%   (354.75 ms reachable headroom)
+  status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
 Op breakdown — device time by op class (latest profile · what to target, ranked):
@@ -36,8 +36,10 @@ MatmulDeviceOperation              ✓win      —         ✓win      ✓win   
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —           1092.12
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
+MatmulDeviceOperation              ·try      —         ·try      —         ·try      —         —         —            891.43
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
+host_overhead                      —         —         —         —         —         —         —         ✓win              —
 
 
 Per-attempt detail (every optimization tried — win OR fail — with gain vs baseline and WHY):
@@ -97,6 +99,12 @@ LayerNormDeviceOperation                  shard   1058.09   +1406.09 ms  · no g
 LayerNormDeviceOperation                  shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
 LayerNormDeviceOperation                  shard   1057.73   +1406.45 ms  · no gain  Second shard attempt, different mechanism, and it isolated the real blocker. Rather than sharding the norm (already measured-blocked), I moved the tensor the norm READS: made the short-prefill residua
 LayerNormDeviceOperation             structural   1057.73   +1406.45 ms  · no gain  none: hunted for reducible work behind the 832 four-core prefill norms and every candidate is either already applied or a known dead end. (1) The 832 instances are NOT 26 redundant prefills inside the
+host_overhead                         trace-2cq         —             —  ✓ win      committed: llama3_1_8b_p150: warm up only the prefill LENGTH the request asks for Prefill warmup ran a full, real prefill at EVERY padded length up to
+host_overhead                      trace-capture    891.98   +1572.20 ms  ✓ win      COMMITTED, and the win was NOT the trace lever itself -- trace capture is already applied and engaged here (Generator owns trace_ids_decode, decode_forward(enable_trace=True) does the host I/O plus ex
+MatmulDeviceOperation                      grid    891.98   +1572.20 ms  · no gain  Found genuinely DEAD code and revived it, which is how the rung got a real test. mlp.py already carried a full_grid_ff1_3 branch meant to run decode ff1/ff3 as an L1-width-sharded 1D-multicast matmul 
+MatmulDeviceOperation                      grid    892.07   +1572.11 ms  · no gain  Second grid attempt, going after the helper that actually picks this op's core grid rather than the matmul variant. find_grid_k_n hard-codes max_rows=max_cols=8 (a Wormhole assumption) and it is what 
+MatmulDeviceOperation                     dtype    891.43   +1572.75 ms  · no gain  w1/w3 are already at the bf4_b weight floor, so the only dtype step left on this op is its OUTPUT, which I had just walked bf16 -> bf8_b in c9b2d04. Took the last available step, bf8_b -> bf4_b, on th
+MatmulDeviceOperation                structural    891.98   +1572.20 ms  · no gain  The real structural candidate for this op is the GATE+UP MATMUL FUSION, and I measured it rather than refactoring on faith. w1 (gate) and w3 (up) are both [dim, hidden], both read the SAME activation,
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -1423,8 +1431,165 @@ Code changes — every attempt (win or fail):
     +The decode row is the one worth reading twice. Dropping M from 128 to 32 shrinks THIS kernel ~3.4x
     ... (truncated, 245 more lines)
 
+[#56] host_overhead · trace-capture · win  +1572.20 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/generator.py b/models/demos/llama3_1_8b_p150/tt/generator.py
+    index b0f41bda24..01da3ce7f2 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/generator.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/generator.py
+    @@ -162,12 +162,32 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
+     
+             return ret
+     
+    -    def warmup_model_prefill(self, kv_cache, enable_trace, can_sample_on_device, greedy_only: bool = False):
+    +    def warmup_model_prefill(
+    +        self, kv_cache, enable_trace, can_sample_on_device, greedy_only: bool = False, only_seq_lens=None
+    +    ):
+             if self.already_warmed_up_prefill:
+                 return
+             self.already_warmed_up_prefill = True
+     
+             sequence_lengths_to_warmup = self.model_args[0].get_warmup_prefill_supported_seq_lens()
+    +        # Warm up only the PREFILL LENGTH the caller is actually asking for. The default sweep runs a
+    +        # full real prefill at every padded length up to capped_warmup_seq_len -- 128, 256, 512, 1024
+    +        # -- so a request whose prompt pads to 128 still pays a 256-, a 512- AND a 1024-token prefill,
+    +        # i.e. ~15x the token-work of the request that triggered it, all of it for prompt shapes that
+    +        # never arrive. This is the same argument as the sampling-shape narrowing above, on the
+    +        # sequence-length axis instead: a later longer prompt still works, it just pays its own
+    +        # one-time capture on first use.
+    +        if only_seq_lens:
+    +            wanted = sorted({int(s) for s in only_seq_lens})
+    +            kept = [s for s in sequence_lengths_to_warmup if s in wanted]
+    +            if kept:
+    +                skipped = [s for s in sequence_lengths_to_warmup if s not in wanted]
+    +                if skipped:
+    +                    logger.info(
+    +                        f"Prefill warmup narrowed to {kept}; skipping {skipped} "
+    +                        "(no request has asked for those lengths yet)"
+    +                    )
+    +                sequence_lengths_to_warmup = kept
+             warmup_batch_sizes = (1,)
+     
+             skip_sequence_lengths = False
+    @@ -600,11 +620,22 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
+                 # the request that triggered warmup is greedy, those traces are pure warmup cost for
+    ... (truncated, 21 more lines)
+
+[#57] MatmulDeviceOperation · grid · no gain  +1572.20 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index e7c3ef31df..aa12ba9305 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -153,10 +153,20 @@ class MLP(LightweightModule):
+             if mode == Mode.DECODE and self.prefetcher is None and not TG:
+                 grid = self.mesh_device.compute_with_storage_grid_size()
+                 n_ff = self.args.hidden_dim // self.args.num_devices
+    -            num_cores = grid.x * grid.y
+    -            if (self.dim % (32 * num_cores) == 0) and (n_ff % (32 * num_cores) == 0):
+    +            # This test used to demand that the FULL grid divide both dims, which on an 11x10 P150 is
+    +            # 110 cores against 4096 -- 4096 % 3520 != 0 -- so the whole branch was DEAD and the
+    +            # DRAM-sharded path always ran. Take the largest core count that legally divides both
+    +            # instead, so the branch actually gets exercised.
+    +            num_cores = max(
+    +                (c for c in range(1, grid.x * grid.y + 1) if self.dim % (32 * c) == 0 and n_ff % (32 * c) == 0),
+    +                default=0,
+    +            )
+    +            # The core grid must hold EXACTLY num_cores, not the whole chip: the shard width below is
+    +            # dim // num_cores, so a wider grid would leave cores with no shard.
+    +            fg_rows = max((y for y in range(1, grid.y + 1) if num_cores % y == 0 and num_cores // y <= grid.x), default=0)
+    +            if num_cores > 0 and fg_rows > 0:
+                     full_grid_ff1_3 = True
+    -                fg_core_grid = ttnn.CoreGrid(x=grid.x, y=grid.y)
+    +                fg_core_grid = ttnn.CoreGrid(x=num_cores // fg_rows, y=fg_rows)
+                     ff1_3_full_grid_mem_config = ttnn.create_sharded_memory_config(
+                         shape=(x.shape[-2], self.dim // num_cores),
+                         core_grid=fg_core_grid,
+
+[#58] MatmulDeviceOperation · grid · no gain  +1572.11 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 8b557ec23c..61047ffb53 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -3362,8 +3362,13 @@ class ModelArgs:
+             Raises:
+                 AssertionError: If it's not possible to find such a grid configuration.
+             """
+    -        max_rows = 8
+    -        max_cols = 8  # Maximum number of rows or columns
+    +        # Resolve the REAL compute grid rather than assuming Wormhole's 8x8 (GUIDELINES #1). This
+    +        # helper is what sizes mlp_core_grid / mlp2_core_grid, i.e. the DRAM-sharded DECODE matmuls
+    +        # on the per-token path, so on an 11x10 P150 the old constant capped them at 64 of 110 cores
+    +        # before the divisibility search even started.
+    +        grid = self.mesh_device.compute_with_storage_grid_size() if self.mesh_device is not None else None
+    +        max_rows = grid.y if grid is not None else 8
+    +        max_cols = grid.x if grid is not None else 8
+             max_cores = max_rows * max_cols  # Maximum number of cores
+     
+             # Find all possible numbers of cores that divide N and are less than or equal to max_cores
+
+[#59] MatmulDeviceOperation · dtype · no gain  +1572.75 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index e7c3ef31df..f1c0e5bbe5 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -184,7 +184,11 @@ class MLP(LightweightModule):
+                 # that -- they feed nothing but the SILU mul, whose output ff2 then reads. Applies in
+                 # DECODE as well as PREFILL: decode's intermediate is only 32 rows, but it is written
+                 # twice, read twice and paid on EVERY token.
+    -            ff1_3_out_dtype = ttnn.bfloat8_b
+    +            # Walking one step FURTHER down: bf8_b -> bf4_b. These two tensors feed nothing but the
+    +            # SILU mul (no norm, no softmax, no reduction, no KV cache), so they are outside every
+    +            # hard floor GUIDELINES #13 names. bf4_b is the last dtype step available anywhere in
+    +            # this MLP -- w1/w2/w3 are already at it.
+    +            ff1_3_out_dtype = ttnn.bfloat4_b
+     
+             # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+             # layer and can never be L1-resident, but the [seq, hidden] intermediates can, and that is
+
+[#60] MatmulDeviceOperation · structural · no gain  +1572.20 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/generator.py b/models/demos/llama3_1_8b_p150/tt/generator.py
+    index b0f41bda24..01da3ce7f2 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/generator.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/generator.py
+    @@ -162,12 +162,32 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
+     
+             return ret
+     
+    -    def warmup_model_prefill(self, kv_cache, enable_trace, can_sample_on_device, greedy_only: bool = False):
+    +    def warmup_model_prefill(
+    +        self, kv_cache, enable_trace, can_sample_on_device, greedy_only: bool = False, only_seq_lens=None
+    +    ):
+             if self.already_warmed_up_prefill:
+                 return
+             self.already_warmed_up_prefill = True
+     
+             sequence_lengths_to_warmup = self.model_args[0].get_warmup_prefill_supported_seq_lens()
+    +        # Warm up only the PREFILL LENGTH the caller is actually asking for. The default sweep runs a
+    +        # full real prefill at every padded length up to capped_warmup_seq_len -- 128, 256, 512, 1024
+    +        # -- so a request whose prompt pads to 128 still pays a 256-, a 512- AND a 1024-token prefill,
+    +        # i.e. ~15x the token-work of the request that triggered it, all of it for prompt shapes that
+    +        # never arrive. This is the same argument as the sampling-shape narrowing above, on the
+    +        # sequence-length axis instead: a later longer prompt still works, it just pays its own
+    +        # one-time capture on first use.
+    +        if only_seq_lens:
+    +            wanted = sorted({int(s) for s in only_seq_lens})
+    +            kept = [s for s in sequence_lengths_to_warmup if s in wanted]
+    +            if kept:
+    +                skipped = [s for s in sequence_lengths_to_warmup if s not in wanted]
+    +                if skipped:
+    +                    logger.info(
+    +                        f"Prefill warmup narrowed to {kept}; skipping {skipped} "
+    +                        "(no request has asked for those lengths yet)"
+    +                    )
+    +                sequence_lengths_to_warmup = kept
+             warmup_batch_sizes = (1,)
+     
+             skip_sequence_lengths = False
+    @@ -600,11 +620,22 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
+                 # the request that triggered warmup is greedy, those traces are pure warmup cost for
+    ... (truncated, 21 more lines)
+
 Limitations / suggested manual next steps:
-- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
+- 2 op(s) tried but no lever beat baseline: LayerNormDeviceOperation, MatmulDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
