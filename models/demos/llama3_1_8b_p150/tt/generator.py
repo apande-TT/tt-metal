@@ -630,13 +630,45 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 _warm_lens = {get_padded_prefill_len(int(n)) for n in _req_lens}
             except Exception:  # noqa: BLE001 -- never let the narrowing break a real prefill
                 _warm_lens = None
-            self.warmup_model_prefill(
-                kv_cache=kv_cache,
-                enable_trace=enable_trace,
-                can_sample_on_device=on_device_sampling_enabled,
-                greedy_only=_sampling_params_are_greedy(sampling_params),
-                only_seq_lens=_warm_lens,
+            # ...and once that narrowing leaves ONLY the length this very call is about to run,
+            # the warmup prefill is a straight duplicate of the request behind it: same padded
+            # length, same layers, same ops, and its mock-token KV writes are immediately
+            # overwritten by the real prefill. Every prefill op therefore ran TWICE.
+            #
+            # Nothing needs it. Prefill trace capture is lazy -- `_easy_trace_text_prefill` does
+            # `if self.trace_id_prefill[trace_key] is None: self._capture_trace_prefill(...)` -- and
+            # the sampling trace captures the same way, so the real call compiles and captures for
+            # itself. Skipping only trades a one-time HOST compile onto the first request; the
+            # DEVICE work it removes is pure redundancy.
+            #
+            # Only skip the exact-duplicate case. A warmup covering any length this request will
+            # not run still has something to pre-build, so it still runs.
+            _this_call_lens = None
+            try:
+                _this_call_lens = {get_padded_prefill_len(int(tokens.shape[1]))}
+            except Exception:  # noqa: BLE001 -- never let the narrowing break a real prefill
+                _this_call_lens = None
+            _warmup_is_duplicate = (
+                _warm_lens is not None
+                and _this_call_lens is not None
+                and _warm_lens == _this_call_lens
+                and int(tokens.shape[0]) == 1
             )
+            if _warmup_is_duplicate:
+                logger.info(
+                    f"Skipping prefill warmup: the only length to warm ({sorted(_warm_lens)}) is the "
+                    "one this request runs, so warmup would duplicate it op for op; the real prefill "
+                    "compiles and captures its own trace."
+                )
+                self.already_warmed_up_prefill = True
+            else:
+                self.warmup_model_prefill(
+                    kv_cache=kv_cache,
+                    enable_trace=enable_trace,
+                    can_sample_on_device=on_device_sampling_enabled,
+                    greedy_only=_sampling_params_are_greedy(sampling_params),
+                    only_seq_lens=_warm_lens,
+                )
 
         batch_size, batch_seq_len = tokens.shape
         max_batch_size_per_model = self.model_args[0].max_batch_size

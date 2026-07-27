@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 05:19:21 UTC · 71 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 05:46:47 UTC · 76 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 891.98 ms
-  at-floor            : 60%   (354.75 ms reachable headroom)
+  measured            : 865.93 ms
+  at-floor            : 62%   (328.70 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -37,6 +37,8 @@ MatmulDeviceOperation              ·try      —         ✓win      ·try     
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —           1092.12
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
+MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
+NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      —         —         —         —            955.25
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 host_overhead                      —         —         —         —         —         —         —         ✓win              —
@@ -116,6 +118,11 @@ MatmulDeviceOperation                     shard         —             —  ✓
 MatmulDeviceOperation               tp-fracture    892.11   +1572.07 ms  · no gain  tp_pick_degree(32, 4096, 14336) returned best_tp=1 -- keep decode ff1/ff3 single-chip. Two reasons. The on-mesh sweep is disabled by default because it opens a NESTED mesh device and toggles fabric co
 MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the working tree is clean. A dirty tree scopes record_k
 MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: document the MLP tensor-parallel fracture layout The w1_dims / w2_dims tuples ARE the TP fracture and nothing said so. Ver
+MatmulDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: run the LM head on the full core grid The DRAM-sharded matmul variant width-shards the activation across `lm_head_core_gri
+MatmulDeviceOperation                      grid    867.62   +1596.56 ms  ✓ win      Tried because the LM head is grid=partial for a STRUCTURAL reason, not a tuning one: the DRAM-sharded matmul width-shards the activation across its cores, so num_cores must divide K/32=128 tiles, and 
+NlpCreateHeadsDeviceOperation              grid    955.25   +1508.93 ms  · no gain  Hypothesis: this op is grid=tiny because its stock interleaved program factory sizes cores from num_blocks = batch*seq_len/TILE_HEIGHT (one work unit per input row-tile) -- at batch 1 / seq_len 128 th
+NlpCreateHeadsDeviceOperation             shard         —             —  ✓ win      committed: llama3_1_8b_p150: land the prefill head split in L1 nlp_create_qkv_heads is pure data movement and memory-bound: it reads the fused [S, (nq
+NlpCreateHeadsDeviceOperation             shard    865.93   +1598.25 ms  ✓ win      Hypothesis: this op has no weights and is pure memory-bound data movement, so the shard lever here means removing DRAM round-trips on the tensors it writes -- it emits three head-major views of the fu
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -1830,6 +1837,128 @@ Code changes — every attempt (win or fail):
     +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
     @@ -1,35 +1,40 @@
     ... (truncated, 114 more lines)
+
+[#73] MatmulDeviceOperation · grid · win  +1596.56 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index ce12a6def3..eeb42ce095 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -71,6 +71,18 @@ class LMHead(LightweightModule):
+             self.output_weights_dram_sharded = []
+             self.output_weights_ring_mm = []
+     
+    +        # FULL-GRID LM HEAD. The DRAM-sharded matmul variant width-shards the activation across
+    +        # `lm_head_core_grid` cores, so its core count must divide K/32 = dim/32 = 128 tiles. On a
+    +        # P150 (11x10 = 110 cores) the largest such divisor is 64 -- the head therefore leaves ~46
+    +        # cores idle on every one of its 8 vocab splits, which is exactly the grid=partial tag.
+    +        # There is no way to widen it while keeping that variant, so take the other variant: hold
+    +        # the weights DRAM-INTERLEAVED and let ttnn.linear auto-route, which splits the 501 output
+    +        # tiles per split over the whole grid. Trades DRAM-sharded read bandwidth for occupancy;
+    +        # which one wins is a measurement, not a derivation.
+    +        self.full_grid = (
+    +            self.prefetcher is None and not args.is_galaxy and self.num_devices == 1
+    +        )
+    +
+             self.split_sizes = [self.split_sizes_dram_sharded]
+             if self.prefetcher is not None:
+                 self.split_sizes.append(self.split_sizes_ring_mm)
+    @@ -87,11 +99,15 @@ class LMHead(LightweightModule):
+                     # Concatenate the splits from all devices
+                     combined_split = torch.cat(device_splits, dim=-1)
+     
+    +                # The cache key must encode the memory config: a cached DRAM-width-sharded weight
+    +                # reloaded for the interleaved path (or vice versa) silently feeds the matmul an
+    +                # operand whose shard spec its program config does not expect.
+    +                _layout_tag = "_ilv" if (mode == 0 and self.full_grid) else ""
+                     cache_file_name = (
+                         None
+                         if args.dummy_weights
+                         else weight_cache_path
+    -                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}"
+    +                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}"
+                     )
+     
+                     def pad_to_power_of_2(n):
+    ... (truncated, 50 more lines)
+
+[#74] NlpCreateHeadsDeviceOperation · grid · no gain  +1508.93 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index ce12a6def3..eeb42ce095 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -71,6 +71,18 @@ class LMHead(LightweightModule):
+             self.output_weights_dram_sharded = []
+             self.output_weights_ring_mm = []
+     
+    +        # FULL-GRID LM HEAD. The DRAM-sharded matmul variant width-shards the activation across
+    +        # `lm_head_core_grid` cores, so its core count must divide K/32 = dim/32 = 128 tiles. On a
+    +        # P150 (11x10 = 110 cores) the largest such divisor is 64 -- the head therefore leaves ~46
+    +        # cores idle on every one of its 8 vocab splits, which is exactly the grid=partial tag.
+    +        # There is no way to widen it while keeping that variant, so take the other variant: hold
+    +        # the weights DRAM-INTERLEAVED and let ttnn.linear auto-route, which splits the 501 output
+    +        # tiles per split over the whole grid. Trades DRAM-sharded read bandwidth for occupancy;
+    +        # which one wins is a measurement, not a derivation.
+    +        self.full_grid = (
+    +            self.prefetcher is None and not args.is_galaxy and self.num_devices == 1
+    +        )
+    +
+             self.split_sizes = [self.split_sizes_dram_sharded]
+             if self.prefetcher is not None:
+                 self.split_sizes.append(self.split_sizes_ring_mm)
+    @@ -87,11 +99,15 @@ class LMHead(LightweightModule):
+                     # Concatenate the splits from all devices
+                     combined_split = torch.cat(device_splits, dim=-1)
+     
+    +                # The cache key must encode the memory config: a cached DRAM-width-sharded weight
+    +                # reloaded for the interleaved path (or vice versa) silently feeds the matmul an
+    +                # operand whose shard spec its program config does not expect.
+    +                _layout_tag = "_ilv" if (mode == 0 and self.full_grid) else ""
+                     cache_file_name = (
+                         None
+                         if args.dummy_weights
+                         else weight_cache_path
+    -                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}"
+    +                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}"
+                     )
+     
+                     def pad_to_power_of_2(n):
+    ... (truncated, 50 more lines)
+
+[#76] NlpCreateHeadsDeviceOperation · shard · win  +1598.25 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index 69bba753ac..e4e19d7461 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -963,6 +963,20 @@ class Attention(LightweightModule):
+             ttnn.deallocate(x_11SH)
+     
+             # split qkv into heads
+    +        # L1 island for the head split. This op is pure data movement and memory-bound: it reads
+    +        # the fused [S, (nq + 2*nkv) * head_dim] activation and writes three head-major views of
+    +        # it, and at short prefill every one of those trips is to DRAM. Q/K/V total
+    +        # S * 6144 * 2 B (1.5 MB at S=128), so the whole set fits interleaved L1 comfortably, and
+    +        # the immediate consumers -- q_norm/k_norm, then rotary_embedding -- read it straight back.
+    +        # The op's non-sharded factory requires an INTERLEAVED output config, so this is L1
+    +        # interleaved rather than a shard spec; the sharded factory is not reachable here (its
+    +        # output shard spec is fixed at {TILE_HEIGHT, head_dim}, i.e. seq_len == 32 only).
+    +        # Bounded to short prefill so long prompts keep the DRAM path.
+    +        create_heads_mem_config = (
+    +            ttnn.L1_MEMORY_CONFIG
+    +            if (not self.TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff)
+    +            else ttnn.DRAM_MEMORY_CONFIG
+    +        )
+             (
+                 q_heads_1QSD_pre_rot,
+                 k_heads_1KSD_pre_rot,
+    @@ -972,7 +986,7 @@ class Attention(LightweightModule):
+                 num_heads=self.n_local_heads,
+                 num_kv_heads=self.n_local_kv_heads,
+                 transpose_k_heads=False,
+    -            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    +            memory_config=create_heads_mem_config,
+             )
+     
+             norm_config = self.args.get_norm_config("attn", Mode.PREFILL, None)
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
