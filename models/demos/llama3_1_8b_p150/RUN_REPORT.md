@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 06:07:20 UTC · 80 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 06:07:52 UTC · 82 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -127,6 +127,8 @@ NlpCreateHeadsDeviceOperation        structural         —             —  ✓
 NlpCreateHeadsDeviceOperation        structural    781.95   +1682.23 ms  ✓ win      Hunted for reducible work behind this op rather than its per-call cost, and found the call COUNT was double what the workload needs. Earlier commits narrowed prefill warmup to the sampling shapes and 
 NlpCreateHeadsDeviceOperation           tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: tt-lang kernel for the prefill QKV head split The stock nlp_create_qkv_heads sizes its cores from num_blocks = batch*seq_l
 NlpCreateHeadsDeviceOperation           tt-lang    758.37   +1705.81 ms  ✓ win      Hypothesis: a kernel is the RIGHT rung here because the knob rungs are closed by construction, not by tuning -- the stock op sizes cores from num_blocks = batch*seq_len/TILE_HEIGHT (one work unit per 
+NlpCreateHeadsDeviceOperation           tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the tree is clean. A dirty tree scopes record_kernel_at
+NlpCreateHeadsDeviceOperation           tt-lang    758.37   +1705.81 ms  ✓ win      Re-recorded against a clean tree so the kernel-marker scan sees tt/ttl_create_qkv_heads.py (the first record was diff-scoped to attention.py and flagged UNSUPPORTED). Hypothesis: a kernel is the RIGHT
 
 Code changes — every attempt (win or fail):
 ===========================================

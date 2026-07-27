@@ -232,6 +232,13 @@ class ModelOptimizations:
                 "TensorPrecision": {
                     TensorGroup.FF1_FF3: PrecisionSetting.BFP4,
                     TensorGroup.FF2: PrecisionSetting.BFP4,
+                    # WQKV was still on the BFP8 default while the whole MLP rides bf4_b. The
+                    # fused QKV weight is [dim, (nq + 2*nkv)*head_dim] = 25M params, ~26 MB per
+                    # layer at bf8_b, and the projection is DRAM-bandwidth bound in the roofline
+                    # -- so this is the largest weight left that has a dtype step available. It is
+                    # one resident tensor shared by the prefill AND decode QKV matmuls, so the
+                    # halving lands on both paths.
+                    TensorGroup.WQKV: PrecisionSetting.BFP4,
                 },
                 "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI},
             }
@@ -422,6 +429,12 @@ def parse_decoder_json(json_file_path, default_optimization=ModelOptimizations.p
         for decoder_id, settings in config_data["decoders"].items():
             decoder_id = int(decoder_id)
 
+            # A decoder entry REPLACES the optimization level's settings rather than merging onto
+            # them, so a decoder named here falls back to the BFP8/HIFI2 defaults for every tensor
+            # it does not mention. That looks like a bug and is load-bearing: it is what keeps
+            # decoder 31 -- the last layer, which this file exists to protect -- entirely at BFP8.
+            # Merging instead (so model-wide dtype levers reach it) was measured and REJECTED:
+            # letting FF2/WQKV go bf4_b on layer 31 drops top-1 from 99% to 23.8%.
             tensor_precision = (
                 {TensorGroup[key]: PrecisionSetting[value] for key, value in settings.get("precision_cfg").items()}
                 if "precision_cfg" in settings
