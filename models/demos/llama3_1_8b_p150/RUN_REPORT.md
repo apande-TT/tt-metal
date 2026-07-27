@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 05:12:53 UTC · 70 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 05:19:21 UTC · 71 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -115,6 +115,7 @@ MatmulDeviceOperation                       cpp    892.04   +1572.14 ms  · no g
 MatmulDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: measure both kernel rungs on the decode ff1/ff3 shape too Both hand-kernel scripts now sweep (M, K, N) triples and cover e
 MatmulDeviceOperation               tp-fracture    892.11   +1572.07 ms  · no gain  tp_pick_degree(32, 4096, 14336) returned best_tp=1 -- keep decode ff1/ff3 single-chip. Two reasons. The on-mesh sweep is disabled by default because it opens a NESTED mesh device and toggles fabric co
 MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the working tree is clean. A dirty tree scopes record_k
+MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: document the MLP tensor-parallel fracture layout The w1_dims / w2_dims tuples ARE the TP fracture and nothing said so. Ver
 
 Code changes — every attempt (win or fail):
 ===========================================

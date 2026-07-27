@@ -71,6 +71,18 @@ class LMHead(LightweightModule):
         self.output_weights_dram_sharded = []
         self.output_weights_ring_mm = []
 
+        # FULL-GRID LM HEAD. The DRAM-sharded matmul variant width-shards the activation across
+        # `lm_head_core_grid` cores, so its core count must divide K/32 = dim/32 = 128 tiles. On a
+        # P150 (11x10 = 110 cores) the largest such divisor is 64 -- the head therefore leaves ~46
+        # cores idle on every one of its 8 vocab splits, which is exactly the grid=partial tag.
+        # There is no way to widen it while keeping that variant, so take the other variant: hold
+        # the weights DRAM-INTERLEAVED and let ttnn.linear auto-route, which splits the 501 output
+        # tiles per split over the whole grid. Trades DRAM-sharded read bandwidth for occupancy;
+        # which one wins is a measurement, not a derivation.
+        self.full_grid = (
+            self.prefetcher is None and not args.is_galaxy and self.num_devices == 1
+        )
+
         self.split_sizes = [self.split_sizes_dram_sharded]
         if self.prefetcher is not None:
             self.split_sizes.append(self.split_sizes_ring_mm)
@@ -87,11 +99,15 @@ class LMHead(LightweightModule):
                 # Concatenate the splits from all devices
                 combined_split = torch.cat(device_splits, dim=-1)
 
+                # The cache key must encode the memory config: a cached DRAM-width-sharded weight
+                # reloaded for the interleaved path (or vice versa) silently feeds the matmul an
+                # operand whose shard spec its program config does not expect.
+                _layout_tag = "_ilv" if (mode == 0 and self.full_grid) else ""
                 cache_file_name = (
                     None
                     if args.dummy_weights
                     else weight_cache_path
-                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}"
+                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}"
                 )
 
                 def pad_to_power_of_2(n):
@@ -100,8 +116,12 @@ class LMHead(LightweightModule):
                     return 1 << (n - 1).bit_length()
 
                 if mode == 0:
-                    memory_config = args.create_dram_sharded_mem_config(
-                        k=args.dim, n=math.ceil(combined_split.shape[-1] / self.num_devices)
+                    memory_config = (
+                        ttnn.DRAM_MEMORY_CONFIG
+                        if self.full_grid
+                        else args.create_dram_sharded_mem_config(
+                            k=args.dim, n=math.ceil(combined_split.shape[-1] / self.num_devices)
+                        )
                     )
                     self.output_weights_dram_sharded.append(
                         ttnn.as_tensor(
@@ -154,7 +174,13 @@ class LMHead(LightweightModule):
             Mode.DECODE if use_prefetcher else Mode.PREFILL, self.prefetcher if use_prefetcher else None
         )
 
-        if use_prefetcher:
+        if self.full_grid and not use_prefetcher:
+            # Auto-routed interleaved matmul: no shard spec on either operand, so the op is free to
+            # spread its output tiles over every core instead of the 64 the width-shard pins it to.
+            program_configs = [None] * len(split_sizes)
+            self.lm_head_output_memory_config = ttnn.L1_MEMORY_CONFIG
+            x_sharded = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)
+        elif use_prefetcher:
             x_sharded = ttnn.to_memory_config(x, self.lm_head_output_memory_config)
         else:
             x_sharded = ttnn.to_memory_config(x, self.args.get_lm_head_input_mem_config(Mode.DECODE, None))
@@ -169,12 +195,13 @@ class LMHead(LightweightModule):
                 dtype=self.args.lm_head_dtype if hasattr(self.args, "lm_head_dtype") else ttnn.bfloat8_b,
                 sub_device_id=self.prefetcher.worker_sub_device_id if use_prefetcher else None,
             )
-            output = ttnn.to_memory_config(
-                output,
-                memory_config=self.args.get_lm_head_sharded_output_mem_config(
-                    self.prefetcher if use_prefetcher else None
-                ),
-            )
+            if not (self.full_grid and not use_prefetcher):
+                output = ttnn.to_memory_config(
+                    output,
+                    memory_config=self.args.get_lm_head_sharded_output_mem_config(
+                        self.prefetcher if use_prefetcher else None
+                    ),
+                )
 
             outputs.append(output)
 
