@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 15:30:17 UTC · 123 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 18:26:37 UTC · 133 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 662.92 ms
-  at-floor            : 81%   (125.69 ms reachable headroom)
+  measured            : 661.00 ms
+  at-floor            : 81%   (123.78 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -29,7 +29,7 @@ datamove             51.53   2.1%    7141   slow  NLPConcatHeadsDeviceOperation
 other                24.10   1.0%    2618   slow  NLPCreateQKVHeadsDecodeDeviceOperation
 embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
-Block-level timing (per-stage trace) — latest lever on MatmulDeviceOperation:
+Block-level timing (per-stage trace) — latest lever on SDPAOperation:
   MatmulDeviceOperation 128 x 4096 x 14336 (prefill ff1/ff3)    135.69 ms  ###################### · True  <- hottest
   MatmulDeviceOperation 32 x 4096 x 14336 (decode ff1/ff3)     92.45 ms  ###############.......
   MatmulDeviceOperation 32 x 14336 x 4096 (decode ff2)     78.83 ms  #############.........
@@ -55,11 +55,12 @@ MatmulDeviceOperation              ·try      —         ✓win      ·try     
 MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —           1092.12
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
-MatmulDeviceOperation              ✓win      —         ✓win      ·try      —         —         —         ·try         662.92
+MatmulDeviceOperation              ✓win      —         ✓win      ·try      ·try      ·try      ·try      ✓win         662.92
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ✓win      ·try      ✓win         745.01
 NLPConcatHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            714.94
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
 RotaryEmbeddingLlamaDeviceOperatio ✓win      —         —         —         —         —         —         —                 —
+SDPAOperation                      ✓win      —         —         —         —         —         —         —                 —
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 host_overhead                      —         —         —         —         —         —         —         ✓win              —
@@ -191,6 +192,16 @@ MatmulDeviceOperation                     shard         —             —  · 
 MatmulDeviceOperation                     shard    662.92   +1801.26 ms  · no gain  Hypothesis and the arithmetic that bounds it: this op is DRAM-bw bound, so the only shard that can help is one that REMOVES BYTES, i.e. L1 residency -- and the measured rate says there is almost nothi
 MatmulDeviceOperation                     shard    662.92   +1801.26 ms  · no gain  Hypothesis bounded by arithmetic first: this op is DRAM-bw bound, so only a BYTE-REMOVING shard (L1 residency) can help -- and each vocab split already reads 4096 x 16032 bf4_b = 36.9 MB in 121 us = ~
 MatmulDeviceOperation               tp-fracture    662.92   +1801.26 ms  · no gain  Hypothesis: if the LM head is still DRAM-bandwidth bound after every single-chip lever, splitting the 295 MB output-projection weight across chips would divide the bytes each chip fetches. tp_pick_deg
+MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the tree is clean. A dirty tree scopes record_kernel_at
+MatmulDeviceOperation               tp-fracture    662.92   +1801.26 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide ShardTensorToMesh + CCL plumbing (the first record was diff-scoped and flagged UNSUPPORTED). Hypothesis: if the LM head is sti
+MatmulDeviceOperation               tp-fracture    662.92   +1801.26 ms  · no gain  Re-recorded against a genuinely clean model dir so the evidence scan runs whole-model-dir and sees the ShardTensorToMesh + CCL plumbing (the first two records were diff-scoped -- the generated RUN_REP
+MatmulDeviceOperation                structural   1283.73   +1180.45 ms  · no gain  Hunted the whole LM-head chain for reducible work and found exactly one candidate, then DISPROVED it -- the answer is worth more than the lever. Ruled out first, from source: (a) prefill WARMUP is alr
+MatmulDeviceOperation                   tt-lang         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104) custom generic_op/ttl kernels ARE trace-capturable on this build — verified on device: a cac
+MatmulDeviceOperation                   tt-lang    662.92   +1801.26 ms  · no gain  Measured the tt-lang rung on the LM head's OWN shape rather than inheriting the MLP verdicts, by extending tt/ttl_ff2_matmul.py with ttl_mm_lmhead + LmHeadSplitTTL and routing vocab split 0 through it
+MatmulDeviceOperation                       cpp    662.92   +1801.26 ms  · no gain  Authored and wired the C++ Metalium rung on the LM head's OWN shape: extended tt/cpp_mm_generic.py with LmHeadSplitCpp (the repo's reader/mm/writer triple via ttnn.generic_op) and routed vocab split 0
+MatmulDeviceOperation                   tt-lang    662.92   +1801.26 ms  · no gain  CORRECTION to the earlier tt-lang record for this op, which claimed the kernel "is so slow the 225 s correctness run TIMES OUT". That inference is CONFOUNDED and I withdraw it: the device wedged durin
+SDPAOperation                              grid         —             —  ✓ win      committed: llama3_1_8b_p150: size the prefill SDPA chunk+grid to the work, not to 8x8 The prefill SDPA factory flattens attention into B*n_local_heads*
+SDPAOperation                              grid    661.00   +1803.18 ms  ✓ win      Hypothesis from READING the prefill SDPA program factory rather than guessing a grid: it flattens work into B*n_local_heads*ceil(seq/q_chunk) Q-chunks and pair-distributes them for causal attention, s
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2887,6 +2898,49 @@ Code changes — every attempt (win or fail):
     +        lm_head_weight_dtype = getattr(args, "lm_head_weight_dtype", None) or ttnn.bfloat4_b
              self.lm_head = LMHead(
     ... (truncated, 8 more lines)
+
+[#133] SDPAOperation · grid · win  +1803.18 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 9e0a02dd52..0f4453f745 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1598,8 +1598,51 @@ class ModelArgs:
+                 if seq_len >= 2048
+                 else min(64, chunk_start_idx & -chunk_start_idx)
+             )
+    +        # Occupancy. The prefill SDPA factory flattens the work into
+    +        #     total_q_chunks = B * n_local_heads * ceil(seq_len / q_chunk)
+    +        # and, for causal attention with an even chunk count, hands out PAIRS (one light +
+    +        # one heavy chunk per core) so the triangular load balances. The number of cores it
+    +        # can keep busy is therefore capped by that chunk/pair count, NOT by the grid it is
+    +        # handed: at seq_len=128 the 64-token default gives 2 chunks/head, so 32 heads
+    +        # produce 64 chunks = 32 pairs = 32 busy cores however wide the grid is. That is why
+    +        # the profiler tags this op grid=partial, and no program_config grid alone can fix it.
+    +        #
+    +        # Two coupled corrections, and they must move together:
+    +        #   1. Halve q_chunk (never below one tile) until the busy-core cap covers the grid --
+    +        #      this is what creates work for the idle half of the chip.
+    +        #   2. Size the grid to that cap instead of a hard-coded Wormhole 8x8. Surplus cores
+    +        #      are not free (they are still launched and still join the op's barriers), and
+    +        #      long prefill is the opposite case -- there the 8x8 was leaving 46 of the P150's
+    +        #      110 cores unused.
+    +        grid = getattr(self, "max_grid_size", None)
+    +        if grid is None:  # no device (e.g. test_torch.py) -- keep the historical 8x8
+    +            grid = ttnn.CoreGrid(y=8, x=8)
+    +        sdpa_grid = (min(8, grid.x), min(8, grid.y))
+    +        if chunk_start_idx is None or chunk_start_idx == 0:
+    +            heads = max(1, getattr(self, "n_local_heads", self.n_heads))
+    +            max_cores = grid.x * grid.y
+    +
+    +            def _busy_cap(qc):
+    +                q_num_chunks = max(1, -(-seq_len // qc))
+    +                total = heads * q_num_chunks
+    +                return max(1, total // 2 if q_num_chunks % 2 == 0 else total)
+    +
+    +            while (
+    +                q_chunk > ttnn.TILE_SIZE
+    +                and q_chunk % (2 * ttnn.TILE_SIZE) == 0
+    ... (truncated, 17 more lines)
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation

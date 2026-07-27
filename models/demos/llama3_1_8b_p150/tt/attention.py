@@ -317,6 +317,13 @@ class Attention(LightweightModule):
         else:
             self.k_norm = lambda x, mode, norm_config: x
 
+        # Whether q_norm/k_norm are identity. The fused split+rope kernel does the rotation inside
+        # the head split, i.e. BEFORE where these norms sit in the chain, so it is only a legal
+        # substitution when there are no norms to reorder past (llama has none; qwen3 does).
+        self.qk_norm_is_identity = (
+            f"{q_norm_str}.weight" not in state_dict and f"{k_norm_str}.weight" not in state_dict
+        )
+
         # For ring topology we can use all gather matmul for wo
         self.use_fused_all_gather_matmul = self.args.use_fused_all_gather_matmul
         pt_wo = state_dict[f"{wo_str}.weight"].transpose(-1, -2).unsqueeze(0).unsqueeze(0)
@@ -1037,39 +1044,79 @@ class Attention(LightweightModule):
                 xqkv_fused, self.n_local_heads, self.n_local_kv_heads, self.head_dim
             )
         )
-        if _use_ttl_heads:
-            (
-                q_heads_1QSD_pre_rot,
-                k_heads_1KSD_pre_rot,
-                v_heads_1VSD,
-            ) = ttl_create_qkv_heads.create_qkv_heads_ttl(xqkv_fused, create_heads_mem_config)
-        else:
-            (
-                q_heads_1QSD_pre_rot,
-                k_heads_1KSD_pre_rot,
-                v_heads_1VSD,
-            ) = ttnn.experimental.nlp_create_qkv_heads(
+        # structural rung for RotaryEmbeddingLlamaDeviceOperation: the prefill rope is DISPATCH
+        # bound (736 launches x 9.55 us against a 1.21 us roofline -- a [32,1,128,128] rotation is
+        # only ~8 tiles per core, so almost all of the 9.55 us is fixed launch cost). No knob
+        # removes a fixed cost, so remove the LAUNCHES: the rotation is tile-local (x*cos +
+        # (x @ trans_mat)*sin, one 32x32 trans tile per tile, cos/sin head-broadcast), and the
+        # head-split kernel already streams every Q/K tile through its compute stage -- so the
+        # rotate rides along in the slot the split already pays for and the two rope dispatches
+        # disappear. Only legal while q_norm/k_norm are identity (see qk_norm_is_identity).
+        _fused_rope = (
+            _use_ttl_heads
+            and self.qk_norm_is_identity
+            and not self.use_hf_rope
+            and rot_mats is not None
+            and self.transformation_mats.get("prefill") is not None
+            and ttl_create_qkv_heads.supports_rope(
                 xqkv_fused,
-                num_heads=self.n_local_heads,
-                num_kv_heads=self.n_local_kv_heads,
-                transpose_k_heads=False,
-                memory_config=create_heads_mem_config,
+                self.n_local_heads,
+                self.n_local_kv_heads,
+                self.head_dim,
+                rot_mats[0],
+                rot_mats[1],
+                self.transformation_mats["prefill"],
             )
+        )
+        if _fused_rope:
+            (
+                q_heads_1QSD,
+                k_heads_1KSD,
+                v_heads_1VSD,
+            ) = ttl_create_qkv_heads.create_qkv_heads_rope_ttl(
+                xqkv_fused,
+                rot_mats[0],
+                rot_mats[1],
+                self.transformation_mats["prefill"],
+                create_heads_mem_config,
+            )
+            ttnn.deallocate(xqkv_fused)
+        else:
+            if _use_ttl_heads:
+                (
+                    q_heads_1QSD_pre_rot,
+                    k_heads_1KSD_pre_rot,
+                    v_heads_1VSD,
+                ) = ttl_create_qkv_heads.create_qkv_heads_ttl(xqkv_fused, create_heads_mem_config)
+            else:
+                (
+                    q_heads_1QSD_pre_rot,
+                    k_heads_1KSD_pre_rot,
+                    v_heads_1VSD,
+                ) = ttnn.experimental.nlp_create_qkv_heads(
+                    xqkv_fused,
+                    num_heads=self.n_local_heads,
+                    num_kv_heads=self.n_local_kv_heads,
+                    transpose_k_heads=False,
+                    memory_config=create_heads_mem_config,
+                )
 
-        norm_config = self.args.get_norm_config("attn", Mode.PREFILL, None)
-        q_heads_1QSD_pre_rot = self.q_norm(q_heads_1QSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
-        k_heads_1KSD_pre_rot = self.k_norm(k_heads_1KSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
+            norm_config = self.args.get_norm_config("attn", Mode.PREFILL, None)
+            q_heads_1QSD_pre_rot = self.q_norm(q_heads_1QSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
+            k_heads_1KSD_pre_rot = self.k_norm(k_heads_1KSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
 
-        ttnn.deallocate(xqkv_fused)
+            ttnn.deallocate(xqkv_fused)
 
-        ###
-        # Rotary embeddings
-        ###
+            ###
+            # Rotary embeddings
+            ###
 
-        # Apply rotary embeddings using the selected implementation
-        q_heads_1QSD, k_heads_1KSD = self.rotary_embedding_prefill(q_heads_1QSD_pre_rot, k_heads_1KSD_pre_rot, rot_mats)
-        ttnn.deallocate(q_heads_1QSD_pre_rot)
-        ttnn.deallocate(k_heads_1KSD_pre_rot)
+            # Apply rotary embeddings using the selected implementation
+            q_heads_1QSD, k_heads_1KSD = self.rotary_embedding_prefill(
+                q_heads_1QSD_pre_rot, k_heads_1KSD_pre_rot, rot_mats
+            )
+            ttnn.deallocate(q_heads_1QSD_pre_rot)
+            ttnn.deallocate(k_heads_1KSD_pre_rot)
 
         # Fill KV-Cache
         if kv_cache:
