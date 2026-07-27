@@ -170,12 +170,22 @@ class MLP(LightweightModule):
 
         ff1_3_out_mem_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if full_grid_ff1_3 else ff1_3_input_mem_config
 
+        # ff1/ff3's w1/w3 weights are already at the bf4_b floor, so the only dtype left on this
+        # DRAM-bound pair is what they WRITE. Each emits a [seq, hidden] intermediate that then gets
+        # read three times (the SILU mul reads both and writes its own, ff2 reads that) -- at
+        # seq_len=128 that is 3.67 MB per tensor per layer at bf16. bf8_b halves every one of those
+        # trips. Prefill only: decode's intermediate is 32 rows, too small for this to pay for the
+        # precision, and decode is the steady-state path.
+        ff1_3_out_dtype = ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16
+        if mode == Mode.PREFILL and not TG:
+            ff1_3_out_dtype = ttnn.bfloat8_b
+
         x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
 
         w1_out = ttnn.linear(
             x_sharded,
             self.w1,
-            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
+            dtype=ff1_3_out_dtype,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
             program_config=pc_1,
@@ -188,7 +198,7 @@ class MLP(LightweightModule):
         w3_out = ttnn.linear(
             x_sharded,
             self.w3,
-            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
+            dtype=ff1_3_out_dtype,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
             program_config=pc_3,
