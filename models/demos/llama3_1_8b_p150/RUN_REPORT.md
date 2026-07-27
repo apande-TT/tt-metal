@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 06:31:21 UTC · 86 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 06:39:14 UTC · 88 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -38,7 +38,7 @@ MatmulDeviceOperation              ✓win      —         ✓win      —      
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
-MatmulDeviceOperation              ·try      —         —         —         —         —         —         —            754.36
+MatmulDeviceOperation              ·try      —         ✓win      —         —         —         —         —            754.36
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
@@ -134,6 +134,8 @@ MatmulDeviceOperation                     dtype         —             —  ✓
 MatmulDeviceOperation                     dtype    749.85   +1714.33 ms  ✓ win      Hypothesis: this projection is DRAM-bandwidth bound and WQKV was the largest weight in the model still on the BFP8 default -- the MLP already rides bf4_b end to end, but the fused QKV weight [dim, (nq
 MatmulDeviceOperation                      grid    754.36   +1709.82 ms  · no gain  Hypothesis: decode QKV is grid=partial because find_grid() sorts candidate core counts by distance from a hard-coded target=32 -- the right answer on a 64-core Wormhole, but on a 110-core P150 it pick
 MatmulDeviceOperation                      grid    754.36   +1709.82 ms  · no gain  Hypothesis: decode QKV is grid=partial because find_grid() sorts candidate core counts by distance from a hard-coded target=32 -- correct on a 64-core Wormhole, but on a 110-core P150 it picks 32 core
+MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: write the decode QKV output as bf8_b wqkv reached the bf4_b weight floor in the previous commit, so the only dtype bytes l
+MatmulDeviceOperation                     dtype    749.94   +1714.24 ms  ✓ win      Hypothesis via the catalogued matmul-coherence lever: wqkv hit the bf4_b weight floor in the previous commit, so the only dtype bytes left on this DRAM-bw-bound matmul are the ones it WRITES. Found th
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2176,8 +2178,40 @@ Code changes — every attempt (win or fail):
     +                    return ttnn.CoreGrid(x=cores // rows, y=rows)
     ... (truncated, 5 more lines)
 
+[#88] MatmulDeviceOperation · dtype · win  +1714.24 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index c4ed5954c9..76b944f93e 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -594,13 +594,24 @@ class Attention(LightweightModule):
+             qkv_input_mem_config = self.args.get_attn_qkv_mm_mem_config(Mode.DECODE, self.prefetcher)
+             x_sharded = ttnn.to_memory_config(x, qkv_input_mem_config) if self.prefetcher is not None else x
+     
+    +        # wqkv is already at the bf4_b weight floor, so the only dtype bytes left on this
+    +        # DRAM-bw-bound matmul are what it WRITES. The fused [32, qkv_size] output is consumed
+    +        # only by the (single-chip no-op) all-reduce and then by sharded_to_interleaved, which
+    +        # re-emits bf16 regardless because nlp_create_qkv_heads_decode requires it -- so writing
+    +        # bf8_b here halves the store and the reshard's read without changing the dtype contract
+    +        # the head split sees. bf8_b is the floor: Q/K/V feed the KV cache and SDPA, and pushing
+    +        # attention tensors below bf8_b compounds over depth.
+    +        _qkv_decode_out_dtype = self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16
+    +        if not self.TG and self.prefetcher is None and self.activation_dtype is None:
+    +            _qkv_decode_out_dtype = ttnn.bfloat8_b
+    +
+             xqkv_fused_sharded = ttnn.linear(
+                 x_sharded,
+                 self.wqkv,
+                 memory_config=qkv_input_mem_config,
+                 program_config=self.args.get_attn_qkv_program_config(Mode.DECODE, 1, self.prefetcher),
+                 compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
+    -            dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
+    +            dtype=_qkv_decode_out_dtype,
+                 global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
+                 sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+             )
+
 Limitations / suggested manual next steps:
-- 2 op(s) tried but no lever beat baseline: LayerNormDeviceOperation, MatmulDeviceOperation
+- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:

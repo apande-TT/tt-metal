@@ -605,6 +605,17 @@ class Attention(LightweightModule):
         if not self.TG and self.prefetcher is None and self.activation_dtype is None:
             _qkv_decode_out_dtype = ttnn.bfloat8_b
 
+        # SHARD RUNG (A/B against the bf8_b store above). Both operands of this matmul are
+        # already L1 width-sharded and the 13 MB/layer bf4_b weight can never be L1-resident, so
+        # the only sharding left to change is the HANDOFF: today the output is width-sharded in
+        # L1 and then sharded_to_interleaved'd before the head split. Keeping it sharded deletes
+        # that reshard from the per-token chain -- but nlp_create_qkv_heads_decode requires bf16,
+        # and the reshard is currently what does the bf8_b -> bf16 upcast, so this trades the
+        # store saving for the reshard. Which side wins is a measurement.
+        _keep_qkv_sharded = not self.TG and self.prefetcher is None
+        if _keep_qkv_sharded:
+            _qkv_decode_out_dtype = ttnn.bfloat16
+
         xqkv_fused_sharded = ttnn.linear(
             x_sharded,
             self.wqkv,
@@ -649,7 +660,10 @@ class Attention(LightweightModule):
             )
         else:
             # bfloat16 is required by nlp_create_qkv_heads_decode
-            if self.prefetcher is None:
+            if _keep_qkv_sharded:
+                # Already bf16 and L1 width-sharded -- hand it straight to the head split.
+                xqkv_fused = xqkv_fused_sharded
+            elif self.prefetcher is None:
                 xqkv_fused = ttnn.sharded_to_interleaved(xqkv_fused_sharded, ttnn.L1_MEMORY_CONFIG, ttnn.bfloat16)
                 ttnn.deallocate(xqkv_fused_sharded)
             else:
