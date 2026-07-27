@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 20:20:13 UTC · 145 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 20:21:13 UTC · 148 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -211,6 +211,9 @@ BinaryNgDeviceOperation                   shard    648.17   +1816.01 ms  ✓ win
 BinaryNgDeviceOperation              structural    648.17   +1816.01 ms  · no gain  Hunted reducible work behind this eltwise and found the single largest one in the whole benchmark, then proved it is CORRECTNESS-blocked -- which corrects an earlier round's record of the same lever a
 BinaryNgDeviceOperation                 tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: record the tt-lang residual-add kernel and why it loses tt/ttl_residual_add.py is a real multi-core tt-lang kernel for the
 BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no gain  Authored tt/ttl_residual_add.py, a real multi-core tt-lang kernel, and wired it into the model rather than measuring it standalone. Instance choice first, because four of this op's five shapes are clo
+BinaryNgDeviceOperation                 tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log. Also required for the kernel-marker scan: with a dirty tr
+BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no gain  Re-recorded against a clean tree so the evidence scan runs whole-model-dir and sees tt/ttl_residual_add.py (the first record was diff-scoped by a dirty RUN_REPORT and flagged UNSUPPORTED). Authored tt
+BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no gain  Re-recorded against a genuinely clean tree so the evidence scan runs whole-model-dir and sees tt/ttl_residual_add.py (the first two records were diff-scoped and flagged UNSUPPORTED -- a committed kern
 
 Code changes — every attempt (win or fail):
 ===========================================
