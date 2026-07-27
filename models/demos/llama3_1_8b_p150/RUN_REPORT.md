@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 06:07:52 UTC · 82 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 06:31:21 UTC · 86 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 758.37 ms
-  at-floor            : 71%   (221.14 ms reachable headroom)
+  measured            : 749.85 ms
+  at-floor            : 72%   (212.62 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -34,10 +34,11 @@ op                                 grid      fidelity  dtype     shard     host 
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
-MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —           1092.12
+MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —           1092.12
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
+MatmulDeviceOperation              ·try      —         —         —         —         —         —         —            754.36
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
@@ -129,6 +130,10 @@ NlpCreateHeadsDeviceOperation           tt-lang         —             —  ✓
 NlpCreateHeadsDeviceOperation           tt-lang    758.37   +1705.81 ms  ✓ win      Hypothesis: a kernel is the RIGHT rung here because the knob rungs are closed by construction, not by tuning -- the stock op sizes cores from num_blocks = batch*seq_len/TILE_HEIGHT (one work unit per 
 NlpCreateHeadsDeviceOperation           tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the tree is clean. A dirty tree scopes record_kernel_at
 NlpCreateHeadsDeviceOperation           tt-lang    758.37   +1705.81 ms  ✓ win      Re-recorded against a clean tree so the kernel-marker scan sees tt/ttl_create_qkv_heads.py (the first record was diff-scoped to attention.py and flagged UNSUPPORTED). Hypothesis: a kernel is the RIGHT
+MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: put the fused QKV weight on bf4_b WQKV was still on the BFP8 default while the whole MLP already rides bf4_b. The fused QK
+MatmulDeviceOperation                     dtype    749.85   +1714.33 ms  ✓ win      Hypothesis: this projection is DRAM-bandwidth bound and WQKV was the largest weight in the model still on the BFP8 default -- the MLP already rides bf4_b end to end, but the fused QKV weight [dim, (nq
+MatmulDeviceOperation                      grid    754.36   +1709.82 ms  · no gain  Hypothesis: decode QKV is grid=partial because find_grid() sorts candidate core counts by distance from a hard-coded target=32 -- the right answer on a 64-core Wormhole, but on a 110-core P150 it pick
+MatmulDeviceOperation                      grid    754.36   +1709.82 ms  · no gain  Hypothesis: decode QKV is grid=partial because find_grid() sorts candidate core counts by distance from a hard-coded target=32 -- correct on a 64-core Wormhole, but on a 110-core P150 it picks 32 core
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2052,8 +2057,127 @@ Code changes — every attempt (win or fail):
     +                q_heads_1QSD_pre_rot,
     ... (truncated, 219 more lines)
 
+[#84] MatmulDeviceOperation · dtype · win  +1714.33 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 8b557ec23c..61d172b9df 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -232,6 +232,13 @@ class ModelOptimizations:
+                     "TensorPrecision": {
+                         TensorGroup.FF1_FF3: PrecisionSetting.BFP4,
+                         TensorGroup.FF2: PrecisionSetting.BFP4,
+    +                    # WQKV was still on the BFP8 default while the whole MLP rides bf4_b. The
+    +                    # fused QKV weight is [dim, (nq + 2*nkv)*head_dim] = 25M params, ~26 MB per
+    +                    # layer at bf8_b, and the projection is DRAM-bandwidth bound in the roofline
+    +                    # -- so this is the largest weight left that has a dtype step available. It is
+    +                    # one resident tensor shared by the prefill AND decode QKV matmuls, so the
+    +                    # halving lands on both paths.
+    +                    TensorGroup.WQKV: PrecisionSetting.BFP4,
+                     },
+                     "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI},
+                 }
+    @@ -422,6 +429,12 @@ def parse_decoder_json(json_file_path, default_optimization=ModelOptimizations.p
+             for decoder_id, settings in config_data["decoders"].items():
+                 decoder_id = int(decoder_id)
+     
+    +            # A decoder entry REPLACES the optimization level's settings rather than merging onto
+    +            # them, so a decoder named here falls back to the BFP8/HIFI2 defaults for every tensor
+    +            # it does not mention. That looks like a bug and is load-bearing: it is what keeps
+    +            # decoder 31 -- the last layer, which this file exists to protect -- entirely at BFP8.
+    +            # Merging instead (so model-wide dtype levers reach it) was measured and REJECTED:
+    +            # letting FF2/WQKV go bf4_b on layer 31 drops top-1 from 99% to 23.8%.
+                 tensor_precision = (
+                     {TensorGroup[key]: PrecisionSetting[value] for key, value in settings.get("precision_cfg").items()}
+                     if "precision_cfg" in settings
+
+[#85] MatmulDeviceOperation · grid · no gain  +1709.82 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 61d172b9df..8239ba34de 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -773,7 +773,16 @@ class ModelArgs:
+     
+                 # For maximum performance, set the prefill grid row to 8, even if it can fit in a smaller grid
+                 self.prefill_rows = 8
+    -            self.attn_input_grid = self.dram_shard_core_grid_for_k(self.dim)
+    +            # One grid drives three coupled things here: the width-shard of the attention input,
+    +            # the DECODE QKV matmul's core count, and the attention norm's sharded program config.
+    +            # find_grid() aims at 32 cores, so all three ran on 32 of the P150's 110 -- while 64
+    +            # is equally legal (the only rule is that the core count divide dim/32 = 128 tiles).
+    +            # Widen coherently so the norm still hands the matmul a shard it can consume.
+    +            self.attn_input_grid = (
+    +                self.widest_dram_shard_core_grid_for_k(self.dim)
+    +                if not self.is_galaxy
+    +                else None
+    +            ) or self.dram_shard_core_grid_for_k(self.dim)
+                 self.mlp1_3_grid = lambda seq_len: (
+                     (8, min(min(seq_len, 1024) // 32, 4))
+                     if self.is_galaxy
+    @@ -3292,6 +3301,26 @@ class ModelArgs:
+             rows, cols = self.find_grid(k // ttnn.TILE_SIZE)
+             return ttnn.CoreGrid(x=cols, y=rows)
+     
+    +    def widest_dram_shard_core_grid_for_k(self, k: int):
+    +        """The WIDEST core grid a DRAM-sharded matmul on this K can legally use.
+    +
+    +        ``find_grid`` sorts candidate core counts by distance from a hard-coded ``target = 32``,
+    +        which was the right answer on a 64-core Wormhole and leaves most of a 110-core Blackhole
+    +        idle. The actual constraint is only that the core count divide ``k / TILE`` (the
+    +        activation is width-sharded, one K-slice per core) and fit the device grid -- so take the
+    +        largest such divisor instead of the one nearest 32. Returns None when nothing beats
+    +        ``find_grid``'s choice.
+    +        """
+    +        tiles = k // ttnn.TILE_SIZE
+    +        gx, gy = self.max_grid_size.x, self.max_grid_size.y
+    +        for cores in range(gx * gy, 0, -1):
+    +            if tiles % cores:
+    ... (truncated, 9 more lines)
+
+[#86] MatmulDeviceOperation · grid · no gain  +1709.82 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 61d172b9df..fac6368d6e 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -773,7 +773,11 @@ class ModelArgs:
+     
+                 # For maximum performance, set the prefill grid row to 8, even if it can fit in a smaller grid
+                 self.prefill_rows = 8
+    -            self.attn_input_grid = self.dram_shard_core_grid_for_k(self.dim)
+    +            self.attn_input_grid = (
+    +                self.widest_dram_shard_core_grid_for_k(self.dim)
+    +                if not self.is_galaxy
+    +                else None
+    +            ) or self.dram_shard_core_grid_for_k(self.dim)
+                 self.mlp1_3_grid = lambda seq_len: (
+                     (8, min(min(seq_len, 1024) // 32, 4))
+                     if self.is_galaxy
+    @@ -3292,6 +3296,27 @@ class ModelArgs:
+             rows, cols = self.find_grid(k // ttnn.TILE_SIZE)
+             return ttnn.CoreGrid(x=cols, y=rows)
+     
+    +    def widest_dram_shard_core_grid_for_k(self, k: int):
+    +        """The WIDEST core grid a DRAM-sharded matmul on this K can legally use.
+    +
+    +        MEASURED AND REJECTED for attn_input_grid -- kept as the record of the grid rung on the
+    +        decode QKV matmul. ``find_grid`` sorts candidates by distance from a hard-coded
+    +        ``target = 32``, which looks like a 64-core Wormhole leftover on a 110-core Blackhole:
+    +        the real constraint is only that the core count divide ``k / TILE``. Taking the largest
+    +        such divisor (64 instead of 32 at dim=4096) measured 749.85 -> 754.36 ms. The op is
+    +        DRAM-bandwidth bound, so extra cores buy no bandwidth while halving each core's K-slice
+    +        to 2 tiles and per_core_N from 6 to 3 -- target=32 is load-bearing at this shape.
+    +        """
+    +        tiles = k // ttnn.TILE_SIZE
+    +        gx, gy = self.max_grid_size.x, self.max_grid_size.y
+    +        for cores in range(gx * gy, 0, -1):
+    +            if tiles % cores:
+    +                continue
+    +            for rows in range(min(cores, gy), 0, -1):
+    +                if cores % rows == 0 and cores // rows <= gx:
+    +                    return ttnn.CoreGrid(x=cores // rows, y=rows)
+    ... (truncated, 5 more lines)
+
 Limitations / suggested manual next steps:
-- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
+- 2 op(s) tried but no lever beat baseline: LayerNormDeviceOperation, MatmulDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:

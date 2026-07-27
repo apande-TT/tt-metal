@@ -594,13 +594,24 @@ class Attention(LightweightModule):
         qkv_input_mem_config = self.args.get_attn_qkv_mm_mem_config(Mode.DECODE, self.prefetcher)
         x_sharded = ttnn.to_memory_config(x, qkv_input_mem_config) if self.prefetcher is not None else x
 
+        # wqkv is already at the bf4_b weight floor, so the only dtype bytes left on this
+        # DRAM-bw-bound matmul are what it WRITES. The fused [32, qkv_size] output is consumed
+        # only by the (single-chip no-op) all-reduce and then by sharded_to_interleaved, which
+        # re-emits bf16 regardless because nlp_create_qkv_heads_decode requires it -- so writing
+        # bf8_b here halves the store and the reshard's read without changing the dtype contract
+        # the head split sees. bf8_b is the floor: Q/K/V feed the KV cache and SDPA, and pushing
+        # attention tensors below bf8_b compounds over depth.
+        _qkv_decode_out_dtype = self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16
+        if not self.TG and self.prefetcher is None and self.activation_dtype is None:
+            _qkv_decode_out_dtype = ttnn.bfloat8_b
+
         xqkv_fused_sharded = ttnn.linear(
             x_sharded,
             self.wqkv,
             memory_config=qkv_input_mem_config,
             program_config=self.args.get_attn_qkv_program_config(Mode.DECODE, 1, self.prefetcher),
             compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
-            dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
+            dtype=_qkv_decode_out_dtype,
             global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
             sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
         )
