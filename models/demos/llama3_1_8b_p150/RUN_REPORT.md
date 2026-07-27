@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 03:28:38 UTC · 38 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 03:56:31 UTC · 46 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 1061.00 ms
-  at-floor            : 51%   (523.77 ms reachable headroom)
+  measured            : 1057.72 ms
+  at-floor            : 51%   (520.49 ms reachable headroom)
   status              : BELOW_BAND — keep optimizing
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -34,7 +34,7 @@ op                                 grid      fidelity  dtype     shard     host 
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —           1092.12
-MatmulDeviceOperation              ·try      —         ·try      —         —         —         —         —           1060.95
+MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ·try      ·try      ·try        1057.68
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 
@@ -80,6 +80,14 @@ MatmulDeviceOperation               tp-fracture         —             —  ✓
 MatmulDeviceOperation                      grid   1061.12   +1403.06 ms  · no gain  find_grid_k_n hard-codes max_rows=max_cols=8 (a Wormhole 8x8 assumption) and it is what sizes the DRAM-sharded DECODE matmuls, so on an 11x10 P150 it discards 40%+ of the chip before its divisibility 
 MatmulDeviceOperation                      grid   1063.96   +1400.22 ms  · no gain  Decode ff2 (m=32 -> the per-token path) is DRAM-sharded on mlp2_core_grid, so I attacked the two grid-sizing helpers that pick its core count: find_grid_k_n hard-coded Wormhole 8x8, and find_grid both
 MatmulDeviceOperation                     dtype   1060.95   +1403.23 ms  · no gain  Decode ff2's WEIGHT is already at the bf4_b floor (commit 67acf99 flipped all 896 w2 instances, decode included), so the only dtype bytes left on this DRAM-bw-bound matmul are the ACTIVATIONS flowing 
+MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: carry the DECODE MLP intermediates as bf8_b too The ff1/ff3 -> SILU mul -> ff2 chain was already bf8_b in prefill but deco
+MatmulDeviceOperation                     dtype   1057.72   +1406.46 ms  ✓ win      COMMITTED. Decode ff2's WEIGHT is already at the bf4_b floor, so the only dtype bytes left are the activations around it. First tried the model-wide walk (TensorGroup.ACTIVATION=BFP8) and REVERTED it 
+MatmulDeviceOperation                     shard   1057.68   +1406.50 ms  · no gain  Hypothesis: on a DRAM-bw-bound decode ff2 the bytes to remove are the 33 MB w2 read, so the shard lever means L1 weight residency; the activation side was already fully sharded. Two findings. (1) L1-r
+MatmulDeviceOperation                     shard   1057.68   +1406.50 ms  · no gain  Hypothesis: on a DRAM-bw-bound decode ff2 the bytes to remove are the 33 MB w2 read, so the shard lever here means L1 WEIGHT residency; the activation side of the chain was already sharded. Two result
+MatmulDeviceOperation               tp-fracture   1057.72   +1406.46 ms  · no gain  Hypothesis: if this decode ff2 is DRAM-bandwidth bound and single-chip levers are spent, splitting the 33 MB w2 read across chips would divide the bytes each chip must fetch. tp_pick_degree(32, 14336,
+MatmulDeviceOperation                structural   1057.72   +1406.46 ms  · no gain  Hunted for reducible work and found a real candidate, then DISPROVED it -- the answer is worth more than the lever. A full-depth op-signature probe showed ff2 is not uniformly at the bf4_b floor: 62 i
+MatmulDeviceOperation                   tt-lang   1057.72   +1406.46 ms  · no gain  Hypothesis: the 128-row tt-lang result should NOT be assumed to carry to the decode shape, because M=32 is a quarter of the work and the two costs scale differently -- so I re-measured the kernel on f
+MatmulDeviceOperation                       cpp   1057.72   +1406.46 ms  · no gain  Same reasoning as the tt-lang rung: do not inherit the 128-row verdict, measure the C++ Metalium kernel on ff2's OWN decode shape. Parameterised tt/cpp_mm_generic.py (reader/compute/writer triple adap
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -994,9 +1002,226 @@ Code changes — every attempt (win or fail):
     +
     ... (truncated, 88 more lines)
 
+[#40] MatmulDeviceOperation · dtype · win  +1406.46 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 4bc19dc82c..e7c3ef31df 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -177,7 +177,13 @@ class MLP(LightweightModule):
+             # trips. Prefill only: decode's intermediate is 32 rows, too small for this to pay for the
+             # precision, and decode is the steady-state path.
+             ff1_3_out_dtype = ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16
+    -        if mode == Mode.PREFILL and not TG:
+    +        if not TG:
+    +            # Narrow (per-tensor) form of the activation dtype walk. A model-wide
+    +            # TensorGroup.ACTIVATION=BFP8 destroys accuracy because it also lands on the residual
+    +            # stream, the norm inputs and the KV cache; these two tensors are fenced off from all of
+    +            # that -- they feed nothing but the SILU mul, whose output ff2 then reads. Applies in
+    +            # DECODE as well as PREFILL: decode's intermediate is only 32 rows, but it is written
+    +            # twice, read twice and paid on EVERY token.
+                 ff1_3_out_dtype = ttnn.bfloat8_b
+     
+             # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+
+[#41] MatmulDeviceOperation · shard · no gain  +1406.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 4bc19dc82c..e7c3ef31df 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -177,7 +177,13 @@ class MLP(LightweightModule):
+             # trips. Prefill only: decode's intermediate is 32 rows, too small for this to pay for the
+             # precision, and decode is the steady-state path.
+             ff1_3_out_dtype = ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16
+    -        if mode == Mode.PREFILL and not TG:
+    +        if not TG:
+    +            # Narrow (per-tensor) form of the activation dtype walk. A model-wide
+    +            # TensorGroup.ACTIVATION=BFP8 destroys accuracy because it also lands on the residual
+    +            # stream, the norm inputs and the KV cache; these two tensors are fenced off from all of
+    +            # that -- they feed nothing but the SILU mul, whose output ff2 then reads. Applies in
+    +            # DECODE as well as PREFILL: decode's intermediate is only 32 rows, but it is written
+    +            # twice, read twice and paid on EVERY token.
+                 ff1_3_out_dtype = ttnn.bfloat8_b
+     
+             # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+
+[#42] MatmulDeviceOperation · shard · no gain  +1406.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 8b557ec23c..4b4c59fa6b 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1422,7 +1422,19 @@ class ModelArgs:
+                         use_height_and_width_as_shard_shape=True,
+                     )
+                 else:
+    -                return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
+    +                # Pin the shard spec to ff2's core grid rather than letting the generic
+    +                # L1_WIDTH_SHARDED config derive one from the producing matmul, so the SILU mul lands
+    +                # directly on the grid ff2 reads from and no reshard is needed before ff2.
+    +                return ttnn.create_sharded_memory_config(
+    +                    shape=(
+    +                        self.tile_padded_batch_rows,
+    +                        self.hidden_dim // self.cluster_shape[1] // self.mlp2_core_grid.num_cores,
+    +                    ),
+    +                    core_grid=self.mlp2_core_grid,
+    +                    strategy=ttnn.ShardStrategy.WIDTH,
+    +                    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+    +                    use_height_and_width_as_shard_shape=True,
+    +                )
+             elif mode == Mode.PREFILL:
+                 return ttnn.DRAM_MEMORY_CONFIG
+             else:
+
+[#43] MatmulDeviceOperation · tp-fracture · no gain  +1406.46 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 4bc19dc82c..e7c3ef31df 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -177,7 +177,13 @@ class MLP(LightweightModule):
+             # trips. Prefill only: decode's intermediate is 32 rows, too small for this to pay for the
+             # precision, and decode is the steady-state path.
+             ff1_3_out_dtype = ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16
+    -        if mode == Mode.PREFILL and not TG:
+    +        if not TG:
+    +            # Narrow (per-tensor) form of the activation dtype walk. A model-wide
+    +            # TensorGroup.ACTIVATION=BFP8 destroys accuracy because it also lands on the residual
+    +            # stream, the norm inputs and the KV cache; these two tensors are fenced off from all of
+    +            # that -- they feed nothing but the SILU mul, whose output ff2 then reads. Applies in
+    +            # DECODE as well as PREFILL: decode's intermediate is only 32 rows, but it is written
+    +            # twice, read twice and paid on EVERY token.
+                 ff1_3_out_dtype = ttnn.bfloat8_b
+     
+             # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+
+[#44] MatmulDeviceOperation · structural · no gain  +1406.46 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 8b557ec23c..abc07d8953 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -422,17 +422,25 @@ def parse_decoder_json(json_file_path, default_optimization=ModelOptimizations.p
+             for decoder_id, settings in config_data["decoders"].items():
+                 decoder_id = int(decoder_id)
+     
+    -            tensor_precision = (
+    -                {TensorGroup[key]: PrecisionSetting[value] for key, value in settings.get("precision_cfg").items()}
+    -                if "precision_cfg" in settings
+    -                else default_tensor_dtype_settings
+    -            )
+    +            # MERGE the per-decoder overrides onto the chosen optimization level, do not REPLACE it.
+    +            # ModelOptimizations.__init__ starts from _default_settings() (BFP8 everywhere), so
+    +            # handing it only the JSON's keys silently reverts every tensor the JSON does NOT mention
+    +            # back to that bring-up default. For Llama-3.1-8B the file asks for exactly one thing --
+    +            # decoder 31's FF1_FF3 raised to BFP8 -- and the side effect was that the same decoder's
+    +            # FF2 also fell from the performance preset's BFP4 to BFP8, i.e. the last layer read
+    +            # twice the w2 bytes for no reason anyone asked for. Merging keeps the explicit override
+    +            # and leaves everything else on the preset.
+    +            tensor_precision = dict(default_tensor_dtype_settings)
+    +            if "precision_cfg" in settings:
+    +                tensor_precision.update(
+    +                    {TensorGroup[key]: PrecisionSetting[value] for key, value in settings["precision_cfg"].items()}
+    +                )
+     
+    -            op_fidelity = (
+    -                {OpGroup[key]: MathFidelitySetting[value] for key, value in settings.get("fidelity_cfg").items()}
+    -                if "fidelity_cfg" in settings
+    -                else default_op_fidelity_settings
+    -            )
+    +            op_fidelity = dict(default_op_fidelity_settings)
+    +            if "fidelity_cfg" in settings:
+    +                op_fidelity.update(
+    +                    {OpGroup[key]: MathFidelitySetting[value] for key, value in settings["fidelity_cfg"].items()}
+    +                )
+     
+                 custom_opt = ModelOptimizations({"TensorPrecision": tensor_precision, "OpFidelity": op_fidelity})
+                 decoders_precision.set_decoder_conf(decoder_id, custom_opt)
+
+[#45] MatmulDeviceOperation · tt-lang · no gain  +1406.46 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    index 9c141024a1..296b46a632 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    @@ -1,25 +1,35 @@
+    -"""tt-lang matmul on the ff2 shape -- AUTHORED, MEASURED, and NOT WIRED IN.
+    +"""tt-lang matmul on the ff2 shapes -- AUTHORED, MEASURED, and NOT WIRED IN.
+     
+    -Kept as the record of the tt-lang rung for `MatmulDeviceOperation 128 x 14336 x 4096`, measured on
+    -ff2's OWN shape rather than reusing the w1/w3 result. Each core owns a strip of the N tiles
+    -(128 N-tiles / 64 cores = 2 each, exact); K is reduced in-core with an accumulator DFB ping-pong
+    -seeded from the first partial product (ttl 1.0.1 has no block.fill).
+    +Kept as the record of the tt-lang rung for BOTH ff2 shapes, each measured on its OWN shape rather
+    +than inheriting the w1/w3 result:
+     
+    -MEASURED on M=128, K=14336, N=4096, 8x8 grid:
+    +  * `MatmulDeviceOperation 128 x 14336 x 4096` -- the short-prefill down-projection
+    +  * `MatmulDeviceOperation  32 x 14336 x 4096` -- the DECODE down-projection (the per-token path)
+     
+    -    correctness   PCC 0.999682   (the kernel is right)
+    -    ttl matmul    2.961 ms/call
+    -    ttnn.linear   0.364 ms/call  -> 8.1x SLOWER
+    +Each core owns a strip of the N tiles (128 N-tiles / 64 cores = 2 each, exact); K is reduced in-core
+    +with an accumulator DFB ping-pong seeded from the first partial product (ttl 1.0.1 has no
+    +block.fill). Only M differs between the two runs, so the same kernel serves both.
+     
+    -The C++ Metalium rung was measured on the same shape via tt/cpp_mm_generic.py: PCC 0.993625,
+    -3.113 ms vs 0.362 ms -> 8.6x slower.
+    +MEASURED on K=14336, N=4096, 8x8 grid:
+     
+    -Unlike w1/w3 there is no fusion available here either: ff2's output feeds a residual add and (on a
+    -multi-device mesh) a CCL, and its input round-trip is already removed by the L1 island in mlp.py. So
+    -a hand kernel has nothing to add beyond dataflow it cannot win on -- each core re-reads every A tile
+    -per output tile, while ttnn's matmul multicasts in0 across a core row and blocks K.
+    +    M=128   PCC 0.999692   ttl 2.957 ms/call   vs ttnn.linear 0.358 ms/call  -> 8.3x SLOWER
+    +    M= 32   PCC 0.999695   ttl 0.816 ms/call   vs ttnn.linear 0.300 ms/call  -> 2.7x SLOWER
+     
+    -Run directly to reproduce.
+    +The C++ Metalium rung was measured on the same shapes via tt/cpp_mm_generic.py.
+    +
+    ... (truncated, 91 more lines)
+
+[#46] MatmulDeviceOperation · cpp · no gain  +1406.46 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    index fa9e629a74..c98a9b6ae9 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    @@ -1,28 +1,38 @@
+     """C++ Metalium matmul via ttnn.generic_op -- AUTHORED, MEASURED, and NOT WIRED IN.
+     
+    -Kept as the record of the cpp rung for `MatmulDeviceOperation 128 x 4096 x 14336`.
+    +Kept as the record of the cpp rung for every hot dense matmul in the MLP:
+    +
+    +  * `MatmulDeviceOperation 128 x  4096 x 14336` -- the short-prefill ff1/ff3 up-projection
+    +  * `MatmulDeviceOperation 128 x 14336 x  4096` -- the short-prefill ff2 down-projection
+    +  * `MatmulDeviceOperation  32 x 14336 x  4096` -- the DECODE ff2 down-projection (per-token path)
+     
+     Drives the repo's own programming-example kernel triple (tt_metal/programming_examples/matmul/
+     matmul_multi_core: reader / mm / writer, copied into tt/kernels/) through ttnn.generic_op, with
+     the output tiles partitioned across the entire compute grid.
+     
+    -MEASURED on the real shape (M=128, K=4096, N=14336) on the full 11x10 P150 grid:
+    +MEASURED on the real shapes, on the full 11x10 P150 grid:
+    +
+    +    M    K      N        PCC        generic_op    ttnn.linear     verdict
+    +    128  4096   14336    0.998986    3.565 ms      0.328 ms       10.9x SLOWER
+    +    128  14336  4096     0.993626    3.118 ms      0.357 ms        8.7x SLOWER
+    +     32  14336  4096     0.993594    0.916 ms      0.292 ms        3.1x SLOWER
+     
+    -    correctness   PCC 0.999040   (the kernel is right)
+    -    generic_op    3.573 ms/call
+    -    ttnn.linear   0.331 ms/call  -> the kernel is 10.8x SLOWER
+    +Every kernel is CORRECT and every one loses. The cause is dataflow, not tuning: this reader fetches
+    +every A tile again for each output tile, so A is re-read Nt times from DRAM, while ttnn's production
+    +matmul multicasts each in0 tile across a whole core row and blocks K, moving a small fraction of the
+    +bytes. Beating it would mean reimplementing that mcast matmul -- which is what the stock op already is.
+     
+    -Same root cause as the tt-lang attempt in ttl_gated_ffn.py, and it is a dataflow property, not a
+    -tuning miss: this reader fetches every A tile again for each output tile, so A is re-read Nt times
+    -from DRAM. ttnn's production matmul multicasts each in0 tile across a whole core row and blocks K,
+    -so it moves a small fraction of the bytes. Beating it would mean reimplementing that mcast matmul --
+    -which is what the stock op already is.
+    +The decode row is the one worth reading twice. Dropping M from 128 to 32 shrinks THIS kernel ~3.4x
+    ... (truncated, 245 more lines)
+
 Limitations / suggested manual next steps:
-- 1 op(s) tried but no lever beat baseline: MatmulDeviceOperation
-  -> inspect the per-op device report and consider a hand-written kernel or a structural change.
+- (none flagged automatically — see the per-op device report for remaining headroom.)
 
 Reproduce:
   trace+1CQ perf:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_main_perf.py::test_main_perf -svv
