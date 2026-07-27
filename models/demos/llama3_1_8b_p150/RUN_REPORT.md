@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 08:15:08 UTC · 108 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 08:16:15 UTC · 110 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -31,7 +31,7 @@ embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
-ArgMaxDeviceOperation              ·wedge    —         —         —         —         —         —         —                 —
+ArgMaxDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
@@ -159,6 +159,8 @@ NLPConcatHeadsDeviceOperation        structural    729.90   +1734.28 ms  · no g
 NLPConcatHeadsDeviceOperation        structural         —             —  ✓ win      committed: llama3_1_8b_p150: tt-lang kernel for the prefill concat-heads The mirror of tt/ttl_create_qkv_heads.py at the other end of attention: that k
 NLPConcatHeadsDeviceOperation           tt-lang    714.94   +1749.24 ms  ✓ win      Hypothesis: a kernel is the right rung because the knob rungs proved the parallelisation is baked into the op, not merely untuned -- the interleaved factory sizes cores from num_blocks = batch*seq_len
 ArgMaxDeviceOperation                      grid         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: Read 0xffffffff over PCIe ID 3: the board should be reset.
+ArgMaxDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: document why sub_core_grids is left undefined TTSampling reads getattr(args, "sub_core_grids", None), and leaving it None
+ArgMaxDeviceOperation                      grid    714.94   +1749.24 ms  · no gain  Read the factory before reaching for a knob, and the grid turns out to be ALREADY full. ttnn.argmax takes the multi-core factory here (input is row-major after untilize, dim == rank-1), and with sub_c
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2585,8 +2587,27 @@ Code changes — every attempt (win or fail):
              # For batched prefill, reshape to concatenate batch dimension into sequence
     ... (truncated, 153 more lines)
 
+[#110] ArgMaxDeviceOperation · grid · no gain  +1749.24 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 61d172b9df..9e0a02dd52 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1101,6 +1101,12 @@ class ModelArgs:
+                     # offset-add / untilize / manual_seed / sampling tail behind them). Non-greedy
+                     # requests still take the full path -- the sampler re-derives this per reset_params
+                     # and re-captures its trace when the mode flips.
+    +                #
+    +                # NOTE on the argmax core grid: ModelArgs deliberately does NOT define
+    +                # `sub_core_grids`. TTSampling reads it with getattr(args, "sub_core_grids", None),
+    +                # and leaving it None is what lets ttnn.argmax fall through to
+    +                # split_work_to_cores over the FULL compute grid. Defining it here would NARROW
+    +                # the sampling ops, not widen them.
+                     "allow_force_argmax": True,
+                     "num_links": 1,
+                     "chunks_per_sync": 10,
+
 Limitations / suggested manual next steps:
-- 2 op(s) tried but no lever beat baseline: ArgMaxDeviceOperation, LayerNormDeviceOperation
+- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
