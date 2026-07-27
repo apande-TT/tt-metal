@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 06:52:22 UTC · 97 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 07:37:25 UTC · 102 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 745.01 ms
-  at-floor            : 72%   (207.78 ms reachable headroom)
+  measured            : 729.90 ms
+  at-floor            : 74%   (192.67 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -39,7 +39,9 @@ MatmulDeviceOperation              ·try      —         ✓win      ·try     
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
 MatmulDeviceOperation              ✓win      —         —         —         —         —         —         —                 —
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ✓win      ·try      ✓win         745.01
+NLPConcatHeadsDeviceOperation      ·try      —         —         ·try      —         —         —         —            729.90
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
+RotaryEmbeddingLlamaDeviceOperatio ✓win      —         —         —         —         —         —         —                 —
 TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
 host_overhead                      —         —         —         —         —         —         —         ✓win              —
@@ -145,6 +147,11 @@ MatmulDeviceOperation                structural    745.01   +1719.17 ms  · no g
 MatmulDeviceOperation                   tt-lang    745.01   +1719.17 ms  · no gain  Measured the tt-lang matmul on THIS op's own shape rather than inheriting the sibling MLP verdicts, since M and the K/N ratio both differ -- extended tt/ttl_ff2_matmul.py's (M,K,N) sweep with (32, 409
 MatmulDeviceOperation                   tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: measure both kernel rungs on the decode QKV shape The tt-lang and C++ Metalium rungs had only ever been measured on the ML
 MatmulDeviceOperation                       cpp    745.01   +1719.17 ms  · no gain  Same discipline as the tt-lang rung: do not inherit the MLP verdicts, measure the C++ Metalium reader/compute/writer triple (tt/cpp_mm_generic.py + tt/kernels/*.cpp, driven through ttnn.generic_op wit
+RotaryEmbeddingLlamaDeviceOperatio         grid         —             —  ✓ win      committed: llama3_1_8b_p150: fold heads into the batch dim for the prefill rope The prefill rope program factory parallelises over batch x seq-tiles ON
+RotaryEmbeddingLlamaDeviceOperatio         grid    729.90   +1734.28 ms  ✓ win      Hypothesis: read the program factory instead of guessing at a program_config (this op exposes none). It parallelises over batch x seq-tiles ONLY -- batch_parallel_factor = min(batch, cores), seq_paral
+NLPConcatHeadsDeviceOperation              grid    729.90   +1734.28 ms  · no gain  Hypothesis from reading the program factory: the INTERLEAVED path derives cores from num_blocks = batch * seq_len / TILE_HEIGHT, so heads (dim 1) never enter the split and at batch 1 / seq_len 128 it 
+NLPConcatHeadsDeviceOperation              grid    729.90   +1734.28 ms  · no gain  Third and final grid variant on this op; the sharded factory is measured-blocked at this shape. Recap: the interleaved factory sets cores from num_blocks = batch * seq_len / TILE_HEIGHT, so heads neve
+NLPConcatHeadsDeviceOperation             shard    729.99   +1734.19 ms  · no gain  Hypothesis: the INPUT side of this op is measured-unsafe (three head-sharded variants at the grid rung either scrambled the output or hung), but the OUTPUT side is free -- the interleaved factory only
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2371,8 +2378,165 @@ Code changes — every attempt (win or fail):
     --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
     ... (truncated, 32 more lines)
 
+[#99] RotaryEmbeddingLlamaDeviceOperatio · grid · win  +1734.28 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index aa99bba560..b6b453fdc9 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -540,23 +540,46 @@ class Attention(LightweightModule):
+             return q_heads_1BQD, k_heads_1BKD
+     
+         def _mllama_rope_prefill(self, q_heads_1QSD_pre_rot, k_heads_1KSD_pre_rot, rot_mats):
+    -        q_heads_1QSD = ttnn.experimental.rotary_embedding_llama(
+    -            q_heads_1QSD_pre_rot,
+    -            rot_mats[0],
+    -            rot_mats[1],
+    -            self.transformation_mats["prefill"],
+    -            is_decode_mode=False,
+    -        )
+    -
+    -        k_heads_1KSD = ttnn.experimental.rotary_embedding_llama(
+    -            k_heads_1KSD_pre_rot,
+    -            rot_mats[0],
+    -            rot_mats[1],
+    -            self.transformation_mats["prefill"],
+    -            is_decode_mode=False,
+    -        )
+    +        # HEADS-AS-BATCH. The prefill rope factory parallelises over batch x seq-tiles ONLY and
+    +        # walks n_heads INSIDE each core (num_rows_per_core = sin_cos_rows_per_core * n_heads),
+    +        # so at batch 1 it pins itself to min(cores, seq_len/32) cores -- four of the P150's 110
+    +        # at seq_len 128, no matter how many heads there are. A [1, H, S, D] tiled tensor and a
+    +        # [H, 1, S, D] one have identical physical tile ordering, so folding heads into the BATCH
+    +        # dim is a metadata-only reshape that hands the factory H x min(cores/H, S_t) work units
+    +        # instead of S_t. cos/sin are head-broadcast ([1, 1, S, D]), which the op still accepts
+    +        # (it requires cos.shape[1] == input.shape[1] or 1, and both are 1 after the reshape).
+    +        def _rope(x):
+    +            heads = x.shape[1]
+    +            as_batch = ttnn.reshape(x, [heads, 1, x.shape[2], x.shape[3]])
+    +            out = ttnn.experimental.rotary_embedding_llama(
+    +                as_batch,
+    +                rot_mats[0],
+    +                rot_mats[1],
+    +                self.transformation_mats["prefill"],
+    +                is_decode_mode=False,
+    ... (truncated, 27 more lines)
+
+[#100] NLPConcatHeadsDeviceOperation · grid · no gain  +1734.28 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b6b453fdc9..4b6a1a6418 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -1217,6 +1217,42 @@ class Attention(LightweightModule):
+             ###
+             # Output matmul
+             ###
+    +        # GRID. nlp_concat_heads' INTERLEAVED factory derives its core count from
+    +        # num_blocks = batch * seq_len / TILE_HEIGHT -- heads (dim 1) never enter the split, so at
+    +        # batch 1 / seq_len 128 it runs on four cores while 32 heads of independent work sit idle.
+    +        # Its SHARDED factory instead adopts the input's own shard grid
+    +        # (num_cores = shard grid, blocks_per_core = shard_height / seq_len), so height-sharding
+    +        # the SDPA output at ONE HEAD PER CORE hands it 32 cores. Validate wants full-width shards
+    +        # (shard_w == head_dim), a shard height that is a multiple of seq_len, and a non-height-
+    +        # sharded output, all of which this satisfies.
+    +        _concat_cores = None
+    +        if not self.TG and self.prefetcher is None and batch_size == 1:
+    +            _rows = self.n_local_heads * seq_len
+    +            _shard_h = seq_len  # one head per core
+    +            _n_cores = _rows // _shard_h
+    +            # RECTANGULAR core range only. num_cores_to_corerangeset would give a ragged set on an
+    +            # 11-wide grid (two full rows plus a partial), and the sharded factory mixes
+    +            # corerange_to_cores with grid_to_cores when assigning runtime args -- a non-rectangular
+    +            # set makes those two orderings disagree and the output comes back scrambled
+    +            # (measured: 25.6% top-1).
+    +            _cols = next((c for c in range(self.args.max_grid_size.x, 0, -1) if _n_cores % c == 0), 0)
+    +            _rows_of_cores = _n_cores // _cols if _cols else 0
+    +            if _cols and _rows_of_cores <= self.args.max_grid_size.y:
+    +                _concat_cores = ttnn.MemoryConfig(
+    +                    ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+    +                    ttnn.BufferType.L1,
+    +                    ttnn.ShardSpec(
+    +                        ttnn.CoreRangeSet(
+    +                            {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(_cols - 1, _rows_of_cores - 1))}
+    +                        ),
+    +                        [_shard_h, self.head_dim],
+    +                        ttnn.ShardOrientation.ROW_MAJOR,
+    +                    ),
+    +                )
+    ... (truncated, 7 more lines)
+
+[#101] NLPConcatHeadsDeviceOperation · grid · no gain  +1734.28 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b6b453fdc9..d5d840d0e6 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -1217,6 +1217,42 @@ class Attention(LightweightModule):
+             ###
+             # Output matmul
+             ###
+    +        # GRID. nlp_concat_heads' INTERLEAVED factory derives its core count from
+    +        # num_blocks = batch * seq_len / TILE_HEIGHT -- heads (dim 1) never enter the split, so at
+    +        # batch 1 / seq_len 128 it runs on four cores while 32 heads of independent work sit idle.
+    +        # Its SHARDED factory instead adopts the input's own shard grid, with
+    +        # blocks_per_core = shard_height / seq_len, so height-sharding the SDPA output by HEAD
+    +        # widens it.
+    +        #
+    +        # TWO heads per core, not one, and a RECTANGULAR range. Both are load-bearing:
+    +        #   * one head per core makes num_blocks_per_core = 1, and the writer splits that across
+    +        #     two RISCs as div_up(1,2)=1 and 1-1=0 -- the zero-work RISC hangs the op.
+    +        #   * a ragged core set (num_cores_to_corerangeset on an 11-wide grid) makes the factory's
+    +        #     corerange_to_cores and grid_to_cores orderings disagree, scrambling the output
+    +        #     (measured: 25.6% top-1).
+    +        _concat_cores = None
+    +        if not self.TG and self.prefetcher is None and batch_size == 1 and self.n_local_heads % 2 == 0:
+    +            _heads_per_core = 2
+    +            _shard_h = _heads_per_core * seq_len
+    +            _n_cores = self.n_local_heads // _heads_per_core
+    +            _cols = next((c for c in range(self.args.max_grid_size.x, 0, -1) if _n_cores % c == 0), 0)
+    +            _core_rows = _n_cores // _cols if _cols else 0
+    +            if _cols and 0 < _core_rows <= self.args.max_grid_size.y:
+    +                _concat_cores = ttnn.MemoryConfig(
+    +                    ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+    +                    ttnn.BufferType.L1,
+    +                    ttnn.ShardSpec(
+    +                        ttnn.CoreRangeSet(
+    +                            {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(_cols - 1, _core_rows - 1))}
+    +                        ),
+    +                        [_shard_h, self.head_dim],
+    +                        ttnn.ShardOrientation.ROW_MAJOR,
+    +                    ),
+    +                )
+    ... (truncated, 7 more lines)
+
+[#102] NLPConcatHeadsDeviceOperation · shard · no gain  +1734.19 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b6b453fdc9..f08dcfe873 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -1217,9 +1217,21 @@ class Attention(LightweightModule):
+             ###
+             # Output matmul
+             ###
+    +        # SHARD. The INPUT side of this op is measured-unsafe -- feeding its sharded program
+    +        # factory a head-sharded [1, H, S, D] either scrambles the output or hangs (three variants
+    +        # tried at the grid rung). The OUTPUT side is free: the interleaved factory only requires
+    +        # an INTERLEAVED output config, and L1 interleaved qualifies. The concat result is
+    +        # [1, 1, S, H*D] -- 1 MB at seq_len 128 -- and its consumer is the wo matmul right below,
+    +        # so keeping it in L1 removes a DRAM write plus the read back. Same lever that paid off on
+    +        # the head split at the other end of attention. Bounded to short prefill.
+    +        _concat_out_mem_config = (
+    +            ttnn.L1_MEMORY_CONFIG
+    +            if (not self.TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff)
+    +            else ttnn.DRAM_MEMORY_CONFIG
+    +        )
+             attn_output_11SH = ttnn.experimental.nlp_concat_heads(
+                 attn_output_1QSD,
+    -            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    +            memory_config=_concat_out_mem_config,
+             )
+             ttnn.deallocate(attn_output_1QSD)
+
 Limitations / suggested manual next steps:
-- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
+- 2 op(s) tried but no lever beat baseline: LayerNormDeviceOperation, NLPConcatHeadsDeviceOperat
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
