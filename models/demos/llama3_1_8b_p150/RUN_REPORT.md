@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 08:16:15 UTC · 110 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 11:27:22 UTC · 112 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -161,6 +161,8 @@ NLPConcatHeadsDeviceOperation           tt-lang    714.94   +1749.24 ms  ✓ win
 ArgMaxDeviceOperation                      grid         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: Read 0xffffffff over PCIe ID 3: the board should be reset.
 ArgMaxDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: document why sub_core_grids is left undefined TTSampling reads getattr(args, "sub_core_grids", None), and leaving it None
 ArgMaxDeviceOperation                      grid    714.94   +1749.24 ms  · no gain  Read the factory before reaching for a knob, and the grid turns out to be ALREADY full. ttnn.argmax takes the multi-core factory here (input is row-major after untilize, dim == rank-1), and with sub_c
+ArgMaxDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Final checkpoint of the live lever log for this round. Device hit a board-level PCIe faul
+ArgMaxDeviceOperation                      grid         —             —  · wedged   wedged: round killed (UNPRODUCTIVE 10800s — agent watchdog judged the round stuck (no real progress))
 
 Code changes — every attempt (win or fail):
 ===========================================

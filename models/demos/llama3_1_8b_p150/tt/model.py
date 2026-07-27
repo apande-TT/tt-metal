@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import math
+
 import torch
 from tqdm import tqdm
 
@@ -261,7 +263,20 @@ class Transformer(LightweightModule):
         if lm_head_input_mem_cfg.is_sharded():
             x = ttnn.interleaved_to_sharded(x, lm_head_input_mem_cfg)
         logits = self.lm_head(x)
-        logits = ttnn.to_memory_config(logits, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        # Keep the prefill logits where lm_head already put them (L1 interleaved) instead of
+        # spilling them to DRAM. The consumer is on-device sampling, whose force-argmax path is
+        # `untilize -> ttnn.argmax`, and BOTH of those read this tensor straight through: the
+        # profile shows untilize at 47.8 us/call from DRAM vs 31.4 us from L1, and argmax at
+        # 737 us vs 715 us, on top of the 4.4 MB L1->DRAM copy this line itself pays. argmax
+        # FATALs on any non-INTERLEAVED input, so L1-interleaved is the only shard the op will
+        # accept -- a width/height shard is architecturally closed here.
+        # [1, 1, 32, vocab] at bf8_b is ~4.4 MB, comfortably inside the interleaved-L1 budget;
+        # fall back to DRAM if a wider vocab or a batched-prefill variant makes it big.
+        logits_elems = math.prod(int(d) for d in logits.shape)
+        if logits_elems * 2 > 16 * 1024 * 1024:  # bf16-equivalent bytes; bf8_b is ~half this
+            logits = ttnn.to_memory_config(logits, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        elif logits.memory_config() != ttnn.L1_MEMORY_CONFIG:
+            logits = ttnn.to_memory_config(logits, memory_config=ttnn.L1_MEMORY_CONFIG)
         return logits
 
     def process_hidden_states_after_prefill_trace(self, hidden_states, last_token_idx):
