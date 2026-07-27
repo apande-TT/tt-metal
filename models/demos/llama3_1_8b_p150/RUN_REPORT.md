@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 19:40:40 UTC · 140 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 20:20:13 UTC · 145 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 653.69 ms
-  at-floor            : 82%   (116.46 ms reachable headroom)
+  measured            : 648.17 ms
+  at-floor            : 83%   (110.94 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -30,18 +30,21 @@ other                24.10   1.0%    2618   slow  NLPCreateQKVHeadsDecodeDeviceO
 embedding             2.34   0.1%     114   slow  EmbeddingsDeviceOperation
 
 Block-level timing (per-stage trace) — latest lever on BinaryNgDeviceOperation:
-  BinaryNg [128,14336] bf8_b L1 interleaved, 110 cores (kept)      8.23 ms  ###########........... · True
-  BinaryNg same op, L1 width-shard 64 cores (tried)     11.27 ms  ###############.......
-  BinaryNg same op, L1 block-shard 32 cores (tried)     16.30 ms  ######################  <- hottest
-  BinaryNg [128,4096] bf16 DRAM (prefill residual add)      3.33 ms  ####..................
-  BinaryNg [32,14336] bf8_b L1-width-sharded (decode gate mul)      3.50 ms  #####.................
-  BinaryNg [128,4096] bf16 x bf8_b DRAM (prefill residual add)      2.90 ms  ####..................
-  BinaryNg [32,4096] bf16 L1-width-sharded (decode residual adds)      1.03 ms  #.....................
+  MatmulDeviceOperation (all shapes)    547.69 ms  ###################### · True  <- hottest
+  LayerNormDeviceOperation     52.02 ms  ##....................
+  BinaryNg [128,14336] bf8_b gate mul (kernel-blocked: bf8_b pack)      8.23 ms  ......................
+  BinaryNg [32,14336] bf8_b decode gate mul (kernel-blocked: bf8_b pack)      3.50 ms  ......................
+  BinaryNg [128,4096] post-attn add (kernel-blocked: mixed dtype)      1.30 ms  ......................
+  BinaryNg [128,4096] post-MLP add, stock 3.70us/call on 110 cores      1.30 ms  ......................
+    same add, tt-lang kernel 4.87us/call on 64 cores (reverted)      1.71 ms  ......................
+  BinaryNg [32,4096] decode residual adds      1.03 ms  ......................
+  GenericOpDeviceOperation (tt-lang split+rope + concat)      6.83 ms  ......................
+  SDPAOperation (prefill)      4.80 ms  ......................
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
 ArgMaxDeviceOperation              ✓win      —         —         ✓win      ✓win      —         —         —                 —
-BinaryNgDeviceOperation            ·try      —         —         —         —         —         —         —            660.60
+BinaryNgDeviceOperation            ·try      —         —         ✓win      ·try      ✓win      —         —            648.17
 GenericOpDeviceOperation           ✓win      —         —         —         —         —         —         —                 —
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
@@ -203,6 +206,11 @@ GenericOpDeviceOperation                   grid    653.69   +1810.49 ms  ✓ win
 SDPAOperation                        structural    655.73   +1808.45 ms  · no gain  Hunted reducible work around this dispatch-bound SDPA (368 calls x 13.14us vs a 1.33us roofline, 64 cores, seq 128) and measured TWO candidates, both rejected -- the evidence is the value here. (1) FU
 BinaryNgDeviceOperation                    grid    660.60   +1803.58 ms  · no gain  Read the program factory and the profile before reaching for a knob, and together they decided the rung: for an INTERLEAVED operand binary_ng calls split_work_to_cores over the whole device grid, so t
 BinaryNgDeviceOperation                    grid    671.92   +1792.26 ms  · no gain  Second grid geometry on the same dominant SILU-gate multiply, chosen because BLOCK sharding splits the HEIGHT as well as the width and so can in principle address cores a width split cannot. It cannot
+BinaryNgDeviceOperation                   shard         —             —  ✓ win      committed: llama3_1_8b_p150: keep the short-prefill residual stream in L1 The shard rung for BinaryNgDeviceOperation. The two residual adds were the mo
+BinaryNgDeviceOperation                   shard    648.17   +1816.01 ms  ✓ win      Hypothesis from the per-instance profile rather than the op aggregate: five BinaryNg shapes exist and only ONE class is DRAM-resident -- the two residual adds ([128,4096], 352+352 calls, 6.23 ms at ~8
+BinaryNgDeviceOperation              structural    648.17   +1816.01 ms  · no gain  Hunted reducible work behind this eltwise and found the single largest one in the whole benchmark, then proved it is CORRECTNESS-blocked -- which corrects an earlier round's record of the same lever a
+BinaryNgDeviceOperation                 tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: record the tt-lang residual-add kernel and why it loses tt/ttl_residual_add.py is a real multi-core tt-lang kernel for the
+BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no gain  Authored tt/ttl_residual_add.py, a real multi-core tt-lang kernel, and wired it into the model rather than measuring it standalone. Instance choice first, because four of this op's five shapes are clo
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -3158,8 +3166,137 @@ Code changes — every attempt (win or fail):
              cx, cy = ttl.node(dims=2)
     ... (truncated, 182 more lines)
 
+[#142] BinaryNgDeviceOperation · shard · win  +1816.01 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index 99f360cb07..dc088f0e05 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -1315,12 +1315,18 @@ class Attention(LightweightModule):
+                 else attn_output_11SH
+             )
+     
+    +        # wo writes straight into the residual stream's memory space. At short prefill that stream
+    +        # lives in L1, and landing this output in DRAM instead would make the residual add copy it
+    +        # back in -- which measured as 1149 CopyDeviceOperation calls / +4.20 ms, more than the
+    +        # 3.03 ms the L1 residual saved. The residual config is the single source of truth.
+    +        wo_out_mem_config = self.args.get_residual_mem_config(Mode.PREFILL, self.prefetcher, int(seq_len))
+    +
+             output_11SH = ttnn.linear(
+                 attn_output_11SH_sharded,
+                 self.wo,
+                 compute_kernel_config=self.li_o_prefill_compute_kernel_cfg,
+                 dtype=self.activation_dtype or ttnn.bfloat8_b,
+    -            memory_config=wo_prefill_output_mem_config,
+    +            memory_config=wo_out_mem_config,
+                 program_config=self.args.get_attn_wo_program_config(Mode.PREFILL, seq_len, None),
+             )
+     
+    diff --git a/models/demos/llama3_1_8b_p150/tt/decoder.py b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    index 067ea19c0a..84b99613b9 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/decoder.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    @@ -234,7 +234,7 @@ class TransformerBlock(LightweightModule):
+             residual = x
+     
+             # x is fractured across devices and interleaved in DRAM (for prefill) and sharded in L1 (for decode)
+    -        skip_mem_cfg = self.args.get_residual_mem_config(mode, self.prefetcher)
+    +        skip_mem_cfg = self.args.get_residual_mem_config(mode, self.prefetcher, int(x.shape[-2]))
+     
+             assert (
+                 x.memory_config() == skip_mem_cfg
+    diff --git a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py b/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    index 81444f48f0..7cfaf32cf7 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    ... (truncated, 89 more lines)
+
+[#143] BinaryNgDeviceOperation · structural · no gain  +1816.01 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index 99f360cb07..dc088f0e05 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -1315,12 +1315,18 @@ class Attention(LightweightModule):
+                 else attn_output_11SH
+             )
+     
+    +        # wo writes straight into the residual stream's memory space. At short prefill that stream
+    +        # lives in L1, and landing this output in DRAM instead would make the residual add copy it
+    +        # back in -- which measured as 1149 CopyDeviceOperation calls / +4.20 ms, more than the
+    +        # 3.03 ms the L1 residual saved. The residual config is the single source of truth.
+    +        wo_out_mem_config = self.args.get_residual_mem_config(Mode.PREFILL, self.prefetcher, int(seq_len))
+    +
+             output_11SH = ttnn.linear(
+                 attn_output_11SH_sharded,
+                 self.wo,
+                 compute_kernel_config=self.li_o_prefill_compute_kernel_cfg,
+                 dtype=self.activation_dtype or ttnn.bfloat8_b,
+    -            memory_config=wo_prefill_output_mem_config,
+    +            memory_config=wo_out_mem_config,
+                 program_config=self.args.get_attn_wo_program_config(Mode.PREFILL, seq_len, None),
+             )
+     
+    diff --git a/models/demos/llama3_1_8b_p150/tt/decoder.py b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    index 067ea19c0a..84b99613b9 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/decoder.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    @@ -234,7 +234,7 @@ class TransformerBlock(LightweightModule):
+             residual = x
+     
+             # x is fractured across devices and interleaved in DRAM (for prefill) and sharded in L1 (for decode)
+    -        skip_mem_cfg = self.args.get_residual_mem_config(mode, self.prefetcher)
+    +        skip_mem_cfg = self.args.get_residual_mem_config(mode, self.prefetcher, int(x.shape[-2]))
+     
+             assert (
+                 x.memory_config() == skip_mem_cfg
+    diff --git a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py b/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    index 81444f48f0..7cfaf32cf7 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    ... (truncated, 89 more lines)
+
+[#145] BinaryNgDeviceOperation · tt-lang · no gain  +1815.83 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_residual_add.py b/models/demos/llama3_1_8b_p150/tt/ttl_residual_add.py
+    new file mode 100644
+    index 0000000000..2d72b4599d
+    --- /dev/null
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_residual_add.py
+    @@ -0,0 +1,156 @@
+    +"""tt-lang residual add on the short-prefill shape -- AUTHORED, MEASURED, and NOT WIRED IN.
+    +
+    +Kept as the record of the tt-lang rung for `BinaryNgDeviceOperation`.
+    +
+    +WHICH instance, and why this one. The op code covers five shapes. Only ONE is a same-dtype bf16
+    +add that a ttl kernel can legally replace -- the post-MLP residual add. The others are closed:
+    +  * the post-attention residual add is MIXED dtype (bf16 residual + bf8_b wo output), which the
+    +    kernel's single-dtype dataflow buffers cannot express;
+    +  * both SILU gate multiplies (the largest instances, 8.23 ms and 3.50 ms) are bf8_b, a BLOCK float
+    +    format whose shared-exponent pack the tt-lang packer does not produce correctly on this build --
+    +    measured on this model, having a ttl kernel emit bf8_b drove the e2e gate to a degenerate 28.917
+    +    (a "PCC" above 1), so a kernel is not available for them at any grid.
+    +
+    +WORK DECOMPOSITION. [128, 4096] is 4 height tiles x 128 width tiles = 512 independent output tiles
+    +and an add has no reduction, so every tile may go anywhere. `ttl.node` is 2-D, and naively that caps
+    +the grid: a width split must divide 128 and fit 11 columns (so 8), leaving height (4) on y = 32
+    +cores. As with the head-split kernels the way past it is to let ONE coordinate carry two work
+    +dimensions through a constant divide, which the compiler does lower:
+    +
+    +    cy = w_half * H_T + h_tile        ->  8 rows, 64 cores, 8 tiles each
+    +
+    +MEASURED in the model, against the stock ttnn.add it replaces (352 calls each, same shape/dtype):
+    +
+    +    correctness   e2e PCC 0.985099, unchanged bit-for-bit from the stock op
+    +    ttl kernel    4.87 us/call   on 64 cores
+    +    stock ttnn    3.70 us/call   on 110 cores
+    +    whole model   648.17 -> 648.35 ms  (BinaryNg -1.44 ms, GenericOp +1.74 ms)
+    +
+    +So it is 1.3x SLOWER and deliberately not on the hot path. The reason is structural and is the same
+    +one that closed this op's grid rung: an interleaved binary_ng gets ALL 110 cores from
+    +split_work_to_cores, while any tt-lang decomposition of a 4 x 128 tile grid tops out at 64 (the
+    +width split needs a divisor of 128 that fits 11 columns, and y can only reach 8 rows before
+    +H_T * W_HALVES exceeds the board's 10). A lone eltwise op moves a fixed number of bytes, so losing
+    +42% of the cores cannot be bought back -- exactly the case GUIDELINES/11 names when it warns that a
+    ... (truncated, 122 more lines)
+
 Limitations / suggested manual next steps:
-- 2 op(s) tried but no lever beat baseline: BinaryNgDeviceOperation, LayerNormDeviceOperation
+- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
