@@ -101,13 +101,17 @@ class LMHead(LightweightModule):
 
                 # The cache key must encode the memory config: a cached DRAM-width-sharded weight
                 # reloaded for the interleaved path (or vice versa) silently feeds the matmul an
-                # operand whose shard spec its program config does not expect.
+                # operand whose shard spec its program config does not expect. It must encode the
+                # DTYPE for the same reason -- `as_tensor` returns the cached tensor as it was
+                # stored, so without this a bf8_b cache is reloaded unchanged and a dtype change
+                # here is a silent no-op.
                 _layout_tag = "_ilv" if (mode == 0 and self.full_grid) else ""
+                _dtype_tag = f"_{str(dtype).rsplit('.', 1)[-1].lower()}"
                 cache_file_name = (
                     None
                     if args.dummy_weights
                     else weight_cache_path
-                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}"
+                    / f"output_lm_head_{len(split_sizes)}_split_shard_{i}_{combined_split.shape[-1]}_mode_{mode}{_layout_tag}{_dtype_tag}"
                 )
 
                 def pad_to_power_of_2(n):

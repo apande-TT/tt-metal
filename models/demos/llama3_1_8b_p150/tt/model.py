@@ -142,11 +142,18 @@ class Transformer(LightweightModule):
             TG=args.is_galaxy,
         )
 
+        # The output projection is the single largest weight in the model
+        # ([dim, padded_vocab] = 4096 x 128256, ~70 MB at bf8_b) and its matmul is
+        # DRAM-bandwidth bound, so the bytes it reads ARE its runtime. Every decoder weight
+        # already rides bf4_b under `performance()`; the LM head was left on the model-wide
+        # bf8_b default purely because it is built outside the decoder precision config.
+        # Overridable via ModelArgs for accuracy-first configs.
+        lm_head_weight_dtype = getattr(args, "lm_head_weight_dtype", None) or ttnn.bfloat4_b
         self.lm_head = LMHead(
             args=args,
             mesh_device=mesh_device,
             tt_ccl=self.tt_ccl,
-            dtype=dtype,
+            dtype=lm_head_weight_dtype,
             state_dict=state_dict,
             state_dict_prefix=state_dict_prefix,
             weight_cache_path=weight_cache_path,

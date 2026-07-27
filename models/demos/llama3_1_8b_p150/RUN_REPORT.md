@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-27 12:56:30 UTC · 115 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-27 13:05:44 UTC · 117 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,8 +12,8 @@ tracy trace pass, same window (16 layers):  33.89 ms
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op roofline floors)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 713.16 ms
-  at-floor            : 75%   (175.94 ms reachable headroom)
+  measured            : 682.47 ms
+  at-floor            : 79%   (145.25 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — N/A: not an LLM decode pipeline)
 
@@ -38,7 +38,7 @@ Block-level timing (per-stage trace) — latest lever on ArgMaxDeviceOperation:
   LayerNormDeviceOperation     51.94 ms  ########..............
   MatmulDeviceOperation 32 x 4096 x 6144 (decode QKV)     35.48 ms  ######................
   MatmulDeviceOperation 128 x 4096 x 6144 (prefill QKV)     34.03 ms  ######................
-  ArgMaxDeviceOperation     32.66 ms  #####................. · True
+  ArgMaxDeviceOperation      2.30 ms  ......................
   MatmulDeviceOperation 128 x 4096 x 4096 (prefill wo)     29.02 ms  #####.................
   MatmulDeviceOperation 32 x 4096 x 4096 (decode wo)     25.31 ms  ####..................
   BinaryNgDeviceOperation     18.95 ms  ###...................
@@ -48,7 +48,7 @@ Block-level timing (per-stage trace) — latest lever on ArgMaxDeviceOperation:
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
-ArgMaxDeviceOperation              ✓win      —         —         ✓win      ·wedge    —         —         —                 —
+ArgMaxDeviceOperation              ✓win      —         —         ✓win      ✓win      —         —         —                 —
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
@@ -183,6 +183,8 @@ ArgMaxDeviceOperation                      grid         —             —  · 
 ArgMaxDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: keep the prefill logits in L1 for the argmax `_apply_norm_and_lm_head` pushed the lm_head output straight back to DRAM, so
 ArgMaxDeviceOperation                     shard    713.16   +1751.02 ms  ✓ win      Read the op before reaching for a shard spec, and it decided the whole rung: argmax_device_operation.cpp TT_FATALs unless the input memory_layout is INTERLEAVED, so a width/height shard is architectur
 ArgMaxDeviceOperation                structural         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
+ArgMaxDeviceOperation                structural         —             —  ✓ win      committed: llama3_1_8b_p150: argmax only the live batch rows, not the padding TTSampling rounds the request batch up to a 32-row tile because the LOGIT
+ArgMaxDeviceOperation                structural    682.47   +1781.71 ms  ✓ win      Hypothesis: the reducible work is PADDING, not per-element cost. TTSampling.__init__ does max_batch_size = max(32, roundup(raw_batch,32)) because the LOGITS are tile-layout, but the force-argmax path 
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -2664,6 +2666,49 @@ Code changes — every attempt (win or fail):
              return logits
      
          def process_hidden_states_after_prefill_trace(self, hidden_states, last_token_idx):
+
+[#117] ArgMaxDeviceOperation · structural · win  +1781.71 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model.py b/models/demos/llama3_1_8b_p150/tt/model.py
+    index 0d4df8171b..b2d1ee38fc 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model.py
+    @@ -19,6 +19,7 @@ from models.demos.llama3_1_8b_p150.tt.distributed_norm import DistributedNorm
+     from models.demos.llama3_1_8b_p150.tt.embedding import Embedding, ScaledEmbedding
+     from models.demos.llama3_1_8b_p150.tt.lm_head import LMHead
+     from models.demos.llama3_1_8b_p150.tt.model_config import TensorGroup
+    +from models.demos.llama3_1_8b_p150.tt import sampling_unpadded_argmax as unpadded_argmax
+     from models.demos.llama3_1_8b_p150.tt.rope import HfRotarySetup, RotarySetup
+     
+     
+    @@ -163,6 +164,10 @@ class Transformer(LightweightModule):
+                     mesh_device=mesh_device,
+                     tt_ccl=self.tt_ccl,
+                 )
+    +            # TTSampling rounds the request batch up to a 32-row tile because the LOGITS are
+    +            # tile-layout. Its force-argmax path untilizes first, though, and ROW_MAJOR has no
+    +            # such constraint -- so the argmax reduction can skip the padding rows entirely.
+    +            unpadded_argmax.install(self.sampling, args)
+             else:
+                 self.sampling = None
+     
+    diff --git a/models/demos/llama3_1_8b_p150/tt/sampling_unpadded_argmax.py b/models/demos/llama3_1_8b_p150/tt/sampling_unpadded_argmax.py
+    new file mode 100644
+    index 0000000000..4d628251cd
+    --- /dev/null
+    +++ b/models/demos/llama3_1_8b_p150/tt/sampling_unpadded_argmax.py
+    @@ -0,0 +1,118 @@
+    +"""Drop the tile-padding rows before the force-argmax sampling reduction.
+    +
+    +THE REDUCIBLE WORK. `TTSampling.__init__` rounds the request batch up to a tile:
+    +
+    +    raw_batch = getattr(args, "max_batch_size", 32)
+    +    self.max_batch_size = max(32, ((raw_batch + 31) // 32) * 32)
+    +
+    +That round-up is REQUIRED for the logits themselves -- they are a TILE-layout
+    +`[1, 1, 32, vocab]` tensor and a tile is 32 rows tall, so the norm / LM-head chain has to
+    +compute all 32. It is NOT required for the argmax, because the force-argmax path untilizes
+    +first and a ROW_MAJOR tensor has no such constraint. The profile shows the op paying for the
+    ... (truncated, 107 more lines)
 
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
