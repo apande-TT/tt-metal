@@ -36,6 +36,17 @@ No fusion is left to buy the difference back either: ff2's input round-trip is a
 L1 island in mlp.py, and the gate+up fusion was measured and rejected separately
 (tt/gated_mlp_fusion_probe.py).
 
+UPDATE -- the target this kernel has to beat has since MOVED AWAY from it, which settles the rung
+rather than reopening it. The full-grid lever in mlp.py took the stock 32 x 4096 x 14336 up-projection
+from 12 cores to 90 (DRAM-interleaved w1/w3 + auto-routed ttnn.linear), 123.1 -> 99.6 us/call in
+model, i.e. 33 MB of bf4_b weight at 332 GB/s. The paragraph above already predicted this outcome:
+what remains in the ttnn number is DRAM weight bandwidth, so the stock op improved by getting more
+cores onto that stream, and this kernel -- whose cost scales with m_tiles x per_core_n x k_tiles and
+which re-reads every A tile once per output tile -- gains nothing from the same change. The measured
+2.2x deficit therefore widens to roughly 2.7x. Closing it would mean reimplementing ttnn's mcast
+matmul, and even a perfect reimplementation cannot move bytes that are already flowing at the
+achievable DRAM rate (the LM head independently saturates at 318 GB/s on 101 cores).
+
 Run directly to reproduce the table.
 """
 import time

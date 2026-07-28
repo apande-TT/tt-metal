@@ -36,6 +36,15 @@ Together with the tt-lang rung (tt/ttl_ff2_matmul.py, same shapes, 2.7x-8.3x slo
 custom-kernel lever for these ops: the only thing a hand kernel could add is fusion, and the fusion is
 worth <=0.5% (measured independently via an L1 island for the same intermediates).
 
+UPDATE -- the stock op this kernel is measured against has since got FASTER, which widens the deficit
+rather than reopening the rung. The full-grid lever in mlp.py moved the stock 32 x 4096 x 14336
+up-projection from 12 cores to 90 (DRAM-interleaved w1/w3 + auto-routed ttnn.linear), 123.1 -> 99.6
+us/call in model = 33 MB of bf4_b weight at 332 GB/s. That is precisely the mechanism the paragraph
+above identifies as the residual -- DRAM weight bandwidth -- so the stock op improved by putting more
+cores on that stream, while this kernel (work = Mt x Nt x Kt, A re-read Nt times) gains nothing from
+it. The 3.4x deficit on that shape therefore becomes roughly 4.2x. The generic_op grid was already the
+full 11x10, so there is no occupancy left for it to claim either.
+
 Run directly to reproduce the table above.
 """
 import time
