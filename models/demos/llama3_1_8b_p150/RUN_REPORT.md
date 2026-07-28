@@ -1,37 +1,35 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 11:45:49 UTC · 192 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 12:42:19 UTC · 196 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
 ==========================================================
 optimizing… — baseline->final speedup is finalized when the module converges (per-attempt detail below is live)
-tracy trace pass, BASELINE, same window (16 layers):  11.93 ms
+tracy trace pass (16 layers):  11.93 ms  ->  9.34 ms   (+21.7%, 1.28x)
 trace+1CQ full-pipeline e2e (all layers):  48.38 ms  ->  22.79 ms   (+52.9%, 2.12x)
 
 Roofline & utilization
-  modeled floor       : 537.23 ms   (Σ per-op max(FLOPs/peak, bytes/BW, dispatch); covers 91% of device time)
-  this build's floor  : 331.86 ms   (recomputed from the CURRENT op mix; below the pinned anchor because the ops now move different bytes — new headroom, NOT a new target; the anchor above stays fixed so at-floor% cannot retreat ahead of the measurement)
+  modeled floor       : 537.23 ms   (Σ per-op max(FLOPs/peak, bytes/BW, dispatch); covers 93% of device time)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 567.94 ms
-  at-floor            : 95%   (30.71 ms reachable headroom)
-  status              : IN_BAND — reached the achievable band — done
+  measured            : 534.44 ms
+  status              : PAST BASELINE FLOOR — measured 534.44 ms is faster than the 537.23 ms baseline bound because the optimized build does LESS work (fewer bytes moved), so its own bound is lower; the baseline stays fixed as the reference
   (tok/s/u — unavailable: active_bytes not computed for this pipeline, so the per-token weight-bytes target has no numerator)
 
-Op breakdown — device time by op class (BASELINE profile · what to target, ranked):
+Op breakdown — device time by op class (profile totalling 556.80 ms over 16 layers · what to target, ranked):
 op class         device_ms      %   count  bound  dominant op (shape)
 ---------------------------------------------------------------------------------------------------
-matmul              478.44  77.7%    4456   slow  MatmulDeviceOperation 32 x 4096 x 14336
-reduction            52.91   8.6%    1720   slow  LayerNormDeviceOperation
-attention            37.96   6.2%    2016   slow  NlpCreateHeadsDeviceOperation
-datamove             26.43   4.3%    5406   slow  NLPConcatHeadsDeviceOperation
-host_overhead        21.55   3.5%       0   host  
-other                 9.97   1.6%    2090   slow  PagedFusedUpdateCacheDeviceOperation
-eltwise               8.89   1.4%    2448   slow  BinaryNgDeviceOperation
+matmul              396.86  71.3%    4456   slow  MatmulDeviceOperation 32 x 4096 x 14336
+reduction            53.35   9.6%    1720   slow  LayerNormDeviceOperation
+attention            37.86   6.8%    2016   slow  NlpCreateHeadsDeviceOperation
+datamove             26.45   4.8%    5406   slow  NLPConcatHeadsDeviceOperation
+host_overhead        22.36   4.0%       0   host  
+other                 9.93   1.8%    2090   slow  PagedFusedUpdateCacheDeviceOperation
+eltwise               8.91   1.6%    2448   slow  BinaryNgDeviceOperation
 embedding             1.09   0.2%     103   slow  EmbeddingsDeviceOperation
 
-Block-level timing (per-stage trace) — latest lever on MatmulDeviceOperation:
+Block-level timing (per-stage trace) — latest lever on Matmul 32x14336x4096:
   MatmulDeviceOperation 32 x 4096 x 14336 (ff1/ff3, 90 cores, 332 GB/s)    162.39 ms  ###################### · True  <- hottest
   MatmulDeviceOperation 32 x 14336 x 4096 (ff2, NOW LoFi: 151.31 -> 103.30 ms, 178 -> 261 GB/s)    103.30 ms  ##############........
   MatmulDeviceOperation 32 x 4096 x 6144 (QKV, still HiFi2 x bf4_b - same lever untried)     69.18 ms  #########.............
@@ -43,226 +41,231 @@ Block-level timing (per-stage trace) — latest lever on MatmulDeviceOperation:
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
-ArgMaxDeviceOperation              ·try      —         —         ✓win      ✓win      —         —         —            682.47
-BinaryNgDeviceOperation            ·try      —         —         ✓win      ·try      ·try      ·try      —            648.17
-GenericOpDeviceOperation           ✓win      —         —         —         —         —         —         —            653.69
-LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
-MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ·try        1061.00
-MatmulDeviceOperation              ·try      ·try      ✓win      ·try      ✓win      ·try      ·try      ·try         654.43
-MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —            749.85
-MatmulDeviceOperation              ·try      ✓win      ✓win      ·try      ·try      ·try      ·try      ·try         567.94
-MatmulDeviceOperation              ✓win      ·try      ·try      ·try      ·try      ·try      ·try      ·try         614.88
-MatmulDeviceOperation              ✓win      —         ✓win      ·try      ·try      ·try      ·try      ·try         662.92
-MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ·try         622.89
-NLPConcatHeadsDeviceOperation      ·try      —         —         ·try      ·try      ✓win      —         —            714.94
-NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            758.37
-RotaryEmbeddingLlamaDeviceOperatio ✓win      —         —         —         ✓win      —         —         —            656.91
-SDPAOperation                      ✓win      —         —         —         ·try      —         —         —            655.73
-TopKDeviceOperation                ·try      —         —         ·try      —         ·try      —         —                 —
-TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
+ArgMax                             ·try      —         —         ✓win      ✓win      —         —         —            682.47
+BinaryNg                           ·try      —         —         ✓win      ·try      ·try      ·try      —            648.17
+GenericOp                          ✓win      —         —         —         —         —         —         —            653.69
+LayerNorm                          ·try      —         —         ·try      ·try      —         —         —           1057.73
+Matmul 128x14336x4096              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ·try        1061.00
+Matmul 128x4096x14336              ·try      ·try      ✓win      ·try      ·try      ·try      ·try      ·try         654.43
+Matmul 128x4096x6144               ✓win      —         ✓win      —         —         —         —         —            749.85
+Matmul 32x14336x4096               ·try      ✓win      ✓win      ·try      ·try      ·try      ·try      ·try         567.94
+Matmul 32x4096x14336               ✓win      ·try      ·try      ·try      ·try      ·try      ·try      ·try         614.88
+Matmul 32x4096x16032               ✓win      —         ✓win      ·try      ·try      ·try      ·try      ·try         662.92
+Matmul 32x4096x4096                —         ·try      —         —         —         —         —         —            534.44
+Matmul 32x4096x6144                ·try      ✓win      ·try      ✓win      ·try      ·try      ·try      ·try         534.44
+NLPConcatHeads                     ·try      —         —         ·try      ·try      ✓win      —         —            714.94
+NlpCreateHeads                     ·try      —         —         ✓win      ✓win      ✓win      —         —            758.37
+RotaryEmbeddingLlama               ✓win      —         —         —         ✓win      —         —         —            656.91
+SDPA                               ✓win      —         —         —         ·try      —         —         —            655.73
+TopK                               ·try      —         —         ·try      —         ·try      —         —                 —
+TopK 32x64128                      ·try      —         —         ·try      ✓win      —         —         —           1537.69
 host_overhead                      —         —         —         —         —         —         —         ✓win         891.98
 
 
 Per-attempt detail (every optimization tried — win OR fail — with gain vs baseline and WHY):
 op                                        lever        ms  gain vs base  result     why tried / why it won or failed
 --------------------------------------------------------------------------------------------------------------------
-TopKDeviceOperation                        grid         —             —  ✓ win      committed: llama3_1_8b_p150: profile the real forward, not a crashed decode_step(None) The tracy path called pipeline.decode_step(None), which raised o
-TopKDeviceOperation                        grid   2464.16      +0.02 ms  · no gain  TopK is grid=tiny (1 core, ~10ms/call, 1120ms = 45% of device time), so I handed it an explicit full compute-grid sub_core_grid_topk via ModelArgs. No gain: 2464.18->2464.16ms. Root cause is factory S
-TopKDeviceOperation                       shard   2464.18      +0.00 ms  · no gain  TopK is memory-bound on a DRAM-interleaved sampling chain, so I width-sharded the top-k values/indices into L1 via DECODE_SAMPLING_INPUT_MEMCFG (the designed hook, copied from the llama3_70b_galaxy co
-TopKDeviceOperation                       shard   2464.18      +0.00 ms  · no gain  Second shard variant: same L1 lever but the whole 2x32 gathered row as ONE shard, on the theory that splitting it across 2 cores was desynchronising the device-offset add. Also reverted -- PCC 9.4% To
-TopKDeviceOperation                       shard         —             —  ✓ win      committed: llama3_1_8b_p150: let greedy decode take the argmax sampling path format_sampling_params already normalises temperature=0 rows to k=1 / p=0
-TopKDeviceOperation                  structural   1537.69    +926.49 ms  ✓ win      Hypothesis: TopK's 1120ms is not a tunable cost but REDUNDANT WORK -- decode is greedy (temperature=0), and greedy needs only an argmax, not top-k/top-p/RNG. format_sampling_params already normalises 
-TopKDeviceOperation                     tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: warm up only the sampling shapes the request asks for prefill_forward_text called warmup_model_prefill without greedy_only
-TopKDeviceOperation                  structural   1164.57   +1299.62 ms  ✓ win      Second structural pass on the same op: after force-argmax took TopK off the per-token path, 16 TopK calls (163ms) survived, and the profiler ordering proved they were ALL warmup -- every one precedes 
-MatmulDeviceOperation                      grid   1164.57   +1299.62 ms  · no gain  Hypothesis: this DRAM-bound bf4_b w1/w3 read runs on only 32 of ~110 cores because 2D mcast gives one core ROW per per_core_M block, and short prefill has just m_tiles=4 -- so I swapped short prefill 
-MatmulDeviceOperation                      grid   1164.57   +1299.62 ms  · no gain  Second grid attempt, this time the FULL GUIDELINES/11 recipe rather than a program_config alone: width-shard the prefill activation into L1 across a core count that divides both K-tiles(128) and N-til
-MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: write the prefill MLP intermediates as bf8_b w1/w3 are already at the bf4_b weight floor, so the only dtype left on this D
-MatmulDeviceOperation                     dtype   1144.58   +1319.60 ms  ✓ win      Hypothesis: the op is DRAM-bound but its w1/w3 weights are ALREADY bf4_b, the floor -- so the only dtype left is the output. ff1/ff3 each write a [128,14336] bf16 intermediate (3.67MB/layer) that is r
-MatmulDeviceOperation                     shard   1138.67   +1325.51 ms  · no gain  Reused a catalogued lever: L1 island for the ff1/ff3 -> SILU mul -> ff2 chain in short prefill (weights are ~29MB/layer and can never be L1-resident, but the [seq,hidden] intermediates can, removing t
-MatmulDeviceOperation                     shard   1145.94   +1318.24 ms  · no gain  Second shard variant, distinct mechanism from the L1 island: make the prefill activation L1-resident so ff1 and ff3 both read it from L1 instead of each paying a DRAM read. PCC clean at 0.995949 but N
-MatmulDeviceOperation               tp-fracture   1144.58   +1319.60 ms  · no gain  tp_pick_degree(128, 4096, 14336) returned best_tp=1, i.e. keep this matmul single-chip: the on-mesh TP sweep is disabled by default because it opens a NESTED mesh device and toggles fabric config whil
-MatmulDeviceOperation                structural   1144.58   +1319.60 ms  · no gain  Found real reducible work: get_padded_prefill_len hard-floors at 128, so this benchmark's 6-token prompt pays a FULL 128-token prefill -- 4x the matmul work a 32-row (one tile) prefill would need, on 
-MatmulDeviceOperation                   tt-lang   1144.58   +1319.60 ms  · no gain  Authored tt/ttl_gated_ffn.py: a real multi-core tt-lang kernel computing silu(x@w1)*(x@w3) in ONE op so both [seq,hidden] intermediates stay in L1 -- the exact fusion GUIDELINES/11 names as highest-va
-MatmulDeviceOperation                   tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: record the tt-lang gated-FFN kernel and why it loses tt/ttl_gated_ffn.py is a real multi-core tt-lang kernel computing sil
-MatmulDeviceOperation                       cpp   1144.57   +1319.61 ms  · no gain  Authored tt/cpp_mm_generic.py + tt/kernels/{compute/mm_gated_ffn,dataflow/reader_mm_partitioned,dataflow/writer_mm_partitioned}.cpp: a real C++ Metalium reader/compute/writer triple (adapted from the 
-MatmulDeviceOperation                       cpp         —             —  ✓ win      committed: llama3_1_8b_p150: record the C++ Metalium matmul rung and why it loses tt/cpp_mm_generic.py drives a real Metalium reader/compute/writer tri
-MatmulDeviceOperation                      grid   1135.53   +1328.65 ms  · no gain  ff2's K is the hidden dim, 448 tiles -- the longest reduction in the model -- but matmul_config derives in0_block_w from find_largest_divisor(), which hard-caps at 8, so K is walked in 56 blocks and t
-MatmulDeviceOperation                      grid   1101.85   +1362.33 ms  · no gain  Reused catalogued prior art (commit d8cd69d734, reverted by the from-scratch baseline): use_minimal_qkv_prefill_matmul() claims every seq_len>128, so the 2D-mcast branch only ever sees M<=4 tiles, yet
-MatmulDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: size the short-prefill QKV and ff2 matmul configs to the work Two program-config levers on the prefill matmuls, both cases
-MatmulDeviceOperation                      grid   1092.12   +1372.06 ms  ✓ win      COMMITTED (supersedes the earlier reverted record of the same lever). Re-applied the catalogued QKV short-prefill config together with the ff2 in0_block_w blocking, after proving the full-pipeline gat
-MatmulDeviceOperation                      grid   1092.12   +1372.06 ms  ✓ win      COMMITTED (supersedes the earlier reverted record). ff2's in0_block_w was hard-capped at 8 by find_largest_divisor(), so its 448-tile K -- the longest reduction in the model -- was walked in 56 blocks
-MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: put the FF2 down-projection weights on bf4_b performance() already rides bf4_b for FF1/FF3 but left FF2 on the BFP8 defaul
-MatmulDeviceOperation                     dtype   1063.78   +1400.40 ms  ✓ win      Hypothesis: ff2 is DRAM-bw bound and performance() had already put FF1/FF3 on bf4_b but left FF2 on the BFP8 default, so the down-projection read 2x the weight bytes of the two projections feeding it 
-MatmulDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: keep the short-prefill MLP intermediates in an L1 island The MLP's DRAM traffic is dominated by weight reads that can neve
-MatmulDeviceOperation                     shard   1061.00   +1403.18 ms  ✓ win      Reused the catalogued L1-island lever, this time aimed at ff2 (which READS the intermediate) rather than at the producing matmul: ff1/ff3 outputs land in L1 so the ff1/ff3 -> mul -> ff2 chain never ro
-MatmulDeviceOperation               tp-fracture   1061.00   +1403.18 ms  · no gain  tp_pick_degree(128, 14336, 4096) returned best_tp=1 -- keep single-chip. Same reason as the other matmul: the on-mesh TP sweep is disabled by default because it opens a nested mesh device and toggles 
-MatmulDeviceOperation               tp-fracture   1061.00   +1403.18 ms  · no gain  tp_pick_degree(128, 14336, 4096) returned best_tp=1 -- keep w2 single-chip. The on-mesh TP sweep is disabled by default because it opens a nested mesh device and toggles fabric config while a mesh is 
-MatmulDeviceOperation                structural   1061.00   +1403.18 ms  · no gain  none: investigated ff2's surroundings for reducible work and found none left. (1) Its output all-reduce is already a no-op here -- tt_all_reduce short-circuits and returns the input unchanged when mes
-MatmulDeviceOperation                   tt-lang   1061.00   +1403.18 ms  · no gain  Authored tt/ttl_ff2_matmul.py: a multi-core tt-lang matmul measured on ff2's OWN shape (128x14336x4096, 8x8 grid, 128 N-tiles / 64 cores = 2 each exact, K reduced in-core via an accumulator DFB ping-p
-MatmulDeviceOperation                       cpp   1061.00   +1403.18 ms  · no gain  Ran the authored C++ Metalium generic_op triple (tt/cpp_mm_generic.py + tt/kernels/*.cpp) on ff2's OWN shape (128x14336x4096) across the full 11x10 grid: CORRECT at PCC 0.993625 but 3.113ms/call vs 0.
-MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: record the ff2-shape kernel rungs tt/ttl_ff2_matmul.py measures the tt-lang rung on ff2's OWN shape rather than inheriting
-MatmulDeviceOperation                      grid   1061.12   +1403.06 ms  · no gain  find_grid_k_n hard-codes max_rows=max_cols=8 (a Wormhole 8x8 assumption) and it is what sizes the DRAM-sharded DECODE matmuls, so on an 11x10 P150 it discards 40%+ of the chip before its divisibility 
-MatmulDeviceOperation                      grid   1063.96   +1400.22 ms  · no gain  Decode ff2 (m=32 -> the per-token path) is DRAM-sharded on mlp2_core_grid, so I attacked the two grid-sizing helpers that pick its core count: find_grid_k_n hard-coded Wormhole 8x8, and find_grid both
-MatmulDeviceOperation                     dtype   1060.95   +1403.23 ms  · no gain  Decode ff2's WEIGHT is already at the bf4_b floor (commit 67acf99 flipped all 896 w2 instances, decode included), so the only dtype bytes left on this DRAM-bw-bound matmul are the ACTIVATIONS flowing 
-MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: carry the DECODE MLP intermediates as bf8_b too The ff1/ff3 -> SILU mul -> ff2 chain was already bf8_b in prefill but deco
-MatmulDeviceOperation                     dtype   1057.72   +1406.46 ms  ✓ win      COMMITTED. Decode ff2's WEIGHT is already at the bf4_b floor, so the only dtype bytes left are the activations around it. First tried the model-wide walk (TensorGroup.ACTIVATION=BFP8) and REVERTED it 
-MatmulDeviceOperation                     shard   1057.68   +1406.50 ms  · no gain  Hypothesis: on a DRAM-bw-bound decode ff2 the bytes to remove are the 33 MB w2 read, so the shard lever means L1 weight residency; the activation side was already fully sharded. Two findings. (1) L1-r
-MatmulDeviceOperation                     shard   1057.68   +1406.50 ms  · no gain  Hypothesis: on a DRAM-bw-bound decode ff2 the bytes to remove are the 33 MB w2 read, so the shard lever here means L1 WEIGHT residency; the activation side of the chain was already sharded. Two result
-MatmulDeviceOperation               tp-fracture   1057.72   +1406.46 ms  · no gain  Hypothesis: if this decode ff2 is DRAM-bandwidth bound and single-chip levers are spent, splitting the 33 MB w2 read across chips would divide the bytes each chip must fetch. tp_pick_degree(32, 14336,
-MatmulDeviceOperation                structural   1057.72   +1406.46 ms  · no gain  Hunted for reducible work and found a real candidate, then DISPROVED it -- the answer is worth more than the lever. A full-depth op-signature probe showed ff2 is not uniformly at the bf4_b floor: 62 i
-MatmulDeviceOperation                   tt-lang   1057.72   +1406.46 ms  · no gain  Hypothesis: the 128-row tt-lang result should NOT be assumed to carry to the decode shape, because M=32 is a quarter of the work and the two costs scale differently -- so I re-measured the kernel on f
-MatmulDeviceOperation                       cpp   1057.72   +1406.46 ms  · no gain  Same reasoning as the tt-lang rung: do not inherit the 128-row verdict, measure the C++ Metalium kernel on ff2's OWN decode shape. Parameterised tt/cpp_mm_generic.py (reader/compute/writer triple adap
-MatmulDeviceOperation                   tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: measure both kernel rungs on the DECODE ff2 shape The tt-lang and C++ Metalium rungs for ff2 had only ever been measured a
-LayerNormDeviceOperation                   grid         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
-LayerNormDeviceOperation                   grid   1057.73   +1406.45 ms  · no gain  Hypothesis, and the profile backs it precisely: of LayerNorm's 68.4 ms, 54.5 ms is 832 instances running on FOUR cores, DRAM_INTERLEAVED. The interleaved rms_norm kernel parallelises ONLY over the inp
-LayerNormDeviceOperation                   grid   1057.73   +1406.45 ms  · no gain  Second grid attempt on the same 4-core prefill norm, changing the PLUMBING rather than the occupancy target, to test whether the first attempt's trace crash came from the way the sharded result was ha
-LayerNormDeviceOperation                  shard   1058.09   +1406.09 ms  · no gain  Third distinct attempt on this op, and the only trace-safe form of 'shard it into L1' left. Sharding the ACTIVATION is already measured-blocked (two plumbings, both crash trace capture with cq_id 0 ou
-LayerNormDeviceOperation                  shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
-LayerNormDeviceOperation                  shard   1057.73   +1406.45 ms  · no gain  Second shard attempt, different mechanism, and it isolated the real blocker. Rather than sharding the norm (already measured-blocked), I moved the tensor the norm READS: made the short-prefill residua
-LayerNormDeviceOperation             structural   1057.73   +1406.45 ms  · no gain  none: hunted for reducible work behind the 832 four-core prefill norms and every candidate is either already applied or a known dead end. (1) The 832 instances are NOT 26 redundant prefills inside the
-host_overhead                         trace-2cq         —             —  ✓ win      committed: llama3_1_8b_p150: warm up only the prefill LENGTH the request asks for Prefill warmup ran a full, real prefill at EVERY padded length up to
+TopK                                       grid         —             —  · no gain  committed: llama3_1_8b_p150: profile the real forward, not a crashed decode_step(None) The tracy path called pipeline.decode_step(None), which raised o
+TopK 32x64128                              grid   2464.16      +0.02 ms  · no gain  TopK is grid=tiny (1 core, ~10ms/call, 1120ms = 45% of device time), so I handed it an explicit full compute-grid sub_core_grid_topk via ModelArgs. No gain: 2464.18->2464.16ms. Root cause is factory S
+TopK 32x64128                             shard   2464.18      +0.00 ms  · no gain  TopK is memory-bound on a DRAM-interleaved sampling chain, so I width-sharded the top-k values/indices into L1 via DECODE_SAMPLING_INPUT_MEMCFG (the designed hook, copied from the llama3_70b_galaxy co
+TopK 32x64128                             shard   2464.18      +0.00 ms  · no gain  Second shard variant: same L1 lever but the whole 2x32 gathered row as ONE shard, on the theory that splitting it across 2 cores was desynchronising the device-offset add. Also reverted -- PCC 9.4% To
+TopK                                      shard         —             —  · no gain  committed: llama3_1_8b_p150: let greedy decode take the argmax sampling path format_sampling_params already normalises temperature=0 rows to k=1 / p=0
+TopK 32x64128                        structural   1537.69    +926.49 ms  ✓ win      Hypothesis: TopK's 1120ms is not a tunable cost but REDUNDANT WORK -- decode is greedy (temperature=0), and greedy needs only an argmax, not top-k/top-p/RNG. format_sampling_params already normalises 
+TopK                                    tt-lang         —             —  · no gain  committed: llama3_1_8b_p150: warm up only the sampling shapes the request asks for prefill_forward_text called warmup_model_prefill without greedy_only
+TopK 32x64128                        structural   1164.57   +1299.62 ms  ✓ win      Second structural pass on the same op: after force-argmax took TopK off the per-token path, 16 TopK calls (163ms) survived, and the profiler ordering proved they were ALL warmup -- every one precedes 
+Matmul 128x4096x14336                      grid   1164.57   +1299.62 ms  · no gain  Hypothesis: this DRAM-bound bf4_b w1/w3 read runs on only 32 of ~110 cores because 2D mcast gives one core ROW per per_core_M block, and short prefill has just m_tiles=4 -- so I swapped short prefill 
+Matmul 128x4096x14336                      grid   1164.57   +1299.62 ms  · no gain  Second grid attempt, this time the FULL GUIDELINES/11 recipe rather than a program_config alone: width-shard the prefill activation into L1 across a core count that divides both K-tiles(128) and N-til
+Matmul 128x4096x14336                     dtype         —             —  · no gain  committed: llama3_1_8b_p150: write the prefill MLP intermediates as bf8_b w1/w3 are already at the bf4_b weight floor, so the only dtype left on this D
+Matmul 128x4096x14336                     dtype   1144.58   +1319.60 ms  ✓ win      Hypothesis: the op is DRAM-bound but its w1/w3 weights are ALREADY bf4_b, the floor -- so the only dtype left is the output. ff1/ff3 each write a [128,14336] bf16 intermediate (3.67MB/layer) that is r
+Matmul 128x4096x14336                     shard   1138.67   +1325.51 ms  · no gain  Reused a catalogued lever: L1 island for the ff1/ff3 -> SILU mul -> ff2 chain in short prefill (weights are ~29MB/layer and can never be L1-resident, but the [seq,hidden] intermediates can, removing t
+Matmul 128x4096x14336                     shard   1145.94   +1318.24 ms  · no gain  Second shard variant, distinct mechanism from the L1 island: make the prefill activation L1-resident so ff1 and ff3 both read it from L1 instead of each paying a DRAM read. PCC clean at 0.995949 but N
+Matmul 128x4096x14336               tp-fracture   1144.58   +1319.60 ms  · no gain  tp_pick_degree(128, 4096, 14336) returned best_tp=1, i.e. keep this matmul single-chip: the on-mesh TP sweep is disabled by default because it opens a NESTED mesh device and toggles fabric config whil
+Matmul 128x4096x14336                structural   1144.58   +1319.60 ms  · no gain  Found real reducible work: get_padded_prefill_len hard-floors at 128, so this benchmark's 6-token prompt pays a FULL 128-token prefill -- 4x the matmul work a 32-row (one tile) prefill would need, on 
+Matmul 128x4096x14336                   tt-lang   1144.58   +1319.60 ms  · no gain  Authored tt/ttl_gated_ffn.py: a real multi-core tt-lang kernel computing silu(x@w1)*(x@w3) in ONE op so both [seq,hidden] intermediates stay in L1 -- the exact fusion GUIDELINES/11 names as highest-va
+Matmul 128x4096x14336                   tt-lang         —             —  · no gain  committed: llama3_1_8b_p150: record the tt-lang gated-FFN kernel and why it loses tt/ttl_gated_ffn.py is a real multi-core tt-lang kernel computing sil
+Matmul 128x4096x14336                       cpp   1144.57   +1319.61 ms  · no gain  Authored tt/cpp_mm_generic.py + tt/kernels/{compute/mm_gated_ffn,dataflow/reader_mm_partitioned,dataflow/writer_mm_partitioned}.cpp: a real C++ Metalium reader/compute/writer triple (adapted from the 
+Matmul 128x4096x14336                       cpp         —             —  · no gain  committed: llama3_1_8b_p150: record the C++ Metalium matmul rung and why it loses tt/cpp_mm_generic.py drives a real Metalium reader/compute/writer tri
+Matmul 128x14336x4096                      grid   1135.53   +1328.65 ms  · no gain  ff2's K is the hidden dim, 448 tiles -- the longest reduction in the model -- but matmul_config derives in0_block_w from find_largest_divisor(), which hard-caps at 8, so K is walked in 56 blocks and t
+Matmul 128x4096x6144                       grid   1101.85   +1362.33 ms  · no gain  Reused catalogued prior art (commit d8cd69d734, reverted by the from-scratch baseline): use_minimal_qkv_prefill_matmul() claims every seq_len>128, so the 2D-mcast branch only ever sees M<=4 tiles, yet
+Matmul 128x14336x4096                      grid         —             —  · no gain  committed: llama3_1_8b_p150: size the short-prefill QKV and ff2 matmul configs to the work Two program-config levers on the prefill matmuls, both cases
+Matmul 128x4096x6144                       grid   1092.12   +1372.06 ms  ✓ win      COMMITTED (supersedes the earlier reverted record of the same lever). Re-applied the catalogued QKV short-prefill config together with the ff2 in0_block_w blocking, after proving the full-pipeline gat
+Matmul 128x14336x4096                      grid   1092.12   +1372.06 ms  · no gain  COMMITTED (supersedes the earlier reverted record). ff2's in0_block_w was hard-capped at 8 by find_largest_divisor(), so its 448-tile K -- the longest reduction in the model -- was walked in 56 blocks
+Matmul 128x14336x4096                     dtype         —             —  · no gain  committed: llama3_1_8b_p150: put the FF2 down-projection weights on bf4_b performance() already rides bf4_b for FF1/FF3 but left FF2 on the BFP8 defaul
+Matmul 128x14336x4096                     dtype   1063.78   +1400.40 ms  ✓ win      Hypothesis: ff2 is DRAM-bw bound and performance() had already put FF1/FF3 on bf4_b but left FF2 on the BFP8 default, so the down-projection read 2x the weight bytes of the two projections feeding it 
+Matmul 128x14336x4096                     shard         —             —  · no gain  committed: llama3_1_8b_p150: keep the short-prefill MLP intermediates in an L1 island The MLP's DRAM traffic is dominated by weight reads that can neve
+Matmul 128x14336x4096                     shard   1061.00   +1403.18 ms  ✓ win      Reused the catalogued L1-island lever, this time aimed at ff2 (which READS the intermediate) rather than at the producing matmul: ff1/ff3 outputs land in L1 so the ff1/ff3 -> mul -> ff2 chain never ro
+Matmul 128x14336x4096               tp-fracture   1061.00   +1403.18 ms  · no gain  tp_pick_degree(128, 14336, 4096) returned best_tp=1 -- keep single-chip. Same reason as the other matmul: the on-mesh TP sweep is disabled by default because it opens a nested mesh device and toggles 
+Matmul 128x14336x4096               tp-fracture   1061.00   +1403.18 ms  · no gain  tp_pick_degree(128, 14336, 4096) returned best_tp=1 -- keep w2 single-chip. The on-mesh TP sweep is disabled by default because it opens a nested mesh device and toggles fabric config while a mesh is 
+Matmul 128x14336x4096                structural   1061.00   +1403.18 ms  · no gain  none: investigated ff2's surroundings for reducible work and found none left. (1) Its output all-reduce is already a no-op here -- tt_all_reduce short-circuits and returns the input unchanged when mes
+Matmul 128x14336x4096                   tt-lang   1061.00   +1403.18 ms  · no gain  Authored tt/ttl_ff2_matmul.py: a multi-core tt-lang matmul measured on ff2's OWN shape (128x14336x4096, 8x8 grid, 128 N-tiles / 64 cores = 2 each exact, K reduced in-core via an accumulator DFB ping-p
+Matmul 128x14336x4096                       cpp   1061.00   +1403.18 ms  · no gain  Ran the authored C++ Metalium generic_op triple (tt/cpp_mm_generic.py + tt/kernels/*.cpp) on ff2's OWN shape (128x14336x4096) across the full 11x10 grid: CORRECT at PCC 0.993625 but 3.113ms/call vs 0.
+Matmul 128x14336x4096               tp-fracture         —             —  · no gain  committed: llama3_1_8b_p150: record the ff2-shape kernel rungs tt/ttl_ff2_matmul.py measures the tt-lang rung on ff2's OWN shape rather than inheriting
+Matmul 32x14336x4096                       grid   1061.12   +1403.06 ms  · no gain  find_grid_k_n hard-codes max_rows=max_cols=8 (a Wormhole 8x8 assumption) and it is what sizes the DRAM-sharded DECODE matmuls, so on an 11x10 P150 it discards 40%+ of the chip before its divisibility 
+Matmul 32x14336x4096                       grid   1063.96   +1400.22 ms  · no gain  Decode ff2 (m=32 -> the per-token path) is DRAM-sharded on mlp2_core_grid, so I attacked the two grid-sizing helpers that pick its core count: find_grid_k_n hard-coded Wormhole 8x8, and find_grid both
+Matmul 32x14336x4096                      dtype   1060.95   +1403.23 ms  · no gain  Decode ff2's WEIGHT is already at the bf4_b floor (commit 67acf99 flipped all 896 w2 instances, decode included), so the only dtype bytes left on this DRAM-bw-bound matmul are the ACTIVATIONS flowing 
+Matmul 32x14336x4096                      dtype         —             —  · no gain  committed: llama3_1_8b_p150: carry the DECODE MLP intermediates as bf8_b too The ff1/ff3 -> SILU mul -> ff2 chain was already bf8_b in prefill but deco
+Matmul 32x14336x4096                      dtype   1057.72   +1406.46 ms  ✓ win      COMMITTED. Decode ff2's WEIGHT is already at the bf4_b floor, so the only dtype bytes left are the activations around it. First tried the model-wide walk (TensorGroup.ACTIVATION=BFP8) and REVERTED it 
+Matmul 32x14336x4096                      shard   1057.68   +1406.50 ms  · no gain  Hypothesis: on a DRAM-bw-bound decode ff2 the bytes to remove are the 33 MB w2 read, so the shard lever means L1 weight residency; the activation side was already fully sharded. Two findings. (1) L1-r
+Matmul 32x14336x4096                      shard   1057.68   +1406.50 ms  · no gain  Hypothesis: on a DRAM-bw-bound decode ff2 the bytes to remove are the 33 MB w2 read, so the shard lever here means L1 WEIGHT residency; the activation side of the chain was already sharded. Two result
+Matmul 32x14336x4096                tp-fracture   1057.72   +1406.46 ms  · no gain  Hypothesis: if this decode ff2 is DRAM-bandwidth bound and single-chip levers are spent, splitting the 33 MB w2 read across chips would divide the bytes each chip must fetch. tp_pick_degree(32, 14336,
+Matmul 32x14336x4096                 structural   1057.72   +1406.46 ms  · no gain  Hunted for reducible work and found a real candidate, then DISPROVED it -- the answer is worth more than the lever. A full-depth op-signature probe showed ff2 is not uniformly at the bf4_b floor: 62 i
+Matmul 32x14336x4096                    tt-lang   1057.72   +1406.46 ms  · no gain  Hypothesis: the 128-row tt-lang result should NOT be assumed to carry to the decode shape, because M=32 is a quarter of the work and the two costs scale differently -- so I re-measured the kernel on f
+Matmul 32x14336x4096                        cpp   1057.72   +1406.46 ms  · no gain  Same reasoning as the tt-lang rung: do not inherit the 128-row verdict, measure the C++ Metalium kernel on ff2's OWN decode shape. Parameterised tt/cpp_mm_generic.py (reader/compute/writer triple adap
+Matmul 32x14336x4096                    tt-lang         —             —  · no gain  committed: llama3_1_8b_p150: measure both kernel rungs on the DECODE ff2 shape The tt-lang and C++ Metalium rungs for ff2 had only ever been measured a
+LayerNorm                                  grid         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
+LayerNorm                                  grid   1057.73   +1406.45 ms  · no gain  Hypothesis, and the profile backs it precisely: of LayerNorm's 68.4 ms, 54.5 ms is 832 instances running on FOUR cores, DRAM_INTERLEAVED. The interleaved rms_norm kernel parallelises ONLY over the inp
+LayerNorm                                  grid   1057.73   +1406.45 ms  · no gain  Second grid attempt on the same 4-core prefill norm, changing the PLUMBING rather than the occupancy target, to test whether the first attempt's trace crash came from the way the sharded result was ha
+LayerNorm                                 shard   1058.09   +1406.09 ms  · no gain  Third distinct attempt on this op, and the only trace-safe form of 'shard it into L1' left. Sharding the ACTIVATION is already measured-blocked (two plumbings, both crash trace capture with cq_id 0 ou
+LayerNorm                                 shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
+LayerNorm                                 shard   1057.73   +1406.45 ms  · no gain  Second shard attempt, different mechanism, and it isolated the real blocker. Rather than sharding the norm (already measured-blocked), I moved the tensor the norm READS: made the short-prefill residua
+LayerNorm                            structural   1057.73   +1406.45 ms  · no gain  none: hunted for reducible work behind the 832 four-core prefill norms and every candidate is either already applied or a known dead end. (1) The 832 instances are NOT 26 redundant prefills inside the
+host_overhead                         trace-2cq         —             —  · no gain  committed: llama3_1_8b_p150: warm up only the prefill LENGTH the request asks for Prefill warmup ran a full, real prefill at EVERY padded length up to
 host_overhead                      trace-capture    891.98   +1572.20 ms  ✓ win      COMMITTED, and the win was NOT the trace lever itself -- trace capture is already applied and engaged here (Generator owns trace_ids_decode, decode_forward(enable_trace=True) does the host I/O plus ex
-MatmulDeviceOperation                      grid    891.98   +1572.20 ms  · no gain  Found genuinely DEAD code and revived it, which is how the rung got a real test. mlp.py already carried a full_grid_ff1_3 branch meant to run decode ff1/ff3 as an L1-width-sharded 1D-multicast matmul 
-MatmulDeviceOperation                      grid    892.07   +1572.11 ms  · no gain  Second grid attempt, going after the helper that actually picks this op's core grid rather than the matmul variant. find_grid_k_n hard-codes max_rows=max_cols=8 (a Wormhole assumption) and it is what 
-MatmulDeviceOperation                     dtype    891.43   +1572.75 ms  · no gain  w1/w3 are already at the bf4_b weight floor, so the only dtype step left on this op is its OUTPUT, which I had just walked bf16 -> bf8_b in c9b2d04. Took the last available step, bf8_b -> bf4_b, on th
-MatmulDeviceOperation                structural    891.98   +1572.20 ms  · no gain  The real structural candidate for this op is the GATE+UP MATMUL FUSION, and I measured it rather than refactoring on faith. w1 (gate) and w3 (up) are both [dim, hidden], both read the SAME activation,
-MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: measure and reject the gate+up matmul fusion w1 (gate) and w3 (up) are both [dim, hidden], both read the same activation,
-MatmulDeviceOperation                     shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
-MatmulDeviceOperation                     shard    892.04   +1572.14 ms  · no gain  Two things to record. First, the WEIGHT side is architecturally closed, same arithmetic as decode ff2: the only L1-residency path is the DramPrefetcher global CB, and is_prefetcher_supported() is Fals
-MatmulDeviceOperation                     shard    892.05   +1572.13 ms  · no gain  Second shard attempt, on the OUTPUT side of the op rather than its input, and deliberately chosen as a variant known to be trace-safe (the equivalent edit completed cleanly on the ff2 rung, unlike the
-MatmulDeviceOperation               tp-fracture    892.04   +1572.14 ms  · no gain  tp_pick_degree(32, 4096, 14336) returned best_tp=1 -- keep decode ff1/ff3 single-chip. Same two reasons as the sibling ff2 op: the on-mesh sweep is disabled by default because it opens a NESTED mesh d
-MatmulDeviceOperation                   tt-lang    892.04   +1572.14 ms  · no gain  Measured the tt-lang kernel on this op's OWN shape rather than inheriting the ff2 verdict, since M and the K/N ratio both differ. Extended tt/ttl_ff2_matmul.py to sweep (M,K,N) triples; the multi-core
-MatmulDeviceOperation                       cpp    892.04   +1572.14 ms  · no gain  Measured the C++ Metalium reader/compute/writer triple (via ttnn.generic_op, output tiles partitioned across the full 11x10 grid) on this op's OWN shape. On 32x4096x14336: PCC 0.999022, 1.039 ms/call 
-MatmulDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: measure both kernel rungs on the decode ff1/ff3 shape too Both hand-kernel scripts now sweep (M, K, N) triples and cover e
-MatmulDeviceOperation               tp-fracture    892.11   +1572.07 ms  · no gain  tp_pick_degree(32, 4096, 14336) returned best_tp=1 -- keep decode ff1/ff3 single-chip. Two reasons. The on-mesh sweep is disabled by default because it opens a NESTED mesh device and toggles fabric co
-MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the working tree is clean. A dirty tree scopes record_k
-MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: document the MLP tensor-parallel fracture layout The w1_dims / w2_dims tuples ARE the TP fracture and nothing said so. Ver
-MatmulDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: run the LM head on the full core grid The DRAM-sharded matmul variant width-shards the activation across `lm_head_core_gri
-MatmulDeviceOperation                      grid    867.62   +1596.56 ms  ✓ win      Tried because the LM head is grid=partial for a STRUCTURAL reason, not a tuning one: the DRAM-sharded matmul width-shards the activation across its cores, so num_cores must divide K/32=128 tiles, and 
-NlpCreateHeadsDeviceOperation              grid    955.25   +1508.93 ms  · no gain  Hypothesis: this op is grid=tiny because its stock interleaved program factory sizes cores from num_blocks = batch*seq_len/TILE_HEIGHT (one work unit per input row-tile) -- at batch 1 / seq_len 128 th
-NlpCreateHeadsDeviceOperation             shard         —             —  ✓ win      committed: llama3_1_8b_p150: land the prefill head split in L1 nlp_create_qkv_heads is pure data movement and memory-bound: it reads the fused [S, (nq
-NlpCreateHeadsDeviceOperation             shard    865.93   +1598.25 ms  ✓ win      Hypothesis: this op has no weights and is pure memory-bound data movement, so the shard lever here means removing DRAM round-trips on the tensors it writes -- it emits three head-major views of the fu
-NlpCreateHeadsDeviceOperation        structural         —             —  ✓ win      committed: llama3_1_8b_p150: skip the prefill warmup when it duplicates the request Warmup was already narrowed (in earlier commits) to the sampling sh
-NlpCreateHeadsDeviceOperation        structural    781.95   +1682.23 ms  ✓ win      Hunted for reducible work behind this op rather than its per-call cost, and found the call COUNT was double what the workload needs. Earlier commits narrowed prefill warmup to the sampling shapes and 
-NlpCreateHeadsDeviceOperation           tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: tt-lang kernel for the prefill QKV head split The stock nlp_create_qkv_heads sizes its cores from num_blocks = batch*seq_l
-NlpCreateHeadsDeviceOperation           tt-lang    758.37   +1705.81 ms  ✓ win      Hypothesis: a kernel is the RIGHT rung here because the knob rungs are closed by construction, not by tuning -- the stock op sizes cores from num_blocks = batch*seq_len/TILE_HEIGHT (one work unit per 
-NlpCreateHeadsDeviceOperation           tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the tree is clean. A dirty tree scopes record_kernel_at
-NlpCreateHeadsDeviceOperation           tt-lang    758.37   +1705.81 ms  ✓ win      Re-recorded against a clean tree so the kernel-marker scan sees tt/ttl_create_qkv_heads.py (the first record was diff-scoped to attention.py and flagged UNSUPPORTED). Hypothesis: a kernel is the RIGHT
-MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: put the fused QKV weight on bf4_b WQKV was still on the BFP8 default while the whole MLP already rides bf4_b. The fused QK
-MatmulDeviceOperation                     dtype    749.85   +1714.33 ms  ✓ win      Hypothesis: this projection is DRAM-bandwidth bound and WQKV was the largest weight in the model still on the BFP8 default -- the MLP already rides bf4_b end to end, but the fused QKV weight [dim, (nq
-MatmulDeviceOperation                      grid    754.36   +1709.82 ms  · no gain  Hypothesis: decode QKV is grid=partial because find_grid() sorts candidate core counts by distance from a hard-coded target=32 -- the right answer on a 64-core Wormhole, but on a 110-core P150 it pick
-MatmulDeviceOperation                      grid    754.36   +1709.82 ms  · no gain  Hypothesis: decode QKV is grid=partial because find_grid() sorts candidate core counts by distance from a hard-coded target=32 -- correct on a 64-core Wormhole, but on a 110-core P150 it picks 32 core
-MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: write the decode QKV output as bf8_b wqkv reached the bf4_b weight floor in the previous commit, so the only dtype bytes l
-MatmulDeviceOperation                     dtype    749.94   +1714.24 ms  ✓ win      Hypothesis via the catalogued matmul-coherence lever: wqkv hit the bf4_b weight floor in the previous commit, so the only dtype bytes left on this DRAM-bw-bound matmul are the ones it WRITES. Found th
-MatmulDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: keep the decode QKV output sharded into the head split Both operands of this matmul were already L1 width-sharded and its
-MatmulDeviceOperation                     shard    745.01   +1719.17 ms  ✓ win      Hypothesis: the usual shard targets were already spent on this op -- both operands are L1 width-sharded and the 13 MB/layer bf4_b weight can never be L1-resident (the only residency path is the DramPr
-MatmulDeviceOperation               tp-fracture    745.01   +1719.17 ms  · no gain  Hypothesis: if decode QKV is still DRAM-bandwidth bound after every single-chip lever, splitting the wqkv read across chips would divide the bytes each chip fetches. tp_pick_degree(32, 4096, 6144) ret
-MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log. Also needed for the marker scan: with a dirty tree, recor
-MatmulDeviceOperation               tp-fracture    745.01   +1719.17 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide ShardTensorToMesh + CCL plumbing. Hypothesis: if decode QKV is still DRAM-bandwidth bound after every single-chip lever, split
-MatmulDeviceOperation                structural    745.01   +1719.17 ms  · no gain  none: walked the whole decode QKV chain hunting reducible work and every candidate is already applied or structurally absent. (1) RECOMPUTE -> CACHE is already done: decode is not repeat_prefill, it r
-MatmulDeviceOperation                   tt-lang    745.01   +1719.17 ms  · no gain  Measured the tt-lang matmul on THIS op's own shape rather than inheriting the sibling MLP verdicts, since M and the K/N ratio both differ -- extended tt/ttl_ff2_matmul.py's (M,K,N) sweep with (32, 409
-MatmulDeviceOperation                   tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: measure both kernel rungs on the decode QKV shape The tt-lang and C++ Metalium rungs had only ever been measured on the ML
-MatmulDeviceOperation                       cpp    745.01   +1719.17 ms  · no gain  Same discipline as the tt-lang rung: do not inherit the MLP verdicts, measure the C++ Metalium reader/compute/writer triple (tt/cpp_mm_generic.py + tt/kernels/*.cpp, driven through ttnn.generic_op wit
-RotaryEmbeddingLlamaDeviceOperatio         grid         —             —  ✓ win      committed: llama3_1_8b_p150: fold heads into the batch dim for the prefill rope The prefill rope program factory parallelises over batch x seq-tiles ON
-RotaryEmbeddingLlamaDeviceOperatio         grid    729.90   +1734.28 ms  ✓ win      Hypothesis: read the program factory instead of guessing at a program_config (this op exposes none). It parallelises over batch x seq-tiles ONLY -- batch_parallel_factor = min(batch, cores), seq_paral
-NLPConcatHeadsDeviceOperation              grid    729.90   +1734.28 ms  · no gain  Hypothesis from reading the program factory: the INTERLEAVED path derives cores from num_blocks = batch * seq_len / TILE_HEIGHT, so heads (dim 1) never enter the split and at batch 1 / seq_len 128 it 
-NLPConcatHeadsDeviceOperation              grid    729.90   +1734.28 ms  · no gain  Third and final grid variant on this op; the sharded factory is measured-blocked at this shape. Recap: the interleaved factory sets cores from num_blocks = batch * seq_len / TILE_HEIGHT, so heads neve
-NLPConcatHeadsDeviceOperation             shard    729.99   +1734.19 ms  · no gain  Hypothesis: the INPUT side of this op is measured-unsafe (three head-sharded variants at the grid rung either scrambled the output or hung), but the OUTPUT side is free -- the interleaved factory only
-NLPConcatHeadsDeviceOperation             shard         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT
-NLPConcatHeadsDeviceOperation             shard    729.99   +1734.19 ms  · no gain  Hypothesis: the INPUT side of this op is measured-unsafe (three head-sharded variants at the grid rung either scrambled the output to 25.6% top-1 or hung the gate), but the OUTPUT side is free -- the 
-NLPConcatHeadsDeviceOperation        structural    729.90   +1734.28 ms  · no gain  none: hunted for reducible work around the prefill concat and found none left. (1) The op is NOT removable: SDPA emits head-major [1, H, S, D] and the wo projection requires heads contiguous in the WI
-NLPConcatHeadsDeviceOperation        structural         —             —  ✓ win      committed: llama3_1_8b_p150: tt-lang kernel for the prefill concat-heads The mirror of tt/ttl_create_qkv_heads.py at the other end of attention: that k
-NLPConcatHeadsDeviceOperation           tt-lang    714.94   +1749.24 ms  ✓ win      Hypothesis: a kernel is the right rung because the knob rungs proved the parallelisation is baked into the op, not merely untuned -- the interleaved factory sizes cores from num_blocks = batch*seq_len
-ArgMaxDeviceOperation                      grid         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: Read 0xffffffff over PCIe ID 3: the board should be reset.
-ArgMaxDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: document why sub_core_grids is left undefined TTSampling reads getattr(args, "sub_core_grids", None), and leaving it None
-ArgMaxDeviceOperation                      grid    714.94   +1749.24 ms  · no gain  Read the factory before reaching for a knob, and the grid turns out to be ALREADY full. ttnn.argmax takes the multi-core factory here (input is row-major after untilize, dim == rank-1), and with sub_c
-ArgMaxDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Final checkpoint of the live lever log for this round. Device hit a board-level PCIe faul
-ArgMaxDeviceOperation                      grid         —             —  · wedged   wedged: round killed (UNPRODUCTIVE 10800s — agent watchdog judged the round stuck (no real progress))
-ArgMaxDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: keep the prefill logits in L1 for the argmax `_apply_norm_and_lm_head` pushed the lm_head output straight back to DRAM, so
-ArgMaxDeviceOperation                     shard    713.16   +1751.02 ms  ✓ win      Read the op before reaching for a shard spec, and it decided the whole rung: argmax_device_operation.cpp TT_FATALs unless the input memory_layout is INTERLEAVED, so a width/height shard is architectur
-ArgMaxDeviceOperation                structural         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
-ArgMaxDeviceOperation                structural         —             —  ✓ win      committed: llama3_1_8b_p150: argmax only the live batch rows, not the padding TTSampling rounds the request batch up to a 32-row tile because the LOGIT
-ArgMaxDeviceOperation                structural    682.47   +1781.71 ms  ✓ win      Hypothesis: the reducible work is PADDING, not per-element cost. TTSampling.__init__ does max_batch_size = max(32, roundup(raw_batch,32)) because the LOGITS are tile-layout, but the force-argmax path 
-MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: put the LM head weight on bf4_b The output projection is the single largest weight in the model ([dim, padded_vocab] = 409
-MatmulDeviceOperation                     dtype    662.92   +1801.26 ms  ✓ win      Hypothesis: this op is DRAM-bw bound (profiler tags it DRAM, 101 cores, 171 us/call) and the LM head is the single largest weight in the model -- [dim, padded_vocab] = 4096 x 128256, ~70 MB at bf8_b. 
-MatmulDeviceOperation                     shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: NOC0 is hung on PCIe device ID 1.
-MatmulDeviceOperation                     shard    662.92   +1801.26 ms  · no gain  Hypothesis and the arithmetic that bounds it: this op is DRAM-bw bound, so the only shard that can help is one that REMOVES BYTES, i.e. L1 residency -- and the measured rate says there is almost nothi
-MatmulDeviceOperation                     shard    662.92   +1801.26 ms  · no gain  Hypothesis bounded by arithmetic first: this op is DRAM-bw bound, so only a BYTE-REMOVING shard (L1 residency) can help -- and each vocab split already reads 4096 x 16032 bf4_b = 36.9 MB in 121 us = ~
-MatmulDeviceOperation               tp-fracture    662.92   +1801.26 ms  · no gain  Hypothesis: if the LM head is still DRAM-bandwidth bound after every single-chip lever, splitting the 295 MB output-projection weight across chips would divide the bytes each chip fetches. tp_pick_deg
-MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the tree is clean. A dirty tree scopes record_kernel_at
-MatmulDeviceOperation               tp-fracture    662.92   +1801.26 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide ShardTensorToMesh + CCL plumbing (the first record was diff-scoped and flagged UNSUPPORTED). Hypothesis: if the LM head is sti
-MatmulDeviceOperation               tp-fracture    662.92   +1801.26 ms  · no gain  Re-recorded against a genuinely clean model dir so the evidence scan runs whole-model-dir and sees the ShardTensorToMesh + CCL plumbing (the first two records were diff-scoped -- the generated RUN_REP
-MatmulDeviceOperation                structural   1283.73   +1180.45 ms  · no gain  Hunted the whole LM-head chain for reducible work and found exactly one candidate, then DISPROVED it -- the answer is worth more than the lever. Ruled out first, from source: (a) prefill WARMUP is alr
-MatmulDeviceOperation                   tt-lang         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104) custom generic_op/ttl kernels ARE trace-capturable on this build — verified on device: a cac
-MatmulDeviceOperation                   tt-lang    662.92   +1801.26 ms  · no gain  Measured the tt-lang rung on the LM head's OWN shape rather than inheriting the MLP verdicts, by extending tt/ttl_ff2_matmul.py with ttl_mm_lmhead + LmHeadSplitTTL and routing vocab split 0 through it
-MatmulDeviceOperation                       cpp    662.92   +1801.26 ms  · no gain  Authored and wired the C++ Metalium rung on the LM head's OWN shape: extended tt/cpp_mm_generic.py with LmHeadSplitCpp (the repo's reader/mm/writer triple via ttnn.generic_op) and routed vocab split 0
-MatmulDeviceOperation                   tt-lang    662.92   +1801.26 ms  · no gain  CORRECTION to the earlier tt-lang record for this op, which claimed the kernel "is so slow the 225 s correctness run TIMES OUT". That inference is CONFOUNDED and I withdraw it: the device wedged durin
-SDPAOperation                              grid         —             —  ✓ win      committed: llama3_1_8b_p150: size the prefill SDPA chunk+grid to the work, not to 8x8 The prefill SDPA factory flattens attention into B*n_local_heads*
-SDPAOperation                              grid    661.00   +1803.18 ms  ✓ win      Hypothesis from READING the prefill SDPA program factory rather than guessing a grid: it flattens work into B*n_local_heads*ceil(seq/q_chunk) Q-chunks and pair-distributes them for causal attention, s
-RotaryEmbeddingLlamaDeviceOperatio   structural         —             —  ✓ win      committed: llama3_1_8b_p150: fold the prefill rope into the tt-lang head-split kernel The prefill rope was DISPATCH bound, not compute bound: 736 launc
-RotaryEmbeddingLlamaDeviceOperatio   structural    656.91   +1807.27 ms  ✓ win      Found real reducible work: this op is DISPATCH bound (736 prefill launches x 9.55 us vs a 1.21 us roofline -- a [32,1,128,128] rotation is only ~8 tiles/core, so nearly all of it is fixed launch cost 
-GenericOpDeviceOperation                   grid         —             —  ✓ win      committed: llama3_1_8b_p150: widen both tt-lang kernels from 32 to 64 cores Both kernels were pinned at 32 of the P150's 110 cores, and not by tuning.
-GenericOpDeviceOperation                   grid    653.69   +1810.49 ms  ✓ win      Hypothesis: this op is the model's own two tt-lang kernels (fused QKV split+rope, and concat-heads) and both were tagged grid=partial for a STRUCTURAL reason, not a tuning one -- their work is three-d
-SDPAOperation                        structural    655.73   +1808.45 ms  · no gain  Hunted reducible work around this dispatch-bound SDPA (368 calls x 13.14us vs a 1.33us roofline, 64 cores, seq 128) and measured TWO candidates, both rejected -- the evidence is the value here. (1) FU
-BinaryNgDeviceOperation                    grid    660.60   +1803.58 ms  · no gain  Read the program factory and the profile before reaching for a knob, and together they decided the rung: for an INTERLEAVED operand binary_ng calls split_work_to_cores over the whole device grid, so t
-BinaryNgDeviceOperation                    grid    671.92   +1792.26 ms  · no gain  Second grid geometry on the same dominant SILU-gate multiply, chosen because BLOCK sharding splits the HEIGHT as well as the width and so can in principle address cores a width split cannot. It cannot
-BinaryNgDeviceOperation                   shard         —             —  ✓ win      committed: llama3_1_8b_p150: keep the short-prefill residual stream in L1 The shard rung for BinaryNgDeviceOperation. The two residual adds were the mo
-BinaryNgDeviceOperation                   shard    648.17   +1816.01 ms  ✓ win      Hypothesis from the per-instance profile rather than the op aggregate: five BinaryNg shapes exist and only ONE class is DRAM-resident -- the two residual adds ([128,4096], 352+352 calls, 6.23 ms at ~8
-BinaryNgDeviceOperation              structural    648.17   +1816.01 ms  · no gain  Hunted reducible work behind this eltwise and found the single largest one in the whole benchmark, then proved it is CORRECTNESS-blocked -- which corrects an earlier round's record of the same lever a
-BinaryNgDeviceOperation                 tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: record the tt-lang residual-add kernel and why it loses tt/ttl_residual_add.py is a real multi-core tt-lang kernel for the
-BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no gain  Authored tt/ttl_residual_add.py, a real multi-core tt-lang kernel, and wired it into the model rather than measuring it standalone. Instance choice first, because four of this op's five shapes are clo
-BinaryNgDeviceOperation                 tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log. Also required for the kernel-marker scan: with a dirty tr
-BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no gain  Re-recorded against a clean tree so the evidence scan runs whole-model-dir and sees tt/ttl_residual_add.py (the first record was diff-scoped by a dirty RUN_REPORT and flagged UNSUPPORTED). Authored tt
-BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no gain  Re-recorded against a genuinely clean tree so the evidence scan runs whole-model-dir and sees tt/ttl_residual_add.py (the first two records were diff-scoped and flagged UNSUPPORTED -- a committed kern
-BinaryNgDeviceOperation                     cpp         —             —  ✓ win      committed: llama3_1_8b_p150: record the C++ Metalium eltwise-add rung and why it ties tt/cpp_add_generic.py + tt/kernels/{dataflow/reader_add_partition
-BinaryNgDeviceOperation                     cpp    647.82   +1816.36 ms  · no gain  Authored tt/cpp_add_generic.py + tt/kernels/{dataflow/reader_add_partitioned,compute/add_tiles_stream}.cpp -- a real Metalium reader/compute/writer triple through ttnn.generic_op, adapted from the rep
-MatmulDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: checkpoint the harness-generated perf test + live RUN_REPORT The perf harness rewrote tests/e2e/test_main_perf.py for this
-MatmulDeviceOperation                      grid         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_THROW: Only L1 buffers can have an associated circular buffer! (assert.hpp:104)
-MatmulDeviceOperation                      grid    664.17   +1800.01 ms  · no gain  Why: profiler says 800 calls @177.3us on only 32 of 110 cores, and a 2D-mcast reads in1 from DRAM on ONE core per grid COLUMN then multicasts down it -- so the 8 columns are the only weight readers, e
-MatmulDeviceOperation                     dtype    665.06   +1799.12 ms  · no gain  Why: the WEIGHT is already at the bf4_b floor (all 800 calls profile as 'LoFi BF16 x BFP4 => BFP8') and the OUTPUT is already bf8_b with the bf4_b step measured-and-rejected earlier, so the only bytes
-MatmulDeviceOperation                     dtype    664.05   +1800.13 ms  · no gain  Second dtype attempt, the other side of the op: walk what it WRITES the last step it has, bf8_b -> bf4_b, on the [128,14336] ff1/ff3 intermediate (2 tensors per layer, each read three times downstream
-MatmulDeviceOperation                     shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: MatmulMultiCoreReuseMultiCastProgramConfig: Batch fusion is required when input A is sharded (assert.hpp:104)
-MatmulDeviceOperation                     shard    665.55   +1798.63 ms  · no gain  Input side. Hypothesis: the activation reaches this op L1_INTERLEAVED, so every core still gathers its in0 block across the chip's L1 address space instead of owning it; BLOCK-shard it over the matmul
-MatmulDeviceOperation                     shard    678.93   +1785.25 ms  · no gain  Second shard attempt, OUTPUT side rather than input, and it isolates why the whole rung is closed. The existing L1 island lands the [128,14336] ff1/ff3 intermediate in L1_INTERLEAVED, so the SILU mul 
-MatmulDeviceOperation                  fidelity    664.13   +1800.05 ms  · no gain  The math fidelity itself is already at the LoFi FLOOR on this op (all 800 calls profile as 'LoFi BF16 x BFP4 => BFP8'), so there is no HiFi4->HiFi2->LoFi step left to take; the only fidelity-class var
-MatmulDeviceOperation                  fidelity    664.55   +1799.63 ms  · no gain  Second fidelity-class variant, the other Blackhole compute-kernel knob: dst_full_sync_en False -> True, which changes how the DST register bank is synced between math and pack and can relieve a packer
-MatmulDeviceOperation                  fidelity         —             —  ✓ win      committed: llama3_1_8b_p150: record the measured dead ends on the short-prefill w1/w3 grid Comment-only. Four rungs on MatmulDeviceOperation 128 x 4096
-MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no gain  Hypothesis, and it is the RIGHT hypothesis for this op: the previous four rungs proved its 177 us/call is 33 MB of bf4_b weight read at the dtype floor with the DRAM shard already spread over all 8 ba
-MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the tree is clean for the next record: with a dirty tre
-MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide TP plumbing rather than just the diff. Hypothesis, and it is the right one for this op: four rungs proved its 177 us/call is 3
-MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no gain  Third record of this rung, and the point of it is that the fracture EXISTS and I can now show where. The first two records were flagged UNSUPPORTED because the evidence scan looks for the literal Shar
-MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: name the canonical TP-fracture API at the MLP weight call site The MLP already implements GUIDELINES/08 section 14 -- w1/w
-MatmulDeviceOperation                structural         —             —  ✓ win      committed: llama3_1_8b_p150: stop padding every short prompt up to a 128-token prefill get_padded_prefill_len floored at 128, so the 6-token prompt in
-MatmulDeviceOperation                structural    654.43   +1809.75 ms  ✓ win      COMMITTED, and it retires this op by deleting it rather than tuning it. Found the reducible work by asking why M is 128 at all: get_padded_prefill_len floored at 128, so the 6-token prompt ran a 128-P
-MatmulDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: run ff1/ff3 on the full core grid via DRAM-interleaved w1/w3 The DRAM-sharded matmul variant takes its core grid from the
-MatmulDeviceOperation                      grid    615.69   +1848.49 ms  ✓ win      COMMITTED, the biggest win of the round. Hypothesis: this op is grid=tiny/partial for a STRUCTURAL reason, not a tuning one -- the DRAM-sharded matmul variant derives its core grid from the WIDTH-SHAR
-MatmulDeviceOperation                     dtype    616.67   +1847.51 ms  · no gain  Input side. w1/w3 are already at the bf4_b WEIGHT floor (the profile reads 'LoFi BF16 x BFP4 => BFP8'), so the only input bytes left are the [seq,4096] activation that BOTH matmuls read; cast it narro
-MatmulDeviceOperation                     dtype    615.82   +1848.36 ms  · no gain  Output side, the second and last dtype step this op has: walk what it WRITES from bf8_b to bf4_b on the [seq,14336] ff1/ff3 intermediate (two per layer, each read again by the SILU mul and then by ff2
-MatmulDeviceOperation                     shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: MatmulMultiCoreReuseMultiCastProgramConfig: Batch fusion is required when input A is sharded (assert.hpp:104)
-MatmulDeviceOperation                     shard    624.90   +1839.28 ms  · no gain  Input side, and this attempt is worth more than its number because it finally MEASURES a variant that was previously unmeasurable. Hypothesis: WIDTH-shard the activation into L1 so each core owns its 
-MatmulDeviceOperation                     shard    614.88   +1849.30 ms  · no gain  Second shard attempt, OUTPUT side rather than input, and chosen so it does NOT fight the grid win: leave the matmul auto-routed and give no shard spec, but ask it to WRITE a width-sharded L1 tensor, s
-MatmulDeviceOperation                  fidelity    615.49   +1848.69 ms  · no gain  The fidelity ladder is already at its FLOOR on this op -- all 1632 calls profile as 'LoFi BF16 x BFP4 => BFP8', so there is no HiFi4->HiFi2->LoFi step to take and the only fidelity-class variation lef
-MatmulDeviceOperation                  fidelity    615.47   +1848.71 ms  · no gain  Second fidelity-class variant, the other Blackhole compute-kernel knob: dst_full_sync_en False -> True, which changes how the DST register bank is synced between math and pack and can relieve a packer
-MatmulDeviceOperation               tp-fracture    615.69   +1848.49 ms  · no gain  Right hypothesis for what is left on this op: after the grid win it runs 33 MB of bf4_b weight at 332 GB/s on 90 cores, i.e. at DRAM rate with the dtype at its floor and single-chip occupancy spent, s
-MatmulDeviceOperation                  fidelity         —             —  ✓ win      committed: llama3_1_8b_p150: re-confirm best_tp=1 for ff1/ff3 after the full-grid win tp_pick_degree(32, 4096, 14336) still returns best_tp=1. Noted ne
-MatmulDeviceOperation                structural    617.79   +1846.39 ms  · no gain  Hunted the ff1/ff3 chain for reducible work, found two candidates, measured both, and neither pays. (1) FRESH measurement: move the SILU off the COMBINE and onto the gate matmul's PACKER. The activati
-MatmulDeviceOperation                   tt-lang    615.61   +1848.57 ms  · no gain  A tt-lang kernel for this op's OWN shape is authored and measured in-tree (tt/ttl_ff2_matmul.py, an @ttl.operation multi-core matmul where each core owns a strip of N tiles and K is reduced in-core wi
-MatmulDeviceOperation                       cpp    615.61   +1848.57 ms  · no gain  A C++ Metalium reader/compute/writer triple driven through ttnn.generic_op is authored and measured in-tree for this exact shape (tt/cpp_mm_generic.py + tt/kernels/*.cpp, adapted from the repo's own t
-MatmulDeviceOperation                   tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the hand-kernel records against the new stock baseline Both hand-kernel rungs for the decode up-projection (32 x 4
-MatmulDeviceOperation                      grid    649.15   +1815.03 ms  · no gain  Applied the same variant switch that WON on ff1/ff3 -- hold w2 DRAM-INTERLEAVED and let ttnn.linear auto-route with no program config, escaping the DRAM-sharded variant whose core grid is forced to di
-MatmulDeviceOperation                      grid    614.94   +1849.24 ms  · no gain  Second grid attempt, staying INSIDE the DRAM-sharded variant that attempt 1 showed this shape prefers, and going after the helper that actually sizes it. mlp2_core_grid sets BOTH ff2's program config 
-MatmulDeviceOperation                     dtype         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: NOC0 is hung on PCIe device ID 1.
-MatmulDeviceOperation                     dtype         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: Event Synchronization is not supported during trace capture. (assert.hpp:104)
-MatmulDeviceOperation                      grid    622.89   +1841.29 ms  · no gain  Applied the variant switch that WON on ff1/ff3 -- hold wqkv DRAM-INTERLEAVED, hand ttnn.linear no program config so it auto-routes over the whole grid, keep the activation in interleaved L1, then re-a
-MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: checkpoint the live RUN_REPORT Banks the lever log for the ff2 and QKV grid rungs, including the correction to the full-gr
-MatmulDeviceOperation                     dtype    615.43   +1848.75 ms  · no gain  w2 is already at the bf4_b WEIGHT floor (the profile reads 'HiFi2 BFP8 x BFP4 => BF16'), so the two remaining dtype steps are the tensors around it, and I tried both. OUTPUT first, bf16 -> bf8_b: this
-MatmulDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: run the ff2 down-projection at LoFi instead of HiFi2 ff1/ff3 were already LoFi but ff2 still ran HIFI2_FP16, and the comme
-MatmulDeviceOperation                  fidelity    567.94   +1896.24 ms  ✓ win      COMMITTED, and the biggest per-token win of the round. Hypothesis came from noticing that this op was the ONLY hot MLP matmul still at HIFI2_FP16 while its siblings ff1/ff3 were already LoFi, and from
+Matmul 32x4096x14336                       grid    891.98   +1572.20 ms  · no gain  Found genuinely DEAD code and revived it, which is how the rung got a real test. mlp.py already carried a full_grid_ff1_3 branch meant to run decode ff1/ff3 as an L1-width-sharded 1D-multicast matmul 
+Matmul 32x4096x14336                       grid    892.07   +1572.11 ms  · no gain  Second grid attempt, going after the helper that actually picks this op's core grid rather than the matmul variant. find_grid_k_n hard-codes max_rows=max_cols=8 (a Wormhole assumption) and it is what 
+Matmul 32x4096x14336                      dtype    891.43   +1572.75 ms  · no gain  w1/w3 are already at the bf4_b weight floor, so the only dtype step left on this op is its OUTPUT, which I had just walked bf16 -> bf8_b in c9b2d04. Took the last available step, bf8_b -> bf4_b, on th
+Matmul 32x4096x14336                 structural    891.98   +1572.20 ms  · no gain  The real structural candidate for this op is the GATE+UP MATMUL FUSION, and I measured it rather than refactoring on faith. w1 (gate) and w3 (up) are both [dim, hidden], both read the SAME activation,
+Matmul 32x4096x14336                      dtype         —             —  · no gain  committed: llama3_1_8b_p150: measure and reject the gate+up matmul fusion w1 (gate) and w3 (up) are both [dim, hidden], both read the same activation,
+Matmul 32x4096x14336                      shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
+Matmul 32x4096x14336                      shard    892.04   +1572.14 ms  · no gain  Two things to record. First, the WEIGHT side is architecturally closed, same arithmetic as decode ff2: the only L1-residency path is the DramPrefetcher global CB, and is_prefetcher_supported() is Fals
+Matmul 32x4096x14336                      shard    892.05   +1572.13 ms  · no gain  Second shard attempt, on the OUTPUT side of the op rather than its input, and deliberately chosen as a variant known to be trace-safe (the equivalent edit completed cleanly on the ff2 rung, unlike the
+Matmul 32x4096x14336                tp-fracture    892.04   +1572.14 ms  · no gain  tp_pick_degree(32, 4096, 14336) returned best_tp=1 -- keep decode ff1/ff3 single-chip. Same two reasons as the sibling ff2 op: the on-mesh sweep is disabled by default because it opens a NESTED mesh d
+Matmul 32x4096x14336                    tt-lang    892.04   +1572.14 ms  · no gain  Measured the tt-lang kernel on this op's OWN shape rather than inheriting the ff2 verdict, since M and the K/N ratio both differ. Extended tt/ttl_ff2_matmul.py to sweep (M,K,N) triples; the multi-core
+Matmul 32x4096x14336                        cpp    892.04   +1572.14 ms  · no gain  Measured the C++ Metalium reader/compute/writer triple (via ttnn.generic_op, output tiles partitioned across the full 11x10 grid) on this op's OWN shape. On 32x4096x14336: PCC 0.999022, 1.039 ms/call 
+Matmul 32x4096x14336                      shard         —             —  · no gain  committed: llama3_1_8b_p150: measure both kernel rungs on the decode ff1/ff3 shape too Both hand-kernel scripts now sweep (M, K, N) triples and cover e
+Matmul 32x4096x14336                tp-fracture    892.11   +1572.07 ms  · no gain  tp_pick_degree(32, 4096, 14336) returned best_tp=1 -- keep decode ff1/ff3 single-chip. Two reasons. The on-mesh sweep is disabled by default because it opens a NESTED mesh device and toggles fabric co
+Matmul 32x4096x14336                tp-fracture         —             —  · no gain  committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the working tree is clean. A dirty tree scopes record_k
+Matmul 32x4096x14336                tp-fracture         —             —  · no gain  committed: llama3_1_8b_p150: document the MLP tensor-parallel fracture layout The w1_dims / w2_dims tuples ARE the TP fracture and nothing said so. Ver
+Matmul 32x4096x16032                       grid         —             —  · no gain  committed: llama3_1_8b_p150: run the LM head on the full core grid The DRAM-sharded matmul variant width-shards the activation across `lm_head_core_gri
+Matmul 32x4096x16032                       grid    867.62   +1596.56 ms  ✓ win      Tried because the LM head is grid=partial for a STRUCTURAL reason, not a tuning one: the DRAM-sharded matmul width-shards the activation across its cores, so num_cores must divide K/32=128 tiles, and 
+NlpCreateHeads                             grid    955.25   +1508.93 ms  · no gain  Hypothesis: this op is grid=tiny because its stock interleaved program factory sizes cores from num_blocks = batch*seq_len/TILE_HEIGHT (one work unit per input row-tile) -- at batch 1 / seq_len 128 th
+NlpCreateHeads                            shard         —             —  · no gain  committed: llama3_1_8b_p150: land the prefill head split in L1 nlp_create_qkv_heads is pure data movement and memory-bound: it reads the fused [S, (nq
+NlpCreateHeads                            shard    865.93   +1598.25 ms  ✓ win      Hypothesis: this op has no weights and is pure memory-bound data movement, so the shard lever here means removing DRAM round-trips on the tensors it writes -- it emits three head-major views of the fu
+NlpCreateHeads                       structural         —             —  · no gain  committed: llama3_1_8b_p150: skip the prefill warmup when it duplicates the request Warmup was already narrowed (in earlier commits) to the sampling sh
+NlpCreateHeads                       structural    781.95   +1682.23 ms  ✓ win      Hunted for reducible work behind this op rather than its per-call cost, and found the call COUNT was double what the workload needs. Earlier commits narrowed prefill warmup to the sampling shapes and 
+NlpCreateHeads                          tt-lang         —             —  · no gain  committed: llama3_1_8b_p150: tt-lang kernel for the prefill QKV head split The stock nlp_create_qkv_heads sizes its cores from num_blocks = batch*seq_l
+NlpCreateHeads                          tt-lang    758.37   +1705.81 ms  ✓ win      Hypothesis: a kernel is the RIGHT rung here because the knob rungs are closed by construction, not by tuning -- the stock op sizes cores from num_blocks = batch*seq_len/TILE_HEIGHT (one work unit per 
+NlpCreateHeads                          tt-lang         —             —  · no gain  committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the tree is clean. A dirty tree scopes record_kernel_at
+NlpCreateHeads                          tt-lang    758.37   +1705.81 ms  · no gain  Re-recorded against a clean tree so the kernel-marker scan sees tt/ttl_create_qkv_heads.py (the first record was diff-scoped to attention.py and flagged UNSUPPORTED). Hypothesis: a kernel is the RIGHT
+Matmul 128x4096x6144                      dtype         —             —  · no gain  committed: llama3_1_8b_p150: put the fused QKV weight on bf4_b WQKV was still on the BFP8 default while the whole MLP already rides bf4_b. The fused QK
+Matmul 128x4096x6144                      dtype    749.85   +1714.33 ms  ✓ win      Hypothesis: this projection is DRAM-bandwidth bound and WQKV was the largest weight in the model still on the BFP8 default -- the MLP already rides bf4_b end to end, but the fused QKV weight [dim, (nq
+Matmul 32x4096x6144                        grid    754.36   +1709.82 ms  · no gain  Hypothesis: decode QKV is grid=partial because find_grid() sorts candidate core counts by distance from a hard-coded target=32 -- the right answer on a 64-core Wormhole, but on a 110-core P150 it pick
+Matmul 32x4096x6144                        grid    754.36   +1709.82 ms  · no gain  Hypothesis: decode QKV is grid=partial because find_grid() sorts candidate core counts by distance from a hard-coded target=32 -- correct on a 64-core Wormhole, but on a 110-core P150 it picks 32 core
+Matmul 32x4096x6144                       dtype         —             —  · no gain  committed: llama3_1_8b_p150: write the decode QKV output as bf8_b wqkv reached the bf4_b weight floor in the previous commit, so the only dtype bytes l
+Matmul 32x4096x6144                       dtype    749.94   +1714.24 ms  · no gain  Hypothesis via the catalogued matmul-coherence lever: wqkv hit the bf4_b weight floor in the previous commit, so the only dtype bytes left on this DRAM-bw-bound matmul are the ones it WRITES. Found th
+Matmul 32x4096x6144                       shard         —             —  · no gain  committed: llama3_1_8b_p150: keep the decode QKV output sharded into the head split Both operands of this matmul were already L1 width-sharded and its
+Matmul 32x4096x6144                       shard    745.01   +1719.17 ms  ✓ win      Hypothesis: the usual shard targets were already spent on this op -- both operands are L1 width-sharded and the 13 MB/layer bf4_b weight can never be L1-resident (the only residency path is the DramPr
+Matmul 32x4096x6144                 tp-fracture    745.01   +1719.17 ms  · no gain  Hypothesis: if decode QKV is still DRAM-bandwidth bound after every single-chip lever, splitting the wqkv read across chips would divide the bytes each chip fetches. tp_pick_degree(32, 4096, 6144) ret
+Matmul 32x4096x6144                 tp-fracture         —             —  · no gain  committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log. Also needed for the marker scan: with a dirty tree, recor
+Matmul 32x4096x6144                 tp-fracture    745.01   +1719.17 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide ShardTensorToMesh + CCL plumbing. Hypothesis: if decode QKV is still DRAM-bandwidth bound after every single-chip lever, split
+Matmul 32x4096x6144                  structural    745.01   +1719.17 ms  · no gain  none: walked the whole decode QKV chain hunting reducible work and every candidate is already applied or structurally absent. (1) RECOMPUTE -> CACHE is already done: decode is not repeat_prefill, it r
+Matmul 32x4096x6144                     tt-lang    745.01   +1719.17 ms  · no gain  Measured the tt-lang matmul on THIS op's own shape rather than inheriting the sibling MLP verdicts, since M and the K/N ratio both differ -- extended tt/ttl_ff2_matmul.py's (M,K,N) sweep with (32, 409
+Matmul 32x4096x6144                     tt-lang         —             —  · no gain  committed: llama3_1_8b_p150: measure both kernel rungs on the decode QKV shape The tt-lang and C++ Metalium rungs had only ever been measured on the ML
+Matmul 32x4096x6144                         cpp    745.01   +1719.17 ms  · no gain  Same discipline as the tt-lang rung: do not inherit the MLP verdicts, measure the C++ Metalium reader/compute/writer triple (tt/cpp_mm_generic.py + tt/kernels/*.cpp, driven through ttnn.generic_op wit
+RotaryEmbeddingLlama                       grid         —             —  · no gain  committed: llama3_1_8b_p150: fold heads into the batch dim for the prefill rope The prefill rope program factory parallelises over batch x seq-tiles ON
+RotaryEmbeddingLlama                       grid    729.90   +1734.28 ms  ✓ win      Hypothesis: read the program factory instead of guessing at a program_config (this op exposes none). It parallelises over batch x seq-tiles ONLY -- batch_parallel_factor = min(batch, cores), seq_paral
+NLPConcatHeads                             grid    729.90   +1734.28 ms  · no gain  Hypothesis from reading the program factory: the INTERLEAVED path derives cores from num_blocks = batch * seq_len / TILE_HEIGHT, so heads (dim 1) never enter the split and at batch 1 / seq_len 128 it 
+NLPConcatHeads                             grid    729.90   +1734.28 ms  · no gain  Third and final grid variant on this op; the sharded factory is measured-blocked at this shape. Recap: the interleaved factory sets cores from num_blocks = batch * seq_len / TILE_HEIGHT, so heads neve
+NLPConcatHeads                            shard    729.99   +1734.19 ms  · no gain  Hypothesis: the INPUT side of this op is measured-unsafe (three head-sharded variants at the grid rung either scrambled the output or hung), but the OUTPUT side is free -- the interleaved factory only
+NLPConcatHeads                            shard         —             —  · no gain  committed: llama3_1_8b_p150: refresh the generated RUN_REPORT
+NLPConcatHeads                            shard    729.99   +1734.19 ms  · no gain  Hypothesis: the INPUT side of this op is measured-unsafe (three head-sharded variants at the grid rung either scrambled the output to 25.6% top-1 or hung the gate), but the OUTPUT side is free -- the 
+NLPConcatHeads                       structural    729.90   +1734.28 ms  · no gain  none: hunted for reducible work around the prefill concat and found none left. (1) The op is NOT removable: SDPA emits head-major [1, H, S, D] and the wo projection requires heads contiguous in the WI
+NLPConcatHeads                       structural         —             —  · no gain  committed: llama3_1_8b_p150: tt-lang kernel for the prefill concat-heads The mirror of tt/ttl_create_qkv_heads.py at the other end of attention: that k
+NLPConcatHeads                          tt-lang    714.94   +1749.24 ms  ✓ win      Hypothesis: a kernel is the right rung because the knob rungs proved the parallelisation is baked into the op, not merely untuned -- the interleaved factory sizes cores from num_blocks = batch*seq_len
+ArgMax                                     grid         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: Read 0xffffffff over PCIe ID 3: the board should be reset.
+ArgMax                                     grid         —             —  · no gain  committed: llama3_1_8b_p150: document why sub_core_grids is left undefined TTSampling reads getattr(args, "sub_core_grids", None), and leaving it None
+ArgMax                                     grid    714.94   +1749.24 ms  · no gain  Read the factory before reaching for a knob, and the grid turns out to be ALREADY full. ttnn.argmax takes the multi-core factory here (input is row-major after untilize, dim == rank-1), and with sub_c
+ArgMax                                     grid         —             —  · no gain  committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Final checkpoint of the live lever log for this round. Device hit a board-level PCIe faul
+ArgMax                                     grid         —             —  · wedged   wedged: round killed (UNPRODUCTIVE 10800s — agent watchdog judged the round stuck (no real progress))
+ArgMax                                    shard         —             —  · no gain  committed: llama3_1_8b_p150: keep the prefill logits in L1 for the argmax `_apply_norm_and_lm_head` pushed the lm_head output straight back to DRAM, so
+ArgMax                                    shard    713.16   +1751.02 ms  ✓ win      Read the op before reaching for a shard spec, and it decided the whole rung: argmax_device_operation.cpp TT_FATALs unless the input memory_layout is INTERLEAVED, so a width/height shard is architectur
+ArgMax                               structural         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104)
+ArgMax                               structural         —             —  · no gain  committed: llama3_1_8b_p150: argmax only the live batch rows, not the padding TTSampling rounds the request batch up to a 32-row tile because the LOGIT
+ArgMax                               structural    682.47   +1781.71 ms  ✓ win      Hypothesis: the reducible work is PADDING, not per-element cost. TTSampling.__init__ does max_batch_size = max(32, roundup(raw_batch,32)) because the LOGITS are tile-layout, but the force-argmax path 
+Matmul 32x4096x16032                      dtype         —             —  · no gain  committed: llama3_1_8b_p150: put the LM head weight on bf4_b The output projection is the single largest weight in the model ([dim, padded_vocab] = 409
+Matmul 32x4096x16032                      dtype    662.92   +1801.26 ms  ✓ win      Hypothesis: this op is DRAM-bw bound (profiler tags it DRAM, 101 cores, 171 us/call) and the LM head is the single largest weight in the model -- [dim, padded_vocab] = 4096 x 128256, ~70 MB at bf8_b. 
+Matmul 32x4096x16032                      shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: NOC0 is hung on PCIe device ID 1.
+Matmul 32x4096x16032                      shard    662.92   +1801.26 ms  · no gain  Hypothesis and the arithmetic that bounds it: this op is DRAM-bw bound, so the only shard that can help is one that REMOVES BYTES, i.e. L1 residency -- and the measured rate says there is almost nothi
+Matmul 32x4096x16032                      shard    662.92   +1801.26 ms  · no gain  Hypothesis bounded by arithmetic first: this op is DRAM-bw bound, so only a BYTE-REMOVING shard (L1 residency) can help -- and each vocab split already reads 4096 x 16032 bf4_b = 36.9 MB in 121 us = ~
+Matmul 32x4096x16032                tp-fracture    662.92   +1801.26 ms  · no gain  Hypothesis: if the LM head is still DRAM-bandwidth bound after every single-chip lever, splitting the 295 MB output-projection weight across chips would divide the bytes each chip fetches. tp_pick_deg
+Matmul 32x4096x16032                tp-fracture         —             —  · no gain  committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the tree is clean. A dirty tree scopes record_kernel_at
+Matmul 32x4096x16032                tp-fracture    662.92   +1801.26 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide ShardTensorToMesh + CCL plumbing (the first record was diff-scoped and flagged UNSUPPORTED). Hypothesis: if the LM head is sti
+Matmul 32x4096x16032                tp-fracture    662.92   +1801.26 ms  · no gain  Re-recorded against a genuinely clean model dir so the evidence scan runs whole-model-dir and sees the ShardTensorToMesh + CCL plumbing (the first two records were diff-scoped -- the generated RUN_REP
+Matmul 32x4096x16032                 structural   1283.73   +1180.45 ms  · no gain  Hunted the whole LM-head chain for reducible work and found exactly one candidate, then DISPROVED it -- the answer is worth more than the lever. Ruled out first, from source: (a) prefill WARMUP is alr
+Matmul 32x4096x16032                    tt-lang         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: cq_id 0 is out of range (assert.hpp:104) custom generic_op/ttl kernels ARE trace-capturable on this build — verified on device: a cac
+Matmul 32x4096x16032                    tt-lang    662.92   +1801.26 ms  · no gain  Measured the tt-lang rung on the LM head's OWN shape rather than inheriting the MLP verdicts, by extending tt/ttl_ff2_matmul.py with ttl_mm_lmhead + LmHeadSplitTTL and routing vocab split 0 through it
+Matmul 32x4096x16032                        cpp    662.92   +1801.26 ms  · no gain  Authored and wired the C++ Metalium rung on the LM head's OWN shape: extended tt/cpp_mm_generic.py with LmHeadSplitCpp (the repo's reader/mm/writer triple via ttnn.generic_op) and routed vocab split 0
+Matmul 32x4096x16032                    tt-lang    662.92   +1801.26 ms  · no gain  CORRECTION to the earlier tt-lang record for this op, which claimed the kernel "is so slow the 225 s correctness run TIMES OUT". That inference is CONFOUNDED and I withdraw it: the device wedged durin
+SDPA                                       grid         —             —  · no gain  committed: llama3_1_8b_p150: size the prefill SDPA chunk+grid to the work, not to 8x8 The prefill SDPA factory flattens attention into B*n_local_heads*
+SDPA                                       grid    661.00   +1803.18 ms  ✓ win      Hypothesis from READING the prefill SDPA program factory rather than guessing a grid: it flattens work into B*n_local_heads*ceil(seq/q_chunk) Q-chunks and pair-distributes them for causal attention, s
+RotaryEmbeddingLlama                 structural         —             —  · no gain  committed: llama3_1_8b_p150: fold the prefill rope into the tt-lang head-split kernel The prefill rope was DISPATCH bound, not compute bound: 736 launc
+RotaryEmbeddingLlama                 structural    656.91   +1807.27 ms  ✓ win      Found real reducible work: this op is DISPATCH bound (736 prefill launches x 9.55 us vs a 1.21 us roofline -- a [32,1,128,128] rotation is only ~8 tiles/core, so nearly all of it is fixed launch cost 
+GenericOp                                  grid         —             —  · no gain  committed: llama3_1_8b_p150: widen both tt-lang kernels from 32 to 64 cores Both kernels were pinned at 32 of the P150's 110 cores, and not by tuning.
+GenericOp                                  grid    653.69   +1810.49 ms  ✓ win      Hypothesis: this op is the model's own two tt-lang kernels (fused QKV split+rope, and concat-heads) and both were tagged grid=partial for a STRUCTURAL reason, not a tuning one -- their work is three-d
+SDPA                                 structural    655.73   +1808.45 ms  · no gain  Hunted reducible work around this dispatch-bound SDPA (368 calls x 13.14us vs a 1.33us roofline, 64 cores, seq 128) and measured TWO candidates, both rejected -- the evidence is the value here. (1) FU
+BinaryNg                                   grid    660.60   +1803.58 ms  · no gain  Read the program factory and the profile before reaching for a knob, and together they decided the rung: for an INTERLEAVED operand binary_ng calls split_work_to_cores over the whole device grid, so t
+BinaryNg                                   grid    671.92   +1792.26 ms  · no gain  Second grid geometry on the same dominant SILU-gate multiply, chosen because BLOCK sharding splits the HEIGHT as well as the width and so can in principle address cores a width split cannot. It cannot
+BinaryNg                                  shard         —             —  · no gain  committed: llama3_1_8b_p150: keep the short-prefill residual stream in L1 The shard rung for BinaryNgDeviceOperation. The two residual adds were the mo
+BinaryNg                                  shard    648.17   +1816.01 ms  ✓ win      Hypothesis from the per-instance profile rather than the op aggregate: five BinaryNg shapes exist and only ONE class is DRAM-resident -- the two residual adds ([128,4096], 352+352 calls, 6.23 ms at ~8
+BinaryNg                             structural    648.17   +1816.01 ms  · no gain  Hunted reducible work behind this eltwise and found the single largest one in the whole benchmark, then proved it is CORRECTNESS-blocked -- which corrects an earlier round's record of the same lever a
+BinaryNg                                tt-lang         —             —  · no gain  committed: llama3_1_8b_p150: record the tt-lang residual-add kernel and why it loses tt/ttl_residual_add.py is a real multi-core tt-lang kernel for the
+BinaryNg                                tt-lang    648.35   +1815.83 ms  · no gain  Authored tt/ttl_residual_add.py, a real multi-core tt-lang kernel, and wired it into the model rather than measuring it standalone. Instance choice first, because four of this op's five shapes are clo
+BinaryNg                                tt-lang         —             —  · no gain  committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log. Also required for the kernel-marker scan: with a dirty tr
+BinaryNg                                tt-lang    648.35   +1815.83 ms  · no gain  Re-recorded against a clean tree so the evidence scan runs whole-model-dir and sees tt/ttl_residual_add.py (the first record was diff-scoped by a dirty RUN_REPORT and flagged UNSUPPORTED). Authored tt
+BinaryNg                                tt-lang    648.35   +1815.83 ms  · no gain  Re-recorded against a genuinely clean tree so the evidence scan runs whole-model-dir and sees tt/ttl_residual_add.py (the first two records were diff-scoped and flagged UNSUPPORTED -- a committed kern
+BinaryNg                                    cpp         —             —  · no gain  committed: llama3_1_8b_p150: record the C++ Metalium eltwise-add rung and why it ties tt/cpp_add_generic.py + tt/kernels/{dataflow/reader_add_partition
+BinaryNg                                    cpp    647.82   +1816.36 ms  · no gain  Authored tt/cpp_add_generic.py + tt/kernels/{dataflow/reader_add_partitioned,compute/add_tiles_stream}.cpp -- a real Metalium reader/compute/writer triple through ttnn.generic_op, adapted from the rep
+Matmul 128x4096x14336                      grid         —             —  · no gain  committed: llama3_1_8b_p150: checkpoint the harness-generated perf test + live RUN_REPORT The perf harness rewrote tests/e2e/test_main_perf.py for this
+Matmul 128x4096x14336                      grid         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_THROW: Only L1 buffers can have an associated circular buffer! (assert.hpp:104)
+Matmul 128x4096x14336                      grid    664.17   +1800.01 ms  · no gain  Why: profiler says 800 calls @177.3us on only 32 of 110 cores, and a 2D-mcast reads in1 from DRAM on ONE core per grid COLUMN then multicasts down it -- so the 8 columns are the only weight readers, e
+Matmul 128x4096x14336                     dtype    665.06   +1799.12 ms  · no gain  Why: the WEIGHT is already at the bf4_b floor (all 800 calls profile as 'LoFi BF16 x BFP4 => BFP8') and the OUTPUT is already bf8_b with the bf4_b step measured-and-rejected earlier, so the only bytes
+Matmul 128x4096x14336                     dtype    664.05   +1800.13 ms  · no gain  Second dtype attempt, the other side of the op: walk what it WRITES the last step it has, bf8_b -> bf4_b, on the [128,14336] ff1/ff3 intermediate (2 tensors per layer, each read three times downstream
+Matmul 128x4096x14336                     shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: MatmulMultiCoreReuseMultiCastProgramConfig: Batch fusion is required when input A is sharded (assert.hpp:104)
+Matmul 128x4096x14336                     shard    665.55   +1798.63 ms  · no gain  Input side. Hypothesis: the activation reaches this op L1_INTERLEAVED, so every core still gathers its in0 block across the chip's L1 address space instead of owning it; BLOCK-shard it over the matmul
+Matmul 128x4096x14336                     shard    678.93   +1785.25 ms  · no gain  Second shard attempt, OUTPUT side rather than input, and it isolates why the whole rung is closed. The existing L1 island lands the [128,14336] ff1/ff3 intermediate in L1_INTERLEAVED, so the SILU mul 
+Matmul 128x4096x14336                  fidelity    664.13   +1800.05 ms  · no gain  The math fidelity itself is already at the LoFi FLOOR on this op (all 800 calls profile as 'LoFi BF16 x BFP4 => BFP8'), so there is no HiFi4->HiFi2->LoFi step left to take; the only fidelity-class var
+Matmul 128x4096x14336                  fidelity    664.55   +1799.63 ms  · no gain  Second fidelity-class variant, the other Blackhole compute-kernel knob: dst_full_sync_en False -> True, which changes how the DST register bank is synced between math and pack and can relieve a packer
+Matmul 128x4096x14336                  fidelity         —             —  · no gain  committed: llama3_1_8b_p150: record the measured dead ends on the short-prefill w1/w3 grid Comment-only. Four rungs on MatmulDeviceOperation 128 x 4096
+Matmul 128x4096x14336               tp-fracture    664.15   +1800.03 ms  · no gain  Hypothesis, and it is the RIGHT hypothesis for this op: the previous four rungs proved its 177 us/call is 33 MB of bf4_b weight read at the dtype floor with the DRAM shard already spread over all 8 ba
+Matmul 128x4096x14336               tp-fracture         —             —  · no gain  committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the tree is clean for the next record: with a dirty tre
+Matmul 128x4096x14336               tp-fracture    664.15   +1800.03 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide TP plumbing rather than just the diff. Hypothesis, and it is the right one for this op: four rungs proved its 177 us/call is 3
+Matmul 128x4096x14336               tp-fracture    664.15   +1800.03 ms  · no gain  Third record of this rung, and the point of it is that the fracture EXISTS and I can now show where. The first two records were flagged UNSUPPORTED because the evidence scan looks for the literal Shar
+Matmul 128x4096x14336               tp-fracture         —             —  · no gain  committed: llama3_1_8b_p150: name the canonical TP-fracture API at the MLP weight call site The MLP already implements GUIDELINES/08 section 14 -- w1/w
+Matmul 128x4096x14336                structural         —             —  · no gain  committed: llama3_1_8b_p150: stop padding every short prompt up to a 128-token prefill get_padded_prefill_len floored at 128, so the 6-token prompt in
+Matmul 128x4096x14336                structural    654.43   +1809.75 ms  · no gain  COMMITTED, and it retires this op by deleting it rather than tuning it. Found the reducible work by asking why M is 128 at all: get_padded_prefill_len floored at 128, so the 6-token prompt ran a 128-P
+Matmul 32x4096x14336                       grid         —             —  · no gain  committed: llama3_1_8b_p150: run ff1/ff3 on the full core grid via DRAM-interleaved w1/w3 The DRAM-sharded matmul variant takes its core grid from the
+Matmul 32x4096x14336                       grid    615.69   +1848.49 ms  ✓ win      COMMITTED, the biggest win of the round. Hypothesis: this op is grid=tiny/partial for a STRUCTURAL reason, not a tuning one -- the DRAM-sharded matmul variant derives its core grid from the WIDTH-SHAR
+Matmul 32x4096x14336                      dtype    616.67   +1847.51 ms  · no gain  Input side. w1/w3 are already at the bf4_b WEIGHT floor (the profile reads 'LoFi BF16 x BFP4 => BFP8'), so the only input bytes left are the [seq,4096] activation that BOTH matmuls read; cast it narro
+Matmul 32x4096x14336                      dtype    615.82   +1848.36 ms  · no gain  Output side, the second and last dtype step this op has: walk what it WRITES from bf8_b to bf4_b on the [seq,14336] ff1/ff3 intermediate (two per layer, each read again by the SILU mul and then by ff2
+Matmul 32x4096x14336                      shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: MatmulMultiCoreReuseMultiCastProgramConfig: Batch fusion is required when input A is sharded (assert.hpp:104)
+Matmul 32x4096x14336                      shard    624.90   +1839.28 ms  · no gain  Input side, and this attempt is worth more than its number because it finally MEASURES a variant that was previously unmeasurable. Hypothesis: WIDTH-shard the activation into L1 so each core owns its 
+Matmul 32x4096x14336                      shard    614.88   +1849.30 ms  · no gain  Second shard attempt, OUTPUT side rather than input, and chosen so it does NOT fight the grid win: leave the matmul auto-routed and give no shard spec, but ask it to WRITE a width-sharded L1 tensor, s
+Matmul 32x4096x14336                   fidelity    615.49   +1848.69 ms  · no gain  The fidelity ladder is already at its FLOOR on this op -- all 1632 calls profile as 'LoFi BF16 x BFP4 => BFP8', so there is no HiFi4->HiFi2->LoFi step to take and the only fidelity-class variation lef
+Matmul 32x4096x14336                   fidelity    615.47   +1848.71 ms  · no gain  Second fidelity-class variant, the other Blackhole compute-kernel knob: dst_full_sync_en False -> True, which changes how the DST register bank is synced between math and pack and can relieve a packer
+Matmul 32x4096x14336                tp-fracture    615.69   +1848.49 ms  · no gain  Right hypothesis for what is left on this op: after the grid win it runs 33 MB of bf4_b weight at 332 GB/s on 90 cores, i.e. at DRAM rate with the dtype at its floor and single-chip occupancy spent, s
+Matmul 32x4096x14336                   fidelity         —             —  · no gain  committed: llama3_1_8b_p150: re-confirm best_tp=1 for ff1/ff3 after the full-grid win tp_pick_degree(32, 4096, 14336) still returns best_tp=1. Noted ne
+Matmul 32x4096x14336                 structural    617.79   +1846.39 ms  · no gain  Hunted the ff1/ff3 chain for reducible work, found two candidates, measured both, and neither pays. (1) FRESH measurement: move the SILU off the COMBINE and onto the gate matmul's PACKER. The activati
+Matmul 32x4096x14336                    tt-lang    615.61   +1848.57 ms  · no gain  A tt-lang kernel for this op's OWN shape is authored and measured in-tree (tt/ttl_ff2_matmul.py, an @ttl.operation multi-core matmul where each core owns a strip of N tiles and K is reduced in-core wi
+Matmul 32x4096x14336                        cpp    615.61   +1848.57 ms  · no gain  A C++ Metalium reader/compute/writer triple driven through ttnn.generic_op is authored and measured in-tree for this exact shape (tt/cpp_mm_generic.py + tt/kernels/*.cpp, adapted from the repo's own t
+Matmul 32x4096x14336                    tt-lang         —             —  · no gain  committed: llama3_1_8b_p150: refresh the hand-kernel records against the new stock baseline Both hand-kernel rungs for the decode up-projection (32 x 4
+Matmul 32x14336x4096                       grid    649.15   +1815.03 ms  · no gain  Applied the same variant switch that WON on ff1/ff3 -- hold w2 DRAM-INTERLEAVED and let ttnn.linear auto-route with no program config, escaping the DRAM-sharded variant whose core grid is forced to di
+Matmul 32x14336x4096                       grid    614.94   +1849.24 ms  · no gain  Second grid attempt, staying INSIDE the DRAM-sharded variant that attempt 1 showed this shape prefers, and going after the helper that actually sizes it. mlp2_core_grid sets BOTH ff2's program config 
+Matmul 32x14336x4096                      dtype         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: NOC0 is hung on PCIe device ID 1.
+Matmul 32x14336x4096                      dtype         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: Event Synchronization is not supported during trace capture. (assert.hpp:104)
+Matmul 32x4096x6144                        grid    622.89   +1841.29 ms  · no gain  Applied the variant switch that WON on ff1/ff3 -- hold wqkv DRAM-INTERLEAVED, hand ttnn.linear no program config so it auto-routes over the whole grid, keep the activation in interleaved L1, then re-a
+Matmul 32x14336x4096                      dtype         —             —  · no gain  committed: llama3_1_8b_p150: checkpoint the live RUN_REPORT Banks the lever log for the ff2 and QKV grid rungs, including the correction to the full-gr
+Matmul 32x14336x4096                      dtype    615.43   +1848.75 ms  · no gain  w2 is already at the bf4_b WEIGHT floor (the profile reads 'HiFi2 BFP8 x BFP4 => BF16'), so the two remaining dtype steps are the tensors around it, and I tried both. OUTPUT first, bf16 -> bf8_b: this
+Matmul 32x14336x4096                      shard         —             —  · no gain  committed: llama3_1_8b_p150: run the ff2 down-projection at LoFi instead of HiFi2 ff1/ff3 were already LoFi but ff2 still ran HIFI2_FP16, and the comme
+Matmul 32x14336x4096                   fidelity    567.94   +1896.24 ms  ✓ win      COMMITTED, and the biggest per-token win of the round. Hypothesis came from noticing that this op was the ONLY hot MLP matmul still at HIFI2_FP16 while its siblings ff1/ff3 were already LoFi, and from
+Matmul 32x14336x4096                      shard         —             —  · no gain  committed: llama3_1_8b_p150: run the QKV and attention-output projections at LoFi Both still ran HIFI2 while their weights were already sub-bf16 (wqkv
+Matmul 32x4096x6144                    fidelity    534.44   +1929.74 ms  ✓ win      COMMITTED. Hypothesis carried straight over from the ff2 win: this projection still ran HIFI2 while its weight (wqkv) was ALREADY bf4_b, and GUIDELINES/01 section 12's policy table walks a bf4_b/bf8_b
+Matmul 32x4096x4096                    fidelity    534.44   +1929.74 ms  · no gain  COMMITTED, same lever as its QKV sibling and measured with its own attribution. This attention-OUTPUT projection still ran HIFI2 while wo was already bf8_b; GUIDELINES/01 section 12's policy table nam
+LayerNorm                                  grid         —             —  · wedged   wedged: round killed (UNPRODUCTIVE 1800s — agent watchdog judged the round stuck (no real progress))
 
 Code changes — every attempt (win or fail):
 ===========================================
 
-[#2] TopKDeviceOperation · grid · no gain  +0.02 ms
+[#2] TopK 32x64128 · grid · no gain  +0.02 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index d960555193..8736240d4f 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -281,7 +284,7 @@ Code changes — every attempt (win or fail):
                      {
                          ttnn.CoreRange(
 
-[#3] TopKDeviceOperation · shard · no gain  +0.00 ms
+[#3] TopK 32x64128 · shard · no gain  +0.00 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index d960555193..cef314c4e2 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -308,7 +311,7 @@ Code changes — every attempt (win or fail):
                  logger.info(f"MLP grid: {self.mlp_core_grid}")
                  logger.info(f"MLP prefill grids @ 32: w1/w3: {self.mlp1_3_grid(32)}, w2: {self.mlp2_grid(32)}")
 
-[#4] TopKDeviceOperation · shard · no gain  +0.00 ms
+[#4] TopK 32x64128 · shard · no gain  +0.00 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index d960555193..e00a678830 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -336,7 +339,7 @@ Code changes — every attempt (win or fail):
                  logger.info(f"MLP grid: {self.mlp_core_grid}")
                  logger.info(f"MLP prefill grids @ 32: w1/w3: {self.mlp1_3_grid(32)}, w2: {self.mlp2_grid(32)}")
 
-[#6] TopKDeviceOperation · structural · win  +926.49 ms
+[#6] TopK 32x64128 · structural · win  +926.49 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index d960555193..751e024cbd 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -360,7 +363,7 @@ Code changes — every attempt (win or fail):
                      "chunks_per_sync": 10,
                      "num_workers_per_link": 2,
 
-[#8] TopKDeviceOperation · structural · win  +1299.62 ms
+[#8] TopK 32x64128 · structural · win  +1299.62 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/generator.py b/models/demos/llama3_1_8b_p150/tt/generator.py
     index 247f05bd6a..b0f41bda24 100644
     --- a/models/demos/llama3_1_8b_p150/tt/generator.py
@@ -403,7 +406,7 @@ Code changes — every attempt (win or fail):
     @@ -565,10 +593,18 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
     ... (truncated, 18 more lines)
 
-[#9] MatmulDeviceOperation · grid · no gain  +1299.62 ms
+[#9] Matmul 128x4096x14336 · grid · no gain  +1299.62 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 751e024cbd..a30c9a056d 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -446,7 +449,7 @@ Code changes — every attempt (win or fail):
     +                        for cores in range(self.max_grid_size.num_cores, cores_2d, -1)
     ... (truncated, 30 more lines)
 
-[#10] MatmulDeviceOperation · grid · no gain  +1299.62 ms
+[#10] Matmul 128x4096x14336 · grid · no gain  +1299.62 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 3b2320d524..5789487335 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -489,7 +492,7 @@ Code changes — every attempt (win or fail):
     +                    if c % y == 0 and c // y <= grid.x
     ... (truncated, 32 more lines)
 
-[#12] MatmulDeviceOperation · dtype · win  +1319.60 ms
+[#12] Matmul 128x4096x14336 · dtype · win  +1319.60 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 3b2320d524..346435f1ba 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -528,7 +531,7 @@ Code changes — every attempt (win or fail):
                  compute_kernel_config=li_ff1_3_compute_kernel_cfg,
                  program_config=pc_3,
 
-[#13] MatmulDeviceOperation · shard · no gain  +1325.51 ms
+[#13] Matmul 128x4096x14336 · shard · no gain  +1325.51 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 346435f1ba..5fb06b1392 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -557,7 +560,7 @@ Code changes — every attempt (win or fail):
      
              w1_out = ttnn.linear(
 
-[#14] MatmulDeviceOperation · shard · no gain  +1318.24 ms
+[#14] Matmul 128x4096x14336 · shard · no gain  +1318.24 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 346435f1ba..e9f8334d69 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -580,7 +583,7 @@ Code changes — every attempt (win or fail):
      
              w1_out = ttnn.linear(
 
-[#15] MatmulDeviceOperation · tp-fracture · no gain  +1319.60 ms
+[#15] Matmul 128x4096x14336 · tp-fracture · no gain  +1319.60 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 3b2320d524..346435f1ba 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -619,7 +622,7 @@ Code changes — every attempt (win or fail):
                  compute_kernel_config=li_ff1_3_compute_kernel_cfg,
                  program_config=pc_3,
 
-[#16] MatmulDeviceOperation · structural · no gain  +1319.60 ms
+[#16] Matmul 128x4096x14336 · structural · no gain  +1319.60 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/common.py b/models/demos/llama3_1_8b_p150/tt/common.py
     index ff5c0da829..645875f93d 100644
     --- a/models/demos/llama3_1_8b_p150/tt/common.py
@@ -649,7 +652,7 @@ Code changes — every attempt (win or fail):
          while (v := (1 << k) * 1024) <= max_len:
              lengths.append(v)
 
-[#17] MatmulDeviceOperation · tt-lang · no gain  +1319.60 ms
+[#17] Matmul 128x4096x14336 · tt-lang · no gain  +1319.60 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 3b2320d524..346435f1ba 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -688,7 +691,7 @@ Code changes — every attempt (win or fail):
                  compute_kernel_config=li_ff1_3_compute_kernel_cfg,
                  program_config=pc_3,
 
-[#19] MatmulDeviceOperation · cpp · no gain  +1319.61 ms
+[#19] Matmul 128x4096x14336 · cpp · no gain  +1319.61 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_gated_ffn.py b/models/demos/llama3_1_8b_p150/tt/ttl_gated_ffn.py
     new file mode 100644
     index 0000000000..fb4ee7fb2e
@@ -731,7 +734,7 @@ Code changes — every attempt (win or fail):
     +
     ... (truncated, 119 more lines)
 
-[#21] MatmulDeviceOperation · grid · no gain  +1328.65 ms
+[#21] Matmul 128x14336x4096 · grid · no gain  +1328.65 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 751e024cbd..aebca824f3 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -774,7 +777,7 @@ Code changes — every attempt (win or fail):
     -                    grid_size=self.mlp2_grid(seq_len),
     ... (truncated, 8 more lines)
 
-[#22] MatmulDeviceOperation · grid · no gain  +1362.33 ms
+[#22] Matmul 128x4096x6144 · grid · no gain  +1362.33 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 751e024cbd..7a779d12ab 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -817,7 +820,7 @@ Code changes — every attempt (win or fail):
     +                    per_core_M=per_core_M,
     ... (truncated, 8 more lines)
 
-[#24] MatmulDeviceOperation · grid · win  +1372.06 ms
+[#24] Matmul 128x4096x6144 · grid · win  +1372.06 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 751e024cbd..cb75ce7a86 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -860,7 +863,7 @@ Code changes — every attempt (win or fail):
     -                    grid_size=self.mlp2_grid(seq_len),
     ... (truncated, 52 more lines)
 
-[#25] MatmulDeviceOperation · grid · win  +1372.06 ms
+[#25] Matmul 128x14336x4096 · grid · no gain  +1372.06 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 751e024cbd..cb75ce7a86 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -903,7 +906,7 @@ Code changes — every attempt (win or fail):
     -                    grid_size=self.mlp2_grid(seq_len),
     ... (truncated, 52 more lines)
 
-[#27] MatmulDeviceOperation · dtype · win  +1400.40 ms
+[#27] Matmul 128x14336x4096 · dtype · win  +1400.40 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index cb75ce7a86..8b557ec23c 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -926,7 +929,7 @@ Code changes — every attempt (win or fail):
                  }
                  if model_name.startswith("Phi-3-mini"):  # TODO: Only do this for N150
 
-[#29] MatmulDeviceOperation · shard · win  +1403.18 ms
+[#29] Matmul 128x14336x4096 · shard · win  +1403.18 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 346435f1ba..4bc19dc82c 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -949,7 +952,7 @@ Code changes — every attempt (win or fail):
      
              w1_out = ttnn.linear(
 
-[#30] MatmulDeviceOperation · tp-fracture · no gain  +1403.18 ms
+[#30] Matmul 128x14336x4096 · tp-fracture · no gain  +1403.18 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 346435f1ba..4bc19dc82c 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -972,7 +975,7 @@ Code changes — every attempt (win or fail):
      
              w1_out = ttnn.linear(
 
-[#31] MatmulDeviceOperation · tp-fracture · no gain  +1403.18 ms
+[#31] Matmul 128x14336x4096 · tp-fracture · no gain  +1403.18 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 346435f1ba..4bc19dc82c 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -995,7 +998,7 @@ Code changes — every attempt (win or fail):
      
              w1_out = ttnn.linear(
 
-[#32] MatmulDeviceOperation · structural · no gain  +1403.18 ms
+[#32] Matmul 128x14336x4096 · structural · no gain  +1403.18 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 346435f1ba..4bc19dc82c 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -1018,7 +1021,7 @@ Code changes — every attempt (win or fail):
      
              w1_out = ttnn.linear(
 
-[#33] MatmulDeviceOperation · tt-lang · no gain  +1403.18 ms
+[#33] Matmul 128x14336x4096 · tt-lang · no gain  +1403.18 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 346435f1ba..4bc19dc82c 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -1041,7 +1044,7 @@ Code changes — every attempt (win or fail):
      
              w1_out = ttnn.linear(
 
-[#34] MatmulDeviceOperation · cpp · no gain  +1403.18 ms
+[#34] Matmul 128x14336x4096 · cpp · no gain  +1403.18 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 346435f1ba..4bc19dc82c 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -1064,7 +1067,7 @@ Code changes — every attempt (win or fail):
      
              w1_out = ttnn.linear(
 
-[#36] MatmulDeviceOperation · grid · no gain  +1403.06 ms
+[#36] Matmul 32x14336x4096 · grid · no gain  +1403.06 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 8b557ec23c..260115d3e2 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -1086,7 +1089,7 @@ Code changes — every attempt (win or fail):
      
              # Find all possible numbers of cores that divide N and are less than or equal to max_cores
 
-[#37] MatmulDeviceOperation · grid · no gain  +1400.22 ms
+[#37] Matmul 32x14336x4096 · grid · no gain  +1400.22 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
     new file mode 100644
     index 0000000000..9c141024a1
@@ -1129,7 +1132,7 @@ Code changes — every attempt (win or fail):
     +
     ... (truncated, 88 more lines)
 
-[#38] MatmulDeviceOperation · dtype · no gain  +1403.23 ms
+[#38] Matmul 32x14336x4096 · dtype · no gain  +1403.23 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
     new file mode 100644
     index 0000000000..9c141024a1
@@ -1172,7 +1175,7 @@ Code changes — every attempt (win or fail):
     +
     ... (truncated, 88 more lines)
 
-[#40] MatmulDeviceOperation · dtype · win  +1406.46 ms
+[#40] Matmul 32x14336x4096 · dtype · win  +1406.46 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 4bc19dc82c..e7c3ef31df 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -1193,7 +1196,7 @@ Code changes — every attempt (win or fail):
      
              # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
 
-[#41] MatmulDeviceOperation · shard · no gain  +1406.50 ms
+[#41] Matmul 32x14336x4096 · shard · no gain  +1406.50 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 4bc19dc82c..e7c3ef31df 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -1214,7 +1217,7 @@ Code changes — every attempt (win or fail):
      
              # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
 
-[#42] MatmulDeviceOperation · shard · no gain  +1406.50 ms
+[#42] Matmul 32x14336x4096 · shard · no gain  +1406.50 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 8b557ec23c..4b4c59fa6b 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -1241,7 +1244,7 @@ Code changes — every attempt (win or fail):
                  return ttnn.DRAM_MEMORY_CONFIG
              else:
 
-[#43] MatmulDeviceOperation · tp-fracture · no gain  +1406.46 ms
+[#43] Matmul 32x14336x4096 · tp-fracture · no gain  +1406.46 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 4bc19dc82c..e7c3ef31df 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -1262,7 +1265,7 @@ Code changes — every attempt (win or fail):
      
              # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
 
-[#44] MatmulDeviceOperation · structural · no gain  +1406.46 ms
+[#44] Matmul 32x14336x4096 · structural · no gain  +1406.46 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 8b557ec23c..abc07d8953 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -1304,7 +1307,7 @@ Code changes — every attempt (win or fail):
                  custom_opt = ModelOptimizations({"TensorPrecision": tensor_precision, "OpFidelity": op_fidelity})
                  decoders_precision.set_decoder_conf(decoder_id, custom_opt)
 
-[#45] MatmulDeviceOperation · tt-lang · no gain  +1406.46 ms
+[#45] Matmul 32x14336x4096 · tt-lang · no gain  +1406.46 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
     index 9c141024a1..296b46a632 100644
     --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
@@ -1347,7 +1350,7 @@ Code changes — every attempt (win or fail):
     +
     ... (truncated, 91 more lines)
 
-[#46] MatmulDeviceOperation · cpp · no gain  +1406.46 ms
+[#46] Matmul 32x14336x4096 · cpp · no gain  +1406.46 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index fa9e629a74..c98a9b6ae9 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
@@ -1390,7 +1393,7 @@ Code changes — every attempt (win or fail):
     +The decode row is the one worth reading twice. Dropping M from 128 to 32 shrinks THIS kernel ~3.4x
     ... (truncated, 245 more lines)
 
-[#49] LayerNormDeviceOperation · grid · no gain  +1406.45 ms
+[#49] LayerNorm · grid · no gain  +1406.45 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py b/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
     index 81444f48f0..5aae30235b 100644
     --- a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
@@ -1433,7 +1436,7 @@ Code changes — every attempt (win or fail):
     +            out_sharded=(mode == Mode.DECODE),
     ... (truncated, 65 more lines)
 
-[#50] LayerNormDeviceOperation · grid · no gain  +1406.45 ms
+[#50] LayerNorm · grid · no gain  +1406.45 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py b/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
     index 81444f48f0..be3ccd5cfe 100644
     --- a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
@@ -1476,7 +1479,7 @@ Code changes — every attempt (win or fail):
      
     ... (truncated, 2 more lines)
 
-[#51] LayerNormDeviceOperation · shard · no gain  +1406.09 ms
+[#51] LayerNorm · shard · no gain  +1406.09 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/decoder.py b/models/demos/llama3_1_8b_p150/tt/decoder.py
     index 067ea19c0a..9ebbfda6d6 100644
     --- a/models/demos/llama3_1_8b_p150/tt/decoder.py
@@ -1519,7 +1522,7 @@ Code changes — every attempt (win or fail):
     +++ b/models/demos/llama3_1_8b_p150/tt/model.py
     ... (truncated, 8 more lines)
 
-[#53] LayerNormDeviceOperation · shard · no gain  +1406.45 ms
+[#53] LayerNorm · shard · no gain  +1406.45 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 8b557ec23c..177fe419a3 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -1541,7 +1544,7 @@ Code changes — every attempt (win or fail):
              else:
                  raise ValueError(f"Invalid mode: {mode}")
 
-[#54] LayerNormDeviceOperation · structural · no gain  +1406.45 ms
+[#54] LayerNorm · structural · no gain  +1406.45 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index fa9e629a74..c98a9b6ae9 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
@@ -1627,7 +1630,7 @@ Code changes — every attempt (win or fail):
                  # the request that triggered warmup is greedy, those traces are pure warmup cost for
     ... (truncated, 21 more lines)
 
-[#57] MatmulDeviceOperation · grid · no gain  +1572.20 ms
+[#57] Matmul 32x4096x14336 · grid · no gain  +1572.20 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index e7c3ef31df..aa12ba9305 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -1657,7 +1660,7 @@ Code changes — every attempt (win or fail):
                          shape=(x.shape[-2], self.dim // num_cores),
                          core_grid=fg_core_grid,
 
-[#58] MatmulDeviceOperation · grid · no gain  +1572.11 ms
+[#58] Matmul 32x4096x14336 · grid · no gain  +1572.11 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 8b557ec23c..61047ffb53 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -1679,7 +1682,7 @@ Code changes — every attempt (win or fail):
      
              # Find all possible numbers of cores that divide N and are less than or equal to max_cores
 
-[#59] MatmulDeviceOperation · dtype · no gain  +1572.75 ms
+[#59] Matmul 32x4096x14336 · dtype · no gain  +1572.75 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index e7c3ef31df..f1c0e5bbe5 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -1698,7 +1701,7 @@ Code changes — every attempt (win or fail):
              # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
              # layer and can never be L1-resident, but the [seq, hidden] intermediates can, and that is
 
-[#60] MatmulDeviceOperation · structural · no gain  +1572.20 ms
+[#60] Matmul 32x4096x14336 · structural · no gain  +1572.20 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/generator.py b/models/demos/llama3_1_8b_p150/tt/generator.py
     index b0f41bda24..01da3ce7f2 100644
     --- a/models/demos/llama3_1_8b_p150/tt/generator.py
@@ -1741,7 +1744,7 @@ Code changes — every attempt (win or fail):
                  # the request that triggered warmup is greedy, those traces are pure warmup cost for
     ... (truncated, 21 more lines)
 
-[#63] MatmulDeviceOperation · shard · no gain  +1572.14 ms
+[#63] Matmul 32x4096x14336 · shard · no gain  +1572.14 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index e7c3ef31df..d37ba04690 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -1773,7 +1776,7 @@ Code changes — every attempt (win or fail):
      
              if TG:
 
-[#64] MatmulDeviceOperation · shard · no gain  +1572.13 ms
+[#64] Matmul 32x4096x14336 · shard · no gain  +1572.13 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 8b557ec23c..b8b64325ee 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -1801,7 +1804,7 @@ Code changes — every attempt (win or fail):
                  return ttnn.DRAM_MEMORY_CONFIG
              else:
 
-[#65] MatmulDeviceOperation · tp-fracture · no gain  +1572.14 ms
+[#65] Matmul 32x4096x14336 · tp-fracture · no gain  +1572.14 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index c98a9b6ae9..6da7db8484 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
@@ -1844,7 +1847,7 @@ Code changes — every attempt (win or fail):
          ttl_mm(a, b, y)
     ... (truncated, 27 more lines)
 
-[#66] MatmulDeviceOperation · tt-lang · no gain  +1572.14 ms
+[#66] Matmul 32x4096x14336 · tt-lang · no gain  +1572.14 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index c98a9b6ae9..27cae9296a 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
@@ -1887,7 +1890,7 @@ Code changes — every attempt (win or fail):
     @@ -1,35 +1,40 @@
     ... (truncated, 114 more lines)
 
-[#67] MatmulDeviceOperation · cpp · no gain  +1572.14 ms
+[#67] Matmul 32x4096x14336 · cpp · no gain  +1572.14 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index c98a9b6ae9..27cae9296a 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
@@ -1930,7 +1933,7 @@ Code changes — every attempt (win or fail):
     @@ -1,35 +1,40 @@
     ... (truncated, 114 more lines)
 
-[#69] MatmulDeviceOperation · tp-fracture · no gain  +1572.07 ms
+[#69] Matmul 32x4096x14336 · tp-fracture · no gain  +1572.07 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index c98a9b6ae9..27cae9296a 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
@@ -1973,7 +1976,7 @@ Code changes — every attempt (win or fail):
     @@ -1,35 +1,40 @@
     ... (truncated, 114 more lines)
 
-[#73] MatmulDeviceOperation · grid · win  +1596.56 ms
+[#73] Matmul 32x4096x16032 · grid · win  +1596.56 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
     index ce12a6def3..eeb42ce095 100644
     --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
@@ -2016,7 +2019,7 @@ Code changes — every attempt (win or fail):
                      def pad_to_power_of_2(n):
     ... (truncated, 50 more lines)
 
-[#74] NlpCreateHeadsDeviceOperation · grid · no gain  +1508.93 ms
+[#74] NlpCreateHeads · grid · no gain  +1508.93 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
     index ce12a6def3..eeb42ce095 100644
     --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
@@ -2059,7 +2062,7 @@ Code changes — every attempt (win or fail):
                      def pad_to_power_of_2(n):
     ... (truncated, 50 more lines)
 
-[#76] NlpCreateHeadsDeviceOperation · shard · win  +1598.25 ms
+[#76] NlpCreateHeads · shard · win  +1598.25 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index 69bba753ac..e4e19d7461 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -2095,7 +2098,7 @@ Code changes — every attempt (win or fail):
      
              norm_config = self.args.get_norm_config("attn", Mode.PREFILL, None)
 
-[#78] NlpCreateHeadsDeviceOperation · structural · win  +1682.23 ms
+[#78] NlpCreateHeads · structural · win  +1682.23 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/generator.py b/models/demos/llama3_1_8b_p150/tt/generator.py
     index 01da3ce7f2..19e57ec6e8 100644
     --- a/models/demos/llama3_1_8b_p150/tt/generator.py
@@ -2138,7 +2141,7 @@ Code changes — every attempt (win or fail):
     +                logger.info(
     ... (truncated, 16 more lines)
 
-[#80] NlpCreateHeadsDeviceOperation · tt-lang · win  +1705.81 ms
+[#80] NlpCreateHeads · tt-lang · win  +1705.81 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index e4e19d7461..c4ed5954c9 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -2181,7 +2184,7 @@ Code changes — every attempt (win or fail):
     +                q_heads_1QSD_pre_rot,
     ... (truncated, 219 more lines)
 
-[#84] MatmulDeviceOperation · dtype · win  +1714.33 ms
+[#84] Matmul 128x4096x6144 · dtype · win  +1714.33 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 8b557ec23c..61d172b9df 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -2214,7 +2217,7 @@ Code changes — every attempt (win or fail):
                      {TensorGroup[key]: PrecisionSetting[value] for key, value in settings.get("precision_cfg").items()}
                      if "precision_cfg" in settings
 
-[#85] MatmulDeviceOperation · grid · no gain  +1709.82 ms
+[#85] Matmul 32x4096x6144 · grid · no gain  +1709.82 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 61d172b9df..8239ba34de 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -2257,7 +2260,7 @@ Code changes — every attempt (win or fail):
     +            if tiles % cores:
     ... (truncated, 9 more lines)
 
-[#86] MatmulDeviceOperation · grid · no gain  +1709.82 ms
+[#86] Matmul 32x4096x6144 · grid · no gain  +1709.82 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 61d172b9df..fac6368d6e 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -2300,7 +2303,7 @@ Code changes — every attempt (win or fail):
     +                    return ttnn.CoreGrid(x=cores // rows, y=rows)
     ... (truncated, 5 more lines)
 
-[#88] MatmulDeviceOperation · dtype · win  +1714.24 ms
+[#88] Matmul 32x4096x6144 · dtype · no gain  +1714.24 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index c4ed5954c9..76b944f93e 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -2332,7 +2335,7 @@ Code changes — every attempt (win or fail):
                  sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
              )
 
-[#90] MatmulDeviceOperation · shard · win  +1719.17 ms
+[#90] Matmul 32x4096x6144 · shard · win  +1719.17 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index 76b944f93e..aa99bba560 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -2368,7 +2371,7 @@ Code changes — every attempt (win or fail):
                      ttnn.deallocate(xqkv_fused_sharded)
                  else:
 
-[#91] MatmulDeviceOperation · tp-fracture · no gain  +1719.17 ms
+[#91] Matmul 32x4096x6144 · tp-fracture · no gain  +1719.17 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index 76b944f93e..aa99bba560 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -2404,7 +2407,7 @@ Code changes — every attempt (win or fail):
                      ttnn.deallocate(xqkv_fused_sharded)
                  else:
 
-[#95] MatmulDeviceOperation · tt-lang · no gain  +1719.17 ms
+[#95] Matmul 32x4096x6144 · tt-lang · no gain  +1719.17 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
     index d126d0c5d2..cc46767225 100644
     --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
@@ -2441,7 +2444,7 @@ Code changes — every attempt (win or fail):
      
      @ttl.operation(grid=(GRID_Y, GRID_X))
 
-[#97] MatmulDeviceOperation · cpp · no gain  +1719.17 ms
+[#97] Matmul 32x4096x6144 · cpp · no gain  +1719.17 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index 27cae9296a..e2c1fbd8cb 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
@@ -2484,7 +2487,7 @@ Code changes — every attempt (win or fail):
     --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
     ... (truncated, 32 more lines)
 
-[#99] RotaryEmbeddingLlamaDeviceOperatio · grid · win  +1734.28 ms
+[#99] RotaryEmbeddingLlama · grid · win  +1734.28 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index aa99bba560..b6b453fdc9 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -2527,7 +2530,7 @@ Code changes — every attempt (win or fail):
     +                is_decode_mode=False,
     ... (truncated, 27 more lines)
 
-[#100] NLPConcatHeadsDeviceOperation · grid · no gain  +1734.28 ms
+[#100] NLPConcatHeads · grid · no gain  +1734.28 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index b6b453fdc9..4b6a1a6418 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -2570,7 +2573,7 @@ Code changes — every attempt (win or fail):
     +                )
     ... (truncated, 7 more lines)
 
-[#101] NLPConcatHeadsDeviceOperation · grid · no gain  +1734.28 ms
+[#101] NLPConcatHeads · grid · no gain  +1734.28 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index b6b453fdc9..d5d840d0e6 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -2613,7 +2616,7 @@ Code changes — every attempt (win or fail):
     +                )
     ... (truncated, 7 more lines)
 
-[#102] NLPConcatHeadsDeviceOperation · shard · no gain  +1734.19 ms
+[#102] NLPConcatHeads · shard · no gain  +1734.19 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index b6b453fdc9..f08dcfe873 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -2641,7 +2644,7 @@ Code changes — every attempt (win or fail):
              )
              ttnn.deallocate(attn_output_1QSD)
 
-[#107] NLPConcatHeadsDeviceOperation · tt-lang · win  +1749.24 ms
+[#107] NLPConcatHeads · tt-lang · win  +1749.24 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index b6b453fdc9..29cd6c48a9 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -2684,7 +2687,7 @@ Code changes — every attempt (win or fail):
              # For batched prefill, reshape to concatenate batch dimension into sequence
     ... (truncated, 153 more lines)
 
-[#110] ArgMaxDeviceOperation · grid · no gain  +1749.24 ms
+[#110] ArgMax · grid · no gain  +1749.24 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 61d172b9df..9e0a02dd52 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -2703,7 +2706,7 @@ Code changes — every attempt (win or fail):
                      "num_links": 1,
                      "chunks_per_sync": 10,
 
-[#114] ArgMaxDeviceOperation · shard · win  +1751.02 ms
+[#114] ArgMax · shard · win  +1751.02 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model.py b/models/demos/llama3_1_8b_p150/tt/model.py
     index e19e919f4c..0d4df8171b 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model.py
@@ -2740,7 +2743,7 @@ Code changes — every attempt (win or fail):
      
          def process_hidden_states_after_prefill_trace(self, hidden_states, last_token_idx):
 
-[#117] ArgMaxDeviceOperation · structural · win  +1781.71 ms
+[#117] ArgMax · structural · win  +1781.71 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model.py b/models/demos/llama3_1_8b_p150/tt/model.py
     index 0d4df8171b..b2d1ee38fc 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model.py
@@ -2783,7 +2786,7 @@ Code changes — every attempt (win or fail):
     +first and a ROW_MAJOR tensor has no such constraint. The profile shows the op paying for the
     ... (truncated, 107 more lines)
 
-[#119] MatmulDeviceOperation · dtype · win  +1801.26 ms
+[#119] Matmul 32x4096x16032 · dtype · win  +1801.26 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
     index eeb42ce095..7f72b1c0b6 100644
     --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
@@ -2826,7 +2829,7 @@ Code changes — every attempt (win or fail):
              self.lm_head = LMHead(
     ... (truncated, 8 more lines)
 
-[#121] MatmulDeviceOperation · shard · no gain  +1801.26 ms
+[#121] Matmul 32x4096x16032 · shard · no gain  +1801.26 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
     index eeb42ce095..7f72b1c0b6 100644
     --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
@@ -2869,7 +2872,7 @@ Code changes — every attempt (win or fail):
              self.lm_head = LMHead(
     ... (truncated, 8 more lines)
 
-[#122] MatmulDeviceOperation · shard · no gain  +1801.26 ms
+[#122] Matmul 32x4096x16032 · shard · no gain  +1801.26 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
     index eeb42ce095..7f72b1c0b6 100644
     --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
@@ -2912,7 +2915,7 @@ Code changes — every attempt (win or fail):
              self.lm_head = LMHead(
     ... (truncated, 8 more lines)
 
-[#123] MatmulDeviceOperation · tp-fracture · no gain  +1801.26 ms
+[#123] Matmul 32x4096x16032 · tp-fracture · no gain  +1801.26 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
     index eeb42ce095..7f72b1c0b6 100644
     --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
@@ -2955,7 +2958,7 @@ Code changes — every attempt (win or fail):
              self.lm_head = LMHead(
     ... (truncated, 8 more lines)
 
-[#133] SDPAOperation · grid · win  +1803.18 ms
+[#133] SDPA · grid · win  +1803.18 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 9e0a02dd52..0f4453f745 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -2998,7 +3001,7 @@ Code changes — every attempt (win or fail):
     +                and q_chunk % (2 * ttnn.TILE_SIZE) == 0
     ... (truncated, 17 more lines)
 
-[#135] RotaryEmbeddingLlamaDeviceOperatio · structural · win  +1807.27 ms
+[#135] RotaryEmbeddingLlama · structural · win  +1807.27 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index 29cd6c48a9..99f360cb07 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -3041,7 +3044,7 @@ Code changes — every attempt (win or fail):
     +            and self.qk_norm_is_identity
     ... (truncated, 335 more lines)
 
-[#137] GenericOpDeviceOperation · grid · win  +1810.49 ms
+[#137] GenericOp · grid · win  +1810.49 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
     index 31e6d95100..81c0fcecb2 100644
     --- a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
@@ -3084,7 +3087,7 @@ Code changes — every attempt (win or fail):
              cx, cy = ttl.node(dims=2)
     ... (truncated, 182 more lines)
 
-[#138] SDPAOperation · structural · no gain  +1808.45 ms
+[#138] SDPA · structural · no gain  +1808.45 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
     index 31e6d95100..81c0fcecb2 100644
     --- a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
@@ -3127,7 +3130,7 @@ Code changes — every attempt (win or fail):
              cx, cy = ttl.node(dims=2)
     ... (truncated, 182 more lines)
 
-[#139] BinaryNgDeviceOperation · grid · no gain  +1803.58 ms
+[#139] BinaryNg · grid · no gain  +1803.58 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
     index 31e6d95100..81c0fcecb2 100644
     --- a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
@@ -3170,7 +3173,7 @@ Code changes — every attempt (win or fail):
              cx, cy = ttl.node(dims=2)
     ... (truncated, 182 more lines)
 
-[#140] BinaryNgDeviceOperation · grid · no gain  +1792.26 ms
+[#140] BinaryNg · grid · no gain  +1792.26 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
     index 31e6d95100..81c0fcecb2 100644
     --- a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
@@ -3213,7 +3216,7 @@ Code changes — every attempt (win or fail):
              cx, cy = ttl.node(dims=2)
     ... (truncated, 182 more lines)
 
-[#142] BinaryNgDeviceOperation · shard · win  +1816.01 ms
+[#142] BinaryNg · shard · win  +1816.01 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index 99f360cb07..dc088f0e05 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -3256,7 +3259,7 @@ Code changes — every attempt (win or fail):
     --- a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
     ... (truncated, 89 more lines)
 
-[#143] BinaryNgDeviceOperation · structural · no gain  +1816.01 ms
+[#143] BinaryNg · structural · no gain  +1816.01 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index 99f360cb07..dc088f0e05 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -3299,7 +3302,7 @@ Code changes — every attempt (win or fail):
     --- a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
     ... (truncated, 89 more lines)
 
-[#145] BinaryNgDeviceOperation · tt-lang · no gain  +1815.83 ms
+[#145] BinaryNg · tt-lang · no gain  +1815.83 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_residual_add.py b/models/demos/llama3_1_8b_p150/tt/ttl_residual_add.py
     new file mode 100644
     index 0000000000..2d72b4599d
@@ -3342,7 +3345,7 @@ Code changes — every attempt (win or fail):
     +42% of the cores cannot be bought back -- exactly the case GUIDELINES/11 names when it warns that a
     ... (truncated, 122 more lines)
 
-[#150] BinaryNgDeviceOperation · cpp · no gain  +1816.36 ms
+[#150] BinaryNg · cpp · no gain  +1816.36 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_add_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_add_generic.py
     new file mode 100644
     index 0000000000..a3ed3bd601
@@ -3385,7 +3388,7 @@ Code changes — every attempt (win or fail):
     +tt-lang loss was OCCUPANCY, not code quality, and once occupancy is equalised a hand-written
     ... (truncated, 240 more lines)
 
-[#153] MatmulDeviceOperation · grid · no gain  +1800.01 ms
+[#153] Matmul 128x4096x14336 · grid · no gain  +1800.01 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 4faeb90502..34cc101761 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -3409,7 +3412,7 @@ Code changes — every attempt (win or fail):
                      m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                      k=self.dim // self.cluster_shape[0],
 
-[#154] MatmulDeviceOperation · dtype · no gain  +1799.12 ms
+[#154] Matmul 128x4096x14336 · dtype · no gain  +1799.12 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 4faeb90502..34cc101761 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -3433,7 +3436,7 @@ Code changes — every attempt (win or fail):
                      m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                      k=self.dim // self.cluster_shape[0],
 
-[#155] MatmulDeviceOperation · dtype · no gain  +1800.13 ms
+[#155] Matmul 128x4096x14336 · dtype · no gain  +1800.13 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 4faeb90502..34cc101761 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -3457,7 +3460,7 @@ Code changes — every attempt (win or fail):
                      m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                      k=self.dim // self.cluster_shape[0],
 
-[#157] MatmulDeviceOperation · shard · no gain  +1798.63 ms
+[#157] Matmul 128x4096x14336 · shard · no gain  +1798.63 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 4faeb90502..34cc101761 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -3481,7 +3484,7 @@ Code changes — every attempt (win or fail):
                      m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                      k=self.dim // self.cluster_shape[0],
 
-[#158] MatmulDeviceOperation · shard · no gain  +1785.25 ms
+[#158] Matmul 128x4096x14336 · shard · no gain  +1785.25 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 4faeb90502..34cc101761 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -3505,7 +3508,7 @@ Code changes — every attempt (win or fail):
                      m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                      k=self.dim // self.cluster_shape[0],
 
-[#159] MatmulDeviceOperation · fidelity · no gain  +1800.05 ms
+[#159] Matmul 128x4096x14336 · fidelity · no gain  +1800.05 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 4faeb90502..34cc101761 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -3529,7 +3532,7 @@ Code changes — every attempt (win or fail):
                      m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                      k=self.dim // self.cluster_shape[0],
 
-[#160] MatmulDeviceOperation · fidelity · no gain  +1799.63 ms
+[#160] Matmul 128x4096x14336 · fidelity · no gain  +1799.63 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 4faeb90502..34cc101761 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -3553,7 +3556,7 @@ Code changes — every attempt (win or fail):
                      m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                      k=self.dim // self.cluster_shape[0],
 
-[#162] MatmulDeviceOperation · tp-fracture · no gain  +1800.03 ms
+[#162] Matmul 128x4096x14336 · tp-fracture · no gain  +1800.03 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
     index 4faeb90502..34cc101761 100644
     --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
@@ -3577,7 +3580,7 @@ Code changes — every attempt (win or fail):
                      m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                      k=self.dim // self.cluster_shape[0],
 
-[#165] MatmulDeviceOperation · tp-fracture · no gain  +1800.03 ms
+[#165] Matmul 128x4096x14336 · tp-fracture · no gain  +1800.03 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 6f1e90ce74..d3f6deafea 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -3605,7 +3608,7 @@ Code changes — every attempt (win or fail):
              w1_dims = (-1, -2) if args.is_galaxy else (-2, -1)
              w2_dims = (-2, -1) if args.is_galaxy else (-1, -2)
 
-[#168] MatmulDeviceOperation · structural · win  +1809.75 ms
+[#168] Matmul 128x4096x14336 · structural · no gain  +1809.75 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
     index dc088f0e05..e4c7caf147 100644
     --- a/models/demos/llama3_1_8b_p150/tt/attention.py
@@ -3648,7 +3651,7 @@ Code changes — every attempt (win or fail):
     +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
     ... (truncated, 25 more lines)
 
-[#170] MatmulDeviceOperation · grid · win  +1848.49 ms
+[#170] Matmul 32x4096x14336 · grid · win  +1848.49 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index d3f6deafea..b1f261daa4 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -3691,7 +3694,7 @@ Code changes — every attempt (win or fail):
     -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
     ... (truncated, 66 more lines)
 
-[#171] MatmulDeviceOperation · dtype · no gain  +1847.51 ms
+[#171] Matmul 32x4096x14336 · dtype · no gain  +1847.51 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index d3f6deafea..b1f261daa4 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -3734,7 +3737,7 @@ Code changes — every attempt (win or fail):
     -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
     ... (truncated, 66 more lines)
 
-[#172] MatmulDeviceOperation · dtype · no gain  +1848.36 ms
+[#172] Matmul 32x4096x14336 · dtype · no gain  +1848.36 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index d3f6deafea..b1f261daa4 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -3777,7 +3780,7 @@ Code changes — every attempt (win or fail):
     -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
     ... (truncated, 66 more lines)
 
-[#174] MatmulDeviceOperation · shard · no gain  +1839.28 ms
+[#174] Matmul 32x4096x14336 · shard · no gain  +1839.28 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index d3f6deafea..b1f261daa4 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -3820,7 +3823,7 @@ Code changes — every attempt (win or fail):
     -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
     ... (truncated, 66 more lines)
 
-[#175] MatmulDeviceOperation · shard · no gain  +1849.30 ms
+[#175] Matmul 32x4096x14336 · shard · no gain  +1849.30 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index d3f6deafea..b1f261daa4 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -3863,7 +3866,7 @@ Code changes — every attempt (win or fail):
     -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
     ... (truncated, 66 more lines)
 
-[#176] MatmulDeviceOperation · fidelity · no gain  +1848.69 ms
+[#176] Matmul 32x4096x14336 · fidelity · no gain  +1848.69 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index d3f6deafea..b1f261daa4 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -3906,7 +3909,7 @@ Code changes — every attempt (win or fail):
     -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
     ... (truncated, 66 more lines)
 
-[#177] MatmulDeviceOperation · fidelity · no gain  +1848.71 ms
+[#177] Matmul 32x4096x14336 · fidelity · no gain  +1848.71 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index d3f6deafea..b1f261daa4 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -3949,7 +3952,7 @@ Code changes — every attempt (win or fail):
     -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
     ... (truncated, 66 more lines)
 
-[#178] MatmulDeviceOperation · tp-fracture · no gain  +1848.49 ms
+[#178] Matmul 32x4096x14336 · tp-fracture · no gain  +1848.49 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index b1f261daa4..138b55a557 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -3966,7 +3969,7 @@ Code changes — every attempt (win or fail):
              w1_dims = (-1, -2) if args.is_galaxy else (-2, -1)
              w2_dims = (-2, -1) if args.is_galaxy else (-1, -2)
 
-[#180] MatmulDeviceOperation · structural · no gain  +1846.39 ms
+[#180] Matmul 32x4096x14336 · structural · no gain  +1846.39 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index b1f261daa4..138b55a557 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -3983,7 +3986,7 @@ Code changes — every attempt (win or fail):
              w1_dims = (-1, -2) if args.is_galaxy else (-2, -1)
              w2_dims = (-2, -1) if args.is_galaxy else (-1, -2)
 
-[#181] MatmulDeviceOperation · tt-lang · no gain  +1848.57 ms
+[#181] Matmul 32x4096x14336 · tt-lang · no gain  +1848.57 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
     index cc46767225..bcd5be8024 100644
     --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
@@ -4007,7 +4010,7 @@ Code changes — every attempt (win or fail):
      """
      import time
 
-[#182] MatmulDeviceOperation · cpp · no gain  +1848.57 ms
+[#182] Matmul 32x4096x14336 · cpp · no gain  +1848.57 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index e2c1fbd8cb..dfb4f34d8e 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
@@ -4050,7 +4053,7 @@ Code changes — every attempt (win or fail):
      Run directly to reproduce the table.
     ... (truncated, 2 more lines)
 
-[#184] MatmulDeviceOperation · grid · no gain  +1815.03 ms
+[#184] Matmul 32x14336x4096 · grid · no gain  +1815.03 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index e2c1fbd8cb..dfb4f34d8e 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
@@ -4093,7 +4096,7 @@ Code changes — every attempt (win or fail):
      Run directly to reproduce the table.
     ... (truncated, 2 more lines)
 
-[#185] MatmulDeviceOperation · grid · no gain  +1849.24 ms
+[#185] Matmul 32x14336x4096 · grid · no gain  +1849.24 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index e2c1fbd8cb..dfb4f34d8e 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
@@ -4136,7 +4139,7 @@ Code changes — every attempt (win or fail):
      Run directly to reproduce the table.
     ... (truncated, 2 more lines)
 
-[#188] MatmulDeviceOperation · grid · no gain  +1841.29 ms
+[#188] Matmul 32x4096x6144 · grid · no gain  +1841.29 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
     index e2c1fbd8cb..dfb4f34d8e 100644
     --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
@@ -4179,7 +4182,7 @@ Code changes — every attempt (win or fail):
      Run directly to reproduce the table.
     ... (truncated, 2 more lines)
 
-[#192] MatmulDeviceOperation · fidelity · win  +1896.24 ms
+[#192] Matmul 32x14336x4096 · fidelity · win  +1896.24 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
     index 138b55a557..5099b1712e 100644
     --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
@@ -4201,8 +4204,64 @@ Code changes — every attempt (win or fail):
              ff2_input_mem_config = self.args.get_mlp_ff2_mem_config(mode, self.prefetcher)
              if mode == Mode.PREFILL:
 
+[#194] Matmul 32x4096x6144 · fidelity · win  +1929.74 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index e4c7caf147..b7d8e58302 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -145,6 +145,21 @@ class Attention(LightweightModule):
+                 decoder_id=layer_num, op=OpGroup.LI_O_PREFILL, configuration=configuration
+             )
+     
+    +        # FIDELITY rung for the QKV and attention-output projections. Both still run HIFI2 while their
+    +        # WEIGHTS are already sub-bf16 (wqkv bf4_b, wo bf8_b), and GUIDELINES/01 section 12's policy
+    +        # table is explicit that a bf8_b/bf4_b matmul (QKV / MLP / attn-out) should be walked to LoFi --
+    +        # it also warns this is the most commonly SKIPPED win because it feels risky. Measured on the
+    +        # sibling ff2 down-projection in this same model: HiFi2 -> LoFi took it 185.4 -> 126.6 us/call
+    +        # and the whole pipeline 22.06 -> 19.24 ms per token at PCC 0.9854. These decode matmuls run on
+    +        # ~12 cores, where math is a real term rather than a rounding error (the note above the decode
+    +        # program configs says as much). SDPA and the norms are deliberately NOT touched: attention
+    +        # scores and normalisation must stay at HiFi2 or the error compounds over depth.
+    +        if not self.TG and prefetcher is None and configuration.num_devices == 1:
+    +            self.li_qkv_decode_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+    +            self.li_o_decode_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+    +            self.li_qkv_prefill_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+    +            self.li_o_prefill_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+    +
+             layer_name = configuration.get_state_dict_prefix(self.__class__.__name__, layer_num)
+             if configuration.dummy_weights or (weight_cache_path is None):
+                 cache_name = lambda _: None
+
+[#195] Matmul 32x4096x4096 · fidelity · no gain  +1929.74 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index e4c7caf147..b7d8e58302 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -145,6 +145,21 @@ class Attention(LightweightModule):
+                 decoder_id=layer_num, op=OpGroup.LI_O_PREFILL, configuration=configuration
+             )
+     
+    +        # FIDELITY rung for the QKV and attention-output projections. Both still run HIFI2 while their
+    +        # WEIGHTS are already sub-bf16 (wqkv bf4_b, wo bf8_b), and GUIDELINES/01 section 12's policy
+    +        # table is explicit that a bf8_b/bf4_b matmul (QKV / MLP / attn-out) should be walked to LoFi --
+    +        # it also warns this is the most commonly SKIPPED win because it feels risky. Measured on the
+    +        # sibling ff2 down-projection in this same model: HiFi2 -> LoFi took it 185.4 -> 126.6 us/call
+    +        # and the whole pipeline 22.06 -> 19.24 ms per token at PCC 0.9854. These decode matmuls run on
+    +        # ~12 cores, where math is a real term rather than a rounding error (the note above the decode
+    +        # program configs says as much). SDPA and the norms are deliberately NOT touched: attention
+    +        # scores and normalisation must stay at HiFi2 or the error compounds over depth.
+    +        if not self.TG and prefetcher is None and configuration.num_devices == 1:
+    +            self.li_qkv_decode_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+    +            self.li_o_decode_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+    +            self.li_qkv_prefill_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+    +            self.li_o_prefill_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+    +
+             layer_name = configuration.get_state_dict_prefix(self.__class__.__name__, layer_num)
+             if configuration.dummy_weights or (weight_cache_path is None):
+                 cache_name = lambda _: None
+
 Limitations / suggested manual next steps:
-- 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
+- 3 op(s) tried but no lever beat baseline: LayerNorm, Matmul 32x4096x4096, TopK
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
@@ -4252,6 +4311,10 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
+
+
 
 
 
