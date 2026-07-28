@@ -75,7 +75,14 @@ class MLP(LightweightModule):
             )
             return result
 
-        # Sharded weights
+        # Sharded weights. These dims ARE the tensor-parallel fracture (GUIDELINES/08 section 7):
+        # w1/w3 are column-fractured on the output dim and w2 row-fractured on the contraction dim,
+        # so the cross-device reduction lands after the down-projection -- which is why tt_all_reduce
+        # sits on w2's output below and not on w1/w3's. On a 1x1 mesh (cluster_shape [1,1]) the
+        # ShardTensor2dMesh mapper is a no-op and tt_all_reduce short-circuits, so the whole scheme
+        # costs nothing here; it is the reason tp_pick_degree returns best_tp=1 for these matmuls
+        # rather than there being no TP support. TP remains the one lever that would cut the ~99 MB
+        # of MLP weight bytes read per layer per token, and it needs more than one chip.
         w1_dims = (-1, -2) if args.is_galaxy else (-2, -1)
         w2_dims = (-2, -1) if args.is_galaxy else (-1, -2)
 
@@ -170,12 +177,38 @@ class MLP(LightweightModule):
 
         ff1_3_out_mem_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if full_grid_ff1_3 else ff1_3_input_mem_config
 
+        # ff1/ff3's w1/w3 weights are already at the bf4_b floor, so the only dtype left on this
+        # DRAM-bound pair is what they WRITE. Each emits a [seq, hidden] intermediate that then gets
+        # read three times (the SILU mul reads both and writes its own, ff2 reads that) -- at
+        # seq_len=128 that is 3.67 MB per tensor per layer at bf16. bf8_b halves every one of those
+        # trips. Prefill only: decode's intermediate is 32 rows, too small for this to pay for the
+        # precision, and decode is the steady-state path.
+        ff1_3_out_dtype = ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16
+        if not TG:
+            # Narrow (per-tensor) form of the activation dtype walk. A model-wide
+            # TensorGroup.ACTIVATION=BFP8 destroys accuracy because it also lands on the residual
+            # stream, the norm inputs and the KV cache; these two tensors are fenced off from all of
+            # that -- they feed nothing but the SILU mul, whose output ff2 then reads. Applies in
+            # DECODE as well as PREFILL: decode's intermediate is only 32 rows, but it is written
+            # twice, read twice and paid on EVERY token.
+            ff1_3_out_dtype = ttnn.bfloat8_b
+
+        # L1 island for the ff1/ff3 -> mul -> ff2 chain in short prefill. w1/w2/w3 are ~15-29 MB per
+        # layer and can never be L1-resident, but the [seq, hidden] intermediates can, and that is
+        # what ff2 READS: landing ff1/ff3 in L1 removes three DRAM round-trips per MLP (ff1 and ff3
+        # write, the mul reads both and writes, ff2 reads that). ttnn.mul inherits w1_out's memory
+        # config, so one change carries the whole chain. Bounded to prompts at or under
+        # prefill_len_cutoff; w1_out/w3_out are freed right after the mul, so the island peaks at
+        # three intermediates -- ~1.95 MB each at bf8_b for seq_len=128.
+        if mode == Mode.PREFILL and not TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff:
+            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+
         x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
 
         w1_out = ttnn.linear(
             x_sharded,
             self.w1,
-            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
+            dtype=ff1_3_out_dtype,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
             program_config=pc_1,
@@ -188,7 +221,7 @@ class MLP(LightweightModule):
         w3_out = ttnn.linear(
             x_sharded,
             self.w3,
-            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
+            dtype=ff1_3_out_dtype,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
             program_config=pc_3,
@@ -305,6 +338,10 @@ class MLP(LightweightModule):
         )
 
         ff2_input_mem_config = self.args.get_mlp_ff2_mem_config(mode, self.prefetcher)
+        if mode == Mode.PREFILL:
+            # Same reason as wo in attention: ff2's output IS the next residual add's operand, so it
+            # must land wherever the residual stream lives or the add pays a copy to bring it there.
+            ff2_input_mem_config = self.args.get_residual_mem_config(mode, self.prefetcher, int(seq_len))
         w2_in_sharded = w2_in
 
         if seq_len > 128 and mode != Mode.DECODE:

@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import math
+
 import torch
 from tqdm import tqdm
 
@@ -17,6 +19,7 @@ from models.demos.llama3_1_8b_p150.tt.distributed_norm import DistributedNorm
 from models.demos.llama3_1_8b_p150.tt.embedding import Embedding, ScaledEmbedding
 from models.demos.llama3_1_8b_p150.tt.lm_head import LMHead
 from models.demos.llama3_1_8b_p150.tt.model_config import TensorGroup
+from models.demos.llama3_1_8b_p150.tt import sampling_unpadded_argmax as unpadded_argmax
 from models.demos.llama3_1_8b_p150.tt.rope import HfRotarySetup, RotarySetup
 
 
@@ -139,11 +142,18 @@ class Transformer(LightweightModule):
             TG=args.is_galaxy,
         )
 
+        # The output projection is the single largest weight in the model
+        # ([dim, padded_vocab] = 4096 x 128256, ~70 MB at bf8_b) and its matmul is
+        # DRAM-bandwidth bound, so the bytes it reads ARE its runtime. Every decoder weight
+        # already rides bf4_b under `performance()`; the LM head was left on the model-wide
+        # bf8_b default purely because it is built outside the decoder precision config.
+        # Overridable via ModelArgs for accuracy-first configs.
+        lm_head_weight_dtype = getattr(args, "lm_head_weight_dtype", None) or ttnn.bfloat4_b
         self.lm_head = LMHead(
             args=args,
             mesh_device=mesh_device,
             tt_ccl=self.tt_ccl,
-            dtype=dtype,
+            dtype=lm_head_weight_dtype,
             state_dict=state_dict,
             state_dict_prefix=state_dict_prefix,
             weight_cache_path=weight_cache_path,
@@ -161,6 +171,10 @@ class Transformer(LightweightModule):
                 mesh_device=mesh_device,
                 tt_ccl=self.tt_ccl,
             )
+            # TTSampling rounds the request batch up to a 32-row tile because the LOGITS are
+            # tile-layout. Its force-argmax path untilizes first, though, and ROW_MAJOR has no
+            # such constraint -- so the argmax reduction can skip the padding rows entirely.
+            unpadded_argmax.install(self.sampling, args)
         else:
             self.sampling = None
 
@@ -261,7 +275,20 @@ class Transformer(LightweightModule):
         if lm_head_input_mem_cfg.is_sharded():
             x = ttnn.interleaved_to_sharded(x, lm_head_input_mem_cfg)
         logits = self.lm_head(x)
-        logits = ttnn.to_memory_config(logits, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        # Keep the prefill logits where lm_head already put them (L1 interleaved) instead of
+        # spilling them to DRAM. The consumer is on-device sampling, whose force-argmax path is
+        # `untilize -> ttnn.argmax`, and BOTH of those read this tensor straight through: the
+        # profile shows untilize at 47.8 us/call from DRAM vs 31.4 us from L1, and argmax at
+        # 737 us vs 715 us, on top of the 4.4 MB L1->DRAM copy this line itself pays. argmax
+        # FATALs on any non-INTERLEAVED input, so L1-interleaved is the only shard the op will
+        # accept -- a width/height shard is architecturally closed here.
+        # [1, 1, 32, vocab] at bf8_b is ~4.4 MB, comfortably inside the interleaved-L1 budget;
+        # fall back to DRAM if a wider vocab or a batched-prefill variant makes it big.
+        logits_elems = math.prod(int(d) for d in logits.shape)
+        if logits_elems * 2 > 16 * 1024 * 1024:  # bf16-equivalent bytes; bf8_b is ~half this
+            logits = ttnn.to_memory_config(logits, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        elif logits.memory_config() != ttnn.L1_MEMORY_CONFIG:
+            logits = ttnn.to_memory_config(logits, memory_config=ttnn.L1_MEMORY_CONFIG)
         return logits
 
     def process_hidden_states_after_prefill_trace(self, hidden_states, last_token_idx):
@@ -895,8 +922,16 @@ class Transformer(LightweightModule):
                     self.args.get_residual_mem_config(mode, self.prefetcher),
                     activation_dtype,
                 )
-            elif activation_dtype is not None and x.dtype != activation_dtype:
-                x = ttnn.typecast(x, activation_dtype)
+            else:
+                if activation_dtype is not None and x.dtype != activation_dtype:
+                    x = ttnn.typecast(x, activation_dtype)
+                # The decoder asserts its input already sits in the residual memory config, so when
+                # short prefill puts the residual stream in L1 the FIRST layer's input (straight off
+                # the embedding, in DRAM) has to be moved there. Layers 2..N are already L1 because
+                # the previous layer's residual add wrote it, and to_memory_config is a no-op then.
+                _residual_cfg = self.args.get_residual_mem_config(mode, self.prefetcher, int(x.shape[-2]))
+                if x.memory_config() != _residual_cfg:
+                    x = ttnn.to_memory_config(x, _residual_cfg)
 
             # vLLM hybrid kv-cache-groups: each attention layer gets its own
             # paged pool (sliding-window vs full-attention have different

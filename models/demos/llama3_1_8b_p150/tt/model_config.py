@@ -224,7 +224,22 @@ class ModelOptimizations:
             )
         else:
             settings = {
-                "TensorPrecision": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4},
+                # FF1/FF3 already ride bf4_b here, but FF2 was left on the BFP8 default -- so the
+                # down-projection reads twice the weight bytes of the two projections feeding it,
+                # on both the prefill and the decode path (it is the same resident tensor). ff2 is
+                # DRAM-bandwidth bound in the roofline, and w2 is ~29 MB per layer at bf8_b, so
+                # halving it is the largest remaining dtype lever in the MLP.
+                "TensorPrecision": {
+                    TensorGroup.FF1_FF3: PrecisionSetting.BFP4,
+                    TensorGroup.FF2: PrecisionSetting.BFP4,
+                    # WQKV was still on the BFP8 default while the whole MLP rides bf4_b. The
+                    # fused QKV weight is [dim, (nq + 2*nkv)*head_dim] = 25M params, ~26 MB per
+                    # layer at bf8_b, and the projection is DRAM-bandwidth bound in the roofline
+                    # -- so this is the largest weight left that has a dtype step available. It is
+                    # one resident tensor shared by the prefill AND decode QKV matmuls, so the
+                    # halving lands on both paths.
+                    TensorGroup.WQKV: PrecisionSetting.BFP4,
+                },
                 "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI},
             }
             if model_name.startswith("Phi-3-mini"):  # TODO: Only do this for N150
@@ -414,6 +429,12 @@ def parse_decoder_json(json_file_path, default_optimization=ModelOptimizations.p
         for decoder_id, settings in config_data["decoders"].items():
             decoder_id = int(decoder_id)
 
+            # A decoder entry REPLACES the optimization level's settings rather than merging onto
+            # them, so a decoder named here falls back to the BFP8/HIFI2 defaults for every tensor
+            # it does not mention. That looks like a bug and is load-bearing: it is what keeps
+            # decoder 31 -- the last layer, which this file exists to protect -- entirely at BFP8.
+            # Merging instead (so model-wide dtype levers reach it) was measured and REJECTED:
+            # letting FF2/WQKV go bf4_b on layer 31 drops top-1 from 99% to 23.8%.
             tensor_precision = (
                 {TensorGroup[key]: PrecisionSetting[value] for key, value in settings.get("precision_cfg").items()}
                 if "precision_cfg" in settings
@@ -1071,7 +1092,22 @@ class ModelArgs:
                 "rs_memory_config": ttnn.DRAM_MEMORY_CONFIG,
             }
             default_sampling_force_argmax = {
-                "allow_force_argmax": False,
+                # Greedy rows (temperature=0) normalise to k=1 / p=0 / temp=1, which the sampler can
+                # serve with a single untilize+argmax instead of the top-k/top-p/RNG chain. That
+                # matters a lot here: this vocab is 128256, the [1, 1]-mesh sampler splits it into
+                # 2x64128 before TopK, and 64128 is not a power of two -- so ttnn.topk falls off its
+                # multi-core factory onto the single-core bitonic one and burns ~10ms per call on ONE
+                # core. Allowing the argmax path deletes both TopK calls (and the concat / typecast /
+                # offset-add / untilize / manual_seed / sampling tail behind them). Non-greedy
+                # requests still take the full path -- the sampler re-derives this per reset_params
+                # and re-captures its trace when the mode flips.
+                #
+                # NOTE on the argmax core grid: ModelArgs deliberately does NOT define
+                # `sub_core_grids`. TTSampling reads it with getattr(args, "sub_core_grids", None),
+                # and leaving it None is what lets ttnn.argmax fall through to
+                # split_work_to_cores over the FULL compute grid. Defining it here would NARROW
+                # the sampling ops, not widen them.
+                "allow_force_argmax": True,
                 "num_links": 1,
                 "chunks_per_sync": 10,
                 "num_workers_per_link": 2,
@@ -1189,8 +1225,15 @@ class ModelArgs:
     # RESIDUAL MEMORY CONFIGS
     # =========================================================================
     @lru_cache(maxsize=None)
-    def get_residual_mem_config(self, mode: Mode, prefetcher: Prefetcher = None):
-        """Get the memory config for decode residual tensors."""
+    def get_residual_mem_config(self, mode: Mode, prefetcher: Prefetcher = None, seq_len: int = None):
+        """Get the memory config for decode residual tensors.
+
+        seq_len (PREFILL only): at short prefill the residual stream is small enough to live in L1,
+        which is the shard rung for the two residual BinaryNg adds -- they are the model's only
+        DRAM-resident eltwise (352 + 352 calls, 6.23 ms at ~8.9 us each) and everything they touch
+        is a [seq, dim] activation, so L1 residency removes the DRAM round-trip on both operands and
+        the result. Left in DRAM for long prefill, where [seq, dim] no longer fits.
+        """
         if mode == Mode.DECODE:
             if prefetcher is not None:
                 num_residual_worker_cores = 32 if self.num_devices == 4 else 16
@@ -1221,6 +1264,13 @@ class ModelArgs:
                     use_height_and_width_as_shard_shape=True,
                 )
         elif mode == Mode.PREFILL:
+            if (
+                seq_len is not None
+                and seq_len <= self.prefill_len_cutoff
+                and not self.is_galaxy
+                and prefetcher is None
+            ):
+                return ttnn.L1_MEMORY_CONFIG
             return ttnn.DRAM_MEMORY_CONFIG
         else:
             raise ValueError(f"Invalid mode: {mode}")
@@ -1356,14 +1406,37 @@ class ModelArgs:
                     compute_with_storage_grid_size=ttnn.CoreCoord(grid[0], grid[1]),
                 )
             else:
-                return self.matmul_config(
-                    m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
-                    k=self.hidden_dim // (self.cluster_shape[1] if self.is_galaxy else 1),
-                    n=self.dim,
-                    grid_size=self.mlp2_grid(seq_len),
-                    per_core_N=math.ceil(self.dim / (ttnn.TILE_SIZE * self.dram_shard_grid_width))
+                _m = min(seq_len, self.prefill_len_cutoff)  # 512 if BH, 1024 if WH
+                _k = self.hidden_dim // (self.cluster_shape[1] if self.is_galaxy else 1)
+                _grid = self.mlp2_grid(seq_len)
+                _per_core_N = (
+                    math.ceil(self.dim / (ttnn.TILE_SIZE * self.dram_shard_grid_width))
                     if not self.is_galaxy
-                    else None,
+                    else None
+                )
+                # ff2's K is the hidden dim -- 448 tiles, by far the longest reduction in the model.
+                # matmul_config derives in0_block_w from find_largest_divisor(), which hard-caps at
+                # 8, so K is walked in 56 separate blocks and the mcast/packer sync is re-paid every
+                # one of them. On a matmul the roofline tags memory-bound that is pure overhead.
+                # Take the largest block that still divides the per-row K AND leaves the in1 CB
+                # inside L1: the CB is in0_block_w x per_core_N tiles, double-buffered, bfp8
+                # (~1088 B/tile), against a 1.57 MB budget.
+                if not self.is_galaxy and _per_core_N:
+                    _k_per_row = _k // ttnn.TILE_SIZE // _grid[1]
+                    _budget_tiles = int(0.5 * 1_572_864 / (2 * 1088 * _per_core_N))
+                    _in0_block_w = max(
+                        (b for b in range(1, _k_per_row + 1) if _k_per_row % b == 0 and b <= _budget_tiles),
+                        default=1,
+                    )
+                    return self.matmul_config(
+                        m=_m, k=_k, n=self.dim, grid_size=_grid, per_core_N=_per_core_N, in0_block_w=_in0_block_w
+                    )
+                return self.matmul_config(
+                    m=_m,
+                    k=_k,
+                    n=self.dim,
+                    grid_size=_grid,
+                    per_core_N=_per_core_N,
                 )
         else:
             raise ValueError(f"Invalid mode: {mode}")
@@ -1539,8 +1612,51 @@ class ModelArgs:
             if seq_len >= 2048
             else min(64, chunk_start_idx & -chunk_start_idx)
         )
+        # Occupancy. The prefill SDPA factory flattens the work into
+        #     total_q_chunks = B * n_local_heads * ceil(seq_len / q_chunk)
+        # and, for causal attention with an even chunk count, hands out PAIRS (one light +
+        # one heavy chunk per core) so the triangular load balances. The number of cores it
+        # can keep busy is therefore capped by that chunk/pair count, NOT by the grid it is
+        # handed: at seq_len=128 the 64-token default gives 2 chunks/head, so 32 heads
+        # produce 64 chunks = 32 pairs = 32 busy cores however wide the grid is. That is why
+        # the profiler tags this op grid=partial, and no program_config grid alone can fix it.
+        #
+        # Two coupled corrections, and they must move together:
+        #   1. Halve q_chunk (never below one tile) until the busy-core cap covers the grid --
+        #      this is what creates work for the idle half of the chip.
+        #   2. Size the grid to that cap instead of a hard-coded Wormhole 8x8. Surplus cores
+        #      are not free (they are still launched and still join the op's barriers), and
+        #      long prefill is the opposite case -- there the 8x8 was leaving 46 of the P150's
+        #      110 cores unused.
+        grid = getattr(self, "max_grid_size", None)
+        if grid is None:  # no device (e.g. test_torch.py) -- keep the historical 8x8
+            grid = ttnn.CoreGrid(y=8, x=8)
+        sdpa_grid = (min(8, grid.x), min(8, grid.y))
+        if chunk_start_idx is None or chunk_start_idx == 0:
+            heads = max(1, getattr(self, "n_local_heads", self.n_heads))
+            max_cores = grid.x * grid.y
+
+            def _busy_cap(qc):
+                q_num_chunks = max(1, -(-seq_len // qc))
+                total = heads * q_num_chunks
+                return max(1, total // 2 if q_num_chunks % 2 == 0 else total)
+
+            while (
+                q_chunk > ttnn.TILE_SIZE
+                and q_chunk % (2 * ttnn.TILE_SIZE) == 0
+                and seq_len % q_chunk == 0
+                and _busy_cap(q_chunk) < max_cores
+            ):
+                q_chunk //= 2
+            cap = _busy_cap(q_chunk)
+            best = max(
+                ((gx * gy, gx, gy) for gx in range(1, grid.x + 1) for gy in range(1, grid.y + 1) if gx * gy <= cap),
+                default=(0, 0, 0),
+            )
+            if best[0] > 0:
+                sdpa_grid = (best[1], best[2])
         return ttnn.SDPAProgramConfig(
-            compute_with_storage_grid_size=(8, 8),
+            compute_with_storage_grid_size=sdpa_grid,
             exp_approx_mode=False,
             q_chunk_size=q_chunk,
             k_chunk_size=k_chunk,
@@ -1652,6 +1768,43 @@ class ModelArgs:
                     K_block_size=8,
                     N_block_size=8,
                     compute_with_storage_grid_size=ttnn.CoreCoord(8, 10) if is_blackhole() else ttnn.CoreCoord(8, 8),
+                )
+            elif is_blackhole() and self.device_name != "P100":
+                # SHORT prefill only: use_minimal_qkv_prefill_matmul() already claims every
+                # seq_len > 128, so M here is at most 4 tiles. The legacy config below spent
+                # that on a hard-coded (8, 10) grid with per_core_M=1 -- only M_tiles x 8 =
+                # 32 of the device's ~130 cores ever ran -- and walked K in 128 SINGLE-tile
+                # steps with a 1x1 subblock (the FIXME). Both are pure loss on a QKV matmul
+                # the roofline tags memory-bound: 128 one-tile K steps read the bfp8 weight
+                # in the smallest possible blocks and re-pay the mcast/packer sync each step.
+                # Size the config to the actual work instead: one core ROW per M tile, N
+                # spread over the widest real device column count that divides it, K walked
+                # in 8-tile blocks, and the largest subblock HIFI2 allows.
+                m_tiles = max(1, math.ceil(seq_len / ttnn.TILE_SIZE))
+                n_tiles = math.ceil(self.qkv_size / self.cluster_shape[1] / ttnn.TILE_SIZE)
+                k_tiles = self.dim // ttnn.TILE_SIZE
+                # Exact blocking: num_blocks_y must equal grid_y and num_blocks_x grid_x.
+                grid_y = min(m_tiles, self.max_grid_size.y)
+                per_core_M = math.ceil(m_tiles / grid_y)
+                grid_x = max(x for x in range(1, self.max_grid_size.x + 1) if n_tiles % x == 0)
+                per_core_N = n_tiles // grid_x
+                # LI_QKV_PREFILL runs HIFI2, which sets fp32_dest_acc_en=True, so Blackhole
+                # caps out_subblock_h * out_subblock_w at 4 (not 8).
+                out_subblock_h = max(h for h in range(1, 5) if per_core_M % h == 0)
+                out_subblock_w = max(w for w in range(1, (4 // out_subblock_h) + 1) if per_core_N % w == 0)
+                # in1 CB = in0_block_w * per_core_N * 2 (double-buffered) bfp8 tiles; 8 x 16 x 2
+                # x 1088 B ~= 278 KB, comfortably inside the 1.57 MB L1 budget.
+                in0_block_w = max(b for b in (8, 4, 2, 1) if k_tiles % b == 0)
+                return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+                    compute_with_storage_grid_size=(grid_x, grid_y),
+                    in0_block_w=in0_block_w,
+                    out_subblock_h=out_subblock_h,
+                    out_subblock_w=out_subblock_w,
+                    per_core_M=per_core_M,
+                    per_core_N=per_core_N,
+                    transpose_mcast=False,
+                    fused_activation=None,
+                    fuse_batch=seq_len <= self.MAX_QKV_MM_SEQ_LEN,
                 )
             else:
                 return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(

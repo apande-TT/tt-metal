@@ -103,6 +103,13 @@ class DistributedNorm(LightweightModule):
                 subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
             )
         else:
+            # PREFILL, single chip: the residual stream may already be in L1 (short prefill), and
+            # forcing it to DRAM here costs a copy IN plus a copy back OUT for every norm -- measured
+            # as 704 CopyDeviceOperation calls / 3.03 ms, which is most of what the L1 residual won.
+            # The interleaved rms_norm kernel reads an interleaved input whatever its buffer type, so
+            # leave the tensor where it already is.
+            if mode == Mode.PREFILL and not self.args.is_multichip:
+                input_mem_cfg = x.memory_config()
             x = ttnn.to_memory_config(x, input_mem_cfg)
 
         x = self.norm(

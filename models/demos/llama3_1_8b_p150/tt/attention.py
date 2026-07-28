@@ -7,6 +7,7 @@ import math
 import torch
 
 import ttnn
+from models.demos.llama3_1_8b_p150.tt import ttl_concat_heads, ttl_create_qkv_heads
 from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
 from models.common.utility_functions import nearest_32
@@ -316,6 +317,13 @@ class Attention(LightweightModule):
         else:
             self.k_norm = lambda x, mode, norm_config: x
 
+        # Whether q_norm/k_norm are identity. The fused split+rope kernel does the rotation inside
+        # the head split, i.e. BEFORE where these norms sit in the chain, so it is only a legal
+        # substitution when there are no norms to reorder past (llama has none; qwen3 does).
+        self.qk_norm_is_identity = (
+            f"{q_norm_str}.weight" not in state_dict and f"{k_norm_str}.weight" not in state_dict
+        )
+
         # For ring topology we can use all gather matmul for wo
         self.use_fused_all_gather_matmul = self.args.use_fused_all_gather_matmul
         pt_wo = state_dict[f"{wo_str}.weight"].transpose(-1, -2).unsqueeze(0).unsqueeze(0)
@@ -539,23 +547,46 @@ class Attention(LightweightModule):
         return q_heads_1BQD, k_heads_1BKD
 
     def _mllama_rope_prefill(self, q_heads_1QSD_pre_rot, k_heads_1KSD_pre_rot, rot_mats):
-        q_heads_1QSD = ttnn.experimental.rotary_embedding_llama(
-            q_heads_1QSD_pre_rot,
-            rot_mats[0],
-            rot_mats[1],
-            self.transformation_mats["prefill"],
-            is_decode_mode=False,
-        )
+        # HEADS-AS-BATCH. The prefill rope factory parallelises over batch x seq-tiles ONLY and
+        # walks n_heads INSIDE each core (num_rows_per_core = sin_cos_rows_per_core * n_heads),
+        # so at batch 1 it pins itself to min(cores, seq_len/32) cores -- four of the P150's 110
+        # at seq_len 128, no matter how many heads there are. A [1, H, S, D] tiled tensor and a
+        # [H, 1, S, D] one have identical physical tile ordering, so folding heads into the BATCH
+        # dim is a metadata-only reshape that hands the factory H x min(cores/H, S_t) work units
+        # instead of S_t. cos/sin are head-broadcast ([1, 1, S, D]), which the op still accepts
+        # (it requires cos.shape[1] == input.shape[1] or 1, and both are 1 after the reshape).
+        def _rope(x):
+            heads = x.shape[1]
+            as_batch = ttnn.reshape(x, [heads, 1, x.shape[2], x.shape[3]])
+            out = ttnn.experimental.rotary_embedding_llama(
+                as_batch,
+                rot_mats[0],
+                rot_mats[1],
+                self.transformation_mats["prefill"],
+                is_decode_mode=False,
+            )
+            return ttnn.reshape(out, [1, heads, out.shape[2], out.shape[3]])
 
-        k_heads_1KSD = ttnn.experimental.rotary_embedding_llama(
-            k_heads_1KSD_pre_rot,
-            rot_mats[0],
-            rot_mats[1],
-            self.transformation_mats["prefill"],
-            is_decode_mode=False,
-        )
+        _heads_as_batch = not self.TG and rot_mats[0].shape[1] == 1
+        if not _heads_as_batch:
+            return (
+                ttnn.experimental.rotary_embedding_llama(
+                    q_heads_1QSD_pre_rot,
+                    rot_mats[0],
+                    rot_mats[1],
+                    self.transformation_mats["prefill"],
+                    is_decode_mode=False,
+                ),
+                ttnn.experimental.rotary_embedding_llama(
+                    k_heads_1KSD_pre_rot,
+                    rot_mats[0],
+                    rot_mats[1],
+                    self.transformation_mats["prefill"],
+                    is_decode_mode=False,
+                ),
+            )
 
-        return q_heads_1QSD, k_heads_1KSD
+        return _rope(q_heads_1QSD_pre_rot), _rope(k_heads_1KSD_pre_rot)
 
     def _hf_rope_prefill(self, q_heads_1QSD_pre_rot, k_heads_1KSD_pre_rot, rot_mats):
         if q_heads_1QSD_pre_rot.dtype != ttnn.bfloat16:
@@ -593,13 +624,35 @@ class Attention(LightweightModule):
         qkv_input_mem_config = self.args.get_attn_qkv_mm_mem_config(Mode.DECODE, self.prefetcher)
         x_sharded = ttnn.to_memory_config(x, qkv_input_mem_config) if self.prefetcher is not None else x
 
+        # wqkv is already at the bf4_b weight floor, so the only dtype bytes left on this
+        # DRAM-bw-bound matmul are what it WRITES. The fused [32, qkv_size] output is consumed
+        # only by the (single-chip no-op) all-reduce and then by sharded_to_interleaved, which
+        # re-emits bf16 regardless because nlp_create_qkv_heads_decode requires it -- so writing
+        # bf8_b here halves the store and the reshard's read without changing the dtype contract
+        # the head split sees. bf8_b is the floor: Q/K/V feed the KV cache and SDPA, and pushing
+        # attention tensors below bf8_b compounds over depth.
+        _qkv_decode_out_dtype = self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16
+        if not self.TG and self.prefetcher is None and self.activation_dtype is None:
+            _qkv_decode_out_dtype = ttnn.bfloat8_b
+
+        # SHARD RUNG (A/B against the bf8_b store above). Both operands of this matmul are
+        # already L1 width-sharded and the 13 MB/layer bf4_b weight can never be L1-resident, so
+        # the only sharding left to change is the HANDOFF: today the output is width-sharded in
+        # L1 and then sharded_to_interleaved'd before the head split. Keeping it sharded deletes
+        # that reshard from the per-token chain -- but nlp_create_qkv_heads_decode requires bf16,
+        # and the reshard is currently what does the bf8_b -> bf16 upcast, so this trades the
+        # store saving for the reshard. Which side wins is a measurement.
+        _keep_qkv_sharded = not self.TG and self.prefetcher is None
+        if _keep_qkv_sharded:
+            _qkv_decode_out_dtype = ttnn.bfloat16
+
         xqkv_fused_sharded = ttnn.linear(
             x_sharded,
             self.wqkv,
             memory_config=qkv_input_mem_config,
             program_config=self.args.get_attn_qkv_program_config(Mode.DECODE, 1, self.prefetcher),
             compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
-            dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
+            dtype=_qkv_decode_out_dtype,
             global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
             sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
         )
@@ -637,7 +690,10 @@ class Attention(LightweightModule):
             )
         else:
             # bfloat16 is required by nlp_create_qkv_heads_decode
-            if self.prefetcher is None:
+            if _keep_qkv_sharded:
+                # Already bf16 and L1 width-sharded -- hand it straight to the head split.
+                xqkv_fused = xqkv_fused_sharded
+            elif self.prefetcher is None:
                 xqkv_fused = ttnn.sharded_to_interleaved(xqkv_fused_sharded, ttnn.L1_MEMORY_CONFIG, ttnn.bfloat16)
                 ttnn.deallocate(xqkv_fused_sharded)
             else:
@@ -963,32 +1019,104 @@ class Attention(LightweightModule):
         ttnn.deallocate(x_11SH)
 
         # split qkv into heads
-        (
-            q_heads_1QSD_pre_rot,
-            k_heads_1KSD_pre_rot,
-            v_heads_1VSD,
-        ) = ttnn.experimental.nlp_create_qkv_heads(
-            xqkv_fused,
-            num_heads=self.n_local_heads,
-            num_kv_heads=self.n_local_kv_heads,
-            transpose_k_heads=False,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        # L1 island for the head split. This op is pure data movement and memory-bound: it reads
+        # the fused [S, (nq + 2*nkv) * head_dim] activation and writes three head-major views of
+        # it, and at short prefill every one of those trips is to DRAM. Q/K/V total
+        # S * 6144 * 2 B (1.5 MB at S=128), so the whole set fits interleaved L1 comfortably, and
+        # the immediate consumers -- q_norm/k_norm, then rotary_embedding -- read it straight back.
+        # The op's non-sharded factory requires an INTERLEAVED output config, so this is L1
+        # interleaved rather than a shard spec; the sharded factory is not reachable here (its
+        # output shard spec is fixed at {TILE_HEIGHT, head_dim}, i.e. seq_len == 32 only).
+        # Bounded to short prefill so long prompts keep the DRAM path.
+        create_heads_mem_config = (
+            ttnn.L1_MEMORY_CONFIG
+            if (not self.TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff)
+            else ttnn.DRAM_MEMORY_CONFIG
         )
+        # tt-lang rung: the stock op's core count is baked into its factory (one work unit per
+        # input row-tile -> 4 cores here), so the only way past it is a kernel whose work
+        # decomposition differs. ttl_create_qkv_heads parallelises over (seq_tile x head) and
+        # measures 0.0555 ms/call vs the stock op's 0.0810 at this shape, PCC 1.000000.
+        _use_ttl_heads = (
+            not self.TG
+            and self.prefetcher is None
+            and ttl_create_qkv_heads.supports(
+                xqkv_fused, self.n_local_heads, self.n_local_kv_heads, self.head_dim
+            )
+        )
+        # structural rung for RotaryEmbeddingLlamaDeviceOperation: the prefill rope is DISPATCH
+        # bound (736 launches x 9.55 us against a 1.21 us roofline -- a [32,1,128,128] rotation is
+        # only ~8 tiles per core, so almost all of the 9.55 us is fixed launch cost). No knob
+        # removes a fixed cost, so remove the LAUNCHES: the rotation is tile-local (x*cos +
+        # (x @ trans_mat)*sin, one 32x32 trans tile per tile, cos/sin head-broadcast), and the
+        # head-split kernel already streams every Q/K tile through its compute stage -- so the
+        # rotate rides along in the slot the split already pays for and the two rope dispatches
+        # disappear. Only legal while q_norm/k_norm are identity (see qk_norm_is_identity).
+        _fused_rope = (
+            _use_ttl_heads
+            and self.qk_norm_is_identity
+            and not self.use_hf_rope
+            and rot_mats is not None
+            and self.transformation_mats.get("prefill") is not None
+            and ttl_create_qkv_heads.supports_rope(
+                xqkv_fused,
+                self.n_local_heads,
+                self.n_local_kv_heads,
+                self.head_dim,
+                rot_mats[0],
+                rot_mats[1],
+                self.transformation_mats["prefill"],
+            )
+        )
+        if _fused_rope:
+            (
+                q_heads_1QSD,
+                k_heads_1KSD,
+                v_heads_1VSD,
+            ) = ttl_create_qkv_heads.create_qkv_heads_rope_ttl(
+                xqkv_fused,
+                rot_mats[0],
+                rot_mats[1],
+                self.transformation_mats["prefill"],
+                create_heads_mem_config,
+            )
+            ttnn.deallocate(xqkv_fused)
+        else:
+            if _use_ttl_heads:
+                (
+                    q_heads_1QSD_pre_rot,
+                    k_heads_1KSD_pre_rot,
+                    v_heads_1VSD,
+                ) = ttl_create_qkv_heads.create_qkv_heads_ttl(xqkv_fused, create_heads_mem_config)
+            else:
+                (
+                    q_heads_1QSD_pre_rot,
+                    k_heads_1KSD_pre_rot,
+                    v_heads_1VSD,
+                ) = ttnn.experimental.nlp_create_qkv_heads(
+                    xqkv_fused,
+                    num_heads=self.n_local_heads,
+                    num_kv_heads=self.n_local_kv_heads,
+                    transpose_k_heads=False,
+                    memory_config=create_heads_mem_config,
+                )
 
-        norm_config = self.args.get_norm_config("attn", Mode.PREFILL, None)
-        q_heads_1QSD_pre_rot = self.q_norm(q_heads_1QSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
-        k_heads_1KSD_pre_rot = self.k_norm(k_heads_1KSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
+            norm_config = self.args.get_norm_config("attn", Mode.PREFILL, None)
+            q_heads_1QSD_pre_rot = self.q_norm(q_heads_1QSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
+            k_heads_1KSD_pre_rot = self.k_norm(k_heads_1KSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
 
-        ttnn.deallocate(xqkv_fused)
+            ttnn.deallocate(xqkv_fused)
 
-        ###
-        # Rotary embeddings
-        ###
+            ###
+            # Rotary embeddings
+            ###
 
-        # Apply rotary embeddings using the selected implementation
-        q_heads_1QSD, k_heads_1KSD = self.rotary_embedding_prefill(q_heads_1QSD_pre_rot, k_heads_1KSD_pre_rot, rot_mats)
-        ttnn.deallocate(q_heads_1QSD_pre_rot)
-        ttnn.deallocate(k_heads_1KSD_pre_rot)
+            # Apply rotary embeddings using the selected implementation
+            q_heads_1QSD, k_heads_1KSD = self.rotary_embedding_prefill(
+                q_heads_1QSD_pre_rot, k_heads_1KSD_pre_rot, rot_mats
+            )
+            ttnn.deallocate(q_heads_1QSD_pre_rot)
+            ttnn.deallocate(k_heads_1KSD_pre_rot)
 
         # Fill KV-Cache
         if kv_cache:
@@ -1136,10 +1264,22 @@ class Attention(LightweightModule):
         ###
         # Output matmul
         ###
-        attn_output_11SH = ttnn.experimental.nlp_concat_heads(
-            attn_output_1QSD,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
+        # tt-lang rung, and the mirror of the head-split kernel at the other end of attention.
+        # The stock op's core count is baked into its factory (num_blocks = batch * seq_len / 32,
+        # heads never enter the split -> 4 cores here), and its sharded factory is measured-unsafe
+        # at this shape. ttl_concat_heads parallelises over (seq_tile x head) instead and measures
+        # 0.0430 ms/call vs the stock op's 0.0572 at this shape, PCC 1.000000.
+        if (
+            not self.TG
+            and self.prefetcher is None
+            and ttl_concat_heads.supports(attn_output_1QSD, self.n_local_heads, self.head_dim)
+        ):
+            attn_output_11SH = ttl_concat_heads.concat_heads_ttl(attn_output_1QSD, ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            attn_output_11SH = ttnn.experimental.nlp_concat_heads(
+                attn_output_1QSD,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
         ttnn.deallocate(attn_output_1QSD)
 
         # For batched prefill, reshape to concatenate batch dimension into sequence
@@ -1175,12 +1315,18 @@ class Attention(LightweightModule):
             else attn_output_11SH
         )
 
+        # wo writes straight into the residual stream's memory space. At short prefill that stream
+        # lives in L1, and landing this output in DRAM instead would make the residual add copy it
+        # back in -- which measured as 1149 CopyDeviceOperation calls / +4.20 ms, more than the
+        # 3.03 ms the L1 residual saved. The residual config is the single source of truth.
+        wo_out_mem_config = self.args.get_residual_mem_config(Mode.PREFILL, self.prefetcher, int(seq_len))
+
         output_11SH = ttnn.linear(
             attn_output_11SH_sharded,
             self.wo,
             compute_kernel_config=self.li_o_prefill_compute_kernel_cfg,
             dtype=self.activation_dtype or ttnn.bfloat8_b,
-            memory_config=wo_prefill_output_mem_config,
+            memory_config=wo_out_mem_config,
             program_config=self.args.get_attn_wo_program_config(Mode.PREFILL, seq_len, None),
         )
 
