@@ -145,6 +145,21 @@ class Attention(LightweightModule):
             decoder_id=layer_num, op=OpGroup.LI_O_PREFILL, configuration=configuration
         )
 
+        # FIDELITY rung for the QKV and attention-output projections. Both still run HIFI2 while their
+        # WEIGHTS are already sub-bf16 (wqkv bf4_b, wo bf8_b), and GUIDELINES/01 section 12's policy
+        # table is explicit that a bf8_b/bf4_b matmul (QKV / MLP / attn-out) should be walked to LoFi --
+        # it also warns this is the most commonly SKIPPED win because it feels risky. Measured on the
+        # sibling ff2 down-projection in this same model: HiFi2 -> LoFi took it 185.4 -> 126.6 us/call
+        # and the whole pipeline 22.06 -> 19.24 ms per token at PCC 0.9854. These decode matmuls run on
+        # ~12 cores, where math is a real term rather than a rounding error (the note above the decode
+        # program configs says as much). SDPA and the norms are deliberately NOT touched: attention
+        # scores and normalisation must stay at HiFi2 or the error compounds over depth.
+        if not self.TG and prefetcher is None and configuration.num_devices == 1:
+            self.li_qkv_decode_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+            self.li_o_decode_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+            self.li_qkv_prefill_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+            self.li_o_prefill_compute_kernel_cfg = configuration.compute_kernel_config_lofi
+
         layer_name = configuration.get_state_dict_prefix(self.__class__.__name__, layer_num)
         if configuration.dummy_weights or (weight_cache_path is None):
             cache_name = lambda _: None

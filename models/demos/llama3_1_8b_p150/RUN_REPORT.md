@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 11:37:59 UTC · 190 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 11:45:49 UTC · 192 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -14,8 +14,8 @@ Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op max(FLOPs/peak, bytes/BW, dispatch); covers 91% of device time)
   this build's floor  : 331.86 ms   (recomputed from the CURRENT op mix; below the pinned anchor because the ops now move different bytes — new headroom, NOT a new target; the anchor above stays fixed so at-floor% cannot retreat ahead of the measurement)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 615.69 ms
-  at-floor            : 87%   (78.46 ms reachable headroom)
+  measured            : 567.94 ms
+  at-floor            : 95%   (30.71 ms reachable headroom)
   status              : IN_BAND — reached the achievable band — done
   (tok/s/u — unavailable: active_bytes not computed for this pipeline, so the per-token weight-bytes target has no numerator)
 
@@ -32,16 +32,14 @@ eltwise               8.89   1.4%    2448   slow  BinaryNgDeviceOperation
 embedding             1.09   0.2%     103   slow  EmbeddingsDeviceOperation
 
 Block-level timing (per-stage trace) — latest lever on MatmulDeviceOperation:
-  MatmulDeviceOperation 32 x 4096 x 14336 (ff1/ff3, NOW 90 cores @ 99.6us, 332 GB/s)    162.51 ms  ###################### · True  <- hottest
-  MatmulDeviceOperation 32 x 14336 x 4096 (ff2, kept DRAM-sharded on 8/12 cores: full grid measured 34ms WORSE)    151.31 ms  ####################..
-  MatmulDeviceOperation 32 x 4096 x 6144 (QKV, still 8/12 cores, 167 GB/s - next target)     69.19 ms  #########.............
-  LayerNormDeviceOperation (1679 calls, 1-64 cores)     51.85 ms  #######...............
-  MatmulDeviceOperation 32 x 4096 x 4096 (wo, still 8/12 cores)     51.73 ms  #######...............
-  MatmulDeviceOperation 32 x 4096 x 16032 (LM head, 101 cores - the lever this reused)     43.70 ms  ######................
-  NlpCreateHeadsDeviceOperation (1 core: tt-lang kernel gated on SEQ_LEN==128)     28.55 ms  ####..................
-  NLPConcatHeadsDeviceOperation (1 core: same cause)     18.33 ms  ##....................
-  BinaryNgDeviceOperation (110 cores)      8.89 ms  #.....................
-  RotaryEmbeddingLlamaDeviceOperation (110 cores)      5.97 ms  #.....................
+  MatmulDeviceOperation 32 x 4096 x 14336 (ff1/ff3, 90 cores, 332 GB/s)    162.39 ms  ###################### · True  <- hottest
+  MatmulDeviceOperation 32 x 14336 x 4096 (ff2, NOW LoFi: 151.31 -> 103.30 ms, 178 -> 261 GB/s)    103.30 ms  ##############........
+  MatmulDeviceOperation 32 x 4096 x 6144 (QKV, still HiFi2 x bf4_b - same lever untried)     69.18 ms  #########.............
+  LayerNormDeviceOperation (1679 calls, 757 on ONE core)     52.33 ms  #######...............
+  MatmulDeviceOperation 32 x 4096 x 4096 (wo, still HiFi2 x bf8_b - same lever untried)     51.73 ms  #######...............
+  MatmulDeviceOperation 32 x 4096 x 16032 (LM head, still HiFi2 x bf4_b on 101 cores)     43.69 ms  ######................
+  NlpCreateHeadsDeviceOperation (1 core)     28.50 ms  ####..................
+  NLPConcatHeadsDeviceOperation (1 core)     18.31 ms  ##....................
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
@@ -52,7 +50,7 @@ LayerNormDeviceOperation           ·try      —         —         ·try     
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ·try        1061.00
 MatmulDeviceOperation              ·try      ·try      ✓win      ·try      ✓win      ·try      ·try      ·try         654.43
 MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —            749.85
-MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ·try      ·try      ·try         614.94
+MatmulDeviceOperation              ·try      ✓win      ✓win      ·try      ·try      ·try      ·try      ·try         567.94
 MatmulDeviceOperation              ✓win      ·try      ·try      ·try      ·try      ·try      ·try      ·try         614.88
 MatmulDeviceOperation              ✓win      —         ✓win      ·try      ·try      ·try      ·try      ·try         662.92
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ·try         622.89
@@ -258,6 +256,8 @@ MatmulDeviceOperation                     dtype         —             —  · 
 MatmulDeviceOperation                      grid    622.89   +1841.29 ms  · no gain  Applied the variant switch that WON on ff1/ff3 -- hold wqkv DRAM-INTERLEAVED, hand ttnn.linear no program config so it auto-routes over the whole grid, keep the activation in interleaved L1, then re-a
 MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: checkpoint the live RUN_REPORT Banks the lever log for the ff2 and QKV grid rungs, including the correction to the full-gr
 MatmulDeviceOperation                     dtype    615.43   +1848.75 ms  · no gain  w2 is already at the bf4_b WEIGHT floor (the profile reads 'HiFi2 BFP8 x BFP4 => BF16'), so the two remaining dtype steps are the tensors around it, and I tried both. OUTPUT first, bf16 -> bf8_b: this
+MatmulDeviceOperation                     shard         —             —  ✓ win      committed: llama3_1_8b_p150: run the ff2 down-projection at LoFi instead of HiFi2 ff1/ff3 were already LoFi but ff2 still ran HIFI2_FP16, and the comme
+MatmulDeviceOperation                  fidelity    567.94   +1896.24 ms  ✓ win      COMMITTED, and the biggest per-token win of the round. Hypothesis came from noticing that this op was the ONLY hot MLP matmul still at HIFI2_FP16 while its siblings ff1/ff3 were already LoFi, and from
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4179,6 +4179,28 @@ Code changes — every attempt (win or fail):
      Run directly to reproduce the table.
     ... (truncated, 2 more lines)
 
+[#192] MatmulDeviceOperation · fidelity · win  +1896.24 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 138b55a557..5099b1712e 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -409,6 +409,15 @@ class MLP(LightweightModule):
+             li_ff2_compute_kernel_cfg = self.decoders_optimizations.get_math_fidelity(
+                 decoder_id=layer_num, op=OpGroup.LI_FF2, configuration=self.args
+             )
+    +        # fidelity rung for ff2. Unlike ff1/ff3 (already LoFi) this op still runs HIFI2_FP16, and the
+    +        # comment above the program configs says why that was chosen: the DRAM-sharded decode matmuls
+    +        # "use HiFi2; this drops 1 bit of the activations but would be FLOP-bound on 12 cores with
+    +        # HiFi4". That reasoning cuts both ways -- on only ~12 cores the math is a real term, and ff2
+    +        # moves its 33 MB at 178 GB/s while the same weight size flows at 332 GB/s in ff1/ff3, so ff2
+    +        # is NOT purely DRAM-bound and there should be math cost to recover. w2 is bf4_b, and the
+    +        # catalogued policy for a bf4_b/bf8_b matmul is LoFi.
+    +        if fg_ff1_3:
+    +            li_ff2_compute_kernel_cfg = self.args.compute_kernel_config_lofi
+     
+             ff2_input_mem_config = self.args.get_mlp_ff2_mem_config(mode, self.prefetcher)
+             if mode == Mode.PREFILL:
+
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
@@ -4230,6 +4252,8 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
 
 
 
