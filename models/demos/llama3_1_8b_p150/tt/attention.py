@@ -367,6 +367,8 @@ class Attention(LightweightModule):
                 cache_file_name=(cache_name("wo_sharded_ring")),
             )
 
+        _wo_dtype_tag = f"_{str(self.wo_dtype).rsplit('.', 1)[-1].lower()}"
+
         def get_wo_memory_config():
             if self.use_fused_all_gather_matmul or self.TG:
                 return ttnn.DRAM_MEMORY_CONFIG
@@ -381,7 +383,12 @@ class Attention(LightweightModule):
             memory_config=get_wo_memory_config(),
             mesh_mapper=get_wo_mesh_mapper(),
             cache_file_name=(
-                cache_name("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else cache_name("wo")
+                # The cache key MUST encode the dtype. `as_tensor` returns the cached tensor exactly as
+                # it was stored, so without this tag a previously-cached bf8_b wo is reloaded unchanged
+                # and lowering wo_dtype is a SILENT no-op that measures as "no gain".
+                cache_name(f"wo_width_sharded_2d{_wo_dtype_tag}")
+                if (self.use_fused_all_gather_matmul or self.TG)
+                else cache_name(f"wo{_wo_dtype_tag}")
             ),
         )
         if not use_paged_kv_cache:

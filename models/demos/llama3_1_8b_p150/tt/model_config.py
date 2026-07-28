@@ -239,6 +239,14 @@ class ModelOptimizations:
                     # one resident tensor shared by the prefill AND decode QKV matmuls, so the
                     # halving lands on both paths.
                     TensorGroup.WQKV: PrecisionSetting.BFP4,
+                    # WO is the last tensor group `performance()` never lowered: FF1/FF3, FF2 and WQKV
+                    # all ride bf4_b, while the attention output projection was still inheriting the
+                    # BFP8 default simply because it is not named here. It is [n_heads*head_dim, dim]
+                    # = 4096 x 4096 = 16.8M params, ~17.8 MB per layer at bf8_b, and the roofline tags
+                    # its decode matmul memory-bound -- so halving it removes ~8.4 MB per layer, ~270 MB
+                    # per token across 32 layers. It is one resident tensor shared by the prefill AND
+                    # decode wo matmuls, so the halving lands on both paths.
+                    TensorGroup.WO: PrecisionSetting.BFP4,
                 },
                 "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI},
             }
