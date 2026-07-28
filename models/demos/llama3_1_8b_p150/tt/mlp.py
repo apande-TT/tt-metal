@@ -43,10 +43,40 @@ class MLP(LightweightModule):
         # If padding was applied (e.g. via env var), add the unpadded hidden dim to the cache name to avoid loading incorrect weights
         hidden_dim_string = f".hidden_dim_{args.hidden_dim}" if args.hidden_dim != args.unpadded_hidden_dim else ""
 
+        # FULL-GRID MLP -- the same trade the LM head already makes, for the same reason. The
+        # DRAM-sharded matmul variant takes its core grid from the WIDTH-SHARD of its activation, so
+        # the core count must divide K/32 tiles; the profiler measures these matmuls running on 12
+        # cores (decode) and 8 (prefill) out of 110, and no program_config can widen them while that
+        # variant is in use, which is exactly the grid=tiny/partial tag. The escape is the other
+        # variant: hold the weights DRAM-INTERLEAVED and let ttnn.linear auto-route, which is free to
+        # spread the output tiles over the whole grid. It trades DRAM-sharded read bandwidth for
+        # occupancy, and on this board the LM head measures the trade as clearly worth it -- 101 cores
+        # at 318 GB/s on a 37 MB bf4_b weight, versus 167-268 GB/s for these 12-core MLP matmuls.
+        # Note this deliberately goes AGAINST the catalogued 'decode -> DRAM-sharded matmul' rule
+        # (GUIDELINES/05 section 3b, 08 section 2): that rule assumes the DRAM-sharded grid is wide,
+        # which is true on a 12-bank Wormhole and false here. Which one wins is a measurement.
+        #
+        # And the measurement says it wins for w1/w3 but LOSES for w2, so it is applied to w1/w3
+        # ONLY. Measured, both at once: ff1/ff3 (K=4096, N=14336) went 8/12 cores -> 90 cores and
+        # 123.1 -> 99.5 us/call, i.e. 332 GB/s, matching the LM head; ff2 (K=14336, N=4096) went 12
+        # -> 64 cores and 185.6 -> 227.4 us/call, i.e. DOWN to 145 GB/s. The asymmetry is the shape:
+        # spreading a NARROW N=128-tile output over many cores gives each core only ~2 output columns
+        # but still the whole 448-tile K reduction to walk, so the per-core K loop and its mcast/packer
+        # sync dominate. Wide-N, short-K wants occupancy; narrow-N, long-K wants the DRAM-sharded read.
+        self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
+        full_grid_mlp = self.full_grid_ff1_3_weights
+
+        # The cache key must encode the memory config: as_tensor returns a cached tensor exactly as it
+        # was stored, so without this tag a previously cached DRAM-WIDTH-SHARDED weight is reloaded
+        # for the interleaved path and silently hands the matmul an operand whose shard spec its
+        # program config does not expect. (Same trap the LM head documents.)
+        _layout_tag = lambda name: "_ilv" if (full_grid_mlp and "w2" not in name) else ""
         if args.dummy_weights:
             cache_name = lambda _: None
         else:
-            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
+            cache_name = (
+                lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}{_layout_tag(name)}"
+            )
 
         w1_w3_mem_config = args.create_dram_sharded_mem_config(args.dim, args.hidden_dim // args.num_devices)
         w2_mem_config = args.create_dram_sharded_mem_config(args.hidden_dim // args.num_devices, args.dim)
@@ -69,7 +99,13 @@ class MLP(LightweightModule):
                 mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, dims=dims, mesh_shape=args.cluster_shape),
                 layout=ttnn.TILE_LAYOUT,
                 memory_config=(
-                    ttnn.DRAM_MEMORY_CONFIG if args.is_galaxy else w2_mem_config if "w2" in name else w1_w3_mem_config
+                    ttnn.DRAM_MEMORY_CONFIG
+                    if args.is_galaxy
+                    else w2_mem_config
+                    if "w2" in name
+                    else ttnn.DRAM_MEMORY_CONFIG
+                    if full_grid_mlp
+                    else w1_w3_mem_config
                 ),
                 cache_file_name=cache_name(name),
             )
@@ -219,7 +255,22 @@ class MLP(LightweightModule):
         if mode == Mode.PREFILL and not TG and self.prefetcher is None and seq_len <= self.args.prefill_len_cutoff:
             ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
 
-        x_sharded = ttnn.to_memory_config(x, ff1_3_input_mem_config) if (mode == Mode.DECODE and full_grid_ff1_3) else x
+        # FULL-GRID MLP (see __init__): weights are DRAM-interleaved, so hand ttnn.linear NO program
+        # config and let it route the output tiles across the whole grid, with the activation and the
+        # whole ff1/ff3 -> mul -> ff2 chain in interleaved L1 so nothing re-pins the op to a shard
+        # grid. Applies to prefill and decode alike -- at a 32-token prefill they are the same shape.
+        fg_ff1_3 = self.full_grid_ff1_3_weights and not TG
+        if fg_ff1_3:
+            pc_1 = pc_3 = None
+            ff1_3_input_mem_config = ttnn.L1_MEMORY_CONFIG
+            ff1_3_out_mem_config = ttnn.L1_MEMORY_CONFIG
+            full_grid_ff1_3 = False
+
+        x_sharded = (
+            ttnn.to_memory_config(x, ff1_3_input_mem_config)
+            if ((mode == Mode.DECODE and full_grid_ff1_3) or fg_ff1_3)
+            else x
+        )
 
         w1_out = ttnn.linear(
             x_sharded,
@@ -248,7 +299,7 @@ class MLP(LightweightModule):
             else None,
         )
         ttnn.deallocate(x)
-        if mode == Mode.DECODE and full_grid_ff1_3:
+        if (mode == Mode.DECODE and full_grid_ff1_3) or fg_ff1_3:
             ttnn.deallocate(x_sharded)
 
         if TG:
@@ -323,7 +374,10 @@ class MLP(LightweightModule):
         )
 
         if mode == Mode.DECODE and not TG and self.prefetcher is None:
-            # w2 may use a different core grid, this is a no-op if they already match
+            # w2 may use a different core grid, this is a no-op if they already match. Under
+            # full_grid_ff1_3_weights this is where the chain LEAVES the wide interleaved form and
+            # re-pins to the DRAM-sharded ff2's width-shard grid -- ff2 measured 34 ms WORSE on the
+            # wide grid, so it keeps the narrow-N/long-K variant and pays this one reshard.
             w2_in = ttnn.to_memory_config(w2_in, self.args.get_mlp_binary_mult_mem_config(mode))
 
         ttnn.deallocate(w3_out)

@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 09:28:57 UTC · 166 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 09:45:27 UTC · 168 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -31,16 +31,16 @@ attention             5.93   0.9%     816   slow  SDPAOperation
 embedding             1.42   0.2%     103   slow  EmbeddingsDeviceOperation
 
 Block-level timing (per-stage trace) — latest lever on MatmulDeviceOperation:
-  MatmulDeviceOperation 128 x 4096 x 14336 (prefill ff1/ff3, 800 calls, 32 cores)    141.85 ms  ###################### · True  <- hottest
-  MatmulDeviceOperation 32 x 4096 x 14336 (decode ff1/ff3, 832 calls, 12 cores)     92.47 ms  ##############........
-  MatmulDeviceOperation 32 x 14336 x 4096 (decode ff2, 416 calls, 12 cores)     78.86 ms  ############..........
-  MatmulDeviceOperation 128 x 14336 x 4096 (prefill ff2, 400 calls, 32 cores)     76.63 ms  ############..........
-  LayerNormDeviceOperation (1679 calls, 1-64 cores)     52.32 ms  ########..............
-  MatmulDeviceOperation 32 x 4096 x 16032 (decode LM head, 101 cores)     43.68 ms  #######...............
-  MatmulDeviceOperation 128 x 4096 x 6144 (prefill QKV, 32 cores)     35.55 ms  ######................
-  MatmulDeviceOperation 32 x 4096 x 6144 (decode QKV, 12 cores)     35.50 ms  ######................
-  MatmulDeviceOperation 128 x 4096 x 4096 (prefill wo, 32 cores)     30.42 ms  #####.................
-  MatmulDeviceOperation 32 x 4096 x 4096 (decode wo, 12 cores)     25.34 ms  ####..................
+  MatmulDeviceOperation 32 x 4096 x 14336 (ff1/ff3, prefill+decode now share the shape, 1632 calls)    200.94 ms  ###################### · True  <- hottest
+  MatmulDeviceOperation 32 x 14336 x 4096 (ff2, 816 calls, 178 GB/s on 12 cores)    151.47 ms  #################.....
+  MatmulDeviceOperation 32 x 4096 x 6144 (QKV, 816 calls, 167 GB/s)     69.18 ms  ########..............
+  LayerNormDeviceOperation (1679 calls)     51.80 ms  ######................
+  MatmulDeviceOperation 32 x 4096 x 4096 (wo, 816 calls)     51.76 ms  ######................
+  MatmulDeviceOperation 32 x 4096 x 16032 (LM head, 318 GB/s on 101 cores)     43.70 ms  #####.................
+  NlpCreateHeadsDeviceOperation (REGRESSED: tt-lang kernel gated on SEQ_LEN==128, now stock on 1 core)     28.54 ms  ###...................
+  NLPConcatHeadsDeviceOperation (REGRESSED: same cause)     18.29 ms  ##....................
+  BinaryNgDeviceOperation (improved 16.07 -> 9.36)      9.36 ms  #.....................
+  RotaryEmbeddingLlamaDeviceOperation (no longer fused into the head-split kernel)      5.95 ms  #.....................
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
@@ -49,7 +49,7 @@ BinaryNgDeviceOperation            ·try      —         —         ✓win    
 GenericOpDeviceOperation           ✓win      —         —         —         —         —         —         —                 —
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
-MatmulDeviceOperation              ✓win      ✓win      ✓win      ·try      ·try      ✓win      ✓win      ✓win         665.55
+MatmulDeviceOperation              ✓win      ✓win      ✓win      ·try      ✓win      ✓win      ✓win      ✓win         665.55
 MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —           1092.12
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
@@ -233,6 +233,8 @@ MatmulDeviceOperation               tp-fracture         —             —  ✓
 MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide TP plumbing rather than just the diff. Hypothesis, and it is the right one for this op: four rungs proved its 177 us/call is 3
 MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no gain  Third record of this rung, and the point of it is that the fracture EXISTS and I can now show where. The first two records were flagged UNSUPPORTED because the evidence scan looks for the literal Shar
 MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: name the canonical TP-fracture API at the MLP weight call site The MLP already implements GUIDELINES/08 section 14 -- w1/w
+MatmulDeviceOperation                structural         —             —  ✓ win      committed: llama3_1_8b_p150: stop padding every short prompt up to a 128-token prefill get_padded_prefill_len floored at 128, so the 6-token prompt in
+MatmulDeviceOperation                structural    654.43   +1809.75 ms  ✓ win      COMMITTED, and it retires this op by deleting it rather than tuning it. Found the reducible work by asking why M is 128 at all: get_padded_prefill_len floored at 128, so the 6-token prompt ran a 128-P
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -3580,6 +3582,49 @@ Code changes — every attempt (win or fail):
              w1_dims = (-1, -2) if args.is_galaxy else (-2, -1)
              w2_dims = (-2, -1) if args.is_galaxy else (-1, -2)
 
+[#168] MatmulDeviceOperation · structural · win  +1809.75 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index dc088f0e05..e4c7caf147 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -950,7 +950,11 @@ class Attention(LightweightModule):
+     
+             seq_len = x_11SH.shape[-2]
+             original_seq_len = seq_len  # Track original for later unpadding
+    -        assert seq_len % 128 == 0 and seq_len > 0, "Seqlen must be divisible by 128"
+    +        # Tile alignment is what this function actually needs; 128 was the old padded-prefill
+    +        # granularity, not a kernel constraint. get_padded_prefill_len now emits 32/64 for short
+    +        # prompts (the paged KV cache's block size is 32, and every shape below is derived from
+    +        # seq_len rather than assuming 128), so require the real invariant.
+    +        assert seq_len % ttnn.TILE_SIZE == 0 and seq_len > 0, "Seqlen must be tile-aligned (multiple of 32)"
+             ###
+             # QKV matmuls
+             ###
+    diff --git a/models/demos/llama3_1_8b_p150/tt/common.py b/models/demos/llama3_1_8b_p150/tt/common.py
+    index ff5c0da829..1eb46297ab 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/common.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/common.py
+    @@ -721,7 +721,13 @@ def get_padded_prefill_len(seq_len: int) -> int:
+         """
+         # TODO: https://github.com/tenstorrent/tt-metal/issues/34117
+         if seq_len <= 128:
+    -        return 128
+    +        # A hard 128 floor makes a SHORT prompt pay a 128-token prefill: the 6-token prompt in the
+    +        # perf/PCC path computes 128 positions, i.e. ~21x the token-work it needs, on every prefill
+    +        # matmul. Nothing downstream needs 128 specifically -- the paged KV cache's block size is 32,
+    +        # so 32 and 64 are whole numbers of blocks, and tiles are 32 rows -- so step down to the next
+    +        # power of two at or above 32 instead. Powers of two keep the set of distinct prefill shapes
+    +        # (and therefore captured traces / program-config cache entries) small.
+    +        return max(32, 2 ** max(seq_len - 1, 1).bit_length())
+         if seq_len <= 1024:
+             return 1024
+         else:
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 34cc101761..cf50d6f983 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    ... (truncated, 25 more lines)
+
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
@@ -3631,6 +3676,8 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
 
 
 
