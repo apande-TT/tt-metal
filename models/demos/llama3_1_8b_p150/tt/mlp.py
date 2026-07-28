@@ -83,6 +83,22 @@ class MLP(LightweightModule):
         # costs nothing here; it is the reason tp_pick_degree returns best_tp=1 for these matmuls
         # rather than there being no TP support. TP remains the one lever that would cut the ~99 MB
         # of MLP weight bytes read per layer per token, and it needs more than one chip.
+        #
+        # Mapping to the canonical GUIDELINES/08 section 14 form, because the names differ and that
+        # has cost a reader time before: the canonical 1-D recipe is
+        #     w_shard = ttnn.as_tensor(W, mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=-1))
+        #     y = ttnn.all_gather(ttnn.linear(x, w_shard), dim=-1, cluster_axis=TP_AXIS, ...)
+        # for a column-fracture, and ShardTensorToMesh(mesh, dim=0) + reduce_scatter for a
+        # row-fracture. ShardTensor2dMesh(dims=w1_dims) below IS that mapper generalised to a 2-D
+        # mesh (a 1-D mesh is the degenerate case), and tt_all_reduce() below dispatches to the
+        # ttnn all_gather / reduce_scatter CCLs. So w1/w3 are the column-fracture + gather and w2 is
+        # the row-fracture + reduce, already written; there is no missing TP implementation here.
+        # MEASURED verdict for the tp-fracture rung on the MLP matmuls: tp_pick_degree returns
+        # best_tp=1 for (128,4096,14336), (32,4096,14336), (128,14336,4096) and (32,14336,4096) --
+        # keep them single-chip. This run resolves to a 1x1 mesh, so cluster_shape is [1,1], the
+        # mapper is an identity and tt_all_reduce short-circuits to its input; and the 8B weights fit
+        # on one P150, so TP would be a pure bandwidth play. Raising it is a TOPOLOGY change
+        # (TT_PERF_MESH_ROWS/COLS), not a model edit.
         w1_dims = (-1, -2) if args.is_galaxy else (-2, -1)
         w2_dims = (-2, -1) if args.is_galaxy else (-1, -2)
 

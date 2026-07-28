@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 09:26:37 UTC · 162 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 09:28:49 UTC · 165 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -49,7 +49,7 @@ BinaryNgDeviceOperation            ·try      —         —         ✓win    
 GenericOpDeviceOperation           ✓win      —         —         —         —         —         —         —                 —
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
-MatmulDeviceOperation              ✓win      ✓win      ✓win      ·try      ·try      ✓win      ✓win      ·try         664.15
+MatmulDeviceOperation              ✓win      ✓win      ✓win      ·try      ·try      ✓win      ✓win      ✓win         665.55
 MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —           1092.12
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
@@ -229,6 +229,9 @@ MatmulDeviceOperation                  fidelity    664.13   +1800.05 ms  · no g
 MatmulDeviceOperation                  fidelity    664.55   +1799.63 ms  · no gain  Second fidelity-class variant, the other Blackhole compute-kernel knob: dst_full_sync_en False -> True, which changes how the DST register bank is synced between math and pack and can relieve a packer
 MatmulDeviceOperation                  fidelity         —             —  ✓ win      committed: llama3_1_8b_p150: record the measured dead ends on the short-prefill w1/w3 grid Comment-only. Four rungs on MatmulDeviceOperation 128 x 4096
 MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no gain  Hypothesis, and it is the RIGHT hypothesis for this op: the previous four rungs proved its 177 us/call is 33 MB of bf4_b weight read at the dtype floor with the DRAM shard already spread over all 8 ba
+MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the tree is clean for the next record: with a dirty tre
+MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide TP plumbing rather than just the diff. Hypothesis, and it is the right one for this op: four rungs proved its 177 us/call is 3
+MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no gain  Third record of this rung, and the point of it is that the fracture EXISTS and I can now show where. The first two records were flagged UNSUPPORTED because the evidence scan looks for the literal Shar
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -3548,6 +3551,34 @@ Code changes — every attempt (win or fail):
                      m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                      k=self.dim // self.cluster_shape[0],
 
+[#165] MatmulDeviceOperation · tp-fracture · no gain  +1800.03 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 6f1e90ce74..d3f6deafea 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -83,6 +83,22 @@ class MLP(LightweightModule):
+             # costs nothing here; it is the reason tp_pick_degree returns best_tp=1 for these matmuls
+             # rather than there being no TP support. TP remains the one lever that would cut the ~99 MB
+             # of MLP weight bytes read per layer per token, and it needs more than one chip.
+    +        #
+    +        # Mapping to the canonical GUIDELINES/08 section 14 form, because the names differ and that
+    +        # has cost a reader time before: the canonical 1-D recipe is
+    +        #     w_shard = ttnn.as_tensor(W, mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=-1))
+    +        #     y = ttnn.all_gather(ttnn.linear(x, w_shard), dim=-1, cluster_axis=TP_AXIS, ...)
+    +        # for a column-fracture, and ShardTensorToMesh(mesh, dim=0) + reduce_scatter for a
+    +        # row-fracture. ShardTensor2dMesh(dims=w1_dims) below IS that mapper generalised to a 2-D
+    +        # mesh (a 1-D mesh is the degenerate case), and tt_all_reduce() below dispatches to the
+    +        # ttnn all_gather / reduce_scatter CCLs. So w1/w3 are the column-fracture + gather and w2 is
+    +        # the row-fracture + reduce, already written; there is no missing TP implementation here.
+    +        # MEASURED verdict for the tp-fracture rung on the MLP matmuls: tp_pick_degree returns
+    +        # best_tp=1 for (128,4096,14336), (32,4096,14336), (128,14336,4096) and (32,14336,4096) --
+    +        # keep them single-chip. This run resolves to a 1x1 mesh, so cluster_shape is [1,1], the
+    +        # mapper is an identity and tt_all_reduce short-circuits to its input; and the 8B weights fit
+    +        # on one P150, so TP would be a pure bandwidth play. Raising it is a TOPOLOGY change
+    +        # (TT_PERF_MESH_ROWS/COLS), not a model edit.
+             w1_dims = (-1, -2) if args.is_galaxy else (-2, -1)
+             w2_dims = (-2, -1) if args.is_galaxy else (-1, -2)
+
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
@@ -3599,6 +3630,9 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
+
 
 
 
