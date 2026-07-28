@@ -1,19 +1,19 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Re-rendered with the corrected report code — 2026-07-28 13:19:15 UTC_
+_Updated live: 2026-07-28 13:24:14 UTC · 203 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
 ==========================================================
-eager per-op device time (16 layers):  2464.18 ms  ->  534.44 ms   (+78.3%, 4.61x)
+optimizing… — baseline->final speedup is finalized when the module converges (per-attempt detail below is live)
 tracy trace pass (16 layers):  11.93 ms  ->  9.34 ms   (+21.7%, 1.28x)
 trace+1CQ full-pipeline e2e (all layers):  48.38 ms  ->  22.79 ms   (+52.9%, 2.12x)
 
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op max(FLOPs/peak, bytes/BW, dispatch); covers 93% of device time)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 493.61 ms
+  measured            : 465.94 ms
   status              : PAST BASELINE FLOOR — keep optimizing
   (tok/s/u — n/a: no weight-bytes input for this pipeline)
 
@@ -54,7 +54,7 @@ Matmul 32x4096x16032               ✓win      —         ✓win      ·try    
 Matmul 32x4096x4096                —         ·try      —         —         —         —         —         —            534.44
 Matmul 32x4096x6144                ·try      ✓win      ·try      ✓win      ·try      ·try      ·try      ·try         534.44
 NLPConcatHeads                     ·try      —         —         ·try      ·try      ✓win      —         —            714.94
-NlpCreateHeads                     ·try      —         —         ✓win      ✓win      ✓win      —         —            758.37
+NlpCreateHeads                     ✓win      —         —         ✓win      ✓win      ✓win      —         —            465.94
 RotaryEmbeddingLlama               ✓win      —         —         —         ✓win      —         —         —            656.91
 SDPA                               ✓win      —         —         —         ·try      —         —         —            655.73
 TopK                               ·try      —         —         ·try      —         ·try      —         —                 —
@@ -267,6 +267,7 @@ LayerNorm                                  grid    493.61   +1970.57 ms  ✓ win
 Matmul 32x14336x4096                 structural    575.26   +1888.92 ms  · no gain  Hypothesis: the recorded 'full-grid LOSES for w2' verdict (185.6 -> 227.4 us/call) was measured while ff2 still ran HiFi2, and the stated cause was a MATH term (each core gets ~2 output columns of a n
 Matmul 32x14336x4096                    tt-lang    493.72   +1970.46 ms  · no gain  Hypothesis: a hand tt-lang matmul could beat stock ttnn on this decode ff2 shape by owning the K reduction in-core instead of paying the stock op's mcast/packer sync on a 448-tile K. The kernel is aut
 Matmul 32x14336x4096                        cpp    493.72   +1970.46 ms  · no gain  Hypothesis: if tt-lang could not express a faster K reduction for this decode ff2, raw Metalium might, by controlling the reader/compute/writer triple directly. Authored and measured in-tree (tt/cpp_m
+NlpCreateHeads                             grid    465.94   +1998.24 ms  ✓ win      Hypothesis: this op is grid=tiny because a 32-token padded prompt is ONE seq tile and stock nlp_create_qkv_heads assigns one work unit per input row-tile, so the entire split ran on a SINGLE core; the
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4333,12 +4334,56 @@ Code changes — every attempt (win or fail):
              self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
              full_grid_mlp = self.full_grid_ff1_3_weights
 
+[#203] NlpCreateHeads · grid · win  +1998.24 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_create_qkv_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_create_qkv_heads.py
+    index bb190cde33..00066ce30d 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_create_qkv_heads.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_create_qkv_heads.py
+    @@ -203,12 +203,79 @@ def ttl_create_heads_rope(
+                     ttl.copy(blk, v[cx * seq_tiles + st, c0 + c]).wait()
+     
+     
+    +# GRID RUNG for the SINGLE-SEQ-TILE prefill (seq_len == 32). A 32-token padded prompt is ONE seq
+    +# tile, and the stock nlp_create_qkv_heads assigns one work unit per input row-tile, so it runs the
+    +# whole split on a SINGLE core -- that is the grid=tiny tag, and no program_config exists for this op
+    +# to widen it, so the only way past it is a kernel with a different work decomposition.
+    +#
+    +# The 128-row kernel above cannot just be pointed at this shape: its y axis carries
+    +# cy = dim_half * SEQ_T + seq_tile, so at SEQ_T == 1 it would collapse to DIM_HALVES = 2 rows = 16
+    +# cores. But SEQ_T == 1 is exactly what FREES the y axis -- with no seq tiles to carry, y can hold one
+    +# dim tile per row instead of a half-head, so DIM_HALVES rises to HD_T (4) and HALF_T falls to 1.
+    +# That gives 8 x 4 = 32 cores at 6 tiles each, which covers all
+    +# (32 Q + 8 K + 8 V) heads x 1 seq tile x 4 dim tiles = 192 tiles exactly.
+    +# Kept as a SEPARATE @ttl.operation rather than parameterising the one above, because the grid and the
+    +# per-core tile counts are compile-time constants baked into the decorator.
+    +SEQ_LEN_1T = TILE
+    +SEQ_T_1T = SEQ_LEN_1T // TILE  # == 1
+    +DIM_HALVES_1T = HD_T  # one dim tile per y row, the whole point of this variant
+    +HALF_T_1T = HD_T // DIM_HALVES_1T  # == 1
+    +GRID_Y_1T = SEQ_T_1T * DIM_HALVES_1T  # == 4
+    +
+    +
+    +@ttl.operation(grid=(GRID_X, GRID_Y_1T))
+    +def ttl_create_heads_1t(x: ttnn.Tensor, q: ttnn.Tensor, k: ttnn.Tensor, v: ttnn.Tensor) -> None:
+    +    """Single-seq-tile twin of ``ttl_create_heads``: x [32, (nq + 2*nkv)*hd] -> q/k/v head-major.
+    +
+    +    With SEQ_T == 1 the seq index is constant 0 and y carries the dim tile directly (c0 = cy), so
+    +    core (cx, cy) moves head-group cx's 4 Q heads plus K head cx and V head cx, at dim tile cy.
+    +    """
+    +    seq_tiles = x.shape[0] // TILE
+    +    in_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+    +    out_dfb = ttl.make_dataflow_buffer_like(q, shape=(1, 1), block_count=2)
+    +
+    +    per_core_tiles = (Q_PER_COL + 2) * HALF_T_1T
+    ... (truncated, 78 more lines)
+
 Limitations / suggested manual next steps:
 - 2 op(s) tried but no lever beat baseline: Matmul 32x4096x4096, TopK
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
-  trace+1CQ perf:  (node-id not provided)
+  trace+1CQ perf:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_main_perf.py::test_main_perf -svv
+  full-model e2e PCC:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_pcc.py -svv
 
 levels: grid -> fidelity -> dtype -> shard -> host -> tt-lang -> cpp   |   ✓win = beat baseline, ·try = measured no-gain, ·wedge = wedged/crashed when tried, — = not attempted
 ```
@@ -4383,6 +4428,7 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
 
 
 
