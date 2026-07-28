@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 12:45:57 UTC · 198 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 12:58:01 UTC · 199 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -13,8 +13,8 @@ trace+1CQ full-pipeline e2e (all layers):  48.38 ms  ->  22.79 ms   (+52.9%, 2.1
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op max(FLOPs/peak, bytes/BW, dispatch); covers 93% of device time)
   achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 534.44 ms
-  status              : PAST BASELINE FLOOR — measured 534.44 ms is faster than the 537.23 ms baseline bound because the optimized build does LESS work (fewer bytes moved), so its own bound is lower; the baseline stays fixed as the reference
+  measured            : 493.61 ms
+  status              : PAST BASELINE FLOOR — measured 493.61 ms is faster than the 537.23 ms baseline bound because the optimized build does LESS work (fewer bytes moved), so its own bound is lower; the baseline stays fixed as the reference
   (tok/s/u — unavailable: active_bytes not computed for this pipeline, so the per-token weight-bytes target has no numerator)
 
 Op breakdown — device time by op class (profile totalling 556.80 ms over 16 layers · what to target, ranked):
@@ -44,7 +44,7 @@ op                                 grid      fidelity  dtype     shard     host 
 ArgMax                             ·try      —         —         ✓win      ✓win      —         —         —            682.47
 BinaryNg                           ·try      —         —         ✓win      ·try      ·try      ·try      —            648.17
 GenericOp                          ✓win      —         —         —         —         —         —         —            653.69
-LayerNorm                          ·try      —         —         ·try      ·try      —         —         —            493.45
+LayerNorm                          ✓win      —         —         ·try      ·try      —         —         —            493.61
 Matmul 128x14336x4096              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ·try        1061.00
 Matmul 128x4096x14336              ·try      ·try      ✓win      ·try      ·try      ·try      ·try      ·try         654.43
 Matmul 128x4096x6144               ✓win      —         ✓win      —         —         —         —         —            749.85
@@ -263,6 +263,7 @@ Matmul 32x4096x4096                    fidelity    534.44   +1929.74 ms  · no g
 LayerNorm                                  grid         —             —  · wedged   wedged: round killed (UNPRODUCTIVE 1800s — agent watchdog judged the round stuck (no real progress))
 LayerNorm                                  grid    493.45   +1970.73 ms  · no gain  Tried because prefill took the INTERLEAVED rms_norm kernel running on ONE core (62.5us/call x 757 calls = 47.3ms, ~90% of the norm bucket) while the decode path does the same [32,dim] shape on 32-64 c
 Matmul 32x14336x4096                tp-fracture    493.45   +1970.73 ms  · no gain  Tried because this ff2 down-projection (K=14336) is the largest-gap op left and is tagged memory-bound after every single-chip lever, so column-fracturing the weight across a TP axis would split the 1
+LayerNorm                                  grid    493.61   +1970.57 ms  ✓ win      Tried because the interleaved rms_norm kernel parallelises over ROWS, so a [32,dim] padded prefill is ONE tile-row and can only ever occupy ONE core -- profiled at 62.5us/call x 757 calls = 47.3ms, ~9
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4262,8 +4263,51 @@ Code changes — every attempt (win or fail):
              if configuration.dummy_weights or (weight_cache_path is None):
                  cache_name = lambda _: None
 
+[#199] LayerNorm · grid · win  +1970.57 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py b/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    index 7cfaf32cf7..76675340eb 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/distributed_norm.py
+    @@ -112,6 +112,42 @@ class DistributedNorm(LightweightModule):
+                     input_mem_cfg = x.memory_config()
+                 x = ttnn.to_memory_config(x, input_mem_cfg)
+     
+    +        # GRID rung for LayerNormDeviceOperation. Prefill took the INTERLEAVED rms_norm kernel, which
+    +        # the profiler measured on ONE core at 62.5 us/call -- 757 such calls, 47.3 ms, i.e. ~90% of
+    +        # the whole norm bucket, against a 0.85 ms roofline for all 1679 norms. The interleaved kernel
+    +        # parallelises over ROWS, and a [32, dim] prefill is a single tile-row, so it can only ever get
+    +        # one core; the SHARDED kernel parallelises over WIDTH and does the same shape in 6.1-6.5 us on
+    +        # 32-64 cores. create_sharded_norm_config's block_h is tile_padded_batch_rows // 32, so the
+    +        # existing config is valid exactly when the prefill is that many rows -- which a short
+    +        # (32-token) padded prefill now is. So shard the input, run the sharded kernel, and hand the
+    +        # result back in the layout the prefill graph expects. The two reshards are on a [32, dim]
+    +        # tensor (~256 KB) against ~56 us saved per norm.
+    +        _prefill_sharded_norm = (
+    +            mode == Mode.PREFILL
+    +            and not self.TG
+    +            and not self.args.is_multichip
+    +            and not self.args.is_distributed_norm(mode)
+    +            and norm_config is not None
+    +            and norm_config.get("sharded_program_config") is not None
+    +            and norm_config.get("sharded_output_config") is not None
+    +            and int(x.shape[-2]) == self.args.tile_padded_batch_rows
+    +            and int(x.shape[-4]) == 1
+    +            and int(x.shape[-3]) == 1
+    +        )
+    +        if _prefill_sharded_norm:
+    +            _restore_mem_cfg = x.memory_config()
+    +            x_sharded_in = ttnn.to_memory_config(x, norm_config["sharded_output_config"])
+    +            y = self.norm(x_sharded_in, mode=mode, in_sharded=True, out_sharded=True, norm_config=norm_config)
+    +            ttnn.deallocate(x_sharded_in)
+    +            out = ttnn.to_memory_config(y, _restore_mem_cfg)
+    +            # MUST free the sharded intermediate. Leaving it alive leaks a [32, dim] L1 buffer per norm
+    +            # call -- 2 norms x 32 layers -- which exhausts L1 and pushes every later allocation to
+    +            # DRAM: measured as a 45% GLOBAL slowdown (ff1/ff3 99.5 -> 146.4 us/call, ff2 126.6 ->
+    +            # 212.9) even though the norm itself got 3.2x faster. The norm win is only real with this.
+    ... (truncated, 7 more lines)
+
 Limitations / suggested manual next steps:
-- 3 op(s) tried but no lever beat baseline: LayerNorm, Matmul 32x4096x4096, TopK
+- 2 op(s) tried but no lever beat baseline: Matmul 32x4096x4096, TopK
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
@@ -4313,6 +4357,7 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
 
 
 
