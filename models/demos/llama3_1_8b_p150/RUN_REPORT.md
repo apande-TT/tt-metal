@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 09:24:58 UTC · 160 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 09:26:37 UTC · 162 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -49,7 +49,7 @@ BinaryNgDeviceOperation            ·try      —         —         ✓win    
 GenericOpDeviceOperation           ✓win      —         —         —         —         —         —         —                 —
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
-MatmulDeviceOperation              ✓win      ·try      ✓win      ·try      ·try      ✓win      ✓win      ·try         664.13
+MatmulDeviceOperation              ✓win      ✓win      ✓win      ·try      ·try      ✓win      ✓win      ·try         664.15
 MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —           1092.12
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
@@ -227,6 +227,8 @@ MatmulDeviceOperation                     shard    665.55   +1798.63 ms  · no g
 MatmulDeviceOperation                     shard    678.93   +1785.25 ms  · no gain  Second shard attempt, OUTPUT side rather than input, and it isolates why the whole rung is closed. The existing L1 island lands the [128,14336] ff1/ff3 intermediate in L1_INTERLEAVED, so the SILU mul 
 MatmulDeviceOperation                  fidelity    664.13   +1800.05 ms  · no gain  The math fidelity itself is already at the LoFi FLOOR on this op (all 800 calls profile as 'LoFi BF16 x BFP4 => BFP8'), so there is no HiFi4->HiFi2->LoFi step left to take; the only fidelity-class var
 MatmulDeviceOperation                  fidelity    664.55   +1799.63 ms  · no gain  Second fidelity-class variant, the other Blackhole compute-kernel knob: dst_full_sync_en False -> True, which changes how the DST register bank is synced between math and pack and can relieve a packer
+MatmulDeviceOperation                  fidelity         —             —  ✓ win      committed: llama3_1_8b_p150: record the measured dead ends on the short-prefill w1/w3 grid Comment-only. Four rungs on MatmulDeviceOperation 128 x 4096
+MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no gain  Hypothesis, and it is the RIGHT hypothesis for this op: the previous four rungs proved its 177 us/call is 33 MB of bf4_b weight read at the dtype floor with the DRAM shard already spread over all 8 ba
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -3522,6 +3524,30 @@ Code changes — every attempt (win or fail):
                      m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                      k=self.dim // self.cluster_shape[0],
 
+[#162] MatmulDeviceOperation · tp-fracture · no gain  +1800.03 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 4faeb90502..34cc101761 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1346,6 +1346,17 @@ class ModelArgs:
+                             num_cores=self.mlp_core_grid.num_cores,
+                         )
+             elif mode == Mode.PREFILL:
+    +            # MEASURED DEAD END for the grid rung on short prefill w1/w3 (128 x 4096 x 14336).
+    +            # A 2D-mcast matmul reads in1 -- the weight -- from DRAM on ONE core per grid COLUMN and
+    +            # multicasts it down that column, so the COLUMN COUNT is the number of concurrent weight
+    +            # readers: the config below gives 8 readers, each pulling per_core_N=56 x k_tiles=128
+    +            # bf4_b tiles = 4.1 MB, i.e. ~23 GB/s per reader at 177 us/call -- the PER-CORE NoC
+    +            # ceiling, not the chip's DRAM ceiling. Widening to the device's 11 columns DOES pay
+    +            # (44 cores, 177.3 -> 164.3 us/call, -10.4 ms), but N=448 tiles has no divisor between
+    +            # 8 and 14, so 11 columns means a RAGGED tail column -- and the mcast kernel fills the
+    +            # ragged block with garbage: PCC collapsed to 0.125 (same failure the 1D in0-mcast form
+    +            # hit at 110 cores / per_core_N=5). Exact division is mandatory, and it caps the column
+    +            # count at 8. Do not re-widen this grid without padding N to a multiple of the columns.
+                 return self.matmul_config(
+                     m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
+                     k=self.dim // self.cluster_shape[0],
+
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
@@ -3573,6 +3599,8 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
 
 
 
