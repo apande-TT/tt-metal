@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 17:57:21 UTC · 256 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 17:57:41 UTC · 257 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -321,6 +321,7 @@ PagedFusedUpdateCache                structural    440.68   +2023.50 ms  · no g
 PagedFusedUpdateCache                   tt-lang    440.68   +2023.50 ms  · no gain  NOT EXPRESSIBLE in tt-lang on this build, blocked twice over, and the first blocker is one this campaign already MEASURED rather than assumed. (1) DTYPE. The destination is the KV cache, and its dtype
 PagedFusedUpdateCache                   tt-lang    440.68   +2023.50 ms  · no gain  Re-recorded against a clean tree so the evidence scan runs whole-model-dir and sees the ttl kernels in tt/ (the first record was diff-scoped -- the harness streams every attempt into RUN_REPORT.md, so
 PagedFusedUpdateCache                       cpp    440.68   +2023.50 ms  · no gain  Unlike the tt-lang rung this is not formally impossible -- a generic_op CB does accept bfp8_b, and a raw Metalium reader CAN read page_table and update_idxs_tensor from DRAM and compute a destination 
+PagedFusedUpdateCache                       cpp    440.68   +2023.50 ms  · no gain  Re-recorded against a clean tree so the evidence scan runs whole-model-dir and sees the generic_op kernels in tt/ (each resolved attempt is streamed into RUN_REPORT.md, so the tree is dirty again imme
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -6090,6 +6091,7 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
 
 
 
