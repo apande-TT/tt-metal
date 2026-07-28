@@ -1,20 +1,20 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 14:02:31 UTC · 212 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 17:56:19 UTC · 254 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
 ==========================================================
 optimizing… — baseline->final speedup is finalized when the module converges (per-attempt detail below is live)
-tracy trace pass (16 layers):  43.06 ms  ->  9.34 ms   (+78.3%, 4.61x)
-trace+1CQ full-pipeline e2e (all layers):  48.38 ms  ->  22.79 ms   (+52.9%, 2.12x)
+trace+1CQ full-pipeline e2e (all layers):  48.38 ms  ->  16.99 ms   (+64.9%, 2.85x)
 
 Roofline & utilization
-  theoretical ceiling : 153.8 tok/s/u
-  achievable (60-80%) : 92.3 - 123.0 tok/s/u
-  measured            : n/a — the per-token reading is from a 16-layer window, the ceiling is for all layers (re-profile at full depth)
-  utilization         : n/a
+  theoretical ceiling : 84.0 tok/s/u
+  achievable (60-80%) : 50.4 - 67.2 tok/s/u
+  measured            : 58.9 tok/s/u   (1000 / 16.99 ms)
+  measured mem BW     : 359 GB/s   (6.09 GB / 16.99 ms)
+  utilization         : 70%   (measured / ceiling)
 
 Op breakdown — device time by op class (profile totalling 556.80 ms over 16 layers · what to target, ranked):
 op class         device_ms      %   count  bound  dominant op (shape)
@@ -41,21 +41,21 @@ Block-level timing (per-stage trace) — latest lever on Matmul 32x14336x4096:
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
 ArgMax                             ·try      —         —         ✓win      ✓win      —         —         —            682.47
-BinaryNg                           ·try      —         —         ✓win      ·try      ·try      ·try      —            648.17
+BinaryNg                           ·try      ·try      —         ✓win      ·try      ·try      ·try      —            440.60
 GenericOp                          ✓win      —         —         —         —         —         —         —            653.69
-LayerNorm                          ✓win      —         —         ·try      ·try      —         —         —            493.61
+LayerNorm                          ✓win      ·try      —         ·try      ·try      —         —         —            440.36
 Matmul 128x14336x4096              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ·try        1061.00
 Matmul 128x4096x14336              ·try      ·try      ✓win      ·try      ·try      ·try      ·try      ·try         654.43
 Matmul 128x4096x6144               ✓win      —         ✓win      —         —         —         —         —            749.85
 Matmul 32x14336x4096               ·try      ✓win      ✓win      ·try      ·try      ·try      ·try      ·try         493.45
 Matmul 32x4096x14336               ✓win      ·try      ·try      ·try      ·try      ·try      ·try      ·try         614.88
-Matmul 32x4096x16032               ✓win      —         ✓win      ·try      ·try      ·try      ·try      ·try         662.92
-Matmul 32x4096x4096                ·try      ·try      —         —         —         —         —         —            453.08
-Matmul 32x4096x6144                ·try      ✓win      ·try      ✓win      ·try      ·try      ·try      ·try         459.95
-NLPConcatHeads                     ✓win      —         —         ·try      ·try      ✓win      —         —            448.70
-NlpCreateHeads                     ✓win      —         —         ✓win      ✓win      ✓win      —         —            465.94
-PagedFusedUpdateCache              ·try      —         —         —         —         —         —         —            448.70
-RotaryEmbeddingLlama               ✓win      —         —         —         ✓win      —         —         —            656.91
+Matmul 32x4096x16032               ✓win      ·try      ✓win      ·try      ·try      ·try      ·try      ·try         448.70
+Matmul 32x4096x4096                ·try      ·try      ✓win      —         —         —         —         —            440.68
+Matmul 32x4096x6144                ·try      ✓win      ·try      ✓win      ·try      ·try      ·try      ·try         448.70
+NLPConcatHeads                     ·try      —         —         ·try      ·try      ✓win      —         —            448.70
+NlpCreateHeads                     ·try      —         —         ✓win      ✓win      ✓win      —         —            465.94
+PagedFusedUpdateCache              ·try      ·try      —         ·try      ·try      ·try      —         —            440.51
+RotaryEmbeddingLlama               ✓win      ·try      —         ·try      ✓win      —         —         —            439.51
 SDPA                               ✓win      —         —         —         ·try      —         —         —            655.73
 TopK                               ·try      —         —         ·try      —         ·try      —         —                 —
 TopK 32x64128                      ·try      —         —         ·try      ✓win      —         —         —           1537.69
@@ -267,9 +267,9 @@ LayerNorm                                  grid    493.61   +1970.57 ms  ✓ win
 Matmul 32x14336x4096                 structural    575.26   +1888.92 ms  · no gain  Hypothesis: the recorded 'full-grid LOSES for w2' verdict (185.6 -> 227.4 us/call) was measured while ff2 still ran HiFi2, and the stated cause was a MATH term (each core gets ~2 output columns of a n
 Matmul 32x14336x4096                    tt-lang    493.72   +1970.46 ms  · no gain  Hypothesis: a hand tt-lang matmul could beat stock ttnn on this decode ff2 shape by owning the K reduction in-core instead of paying the stock op's mcast/packer sync on a 448-tile K. The kernel is aut
 Matmul 32x14336x4096                        cpp    493.72   +1970.46 ms  · no gain  Hypothesis: if tt-lang could not express a faster K reduction for this decode ff2, raw Metalium might, by controlling the reader/compute/writer triple directly. Authored and measured in-tree (tt/cpp_m
-NlpCreateHeads                             grid    465.94   +1998.24 ms  ✓ win      Hypothesis: this op is grid=tiny because a 32-token padded prompt is ONE seq tile and stock nlp_create_qkv_heads assigns one work unit per input row-tile, so the entire split ran on a SINGLE core; the
+NlpCreateHeads                             grid    465.94   +1998.24 ms  · no gain  Hypothesis: this op is grid=tiny because a 32-token padded prompt is ONE seq tile and stock nlp_create_qkv_heads assigns one work unit per input row-tile, so the entire split ran on a SINGLE core; the
 host_overhead                      trace-capture    465.94   +1998.24 ms  · no gain  Hypothesis: a host-bound bucket means the host is re-issuing every op per step, so trace capture (GUIDELINES/08 section 11) should collapse the dispatch gaps. VERIFIED ALREADY APPLIED, so there is no 
-NLPConcatHeads                             grid    448.70   +2015.48 ms  ✓ win      Hypothesis: REUSED the lever just learned on the head split -- an in-tree tt-lang concat kernel already existed but its supports() was pinned to SEQ_LEN == 128, so the 32-token padded prompt fell thro
+NLPConcatHeads                             grid    448.70   +2015.48 ms  · no gain  Hypothesis: REUSED the lever just learned on the head split -- an in-tree tt-lang concat kernel already existed but its supports() was pinned to SEQ_LEN == 128, so the 32-token padded prompt fell thro
 Matmul 32x4096x16032                       grid    448.70   +2015.48 ms  · no gain  Hypothesis: the LM head is grid=partial for a STRUCTURAL reason, not a tuning one -- the DRAM-sharded matmul width-shards the activation across lm_head_core_grid cores, so its core count must divide K
 Matmul 32x4096x16032                       grid    448.72   +2015.46 ms  · no gain  Hypothesis: the LM head auto-route passes neither a program_config nor a core_grid, so ttnn picks the grid and the profiler measures it on 101 of 110 cores -- so ask for the full grid EXPLICITLY (core
 Matmul 32x4096x16032                      dtype         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: Event Synchronization is not supported during trace capture. (assert.hpp:104)
@@ -277,6 +277,48 @@ Matmul 32x4096x16032                      dtype    448.70   +2015.48 ms  · no g
 Matmul 32x4096x4096                        grid    453.08   +2011.10 ms  · no gain  Hypothesis: this decode attention-output projection (wo) is grid=tiny because the DRAM-sharded matmul width-shards its activation, so the core count must divide K/32 = 128 tiles and caps at 64 of 110 
 Matmul 32x4096x6144                        grid    459.95   +2004.24 ms  · no gain  Hypothesis: this fused QKV projection is grid=tiny because the DRAM-sharded variant pins it to a narrow core grid, so try the escape that won for ff1/ff3 and the LM head -- wqkv held DRAM-INTERLEAVED 
 PagedFusedUpdateCache                      grid    448.70   +2015.48 ms  · no gain  Hypothesis: the op is tagged grid=tiny, so a full-grid program_config should raise its occupancy. NO GAIN and no lever exists to pull: checked the actual C++ binding (ttnn/cpp/ttnn/operations/experime
+Matmul 32x4096x16032                      dtype    448.73   +2015.45 ms  · no gain  Hypothesis: the LM head WEIGHT is already pinned at the bf4_b floor (model.py sets lm_head_weight_dtype=bfloat4_b), so the only dtype bytes left on this DRAM-bw-bound op are the ACTIVATION, which all 
+Matmul 32x4096x16032                      shard    453.85   +2010.33 ms  · no gain  Hypothesis: the grid-rung winner left the activation L1-INTERLEAVED, so all 8 vocab splits re-fetch its 128 K-tiles through the interleaved path -- pinning it as an L1 WIDTH shard (one K slice per cor
+Matmul 32x4096x16032                      shard    449.00   +2015.18 ms  · no gain  Second shard target on this op, chosen because the FIRST one failed for a reason specific to the activation: sharding in0 forces the 64-core grid that divides K and costs more occupancy than it saves.
+Matmul 32x4096x16032                   fidelity    449.18   +2015.00 ms  · no gain  Hypothesis: the LM head still runs HiFi2 against a bf4_b weight, and GUIDELINES/01 section 12 pairs bf4_b/bf8_b matmuls with LoFi -- HiFi2 spends 2x the math passes resolving mantissa bits a 4-bit wei
+Matmul 32x4096x16032                tp-fracture    448.70   +2015.48 ms  · no gain  Hypothesis: this op is DRAM-bw bound after every single-chip lever, and it streams the largest weight in the model (4096 x 128256 = 295 MB at bf4_b per token), so fracturing that weight across a TP ax
+Matmul 32x4096x16032                 structural    559.52   +1904.66 ms  · no gain  Found reducible work and DISPROVED it -- the negative result is the deliverable. Hypothesis: the 8-way vocab split exists ONLY to serve the DRAM-sharded variant, whose per-core L1 width-shard caps col
+Matmul 32x4096x16032                 structural    448.70   +2015.48 ms  · no gain  Follow-up to the collapse-the-splits regression, testing the OPPOSITE direction it implied. If N narrower splits win by letting each op's weight prefetch overlap the previous op's math (1 split = 559 
+Matmul 32x4096x16032                    tt-lang    516.37   +1947.81 ms  · no gain  Measured the tt-lang rung on the LM head's OWN shape instead of inheriting the MLP verdicts: authored tt/ttl_lm_head.py (ttl_mm_lmhead + LmHeadSplitTTL, strip-per-core k-reduction with an accumulator 
+Matmul 32x4096x16032                        cpp    474.85   +1989.33 ms  · no gain  Authored and wired the C++ Metalium rung on the LM head's OWN shape: added tt/cpp_mm_lm_head.py (LmHeadSplitCpp), driving the repo's reader/mm/writer triple through ttnn.generic_op, and routed vocab s
+Matmul 32x4096x6144                       dtype    449.53   +2014.65 ms  · no gain  Hypothesis: every other dtype byte on this fused QKV projection is already spent -- the WEIGHT is at the bf4_b floor (with layer 31 deliberately held at bf8_b, since merging the model-wide dtype lever
+Matmul 32x4096x6144                       dtype         —             —  · wedged   wedged/crashed when tried: FW start, core (1, 2), risc BRISC is reporting a second start of FW for op 2046979. This is before other cores have reported any activity on this op. Other cores might have 
+Matmul 32x4096x6144                       dtype    453.66   +2010.52 ms  · no gain  Second dtype target on this op: the STORE. The first one (activation bf16 -> bf8_b) failed on arithmetic, so this one goes after the write instead -- bf16 -> bf8_b halves the [32, 6144] the matmul sto
+Matmul 32x4096x6144                       shard    454.07   +2010.11 ms  · no gain  Hypothesis, from reading how the grid is CHOSEN rather than from the grid tag: attn_input_grid comes from dram_shard_core_grid_for_k -> find_grid, which sorts the divisors of K/32 = 128 tiles by close
+Matmul 32x4096x6144                       shard    447.99   +2016.19 ms  · no gain  Second shard target on this op, testing the falsifiable prediction the FIRST one produced. Widening the DRAM-shard grid 32 -> 64 cores lost (454.07 ms) and the stated cause was tiles-per-core, not cor
+Matmul 32x4096x6144                 tp-fracture    448.70   +2015.48 ms  · no gain  Hypothesis: this fused QKV projection is still memory-bound after every single-chip lever, streaming ~14.2 MB of bf4_b weight per layer per token, so column-fracturing wqkv across a TP axis would divi
+Matmul 32x4096x6144                  structural    448.70   +2015.48 ms  · no gain  none: hunted the whole QKV chain in source for reducible work and every candidate is either already applied or provably absent. (a) RECOMPUTE -> cache: decode is NOT repeat_prefill, it is a real singl
+Matmul 32x4096x6144                     tt-lang    454.97   +2009.21 ms  · no gain  Measured the tt-lang rung on this op IN THE MODEL rather than trusting the standalone number: tt/ttl_ff2_matmul.py had already timed ttl_mm on this exact shape in isolation (0.324 vs 0.145 ms) but a b
+Matmul 32x4096x6144                         cpp    455.63   +2008.55 ms  · no gain  Authored and wired the C++ Metalium rung on this op in the live decode path: added tt/cpp_mm_qkv.py (QkvCpp) driving the repo's reader/mm/writer triple through ttnn.generic_op on the full 11x10 grid, 
+Matmul 32x4096x4096                        grid    448.96   +2015.22 ms  · no gain  First: this op is NOT grid=tiny by oversight. num_cores for the wo DRAM-sharded matmul is n_heads, because its activation comes straight out of nlp_concat_heads_decode, which shards ONE CORE PER HEAD 
+Matmul 32x4096x4096                       dtype    440.68   +2023.50 ms  ✓ win      WIN, committed. Hypothesis came from reading the precision config rather than the op tags: `performance()` names FF1_FF3, FF2 and WQKV as BFP4 but never names WO, so the attention output projection wa
+LayerNorm                              fidelity    440.57   +2023.61 ms  · no gain  FORCE-TRIED against the catalogue's own prediction, because GUIDELINES/01 section 12 requires the precision drop be MEASURED rather than reasoned about. GUIDELINES/02 section 4 states HiFi2 is the FLO
+LayerNorm                                 shard    440.36   +2023.82 ms  · no gain  Picked the one tensor this op still had on DRAM, since the ACTIVATION side is already done -- the earlier sharded-norm lever moved the prefill off the one-core interleaved kernel and the decode path a
+LayerNorm                            structural    440.68   +2023.50 ms  · no gain  none: bound_by=dispatch says the lever is op COUNT, so I went after the catalogue's headline fusion and found it structurally INAPPLICABLE here -- that correction is the deliverable. GUIDELINES/06 sec
+RotaryEmbeddingLlama                       grid    440.68   +2023.50 ms  · no gain  Two findings, and the first one closes the rung by proof rather than by measurement. (1) The CORE COUNT on this op is not tunable, and num_to_corerange's own rectangularity rule shows why: the fused Q
+RotaryEmbeddingLlama                       grid    440.85   +2023.33 ms  · no gain  Second grid attempt: the COORDINATED placement move the first attempt's failure showed was required. Attempt 1 shifted only the Q/K core ranges and destroyed correctness (Top1 99% -> 16.5%) because th
+RotaryEmbeddingLlama                      shard    439.51   +2024.67 ms  · no gain  Established first that the DECODE side has nothing left to shard: Q/K are height-sharded by to_qk_fused_memory_config, and cos/sin plus the decode transformation matrix are all height-sharded on batch
+RotaryEmbeddingLlama                      shard    439.96   +2024.22 ms  · no gain  Second shard target, the last un-placed operand pair on this op: the PREFILL cos/sin matrices, which get_rot_mats creates with no memory_config and therefore lands in DRAM, so the prefill rope re-read
+RotaryEmbeddingLlama                   fidelity    440.76   +2023.42 ms  · no gain  Worth trying because the profiler tag pointed at a genuine omission, not a tuned choice: the fused-QK rope call passes NO compute_kernel_config, so the op falls back to its HiFi4 default (fidelity=hif
+RotaryEmbeddingLlama                 structural    440.68   +2023.50 ms  · no gain  none: bound_by=memory with a small per-call footprint means the lever is op count, and BOTH available fusions are already in the tree -- verified in source, not assumed. (a) DECODE already runs the FU
+BinaryNg                                   grid    440.60   +2023.58 ms  · no gain  Hypothesis, and it was a real prediction rather than a repeat: get_residual_mem_config IS these adds' grid (they parallelise over the residual stream's L1 WIDTH shard), and dram_shard_core_grid_for_k 
+BinaryNg                                   grid    441.43   +2022.75 ms  · no gain  Second grid attempt, run as the FALSIFYING test of attempt 1's explanation rather than another guess. Widening these adds 32 -> 64 cores was flat, and I attributed that to the op being launch-bound (a
+BinaryNg                                  shard    441.01   +2023.17 ms  · no gain  Chose the MLP GATING MUL rather than the residual adds, because the adds have nothing left: both operands and the result already live in the residual stream's L1 width shard. The mul is the other Bina
+BinaryNg                                  shard    440.68   +2023.50 ms  · no gain  Second shard target: the PREFILL residual adds. Worth trying because the shard was genuinely untried on this side -- the committed lever got the short-prefill residual out of DRAM into L1 but only INT
+BinaryNg                               fidelity    440.68   +2023.50 ms  · no gain  NOT REACHABLE, and I checked the binding rather than assuming. The profile tags this op fidelity=hifi4, which looks like the same free win the rope's HiFi4 default looked like -- but the TTNN eltwise 
+BinaryNg                             structural    440.68   +2023.50 ms  · no gain  none: every fusion that could remove one of these ops is either already applied or already measured and rejected -- all four verified in this tree, not assumed. (a) The SiLU is ALREADY fused into the 
+BinaryNg                                tt-lang    439.18   +2025.00 ms  · no gain  Measured the tt-lang rung at the shape this pipeline ACTUALLY runs, which had never been measured: tt/ttl_residual_add.py existed but was pinned to SEQ_LEN == 128, so the 32-token padded prefill fell 
+BinaryNg                                    cpp    440.44   +2023.74 ms  · no gain  Measured the cpp rung at the live 32-token shape, which had never been reached: cpp_add_generic's build_program was ALREADY shape-generic (it takes m,n and partitions m*n/1024 tiles across the whole g
+PagedFusedUpdateCache                      grid    440.85   +2023.33 ms  · no gain  Second grid attempt, and it closes the rung on two independent grounds. (1) NO GRID KNOB EXISTS IN THE API -- I inspected the binding rather than inferring: paged_fused_update_cache accepts only updat
+PagedFusedUpdateCache                  fidelity    440.51   +2023.67 ms  · no gain  Reachable here, unlike on the eltwise ops: paged_fused_update_cache DOES expose compute_kernel_config, and the call site passed none, so the profiler's fidelity=hifi4 tag is the op's own default. GUID
+PagedFusedUpdateCache                     shard    440.68   +2023.50 ms  · no gain  Both operand sides are already at their only viable placement, and for this op the arithmetic settles it rather than a measurement being informative. (a) INPUT side is ALREADY L1-sharded: k_heads_1BKD
+PagedFusedUpdateCache                structural    440.68   +2023.50 ms  · no gain  none: this op IS the KV-cache lever, already applied in its best available form, so the restructures the rung asks about are either done or inapplicable. (a) recompute -> cache does not apply because 
+PagedFusedUpdateCache                   tt-lang    440.68   +2023.50 ms  · no gain  NOT EXPRESSIBLE in tt-lang on this build, blocked twice over, and the first blocker is one this campaign already MEASURED rather than assumed. (1) DTYPE. The destination is the KV cache, and its dtype
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4343,7 +4385,7 @@ Code changes — every attempt (win or fail):
              self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
              full_grid_mlp = self.full_grid_ff1_3_weights
 
-[#203] NlpCreateHeads · grid · win  +1998.24 ms
+[#203] NlpCreateHeads · grid · no gain  +1998.24 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_create_qkv_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_create_qkv_heads.py
     index bb190cde33..00066ce30d 100644
     --- a/models/demos/llama3_1_8b_p150/tt/ttl_create_qkv_heads.py
@@ -4386,7 +4428,7 @@ Code changes — every attempt (win or fail):
     +    per_core_tiles = (Q_PER_COL + 2) * HALF_T_1T
     ... (truncated, 78 more lines)
 
-[#205] NLPConcatHeads · grid · win  +2015.48 ms
+[#205] NLPConcatHeads · grid · no gain  +2015.48 ms
     diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
     index 81c0fcecb2..19b512cb7f 100644
     --- a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
@@ -4625,8 +4667,1378 @@ Code changes — every attempt (win or fail):
     +  "source": "measured from the device profile: sum of per-op bytes / 51 decode iterations in the window (bf4_b FFN, bf8_b wo), for the 16-layer profiled configuration"
     +}
 
+[#213] Matmul 32x4096x16032 · dtype · no gain  +2015.45 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index 7f72b1c0b6..36f1fb0395 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -184,6 +184,14 @@ class LMHead(LightweightModule):
+                 program_configs = [None] * len(split_sizes)
+                 self.lm_head_output_memory_config = ttnn.L1_MEMORY_CONFIG
+                 x_sharded = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)
+    +            # DTYPE RUNG. The WEIGHT is already at the bf4_b floor, so the only bytes left on this
+    +            # DRAM-bw-bound op are the activation and the logits. The activation is re-read by all
+    +            # EIGHT vocab splits, so carrying it as bf8_b instead of bf16 halves the in0 bytes each
+    +            # split unpacks. Cast once, outside the loop, so the 8 splits share the narrow copy.
+    +            # No deallocate here: to_memory_config can alias x when x is already L1-interleaved,
+    +            # and forward() deallocates x below -- freeing the alias too would double-free.
+    +            if x_sharded.dtype == ttnn.bfloat16:
+    +                x_sharded = ttnn.typecast(x_sharded, ttnn.bfloat8_b)
+             elif use_prefetcher:
+                 x_sharded = ttnn.to_memory_config(x, self.lm_head_output_memory_config)
+             else:
+
+[#214] Matmul 32x4096x16032 · shard · no gain  +2010.33 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index 7f72b1c0b6..0309d03b46 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -184,6 +184,39 @@ class LMHead(LightweightModule):
+                 program_configs = [None] * len(split_sizes)
+                 self.lm_head_output_memory_config = ttnn.L1_MEMORY_CONFIG
+                 x_sharded = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)
+    +            # SHARD RUNG. The auto-route leaves the activation L1-INTERLEAVED, so every one of the
+    +            # 8 vocab splits re-fetches all 128 K-tiles of it through the interleaved path. Pin it
+    +            # instead as an L1 WIDTH shard so each core owns its own K slice and the mcast reads a
+    +            # local shard. The shard grid must divide K/32 = 128 tiles, so 64 cores is the widest
+    +            # legal one -- but unlike the stock DRAM-sharded variant this keeps the WEIGHT
+    +            # interleaved (the layout that won the grid rung), so only the activation is pinned.
+    +            _shard_cores = 64
+    +            _k_tiles = self.args.dim // 32
+    +            if _k_tiles % _shard_cores == 0:
+    +                x_sharded = ttnn.to_memory_config(
+    +                    x_sharded,
+    +                    ttnn.create_sharded_memory_config(
+    +                        shape=(32, self.args.dim // _shard_cores),
+    +                        core_grid=ttnn.CoreGrid(y=8, x=8),
+    +                        strategy=ttnn.ShardStrategy.WIDTH,
+    +                        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+    +                        use_height_and_width_as_shard_shape=True,
+    +                    ),
+    +                )
+    +                program_configs = [
+    +                    ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+    +                        compute_with_storage_grid_size=(8, 8),
+    +                        in0_block_w=_k_tiles // _shard_cores,
+    +                        out_subblock_h=1,
+    +                        out_subblock_w=1,
+    +                        per_core_M=1,
+    +                        per_core_N=math.ceil(math.ceil(split_size / 32) / _shard_cores),
+    +                        fuse_batch=True,
+    +                        mcast_in0=True,
+    +                        fused_activation=None,
+    +                    )
+    +                    for split_size in split_sizes
+    ... (truncated, 4 more lines)
+
+[#215] Matmul 32x4096x16032 · shard · no gain  +2015.18 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index 7f72b1c0b6..10ae10d5fd 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -182,7 +182,12 @@ class LMHead(LightweightModule):
+                 # Auto-routed interleaved matmul: no shard spec on either operand, so the op is free to
+                 # spread its output tiles over every core instead of the 64 the width-shard pins it to.
+                 program_configs = [None] * len(split_sizes)
+    -            self.lm_head_output_memory_config = ttnn.L1_MEMORY_CONFIG
+    +            # SHARD RUNG, second target. Sharding the ACTIVATION lost (it forces the 64-core grid
+    +            # that divides K), so shard the tensor on the OTHER side instead: the logits. Each split
+    +            # writes [32, 16032] into L1 INTERLEAVED and the 8-way concat reads all of it straight
+    +            # back, so a WIDTH shard keeps each split's slice on the cores that produced it and lets
+    +            # the concat read local shards. This leaves the auto-route (and its full grid) alone.
+    +            self.lm_head_output_memory_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
+                 x_sharded = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)
+             elif use_prefetcher:
+                 x_sharded = ttnn.to_memory_config(x, self.lm_head_output_memory_config)
+
+[#216] Matmul 32x4096x16032 · fidelity · no gain  +2015.00 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index 7f72b1c0b6..f70889ec44 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -156,8 +156,12 @@ class LMHead(LightweightModule):
+                             )
+                         )
+     
+    +        # FIDELITY RUNG. The weight is bf4_b, and GUIDELINES/01 section 12 pairs a bf4_b/bf8_b matmul
+    +        # with LoFi -- HiFi2 spends 2x the math passes resolving mantissa bits a 4-bit weight does not
+    +        # have, so the extra fidelity is bought against a precision the operand cannot supply. This is
+    +        # the same drop that took ff2 from 151 -> 103 ms.
+             self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+    -            math_fidelity=ttnn.MathFidelity.HiFi2,
+    +            math_fidelity=ttnn.MathFidelity.LoFi,
+                 math_approx_mode=False,
+                 fp32_dest_acc_en=False,
+                 packer_l1_acc=True,
+
+[#218] Matmul 32x4096x16032 · structural · no gain  +1904.66 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index 7f72b1c0b6..18614be4e6 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -83,6 +83,22 @@ class LMHead(LightweightModule):
+                 self.prefetcher is None and not args.is_galaxy and self.num_devices == 1
+             )
+     
+    +        # STRUCTURAL: with the interleaved auto-route there is no reason to SPLIT the vocab at all.
+    +        # The 8 splits exist only to serve the DRAM-sharded variant, whose per-core L1 width-shard
+    +        # caps the columns one matmul may own (`max_columns_per_device`). The interleaved path holds
+    +        # the weight in DRAM and the logits in interleaved L1, so neither operand has a per-core cap
+    +        # and the whole 128256-wide projection fits one op. Collapsing the splits pays three ways:
+    +        #   - 7 fewer op launches per token,
+    +        #   - the 8-way ttnn.concat disappears entirely (it read 4.4 MB of logits and wrote 4.4 MB
+    +        #     back just to rejoin slices that never needed separating),
+    +        #   - the auto-route amortises far better: 4008 output tiles over ~110 cores is ~36 tiles per
+    +        #     core instead of the ~4.5 a single 16032-wide split gives it, and the learned matmul
+    +        #     lever for this model says tiles-per-core is what decides a wide-grid matmul.
+    +        # The weight BYTES are unchanged (same 295 MB at bf4_b), so this is not a bandwidth play --
+    +        # it removes per-op overhead and a redundant round-trip.
+    +        if self.full_grid:
+    +            self.split_sizes_dram_sharded = [size_per_device]
+    +
+             self.split_sizes = [self.split_sizes_dram_sharded]
+             if self.prefetcher is not None:
+                 self.split_sizes.append(self.split_sizes_ring_mm)
+    @@ -213,12 +229,17 @@ class LMHead(LightweightModule):
+     
+             # Concatenate the outputs
+             # outputs shape: a list of tensors, each tensor is 1,1,32,size_per_device per device
+    -        output = ttnn.concat(
+    -            outputs,
+    -            dim=-1,
+    -            memory_config=ttnn.L1_MEMORY_CONFIG if not use_prefetcher else ttnn.DRAM_MEMORY_CONFIG,
+    -            sub_core_grids=self.prefetcher.all_worker_cores_range_set if use_prefetcher else None,
+    -        )
+    +        # A single split has nothing to rejoin, and ttnn.concat of one tensor is a pure copy of the
+    +        # whole logits tensor -- skip it so collapsing the splits actually removes the round-trip.
+    +        if len(outputs) == 1:
+    ... (truncated, 11 more lines)
+
+[#219] Matmul 32x4096x16032 · structural · no gain  +2015.48 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index 7f72b1c0b6..7715fc4c30 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -83,6 +83,25 @@ class LMHead(LightweightModule):
+                 self.prefetcher is None and not args.is_galaxy and self.num_devices == 1
+             )
+     
+    +        # STRUCTURAL: the vocab SPLIT COUNT is a free tuning knob on the interleaved auto-route, and
+    +        # it is not there for the reason it looks like. It exists to serve the DRAM-sharded variant,
+    +        # whose per-core L1 width-shard caps the columns one matmul may own (max_columns_per_device);
+    +        # the interleaved path keeps the weight in DRAM and the logits in interleaved L1, so neither
+    +        # operand has a per-core cap. Collapsing it to ONE 4096x128256 op was measured and LOST hard
+    +        # (448.70 -> 559.52 ms): a single 295 MB weight stream serialises the DRAM fetch behind one
+    +        # program, while N narrower splits let each op's weight prefetch overlap the previous op's
+    +        # math. The splits are PIPELINING, not leftover overhead. So push the knob the other way --
+    +        # if overlap is what pays, halving the split width should deepen the pipeline. The concat it
+    +        # costs is cheap next to the overlap it buys.
+    +        # 16 is not reachable: size_per_device/32 = 4008 output tiles = 2^3 x 3 x 167, so the split
+    +        # count must divide 4008 for every split to stay tile-aligned. 12 is the next step past the
+    +        # current 8 (334 tiles per split, ~3.0 per core against ~4.5 today).
+    +        if self.full_grid:
+    +            _n_splits = 12
+    +            _out_tiles = size_per_device // tile_size
+    +            if _out_tiles % _n_splits == 0:
+    +                self.split_sizes_dram_sharded = [size_per_device // _n_splits] * _n_splits
+    +
+             self.split_sizes = [self.split_sizes_dram_sharded]
+             if self.prefetcher is not None:
+                 self.split_sizes.append(self.split_sizes_ring_mm)
+    @@ -213,12 +232,17 @@ class LMHead(LightweightModule):
+     
+             # Concatenate the outputs
+             # outputs shape: a list of tensors, each tensor is 1,1,32,size_per_device per device
+    -        output = ttnn.concat(
+    -            outputs,
+    -            dim=-1,
+    -            memory_config=ttnn.L1_MEMORY_CONFIG if not use_prefetcher else ttnn.DRAM_MEMORY_CONFIG,
+    -            sub_core_grids=self.prefetcher.all_worker_cores_range_set if use_prefetcher else None,
+    -        )
+    ... (truncated, 14 more lines)
+
+[#220] Matmul 32x4096x16032 · tt-lang · no gain  +1947.81 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index 7f72b1c0b6..79274ad6d5 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -156,6 +156,22 @@ class LMHead(LightweightModule):
+                             )
+                         )
+     
+    +        # TT-LANG RUNG. Route vocab split 0 through the hand tt-lang kernel so the rung is measured
+    +        # in the real pipeline (under trace+1CQ), on this op's OWN shape, against the stock op running
+    +        # the other 7 splits as the control. Split 0 only: one split is enough to read the per-call
+    +        # cost off the profile, and it keeps the correctness surface small.
+    +        self.ttl_split = None
+    +        if self.full_grid and not args.dummy_weights:
+    +            from models.demos.llama3_1_8b_p150.tt.ttl_lm_head import LmHeadSplitTTL
+    +
+    +            _s0 = self.split_sizes_dram_sharded[0]
+    +            self.ttl_split = LmHeadSplitTTL(
+    +                mesh_device,
+    +                torch_output_weights[:, :_s0],
+    +                args.tile_padded_batch_rows,
+    +                ttnn.bfloat8_b,
+    +            )
+    +
+             self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+                 math_fidelity=ttnn.MathFidelity.HiFi2,
+                 math_approx_mode=False,
+    @@ -190,6 +206,9 @@ class LMHead(LightweightModule):
+                 x_sharded = ttnn.to_memory_config(x, self.args.get_lm_head_input_mem_config(Mode.DECODE, None))
+     
+             for i, (weight, pc) in enumerate(zip(output_weights, program_configs)):
+    +            if i == 0 and self.ttl_split is not None and self.full_grid and not use_prefetcher:
+    +                outputs.append(self.ttl_split(x_sharded))
+    +                continue
+                 output = ttnn.linear(
+                     x_sharded,
+                     weight,
+
+[#221] Matmul 32x4096x16032 · cpp · no gain  +1989.33 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index 7f72b1c0b6..14edee1fd8 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -156,6 +156,21 @@ class LMHead(LightweightModule):
+                             )
+                         )
+     
+    +        # CPP RUNG. Route vocab split 0 through the hand C++ Metalium kernel (ttnn.generic_op) so the
+    +        # rung is measured in the real pipeline, on this op's OWN shape, with the stock op running the
+    +        # other 7 splits as the control.
+    +        self.cpp_split = None
+    +        if self.full_grid and not args.dummy_weights:
+    +            from models.demos.llama3_1_8b_p150.tt.cpp_mm_lm_head import LmHeadSplitCpp
+    +
+    +            _s0 = self.split_sizes_dram_sharded[0]
+    +            self.cpp_split = LmHeadSplitCpp(
+    +                mesh_device,
+    +                torch_output_weights[:, :_s0],
+    +                args.tile_padded_batch_rows,
+    +                ttnn.bfloat8_b,
+    +            )
+    +
+             self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+                 math_fidelity=ttnn.MathFidelity.HiFi2,
+                 math_approx_mode=False,
+    @@ -190,6 +205,9 @@ class LMHead(LightweightModule):
+                 x_sharded = ttnn.to_memory_config(x, self.args.get_lm_head_input_mem_config(Mode.DECODE, None))
+     
+             for i, (weight, pc) in enumerate(zip(output_weights, program_configs)):
+    +            if i == 0 and self.cpp_split is not None and self.full_grid and not use_prefetcher:
+    +                outputs.append(self.cpp_split(x_sharded))
+    +                continue
+                 output = ttnn.linear(
+                     x_sharded,
+                     weight,
+
+[#222] Matmul 32x4096x6144 · dtype · no gain  +2014.65 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..29a15f9c59 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -639,6 +639,16 @@ class Attention(LightweightModule):
+             qkv_input_mem_config = self.args.get_attn_qkv_mm_mem_config(Mode.DECODE, self.prefetcher)
+             x_sharded = ttnn.to_memory_config(x, qkv_input_mem_config) if self.prefetcher is not None else x
+     
+    +        # DTYPE RUNG, read side. The WEIGHT is already at the bf4_b floor (and layer 31 is held at
+    +        # bf8_b on purpose -- merging the model-wide dtype levers into it was measured to drop top-1
+    +        # from 99% to 23.8%), and the WRITE side is settled by the two levers below. That leaves the
+    +        # ACTIVATION as the last dtype byte this matmul touches: the norm hands it over as bf16, so
+    +        # carrying it as bf8_b halves the in0 the matmul unpacks. Safe direction for a decode
+    +        # projection -- this is the in0 of a matmul, not a norm statistic or an attention score.
+    +        if not self.TG and self.prefetcher is None and self.activation_dtype is None:
+    +            if x_sharded.dtype == ttnn.bfloat16:
+    +                x_sharded = ttnn.typecast(x_sharded, ttnn.bfloat8_b)
+    +
+             # wqkv is already at the bf4_b weight floor, so the only dtype bytes left on this
+             # DRAM-bw-bound matmul are what it WRITES. The fused [32, qkv_size] output is consumed
+             # only by the (single-chip no-op) all-reduce and then by sharded_to_interleaved, which
+
+[#224] Matmul 32x4096x6144 · dtype · no gain  +2010.52 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..d993c96093 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -657,9 +657,18 @@ class Attention(LightweightModule):
+             # that reshard from the per-token chain -- but nlp_create_qkv_heads_decode requires bf16,
+             # and the reshard is currently what does the bf8_b -> bf16 upcast, so this trades the
+             # store saving for the reshard. Which side wins is a measurement.
+    -        _keep_qkv_sharded = not self.TG and self.prefetcher is None
+    +        # DTYPE RUNG, write side, isolated. The variable under test is the STORE dtype: bf16 (today)
+    +        # vs bf8_b, which halves what this matmul writes. bf8_b needs an upcast before
+    +        # nlp_create_qkv_heads_decode, and doing it as a standalone ttnn.typecast is NOT measurable
+    +        # here -- it FATALs the profiler with "Event Synchronization is not supported during trace
+    +        # capture". So take the upcast from the existing sharded_to_interleaved path instead, which
+    +        # is already trace-clean: that means giving up the keep-sharded handoff to buy the narrow
+    +        # store, and the point of the measurement is which of the two is worth more.
+    +        _keep_qkv_sharded = False
+             if _keep_qkv_sharded:
+                 _qkv_decode_out_dtype = ttnn.bfloat16
+    +        else:
+    +            _qkv_decode_out_dtype = ttnn.bfloat8_b
+     
+             xqkv_fused_sharded = ttnn.linear(
+                 x_sharded,
+
+[#225] Matmul 32x4096x6144 · shard · no gain  +2010.11 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index cf50d6f983..5405dbb43b 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -774,6 +774,24 @@ class ModelArgs:
+                 # For maximum performance, set the prefill grid row to 8, even if it can fit in a smaller grid
+                 self.prefill_rows = 8
+                 self.attn_input_grid = self.dram_shard_core_grid_for_k(self.dim)
+    +            # SHARD RUNG for the decode QKV projection (32 x 4096 x 6144, tagged grid=tiny).
+    +            # `dram_shard_core_grid_for_k` picks the core count via find_grid, which sorts the
+    +            # divisors of K/32 = 128 tiles by closeness to a hard-coded target of 32 -- so it lands on
+    +            # 32 cores and stops, even though 64 also divides 128 and the board has 110. That target
+    +            # is a Wormhole-era default, not a Blackhole measurement. This grid IS the shard spec: the
+    +            # DRAM-sharded matmul parallelises over the activation's L1 WIDTH shard, so doubling the
+    +            # shard grid doubles the cores pulling the 14.2 MB bf4_b weight. Both divisibility
+    +            # constraints still hold at 64: K = 4096 is 2048-aligned (dram_matmul_config asserts
+    +            # k % (32 * num_cores) == 0) and N/32 = 192 tiles divides by 64 at 3 tiles per core, which
+    +            # matters because the DRAM-sharded matmul has NO padding support. Coordinated by
+    +            # construction -- attn_input_grid also drives the attention norm's sharded config and the
+    +            # matmul's program config, so all three move together.
+    +            if not self.is_galaxy and self.num_devices == 1:
+    +                _k_tiles = self.dim // ttnn.TILE_SIZE
+    +                _n_tiles = self.qkv_size // self.num_devices // ttnn.TILE_SIZE
+    +                _wide = 64
+    +                if _k_tiles % _wide == 0 and _n_tiles % _wide == 0 and _wide <= grid.x * grid.y:
+    +                    self.attn_input_grid = ttnn.CoreGrid(y=8, x=8)
+                 self.mlp1_3_grid = lambda seq_len: (
+                     (8, min(min(seq_len, 1024) // 32, 4))
+                     if self.is_galaxy
+
+[#226] Matmul 32x4096x6144 · shard · no gain  +2016.19 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index cf50d6f983..d18524b244 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -774,6 +774,21 @@ class ModelArgs:
+                 # For maximum performance, set the prefill grid row to 8, even if it can fit in a smaller grid
+                 self.prefill_rows = 8
+                 self.attn_input_grid = self.dram_shard_core_grid_for_k(self.dim)
+    +            # SHARD RUNG for the decode QKV projection (32 x 4096 x 6144), second target, testing the
+    +            # prediction the FIRST one produced. Widening this shard grid 32 -> 64 cores LOST (448.70
+    +            # -> 454.07 ms) and the reason was tiles-per-core, not core count: 192 output tiles over 64
+    +            # cores is 3.0 each against 6.0 at 32, and below ~4 the per-core mcast/packer sync stops
+    +            # being amortised. If that term is really what binds, then NARROWING the shard should win,
+    +            # since 16 cores gives 12 tiles each. This is the falsifiable half of the same hypothesis:
+    +            # find_grid's hard-coded target of 32 is either optimal or merely adequate, and only the
+    +            # other side of it can tell them apart. Both no-padding constraints hold at 16 (K/32 = 128
+    +            # and N/32 = 192 are each divisible by 16).
+    +            if not self.is_galaxy and self.num_devices == 1:
+    +                _k_tiles = self.dim // ttnn.TILE_SIZE
+    +                _n_tiles = self.qkv_size // self.num_devices // ttnn.TILE_SIZE
+    +                _narrow = 16
+    +                if _k_tiles % _narrow == 0 and _n_tiles % _narrow == 0:
+    +                    self.attn_input_grid = ttnn.CoreGrid(y=2, x=8)
+                 self.mlp1_3_grid = lambda seq_len: (
+                     (8, min(min(seq_len, 1024) // 32, 4))
+                     if self.is_galaxy
+
+[#229] Matmul 32x4096x6144 · tt-lang · no gain  +2009.21 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..acdac086fb 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -286,6 +286,22 @@ class Attention(LightweightModule):
+                 cache_file_name=cache_name("wqkv_sharded_2d"),
+             )
+     
+    +        # TT-LANG RUNG for the decode QKV projection (32 x 4096 x 6144). Wired on ONE layer so the
+    +        # per-call cost is readable off the profile while the other 31 layers run stock as the control,
+    +        # and so the kernel's bf16 weight copy stays ~50 MB instead of ~1.6 GB.
+    +        self.qkv_ttl = None
+    +        if not self.TG and prefetcher is None and configuration.num_devices == 1 and layer_num == 0:
+    +            from models.demos.llama3_1_8b_p150.tt.ttl_qkv_matmul import QkvTTL, supports
+    +
+    +            _w = qkv_cat.squeeze(0).squeeze(0)
+    +            if supports(configuration.tile_padded_batch_rows, _w.shape[0], _w.shape[1]):
+    +                self.qkv_ttl = QkvTTL(
+    +                    mesh_device,
+    +                    _w,
+    +                    configuration.tile_padded_batch_rows,
+    +                    configuration.attn_input_grid,
+    +                )
+    +
+             def norm_reshard(x, norm, mode, norm_config):
+                 """Hack until RMSNorm supports height-sharded output config"""
+                 if mode == Mode.DECODE:
+    @@ -661,16 +677,19 @@ class Attention(LightweightModule):
+             if _keep_qkv_sharded:
+                 _qkv_decode_out_dtype = ttnn.bfloat16
+     
+    -        xqkv_fused_sharded = ttnn.linear(
+    -            x_sharded,
+    -            self.wqkv,
+    -            memory_config=qkv_input_mem_config,
+    -            program_config=self.args.get_attn_qkv_program_config(Mode.DECODE, 1, self.prefetcher),
+    -            compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
+    -            dtype=_qkv_decode_out_dtype,
+    -            global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
+    -            sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+    ... (truncated, 17 more lines)
+
+[#230] Matmul 32x4096x6144 · cpp · no gain  +2008.55 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..588998b437 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -286,6 +286,21 @@ class Attention(LightweightModule):
+                 cache_file_name=cache_name("wqkv_sharded_2d"),
+             )
+     
+    +        # CPP RUNG for the decode QKV projection (32 x 4096 x 6144). Wired on ONE layer so the per-call
+    +        # cost is readable off the profile while the other 31 layers run stock as the control, and so
+    +        # the kernel's bf16 weight copy stays ~50 MB instead of ~1.6 GB.
+    +        self.qkv_cpp = None
+    +        if not self.TG and prefetcher is None and configuration.num_devices == 1 and layer_num == 0:
+    +            from models.demos.llama3_1_8b_p150.tt.cpp_mm_qkv import QkvCpp
+    +
+    +            _w = qkv_cat.squeeze(0).squeeze(0)
+    +            self.qkv_cpp = QkvCpp(
+    +                mesh_device,
+    +                _w,
+    +                configuration.tile_padded_batch_rows,
+    +                configuration.attn_input_grid,
+    +            )
+    +
+             def norm_reshard(x, norm, mode, norm_config):
+                 """Hack until RMSNorm supports height-sharded output config"""
+                 if mode == Mode.DECODE:
+    @@ -661,16 +676,19 @@ class Attention(LightweightModule):
+             if _keep_qkv_sharded:
+                 _qkv_decode_out_dtype = ttnn.bfloat16
+     
+    -        xqkv_fused_sharded = ttnn.linear(
+    -            x_sharded,
+    -            self.wqkv,
+    -            memory_config=qkv_input_mem_config,
+    -            program_config=self.args.get_attn_qkv_program_config(Mode.DECODE, 1, self.prefetcher),
+    -            compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
+    -            dtype=_qkv_decode_out_dtype,
+    -            global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
+    -            sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+    -        )
+    ... (truncated, 16 more lines)
+
+[#231] Matmul 32x4096x4096 · grid · no gain  +2015.22 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..fba5a5a4d0 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -12,7 +12,7 @@ from models.common.lightweightmodule import LightweightModule
+     from models.common.rmsnorm import RMSNorm
+     from models.common.utility_functions import nearest_32
+     from models.demos.llama3_1_8b_p150.tt.ccl import tt_all_gather, tt_all_reduce
+    -from models.demos.llama3_1_8b_p150.tt.common import Mode
+    +from models.demos.llama3_1_8b_p150.tt.common import Mode, num_to_core_range_set
+     from models.demos.llama3_1_8b_p150.tt.model_config import OpGroup, TensorGroup, num_to_corerange
+     
+     
+    @@ -286,6 +286,20 @@ class Attention(LightweightModule):
+                 cache_file_name=cache_name("wqkv_sharded_2d"),
+             )
+     
+    +        # GRID RUNG for the decode wo projection: the ONE core count both halves of the coordinated
+    +        # edit must agree on. Kept here (rather than recomputed at each site) so the activation reshard
+    +        # in forward_decode and the matmul's num_cores in get_attn_output_program_config cannot drift
+    +        # apart -- a DRAM-sharded matmul whose grid does not match its activation's shard is a hard
+    +        # failure, not a slow path. None = leave the producer's one-core-per-head grid alone.
+    +        self._wo_reshard_cores = None
+    +        if not self.TG and prefetcher is None and configuration.num_devices == 1:
+    +            _full = configuration.n_heads // configuration.num_devices
+    +            _half = _full // 2
+    +            _k_tiles = ((configuration.n_heads * configuration.head_dim) // configuration.num_devices) // 32
+    +            _n_tiles = configuration.dim // 32
+    +            if _half > 0 and _k_tiles % _half == 0 and _n_tiles % _half == 0:
+    +                self._wo_reshard_cores = _half
+    +
+             def norm_reshard(x, norm, mode, norm_config):
+                 """Hack until RMSNorm supports height-sharded output config"""
+                 if mode == Mode.DECODE:
+    @@ -908,6 +922,24 @@ class Attention(LightweightModule):
+                     ttnn.to_memory_config(attn_output, wo_input_mem_config) if self.prefetcher is not None else attn_output
+                 )
+     
+    +            # GRID RUNG, activation half of the coordinated edit. The wo DRAM-sharded matmul
+    +            # parallelises over its activation's L1 WIDTH shard, so narrowing the matmul grid (see
+    ... (truncated, 55 more lines)
+
+[#232] Matmul 32x4096x4096 · dtype · win  +2023.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..1210c1fedf 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -367,6 +367,8 @@ class Attention(LightweightModule):
+                     cache_file_name=(cache_name("wo_sharded_ring")),
+                 )
+     
+    +        _wo_dtype_tag = f"_{str(self.wo_dtype).rsplit('.', 1)[-1].lower()}"
+    +
+             def get_wo_memory_config():
+                 if self.use_fused_all_gather_matmul or self.TG:
+                     return ttnn.DRAM_MEMORY_CONFIG
+    @@ -381,7 +383,12 @@ class Attention(LightweightModule):
+                 memory_config=get_wo_memory_config(),
+                 mesh_mapper=get_wo_mesh_mapper(),
+                 cache_file_name=(
+    -                cache_name("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else cache_name("wo")
+    +                # The cache key MUST encode the dtype. `as_tensor` returns the cached tensor exactly as
+    +                # it was stored, so without this tag a previously-cached bf8_b wo is reloaded unchanged
+    +                # and lowering wo_dtype is a SILENT no-op that measures as "no gain".
+    +                cache_name(f"wo_width_sharded_2d{_wo_dtype_tag}")
+    +                if (self.use_fused_all_gather_matmul or self.TG)
+    +                else cache_name(f"wo{_wo_dtype_tag}")
+                 ),
+             )
+             if not use_paged_kv_cache:
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index cf50d6f983..f989d783a0 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -239,6 +239,14 @@ class ModelOptimizations:
+                         # one resident tensor shared by the prefill AND decode QKV matmuls, so the
+                         # halving lands on both paths.
+                         TensorGroup.WQKV: PrecisionSetting.BFP4,
+    +                    # WO is the last tensor group `performance()` never lowered: FF1/FF3, FF2 and WQKV
+    +                    # all ride bf4_b, while the attention output projection was still inheriting the
+    +                    # BFP8 default simply because it is not named here. It is [n_heads*head_dim, dim]
+    +                    # = 4096 x 4096 = 16.8M params, ~17.8 MB per layer at bf8_b, and the roofline tags
+    +                    # its decode matmul memory-bound -- so halving it removes ~8.4 MB per layer, ~270 MB
+    ... (truncated, 6 more lines)
+
+[#233] LayerNorm · fidelity · no gain  +2023.61 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/decoder.py b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    index 84b99613b9..260a75779a 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/decoder.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    @@ -162,6 +162,24 @@ class TransformerBlock(LightweightModule):
+                 TG=args.is_galaxy,
+                 ag_config_key="FFN_LN_AG_CONFIG",
+             )
+    +        # FIDELITY RUNG for LayerNormDeviceOperation. GUIDELINES/02 section 4 says HiFi2 is the FLOOR
+    +        # for a norm and LoFi "passes single-layer but fails 24-layer", so the expected outcome here is
+    +        # a PCC revert -- but GUIDELINES/01 section 12 is equally explicit that the drop must be MEASURED
+    +        # rather than reasoned about, because precision wins are the most commonly skipped ones. So force
+    +        # it and let the full-model gate decide. Overridden on the INSTANCE from the model dir rather
+    +        # than in models/common/rmsnorm.py: that file is shared with every other model, and git_revert
+    +        # is scoped to this model dir, so editing it would leave the repo dirty outside the revert's
+    +        # reach. fp32_dest_acc_en is left alone -- section 4 calls it mandatory for norms, and mixing two
+    +        # precision changes into one measurement would make the result unattributable.
+    +        _norm_lofi = ttnn.WormholeComputeKernelConfig(
+    +            math_fidelity=ttnn.MathFidelity.LoFi,
+    +            math_approx_mode=False,
+    +            fp32_dest_acc_en=True,
+    +            packer_l1_acc=True,
+    +        )
+    +        for _dn in (self.attention_norm, self.ff_norm):
+    +            _dn.norm.compute_kernel_config_hifi2 = _norm_lofi
+    +
+             if f"layers.{layer_num}.pre_feedforward_layernorm.weight" in state_dict:
+                 self.pre_ff_norm = DistributedNorm(  # pre_feedforward_layernorm
+                     RMSNorm(
+
+[#234] LayerNorm · shard · no gain  +2023.82 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/decoder.py b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    index 84b99613b9..28c338dab6 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/decoder.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    @@ -118,6 +118,20 @@ class TransformerBlock(LightweightModule):
+                 or use_galaxy_row_submesh_rmsnorm_l1_workaround
+             ):
+                 extra_rmsnorm_kwargs["fp32_dest_acc_en"] = False
+    +
+    +        # SHARD RUNG for LayerNormDeviceOperation. The ACTIVATION side is already done -- the earlier
+    +        # sharded-norm lever moved the prefill off the one-core interleaved kernel, and the decode path
+    +        # already runs sharded via get_norm_config. The one tensor still on DRAM is the norm WEIGHT.
+    +        # It is only [dim] = 4096 elements = 8 KB, so 2 norms x 32 layers is ~512 KB total, trivially
+    +        # L1-resident, and this op is DISPATCH-bound across ~1700 tiny calls -- exactly the regime where
+    +        # a per-call DRAM fetch is a large fraction of the call. Pinning the weight in L1 removes that
+    +        # fetch from every call.
+    +        # weight_cache_path is forced to None for these two ONLY: as_tensor returns a cached tensor
+    +        # exactly as it was stored and the cache key does not encode memory_config, so a previously
+    +        # cached DRAM weight would be reloaded unchanged and the lever would be a silent no-op. Paying a
+    +        # startup re-tilize is the cheap way to guarantee the lever is actually live.
+    +        extra_rmsnorm_kwargs["weight_memory_config"] = ttnn.L1_MEMORY_CONFIG
+    +
+             self.attention_norm = DistributedNorm(
+                 RMSNorm(
+                     device=mesh_device,
+    @@ -125,7 +139,7 @@ class TransformerBlock(LightweightModule):
+                     eps=args.norm_eps,
+                     state_dict=state_dict,
+                     state_dict_prefix=args.get_state_dict_prefix("", layer_num),
+    -                weight_cache_path=None if args.dummy_weights else weight_cache_path,
+    +                weight_cache_path=None,  # SHARD RUNG: bypass the cache so the L1 placement is live
+                     weight_dtype=ttnn.bfloat16,
+                     weight_key="attention_norm",
+                     is_distributed=self.args.is_distributed_norm,
+    @@ -147,7 +161,7 @@ class TransformerBlock(LightweightModule):
+                     eps=args.norm_eps,
+                     state_dict=state_dict,
+                     state_dict_prefix=args.get_state_dict_prefix("", layer_num),
+    -                weight_cache_path=None if args.dummy_weights else weight_cache_path,
+    +                weight_cache_path=None,  # SHARD RUNG: bypass the cache so the L1 placement is live
+    ... (truncated, 3 more lines)
+
+[#235] LayerNorm · structural · no gain  +2023.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/perf_target_inputs.json b/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    index 2009f2c22a..53982158e5 100644
+    --- a/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    +++ b/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    @@ -1,8 +1,9 @@
+     {
+    -  "weight_bytes": 3330000000,
+    +  "weight_bytes": 6094651392,
+       "dominant_dtype": "bfloat4_b",
+    -  "layers": 16,
+    +  "unit": "token",
+    +  "layers": 32,
+       "kv_heads": 8,
+       "head_dim": 128,
+    -  "source": "measured from the device profile: sum of per-op bytes / 51 decode iterations in the window (bf4_b FFN, bf8_b wo), for the 16-layer profiled configuration"
+    +  "source": "analytic from safetensors headers at the BASELINE dtypes (FF1/FF3 bfp4, FF2/WQKV/WO bfp8), 32 layers + lm_head, embedding table excluded (one row per token)"
+     }
+
+[#236] RotaryEmbeddingLlama · grid · no gain  +2023.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/perf_target_inputs.json b/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    index 2009f2c22a..53982158e5 100644
+    --- a/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    +++ b/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    @@ -1,8 +1,9 @@
+     {
+    -  "weight_bytes": 3330000000,
+    +  "weight_bytes": 6094651392,
+       "dominant_dtype": "bfloat4_b",
+    -  "layers": 16,
+    +  "unit": "token",
+    +  "layers": 32,
+       "kv_heads": 8,
+       "head_dim": 128,
+    -  "source": "measured from the device profile: sum of per-op bytes / 51 decode iterations in the window (bf4_b FFN, bf8_b wo), for the 16-layer profiled configuration"
+    +  "source": "analytic from safetensors headers at the BASELINE dtypes (FF1/FF3 bfp4, FF2/WQKV/WO bfp8), 32 layers + lm_head, embedding table excluded (one row per token)"
+     }
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index 1210c1fedf..fb8b40e91f 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -503,10 +503,23 @@ class Attention(LightweightModule):
+             assert q_batch == k_batch
+     
+             row_size = 8  # We assume a row size of 8 cores
+    -        k_start_core = ttnn.CoreCoord(q_batch % row_size, q_batch // row_size)
+     
+    -        q_core_grid = ttnn.CoreRangeSet({num_to_corerange(q_batch)})
+    -        k_core_grid = ttnn.CoreRangeSet({num_to_corerange(k_batch, start_core=k_start_core)})
+    +        # GRID RUNG for RotaryEmbeddingLlamaDeviceOperation. The CORE COUNT here is not tunable and the
+    +        # rectangularity rule in num_to_corerange proves it: the op parallelises over BATCH, batch is 32,
+    +        # and the assert `x < grid_x or x % grid_x == 0` rejects any grid width that does not divide 32 --
+    +        # so an 11-wide Blackhole row is ILLEGAL for a 32-core shard and 8x4 is forced, giving 32 cores
+    +        # for Q plus 32 for K = 64 of 110. That is the ceiling for this op, not a tuning miss.
+    +        # What IS tunable is WHERE those 64 cores sit. Today Q lands on (0,0)-(7,3), which is EXACTLY the
+    +        # 32 cores of attn_input_grid (CoreGrid(x=8, y=4)) -- the same cores holding the QKV matmul's
+    +        # activation shard and the attention norm's. Push Q and K down to rows 2-9 so the rope's L1
+    +        # residency stops overlapping the projection's, and see whether the collision was costing
+    +        # anything. Legal on a 10-row grid: Q (0,2)-(7,5), K (0,6)-(7,9).
+    +        _row_off = 2 if not self.TG and self.prefetcher is None else 0
+    ... (truncated, 8 more lines)
+
+[#237] RotaryEmbeddingLlama · grid · no gain  +2023.33 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index 1210c1fedf..aed2aa814d 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -503,10 +503,19 @@ class Attention(LightweightModule):
+             assert q_batch == k_batch
+     
+             row_size = 8  # We assume a row size of 8 cores
+    -        k_start_core = ttnn.CoreCoord(q_batch % row_size, q_batch // row_size)
+     
+    -        q_core_grid = ttnn.CoreRangeSet({num_to_corerange(q_batch)})
+    -        k_core_grid = ttnn.CoreRangeSet({num_to_corerange(k_batch, start_core=k_start_core)})
+    +        # GRID RUNG for RotaryEmbeddingLlamaDeviceOperation, coordinated half B (half A is
+    +        # get_batch_grid in rope.py, which places the cos/sin shard). The 64-core count is capped by the
+    +        # fused op's doubled batch, so only the PLACEMENT is free: Q currently lands on (0,0)-(7,3),
+    +        # exactly the 32 cores of attn_input_grid. Shift Q/K down one row to (0,1)-(7,4) and (0,5)-(7,8)
+    +        # so the rope block stops overlapping the projection's shard. Both halves must agree -- the
+    +        # cos/sin shard is a contract with these ranges, not a hint.
+    +        _row_off = 1 if (not self.TG and self.prefetcher is None and q_batch == 32) else 0
+    +        q_start_core = ttnn.CoreCoord(0, _row_off)
+    +        k_start_core = ttnn.CoreCoord(q_batch % row_size, _row_off + q_batch // row_size)
+    +
+    +        q_core_grid = ttnn.CoreRangeSet({num_to_corerange(q_batch, start_core=q_start_core, grid_y=10)})
+    +        k_core_grid = ttnn.CoreRangeSet({num_to_corerange(k_batch, start_core=k_start_core, grid_y=10)})
+     
+             q_mem_config = ttnn.create_sharded_memory_config(
+                 shape=(nearest_32(n_q_heads), self.head_dim),
+    diff --git a/models/demos/llama3_1_8b_p150/tt/rope.py b/models/demos/llama3_1_8b_p150/tt/rope.py
+    index 21b89dcccb..4a6b047c1a 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/rope.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/rope.py
+    @@ -812,6 +812,19 @@ class RotarySetup(LightweightModule):
+                     else:
+                         # Use batch_size (which is doubled_batch_size for fused QK) to determine the number of cores
+                         if batch_size % 32 == 0:
+    +                        # GRID RUNG for RotaryEmbeddingLlamaDeviceOperation, coordinated half A.
+    +                        # The 64-core COUNT is a hard cap (the fused op parallelises over the doubled
+    +                        # batch of 64), so the only free variable is WHERE the block sits. Today
+    +                        # CoreGrid(y=8, x=8) pins it to rows 0-7, and Q's half (rows 0-3) is exactly the
+    +                        # 32 cores of attn_input_grid, shared with the QKV activation shard and the
+    ... (truncated, 11 more lines)
+
+[#238] RotaryEmbeddingLlama · shard · no gain  +2024.67 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/rope.py b/models/demos/llama3_1_8b_p150/tt/rope.py
+    index 21b89dcccb..ca9e2a396a 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/rope.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/rope.py
+    @@ -851,12 +851,18 @@ class RotarySetup(LightweightModule):
+     
+             # TODO: Colman, should this be TILE_SIZE or head_dim? Why should it be different for prefill and decode?
+             prefill_trans_mat_torch = get_rot_transformation_mat(dhead=head_dim)
+    +        # SHARD RUNG for RotaryEmbeddingLlamaDeviceOperation. Every operand of the DECODE rope is already
+    +        # L1-sharded -- Q/K height-sharded by to_qk_fused_memory_config, cos/sin and the decode
+    +        # transformation matrix height-sharded on batch_grid just above. The one operand still on DRAM is
+    +        # this PREFILL transformation matrix, re-read from DRAM on every prefill rope call. It is only
+    +        # [head_dim, head_dim] = 128x128 bf16 = 32 KB, so it is trivially L1-resident, and the roofline
+    +        # tags this op memory-bound -- so pin it in L1 and remove that fetch.
+             self.transformation_mat_prefill = ttnn.from_torch(
+                 prefill_trans_mat_torch,
+                 device=device,
+                 layout=ttnn.TILE_LAYOUT,
+                 dtype=datatype,
+    -            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    +            memory_config=ttnn.L1_MEMORY_CONFIG,
+                 mesh_mapper=replicate_tensor_to_mesh_mapper(device),
+             )
+
+[#239] RotaryEmbeddingLlama · shard · no gain  +2024.22 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/rope.py b/models/demos/llama3_1_8b_p150/tt/rope.py
+    index 21b89dcccb..b770afd2a3 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/rope.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/rope.py
+    @@ -363,11 +363,18 @@ def get_rot_mats(
+             rope_scaling=rope_scaling,
+         )
+     
+    +    # SHARD RUNG for RotaryEmbeddingLlamaDeviceOperation, second target. These are the PREFILL rope
+    +    # matrices and they take the default DRAM placement, so the prefill rope re-reads them from DRAM on
+    +    # every call. The decode side has nothing left (Q/K, cos/sin and the decode transformation matrix are
+    +    # all L1-sharded already), so this is the remaining un-placed operand pair. At [1, 1, 2*seq_len,
+    +    # head_dim] with seq_len <= 1024 that is ~512 KB each, ~1 MB together, comfortably L1-resident.
+    +    _rot_mem_config = ttnn.L1_MEMORY_CONFIG
+         cos_matrix = ttnn.from_torch(
+             cos_matrix,
+             device=device,
+             layout=rot_mats_layout,
+             dtype=datatype,
+    +        memory_config=_rot_mem_config,
+             mesh_mapper=replicate_tensor_to_mesh_mapper(device),
+         )
+         sin_matrix = ttnn.from_torch(
+    @@ -375,6 +382,7 @@ def get_rot_mats(
+             device=device,
+             layout=rot_mats_layout,
+             dtype=datatype,
+    +        memory_config=_rot_mem_config,
+             mesh_mapper=replicate_tensor_to_mesh_mapper(device),
+         )
+         return [cos_matrix, sin_matrix]
+
+[#240] RotaryEmbeddingLlama · fidelity · no gain  +2023.42 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index 1210c1fedf..c956fd68ca 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -166,6 +166,15 @@ class Attention(LightweightModule):
+             else:
+                 cache_name = lambda name: weight_cache_path / (f"{layer_name}.{name}")
+     
+    +        # FIDELITY RUNG for RotaryEmbeddingLlamaDeviceOperation: the rope calls pass no
+    +        # compute_kernel_config today, so they run at the op's HiFi4 default.
+    +        self._rope_compute_kernel_cfg = ttnn.WormholeComputeKernelConfig(
+    +            math_fidelity=ttnn.MathFidelity.HiFi2,
+    +            math_approx_mode=False,
+    +            fp32_dest_acc_en=False,
+    +            packer_l1_acc=True,
+    +        )
+    +
+             # Select rotary embedding implementation for decode
+             if self.use_hf_rope and self.use_qk_fused:
+                 raise NotImplementedError("Fused QK is not implemented for HF-style rope")
+    @@ -543,8 +552,19 @@ class Attention(LightweightModule):
+                 q_heads_pre_rot_1BQD, k_heads_pre_rot_1BKD
+             )
+     
+    +        # FIDELITY RUNG for RotaryEmbeddingLlamaDeviceOperation. This call passes no
+    +        # compute_kernel_config, so the op falls back to its default HiFi4 -- which the profiler confirms
+    +        # (fidelity=hifi4). GUIDELINES/01 section 12: HiFi4 is the bring-up default, not a perf choice,
+    +        # and costs 4x the math passes; the Tensix math engine runs ~2x faster at HiFi2. A rope is a
+    +        # multiply-add against bf16 cos/sin, not a variance reduction, so the norm-specific floor
+    +        # (HiFi2 + fp32_dest mandatory) does not bind here and fp32_dest_acc_en can stay False.
+             q_heads_1BQD, k_heads_1BKD = ttnn.experimental.rotary_embedding_llama_fused_qk(
+    -            q_heads_pre_rot_1BQD, k_heads_pre_rot_1BKD, rot_mats[0], rot_mats[1], self.transformation_mats["decode"]
+    +            q_heads_pre_rot_1BQD,
+    +            k_heads_pre_rot_1BKD,
+    +            rot_mats[0],
+    +            rot_mats[1],
+    +            self.transformation_mats["decode"],
+    +            compute_kernel_config=self._rope_compute_kernel_cfg,
+             )
+             return q_heads_1BQD, k_heads_1BKD
+    ... (truncated, 1 more lines)
+
+[#241] RotaryEmbeddingLlama · structural · no gain  +2023.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..1210c1fedf 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -367,6 +367,8 @@ class Attention(LightweightModule):
+                     cache_file_name=(cache_name("wo_sharded_ring")),
+                 )
+     
+    +        _wo_dtype_tag = f"_{str(self.wo_dtype).rsplit('.', 1)[-1].lower()}"
+    +
+             def get_wo_memory_config():
+                 if self.use_fused_all_gather_matmul or self.TG:
+                     return ttnn.DRAM_MEMORY_CONFIG
+    @@ -381,7 +383,12 @@ class Attention(LightweightModule):
+                 memory_config=get_wo_memory_config(),
+                 mesh_mapper=get_wo_mesh_mapper(),
+                 cache_file_name=(
+    -                cache_name("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else cache_name("wo")
+    +                # The cache key MUST encode the dtype. `as_tensor` returns the cached tensor exactly as
+    +                # it was stored, so without this tag a previously-cached bf8_b wo is reloaded unchanged
+    +                # and lowering wo_dtype is a SILENT no-op that measures as "no gain".
+    +                cache_name(f"wo_width_sharded_2d{_wo_dtype_tag}")
+    +                if (self.use_fused_all_gather_matmul or self.TG)
+    +                else cache_name(f"wo{_wo_dtype_tag}")
+                 ),
+             )
+             if not use_paged_kv_cache:
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index cf50d6f983..f989d783a0 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -239,6 +239,14 @@ class ModelOptimizations:
+                         # one resident tensor shared by the prefill AND decode QKV matmuls, so the
+                         # halving lands on both paths.
+                         TensorGroup.WQKV: PrecisionSetting.BFP4,
+    +                    # WO is the last tensor group `performance()` never lowered: FF1/FF3, FF2 and WQKV
+    +                    # all ride bf4_b, while the attention output projection was still inheriting the
+    +                    # BFP8 default simply because it is not named here. It is [n_heads*head_dim, dim]
+    +                    # = 4096 x 4096 = 16.8M params, ~17.8 MB per layer at bf8_b, and the roofline tags
+    +                    # its decode matmul memory-bound -- so halving it removes ~8.4 MB per layer, ~270 MB
+    ... (truncated, 6 more lines)
+
+[#242] BinaryNg · grid · no gain  +2023.58 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index f989d783a0..d24ddca690 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1261,6 +1261,20 @@ class ModelArgs:
+                     return ttnn.L1_MEMORY_CONFIG
+                 else:
+                     residual_grid = self.dram_shard_core_grid_for_k(self.dim // self.num_devices)
+    +                # GRID RUNG for BinaryNgDeviceOperation (the two decode residual adds). This memory
+    +                # config IS the adds' grid: they parallelise over the residual stream's L1 WIDTH shard,
+    +                # and dram_shard_core_grid_for_k -> find_grid lands on 32 cores because find_grid sorts
+    +                # the divisors of dim/32 = 128 tiles by closeness to a hard-coded target of 32. That
+    +                # leaves 4 tiles per core on a 110-core board. Unlike a matmul, an eltwise add has no
+    +                # mcast or packer-sync term to amortise -- it is pure streaming -- so the tiles-per-core
+    +                # floor that made the QKV and wo grid widenings lose should NOT bind here, and 64 cores
+    +                # (2 tiles each) ought to halve the per-core work. 128 tiles divides 64 exactly.
+    +                # Self-consistent by construction: this one function defines the residual layout, and
+    +                # decoder.forward asserts every producer hands its result back in exactly this config.
+    +                if not self.is_galaxy and self.num_devices == 1:
+    +                    _res_tiles = (self.dim // self.num_devices) // ttnn.TILE_SIZE
+    +                    if _res_tiles % 64 == 0:
+    +                        residual_grid = ttnn.CoreGrid(y=8, x=8)
+                     return ttnn.create_sharded_memory_config(
+                         (
+                             self.tile_padded_batch_rows,
+
+[#243] BinaryNg · grid · no gain  +2022.75 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index f989d783a0..13fb141c47 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1261,6 +1261,17 @@ class ModelArgs:
+                     return ttnn.L1_MEMORY_CONFIG
+                 else:
+                     residual_grid = self.dram_shard_core_grid_for_k(self.dim // self.num_devices)
+    +                # GRID RUNG for BinaryNgDeviceOperation, second attempt: the falsifying direction.
+    +                # Widening these adds' shard grid 32 -> 64 cores was flat, and the explanation offered
+    +                # was that a [32, 4096] add moves only ~256 KB, so it is launch-bound rather than
+    +                # work-bound and per-core work is irrelevant. If that is right, NARROWING to 16 cores
+    +                # (8 tiles each, double the per-core work) must ALSO be flat; if instead it regresses,
+    +                # the op was work-bound after all and the 64-core result needs re-reading. 128 tiles
+    +                # divides 16 exactly.
+    +                if not self.is_galaxy and self.num_devices == 1:
+    +                    _res_tiles = (self.dim // self.num_devices) // ttnn.TILE_SIZE
+    +                    if _res_tiles % 16 == 0:
+    +                        residual_grid = ttnn.CoreGrid(y=2, x=8)
+                     return ttnn.create_sharded_memory_config(
+                         (
+                             self.tile_padded_batch_rows,
+
+[#244] BinaryNg · shard · no gain  +2023.17 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 179087ae9a..828c273bf1 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -380,15 +380,24 @@ class MLP(LightweightModule):
+                         memory_config=self.model_config["FF1_OUT_GATHERED_MEMCFG"] if mode == Mode.DECODE else None,
+                     )
+     
+    +        # SHARD RUNG for BinaryNgDeviceOperation. This mul's output is L1 INTERLEAVED (it inherits
+    +        # w1_out's config) and is then immediately resharded to ff2's width-shard grid on the next
+    +        # statement. So ask the mul to WRITE that shard directly: the op's own output becomes
+    +        # L1-width-sharded and the separate reshard disappears, one fewer launch per MLP per token.
+    +        # Deliberately does NOT touch w1_out/w3_out -- re-pinning ff1/ff3 off the wide interleaved form
+    +        # was measured at 34 ms WORSE for ff2, so only the mul's OUTPUT side moves.
+    +        _mul_shard_direct = mode == Mode.DECODE and not TG and self.prefetcher is None
+             w2_in = ttnn.mul(
+                 w1_out,
+                 w3_out,
+                 input_tensor_a_activations=[self.activation_type],
+                 dtype=activation_dtype or ttnn.bfloat8_b,
+    -            memory_config=w1_out.memory_config(),
+    +            memory_config=(
+    +                self.args.get_mlp_binary_mult_mem_config(mode) if _mul_shard_direct else w1_out.memory_config()
+    +            ),
+             )
+     
+    -        if mode == Mode.DECODE and not TG and self.prefetcher is None:
+    +        if False:
+                 # w2 may use a different core grid, this is a no-op if they already match. Under
+                 # full_grid_ff1_3_weights this is where the chain LEAVES the wide interleaved form and
+                 # re-pins to the DRAM-sharded ff2's width-shard grid -- ff2 measured 34 ms WORSE on the
+
+[#245] BinaryNg · shard · no gain  +2023.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index f989d783a0..ce23b32abe 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1278,6 +1278,22 @@ class ModelArgs:
+                     and not self.is_galaxy
+                     and prefetcher is None
+                 ):
+    +                # SHARD RUNG for BinaryNgDeviceOperation, second target: the PREFILL residual adds.
+    +                # The committed lever already got them out of DRAM into L1, but only INTERLEAVED -- so
+    +                # the shard itself is still untried on this side, and the decode path shows what it
+    +                # looks like done (a WIDTH shard over dram_shard_core_grid_for_k). A width shard gives
+    +                # each core a fixed slice instead of letting the op stride an interleaved buffer, which
+    +                # is the remaining difference between the two phases' residual layouts. Only legal when
+    +                # the row count matches the decode shard's height, so gate on that.
+    +                if seq_len is not None and seq_len == self.tile_padded_batch_rows:
+    +                    _res_grid = self.dram_shard_core_grid_for_k(self.dim // self.num_devices)
+    +                    return ttnn.create_sharded_memory_config(
+    +                        (self.tile_padded_batch_rows, self.dim // _res_grid.num_cores // self.num_devices),
+    +                        _res_grid,
+    +                        ttnn.ShardStrategy.WIDTH,
+    +                        ttnn.ShardOrientation.ROW_MAJOR,
+    +                        use_height_and_width_as_shard_shape=True,
+    +                    )
+                     return ttnn.L1_MEMORY_CONFIG
+                 return ttnn.DRAM_MEMORY_CONFIG
+             else:
+
+[#246] BinaryNg · fidelity · no gain  +2023.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..1210c1fedf 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -367,6 +367,8 @@ class Attention(LightweightModule):
+                     cache_file_name=(cache_name("wo_sharded_ring")),
+                 )
+     
+    +        _wo_dtype_tag = f"_{str(self.wo_dtype).rsplit('.', 1)[-1].lower()}"
+    +
+             def get_wo_memory_config():
+                 if self.use_fused_all_gather_matmul or self.TG:
+                     return ttnn.DRAM_MEMORY_CONFIG
+    @@ -381,7 +383,12 @@ class Attention(LightweightModule):
+                 memory_config=get_wo_memory_config(),
+                 mesh_mapper=get_wo_mesh_mapper(),
+                 cache_file_name=(
+    -                cache_name("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else cache_name("wo")
+    +                # The cache key MUST encode the dtype. `as_tensor` returns the cached tensor exactly as
+    +                # it was stored, so without this tag a previously-cached bf8_b wo is reloaded unchanged
+    +                # and lowering wo_dtype is a SILENT no-op that measures as "no gain".
+    +                cache_name(f"wo_width_sharded_2d{_wo_dtype_tag}")
+    +                if (self.use_fused_all_gather_matmul or self.TG)
+    +                else cache_name(f"wo{_wo_dtype_tag}")
+                 ),
+             )
+             if not use_paged_kv_cache:
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index cf50d6f983..f989d783a0 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -239,6 +239,14 @@ class ModelOptimizations:
+                         # one resident tensor shared by the prefill AND decode QKV matmuls, so the
+                         # halving lands on both paths.
+                         TensorGroup.WQKV: PrecisionSetting.BFP4,
+    +                    # WO is the last tensor group `performance()` never lowered: FF1/FF3, FF2 and WQKV
+    +                    # all ride bf4_b, while the attention output projection was still inheriting the
+    +                    # BFP8 default simply because it is not named here. It is [n_heads*head_dim, dim]
+    +                    # = 4096 x 4096 = 16.8M params, ~17.8 MB per layer at bf8_b, and the roofline tags
+    +                    # its decode matmul memory-bound -- so halving it removes ~8.4 MB per layer, ~270 MB
+    ... (truncated, 6 more lines)
+
+[#247] BinaryNg · structural · no gain  +2023.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..1210c1fedf 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -367,6 +367,8 @@ class Attention(LightweightModule):
+                     cache_file_name=(cache_name("wo_sharded_ring")),
+                 )
+     
+    +        _wo_dtype_tag = f"_{str(self.wo_dtype).rsplit('.', 1)[-1].lower()}"
+    +
+             def get_wo_memory_config():
+                 if self.use_fused_all_gather_matmul or self.TG:
+                     return ttnn.DRAM_MEMORY_CONFIG
+    @@ -381,7 +383,12 @@ class Attention(LightweightModule):
+                 memory_config=get_wo_memory_config(),
+                 mesh_mapper=get_wo_mesh_mapper(),
+                 cache_file_name=(
+    -                cache_name("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else cache_name("wo")
+    +                # The cache key MUST encode the dtype. `as_tensor` returns the cached tensor exactly as
+    +                # it was stored, so without this tag a previously-cached bf8_b wo is reloaded unchanged
+    +                # and lowering wo_dtype is a SILENT no-op that measures as "no gain".
+    +                cache_name(f"wo_width_sharded_2d{_wo_dtype_tag}")
+    +                if (self.use_fused_all_gather_matmul or self.TG)
+    +                else cache_name(f"wo{_wo_dtype_tag}")
+                 ),
+             )
+             if not use_paged_kv_cache:
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index cf50d6f983..f989d783a0 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -239,6 +239,14 @@ class ModelOptimizations:
+                         # one resident tensor shared by the prefill AND decode QKV matmuls, so the
+                         # halving lands on both paths.
+                         TensorGroup.WQKV: PrecisionSetting.BFP4,
+    +                    # WO is the last tensor group `performance()` never lowered: FF1/FF3, FF2 and WQKV
+    +                    # all ride bf4_b, while the attention output projection was still inheriting the
+    +                    # BFP8 default simply because it is not named here. It is [n_heads*head_dim, dim]
+    +                    # = 4096 x 4096 = 16.8M params, ~17.8 MB per layer at bf8_b, and the roofline tags
+    +                    # its decode matmul memory-bound -- so halving it removes ~8.4 MB per layer, ~270 MB
+    ... (truncated, 6 more lines)
+
+[#248] BinaryNg · tt-lang · no gain  +2025.00 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/decoder.py b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    index 84b99613b9..d4a88298ec 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/decoder.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/decoder.py
+    @@ -3,6 +3,7 @@
+     # SPDX-License-Identifier: Apache-2.0
+     
+     import ttnn
+    +from models.demos.llama3_1_8b_p150.tt import ttl_residual_add
+     from models.common.lightweightmodule import LightweightModule
+     from models.common.rmsnorm import RMSNorm
+     from models.demos.llama3_1_8b_p150.tt.attention import Attention as DefaultAttention
+    @@ -326,13 +327,29 @@ class TransformerBlock(LightweightModule):
+                         cluster_axis=1,
+                     )
+     
+    +        _out_dtype = (
+    +            self.args.ccl_dtype
+    +            if TG and not self.args.is_distributed_norm(mode)
+    +            else activation_dtype or ttnn.bfloat16
+    +        )
+    +
+    +        # TT-LANG RUNG for BinaryNgDeviceOperation. This is the post-MLP residual add -- the ONE
+    +        # BinaryNg instance a ttl kernel can legally replace (the post-attention add is mixed dtype,
+    +        # bf16 residual + bf8_b wo output, and both SILU gate multiplies are bf8_b, whose shared-exponent
+    +        # pack this build's ttl packer does not emit correctly). The existing kernel is pinned to
+    +        # SEQ_LEN == 128, so the 32-token padded prefill this pipeline actually runs fell through its
+    +        # supports() and the rung was never measured at the live shape -- the same gap that was worth
+    +        # real wins on the head-split and concat-heads kernels. Route through the single-seq-tile
+    +        # specialisation when the shape and dtype match exactly.
+    +        if not TG and self.prefetcher is None and _out_dtype == ttnn.bfloat16:
+    +            if ttl_residual_add.supports_s32(residual, hidden_states):
+    +                return ttl_residual_add.residual_add_ttl_s32(residual, hidden_states, skip_mem_cfg)
+    +
+             out = ttnn.add(
+                 residual,
+                 hidden_states,
+                 memory_config=skip_mem_cfg,
+    -            dtype=self.args.ccl_dtype
+    -            if TG and not self.args.is_distributed_norm(mode)
+    ... (truncated, 97 more lines)
+
+[#249] BinaryNg · cpp · no gain  +2023.74 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_add_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_add_generic.py
+    index a3ed3bd601..305bae372a 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/cpp_add_generic.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_add_generic.py
+    @@ -174,3 +174,45 @@ def main():
+     
+     if __name__ == "__main__":
+         main()
+    +
+    +
+    +# ---------------------------------------------------------------------------------------------
+    +# SHAPE-GENERIC ENTRY POINTS -- the cpp rung for BinaryNgDeviceOperation at the 32-token padded
+    +# prefill, which is the shape this pipeline actually runs. `build_program` above is already
+    +# shape-generic (it takes m and n and partitions m*n/1024 tiles across the whole grid); only the
+    +# module-level SEQ_LEN constant pinned `supports`/`add_cpp` to 128, so the 32-token prefill fell
+    +# through and this rung had never been measured at the live shape.
+    +#
+    +# Also resolves the kernel-source ROOT from __file__: the absolute path baked in above points at a
+    +# /tmp worktree from an earlier session that no longer exists, so it cannot compile in a later run.
+    +import os as _os
+    +
+    +ROOT_LOCAL = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "kernels")
+    +
+    +
+    +def supports_any(a, b) -> bool:
+    +    """Shape-generic gate: any tile-aligned [1, 1, S, D] bf16 pair in an INTERLEAVED layout."""
+    +    for t in (a, b):
+    +        if t is None or t.dtype != ttnn.bfloat16 or len(t.shape) != 4:
+    +            return False
+    +        if int(t.shape[0]) != 1 or int(t.shape[1]) != 1:
+    +            return False
+    +        if int(t.shape[-2]) % TILE != 0 or int(t.shape[-1]) % TILE != 0:
+    +            return False
+    +        # build_program's reader/writer address a linear interleaved page stream; a shard spec would
+    +        # need different runtime args, so leave sharded operands on the stock op.
+    +        if t.memory_config().is_sharded():
+    +            return False
+    +    return int(a.shape[-2]) == int(b.shape[-2]) and int(a.shape[-1]) == int(b.shape[-1])
+    +
+    +
+    ... (truncated, 55 more lines)
+
+[#250] PagedFusedUpdateCache · grid · no gain  +2023.33 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..1210c1fedf 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -367,6 +367,8 @@ class Attention(LightweightModule):
+                     cache_file_name=(cache_name("wo_sharded_ring")),
+                 )
+     
+    +        _wo_dtype_tag = f"_{str(self.wo_dtype).rsplit('.', 1)[-1].lower()}"
+    +
+             def get_wo_memory_config():
+                 if self.use_fused_all_gather_matmul or self.TG:
+                     return ttnn.DRAM_MEMORY_CONFIG
+    @@ -381,7 +383,12 @@ class Attention(LightweightModule):
+                 memory_config=get_wo_memory_config(),
+                 mesh_mapper=get_wo_mesh_mapper(),
+                 cache_file_name=(
+    -                cache_name("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else cache_name("wo")
+    +                # The cache key MUST encode the dtype. `as_tensor` returns the cached tensor exactly as
+    +                # it was stored, so without this tag a previously-cached bf8_b wo is reloaded unchanged
+    +                # and lowering wo_dtype is a SILENT no-op that measures as "no gain".
+    +                cache_name(f"wo_width_sharded_2d{_wo_dtype_tag}")
+    +                if (self.use_fused_all_gather_matmul or self.TG)
+    +                else cache_name(f"wo{_wo_dtype_tag}")
+                 ),
+             )
+             if not use_paged_kv_cache:
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index cf50d6f983..f989d783a0 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -239,6 +239,14 @@ class ModelOptimizations:
+                         # one resident tensor shared by the prefill AND decode QKV matmuls, so the
+                         # halving lands on both paths.
+                         TensorGroup.WQKV: PrecisionSetting.BFP4,
+    +                    # WO is the last tensor group `performance()` never lowered: FF1/FF3, FF2 and WQKV
+    +                    # all ride bf4_b, while the attention output projection was still inheriting the
+    +                    # BFP8 default simply because it is not named here. It is [n_heads*head_dim, dim]
+    +                    # = 4096 x 4096 = 16.8M params, ~17.8 MB per layer at bf8_b, and the roofline tags
+    +                    # its decode matmul memory-bound -- so halving it removes ~8.4 MB per layer, ~270 MB
+    ... (truncated, 6 more lines)
+
+[#251] PagedFusedUpdateCache · fidelity · no gain  +2023.67 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index 1210c1fedf..9abc0fe279 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -166,6 +166,16 @@ class Attention(LightweightModule):
+             else:
+                 cache_name = lambda name: weight_cache_path / (f"{layer_name}.{name}")
+     
+    +        # FIDELITY RUNG for PagedFusedUpdateCacheDeviceOperation: the call site passes no
+    +        # compute_kernel_config, so the op runs at its HiFi4 default. fp32_dest_acc_en stays False --
+    +        # this is a cache write, not a reduction, so the norm floor does not apply.
+    +        self._kv_update_compute_kernel_cfg = ttnn.WormholeComputeKernelConfig(
+    +            math_fidelity=ttnn.MathFidelity.HiFi2,
+    +            math_approx_mode=False,
+    +            fp32_dest_acc_en=False,
+    +            packer_l1_acc=True,
+    +        )
+    +
+             # Select rotary embedding implementation for decode
+             if self.use_hf_rope and self.use_qk_fused:
+                 raise NotImplementedError("Fused QK is not implemented for HF-style rope")
+    @@ -766,8 +776,20 @@ class Attention(LightweightModule):
+             # keys, [max_batch_size, n_kv_heads // configuration.num_devices, max_seq_len, head_dim]
+     
+             if self.use_qk_fused:
+    +            # FIDELITY RUNG for PagedFusedUpdateCacheDeviceOperation. Unlike the eltwise ops, this one
+    +            # DOES expose compute_kernel_config, and the call passes none -- so the profiler's
+    +            # fidelity=hifi4 tag is the op's own default. GUIDELINES/01 section 12 says HiFi4 costs 4x
+    +            # the math passes, so drop it to HiFi2. Expectation is zero (the op is a cache WRITE, and
+    +            # bound_by=dispatch), but the guideline is explicit that the drop must be measured, not
+    +            # reasoned about, so measure it.
+                 ttnn.experimental.paged_fused_update_cache(
+    -                keys, k_heads_1BKD, values, v_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table
+    +                keys,
+    +                k_heads_1BKD,
+    +                values,
+    +                v_heads_1BKD,
+    +                update_idxs_tensor=current_pos,
+    +                page_table=page_table,
+    +                compute_kernel_config=self._kv_update_compute_kernel_cfg,
+    ... (truncated, 3 more lines)
+
+[#252] PagedFusedUpdateCache · shard · no gain  +2023.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..1210c1fedf 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -367,6 +367,8 @@ class Attention(LightweightModule):
+                     cache_file_name=(cache_name("wo_sharded_ring")),
+                 )
+     
+    +        _wo_dtype_tag = f"_{str(self.wo_dtype).rsplit('.', 1)[-1].lower()}"
+    +
+             def get_wo_memory_config():
+                 if self.use_fused_all_gather_matmul or self.TG:
+                     return ttnn.DRAM_MEMORY_CONFIG
+    @@ -381,7 +383,12 @@ class Attention(LightweightModule):
+                 memory_config=get_wo_memory_config(),
+                 mesh_mapper=get_wo_mesh_mapper(),
+                 cache_file_name=(
+    -                cache_name("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else cache_name("wo")
+    +                # The cache key MUST encode the dtype. `as_tensor` returns the cached tensor exactly as
+    +                # it was stored, so without this tag a previously-cached bf8_b wo is reloaded unchanged
+    +                # and lowering wo_dtype is a SILENT no-op that measures as "no gain".
+    +                cache_name(f"wo_width_sharded_2d{_wo_dtype_tag}")
+    +                if (self.use_fused_all_gather_matmul or self.TG)
+    +                else cache_name(f"wo{_wo_dtype_tag}")
+                 ),
+             )
+             if not use_paged_kv_cache:
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index cf50d6f983..f989d783a0 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -239,6 +239,14 @@ class ModelOptimizations:
+                         # one resident tensor shared by the prefill AND decode QKV matmuls, so the
+                         # halving lands on both paths.
+                         TensorGroup.WQKV: PrecisionSetting.BFP4,
+    +                    # WO is the last tensor group `performance()` never lowered: FF1/FF3, FF2 and WQKV
+    +                    # all ride bf4_b, while the attention output projection was still inheriting the
+    +                    # BFP8 default simply because it is not named here. It is [n_heads*head_dim, dim]
+    +                    # = 4096 x 4096 = 16.8M params, ~17.8 MB per layer at bf8_b, and the roofline tags
+    +                    # its decode matmul memory-bound -- so halving it removes ~8.4 MB per layer, ~270 MB
+    ... (truncated, 6 more lines)
+
+[#253] PagedFusedUpdateCache · structural · no gain  +2023.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..1210c1fedf 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -367,6 +367,8 @@ class Attention(LightweightModule):
+                     cache_file_name=(cache_name("wo_sharded_ring")),
+                 )
+     
+    +        _wo_dtype_tag = f"_{str(self.wo_dtype).rsplit('.', 1)[-1].lower()}"
+    +
+             def get_wo_memory_config():
+                 if self.use_fused_all_gather_matmul or self.TG:
+                     return ttnn.DRAM_MEMORY_CONFIG
+    @@ -381,7 +383,12 @@ class Attention(LightweightModule):
+                 memory_config=get_wo_memory_config(),
+                 mesh_mapper=get_wo_mesh_mapper(),
+                 cache_file_name=(
+    -                cache_name("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else cache_name("wo")
+    +                # The cache key MUST encode the dtype. `as_tensor` returns the cached tensor exactly as
+    +                # it was stored, so without this tag a previously-cached bf8_b wo is reloaded unchanged
+    +                # and lowering wo_dtype is a SILENT no-op that measures as "no gain".
+    +                cache_name(f"wo_width_sharded_2d{_wo_dtype_tag}")
+    +                if (self.use_fused_all_gather_matmul or self.TG)
+    +                else cache_name(f"wo{_wo_dtype_tag}")
+                 ),
+             )
+             if not use_paged_kv_cache:
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index cf50d6f983..f989d783a0 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -239,6 +239,14 @@ class ModelOptimizations:
+                         # one resident tensor shared by the prefill AND decode QKV matmuls, so the
+                         # halving lands on both paths.
+                         TensorGroup.WQKV: PrecisionSetting.BFP4,
+    +                    # WO is the last tensor group `performance()` never lowered: FF1/FF3, FF2 and WQKV
+    +                    # all ride bf4_b, while the attention output projection was still inheriting the
+    +                    # BFP8 default simply because it is not named here. It is [n_heads*head_dim, dim]
+    +                    # = 4096 x 4096 = 16.8M params, ~17.8 MB per layer at bf8_b, and the roofline tags
+    +                    # its decode matmul memory-bound -- so halving it removes ~8.4 MB per layer, ~270 MB
+    ... (truncated, 6 more lines)
+
+[#254] PagedFusedUpdateCache · tt-lang · no gain  +2023.50 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..1210c1fedf 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -367,6 +367,8 @@ class Attention(LightweightModule):
+                     cache_file_name=(cache_name("wo_sharded_ring")),
+                 )
+     
+    +        _wo_dtype_tag = f"_{str(self.wo_dtype).rsplit('.', 1)[-1].lower()}"
+    +
+             def get_wo_memory_config():
+                 if self.use_fused_all_gather_matmul or self.TG:
+                     return ttnn.DRAM_MEMORY_CONFIG
+    @@ -381,7 +383,12 @@ class Attention(LightweightModule):
+                 memory_config=get_wo_memory_config(),
+                 mesh_mapper=get_wo_mesh_mapper(),
+                 cache_file_name=(
+    -                cache_name("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else cache_name("wo")
+    +                # The cache key MUST encode the dtype. `as_tensor` returns the cached tensor exactly as
+    +                # it was stored, so without this tag a previously-cached bf8_b wo is reloaded unchanged
+    +                # and lowering wo_dtype is a SILENT no-op that measures as "no gain".
+    +                cache_name(f"wo_width_sharded_2d{_wo_dtype_tag}")
+    +                if (self.use_fused_all_gather_matmul or self.TG)
+    +                else cache_name(f"wo{_wo_dtype_tag}")
+                 ),
+             )
+             if not use_paged_kv_cache:
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index cf50d6f983..f989d783a0 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -239,6 +239,14 @@ class ModelOptimizations:
+                         # one resident tensor shared by the prefill AND decode QKV matmuls, so the
+                         # halving lands on both paths.
+                         TensorGroup.WQKV: PrecisionSetting.BFP4,
+    +                    # WO is the last tensor group `performance()` never lowered: FF1/FF3, FF2 and WQKV
+    +                    # all ride bf4_b, while the attention output projection was still inheriting the
+    +                    # BFP8 default simply because it is not named here. It is [n_heads*head_dim, dim]
+    +                    # = 4096 x 4096 = 16.8M params, ~17.8 MB per layer at bf8_b, and the roofline tags
+    +                    # its decode matmul memory-bound -- so halving it removes ~8.4 MB per layer, ~270 MB
+    ... (truncated, 6 more lines)
+
 Limitations / suggested manual next steps:
-- 3 op(s) tried but no lever beat baseline: Matmul 32x4096x4096, PagedFusedUpdateCache, TopK
+- 2 op(s) tried but no lever beat baseline: PagedFusedUpdateCache, TopK
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
@@ -4676,6 +6088,9 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
+
 
 
 
