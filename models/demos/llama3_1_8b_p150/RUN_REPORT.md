@@ -1,21 +1,20 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Re-rendered with the bandwidth roofline active — 2026-07-28 13:35:45 UTC_
+_Updated live: 2026-07-28 14:02:31 UTC · 212 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
 ==========================================================
-eager per-op device time (16 layers):  2464.18 ms  ->  534.44 ms   (+78.3%, 4.61x)
-tracy trace pass (16 layers):  11.93 ms  ->  9.34 ms   (+21.7%, 1.28x)
+optimizing… — baseline->final speedup is finalized when the module converges (per-attempt detail below is live)
+tracy trace pass (16 layers):  43.06 ms  ->  9.34 ms   (+78.3%, 4.61x)
 trace+1CQ full-pipeline e2e (all layers):  48.38 ms  ->  22.79 ms   (+52.9%, 2.12x)
 
 Roofline & utilization
   theoretical ceiling : 153.8 tok/s/u
   achievable (60-80%) : 92.3 - 123.0 tok/s/u
-  measured            : 107.1 tok/s/u   (1000 / 9.34 ms)
-  measured mem BW     : 357 GB/s   (3.33 GB / 9.34 ms)
-  utilization         : 70%   (measured / ceiling)
+  measured            : n/a — the per-token reading is from a 16-layer window, the ceiling is for all layers (re-profile at full depth)
+  utilization         : n/a
 
 Op breakdown — device time by op class (profile totalling 556.80 ms over 16 layers · what to target, ranked):
 op class         device_ms      %   count  bound  dominant op (shape)
@@ -51,10 +50,11 @@ Matmul 128x4096x6144               ✓win      —         ✓win      —      
 Matmul 32x14336x4096               ·try      ✓win      ✓win      ·try      ·try      ·try      ·try      ·try         493.45
 Matmul 32x4096x14336               ✓win      ·try      ·try      ·try      ·try      ·try      ·try      ·try         614.88
 Matmul 32x4096x16032               ✓win      —         ✓win      ·try      ·try      ·try      ·try      ·try         662.92
-Matmul 32x4096x4096                —         ·try      —         —         —         —         —         —            534.44
-Matmul 32x4096x6144                ·try      ✓win      ·try      ✓win      ·try      ·try      ·try      ·try         534.44
+Matmul 32x4096x4096                ·try      ·try      —         —         —         —         —         —            453.08
+Matmul 32x4096x6144                ·try      ✓win      ·try      ✓win      ·try      ·try      ·try      ·try         459.95
 NLPConcatHeads                     ✓win      —         —         ·try      ·try      ✓win      —         —            448.70
 NlpCreateHeads                     ✓win      —         —         ✓win      ✓win      ✓win      —         —            465.94
+PagedFusedUpdateCache              ·try      —         —         —         —         —         —         —            448.70
 RotaryEmbeddingLlama               ✓win      —         —         —         ✓win      —         —         —            656.91
 SDPA                               ✓win      —         —         —         ·try      —         —         —            655.73
 TopK                               ·try      —         —         ·try      —         ·try      —         —                 —
@@ -270,6 +270,13 @@ Matmul 32x14336x4096                        cpp    493.72   +1970.46 ms  · no g
 NlpCreateHeads                             grid    465.94   +1998.24 ms  ✓ win      Hypothesis: this op is grid=tiny because a 32-token padded prompt is ONE seq tile and stock nlp_create_qkv_heads assigns one work unit per input row-tile, so the entire split ran on a SINGLE core; the
 host_overhead                      trace-capture    465.94   +1998.24 ms  · no gain  Hypothesis: a host-bound bucket means the host is re-issuing every op per step, so trace capture (GUIDELINES/08 section 11) should collapse the dispatch gaps. VERIFIED ALREADY APPLIED, so there is no 
 NLPConcatHeads                             grid    448.70   +2015.48 ms  ✓ win      Hypothesis: REUSED the lever just learned on the head split -- an in-tree tt-lang concat kernel already existed but its supports() was pinned to SEQ_LEN == 128, so the 32-token padded prompt fell thro
+Matmul 32x4096x16032                       grid    448.70   +2015.48 ms  · no gain  Hypothesis: the LM head is grid=partial for a STRUCTURAL reason, not a tuning one -- the DRAM-sharded matmul width-shards the activation across lm_head_core_grid cores, so its core count must divide K
+Matmul 32x4096x16032                       grid    448.72   +2015.46 ms  · no gain  Hypothesis: the LM head auto-route passes neither a program_config nor a core_grid, so ttnn picks the grid and the profiler measures it on 101 of 110 cores -- so ask for the full grid EXPLICITLY (core
+Matmul 32x4096x16032                      dtype         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: Event Synchronization is not supported during trace capture. (assert.hpp:104)
+Matmul 32x4096x16032                      dtype    448.70   +2015.48 ms  · no gain  Hypothesis: the LM head WEIGHT is already at the bf4_b floor (model.py sets lm_head_weight_dtype = bfloat4_b), so the only dtype bytes left on this DRAM-bw-bound op are what it WRITES -- the [32, padd
+Matmul 32x4096x4096                        grid    453.08   +2011.10 ms  · no gain  Hypothesis: this decode attention-output projection (wo) is grid=tiny because the DRAM-sharded matmul width-shards its activation, so the core count must divide K/32 = 128 tiles and caps at 64 of 110 
+Matmul 32x4096x6144                        grid    459.95   +2004.24 ms  · no gain  Hypothesis: this fused QKV projection is grid=tiny because the DRAM-sharded variant pins it to a narrow core grid, so try the escape that won for ff1/ff3 and the LM head -- wqkv held DRAM-INTERLEAVED 
+PagedFusedUpdateCache                      grid    448.70   +2015.48 ms  · no gain  Hypothesis: the op is tagged grid=tiny, so a full-grid program_config should raise its occupancy. NO GAIN and no lever exists to pull: checked the actual C++ binding (ttnn/cpp/ttnn/operations/experime
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4422,12 +4429,209 @@ Code changes — every attempt (win or fail):
     +                ttl.copy(x[(cx * HEADS_PER_COL + hh) * seq_tiles, cy], blk).wait()
     ... (truncated, 43 more lines)
 
+[#206] Matmul 32x4096x16032 · grid · no gain  +2015.48 ms
+    diff --git a/models/demos/llama3_1_8b_p150/perf_target_inputs.json b/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    new file mode 100644
+    index 0000000000..2009f2c22a
+    --- /dev/null
+    +++ b/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    @@ -0,0 +1,8 @@
+    +{
+    +  "weight_bytes": 3330000000,
+    +  "dominant_dtype": "bfloat4_b",
+    +  "layers": 16,
+    +  "kv_heads": 8,
+    +  "head_dim": 128,
+    +  "source": "measured from the device profile: sum of per-op bytes / 51 decode iterations in the window (bf4_b FFN, bf8_b wo), for the 16-layer profiled configuration"
+    +}
+
+[#207] Matmul 32x4096x16032 · grid · no gain  +2015.46 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index 7f72b1c0b6..c7cad56479 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -178,12 +178,23 @@ class LMHead(LightweightModule):
+                 Mode.DECODE if use_prefetcher else Mode.PREFILL, self.prefetcher if use_prefetcher else None
+             )
+     
+    +        _lm_head_full_core_grid = None
+             if self.full_grid and not use_prefetcher:
+                 # Auto-routed interleaved matmul: no shard spec on either operand, so the op is free to
+                 # spread its output tiles over every core instead of the 64 the width-shard pins it to.
+                 program_configs = [None] * len(split_sizes)
+                 self.lm_head_output_memory_config = ttnn.L1_MEMORY_CONFIG
+                 x_sharded = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)
+    +            # GRID rung: the auto-route above passes neither a program_config NOR a core_grid, so
+    +            # ttnn picks the grid itself and the profiler measures it landing on 101 of 110 cores.
+    +            # Ask for the whole grid explicitly and let the measurement say whether those last 9
+    +            # cores are reachable. The tile arithmetic predicts they are NOT: a split is
+    +            # 16032/32 = 501 output tiles, and 501 over 110 cores is 4.55, so the ceil lands at 5
+    +            # tiles x 101 cores (4 tiles would need 126 cores). gcd(4008 total tiles, 110) is 2, so
+    +            # NO split count divides this vocab evenly across the grid. Measured anyway rather than
+    +            # derived, because that is the rung.
+    +            _g = self.mesh_device.compute_with_storage_grid_size()
+    +            _lm_head_full_core_grid = ttnn.CoreGrid(y=_g.y, x=_g.x)
+             elif use_prefetcher:
+                 x_sharded = ttnn.to_memory_config(x, self.lm_head_output_memory_config)
+             else:
+    @@ -195,6 +206,7 @@ class LMHead(LightweightModule):
+                     weight,
+                     compute_kernel_config=self.compute_kernel_config,
+                     program_config=pc,
+    +                core_grid=_lm_head_full_core_grid,
+                     memory_config=self.lm_head_output_memory_config,
+                     dtype=self.args.lm_head_dtype if hasattr(self.args, "lm_head_dtype") else ttnn.bfloat8_b,
+                     sub_device_id=self.prefetcher.worker_sub_device_id if use_prefetcher else None,
+
+[#209] Matmul 32x4096x16032 · dtype · no gain  +2015.48 ms
+    diff --git a/models/demos/llama3_1_8b_p150/perf_target_inputs.json b/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    index 2009f2c22a..f3df39ccba 100644
+    --- a/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    +++ b/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    @@ -1,8 +1,8 @@
+     {
+    -  "weight_bytes": 3330000000,
+    +  "weight_bytes": 6094651392,
+       "dominant_dtype": "bfloat4_b",
+    -  "layers": 16,
+    +  "layers": 32,
+       "kv_heads": 8,
+       "head_dim": 128,
+    -  "source": "measured from the device profile: sum of per-op bytes / 51 decode iterations in the window (bf4_b FFN, bf8_b wo), for the 16-layer profiled configuration"
+    -}
+    +  "source": "analytic from the shipped dtypes (FF1/FF3 bfp4, FF2/WQKV/WO bfp8) over all 32 layers + lm_head; independent of any profile so it does not move as the build changes"
+    +}
+    \ No newline at end of file
+    diff --git a/models/demos/llama3_1_8b_p150/tt/lm_head.py b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    index 7f72b1c0b6..8b188d5d9b 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/lm_head.py
+    @@ -196,7 +196,14 @@ class LMHead(LightweightModule):
+                     compute_kernel_config=self.compute_kernel_config,
+                     program_config=pc,
+                     memory_config=self.lm_head_output_memory_config,
+    -                dtype=self.args.lm_head_dtype if hasattr(self.args, "lm_head_dtype") else ttnn.bfloat8_b,
+    +                # DTYPE rung. The WEIGHT is already at the bf4_b floor (model.py sets
+    +                # lm_head_weight_dtype = bfloat4_b), so the only dtype bytes left on this op are what
+    +                # it WRITES: the [32, padded_vocab] logits. The arithmetic says up front that this
+    +                # cannot matter much -- the logits are ~4.4 MB at bf8_b against a ~295 MB weight read,
+    +                # so even a perfect halving is <1% of the op -- and the logits are what argmax/sampling
+    +                # turn into the output token, so this is the one tensor in the model where precision is
+    +                # the product. Measured rather than assumed, because that is the rung.
+    +                dtype=ttnn.bfloat4_b,
+                     sub_device_id=self.prefetcher.worker_sub_device_id if use_prefetcher else None,
+                 )
+                 if not (self.full_grid and not use_prefetcher):
+
+[#210] Matmul 32x4096x4096 · grid · no gain  +2011.10 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..5122c9dd24 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -367,8 +367,27 @@ class Attention(LightweightModule):
+                     cache_file_name=(cache_name("wo_sharded_ring")),
+                 )
+     
+    +        # GRID rung for the decode attention-output projection (32 x 4096 x 4096). The DRAM-sharded
+    +        # matmul variant width-shards the activation, so its core count must divide K/32 = 128 tiles
+    +        # and caps at 64 of the P150's 110 cores -- the grid=tiny tag, and no program_config widens it
+    +        # while that variant is in use. The escape is the same one the LM head and ff1/ff3 already
+    +        # take: hold the weight DRAM-INTERLEAVED and let ttnn.linear auto-route the output tiles over
+    +        # the whole grid.
+    +        #
+    +        # Genuinely uncertain which way this goes, which is why it is measured. ff2 LOST this trade
+    +        # because its narrow N=128-tile output gave each core ~2 columns while still walking a 448-tile
+    +        # K reduction, so the per-core K loop dominated. wo has the SAME narrow N=128 tiles, but its K
+    +        # is only 128 tiles -- 3.5x shorter than ff2's -- so the term that killed ff2's wide grid is
+    +        # much smaller here, while the occupancy upside (64 -> ~110 cores) is the same.
+    +        self.full_grid_wo = (
+    +            self.prefetcher is None
+    +            and not self.TG
+    +            and self.num_devices == 1
+    +            and not self.use_fused_all_gather_matmul
+    +        )
+    +
+             def get_wo_memory_config():
+    -            if self.use_fused_all_gather_matmul or self.TG:
+    +            if self.use_fused_all_gather_matmul or self.TG or self.full_grid_wo:
+                     return ttnn.DRAM_MEMORY_CONFIG
+                 else:
+                     return wo_mem_config
+    @@ -380,8 +399,16 @@ class Attention(LightweightModule):
+                 device=self.mesh_device,
+                 memory_config=get_wo_memory_config(),
+                 mesh_mapper=get_wo_mesh_mapper(),
+    +            # The cache key MUST encode the memory config: as_tensor returns a cached tensor exactly
+    +            # as it was stored, so without the _ilv tag a previously cached DRAM-WIDTH-SHARDED wo is
+    +            # reloaded for the interleaved path and silently hands the matmul an operand whose shard
+    ... (truncated, 31 more lines)
+
+[#211] Matmul 32x4096x6144 · grid · no gain  +2004.24 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/attention.py b/models/demos/llama3_1_8b_p150/tt/attention.py
+    index b7d8e58302..3063f59b0f 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/attention.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/attention.py
+    @@ -274,16 +274,30 @@ class Attention(LightweightModule):
+     
+             qkv_cat = torch.cat(qkv_list, dim=-1).unsqueeze(0).unsqueeze(0)
+     
+    +        # GRID rung for the fused QKV projection (32 x 4096 x 6144). Same lever as ff1/ff3 and the LM
+    +        # head: the DRAM-sharded variant pins the op to a narrow core grid, so hold the weight
+    +        # DRAM-INTERLEAVED and let ttnn.linear auto-route over the whole grid.
+    +        #
+    +        # The refined occupancy rule PREDICTS THIS LOSES, and the point of measuring is to test that
+    +        # prediction rather than trust it: the trade is decided by tiles-per-core on the OUTPUT, and
+    +        # N=6144 is 192 tiles over ~110 cores = 1.75 tiles/core, below the ~2 where the per-core
+    +        # mcast/packer sync stops being amortisable. The ops that WON this trade were N=14336
+    +        # (448 tiles, ~4/core) and N=16032 (501 tiles); the ops that LOST were both N=128 tiles.
+    +        # QKV sits just under the threshold, so it is the case that actually tests the rule.
+    +        self.full_grid_qkv = self.prefetcher is None and not self.TG and self.num_devices == 1
+    +
+             self.wqkv = ttnn.as_tensor(
+                 qkv_cat,
+                 dtype=self.wqkv_dtype,
+                 layout=ttnn.TILE_LAYOUT,
+                 device=self.mesh_device,
+    -            memory_config=ttnn.DRAM_MEMORY_CONFIG if self.TG else wqkv_mem_config,
+    +            memory_config=ttnn.DRAM_MEMORY_CONFIG if (self.TG or self.full_grid_qkv) else wqkv_mem_config,
+                 mesh_mapper=ttnn.ShardTensor2dMesh(
+                     self.mesh_device, dims=(3, 2) if self.TG else (2, 3), mesh_shape=configuration.cluster_shape
+                 ),
+    -            cache_file_name=cache_name("wqkv_sharded_2d"),
+    +            # Layout must be in the cache key: as_tensor returns the cached tensor exactly as stored,
+    +            # so an untagged switch silently reloads the width-sharded weight into the interleaved path.
+    +            cache_file_name=cache_name("wqkv_sharded_2d_ilv" if self.full_grid_qkv else "wqkv_sharded_2d"),
+             )
+     
+             def norm_reshard(x, norm, mode, norm_config):
+    @@ -664,8 +678,13 @@ class Attention(LightweightModule):
+             xqkv_fused_sharded = ttnn.linear(
+                 x_sharded,
+    ... (truncated, 39 more lines)
+
+[#212] PagedFusedUpdateCache · grid · no gain  +2015.48 ms
+    diff --git a/models/demos/llama3_1_8b_p150/perf_target_inputs.json b/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    new file mode 100644
+    index 0000000000..2009f2c22a
+    --- /dev/null
+    +++ b/models/demos/llama3_1_8b_p150/perf_target_inputs.json
+    @@ -0,0 +1,8 @@
+    +{
+    +  "weight_bytes": 3330000000,
+    +  "dominant_dtype": "bfloat4_b",
+    +  "layers": 16,
+    +  "kv_heads": 8,
+    +  "head_dim": 128,
+    +  "source": "measured from the device profile: sum of per-op bytes / 51 decode iterations in the window (bf4_b FFN, bf8_b wo), for the 16-layer profiled configuration"
+    +}
+
 Limitations / suggested manual next steps:
-- 2 op(s) tried but no lever beat baseline: Matmul 32x4096x4096, TopK
+- 3 op(s) tried but no lever beat baseline: Matmul 32x4096x4096, PagedFusedUpdateCache, TopK
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
-  trace+1CQ perf:  (node-id not provided)
+  trace+1CQ perf:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_main_perf.py::test_main_perf -svv
+  full-model e2e PCC:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_pcc.py -svv
 
 levels: grid -> fidelity -> dtype -> shard -> host -> tt-lang -> cpp   |   ✓win = beat baseline, ·try = measured no-gain, ·wedge = wedged/crashed when tried, — = not attempted
 ```
@@ -4472,6 +4676,7 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
 
 
 
