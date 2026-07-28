@@ -1,60 +1,46 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 08:27:43 UTC · 150 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 09:24:58 UTC · 160 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
 ==========================================================
 optimizing… — baseline->final speedup is finalized when the module converges (per-attempt detail below is live)
-tracy trace pass, BASELINE, same window (16 layers):  2.63 ms
+tracy trace pass, BASELINE, same window (16 layers):  12.14 ms
 trace+1CQ full-pipeline e2e (all layers):  48.38 ms  ->  22.79 ms   (+52.9%, 2.12x)
 
 Roofline & utilization
-  modeled floor       : 537.23 ms   (Σ per-op roofline floors)
-  achievable (60-80%) : 671.54 - 895.38 ms
+  modeled floor       : 341.47 ms   (Σ per-op roofline floors)
+  achievable (60-80%) : 426.83 - 569.11 ms
   measured            : 648.17 ms
-  at-floor            : 83%   (110.94 ms reachable headroom)
-  status              : IN_BAND — reached the achievable band — done
+  at-floor            : 53%   (306.70 ms reachable headroom)
+  status              : BELOW_BAND — keep optimizing
   (tok/s/u — N/A: not an LLM decode pipeline)
 
 Op breakdown — device time by op class (BASELINE profile · what to target, ranked):
 op class         device_ms      %   count  bound  dominant op (shape)
 ---------------------------------------------------------------------------------------------------
-matmul              108.16  85.0%     886   slow  MatmulDeviceOperation 32 x 4096 x 16032
-host_overhead        32.15  25.3%       0   host  
-reduction             8.86   7.0%     292   slow  LayerNormDeviceOperation
-datamove              3.73   2.9%    1013   slow  UntilizeDeviceOperation
-other                 2.31   1.8%     398   slow  GenericOpDeviceOperation
-eltwise               2.01   1.6%     306   slow  BinaryNgDeviceOperation
-embedding             1.37   1.1%     103   slow  EmbeddingsDeviceOperation
-attention             0.74   0.6%     102   slow  SDPAOperation
+matmul              560.29  84.4%    4456   slow  MatmulDeviceOperation 128 x 4096 x 14336
+reduction            53.37   8.0%    1720   slow  LayerNormDeviceOperation
+host_overhead        46.61   7.0%       0   host  
+other                18.43   2.8%    2890   slow  GenericOpDeviceOperation
+eltwise              16.07   2.4%    2448   slow  BinaryNgDeviceOperation
+datamove              8.66   1.3%    4611   slow  TypecastDeviceOperation
+attention             5.93   0.9%     816   slow  SDPAOperation
+embedding             1.42   0.2%     103   slow  EmbeddingsDeviceOperation
 
-Block-level timing (per-stage trace) — latest lever on BinaryNgDeviceOperation:
-  MatmulDeviceOperation (all shapes)    547.69 ms  ###################### · True  <- hottest
-  LayerNormDeviceOperation     52.02 ms  ##....................
-  BinaryNg [128,14336] bf8_b gate mul (kernel-blocked: bf8_b pack)      8.23 ms  ......................
-  BinaryNg [32,14336] bf8_b decode gate mul (kernel-blocked: bf8_b pack)      3.50 ms  ......................
-  BinaryNg [128,4096] post-MLP add, stock 3.67us/call @110 cores      1.29 ms  ......................
-    same add, C++ Metalium 3.87us/call @110 cores (parity, reverted)      1.36 ms  ......................
-    same add, tt-lang 4.87us/call @64 cores (1.32x, reverted)      1.71 ms  ......................
-  BinaryNg [128,4096] post-attn add (kernel-blocked: mixed dtype)      1.29 ms  ......................
-  BinaryNg [32,4096] decode residual adds      1.03 ms  ......................
-  GenericOpDeviceOperation (tt-lang split+rope + concat)      6.83 ms  ......................
-  SDPAOperation (prefill)      4.80 ms  ......................
-
-Block-level timing (per-stage trace) — latest lever on BinaryNgDeviceOperation:
-  MatmulDeviceOperation (all shapes)    547.69 ms  ###################### · True  <- hottest
-  LayerNormDeviceOperation     52.02 ms  ##....................
-  BinaryNg [128,14336] bf8_b gate mul (kernel-blocked: bf8_b pack)      8.23 ms  ......................
-  BinaryNg [32,14336] bf8_b decode gate mul (kernel-blocked: bf8_b pack)      3.50 ms  ......................
-  BinaryNg [128,4096] post-MLP add, stock 3.67us/call @110 cores      1.29 ms  ......................
-    same add, C++ Metalium 3.87us/call @110 cores (parity, reverted)      1.36 ms  ......................
-    same add, tt-lang 4.87us/call @64 cores (1.32x, reverted)      1.71 ms  ......................
-  BinaryNg [128,4096] post-attn add (kernel-blocked: mixed dtype)      1.29 ms  ......................
-  BinaryNg [32,4096] decode residual adds      1.03 ms  ......................
-  GenericOpDeviceOperation (tt-lang split+rope + concat)      6.83 ms  ......................
-  SDPAOperation (prefill)      4.80 ms  ......................
+Block-level timing (per-stage trace) — latest lever on MatmulDeviceOperation:
+  MatmulDeviceOperation 128 x 4096 x 14336 (prefill ff1/ff3, 800 calls, 32 cores)    141.85 ms  ###################### · True  <- hottest
+  MatmulDeviceOperation 32 x 4096 x 14336 (decode ff1/ff3, 832 calls, 12 cores)     92.47 ms  ##############........
+  MatmulDeviceOperation 32 x 14336 x 4096 (decode ff2, 416 calls, 12 cores)     78.86 ms  ############..........
+  MatmulDeviceOperation 128 x 14336 x 4096 (prefill ff2, 400 calls, 32 cores)     76.63 ms  ############..........
+  LayerNormDeviceOperation (1679 calls, 1-64 cores)     52.32 ms  ########..............
+  MatmulDeviceOperation 32 x 4096 x 16032 (decode LM head, 101 cores)     43.68 ms  #######...............
+  MatmulDeviceOperation 128 x 4096 x 6144 (prefill QKV, 32 cores)     35.55 ms  ######................
+  MatmulDeviceOperation 32 x 4096 x 6144 (decode QKV, 12 cores)     35.50 ms  ######................
+  MatmulDeviceOperation 128 x 4096 x 4096 (prefill wo, 32 cores)     30.42 ms  #####.................
+  MatmulDeviceOperation 32 x 4096 x 4096 (decode wo, 12 cores)     25.34 ms  ####..................
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
@@ -63,7 +49,7 @@ BinaryNgDeviceOperation            ·try      —         —         ✓win    
 GenericOpDeviceOperation           ✓win      —         —         —         —         —         —         —                 —
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
-MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ✓win      ·try        1138.67
+MatmulDeviceOperation              ✓win      ·try      ✓win      ·try      ·try      ✓win      ✓win      ·try         664.13
 MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —           1092.12
 MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
 MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
@@ -231,6 +217,16 @@ BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no g
 BinaryNgDeviceOperation                 tt-lang    648.35   +1815.83 ms  · no gain  Re-recorded against a genuinely clean tree so the evidence scan runs whole-model-dir and sees tt/ttl_residual_add.py (the first two records were diff-scoped and flagged UNSUPPORTED -- a committed kern
 BinaryNgDeviceOperation                     cpp         —             —  ✓ win      committed: llama3_1_8b_p150: record the C++ Metalium eltwise-add rung and why it ties tt/cpp_add_generic.py + tt/kernels/{dataflow/reader_add_partition
 BinaryNgDeviceOperation                     cpp    647.82   +1816.36 ms  · no gain  Authored tt/cpp_add_generic.py + tt/kernels/{dataflow/reader_add_partitioned,compute/add_tiles_stream}.cpp -- a real Metalium reader/compute/writer triple through ttnn.generic_op, adapted from the rep
+MatmulDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: checkpoint the harness-generated perf test + live RUN_REPORT The perf harness rewrote tests/e2e/test_main_perf.py for this
+MatmulDeviceOperation                      grid         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_THROW: Only L1 buffers can have an associated circular buffer! (assert.hpp:104)
+MatmulDeviceOperation                      grid    664.17   +1800.01 ms  · no gain  Why: profiler says 800 calls @177.3us on only 32 of 110 cores, and a 2D-mcast reads in1 from DRAM on ONE core per grid COLUMN then multicasts down it -- so the 8 columns are the only weight readers, e
+MatmulDeviceOperation                     dtype    665.06   +1799.12 ms  · no gain  Why: the WEIGHT is already at the bf4_b floor (all 800 calls profile as 'LoFi BF16 x BFP4 => BFP8') and the OUTPUT is already bf8_b with the bf4_b step measured-and-rejected earlier, so the only bytes
+MatmulDeviceOperation                     dtype    664.05   +1800.13 ms  · no gain  Second dtype attempt, the other side of the op: walk what it WRITES the last step it has, bf8_b -> bf4_b, on the [128,14336] ff1/ff3 intermediate (2 tensors per layer, each read three times downstream
+MatmulDeviceOperation                     shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: MatmulMultiCoreReuseMultiCastProgramConfig: Batch fusion is required when input A is sharded (assert.hpp:104)
+MatmulDeviceOperation                     shard    665.55   +1798.63 ms  · no gain  Input side. Hypothesis: the activation reaches this op L1_INTERLEAVED, so every core still gathers its in0 block across the chip's L1 address space instead of owning it; BLOCK-shard it over the matmul
+MatmulDeviceOperation                     shard    678.93   +1785.25 ms  · no gain  Second shard attempt, OUTPUT side rather than input, and it isolates why the whole rung is closed. The existing L1 island lands the [128,14336] ff1/ff3 intermediate in L1_INTERLEAVED, so the SILU mul 
+MatmulDeviceOperation                  fidelity    664.13   +1800.05 ms  · no gain  The math fidelity itself is already at the LoFi FLOOR on this op (all 800 calls profile as 'LoFi BF16 x BFP4 => BFP8'), so there is no HiFi4->HiFi2->LoFi step left to take; the only fidelity-class var
+MatmulDeviceOperation                  fidelity    664.55   +1799.63 ms  · no gain  Second fidelity-class variant, the other Blackhole compute-kernel knob: dst_full_sync_en False -> True, which changes how the DST register bank is synced between math and pack and can relieve a packer
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -3358,6 +3354,174 @@ Code changes — every attempt (win or fail):
     +tt-lang loss was OCCUPANCY, not code quality, and once occupancy is equalised a hand-written
     ... (truncated, 240 more lines)
 
+[#153] MatmulDeviceOperation · grid · no gain  +1800.01 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 4faeb90502..34cc101761 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1346,6 +1346,17 @@ class ModelArgs:
+                             num_cores=self.mlp_core_grid.num_cores,
+                         )
+             elif mode == Mode.PREFILL:
+    +            # MEASURED DEAD END for the grid rung on short prefill w1/w3 (128 x 4096 x 14336).
+    +            # A 2D-mcast matmul reads in1 -- the weight -- from DRAM on ONE core per grid COLUMN and
+    +            # multicasts it down that column, so the COLUMN COUNT is the number of concurrent weight
+    +            # readers: the config below gives 8 readers, each pulling per_core_N=56 x k_tiles=128
+    +            # bf4_b tiles = 4.1 MB, i.e. ~23 GB/s per reader at 177 us/call -- the PER-CORE NoC
+    +            # ceiling, not the chip's DRAM ceiling. Widening to the device's 11 columns DOES pay
+    +            # (44 cores, 177.3 -> 164.3 us/call, -10.4 ms), but N=448 tiles has no divisor between
+    +            # 8 and 14, so 11 columns means a RAGGED tail column -- and the mcast kernel fills the
+    +            # ragged block with garbage: PCC collapsed to 0.125 (same failure the 1D in0-mcast form
+    +            # hit at 110 cores / per_core_N=5). Exact division is mandatory, and it caps the column
+    +            # count at 8. Do not re-widen this grid without padding N to a multiple of the columns.
+                 return self.matmul_config(
+                     m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
+                     k=self.dim // self.cluster_shape[0],
+
+[#154] MatmulDeviceOperation · dtype · no gain  +1799.12 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 4faeb90502..34cc101761 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1346,6 +1346,17 @@ class ModelArgs:
+                             num_cores=self.mlp_core_grid.num_cores,
+                         )
+             elif mode == Mode.PREFILL:
+    +            # MEASURED DEAD END for the grid rung on short prefill w1/w3 (128 x 4096 x 14336).
+    +            # A 2D-mcast matmul reads in1 -- the weight -- from DRAM on ONE core per grid COLUMN and
+    +            # multicasts it down that column, so the COLUMN COUNT is the number of concurrent weight
+    +            # readers: the config below gives 8 readers, each pulling per_core_N=56 x k_tiles=128
+    +            # bf4_b tiles = 4.1 MB, i.e. ~23 GB/s per reader at 177 us/call -- the PER-CORE NoC
+    +            # ceiling, not the chip's DRAM ceiling. Widening to the device's 11 columns DOES pay
+    +            # (44 cores, 177.3 -> 164.3 us/call, -10.4 ms), but N=448 tiles has no divisor between
+    +            # 8 and 14, so 11 columns means a RAGGED tail column -- and the mcast kernel fills the
+    +            # ragged block with garbage: PCC collapsed to 0.125 (same failure the 1D in0-mcast form
+    +            # hit at 110 cores / per_core_N=5). Exact division is mandatory, and it caps the column
+    +            # count at 8. Do not re-widen this grid without padding N to a multiple of the columns.
+                 return self.matmul_config(
+                     m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
+                     k=self.dim // self.cluster_shape[0],
+
+[#155] MatmulDeviceOperation · dtype · no gain  +1800.13 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 4faeb90502..34cc101761 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1346,6 +1346,17 @@ class ModelArgs:
+                             num_cores=self.mlp_core_grid.num_cores,
+                         )
+             elif mode == Mode.PREFILL:
+    +            # MEASURED DEAD END for the grid rung on short prefill w1/w3 (128 x 4096 x 14336).
+    +            # A 2D-mcast matmul reads in1 -- the weight -- from DRAM on ONE core per grid COLUMN and
+    +            # multicasts it down that column, so the COLUMN COUNT is the number of concurrent weight
+    +            # readers: the config below gives 8 readers, each pulling per_core_N=56 x k_tiles=128
+    +            # bf4_b tiles = 4.1 MB, i.e. ~23 GB/s per reader at 177 us/call -- the PER-CORE NoC
+    +            # ceiling, not the chip's DRAM ceiling. Widening to the device's 11 columns DOES pay
+    +            # (44 cores, 177.3 -> 164.3 us/call, -10.4 ms), but N=448 tiles has no divisor between
+    +            # 8 and 14, so 11 columns means a RAGGED tail column -- and the mcast kernel fills the
+    +            # ragged block with garbage: PCC collapsed to 0.125 (same failure the 1D in0-mcast form
+    +            # hit at 110 cores / per_core_N=5). Exact division is mandatory, and it caps the column
+    +            # count at 8. Do not re-widen this grid without padding N to a multiple of the columns.
+                 return self.matmul_config(
+                     m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
+                     k=self.dim // self.cluster_shape[0],
+
+[#157] MatmulDeviceOperation · shard · no gain  +1798.63 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 4faeb90502..34cc101761 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1346,6 +1346,17 @@ class ModelArgs:
+                             num_cores=self.mlp_core_grid.num_cores,
+                         )
+             elif mode == Mode.PREFILL:
+    +            # MEASURED DEAD END for the grid rung on short prefill w1/w3 (128 x 4096 x 14336).
+    +            # A 2D-mcast matmul reads in1 -- the weight -- from DRAM on ONE core per grid COLUMN and
+    +            # multicasts it down that column, so the COLUMN COUNT is the number of concurrent weight
+    +            # readers: the config below gives 8 readers, each pulling per_core_N=56 x k_tiles=128
+    +            # bf4_b tiles = 4.1 MB, i.e. ~23 GB/s per reader at 177 us/call -- the PER-CORE NoC
+    +            # ceiling, not the chip's DRAM ceiling. Widening to the device's 11 columns DOES pay
+    +            # (44 cores, 177.3 -> 164.3 us/call, -10.4 ms), but N=448 tiles has no divisor between
+    +            # 8 and 14, so 11 columns means a RAGGED tail column -- and the mcast kernel fills the
+    +            # ragged block with garbage: PCC collapsed to 0.125 (same failure the 1D in0-mcast form
+    +            # hit at 110 cores / per_core_N=5). Exact division is mandatory, and it caps the column
+    +            # count at 8. Do not re-widen this grid without padding N to a multiple of the columns.
+                 return self.matmul_config(
+                     m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
+                     k=self.dim // self.cluster_shape[0],
+
+[#158] MatmulDeviceOperation · shard · no gain  +1785.25 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 4faeb90502..34cc101761 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1346,6 +1346,17 @@ class ModelArgs:
+                             num_cores=self.mlp_core_grid.num_cores,
+                         )
+             elif mode == Mode.PREFILL:
+    +            # MEASURED DEAD END for the grid rung on short prefill w1/w3 (128 x 4096 x 14336).
+    +            # A 2D-mcast matmul reads in1 -- the weight -- from DRAM on ONE core per grid COLUMN and
+    +            # multicasts it down that column, so the COLUMN COUNT is the number of concurrent weight
+    +            # readers: the config below gives 8 readers, each pulling per_core_N=56 x k_tiles=128
+    +            # bf4_b tiles = 4.1 MB, i.e. ~23 GB/s per reader at 177 us/call -- the PER-CORE NoC
+    +            # ceiling, not the chip's DRAM ceiling. Widening to the device's 11 columns DOES pay
+    +            # (44 cores, 177.3 -> 164.3 us/call, -10.4 ms), but N=448 tiles has no divisor between
+    +            # 8 and 14, so 11 columns means a RAGGED tail column -- and the mcast kernel fills the
+    +            # ragged block with garbage: PCC collapsed to 0.125 (same failure the 1D in0-mcast form
+    +            # hit at 110 cores / per_core_N=5). Exact division is mandatory, and it caps the column
+    +            # count at 8. Do not re-widen this grid without padding N to a multiple of the columns.
+                 return self.matmul_config(
+                     m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
+                     k=self.dim // self.cluster_shape[0],
+
+[#159] MatmulDeviceOperation · fidelity · no gain  +1800.05 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 4faeb90502..34cc101761 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1346,6 +1346,17 @@ class ModelArgs:
+                             num_cores=self.mlp_core_grid.num_cores,
+                         )
+             elif mode == Mode.PREFILL:
+    +            # MEASURED DEAD END for the grid rung on short prefill w1/w3 (128 x 4096 x 14336).
+    +            # A 2D-mcast matmul reads in1 -- the weight -- from DRAM on ONE core per grid COLUMN and
+    +            # multicasts it down that column, so the COLUMN COUNT is the number of concurrent weight
+    +            # readers: the config below gives 8 readers, each pulling per_core_N=56 x k_tiles=128
+    +            # bf4_b tiles = 4.1 MB, i.e. ~23 GB/s per reader at 177 us/call -- the PER-CORE NoC
+    +            # ceiling, not the chip's DRAM ceiling. Widening to the device's 11 columns DOES pay
+    +            # (44 cores, 177.3 -> 164.3 us/call, -10.4 ms), but N=448 tiles has no divisor between
+    +            # 8 and 14, so 11 columns means a RAGGED tail column -- and the mcast kernel fills the
+    +            # ragged block with garbage: PCC collapsed to 0.125 (same failure the 1D in0-mcast form
+    +            # hit at 110 cores / per_core_N=5). Exact division is mandatory, and it caps the column
+    +            # count at 8. Do not re-widen this grid without padding N to a multiple of the columns.
+                 return self.matmul_config(
+                     m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
+                     k=self.dim // self.cluster_shape[0],
+
+[#160] MatmulDeviceOperation · fidelity · no gain  +1799.63 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/model_config.py b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    index 4faeb90502..34cc101761 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/model_config.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
+    @@ -1346,6 +1346,17 @@ class ModelArgs:
+                             num_cores=self.mlp_core_grid.num_cores,
+                         )
+             elif mode == Mode.PREFILL:
+    +            # MEASURED DEAD END for the grid rung on short prefill w1/w3 (128 x 4096 x 14336).
+    +            # A 2D-mcast matmul reads in1 -- the weight -- from DRAM on ONE core per grid COLUMN and
+    +            # multicasts it down that column, so the COLUMN COUNT is the number of concurrent weight
+    +            # readers: the config below gives 8 readers, each pulling per_core_N=56 x k_tiles=128
+    +            # bf4_b tiles = 4.1 MB, i.e. ~23 GB/s per reader at 177 us/call -- the PER-CORE NoC
+    +            # ceiling, not the chip's DRAM ceiling. Widening to the device's 11 columns DOES pay
+    +            # (44 cores, 177.3 -> 164.3 us/call, -10.4 ms), but N=448 tiles has no divisor between
+    +            # 8 and 14, so 11 columns means a RAGGED tail column -- and the mcast kernel fills the
+    +            # ragged block with garbage: PCC collapsed to 0.125 (same failure the 1D in0-mcast form
+    +            # hit at 110 cores / per_core_N=5). Exact division is mandatory, and it caps the column
+    +            # count at 8. Do not re-widen this grid without padding N to a multiple of the columns.
+                 return self.matmul_config(
+                     m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
+                     k=self.dim // self.cluster_shape[0],
+
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
@@ -3409,4 +3573,14 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
+
+
+
+
+
+
+
+
 

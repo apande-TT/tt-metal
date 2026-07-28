@@ -1346,6 +1346,17 @@ class ModelArgs:
                         num_cores=self.mlp_core_grid.num_cores,
                     )
         elif mode == Mode.PREFILL:
+            # MEASURED DEAD END for the grid rung on short prefill w1/w3 (128 x 4096 x 14336).
+            # A 2D-mcast matmul reads in1 -- the weight -- from DRAM on ONE core per grid COLUMN and
+            # multicasts it down that column, so the COLUMN COUNT is the number of concurrent weight
+            # readers: the config below gives 8 readers, each pulling per_core_N=56 x k_tiles=128
+            # bf4_b tiles = 4.1 MB, i.e. ~23 GB/s per reader at 177 us/call -- the PER-CORE NoC
+            # ceiling, not the chip's DRAM ceiling. Widening to the device's 11 columns DOES pay
+            # (44 cores, 177.3 -> 164.3 us/call, -10.4 ms), but N=448 tiles has no divisor between
+            # 8 and 14, so 11 columns means a RAGGED tail column -- and the mcast kernel fills the
+            # ragged block with garbage: PCC collapsed to 0.125 (same failure the 1D in0-mcast form
+            # hit at 110 cores / per_core_N=5). Exact division is mandatory, and it caps the column
+            # count at 8. Do not re-widen this grid without padding N to a multiple of the columns.
             return self.matmul_config(
                 m=min(seq_len, self.prefill_len_cutoff),  # 512 if BH, 1024 if WH
                 k=self.dim // self.cluster_shape[0],
