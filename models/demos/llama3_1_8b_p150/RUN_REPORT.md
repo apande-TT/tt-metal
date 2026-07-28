@@ -1,67 +1,67 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 09:45:27 UTC · 168 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 10:35:57 UTC · 178 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
 ==========================================================
 optimizing… — baseline->final speedup is finalized when the module converges (per-attempt detail below is live)
-tracy trace pass, BASELINE, same window (16 layers):  12.14 ms
+tracy trace pass, BASELINE, same window (16 layers):  11.93 ms
 trace+1CQ full-pipeline e2e (all layers):  48.38 ms  ->  22.79 ms   (+52.9%, 2.12x)
 
 Roofline & utilization
-  modeled floor       : 341.47 ms   (Σ per-op roofline floors)
-  achievable (60-80%) : 426.83 - 569.11 ms
-  measured            : 648.17 ms
-  at-floor            : 53%   (306.70 ms reachable headroom)
+  modeled floor       : 331.86 ms   (Σ per-op roofline floors)
+  achievable (60-80%) : 414.82 - 553.10 ms
+  measured            : 615.69 ms
+  at-floor            : 54%   (283.83 ms reachable headroom)
   status              : BELOW_BAND — keep optimizing
   (tok/s/u — N/A: not an LLM decode pipeline)
 
 Op breakdown — device time by op class (BASELINE profile · what to target, ranked):
 op class         device_ms      %   count  bound  dominant op (shape)
 ---------------------------------------------------------------------------------------------------
-matmul              560.29  84.4%    4456   slow  MatmulDeviceOperation 128 x 4096 x 14336
-reduction            53.37   8.0%    1720   slow  LayerNormDeviceOperation
-host_overhead        46.61   7.0%       0   host  
-other                18.43   2.8%    2890   slow  GenericOpDeviceOperation
-eltwise              16.07   2.4%    2448   slow  BinaryNgDeviceOperation
-datamove              8.66   1.3%    4611   slow  TypecastDeviceOperation
-attention             5.93   0.9%     816   slow  SDPAOperation
-embedding             1.42   0.2%     103   slow  EmbeddingsDeviceOperation
+matmul              478.44  77.7%    4456   slow  MatmulDeviceOperation 32 x 4096 x 14336
+reduction            52.91   8.6%    1720   slow  LayerNormDeviceOperation
+attention            37.96   6.2%    2016   slow  NlpCreateHeadsDeviceOperation
+datamove             26.43   4.3%    5406   slow  NLPConcatHeadsDeviceOperation
+host_overhead        21.55   3.5%       0   host  
+other                 9.97   1.6%    2090   slow  PagedFusedUpdateCacheDeviceOperation
+eltwise               8.89   1.4%    2448   slow  BinaryNgDeviceOperation
+embedding             1.09   0.2%     103   slow  EmbeddingsDeviceOperation
 
 Block-level timing (per-stage trace) — latest lever on MatmulDeviceOperation:
-  MatmulDeviceOperation 32 x 4096 x 14336 (ff1/ff3, prefill+decode now share the shape, 1632 calls)    200.94 ms  ###################### · True  <- hottest
-  MatmulDeviceOperation 32 x 14336 x 4096 (ff2, 816 calls, 178 GB/s on 12 cores)    151.47 ms  #################.....
-  MatmulDeviceOperation 32 x 4096 x 6144 (QKV, 816 calls, 167 GB/s)     69.18 ms  ########..............
-  LayerNormDeviceOperation (1679 calls)     51.80 ms  ######................
-  MatmulDeviceOperation 32 x 4096 x 4096 (wo, 816 calls)     51.76 ms  ######................
-  MatmulDeviceOperation 32 x 4096 x 16032 (LM head, 318 GB/s on 101 cores)     43.70 ms  #####.................
-  NlpCreateHeadsDeviceOperation (REGRESSED: tt-lang kernel gated on SEQ_LEN==128, now stock on 1 core)     28.54 ms  ###...................
-  NLPConcatHeadsDeviceOperation (REGRESSED: same cause)     18.29 ms  ##....................
-  BinaryNgDeviceOperation (improved 16.07 -> 9.36)      9.36 ms  #.....................
-  RotaryEmbeddingLlamaDeviceOperation (no longer fused into the head-split kernel)      5.95 ms  #.....................
+  MatmulDeviceOperation 32 x 4096 x 14336 (ff1/ff3, NOW 90 cores @ 99.6us, 332 GB/s)    162.51 ms  ###################### · True  <- hottest
+  MatmulDeviceOperation 32 x 14336 x 4096 (ff2, kept DRAM-sharded on 8/12 cores: full grid measured 34ms WORSE)    151.31 ms  ####################..
+  MatmulDeviceOperation 32 x 4096 x 6144 (QKV, still 8/12 cores, 167 GB/s - next target)     69.19 ms  #########.............
+  LayerNormDeviceOperation (1679 calls, 1-64 cores)     51.85 ms  #######...............
+  MatmulDeviceOperation 32 x 4096 x 4096 (wo, still 8/12 cores)     51.73 ms  #######...............
+  MatmulDeviceOperation 32 x 4096 x 16032 (LM head, 101 cores - the lever this reused)     43.70 ms  ######................
+  NlpCreateHeadsDeviceOperation (1 core: tt-lang kernel gated on SEQ_LEN==128)     28.55 ms  ####..................
+  NLPConcatHeadsDeviceOperation (1 core: same cause)     18.33 ms  ##....................
+  BinaryNgDeviceOperation (110 cores)      8.89 ms  #.....................
+  RotaryEmbeddingLlamaDeviceOperation (110 cores)      5.97 ms  #.....................
 
 op                                 grid      fidelity  dtype     shard     host      tt-lang   cpp       other       best ms
 ----------------------------------------------------------------------------------------------------------------------------
-ArgMaxDeviceOperation              ✓win      —         —         ✓win      ✓win      —         —         —                 —
-BinaryNgDeviceOperation            ·try      —         —         ✓win      ·try      ✓win      ✓win      —            648.17
-GenericOpDeviceOperation           ✓win      —         —         —         —         —         —         —                 —
+ArgMaxDeviceOperation              ·try      —         —         ✓win      ✓win      —         —         —            682.47
+BinaryNgDeviceOperation            ·try      —         —         ✓win      ·try      ·try      ·try      —            648.17
+GenericOpDeviceOperation           ✓win      —         —         —         —         —         —         —            653.69
 LayerNormDeviceOperation           ·try      —         —         ·try      ·try      —         —         —           1057.73
-MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ✓win        1061.00
-MatmulDeviceOperation              ✓win      ✓win      ✓win      ·try      ✓win      ✓win      ✓win      ✓win         665.55
-MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —           1092.12
-MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ✓win      ·try      ·try        1057.68
-MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ✓win         891.98
-MatmulDeviceOperation              ✓win      —         ✓win      ·try      ·try      ·try      ·try      ✓win         662.92
-MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ✓win      ·try      ✓win         745.01
-NLPConcatHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            714.94
-NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            955.25
-RotaryEmbeddingLlamaDeviceOperatio ✓win      —         —         —         ✓win      —         —         —                 —
+MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ·try        1061.00
+MatmulDeviceOperation              ·try      ·try      ✓win      ·try      ✓win      ·try      ·try      ·try         654.43
+MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —            749.85
+MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ·try      ·try      ·try        1057.68
+MatmulDeviceOperation              ✓win      ·try      ·try      ·try      ·try      ·try      ·try      ·try         614.88
+MatmulDeviceOperation              ✓win      —         ✓win      ·try      ·try      ·try      ·try      ·try         662.92
+MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ·try         745.01
+NLPConcatHeadsDeviceOperation      ·try      —         —         ·try      ·try      ✓win      —         —            714.94
+NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            758.37
+RotaryEmbeddingLlamaDeviceOperatio ✓win      —         —         —         ✓win      —         —         —            656.91
 SDPAOperation                      ✓win      —         —         —         ·try      —         —         —            655.73
-TopKDeviceOperation                ✓win      —         —         ✓win      —         ✓win      —         —                 —
+TopKDeviceOperation                ·try      —         —         ·try      —         ·try      —         —                 —
 TopKDeviceOperation                ·try      —         —         ·try      ✓win      —         —         —           1537.69
-host_overhead                      —         —         —         —         —         —         —         ✓win              —
+host_overhead                      —         —         —         —         —         —         —         ✓win         891.98
 
 
 Per-attempt detail (every optimization tried — win OR fail — with gain vs baseline and WHY):
@@ -235,6 +235,16 @@ MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no g
 MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: name the canonical TP-fracture API at the MLP weight call site The MLP already implements GUIDELINES/08 section 14 -- w1/w
 MatmulDeviceOperation                structural         —             —  ✓ win      committed: llama3_1_8b_p150: stop padding every short prompt up to a 128-token prefill get_padded_prefill_len floored at 128, so the 6-token prompt in
 MatmulDeviceOperation                structural    654.43   +1809.75 ms  ✓ win      COMMITTED, and it retires this op by deleting it rather than tuning it. Found the reducible work by asking why M is 128 at all: get_padded_prefill_len floored at 128, so the 6-token prompt ran a 128-P
+MatmulDeviceOperation                      grid         —             —  ✓ win      committed: llama3_1_8b_p150: run ff1/ff3 on the full core grid via DRAM-interleaved w1/w3 The DRAM-sharded matmul variant takes its core grid from the
+MatmulDeviceOperation                      grid    615.69   +1848.49 ms  ✓ win      COMMITTED, the biggest win of the round. Hypothesis: this op is grid=tiny/partial for a STRUCTURAL reason, not a tuning one -- the DRAM-sharded matmul variant derives its core grid from the WIDTH-SHAR
+MatmulDeviceOperation                     dtype    616.67   +1847.51 ms  · no gain  Input side. w1/w3 are already at the bf4_b WEIGHT floor (the profile reads 'LoFi BF16 x BFP4 => BFP8'), so the only input bytes left are the [seq,4096] activation that BOTH matmuls read; cast it narro
+MatmulDeviceOperation                     dtype    615.82   +1848.36 ms  · no gain  Output side, the second and last dtype step this op has: walk what it WRITES from bf8_b to bf4_b on the [seq,14336] ff1/ff3 intermediate (two per layer, each read again by the SILU mul and then by ff2
+MatmulDeviceOperation                     shard         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: MatmulMultiCoreReuseMultiCastProgramConfig: Batch fusion is required when input A is sharded (assert.hpp:104)
+MatmulDeviceOperation                     shard    624.90   +1839.28 ms  · no gain  Input side, and this attempt is worth more than its number because it finally MEASURES a variant that was previously unmeasurable. Hypothesis: WIDTH-shard the activation into L1 so each core owns its 
+MatmulDeviceOperation                     shard    614.88   +1849.30 ms  · no gain  Second shard attempt, OUTPUT side rather than input, and chosen so it does NOT fight the grid win: leave the matmul auto-routed and give no shard spec, but ask it to WRITE a width-sharded L1 tensor, s
+MatmulDeviceOperation                  fidelity    615.49   +1848.69 ms  · no gain  The fidelity ladder is already at its FLOOR on this op -- all 1632 calls profile as 'LoFi BF16 x BFP4 => BFP8', so there is no HiFi4->HiFi2->LoFi step to take and the only fidelity-class variation lef
+MatmulDeviceOperation                  fidelity    615.47   +1848.71 ms  · no gain  Second fidelity-class variant, the other Blackhole compute-kernel knob: dst_full_sync_en False -> True, which changes how the DST register bank is synced between math and pack and can relieve a packer
+MatmulDeviceOperation               tp-fracture    615.69   +1848.49 ms  · no gain  Right hypothesis for what is left on this op: after the grid win it runs 33 MB of bf4_b weight at 332 GB/s on 90 cores, i.e. at DRAM rate with the dtype at its floor and single-chip occupancy spent, s
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -3625,6 +3635,324 @@ Code changes — every attempt (win or fail):
     +++ b/models/demos/llama3_1_8b_p150/tt/model_config.py
     ... (truncated, 25 more lines)
 
+[#170] MatmulDeviceOperation · grid · win  +1848.49 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index d3f6deafea..b1f261daa4 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -43,10 +43,40 @@ class MLP(LightweightModule):
+             # If padding was applied (e.g. via env var), add the unpadded hidden dim to the cache name to avoid loading incorrect weights
+             hidden_dim_string = f".hidden_dim_{args.hidden_dim}" if args.hidden_dim != args.unpadded_hidden_dim else ""
+     
+    +        # FULL-GRID MLP -- the same trade the LM head already makes, for the same reason. The
+    +        # DRAM-sharded matmul variant takes its core grid from the WIDTH-SHARD of its activation, so
+    +        # the core count must divide K/32 tiles; the profiler measures these matmuls running on 12
+    +        # cores (decode) and 8 (prefill) out of 110, and no program_config can widen them while that
+    +        # variant is in use, which is exactly the grid=tiny/partial tag. The escape is the other
+    +        # variant: hold the weights DRAM-INTERLEAVED and let ttnn.linear auto-route, which is free to
+    +        # spread the output tiles over the whole grid. It trades DRAM-sharded read bandwidth for
+    +        # occupancy, and on this board the LM head measures the trade as clearly worth it -- 101 cores
+    +        # at 318 GB/s on a 37 MB bf4_b weight, versus 167-268 GB/s for these 12-core MLP matmuls.
+    +        # Note this deliberately goes AGAINST the catalogued 'decode -> DRAM-sharded matmul' rule
+    +        # (GUIDELINES/05 section 3b, 08 section 2): that rule assumes the DRAM-sharded grid is wide,
+    +        # which is true on a 12-bank Wormhole and false here. Which one wins is a measurement.
+    +        #
+    +        # And the measurement says it wins for w1/w3 but LOSES for w2, so it is applied to w1/w3
+    +        # ONLY. Measured, both at once: ff1/ff3 (K=4096, N=14336) went 8/12 cores -> 90 cores and
+    +        # 123.1 -> 99.5 us/call, i.e. 332 GB/s, matching the LM head; ff2 (K=14336, N=4096) went 12
+    +        # -> 64 cores and 185.6 -> 227.4 us/call, i.e. DOWN to 145 GB/s. The asymmetry is the shape:
+    +        # spreading a NARROW N=128-tile output over many cores gives each core only ~2 output columns
+    +        # but still the whole 448-tile K reduction to walk, so the per-core K loop and its mcast/packer
+    +        # sync dominate. Wide-N, short-K wants occupancy; narrow-N, long-K wants the DRAM-sharded read.
+    +        self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
+    +        full_grid_mlp = self.full_grid_ff1_3_weights
+    +
+    +        # The cache key must encode the memory config: as_tensor returns a cached tensor exactly as it
+    +        # was stored, so without this tag a previously cached DRAM-WIDTH-SHARDED weight is reloaded
+    +        # for the interleaved path and silently hands the matmul an operand whose shard spec its
+    +        # program config does not expect. (Same trap the LM head documents.)
+    +        _layout_tag = lambda name: "_ilv" if (full_grid_mlp and "w2" not in name) else ""
+             if args.dummy_weights:
+                 cache_name = lambda _: None
+             else:
+    -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
+    ... (truncated, 66 more lines)
+
+[#171] MatmulDeviceOperation · dtype · no gain  +1847.51 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index d3f6deafea..b1f261daa4 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -43,10 +43,40 @@ class MLP(LightweightModule):
+             # If padding was applied (e.g. via env var), add the unpadded hidden dim to the cache name to avoid loading incorrect weights
+             hidden_dim_string = f".hidden_dim_{args.hidden_dim}" if args.hidden_dim != args.unpadded_hidden_dim else ""
+     
+    +        # FULL-GRID MLP -- the same trade the LM head already makes, for the same reason. The
+    +        # DRAM-sharded matmul variant takes its core grid from the WIDTH-SHARD of its activation, so
+    +        # the core count must divide K/32 tiles; the profiler measures these matmuls running on 12
+    +        # cores (decode) and 8 (prefill) out of 110, and no program_config can widen them while that
+    +        # variant is in use, which is exactly the grid=tiny/partial tag. The escape is the other
+    +        # variant: hold the weights DRAM-INTERLEAVED and let ttnn.linear auto-route, which is free to
+    +        # spread the output tiles over the whole grid. It trades DRAM-sharded read bandwidth for
+    +        # occupancy, and on this board the LM head measures the trade as clearly worth it -- 101 cores
+    +        # at 318 GB/s on a 37 MB bf4_b weight, versus 167-268 GB/s for these 12-core MLP matmuls.
+    +        # Note this deliberately goes AGAINST the catalogued 'decode -> DRAM-sharded matmul' rule
+    +        # (GUIDELINES/05 section 3b, 08 section 2): that rule assumes the DRAM-sharded grid is wide,
+    +        # which is true on a 12-bank Wormhole and false here. Which one wins is a measurement.
+    +        #
+    +        # And the measurement says it wins for w1/w3 but LOSES for w2, so it is applied to w1/w3
+    +        # ONLY. Measured, both at once: ff1/ff3 (K=4096, N=14336) went 8/12 cores -> 90 cores and
+    +        # 123.1 -> 99.5 us/call, i.e. 332 GB/s, matching the LM head; ff2 (K=14336, N=4096) went 12
+    +        # -> 64 cores and 185.6 -> 227.4 us/call, i.e. DOWN to 145 GB/s. The asymmetry is the shape:
+    +        # spreading a NARROW N=128-tile output over many cores gives each core only ~2 output columns
+    +        # but still the whole 448-tile K reduction to walk, so the per-core K loop and its mcast/packer
+    +        # sync dominate. Wide-N, short-K wants occupancy; narrow-N, long-K wants the DRAM-sharded read.
+    +        self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
+    +        full_grid_mlp = self.full_grid_ff1_3_weights
+    +
+    +        # The cache key must encode the memory config: as_tensor returns a cached tensor exactly as it
+    +        # was stored, so without this tag a previously cached DRAM-WIDTH-SHARDED weight is reloaded
+    +        # for the interleaved path and silently hands the matmul an operand whose shard spec its
+    +        # program config does not expect. (Same trap the LM head documents.)
+    +        _layout_tag = lambda name: "_ilv" if (full_grid_mlp and "w2" not in name) else ""
+             if args.dummy_weights:
+                 cache_name = lambda _: None
+             else:
+    -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
+    ... (truncated, 66 more lines)
+
+[#172] MatmulDeviceOperation · dtype · no gain  +1848.36 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index d3f6deafea..b1f261daa4 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -43,10 +43,40 @@ class MLP(LightweightModule):
+             # If padding was applied (e.g. via env var), add the unpadded hidden dim to the cache name to avoid loading incorrect weights
+             hidden_dim_string = f".hidden_dim_{args.hidden_dim}" if args.hidden_dim != args.unpadded_hidden_dim else ""
+     
+    +        # FULL-GRID MLP -- the same trade the LM head already makes, for the same reason. The
+    +        # DRAM-sharded matmul variant takes its core grid from the WIDTH-SHARD of its activation, so
+    +        # the core count must divide K/32 tiles; the profiler measures these matmuls running on 12
+    +        # cores (decode) and 8 (prefill) out of 110, and no program_config can widen them while that
+    +        # variant is in use, which is exactly the grid=tiny/partial tag. The escape is the other
+    +        # variant: hold the weights DRAM-INTERLEAVED and let ttnn.linear auto-route, which is free to
+    +        # spread the output tiles over the whole grid. It trades DRAM-sharded read bandwidth for
+    +        # occupancy, and on this board the LM head measures the trade as clearly worth it -- 101 cores
+    +        # at 318 GB/s on a 37 MB bf4_b weight, versus 167-268 GB/s for these 12-core MLP matmuls.
+    +        # Note this deliberately goes AGAINST the catalogued 'decode -> DRAM-sharded matmul' rule
+    +        # (GUIDELINES/05 section 3b, 08 section 2): that rule assumes the DRAM-sharded grid is wide,
+    +        # which is true on a 12-bank Wormhole and false here. Which one wins is a measurement.
+    +        #
+    +        # And the measurement says it wins for w1/w3 but LOSES for w2, so it is applied to w1/w3
+    +        # ONLY. Measured, both at once: ff1/ff3 (K=4096, N=14336) went 8/12 cores -> 90 cores and
+    +        # 123.1 -> 99.5 us/call, i.e. 332 GB/s, matching the LM head; ff2 (K=14336, N=4096) went 12
+    +        # -> 64 cores and 185.6 -> 227.4 us/call, i.e. DOWN to 145 GB/s. The asymmetry is the shape:
+    +        # spreading a NARROW N=128-tile output over many cores gives each core only ~2 output columns
+    +        # but still the whole 448-tile K reduction to walk, so the per-core K loop and its mcast/packer
+    +        # sync dominate. Wide-N, short-K wants occupancy; narrow-N, long-K wants the DRAM-sharded read.
+    +        self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
+    +        full_grid_mlp = self.full_grid_ff1_3_weights
+    +
+    +        # The cache key must encode the memory config: as_tensor returns a cached tensor exactly as it
+    +        # was stored, so without this tag a previously cached DRAM-WIDTH-SHARDED weight is reloaded
+    +        # for the interleaved path and silently hands the matmul an operand whose shard spec its
+    +        # program config does not expect. (Same trap the LM head documents.)
+    +        _layout_tag = lambda name: "_ilv" if (full_grid_mlp and "w2" not in name) else ""
+             if args.dummy_weights:
+                 cache_name = lambda _: None
+             else:
+    -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
+    ... (truncated, 66 more lines)
+
+[#174] MatmulDeviceOperation · shard · no gain  +1839.28 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index d3f6deafea..b1f261daa4 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -43,10 +43,40 @@ class MLP(LightweightModule):
+             # If padding was applied (e.g. via env var), add the unpadded hidden dim to the cache name to avoid loading incorrect weights
+             hidden_dim_string = f".hidden_dim_{args.hidden_dim}" if args.hidden_dim != args.unpadded_hidden_dim else ""
+     
+    +        # FULL-GRID MLP -- the same trade the LM head already makes, for the same reason. The
+    +        # DRAM-sharded matmul variant takes its core grid from the WIDTH-SHARD of its activation, so
+    +        # the core count must divide K/32 tiles; the profiler measures these matmuls running on 12
+    +        # cores (decode) and 8 (prefill) out of 110, and no program_config can widen them while that
+    +        # variant is in use, which is exactly the grid=tiny/partial tag. The escape is the other
+    +        # variant: hold the weights DRAM-INTERLEAVED and let ttnn.linear auto-route, which is free to
+    +        # spread the output tiles over the whole grid. It trades DRAM-sharded read bandwidth for
+    +        # occupancy, and on this board the LM head measures the trade as clearly worth it -- 101 cores
+    +        # at 318 GB/s on a 37 MB bf4_b weight, versus 167-268 GB/s for these 12-core MLP matmuls.
+    +        # Note this deliberately goes AGAINST the catalogued 'decode -> DRAM-sharded matmul' rule
+    +        # (GUIDELINES/05 section 3b, 08 section 2): that rule assumes the DRAM-sharded grid is wide,
+    +        # which is true on a 12-bank Wormhole and false here. Which one wins is a measurement.
+    +        #
+    +        # And the measurement says it wins for w1/w3 but LOSES for w2, so it is applied to w1/w3
+    +        # ONLY. Measured, both at once: ff1/ff3 (K=4096, N=14336) went 8/12 cores -> 90 cores and
+    +        # 123.1 -> 99.5 us/call, i.e. 332 GB/s, matching the LM head; ff2 (K=14336, N=4096) went 12
+    +        # -> 64 cores and 185.6 -> 227.4 us/call, i.e. DOWN to 145 GB/s. The asymmetry is the shape:
+    +        # spreading a NARROW N=128-tile output over many cores gives each core only ~2 output columns
+    +        # but still the whole 448-tile K reduction to walk, so the per-core K loop and its mcast/packer
+    +        # sync dominate. Wide-N, short-K wants occupancy; narrow-N, long-K wants the DRAM-sharded read.
+    +        self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
+    +        full_grid_mlp = self.full_grid_ff1_3_weights
+    +
+    +        # The cache key must encode the memory config: as_tensor returns a cached tensor exactly as it
+    +        # was stored, so without this tag a previously cached DRAM-WIDTH-SHARDED weight is reloaded
+    +        # for the interleaved path and silently hands the matmul an operand whose shard spec its
+    +        # program config does not expect. (Same trap the LM head documents.)
+    +        _layout_tag = lambda name: "_ilv" if (full_grid_mlp and "w2" not in name) else ""
+             if args.dummy_weights:
+                 cache_name = lambda _: None
+             else:
+    -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
+    ... (truncated, 66 more lines)
+
+[#175] MatmulDeviceOperation · shard · no gain  +1849.30 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index d3f6deafea..b1f261daa4 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -43,10 +43,40 @@ class MLP(LightweightModule):
+             # If padding was applied (e.g. via env var), add the unpadded hidden dim to the cache name to avoid loading incorrect weights
+             hidden_dim_string = f".hidden_dim_{args.hidden_dim}" if args.hidden_dim != args.unpadded_hidden_dim else ""
+     
+    +        # FULL-GRID MLP -- the same trade the LM head already makes, for the same reason. The
+    +        # DRAM-sharded matmul variant takes its core grid from the WIDTH-SHARD of its activation, so
+    +        # the core count must divide K/32 tiles; the profiler measures these matmuls running on 12
+    +        # cores (decode) and 8 (prefill) out of 110, and no program_config can widen them while that
+    +        # variant is in use, which is exactly the grid=tiny/partial tag. The escape is the other
+    +        # variant: hold the weights DRAM-INTERLEAVED and let ttnn.linear auto-route, which is free to
+    +        # spread the output tiles over the whole grid. It trades DRAM-sharded read bandwidth for
+    +        # occupancy, and on this board the LM head measures the trade as clearly worth it -- 101 cores
+    +        # at 318 GB/s on a 37 MB bf4_b weight, versus 167-268 GB/s for these 12-core MLP matmuls.
+    +        # Note this deliberately goes AGAINST the catalogued 'decode -> DRAM-sharded matmul' rule
+    +        # (GUIDELINES/05 section 3b, 08 section 2): that rule assumes the DRAM-sharded grid is wide,
+    +        # which is true on a 12-bank Wormhole and false here. Which one wins is a measurement.
+    +        #
+    +        # And the measurement says it wins for w1/w3 but LOSES for w2, so it is applied to w1/w3
+    +        # ONLY. Measured, both at once: ff1/ff3 (K=4096, N=14336) went 8/12 cores -> 90 cores and
+    +        # 123.1 -> 99.5 us/call, i.e. 332 GB/s, matching the LM head; ff2 (K=14336, N=4096) went 12
+    +        # -> 64 cores and 185.6 -> 227.4 us/call, i.e. DOWN to 145 GB/s. The asymmetry is the shape:
+    +        # spreading a NARROW N=128-tile output over many cores gives each core only ~2 output columns
+    +        # but still the whole 448-tile K reduction to walk, so the per-core K loop and its mcast/packer
+    +        # sync dominate. Wide-N, short-K wants occupancy; narrow-N, long-K wants the DRAM-sharded read.
+    +        self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
+    +        full_grid_mlp = self.full_grid_ff1_3_weights
+    +
+    +        # The cache key must encode the memory config: as_tensor returns a cached tensor exactly as it
+    +        # was stored, so without this tag a previously cached DRAM-WIDTH-SHARDED weight is reloaded
+    +        # for the interleaved path and silently hands the matmul an operand whose shard spec its
+    +        # program config does not expect. (Same trap the LM head documents.)
+    +        _layout_tag = lambda name: "_ilv" if (full_grid_mlp and "w2" not in name) else ""
+             if args.dummy_weights:
+                 cache_name = lambda _: None
+             else:
+    -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
+    ... (truncated, 66 more lines)
+
+[#176] MatmulDeviceOperation · fidelity · no gain  +1848.69 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index d3f6deafea..b1f261daa4 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -43,10 +43,40 @@ class MLP(LightweightModule):
+             # If padding was applied (e.g. via env var), add the unpadded hidden dim to the cache name to avoid loading incorrect weights
+             hidden_dim_string = f".hidden_dim_{args.hidden_dim}" if args.hidden_dim != args.unpadded_hidden_dim else ""
+     
+    +        # FULL-GRID MLP -- the same trade the LM head already makes, for the same reason. The
+    +        # DRAM-sharded matmul variant takes its core grid from the WIDTH-SHARD of its activation, so
+    +        # the core count must divide K/32 tiles; the profiler measures these matmuls running on 12
+    +        # cores (decode) and 8 (prefill) out of 110, and no program_config can widen them while that
+    +        # variant is in use, which is exactly the grid=tiny/partial tag. The escape is the other
+    +        # variant: hold the weights DRAM-INTERLEAVED and let ttnn.linear auto-route, which is free to
+    +        # spread the output tiles over the whole grid. It trades DRAM-sharded read bandwidth for
+    +        # occupancy, and on this board the LM head measures the trade as clearly worth it -- 101 cores
+    +        # at 318 GB/s on a 37 MB bf4_b weight, versus 167-268 GB/s for these 12-core MLP matmuls.
+    +        # Note this deliberately goes AGAINST the catalogued 'decode -> DRAM-sharded matmul' rule
+    +        # (GUIDELINES/05 section 3b, 08 section 2): that rule assumes the DRAM-sharded grid is wide,
+    +        # which is true on a 12-bank Wormhole and false here. Which one wins is a measurement.
+    +        #
+    +        # And the measurement says it wins for w1/w3 but LOSES for w2, so it is applied to w1/w3
+    +        # ONLY. Measured, both at once: ff1/ff3 (K=4096, N=14336) went 8/12 cores -> 90 cores and
+    +        # 123.1 -> 99.5 us/call, i.e. 332 GB/s, matching the LM head; ff2 (K=14336, N=4096) went 12
+    +        # -> 64 cores and 185.6 -> 227.4 us/call, i.e. DOWN to 145 GB/s. The asymmetry is the shape:
+    +        # spreading a NARROW N=128-tile output over many cores gives each core only ~2 output columns
+    +        # but still the whole 448-tile K reduction to walk, so the per-core K loop and its mcast/packer
+    +        # sync dominate. Wide-N, short-K wants occupancy; narrow-N, long-K wants the DRAM-sharded read.
+    +        self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
+    +        full_grid_mlp = self.full_grid_ff1_3_weights
+    +
+    +        # The cache key must encode the memory config: as_tensor returns a cached tensor exactly as it
+    +        # was stored, so without this tag a previously cached DRAM-WIDTH-SHARDED weight is reloaded
+    +        # for the interleaved path and silently hands the matmul an operand whose shard spec its
+    +        # program config does not expect. (Same trap the LM head documents.)
+    +        _layout_tag = lambda name: "_ilv" if (full_grid_mlp and "w2" not in name) else ""
+             if args.dummy_weights:
+                 cache_name = lambda _: None
+             else:
+    -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
+    ... (truncated, 66 more lines)
+
+[#177] MatmulDeviceOperation · fidelity · no gain  +1848.71 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index d3f6deafea..b1f261daa4 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -43,10 +43,40 @@ class MLP(LightweightModule):
+             # If padding was applied (e.g. via env var), add the unpadded hidden dim to the cache name to avoid loading incorrect weights
+             hidden_dim_string = f".hidden_dim_{args.hidden_dim}" if args.hidden_dim != args.unpadded_hidden_dim else ""
+     
+    +        # FULL-GRID MLP -- the same trade the LM head already makes, for the same reason. The
+    +        # DRAM-sharded matmul variant takes its core grid from the WIDTH-SHARD of its activation, so
+    +        # the core count must divide K/32 tiles; the profiler measures these matmuls running on 12
+    +        # cores (decode) and 8 (prefill) out of 110, and no program_config can widen them while that
+    +        # variant is in use, which is exactly the grid=tiny/partial tag. The escape is the other
+    +        # variant: hold the weights DRAM-INTERLEAVED and let ttnn.linear auto-route, which is free to
+    +        # spread the output tiles over the whole grid. It trades DRAM-sharded read bandwidth for
+    +        # occupancy, and on this board the LM head measures the trade as clearly worth it -- 101 cores
+    +        # at 318 GB/s on a 37 MB bf4_b weight, versus 167-268 GB/s for these 12-core MLP matmuls.
+    +        # Note this deliberately goes AGAINST the catalogued 'decode -> DRAM-sharded matmul' rule
+    +        # (GUIDELINES/05 section 3b, 08 section 2): that rule assumes the DRAM-sharded grid is wide,
+    +        # which is true on a 12-bank Wormhole and false here. Which one wins is a measurement.
+    +        #
+    +        # And the measurement says it wins for w1/w3 but LOSES for w2, so it is applied to w1/w3
+    +        # ONLY. Measured, both at once: ff1/ff3 (K=4096, N=14336) went 8/12 cores -> 90 cores and
+    +        # 123.1 -> 99.5 us/call, i.e. 332 GB/s, matching the LM head; ff2 (K=14336, N=4096) went 12
+    +        # -> 64 cores and 185.6 -> 227.4 us/call, i.e. DOWN to 145 GB/s. The asymmetry is the shape:
+    +        # spreading a NARROW N=128-tile output over many cores gives each core only ~2 output columns
+    +        # but still the whole 448-tile K reduction to walk, so the per-core K loop and its mcast/packer
+    +        # sync dominate. Wide-N, short-K wants occupancy; narrow-N, long-K wants the DRAM-sharded read.
+    +        self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
+    +        full_grid_mlp = self.full_grid_ff1_3_weights
+    +
+    +        # The cache key must encode the memory config: as_tensor returns a cached tensor exactly as it
+    +        # was stored, so without this tag a previously cached DRAM-WIDTH-SHARDED weight is reloaded
+    +        # for the interleaved path and silently hands the matmul an operand whose shard spec its
+    +        # program config does not expect. (Same trap the LM head documents.)
+    +        _layout_tag = lambda name: "_ilv" if (full_grid_mlp and "w2" not in name) else ""
+             if args.dummy_weights:
+                 cache_name = lambda _: None
+             else:
+    -            cache_name = lambda name: weight_cache_path / f"{state_dict_prefix}.{name}{hidden_dim_string}"
+    ... (truncated, 66 more lines)
+
+[#178] MatmulDeviceOperation · tp-fracture · no gain  +1848.49 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index b1f261daa4..138b55a557 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -134,7 +134,10 @@ class MLP(LightweightModule):
+             # keep them single-chip. This run resolves to a 1x1 mesh, so cluster_shape is [1,1], the
+             # mapper is an identity and tt_all_reduce short-circuits to its input; and the 8B weights fit
+             # on one P150, so TP would be a pure bandwidth play. Raising it is a TOPOLOGY change
+    -        # (TT_PERF_MESH_ROWS/COLS), not a model edit.
+    +        # (TT_PERF_MESH_ROWS/COLS), not a model edit. Re-confirmed after the full-grid win moved
+    +        # ff1/ff3 to 90 cores: tp_pick_degree(32, 4096, 14336) still returns best_tp=1, which is the
+    +        # expected answer -- TP would divide the 33 MB weight read across chips, but there is only one
+    +        # chip in this mesh, and single-chip occupancy has already been taken as far as it goes.
+             w1_dims = (-1, -2) if args.is_galaxy else (-2, -1)
+             w2_dims = (-2, -1) if args.is_galaxy else (-1, -2)
+
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
@@ -3676,6 +4004,16 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
+
+
+
+
+
+
+
+
 
 
 

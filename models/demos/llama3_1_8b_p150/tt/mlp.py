@@ -134,7 +134,10 @@ class MLP(LightweightModule):
         # keep them single-chip. This run resolves to a 1x1 mesh, so cluster_shape is [1,1], the
         # mapper is an identity and tt_all_reduce short-circuits to its input; and the 8B weights fit
         # on one P150, so TP would be a pure bandwidth play. Raising it is a TOPOLOGY change
-        # (TT_PERF_MESH_ROWS/COLS), not a model edit.
+        # (TT_PERF_MESH_ROWS/COLS), not a model edit. Re-confirmed after the full-grid win moved
+        # ff1/ff3 to 90 cores: tp_pick_degree(32, 4096, 14336) still returns best_tp=1, which is the
+        # expected answer -- TP would divide the 33 MB weight read across chips, but there is only one
+        # chip in this mesh, and single-chip occupancy has already been taken as far as it goes.
         w1_dims = (-1, -2) if args.is_galaxy else (-2, -1)
         w2_dims = (-2, -1) if args.is_galaxy else (-1, -2)
 
