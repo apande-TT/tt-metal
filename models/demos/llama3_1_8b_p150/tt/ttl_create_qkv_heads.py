@@ -203,12 +203,79 @@ def ttl_create_heads_rope(
                 ttl.copy(blk, v[cx * seq_tiles + st, c0 + c]).wait()
 
 
-def supports(xqkv_fused, num_heads, num_kv_heads, head_dim) -> bool:
-    """Is this call the exact shape the kernel is specialised for?
+# GRID RUNG for the SINGLE-SEQ-TILE prefill (seq_len == 32). A 32-token padded prompt is ONE seq
+# tile, and the stock nlp_create_qkv_heads assigns one work unit per input row-tile, so it runs the
+# whole split on a SINGLE core -- that is the grid=tiny tag, and no program_config exists for this op
+# to widen it, so the only way past it is a kernel with a different work decomposition.
+#
+# The 128-row kernel above cannot just be pointed at this shape: its y axis carries
+# cy = dim_half * SEQ_T + seq_tile, so at SEQ_T == 1 it would collapse to DIM_HALVES = 2 rows = 16
+# cores. But SEQ_T == 1 is exactly what FREES the y axis -- with no seq tiles to carry, y can hold one
+# dim tile per row instead of a half-head, so DIM_HALVES rises to HD_T (4) and HALF_T falls to 1.
+# That gives 8 x 4 = 32 cores at 6 tiles each, which covers all
+# (32 Q + 8 K + 8 V) heads x 1 seq tile x 4 dim tiles = 192 tiles exactly.
+# Kept as a SEPARATE @ttl.operation rather than parameterising the one above, because the grid and the
+# per-core tile counts are compile-time constants baked into the decorator.
+SEQ_LEN_1T = TILE
+SEQ_T_1T = SEQ_LEN_1T // TILE  # == 1
+DIM_HALVES_1T = HD_T  # one dim tile per y row, the whole point of this variant
+HALF_T_1T = HD_T // DIM_HALVES_1T  # == 1
+GRID_Y_1T = SEQ_T_1T * DIM_HALVES_1T  # == 4
 
-    The grid mapping is division-free only because the extents line up: 4 seq tiles on the y
-    axis, 8 grid columns each owning 4 Q heads plus one K and one V head. Anything else falls
-    back to the stock op.
+
+@ttl.operation(grid=(GRID_X, GRID_Y_1T))
+def ttl_create_heads_1t(x: ttnn.Tensor, q: ttnn.Tensor, k: ttnn.Tensor, v: ttnn.Tensor) -> None:
+    """Single-seq-tile twin of ``ttl_create_heads``: x [32, (nq + 2*nkv)*hd] -> q/k/v head-major.
+
+    With SEQ_T == 1 the seq index is constant 0 and y carries the dim tile directly (c0 = cy), so
+    core (cx, cy) moves head-group cx's 4 Q heads plus K head cx and V head cx, at dim tile cy.
+    """
+    seq_tiles = x.shape[0] // TILE
+    in_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+    out_dfb = ttl.make_dataflow_buffer_like(q, shape=(1, 1), block_count=2)
+
+    per_core_tiles = (Q_PER_COL + 2) * HALF_T_1T
+
+    @ttl.datamovement()
+    def read():
+        cx, cy = ttl.node(dims=2)
+        for hh in range(Q_PER_COL):
+            with in_dfb.reserve() as blk:
+                ttl.copy(x[0, (cx * Q_PER_COL + hh) * HD_T + cy], blk).wait()
+        with in_dfb.reserve() as blk:
+            ttl.copy(x[0, (N_Q_HEADS + cx) * HD_T + cy], blk).wait()
+        with in_dfb.reserve() as blk:
+            ttl.copy(x[0, (N_Q_HEADS + N_KV_HEADS + cx) * HD_T + cy], blk).wait()
+
+    @ttl.compute()
+    def passthrough():
+        for _ in range(per_core_tiles):
+            with in_dfb.wait() as ib:
+                with out_dfb.reserve() as ob:
+                    ob.store(ib)
+
+    @ttl.datamovement()
+    def write():
+        cx, cy = ttl.node(dims=2)
+        for hh in range(Q_PER_COL):
+            with out_dfb.wait() as blk:
+                ttl.copy(blk, q[(cx * Q_PER_COL + hh) * seq_tiles, cy]).wait()
+        with out_dfb.wait() as blk:
+            ttl.copy(blk, k[cx * seq_tiles, cy]).wait()
+        with out_dfb.wait() as blk:
+            ttl.copy(blk, v[cx * seq_tiles, cy]).wait()
+
+
+# seq_len -> the specialised split op for it. The rope-fused variant is 128-only (see supports_rope).
+_SPLIT_OPS = {SEQ_LEN: ttl_create_heads, SEQ_LEN_1T: ttl_create_heads_1t}
+
+
+def supports(xqkv_fused, num_heads, num_kv_heads, head_dim) -> bool:
+    """Is this call one of the shapes a kernel is specialised for?
+
+    The grid mapping is division-free only because the extents line up: 8 grid columns each owning
+    4 Q heads plus one K and one V head, with y carrying the seq tiles (128-row variant) or the dim
+    tiles (single-seq-tile variant). Any other seq length falls back to the stock op.
     """
     return (
         num_heads == N_Q_HEADS
@@ -217,7 +284,7 @@ def supports(xqkv_fused, num_heads, num_kv_heads, head_dim) -> bool:
         and len(xqkv_fused.shape) == 4
         and xqkv_fused.shape[0] == 1
         and xqkv_fused.shape[1] == 1
-        and xqkv_fused.shape[-2] == SEQ_LEN
+        and int(xqkv_fused.shape[-2]) in _SPLIT_OPS
         and xqkv_fused.shape[-1] == (N_Q_HEADS + 2 * N_KV_HEADS) * HEAD_DIM
     )
 
@@ -239,7 +306,7 @@ def create_qkv_heads_ttl(xqkv_fused, memory_config):
         return ttnn.empty([heads * seq_len, HEAD_DIM], dtype, ttnn.TILE_LAYOUT, device, memory_config)
 
     q, k, v = _out(N_Q_HEADS), _out(N_KV_HEADS), _out(N_KV_HEADS)
-    ttl_create_heads(x2, q, k, v)
+    _SPLIT_OPS[seq_len](x2, q, k, v)
 
     return (
         ttnn.reshape(q, [1, N_Q_HEADS, seq_len, HEAD_DIM]),
@@ -258,6 +325,11 @@ def supports_rope(xqkv_fused, num_heads, num_kv_heads, head_dim, cos, sin, trans
     tensors must be bf16, since the fused kernel does the rotate in the split's dtype.
     """
     if not supports(xqkv_fused, num_heads, num_kv_heads, head_dim):
+        return False
+    # The rope-fused kernel is specialised to the 128-row grid only. The single-seq-tile variant
+    # spends its y axis on dim tiles, so it has no seq-tile coordinate to index cos/sin with; that
+    # shape takes the plain split plus the stock rope ops.
+    if int(xqkv_fused.shape[-2]) != SEQ_LEN:
         return False
     if cos is None or sin is None or trans is None:
         return False

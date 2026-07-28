@@ -1,12 +1,12 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 13:14:15 UTC · 201 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Re-rendered with the corrected report code — 2026-07-28 13:19:15 UTC_
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
 ==========================================================
-optimizing… — baseline->final speedup is finalized when the module converges (per-attempt detail below is live)
+eager per-op device time (16 layers):  2464.18 ms  ->  534.44 ms   (+78.3%, 4.61x)
 tracy trace pass (16 layers):  11.93 ms  ->  9.34 ms   (+21.7%, 1.28x)
 trace+1CQ full-pipeline e2e (all layers):  48.38 ms  ->  22.79 ms   (+52.9%, 2.12x)
 
@@ -14,8 +14,8 @@ Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op max(FLOPs/peak, bytes/BW, dispatch); covers 93% of device time)
   achievable (60-80%) : 671.54 - 895.38 ms
   measured            : 493.61 ms
-  status              : PAST BASELINE FLOOR — measured 493.61 ms is faster than the 537.23 ms baseline bound because the optimized build does LESS work (fewer bytes moved), so its own bound is lower; the baseline stays fixed as the reference
-  (tok/s/u — unavailable: active_bytes not computed for this pipeline, so the per-token weight-bytes target has no numerator)
+  status              : PAST BASELINE FLOOR — keep optimizing
+  (tok/s/u — n/a: no weight-bytes input for this pipeline)
 
 Op breakdown — device time by op class (profile totalling 556.80 ms over 16 layers · what to target, ranked):
 op class         device_ms      %   count  bound  dominant op (shape)
@@ -266,6 +266,7 @@ Matmul 32x14336x4096                tp-fracture    493.45   +1970.73 ms  · no g
 LayerNorm                                  grid    493.61   +1970.57 ms  ✓ win      Tried because the interleaved rms_norm kernel parallelises over ROWS, so a [32,dim] padded prefill is ONE tile-row and can only ever occupy ONE core -- profiled at 62.5us/call x 757 calls = 47.3ms, ~9
 Matmul 32x14336x4096                 structural    575.26   +1888.92 ms  · no gain  Hypothesis: the recorded 'full-grid LOSES for w2' verdict (185.6 -> 227.4 us/call) was measured while ff2 still ran HiFi2, and the stated cause was a MATH term (each core gets ~2 output columns of a n
 Matmul 32x14336x4096                    tt-lang    493.72   +1970.46 ms  · no gain  Hypothesis: a hand tt-lang matmul could beat stock ttnn on this decode ff2 shape by owning the K reduction in-core instead of paying the stock op's mcast/packer sync on a 448-tile K. The kernel is aut
+Matmul 32x14336x4096                        cpp    493.72   +1970.46 ms  · no gain  Hypothesis: if tt-lang could not express a faster K reduction for this decode ff2, raw Metalium might, by controlling the reader/compute/writer triple directly. Authored and measured in-tree (tt/cpp_m
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4337,8 +4338,7 @@ Limitations / suggested manual next steps:
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
-  trace+1CQ perf:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_main_perf.py::test_main_perf -svv
-  full-model e2e PCC:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_pcc.py -svv
+  trace+1CQ perf:  (node-id not provided)
 
 levels: grid -> fidelity -> dtype -> shard -> host -> tt-lang -> cpp   |   ✓win = beat baseline, ·try = measured no-gain, ·wedge = wedged/crashed when tried, — = not attempted
 ```
@@ -4383,6 +4383,8 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
 
 
 
