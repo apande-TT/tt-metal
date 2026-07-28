@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 09:28:49 UTC · 165 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 09:28:57 UTC · 166 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -232,6 +232,7 @@ MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no g
 MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the generated RUN_REPORT Checkpoints the live lever log so the tree is clean for the next record: with a dirty tre
 MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no gain  Re-recorded against a clean tree so the evidence scan sees the model-wide TP plumbing rather than just the diff. Hypothesis, and it is the right one for this op: four rungs proved its 177 us/call is 3
 MatmulDeviceOperation               tp-fracture    664.15   +1800.03 ms  · no gain  Third record of this rung, and the point of it is that the fracture EXISTS and I can now show where. The first two records were flagged UNSUPPORTED because the evidence scan looks for the literal Shar
+MatmulDeviceOperation               tp-fracture         —             —  ✓ win      committed: llama3_1_8b_p150: name the canonical TP-fracture API at the MLP weight call site The MLP already implements GUIDELINES/08 section 14 -- w1/w
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -3630,6 +3631,7 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
 
 
 

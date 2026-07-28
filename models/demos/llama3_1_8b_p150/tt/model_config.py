@@ -1623,6 +1623,12 @@ class ModelArgs:
             if seq_len >= 2048
             else min(64, chunk_start_idx & -chunk_start_idx)
         )
+        # A chunk can never exceed the sequence it chunks. The ladders above bottom out at 64, so a
+        # padded prefill SHORTER than 64 (get_padded_prefill_len now emits 32 for a short prompt)
+        # would hand SDPA a q/k chunk bigger than seq_len and die inside the first decoder layer.
+        # Clamp to the sequence, tile-aligned.
+        q_chunk = min(q_chunk, max(ttnn.TILE_SIZE, seq_len))
+        k_chunk = min(k_chunk, max(ttnn.TILE_SIZE, seq_len))
         # Occupancy. The prefill SDPA factory flattens the work into
         #     total_q_chunks = B * n_local_heads * ceil(seq_len / q_chunk)
         # and, for causal attention with an even chunk count, hands out PAIRS (one light +
@@ -2606,6 +2612,11 @@ class ModelArgs:
         # TODO: If no specific sequence lengths are listed for a model and device, the default one will be used (from the default_supported_seq_lens dictionary)
         model_specific_supported_seq_lens = {
             "Llama-3.1-8B": {
+                # 32 and 64 are the short-prompt padded lengths get_padded_prefill_len now produces
+                # (the paged KV cache's block size is 32, so both are whole numbers of blocks). They
+                # have to be listed here or can_enable_trace() refuses to trace them and a short
+                # prompt silently loses trace capture along with the shorter prefill.
+                "P150": [32, 64, 128, 1024],
                 "P100": [128, 1024],
                 "N150": [128, 1024],
                 "N300": [128, 1024, 2048, 4096, 8192],

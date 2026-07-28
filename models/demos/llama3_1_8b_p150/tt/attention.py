@@ -950,7 +950,11 @@ class Attention(LightweightModule):
 
         seq_len = x_11SH.shape[-2]
         original_seq_len = seq_len  # Track original for later unpadding
-        assert seq_len % 128 == 0 and seq_len > 0, "Seqlen must be divisible by 128"
+        # Tile alignment is what this function actually needs; 128 was the old padded-prefill
+        # granularity, not a kernel constraint. get_padded_prefill_len now emits 32/64 for short
+        # prompts (the paged KV cache's block size is 32, and every shape below is derived from
+        # seq_len rather than assuming 128), so require the real invariant.
+        assert seq_len % ttnn.TILE_SIZE == 0 and seq_len > 0, "Seqlen must be tile-aligned (multiple of 32)"
         ###
         # QKV matmuls
         ###

@@ -721,7 +721,13 @@ def get_padded_prefill_len(seq_len: int) -> int:
     """
     # TODO: https://github.com/tenstorrent/tt-metal/issues/34117
     if seq_len <= 128:
-        return 128
+        # A hard 128 floor makes a SHORT prompt pay a 128-token prefill: the 6-token prompt in the
+        # perf/PCC path computes 128 positions, i.e. ~21x the token-work it needs, on every prefill
+        # matmul. Nothing downstream needs 128 specifically -- the paged KV cache's block size is 32,
+        # so 32 and 64 are whole numbers of blocks, and tiles are 32 rows -- so step down to the next
+        # power of two at or above 32 instead. Powers of two keep the set of distinct prefill shapes
+        # (and therefore captured traces / program-config cache entries) small.
+        return max(32, 2 ** max(seq_len - 1, 1).bit_length())
     if seq_len <= 1024:
         return 1024
     else:
