@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 10:48:37 UTC · 182 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 11:32:05 UTC · 188 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -12,6 +12,7 @@ trace+1CQ full-pipeline e2e (all layers):  48.38 ms  ->  22.79 ms   (+52.9%, 2.1
 
 Roofline & utilization
   modeled floor       : 537.23 ms   (Σ per-op max(FLOPs/peak, bytes/BW, dispatch); covers 91% of device time)
+  this build's floor  : 331.86 ms   (recomputed from the CURRENT op mix; below the pinned anchor because the ops now move different bytes — new headroom, NOT a new target; the anchor above stays fixed so at-floor% cannot retreat ahead of the measurement)
   achievable (60-80%) : 671.54 - 895.38 ms
   measured            : 615.69 ms
   at-floor            : 87%   (78.46 ms reachable headroom)
@@ -51,10 +52,10 @@ LayerNormDeviceOperation           ·try      —         —         ·try     
 MatmulDeviceOperation              ✓win      —         ✓win      ✓win      ·try      ·try      ·try      ·try        1061.00
 MatmulDeviceOperation              ·try      ·try      ✓win      ·try      ✓win      ·try      ·try      ·try         654.43
 MatmulDeviceOperation              ✓win      —         ✓win      —         —         —         —         —            749.85
-MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ·try      ·try      ·try        1057.68
+MatmulDeviceOperation              ·try      —         ✓win      ·try      ·try      ·try      ·try      ·try         614.94
 MatmulDeviceOperation              ✓win      ·try      ·try      ·try      ·try      ·try      ·try      ·try         614.88
 MatmulDeviceOperation              ✓win      —         ✓win      ·try      ·try      ·try      ·try      ·try         662.92
-MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ·try         745.01
+MatmulDeviceOperation              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ·try         622.89
 NLPConcatHeadsDeviceOperation      ·try      —         —         ·try      ·try      ✓win      —         —            714.94
 NlpCreateHeadsDeviceOperation      ·try      —         —         ✓win      ✓win      ✓win      —         —            758.37
 RotaryEmbeddingLlamaDeviceOperatio ✓win      —         —         —         ✓win      —         —         —            656.91
@@ -249,6 +250,12 @@ MatmulDeviceOperation                  fidelity         —             —  ✓
 MatmulDeviceOperation                structural    617.79   +1846.39 ms  · no gain  Hunted the ff1/ff3 chain for reducible work, found two candidates, measured both, and neither pays. (1) FRESH measurement: move the SILU off the COMBINE and onto the gate matmul's PACKER. The activati
 MatmulDeviceOperation                   tt-lang    615.61   +1848.57 ms  · no gain  A tt-lang kernel for this op's OWN shape is authored and measured in-tree (tt/ttl_ff2_matmul.py, an @ttl.operation multi-core matmul where each core owns a strip of N tiles and K is reduced in-core wi
 MatmulDeviceOperation                       cpp    615.61   +1848.57 ms  · no gain  A C++ Metalium reader/compute/writer triple driven through ttnn.generic_op is authored and measured in-tree for this exact shape (tt/cpp_mm_generic.py + tt/kernels/*.cpp, adapted from the repo's own t
+MatmulDeviceOperation                   tt-lang         —             —  ✓ win      committed: llama3_1_8b_p150: refresh the hand-kernel records against the new stock baseline Both hand-kernel rungs for the decode up-projection (32 x 4
+MatmulDeviceOperation                      grid    649.15   +1815.03 ms  · no gain  Applied the same variant switch that WON on ff1/ff3 -- hold w2 DRAM-INTERLEAVED and let ttnn.linear auto-route with no program config, escaping the DRAM-sharded variant whose core grid is forced to di
+MatmulDeviceOperation                      grid    614.94   +1849.24 ms  · no gain  Second grid attempt, staying INSIDE the DRAM-sharded variant that attempt 1 showed this shape prefers, and going after the helper that actually sizes it. mlp2_core_grid sets BOTH ff2's program config 
+MatmulDeviceOperation                     dtype         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: NOC0 is hung on PCIe device ID 1.
+MatmulDeviceOperation                     dtype         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: Event Synchronization is not supported during trace capture. (assert.hpp:104)
+MatmulDeviceOperation                      grid    622.89   +1841.29 ms  · no gain  Applied the variant switch that WON on ff1/ff3 -- hold wqkv DRAM-INTERLEAVED, hand ttnn.linear no program config so it auto-routes over the whole grid, keep the activation in interleaved L1, then re-a
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4041,6 +4048,135 @@ Code changes — every attempt (win or fail):
      Run directly to reproduce the table.
     ... (truncated, 2 more lines)
 
+[#184] MatmulDeviceOperation · grid · no gain  +1815.03 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    index e2c1fbd8cb..dfb4f34d8e 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    @@ -36,6 +36,15 @@ Together with the tt-lang rung (tt/ttl_ff2_matmul.py, same shapes, 2.7x-8.3x slo
+     custom-kernel lever for these ops: the only thing a hand kernel could add is fusion, and the fusion is
+     worth <=0.5% (measured independently via an L1 island for the same intermediates).
+     
+    +UPDATE -- the stock op this kernel is measured against has since got FASTER, which widens the deficit
+    +rather than reopening the rung. The full-grid lever in mlp.py moved the stock 32 x 4096 x 14336
+    +up-projection from 12 cores to 90 (DRAM-interleaved w1/w3 + auto-routed ttnn.linear), 123.1 -> 99.6
+    +us/call in model = 33 MB of bf4_b weight at 332 GB/s. That is precisely the mechanism the paragraph
+    +above identifies as the residual -- DRAM weight bandwidth -- so the stock op improved by putting more
+    +cores on that stream, while this kernel (work = Mt x Nt x Kt, A re-read Nt times) gains nothing from
+    +it. The 3.4x deficit on that shape therefore becomes roughly 4.2x. The generic_op grid was already the
+    +full 11x10, so there is no occupancy left for it to claim either.
+    +
+     Run directly to reproduce the table above.
+     """
+     import time
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    index cc46767225..bcd5be8024 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    @@ -36,6 +36,17 @@ No fusion is left to buy the difference back either: ff2's input round-trip is a
+     L1 island in mlp.py, and the gate+up fusion was measured and rejected separately
+     (tt/gated_mlp_fusion_probe.py).
+     
+    +UPDATE -- the target this kernel has to beat has since MOVED AWAY from it, which settles the rung
+    +rather than reopening it. The full-grid lever in mlp.py took the stock 32 x 4096 x 14336 up-projection
+    +from 12 cores to 90 (DRAM-interleaved w1/w3 + auto-routed ttnn.linear), 123.1 -> 99.6 us/call in
+    +model, i.e. 33 MB of bf4_b weight at 332 GB/s. The paragraph above already predicted this outcome:
+    +what remains in the ttnn number is DRAM weight bandwidth, so the stock op improved by getting more
+    +cores onto that stream, and this kernel -- whose cost scales with m_tiles x per_core_n x k_tiles and
+    +which re-reads every A tile once per output tile -- gains nothing from the same change. The measured
+    +2.2x deficit therefore widens to roughly 2.7x. Closing it would mean reimplementing ttnn's mcast
+    +matmul, and even a perfect reimplementation cannot move bytes that are already flowing at the
+    +achievable DRAM rate (the LM head independently saturates at 318 GB/s on 101 cores).
+    +
+     Run directly to reproduce the table.
+    ... (truncated, 2 more lines)
+
+[#185] MatmulDeviceOperation · grid · no gain  +1849.24 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    index e2c1fbd8cb..dfb4f34d8e 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    @@ -36,6 +36,15 @@ Together with the tt-lang rung (tt/ttl_ff2_matmul.py, same shapes, 2.7x-8.3x slo
+     custom-kernel lever for these ops: the only thing a hand kernel could add is fusion, and the fusion is
+     worth <=0.5% (measured independently via an L1 island for the same intermediates).
+     
+    +UPDATE -- the stock op this kernel is measured against has since got FASTER, which widens the deficit
+    +rather than reopening the rung. The full-grid lever in mlp.py moved the stock 32 x 4096 x 14336
+    +up-projection from 12 cores to 90 (DRAM-interleaved w1/w3 + auto-routed ttnn.linear), 123.1 -> 99.6
+    +us/call in model = 33 MB of bf4_b weight at 332 GB/s. That is precisely the mechanism the paragraph
+    +above identifies as the residual -- DRAM weight bandwidth -- so the stock op improved by putting more
+    +cores on that stream, while this kernel (work = Mt x Nt x Kt, A re-read Nt times) gains nothing from
+    +it. The 3.4x deficit on that shape therefore becomes roughly 4.2x. The generic_op grid was already the
+    +full 11x10, so there is no occupancy left for it to claim either.
+    +
+     Run directly to reproduce the table above.
+     """
+     import time
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    index cc46767225..bcd5be8024 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    @@ -36,6 +36,17 @@ No fusion is left to buy the difference back either: ff2's input round-trip is a
+     L1 island in mlp.py, and the gate+up fusion was measured and rejected separately
+     (tt/gated_mlp_fusion_probe.py).
+     
+    +UPDATE -- the target this kernel has to beat has since MOVED AWAY from it, which settles the rung
+    +rather than reopening it. The full-grid lever in mlp.py took the stock 32 x 4096 x 14336 up-projection
+    +from 12 cores to 90 (DRAM-interleaved w1/w3 + auto-routed ttnn.linear), 123.1 -> 99.6 us/call in
+    +model, i.e. 33 MB of bf4_b weight at 332 GB/s. The paragraph above already predicted this outcome:
+    +what remains in the ttnn number is DRAM weight bandwidth, so the stock op improved by getting more
+    +cores onto that stream, and this kernel -- whose cost scales with m_tiles x per_core_n x k_tiles and
+    +which re-reads every A tile once per output tile -- gains nothing from the same change. The measured
+    +2.2x deficit therefore widens to roughly 2.7x. Closing it would mean reimplementing ttnn's mcast
+    +matmul, and even a perfect reimplementation cannot move bytes that are already flowing at the
+    +achievable DRAM rate (the LM head independently saturates at 318 GB/s on 101 cores).
+    +
+     Run directly to reproduce the table.
+    ... (truncated, 2 more lines)
+
+[#188] MatmulDeviceOperation · grid · no gain  +1841.29 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    index e2c1fbd8cb..dfb4f34d8e 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/cpp_mm_generic.py
+    @@ -36,6 +36,15 @@ Together with the tt-lang rung (tt/ttl_ff2_matmul.py, same shapes, 2.7x-8.3x slo
+     custom-kernel lever for these ops: the only thing a hand kernel could add is fusion, and the fusion is
+     worth <=0.5% (measured independently via an L1 island for the same intermediates).
+     
+    +UPDATE -- the stock op this kernel is measured against has since got FASTER, which widens the deficit
+    +rather than reopening the rung. The full-grid lever in mlp.py moved the stock 32 x 4096 x 14336
+    +up-projection from 12 cores to 90 (DRAM-interleaved w1/w3 + auto-routed ttnn.linear), 123.1 -> 99.6
+    +us/call in model = 33 MB of bf4_b weight at 332 GB/s. That is precisely the mechanism the paragraph
+    +above identifies as the residual -- DRAM weight bandwidth -- so the stock op improved by putting more
+    +cores on that stream, while this kernel (work = Mt x Nt x Kt, A re-read Nt times) gains nothing from
+    +it. The 3.4x deficit on that shape therefore becomes roughly 4.2x. The generic_op grid was already the
+    +full 11x10, so there is no occupancy left for it to claim either.
+    +
+     Run directly to reproduce the table above.
+     """
+     import time
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    index cc46767225..bcd5be8024 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_ff2_matmul.py
+    @@ -36,6 +36,17 @@ No fusion is left to buy the difference back either: ff2's input round-trip is a
+     L1 island in mlp.py, and the gate+up fusion was measured and rejected separately
+     (tt/gated_mlp_fusion_probe.py).
+     
+    +UPDATE -- the target this kernel has to beat has since MOVED AWAY from it, which settles the rung
+    +rather than reopening it. The full-grid lever in mlp.py took the stock 32 x 4096 x 14336 up-projection
+    +from 12 cores to 90 (DRAM-interleaved w1/w3 + auto-routed ttnn.linear), 123.1 -> 99.6 us/call in
+    +model, i.e. 33 MB of bf4_b weight at 332 GB/s. The paragraph above already predicted this outcome:
+    +what remains in the ttnn number is DRAM weight bandwidth, so the stock op improved by getting more
+    +cores onto that stream, and this kernel -- whose cost scales with m_tiles x per_core_n x k_tiles and
+    +which re-reads every A tile once per output tile -- gains nothing from the same change. The measured
+    +2.2x deficit therefore widens to roughly 2.7x. Closing it would mean reimplementing ttnn's mcast
+    +matmul, and even a perfect reimplementation cannot move bytes that are already flowing at the
+    +achievable DRAM rate (the LM head independently saturates at 318 GB/s on 101 cores).
+    +
+     Run directly to reproduce the table.
+    ... (truncated, 2 more lines)
+
 Limitations / suggested manual next steps:
 - 1 op(s) tried but no lever beat baseline: LayerNormDeviceOperation
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
@@ -4092,6 +4228,14 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
+
+
+
+
+
+
 
 
 
