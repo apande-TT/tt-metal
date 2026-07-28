@@ -220,9 +220,12 @@ def test_recover_device_end_to_end_resets_the_named_chip(tmp_path, monkeypatch):
 
 
 def test_board_reset_reports_failure(tmp_path, monkeypatch):
+    """`_sp` is the real subprocess module, shared by the whole pytest process: patch it through
+    monkeypatch so it is restored. A bare assignment here left every later test's subprocess.run
+    returning rc=1, which broke unrelated git-backed suites long after this test had passed."""
     m, _ = _mcp_real_board_reset(tmp_path, monkeypatch)
     m._run_module = lambda: None
-    m._sp.run = lambda *a, **k: type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+    monkeypatch.setattr(m._sp, "run", lambda *a, **k: type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})())
     assert m._board_reset("ut", "note", target="3") is False
 
 

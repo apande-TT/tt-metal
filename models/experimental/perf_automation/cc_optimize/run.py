@@ -424,7 +424,49 @@ def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str
             f"  [optimize/cc] FULL-model end-to-end ({label}) = {ms:.1f} ms"
             f"  (ALL layers, prefill + 1 decode{', ' + mode if mode else ''})"
         )
+        _ledger_fullpipe(ms, mode, label)
     return ms, mode
+
+
+def _ledger():
+    """The measurement ledger (cc_optimize/measurements.py), loaded by path."""
+    global _LEDGER_MOD
+    try:
+        return _LEDGER_MOD
+    except NameError:
+        pass
+    import importlib.util as _ilu
+
+    _p = Path(__file__).with_name("measurements.py")
+    _spec = _ilu.spec_from_file_location("tt_measurements", str(_p))
+    _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m)
+    globals()["_LEDGER_MOD"] = _m
+    return _m
+
+
+def _ledger_fullpipe(ms: float, mode: str, label: str) -> None:
+    """Record the whole-model gate reading AT THE MOMENT IT IS TAKEN, with the mode it was taken in.
+
+    The mode matters more than the number: the BEFORE bookend is captured once and never re-taken,
+    so an eager BEFORE could sit next to a trace+1cq AFTER and be subtracted, printing
+    `before 47.10 ms -> after 100.00 ms (-112.3% SLOWER)`. Stored side by side with their modes,
+    that pair is refused instead of computed. The first such reading ever taken for this
+    (model, task) is the BEFORE and survives every rerun."""
+    try:
+        led = _ledger()
+        seen = led.first(led.KIND_FULLPIPE, led.PHASE_BEFORE)
+        phase = led.PHASE_AFTER if seen else led.PHASE_BEFORE
+        led.record(
+            led.KIND_FULLPIPE,
+            phase,
+            ms,
+            depth="all",
+            mode=mode or "unknown",
+            source="fullpipe-gate:%s" % (label or ""),
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 _HOST_XFER_OPS = (
@@ -1963,11 +2005,26 @@ def _run_round_with_watchdog(cmd: list, repo_root: Path, devices: str, kernel_lo
     return True
 
 
+def _baseline_name() -> str:
+    """Filename of the rolling baseline, KEYED by (model, task) to match perf_mcp._baseline_path().
+
+    This read used to hardcode the unkeyed "perf_mcp_baseline.json". perf_mcp writes the keyed file,
+    so the two never referred to the same run: whatever model last profiled anywhere on the box
+    supplied the "before" number. llama3_1_8b_p150 reported `eager per-op (all layers): 0.06 ms ->
+    648.17 ms (-1062476.1%)` -- a sub-millisecond anchor from an unrelated run against a real
+    648 ms reading, while this run's own baseline sat in the keyed file at 2464.18 ms. Same defect
+    as the full-pipeline scoreboard: a file any other process can write is not this run's baseline.
+    """
+    model = os.environ.get("PERF_MCP_MODEL_NAME") or Path(os.environ.get("PERF_MCP_MODEL_ROOT", "") or "model").name
+    task = os.environ.get("PERF_MCP_TASK", "main")
+    return "perf_mcp_baseline_%s_%s.json" % (model, task)
+
+
 def _baseline_ms() -> float | None:
     try:
         import tempfile
 
-        d = json.loads((Path(tempfile.gettempdir()) / "perf_mcp_baseline.json").read_text())
+        d = json.loads((Path(tempfile.gettempdir()) / _baseline_name()).read_text())
         return float(d["device_ms"]) if d.get("device_ms") is not None else None
     except Exception:  # noqa: BLE001
         return None
@@ -2010,45 +2067,6 @@ def _comparable(value, stored_depth: str, want_depth: str):
     if not stored_depth:
         return Verdict.unknown("no depth stamp, so the window it was profiled at is unknown")
     return Reading(value, depth=stored_depth).comparable_to(Reading(value, depth=want_depth))
-
-
-def _original_baseline_ms(model_name: str, task: str, perf_layers: str = "") -> float | None:
-    """The FIRST baseline recorded for this (model, task), or None when it is not comparable.
-
-    The file is written once and never refreshed, so it outlives the profiling window it was taken
-    at. Pairing it with a later run's number produced the headline
-
-        baseline 832.93 ms  ->  final 1088.15 ms   (-30.6%, 0.77x)
-
-    on llama3_1_8b_p150 -- a 2-layer profile from the previous day against a 16-layer one. Nothing had
-    regressed; that run was 2149.71 -> 1088.15. Returning None here makes the caller fall back to THIS
-    run's own baseline, which is always measured over the same work as its final.
-    """
-    try:
-        import tempfile
-
-        p = Path(tempfile.gettempdir()) / ("perf_mcp_orig_baseline_%s_%s.json" % (model_name, task))
-        if not p.is_file():
-            return None
-        d = json.loads(p.read_text())
-        if d.get("device_ms") is None:
-            return None
-        want = (perf_layers or os.environ.get("TT_PERF_LAYERS") or "").strip() or "all"
-        got = str(d.get("perf_layers", "")).strip()
-        # ONE definition of "may these be compared" -- integrity.Reading, shared with the report
-        # renderer. Hand-rolling the axis comparison here is what let each site drift: four separate
-        # bespoke checks, each fixed after it had already published a wrong number.
-        verdict = _comparable(d["device_ms"], got, want)
-        if not verdict.is_pass:
-            print(
-                "  [optimize/cc] original baseline not usable as the headline anchor: %s; using "
-                "THIS run's baseline instead" % verdict.reason
-            )
-            return None
-        return float(d["device_ms"])
-    except Exception:  # noqa: BLE001
-        pass
-    return None
 
 
 def _prune_legacy_reports(demo_dir: Path) -> None:
@@ -2162,17 +2180,12 @@ def _emit_summary(
         perf_test=perf_test,
         report_csv=report_csv,
         residual=residual,
-        before_ms=before_ms,
-        after_ms=after_ms,
-        before_mode=before_mode,
-        after_mode=after_mode,
         baseline_profile=(
             json.loads(Path(report_csv).parent.joinpath("baseline_profile.json").read_text())
             if report_csv and Path(report_csv).parent.joinpath("baseline_profile.json").is_file()
             else None
         ),
         finalized=True,
-        original_baseline_ms=_original_baseline_ms(model_name, task, os.environ.get("TT_PERF_LAYERS", "")),
         final_override_ms=_cur_ms,
         throughput=_throughput,
     )
@@ -2412,10 +2425,6 @@ def optimize_pipeline(
         metric,
         start_sha,
         perf_test=(pipe or {}).get("perf_test", ""),
-        before_mode=before_mode,
-        after_mode=after_mode,
-        before_ms=before_ms,
-        after_ms=after_ms,
     )
     return {"task": task, "rounds": rounds, "can_stop": can_stop, "halted": halted}
 
@@ -2757,6 +2766,7 @@ def run_cc_optimize(
     _decide_parallelism_route(demo_dir, manifest, repo_root, metric, devices, model_id_hint)
     model_rel = os.path.relpath(demo_dir, repo_root)
     model_name = Path(demo_dir).name
+    os.environ.setdefault("PERF_MCP_MODEL_NAME", model_name or "model")
     _cfg_ref = _resolve_model_id(demo_dir, model_id_hint) or str(demo_dir)
     pipes = pipelines_from_manifest(manifest, model_rel)
     is_mm = manifest.get("pathmap", {}).get("is_multimodal")

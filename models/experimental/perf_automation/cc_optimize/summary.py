@@ -256,64 +256,146 @@ def _floor_status(floor_ms: float, measured_ms: float) -> str:
     return str(score(target_from_floor_ms(floor_ms), measured_ms).get("status") or "UNKNOWN")
 
 
-def _run_baseline_ms(baseline_profile: dict | None):
-    """THIS run's own starting measurement, from the profile captured before any lever was applied.
-
-    Distinct from the `baseline_ms` argument, which run.py fills with the CURRENT committed value --
-    a name that invites exactly the mistake of treating it as the run's starting point.
-    """
+def _throughput_from_profile(baseline_profile: dict | None) -> dict | None:
+    """Compute the roofline-target snapshot from the always-written baseline device profile, so the
+    Roofline section renders deterministically even when the per-profile persist did not fire. Uses the
+    pure-python roofline + perf_target modules via the agent package. Never raises."""
     if not isinstance(baseline_profile, dict):
         return None
-    try:
-        v = float(baseline_profile.get("device_ms") or 0.0)
-    except (TypeError, ValueError):
-        return None
-    return v if v > 0 else None
-
-
-def _reading(value, mode: str = "", stage: str = "", depth: str = ""):
-    """Wrap a ms value with its provenance. Delegates to integrity.Reading so DEPTH, MODE and STAGE
-    are defined once for the whole tool rather than re-checked ad hoc at each render site -- every
-    reporting bug in the 2026-07-27 audit was a bare float compared against another bare float."""
     try:
         _pa = str(Path(__file__).resolve().parent.parent)
         if _pa not in sys.path:
             sys.path.insert(0, _pa)
-        from agent.integrity import Reading
+        from agent import perf_target as _pt
+        from agent import roofline as _rl
 
-        return Reading(value, depth=depth or _raw_depth(), mode=mode, stage=stage)
+        rep = _rl.residual_report(baseline_profile, {})
+        floor = rep.get("modeled_floor_ms")
+        tgt = _pt.target_from_floor_ms(floor)
+        return {
+            "scope": "model",
+            "is_llm_decode": False,
+            "theoretical_tok_s": tgt.theoretical_tok_s,
+            "band": [tgt.band[0], tgt.band[1]],
+            "active_bytes": tgt.active_bytes,
+            "peak_bw_gbps": 0.0,
+            "tp_degree": tgt.tp_degree,
+            "modeled_floor_ms": floor,
+        }
     except Exception:  # noqa: BLE001
         return None
 
 
-def _raw_depth() -> str:
-    raw = (os.environ.get("TT_PERF_LAYERS") or "").strip()
-    return raw if raw.isdigit() and int(raw) > 0 else "all"
+def _stages_from_profile(baseline_profile: dict | None) -> list:
+    """Derive block-level stage rows from the profile op-class buckets, so the Block-level timing table
+    renders deterministically even when no attempt carried per-stage timings."""
+    prof = baseline_profile if isinstance(baseline_profile, dict) else {}
+    rows = []
+    for b in prof.get("buckets") or []:
+        if not isinstance(b, dict):
+            continue
+        rows.append({"name": str(b.get("id", "?")), "ms": float(b.get("device_ms") or 0.0)})
+    if not rows:
+        return []
+    rows.sort(key=lambda r: -r["ms"])
+    rows[0]["dominant"] = True
+    return rows
 
 
-def _same_measurement(before_mode: str, after_mode: str) -> bool:
-    """Are two full-pipeline readings the same KIND of number? Thin wrapper over Reading so the rule
-    lives in one place; kept as a predicate because the render site reads better that way."""
-    a = _reading(1.0, mode=before_mode)
-    b = _reading(1.0, mode=after_mode)
-    if a is None or b is None:  # integrity unavailable: fall back to the literal comparison
-        x, y = (before_mode or "").strip().lower(), (after_mode or "").strip().lower()
-        return x == y
-    return bool(a.comparable_to(b))
+def _ledger():
+    """The measurement ledger (cc_optimize/measurements.py), loaded by path."""
+    global _LEDGER_MOD
+    try:
+        return _LEDGER_MOD
+    except NameError:
+        pass
+    import importlib.util as _ilu
+
+    _p = Path(__file__).with_name("measurements.py")
+    _spec = _ilu.spec_from_file_location("tt_measurements", str(_p))
+    _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m)
+    globals()["_LEDGER_MOD"] = _m
+    return _m
 
 
-def _depth_label() -> str:
+def _ledger_pair(kind: str, model: str = "", task: str = ""):
+    """(before, after) for one measurement kind, straight from the ledger.
+
+    THE POINT: these carry their own depth and mode, so the report never has to infer what a number
+    measured, and there is no chain to fall through when one is missing. `first` is the earliest
+    reading ever taken for this (model, task), so it is the TRUE original even on the fifth rerun.
+    """
+    try:
+        led = _ledger()
+        return (
+            led.first(kind, led.PHASE_BEFORE, model=model, task=task),
+            led.last(kind, led.PHASE_AFTER, model=model, task=task),
+        )
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _ledger_line(kind: str, title: str, model: str = "", task: str = ""):
+    """Render one before/after line from the ledger, or None when it has nothing to say."""
+    try:
+        led = _ledger()
+        a, b = _ledger_pair(kind, model, task)
+        if not a and not b:
+            return None
+        if a and not b:
+            # A before with no after yet is the normal state for most of a run. Returning None here
+            # printed "not measured" over a reading the ledger actually held, hiding the anchor until
+            # the first after landed.
+            _d = str(a.get("depth") or "unknown")
+            return "%s (%s):  %.2f ms  ->  (after not measured yet)" % (
+                title,
+                "all layers" if _d == "all" else "%s layers" % _d,
+                a.get("value_ms"),
+            )
+        if b and not a:
+            _d = str(b.get("depth") or "unknown")
+            return "%s (%s):  (before not measured)  ->  %.2f ms" % (
+                title,
+                "all layers" if _d == "all" else "%s layers" % _d,
+                b.get("value_ms"),
+            )
+        av, bv = a.get("value_ms"), b.get("value_ms")
+        depth = a.get("depth") or "unknown"
+        dl = "all layers" if str(depth) == "all" else "%s layers" % depth
+        ok, why = led.comparable(a, b)
+        if not ok:
+            return "%s (%s):  before %.2f ms [%s]  ->  after %.2f ms [%s]   — NOT COMPARABLE: %s" % (
+                title,
+                dl,
+                av,
+                a.get("mode") or "unknown mode",
+                bv,
+                b.get("mode") or "unknown mode",
+                why,
+            )
+        pct = led.delta_pct(a, b)
+        spd = (av / bv) if bv else 1.0
+        return "%s (%s):  %.2f ms  ->  %.2f ms   (%+.1f%%, %.2fx)" % (title, dl, av, bv, pct, spd)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _depth_label(profile: dict | None = None) -> str:
     """How much of the model the tracy numbers cover. A ms figure means nothing without it: the whole
-    2-layer-vs-16-layer confusion came from a headline that printed neither side's depth."""
-    raw = (os.environ.get("TT_PERF_LAYERS") or "").strip()
+    2-layer-vs-16-layer confusion came from a headline that printed neither side's depth.
+
+    Read the depth the PROFILE was stamped with, not this process's env. The depth is exported into
+    the profiling SUBPROCESS, so the renderer's own TT_PERF_LAYERS is usually empty -- which made the
+    label fall through to "all layers" for a run profiled at 16, printing a depth that was simply
+    wrong. Env stays as the fallback for profiles written before stamping.
+    """
+    raw = ""
+    if isinstance(profile, dict):
+        raw = str(profile.get("perf_layers") or "").strip()
+    if not raw:
+        raw = (os.environ.get("TT_PERF_LAYERS") or "").strip()
     return "%s layers" % raw if raw.isdigit() and int(raw) > 0 else "all layers"
-
-
-def _all_layers_label() -> str:
-    """Depth of the whole-model gate. It always runs uncapped, so name the real count when the profile
-    reveals it, else say 'all layers' rather than implying a number we do not have."""
-    n = (os.environ.get("PERF_MCP_MODEL_LAYERS") or "").strip()
-    return "all %s layers" % n if n.isdigit() and int(n) > 0 else "all layers"
 
 
 def _baseline_trace_ms(baseline_profile: dict | None):
@@ -460,13 +542,8 @@ def render_summary(
     perf_test: str = "",
     report_csv: str = "",
     residual: dict | None = None,
-    before_ms: float | None = None,
-    after_ms: float | None = None,
     baseline_profile: dict | None = None,
     finalized: bool = True,
-    before_mode: str = "",
-    after_mode: str = "",
-    original_baseline_ms: float | None = None,
     final_override_ms: float | None = None,
     throughput: dict | None = None,
 ) -> str:
@@ -506,11 +583,8 @@ def render_summary(
     # wrong: run.py passes the CURRENT committed ms in that slot, so refusing a stale original made a
     # 3.45x run print "714.94 -> 714.94 (+0.0%)". This run's own baseline_profile.json is written once
     # at the start and is the only value guaranteed to predate every lever.
-    hdr_base = original_baseline_ms
-    if hdr_base is None:
-        hdr_base = _run_baseline_ms(baseline_profile)
-    if hdr_base is None:
-        hdr_base = baseline_ms
+    _base_row = _ledger_pair(_ledger().KIND_EAGER, model, task)[0]
+    hdr_base = float(_base_row["value_ms"]) if _base_row else None
     # The baseline is a measured fact, never a derived one. This used to substitute the SLOWEST
     # measurement ever recorded whenever the real baseline was not better than the final -- i.e.
     # precisely when the run achieved NOTHING -- so 100 -> 105 with a 180 ms failed experiment
@@ -525,49 +599,20 @@ def render_summary(
         lines.append(
             "optimizing… — baseline->final speedup is finalized when the module converges (per-attempt detail below is live)"
         )
-    elif hdr_base and final_ms and hdr_base > 0:
-        # Say WHAT was measured and OVER HOW MUCH WORK, never a bare "baseline". These are tracy
-        # per-op numbers from the EAGER pass over a capped window; the whole-model trace figure is a
-        # different measurement and gets its own line. Reporting them as one "baseline -> final"
-        # produced "baseline 832.93 -> final 1088.15 (-30.6%)" on llama3_1_8b_p150 by pairing a
-        # 2-layer profile with a 16-layer one -- a regression that never happened.
-        pct = (hdr_base - final_ms) / hdr_base * 100.0
-        spd = hdr_base / final_ms if final_ms > 0 else 1.0
-        lines.append(
-            f"eager per-op device time ({_depth_label()}):  {hdr_base:.2f} ms  ->  {final_ms:.2f} ms"
-            f"   ({pct:+.1f}%, {spd:.2f}x)"
-        )
-    elif hdr_base:
-        lines.append(f"eager per-op device time ({_depth_label()}):  {hdr_base:.2f} ms  ->  (no measured win recorded)")
     else:
-        lines.append("eager per-op device time: unavailable (no profile found)")
+        _eager = _ledger_line(_ledger().KIND_EAGER, "eager per-op device time", model, task)
+        lines.append(_eager or "eager per-op device time: not measured (no ledger reading for this run)")
     _bl_trace = _baseline_trace_ms(baseline_profile)
     if _bl_trace:
-        lines.append(f"tracy trace pass, BASELINE, same window ({_depth_label()}):  {_bl_trace:.2f} ms")
+        lines.append(f"tracy trace pass, BASELINE, same window ({_depth_label(baseline_profile)}):  {_bl_trace:.2f} ms")
     _trace_scope = f"module ({task})" if os.environ.get("TT_PERF_MODULE_LEVEL") == "1" else "full-pipeline e2e"
-    _all = _all_layers_label()
-    _mode_ok = _same_measurement(before_mode, after_mode)
-    if before_ms and after_ms and _mode_ok:
-        _d = (before_ms - after_ms) / before_ms * 100.0 if before_ms else 0.0
-        lines.append(
-            f"trace+1CQ {_trace_scope} ({_all}):  before {before_ms:.2f} ms  ->  after {after_ms:.2f} ms"
-            f"   ({_d:+.1f}% {'faster' if _d >= 0 else 'SLOWER'})"
-        )
-    elif before_ms and after_ms:
-        # Different measurement modes are different UNITS -- an eager wall-clock over the whole
-        # forward vs a trace+1cq per-token step. _establish_fullpipe_baseline re-baselines the stored
-        # value when the mode changes, but the BEFORE bookend is captured once and never re-taken, so
-        # the pair can drift apart mid-run. Subtracting them printed "before 47.10 ms -> after
-        # 100.00 ms (-112.3% SLOWER)" on llama3_1_8b_p150. Report both, refuse the delta.
-        lines.append(
-            f"{_trace_scope} ({_all}):  before {before_ms:.2f} ms [{before_mode or 'unknown mode'}]"
-            f"  ->  after {after_ms:.2f} ms [{after_mode or 'unknown mode'}]"
-            "   — NOT COMPARABLE: different measurement modes, no delta computed"
-        )
-    elif before_ms:
-        lines.append(f"trace+1CQ {_trace_scope} ({_all}):  before {before_ms:.2f} ms  ->  (after not measured)")
+    _fp = _ledger_line(_ledger().KIND_FULLPIPE, "trace+1CQ %s" % _trace_scope, model, task)
+    if _fp:
+        lines.append(_fp)
     lines.append("")
 
+    if not isinstance(throughput, dict):
+        throughput = _throughput_from_profile(baseline_profile)
     lines.extend(_roofline_lines(throughput, final_ms))
     lines.extend(_baseline_bucket_lines(baseline_profile, report_csv))
 
@@ -577,6 +622,18 @@ def render_summary(
             f"Block-level timing (per-stage trace) — latest lever on {_op_label(_st.get('op_signature', '?'))}:"
         )
         lines.extend(_stage_table_lines(_st["stages"]))
+        lines.append("")
+
+    _st = next((a for a in reversed(attempts) if isinstance(a, dict) and a.get("stages")), None)
+    _stages = _st["stages"] if _st else _stages_from_profile(baseline_profile)
+    if _stages:
+        _lbl = (
+            f"latest lever on {_op_label(_st.get('op_signature', '?'))}"
+            if _st
+            else "op-class breakdown (BASELINE profile)"
+        )
+        lines.append(f"Block-level timing (per-stage trace) — {_lbl}:")
+        lines.extend(_stage_table_lines(_stages))
         lines.append("")
 
     if by_op:

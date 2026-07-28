@@ -59,13 +59,19 @@ if os.environ.get("PERF_MCP_PCC_TEST") and _MANIFEST:
     _MANIFEST.setdefault("pathmap", {}).setdefault("pcc", {}).setdefault("end_to_end", {})
     _MANIFEST["pathmap"]["pcc"]["end_to_end"]["path"] = os.environ["PERF_MCP_PCC_TEST"]
 _MODEL_ROOT = Path(os.environ.get("PERF_MCP_MODEL_ROOT") or _MANIFEST.get("config", {}).get("model_root", "."))
+# PUBLISH the key every per-run artifact is named after. perf_mcp derived it from _MODEL_ROOT while
+# run.py and the ledger read PERF_MCP_MODEL_NAME -- which nothing ever set, so those fell back to the
+# literal "model". Reader and writer then pointed at different files (perf_mcp_baseline_model_main.json
+# appeared beside the real one) and every model would have shared one "model" ledger: the unkeyed bug
+# under a new name. One authoritative source, exported once, read by all three processes.
+os.environ.setdefault("PERF_MCP_MODEL_NAME", _MODEL_ROOT.name or "model")
 _ENV = _MANIFEST.get("env", {})
 
 
 # where profile_model stashes the current baseline so measure_candidate can compare structurally
 def _baseline_path():
     """Per-(model, task) device_ms baseline. Was a single global file, unlike the already-keyed
-    _original_baseline_path()/_throughput_path(), and nothing reset it at task start -- so the
+    the measurement ledger / _throughput_path(), and nothing reset it at task start -- so the
     baseline a candidate was compared against could belong to a previous model, a previous
     module, or a concurrent optimize on the same box. A leftover SLOWER baseline books the
     first candidate of the new run as a large fake win."""
@@ -75,7 +81,7 @@ def _baseline_path():
 
 
 # The tool is trace+1cq end to end; this is the ONLY full-pipeline baseline (no 2-CQ twin).
-# KEYED by (model, task), like _baseline_path() and _original_baseline_path(). It was a single global
+# KEYED by (model, task), like _baseline_path() and the measurement ledger. It was a single global
 # file, so anything on the box could overwrite a live run's AFTER number: on 2026-07-27 a unit test
 # writing a fixture value of 100.0 to the real path landed in a 10-hour optimize run whose every
 # actual reading was ~23.9 ms, and two concurrent optimize runs would have done the same to each
@@ -354,6 +360,24 @@ _MATERIAL_GAP_ENV_SET = "PERF_MCP_MATERIAL_GAP_MS" in os.environ
 _MATERIAL_GAP_FRAC = float(os.environ.get("PERF_MCP_MATERIAL_GAP_FRAC", "0.03"))
 _MATERIAL_GAP_FLOOR = float(os.environ.get("PERF_MCP_MATERIAL_GAP_FLOOR", "0.05"))
 _MAX_KNOB_RETRIES = int(os.environ.get("PERF_MCP_MAX_KNOB_RETRIES", "2"))
+
+_KNOB_ORDER = {
+    "memory": ("grid", "dtype", "shard", "fidelity"),
+    "compute": ("grid", "fidelity", "dtype", "shard"),
+    "dispatch": ("grid", "fidelity", "dtype", "shard"),
+    "": ("grid", "dtype", "shard", "fidelity"),
+}
+
+_KNOB_REASON = {
+    "grid": lambda g, f, w: "occupy the FULL core grid (grid=%s) via a full-grid program_config; "
+    "record_kernel_attempt(...,'grid',...) even on a no-gain" % (g or "unknown"),
+    "fidelity": lambda g, f, w: "lower the math fidelity (now %s) HiFi4->HiFi2->LoFi; "
+    "record_kernel_attempt(...,'fidelity',...) to mark it tried (even on a PCC revert / no-gain)" % (f or "unknown"),
+    "dtype": lambda g, f, w: "lower the weight dtype (now %s) to bf8_b/bf4_b; "
+    "record_kernel_attempt(...,'dtype',...) even on a PCC revert / no-gain" % (w or "unknown"),
+    "shard": lambda g, f, w: "shard this op's weights/activations into L1 (height/width shard) to cut DRAM "
+    "reads; record_kernel_attempt(...,'shard',...) to mark it tried (even on a no-gain)",
+}
 _MAX_KERNEL_WEDGES = int(os.environ.get("PERF_MCP_MAX_KERNEL_WEDGES", "3"))
 
 
@@ -586,12 +610,6 @@ def _read_baseline_profile():
     return None
 
 
-def _original_baseline_path():
-    model = _MODEL_ROOT.name if _MODEL_ROOT else "model"
-    task = os.environ.get("PERF_MCP_TASK", "main")
-    return Path(tempfile.gettempdir()) / ("perf_mcp_orig_baseline_%s_%s.json" % (model, task))
-
-
 def _throughput_path():
     """Per-(model, task) path for the STATIC roofline-target snapshot the report renders. Keyed like
     the baseline path so a per-module run never reads another module's target."""
@@ -657,19 +675,49 @@ def _is_credible_profile(prof: dict) -> bool:
     return True
 
 
-def _report_original_baseline_ms():
-    """The first baseline ever recorded for this (model, task) -- but only if it was profiled at the
-    depth this run is using. A ms figure taken over 2 layers is not comparable to one over 16."""
+def _ledger():
+    """The measurement ledger (cc_optimize/measurements.py), loaded by path so the MCP server keeps
+    working under a bare sys.path."""
+    global _LEDGER_MOD
     try:
-        p = _original_baseline_path()
-        if p.exists():
-            d = json.loads(p.read_text())
-            _now = (os.environ.get("TT_PERF_LAYERS") or "").strip() or "all"
-            if str(d.get("perf_layers", _now)) == _now:
-                return round(float(d.get("device_ms", 0.0)), 4)
+        return _LEDGER_MOD
+    except NameError:
+        pass
+    import importlib.util as _ilu
+
+    _p = Path(__file__).with_name("measurements.py")
+    _spec = _ilu.spec_from_file_location("tt_measurements", str(_p))
+    _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m)
+    globals()["_LEDGER_MOD"] = _m
+    return _m
+
+
+def _ledger_record(prof: dict) -> None:
+    """Append this profile's eager per-op total to the ledger, with the depth it was taken at.
+
+    PHASE is decided by the ledger's own history, not by a caller flag: the first eager reading ever
+    taken for this (model, task) is the BEFORE, everything after is an AFTER. That is what makes the
+    original survive a rerun -- a second optimize on an already-optimized model appends an 'after',
+    it cannot overwrite the original 'before'.
+    """
+    try:
+        led = _ledger()
+        ms = prof.get("device_ms")
+        depth = str(prof.get("perf_layers") or "all")
+        _mname = _MODEL_ROOT.name if _MODEL_ROOT else ""
+        seen = led.first(led.KIND_EAGER, led.PHASE_BEFORE, model=_mname)
+        phase = led.PHASE_AFTER if seen else led.PHASE_BEFORE
+        if phase == led.PHASE_BEFORE and not _is_credible_profile(prof):
+            return
+        led.record(led.KIND_EAGER, phase, ms, depth=depth, mode="eager", source="profile_model", model=_mname)
+        _tr = _baseline_trace_ms_from(prof) if "_baseline_trace_ms_from" in globals() else None
+        if _tr:
+            led.record(
+                led.KIND_TRACE_PASS, phase, _tr, depth=depth, mode="tracy-trace", source="profile_model", model=_mname
+            )
     except Exception:  # noqa: BLE001
         pass
-    return _report_baseline_ms()
 
 
 def _merge_cumulative(cum_path, attempts) -> list:
@@ -850,6 +898,21 @@ def _trace_compat_feedback(raw_reason: str) -> str:
 def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool, str, str]:
     """DETERMINISTIC ladder gate for ONE open op. Returns (done, rung, reason).
 
+    bound_by sets PRIORITY, never MEMBERSHIP. The bound-conditional gates below decide which rung is
+    tried FIRST -- fidelity speeds the math engine, so it cannot help an op waiting on DRAM bytes and
+    should not lead there. They must not decide which rungs are tried AT ALL: bound_by is a roofline
+    ESTIMATE, ops are rarely purely one-bound, and `compute` is only ever computed for matmuls, so no
+    reduction/eltwise op can be compute-bound however it behaves. Used as a filter, that silently
+    deleted levers for a whole run -- llama3_1_8b_p150 recorded 0 fidelity attempts across 133, and
+    its two costliest ops (TopK, 631ms + 489ms at HiFi2) were structurally ineligible for the rung.
+    It also dropped every knob for dispatch-bound ops, which matched no gate at all.
+
+    So after the bound-appropriate rungs are exhausted, the completeness sweep offers each remaining
+    knob ONCE (not _MAX_KNOB_RETRIES -- a floor, not a second search) before the op may clear. This
+    is the rule record_kernel_attempt already applies to the expensive kernel rungs: a measured
+    attempt REPLACES "I reasoned it won't help". The cheapest knob on the ladder should not be the
+    only one exempt from it. Host-bucket entries stay exempt: they are not device ops.
+
     The optimize ladder is knob -> fusion -> tt-lang -> C++. This enforces the climb ORDER from the
     op's OWN profile tags + the recorded kernel attempts — the agent CANNOT skip a rung, and a kernel
     attempt does NOT clear an op while a cheaper lever is still untried. An op is DONE only when the
@@ -901,31 +964,29 @@ def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool
             "This does NOT clear a repeat_prefill RECOMPUTE gap: if the generation_loop 'kv-cache' target is still "
             "blocking, the residual here is redundant recompute, reducible ONLY by a KV-cache (NOT irreducible).",
         )
-    # BOX (1) KNOBS — exhaust the cheap levers IN ORDER before any kernel. A knob is satisfied when
-    # the profile tag shows it applied, OR a record_kernel_attempt of that knob-kind is on file (so a
-    # PCC-failed/ineffective knob can be marked 'tried' and not loop forever).
-    if grid and grid != "full" and grid_tries < _MAX_KNOB_RETRIES:
-        return (False, "knob:grid", f"occupy the FULL core grid (grid={grid}) via a full-grid program_config")
-    if bound == "compute" and fidelity_tries < _MAX_KNOB_RETRIES:
-        return (
-            False,
-            "knob:fidelity",
-            f"lower the math fidelity (now {fidelity or 'unknown'}) HiFi4->HiFi2->LoFi on this compute-bound op; "
-            "record_kernel_attempt(...,'fidelity',...) to mark it tried (even on a PCC revert / no-gain)",
-        )
-    if is_matmul and bound == "memory" and wdtype not in ("bf8_b", "bf4_b") and dtype_tries < _MAX_KNOB_RETRIES:
-        return (
-            False,
-            "knob:dtype",
-            f"lower the weight dtype (now {wdtype or 'unknown'}) to bf8_b/bf4_b; if PCC fails, record_kernel_attempt(...,'dtype',...) to mark it tried",
-        )
-    if bound == "memory" and shard_tries < _MAX_KNOB_RETRIES:
-        return (
-            False,
-            "knob:shard",
-            "shard this memory-bound op's weights/activations into L1 (height/width shard) to cut DRAM reads; "
-            "record_kernel_attempt(...,'shard',...) to mark it tried (even on a no-gain)",
-        )
+    tries = {"grid": grid_tries, "fidelity": fidelity_tries, "dtype": dtype_tries, "shard": shard_tries}
+    applicable = {
+        "grid": grid != "full",
+        "fidelity": True,
+        "dtype": is_matmul,
+        "shard": True,
+    }
+    preferred = {
+        "grid": True,
+        "fidelity": bound == "compute",
+        "dtype": bound == "memory" and is_matmul and wdtype not in ("bf8_b", "bf4_b"),
+        "shard": bound == "memory",
+    }
+    order = _KNOB_ORDER.get(bound) or _KNOB_ORDER[""]
+    for want_preferred in (True, False):
+        for knob in order:
+            if not applicable[knob] or preferred[knob] is not want_preferred:
+                continue
+            if tries[knob] >= (_MAX_KNOB_RETRIES if want_preferred else 1):
+                continue
+            lead = "" if want_preferred else "LOW-PRIORITY SWEEP (bound_by=%s): " % (bound or "unknown")
+            return (False, "knob:" + knob, lead + _KNOB_REASON[knob](grid, fidelity, wdtype))
+
     if _tp_candidate(open_op, op_code) and "tp-fracture" not in kinds:
         return (
             False,
@@ -1466,21 +1527,9 @@ def profile_model() -> dict:
                 f"recorded — auto-heal could not get a clean run. Re-profile a smaller/signposted region."
             ),
         }
+    prof.setdefault("perf_layers", (os.environ.get("TT_PERF_LAYERS") or "").strip() or "all")
     _baseline_path().write_text(json.dumps(prof))
-    _orig = _original_baseline_path()
-    if not _orig.exists() and _is_credible_profile(prof):
-        try:
-            # Stamp the DEPTH this was profiled at. The file is written once and never refreshed, so
-            # a later run with a different coverage window would otherwise compare against it blind:
-            # llama3_1_8b_p150 reported "baseline 832.93 -> final 1088.15 (-30.6%)" by pairing a
-            # 2-layer profile from a previous day with a 16-layer one, a regression that never
-            # happened (the run was actually 2149.71 -> 1088.15). A ms figure is only comparable to
-            # another taken over the SAME amount of work.
-            _stamped = dict(prof)
-            _stamped["perf_layers"] = (os.environ.get("TT_PERF_LAYERS") or "").strip() or "all"
-            _orig.write_text(json.dumps(_stamped))
-        except Exception:  # noqa: BLE001
-            pass
+    _ledger_record(prof)
     dev = round(float(prof.get("device_ms", 0.0)), 4)
     target, at_floor, residual_gap, open_ops = None, None, None, []
     try:
