@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 13:08:41 UTC · 200 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 13:14:15 UTC · 201 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -265,6 +265,7 @@ LayerNorm                                  grid    493.45   +1970.73 ms  · no g
 Matmul 32x14336x4096                tp-fracture    493.45   +1970.73 ms  · no gain  Tried because this ff2 down-projection (K=14336) is the largest-gap op left and is tagged memory-bound after every single-chip lever, so column-fracturing the weight across a TP axis would split the 1
 LayerNorm                                  grid    493.61   +1970.57 ms  ✓ win      Tried because the interleaved rms_norm kernel parallelises over ROWS, so a [32,dim] padded prefill is ONE tile-row and can only ever occupy ONE core -- profiled at 62.5us/call x 757 calls = 47.3ms, ~9
 Matmul 32x14336x4096                 structural    575.26   +1888.92 ms  · no gain  Hypothesis: the recorded 'full-grid LOSES for w2' verdict (185.6 -> 227.4 us/call) was measured while ff2 still ran HiFi2, and the stated cause was a MATH term (each core gets ~2 output columns of a n
+Matmul 32x14336x4096                    tt-lang    493.72   +1970.46 ms  · no gain  Hypothesis: a hand tt-lang matmul could beat stock ttnn on this decode ff2 shape by owning the K reduction in-core instead of paying the stock op's mcast/packer sync on a 448-tile K. The kernel is aut
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4307,6 +4308,30 @@ Code changes — every attempt (win or fail):
     +            # 212.9) even though the norm itself got 3.2x faster. The norm win is only real with this.
     ... (truncated, 7 more lines)
 
+[#201] Matmul 32x14336x4096 · tt-lang · no gain  +1970.46 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/mlp.py b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    index 5099b1712e..179087ae9a 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/mlp.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/mlp.py
+    @@ -63,6 +63,18 @@ class MLP(LightweightModule):
+             # spreading a NARROW N=128-tile output over many cores gives each core only ~2 output columns
+             # but still the whole 448-tile K reduction to walk, so the per-core K loop and its mcast/packer
+             # sync dominate. Wide-N, short-K wants occupancy; narrow-N, long-K wants the DRAM-sharded read.
+    +        #
+    +        # RE-TESTED for w2 on the structural rung after ff2 moved to LoFi, and the verdict above STILL
+    +        # HOLDS -- do not try this again. The retest was worth doing because the stated reason w2 lost
+    +        # was a MATH term (the per-core K loop), and LoFi makes that loop ~3.6x cheaper, so the balance
+    +        # could plausibly have flipped; the LM head reaching 332 GB/s on this same interleaved layout
+    +        # said there was ~20% of bandwidth headroom to chase. Measured: 493.61 -> 575.26 ms (+81.7),
+    +        # per-token 9.38 -> 11.46. So the DRAM-sharded read, not the math, is what this shape is buying,
+    +        # and no fidelity change rescues the wide grid for a narrow-N/long-K matmul.
+    +        # One byproduct worth keeping: auto-routing ff2 dropped PCC to 0.948 (vs 0.985) purely from how
+    +        # the 448-tile K reduction re-accumulates, and LoFi + fp32_dest_acc_en=True restored it to
+    +        # 0.986. If a future lever ever needs a wide-grid ff2, the accumulator -- not the fidelity --
+    +        # is the knob that keeps it correct.
+             self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
+             full_grid_mlp = self.full_grid_ff1_3_weights
+
 Limitations / suggested manual next steps:
 - 2 op(s) tried but no lever beat baseline: Matmul 32x4096x4096, TopK
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
@@ -4358,6 +4383,7 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
 
 
 
