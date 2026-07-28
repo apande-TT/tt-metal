@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 12:58:01 UTC · 199 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 13:08:41 UTC · 200 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -264,6 +264,7 @@ LayerNorm                                  grid         —             —  · 
 LayerNorm                                  grid    493.45   +1970.73 ms  · no gain  Tried because prefill took the INTERLEAVED rms_norm kernel running on ONE core (62.5us/call x 757 calls = 47.3ms, ~90% of the norm bucket) while the decode path does the same [32,dim] shape on 32-64 c
 Matmul 32x14336x4096                tp-fracture    493.45   +1970.73 ms  · no gain  Tried because this ff2 down-projection (K=14336) is the largest-gap op left and is tagged memory-bound after every single-chip lever, so column-fracturing the weight across a TP axis would split the 1
 LayerNorm                                  grid    493.61   +1970.57 ms  ✓ win      Tried because the interleaved rms_norm kernel parallelises over ROWS, so a [32,dim] padded prefill is ONE tile-row and can only ever occupy ONE core -- profiled at 62.5us/call x 757 calls = 47.3ms, ~9
+Matmul 32x14336x4096                 structural    575.26   +1888.92 ms  · no gain  Hypothesis: the recorded 'full-grid LOSES for w2' verdict (185.6 -> 227.4 us/call) was measured while ff2 still ran HiFi2, and the stated cause was a MATH term (each core gets ~2 output columns of a n
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4357,6 +4358,7 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
 
 
 

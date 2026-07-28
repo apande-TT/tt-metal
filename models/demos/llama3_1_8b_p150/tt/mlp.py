@@ -63,6 +63,18 @@ class MLP(LightweightModule):
         # spreading a NARROW N=128-tile output over many cores gives each core only ~2 output columns
         # but still the whole 448-tile K reduction to walk, so the per-core K loop and its mcast/packer
         # sync dominate. Wide-N, short-K wants occupancy; narrow-N, long-K wants the DRAM-sharded read.
+        #
+        # RE-TESTED for w2 on the structural rung after ff2 moved to LoFi, and the verdict above STILL
+        # HOLDS -- do not try this again. The retest was worth doing because the stated reason w2 lost
+        # was a MATH term (the per-core K loop), and LoFi makes that loop ~3.6x cheaper, so the balance
+        # could plausibly have flipped; the LM head reaching 332 GB/s on this same interleaved layout
+        # said there was ~20% of bandwidth headroom to chase. Measured: 493.61 -> 575.26 ms (+81.7),
+        # per-token 9.38 -> 11.46. So the DRAM-sharded read, not the math, is what this shape is buying,
+        # and no fidelity change rescues the wide grid for a narrow-N/long-K matmul.
+        # One byproduct worth keeping: auto-routing ff2 dropped PCC to 0.948 (vs 0.985) purely from how
+        # the 448-tile K reduction re-accumulates, and LoFi + fp32_dest_acc_en=True restored it to
+        # 0.986. If a future lever ever needs a wide-grid ff2, the accumulator -- not the fidelity --
+        # is the knob that keeps it correct.
         self.full_grid_ff1_3_weights = prefetcher is None and not args.is_galaxy and args.num_devices == 1
         full_grid_mlp = self.full_grid_ff1_3_weights
 
