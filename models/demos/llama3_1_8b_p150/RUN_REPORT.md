@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 13:24:14 UTC · 203 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 13:25:48 UTC · 204 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -268,6 +268,7 @@ Matmul 32x14336x4096                 structural    575.26   +1888.92 ms  · no g
 Matmul 32x14336x4096                    tt-lang    493.72   +1970.46 ms  · no gain  Hypothesis: a hand tt-lang matmul could beat stock ttnn on this decode ff2 shape by owning the K reduction in-core instead of paying the stock op's mcast/packer sync on a 448-tile K. The kernel is aut
 Matmul 32x14336x4096                        cpp    493.72   +1970.46 ms  · no gain  Hypothesis: if tt-lang could not express a faster K reduction for this decode ff2, raw Metalium might, by controlling the reader/compute/writer triple directly. Authored and measured in-tree (tt/cpp_m
 NlpCreateHeads                             grid    465.94   +1998.24 ms  ✓ win      Hypothesis: this op is grid=tiny because a 32-token padded prompt is ONE seq tile and stock nlp_create_qkv_heads assigns one work unit per input row-tile, so the entire split ran on a SINGLE core; the
+host_overhead                      trace-capture    465.94   +1998.24 ms  · no gain  Hypothesis: a host-bound bucket means the host is re-issuing every op per step, so trace capture (GUIDELINES/08 section 11) should collapse the dispatch gaps. VERIFIED ALREADY APPLIED, so there is no 
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4428,6 +4429,7 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
 
 
 
