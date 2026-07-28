@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 12:45:39 UTC · 197 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 12:45:57 UTC · 198 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -48,7 +48,7 @@ LayerNorm                          ·try      —         —         ·try     
 Matmul 128x14336x4096              ·try      —         ✓win      ✓win      ·try      ·try      ·try      ·try        1061.00
 Matmul 128x4096x14336              ·try      ·try      ✓win      ·try      ·try      ·try      ·try      ·try         654.43
 Matmul 128x4096x6144               ✓win      —         ✓win      —         —         —         —         —            749.85
-Matmul 32x14336x4096               ·try      ✓win      ✓win      ·try      ·try      ·try      ·try      ·try         567.94
+Matmul 32x14336x4096               ·try      ✓win      ✓win      ·try      ·try      ·try      ·try      ·try         493.45
 Matmul 32x4096x14336               ✓win      ·try      ·try      ·try      ·try      ·try      ·try      ·try         614.88
 Matmul 32x4096x16032               ✓win      —         ✓win      ·try      ·try      ·try      ·try      ·try         662.92
 Matmul 32x4096x4096                —         ·try      —         —         —         —         —         —            534.44
@@ -262,6 +262,7 @@ Matmul 32x4096x6144                    fidelity    534.44   +1929.74 ms  ✓ win
 Matmul 32x4096x4096                    fidelity    534.44   +1929.74 ms  · no gain  COMMITTED, same lever as its QKV sibling and measured with its own attribution. This attention-OUTPUT projection still ran HIFI2 while wo was already bf8_b; GUIDELINES/01 section 12's policy table nam
 LayerNorm                                  grid         —             —  · wedged   wedged: round killed (UNPRODUCTIVE 1800s — agent watchdog judged the round stuck (no real progress))
 LayerNorm                                  grid    493.45   +1970.73 ms  · no gain  Tried because prefill took the INTERLEAVED rms_norm kernel running on ONE core (62.5us/call x 757 calls = 47.3ms, ~90% of the norm bucket) while the decode path does the same [32,dim] shape on 32-64 c
+Matmul 32x14336x4096                tp-fracture    493.45   +1970.73 ms  · no gain  Tried because this ff2 down-projection (K=14336) is the largest-gap op left and is tagged memory-bound after every single-chip lever, so column-fracturing the weight across a TP axis would split the 1
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4312,6 +4313,7 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
 
 
 

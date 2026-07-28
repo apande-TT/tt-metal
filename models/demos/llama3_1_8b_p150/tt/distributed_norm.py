@@ -112,6 +112,42 @@ class DistributedNorm(LightweightModule):
                 input_mem_cfg = x.memory_config()
             x = ttnn.to_memory_config(x, input_mem_cfg)
 
+        # GRID rung for LayerNormDeviceOperation. Prefill took the INTERLEAVED rms_norm kernel, which
+        # the profiler measured on ONE core at 62.5 us/call -- 757 such calls, 47.3 ms, i.e. ~90% of
+        # the whole norm bucket, against a 0.85 ms roofline for all 1679 norms. The interleaved kernel
+        # parallelises over ROWS, and a [32, dim] prefill is a single tile-row, so it can only ever get
+        # one core; the SHARDED kernel parallelises over WIDTH and does the same shape in 6.1-6.5 us on
+        # 32-64 cores. create_sharded_norm_config's block_h is tile_padded_batch_rows // 32, so the
+        # existing config is valid exactly when the prefill is that many rows -- which a short
+        # (32-token) padded prefill now is. So shard the input, run the sharded kernel, and hand the
+        # result back in the layout the prefill graph expects. The two reshards are on a [32, dim]
+        # tensor (~256 KB) against ~56 us saved per norm.
+        _prefill_sharded_norm = (
+            mode == Mode.PREFILL
+            and not self.TG
+            and not self.args.is_multichip
+            and not self.args.is_distributed_norm(mode)
+            and norm_config is not None
+            and norm_config.get("sharded_program_config") is not None
+            and norm_config.get("sharded_output_config") is not None
+            and int(x.shape[-2]) == self.args.tile_padded_batch_rows
+            and int(x.shape[-4]) == 1
+            and int(x.shape[-3]) == 1
+        )
+        if _prefill_sharded_norm:
+            _restore_mem_cfg = x.memory_config()
+            x_sharded_in = ttnn.to_memory_config(x, norm_config["sharded_output_config"])
+            y = self.norm(x_sharded_in, mode=mode, in_sharded=True, out_sharded=True, norm_config=norm_config)
+            ttnn.deallocate(x_sharded_in)
+            out = ttnn.to_memory_config(y, _restore_mem_cfg)
+            # MUST free the sharded intermediate. Leaving it alive leaks a [32, dim] L1 buffer per norm
+            # call -- 2 norms x 32 layers -- which exhausts L1 and pushes every later allocation to
+            # DRAM: measured as a 45% GLOBAL slowdown (ff1/ff3 99.5 -> 146.4 us/call, ff2 126.6 ->
+            # 212.9) even though the norm itself got 3.2x faster. The norm win is only real with this.
+            if out is not y:
+                ttnn.deallocate(y)
+            return out
+
         x = self.norm(
             x, mode=mode, in_sharded=(mode == Mode.DECODE), out_sharded=(mode == Mode.DECODE), norm_config=norm_config
         )
