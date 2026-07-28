@@ -409,6 +409,15 @@ class MLP(LightweightModule):
         li_ff2_compute_kernel_cfg = self.decoders_optimizations.get_math_fidelity(
             decoder_id=layer_num, op=OpGroup.LI_FF2, configuration=self.args
         )
+        # fidelity rung for ff2. Unlike ff1/ff3 (already LoFi) this op still runs HIFI2_FP16, and the
+        # comment above the program configs says why that was chosen: the DRAM-sharded decode matmuls
+        # "use HiFi2; this drops 1 bit of the activations but would be FLOP-bound on 12 cores with
+        # HiFi4". That reasoning cuts both ways -- on only ~12 cores the math is a real term, and ff2
+        # moves its 33 MB at 178 GB/s while the same weight size flows at 332 GB/s in ff1/ff3, so ff2
+        # is NOT purely DRAM-bound and there should be math cost to recover. w2 is bf4_b, and the
+        # catalogued policy for a bf4_b/bf8_b matmul is LoFi.
+        if fg_ff1_3:
+            li_ff2_compute_kernel_cfg = self.args.compute_kernel_config_lofi
 
         ff2_input_mem_config = self.args.get_mlp_ff2_mem_config(mode, self.prefetcher)
         if mode == Mode.PREFILL:

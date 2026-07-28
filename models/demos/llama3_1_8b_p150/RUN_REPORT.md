@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 11:32:05 UTC · 188 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 11:37:59 UTC · 190 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -256,6 +256,8 @@ MatmulDeviceOperation                      grid    614.94   +1849.24 ms  · no g
 MatmulDeviceOperation                     dtype         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: E RuntimeError: NOC0 is hung on PCIe device ID 1.
 MatmulDeviceOperation                     dtype         —             —  · wedged   wedged/crashed when tried: perf test crashed at runtime: TT_FATAL: Event Synchronization is not supported during trace capture. (assert.hpp:104)
 MatmulDeviceOperation                      grid    622.89   +1841.29 ms  · no gain  Applied the variant switch that WON on ff1/ff3 -- hold wqkv DRAM-INTERLEAVED, hand ttnn.linear no program config so it auto-routes over the whole grid, keep the activation in interleaved L1, then re-a
+MatmulDeviceOperation                     dtype         —             —  ✓ win      committed: llama3_1_8b_p150: checkpoint the live RUN_REPORT Banks the lever log for the ff2 and QKV grid rungs, including the correction to the full-gr
+MatmulDeviceOperation                     dtype    615.43   +1848.75 ms  · no gain  w2 is already at the bf4_b WEIGHT floor (the profile reads 'HiFi2 BFP8 x BFP4 => BF16'), so the two remaining dtype steps are the tensors around it, and I tried both. OUTPUT first, bf16 -> bf8_b: this
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4228,6 +4230,8 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
 
 
 
