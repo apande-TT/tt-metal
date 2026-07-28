@@ -1,7 +1,7 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 17:56:19 UTC · 254 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Updated live: 2026-07-28 17:57:21 UTC · 256 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
@@ -54,7 +54,7 @@ Matmul 32x4096x4096                ·try      ·try      ✓win      —        
 Matmul 32x4096x6144                ·try      ✓win      ·try      ✓win      ·try      ·try      ·try      ·try         448.70
 NLPConcatHeads                     ·try      —         —         ·try      ·try      ✓win      —         —            448.70
 NlpCreateHeads                     ·try      —         —         ✓win      ✓win      ✓win      —         —            465.94
-PagedFusedUpdateCache              ·try      ·try      —         ·try      ·try      ·try      —         —            440.51
+PagedFusedUpdateCache              ·try      ·try      —         ·try      ·try      ·try      ·try      —            440.51
 RotaryEmbeddingLlama               ✓win      ·try      —         ·try      ✓win      —         —         —            439.51
 SDPA                               ✓win      —         —         —         ·try      —         —         —            655.73
 TopK                               ·try      —         —         ·try      —         ·try      —         —                 —
@@ -319,6 +319,8 @@ PagedFusedUpdateCache                  fidelity    440.51   +2023.67 ms  · no g
 PagedFusedUpdateCache                     shard    440.68   +2023.50 ms  · no gain  Both operand sides are already at their only viable placement, and for this op the arithmetic settles it rather than a measurement being informative. (a) INPUT side is ALREADY L1-sharded: k_heads_1BKD
 PagedFusedUpdateCache                structural    440.68   +2023.50 ms  · no gain  none: this op IS the KV-cache lever, already applied in its best available form, so the restructures the rung asks about are either done or inapplicable. (a) recompute -> cache does not apply because 
 PagedFusedUpdateCache                   tt-lang    440.68   +2023.50 ms  · no gain  NOT EXPRESSIBLE in tt-lang on this build, blocked twice over, and the first blocker is one this campaign already MEASURED rather than assumed. (1) DTYPE. The destination is the KV cache, and its dtype
+PagedFusedUpdateCache                   tt-lang    440.68   +2023.50 ms  · no gain  Re-recorded against a clean tree so the evidence scan runs whole-model-dir and sees the ttl kernels in tt/ (the first record was diff-scoped -- the harness streams every attempt into RUN_REPORT.md, so
+PagedFusedUpdateCache                       cpp    440.68   +2023.50 ms  · no gain  Unlike the tt-lang rung this is not formally impossible -- a generic_op CB does accept bfp8_b, and a raw Metalium reader CAN read page_table and update_idxs_tensor from DRAM and compute a destination 
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -6088,6 +6090,8 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
 
 
 
