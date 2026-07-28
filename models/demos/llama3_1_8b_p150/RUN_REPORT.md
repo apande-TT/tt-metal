@@ -1,21 +1,21 @@
 <!-- BEGIN optimize -->
 # Optimize (perf) — `llama3_1_8b_p150`
 
-_Updated live: 2026-07-28 13:25:48 UTC · 204 lever attempt(s) so far — each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed._
+_Re-rendered with the bandwidth roofline active — 2026-07-28 13:35:45 UTC_
 
 ```
 Optimization summary — llama3_1_8b_p150 · main (device_ms)
 ==========================================================
-optimizing… — baseline->final speedup is finalized when the module converges (per-attempt detail below is live)
+eager per-op device time (16 layers):  2464.18 ms  ->  534.44 ms   (+78.3%, 4.61x)
 tracy trace pass (16 layers):  11.93 ms  ->  9.34 ms   (+21.7%, 1.28x)
 trace+1CQ full-pipeline e2e (all layers):  48.38 ms  ->  22.79 ms   (+52.9%, 2.12x)
 
 Roofline & utilization
-  modeled floor       : 537.23 ms   (Σ per-op max(FLOPs/peak, bytes/BW, dispatch); covers 93% of device time)
-  achievable (60-80%) : 671.54 - 895.38 ms
-  measured            : 465.94 ms
-  status              : PAST BASELINE FLOOR — keep optimizing
-  (tok/s/u — n/a: no weight-bytes input for this pipeline)
+  theoretical ceiling : 153.8 tok/s/u
+  achievable (60-80%) : 92.3 - 123.0 tok/s/u
+  measured            : 107.1 tok/s/u   (1000 / 9.34 ms)
+  measured mem BW     : 357 GB/s   (3.33 GB / 9.34 ms)
+  utilization         : 70%   (measured / ceiling)
 
 Op breakdown — device time by op class (profile totalling 556.80 ms over 16 layers · what to target, ranked):
 op class         device_ms      %   count  bound  dominant op (shape)
@@ -53,7 +53,7 @@ Matmul 32x4096x14336               ✓win      ·try      ·try      ·try      
 Matmul 32x4096x16032               ✓win      —         ✓win      ·try      ·try      ·try      ·try      ·try         662.92
 Matmul 32x4096x4096                —         ·try      —         —         —         —         —         —            534.44
 Matmul 32x4096x6144                ·try      ✓win      ·try      ✓win      ·try      ·try      ·try      ·try         534.44
-NLPConcatHeads                     ·try      —         —         ·try      ·try      ✓win      —         —            714.94
+NLPConcatHeads                     ✓win      —         —         ·try      ·try      ✓win      —         —            448.70
 NlpCreateHeads                     ✓win      —         —         ✓win      ✓win      ✓win      —         —            465.94
 RotaryEmbeddingLlama               ✓win      —         —         —         ✓win      —         —         —            656.91
 SDPA                               ✓win      —         —         —         ·try      —         —         —            655.73
@@ -269,6 +269,7 @@ Matmul 32x14336x4096                    tt-lang    493.72   +1970.46 ms  · no g
 Matmul 32x14336x4096                        cpp    493.72   +1970.46 ms  · no gain  Hypothesis: if tt-lang could not express a faster K reduction for this decode ff2, raw Metalium might, by controlling the reader/compute/writer triple directly. Authored and measured in-tree (tt/cpp_m
 NlpCreateHeads                             grid    465.94   +1998.24 ms  ✓ win      Hypothesis: this op is grid=tiny because a 32-token padded prompt is ONE seq tile and stock nlp_create_qkv_heads assigns one work unit per input row-tile, so the entire split ran on a SINGLE core; the
 host_overhead                      trace-capture    465.94   +1998.24 ms  · no gain  Hypothesis: a host-bound bucket means the host is re-issuing every op per step, so trace capture (GUIDELINES/08 section 11) should collapse the dispatch gaps. VERIFIED ALREADY APPLIED, so there is no 
+NLPConcatHeads                             grid    448.70   +2015.48 ms  ✓ win      Hypothesis: REUSED the lever just learned on the head split -- an in-tree tt-lang concat kernel already existed but its supports() was pinned to SEQ_LEN == 128, so the 32-token padded prompt fell thro
 
 Code changes — every attempt (win or fail):
 ===========================================
@@ -4378,13 +4379,55 @@ Code changes — every attempt (win or fail):
     +    per_core_tiles = (Q_PER_COL + 2) * HALF_T_1T
     ... (truncated, 78 more lines)
 
+[#205] NLPConcatHeads · grid · win  +2015.48 ms
+    diff --git a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    index 81c0fcecb2..19b512cb7f 100644
+    --- a/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    +++ b/models/demos/llama3_1_8b_p150/tt/ttl_concat_heads.py
+    @@ -92,15 +92,67 @@ def ttl_concat_heads(x: ttnn.Tensor, y: ttnn.Tensor) -> None:
+                         ttl.copy(blk, y[st, (cx * HEADS_PER_COL + hh) * HD_T + c0 + c]).wait()
+     
+     
+    +# GRID RUNG for the SINGLE-SEQ-TILE prefill (seq_len == 32) -- the same lever, and the same latent
+    +# bug, as the head-split kernel's 1T twin. The guard below was pinned to SEQ_LEN == 128, so a 32-token
+    +# padded prompt fell straight through to the stock nlp_concat_heads, which assigns one work unit per
+    +# input row-tile and therefore ran on a SINGLE core: the grid=tiny tag on a DISPATCH-bound op.
+    +#
+    +# At SEQ_T == 1 the work is head(32) x dim tile(4) with no seq extent, which FREES the y axis: instead
+    +# of splitting a head's dim tiles into halves it carries ONE dim tile per row, so DIM_HALVES rises to
+    +# HD_T (4) and HALF_T falls to 1. That is 8 x 4 = 32 cores at HEADS_PER_COL * 1 = 4 tiles each, and
+    +# 32 x 4 = 128 tiles covers all 32 heads x 1 seq tile x 4 dim tiles exactly. With SEQ_T == 1 the seq
+    +# index is constant 0 and c0 collapses to cy, so this variant needs no divide on the node coord at all.
+    +SEQ_LEN_1T = TILE
+    +SEQ_T_1T = SEQ_LEN_1T // TILE  # == 1
+    +DIM_HALVES_1T = HD_T  # one dim tile per y row, the whole point of this variant
+    +HALF_T_1T = HD_T // DIM_HALVES_1T  # == 1
+    +GRID_Y_1T = SEQ_T_1T * DIM_HALVES_1T  # == 4
+    +
+    +
+    +@ttl.operation(grid=(GRID_X, GRID_Y_1T))
+    +def ttl_concat_heads_1t(x: ttnn.Tensor, y: ttnn.Tensor) -> None:
+    +    """Single-seq-tile twin of ``ttl_concat_heads``: x [H*32, hd] -> y [32, H*hd]."""
+    +    seq_tiles = y.shape[0] // TILE
+    +    in_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+    +    out_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
+    +
+    +    per_core_tiles = HEADS_PER_COL * HALF_T_1T
+    +
+    +    @ttl.datamovement()
+    +    def read():
+    +        cx, cy = ttl.node(dims=2)
+    +        for hh in range(HEADS_PER_COL):
+    +            with in_dfb.reserve() as blk:
+    +                ttl.copy(x[(cx * HEADS_PER_COL + hh) * seq_tiles, cy], blk).wait()
+    ... (truncated, 43 more lines)
+
 Limitations / suggested manual next steps:
 - 2 op(s) tried but no lever beat baseline: Matmul 32x4096x4096, TopK
   -> inspect the per-op device report and consider a hand-written kernel or a structural change.
 
 Reproduce:
-  trace+1CQ perf:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_main_perf.py::test_main_perf -svv
-  full-model e2e PCC:  python -m pytest models/demos/llama3_1_8b_p150/tests/e2e/test_pcc.py -svv
+  trace+1CQ perf:  (node-id not provided)
 
 levels: grid -> fidelity -> dtype -> shard -> host -> tt-lang -> cpp   |   ✓win = beat baseline, ·try = measured no-gain, ·wedge = wedged/crashed when tried, — = not attempted
 ```
@@ -4429,6 +4472,8 @@ python -m pytest models/demos/llama3_1_8b_p150/demo/simple_text_demo.py::test_de
 
 ## Next steps
 <!-- END bringup -->
+
+
 
 
 
