@@ -108,6 +108,23 @@ def build(device, torch_module):
     log_input = bool(getattr(se, "log_input", True))
     inorm_eps = float(getattr(se.instancenorm, "eps", 1e-5))
 
+    # ---------------- narrow TRUNK format ----------------
+    # The SE-ResNet trunk is DATAMOVE-bound, not compute-bound: each im2col conv gathers
+    # k*k taps into a multi-MB stack and then merges both tile dims, so its time is bytes
+    # MOVED, and halving the stored format ~halves it. Carry the trunk (activations AND
+    # weights) in bf16 and cast back at the trunk exit, leaving the wide format where
+    # cancellation actually matters: the STFT/mel front end, the instancenorm statistics,
+    # and the sum-of-squares ASP pooling. fp32_dest_acc_en stays on, so this changes the
+    # STORED format only, never accumulation precision.
+    TRUNK_DT = ttnn.bfloat16
+
+    def _rep_t(t):
+        return ttnn.from_torch(
+            t.contiguous().to(torch.bfloat16), dtype=TRUNK_DT,
+            layout=ttnn.TILE_LAYOUT, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+
     # ---------------- conv / bn helpers ----------------
     def _bn_ss(bn):
         g = bn.weight.detach().float()
@@ -128,8 +145,9 @@ def build(device, torch_module):
             scale, shift = _bn_ss(fold_bn)
             Wm = Wm * scale.reshape(1, -1)
             b = b * scale + shift
+        # trunk weights in the trunk format (shared prep -> every conv2d instance)
         return {
-            "Wm": _rep(Wm), "b": _rep(b.reshape(1, 1, Cout)),
+            "Wm": _rep_t(Wm), "b": _rep_t(b.reshape(1, 1, Cout)),
             "kh": kh, "kw": kw, "Cin": Cin, "Cout": Cout,
             "s": int(conv.stride[0]), "p": int(conv.padding[0]),
         }
@@ -137,7 +155,7 @@ def build(device, torch_module):
     def _bn4(bn):
         scale, shift = _bn_ss(bn)
         C = scale.numel()
-        return _rep(scale.reshape(1, C, 1, 1)), _rep(shift.reshape(1, C, 1, 1))
+        return _rep_t(scale.reshape(1, C, 1, 1)), _rep_t(shift.reshape(1, C, 1, 1))
 
     def _prep_se(se_layer):
         fc = se_layer.fc
@@ -146,8 +164,8 @@ def build(device, torch_module):
         W2 = fc[2].weight.detach().float()                      # [C, r]
         b2 = fc[2].bias.detach().float()
         return {
-            "W1": _rep(W1.t()), "b1": _rep(b1.reshape(1, -1)),
-            "W2": _rep(W2.t()), "b2": _rep(b2.reshape(1, -1)),
+            "W1": _rep_t(W1.t()), "b1": _rep_t(b1.reshape(1, -1)),
+            "W2": _rep_t(W2.t()), "b2": _rep_t(b2.reshape(1, -1)),
         }
 
     def _prep_block(blk):
@@ -298,6 +316,7 @@ def build(device, torch_module):
 
         F = int(x.shape[-1])
         x = ttnn.reshape(x, [1, 1, 64, F])                     # unsqueeze(1)
+        x = ttnn.typecast(x, TRUNK_DT)                          # TRUNK ENTRY (see _rep_t)
 
         # stem
         x = _conv2d(x, top_conv1)
@@ -312,6 +331,9 @@ def build(device, torch_module):
         # reshape [1, C, H, W] -> [1, C*H, W]
         C = int(x.shape[1]); H = int(x.shape[2]); Wt = int(x.shape[3])
         x = ttnn.reshape(x, [1, C * H, Wt])                    # [1, 2048, F']
+        # TRUNK EXIT: the attention softmax and the ASP sum-of-squares below subtract
+        # mu^2 from E[x^2], so they stay in the wide format.
+        x = ttnn.typecast(x, ttnn.float32)
 
         # attention: conv1d -> relu -> bn1d -> conv1d -> softmax(time)
         w = _conv1d_1x1(x, att_c1)

@@ -1,5 +1,5 @@
 {
-  "weight_bytes": 133582652,
+  "weight_bytes": 2086199391,
   "dominant_dtype": "bfloat16",
   "source": "checkpoint bytes + HF config"
 }
