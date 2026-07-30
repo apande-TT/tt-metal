@@ -1,0 +1,4722 @@
+{
+  "shapes": 76,
+  "seeded": 76,
+  "improved": 58,
+  "seeds": [
+    {
+      "shape": {
+        "m": 259,
+        "k": 80,
+        "n": 1024
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3425,
+      "baseline_ms": 0.3549,
+      "speedup": 1.036,
+      "pcc": 0.99978
+    },
+    {
+      "shape": {
+        "m": 259,
+        "k": 1024,
+        "n": 3072
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat16",
+      "best_ms": 0.6224,
+      "baseline_ms": 0.6224,
+      "speedup": 1.0,
+      "pcc": 0.99985
+    },
+    {
+      "shape": {
+        "m": 259,
+        "k": 64,
+        "n": 259
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3335,
+      "baseline_ms": 0.3401,
+      "speedup": 1.02,
+      "pcc": 0.99989
+    },
+    {
+      "shape": {
+        "m": 64,
+        "k": 259,
+        "n": 259
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.34,
+      "baseline_ms": 0.3483,
+      "speedup": 1.024,
+      "pcc": 0.99961
+    },
+    {
+      "shape": {
+        "m": 259,
+        "k": 1024,
+        "n": 1024
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.357,
+      "baseline_ms": 0.3742,
+      "speedup": 1.048,
+      "pcc": 0.99944
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 1024,
+        "n": 64
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3354,
+      "baseline_ms": 0.3978,
+      "speedup": 1.186,
+      "pcc": 0.99885
+    },
+    {
+      "shape": {
+        "m": 291,
+        "k": 1024,
+        "n": 64
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3423,
+      "baseline_ms": 0.801,
+      "speedup": 2.34,
+      "pcc": 0.99945
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 64,
+        "n": 291
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3293,
+      "baseline_ms": 0.3327,
+      "speedup": 1.01,
+      "pcc": 0.99983
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 291,
+        "n": 64
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.329,
+      "baseline_ms": 0.3369,
+      "speedup": 1.024,
+      "pcc": 0.9997
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 512,
+        "n": 1024
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3374,
+      "baseline_ms": 0.4154,
+      "speedup": 1.231,
+      "pcc": 0.99958
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 1024,
+        "n": 5460
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3669,
+      "baseline_ms": 0.6237,
+      "speedup": 1.7,
+      "pcc": 0.99886
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 2730,
+        "n": 1024
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.4223,
+      "baseline_ms": 0.6276,
+      "speedup": 1.486,
+      "pcc": 0.99395
+    },
+    {
+      "shape": {
+        "m": 61,
+        "k": 1024,
+        "n": 128
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.34,
+      "baseline_ms": 0.3403,
+      "speedup": 1.001,
+      "pcc": 0.99944
+    },
+    {
+      "shape": {
+        "m": 61,
+        "k": 1024,
+        "n": 1024
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3486,
+      "baseline_ms": 0.4112,
+      "speedup": 1.18,
+      "pcc": 0.99899
+    },
+    {
+      "shape": {
+        "m": 61,
+        "k": 1024,
+        "n": 512
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat16",
+      "best_ms": 0.3447,
+      "baseline_ms": 0.3447,
+      "speedup": 1.0,
+      "pcc": 0.99984
+    },
+    {
+      "shape": {
+        "m": 61,
+        "k": 4096,
+        "n": 1024
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat16",
+      "best_ms": 0.6241,
+      "baseline_ms": 0.6245,
+      "speedup": 1.001,
+      "pcc": 0.99901
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 256,
+        "n": 256
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3283,
+      "baseline_ms": 0.3324,
+      "speedup": 1.012,
+      "pcc": 0.99977
+    },
+    {
+      "shape": {
+        "m": 201,
+        "k": 512,
+        "n": 257
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.3422,
+      "baseline_ms": 0.3708,
+      "speedup": 1.084,
+      "pcc": 0.99987
+    },
+    {
+      "shape": {
+        "m": 201,
+        "k": 257,
+        "n": 64
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3361,
+      "baseline_ms": 0.345,
+      "speedup": 1.026,
+      "pcc": 0.99957
+    },
+    {
+      "shape": {
+        "m": 12864,
+        "k": 9,
+        "n": 32
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3486,
+      "baseline_ms": 0.3794,
+      "speedup": 1.088,
+      "pcc": 0.99994
+    },
+    {
+      "shape": {
+        "m": 12864,
+        "k": 288,
+        "n": 32
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.6211,
+      "baseline_ms": 0.6219,
+      "speedup": 1.001,
+      "pcc": 0.9996
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 32,
+        "n": 4
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.32,
+      "baseline_ms": 0.327,
+      "speedup": 1.022,
+      "pcc": 0.99989
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 4,
+        "n": 32
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3256,
+      "baseline_ms": 0.333,
+      "speedup": 1.023,
+      "pcc": 0.99993
+    },
+    {
+      "shape": {
+        "m": 3232,
+        "k": 288,
+        "n": 64
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3529,
+      "baseline_ms": 0.3976,
+      "speedup": 1.127,
+      "pcc": 0.9996
+    },
+    {
+      "shape": {
+        "m": 3232,
+        "k": 576,
+        "n": 64
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3686,
+      "baseline_ms": 0.6219,
+      "speedup": 1.687,
+      "pcc": 0.99951
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 64,
+        "n": 8
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat16",
+      "best_ms": 0.3227,
+      "baseline_ms": 0.329,
+      "speedup": 1.02,
+      "pcc": 0.99998
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 8,
+        "n": 64
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3277,
+      "baseline_ms": 0.3332,
+      "speedup": 1.017,
+      "pcc": 0.9999
+    },
+    {
+      "shape": {
+        "m": 3232,
+        "k": 32,
+        "n": 64
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3402,
+      "baseline_ms": 0.3402,
+      "speedup": 1.0,
+      "pcc": 0.99983
+    },
+    {
+      "shape": {
+        "m": 816,
+        "k": 576,
+        "n": 128
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.35,
+      "baseline_ms": 0.3618,
+      "speedup": 1.034,
+      "pcc": 0.99888
+    },
+    {
+      "shape": {
+        "m": 816,
+        "k": 1152,
+        "n": 128
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3681,
+      "baseline_ms": 0.6515,
+      "speedup": 1.77,
+      "pcc": 0.99633
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 128,
+        "n": 16
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.325,
+      "baseline_ms": 0.3278,
+      "speedup": 1.009,
+      "pcc": 0.99996
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 16,
+        "n": 128
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3262,
+      "baseline_ms": 0.3319,
+      "speedup": 1.017,
+      "pcc": 0.99991
+    },
+    {
+      "shape": {
+        "m": 816,
+        "k": 64,
+        "n": 128
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3381,
+      "baseline_ms": 0.3463,
+      "speedup": 1.024,
+      "pcc": 0.99989
+    },
+    {
+      "shape": {
+        "m": 208,
+        "k": 1152,
+        "n": 256
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3573,
+      "baseline_ms": 0.3645,
+      "speedup": 1.02,
+      "pcc": 0.99639
+    },
+    {
+      "shape": {
+        "m": 208,
+        "k": 2304,
+        "n": 256
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3514,
+      "baseline_ms": 0.3581,
+      "speedup": 1.019,
+      "pcc": 0.99924
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 256,
+        "n": 32
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3242,
+      "baseline_ms": 0.329,
+      "speedup": 1.015,
+      "pcc": 0.99972
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 32,
+        "n": 256
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3271,
+      "baseline_ms": 0.328,
+      "speedup": 1.003,
+      "pcc": 0.99994
+    },
+    {
+      "shape": {
+        "m": 208,
+        "k": 128,
+        "n": 256
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3411,
+      "baseline_ms": 0.3694,
+      "speedup": 1.083,
+      "pcc": 0.99983
+    },
+    {
+      "shape": {
+        "m": 26,
+        "k": 2048,
+        "n": 128
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3436,
+      "baseline_ms": 0.3501,
+      "speedup": 1.019,
+      "pcc": 0.99655
+    },
+    {
+      "shape": {
+        "m": 26,
+        "k": 128,
+        "n": 2048
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat16",
+      "best_ms": 0.334,
+      "baseline_ms": 0.3409,
+      "speedup": 1.021,
+      "pcc": 0.99998
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 4096,
+        "n": 512
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat16",
+      "best_ms": 0.6233,
+      "baseline_ms": 0.6235,
+      "speedup": 1.0,
+      "pcc": 0.9991
+    },
+    {
+      "shape": {
+        "m": 64,
+        "k": 1024,
+        "n": 128
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3394,
+      "baseline_ms": 0.3437,
+      "speedup": 1.013,
+      "pcc": 0.99949
+    },
+    {
+      "shape": {
+        "m": 64,
+        "k": 1024,
+        "n": 1024
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3457,
+      "baseline_ms": 0.3561,
+      "speedup": 1.03,
+      "pcc": 0.99899
+    },
+    {
+      "shape": {
+        "m": 64,
+        "k": 1024,
+        "n": 512
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat16",
+      "best_ms": 0.3466,
+      "baseline_ms": 0.3466,
+      "speedup": 1.0,
+      "pcc": 0.99984
+    },
+    {
+      "shape": {
+        "m": 64,
+        "k": 4096,
+        "n": 1024
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat16",
+      "best_ms": 0.6219,
+      "baseline_ms": 0.6219,
+      "speedup": 1.0,
+      "pcc": 0.999
+    },
+    {
+      "shape": {
+        "m": 64,
+        "k": 1024,
+        "n": 1026
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3512,
+      "baseline_ms": 0.3592,
+      "speedup": 1.023,
+      "pcc": 0.99886
+    },
+    {
+      "shape": {
+        "m": 1024,
+        "k": 6,
+        "n": 24
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3338,
+      "baseline_ms": 0.3364,
+      "speedup": 1.008,
+      "pcc": 0.99992
+    },
+    {
+      "shape": {
+        "m": 1024,
+        "k": 24,
+        "n": 26
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3312,
+      "baseline_ms": 0.3375,
+      "speedup": 1.019,
+      "pcc": 0.99982
+    },
+    {
+      "shape": {
+        "m": 26,
+        "k": 7168,
+        "n": 512
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.6216,
+      "baseline_ms": 0.6234,
+      "speedup": 1.003,
+      "pcc": 0.99855
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 512,
+        "n": 512
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3364,
+      "baseline_ms": 0.4273,
+      "speedup": 1.27,
+      "pcc": 0.99956
+    },
+    {
+      "shape": {
+        "m": 208,
+        "k": 8192,
+        "n": 256
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3742,
+      "baseline_ms": 0.6233,
+      "speedup": 1.666,
+      "pcc": 0.99661
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 512,
+        "n": 256
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3327,
+      "baseline_ms": 0.3384,
+      "speedup": 1.017,
+      "pcc": 0.99964
+    },
+    {
+      "shape": {
+        "m": 208,
+        "k": 768,
+        "n": 256
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3432,
+      "baseline_ms": 0.3463,
+      "speedup": 1.009,
+      "pcc": 0.99953
+    },
+    {
+      "shape": {
+        "m": 208,
+        "k": 1792,
+        "n": 256
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3449,
+      "baseline_ms": 0.3538,
+      "speedup": 1.026,
+      "pcc": 0.99921
+    },
+    {
+      "shape": {
+        "m": 208,
+        "k": 2816,
+        "n": 256
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3479,
+      "baseline_ms": 0.3617,
+      "speedup": 1.04,
+      "pcc": 0.99914
+    },
+    {
+      "shape": {
+        "m": 1664,
+        "k": 4096,
+        "n": 128
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.7217,
+      "baseline_ms": 0.7385,
+      "speedup": 1.023,
+      "pcc": 0.99938
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 512,
+        "n": 128
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.331,
+      "baseline_ms": 0.4563,
+      "speedup": 1.379,
+      "pcc": 0.99987
+    },
+    {
+      "shape": {
+        "m": 1664,
+        "k": 384,
+        "n": 128
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.354,
+      "baseline_ms": 0.3628,
+      "speedup": 1.025,
+      "pcc": 0.99971
+    },
+    {
+      "shape": {
+        "m": 1664,
+        "k": 896,
+        "n": 128
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.362,
+      "baseline_ms": 0.6218,
+      "speedup": 1.718,
+      "pcc": 0.99916
+    },
+    {
+      "shape": {
+        "m": 1664,
+        "k": 1408,
+        "n": 128
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3742,
+      "baseline_ms": 0.6239,
+      "speedup": 1.667,
+      "pcc": 0.99808
+    },
+    {
+      "shape": {
+        "m": 3328,
+        "k": 512,
+        "n": 64
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3644,
+      "baseline_ms": 0.6226,
+      "speedup": 1.709,
+      "pcc": 0.99963
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 512,
+        "n": 64
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.3317,
+      "baseline_ms": 0.391,
+      "speedup": 1.179,
+      "pcc": 0.99987
+    },
+    {
+      "shape": {
+        "m": 3328,
+        "k": 192,
+        "n": 64
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3451,
+      "baseline_ms": 0.3576,
+      "speedup": 1.036,
+      "pcc": 0.99985
+    },
+    {
+      "shape": {
+        "m": 3328,
+        "k": 448,
+        "n": 64
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3625,
+      "baseline_ms": 0.6226,
+      "speedup": 1.718,
+      "pcc": 0.99965
+    },
+    {
+      "shape": {
+        "m": 3328,
+        "k": 704,
+        "n": 64
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3761,
+      "baseline_ms": 0.6231,
+      "speedup": 1.657,
+      "pcc": 0.99936
+    },
+    {
+      "shape": {
+        "m": 6656,
+        "k": 256,
+        "n": 32
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3699,
+      "baseline_ms": 0.6226,
+      "speedup": 1.683,
+      "pcc": 0.99977
+    },
+    {
+      "shape": {
+        "m": 1,
+        "k": 512,
+        "n": 32
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3285,
+      "baseline_ms": 0.3293,
+      "speedup": 1.002,
+      "pcc": 0.99965
+    },
+    {
+      "shape": {
+        "m": 6656,
+        "k": 96,
+        "n": 32
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3417,
+      "baseline_ms": 0.4416,
+      "speedup": 1.292,
+      "pcc": 0.99978
+    },
+    {
+      "shape": {
+        "m": 6656,
+        "k": 224,
+        "n": 32
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3591,
+      "baseline_ms": 0.6231,
+      "speedup": 1.735,
+      "pcc": 0.99971
+    },
+    {
+      "shape": {
+        "m": 6656,
+        "k": 352,
+        "n": 32
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3737,
+      "baseline_ms": 0.6229,
+      "speedup": 1.667,
+      "pcc": 0.99947
+    },
+    {
+      "shape": {
+        "m": 6656,
+        "k": 224,
+        "n": 1
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3611,
+      "baseline_ms": 0.6259,
+      "speedup": 1.733,
+      "pcc": 0.9999
+    },
+    {
+      "shape": {
+        "m": 51,
+        "k": 1024,
+        "n": 128
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3409,
+      "baseline_ms": 0.3856,
+      "speedup": 1.131,
+      "pcc": 0.99948
+    },
+    {
+      "shape": {
+        "m": 51,
+        "k": 1024,
+        "n": 1024
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3494,
+      "baseline_ms": 0.3878,
+      "speedup": 1.11,
+      "pcc": 0.99899
+    },
+    {
+      "shape": {
+        "m": 51,
+        "k": 1024,
+        "n": 512
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.3457,
+      "baseline_ms": 0.3458,
+      "speedup": 1.0,
+      "pcc": 0.99983
+    },
+    {
+      "shape": {
+        "m": 51,
+        "k": 4096,
+        "n": 1024
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.6246,
+      "baseline_ms": 0.6278,
+      "speedup": 1.005,
+      "pcc": 0.99939
+    },
+    {
+      "shape": {
+        "m": 51,
+        "k": 1024,
+        "n": 1026
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3532,
+      "baseline_ms": 0.3582,
+      "speedup": 1.014,
+      "pcc": 0.99887
+    }
+  ],
+  "ok": true,
+  "table": [
+    {
+      "m": 259,
+      "k": 80,
+      "n": 1024,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3566,
+          "pcc": 0.9999
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3425,
+          "pcc": 0.99978
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3548,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3504,
+          "pcc": 0.99986
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3549,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.35,
+          "pcc": 0.99986
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3425,
+        "pcc": 0.99978
+      }
+    },
+    {
+      "m": 259,
+      "k": 1024,
+      "n": 3072,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6226,
+          "pcc": 0.99986
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.626,
+          "pcc": 0.99899
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6229,
+          "pcc": 0.99985
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.652,
+          "pcc": 0.99889
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6224,
+          "pcc": 0.99985
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.623,
+          "pcc": 0.99889
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat16",
+        "ms": 0.6224,
+        "pcc": 0.99985
+      }
+    },
+    {
+      "m": 259,
+      "k": 64,
+      "n": 259,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3425,
+          "pcc": 0.9999
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3397,
+          "pcc": 0.99981
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3404,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3335,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3401,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4262,
+          "pcc": 0.99989
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3335,
+        "pcc": 0.99989
+      }
+    },
+    {
+      "m": 64,
+      "k": 259,
+      "n": 259,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3511,
+          "pcc": 0.99988
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3418,
+          "pcc": 0.99954
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4066,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3427,
+          "pcc": 0.99961
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3483,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.34,
+          "pcc": 0.99961
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.34,
+        "pcc": 0.99961
+      }
+    },
+    {
+      "m": 259,
+      "k": 1024,
+      "n": 1024,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3713,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3625,
+          "pcc": 0.99949
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3703,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.357,
+          "pcc": 0.99944
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3742,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.434,
+          "pcc": 0.99944
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.357,
+        "pcc": 0.99944
+      }
+    },
+    {
+      "m": 32,
+      "k": 1024,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3357,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3384,
+          "pcc": 0.99898
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3961,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3354,
+          "pcc": 0.99885
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3978,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3385,
+          "pcc": 0.99885
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3354,
+        "pcc": 0.99885
+      }
+    },
+    {
+      "m": 291,
+      "k": 1024,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3553,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.345,
+          "pcc": 0.9995
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3476,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3423,
+          "pcc": 0.99945
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.801,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3512,
+          "pcc": 0.99945
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3423,
+        "pcc": 0.99945
+      }
+    },
+    {
+      "m": 32,
+      "k": 64,
+      "n": 291,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.7253,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3293,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3311,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.332,
+          "pcc": 0.99991
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3327,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3305,
+          "pcc": 0.99991
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3293,
+        "pcc": 0.99983
+      }
+    },
+    {
+      "m": 32,
+      "k": 291,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3367,
+          "pcc": 0.99988
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.329,
+          "pcc": 0.9997
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3395,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3292,
+          "pcc": 0.99975
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3369,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4175,
+          "pcc": 0.99975
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.329,
+        "pcc": 0.9997
+      }
+    },
+    {
+      "m": 32,
+      "k": 512,
+      "n": 1024,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3419,
+          "pcc": 0.99987
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3396,
+          "pcc": 0.99956
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.344,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3374,
+          "pcc": 0.99958
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.4154,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3394,
+          "pcc": 0.99958
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3374,
+        "pcc": 0.99958
+      }
+    },
+    {
+      "m": 32,
+      "k": 1024,
+      "n": 5460,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6235,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.4189,
+          "pcc": 0.99899
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6491,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.4161,
+          "pcc": 0.99886
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6237,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3669,
+          "pcc": 0.99886
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.3669,
+        "pcc": 0.99886
+      }
+    },
+    {
+      "m": 32,
+      "k": 2730,
+      "n": 1024,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6246,
+          "pcc": 0.99963
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.4224,
+          "pcc": 0.99472
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6228,
+          "pcc": 0.99944
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.4223,
+          "pcc": 0.99395
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6276,
+          "pcc": 0.99943
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4231,
+          "pcc": 0.99395
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.4223,
+        "pcc": 0.99395
+      }
+    },
+    {
+      "m": 61,
+      "k": 1024,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3433,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3406,
+          "pcc": 0.9995
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3788,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3887,
+          "pcc": 0.99944
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3403,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.34,
+          "pcc": 0.99944
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.34,
+        "pcc": 0.99944
+      }
+    },
+    {
+      "m": 61,
+      "k": 1024,
+      "n": 1024,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3563,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3486,
+          "pcc": 0.99899
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3556,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3489,
+          "pcc": 0.99886
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.4112,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3505,
+          "pcc": 0.99886
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3486,
+        "pcc": 0.99899
+      }
+    },
+    {
+      "m": 61,
+      "k": 1024,
+      "n": 512,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3456,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3468,
+          "pcc": 0.99949
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3495,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.7745,
+          "pcc": 0.99944
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3447,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3482,
+          "pcc": 0.99944
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat16",
+        "ms": 0.3447,
+        "pcc": 0.99984
+      }
+    },
+    {
+      "m": 61,
+      "k": 4096,
+      "n": 1024,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6245,
+          "pcc": 0.99938
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.6512,
+          "pcc": 0.98882
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6241,
+          "pcc": 0.99901
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.6231,
+          "pcc": 0.98742
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6245,
+          "pcc": 0.99901
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.6222,
+          "pcc": 0.98742
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat16",
+        "ms": 0.6241,
+        "pcc": 0.99901
+      }
+    },
+    {
+      "m": 1,
+      "k": 256,
+      "n": 256,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3321,
+          "pcc": 0.99991
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3309,
+          "pcc": 0.99971
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3306,
+          "pcc": 0.99997
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3283,
+          "pcc": 0.99977
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3324,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3331,
+          "pcc": 0.99977
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3283,
+        "pcc": 0.99977
+      }
+    },
+    {
+      "m": 201,
+      "k": 512,
+      "n": 257,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3422,
+          "pcc": 0.99987
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3644,
+          "pcc": 0.99957
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4006,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3422,
+          "pcc": 0.99958
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3708,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3448,
+          "pcc": 0.99958
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.3422,
+        "pcc": 0.99987
+      }
+    },
+    {
+      "m": 201,
+      "k": 257,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3846,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3361,
+          "pcc": 0.99957
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3426,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3377,
+          "pcc": 0.99962
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.345,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4067,
+          "pcc": 0.99962
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3361,
+        "pcc": 0.99957
+      }
+    },
+    {
+      "m": 12864,
+      "k": 9,
+      "n": 32,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3801,
+          "pcc": 0.9999
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.4034,
+          "pcc": 0.99985
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4406,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3486,
+          "pcc": 0.99994
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3794,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3519,
+          "pcc": 0.99994
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3486,
+        "pcc": 0.99994
+      }
+    },
+    {
+      "m": 12864,
+      "k": 288,
+      "n": 32,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6235,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.6233,
+          "pcc": 0.99956
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.636,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.6211,
+          "pcc": 0.9996
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6219,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.8764,
+          "pcc": 0.9996
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.6211,
+        "pcc": 0.9996
+      }
+    },
+    {
+      "m": 1,
+      "k": 32,
+      "n": 4,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3275,
+          "pcc": 0.99986
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3292,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3288,
+          "pcc": 0.99997
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3263,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.327,
+          "pcc": 1.0
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.32,
+          "pcc": 0.99989
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.32,
+        "pcc": 0.99989
+      }
+    },
+    {
+      "m": 1,
+      "k": 4,
+      "n": 32,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3326,
+          "pcc": 0.99986
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3308,
+          "pcc": 0.99985
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.331,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3256,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.333,
+          "pcc": 1.0
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3868,
+          "pcc": 0.99993
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3256,
+        "pcc": 0.99993
+      }
+    },
+    {
+      "m": 3232,
+      "k": 288,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3708,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.353,
+          "pcc": 0.99955
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4847,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3529,
+          "pcc": 0.9996
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3976,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4175,
+          "pcc": 0.9996
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3529,
+        "pcc": 0.9996
+      }
+    },
+    {
+      "m": 3232,
+      "k": 576,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6264,
+          "pcc": 0.99987
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.4712,
+          "pcc": 0.99951
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6225,
+          "pcc": 0.99992
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3686,
+          "pcc": 0.99951
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6219,
+          "pcc": 0.99992
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3691,
+          "pcc": 0.99951
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3686,
+        "pcc": 0.99951
+      }
+    },
+    {
+      "m": 1,
+      "k": 64,
+      "n": 8,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3262,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3942,
+          "pcc": 0.99962
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3227,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3255,
+          "pcc": 0.99988
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.329,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3296,
+          "pcc": 0.99988
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat16",
+        "ms": 0.3227,
+        "pcc": 0.99998
+      }
+    },
+    {
+      "m": 1,
+      "k": 8,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3322,
+          "pcc": 0.99992
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3891,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3346,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3369,
+          "pcc": 0.9999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3332,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3277,
+          "pcc": 0.9999
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.3277,
+        "pcc": 0.9999
+      }
+    },
+    {
+      "m": 3232,
+      "k": 32,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3497,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3402,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3441,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3402,
+          "pcc": 0.99992
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3402,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.5429,
+          "pcc": 0.99992
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3402,
+        "pcc": 0.99983
+      }
+    },
+    {
+      "m": 816,
+      "k": 576,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3594,
+          "pcc": 0.99987
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3542,
+          "pcc": 0.99893
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3606,
+          "pcc": 0.99992
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.5405,
+          "pcc": 0.99888
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3618,
+          "pcc": 0.99992
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.35,
+          "pcc": 0.99888
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.35,
+        "pcc": 0.99888
+      }
+    },
+    {
+      "m": 816,
+      "k": 1152,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6252,
+          "pcc": 0.99982
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.4217,
+          "pcc": 0.99665
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6255,
+          "pcc": 0.99981
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3785,
+          "pcc": 0.99633
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6515,
+          "pcc": 0.99981
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3681,
+          "pcc": 0.99633
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.3681,
+        "pcc": 0.99633
+      }
+    },
+    {
+      "m": 1,
+      "k": 128,
+      "n": 16,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3265,
+          "pcc": 0.99994
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.4189,
+          "pcc": 0.99988
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3854,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.325,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3278,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3276,
+          "pcc": 0.99996
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.325,
+        "pcc": 0.99996
+      }
+    },
+    {
+      "m": 1,
+      "k": 16,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3309,
+          "pcc": 0.99987
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3619,
+          "pcc": 0.99981
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3942,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3262,
+          "pcc": 0.99991
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3319,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3333,
+          "pcc": 0.99991
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3262,
+        "pcc": 0.99991
+      }
+    },
+    {
+      "m": 816,
+      "k": 64,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3555,
+          "pcc": 0.9999
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.4041,
+          "pcc": 0.9998
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3419,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3381,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3463,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3396,
+          "pcc": 0.99989
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3381,
+        "pcc": 0.99989
+      }
+    },
+    {
+      "m": 208,
+      "k": 1152,
+      "n": 256,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.362,
+          "pcc": 0.99982
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3617,
+          "pcc": 0.99673
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3578,
+          "pcc": 0.99982
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3573,
+          "pcc": 0.99639
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3645,
+          "pcc": 0.99981
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.358,
+          "pcc": 0.99639
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3573,
+        "pcc": 0.99639
+      }
+    },
+    {
+      "m": 208,
+      "k": 2304,
+      "n": 256,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3571,
+          "pcc": 0.99969
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3514,
+          "pcc": 0.99924
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3584,
+          "pcc": 0.99954
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.413,
+          "pcc": 0.99904
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3581,
+          "pcc": 0.99954
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4084,
+          "pcc": 0.99904
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3514,
+        "pcc": 0.99924
+      }
+    },
+    {
+      "m": 1,
+      "k": 256,
+      "n": 32,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3276,
+          "pcc": 0.9999
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3282,
+          "pcc": 0.9996
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3315,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3242,
+          "pcc": 0.99972
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.329,
+          "pcc": 0.99997
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3962,
+          "pcc": 0.99972
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3242,
+        "pcc": 0.99972
+      }
+    },
+    {
+      "m": 1,
+      "k": 32,
+      "n": 256,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3289,
+          "pcc": 0.9999
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3306,
+          "pcc": 0.99987
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3283,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3271,
+          "pcc": 0.99994
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.328,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3913,
+          "pcc": 0.99994
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3271,
+        "pcc": 0.99994
+      }
+    },
+    {
+      "m": 208,
+      "k": 128,
+      "n": 256,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3421,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3431,
+          "pcc": 0.99975
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3427,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3424,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3694,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3411,
+          "pcc": 0.99983
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.3411,
+        "pcc": 0.99983
+      }
+    },
+    {
+      "m": 26,
+      "k": 2048,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3464,
+          "pcc": 0.99973
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.4022,
+          "pcc": 0.99698
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3562,
+          "pcc": 0.99965
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3484,
+          "pcc": 0.99655
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3501,
+          "pcc": 0.99965
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3436,
+          "pcc": 0.99655
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.3436,
+        "pcc": 0.99655
+      }
+    },
+    {
+      "m": 26,
+      "k": 128,
+      "n": 2048,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3379,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.339,
+          "pcc": 0.9998
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.334,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3384,
+          "pcc": 0.99988
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3409,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4972,
+          "pcc": 0.99988
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat16",
+        "ms": 0.334,
+        "pcc": 0.99998
+      }
+    },
+    {
+      "m": 1,
+      "k": 4096,
+      "n": 512,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6849,
+          "pcc": 0.99946
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3825,
+          "pcc": 0.98948
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6233,
+          "pcc": 0.9991
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3792,
+          "pcc": 0.98771
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6235,
+          "pcc": 0.99909
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4978,
+          "pcc": 0.98771
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat16",
+        "ms": 0.6233,
+        "pcc": 0.9991
+      }
+    },
+    {
+      "m": 64,
+      "k": 1024,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.4271,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3394,
+          "pcc": 0.99949
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4516,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3406,
+          "pcc": 0.99944
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3437,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3421,
+          "pcc": 0.99944
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3394,
+        "pcc": 0.99949
+      }
+    },
+    {
+      "m": 64,
+      "k": 1024,
+      "n": 1024,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3558,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3457,
+          "pcc": 0.99899
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3584,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3524,
+          "pcc": 0.99887
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3561,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3499,
+          "pcc": 0.99887
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3457,
+        "pcc": 0.99899
+      }
+    },
+    {
+      "m": 64,
+      "k": 1024,
+      "n": 512,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3484,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3479,
+          "pcc": 0.9995
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3483,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.4423,
+          "pcc": 0.99945
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3466,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4005,
+          "pcc": 0.99945
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat16",
+        "ms": 0.3466,
+        "pcc": 0.99984
+      }
+    },
+    {
+      "m": 64,
+      "k": 4096,
+      "n": 1024,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6241,
+          "pcc": 0.99938
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.6491,
+          "pcc": 0.98883
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6246,
+          "pcc": 0.999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.6661,
+          "pcc": 0.98742
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6219,
+          "pcc": 0.999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.6223,
+          "pcc": 0.98742
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat16",
+        "ms": 0.6219,
+        "pcc": 0.999
+      }
+    },
+    {
+      "m": 64,
+      "k": 1024,
+      "n": 1026,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3576,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3534,
+          "pcc": 0.99897
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3559,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3539,
+          "pcc": 0.99886
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3592,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3512,
+          "pcc": 0.99886
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.3512,
+        "pcc": 0.99886
+      }
+    },
+    {
+      "m": 1024,
+      "k": 6,
+      "n": 24,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.338,
+          "pcc": 0.99987
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3597,
+          "pcc": 0.9998
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3354,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3886,
+          "pcc": 0.99992
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3364,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3338,
+          "pcc": 0.99992
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.3338,
+        "pcc": 0.99992
+      }
+    },
+    {
+      "m": 1024,
+      "k": 24,
+      "n": 26,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3351,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3312,
+          "pcc": 0.99982
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4294,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3344,
+          "pcc": 0.99992
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3375,
+          "pcc": 0.99999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3334,
+          "pcc": 0.99992
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3312,
+        "pcc": 0.99982
+      }
+    },
+    {
+      "m": 26,
+      "k": 7168,
+      "n": 512,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6216,
+          "pcc": 0.99855
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.6235,
+          "pcc": 0.96757
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6233,
+          "pcc": 0.99779
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.6231,
+          "pcc": 0.96487
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6234,
+          "pcc": 0.99779
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.6234,
+          "pcc": 0.96487
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.6216,
+        "pcc": 0.99855
+      }
+    },
+    {
+      "m": 1,
+      "k": 512,
+      "n": 512,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3391,
+          "pcc": 0.99986
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3364,
+          "pcc": 0.99956
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4117,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3387,
+          "pcc": 0.99956
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.4273,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3377,
+          "pcc": 0.99956
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3364,
+        "pcc": 0.99956
+      }
+    },
+    {
+      "m": 208,
+      "k": 8192,
+      "n": 256,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6244,
+          "pcc": 0.99817
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.4251,
+          "pcc": 0.99726
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6229,
+          "pcc": 0.9973
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3742,
+          "pcc": 0.99661
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6233,
+          "pcc": 0.9973
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4321,
+          "pcc": 0.99661
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3742,
+        "pcc": 0.99661
+      }
+    },
+    {
+      "m": 1,
+      "k": 512,
+      "n": 256,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3381,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3872,
+          "pcc": 0.99958
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.335,
+          "pcc": 0.99995
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3327,
+          "pcc": 0.99964
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3384,
+          "pcc": 0.99995
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3708,
+          "pcc": 0.99964
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3327,
+        "pcc": 0.99964
+      }
+    },
+    {
+      "m": 208,
+      "k": 768,
+      "n": 256,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3452,
+          "pcc": 0.99985
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3432,
+          "pcc": 0.99953
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3481,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3438,
+          "pcc": 0.99952
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3463,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3447,
+          "pcc": 0.99952
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3432,
+        "pcc": 0.99953
+      }
+    },
+    {
+      "m": 208,
+      "k": 1792,
+      "n": 256,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3511,
+          "pcc": 0.99975
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3486,
+          "pcc": 0.99936
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4395,
+          "pcc": 0.99967
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3477,
+          "pcc": 0.99921
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3538,
+          "pcc": 0.99967
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3449,
+          "pcc": 0.99921
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.3449,
+        "pcc": 0.99921
+      }
+    },
+    {
+      "m": 208,
+      "k": 2816,
+      "n": 256,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.359,
+          "pcc": 0.99962
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3479,
+          "pcc": 0.99914
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4211,
+          "pcc": 0.9994
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3516,
+          "pcc": 0.99888
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3617,
+          "pcc": 0.9994
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4066,
+          "pcc": 0.99888
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3479,
+        "pcc": 0.99914
+      }
+    },
+    {
+      "m": 1664,
+      "k": 4096,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.7217,
+          "pcc": 0.99938
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.6232,
+          "pcc": 0.9888
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.7367,
+          "pcc": 0.999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.6527,
+          "pcc": 0.98738
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.7385,
+          "pcc": 0.999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.6224,
+          "pcc": 0.98738
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.7217,
+        "pcc": 0.99938
+      }
+    },
+    {
+      "m": 1,
+      "k": 512,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.331,
+          "pcc": 0.99987
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3349,
+          "pcc": 0.99957
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3367,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3336,
+          "pcc": 0.99946
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.4563,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3352,
+          "pcc": 0.99946
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.331,
+        "pcc": 0.99987
+      }
+    },
+    {
+      "m": 1664,
+      "k": 384,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3593,
+          "pcc": 0.99988
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3557,
+          "pcc": 0.99967
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3685,
+          "pcc": 0.99995
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.354,
+          "pcc": 0.99971
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3628,
+          "pcc": 0.99995
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4106,
+          "pcc": 0.99971
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.354,
+        "pcc": 0.99971
+      }
+    },
+    {
+      "m": 1664,
+      "k": 896,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6526,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.362,
+          "pcc": 0.99916
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6273,
+          "pcc": 0.99986
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.4115,
+          "pcc": 0.99909
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6218,
+          "pcc": 0.99986
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3638,
+          "pcc": 0.99909
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.362,
+        "pcc": 0.99916
+      }
+    },
+    {
+      "m": 1664,
+      "k": 1408,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6234,
+          "pcc": 0.9998
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3763,
+          "pcc": 0.99834
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6253,
+          "pcc": 0.99976
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3742,
+          "pcc": 0.99808
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6239,
+          "pcc": 0.99976
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3751,
+          "pcc": 0.99808
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3742,
+        "pcc": 0.99808
+      }
+    },
+    {
+      "m": 3328,
+      "k": 512,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6242,
+          "pcc": 0.99987
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3668,
+          "pcc": 0.99957
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6267,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3676,
+          "pcc": 0.99963
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6226,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3644,
+          "pcc": 0.99963
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.3644,
+        "pcc": 0.99963
+      }
+    },
+    {
+      "m": 1,
+      "k": 512,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3317,
+          "pcc": 0.99987
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3349,
+          "pcc": 0.99945
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.333,
+          "pcc": 0.99992
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.332,
+          "pcc": 0.99958
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.391,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3402,
+          "pcc": 0.99958
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.3317,
+        "pcc": 0.99987
+      }
+    },
+    {
+      "m": 3328,
+      "k": 192,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3951,
+          "pcc": 0.9999
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3789,
+          "pcc": 0.99978
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.358,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3451,
+          "pcc": 0.99985
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3576,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3493,
+          "pcc": 0.99985
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3451,
+        "pcc": 0.99985
+      }
+    },
+    {
+      "m": 3328,
+      "k": 448,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6248,
+          "pcc": 0.99988
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3652,
+          "pcc": 0.99962
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6223,
+          "pcc": 0.99994
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3625,
+          "pcc": 0.99965
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6226,
+          "pcc": 0.99994
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3649,
+          "pcc": 0.99965
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3625,
+        "pcc": 0.99965
+      }
+    },
+    {
+      "m": 3328,
+      "k": 704,
+      "n": 64,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6229,
+          "pcc": 0.99986
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3762,
+          "pcc": 0.99939
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6506,
+          "pcc": 0.99991
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3761,
+          "pcc": 0.99936
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6231,
+          "pcc": 0.99991
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3786,
+          "pcc": 0.99936
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3761,
+        "pcc": 0.99936
+      }
+    },
+    {
+      "m": 6656,
+      "k": 256,
+      "n": 32,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6249,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.4159,
+          "pcc": 0.99975
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6259,
+          "pcc": 0.99996
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3699,
+          "pcc": 0.99977
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6226,
+          "pcc": 0.99997
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4418,
+          "pcc": 0.99977
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3699,
+        "pcc": 0.99977
+      }
+    },
+    {
+      "m": 1,
+      "k": 512,
+      "n": 32,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3316,
+          "pcc": 0.99991
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3285,
+          "pcc": 0.99965
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3299,
+          "pcc": 0.99994
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.4027,
+          "pcc": 0.99969
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3293,
+          "pcc": 0.99993
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3317,
+          "pcc": 0.99969
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3285,
+        "pcc": 0.99965
+      }
+    },
+    {
+      "m": 6656,
+      "k": 96,
+      "n": 32,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3536,
+          "pcc": 0.9999
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3417,
+          "pcc": 0.99978
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4407,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.4361,
+          "pcc": 0.99987
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.4416,
+          "pcc": 0.99998
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3475,
+          "pcc": 0.99987
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3417,
+        "pcc": 0.99978
+      }
+    },
+    {
+      "m": 6656,
+      "k": 224,
+      "n": 32,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6267,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3633,
+          "pcc": 0.99965
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6245,
+          "pcc": 0.99997
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3618,
+          "pcc": 0.99971
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6231,
+          "pcc": 0.99997
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3591,
+          "pcc": 0.99971
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.3591,
+        "pcc": 0.99971
+      }
+    },
+    {
+      "m": 6656,
+      "k": 352,
+      "n": 32,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6244,
+          "pcc": 0.99988
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3764,
+          "pcc": 0.99945
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6226,
+          "pcc": 0.99995
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3792,
+          "pcc": 0.99947
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6229,
+          "pcc": 0.99995
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3737,
+          "pcc": 0.99947
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat8_b",
+        "ms": 0.3737,
+        "pcc": 0.99947
+      }
+    },
+    {
+      "m": 6656,
+      "k": 224,
+      "n": 1,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6266,
+          "pcc": 0.99989
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3699,
+          "pcc": 0.99982
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6252,
+          "pcc": 0.99997
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3611,
+          "pcc": 0.9999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6259,
+          "pcc": 0.99997
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3629,
+          "pcc": 0.9999
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3611,
+        "pcc": 0.9999
+      }
+    },
+    {
+      "m": 51,
+      "k": 1024,
+      "n": 128,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.4066,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3409,
+          "pcc": 0.99948
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4031,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3436,
+          "pcc": 0.99943
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3856,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.341,
+          "pcc": 0.99943
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3409,
+        "pcc": 0.99948
+      }
+    },
+    {
+      "m": 51,
+      "k": 1024,
+      "n": 1024,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3561,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3494,
+          "pcc": 0.99899
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.4103,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3534,
+          "pcc": 0.99887
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3878,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3518,
+          "pcc": 0.99887
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3494,
+        "pcc": 0.99899
+      }
+    },
+    {
+      "m": 51,
+      "k": 1024,
+      "n": 512,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3457,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3476,
+          "pcc": 0.99949
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3498,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.499,
+          "pcc": 0.99944
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3458,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3478,
+          "pcc": 0.99944
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.3457,
+        "pcc": 0.99983
+      }
+    },
+    {
+      "m": 51,
+      "k": 4096,
+      "n": 1024,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6246,
+          "pcc": 0.99939
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.6776,
+          "pcc": 0.9888
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.6273,
+          "pcc": 0.99902
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.6228,
+          "pcc": 0.98731
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.6278,
+          "pcc": 0.99901
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.6231,
+          "pcc": 0.98731
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.6246,
+        "pcc": 0.99939
+      }
+    },
+    {
+      "m": 51,
+      "k": 1024,
+      "n": 1026,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3544,
+          "pcc": 0.99983
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.354,
+          "pcc": 0.99898
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3572,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3532,
+          "pcc": 0.99887
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3582,
+          "pcc": 0.99984
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.355,
+          "pcc": 0.99887
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat8_b",
+        "ms": 0.3532,
+        "pcc": 0.99887
+      }
+    }
+  ]
+}
