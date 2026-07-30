@@ -79,19 +79,29 @@ def build(device, torch_module):
     def _mm(a, b):
         return ttnn.matmul(a, b, compute_kernel_config=kcfg)
 
+    def _stage(t, mapper):
+        """Upload one weight to the mesh, tilizing ROW VECTORS on the host.
+
+        A bias / norm scale has logical height 1, so a DEVICE tilize has to val-pad it
+        1 -> 32 rows, which ttnn runs on a SINGLE core: ~88 us per call for a few KB.
+        There are 8 such vectors per block, so the 30 blocks burned tens of ms of device
+        time uploading ~1 MB. Tilizing them host-side is free by comparison. Real
+        matrices are already tile-shaped (no val padding) and keep the multicore device
+        path, where host tilizing megabytes would be the worse trade."""
+        t = t.contiguous().to(torch.bfloat16)
+        if t.dim() >= 2 and int(t.shape[-2]) == 1:
+            return ttnn.to_device(
+                ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                                mesh_mapper=mapper),
+                device)
+        return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                               device=device, mesh_mapper=mapper)
+
     def _rep(t):
-        return ttnn.from_torch(
-            t.contiguous().to(torch.bfloat16), dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT, device=device,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
-        )
+        return _stage(t, ttnn.ReplicateTensorToMesh(device))
 
     def _shard(t, dim):
-        return ttnn.from_torch(
-            t.contiguous().to(torch.bfloat16), dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT, device=device,
-            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=dim),
-        )
+        return _stage(t, ttnn.ShardTensorToMesh(device, dim=dim))
 
     def _norm(mod):
         return (_rep(mod.weight.detach().reshape(1, 1, -1)),
