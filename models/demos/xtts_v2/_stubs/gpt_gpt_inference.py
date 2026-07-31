@@ -164,17 +164,22 @@ def build(device, torch_module):
                            program_config=pc)
 
     def _mm_l1(a, b):
-        """Row-parallel partial product, emitted straight into L1.
+        """Row-parallel partial product, emitted straight into L1, on a right-sized grid.
+
+        These are the two c_proj projections per block, and they were the last matmuls
+        still on ttnn default routing after the tuned program config landed on qkv/c_fc.
 
         Its only consumer is the collective in _reduce, which is dispatch/latency-bound.
         Producing the partial in L1 (and reducing back into L1) means no DRAM round-trip
         anywhere around the collective, instead of write-DRAM / read-DRAM / write-DRAM /
         read-DRAM for the matmul->reduce->add chain."""
+        pc = _pcfg(a, b)
         try:
             return ttnn.matmul(a, b, compute_kernel_config=kcfg,
-                               memory_config=ttnn.L1_MEMORY_CONFIG)
+                               memory_config=ttnn.L1_MEMORY_CONFIG,
+                               program_config=pc)
         except Exception:  # noqa: BLE001 - shape does not fit L1
-            return ttnn.matmul(a, b, compute_kernel_config=kcfg)
+            return ttnn.matmul(a, b, compute_kernel_config=kcfg, program_config=pc)
 
     def _stage(t, mapper):
         """Upload one weight to the mesh, tilizing ROW VECTORS on the host.
