@@ -56,13 +56,17 @@ import ttnn
 # A native conv keeps its [k*Cin, Cout] weight block resident in L1 circular buffers,
 # so this budget -- not the activation -- is what decides whether the native form is
 # usable at all. It is a COVERAGE knob: every conv above it falls back to im2col, and
-# im2col is what generates the val-padded tilizes (a TILE slice at a time offset that
-# is not a multiple of 32 costs untilize + retilize). Raised from 1 MB to 3 MB to pull
-# ups[1] (k=16, Cin=256 -> a 27 MB im2col stack at L=1664) and the k=7/k=11 stage-0
-# ResBlocks onto the native path. conv_pre (14.7 MB) and ups[0] (8.4 MB) stay on
-# im2col -- they sit at L=26..208 where im2col is cheap, and forcing them native
-# overflows L1 outright ("circular buffers grow to 7122176 B").
-_NATIVE_WEIGHT_BUDGET_B = 3 << 20
+# im2col is what generates the layout churn (a TILE slice at a time offset that is not
+# a multiple of 32 costs untilize + retilize).
+#
+# Walked it and measured every step, because the curve is not monotonic:
+#   1 MB -> 100.95 ms   3 MB -> 93.16 ms   9 MB -> 89.71 ms   15 MB -> 91.14 ms
+# 3 MB pulls in ups[1] (k=16, Cin=256; its im2col stack at L=1664 is 27 MB) and the
+# k=7/k=11 stage-0 ResBlocks; 9 MB also pulls in ups[0]. 15 MB additionally covers
+# conv_pre, and that LOSES: Cin=1024 over only L=26 is a bad native conv shape -- the
+# weight block dwarfs the work -- while im2col over 26 positions is nearly free. So
+# conv_pre is the one conv deliberately left on im2col.
+_NATIVE_WEIGHT_BUDGET_B = 9 << 20
 
 
 def build(device, torch_module):
