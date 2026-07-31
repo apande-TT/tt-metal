@@ -105,6 +105,32 @@ def build(device, torch_module):
         except Exception:  # noqa: BLE001 - will not fit L1
             return ttnn.add(a, b)
 
+    # knob:grid (second attempt). Forcing the MAXIMUM core grid regressed decode 4.6%
+    # (64 cores each owning one output tile, mcast setup dominating). So try a RIGHT-SIZED
+    # explicit program config instead: one output tile per core, K split into blocks so the
+    # in0 stream is bounded, derived from the actual tile counts at the call site rather
+    # than from a fixed guess. out_subblock_h*w must stay <= 4 because fp32_dest_acc_en is
+    # on. Falls back to the default routing for shapes this cannot tile evenly.
+    _grid = device.compute_with_storage_grid_size()
+
+    def _pcfg(a, b):
+        mt = (int(a.shape[-2]) + 31) // 32
+        kt = int(a.shape[-1]) // 32
+        nt = int(b.shape[-1]) // 32
+        if kt == 0 or nt == 0 or int(a.shape[-1]) % 32 or int(b.shape[-1]) % 32:
+            return None
+        ncores = min(_grid.x * _grid.y, nt)
+        gx = min(_grid.x, ncores)
+        gy = max(1, ncores // gx)
+        if gx * gy == 0 or nt % (gx * gy):
+            return None
+        ibw = 4 if kt % 4 == 0 else 1
+        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(gx, gy),
+            in0_block_w=ibw, out_subblock_h=1, out_subblock_w=1,
+            per_core_M=mt, per_core_N=nt // (gx * gy),
+            fuse_batch=True, fused_activation=None, mcast_in0=True)
+
     def _mm(a, b):
         return ttnn.matmul(a, b, compute_kernel_config=kcfg)
 
@@ -118,7 +144,11 @@ def build(device, torch_module):
         qkv and c_fc projections are COLUMN-parallel (each chip owns the matching bias
         columns), whereas the row-parallel output projections must add their replicated
         bias ONCE, after the collective -- never folded into the per-chip partial."""
-        return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg)
+        pc = _pcfg(a, b)
+        if pc is None:
+            return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg)
+        return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg,
+                           program_config=pc)
 
     def _mm_l1(a, b):
         """Row-parallel partial product, emitted straight into L1.
