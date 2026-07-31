@@ -157,11 +157,12 @@ def build(device, torch_module):
         taps = [ttnn.slice(xp, [0, 0, t * dil], [1, Cin, t * dil + Lout], memory_config=tap_mc)
                 for t in range(k)]
         xc = ttnn.concat(taps, dim=1, memory_config=stack_mc) if k > 1 else taps[0]
+        out_mc = _l1_if_fits((Lout, int(meta["Wm"].shape[-1])))
         y = ttnn.matmul(ttnn.transpose(xc, 1, 2, memory_config=stack_mc), meta["Wm"],
-                        compute_kernel_config=kcfg)  # [1,Lout,Cout]
+                        compute_kernel_config=kcfg, memory_config=out_mc)  # [1,Lout,Cout]
         if meta["b"] is not None:
-            y = ttnn.add(y, meta["b"])
-        return ttnn.transpose(y, 1, 2)                          # [1, Cout, Lout]
+            y = ttnn.add(y, meta["b"], memory_config=out_mc)
+        return ttnn.transpose(y, 1, 2, memory_config=out_mc)    # [1, Cout, Lout]
 
     def _convT1d(x, meta):
         # Dilate input by inserting stride-1 zeros, then stride-1 conv with Weff.
@@ -169,10 +170,13 @@ def build(device, torch_module):
         Cin = int(x.shape[1])
         T = int(x.shape[-1])
         if s > 1:
+            # The dilation is 4 more datamove ops whose intermediates are each consumed
+            # only by the next one, so they take the same L1 residency as the im2col.
+            dil_mc = _l1_if_fits((Cin, T * s))
             xd = ttnn.reshape(x, [1, Cin, T, 1])
             xd = ttnn.pad(xd, [(0, 0), (0, 0), (0, 0), (0, s - 1)], value=0.0)  # [1,Cin,T,s]
             xd = ttnn.reshape(xd, [1, Cin, T * s])
-            xd = ttnn.slice(xd, [0, 0, 0], [1, Cin, (T - 1) * s + 1])
+            xd = ttnn.slice(xd, [0, 0, 0], [1, Cin, (T - 1) * s + 1], memory_config=dil_mc)
         else:
             xd = x
         conv_meta = {"Wm": meta["Wm"], "b": meta["b"], "k": k, "dil": 1, "pad": k - 1 - pad}
@@ -182,7 +186,11 @@ def build(device, torch_module):
         return y
 
     def _lrelu(x, slope):
-        return ttnn.leaky_relu(x, negative_slope=slope)
+        # The activation feeds straight into the next conv's im2col slices, so keep it
+        # in L1 too -- otherwise every resblock hop pays a DRAM write+read between the
+        # activation and the taps that read it k times.
+        return ttnn.leaky_relu(x, negative_slope=slope,
+                               memory_config=_l1_if_fits(tuple(x.shape)))
 
     def forward(latents, g=None, **_):
         if not isinstance(g, ttnn.Tensor):
@@ -211,7 +219,7 @@ def build(device, torch_module):
                 for c1, c2 in resblocks[i * num_k + j]:
                     xt = _conv1d(_lrelu(x, 0.1), c1)
                     xt = _conv1d(_lrelu(xt, 0.1), c2)
-                    x = ttnn.add(xt, x)
+                    x = ttnn.add(xt, x, memory_config=_l1_if_fits(tuple(x.shape)))
                 z_sum = x if z_sum is None else ttnn.add(z_sum, x)
             o = ttnn.multiply(z_sum, 1.0 / num_k)
         o = _lrelu(o, 0.01)                                     # final: default slope 0.01

@@ -108,6 +108,18 @@ def build(device, torch_module):
     def _mm(a, b):
         return ttnn.matmul(a, b, compute_kernel_config=kcfg)
 
+    def _lin(a, b, bias):
+        """Projection WITH its bias folded into the matmul.
+
+        A decode step is dispatch-bound -- op COUNT is the cost -- and a separate
+        ttnn.add for the bias is a whole extra dispatch to add one broadcast row to a
+        result the matmul kernel already has in its accumulator. ttnn.linear does it in
+        the same op. This is only legal where the bias belongs to THIS chip's shard: the
+        qkv and c_fc projections are COLUMN-parallel (each chip owns the matching bias
+        columns), whereas the row-parallel output projections must add their replicated
+        bias ONCE, after the collective -- never folded into the per-chip partial."""
+        return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg)
+
     def _mm_l1(a, b):
         """Row-parallel partial product, emitted straight into L1.
 
@@ -243,7 +255,7 @@ def build(device, torch_module):
     def _mlp(x, L):
         h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1],
                             epsilon=L["ln2"][2], compute_kernel_config=_ln_kcfg)
-        ff = ttnn.add(_mm(h, L["wt_fc"]), L["b_fc"])
+        ff = _lin(h, L["wt_fc"], L["b_fc"])
         ff = ttnn.gelu(ff, variant=ttnn.GeluVariant.Tanh)
         return _add_l1(x, ttnn.add(_reduce(_mm_l1(ff, L["wt_mo"])), L["b_mo"]))
 
@@ -252,7 +264,7 @@ def build(device, torch_module):
                             compute_kernel_config=_ln_kcfg)
         x = ttnn.layer_norm(x, weight=fn_w, bias=fn_b, epsilon=fn_eps,
                             compute_kernel_config=_ln_kcfg)
-        return ttnn.add(_mm(x, lm_w), lm_b)
+        return _lin(x, lm_w, lm_b)
 
     def _block(x, L, T, kv_sink=None):
         # --- attention ---
@@ -264,7 +276,7 @@ def build(device, torch_module):
         # shuffle as one multicore device op, so no layout round-trip happens at all.
         h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1],
                             epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
-        qkv = ttnn.add(_mm(h, L["wt_qkv"]), L["bt_qkv"])       # [1, T, 3*shard_w]
+        qkv = _lin(h, L["wt_qkv"], L["bt_qkv"])                # [1, T, 3*shard_w]
         qkv = ttnn.reshape(qkv, [1, 1, T, 3 * shard_w])        # leading-dim view, no repack
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=heads_pc, num_kv_heads=heads_pc, transpose_k_heads=False)
@@ -331,7 +343,7 @@ def build(device, torch_module):
         for L, (kc, vc) in zip(layers, _kv["kv"]):
             h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1],
                             epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
-            qkv = ttnn.add(_mm(h, L["wt_qkv"]), L["bt_qkv"])            # [1,1,3*shard_w]
+            qkv = _lin(h, L["wt_qkv"], L["bt_qkv"])                     # [1,1,3*shard_w]
             qkv = ttnn.reshape(qkv, [1, 1, 1, 3 * shard_w])
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
                 qkv, num_heads=heads_pc, num_kv_heads=heads_pc, transpose_k_heads=False)
