@@ -36,6 +36,19 @@ def build(device, torch_module):
     _g = device.compute_with_storage_grid_size()
     _core_grid = ttnn.CoreGrid(y=_g.y, x=_g.x)
 
+    # FIDELITY. Every matmul here was on ttnn's DEFAULT compute config, i.e. LoFi with a
+    # bf16 destination register. That is fine in isolation (the per-stub PCC test passes at
+    # ~0.999), but this stub's output is the CONDITIONING PREFIX of a 30-layer greedy decode:
+    # the AR argmax at the first audio code can sit within ~1% of its runner-up, so a LoFi
+    # rounding here flips a token and diverges the whole sequence. HiFi4 with fp32
+    # accumulation costs a few hundred microseconds once per utterance and removes that.
+    _kcfg = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=True,
+    )
+
     def _rep(t):
         # A bias / norm scale has logical height 1, so a DEVICE tilize has to val-pad it
         # 1 -> 32 rows, which ttnn runs on a SINGLE core -- the profile's grid=tiny
@@ -81,7 +94,7 @@ def build(device, torch_module):
 
     def _conv1x1(x_ct, wt_co, b_1o):
         y = ttnn.transpose(x_ct, -2, -1)      # [1, T, C_in]
-        y = ttnn.matmul(y, wt_co)             # [1, T, C_out]
+        y = ttnn.matmul(y, wt_co, compute_kernel_config=_kcfg)   # [1, T, C_out]
         y = ttnn.add(y, b_1o)
         return ttnn.transpose(y, -2, -1)      # [1, C_out, T]
 
@@ -107,11 +120,13 @@ def build(device, torch_module):
         # knob:grid -- both attention matmuls are batched over heads and ttnn routes them
         # onto ~10 cores. Hand them the REAL compute grid (resolved, never hard-coded) so
         # the head batch and the output tiles spread across the whole chip.
-        w = ttnn.multiply(ttnn.matmul(ttnn.transpose(q, -2, -1), k, core_grid=_core_grid),
+        w = ttnn.multiply(ttnn.matmul(ttnn.transpose(q, -2, -1), k, core_grid=_core_grid,
+                                      compute_kernel_config=_kcfg),
                           ch ** -0.5)
         w = ttnn.softmax(w, dim=-1)
         a = ttnn.matmul(v, ttnn.transpose(w, -2, -1),
-                        core_grid=_core_grid)           # [1, h, ch, T]
+                        core_grid=_core_grid,
+                        compute_kernel_config=_kcfg)    # [1, h, ch, T]
         a = ttnn.reshape(a, [1, C, T])
 
         h2 = _conv1x1(a, p["wt_proj"], p["b_proj"])

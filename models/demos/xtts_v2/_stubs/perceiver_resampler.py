@@ -93,6 +93,18 @@ def build(device, torch_module):
         })
 
     nm = torch_module.norm
+    # FIDELITY. These matmuls were on ttnn's DEFAULT compute config (LoFi, bf16 destination
+    # register). The resampler's 32 output latents are the CONDITIONING PREFIX of a 30-layer
+    # greedy decode, where the first audio code's argmax can sit within ~1% of its runner-up --
+    # a LoFi rounding here flips that token and diverges the whole generated sequence. HiFi4
+    # with fp32 accumulation is a once-per-utterance cost on 32 rows.
+    _kcfg = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=True,
+    )
+
     rms_scale = float(nm.scale)
     rms_gamma = _rep(nm.gamma.detach().reshape(1, 1, -1)) if nm.gamma is not None else None
 
@@ -100,23 +112,24 @@ def build(device, torch_module):
         # cross_attn_include_queries=True: keys/values attend over the latents
         # concatenated with the context along the sequence axis.
         kv_ctx = ttnn.concat([latents_t, ctx], dim=1)     # [1, n+S, dim]
-        q = ttnn.matmul(latents_t, L["wt_q"])             # [1, n, head_dim] head i
-        k = ttnn.matmul(kv_ctx, L["wt_k"])                # [1, n+S, head_dim]
-        v = ttnn.matmul(kv_ctx, L["wt_v"])
-        sim = ttnn.multiply(ttnn.matmul(q, ttnn.transpose(k, -2, -1)), L["scale"])
+        q = ttnn.matmul(latents_t, L["wt_q"], compute_kernel_config=_kcfg)   # [1,n,head_dim] head i
+        k = ttnn.matmul(kv_ctx, L["wt_k"], compute_kernel_config=_kcfg)      # [1, n+S, head_dim]
+        v = ttnn.matmul(kv_ctx, L["wt_v"], compute_kernel_config=_kcfg)
+        sim = ttnn.multiply(ttnn.matmul(q, ttnn.transpose(k, -2, -1),
+                                        compute_kernel_config=_kcfg), L["scale"])
         a = ttnn.softmax(sim, dim=-1)
-        out = ttnn.matmul(a, v)                           # [1, n, head_dim]
+        out = ttnn.matmul(a, v, compute_kernel_config=_kcfg)                 # [1, n, head_dim]
         out = ttnn.all_gather(out, dim=2, num_links=1, topology=ttnn.Topology.Linear)
-        return ttnn.matmul(out, L["wt_o"])                # [1, n, dim]
+        return ttnn.matmul(out, L["wt_o"], compute_kernel_config=_kcfg)      # [1, n, dim]
 
     def _ff(x, L):
-        h = ttnn.add(ttnn.matmul(x, L["wt_ff1"]), L["b_ff1"])   # [1, n, 5460]
+        h = ttnn.add(ttnn.matmul(x, L["wt_ff1"], compute_kernel_config=_kcfg), L["b_ff1"])
         half = int(h.shape[-1]) // 2
         n = int(h.shape[-2])
         a = ttnn.slice(h, [0, 0, 0], [1, n, half])
         g = ttnn.slice(h, [0, 0, half], [1, n, 2 * half])
         h = ttnn.multiply(a, ttnn.gelu(g, variant=ttnn.GeluVariant.Accurate))
-        return ttnn.add(ttnn.matmul(h, L["wt_ff2"]), L["b_ff2"])  # [1, n, dim]
+        return ttnn.add(ttnn.matmul(h, L["wt_ff2"], compute_kernel_config=_kcfg), L["b_ff2"])
 
     def forward(x, mask=None, **_):
         lat = latents

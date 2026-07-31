@@ -129,7 +129,7 @@ def build(device, torch_module):
         try:
             return ttnn.matmul(a, b, compute_kernel_config=kcfg,
                                memory_config=ttnn.L1_MEMORY_CONFIG)
-        except Exception:  # noqa: BLE001 - shape does not fit L1
+        except Exception:  # noqa: BLE001 - output too large for L1; fall back to DRAM
             return ttnn.matmul(a, b, compute_kernel_config=kcfg)
 
     def _stage(t, mapper):
@@ -177,14 +177,17 @@ def build(device, torch_module):
         ShardTensorToMesh(dim=1) cuts dim 1 into n_dev equal chunks, so chunk i must
         already hold chip i's q, then k, then v columns — hence the per-chip regroup
         here rather than a plain cat of the three whole projections."""
-        cols, bias = [], []
+        Wo = Wc.new_zeros(int(Wc.shape[0]), 3 * shard_w * n_dev)
+        bo = bc.new_zeros(3 * shard_w * n_dev)
         for i in range(n_dev):
             s = slice(i * shard_w, (i + 1) * shard_w)
-            for o in (0, embed, 2 * embed):
-                cols.append(Wc[:, o:o + embed][:, s])
-                bias.append(bc[o:o + embed][s])
-        return (_shard(torch.cat(cols, dim=1), 1),
-                _shard(torch.cat(bias).reshape(1, 1, -1), 2))
+            for j, o in enumerate((0, embed, 2 * embed)):
+                # chip i's j-th projection lands in chunk (3i + j) -- writing to explicit
+                # destination offsets keeps the per-chip grouping visible.
+                d = slice((i * 3 + j) * shard_w, (i * 3 + j + 1) * shard_w)
+                Wo[:, d] = Wc[:, o:o + embed][:, s]
+                bo[d] = bc[o:o + embed][s]
+        return _shard(Wo, 1), _shard(bo.reshape(1, 1, -1), 2)
 
     # Per-block sharded weights (mirrors the graduated g_p_t2_block scheme).
     layers = []
@@ -258,13 +261,17 @@ def build(device, torch_module):
         # shuffle as one multicore device op, so no layout round-trip happens at all.
         h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1],
                             epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
-        qkv = ttnn.add(_mm(h, L["wt_qkv"]), L["bt_qkv"])       # [1, T, 3*shard_w]
-        qkv = ttnn.reshape(qkv, [1, 1, T, 3 * shard_w])        # leading-dim view, no repack
+        # B = the decode batch: [B, T, dim] is B INDEPENDENT streams stacked on the leading
+        # axis. Batch is a separate axis from the TP-sharded weight axis, so the sharding
+        # and the collectives are untouched -- only the row count grows.
+        B = int(x.shape[0])
+        qkv = ttnn.add(_mm(h, L["wt_qkv"]), L["bt_qkv"])       # [B, T, 3*shard_w]
+        qkv = ttnn.reshape(qkv, [B, 1, T, 3 * shard_w])        # leading-dim view, no repack
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=heads_pc, num_kv_heads=heads_pc, transpose_k_heads=False)
         ctx = ttnn.transformer.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=scaling, compute_kernel_config=kcfg)
-        ctx = ttnn.reshape(ttnn.experimental.nlp_concat_heads(ctx), [1, T, shard_w])
+        ctx = ttnn.reshape(ttnn.experimental.nlp_concat_heads(ctx), [B, T, shard_w])
         x = _add_l1(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
 
         # --- mlp ---
@@ -276,7 +283,9 @@ def build(device, torch_module):
         return x
 
     def forward(emb, *_, **__):
+        """emb ``[B, T, dim]`` -> mel latent ``[B, mel_len - sub, dim]`` (B streams, one program)."""
         T = int(emb.shape[-2])
+        B = int(emb.shape[0])
         x = emb
         for L in layers:
             x = _block(x, L, T)
@@ -288,7 +297,7 @@ def build(device, torch_module):
         # mel latent = final_norm(hidden)[:, -mel_len:][:, :-sub] (LayerNorm is
         # per-position, so slicing the tail is exact). Full hidden dim = 1024.
         hidden_dim = int(x.shape[-1])
-        return ttnn.slice(x, [0, T - mel_len, 0], [1, T - sub, hidden_dim])
+        return ttnn.slice(x, [0, T - mel_len, 0], [B, T - sub, hidden_dim])
 
     return forward
 

@@ -87,6 +87,20 @@ def build(device, torch_module):
         weights_dtype=ttnn.float32,
         deallocate_activation=False,
     )
+    # LENGTH-ADAPTIVE CB BUDGET. A native conv sizes its activation circular buffer from the
+    # activation block, so the CBs grow with the synthesized length: at the captured 6-latent
+    # case the trunk fits L1, but at 12 latents the upsample stack asks for 4.8 MB per core
+    # against a 1.5 MB L1 ("Statically allocated circular buffers ... grow to N B"). Bounding
+    # the activation block height and turning OFF the two double buffers is the knob that
+    # actually caps that growth (act_block_w_div instead ABORTS the process inside
+    # calculate_L1_usage_for_conv_op, and config_tensors_in_dram works but is ~5x slower).
+    conv_cfg_long = ttnn.Conv1dConfig(
+        weights_dtype=ttnn.float32,
+        deallocate_activation=False,
+        act_block_h_override=32,
+        enable_act_double_buffer=False,
+        enable_weights_double_buffer=False,
+    )
     # Pin the native convs to the L1_FULL path. The alternative DRAM width-slicing
     # path issues HOST reads while building its slices, which begin_trace_capture
     # rejects -- the harness then silently falls back to eager, so the vocoder would
@@ -152,12 +166,27 @@ def build(device, torch_module):
             D[i * s, i] = 1.0
         return _rep(D.reshape(1, 1, Lout, Lin))
 
-    # Interpolation matrices for the fixed test length (latents T=6 -> 24 -> 26).
-    Lin1 = 6
+    # Interpolation matrices for the PINNED latent length. Default 6 (the captured PCC
+    # case: 6 -> 24 -> 26); the pipeline sets ``_tt_latent_len`` to the number of audio
+    # codes it actually synthesizes, and everything downstream -- interpolated lengths,
+    # dilation matrices, conv output lengths -- is derived from it.
+    #
+    # Read each interpolated length OFF THE MATRIX rather than recomputing it:
+    # F.interpolate FLOORS its output length (floor(Lin * scale)), which round() does not
+    # match for every length, and a one-sample disagreement here silently misaligns the
+    # whole conv trunk.
+    Lin1 = int(getattr(hd, "_tt_latent_len", 6))
     M1 = _interp_mat(Lin1, scale1)
-    L1 = int(round(Lin1 * scale1))
+    L1 = int(M1.shape[-2])
     M2 = _interp_mat(L1, scale2) if resample else None
-    L2 = int(round(L1 * scale2)) if resample else L1
+    L2 = int(M2.shape[-2]) if resample else L1
+
+    # The interleaved trunk itself becomes the low L1 buffer a conv's CB region then clashes
+    # with, so keep the no-DRAM-round-trip tuning only for the short (captured/traced) shape
+    # and route a long trunk through DRAM.
+    _long = L2 > 26
+    _conv_cfg = conv_cfg_long if _long else conv_cfg
+    _trunk_mem = ttnn.DRAM_MEMORY_CONFIG if _long else ttnn.L1_MEMORY_CONFIG
 
     _wcache = {}
 
@@ -264,7 +293,7 @@ def build(device, torch_module):
         (MatmulMultiCoreReuseMultiCast1D asserts INTERLEAVED), and the trunk feeds one
         to the upsample dilation matmul -- so normalize here, into L1 rather than DRAM
         so the conv chain still never round-trips."""
-        return (ttnn.sharded_to_interleaved(y, ttnn.L1_MEMORY_CONFIG)
+        return (ttnn.sharded_to_interleaved(y, _trunk_mem)
                 if y.memory_config().is_sharded() else y)
 
     def _conv1d_native(x, meta, L):
@@ -274,7 +303,7 @@ def build(device, torch_module):
             in_channels=meta["cin"], out_channels=meta["cout"], batch_size=1,
             input_length=L, kernel_size=meta["k"], stride=1,
             padding=meta["pad"], dilation=meta["dil"], groups=1,
-            dtype=ttnn.float32, conv_config=conv_cfg, compute_config=kcfg,
+            dtype=ttnn.float32, conv_config=_conv_cfg, compute_config=kcfg,
             slice_config=slice_cfg, return_weights_and_bias=True,
         )
         _wcache[meta["key"]] = (w2, b2)
@@ -288,7 +317,7 @@ def build(device, torch_module):
             in_channels=meta["cin"], out_channels=meta["cout"], batch_size=1,
             input_height=1, input_width=L, kernel_size=(1, k), stride=(1, s),
             padding=(0, p), output_padding=(0, op), dilation=(1, 1), groups=1,
-            dtype=ttnn.float32, conv_config=conv_cfg, compute_config=kcfg,
+            dtype=ttnn.float32, conv_config=_conv_cfg, compute_config=kcfg,
             return_weights_and_bias=True,
         )
         _wcache[meta["key"]] = (w2, b2)
@@ -335,14 +364,14 @@ def build(device, torch_module):
         # g arrives [1,512,1] (channels-major); the trunk is channels-LAST.
         g = ttnn.reshape(g, [1, 1, 1, int(g.shape[1])])         # [1,1,1,512]
 
-        # latents are ALREADY channels-last [1, 6, 1024], so time interpolation is a
+        # latents are ALREADY channels-last [1, Lin1, 1024], so time interpolation is a
         # plain left-multiply and the channels-major formulation's transposes are gone.
         # The whole trunk is 4-D [1, 1, L, C] -- the (N, H=1, W=L, C) form the native
         # conv ops consume and produce -- so both conv forms chain with no rank fixups.
         latents = ttnn.reshape(latents, [1, 1, int(latents.shape[-2]), int(latents.shape[-1])])
-        z = ttnn.matmul(M1, latents, compute_kernel_config=kcfg)  # [1,1,24,1024]
+        z = ttnn.matmul(M1, latents, compute_kernel_config=kcfg)  # [1,1,L1,1024]
         if M2 is not None:
-            z = ttnn.matmul(M2, z, compute_kernel_config=kcfg)    # [1,1,26,1024]
+            z = ttnn.matmul(M2, z, compute_kernel_config=kcfg)    # [1,1,L2,1024]
         L = L2
 
         o, L = _conv(z, conv_pre, L)
@@ -364,6 +393,6 @@ def build(device, torch_module):
         o, L = _conv(o, conv_post, L)                           # [1, 1, L, 1]
         # conv_post has ONE output channel, so the channels-last buffer already holds
         # the waveform in time order; drop the trailing channel axis.
-        return ttnn.tanh(ttnn.reshape(o, [1, 1, L]))            # [1, 1, 6656]
+        return ttnn.tanh(ttnn.reshape(o, [1, 1, L]))            # [1, 1, 256*L2]
 
     return forward

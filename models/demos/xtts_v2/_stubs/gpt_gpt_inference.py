@@ -80,6 +80,21 @@ def build(device, torch_module):
         packer_l1_acc=True,
     )
 
+    # DECODE-ATTENTION fidelity. scaled_dot_product_attention_decode (flash-DECODE) returns
+    # GARBAGE when fp32_dest_acc_en is on: measured against a torch reference on this box,
+    # relative error is ~6.0 with fp32_dest_acc_en=True at ANY math fidelity, and ~0.02 with
+    # it off (HiFi4 0.020 / HiFi2 0.018 / LoFi 0.074). The full-sequence flash SDPA is fine
+    # with the same config (0.024), so this is specific to the decode kernel -- and it fails
+    # SILENTLY: greedy decode still produces plausible-looking, stable token ids, so only a
+    # per-step comparison against the reference catches it. Keep HiFi4 for the multiplier and
+    # leave the destination register in bf16 for THIS op only.
+    _sdpa_dec_kcfg = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        math_approx_mode=False,
+        fp32_dest_acc_en=False,
+        packer_l1_acc=True,
+    )
+
     # NORM fidelity. LayerNorm was running on ttnn's default compute config; the catalogued
     # policy for norms is HiFi2 (never LoFi -- it compounds to a PCC failure over depth) with
     # fp32_dest_acc_en MANDATORY, because the variance reduction loses too much precision in
@@ -113,8 +128,25 @@ def build(device, torch_module):
     # on. Falls back to the default routing for shapes this cannot tile evenly.
     _grid = device.compute_with_storage_grid_size()
 
+    def _mtiles(t):
+        """M tiles as the matmul sees them.
+
+        With ``fuse_batch=True`` every LEADING dim folds into M, so a batched ``[B, T, K]``
+        activation contributes B slices -- and each slice's rows are PADDED to a whole tile.
+        The count is therefore ``prod(leading) * ceil(T/32)``:
+          * reading ``shape[-2]`` alone under-sizes ``per_core_M`` B-fold (the tuned config
+            would compute only the first stream's rows);
+          * ``ceil(prod(leading)*T / 32)`` under-counts whenever T is NOT tile-aligned, and
+            the config then asks for more blocks than there are cores
+            (TT_FATAL num_blocks_total <= num_cores).
+        ``ttnn.Shape`` has no python slicing, so walk it by index."""
+        n = 1
+        for i in range(len(t.shape) - 2):
+            n *= int(t.shape[i])
+        return n * ((int(t.shape[-2]) + 31) // 32)
+
     def _pcfg(a, b):
-        mt = (int(a.shape[-2]) + 31) // 32
+        mt = _mtiles(a)
         kt = int(a.shape[-1]) // 32
         nt = int(b.shape[-1]) // 32
         if kt == 0 or nt == 0 or int(a.shape[-1]) % 32 or int(b.shape[-1]) % 32:
@@ -178,7 +210,7 @@ def build(device, torch_module):
             return ttnn.matmul(a, b, compute_kernel_config=kcfg,
                                memory_config=ttnn.L1_MEMORY_CONFIG,
                                program_config=pc)
-        except Exception:  # noqa: BLE001 - shape does not fit L1
+        except Exception:  # noqa: BLE001 - output too large for L1; fall back to DRAM
             return ttnn.matmul(a, b, compute_kernel_config=kcfg, program_config=pc)
 
     def _stage(t, mapper):
@@ -226,14 +258,17 @@ def build(device, torch_module):
         ShardTensorToMesh(dim=1) cuts dim 1 into n_dev equal chunks, so chunk i must
         already hold chip i's q, then k, then v columns — hence the per-chip regroup
         here rather than a plain cat of the three whole projections."""
-        cols, bias = [], []
+        Wo = Wc.new_zeros(int(Wc.shape[0]), 3 * shard_w * n_dev)
+        bo = bc.new_zeros(3 * shard_w * n_dev)
         for i in range(n_dev):
             s = slice(i * shard_w, (i + 1) * shard_w)
-            for o in (0, embed, 2 * embed):
-                cols.append(Wc[:, o:o + embed][:, s])
-                bias.append(bc[o:o + embed][s])
-        return (_shard(torch.cat(cols, dim=1), 1),
-                _shard(torch.cat(bias).reshape(1, 1, -1), 2))
+            for j, o in enumerate((0, embed, 2 * embed)):
+                # chip i's j-th projection lands in chunk (3i + j) -- writing to explicit
+                # destination offsets keeps the per-chip grouping visible.
+                d = slice((i * 3 + j) * shard_w, (i * 3 + j + 1) * shard_w)
+                Wo[:, d] = Wc[:, o:o + embed][:, s]
+                bo[d] = bc[o:o + embed][s]
+        return _shard(Wo, 1), _shard(bo.reshape(1, 1, -1), 2)
 
     # Per-block sharded weights (mirrors the graduated g_p_t2_block scheme).
     layers = []
@@ -292,7 +327,11 @@ def build(device, torch_module):
         # evaporate here: the summation fidelity a compute_kernel_config would set is
         # irrelevant to summing 8 partials into an fp32 accumulator, and placing BOTH halves
         # in L1 is worth nothing when there is no intermediate big enough to care about.
-        if int(partial.shape[-2]) <= 1:
+        # ONE tile row of work == the decode step, at ANY decode batch: B streams are B
+        # ROWS of the same tile (B <= 32), so the test is the TILE count, not shape[-2] --
+        # which for a batched [B,T,W] prefill is T and would send it down the decode path.
+        rows = _mtiles(partial) * 32
+        if rows <= 32:
             return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear,
                                    memory_config=ttnn.L1_MEMORY_CONFIG)
         try:
@@ -305,7 +344,7 @@ def build(device, torch_module):
             # there is nothing to spread across cores, so the reshard is pure added latency
             # on an already latency-bound op. That is the same shape rule the catalogued
             # reduction lever states for LayerNorm, and it holds for the collective too.
-            if int(partial.shape[-2]) > 1:
+            if rows > 32:
                 W = int(partial.shape[-1])
                 ncores = max(1, min(32, W // 32))
                 cfg = ttnn.MemoryConfig(
@@ -314,7 +353,9 @@ def build(device, torch_module):
                         ttnn.CoreRangeSet({ttnn.CoreRange(
                             ttnn.CoreCoord(0, 0), ttnn.CoreCoord(min(7, ncores - 1),
                                                                  (ncores - 1) // 8))}),
-                        [32 * max(1, (int(partial.shape[-2]) + 31) // 32), W // ncores],
+                        # shard height is the tensor's TOTAL padded rows (B*T for a batched
+                        # prefill), not shape[-2]: a width shard splits only the last dim.
+                        [32 * max(1, (rows + 31) // 32), W // ncores],
                         ttnn.ShardOrientation.ROW_MAJOR))
                 partial = ttnn.to_memory_config(partial, cfg)
             scattered = ttnn.reduce_scatter(
@@ -356,26 +397,34 @@ def build(device, torch_module):
         # shuffle as one multicore device op, so no layout round-trip happens at all.
         h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1],
                             epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
-        qkv = _lin(h, L["wt_qkv"], L["bt_qkv"])                # [1, T, 3*shard_w]
-        qkv = ttnn.reshape(qkv, [1, 1, T, 3 * shard_w])        # leading-dim view, no repack
+        # B = DECODE BATCH: the prefill/full-sequence activation is [B, T, dim], i.e. B
+        # INDEPENDENT streams stacked on the leading axis. Batch is a separate axis from
+        # the TP-sharded weight axis -- nothing about the sharding or the collectives
+        # changes, the rows just multiply.
+        B = int(x.shape[0])
+        qkv = _lin(h, L["wt_qkv"], L["bt_qkv"])                # [B, T, 3*shard_w]
+        qkv = ttnn.reshape(qkv, [B, 1, T, 3 * shard_w])        # leading-dim view, no repack
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=heads_pc, num_kv_heads=heads_pc, transpose_k_heads=False)
         if kv_sink is not None:
-            # K/V for the WHOLE padded prefix, in exactly the [1,h,C,d] layout the decode
-            # attention wants -- so the cache is just what prefill already computed.
+            # K/V for the WHOLE padded prefix, in exactly the [B,h,C,d] layout the decode
+            # attention wants -- so the cache is just what prefill already computed, and it
+            # already holds B independent sequences, one per cache slot.
             kv_sink.append((k, v))
         ctx = ttnn.transformer.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=scaling, compute_kernel_config=kcfg)
-        ctx = ttnn.reshape(ttnn.experimental.nlp_concat_heads(ctx), [1, T, shard_w])
+        ctx = ttnn.reshape(ttnn.experimental.nlp_concat_heads(ctx), [B, T, shard_w])
         x = _add_l1(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
         return _mlp(x, L)
 
     def forward(emb, *_, **__):
+        """Full-sequence (prefill) forward. emb ``[B, T, dim]`` -> logits ``[B, T, vocab]``;
+        B independent streams in ONE program (B=1 is just the degenerate case)."""
         T = int(emb.shape[-2])
         x = emb
         for L in layers:
             x = _block(x, L, T)
-        return _head(x)                        # [1, T, vocab]
+        return _head(x)                        # [B, T, vocab]
 
     # ================================================================= #
     # KV-CACHE DECODE. Without it the AR loop is repeat_prefill: every token re-runs the
@@ -420,7 +469,11 @@ def build(device, torch_module):
         return ttnn.to_memory_config(t, cfg)
 
     def prefill_cache(emb):
-        """Run the prefix once, KEEPING every layer's K/V. Returns the prefix logits."""
+        """Run the prefix once, KEEPING every layer's K/V. Returns the prefix logits.
+
+        emb is ``[B, C, dim]``, so each layer's kept K/V is ``[B, heads, C, head_dim]`` --
+        B independent sequences, one cache slot per batch row, seeded for free by the
+        prefill's own head split. Returns ``[B, C, vocab]``."""
         T = int(emb.shape[-2])
         kv = []
         x = emb
@@ -430,14 +483,23 @@ def build(device, torch_module):
         return _head(x)
 
     def decode_one(row_emb, pos):
-        """ONE cached AR step. row_emb: [1,1,dim] (the new token only); pos: a DEVICE tensor
-        holding its absolute position, so the step is trace-capturable (a Python int would
-        bake a stale constant into the trace). Returns [1,1,vocab]."""
+        """ONE cached AR step for ALL B decode streams at once.
+
+        row_emb: ``[1, B, dim]`` -- the B streams' new tokens as B ROWS of one tile
+        (B <= 32), which is the layout every decode op here wants ("users" on dim 2 of the
+        4-D qkv view). pos: a DEVICE tensor of B positions, so the step is
+        trace-capturable (a Python int would bake a stale constant into the trace) AND
+        each stream indexes its OWN cache slot. Returns ``[1, B, vocab]``.
+
+        ONE program serves all B streams: the projections carry B rows, the fused cache
+        write takes B update indices, and decode-SDPA reads B independent cache slots.
+        There is no python loop over streams anywhere in here."""
+        B = int(row_emb.shape[-2])
         x = row_emb
         for L, (kc, vc) in zip(layers, _kv["kv"]):
             h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1],
                             epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
-            qkv = _lin(h, L["wt_qkv"], L["bt_qkv"])                     # [1,1,3*shard_w]
+            qkv = _lin(h, L["wt_qkv"], L["bt_qkv"])                     # [1,B,3*shard_w]
             # DECODE-SPECIFIC head shuffle. The generic nlp_create_qkv_heads emits
             # [1,h,S,d], but every consumer here (cache write, decode attention) wants
             # batch-major [1,S,h,d] and SHARDED -- which cost three ttnn.permute calls
@@ -446,16 +508,23 @@ def build(device, torch_module):
             # each (both 2 and 1 pad to a 32-row tile), which is where the profile's
             # grid=tiny TilizeWithValPadding/UntilizeWithUnpadding time comes from.
             # nlp_create_qkv_heads_decode emits that exact layout, already sharded.
-            qkv = _shard_row(ttnn.reshape(qkv, [1, 1, 1, 3 * shard_w]))
+            # nlp_create_qkv_heads_decode calls dim 2 "users": [1, 1, B, 3*shard_w] with
+            # dims 0/1 both 1 (it TT_FATALs otherwise). The WIDTH shard spec needs no
+            # change for any B <= 32 -- the B user rows pad into the same single tile row.
+            qkv = _shard_row(ttnn.reshape(qkv, [1, 1, B, 3 * shard_w]))
             q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
                 qkv, num_heads=heads_pc, num_kv_heads=heads_pc,
-                overlap_qk_coregrid=False)
+                overlap_qk_coregrid=False)                              # [1,B,h,d]
             # K and V must occupy non-overlapping core ranges for the FUSED write; the
             # decode head op already places them apart, so one dispatch does both.
+            # k/v are [1,B,h,d] (batch on dim 1) and the cache is [B,h,C,d] (batch on
+            # dim 0): the op cross-checks input.padded_shape[1] == cache.padded_shape[0]
+            # == len(update_idxs), so ONE dispatch writes all B streams' slots, each at
+            # its own position.
             ttnn.experimental.paged_fused_update_cache(kc, k, vc, v, update_idxs_tensor=pos)
             ctx = ttnn.transformer.scaled_dot_product_attention_decode(
                 q, kc, vc, is_causal=True,
-                cur_pos_tensor=pos, scale=scaling, compute_kernel_config=kcfg)
+                cur_pos_tensor=pos, scale=scaling, compute_kernel_config=_sdpa_dec_kcfg)
             # The ctx side stays on the generic permute + concat. Its decode-specific
             # twin (nlp_concat_heads_decode) asserts a SHARDED input, and sdpa_decode
             # refuses to produce one for this head configuration ("Sharded output not
@@ -463,7 +532,7 @@ def build(device, torch_module):
             # more than the two ops it removes.
             ctx = ttnn.reshape(
                 ttnn.experimental.nlp_concat_heads(ttnn.permute(ctx, [0, 2, 1, 3])),
-                [1, 1, shard_w])
+                [1, B, shard_w])
             x = _add_l1(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
             x = _mlp(x, L)
         return _head(x)
