@@ -307,6 +307,20 @@ def build(device, torch_module):
     # ================================================================= #
     _kv = {}
 
+    # nlp_create_qkv_heads_decode asserts its input is WIDTH_SHARDED (not height —
+    # it splits the fused row BY HEAD across cores and hands each core its own head).
+    # So give it exactly that: one head per core, head_dim wide, over the
+    # 3*heads_pc heads of the fused q|k|v row. Laying it out this way also lands Q,
+    # K and V on disjoint cores, which is what the FUSED K/V cache write requires.
+    _qkv_cores = ttnn.CoreRangeSet({ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3 * heads_pc - 1, 0))})
+    _qkv_shard = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1,
+        ttnn.ShardSpec(_qkv_cores, [32, head_dim], ttnn.ShardOrientation.ROW_MAJOR))
+
+    def _shard_row(t):
+        return ttnn.to_memory_config(t, _qkv_shard)
+
     def _shard_kv_row(t, cx=0):
         """paged_update_cache REQUIRES a sharded input (it asserts input_tensor.is_sharded()).
 
@@ -344,22 +358,29 @@ def build(device, torch_module):
             h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1],
                             epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
             qkv = _lin(h, L["wt_qkv"], L["bt_qkv"])                     # [1,1,3*shard_w]
-            qkv = ttnn.reshape(qkv, [1, 1, 1, 3 * shard_w])
-            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-                qkv, num_heads=heads_pc, num_kv_heads=heads_pc, transpose_k_heads=False)
-            # nlp_create_qkv_heads gives [1,h,S,d]; the cache-update and decode-attention
-            # ops both want the batch-major [1,S,h,d], and the update wants it SHARDED.
-            # ONE fused cache write for K and V. A decode step is DISPATCH-bound -- ~25 tiny
-            # ops per block x 30 blocks -- so op COUNT is the cost, and two separate
-            # paged_update_cache calls write two single-tile rows back to back on the same
-            # cores. The fused op does both in one dispatch, removing 30 ops per token.
-            ttnn.experimental.paged_fused_update_cache(
-                kc, _shard_kv_row(ttnn.permute(k, [0, 2, 1, 3]), cx=0),
-                vc, _shard_kv_row(ttnn.permute(v, [0, 2, 1, 3]), cx=1),
-                update_idxs_tensor=pos)
+            # DECODE-SPECIFIC head shuffle. The generic nlp_create_qkv_heads emits
+            # [1,h,S,d], but every consumer here (cache write, decode attention) wants
+            # batch-major [1,S,h,d] and SHARDED -- which cost three ttnn.permute calls
+            # plus two to_memory_config reshards per block. With heads_pc=2 and S=1 those
+            # permutes move a 2x64 payload but pay a full untilize + VAL-PADDED retilize
+            # each (both 2 and 1 pad to a 32-row tile), which is where the profile's
+            # grid=tiny TilizeWithValPadding/UntilizeWithUnpadding time comes from.
+            # nlp_create_qkv_heads_decode emits that exact layout, already sharded.
+            qkv = _shard_row(ttnn.reshape(qkv, [1, 1, 1, 3 * shard_w]))
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
+                qkv, num_heads=heads_pc, num_kv_heads=heads_pc,
+                overlap_qk_coregrid=False)
+            # K and V must occupy non-overlapping core ranges for the FUSED write; the
+            # decode head op already places them apart, so one dispatch does both.
+            ttnn.experimental.paged_fused_update_cache(kc, k, vc, v, update_idxs_tensor=pos)
             ctx = ttnn.transformer.scaled_dot_product_attention_decode(
-                ttnn.permute(q, [0, 2, 1, 3]), kc, vc, is_causal=True,
+                q, kc, vc, is_causal=True,
                 cur_pos_tensor=pos, scale=scaling, compute_kernel_config=kcfg)
+            # The ctx side stays on the generic permute + concat. Its decode-specific
+            # twin (nlp_concat_heads_decode) asserts a SHARDED input, and sdpa_decode
+            # refuses to produce one for this head configuration ("Sharded output not
+            # supported for GQA"), so chaining them would need a reshard that costs
+            # more than the two ops it removes.
             ctx = ttnn.reshape(
                 ttnn.experimental.nlp_concat_heads(ttnn.permute(ctx, [0, 2, 1, 3])),
                 [1, 1, shard_w])
