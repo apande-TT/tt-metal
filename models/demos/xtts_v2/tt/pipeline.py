@@ -324,18 +324,39 @@ class XttsPipeline:
         Returns (codes[1,M] long, None).
         """
         self._invoked.add("gpt_gpt_inference")
+        hz = int(horizon)
         text_ids = self._pad_text_ids(text_inputs)
         text_emb = self._embed(text_ids, self.txt_w, self.f_tpos)
         start = torch.tensor([[self.start_audio]], dtype=torch.long)
         emb = ttnn.concat([cl_tt, text_emb, self._embed(start, self.mel_w, self.f_mpos)], dim=1)
         next_ids = []
-        for step in range(int(horizon)):
-            logits = self.f_gpt_logits(emb)                       # [1, T, num_audio]
-            t = int(emb.shape[1])
-            last = ttnn.slice(logits, [0, t - 1, 0], [1, t, self.num_audio])
-            nid = ttnn.argmax(last, dim=-1)                       # [1,1] ON DEVICE
-            next_ids.append(nid)
-            emb = ttnn.concat([emb, self._embed_next(nid, step + 1)], dim=1)
+        if self._kv_capable():
+            # KV-CACHE decode: prefill the prefix ONCE, then each token computes seq_len=1
+            # and attends to cached K/V instead of re-running the whole prefix.
+            real = int(emb.shape[1])
+            C = self._tile_ceil(real + hz)
+            if C > real:
+                tail = ttnn.multiply(ttnn.slice(emb, [0, 0, 0], [1, C - real, self.dim]), 0.0)
+                emb = ttnn.concat([emb, tail], dim=1)      # causal => padding is inert
+            logits = self.f_gpt_logits.prefill_cache(emb)
+            pos = real - 1
+            for step in range(hz):
+                last = ttnn.slice(logits, [0, pos, 0], [1, pos + 1, self.num_audio]) \
+                    if step == 0 else ttnn.slice(logits, [0, 0, 0], [1, 1, self.num_audio])
+                nid = ttnn.argmax(last, dim=-1)                   # [1,1] ON DEVICE
+                next_ids.append(nid)
+                if step + 1 < hz:
+                    pos += 1
+                    row = self._embed_next(nid, step + 1)         # [1,1,dim], mel position
+                    logits = self.f_gpt_logits.decode_one(row, self._kv_pos(pos))
+        else:
+            for step in range(hz):
+                logits = self.f_gpt_logits(emb)                   # [1, T, num_audio]
+                t = int(emb.shape[1])
+                last = ttnn.slice(logits, [0, t - 1, 0], [1, t, self.num_audio])
+                nid = ttnn.argmax(last, dim=-1)                   # [1,1] ON DEVICE
+                next_ids.append(nid)
+                emb = ttnn.concat([emb, self._embed_next(nid, step + 1)], dim=1)
         # single post-loop host copy of the generated ids (reporting/truncation only)
         gen = [int(self._to_torch(n).reshape(-1)[0]) for n in next_ids]
         codes = []
@@ -477,6 +498,20 @@ class XttsPipeline:
         """Seed the resident decode emb (cond|text|start) at fixed capacity C."""
         return self.prefill_trace_setup(inputs)
 
+    def _kv_capable(self):
+        """True when the logits head exposes the KV-cache decode contract."""
+        return callable(getattr(self.f_gpt_logits, "decode_one", None))
+
+    def _kv_pos(self, p):
+        """The decode position as a DEVICE tensor. It has to live on device or a captured
+        trace bakes in a stale constant (the cache would be read/written at one fixed slot
+        for every replay)."""
+        return ttnn.from_torch(
+            torch.tensor([int(p)], dtype=torch.int32), dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if _is_mesh(self.device) else None,
+        )
+
     def decode_trace_setup(self, inputs):
         self.decode_prefill(inputs)
         self._decode_C = self._prefill_C
@@ -489,9 +524,22 @@ class XttsPipeline:
         # absolute row, which counts the 32 cond + text rows ahead of it.
         self._decode_mel_pos = 0
         self._decode_next = None
+        # KV-CACHE: fill the caches from the prefix ONCE here (outside the traced step), and
+        # stage the resident single-row emb + on-device position the step reads. Without this
+        # the traced step is a repeat_prefill -- a full C-row forward to produce one token.
+        self._kv = self._kv_capable()
+        if self._kv:
+            self.f_gpt_logits.prefill_cache(self._decode_emb)
+            self._decode_row = ttnn.slice(
+                self._decode_emb, [0, self._decode_pos, 0],
+                [1, self._decode_pos + 1, self.dim])          # [1,1,dim] resident
+            self._decode_pos_tt = self._kv_pos(self._decode_pos)
         return self._decode_emb
 
     def decode_trace_step(self):
+        if getattr(self, "_kv", False):
+            # seq_len=1 against cached K/V, NOT a re-prefill of the whole prefix.
+            return self.f_gpt_logits.decode_one(self._decode_row, self._decode_pos_tt)
         return self.f_gpt_logits(self._decode_emb)
 
     def decode_step(self):

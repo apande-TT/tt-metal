@@ -58,7 +58,10 @@ _DEV_PARAMS = {"l1_small_size": 4096}
 if _PERF_TRACE:
     # Reserve the trace region at device-open, ONCE, for baseline and every candidate. The tool
     # measures trace+1cq end to end, so the device opens with a single command queue.
-    _DEV_PARAMS["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "23887872"))
+    # The KV-cache decode step adds a third distinct traced program, so all three stages'
+    # trace buffers no longer fit the original 23 MB reservation (mesh_trace.cpp asserts
+    # get_trace_buffers_size() <= trace_region_size and the run silently falls back to eager).
+    _DEV_PARAMS["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "50331648"))
     _DEV_PARAMS["num_command_queues"] = 1
 
 # One resident build per device: the tracy path runs BOTH the eager forward and the trace pass, and

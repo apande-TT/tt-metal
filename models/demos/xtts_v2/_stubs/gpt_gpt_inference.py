@@ -210,7 +210,18 @@ def build(device, torch_module):
             return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear,
                                    memory_config=ttnn.L1_MEMORY_CONFIG)
 
-    def _block(x, L, T):
+    def _mlp(x, L):
+        h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1], epsilon=L["ln2"][2])
+        ff = ttnn.add(_mm(h, L["wt_fc"]), L["b_fc"])
+        ff = ttnn.gelu(ff, variant=ttnn.GeluVariant.Tanh)
+        return ttnn.add(x, ttnn.add(_reduce(_mm_l1(ff, L["wt_mo"])), L["b_mo"]))
+
+    def _head(x):
+        x = ttnn.layer_norm(x, weight=ln_f_w, bias=ln_f_b, epsilon=ln_f_eps)
+        x = ttnn.layer_norm(x, weight=fn_w, bias=fn_b, epsilon=fn_eps)
+        return ttnn.add(_mm(x, lm_w), lm_b)
+
+    def _block(x, L, T, kv_sink=None):
         # --- attention ---
         # ONE fused sharded qkv matmul + the multicore head shuffle. The hand-rolled
         # reshape([1,T,h,d]) + permute split used to be three separate matmuls whose
@@ -223,25 +234,85 @@ def build(device, torch_module):
         qkv = ttnn.reshape(qkv, [1, 1, T, 3 * shard_w])        # leading-dim view, no repack
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=heads_pc, num_kv_heads=heads_pc, transpose_k_heads=False)
+        if kv_sink is not None:
+            # K/V for the WHOLE padded prefix, in exactly the [1,h,C,d] layout the decode
+            # attention wants -- so the cache is just what prefill already computed.
+            kv_sink.append((k, v))
         ctx = ttnn.transformer.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=scaling, compute_kernel_config=kcfg)
         ctx = ttnn.reshape(ttnn.experimental.nlp_concat_heads(ctx), [1, T, shard_w])
         x = ttnn.add(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
-
-        # --- mlp ---
-        h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1], epsilon=L["ln2"][2])
-        ff = ttnn.add(_mm(h, L["wt_fc"]), L["b_fc"])
-        ff = ttnn.gelu(ff, variant=ttnn.GeluVariant.Tanh)
-        x = ttnn.add(x, ttnn.add(_reduce(_mm_l1(ff, L["wt_mo"])), L["b_mo"]))
-        return x
+        return _mlp(x, L)
 
     def forward(emb, *_, **__):
         T = int(emb.shape[-2])
         x = emb
         for L in layers:
             x = _block(x, L, T)
-        x = ttnn.layer_norm(x, weight=ln_f_w, bias=ln_f_b, epsilon=ln_f_eps)
-        x = ttnn.layer_norm(x, weight=fn_w, bias=fn_b, epsilon=fn_eps)
-        return ttnn.add(_mm(x, lm_w), lm_b)    # [1, T, vocab]
+        return _head(x)                        # [1, T, vocab]
 
+    # ================================================================= #
+    # KV-CACHE DECODE. Without it the AR loop is repeat_prefill: every token re-runs the
+    # FULL padded prefix through all 30 blocks, so each step pays T rows of matmul, T rows
+    # of LayerNorm and a T-row collective to learn ONE new row. With the cache a step
+    # computes seq_len=1 and attends to cached history, which is where the per-token time
+    # actually goes. Attached as attributes on `forward` so the stub's build(device, module)
+    # -> forward(emb) contract is unchanged for the PCC harness and the full-sequence path.
+    # ================================================================= #
+    _kv = {}
+
+    def _shard_kv_row(t):
+        """paged_update_cache REQUIRES a sharded input (it asserts input_tensor.is_sharded()).
+
+        The row is [1,1,heads_pc,head_dim] -- heads_pc < 32, so it is a single tile row once
+        padded -- which means one L1 shard of [TILE, head_dim] on one core satisfies the op
+        with no real data movement. The SHAPE must be left alone: the op cross-checks the
+        input's last dim against the cache's head_dim, so folding heads into the last dim
+        (the obvious way to make it one row) is rejected."""
+        core = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))})
+        cfg = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
+            ttnn.ShardSpec(core, [32, int(t.shape[-1])], ttnn.ShardOrientation.ROW_MAJOR))
+        return ttnn.to_memory_config(t, cfg)
+
+    def prefill_cache(emb):
+        """Run the prefix once, KEEPING every layer's K/V. Returns the prefix logits."""
+        T = int(emb.shape[-2])
+        kv = []
+        x = emb
+        for L in layers:
+            x = _block(x, L, T, kv_sink=kv)
+        _kv["kv"], _kv["T"] = kv, T
+        return _head(x)
+
+    def decode_one(row_emb, pos):
+        """ONE cached AR step. row_emb: [1,1,dim] (the new token only); pos: a DEVICE tensor
+        holding its absolute position, so the step is trace-capturable (a Python int would
+        bake a stale constant into the trace). Returns [1,1,vocab]."""
+        x = row_emb
+        for L, (kc, vc) in zip(layers, _kv["kv"]):
+            h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1], epsilon=L["ln1"][2])
+            qkv = ttnn.add(_mm(h, L["wt_qkv"]), L["bt_qkv"])            # [1,1,3*shard_w]
+            qkv = ttnn.reshape(qkv, [1, 1, 1, 3 * shard_w])
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                qkv, num_heads=heads_pc, num_kv_heads=heads_pc, transpose_k_heads=False)
+            # nlp_create_qkv_heads gives [1,h,S,d]; the cache-update and decode-attention
+            # ops both want the batch-major [1,S,h,d], and the update wants it SHARDED.
+            ttnn.experimental.paged_update_cache(
+                kc, _shard_kv_row(ttnn.permute(k, [0, 2, 1, 3])), update_idxs_tensor=pos)
+            ttnn.experimental.paged_update_cache(
+                vc, _shard_kv_row(ttnn.permute(v, [0, 2, 1, 3])), update_idxs_tensor=pos)
+            ctx = ttnn.transformer.scaled_dot_product_attention_decode(
+                ttnn.permute(q, [0, 2, 1, 3]), kc, vc, is_causal=True,
+                cur_pos_tensor=pos, scale=scaling, compute_kernel_config=kcfg)
+            ctx = ttnn.reshape(
+                ttnn.experimental.nlp_concat_heads(ttnn.permute(ctx, [0, 2, 1, 3])),
+                [1, 1, shard_w])
+            x = ttnn.add(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
+            x = _mlp(x, L)
+        return _head(x)
+
+    forward.prefill_cache = prefill_cache
+    forward.decode_one = decode_one
+    forward.cache_len = lambda: int(_kv.get("T", 0))
     return forward
