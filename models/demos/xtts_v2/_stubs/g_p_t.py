@@ -236,9 +236,14 @@ def build(device, torch_module):
             scattered = ttnn.reduce_scatter(
                 partial, dim=2, num_links=1, topology=ttnn.Topology.Linear,
                 memory_config=ttnn.L1_MEMORY_CONFIG, compute_kernel_config=_ccl_kcfg)
+            # num_workers_per_link is the OCCUPANCY knob for a CCL: it adds worker cores on
+            # the SAME ethernet link, which is a different thing from num_links -- raising
+            # the LINK count on this 1x8 linear fabric hangs the collective outright, so this
+            # is the only parallelism dimension left for a grid=tiny CCL.
             return ttnn.all_gather(scattered, dim=2, num_links=1,
                                    topology=ttnn.Topology.Linear,
-                                   memory_config=ttnn.L1_MEMORY_CONFIG)
+                                   memory_config=ttnn.L1_MEMORY_CONFIG,
+                                   num_workers_per_link=2)
         except Exception:  # noqa: BLE001 - fall back to the fused op
             return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear,
                                    memory_config=ttnn.L1_MEMORY_CONFIG)
