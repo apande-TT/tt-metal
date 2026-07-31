@@ -80,6 +80,18 @@ def build(device, torch_module):
         packer_l1_acc=True,
     )
 
+    # NORM fidelity. LayerNorm was running on ttnn's default compute config; the catalogued
+    # policy for norms is HiFi2 (never LoFi -- it compounds to a PCC failure over depth) with
+    # fp32_dest_acc_en MANDATORY, because the variance reduction loses too much precision in
+    # an fp16 destination register. HiFi2 halves the math cost of the reduction relative to
+    # HiFi4 while keeping the accumulator wide.
+    _ln_kcfg = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi2,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=True,
+    )
+
     def _mm(a, b):
         return ttnn.matmul(a, b, compute_kernel_config=kcfg)
 
@@ -211,14 +223,14 @@ def build(device, torch_module):
                                    memory_config=ttnn.L1_MEMORY_CONFIG)
 
     def _mlp(x, L):
-        h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1], epsilon=L["ln2"][2])
+        h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1], epsilon=L["ln2"][2], compute_kernel_config=_ln_kcfg)
         ff = ttnn.add(_mm(h, L["wt_fc"]), L["b_fc"])
         ff = ttnn.gelu(ff, variant=ttnn.GeluVariant.Tanh)
         return ttnn.add(x, ttnn.add(_reduce(_mm_l1(ff, L["wt_mo"])), L["b_mo"]))
 
     def _head(x):
-        x = ttnn.layer_norm(x, weight=ln_f_w, bias=ln_f_b, epsilon=ln_f_eps)
-        x = ttnn.layer_norm(x, weight=fn_w, bias=fn_b, epsilon=fn_eps)
+        x = ttnn.layer_norm(x, weight=ln_f_w, bias=ln_f_b, epsilon=ln_f_eps, compute_kernel_config=_ln_kcfg)
+        x = ttnn.layer_norm(x, weight=fn_w, bias=fn_b, epsilon=fn_eps, compute_kernel_config=_ln_kcfg)
         return ttnn.add(_mm(x, lm_w), lm_b)
 
     def _block(x, L, T, kv_sink=None):
@@ -229,7 +241,7 @@ def build(device, torch_module):
         # SINGLE-CORE retilize (the profile's grid=tiny TilizeWithValPadding, ~62 us
         # per call, 4 per block). nlp_create_qkv_heads / nlp_concat_heads do the same
         # shuffle as one multicore device op, so no layout round-trip happens at all.
-        h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1], epsilon=L["ln1"][2])
+        h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1], epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
         qkv = ttnn.add(_mm(h, L["wt_qkv"]), L["bt_qkv"])       # [1, T, 3*shard_w]
         qkv = ttnn.reshape(qkv, [1, 1, T, 3 * shard_w])        # leading-dim view, no repack
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
@@ -291,7 +303,7 @@ def build(device, torch_module):
         bake a stale constant into the trace). Returns [1,1,vocab]."""
         x = row_emb
         for L, (kc, vc) in zip(layers, _kv["kv"]):
-            h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1], epsilon=L["ln1"][2])
+            h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1], epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
             qkv = ttnn.add(_mm(h, L["wt_qkv"]), L["bt_qkv"])            # [1,1,3*shard_w]
             qkv = ttnn.reshape(qkv, [1, 1, 1, 3 * shard_w])
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
