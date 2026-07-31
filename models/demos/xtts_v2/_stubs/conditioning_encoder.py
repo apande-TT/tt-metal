@@ -33,6 +33,9 @@ import ttnn
 
 
 def build(device, torch_module):
+    _g = device.compute_with_storage_grid_size()
+    _core_grid = ttnn.CoreGrid(y=_g.y, x=_g.x)
+
     def _rep(t):
         # A bias / norm scale has logical height 1, so a DEVICE tilize has to val-pad it
         # 1 -> 32 rows, which ttnn runs on a SINGLE core -- the profile's grid=tiny
@@ -101,9 +104,14 @@ def build(device, torch_module):
         q = ttnn.slice(qkv4, [0, 0, 0, 0], [1, n_heads, ch, T])
         k = ttnn.slice(qkv4, [0, 0, ch, 0], [1, n_heads, 2 * ch, T])
         v = ttnn.slice(qkv4, [0, 0, 2 * ch, 0], [1, n_heads, 3 * ch, T])
-        w = ttnn.multiply(ttnn.matmul(ttnn.transpose(q, -2, -1), k), ch ** -0.5)
+        # knob:grid -- both attention matmuls are batched over heads and ttnn routes them
+        # onto ~10 cores. Hand them the REAL compute grid (resolved, never hard-coded) so
+        # the head batch and the output tiles spread across the whole chip.
+        w = ttnn.multiply(ttnn.matmul(ttnn.transpose(q, -2, -1), k, core_grid=_core_grid),
+                          ch ** -0.5)
         w = ttnn.softmax(w, dim=-1)
-        a = ttnn.matmul(v, ttnn.transpose(w, -2, -1))   # [1, h, ch, T]
+        a = ttnn.matmul(v, ttnn.transpose(w, -2, -1),
+                        core_grid=_core_grid)           # [1, h, ch, T]
         a = ttnn.reshape(a, [1, C, T])
 
         h2 = _conv1x1(a, p["wt_proj"], p["b_proj"])
