@@ -236,17 +236,27 @@ def build(device, torch_module):
         # not need HiFi4 multiplier precision.
         # NOTE: do NOT reach for num_links>1 here -- on this 1x8 linear fabric that HANGS the
         # collective (silent timeout, no exception, wedged device).
+        # DECODE takes the FUSED op, and for the opposite reason to the prefill path above.
+        # At one tile row the collective is pure latency: the reduce_scatter + all_gather
+        # pair is TWO dispatches per projection, i.e. 4 per block and 120 per token across
+        # 30 blocks, to move a single 1024-wide row. ttnn.all_reduce does the same math in
+        # ONE dispatch, halving that. The two reasons the pair is preferred at prefill both
+        # evaporate here: the summation fidelity a compute_kernel_config would set is
+        # irrelevant to summing 8 partials into an fp32 accumulator, and placing BOTH halves
+        # in L1 is worth nothing when there is no intermediate big enough to care about.
+        if int(partial.shape[-2]) <= 1:
+            return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear,
+                                   memory_config=ttnn.L1_MEMORY_CONFIG)
         try:
             # knob:shard -- give the collective a WIDTH-SHARDED input so its workers read
             # their own L1 shard instead of an interleaved buffer: one tile column per core,
             # which spreads it over the grid without splitting a tile.
             #
-            # ONLY for a multi-row collective. Measured both ways: on the MULTI-row prefill /
-            # latent forwards this is worth ~1.2 ms of device time, but at DECODE (one tile
-            # row) it COST 2.6% per token -- there is nothing to spread across cores, so the
-            # reshard is pure added latency on an already latency-bound op. That is the same
-            # shape rule the catalogued reduction lever states for LayerNorm, and it holds
-            # for the collective too.
+            # Measured both ways: on the MULTI-row prefill / latent forwards this is worth
+            # ~1.2 ms of device time, but at DECODE (one tile row) it COST 2.6% per token --
+            # there is nothing to spread across cores, so the reshard is pure added latency
+            # on an already latency-bound op. That is the same shape rule the catalogued
+            # reduction lever states for LayerNorm, and it holds for the collective too.
             if int(partial.shape[-2]) > 1:
                 W = int(partial.shape[-1])
                 ncores = max(1, min(32, W // 32))

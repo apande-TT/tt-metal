@@ -42,6 +42,16 @@ def build(device, torch_module):
     n_latents, dim = int(latents_p.shape[0]), int(latents_p.shape[1])
 
     def _rep(t):
+        # A bias / norm scale has logical height 1, so a DEVICE tilize has to val-pad it
+        # 1 -> 32 rows, which ttnn runs on a SINGLE core -- the profile's grid=tiny
+        # TilizeDeviceOperation, hundreds of calls for a few KB each. Tilizing those on the
+        # HOST is free by comparison. Real matrices are already tile-shaped (no val padding)
+        # and keep the multicore device path, where host-tilizing megabytes is the worse trade.
+        if t.dim() >= 2 and int(t.shape[-2]) == 1:
+            return ttnn.to_device(
+                ttnn.from_torch(t.contiguous().to(torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                                mesh_mapper=ttnn.ReplicateTensorToMesh(device)),
+                device)
         return ttnn.from_torch(
             t.contiguous().to(torch.bfloat16), dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT, device=device,
