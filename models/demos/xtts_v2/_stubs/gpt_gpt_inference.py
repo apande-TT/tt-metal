@@ -119,11 +119,24 @@ def build(device, torch_module):
         nt = int(b.shape[-1]) // 32
         if kt == 0 or nt == 0 or int(a.shape[-1]) % 32 or int(b.shape[-1]) % 32:
             return None
-        ncores = min(_grid.x * _grid.y, nt)
-        gx = min(_grid.x, ncores)
-        gy = max(1, ncores // gx)
-        if gx * gy == 0 or nt % (gx * gy):
+        # Pick the core count as the largest DIVISOR of N_tiles that factors into the real
+        # grid, so every core gets a whole number of output tiles. A naive
+        # gx=min(grid.x, nt) silently bailed out on the fused qkv projection (N=12 tiles
+        # does not divide an 8x1 grid), which left the biggest projection in the block on
+        # ttnn's default routing while the MLP got the tuned config.
+        fac = None
+        for d in range(min(_grid.x * _grid.y, nt), 0, -1):
+            if nt % d:
+                continue
+            for gx in range(min(d, _grid.x), 0, -1):
+                if d % gx == 0 and d // gx <= _grid.y:
+                    fac = (gx, d // gx)
+                    break
+            if fac:
+                break
+        if not fac:
             return None
+        gx, gy = fac
         ibw = 4 if kt % 4 == 0 else 1
         return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
             compute_with_storage_grid_size=(gx, gy),
