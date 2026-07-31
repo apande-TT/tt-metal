@@ -27,13 +27,17 @@ sees a pure-ttnn compute path (no torch compute during forward):
     with precomputed cos/sin bases + a mel filterbank matmul — the exact scheme
     proven for the graduated `mel_spectrogram` component. Reflect padding uses an
     anti-diagonal exchange matmul (ttnn has no flip).
-  * Every Conv2d/Conv1d is realized as im2col + matmul: zero-pad, gather the k*k
-    taps with (optionally strided) slices, concat on channels, matmul the reshaped
-    weight ``[k*k*Cin, Cout]``. BatchNorm at eval is a per-channel affine, folded
-    into the preceding conv's weight/bias whenever no nonlinearity sits between
-    them (conv2->bn2, downsample->bn); the relu-then-bn1 pair keeps bn1 as an
-    explicit per-channel scale/shift.
-  * float32 with fp32 accumulation throughout holds PCC across the deep chain.
+  * Every Conv2d is a native ``ttnn.conv2d`` and the whole SE-ResNet trunk is kept
+    in the flattened channels-LAST form conv2d both consumes and produces, so
+    consecutive convs chain with no layout op between them (only the trunk entry
+    and exit convert). The 1x1 Conv1ds of the attention head stay matmuls.
+    BatchNorm at eval is a per-channel affine, folded into the preceding conv's
+    weight/bias whenever no nonlinearity sits between them (conv2->bn2,
+    downsample->bn); the relu-then-bn1 pair keeps bn1 as an explicit per-channel
+    scale/shift.
+  * The trunk runs in bf16 (it is bytes-moved bound) with fp32 accumulation; the
+    STFT front end, the instancenorm statistics and the ASP sum-of-squares pooling
+    stay float32, which is what holds PCC across the deep chain.
 
 TP=8 scheme
 -----------
@@ -137,25 +141,28 @@ def build(device, torch_module):
         return scale, shift
 
     def _prep_conv2d(conv, fold_bn=None):
+        """Weights for a NATIVE ttnn.conv2d: HOST tensors in torch [Cout,Cin,kh,kw]
+        order, which conv2d prepares (tilizes/shards) itself on first use."""
         W = conv.weight.detach().float()                        # [Cout, Cin, kh, kw]
         Cout, Cin, kh, kw = W.shape
-        Wm = W.permute(2, 3, 1, 0).reshape(kh * kw * Cin, Cout)  # [k*k*Cin, Cout]
         b = conv.bias.detach().float() if conv.bias is not None else base.new_zeros(Cout)
         if fold_bn is not None:
             scale, shift = _bn_ss(fold_bn)
-            Wm = Wm * scale.reshape(1, -1)
+            W = W * scale.reshape(-1, 1, 1, 1)
             b = b * scale + shift
-        # trunk weights in the trunk format (shared prep -> every conv2d instance)
         return {
-            "Wm": _rep_t(Wm), "b": _rep_t(b.reshape(1, 1, Cout)),
+            "W": ttnn.from_torch(W.contiguous().to(torch.bfloat16), TRUNK_DT),
+            "b": ttnn.from_torch(b.reshape(1, 1, 1, Cout).contiguous().to(torch.bfloat16),
+                                 TRUNK_DT),
             "kh": kh, "kw": kw, "Cin": Cin, "Cout": Cout,
             "s": int(conv.stride[0]), "p": int(conv.padding[0]),
         }
 
     def _bn4(bn):
+        # channels-LAST per-channel affine: [1,1,1,C] broadcasts over the flattened NHWC
         scale, shift = _bn_ss(bn)
         C = scale.numel()
-        return _rep_t(scale.reshape(1, C, 1, 1)), _rep_t(shift.reshape(1, C, 1, 1))
+        return _rep_t(scale.reshape(1, 1, 1, C)), _rep_t(shift.reshape(1, 1, 1, C))
 
     def _prep_se(se_layer):
         fc = se_layer.fc
@@ -226,66 +233,59 @@ def build(device, torch_module):
         mel = ttnn.reshape(mel, [1, n_frame, n_mels])
         return ttnn.transpose(mel, 1, 2)                        # [1, n_mels, n_frame]
 
-    def _pad2d(x, p):
-        if p == 0:
-            return x
-        C = int(x.shape[1])
-        H = int(x.shape[2])
-        zl = ttnn.multiply(ttnn.slice(x, [0, 0, 0, 0], [1, C, H, p]), 0.0)  # [1,C,H,p]
-        x = ttnn.concat([zl, x, zl], dim=3)
-        W2 = int(x.shape[3])
-        zt = ttnn.multiply(ttnn.slice(x, [0, 0, 0, 0], [1, C, p, W2]), 0.0)  # [1,C,p,W+2p]
-        x = ttnn.concat([zt, x, zt], dim=2)
-        return x
+    def _conv2d(x, c, H, W):
+        """ONE native ttnn.conv2d. Returns (y, Hout, Wout) with y in the flattened
+        channels-last form conv2d both produces and accepts, so consecutive convs chain
+        with NO layout op between them -- H/W travel alongside as plain ints.
 
-    def _conv2d(x, c):
-        kh, kw, Cin, Cout, s, p = c["kh"], c["kw"], c["Cin"], c["Cout"], c["s"], c["p"]
-        xp = _pad2d(x, p)
-        Hp = int(xp.shape[2])
-        Wp = int(xp.shape[3])
-        Hout = (Hp - kh) // s + 1
-        Wout = (Wp - kw) // s + 1
-        taps = []
-        for i in range(kh):
-            for j in range(kw):
-                taps.append(ttnn.slice(
-                    xp, [0, 0, i, j],
-                    [1, Cin, i + s * (Hout - 1) + 1, j + s * (Wout - 1) + 1],
-                    [1, 1, s, s],
-                ))                                              # [1, Cin, Hout, Wout]
-        xc = ttnn.concat(taps, dim=1) if len(taps) > 1 else taps[0]  # [1, K, Hout, Wout]
-        K = kh * kw * Cin
-        xc = ttnn.reshape(xc, [1, K, Hout * Wout])
-        xc = ttnn.transpose(xc, 1, 2)                           # [1, Hout*Wout, K]
-        y = ttnn.matmul(xc, c["Wm"], compute_kernel_config=kcfg)  # [1, Hout*Wout, Cout]
-        y = ttnn.add(y, c["b"])
-        y = ttnn.transpose(y, 1, 2)                             # [1, Cout, Hout*Wout]
-        return ttnn.reshape(y, [1, Cout, Hout, Wout])
+        This replaces a hand-rolled im2col (zero-pad by slice+concat, gather k*k taps with
+        strided slices, concat them on channels, merge both tile dims, transpose, matmul,
+        transpose, split back). That expansion built a k*k-times inflated stack -- 14.8 MB
+        fp32 at the widest layer -- whose 4D->3D merge alone was 94 calls x ~954 us = 90 ms,
+        25% of device time, and it is pure plumbing: conv2d does the same convolution with
+        a fused sliding-window kernel and never materializes the stack."""
+        y, [Hout, Wout], [wt, bt] = ttnn.conv2d(
+            input_tensor=x, weight_tensor=c["W"], bias_tensor=c["b"], device=device,
+            in_channels=c["Cin"], out_channels=c["Cout"], batch_size=1,
+            input_height=H, input_width=W,
+            kernel_size=(c["kh"], c["kw"]), stride=(c["s"], c["s"]),
+            padding=(c["p"], c["p"]), dilation=(1, 1), groups=1,
+            dtype=TRUNK_DT, compute_config=kcfg,
+            # DRAM out on purpose: a persistent multi-MB L1 residency here moves the L1
+            # high-water mark for every LATER stage on this device.
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            return_output_dim=True, return_weights_and_bias=True,
+        )
+        # conv2d hands back the prepared (tilized/laid-out) weights; keep them so the
+        # preparation happens once per conv instead of once per call.
+        c["W"], c["b"] = wt, bt
+        return y, Hout, Wout
 
     def _apply_bn4(x, ss):
         scale, shift = ss
         return ttnn.add(ttnn.multiply(x, scale), shift)
 
-    def _se(out, se_p):
-        C = int(out.shape[1])
-        y = ttnn.mean(out, dim=[2, 3])                          # [1, C]
+    def _se(out, se_p, C):
+        # squeeze over the flattened spatial axis of the channels-last tensor
+        y = ttnn.mean(out, dim=2, keepdim=True)                  # [1,1,1,C]
         y = ttnn.reshape(y, [1, C])
         y = ttnn.add(ttnn.matmul(y, se_p["W1"], compute_kernel_config=kcfg), se_p["b1"])
         y = ttnn.relu(y)
         y = ttnn.add(ttnn.matmul(y, se_p["W2"], compute_kernel_config=kcfg), se_p["b2"])
         y = ttnn.sigmoid(y)                                     # [1, C]
-        y = ttnn.reshape(y, [1, C, 1, 1])
+        y = ttnn.reshape(y, [1, 1, 1, C])
         return ttnn.multiply(out, y)
 
-    def _block(x, b):
-        out = _conv2d(x, b["conv1"])
+    def _block(x, b, H, W):
+        out, H1, W1 = _conv2d(x, b["conv1"], H, W)
         out = ttnn.relu(out)
         out = _apply_bn4(out, b["bn1"])
-        out = _conv2d(out, b["conv2"])                          # bn2 folded
-        out = _se(out, b["se"])
-        residual = _conv2d(x, b["down"]) if b["down"] is not None else x
+        out, H2, W2 = _conv2d(out, b["conv2"], H1, W1)          # bn2 folded
+        out = _se(out, b["se"], b["conv2"]["Cout"])
+        # no downsample => stride 1 => (H2,W2)==(H,W), so x is already conformant
+        residual = _conv2d(x, b["down"], H, W)[0] if b["down"] is not None else x
         out = ttnn.add(out, residual)
-        return ttnn.relu(out)
+        return ttnn.relu(out), H2, W2
 
     def _conv1d_1x1(x, c):
         xt = ttnn.transpose(x, 1, 2)                            # [1, T, Cin]
@@ -315,25 +315,30 @@ def build(device, torch_module):
         x = ttnn.multiply(xc, ttnn.rsqrt(ttnn.add(var, inorm_eps)))  # [1, 64, F]
 
         F = int(x.shape[-1])
-        x = ttnn.reshape(x, [1, 1, 64, F])                     # unsqueeze(1)
-        x = ttnn.typecast(x, TRUNK_DT)                          # TRUNK ENTRY (see _rep_t)
+        # TRUNK ENTRY. The trunk is channels-LAST (what ttnn.conv2d consumes/produces) and
+        # bf16 (see _rep_t). unsqueeze(1) on [1,64,F] gives NCHW [1,1,64,F] with ONE
+        # channel, whose element order is already NHWC [1,64,F,1], so this costs nothing.
+        Hc, Wc = 64, F
+        x = ttnn.typecast(ttnn.reshape(x, [1, Hc, Wc, 1]), TRUNK_DT)
 
         # stem
-        x = _conv2d(x, top_conv1)
+        x, Hc, Wc = _conv2d(x, top_conv1, Hc, Wc)
         x = ttnn.relu(x)
         x = _apply_bn4(x, top_bn1)
 
         # SE-ResNet stages
         for stage in layers:
             for blk in stage:
-                x = _block(x, blk)
+                x, Hc, Wc = _block(x, blk, Hc, Wc)
 
-        # reshape [1, C, H, W] -> [1, C*H, W]
-        C = int(x.shape[1]); H = int(x.shape[2]); Wt = int(x.shape[3])
-        x = ttnn.reshape(x, [1, C * H, Wt])                    # [1, 2048, F']
-        # TRUNK EXIT: the attention softmax and the ASP sum-of-squares below subtract
-        # mu^2 from E[x^2], so they stay in the wide format.
-        x = ttnn.typecast(x, ttnn.float32)
+        # TRUNK EXIT: back to fp32 NCHW, then [1, C, H, W] -> [1, C*H, W]. The attention
+        # softmax and the ASP sum-of-squares below subtract mu^2 from E[x^2], so they stay
+        # in the wide format. This is the ONLY channels-last -> channels-first move left.
+        C = int(x.shape[-1])
+        x = ttnn.typecast(ttnn.reshape(x, [1, Hc, Wc, C]), ttnn.float32)
+        x = ttnn.permute(x, [0, 3, 1, 2])                      # [1, C, H, W]
+        x = ttnn.reshape(x, [1, C * Hc, Wc])                   # [1, 2048, F']
+        H = Hc
 
         # attention: conv1d -> relu -> bn1d -> conv1d -> softmax(time)
         w = _conv1d_1x1(x, att_c1)

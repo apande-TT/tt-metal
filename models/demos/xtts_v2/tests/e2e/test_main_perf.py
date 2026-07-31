@@ -54,7 +54,9 @@ _MESH_SHAPE = resolve_mesh_shape(default_rows=1, default_cols=8)
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
 # The source passes NO extra device params to open_mesh_device; keep it that way and add ONLY the
 # trace budget when tracing (this test self-opens, so there is no device_params fixture).
-_DEV_PARAMS = {}
+# The speaker encoder's convolutions are native ttnn.conv2d, whose sliding-window/halo
+# path allocates from the L1_SMALL region -- 0 B unless reserved at device open.
+_DEV_PARAMS = {"l1_small_size": 4096}
 if _PERF_TRACE:
     # Reserve the trace region at device-open, ONCE, for baseline and every candidate. The tool
     # measures trace+1cq end to end, so the device opens with a single command queue.

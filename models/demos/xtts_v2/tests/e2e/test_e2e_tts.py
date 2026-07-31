@@ -33,17 +33,23 @@ def _cap(name):
     return list(a) if isinstance(a, (list, tuple)) else [a]
 
 
+# The speaker encoder's convolutions are native ttnn.conv2d, whose sliding-window/halo
+# path allocates from the L1_SMALL region -- that region is 0 B unless it is reserved at
+# device open, so the pipeline requires it exactly as the per-stub PCC tests do.
+_DEV_PARAMS = {"l1_small_size": 4096}
+
+
 def _open_mesh():
     try:
         ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
-        return ttnn.open_mesh_device(ttnn.MeshShape(1, 8)), True
+        return ttnn.open_mesh_device(ttnn.MeshShape(1, 8), **_DEV_PARAMS), True
     except Exception as e:
         print(f"[e2e] mesh open failed ({e}); single-device fallback")
         try:
             ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
         except Exception:
             pass
-        return ttnn.open_device(device_id=0), False
+        return ttnn.open_device(device_id=0, **_DEV_PARAMS), False
 
 
 def _close(dev, is_mesh):

@@ -36,9 +36,15 @@ Every one of the 30 GPT2 blocks is sharded exactly like the graduated
   * Attention is HEAD-parallel (16 heads / 8 chips = 2 heads/chip): fused
     ``c_attn`` split into head-major q|k|v column shards
     (``ShardTensorToMesh(dim=1)``), per-chip on-device causal flash-attention,
-    ``all_gather(dim=2)`` to reassemble heads, REPLICATED ``c_proj``.
-  * MLP is column-then-gather: ``c_fc`` COLUMN-parallel + tanh-GELU per chip,
-    ``all_gather(dim=2)``, REPLICATED ``c_proj``.
+    per-chip head merge, then a ROW-parallel ``c_proj`` + ``all_reduce``.
+  * MLP is column-then-row: ``c_fc`` COLUMN-parallel + tanh-GELU per chip, then a
+    ROW-parallel ``c_proj`` + ``all_reduce``.
+  Both output projections contract over exactly the dim their producer is already
+  split on, so each chip multiplies its own slice by its own weight ROWS and the
+  partials are summed. That is the same math as gathering the input to full width
+  and running a replicated projection, but the collective carries the 1024-wide
+  OUTPUT instead of the 4096-wide MLP input, and each chip does 1/8 of the matmul
+  rather than all of it.
 30 stacked layers compound bf16 rounding, so every matmul runs at HiFi4 fidelity
 with fp32 accumulation. The gathered, sliced latent equals the single-device
 golden.
@@ -145,16 +151,32 @@ def build(device, torch_module):
             "ln2": _norm(blk.ln_2),
             "wt_qkv": wt_qkv,
             "bt_qkv": bt_qkv,
-            "wt_ao": _rep(attn.c_proj.weight.detach()),
+            # Both output projections are ROW-parallel: their contraction dim is exactly
+            # the dim the producer is already split on, so each chip owns the matching
+            # weight ROWS and the partial products are SUMMED (see _block).
+            "wt_ao": _shard(attn.c_proj.weight.detach(), 0),
             "b_ao": _rep(attn.c_proj.bias.detach().reshape(1, 1, -1)),
             "wt_fc": _shard(mlp.c_fc.weight.detach(), 1),
             "b_fc": _shard(mlp.c_fc.bias.detach().reshape(1, 1, -1), 2),
-            "wt_mo": _rep(mlp.c_proj.weight.detach()),
+            "wt_mo": _shard(mlp.c_proj.weight.detach(), 0),
             "b_mo": _rep(mlp.c_proj.bias.detach().reshape(1, 1, -1)),
         })
 
     ln_f_w, ln_f_b, ln_f_eps = _norm(ln_f)
     fn_w, fn_b, fn_eps = _norm(final_norm)
+
+    def _reduce(partial):
+        """Finish a ROW-parallel projection: sum the per-chip partial products.
+
+        The old scheme all_gathered the projection INPUT to full width and then ran a
+        REPLICATED projection, which (a) made every chip redo the whole 4096->1024 MLP
+        matmul and (b) moved 4096 columns over the fabric. Row-parallel moves the SAME
+        1024-wide output instead -- 4x fewer bytes for the MLP -- and each chip does 1/8
+        of the matmul. Mathematically identical: sum_i (x_i . W_i) == x . W for a weight
+        split along the contraction dim, and the bias is added once, after the sum."""
+        if n_dev <= 1:
+            return partial
+        return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear)
 
     def _block(x, L, T):
         # --- attention ---
@@ -172,15 +194,13 @@ def build(device, torch_module):
         ctx = ttnn.transformer.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=scaling, compute_kernel_config=kcfg)
         ctx = ttnn.reshape(ttnn.experimental.nlp_concat_heads(ctx), [1, T, shard_w])
-        ctx = ttnn.all_gather(ctx, dim=2, num_links=1, topology=ttnn.Topology.Linear)
-        x = ttnn.add(x, ttnn.add(_mm(ctx, L["wt_ao"]), L["b_ao"]))
+        x = ttnn.add(x, ttnn.add(_reduce(_mm(ctx, L["wt_ao"])), L["b_ao"]))
 
         # --- mlp ---
         h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1], epsilon=L["ln2"][2])
         ff = ttnn.add(_mm(h, L["wt_fc"]), L["b_fc"])
         ff = ttnn.gelu(ff, variant=ttnn.GeluVariant.Tanh)
-        ff = ttnn.all_gather(ff, dim=2, num_links=1, topology=ttnn.Topology.Linear)
-        x = ttnn.add(x, ttnn.add(_mm(ff, L["wt_mo"]), L["b_mo"]))
+        x = ttnn.add(x, ttnn.add(_reduce(_mm(ff, L["wt_mo"])), L["b_mo"]))
         return x
 
     def forward(emb, *_, **__):
