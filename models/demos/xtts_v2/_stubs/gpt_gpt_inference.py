@@ -228,14 +228,14 @@ def build(device, torch_module):
             scattered = ttnn.reduce_scatter(
                 partial, dim=2, num_links=1, topology=ttnn.Topology.Linear,
                 memory_config=ttnn.L1_MEMORY_CONFIG, compute_kernel_config=_ccl_kcfg)
-            # num_workers_per_link is the OCCUPANCY knob for a CCL: it adds worker cores on
-            # the SAME ethernet link, which is a different thing from num_links -- raising
-            # the LINK count on this 1x8 linear fabric hangs the collective outright, so this
-            # is the only parallelism dimension left for a grid=tiny CCL.
+            # num_workers_per_link is the OCCUPANCY knob for a CCL (worker cores on the SAME
+            # ethernet link -- a different thing from num_links, which HANGS this 1x8 linear
+            # fabric). At decode the gathered tensor is ONE tile row: there is not enough
+            # payload for a second worker to overlap, so the extra core only adds setup to a
+            # collective that is already latency-bound. Left at the default.
             return ttnn.all_gather(scattered, dim=2, num_links=1,
                                    topology=ttnn.Topology.Linear,
-                                   memory_config=ttnn.L1_MEMORY_CONFIG,
-                                   num_workers_per_link=2)
+                                   memory_config=ttnn.L1_MEMORY_CONFIG)
         except Exception:  # noqa: BLE001 - fall back to the fused op
             return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear,
                                    memory_config=ttnn.L1_MEMORY_CONFIG)
@@ -295,15 +295,19 @@ def build(device, torch_module):
     # ================================================================= #
     _kv = {}
 
-    def _shard_kv_row(t):
+    def _shard_kv_row(t, cx=0):
         """paged_update_cache REQUIRES a sharded input (it asserts input_tensor.is_sharded()).
 
         The row is [1,1,heads_pc,head_dim] -- heads_pc < 32, so it is a single tile row once
         padded -- which means one L1 shard of [TILE, head_dim] on one core satisfies the op
         with no real data movement. The SHAPE must be left alone: the op cross-checks the
         input's last dim against the cache's head_dim, so folding heads into the last dim
-        (the obvious way to make it one row) is rejected."""
-        core = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))})
+        (the obvious way to make it one row) is rejected.
+
+        ``cx`` picks WHICH core: the FUSED K+V cache write asserts its two inputs occupy
+        non-overlapping core ranges (it runs both writes concurrently), so K and V have to
+        land on different cores or the op rejects them outright."""
+        core = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(cx, 0), ttnn.CoreCoord(cx, 0))})
         cfg = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
             ttnn.ShardSpec(core, [32, int(t.shape[-1])], ttnn.ShardOrientation.ROW_MAJOR))
@@ -333,10 +337,14 @@ def build(device, torch_module):
                 qkv, num_heads=heads_pc, num_kv_heads=heads_pc, transpose_k_heads=False)
             # nlp_create_qkv_heads gives [1,h,S,d]; the cache-update and decode-attention
             # ops both want the batch-major [1,S,h,d], and the update wants it SHARDED.
-            ttnn.experimental.paged_update_cache(
-                kc, _shard_kv_row(ttnn.permute(k, [0, 2, 1, 3])), update_idxs_tensor=pos)
-            ttnn.experimental.paged_update_cache(
-                vc, _shard_kv_row(ttnn.permute(v, [0, 2, 1, 3])), update_idxs_tensor=pos)
+            # ONE fused cache write for K and V. A decode step is DISPATCH-bound -- ~25 tiny
+            # ops per block x 30 blocks -- so op COUNT is the cost, and two separate
+            # paged_update_cache calls write two single-tile rows back to back on the same
+            # cores. The fused op does both in one dispatch, removing 30 ops per token.
+            ttnn.experimental.paged_fused_update_cache(
+                kc, _shard_kv_row(ttnn.permute(k, [0, 2, 1, 3]), cx=0),
+                vc, _shard_kv_row(ttnn.permute(v, [0, 2, 1, 3]), cx=1),
+                update_idxs_tensor=pos)
             ctx = ttnn.transformer.scaled_dot_product_attention_decode(
                 ttnn.permute(q, [0, 2, 1, 3]), kc, vc, is_causal=True,
                 cur_pos_tensor=pos, scale=scaling, compute_kernel_config=kcfg)

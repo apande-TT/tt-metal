@@ -112,19 +112,38 @@ def build(device, torch_module):
     num_k = int(gen.num_kernels)
     conv_post = _conv_meta(gen.conv_post)
 
+    # knob:shard -- the im2col intermediates (pad slices, k dilated taps, the
+    # concatenated stack) are the profile's dram_interleaved SliceDeviceOperation.
+    # Every one of them is written to DRAM and read straight back by the next op in
+    # the SAME conv, so they are pure round-trip traffic: landing them in L1 removes
+    # that DRAM write+read pair. L1 is finite, so only tensors under this budget are
+    # kept resident (the deep-stack tensors of the last upsample stage are the big
+    # ones); anything larger stays interleaved in DRAM rather than failing to fit.
+    _L1_BUDGET_B = 12 << 20
+
+    def _l1_if_fits(shape, dtype_bytes=4):
+        n = 1
+        for d in shape:
+            n *= int(d)
+        return ttnn.L1_MEMORY_CONFIG if n * dtype_bytes <= _L1_BUDGET_B else ttnn.DRAM_MEMORY_CONFIG
+
     def _pad_time(x, left, right):
         # TILE-layout ttnn.pad forbids nonzero FRONT padding, so build the zero
         # pad natively by zeroing a leading slice and concatenating.
         if left == 0 and right == 0:
             return x
         C = int(x.shape[1])
+        T = int(x.shape[-1])
+        mc = _l1_if_fits((C, T + left + right))
         parts = []
         if left:
-            parts.append(ttnn.multiply(ttnn.slice(x, [0, 0, 0], [1, C, left]), 0.0))
+            parts.append(ttnn.multiply(
+                ttnn.slice(x, [0, 0, 0], [1, C, left], memory_config=mc), 0.0, memory_config=mc))
         parts.append(x)
         if right:
-            parts.append(ttnn.multiply(ttnn.slice(x, [0, 0, 0], [1, C, right]), 0.0))
-        return ttnn.concat(parts, dim=2)
+            parts.append(ttnn.multiply(
+                ttnn.slice(x, [0, 0, 0], [1, C, right], memory_config=mc), 0.0, memory_config=mc))
+        return ttnn.concat(parts, dim=2, memory_config=mc)
 
     def _conv1d(x, meta):
         # x: [1, Cin, T]; stride-1 im2col + matmul.
@@ -133,9 +152,13 @@ def build(device, torch_module):
         T2 = int(xp.shape[-1])
         Lout = T2 - dil * (k - 1)
         Cin = int(x.shape[1])
-        taps = [ttnn.slice(xp, [0, 0, t * dil], [1, Cin, t * dil + Lout]) for t in range(k)]
-        xc = ttnn.concat(taps, dim=1) if k > 1 else taps[0]     # [1, k*Cin, Lout]
-        y = ttnn.matmul(ttnn.transpose(xc, 1, 2), meta["Wm"], compute_kernel_config=kcfg)  # [1,Lout,Cout]
+        tap_mc = _l1_if_fits((Cin, Lout))
+        stack_mc = _l1_if_fits((k * Cin, Lout))
+        taps = [ttnn.slice(xp, [0, 0, t * dil], [1, Cin, t * dil + Lout], memory_config=tap_mc)
+                for t in range(k)]
+        xc = ttnn.concat(taps, dim=1, memory_config=stack_mc) if k > 1 else taps[0]
+        y = ttnn.matmul(ttnn.transpose(xc, 1, 2, memory_config=stack_mc), meta["Wm"],
+                        compute_kernel_config=kcfg)  # [1,Lout,Cout]
         if meta["b"] is not None:
             y = ttnn.add(y, meta["b"])
         return ttnn.transpose(y, 1, 2)                          # [1, Cout, Lout]
