@@ -74,6 +74,19 @@ def build(device, torch_module):
     def _mm(a, b):
         return ttnn.matmul(a, b, compute_kernel_config=kcfg)
 
+    def _mm_l1(a, b):
+        """Row-parallel partial product, emitted straight into L1.
+
+        Its only consumer is the collective in _reduce, which is dispatch/latency-bound.
+        Producing the partial in L1 (and reducing back into L1) means no DRAM round-trip
+        anywhere around the collective, instead of write-DRAM / read-DRAM / write-DRAM /
+        read-DRAM for the matmul->reduce->add chain."""
+        try:
+            return ttnn.matmul(a, b, compute_kernel_config=kcfg,
+                               memory_config=ttnn.L1_MEMORY_CONFIG)
+        except Exception:  # noqa: BLE001 - shape does not fit L1
+            return ttnn.matmul(a, b, compute_kernel_config=kcfg)
+
     def _stage(t, mapper):
         """Upload one weight to the mesh, tilizing ROW VECTORS on the host.
 
@@ -196,13 +209,13 @@ def build(device, torch_module):
         ctx = ttnn.transformer.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=scaling, compute_kernel_config=kcfg)
         ctx = ttnn.reshape(ttnn.experimental.nlp_concat_heads(ctx), [1, T, shard_w])
-        x = ttnn.add(x, ttnn.add(_reduce(_mm(ctx, L["wt_ao"])), L["b_ao"]))
+        x = ttnn.add(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
 
         # --- mlp ---
         h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1], epsilon=L["ln2"][2])
         ff = ttnn.add(_mm(h, L["wt_fc"]), L["b_fc"])
         ff = ttnn.gelu(ff, variant=ttnn.GeluVariant.Tanh)
-        x = ttnn.add(x, ttnn.add(_reduce(_mm(ff, L["wt_mo"])), L["b_mo"]))
+        x = ttnn.add(x, ttnn.add(_reduce(_mm_l1(ff, L["wt_mo"])), L["b_mo"]))
         return x
 
     def forward(emb, *_, **__):
