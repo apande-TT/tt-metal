@@ -189,14 +189,23 @@ model-agnostic: pass shapes on the command line. Axes are `--cores`, `--in0-bloc
 `--out-subblock-w`, `--obw-mult`, `--act-dtypes`, `--fidelities`, plus `--experts`,
 `--active` and `--nnz`.
 
-```bash
-# gate+up: the fused [gate|up] projection, sparse operand is the weight
-python cc_optimize/moe_sparse_matmul_sweep.py --proj gate_up \
-    --K 2880 --N 5760 --experts 32 --active 4 --sparse-input b
+Run it through the wrapper, which picks the right sparse operand per projection
+(`gate_up` sparsifies the weight, `down` sparsifies the activation):
 
-# down: the activation is the sparse operand
-python cc_optimize/moe_sparse_matmul_sweep.py --proj down \
-    --K 2880 --N 2880 --experts 32 --active 4 --sparse-input a
+```bash
+# args: <gate_up|down> <K> <N> [experts] [active]
+cc_optimize/run_moe_sparse_sweep.sh gate_up 2880 5760 32 4
+cc_optimize/run_moe_sparse_sweep.sh down    2880 2880 32 4
+
+# env: MOE_SWEEP_CSV, MOE_SWEEP_ITERS, MOE_SWEEP_GRID="9 5", MOE_SWEEP_PCC,
+#      MOE_SWEEP_EXTRA="--in0-block-w 9 --out-subblock-w 2"
+```
+
+Or call the script directly for full control of every axis:
+
+```bash
+python cc_optimize/moe_sparse_matmul_sweep.py --proj gate_up \
+    --K 2880 --N 5760 --experts 32 --active 4 --sparse-input b --grid 9 5
 ```
 
 Score **per tile**, against the **device** output at `out_subblock_w=1`, never against
