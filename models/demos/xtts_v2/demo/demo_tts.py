@@ -38,7 +38,10 @@ def _captured(name):
 def _open_mesh():
     try:
         ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
-        dev = ttnn.open_mesh_device(ttnn.MeshShape(1, 8))
+        # l1_small_size: the vocoder's native conv1d/conv_transpose2d and the speaker
+        # encoder's conv2d run a sliding-window/halo gather that allocates from the
+        # dedicated L1_SMALL pool, which is 0 B unless reserved here.
+        dev = ttnn.open_mesh_device(ttnn.MeshShape(1, 8), l1_small_size=32768)
         print("[demo] opened 8-chip mesh (TP=8 x DP=1)")
         return dev, True
     except Exception as e:  # pragma: no cover - single-device fallback

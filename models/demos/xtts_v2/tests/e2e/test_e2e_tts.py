@@ -36,7 +36,13 @@ def _cap(name):
 # The speaker encoder's convolutions are native ttnn.conv2d, whose sliding-window/halo
 # path allocates from the L1_SMALL region -- that region is 0 B unless it is reserved at
 # device open, so the pipeline requires it exactly as the per-stub PCC tests do.
-_DEV_PARAMS = {"l1_small_size": 4096}
+# The vocoder trunk is native ttnn.conv1d/conv_transpose2d and the speaker encoder is
+# native ttnn.conv2d; both run a sliding-window/halo gather whose sharding + config
+# tensors allocate from the dedicated L1_SMALL pool. That pool is 0 B unless reserved
+# at device open, and 4 KB only covered the 3x3 conv2d halo -- the vocoder's k=11
+# dilated taps over 6656 samples need more, and coming up short surfaces as a
+# TT_FATAL "Out of Memory ... bank size is 0 B", not an API error.
+_DEV_PARAMS = {"l1_small_size": 32768}
 
 
 def _open_mesh():
