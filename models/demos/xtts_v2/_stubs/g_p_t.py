@@ -238,7 +238,8 @@ def build(device, torch_module):
         # SINGLE-CORE retilize (the profile's grid=tiny TilizeWithValPadding, ~62 us
         # per call, 4 per block). nlp_create_qkv_heads / nlp_concat_heads do the same
         # shuffle as one multicore device op, so no layout round-trip happens at all.
-        h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1], epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
+        h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1],
+                            epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
         qkv = ttnn.add(_mm(h, L["wt_qkv"]), L["bt_qkv"])       # [1, T, 3*shard_w]
         qkv = ttnn.reshape(qkv, [1, 1, T, 3 * shard_w])        # leading-dim view, no repack
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
@@ -249,7 +250,8 @@ def build(device, torch_module):
         x = ttnn.add(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
 
         # --- mlp ---
-        h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1], epsilon=L["ln2"][2], compute_kernel_config=_ln_kcfg)
+        h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1],
+                            epsilon=L["ln2"][2], compute_kernel_config=_ln_kcfg)
         ff = ttnn.add(_mm(h, L["wt_fc"]), L["b_fc"])
         ff = ttnn.gelu(ff, variant=ttnn.GeluVariant.Tanh)
         x = ttnn.add(x, ttnn.add(_reduce(_mm_l1(ff, L["wt_mo"])), L["b_mo"]))
@@ -261,8 +263,10 @@ def build(device, torch_module):
         for L in layers:
             x = _block(x, L, T)
         # last_hidden_state = ln_f(blocks(emb)); then the module's final_norm.
-        x = ttnn.layer_norm(x, weight=ln_f_w, bias=ln_f_b, epsilon=ln_f_eps, compute_kernel_config=_ln_kcfg)
-        x = ttnn.layer_norm(x, weight=fn_w, bias=fn_b, epsilon=fn_eps, compute_kernel_config=_ln_kcfg)
+        x = ttnn.layer_norm(x, weight=ln_f_w, bias=ln_f_b, epsilon=ln_f_eps,
+                            compute_kernel_config=_ln_kcfg)
+        x = ttnn.layer_norm(x, weight=fn_w, bias=fn_b, epsilon=fn_eps,
+                            compute_kernel_config=_ln_kcfg)
         # mel latent = final_norm(hidden)[:, -mel_len:][:, :-sub] (LayerNorm is
         # per-position, so slicing the tail is exact). Full hidden dim = 1024.
         hidden_dim = int(x.shape[-1])
