@@ -92,6 +92,19 @@ def build(device, torch_module):
         packer_l1_acc=True,
     )
 
+    def _add_l1(a, b):
+        """Residual-stream add, landing in L1.
+
+        Its consumer is the next LayerNorm, which is DISPATCH/latency-bound at one-to-two
+        tile rows -- so the lever is removing the DRAM write + read between them, not giving
+        the norm more cores (a width shard was measured and LOST: the reshard cost more than
+        the norm saved, because the qkv matmul downstream reshards anyway). The residual
+        stream is [1,T,1024] bf16, one live tensor at a time, so it cannot crowd L1."""
+        try:
+            return ttnn.add(a, b, memory_config=ttnn.L1_MEMORY_CONFIG)
+        except Exception:  # noqa: BLE001 - will not fit L1
+            return ttnn.add(a, b)
+
     def _mm(a, b):
         return ttnn.matmul(a, b, compute_kernel_config=kcfg)
 
@@ -227,7 +240,7 @@ def build(device, torch_module):
                             epsilon=L["ln2"][2], compute_kernel_config=_ln_kcfg)
         ff = ttnn.add(_mm(h, L["wt_fc"]), L["b_fc"])
         ff = ttnn.gelu(ff, variant=ttnn.GeluVariant.Tanh)
-        return ttnn.add(x, ttnn.add(_reduce(_mm_l1(ff, L["wt_mo"])), L["b_mo"]))
+        return _add_l1(x, ttnn.add(_reduce(_mm_l1(ff, L["wt_mo"])), L["b_mo"]))
 
     def _head(x):
         x = ttnn.layer_norm(x, weight=ln_f_w, bias=ln_f_b, epsilon=ln_f_eps,
@@ -257,7 +270,7 @@ def build(device, torch_module):
         ctx = ttnn.transformer.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=scaling, compute_kernel_config=kcfg)
         ctx = ttnn.reshape(ttnn.experimental.nlp_concat_heads(ctx), [1, T, shard_w])
-        x = ttnn.add(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
+        x = _add_l1(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
         return _mlp(x, L)
 
     def forward(emb, *_, **__):
@@ -325,7 +338,7 @@ def build(device, torch_module):
             ctx = ttnn.reshape(
                 ttnn.experimental.nlp_concat_heads(ttnn.permute(ctx, [0, 2, 1, 3])),
                 [1, 1, shard_w])
-            x = ttnn.add(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
+            x = _add_l1(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
             x = _mlp(x, L)
         return _head(x)
 
