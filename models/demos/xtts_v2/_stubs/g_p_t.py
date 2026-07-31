@@ -176,7 +176,17 @@ def build(device, torch_module):
         split along the contraction dim, and the bias is added once, after the sum."""
         if n_dev <= 1:
             return partial
-        return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear)
+        # Land the reduced result in L1 rather than DRAM_INTERLEAVED. The collective is
+        # DISPATCH-bound (profile tags reduce_scatter/all_gather grid=tiny), so the lever is
+        # latency, not bandwidth: the residual add that consumes this reads it straight out
+        # of L1 instead of paying a DRAM write + read. The tensor is [1,T,1024] bf16, a few
+        # hundred KB, so it cannot crowd L1. NOTE: do NOT reach for num_links>1 here -- on
+        # this 1x8 linear fabric that HANGS the reduce (silent timeout, no exception).
+        try:
+            return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear,
+                                   memory_config=ttnn.L1_MEMORY_CONFIG)
+        except Exception:  # noqa: BLE001 - L1 unavailable for this shape
+            return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear)
 
     def _block(x, L, T):
         # --- attention ---
