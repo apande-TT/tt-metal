@@ -53,11 +53,16 @@ import torch.nn.functional as F
 
 import ttnn
 
-# A native conv keeps its ENTIRE [k*Cin, Cout] weight block resident in an L1
-# circular buffer on every core it runs on, so this budget -- not the activation --
-# is what decides whether the native form is usable at all. 1 MB leaves room for the
-# activation and output CBs inside a 1.5 MB L1.
-_NATIVE_WEIGHT_BUDGET_B = 1 << 20
+# A native conv keeps its [k*Cin, Cout] weight block resident in L1 circular buffers,
+# so this budget -- not the activation -- is what decides whether the native form is
+# usable at all. It is a COVERAGE knob: every conv above it falls back to im2col, and
+# im2col is what generates the val-padded tilizes (a TILE slice at a time offset that
+# is not a multiple of 32 costs untilize + retilize). Raised from 1 MB to 3 MB to pull
+# ups[1] (k=16, Cin=256 -> a 27 MB im2col stack at L=1664) and the k=7/k=11 stage-0
+# ResBlocks onto the native path. conv_pre (14.7 MB) and ups[0] (8.4 MB) stay on
+# im2col -- they sit at L=26..208 where im2col is cheap, and forcing them native
+# overflows L1 outright ("circular buffers grow to 7122176 B").
+_NATIVE_WEIGHT_BUDGET_B = 3 << 20
 
 
 def build(device, torch_module):
