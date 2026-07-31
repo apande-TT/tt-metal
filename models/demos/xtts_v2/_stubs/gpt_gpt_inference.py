@@ -71,6 +71,15 @@ def build(device, torch_module):
         packer_l1_acc=True,
     )
 
+    # The CCL sum needs no multiplier precision (it is an add into an fp32 accumulator),
+    # so it runs at LoFi while every matmul stays at HiFi4.
+    _ccl_kcfg = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.LoFi,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=True,
+    )
+
     def _mm(a, b):
         return ttnn.matmul(a, b, compute_kernel_config=kcfg)
 
@@ -181,17 +190,25 @@ def build(device, torch_module):
         split along the contraction dim, and the bias is added once, after the sum."""
         if n_dev <= 1:
             return partial
-        # Land the reduced result in L1 rather than DRAM_INTERLEAVED. The collective is
-        # DISPATCH-bound (profile tags reduce_scatter/all_gather grid=tiny), so the lever is
-        # latency, not bandwidth: the residual add that consumes this reads it straight out
-        # of L1 instead of paying a DRAM write + read. The tensor is [1,T,1024] bf16, a few
-        # hundred KB, so it cannot crowd L1. NOTE: do NOT reach for num_links>1 here -- on
-        # this 1x8 linear fabric that HANGS the reduce (silent timeout, no exception).
+        # Spelled out as the reduce_scatter + all_gather pair that all_reduce runs anyway,
+        # for two reasons: (a) only reduce_scatter takes a compute_kernel_config, so the
+        # summation fidelity is reachable at all, and (b) all_reduce only lets us place its
+        # final output, while this places BOTH halves in L1. The collective is DISPATCH-bound
+        # (profile tags both halves grid=tiny), so keeping the whole chain out of DRAM is the
+        # lever. The reduce is a plain sum of 8 partials into an fp32 accumulator, so it does
+        # not need HiFi4 multiplier precision.
+        # NOTE: do NOT reach for num_links>1 here -- on this 1x8 linear fabric that HANGS the
+        # collective (silent timeout, no exception, wedged device).
         try:
+            scattered = ttnn.reduce_scatter(
+                partial, dim=2, num_links=1, topology=ttnn.Topology.Linear,
+                memory_config=ttnn.L1_MEMORY_CONFIG, compute_kernel_config=_ccl_kcfg)
+            return ttnn.all_gather(scattered, dim=2, num_links=1,
+                                   topology=ttnn.Topology.Linear,
+                                   memory_config=ttnn.L1_MEMORY_CONFIG)
+        except Exception:  # noqa: BLE001 - fall back to the fused op
             return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear,
                                    memory_config=ttnn.L1_MEMORY_CONFIG)
-        except Exception:  # noqa: BLE001 - L1 unavailable for this shape
-            return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear)
 
     def _block(x, L, T):
         # --- attention ---
