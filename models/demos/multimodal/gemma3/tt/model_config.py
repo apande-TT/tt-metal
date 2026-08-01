@@ -32,9 +32,6 @@ from models.tt_transformers.tt.prefetcher import Prefetcher
 PERFORMANCE_DECODER_CONFIG_FILENAME = "performance_decoder_config.json"
 ACCURACY_DECODER_CONFIG_FILENAME = "accuracy_decoder_config.json"
 
-# Blackhole L1 per Tensix core (also the Wormhole figure to within the safety margin it is used with).
-_L1_BYTES_PER_CORE = 1_572_864
-
 # SDPA decode k_chunk when force_fixed_decode_k_chunk is True (paged text path; see text_demo).
 _GEMMA3_SDPA_DECODE_K_CHUNK_DEFAULT = 256
 # Under program trace, use the smallest valid k_chunk (pow2, multiple of 32) to reduce L1 vs static CB limits.
@@ -129,6 +126,21 @@ class ModelArgs(TTModelArgs):
         if self.num_devices == 1:
             # Turn off fp32_dest_acc_en to not trigger L1 OOM
             self._force_sdpa_prefill_hifi4_fp16()
+
+        # FF2 is a bfp8 x bfp8 matmul still running HiFi2 while FLOP-bound at ~85% of peak.
+        # GUIDELINES 01 §12: a bf8b matmul should hold at LoFi, which is ~2x the math rate.
+        self._set_op_fidelity({OpGroup.LI_FF2: MathFidelitySetting.LOFI})
+
+    def _set_op_fidelity(self, fidelity_by_op):
+        """Override math fidelity for specific op groups across every decoder."""
+        for decoder_id, conf in list(self.optimizations.decoder_optimizations.items()):
+            tensor_precision = {key: value for key, value in conf.tensor_dtype_settings.items() if value is not None}
+            op_fidelity = dict(conf.op_fidelity_settings)
+            op_fidelity.update(fidelity_by_op)
+            fixed_conf = ModelOptimizations({"TensorPrecision": tensor_precision, "OpFidelity": op_fidelity})
+            fixed_conf.__name__ = getattr(conf, "__name__", fixed_conf.__name__)
+            self.optimizations.set_decoder_conf(decoder_id, fixed_conf)
+        self.model_config["DECODERS_OPTIMIZATIONS"] = self.optimizations
 
     def _relax_attention_ops_for_program_trace(self):
         """Lower L1 for prefill+decode attention under program tracing (minimal_matmul / SDPA / linear)."""
@@ -247,32 +259,12 @@ class ModelArgs(TTModelArgs):
                     break
         return best
 
-    def get_mlp_ff1_3_mem_config(self, mode: Mode, prefetcher: Prefetcher = None):
-        """Keep the prefill FF1/FF3 outputs resident in L1 instead of round-tripping them to DRAM.
-
-        FF1/FF3 write a [seq, 15360] activation to DRAM and the very next two ops read it straight
-        back: the SiLU-gate ``mul`` (which inherits w1_out's memory config, so it lands in L1 too)
-        and then FF2. That is ~3 x seq x 15360 x 2B of pure round-trip per layer that never had to
-        leave the chip -- the "L1 handoff / FF1 -> FF2 island" knob. Decode already runs
-        L1-width-sharded here; only prefill was on DRAM.
-
-        Budgeted, because it is gated on the LONGEST prefill this instance will run: w1_out, w3_out
-        and the bf8 gate product must all be live at once (the deallocates come after the mul), and
-        overflowing L1 is a hard failure, not a slow path.
-        """
-        if mode == Mode.PREFILL and prefetcher is None and not self.is_galaxy and self._ff1_3_l1_handoff_fits():
-            return ttnn.L1_MEMORY_CONFIG
-        return super().get_mlp_ff1_3_mem_config(mode, prefetcher)
-
-    def _ff1_3_l1_handoff_fits(self) -> bool:
-        """True when w1_out + w3_out + the bf8 gate product fit a conservative half of total L1."""
-        grid = getattr(self, "max_grid_size", None)
-        if grid is None:
-            return False
-        total_l1 = int(grid.x) * int(grid.y) * _L1_BYTES_PER_CORE
-        seq = int(self.max_seq_len)
-        live = 2 * seq * self.hidden_dim * 2 + seq * self.hidden_dim * 17 // 16  # 2x bf16 + 1x bf8_b
-        return live <= total_l1 // 2
+    # NOTE -- an L1 handoff for the prefill FF1/FF3 output was tried here and REMOVED. Keeping
+    # w1_out/w3_out resident in L1 does cut a real DRAM round-trip and is worth ~12ms of eager
+    # device_ms even alongside the LoFi FF2 above, but the two compete for L1 against the trace
+    # region's statically allocated circular buffers, and the production trace+1cq per-token metric
+    # is what pays: with both, per-token diverged to 77.3/77.9ms; with LoFi FF2 alone it is
+    # 41.6/42.2ms. The eager profile cannot see that cost, so the handoff looks free there.
 
     def get_attn_qkv_program_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
         """Smaller MinimalMatmul blocks for traced long prefill (default 8³ overflows static CB vs L1)."""
