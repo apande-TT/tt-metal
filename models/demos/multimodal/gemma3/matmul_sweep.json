@@ -1,0 +1,878 @@
+{
+  "shapes": 14,
+  "seeded": 14,
+  "improved": 12,
+  "seeds": [
+    {
+      "shape": {
+        "m": 128,
+        "k": 3840,
+        "n": 8192
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.1237,
+      "baseline_ms": 0.1963,
+      "speedup": 1.587,
+      "pcc": 0.99009
+    },
+    {
+      "shape": {
+        "m": 128,
+        "k": 4096,
+        "n": 3840
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.1266,
+      "baseline_ms": 0.1318,
+      "speedup": 1.041,
+      "pcc": 0.99939
+    },
+    {
+      "shape": {
+        "m": 128,
+        "k": 3840,
+        "n": 15360
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.2112,
+      "baseline_ms": 0.3673,
+      "speedup": 1.739,
+      "pcc": 0.99014
+    },
+    {
+      "shape": {
+        "m": 128,
+        "k": 15360,
+        "n": 3840
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.3845,
+      "baseline_ms": 0.392,
+      "speedup": 1.02,
+      "pcc": 0.99446
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 3840,
+        "n": 16032
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.1975,
+      "baseline_ms": 0.3375,
+      "speedup": 1.709,
+      "pcc": 0.99016
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 3840,
+        "n": 5888
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.1124,
+      "baseline_ms": 0.142,
+      "speedup": 1.263,
+      "pcc": 0.99013
+    },
+    {
+      "shape": {
+        "m": 1024,
+        "k": 3840,
+        "n": 8192
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.6302,
+      "baseline_ms": 1.0313,
+      "speedup": 1.636,
+      "pcc": 0.99997
+    },
+    {
+      "shape": {
+        "m": 1024,
+        "k": 4096,
+        "n": 3840
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.371,
+      "baseline_ms": 0.5185,
+      "speedup": 1.398,
+      "pcc": 0.99951
+    },
+    {
+      "shape": {
+        "m": 512,
+        "k": 3840,
+        "n": 15360
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.3594,
+      "baseline_ms": 0.76,
+      "speedup": 2.115,
+      "pcc": 0.99068
+    },
+    {
+      "shape": {
+        "m": 512,
+        "k": 15360,
+        "n": 3840
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat16",
+      "best_ms": 0.906,
+      "baseline_ms": 1.045,
+      "speedup": 1.153,
+      "pcc": 0.9945
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 3840,
+        "n": 8192
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.1158,
+      "baseline_ms": 0.1878,
+      "speedup": 1.622,
+      "pcc": 0.99015
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 4096,
+        "n": 3840
+      },
+      "fidelity": "HiFi4",
+      "dtype": "bfloat16",
+      "best_ms": 0.1045,
+      "baseline_ms": 0.1045,
+      "speedup": 1.0,
+      "pcc": 0.999
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 3840,
+        "n": 15360
+      },
+      "fidelity": "LoFi",
+      "dtype": "bfloat8_b",
+      "best_ms": 0.1983,
+      "baseline_ms": 0.3361,
+      "speedup": 1.695,
+      "pcc": 0.99015
+    },
+    {
+      "shape": {
+        "m": 32,
+        "k": 15360,
+        "n": 3840
+      },
+      "fidelity": "HiFi2",
+      "dtype": "bfloat16",
+      "best_ms": 0.3135,
+      "baseline_ms": 0.3141,
+      "speedup": 1.002,
+      "pcc": 0.99282
+    }
+  ],
+  "ok": true,
+  "table": [
+    {
+      "m": 128,
+      "k": 3840,
+      "n": 8192,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.1971,
+          "pcc": 0.99946
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.1237,
+          "pcc": 0.99009
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.1943,
+          "pcc": 0.99912
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.1228,
+          "pcc": 0.98877
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.1963,
+          "pcc": 0.99912
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.1305,
+          "pcc": 0.98877
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.1237,
+        "pcc": 0.99009
+      }
+    },
+    {
+      "m": 128,
+      "k": 4096,
+      "n": 3840,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.1266,
+          "pcc": 0.99939
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.1117,
+          "pcc": 0.98882
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.1283,
+          "pcc": 0.99901
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.1148,
+          "pcc": 0.9874
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.1318,
+          "pcc": 0.99901
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.1155,
+          "pcc": 0.9874
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.1266,
+        "pcc": 0.99939
+      }
+    },
+    {
+      "m": 128,
+      "k": 3840,
+      "n": 15360,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3507,
+          "pcc": 0.99946
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.2112,
+          "pcc": 0.99014
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3527,
+          "pcc": 0.99911
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.212,
+          "pcc": 0.98888
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3673,
+          "pcc": 0.99909
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.207,
+          "pcc": 0.98888
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.2112,
+        "pcc": 0.99014
+      }
+    },
+    {
+      "m": 128,
+      "k": 15360,
+      "n": 3840,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3845,
+          "pcc": 0.99446
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3311,
+          "pcc": 0.86442
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3873,
+          "pcc": 0.99285
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3321,
+          "pcc": 0.85863
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.392,
+          "pcc": 0.99284
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.3634,
+          "pcc": 0.85863
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.3845,
+        "pcc": 0.99446
+      }
+    },
+    {
+      "m": 32,
+      "k": 3840,
+      "n": 16032,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3383,
+          "pcc": 0.99944
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.1975,
+          "pcc": 0.99016
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.337,
+          "pcc": 0.99911
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.1971,
+          "pcc": 0.98887
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3375,
+          "pcc": 0.9991
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.1995,
+          "pcc": 0.98887
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.1975,
+        "pcc": 0.99016
+      }
+    },
+    {
+      "m": 32,
+      "k": 3840,
+      "n": 5888,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.1425,
+          "pcc": 0.99943
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.1124,
+          "pcc": 0.99013
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.142,
+          "pcc": 0.99909
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.1161,
+          "pcc": 0.98883
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.142,
+          "pcc": 0.99909
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.1154,
+          "pcc": 0.98883
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.1124,
+        "pcc": 0.99013
+      }
+    },
+    {
+      "m": 1024,
+      "k": 3840,
+      "n": 8192,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.6302,
+          "pcc": 0.99997
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.6049,
+          "pcc": 0.96837
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.7461,
+          "pcc": 0.99962
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.6999,
+          "pcc": 0.96603
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 1.0313,
+          "pcc": 0.9996
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.9919,
+          "pcc": 0.96603
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.6302,
+        "pcc": 0.99997
+      }
+    },
+    {
+      "m": 1024,
+      "k": 4096,
+      "n": 3840,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.371,
+          "pcc": 0.99951
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3522,
+          "pcc": 0.96369
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.374,
+          "pcc": 0.99914
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.3523,
+          "pcc": 0.96098
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.5185,
+          "pcc": 0.99913
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.4802,
+          "pcc": 0.96098
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.371,
+        "pcc": 0.99951
+      }
+    },
+    {
+      "m": 512,
+      "k": 3840,
+      "n": 15360,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.4394,
+          "pcc": 0.99995
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.3594,
+          "pcc": 0.99068
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.5432,
+          "pcc": 0.99963
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.4777,
+          "pcc": 0.98935
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.76,
+          "pcc": 0.99961
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.73,
+          "pcc": 0.98935
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.3594,
+        "pcc": 0.99068
+      }
+    },
+    {
+      "m": 512,
+      "k": 15360,
+      "n": 3840,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.906,
+          "pcc": 0.9945
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.9004,
+          "pcc": 0.66375
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.9192,
+          "pcc": 0.99286
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.9135,
+          "pcc": 0.65692
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 1.045,
+          "pcc": 0.99284
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 1.0115,
+          "pcc": 0.65692
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat16",
+        "ms": 0.906,
+        "pcc": 0.9945
+      }
+    },
+    {
+      "m": 32,
+      "k": 3840,
+      "n": 8192,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.1866,
+          "pcc": 0.99944
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.1158,
+          "pcc": 0.99015
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.1848,
+          "pcc": 0.9991
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.1177,
+          "pcc": 0.98888
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.1878,
+          "pcc": 0.9991
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.1187,
+          "pcc": 0.98888
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.1158,
+        "pcc": 0.99015
+      }
+    },
+    {
+      "m": 32,
+      "k": 4096,
+      "n": 3840,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.1051,
+          "pcc": 0.99938
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.0992,
+          "pcc": 0.98874
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.1074,
+          "pcc": 0.999
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.0966,
+          "pcc": 0.98731
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.1045,
+          "pcc": 0.999
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.0993,
+          "pcc": 0.98731
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi4",
+        "dtype": "bfloat16",
+        "ms": 0.1045,
+        "pcc": 0.999
+      }
+    },
+    {
+      "m": 32,
+      "k": 3840,
+      "n": 15360,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3286,
+          "pcc": 0.99944
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.1983,
+          "pcc": 0.99015
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3324,
+          "pcc": 0.99911
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.1942,
+          "pcc": 0.98881
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3361,
+          "pcc": 0.99911
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.1969,
+          "pcc": 0.98881
+        }
+      ],
+      "best": {
+        "fidelity": "LoFi",
+        "dtype": "bfloat8_b",
+        "ms": 0.1983,
+        "pcc": 0.99015
+      }
+    },
+    {
+      "m": 32,
+      "k": 15360,
+      "n": 3840,
+      "candidates": [
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat16",
+          "ms": 0.3193,
+          "pcc": 0.99442
+        },
+        {
+          "fidelity": "LoFi",
+          "dtype": "bfloat8_b",
+          "ms": 0.2851,
+          "pcc": 0.8643
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat16",
+          "ms": 0.3135,
+          "pcc": 0.99282
+        },
+        {
+          "fidelity": "HiFi2",
+          "dtype": "bfloat8_b",
+          "ms": 0.2843,
+          "pcc": 0.85834
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat16",
+          "ms": 0.3141,
+          "pcc": 0.99281
+        },
+        {
+          "fidelity": "HiFi4",
+          "dtype": "bfloat8_b",
+          "ms": 0.286,
+          "pcc": 0.85834
+        }
+      ],
+      "best": {
+        "fidelity": "HiFi2",
+        "dtype": "bfloat16",
+        "ms": 0.3135,
+        "pcc": 0.99282
+      }
+    }
+  ]
+}

@@ -32,6 +32,9 @@ from models.tt_transformers.tt.prefetcher import Prefetcher
 PERFORMANCE_DECODER_CONFIG_FILENAME = "performance_decoder_config.json"
 ACCURACY_DECODER_CONFIG_FILENAME = "accuracy_decoder_config.json"
 
+# Blackhole L1 per Tensix core (also the Wormhole figure to within the safety margin it is used with).
+_L1_BYTES_PER_CORE = 1_572_864
+
 # SDPA decode k_chunk when force_fixed_decode_k_chunk is True (paged text path; see text_demo).
 _GEMMA3_SDPA_DECODE_K_CHUNK_DEFAULT = 256
 # Under program trace, use the smallest valid k_chunk (pow2, multiple of 32) to reduce L1 vs static CB limits.
@@ -201,6 +204,33 @@ class ModelArgs(TTModelArgs):
         if model_name in model_overrides and device_name in model_overrides[model_name]:
             return model_overrides[model_name][device_name] * 1024
         return super().get_max_prefill_chunk_size()
+
+    def get_mlp_ff1_3_mem_config(self, mode: Mode, prefetcher: Prefetcher = None):
+        """Keep the prefill FF1/FF3 outputs resident in L1 instead of round-tripping them to DRAM.
+
+        FF1/FF3 write a [seq, 15360] activation to DRAM and the very next two ops read it straight
+        back: the SiLU-gate ``mul`` (which inherits w1_out's memory config, so it lands in L1 too)
+        and then FF2. That is ~3 x seq x 15360 x 2B of pure round-trip per layer that never had to
+        leave the chip -- the "L1 handoff / FF1 -> FF2 island" knob. Decode already runs
+        L1-width-sharded here; only prefill was on DRAM.
+
+        Budgeted, because it is gated on the LONGEST prefill this instance will run: w1_out, w3_out
+        and the bf8 gate product must all be live at once (the deallocates come after the mul), and
+        overflowing L1 is a hard failure, not a slow path.
+        """
+        if mode == Mode.PREFILL and prefetcher is None and not self.is_galaxy and self._ff1_3_l1_handoff_fits():
+            return ttnn.L1_MEMORY_CONFIG
+        return super().get_mlp_ff1_3_mem_config(mode, prefetcher)
+
+    def _ff1_3_l1_handoff_fits(self) -> bool:
+        """True when w1_out + w3_out + the bf8 gate product fit a conservative half of total L1."""
+        grid = getattr(self, "max_grid_size", None)
+        if grid is None:
+            return False
+        total_l1 = int(grid.x) * int(grid.y) * _L1_BYTES_PER_CORE
+        seq = int(self.max_seq_len)
+        live = 2 * seq * self.hidden_dim * 2 + seq * self.hidden_dim * 17 // 16  # 2x bf16 + 1x bf8_b
+        return live <= total_l1 // 2
 
     def get_attn_qkv_program_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
         """Smaller MinimalMatmul blocks for traced long prefill (default 8³ overflows static CB vs L1)."""
