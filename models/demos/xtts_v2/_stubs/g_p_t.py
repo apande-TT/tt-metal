@@ -233,6 +233,21 @@ def build(device, torch_module):
     ln_f_w, ln_f_b, ln_f_eps = _norm(ln_f)
     fn_w, fn_b, fn_eps = _norm(final_norm)
 
+    def _sharded_l1(rows, width):
+        """A WIDTH-SHARDED L1 config: one tile column per core, never splitting a tile.
+
+        `rows` is the tensor's TOTAL padded row count (B*T for a batched forward), because
+        a width shard splits only the last dim and every core owns the full height."""
+        ncores = max(1, min(32, width // 32))
+        return ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1,
+            ttnn.ShardSpec(
+                ttnn.CoreRangeSet({ttnn.CoreRange(
+                    ttnn.CoreCoord(0, 0),
+                    ttnn.CoreCoord(min(7, ncores - 1), (ncores - 1) // 8))}),
+                [rows, width // ncores],
+                ttnn.ShardOrientation.ROW_MAJOR))
+
     def _reduce(partial):
         """Finish a ROW-parallel projection: sum the per-chip partial products.
 
@@ -291,9 +306,17 @@ def build(device, torch_module):
                         [rows, W // ncores],
                         ttnn.ShardOrientation.ROW_MAJOR))
                 partial = ttnn.to_memory_config(partial, cfg)
+            # knob:shard, GATHER half. The scatter half above already READS a width-sharded
+            # input, but it still WROTE one interleaved L1 buffer -- and that buffer is the
+            # all_gather's input, which is why the gather still profiles cores=1 while the
+            # scatter does not. Placing the scatter's OUTPUT width-sharded hands the gather a
+            # per-core shard for free: it is the reduce_scatter's own output placement, not
+            # an added reshard, so it costs no extra op. The scatter narrows the last dim by
+            # n_dev, so the sharded width here is W/n_dev, not W.
+            scfg = _sharded_l1(rows, W // n_dev) if rows > 32 else ttnn.L1_MEMORY_CONFIG
             scattered = ttnn.reduce_scatter(
                 partial, dim=2, num_links=1, topology=ttnn.Topology.Linear,
-                memory_config=ttnn.L1_MEMORY_CONFIG, compute_kernel_config=_ccl_kcfg,
+                memory_config=scfg, compute_kernel_config=_ccl_kcfg,
                 num_workers_per_link=2)
             return ttnn.all_gather(scattered, dim=2, num_links=1,
                                    topology=ttnn.Topology.Linear,

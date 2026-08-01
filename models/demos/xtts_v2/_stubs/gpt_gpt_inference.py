@@ -385,9 +385,28 @@ def build(device, torch_module):
             # and the extra core is pure setup on an already latency-bound collective -- but
             # decode never gets here (it returned the fused all_reduce above). At T rows there
             # IS payload to overlap, so both halves take the second worker.
+            # knob:shard, GATHER half. The scatter half above already READS a width-sharded
+            # input, but it still WROTE one interleaved L1 buffer -- and that buffer is the
+            # all_gather's input, which is why the gather still profiles cores=1 while the
+            # scatter does not. Placing the scatter's OUTPUT width-sharded hands the gather a
+            # per-core shard for free: it is the reduce_scatter's own output placement, not
+            # an added reshard, so it costs no extra op. The scatter narrows the last dim by
+            # n_dev, so the sharded width here is W/n_dev, not W.
+            scfg = ttnn.L1_MEMORY_CONFIG
+            if rows > 32:
+                sw = int(partial.shape[-1]) // n_dev
+                sc = max(1, min(32, sw // 32))
+                scfg = ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1,
+                    ttnn.ShardSpec(
+                        ttnn.CoreRangeSet({ttnn.CoreRange(
+                            ttnn.CoreCoord(0, 0), ttnn.CoreCoord(min(7, sc - 1),
+                                                                 (sc - 1) // 8))}),
+                        [32 * max(1, (rows + 31) // 32), sw // sc],
+                        ttnn.ShardOrientation.ROW_MAJOR))
             scattered = ttnn.reduce_scatter(
                 partial, dim=2, num_links=1, topology=ttnn.Topology.Linear,
-                memory_config=ttnn.L1_MEMORY_CONFIG, compute_kernel_config=_ccl_kcfg,
+                memory_config=scfg, compute_kernel_config=_ccl_kcfg,
                 num_workers_per_link=2)
             return ttnn.all_gather(scattered, dim=2, num_links=1,
                                    topology=ttnn.Topology.Linear,
