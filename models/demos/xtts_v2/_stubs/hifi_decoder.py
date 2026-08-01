@@ -115,14 +115,53 @@ def build(device, torch_module):
     # for the one path (a bias-less im2col conv) that has to fall back to a real op.
     _ACT_SLOPE = {id(_ACT01): 0.1, id(_ACT001): 0.01}
 
+    # knob:grid. The stage-2 convs (out_nhw ~8900) are the single biggest slice of the
+    # conv bucket and every one profiles cores=32 out of 64. The cause is the LAYOUT, not
+    # a missing knob: ttnn BLOCK-shards them, and for a block shard
+    # conv2d_utils::determine_parallel_config sets num_cores_c from the CHANNEL BLOCK
+    # count -- Cin=128 is 4 tile columns, so only 4 core columns can ever be used, and
+    # 8 nhw rows x 4 channel columns is 32 cores by construction. The one layout that can
+    # use all 64 is HEIGHT_SHARDED, but that replicates the whole [k*Cin, Cout] weight
+    # block on EVERY core: at k=11 that is 720 KB of static CB and the program then
+    # collides with the L1 buffers outright. So take the full grid exactly where the
+    # height-sharded weight block still fits, and leave the k=11 convs block-sharded.
+    _HEIGHT_SHARD_WEIGHT_CAP_B = 512 << 10
+    _full_grid = ttnn.CoreRangeSet({ttnn.CoreRange(
+        ttnn.CoreCoord(0, 0),
+        ttnn.CoreCoord(device.compute_with_storage_grid_size().x - 1,
+                       device.compute_with_storage_grid_size().y - 1))})
+    _grid_cores = (device.compute_with_storage_grid_size().x
+                   * device.compute_with_storage_grid_size().y)
+    # The override is UNCONDITIONAL once set, so a conv with fewer tile rows than cores
+    # cannot satisfy it, falls off the L1_FULL path into DRAM auto-slicing, and hard-fails
+    # ("could not find valid slice configuration"). Two tile rows per core is the floor.
+    _FULL_GRID_MIN_NTILES = 2 * _grid_cores
+    _cfg_cache = {}
+
+    def _cfg(long, act, full=False):
+        """The conv config for (trunk length, fused activation, full-grid override).
+
+        Cached so every conv wanting the same combination is handed the SAME object: the
+        conv_config is hashed into the program key, and a fresh object per call would
+        split the program cache."""
+        key = (bool(long), 0 if act is None else id(act), bool(full))
+        cfg = _cfg_cache.get(key)
+        if cfg is None:
+            kw = dict(weights_dtype=ttnn.float32, deallocate_activation=False)
+            if long:
+                kw.update(act_block_h_override=32, enable_act_double_buffer=False,
+                          enable_weights_double_buffer=False)
+            if act is not None:
+                kw["activation"] = act
+            if full:
+                kw.update(core_grid=_full_grid,
+                          shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                          override_sharding_config=True)
+            cfg = _cfg_cache[key] = ttnn.Conv1dConfig(**kw)
+        return cfg
+
     def _cfg_with_act(long, act):
-        kw = dict(weights_dtype=ttnn.float32, deallocate_activation=False)
-        if long:
-            kw.update(act_block_h_override=32, enable_act_double_buffer=False,
-                      enable_weights_double_buffer=False)
-        if act is not None:
-            kw["activation"] = act
-        return ttnn.Conv1dConfig(**kw)
+        return _cfg(long, act)
     # Pin the native convs to the L1_FULL path. The alternative DRAM width-slicing
     # path issues HOST reads while building its slices, which begin_trace_capture
     # rejects -- the harness then silently falls back to eager, so the vocoder would
@@ -329,13 +368,19 @@ def build(device, torch_module):
 
     def _conv1d_native(x, meta, L, act=None):
         w, b = _prepared(meta)
+        # See the _cfg comment: take the full grid only where there are rows to spread AND
+        # the height-sharded (per-core replicated) weight block still fits L1.
+        lout = L + 2 * meta["pad"] - meta["dil"] * (meta["k"] - 1)
+        full = (_long
+                and (lout + 31) // 32 >= _FULL_GRID_MIN_NTILES
+                and meta["k"] * meta["cin"] * meta["cout"] * 4 <= _HEIGHT_SHARD_WEIGHT_CAP_B)
         y, (w2, b2) = ttnn.conv1d(
             input_tensor=x, weight_tensor=w, bias_tensor=b, device=device,
             in_channels=meta["cin"], out_channels=meta["cout"], batch_size=1,
             input_length=L, kernel_size=meta["k"], stride=1,
             padding=meta["pad"], dilation=meta["dil"], groups=1,
             dtype=ttnn.float32,
-            conv_config=(_conv_cfg_act if act is not None else _conv_cfg),
+            conv_config=_cfg(_long, act, full),
             compute_config=kcfg,
             slice_config=slice_cfg, return_weights_and_bias=True,
         )

@@ -145,7 +145,14 @@ def build(device, torch_module):
             n *= int(t.shape[i])
         return n * ((int(t.shape[-2]) + 31) // 32)
 
-    def _pcfg(a, b):
+    # The MLP's tanh-GELU is a standalone unary pass over the [rows, 4096] hidden -- the
+    # widest activation in the block -- purely to apply a scalar function to a tensor the
+    # c_fc matmul had in its accumulator one op earlier. It rides the matmul's packer
+    # instead: the fused form costs the SFPU LUT and nothing else, while the standalone op
+    # costs a dispatch plus a full DRAM round-trip of the hidden.
+    _GELU_TANH = ttnn.UnaryWithParam(ttnn.UnaryOpType.GELU_TANH)
+
+    def _pcfg(a, b, act=None):
         mt = _mtiles(a)
         kt = int(a.shape[-1]) // 32
         nt = int(b.shape[-1]) // 32
@@ -174,13 +181,13 @@ def build(device, torch_module):
             compute_with_storage_grid_size=(gx, gy),
             in0_block_w=ibw, out_subblock_h=1, out_subblock_w=1,
             per_core_M=mt, per_core_N=nt // (gx * gy),
-            fuse_batch=True, fused_activation=None, mcast_in0=True)
+            fuse_batch=True, fused_activation=act, mcast_in0=True)
 
     def _mm(a, b):
         return ttnn.matmul(a, b, compute_kernel_config=kcfg)
 
-    def _lin(a, b, bias):
-        """Projection WITH its bias folded into the matmul.
+    def _lin(a, b, bias, act=None):
+        """Projection WITH its bias (and optionally its activation) folded into the matmul.
 
         A decode step is dispatch-bound -- op COUNT is the cost -- and a separate
         ttnn.add for the bias is a whole extra dispatch to add one broadcast row to a
@@ -189,9 +196,14 @@ def build(device, torch_module):
         qkv and c_fc projections are COLUMN-parallel (each chip owns the matching bias
         columns), whereas the row-parallel output projections must add their replicated
         bias ONCE, after the collective -- never folded into the per-chip partial."""
-        pc = _pcfg(a, b)
+        pc = _pcfg(a, b, act)
         if pc is None:
-            return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg)
+            if act is None:
+                return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg)
+            return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg,
+                               activation=act)
+        # A program_config carries its OWN fused_activation, and ttnn rejects the
+        # `activation` kwarg alongside one -- so the activation went into the pc above.
         return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg,
                            program_config=pc)
 
@@ -419,8 +431,7 @@ def build(device, torch_module):
     def _mlp(x, L):
         h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1],
                             epsilon=L["ln2"][2], compute_kernel_config=_ln_kcfg)
-        ff = _lin(h, L["wt_fc"], L["b_fc"])
-        ff = ttnn.gelu(ff, variant=ttnn.GeluVariant.Tanh)
+        ff = _lin(h, L["wt_fc"], L["b_fc"], act=_GELU_TANH)
         return _add_l1(x, _reduce(_lin_l1(ff, L["wt_mo"], L["b_mo"])))
 
     def _head(x):

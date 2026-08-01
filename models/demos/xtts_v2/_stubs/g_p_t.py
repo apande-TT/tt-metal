@@ -233,6 +233,8 @@ def build(device, torch_module):
     ln_f_w, ln_f_b, ln_f_eps = _norm(ln_f)
     fn_w, fn_b, fn_eps = _norm(final_norm)
 
+    _GELU_TANH = ttnn.UnaryWithParam(ttnn.UnaryOpType.GELU_TANH)
+
     def _sharded_l1(rows, width):
         """A WIDTH-SHARDED L1 config: one tile column per core, never splitting a tile.
 
@@ -352,8 +354,11 @@ def build(device, torch_module):
         # --- mlp ---
         h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1],
                             epsilon=L["ln2"][2], compute_kernel_config=_ln_kcfg)
-        ff = ttnn.add(_mm(h, L["wt_fc"]), L["b_fc"])
-        ff = ttnn.gelu(ff, variant=ttnn.GeluVariant.Tanh)
+        # The tanh-GELU rides the bias add's packer. That add already reads and rewrites
+        # the whole [rows, 4096] hidden -- the widest activation in the block -- so the
+        # fused activation is free, while a standalone ttnn.gelu is one more dispatch and
+        # one more full DRAM round-trip of the same bytes.
+        ff = ttnn.add(_mm(h, L["wt_fc"]), L["b_fc"], activations=[_GELU_TANH])
         x = _add_l1(x, _reduce(_lin_l1(ff, L["wt_mo"], L["b_mo"])))
         return x
 
