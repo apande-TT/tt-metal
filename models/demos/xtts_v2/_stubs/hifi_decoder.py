@@ -101,6 +101,28 @@ def build(device, torch_module):
         enable_act_double_buffer=False,
         enable_weights_double_buffer=False,
     )
+    # structural (leaky_relu elision). The trunk's LeakyReLUs are the model's single
+    # biggest eltwise cost: 77 of them, all fp32, and every one is a full DRAM
+    # round-trip of an activation that is up to 35584x32. They are pure-elementwise,
+    # so wherever the activation's ONLY consumer is the LeakyReLU, the LeakyReLU can
+    # ride the producing op's packer instead of being its own pass over DRAM. The
+    # producers here are convs (Conv1dConfig.activation) and binary eltwise ops
+    # (`activations=`), and both accept a parameterised UnaryWithParam -- so the
+    # 0.1/0.01 slopes fuse exactly, with no change to the arithmetic.
+    _ACT01 = ttnn.UnaryWithParam(ttnn.UnaryOpType.LEAKY_RELU, 0.1)
+    _ACT001 = ttnn.UnaryWithParam(ttnn.UnaryOpType.LEAKY_RELU, 0.01)
+    # UnaryWithParam does not read its params back out, so keep the slopes alongside
+    # for the one path (a bias-less im2col conv) that has to fall back to a real op.
+    _ACT_SLOPE = {id(_ACT01): 0.1, id(_ACT001): 0.01}
+
+    def _cfg_with_act(long, act):
+        kw = dict(weights_dtype=ttnn.float32, deallocate_activation=False)
+        if long:
+            kw.update(act_block_h_override=32, enable_act_double_buffer=False,
+                      enable_weights_double_buffer=False)
+        if act is not None:
+            kw["activation"] = act
+        return ttnn.Conv1dConfig(**kw)
     # Pin the native convs to the L1_FULL path. The alternative DRAM width-slicing
     # path issues HOST reads while building its slices, which begin_trace_capture
     # rejects -- the harness then silently falls back to eager, so the vocoder would
@@ -186,6 +208,10 @@ def build(device, torch_module):
     # and route a long trunk through DRAM.
     _long = L2 > 26
     _conv_cfg = conv_cfg_long if _long else conv_cfg
+    # Same config, plus the fused LeakyReLU(0.1) the ResBlock applies to every convs1
+    # output. Built once here: a conv_config is hashed into the program key, so handing
+    # the SAME object to every activated conv keeps them on one cached program each.
+    _conv_cfg_act = _cfg_with_act(_long, _ACT01)
     _trunk_mem = ttnn.DRAM_MEMORY_CONFIG if _long else ttnn.L1_MEMORY_CONFIG
 
     _wcache = {}
@@ -270,7 +296,7 @@ def build(device, torch_module):
             parts.append(ttnn.multiply(ttnn.slice(x, [0, 0, 0, 0], [1, 1, right, C]), 0.0))
         return ttnn.concat(parts, dim=2)
 
-    def _conv1d_im2col(x, meta, L, k, dil, pad):
+    def _conv1d_im2col(x, meta, L, k, dil, pad, act=None):
         cin, cout = meta["cin"], meta["cout"]
         xp = _pad_time(x, pad, pad, cin)
         T2 = L + 2 * pad
@@ -283,7 +309,12 @@ def build(device, torch_module):
         xc = ttnn.concat(taps, dim=3) if k > 1 else taps[0]      # [1,1,Lout,k*Cin]
         y = ttnn.matmul(xc, meta["Wm"], compute_kernel_config=kcfg)
         if meta["b"] is not None:
-            y = ttnn.add(y, meta["b"])
+            # The bias add already reads and rewrites the whole output, so a fused
+            # post-activation there is free; a standalone LeakyReLU would be a second
+            # full pass over the same bytes.
+            y = ttnn.add(y, meta["b"], activations=([act] if act is not None else []))
+        elif act is not None:
+            y = ttnn.leaky_relu(y, negative_slope=_ACT_SLOPE[id(act)])
         return y, Lout
 
     # ---------------- native ---------------- #
@@ -296,14 +327,16 @@ def build(device, torch_module):
         return (ttnn.sharded_to_interleaved(y, _trunk_mem)
                 if y.memory_config().is_sharded() else y)
 
-    def _conv1d_native(x, meta, L):
+    def _conv1d_native(x, meta, L, act=None):
         w, b = _prepared(meta)
         y, (w2, b2) = ttnn.conv1d(
             input_tensor=x, weight_tensor=w, bias_tensor=b, device=device,
             in_channels=meta["cin"], out_channels=meta["cout"], batch_size=1,
             input_length=L, kernel_size=meta["k"], stride=1,
             padding=meta["pad"], dilation=meta["dil"], groups=1,
-            dtype=ttnn.float32, conv_config=_conv_cfg, compute_config=kcfg,
+            dtype=ttnn.float32,
+            conv_config=(_conv_cfg_act if act is not None else _conv_cfg),
+            compute_config=kcfg,
             slice_config=slice_cfg, return_weights_and_bias=True,
         )
         _wcache[meta["key"]] = (w2, b2)
@@ -324,10 +357,10 @@ def build(device, torch_module):
         return _il(y), (L - 1) * s - 2 * p + (k - 1) + op + 1
 
     # ---------------- dispatch ---------------- #
-    def _conv(x, meta, L):
+    def _conv(x, meta, L, act=None):
         if meta["native"]:
-            return _conv1d_native(x, meta, L)
-        return _conv1d_im2col(x, meta, L, meta["k"], meta["dil"], meta["pad"])
+            return _conv1d_native(x, meta, L, act)
+        return _conv1d_im2col(x, meta, L, meta["k"], meta["dil"], meta["pad"], act)
 
     def _convT(x, meta, L, idx):
         if meta["native"]:
@@ -375,21 +408,29 @@ def build(device, torch_module):
         L = L2
 
         o, L = _conv(z, conv_pre, L)
-        o = ttnn.add(o, _cond(g, cond_layer))
+        # The pre-upsample LeakyReLU of stage 0 is the ONLY consumer of this sum, so it
+        # rides the add's packer instead of costing its own DRAM pass.
+        o = ttnn.add(o, _cond(g, cond_layer), activations=[_ACT01])
         for i in range(num_up):
-            o = _lrelu(o, 0.1)
             o, L = _convT(o, ups[i], L, i)
             o = ttnn.add(o, _cond(g, conds[i]))
+            # `o` here has TWO consumers -- the LeakyReLU that opens every ResBlock and
+            # the residual each ResBlock adds back -- so it cannot be fused away. But the
+            # num_k ResBlocks all open on the SAME LeakyReLU(o), which the loop below used
+            # to recompute once per block: hoist it and compute it once.
+            o_act = _lrelu(o, 0.1)
             z_sum = None
             for j in range(num_k):
                 x = o
-                for c1, c2 in resblocks[i * num_k + j]:
-                    xt, _ = _conv(_lrelu(x, 0.1), c1, L)
-                    xt, _ = _conv(_lrelu(xt, 0.1), c2, L)
+                for pi, (c1, c2) in enumerate(resblocks[i * num_k + j]):
+                    xt, _ = _conv(o_act if pi == 0 else _lrelu(x, 0.1), c1, L, act=_ACT01)
+                    xt, _ = _conv(xt, c2, L)
                     x = ttnn.add(xt, x)
                 z_sum = x if z_sum is None else ttnn.add(z_sum, x)
-            o = ttnn.multiply(z_sum, 1.0 / num_k)
-        o = _lrelu(o, 0.01)                                     # final: default slope 0.01
+            # The MRF mean feeds exactly one op: the next stage's opening LeakyReLU, or
+            # -- on the last stage -- the final LeakyReLU(0.01) before conv_post.
+            o = ttnn.multiply(z_sum, 1.0 / num_k,
+                              activations=[_ACT001 if i == num_up - 1 else _ACT01])
         o, L = _conv(o, conv_post, L)                           # [1, 1, L, 1]
         # conv_post has ONE output channel, so the channels-last buffer already holds
         # the waveform in time order; drop the trailing channel axis.
