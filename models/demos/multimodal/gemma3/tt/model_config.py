@@ -27,7 +27,7 @@ from models.tt_transformers.tt.model_config import (
     MathFidelitySetting,
 )
 from models.tt_transformers.tt.model_config import ModelArgs as TTModelArgs
-from models.tt_transformers.tt.model_config import ModelOptimizations, OpGroup
+from models.tt_transformers.tt.model_config import ModelOptimizations, OpGroup, PrecisionSetting, TensorGroup
 from models.tt_transformers.tt.prefetcher import Prefetcher
 
 # file names for performance and accuracy mode override files
@@ -188,6 +188,13 @@ class ModelArgs(TTModelArgs):
         # fp32_dest_acc_en=False, packer_l1_acc=True), and fp32_dest_acc_en is what that relaxation
         # was reaching for. SDPA is deliberately left alone -- gemma3 needs HIFI2_NA there for
         # decode correctness.
+        # FF2's WEIGHT is the last one in the MLP still above the floor: FF1/FF3 are already bfloat4_b
+        # while w2 -- the single biggest weight in the block at 15360x3840 -- is still bfloat8_b. On a
+        # memory-bound down-projection the weight read IS the cost, so halving it is the dtype rung
+        # here. gemma3's own PERF.md documents "bfp4 MLP weights" as the intended performance
+        # configuration, and FF2 already runs LoFi (below), which is the matching fidelity for bfp4.
+        self._set_tensor_dtype({TensorGroup.FF2: PrecisionSetting.BFP4})
+
         self._set_op_fidelity(
             {
                 OpGroup.LI_FF2: MathFidelitySetting.LOFI,
@@ -255,6 +262,21 @@ class ModelArgs(TTModelArgs):
             if pc is not None:
                 return pc
         return super().get_mlp_ff1_3_prg_config(mode, seq_len, prefetcher)
+
+    def _set_tensor_dtype(self, dtype_by_tensor):
+        """Override the weight dtype for specific tensor groups across EVERY decoder.
+
+        Same shape as ``_set_op_fidelity`` below, and deliberately applied to every decoder rather
+        than a layer subset so the lever cannot land on only the profiled slice.
+        """
+        for decoder_id, conf in list(self.optimizations.decoder_optimizations.items()):
+            tensor_precision = {key: value for key, value in conf.tensor_dtype_settings.items() if value is not None}
+            tensor_precision.update(dtype_by_tensor)
+            op_fidelity = dict(conf.op_fidelity_settings)
+            fixed_conf = ModelOptimizations({"TensorPrecision": tensor_precision, "OpFidelity": op_fidelity})
+            fixed_conf.__name__ = getattr(conf, "__name__", fixed_conf.__name__)
+            self.optimizations.set_decoder_conf(decoder_id, fixed_conf)
+        self.model_config["DECODERS_OPTIMIZATIONS"] = self.optimizations
 
     def _set_op_fidelity(self, fidelity_by_op):
         """Override math fidelity for specific op groups across every decoder."""
