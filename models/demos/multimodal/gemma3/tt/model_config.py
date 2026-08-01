@@ -339,7 +339,26 @@ class ModelArgs(TTModelArgs):
         # memory-bound down-projection the weight read IS the cost, so halving it is the dtype rung
         # here. gemma3's own PERF.md documents "bfp4 MLP weights" as the intended performance
         # configuration, and FF2 already runs LoFi (below), which is the matching fidelity for bfp4.
-        self._set_tensor_dtype({TensorGroup.FF2: PrecisionSetting.BFP4})
+        # WQKV and WO are the last weights above the floor once FF1/FF3 and FF2 are bfp4. Both are
+        # pure weight reads on the decode path -- 3840x8192 and 4096x3840 read in full for every
+        # token -- so halving them is the only lever those projections have left, and unlike the
+        # prefill grid work it moves the per-token metric. This IS a step past the usual convention:
+        # the stock accuracy preset keeps "BFP8 attention" even where it takes bfp4 MLPs, so the PCC
+        # gate decided it rather than precedent (0.9793 -> 0.9744 against a 0.95 floor).
+        #
+        # Measured: decode QKV 60.0 -> 53.0us, decode attn-out 32.4 -> 27.7us, prefill QKV
+        # 158.3 -> 116.4us, prefill attn-out 76.9 -> 60.0us; model 424.6 -> 415.2ms.
+        #
+        # NOTE the first measurement of this lever read 699.7ms and was NOT a lever effect: that
+        # profile showed a uniform ~1.7x slowdown across ops it cannot touch (LayerNorm 9.7 ->
+        # 19.3us), the degraded-device signature that also hit the trace gate. Re-measured clean.
+        self._set_tensor_dtype(
+            {
+                TensorGroup.FF2: PrecisionSetting.BFP4,
+                TensorGroup.WQKV: PrecisionSetting.BFP4,
+                TensorGroup.WO: PrecisionSetting.BFP4,
+            }
+        )
 
         self._set_op_fidelity(
             {
@@ -603,8 +622,54 @@ class ModelArgs(TTModelArgs):
     # is what pays: with both, per-token diverged to 77.3/77.9ms; with LoFi FF2 alone it is
     # 41.6/42.2ms. The eager profile cannot see that cost, so the handoff looks free there.
 
+    def _short_prefill_qkv_prg_config(self, seq_len: int):
+        """The wasted-rows fix again, on the QKV projection -- plus the block sizes stock never set.
+
+        Stock's short-prefill QKV is the config carrying its own "FIXME: optimize this config for
+        prefill": grid (8, 10) with ``per_core_M = max(1, ceil(seq_len/32/8)) = 1``, ``in0_block_w=1``
+        and ``out_subblock_h/w = 1``. Three things go to waste at ISL 128 and one edit fixes all
+        three, because ``matmul_config`` derives the last two from the grid:
+
+        * 10 grid ROWS at per_core_M=1 cover 10 M-tiles when the op has 4 -- six rows idle, 32 of 80
+          cores active. Trimming rows to the M-tiles that exist makes every assigned core work.
+        * ``in0_block_w=1`` walks K in 120 single-tile steps; at rows=4 the derived block is
+          find_largest_divisor(120 // 4) = 6.
+        * ``out_subblock_w=1`` against per_core_N=32 wastes the DST budget; get_out_subblock_w picks
+          up to 8 at out_subblock_h=1.
+
+        COLUMNS stay at ``dram_shard_grid_width`` -- per_core_N is pinned to the QKV weight's 8-bank
+        DRAM shard, and mismatching it silently corrupts (measured PCC 0.31 elsewhere in this file).
+        """
+        k = self.dim // self.cluster_shape[0]
+        n = self.qkv_size // self.cluster_shape[1]
+        m_tiles, k_tiles = seq_len // ttnn.TILE_SIZE, k // ttnn.TILE_SIZE
+        if seq_len % ttnn.TILE_SIZE or m_tiles >= self.prefill_rows:
+            return None
+        rows = max((y for y in range(1, m_tiles + 1) if m_tiles % y == 0 and k_tiles % y == 0), default=1)
+        if rows >= self.prefill_rows:
+            return None
+        cols = self.dram_shard_grid_width
+        return self.matmul_config(
+            m=seq_len,
+            k=k,
+            n=n,
+            grid_size=(cols, rows),
+            fuse_batch=True,  # stock uses fuse_batch for seq_len <= MAX_QKV_MM_SEQ_LEN
+            per_core_M=m_tiles // rows,
+            per_core_N=math.ceil(n / (ttnn.TILE_SIZE * cols)),
+        )
+
     def get_attn_qkv_program_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
         """Smaller MinimalMatmul blocks for traced long prefill (default 8³ overflows static CB vs L1)."""
+        if (
+            mode == Mode.PREFILL
+            and prefetcher is None
+            and not self.is_galaxy
+            and not self.use_minimal_qkv_prefill_matmul(seq_len)
+        ):
+            pc = self._short_prefill_qkv_prg_config(seq_len)
+            if pc is not None:
+                return pc
         if self._enable_program_trace and mode == Mode.PREFILL and seq_len > 128:
             return ttnn.MinimalMatmulConfig(
                 M_block_size=4,
