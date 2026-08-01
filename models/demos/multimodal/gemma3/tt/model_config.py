@@ -80,6 +80,152 @@ def _install_ff13_out_dtype_seam():
 
 _install_ff13_out_dtype_seam()
 
+# --- PREFILL RMSNorm: shard the WIDTH so the norm stops running on 4 cores (knob:grid) -----------
+# ttnn.rms_norm with no program_config parallelises over TILE ROWS only. A prefill norm over
+# [1, 1, 128, 3840] therefore has just 4 rows to hand out and lands on FOUR cores of ~110, where it
+# measures 61us for ~2MB of traffic -- about 32 GB/s. There are 192 such norms per prefill pass
+# (4 per layer x 48 layers), so at ISL 128 this one shape is ~23.5ms of device time and the largest
+# LayerNorm bucket in the profile.
+#
+# The DECODE path already solves this: it hands rms_norm a LayerNormShardedMultiCoreProgramConfig
+# with the activation L1 WIDTH-sharded, which parallelises over the 3840-wide dimension instead of
+# the 32-row one, and measures 6.1us on 30 cores. Prefill never takes that path because
+# models/common/rmsnorm.py gates the sharded config on ``in_sharded=(mode == Mode.DECODE)``.
+#
+# That gate is in models/common, outside this model dir, so apply the same treatment at the ttnn
+# boundary: width-shard the activation, run the sharded norm, hand the result back interleaved.
+# Keying on the hidden WIDTH (not a layer index) is what makes this reach all 48 layers and all four
+# norms in each -- and it deliberately does NOT touch gemma3's q_norm/k_norm, whose width is
+# head_dim, nor the decode norms, which are sharded already.
+_GEMMA3_SHARDED_PREFILL_NORM = os.environ.get("GEMMA3_SHARDED_PREFILL_NORM", "1") == "1"
+_NORM_WIDTH = 3840
+# Above this M the default row-parallel norm already has enough rows to fill the grid.
+_NORM_MAX_M = 512
+_NORM_CORES = 40
+_NORM_PLANS = {}
+
+
+def _prefill_norm_plan(m, width, grid):
+    """(sharded_memory_config, program_config) for an [M, width] prefill norm, or None."""
+    key = (m, width, grid.x, grid.y)
+    if key in _NORM_PLANS:
+        return _NORM_PLANS[key]
+    plan = None
+    w_tiles = width // ttnn.TILE_SIZE
+    cores = _NORM_CORES
+    core_grid = None
+    for y in range(1, int(grid.y) + 1):
+        if cores % y == 0 and cores // y <= int(grid.x):
+            core_grid = ttnn.CoreGrid(y=y, x=cores // y)
+            break
+    # Only worth it when the width shard beats the rows the default would have parallelised over.
+    if core_grid is not None and w_tiles % cores == 0 and cores > m // ttnn.TILE_SIZE:
+        block_w = w_tiles // cores
+        subblock_w = max(s for s in range(1, 5) if block_w % s == 0)
+        plan = (
+            ttnn.create_sharded_memory_config(
+                (m, width // cores),
+                core_grid,
+                ttnn.ShardStrategy.WIDTH,
+                ttnn.ShardOrientation.ROW_MAJOR,
+                use_height_and_width_as_shard_shape=True,
+            ),
+            ttnn.LayerNormShardedMultiCoreProgramConfig(
+                compute_with_storage_grid_size=[core_grid.x, core_grid.y],
+                subblock_w=subblock_w,
+                block_h=m // ttnn.TILE_SIZE,
+                block_w=block_w,
+                inplace=False,
+            ),
+        )
+    _NORM_PLANS[key] = plan
+    return plan
+
+
+def _install_prefill_norm_shard_seam():
+    if not _GEMMA3_SHARDED_PREFILL_NORM or getattr(ttnn.rms_norm, "_gemma3_norm_shard_seam", False):
+        return
+
+    stock_rms_norm = ttnn.rms_norm
+
+    def _rms_norm(input_tensor, **kwargs):
+        plan = None
+        if kwargs.get("program_config") is None and kwargs.get("residual_input_tensor") is None:
+            try:
+                shape = list(input_tensor.shape)
+                m, width = int(shape[-2]), int(shape[-1])
+                ok = (
+                    width == _NORM_WIDTH
+                    and m % ttnn.TILE_SIZE == 0
+                    and m <= _NORM_MAX_M
+                    and not input_tensor.memory_config().is_sharded()
+                    and all(int(d) == 1 for d in shape[:-2])
+                )
+                if ok:
+                    plan = _prefill_norm_plan(m, width, input_tensor.device().compute_with_storage_grid_size())
+            except Exception:
+                plan = None
+        if plan is None:
+            return stock_rms_norm(input_tensor, **kwargs)
+        shard_mc, prg_cfg = plan
+        kwargs = dict(kwargs)
+        kwargs["program_config"] = prg_cfg
+        kwargs["memory_config"] = shard_mc
+        x = ttnn.to_memory_config(input_tensor, shard_mc)
+        out = stock_rms_norm(x, **kwargs)
+        ttnn.deallocate(x)
+        result = ttnn.sharded_to_interleaved(out, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(out)
+        return result
+
+    _rms_norm._gemma3_norm_shard_seam = True
+    _rms_norm._stock_rms_norm = stock_rms_norm
+    ttnn.rms_norm = _rms_norm
+    logger.info("gemma3: prefill RMSNorm width-shard seam installed")
+
+
+_install_prefill_norm_shard_seam()
+
+# --- LM HEAD precision: bfp4 weights + the matching LoFi fidelity (knob:dtype) -------------------
+# The LM head is the biggest DECODE op left. It runs 16 splits of [32, 3840] @ [3840, 16032] plus a
+# 5888-wide remainder (16*16032 + 5888 = 262400 = padded_vocab_size) on EVERY token, and measures
+# 191us per split -- ~3.1ms per token out of a ~37ms decode step. Its weight is 3840x16032 bfloat8_b
+# = 65.4MB per split, so at 342 GB/s the op is essentially a weight read; halving the weight is the
+# whole lever, and GUIDELINES 01 sec.12 pairs a bfp4 weight with LoFi rather than HiFi2.
+#
+# Neither is reachable through ModelArgs: lm_head.py takes the model-wide ``dtype`` ctor argument
+# (text_demo passes bfloat8_b for every weight, and lowering THAT would hit attention too) and
+# hard-codes its own HiFi2 compute_kernel_config. So pin both on the LMHead class itself, which
+# keeps the change to this one module instead of the whole model.
+_GEMMA3_LM_HEAD_BFP4 = os.environ.get("GEMMA3_LM_HEAD_BFP4", "1") == "1"
+
+
+def _install_lm_head_precision_seam():
+    from models.tt_transformers.tt import lm_head as lm_head_mod
+
+    cls = lm_head_mod.LMHead
+    if not _GEMMA3_LM_HEAD_BFP4 or getattr(cls, "_gemma3_lm_head_precision_seam", False):
+        return
+
+    stock_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        kwargs["dtype"] = ttnn.bfloat4_b
+        stock_init(self, *args, **kwargs)
+        self.compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.LoFi,
+            math_approx_mode=False,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=True,
+        )
+
+    cls.__init__ = __init__
+    cls._gemma3_lm_head_precision_seam = True
+    logger.info("gemma3: LM head precision seam installed (bfp4 weights + LoFi)")
+
+
+_install_lm_head_precision_seam()
+
 # SDPA decode k_chunk when force_fixed_decode_k_chunk is True (paged text path; see text_demo).
 _GEMMA3_SDPA_DECODE_K_CHUNK_DEFAULT = 256
 # Under program trace, use the smallest valid k_chunk (pow2, multiple of 32) to reduce L1 vs static CB limits.
@@ -254,6 +400,38 @@ class ModelArgs(TTModelArgs):
             per_core_M=m_tiles // rows,
             per_core_N=per_core_N,
         )
+
+    @lru_cache(maxsize=None)
+    def get_mlp_ff2_prg_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
+        """The same wasted-rows fix as ``_short_prefill_ff1_3_prg_config``, for the FF2 side.
+
+        Stock builds the short-prefill FF2 on ``mlp2_grid`` = ``find_prefill_grid(prefill_rows=8,
+        hidden_dim_tiles)`` = (8, 8), so ``per_core_M = ceil(128 / (32*8)) = 1`` and the 8 grid ROWS
+        are asked to cover 8 M-tiles when the op has only 4 -- half the rows do no work. Dropping the
+        grid to the M-tiles that actually exist keeps every core busy and, because ``matmul_config``
+        derives ``in0_block_w = find_largest_divisor(k_tiles // rows)``, it also buys a bigger per-core
+        K block on FF2's very wide K: 480//8 = 60 -> block 6, versus 480//4 = 120 -> block 8.
+
+        COLUMNS stay at stock's ``dram_shard_grid_width``, because per_core_N is pinned to w2's
+        8-bank DRAM shard width and mismatching it silently corrupts (measured PCC 0.31 elsewhere in
+        this file). Returns to stock whenever it cannot improve on it.
+        """
+        if mode == Mode.PREFILL and seq_len <= 128 and prefetcher is None and not self.is_galaxy:
+            m = min(seq_len, self.prefill_len_cutoff)
+            k = self.hidden_dim // (self.cluster_shape[1] if self.is_galaxy else 1)
+            m_tiles, k_tiles = m // ttnn.TILE_SIZE, k // ttnn.TILE_SIZE
+            cols = self.dram_shard_grid_width
+            rows = max((y for y in range(1, m_tiles + 1) if m_tiles % y == 0 and k_tiles % y == 0), default=1)
+            if m % ttnn.TILE_SIZE == 0 and rows < self.prefill_rows:
+                return self.matmul_config(
+                    m=m,
+                    k=k,
+                    n=self.dim,
+                    grid_size=(cols, rows),
+                    per_core_M=m_tiles // rows,
+                    per_core_N=math.ceil(self.dim / (ttnn.TILE_SIZE * cols)),
+                )
+        return super().get_mlp_ff2_prg_config(mode, seq_len, prefetcher)
 
     @lru_cache(maxsize=None)
     def get_mlp_ff1_3_prg_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
@@ -436,6 +614,38 @@ class ModelArgs(TTModelArgs):
             )
         return super().get_attn_qkv_program_config(mode, seq_len, prefetcher)
 
+    def get_attn_sdpa_prefill_program_config(self, seq_len: int = 1, chunk_start_idx: int = None):
+        """Give the SHORT-prefill SDPA enough q-chunks to fill the grid it is already given.
+
+        Stock hard-codes ``compute_with_storage_grid_size=(8, 8)`` and picks ``q_chunk = 64`` for any
+        seq_len < 2048. SDPA parallelises over (batch x heads x q_chunks), so at ISL 128 that is
+        1 x 16 x ceil(128/64) = 32 work units on 64 cores -- HALF THE GRID IDLE, which is the
+        grid=partial tag on this op. It measures 105us per call for ~1.7MB of QKV traffic (~16 GB/s),
+        i.e. it is occupancy-bound, not bandwidth-bound.
+
+        Widening the grid cannot fix that: with only 32 units, cores past 32 have nothing to do. The
+        fix is more UNITS -- halve q_chunk to 32 (one tile, the floor) and the same 128 tokens split
+        into 4 chunks per head, giving 64 units for the 64 cores. q_chunk must divide
+        chunk_start_idx, and 32 divides everything 64 divided, so the stock constraint still holds.
+
+        Only fires when the default genuinely underfills; otherwise defer to stock.
+        """
+        cfg = super().get_attn_sdpa_prefill_program_config(seq_len, chunk_start_idx)
+        grid = cfg.compute_with_storage_grid_size
+        cores = int(grid.x) * int(grid.y)
+        heads = self.n_heads // self.cluster_shape[1]
+        q_chunk = int(cfg.q_chunk_size)
+        if q_chunk <= ttnn.TILE_SIZE or heads * math.ceil(seq_len / q_chunk) >= cores:
+            return cfg
+        while q_chunk > ttnn.TILE_SIZE and heads * math.ceil(seq_len / q_chunk) < cores:
+            q_chunk //= 2
+        return ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=(int(grid.x), int(grid.y)),
+            exp_approx_mode=False,
+            q_chunk_size=q_chunk,
+            k_chunk_size=int(cfg.k_chunk_size),
+        )
+
     def get_attn_sdpa_decode_program_config(self, prefetcher: Prefetcher = None):
         force_fixed_k_chunk = getattr(self, "force_fixed_decode_k_chunk", False)
         if not force_fixed_k_chunk:
@@ -492,6 +702,15 @@ class ModelArgs(TTModelArgs):
         return to_warmup_seq_lens
 
     def get_trace_prefill_supported_seq_lens(self):
+        # NOTE: opting P150 IN to traced prefill ("P150": [128]) was tried here and REVERTED.
+        # ``Generator.can_enable_trace`` gates prefill tracing on membership of this list, so today
+        # every prefill is dispatched op-by-op while decode replays a trace -- prefill is the only
+        # stage still paying host dispatch, which is what the host_overhead bucket measures. But
+        # capture EXECUTES the pass it records: the M=128 FF1/FF3 count went 192 -> 384 (two extra
+        # prefill passes inside the profiled window) and device_ms 448.9 -> 515.1. In a long-lived
+        # server that capture is amortised over many prompts; in this pipeline -- one prefill plus a
+        # handful of decode tokens -- it never is, so tracing prefill costs more than the dispatch
+        # gaps it removes.
         default_supported_seq_lens = {
             # for gemma we have different default supported seq lens than in tt_transformers
             # TODO: should be empty until https://github.com/tenstorrent/tt-metal/issues/33041 is fixed
