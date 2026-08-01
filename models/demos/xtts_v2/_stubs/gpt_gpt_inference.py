@@ -213,6 +213,26 @@ def build(device, torch_module):
         except Exception:  # noqa: BLE001 - output too large for L1; fall back to DRAM
             return ttnn.matmul(a, b, compute_kernel_config=kcfg, program_config=pc)
 
+    def _lin_l1(a, b, bias):
+        """Row-parallel partial product with its SHARE of the replicated bias folded in.
+
+        structural -- the row-parallel output projections used to add their bias as a
+        separate ttnn.add AFTER the collective, on the stated rule that a replicated bias
+        must be added exactly once and so can never go into a per-chip partial. That rule
+        has an exact escape: the collective SUMS the n_dev partials, so staging bias/n_dev
+        and folding THAT into each chip reproduces the bias precisely once after the sum
+        (dividing by a power of two is exact in binary floating point, so it is not even a
+        rounding trade). The bias then rides the matmul kernel's own accumulator instead of
+        costing a dispatch -- one op fewer per output projection, 2 per block, 60 per
+        30-block forward, on a profile whose largest single bucket is per-op dispatch."""
+        pc = _pcfg(a, b)
+        try:
+            return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg,
+                               memory_config=ttnn.L1_MEMORY_CONFIG, program_config=pc)
+        except Exception:  # noqa: BLE001 - output too large for L1; fall back to DRAM
+            return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg,
+                               program_config=pc)
+
     def _stage(t, mapper):
         """Upload one weight to the mesh, tilizing ROW VECTORS on the host.
 
@@ -286,11 +306,11 @@ def build(device, torch_module):
             # the dim the producer is already split on, so each chip owns the matching
             # weight ROWS and the partial products are SUMMED (see _block).
             "wt_ao": _shard(attn.c_proj.weight.detach(), 0),
-            "b_ao": _rep(attn.c_proj.bias.detach().reshape(1, 1, -1)),
+            "b_ao": _rep(attn.c_proj.bias.detach().reshape(1, 1, -1) / n_dev),
             "wt_fc": _shard(mlp.c_fc.weight.detach(), 1),
             "b_fc": _shard(mlp.c_fc.bias.detach().reshape(1, 1, -1), 2),
             "wt_mo": _shard(mlp.c_proj.weight.detach(), 0),
-            "b_mo": _rep(mlp.c_proj.bias.detach().reshape(1, 1, -1)),
+            "b_mo": _rep(mlp.c_proj.bias.detach().reshape(1, 1, -1) / n_dev),
         })
 
     ln_f_w, ln_f_b, ln_f_eps = _norm(ln_f)
@@ -382,7 +402,7 @@ def build(device, torch_module):
                             epsilon=L["ln2"][2], compute_kernel_config=_ln_kcfg)
         ff = _lin(h, L["wt_fc"], L["b_fc"])
         ff = ttnn.gelu(ff, variant=ttnn.GeluVariant.Tanh)
-        return _add_l1(x, ttnn.add(_reduce(_mm_l1(ff, L["wt_mo"])), L["b_mo"]))
+        return _add_l1(x, _reduce(_lin_l1(ff, L["wt_mo"], L["b_mo"])))
 
     def _head(x):
         x = ttnn.layer_norm(x, weight=ln_f_w, bias=ln_f_b, epsilon=ln_f_eps,
@@ -418,7 +438,7 @@ def build(device, torch_module):
         ctx = ttnn.transformer.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=scaling, compute_kernel_config=kcfg)
         ctx = ttnn.reshape(ttnn.experimental.nlp_concat_heads(ctx), [B, T, shard_w])
-        x = _add_l1(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
+        x = _add_l1(x, _reduce(_lin_l1(ctx, L["wt_ao"], L["b_ao"])))
         return _mlp(x, L)
 
     def forward(emb, *_, **__):
@@ -537,7 +557,7 @@ def build(device, torch_module):
             ctx = ttnn.reshape(
                 ttnn.experimental.nlp_concat_heads(ttnn.permute(ctx, [0, 2, 1, 3])),
                 [1, B, shard_w])
-            x = _add_l1(x, ttnn.add(_reduce(_mm_l1(ctx, L["wt_ao"])), L["b_ao"]))
+            x = _add_l1(x, _reduce(_lin_l1(ctx, L["wt_ao"], L["b_ao"])))
             x = _mlp(x, L)
         return _head(x)
 
