@@ -107,18 +107,77 @@ def build(device, torch_module):
         packer_l1_acc=True,
     )
 
-    def _add_l1(a, b):
-        """Residual-stream add, landing in L1.
+    def _wshard(rows, width):
+        """WIDTH-SHARDED L1: one tile column per core, never splitting a tile."""
+        nc = max(1, min(32, width // 32))
+        return nc, ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1,
+            ttnn.ShardSpec(
+                ttnn.CoreRangeSet({ttnn.CoreRange(
+                    ttnn.CoreCoord(0, 0),
+                    ttnn.CoreCoord(min(7, nc - 1), (nc - 1) // 8))}),
+                [rows, width // nc],
+                ttnn.ShardOrientation.ROW_MAJOR))
 
-        Its consumer is the next LayerNorm, which is DISPATCH/latency-bound at one-to-two
-        tile rows -- so the lever is removing the DRAM write + read between them, not giving
-        the norm more cores (a width shard was measured and LOST: the reshard cost more than
-        the norm saved, because the qkv matmul downstream reshards anyway). The residual
-        stream is [1,T,1024] bf16, one live tensor at a time, so it cannot crowd L1."""
+    def _add_l1(a, b):
+        """Residual-stream add, landing WIDTH-SHARDED in L1.
+
+        The residual add's consumer is the next LayerNorm, and an INTERLEAVED LayerNorm
+        parallelises over tile ROWS -- so at decode, where the stream is ONE tile row, it
+        runs on ONE core and costs 41 us to normalise 64 KB. Over 30 blocks x 2 norms that
+        is ~2.5 ms of the ~8.7 ms token, the largest single reachable cost in the decode
+        step. The sharded LayerNorm parallelises over the WIDTH instead (32 tile columns ->
+        32 cores, cross-core reduction), which is the only form that scales at one row.
+        A width shard was tried here before and lost -- but that attempt paid an explicit
+        to_memory_config in front of the norm, and the reshard cost more than the norm
+        saved. Placing the shard as the ADD's own output makes it free, so the earlier
+        result does not carry over. The residual stream is [B,T,1024] bf16, one live
+        tensor at a time, so it cannot crowd L1."""
+        rows = _mtiles(a) * 32
+        w = int(a.shape[-1])
+        if w // 32 >= 8:
+            try:
+                return ttnn.add(a, b, memory_config=_wshard(rows, w)[1])
+            except Exception:  # noqa: BLE001 - shard spec rejected for this shape
+                pass
         try:
             return ttnn.add(a, b, memory_config=ttnn.L1_MEMORY_CONFIG)
         except Exception:  # noqa: BLE001 - will not fit L1
             return ttnn.add(a, b)
+
+    def _ln(x, weight, bias, eps):
+        """LayerNorm that follows its input's placement.
+
+        On a width-sharded input take the sharded program config -- block_h is the
+        stream's tile rows, block_w the tile columns each core owns (1 by construction of
+        _wshard), and the grid is exactly the shard's core range. On anything else fall
+        back to the interleaved form."""
+        mc = x.memory_config()
+        if mc.is_sharded():
+            rows = _mtiles(x) * 32
+            w = int(x.shape[-1])
+            nc = max(1, min(32, w // 32))
+            gx, gy = min(8, nc), max(1, (nc + 7) // 8)
+            try:
+                y = ttnn.layer_norm(
+                    x, weight=weight, bias=bias, epsilon=eps,
+                    compute_kernel_config=_ln_kcfg, memory_config=mc,
+                    program_config=ttnn.LayerNormShardedMultiCoreProgramConfig(
+                        compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+                        subblock_w=1, block_h=max(1, rows // 32),
+                        block_w=(w // 32) // nc, inplace=False))
+                # Hand the norm's consumer an INTERLEAVED tensor. A MultiCast1D matmul
+                # with a sharded in0 demands that the shard's core count equal the program
+                # config's grid, and that grid is sized from N -- 12 cores for the fused
+                # qkv, 16 for c_fc -- which a K-side width shard cannot match (K=32 tiles
+                # does not divide by 12). One reshard here is far cheaper than losing both
+                # the tuned matmul configs and the fused GELU, which a sharded activation
+                # also forbids.
+                return ttnn.to_memory_config(y, ttnn.L1_MEMORY_CONFIG)
+            except Exception:  # noqa: BLE001 - fall back to the interleaved norm
+                x = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)
+        return ttnn.layer_norm(x, weight=weight, bias=bias, epsilon=eps,
+                               compute_kernel_config=_ln_kcfg)
 
     # knob:grid (second attempt). Forcing the MAXIMUM core grid regressed decode 4.6%
     # (64 cores each owning one output tile, mcast setup dominating). So try a RIGHT-SIZED
@@ -177,6 +236,8 @@ def build(device, torch_module):
             return None
         gx, gy = fac
         ibw = 4 if kt % 4 == 0 else 1
+        if a.memory_config().is_sharded():
+            return None
         return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
             compute_with_storage_grid_size=(gx, gy),
             in0_block_w=ibw, out_subblock_h=1, out_subblock_w=1,
@@ -429,16 +490,13 @@ def build(device, torch_module):
                                    memory_config=ttnn.L1_MEMORY_CONFIG)
 
     def _mlp(x, L):
-        h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1],
-                            epsilon=L["ln2"][2], compute_kernel_config=_ln_kcfg)
+        h = _ln(x, L["ln2"][0], L["ln2"][1], L["ln2"][2])
         ff = _lin(h, L["wt_fc"], L["b_fc"], act=_GELU_TANH)
         return _add_l1(x, _reduce(_lin_l1(ff, L["wt_mo"], L["b_mo"])))
 
     def _head(x):
-        x = ttnn.layer_norm(x, weight=ln_f_w, bias=ln_f_b, epsilon=ln_f_eps,
-                            compute_kernel_config=_ln_kcfg)
-        x = ttnn.layer_norm(x, weight=fn_w, bias=fn_b, epsilon=fn_eps,
-                            compute_kernel_config=_ln_kcfg)
+        x = _ln(x, ln_f_w, ln_f_b, ln_f_eps)
+        x = _ln(x, fn_w, fn_b, fn_eps)
         return _lin(x, lm_w, lm_b)
 
     def _block(x, L, T, kv_sink=None):
@@ -449,8 +507,7 @@ def build(device, torch_module):
         # SINGLE-CORE retilize (the profile's grid=tiny TilizeWithValPadding, ~62 us
         # per call, 4 per block). nlp_create_qkv_heads / nlp_concat_heads do the same
         # shuffle as one multicore device op, so no layout round-trip happens at all.
-        h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1],
-                            epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
+        h = _ln(x, L["ln1"][0], L["ln1"][1], L["ln1"][2])
         # B = DECODE BATCH: the prefill/full-sequence activation is [B, T, dim], i.e. B
         # INDEPENDENT streams stacked on the leading axis. Batch is a separate axis from
         # the TP-sharded weight axis -- nothing about the sharding or the collectives
@@ -551,8 +608,7 @@ def build(device, torch_module):
         B = int(row_emb.shape[-2])
         x = row_emb
         for L, (kc, vc) in zip(layers, _kv["kv"]):
-            h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1],
-                            epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
+            h = _ln(x, L["ln1"][0], L["ln1"][1], L["ln1"][2])
             qkv = _lin(h, L["wt_qkv"], L["bt_qkv"])                     # [1,B,3*shard_w]
             # DECODE-SPECIFIC head shuffle. The generic nlp_create_qkv_heads emits
             # [1,h,S,d], but every consumer here (cache write, decode attention) wants

@@ -138,18 +138,18 @@ def build(device, torch_module):
     _FULL_GRID_MIN_NTILES = 2 * _grid_cores
     _cfg_cache = {}
 
-    def _cfg(long, act, full=False):
-        """The conv config for (trunk length, fused activation, full-grid override).
+    def _cfg(long, act, full=False, abh=32):
+        """The conv config for (trunk length, fused activation, full-grid override, act block).
 
         Cached so every conv wanting the same combination is handed the SAME object: the
         conv_config is hashed into the program key, and a fresh object per call would
         split the program cache."""
-        key = (bool(long), 0 if act is None else id(act), bool(full))
+        key = (bool(long), 0 if act is None else id(act), bool(full), int(abh))
         cfg = _cfg_cache.get(key)
         if cfg is None:
             kw = dict(weights_dtype=ttnn.float32, deallocate_activation=False)
             if long:
-                kw.update(act_block_h_override=32, enable_act_double_buffer=False,
+                kw.update(act_block_h_override=abh, enable_act_double_buffer=False,
                           enable_weights_double_buffer=False)
             if act is not None:
                 kw["activation"] = act
@@ -162,6 +162,32 @@ def build(device, torch_module):
 
     def _cfg_with_act(long, act):
         return _cfg(long, act)
+
+    # knob:shard. act_block_h_override IS the conv's shard geometry -- how many activation
+    # ROWS a core takes per pass -- and the profile shows every big conv at
+    # act_block_h_ntiles=1: one tile row at a time out of the ~35 each core owns, so the
+    # weight slice is re-streamed into the compute engine once per tile row instead of
+    # being amortised over a taller block.
+    #
+    # 32 (one tile) is not a free default here, it is the WORST value, and simply raising
+    # it does nothing: determine_per_core_conv_block_config only accepts an override that
+    # DIVIDES the per-core output height, else it snaps down via find_closest_largest_divisor.
+    # This conv's per-core height is 35 tiles (the op code's "ABH=35"), whose divisors are
+    # 1, 5, 7, 35 -- so 128 (4 tiles) snaps straight back to 1. Asking for 7 tiles instead
+    # lets each conv snap to the largest divisor of ITS OWN per-core height that is <= 7,
+    # which is 7 for the block-sharded stage-2 legs and 6 for the height-sharded ones --
+    # no need to replicate ttnn's parallel-config math, the snap-down does it.
+    # 7 tiles is too tall for the HEIGHT-sharded legs: their act block spans the whole
+    # k*Cin inner dim (28 tiles at k=7), so 7 x 28 x fp32 pushed the static CBs to 1.73 MB
+    # against a 1.50 MB L1. A BLOCK-sharded leg divides that inner dim by its channel
+    # columns, so it has the headroom -- take the taller block only there, at 5 tiles
+    # (which is the other non-trivial divisor of 35).
+    _ABH_TALL = 160
+
+    def _abh(lout, meta, full):
+        if full or not _long or (lout + 31) // 32 < _FULL_GRID_MIN_NTILES:
+            return 32
+        return _ABH_TALL if meta["cin"] <= 128 and meta["cout"] <= 128 else 32
     # Pin the native convs to the L1_FULL path. The alternative DRAM width-slicing
     # path issues HOST reads while building its slices, which begin_trace_capture
     # rejects -- the harness then silently falls back to eager, so the vocoder would
@@ -380,7 +406,7 @@ def build(device, torch_module):
             input_length=L, kernel_size=meta["k"], stride=1,
             padding=meta["pad"], dilation=meta["dil"], groups=1,
             dtype=ttnn.float32,
-            conv_config=_cfg(_long, act, full),
+            conv_config=_cfg(_long, act, full, _abh(lout, meta, full)),
             compute_config=kcfg,
             slice_config=slice_cfg, return_weights_and_bias=True,
         )
