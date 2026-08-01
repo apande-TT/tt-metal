@@ -138,16 +138,17 @@ def build(device, torch_module):
     _FULL_GRID_MIN_NTILES = 2 * _grid_cores
     _cfg_cache = {}
 
-    def _cfg(long, act, full=False, abh=32):
-        """The conv config for (trunk length, fused activation, full-grid override, act block).
+    def _cfg(long, act, full=False, abh=32, wdt=None):
+        """The conv config for (trunk length, activation, full-grid, act block, weight dtype).
 
         Cached so every conv wanting the same combination is handed the SAME object: the
         conv_config is hashed into the program key, and a fresh object per call would
         split the program cache."""
-        key = (bool(long), 0 if act is None else id(act), bool(full), int(abh))
+        wdt = ttnn.float32 if wdt is None else wdt
+        key = (bool(long), 0 if act is None else id(act), bool(full), int(abh), str(wdt))
         cfg = _cfg_cache.get(key)
         if cfg is None:
-            kw = dict(weights_dtype=ttnn.float32, deallocate_activation=False)
+            kw = dict(weights_dtype=wdt, deallocate_activation=False)
             if long:
                 kw.update(act_block_h_override=abh, enable_act_double_buffer=False,
                           enable_weights_double_buffer=False)
@@ -403,16 +404,26 @@ def build(device, torch_module):
         # See the _cfg comment: take the full grid only where there are rows to spread AND
         # the height-sharded (per-core replicated) weight block still fits L1.
         lout = L + 2 * meta["pad"] - meta["dil"] * (meta["k"] - 1)
-        full = (_long
-                and (lout + 31) // 32 >= _FULL_GRID_MIN_NTILES
-                and meta["k"] * meta["cin"] * meta["cout"] * 4 <= _HEIGHT_SHARD_WEIGHT_CAP_B)
+        wbytes = meta["k"] * meta["cin"] * meta["cout"] * 4
+        wide = _long and (lout + 31) // 32 >= _FULL_GRID_MIN_NTILES
+        full = wide and wbytes <= _HEIGHT_SHARD_WEIGHT_CAP_B
+        wdt = None
+        if wide and not full and wbytes // 2 <= _HEIGHT_SHARD_WEIGHT_CAP_B:
+            # knob:grid, the k=11 leg. The ONLY thing keeping this conv off the full grid is
+            # that a height shard replicates its [k*Cin, Cout] weight block on EVERY core,
+            # and at fp32 that is 720 KB -- over budget, so it stays block-sharded at the 32
+            # cores its 4 channel blocks allow. Halving the WEIGHT format (the activations
+            # stay fp32) halves that block to 360 KB and puts the full grid back in reach.
+            # Weights are read-only and re-quantised once at prepare time, so this is a
+            # storage change on one leg, not a walk of the whole trunk's precision.
+            full, wdt = True, ttnn.bfloat16
         y, (w2, b2) = ttnn.conv1d(
             input_tensor=x, weight_tensor=w, bias_tensor=b, device=device,
             in_channels=meta["cin"], out_channels=meta["cout"], batch_size=1,
             input_length=L, kernel_size=meta["k"], stride=1,
             padding=meta["pad"], dilation=meta["dil"], groups=1,
             dtype=ttnn.float32,
-            conv_config=_cfg(_long, act, full, _abh(lout, meta, full)),
+            conv_config=_cfg(_long, act, full, _abh(lout, meta, full), wdt),
             compute_config=kcfg,
             slice_config=slice_cfg, return_weights_and_bias=True,
         )
