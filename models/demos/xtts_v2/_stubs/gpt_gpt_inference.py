@@ -302,13 +302,23 @@ def build(device, torch_module):
         rounding trade). The bias then rides the matmul kernel's own accumulator instead of
         costing a dispatch -- one op fewer per output projection, 2 per block, 60 per
         30-block forward, on a profile whose largest single bucket is per-op dispatch."""
+        # CCL WIRE DTYPE. This partial exists only to be summed by the collective, and the
+        # collective is the single biggest cost in the decode step (~200 us of each layer's
+        # ~250). The catalogued CCL lever says to move bfloat8_b instead of bfloat16, and
+        # the zero-op way to do that is to have the PRODUCING matmul emit it -- halving the
+        # bytes on the ethernet link with no cast op anywhere. The residual stream is
+        # untouched: _add_l1 takes its dtype from `a`, so only the wire payload narrows,
+        # and the matmul still accumulates in fp32 before packing.
         pc = _pcfg(a, b)
-        try:
-            return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg,
-                               memory_config=ttnn.L1_MEMORY_CONFIG, program_config=pc)
-        except Exception:  # noqa: BLE001 - output too large for L1; fall back to DRAM
-            return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg,
-                               program_config=pc)
+        for dt in (ttnn.bfloat8_b, None):
+            try:
+                return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg,
+                                   dtype=dt, memory_config=ttnn.L1_MEMORY_CONFIG,
+                                   program_config=pc)
+            except Exception:  # noqa: BLE001 - dtype rejected, or too large for L1
+                continue
+        return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg,
+                           program_config=pc)
 
     def _stage(t, mapper, split=1):
         """Upload one weight to the mesh, tilizing ROW VECTORS on the host.

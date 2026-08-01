@@ -440,12 +440,24 @@ def build(device, torch_module):
         # shard reaches all 64 cores on its own and there is nothing for a grid override
         # to add.
         lout = (L - 1) * s - 2 * p + (k - 1) + op + 1
+        # knob:shard, second pass. This leg is already grid=full and already has the
+        # 5-tile activation block, so the only geometry left is a TALLER block -- and what
+        # bounds it is the per-core weight slice sharing L1 with it. Block-sharded over 8
+        # channel columns that slice is k*Cin/8 x Cout, i.e. 256 KB at fp32; in bf16 it is
+        # 128 KB, which buys the 7-tile block (the last divisor of the 35-row per-core
+        # height). Weights only -- activations and accumulation stay fp32.
+        # 7 tiles does NOT fit even with the halved weight slice (measured: static CBs end
+        # at 1058048 against an L1 buffer at 997376), so the block stays at 5. The bf16
+        # weight slice is still worth taking on its own: this op is bound_by=memory and the
+        # weight block is half the bytes it reads.
+        tall = _abh(lout, meta, False)
+        wdt = ttnn.bfloat16 if tall != 32 else None
         y, (w2, b2) = ttnn.conv_transpose2d(
             input_tensor=x, weight_tensor=w, bias_tensor=b, device=device,
             in_channels=meta["cin"], out_channels=meta["cout"], batch_size=1,
             input_height=1, input_width=L, kernel_size=(1, k), stride=(1, s),
             padding=(0, p), output_padding=(0, op), dilation=(1, 1), groups=1,
-            dtype=ttnn.float32, conv_config=_cfg(_long, None, False, _abh(lout, meta, False)),
+            dtype=ttnn.float32, conv_config=_cfg(_long, None, False, tall, wdt),
             compute_config=kcfg,
             return_weights_and_bias=True,
         )
