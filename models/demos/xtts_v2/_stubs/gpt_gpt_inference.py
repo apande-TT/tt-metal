@@ -358,17 +358,21 @@ def build(device, torch_module):
                         [32 * max(1, (rows + 31) // 32), W // ncores],
                         ttnn.ShardOrientation.ROW_MAJOR))
                 partial = ttnn.to_memory_config(partial, cfg)
-            scattered = ttnn.reduce_scatter(
-                partial, dim=2, num_links=1, topology=ttnn.Topology.Linear,
-                memory_config=ttnn.L1_MEMORY_CONFIG, compute_kernel_config=_ccl_kcfg)
             # num_workers_per_link is the OCCUPANCY knob for a CCL (worker cores on the SAME
             # ethernet link -- a different thing from num_links, which HANGS this 1x8 linear
-            # fabric). At decode the gathered tensor is ONE tile row: there is not enough
-            # payload for a second worker to overlap, so the extra core only adds setup to a
-            # collective that is already latency-bound. Left at the default.
+            # fabric). It is ROW-COUNT-AWARE, and this branch is the multi-row one: at decode
+            # the tensor is ONE tile row, there is no payload for a second worker to overlap,
+            # and the extra core is pure setup on an already latency-bound collective -- but
+            # decode never gets here (it returned the fused all_reduce above). At T rows there
+            # IS payload to overlap, so both halves take the second worker.
+            scattered = ttnn.reduce_scatter(
+                partial, dim=2, num_links=1, topology=ttnn.Topology.Linear,
+                memory_config=ttnn.L1_MEMORY_CONFIG, compute_kernel_config=_ccl_kcfg,
+                num_workers_per_link=2)
             return ttnn.all_gather(scattered, dim=2, num_links=1,
                                    topology=ttnn.Topology.Linear,
-                                   memory_config=ttnn.L1_MEMORY_CONFIG)
+                                   memory_config=ttnn.L1_MEMORY_CONFIG,
+                                   num_workers_per_link=2)
         except Exception:  # noqa: BLE001 - fall back to the fused op
             return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear,
                                    memory_config=ttnn.L1_MEMORY_CONFIG)
