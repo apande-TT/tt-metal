@@ -606,10 +606,24 @@ class ModelArgs(TTModelArgs):
         # Nothing wider keeps the K block (FF1/FF3: 120 K-tiles, so 40 cores gives block 3 and the
         # next core count up drops it to 2). If the K block is genuinely what these matmuls are
         # short of, then spending FEWER cores to raise it should pay. Measured, not assumed.
-        for cores in sorted(
-            (c for c in range(1, base_cores) if K % c == 0 and N % c == 0 and k_block(c) > k_block(base_cores)),
-            reverse=True,
-        ):
+        #
+        # Among those candidates, prefer one whose per-core N slice tiles the weight's DRAM BANK
+        # shard exactly (knob:shard). ``create_dram_sharded_mem_config`` width-shards the weight over
+        # dram_grid_size.x banks, so each bank holds N/banks columns; the DRAM-sharded matmul then
+        # gives each core N/cores of them. When N/cores does not divide N/banks, a core's slice
+        # straddles a bank boundary and its weight stream is split across two banks' read queues
+        # instead of one. FF1/FF3 today lands on 30 cores for 8 banks (480 N-tiles: 60 per bank, 16
+        # per core -- 60 % 16 != 0, so 14 of the 30 cores straddle). Requiring alignment picks 24
+        # cores instead: 20 N-tiles per core, 3 cores per bank, no straddle -- and it happens to buy
+        # a bigger K block too (5 vs 4). FF2 never reaches this branch (a wider grid already keeps
+        # its K block), so this is scoped to the FF1/FF3 shape.
+        dram_grid = getattr(self, "dram_grid_size", None)
+        banks = int(dram_grid.x) if dram_grid is not None else 0
+        aligned = lambda cores: banks > 0 and N % banks == 0 and (N // banks) % (N // cores) == 0
+        candidates = [
+            c for c in range(1, base_cores) if K % c == 0 and N % c == 0 and k_block(c) > k_block(base_cores)
+        ]
+        for cores in sorted(candidates, key=lambda c: (aligned(c), c), reverse=True):
             for rows in range(1, max_rows + 1):
                 if cores % rows == 0 and cores // rows <= max_cols:
                     return rows, cores // rows
