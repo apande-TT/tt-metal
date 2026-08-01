@@ -235,20 +235,54 @@ def build(device, torch_module):
         # not need HiFi4 multiplier precision.
         # NOTE: do NOT reach for num_links>1 here -- on this 1x8 linear fabric that HANGS the
         # collective (silent timeout, no exception, wedged device).
+        interleaved = partial   # the fallback below must not be handed a resharded input
         try:
+            # knob:grid -- the collective profiles grid=tiny, i.e. it runs on ~one worker
+            # core, and a CCL has no program_config to widen. The two occupancy dimensions
+            # it does have are its INPUT PLACEMENT and its worker count:
+            #
+            # (a) a WIDTH-SHARDED L1 input (one tile column per core) lets the workers read
+            #     their own shard instead of a single interleaved buffer. The catalogued
+            #     reduction lever records this as worth ~1.2 ms on MULTI-row forwards and a
+            #     2.6%/token LOSS at one tile row (nothing to spread, so the reshard is pure
+            #     latency) -- the latent head is always multi-row, but keep the shape gate so
+            #     the rule stays true if it is ever called at T=1.
+            # (b) num_workers_per_link adds worker cores on the SAME ethernet link. It was
+            #     already on the gather half; the scatter half is the same grid=tiny shape
+            #     and had been left on the default.
+            # num_links stays 1: raising the LINK count on this 1x8 linear fabric hangs the
+            # collective outright (silent timeout, wedged device).
+            # Padded row count as the device lays the tensor out: every LEADING slice's rows
+            # are padded to a whole tile, so it is prod(leading) * ceil(T/32) * 32 -- NOT
+            # ceil(prod(leading)*T/32)*32, which under-counts whenever T is not tile-aligned
+            # and hands to_memory_config a shard spec that does not cover the buffer.
+            rows = 32 * ((int(partial.shape[-2]) + 31) // 32)
+            for i in range(len(partial.shape) - 2):
+                rows *= int(partial.shape[i])
+            if rows > 32:
+                W = int(partial.shape[-1])
+                ncores = max(1, min(32, W // 32))
+                cfg = ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1,
+                    ttnn.ShardSpec(
+                        ttnn.CoreRangeSet({ttnn.CoreRange(
+                            ttnn.CoreCoord(0, 0),
+                            ttnn.CoreCoord(min(7, ncores - 1), (ncores - 1) // 8))}),
+                        # a width shard splits only the last dim, so the shard HEIGHT is the
+                        # tensor's total padded rows (B*T for a batched forward).
+                        [rows, W // ncores],
+                        ttnn.ShardOrientation.ROW_MAJOR))
+                partial = ttnn.to_memory_config(partial, cfg)
             scattered = ttnn.reduce_scatter(
                 partial, dim=2, num_links=1, topology=ttnn.Topology.Linear,
-                memory_config=ttnn.L1_MEMORY_CONFIG, compute_kernel_config=_ccl_kcfg)
-            # num_workers_per_link is the OCCUPANCY knob for a CCL: it adds worker cores on
-            # the SAME ethernet link, which is a different thing from num_links -- raising
-            # the LINK count on this 1x8 linear fabric hangs the collective outright, so this
-            # is the only parallelism dimension left for a grid=tiny CCL.
+                memory_config=ttnn.L1_MEMORY_CONFIG, compute_kernel_config=_ccl_kcfg,
+                num_workers_per_link=2)
             return ttnn.all_gather(scattered, dim=2, num_links=1,
                                    topology=ttnn.Topology.Linear,
                                    memory_config=ttnn.L1_MEMORY_CONFIG,
                                    num_workers_per_link=2)
         except Exception:  # noqa: BLE001 - fall back to the fused op
-            return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear,
+            return ttnn.all_reduce(interleaved, num_links=1, topology=ttnn.Topology.Linear,
                                    memory_config=ttnn.L1_MEMORY_CONFIG)
 
     def _block(x, L, T):
