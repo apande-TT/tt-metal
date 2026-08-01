@@ -310,7 +310,7 @@ def build(device, torch_module):
             return ttnn.linear(a, b, bias=bias, compute_kernel_config=kcfg,
                                program_config=pc)
 
-    def _stage(t, mapper):
+    def _stage(t, mapper, split=1):
         """Upload one weight to the mesh, tilizing ROW VECTORS on the host.
 
         A bias / norm scale has logical height 1, so a DEVICE tilize has to val-pad it
@@ -320,7 +320,19 @@ def build(device, torch_module):
         matrices are already tile-shaped (no val padding) and keep the multicore device
         path, where host tilizing megabytes would be the worse trade."""
         t = t.contiguous().to(torch.bfloat16)
-        if t.dim() >= 2 and int(t.shape[-2]) == 1:
+        # knob:grid. from_torch(..., device=...) uploads ROW_MAJOR and tilizes ON DEVICE,
+        # and a tilize parallelises over tile ROWS -- so its core count is the weight's
+        # row count / 32 and NO program config can widen it. wt_ao is [128, 1024]: four
+        # tile rows, four cores, 18 us to move 256 KB (14 GB/s). Anything under half the
+        # grid is better tilized on the host, where it costs wall that is already
+        # dominated by weight loading; the tall matrices keep the device path, where
+        # host-tilizing megabytes would be the worse trade. The <=1-row case (biases and
+        # norm scales) is the same rule at its extreme -- a device tilize would have to
+        # val-pad 1 -> 32 rows on a SINGLE core.
+        # `split` is n_dev when the mapper shards the ROW axis: the device tilize sees the
+        # PER-CHIP tensor, so that is the row count that decides its core count.
+        rows = (1 if t.dim() < 2 else int(t.shape[-2])) // max(1, split)
+        if rows // 32 < _grid.x * _grid.y // 2:
             return ttnn.to_device(
                 ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                                 mesh_mapper=mapper),
@@ -332,7 +344,11 @@ def build(device, torch_module):
         return _stage(t, ttnn.ReplicateTensorToMesh(device))
 
     def _shard(t, dim):
-        return _stage(t, ttnn.ShardTensorToMesh(device, dim=dim))
+        # A shard on the ROW axis divides the per-chip height, and it is the per-chip
+        # height that sets the device tilize's core count.
+        rowdim = max(0, len(t.shape) - 2)
+        return _stage(t, ttnn.ShardTensorToMesh(device, dim=dim),
+                      split=n_dev if dim == rowdim else 1)
 
     def _norm(mod):
         return (_rep(mod.weight.detach().reshape(1, 1, -1)),
