@@ -187,7 +187,13 @@ def build(device, torch_module):
     def _abh(lout, meta, full):
         if full or not _long or (lout + 31) // 32 < _FULL_GRID_MIN_NTILES:
             return 32
-        return _ABH_TALL if meta["cin"] <= 128 and meta["cout"] <= 128 else 32
+        # A block shard splits the k*Cin inner dim across ceil(Cin/32) core columns (capped
+        # at grid.x), so the activation block a core actually holds is abh x k*Cin/ncols --
+        # which is why Cin=256 is as affordable as Cin=128: it buys twice the columns. Cap
+        # on that product, not on Cin alone, so the upsample convs qualify too.
+        ncols = max(1, min(8, (meta["cin"] + 31) // 32))
+        wtiles = max(1, (meta["k"] * meta["cin"]) // (ncols * 32))
+        return _ABH_TALL if meta["cout"] <= 128 and (_ABH_TALL // 32) * wtiles <= 96 else 32
     # Pin the native convs to the L1_FULL path. The alternative DRAM width-slicing
     # path issues HOST reads while building its slices, which begin_trace_capture
     # rejects -- the harness then silently falls back to eager, so the vocoder would
@@ -416,12 +422,20 @@ def build(device, torch_module):
     def _convT1d_native(x, meta, L):
         w, b = _prepared(meta)
         s, k, p, op = meta["stride"], meta["k"], meta["pad"], meta["outpad"]
+        # knob:shard. The upsample convs have the same one-tile activation block as the
+        # ResBlock legs -- the profile tags them "ABH=35|1", i.e. 35 tile rows per core
+        # taken ONE at a time -- so they want the same taller block. They stay on ttnn's
+        # own (already full-grid) sharding: Cin=256 gives 8 channel blocks, so the block
+        # shard reaches all 64 cores on its own and there is nothing for a grid override
+        # to add.
+        lout = (L - 1) * s - 2 * p + (k - 1) + op + 1
         y, (w2, b2) = ttnn.conv_transpose2d(
             input_tensor=x, weight_tensor=w, bias_tensor=b, device=device,
             in_channels=meta["cin"], out_channels=meta["cout"], batch_size=1,
             input_height=1, input_width=L, kernel_size=(1, k), stride=(1, s),
             padding=(0, p), output_padding=(0, op), dilation=(1, 1), groups=1,
-            dtype=ttnn.float32, conv_config=_conv_cfg, compute_config=kcfg,
+            dtype=ttnn.float32, conv_config=_cfg(_long, None, False, _abh(lout, meta, False)),
+            compute_config=kcfg,
             return_weights_and_bias=True,
         )
         _wcache[meta["key"]] = (w2, b2)
