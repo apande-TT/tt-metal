@@ -4,7 +4,9 @@
 
 import gc
 import inspect
+import math
 import os
+from functools import lru_cache
 
 import torch
 from loguru import logger
@@ -152,6 +154,64 @@ class ModelArgs(TTModelArgs):
                 OpGroup.LI_O_PREFILL: MathFidelitySetting.LOFI,
             }
         )
+
+    def _short_prefill_ff1_3_prg_config(self, seq_len: int):
+        """Full-grid 2D-mcast config for a prefill FF1/FF3 whose M is SHORTER than the grid is tall.
+
+        ``mlp1_3_grid`` resolves through ``find_prefill_grid(prefill_rows=8, dim_tiles)``, which is
+        hard-capped at ``max_rows = max_cols = 8`` behind a "TODO Improve configuration for BH"
+        comment, so on this 11x10 Blackhole it returns (8, 8) = 64 cores. Two separate things then go
+        to waste at ISL 128:
+
+        * ``per_core_M = ceil(128 / (32 * 8)) = 1``, so the 8 grid ROWS can only cover 8 M-tiles
+          while the op has just 4 — HALF THE ROWS DO NO WORK, leaving 32 cores of ~110 active.
+        * grid_x is capped at 8, so N is split 8 ways when the device has more columns to give.
+
+        Widening the COLUMNS was tried first and is not available: it necessarily changes
+        ``per_core_N`` off ``dram_shard_grid_width``, and stock's comment that this "silently gives
+        bad PCC" is load-bearing on P150 — measured PCC 0.31 at grid_x=10 (per_core_N 60 -> 48).
+        ``per_core_N`` is therefore pinned to the weight's 8-bank DRAM shard width, which pins the
+        column count too, so 32 active cores is a hard floor here unless the weight is re-sharded.
+
+        What IS reachable is the wasted rows. Dropping the grid to the M-tiles that actually exist
+        keeps every core busy AND buys a bigger per-core K block, because ``matmul_config`` derives
+        ``in0_block_w = find_largest_divisor(k_tiles // grid_rows)``: 120//8 = 15 -> block 5, versus
+        120//4 = 30 -> block 6. That is the same trade this run already banked on the decode
+        matmuls (fewer cores, bigger K block) applied to the prefill grid.
+
+        Returns None when it cannot improve on stock, so the caller falls through to it.
+        """
+        m = min(seq_len, self.prefill_len_cutoff)
+        k = self.dim // self.cluster_shape[0]
+        n = self.hidden_dim // self.cluster_shape[1]
+        m_tiles, k_tiles, n_tiles = m // ttnn.TILE_SIZE, k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        if m_tiles >= self.prefill_rows:
+            return None  # stock already fills the rows; leave that path alone
+
+        # COLUMNS: pinned to stock's, so per_core_N keeps matching the weight's DRAM shard width.
+        cols = self.dram_shard_grid_width
+        per_core_N = math.ceil(n / (ttnn.TILE_SIZE * cols))
+        # ROWS: the M-tiles that actually exist, not the fixed prefill_rows. Must also divide k_tiles,
+        # which keeps matmul_config's k-divisibility assert and its in0_block_w derivation valid.
+        rows = max((y for y in range(1, m_tiles + 1) if m_tiles % y == 0 and k_tiles % y == 0), default=1)
+        if rows >= self.prefill_rows:
+            return None
+        return self.matmul_config(
+            m=m,
+            k=k,
+            n=n,
+            grid_size=(cols, rows),
+            per_core_M=m_tiles // rows,
+            per_core_N=per_core_N,
+        )
+
+    @lru_cache(maxsize=None)
+    def get_mlp_ff1_3_prg_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
+        if mode == Mode.PREFILL and prefetcher is None and not self.is_galaxy:
+            pc = self._short_prefill_ff1_3_prg_config(seq_len)
+            if pc is not None:
+                return pc
+        return super().get_mlp_ff1_3_prg_config(mode, seq_len, prefetcher)
 
     def _set_op_fidelity(self, fidelity_by_op):
         """Override math fidelity for specific op groups across every decoder."""
