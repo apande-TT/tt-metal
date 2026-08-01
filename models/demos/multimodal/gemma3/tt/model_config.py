@@ -37,6 +37,49 @@ ACCURACY_DECODER_CONFIG_FILENAME = "accuracy_decoder_config.json"
 # A/B: trade decode matmul cores for a bigger per-core K block (see find_grid_k_n).
 _FEWER_CORES_FOR_BIGGER_K_BLOCK = True
 
+# --- FF1/FF3 OUTPUT dtype (knob:dtype for the FF1/FF3 up-projections) ---------------------------
+# These matmuls are memory-bound with their WEIGHTS already at the bfloat4_b floor, so the only bytes
+# left to cut are on the OUTPUT side: every one of them writes a [M, 15360] bf16 result that the very
+# next op (the SiLU-fused ttnn.mul that gates FF1 with FF3) consumes and re-emits as bfloat8_b
+# ANYWAY. Carrying that intermediate at bf16 buys nothing downstream while doubling both the write
+# and the mul's read.
+#
+# This is deliberately NARROWER than the MLP-wide activation walk already measured on this model,
+# which regressed +60% (it moved the FF1/FF3 INPUT and FF2's input too, forcing typecasts through the
+# whole block). Here only the two up-projections' OUTPUT dtype changes; inputs stay bf16.
+#
+# The text-path MLP lives in models/tt_transformers, outside this model dir, so its ttnn.linear
+# `dtype=` argument is not editable here -- hence the wrapper. Keying on the FF1/FF3 (K, N) role
+# rather than a layer index is what makes this reach all 48 layers x 2 projections.
+_GEMMA3_FF13_BFP8_OUT = os.environ.get("GEMMA3_FF13_BFP8_OUT", "1") == "1"
+_FF13_K_N = (3840, 15360)
+
+
+def _install_ff13_out_dtype_seam():
+    if not _GEMMA3_FF13_BFP8_OUT or getattr(ttnn.linear, "_gemma3_ff13_dtype_seam", False):
+        return
+
+    stock_linear = ttnn.linear
+
+    def _linear(input_tensor_a, input_tensor_b, *args, **kwargs):
+        if kwargs.get("dtype") == ttnn.bfloat16:
+            try:
+                k = int(input_tensor_a.shape[-1])
+                n = int(input_tensor_b.shape[-1])
+            except Exception:
+                k = n = -1
+            if (k, n) == _FF13_K_N:
+                kwargs["dtype"] = ttnn.bfloat8_b
+        return stock_linear(input_tensor_a, input_tensor_b, *args, **kwargs)
+
+    _linear._gemma3_ff13_dtype_seam = True
+    _linear._stock_linear = stock_linear
+    ttnn.linear = _linear
+    logger.info("gemma3: FF1/FF3 output dtype seam installed (bf16 -> bfloat8_b)")
+
+
+_install_ff13_out_dtype_seam()
+
 # SDPA decode k_chunk when force_fixed_decode_k_chunk is True (paged text path; see text_demo).
 _GEMMA3_SDPA_DECODE_K_CHUNK_DEFAULT = 256
 # Under program trace, use the smallest valid k_chunk (pow2, multiple of 32) to reduce L1 vs static CB limits.
