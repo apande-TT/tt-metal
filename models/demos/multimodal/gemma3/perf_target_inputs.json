@@ -1,0 +1,7 @@
+{
+  "weight_bytes": 0,
+  "dominant_dtype": "bfloat16",
+  "source": "checkpoint bytes + HF config",
+  "total_params": 4000000000,
+  "unit": "token"
+}
