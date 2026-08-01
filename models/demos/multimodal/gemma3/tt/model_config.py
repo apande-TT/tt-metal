@@ -32,6 +32,9 @@ from models.tt_transformers.tt.prefetcher import Prefetcher
 PERFORMANCE_DECODER_CONFIG_FILENAME = "performance_decoder_config.json"
 ACCURACY_DECODER_CONFIG_FILENAME = "accuracy_decoder_config.json"
 
+# A/B: trade decode matmul cores for a bigger per-core K block (see find_grid_k_n).
+_FEWER_CORES_FOR_BIGGER_K_BLOCK = True
+
 # SDPA decode k_chunk when force_fixed_decode_k_chunk is True (paged text path; see text_demo).
 _GEMMA3_SDPA_DECODE_K_CHUNK_DEFAULT = 256
 # Under program trace, use the smallest valid k_chunk (pow2, multiple of 32) to reduce L1 vs static CB limits.
@@ -276,6 +279,18 @@ class ModelArgs(TTModelArgs):
                 if cores % rows == 0 and cores // rows <= max_cols:
                     best = (rows, cores // rows)
                     break
+        if best != (base_rows, base_cols) or not _FEWER_CORES_FOR_BIGGER_K_BLOCK:
+            return best
+        # Nothing wider keeps the K block (FF1/FF3: 120 K-tiles, so 40 cores gives block 3 and the
+        # next core count up drops it to 2). If the K block is genuinely what these matmuls are
+        # short of, then spending FEWER cores to raise it should pay. Measured, not assumed.
+        for cores in sorted(
+            (c for c in range(1, base_cores) if K % c == 0 and N % c == 0 and k_block(c) > k_block(base_cores)),
+            reverse=True,
+        ):
+            for rows in range(1, max_rows + 1):
+                if cores % rows == 0 and cores // rows <= max_cols:
+                    return rows, cores // rows
         return best
 
     # NOTE -- an L1 handoff for the prefill FF1/FF3 output was tried here and REMOVED. Keeping
