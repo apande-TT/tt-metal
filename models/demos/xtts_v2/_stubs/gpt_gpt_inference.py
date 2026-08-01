@@ -429,8 +429,25 @@ def build(device, torch_module):
         # which for a batched [B,T,W] prefill is T and would send it down the decode path.
         rows = _mtiles(partial) * 32
         if rows <= 32:
-            return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear,
-                                   memory_config=ttnn.L1_MEMORY_CONFIG)
+            # The reasoning above weighed DISPATCH count, and under trace that is nearly
+            # free: the per-token wall now tracks the SUM of device times, and this pair is
+            # 200 us of the ~250 us each layer spends. Written as the explicit pair the two
+            # halves become tunable -- the sum runs at LoFi (it is an add into an fp32
+            # accumulator, no multiplier precision to lose) and each half gets a second
+            # worker core on the same ethernet link. num_links stays 1: raising the LINK
+            # count on this 1x8 linear fabric hangs the collective outright.
+            try:
+                sc = ttnn.reduce_scatter(
+                    partial, dim=2, num_links=1, topology=ttnn.Topology.Linear,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                    compute_kernel_config=_ccl_kcfg, num_workers_per_link=2)
+                return ttnn.all_gather(sc, dim=2, num_links=1,
+                                       topology=ttnn.Topology.Linear,
+                                       memory_config=ttnn.L1_MEMORY_CONFIG,
+                                       num_workers_per_link=2)
+            except Exception:  # noqa: BLE001 - fall back to the fused op
+                return ttnn.all_reduce(partial, num_links=1, topology=ttnn.Topology.Linear,
+                                       memory_config=ttnn.L1_MEMORY_CONFIG)
         try:
             # knob:shard -- give the collective a WIDTH-SHARDED input so its workers read
             # their own L1 shard instead of an interleaved buffer: one tile column per core,

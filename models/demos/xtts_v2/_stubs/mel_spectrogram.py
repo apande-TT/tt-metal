@@ -110,10 +110,23 @@ def build(device, torch_module):
         Lp = L + 2 * pad
         n_frame = 1 + (Lp - n_fft) // hop
         # im2col: contiguous frames of length n_fft at stride hop, stacked on dim 0.
+        # knob:grid. Framing the signal by TILE-layout slices is what generates this
+        # module's grid=tiny UntilizeWithUnpadding: a ttnn.slice at a time offset that is
+        # not a multiple of 32 is serviced as untilize -> slice -> retilize, and the
+        # untilize of a ONE-ROW [1, n_fft] tensor has nothing to spread across cores, so
+        # every one of the n_frame slices runs on a single core (201 of them, 2.3 ms).
+        # Untilize the signal ONCE with the multicore device op and slice it in ROW_MAJOR,
+        # where an arbitrary offset is just a strided copy; retilize the stacked frames
+        # once at the end. n_frame single-core untilizes become one multicore untilize.
+        prm = ttnn.untilize(padded, use_multicore=True)
         frames = ttnn.concat(
-            [ttnn.slice(padded, [0, i * hop], [1, i * hop + n_fft]) for i in range(n_frame)],
+            [ttnn.slice(prm, [0, i * hop], [1, i * hop + n_fft]) for i in range(n_frame)],
             dim=0,
-        )                                                     # [n_frame, n_fft]
+        )                                                       # [n_frame, n_fft] ROW_MAJOR
+        # to_layout, not ttnn.tilize: n_frame is not a tile multiple and the bare
+        # tilize rejects that outright, while to_layout val-pads to the tile and keeps
+        # the LOGICAL height at n_frame so the downstream matmuls see the same shape.
+        frames = ttnn.to_layout(frames, ttnn.TILE_LAYOUT)
         fw = ttnn.multiply(frames, Wpad)                      # windowed frames
         re = ttnn.matmul(fw, Dcos, compute_kernel_config=kcfg)  # [n_frame, n_freq]
         im = ttnn.matmul(fw, Dsin, compute_kernel_config=kcfg)
