@@ -205,6 +205,48 @@ class ModelArgs(TTModelArgs):
             return model_overrides[model_name][device_name] * 1024
         return super().get_max_prefill_chunk_size()
 
+    def find_grid_k_n(self, K: int, N: int):
+        """Size the DRAM-sharded (decode) matmul grid against the REAL device grid, not a fixed 8x8.
+
+        ``tt_transformers.find_grid_k_n`` hard-codes ``max_rows = max_cols = 8`` -- its sibling
+        ``find_grid`` has a Blackhole branch, this one was never given it. On an 11x10 P150 that caps
+        the decode MLP at 40 of 110 cores: 60 cores divide both 120 and 480 tiles exactly, but 60
+        needs a 6x10 grid and 10 > the hard-coded 8, so the search falls through to 5x8.
+
+        This is the top lever on the decode path. The FF1/FF3 and FF2 decode matmuls are the two
+        costliest ops in the profile and measure ~50% DRAM / ~50% FLOP, so they are half
+        compute-starved -- confirmed independently by the weight-dtype sweep, where doubling their
+        bytes cost only +15%. Cores, not bytes, are what they are short of.
+
+        Everything downstream (dram_matmul_config's in0_block_w/per_core_N, the L1 width-shard of
+        the activation, the binary-mult shard, the sharded norm config) is derived from this grid,
+        so widening it here keeps them all consistent.
+
+        MORE CORES IS NOT UNCONDITIONALLY BETTER, and the measurement says so. Splitting K across
+        more cores also shrinks each core's K block, and ``dram_matmul_config`` derives
+        ``in0_block_w`` from exactly that. Taking 60 cores unconditionally moved FF2 the right way
+        (K block 6 -> 8, 50.9 -> 49.6 ms, and its gate mul 18.6 -> 18.1) but moved FF1/FF3 the wrong
+        way (K block 3 -> 2, 55.2 -> 60.0 ms) for a net loss. So widen only while the K block does
+        not shrink: that keeps 40 cores for FF1/FF3 and takes 60 for FF2.
+        """
+        grid = getattr(self, "max_grid_size", None)
+        if grid is None:
+            return super().find_grid_k_n(K, N)
+        max_rows, max_cols = int(grid.y), int(grid.x)
+        base_rows, base_cols = super().find_grid_k_n(K, N)
+        base_cores = base_rows * base_cols
+        # The K block dram_matmul_config will actually use for a given core count.
+        k_block = lambda cores: self.find_largest_divisor(K // cores)
+        best = (base_rows, base_cols)
+        for cores in sorted(c for c in range(1, max_rows * max_cols + 1) if K % c == 0 and N % c == 0):
+            if cores <= base_cores or k_block(cores) < k_block(base_cores):
+                continue
+            for rows in range(1, max_rows + 1):
+                if cores % rows == 0 and cores // rows <= max_cols:
+                    best = (rows, cores // rows)
+                    break
+        return best
+
     def get_mlp_ff1_3_mem_config(self, mode: Mode, prefetcher: Prefetcher = None):
         """Keep the prefill FF1/FF3 outputs resident in L1 instead of round-tripping them to DRAM.
 
