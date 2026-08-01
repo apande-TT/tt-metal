@@ -54,6 +54,12 @@ _FEWER_CORES_FOR_BIGGER_K_BLOCK = True
 _GEMMA3_FF13_BFP8_OUT = os.environ.get("GEMMA3_FF13_BFP8_OUT", "1") == "1"
 _FF13_K_N = (3840, 15360)
 
+# knob:dtype for the FF1/FF3 up-projections. Their WEIGHT is already at bfloat4_b, the lowest format
+# TTNN has, so the only bytes left on this memory-bound op are on the OUTPUT side -- and there the
+# step from bfloat8_b to bfloat4_b is worth ~4MB of the M=512 call's ~45MB, counted twice because
+# the SiLU-gated mul that consumes it reads it straight back.
+_FF13_OUT_DTYPE = getattr(ttnn, os.environ.get("GEMMA3_FF13_OUT_DTYPE", "bfloat4_b"))
+
 
 def _install_ff13_out_dtype_seam():
     if not _GEMMA3_FF13_BFP8_OUT or getattr(ttnn.linear, "_gemma3_ff13_dtype_seam", False):
@@ -69,7 +75,16 @@ def _install_ff13_out_dtype_seam():
             except Exception:
                 k = n = -1
             if (k, n) == _FF13_K_N:
-                kwargs["dtype"] = ttnn.bfloat8_b
+                # PREFILL ONLY. bfloat4_b on every FF1/FF3 output measures -1.3% device_ms but takes
+                # PCC to 0.9434, under the 0.95 floor. The bytes that lever is worth all live in the
+                # prefill calls (the M=512 output is ~8MB of a ~45MB call; the M=32 decode output is
+                # ~0.5MB of a ~33MB call), so spend the format where it pays and leave the decode
+                # token -- the tensor the accuracy gate actually reads -- at bfloat8_b.
+                try:
+                    m = int(input_tensor_a.shape[-2])
+                except Exception:
+                    m = 0
+                kwargs["dtype"] = _FF13_OUT_DTYPE if m >= 128 else ttnn.bfloat8_b
         return stock_linear(input_tensor_a, input_tensor_b, *args, **kwargs)
 
     _linear._gemma3_ff13_dtype_seam = True
@@ -382,17 +397,25 @@ class ModelArgs(TTModelArgs):
           while the op has just 4 — HALF THE ROWS DO NO WORK, leaving 32 cores of ~110 active.
         * grid_x is capped at 8, so N is split 8 ways when the device has more columns to give.
 
-        Widening the COLUMNS was tried first and is not available: it necessarily changes
-        ``per_core_N`` off ``dram_shard_grid_width``, and stock's comment that this "silently gives
-        bad PCC" is load-bearing on P150 — measured PCC 0.31 at grid_x=10 (per_core_N 60 -> 48).
-        ``per_core_N`` is therefore pinned to the weight's 8-bank DRAM shard width, which pins the
-        column count too, so 32 active cores is a hard floor here unless the weight is re-sharded.
+        Both are reachable. The wasted ROWS came first: dropping the grid to the M-tiles that
+        actually exist keeps every core busy AND buys a bigger per-core K block, because
+        ``matmul_config`` derives ``in0_block_w = find_largest_divisor(k_tiles // grid_rows)``:
+        120//8 = 15 -> block 5, versus 120//4 = 30 -> block 6.
 
-        What IS reachable is the wasted rows. Dropping the grid to the M-tiles that actually exist
-        keeps every core busy AND buys a bigger per-core K block, because ``matmul_config`` derives
-        ``in0_block_w = find_largest_divisor(k_tiles // grid_rows)``: 120//8 = 15 -> block 5, versus
-        120//4 = 30 -> block 6. That is the same trade this run already banked on the decode
-        matmuls (fewer cores, bigger K block) applied to the prefill grid.
+        The COLUMNS are NOT reachable on THIS path, and the reason is narrower than this file used to
+        state. It is not that unpinning ``per_core_N`` from ``dram_shard_grid_width`` is unsafe in
+        general: the long-prefill sibling (``_long_prefill_ff1_3_prg_config``, per_core_M=2) runs the
+        SAME weight at grid_x=10 (per_core_N 48) and grid_x=11 (per_core_N 44) at PCC 0.9742,
+        unchanged. It is specific to this per_core_M=1 config, and it is not a ragged-column effect
+        either — both column counts were measured here:
+
+            grid_x=11, per_core_N=44 (ragged, 480 = 10*44 + 40) -> PCC 0.2157
+            grid_x=10, per_core_N=48 (exact, 480 = 10*48)       -> PCC 0.1520
+
+        Two different column counts, one of them dividing 480 exactly, both garbage, while the same
+        widths are clean one path over. So the pin stays here and 32 cores is the floor for this
+        shape until the per_core_M=1 case itself is understood; do not re-derive it from the general
+        claim, which is false.
 
         Returns None when it cannot improve on stock, so the caller falls through to it.
         """
@@ -403,7 +426,8 @@ class ModelArgs(TTModelArgs):
         if m_tiles >= self.prefill_rows:
             return None  # stock already fills the rows; leave that path alone
 
-        # COLUMNS: pinned to stock's, so per_core_N keeps matching the weight's DRAM shard width.
+        # COLUMNS: pinned to the weight's DRAM shard width. Both wider widths measure garbage PCC
+        # on this per_core_M=1 path (see the docstring); the pin is load-bearing HERE specifically.
         cols = self.dram_shard_grid_width
         per_core_N = math.ceil(n / (ttnn.TILE_SIZE * cols))
         # ROWS: the M-tiles that actually exist, not the fixed prefill_rows. Must also divide k_tiles,
@@ -418,6 +442,50 @@ class ModelArgs(TTModelArgs):
             grid_size=(cols, rows),
             per_core_M=m_tiles // rows,
             per_core_N=per_core_N,
+        )
+
+    def _long_prefill_ff2_minimal_config(self, seq_len: int):
+        """Give the LONG-prefill FF2 the whole grid. Unlike every other MLP config here, this one is
+        NOT pinned by the weight's DRAM shard width, because it is a ``minimal_matmul``.
+
+        Stock hands it ``mlp2_grid`` = ``find_prefill_grid(8, hidden_dim_tiles)`` = (8, 8), the same
+        "TODO Improve configuration for BH" cap, so it runs on 64 of 110 cores at FLOPs% 54.7.
+
+        ``minimal_matmul`` does not take a ``per_core_N``: the program factory splits M over ONE grid
+        axis and N over the other and every core in the grid gets a slice
+        (``M_tiles_per_core = round_up(M_tiles, axis)/axis``), so there is no shard-width pin to
+        violate and no PCC cliff to fall off -- widening the grid just makes each core's slice
+        smaller. It transposes the axes when M > N; here M=512 < N=3840, so M rides grid.y and N
+        rides grid.x.
+
+        M=512: M_tiles=16 over y and N_tiles=120 over x. y=8 is the smallest height that reaches the
+        minimum 2 M-tiles per core (9 and 10 also give 2, but only by padding M with phantom tiles),
+        and x=11 -- prime, dividing nothing -- still beats x=10 because the split is a round_up:
+        ceil(120/11)=11 against ceil(120/10)=12. So (8,8) -> (11,8) = 64 -> 88 cores and 30 -> 22
+        output tiles per core. Block sizes stay at stock's 8/8/8 so the L1 CB budget is untouched.
+        """
+        m = min(seq_len, self.prefill_len_cutoff)
+        n = self.dim
+        if m % ttnn.TILE_SIZE:
+            return None
+        m_tiles, n_tiles = m // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        if m >= n:
+            return None  # the factory would transpose the axes; not the case we measured
+        gx, gy = self.max_grid_size.x, self.max_grid_size.y
+
+        def _smallest_best(tiles, cap):
+            best = min(math.ceil(tiles / c) for c in range(1, cap + 1))
+            return min(c for c in range(1, cap + 1) if math.ceil(tiles / c) == best)
+
+        rows, cols = _smallest_best(m_tiles, gy), _smallest_best(n_tiles, gx)
+        stock_rows, stock_cols = self.mlp2_grid(seq_len)
+        if cols * rows <= stock_cols * stock_rows:
+            return None
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=8,
+            K_block_size=8,
+            N_block_size=8,
+            compute_with_storage_grid_size=ttnn.CoreCoord(cols, rows),
         )
 
     @lru_cache(maxsize=None)
@@ -435,6 +503,10 @@ class ModelArgs(TTModelArgs):
         8-bank DRAM shard width and mismatching it silently corrupts (measured PCC 0.31 elsewhere in
         this file). Returns to stock whenever it cannot improve on it.
         """
+        if mode == Mode.PREFILL and seq_len > 128 and prefetcher is None and not self.is_galaxy:
+            pc = self._long_prefill_ff2_minimal_config(seq_len)
+            if pc is not None:
+                return pc
         if mode == Mode.PREFILL and seq_len <= 128 and prefetcher is None and not self.is_galaxy:
             m = min(seq_len, self.prefill_len_cutoff)
             k = self.hidden_dim // (self.cluster_shape[1] if self.is_galaxy else 1)
