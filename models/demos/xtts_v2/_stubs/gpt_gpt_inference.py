@@ -145,7 +145,7 @@ def build(device, torch_module):
         except Exception:  # noqa: BLE001 - will not fit L1
             return ttnn.add(a, b)
 
-    def _ln(x, weight, bias, eps):
+    def _ln(x, weight, bias, eps, keep_sharded=False):
         """LayerNorm that follows its input's placement.
 
         On a width-sharded input take the sharded program config -- block_h is the
@@ -173,7 +173,11 @@ def build(device, torch_module):
                 # does not divide by 12). One reshard here is far cheaper than losing both
                 # the tuned matmul configs and the fused GELU, which a sharded activation
                 # also forbids.
-                return ttnn.to_memory_config(y, ttnn.L1_MEMORY_CONFIG)
+                # A norm whose consumer is ANOTHER norm should stay sharded: the reshard
+                # exists only for the matmuls, and the two-LayerNorm lm_head would
+                # otherwise hand the second norm an interleaved tensor and drop it back
+                # to the 1-core kernel.
+                return y if keep_sharded else ttnn.to_memory_config(y, ttnn.L1_MEMORY_CONFIG)
             except Exception:  # noqa: BLE001 - fall back to the interleaved norm
                 x = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)
         return ttnn.layer_norm(x, weight=weight, bias=bias, epsilon=eps,
@@ -495,8 +499,13 @@ def build(device, torch_module):
         return _add_l1(x, _reduce(_lin_l1(ff, L["wt_mo"], L["b_mo"])))
 
     def _head(x):
-        x = _ln(x, ln_f_w, ln_f_b, ln_f_eps)
-        x = _ln(x, fn_w, fn_b, fn_eps)
+        # Both lm_head norms stay sharded: the first because its consumer is the second
+        # norm, the second because the lm_head projection is the ONE matmul here with no
+        # tuned program config to satisfy (its N is 1026, which tiles to 33 -- prime-ish
+        # and not worth a config), so it can take the sharded activation on ttnn's default
+        # routing and the reshard disappears entirely.
+        x = _ln(x, ln_f_w, ln_f_b, ln_f_eps, keep_sharded=True)
+        x = _ln(x, fn_w, fn_b, fn_eps, keep_sharded=True)
         return _lin(x, lm_w, lm_b)
 
     def _block(x, L, T, kv_sink=None):

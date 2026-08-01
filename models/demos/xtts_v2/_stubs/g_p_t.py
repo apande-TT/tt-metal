@@ -103,6 +103,63 @@ def build(device, torch_module):
         packer_l1_acc=True,
     )
 
+    def _rows_pad(t):
+        """Total padded rows as the device lays the tensor out: every LEADING slice's rows
+        pad to a whole tile, so it is prod(leading) * ceil(T/32) * 32."""
+        n = 32 * ((int(t.shape[-2]) + 31) // 32)
+        for i in range(len(t.shape) - 2):
+            n *= int(t.shape[i])
+        return n
+
+    def _wshard(rows, width):
+        """WIDTH-SHARDED L1: one tile column per core, never splitting a tile."""
+        nc = max(1, min(32, width // 32))
+        return nc, ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1,
+            ttnn.ShardSpec(
+                ttnn.CoreRangeSet({ttnn.CoreRange(
+                    ttnn.CoreCoord(0, 0),
+                    ttnn.CoreCoord(min(7, nc - 1), (nc - 1) // 8))}),
+                [rows, width // nc],
+                ttnn.ShardOrientation.ROW_MAJOR))
+
+    def _ln(x, weight, bias, eps, keep_sharded=False):
+        """LayerNorm that follows its input's placement.
+
+        The INTERLEAVED norm kernel parallelises over tile ROWS, so this head's 3-tile-row
+        stream pinned it to 3 cores. The SHARDED config parallelises over the WIDTH (32
+        tile columns -> 32 cores), which is what actually scales here. The input shard is
+        free -- it is the residual add's own output placement -- and the output goes back
+        interleaved because the downstream matmuls want it that way."""
+        mc = x.memory_config()
+        if mc.is_sharded():
+            rows = _rows_pad(x)
+            w = int(x.shape[-1])
+            nc = max(1, min(32, w // 32))
+            gx, gy = min(8, nc), max(1, (nc + 7) // 8)
+            try:
+                y = ttnn.layer_norm(
+                    x, weight=weight, bias=bias, epsilon=eps,
+                    compute_kernel_config=_ln_kcfg, memory_config=mc,
+                    program_config=ttnn.LayerNormShardedMultiCoreProgramConfig(
+                        compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+                        subblock_w=1, block_h=max(1, rows // 32),
+                        block_w=(w // 32) // nc, inplace=False))
+                # The sharded program config only ENGAGES on a sharded output:
+                # asking it for an interleaved one silently drops back to the
+                # 1-core interleaved kernel (measured: +17.6%/token). So take the
+                # explicit reshard -- it is the price of the sharded norm, not an
+                # oversight.
+                # A norm whose consumer is ANOTHER norm should stay sharded: the reshard
+                # exists only for the matmuls, and the two-LayerNorm lm_head would
+                # otherwise hand the second norm an interleaved tensor and drop it back
+                # to the 1-core kernel.
+                return y if keep_sharded else ttnn.to_memory_config(y, ttnn.L1_MEMORY_CONFIG)
+            except Exception:  # noqa: BLE001 - fall back to the interleaved norm
+                x = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)
+        return ttnn.layer_norm(x, weight=weight, bias=bias, epsilon=eps,
+                               compute_kernel_config=_ln_kcfg)
+
     def _add_l1(a, b):
         """Residual-stream add, landing in L1.
 
@@ -111,6 +168,13 @@ def build(device, torch_module):
         the norm more cores (a width shard was measured and LOST: the reshard cost more than
         the norm saved, because the qkv matmul downstream reshards anyway). The residual
         stream is [1,T,1024] bf16, one live tensor at a time, so it cannot crowd L1."""
+        rows = _rows_pad(a)
+        w = int(a.shape[-1])
+        if w // 32 >= 8:
+            try:
+                return ttnn.add(a, b, memory_config=_wshard(rows, w)[1])
+            except Exception:  # noqa: BLE001 - shard spec rejected for this shape
+                pass
         try:
             return ttnn.add(a, b, memory_config=ttnn.L1_MEMORY_CONFIG)
         except Exception:  # noqa: BLE001 - will not fit L1
@@ -336,8 +400,7 @@ def build(device, torch_module):
         # SINGLE-CORE retilize (the profile's grid=tiny TilizeWithValPadding, ~62 us
         # per call, 4 per block). nlp_create_qkv_heads / nlp_concat_heads do the same
         # shuffle as one multicore device op, so no layout round-trip happens at all.
-        h = ttnn.layer_norm(x, weight=L["ln1"][0], bias=L["ln1"][1],
-                            epsilon=L["ln1"][2], compute_kernel_config=_ln_kcfg)
+        h = _ln(x, L["ln1"][0], L["ln1"][1], L["ln1"][2])
         # B = the decode batch: [B, T, dim] is B INDEPENDENT streams stacked on the leading
         # axis. Batch is a separate axis from the TP-sharded weight axis, so the sharding
         # and the collectives are untouched -- only the row count grows.
@@ -352,8 +415,7 @@ def build(device, torch_module):
         x = _add_l1(x, _reduce(_lin_l1(ctx, L["wt_ao"], L["b_ao"])))
 
         # --- mlp ---
-        h = ttnn.layer_norm(x, weight=L["ln2"][0], bias=L["ln2"][1],
-                            epsilon=L["ln2"][2], compute_kernel_config=_ln_kcfg)
+        h = _ln(x, L["ln2"][0], L["ln2"][1], L["ln2"][2])
         # The tanh-GELU rides the bias add's packer. That add already reads and rewrites
         # the whole [rows, 4096] hidden -- the widest activation in the block -- so the
         # fused activation is free, while a standalone ttnn.gelu is one more dispatch and
@@ -370,10 +432,8 @@ def build(device, torch_module):
         for L in layers:
             x = _block(x, L, T)
         # last_hidden_state = ln_f(blocks(emb)); then the module's final_norm.
-        x = ttnn.layer_norm(x, weight=ln_f_w, bias=ln_f_b, epsilon=ln_f_eps,
-                            compute_kernel_config=_ln_kcfg)
-        x = ttnn.layer_norm(x, weight=fn_w, bias=fn_b, epsilon=fn_eps,
-                            compute_kernel_config=_ln_kcfg)
+        x = _ln(x, ln_f_w, ln_f_b, ln_f_eps, keep_sharded=True)
+        x = _ln(x, fn_w, fn_b, fn_eps)
         # mel latent = final_norm(hidden)[:, -mel_len:][:, :-sub] (LayerNorm is
         # per-position, so slicing the tail is exact). Full hidden dim = 1024.
         hidden_dim = int(x.shape[-1])
