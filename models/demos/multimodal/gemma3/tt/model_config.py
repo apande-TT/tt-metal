@@ -127,9 +127,28 @@ class ModelArgs(TTModelArgs):
             # Turn off fp32_dest_acc_en to not trigger L1 OOM
             self._force_sdpa_prefill_hifi4_fp16()
 
-        # FF2 is a bfp8 x bfp8 matmul still running HiFi2 while FLOP-bound at ~85% of peak.
-        # GUIDELINES 01 §12: a bf8b matmul should hold at LoFi, which is ~2x the math rate.
-        self._set_op_fidelity({OpGroup.LI_FF2: MathFidelitySetting.LOFI})
+        # NOTE: raising prefill_len_cutoff to 1024 was tried here and REVERTED. It does merge the
+        # batch-2 prefill into one M=1024 matmul so the weight is multicast once instead of twice,
+        # but doubling per_core_M (2 -> 4) doubles the per-core output CB to ~491KB and costs more
+        # than it saves: the op went 43.0 -> 50.7ms, DRAM% 16 -> 25, FLOPs% 76 -> 65.
+
+        # GUIDELINES 01 §12: a bf8b matmul should hold at LoFi, which is ~2x the math rate. FF2
+        # (bfp8 x bfp8, FLOP-bound at ~85% of peak) proved it -- and raised PCC while doing it.
+        # The QKV and attention-output projections are the same case: bfp8 weights still on HiFi2.
+        # These run AFTER _relax_attention_ops_for_program_trace and override its HIFI2_FP16, which
+        # is safe on L1: LoFi and HIFI2_FP16 are identical apart from math_fidelity (both
+        # fp32_dest_acc_en=False, packer_l1_acc=True), and fp32_dest_acc_en is what that relaxation
+        # was reaching for. SDPA is deliberately left alone -- gemma3 needs HIFI2_NA there for
+        # decode correctness.
+        self._set_op_fidelity(
+            {
+                OpGroup.LI_FF2: MathFidelitySetting.LOFI,
+                OpGroup.LI_QKV_DECODE: MathFidelitySetting.LOFI,
+                OpGroup.LI_QKV_PREFILL: MathFidelitySetting.LOFI,
+                OpGroup.LI_O_DECODE: MathFidelitySetting.LOFI,
+                OpGroup.LI_O_PREFILL: MathFidelitySetting.LOFI,
+            }
+        )
 
     def _set_op_fidelity(self, fidelity_by_op):
         """Override math fidelity for specific op groups across every decoder."""
