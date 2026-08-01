@@ -452,10 +452,54 @@ class ModelArgs(TTModelArgs):
                 )
         return super().get_mlp_ff2_prg_config(mode, seq_len, prefetcher)
 
+    def _long_prefill_ff1_3_prg_config(self, seq_len: int):
+        """Widen the LONG-prefill FF1/FF3 (M >= prefill_rows tiles) past stock's 8x8 = 64 cores.
+
+        ``find_prefill_grid`` is hard-capped at ``max_rows = max_cols = 8`` behind a "TODO Improve
+        configuration for BH" comment, so the M=512 chunk runs on 64 of this 11x10 device's 110
+        cores. The profiler tags that op ``bound=FLOP`` at 71.9% -- it is not waiting on DRAM, it is
+        short of math engines, which is exactly the case where more cores pays (and the opposite of
+        the SDPA / hand-matmul case where every extra core re-reads the same stream).
+
+        COLUMNS are the reachable axis here, and unlike the short-prefill path this one can afford
+        to move them: stock pins ``per_core_N`` to ``dram_shard_grid_width`` (8 -> 60 tiles) but
+        480 N-tiles also divide EXACTLY by 10, so per_core_N=48 tiles the output with no remainder
+        and no ragged last column. ROWS stay on a divisor of BOTH m_tiles and k_tiles, which keeps
+        ``matmul_config``'s k-divisibility assert valid and leaves no row computing padding.
+
+        M=512: (8,8)/per_core_N=60 -> (10,8)/per_core_N=48, i.e. 64 -> 80 cores and 120 -> 96
+        output tiles per core. Returns None when it cannot beat stock's core count.
+        """
+        m = min(seq_len, self.prefill_len_cutoff)
+        k = self.dim // self.cluster_shape[0]
+        n = self.hidden_dim // self.cluster_shape[1]
+        if m % ttnn.TILE_SIZE:
+            return None
+        m_tiles, k_tiles, n_tiles = m // ttnn.TILE_SIZE, k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        if m_tiles < self.prefill_rows:
+            return None  # the short-prefill path owns this shape
+        gx, gy = self.max_grid_size.x, self.max_grid_size.y
+        cols = max((c for c in range(1, gx + 1) if n_tiles % c == 0), default=1)
+        rows = max((r for r in range(1, gy + 1) if k_tiles % r == 0 and m_tiles % r == 0), default=1)
+        stock_rows, stock_cols = self.find_prefill_grid(self.prefill_rows, self.dim // ttnn.TILE_SIZE)
+        if cols * rows <= stock_cols * stock_rows:
+            return None
+        return self.matmul_config(
+            m=m,
+            k=k,
+            n=n,
+            grid_size=(cols, rows),
+            per_core_M=m_tiles // rows,
+            per_core_N=n_tiles // cols,
+        )
+
     @lru_cache(maxsize=None)
     def get_mlp_ff1_3_prg_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
         if mode == Mode.PREFILL and prefetcher is None and not self.is_galaxy:
             pc = self._short_prefill_ff1_3_prg_config(seq_len)
+            if pc is not None:
+                return pc
+            pc = self._long_prefill_ff1_3_prg_config(seq_len)
             if pc is not None:
                 return pc
         return super().get_mlp_ff1_3_prg_config(mode, seq_len, prefetcher)
