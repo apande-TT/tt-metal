@@ -37,6 +37,22 @@ ACCURACY_DECODER_CONFIG_FILENAME = "accuracy_decoder_config.json"
 # A/B: trade decode matmul cores for a bigger per-core K block (see find_grid_k_n).
 _FEWER_CORES_FOR_BIGGER_K_BLOCK = True
 
+# knob:grid on the DECODE FF2 (32 x 15360 x 3840) is DONE -- 60 cores is the end of that road.
+# find_grid_k_n's K-block rule already settles this shape on 60. The only wider core count that
+# divides both K and N *and* factors onto an 11x10 grid is 80 (8x10); 96 divides both but every
+# factor pair needs a 12-wide or 12-tall grid. Measured 80 on device: 381.30 vs 381.26 ms, i.e. dead
+# flat, at unchanged PCC. That matches what the short-prefill FF2 and the decode FF1/FF3 already
+# showed -- this op is on a DRAM-bandwidth floor reading its 33MB weight, not short of cores, so the
+# grid=partial tag on it is not an occupancy bug. 0 disables the override entirely.
+_GEMMA3_FF2_DECODE_CORES = int(os.environ.get("GEMMA3_FF2_DECODE_CORES", "0"))
+
+# knob:shard on the DECODE FF2 OUTPUT: MEASURED AND BLOCKED. Stock keeps it L1 width-sharded, and
+# that was the one remaining shard axis on this op (weight already DRAM-bank-sharded, input already
+# L1 width-sharded). Moving it to DRAM would also have freed L1 that the decode trace region
+# competes for -- but it CRASHES the run: the consumers downstream of FF2 are built around a
+# width-sharded input and do not accept an interleaved one. Left off.
+_GEMMA3_FF2_DECODE_OUT_DRAM = os.environ.get("GEMMA3_FF2_DECODE_OUT_DRAM", "0") == "1"
+
 # --- FF1/FF3 OUTPUT dtype (knob:dtype for the FF1/FF3 up-projections) ---------------------------
 # These matmuls are memory-bound with their WEIGHTS already at the bfloat4_b floor, so the only bytes
 # left to cut are on the OUTPUT side: every one of them writes a [M, 15360] bf16 result that the very
@@ -59,6 +75,14 @@ _FF13_K_N = (3840, 15360)
 # step from bfloat8_b to bfloat4_b is worth ~4MB of the M=512 call's ~45MB, counted twice because
 # the SiLU-gated mul that consumes it reads it straight back.
 _FF13_OUT_DTYPE = getattr(ttnn, os.environ.get("GEMMA3_FF13_OUT_DTYPE", "bfloat4_b"))
+
+# knob:dtype for the DECODE FF2 (32 x 15360 x 3840) is MEASURED OUT. Its WEIGHT is already
+# PrecisionSetting.BFP4, the lowest format TTNN has, and at M=32 that weight is ~33MB of the call's
+# ~34MB -- so the output was the only dtype axis left, and it is worth only ~0.25MB. Both steps were
+# run: bfloat8_b measured 381.29 vs 381.25 (flat, i.e. below noise, and PCC 0.9648 -> 0.9635 for
+# nothing), and bfloat4_b CRASHED the run. Disabled -- set the env var to re-enable.
+_FF2_K_N = (15360, 3840)
+_FF2_DECODE_OUT_DTYPE = getattr(ttnn, os.environ.get("GEMMA3_FF2_DECODE_OUT_DTYPE", ""), None)
 
 
 def _install_ff13_out_dtype_seam():
@@ -85,6 +109,13 @@ def _install_ff13_out_dtype_seam():
                 except Exception:
                     m = 0
                 kwargs["dtype"] = _FF13_OUT_DTYPE if m >= 128 else ttnn.bfloat8_b
+            elif _FF2_DECODE_OUT_DTYPE is not None and (k, n) == _FF2_K_N:
+                try:
+                    m = int(input_tensor_a.shape[-2])
+                except Exception:
+                    m = 0
+                if m < 128:
+                    kwargs["dtype"] = _FF2_DECODE_OUT_DTYPE
         return stock_linear(input_tensor_a, input_tensor_b, *args, **kwargs)
 
     _linear._gemma3_ff13_dtype_seam = True
@@ -240,6 +271,108 @@ def _install_lm_head_precision_seam():
 
 
 _install_lm_head_precision_seam()
+
+# --- PREFILL create-heads: land the Q/K/V slices in L1, not DRAM (knob:grid) ---------------------
+# ``nlp_create_qkv_heads`` is pure data movement -- it slices a [1, 1, S, 4096] fused QKV into
+# q[1, 16, S, 256] and k/v[1, 4, S, 256]. Both the call sites this model reaches (the text
+# attention in models/tt_transformers and the vision attention next door) hard-code
+# ``memory_config=ttnn.DRAM_MEMORY_CONFIG``, so the op reads DRAM and writes DRAM for a slice that
+# does no math at all. That round trip is what the profiler's ``grid=tiny`` tag on
+# NlpCreateHeadsDeviceOperation is measuring: with an interleaved DRAM destination the op hands out
+# one work unit per (batch, seq_tile) and the write, not the core count, sets the time.
+#
+# GUIDELINES 04 sec.4 pairs a DRAM create-heads with DRAM-staged SDPA precisely because at ViT
+# high-res Q+K+V is ~14MB and cannot share L1 with SDPA's flash buffers. That reasoning does not
+# transfer here: this prefill's Q+K+V is ~1MB, so the slices fit L1 alongside the flash chunks and
+# SDPA reads them at L1 bandwidth instead of pulling them back over the NoC.
+#
+# Nothing about the math changes -- only where the slices land -- so PCC is bit-identical. The
+# decode path is untouched: it goes through the separate ``nlp_create_qkv_heads_decode`` op, which
+# this wrapper never sees. Keying on the DRAM memory_config rather than a call site is what makes
+# it reach every layer of both towers.
+_GEMMA3_CREATE_HEADS_L1 = os.environ.get("GEMMA3_CREATE_HEADS_L1", "1") == "1"
+
+# tt-lang rung: replace the head split with hand-authored ttl tile-gather kernels
+# (models/demos/multimodal/gemma3/tt/ttl_create_heads.py). Off by default -- see that module and
+# the recorded attempt for why.
+_GEMMA3_CREATE_HEADS_TTL = os.environ.get("GEMMA3_CREATE_HEADS_TTL", "0") == "1"
+
+# cpp rung: replace the head split with a ttnn.generic_op tile gather that parallelises over the
+# OUTPUT tile space instead of over seq tiles (models/demos/multimodal/gemma3/tt/cpp_create_heads.py).
+_GEMMA3_CREATE_HEADS_CPP = os.environ.get("GEMMA3_CREATE_HEADS_CPP", "1") == "1"
+
+
+def _create_heads_cpp_probe(msg):
+    """A can_run guard that never fires would fake parity with the stock op; prove it fired."""
+    path = os.environ.get("GEMMA3_CREATE_HEADS_CPP_PROBE", "/tmp/gemma3_create_heads_cpp_probe.log")
+    try:
+        with open(path, "a") as fh:
+            fh.write("{}\n".format(msg))
+    except Exception:
+        pass
+
+# knob:shard MEASURED AND BLOCKED (2026-08-02). Going from L1 INTERLEAVED to L1 SHARDED means
+# taking the op's ``Sharded{}`` program factory instead of ``Interleaved{}``, and that factory is
+# decode-shaped, not prefill-shaped (nlp_create_qkv_heads_device_operation.cpp):
+#   * the input shard width is hard-checked as (num_q_heads/num_kv_heads + 2)*head_dim, which for a
+#     fused width of (q + 2kv)*head_dim forces the core count to be EXACTLY num_kv_heads -- 8 of
+#     ~110 here. The shard rung cannot widen this op; it can only narrow it.
+#   * compute_output_specs pins the OUTPUT shard to {TILE_HEIGHT, head_dim} -- ONE tile row per
+#     core -- so the sharded path only holds a seq_len of 32. This prefill runs S=128 and S=512.
+# Tried it anyway on the real device, twice. (1) Full-length: the input shard resolved cleanly
+# (w=8192, rows=128, shard=(128,1024), 8 cores) and the first sharded call crashed the run, because
+# 8 cores x 32 rows cannot hold q's 16 heads x 128 rows. (2) Chunked into 32-row pieces so the
+# output spec is legal: a BLOCK_SHARDED output throws "Shard grid must be one full rectangular
+# grid" (the op derives that grid from num_cores_to_corerangeset(num_q_heads=16), and 16 cores is
+# not a rectangle on this 11-wide grid), but a HEIGHT_SHARDED output RUNS on all 48 layers and
+# measures 387.81 ms -- 6.2 ms FASTER than the interleaved path below, even paying 4x the ops.
+#
+# It is still wrong (PCC 0.189), and the reason is a LAYOUT contract, not the kernel: at
+# nlp_create_qkv_heads_program_factory.cpp:391, k_base_addr = q_base_addr +
+# per_core_in_q_heads*head_size, so the sharded path reads each input core's 1024-wide slab as
+# GROUP-INTERLEAVED [2 q heads | 1 k head | 1 v head], whereas the fused QKV this model produces is
+# [all 16 q | all 8 k | all 8 v]. Claiming that 6.2 ms means permuting the wqkv OUTPUT COLUMNS into
+# group-interleaved order at load time -- a structural change, not a knob, and an all-or-nothing
+# one: once the weight is permuted the interleaved fallback below becomes incorrect, so it would
+# have to cover the vision tower and the S=512 prefill too. Left on the interleaved-L1 path above.
+
+
+def _install_create_heads_l1_seam():
+    stock_create_heads = ttnn.experimental.nlp_create_qkv_heads
+    if not _GEMMA3_CREATE_HEADS_L1 or getattr(stock_create_heads, "_gemma3_create_heads_l1_seam", False):
+        return
+
+    def _nlp_create_qkv_heads(*args, **kwargs):
+        if kwargs.get("memory_config") == ttnn.DRAM_MEMORY_CONFIG:
+            kwargs = {**kwargs, "memory_config": ttnn.L1_MEMORY_CONFIG}
+        if _GEMMA3_CREATE_HEADS_TTL and args and not kwargs.get("transpose_k_heads", True):
+            from models.demos.multimodal.gemma3.tt import ttl_create_heads
+
+            return ttl_create_heads.create_qkv_heads(
+                args[0],
+                int(kwargs["num_heads"]),
+                int(kwargs["num_kv_heads"]),
+                kwargs.get("memory_config", ttnn.L1_MEMORY_CONFIG),
+            )
+        if _GEMMA3_CREATE_HEADS_CPP and args and not kwargs.get("transpose_k_heads", True):
+            from models.demos.multimodal.gemma3.tt import cpp_create_heads
+
+            nq, nkv = int(kwargs["num_heads"]), int(kwargs["num_kv_heads"])
+            if cpp_create_heads.can_run(args[0], nq, nkv):
+                _create_heads_cpp_probe("FIRE {}".format(tuple(args[0].shape)))
+                return cpp_create_heads.create_qkv_heads(
+                    args[0], nq, nkv, kwargs.get("memory_config", ttnn.L1_MEMORY_CONFIG)
+                )
+            _create_heads_cpp_probe("SKIP {}".format(tuple(args[0].shape)))
+        return stock_create_heads(*args, **kwargs)
+
+    _nlp_create_qkv_heads._gemma3_create_heads_l1_seam = True
+    _nlp_create_qkv_heads._stock_nlp_create_qkv_heads = stock_create_heads
+    ttnn.experimental.nlp_create_qkv_heads = _nlp_create_qkv_heads
+    logger.info("gemma3: create-heads L1 seam installed (DRAM -> L1 Q/K/V slices)")
+
+
+_install_create_heads_l1_seam()
 
 # SDPA decode k_chunk when force_fixed_decode_k_chunk is True (paged text path; see text_demo).
 _GEMMA3_SDPA_DECODE_K_CHUNK_DEFAULT = 256
@@ -677,6 +810,12 @@ class ModelArgs(TTModelArgs):
             return model_overrides[model_name][device_name] * 1024
         return super().get_max_prefill_chunk_size()
 
+    def get_mlp_ff2_mem_config(self, mode: Mode, prefetcher: Prefetcher = None):
+        """knob:shard probe on the DECODE FF2 output: L1 width-sharded -> DRAM."""
+        if _GEMMA3_FF2_DECODE_OUT_DRAM and mode == Mode.DECODE and prefetcher is None:
+            return ttnn.DRAM_MEMORY_CONFIG
+        return super().get_mlp_ff2_mem_config(mode, prefetcher)
+
     def find_grid_k_n(self, K: int, N: int):
         """Size the DRAM-sharded (decode) matmul grid against the REAL device grid, not a fixed 8x8.
 
@@ -705,6 +844,10 @@ class ModelArgs(TTModelArgs):
         if grid is None:
             return super().find_grid_k_n(K, N)
         max_rows, max_cols = int(grid.y), int(grid.x)
+        if _GEMMA3_FF2_DECODE_CORES and (K, N) == (self.hidden_dim, self.dim):
+            for rows in range(max_rows, 0, -1):
+                if _GEMMA3_FF2_DECODE_CORES % rows == 0 and _GEMMA3_FF2_DECODE_CORES // rows <= max_cols:
+                    return rows, _GEMMA3_FF2_DECODE_CORES // rows
         base_rows, base_cols = super().find_grid_k_n(K, N)
         base_cores = base_rows * base_cols
         # The K block dram_matmul_config will actually use for a given core count.
@@ -808,6 +951,14 @@ class ModelArgs(TTModelArgs):
                 compute_with_storage_grid_size=ttnn.CoreCoord(8, 10) if is_blackhole() else ttnn.CoreCoord(8, 8),
             )
         return super().get_attn_qkv_program_config(mode, seq_len, prefetcher)
+
+    # STRUCTURAL, MEASURED AND REJECTED (2026-08-02): landing the PREFILL QKV matmul output in L1
+    # instead of DRAM removes the head-split's DRAM READ leg (the grid rung already moved its
+    # write), and it is a real device_ms win -- 393.95 -> 390.55 (-3.4 ms) at unchanged PCC. It is
+    # still the wrong trade: the prefill tensor it parks in L1 is [1, 1, S, 8192], and that
+    # pressure lands on the region the decode trace shares, so trace+1cq per-token went 35.48-35.58
+    # -> 35.75/36.02, about +1%. Eager device_ms cannot see trace-region pressure, so this class of
+    # L1 lever has to be judged on the per-token metric, which is the one that ships.
 
     def get_attn_sdpa_prefill_program_config(self, seq_len: int = 1, chunk_start_idx: int = None):
         """Give the SHORT-prefill SDPA enough q-chunks to fill the grid it is already given.
