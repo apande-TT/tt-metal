@@ -272,6 +272,147 @@ def _install_lm_head_precision_seam():
 
 _install_lm_head_precision_seam()
 
+# --- PREFILL QKV fidelity (knob:fidelity): MEASURED OUT, BOTH AXES ------------------------------
+# The fidelity WALK on the QKV projection is already at its floor and there is nothing below it:
+# gemma3's performance optimization level pins OpGroup.LI_QKV_PREFILL to MathFidelitySetting.LOFI,
+# which maps to compute_kernel_config_lofi = LoFi + fp32_dest_acc_en=False + packer_l1_acc=True --
+# exactly what GUIDELINES 01 sec.12 prescribes for a bf8 matmul.
+#
+# That leaves the two axes of the compute kernel config the OpGroup enum has no member for. Both
+# were seamed onto ttnn.experimental.minimal_matmul (keyed on the QKV weight's (K, N) = (3840, 8192),
+# the same keying the FF1/FF3 dtype seam uses, so it reaches all 48 layers rather than one call
+# site) and both were measured against a 376.64 ms baseline:
+#
+#   * ``math_approx_mode=True``  -> 376.61 ms, PCC bit-identical. INERT: the flag only selects the
+#     SFPU's approximate transcendental LUT, and this matmul has no fused activation, so no kernel
+#     on its path ever reads it.
+#   * ``packer_l1_acc=False``    -> 376.79 ms. A small measured LOSS, which is why GUIDELINES 01
+#     sec.4 makes packer_l1_acc=True mandatory rather than optional: without it the packer spills
+#     each K-reduction partial and reads it back instead of accumulating in place, and that traffic
+#     costs more than the shorter packer schedule saves.
+#
+# Seam removed rather than left env-gated: neither setting is worth carrying, and minimal_matmul is
+# shared with FF2, so an inert wrapper on it is pure risk.
+
+# --- PREFILL QKV OUTPUT dtype (knob:dtype for the long-prefill QKV projection) -------------------
+# The QKV WEIGHT is already at the bfloat4_b floor (TensorGroup.WQKV: PrecisionSetting.BFP4 below),
+# which is the lowest format TTNN has, so -- exactly as with FF1/FF3 above -- the only bytes left to
+# cut on this op are on the OUTPUT side.
+#
+# ``ttnn.experimental.minimal_matmul`` takes a ``dtype=`` argument and the long-prefill QKV call site
+# in models/tt_transformers/tt/attention.py does not pass one, so the result defaults to the input's
+# bfloat16: a [1, 1, S, 8192] tensor, 16 MB at S=1024. Nothing downstream needs that width. It is
+# consumed by nlp_create_qkv_heads, which is pure data movement (it slices the fused QKV into q/k/v
+# and does no math on it), and the q/k/v that come out then feed RoPE, the KV cache and SDPA --
+# GUIDELINES 01 sec.13 puts the hard floor for KV-cache and attention-score activations at bfloat8_b,
+# which is exactly where this stops. bfloat4_b is NOT tried on this tensor for that reason.
+#
+# So the write would halve and the create-heads read of it would halve with it. MEASURED AND HARD
+# BLOCKED: the run CRASHES with
+#
+#   TT_FATAL: All input tensors must have dtype = bfloat16
+#   (rotary_embedding_llama_device_operation.cpp:74)
+#
+# RoPE is a sealed upstream op that accepts bfloat16 ONLY, and q/k reach it straight out of the head
+# split, so the fused QKV's dtype propagates into it. This is the same wall the model-wide activation
+# dtype walk already hit from the other direction.
+#
+# The obvious repair does not pay, so it is not worth trying: V never reaches RoPE, but q and k do,
+# and casting only those back after the split costs MORE than the lever saves. At S=1024 the lever is
+# worth 8 MB on the QKV write plus 8 MB on the create-heads read = 16 MB, while a bf8->bf16 typecast
+# of q [1,16,S,256] and k [1,4,S,256] reads 5 MB and writes 10 MB = ~15 MB, plus two extra op
+# launches -- a wash at best, on the prefill path, for a tensor that is already at its floor
+# downstream (GUIDELINES 01 sec.13 puts the hard floor for KV-cache/attention-score activations at
+# bfloat8_b, so bfloat4_b is not available here either).
+#
+# Net: with the WEIGHT already at bfloat4_b and the OUTPUT pinned to bfloat16 by RoPE's contract,
+# this op has no reachable dtype axis left.
+
+# --- PREFILL QKV INPUT shard (knob:shard for the long-prefill QKV projection) --------------------
+# GUIDELINES 01 sec.10, on the INPUT side. minimal_matmul splits N over grid.x, and every column of
+# the grid needs the SAME activation rows: with N on 10 columns the [1, 1, S, 3840] activation is
+# pulled out of DRAM up to 10 times over the course of the op. At S=1024 that is 7.5 MB read as much
+# as ~75 MB. Landing it in L1 once instead is the shard rung here.
+#
+# This is the INPUT, which is distinct from the two L1 levers already measured and rejected on this
+# op: the QKV OUTPUT-in-L1 structural lever (documented at get_attn_qkv_program_config below -- a
+# real -3.4 ms device_ms win that cost +1% per-token) parked a [1,1,S,8192] tensor in L1 for the
+# head split to read, and the FF1/FF3 L1 handoff did the same on the MLP side. The input shard is
+# cheaper than both: [1,1,S,3840] block-sharded over the matmul's own (10, 8) grid is 128 rows x 384
+# columns = ~98 KB per core against the 1.5 MB L1 budget, and it is consumed by the very next op
+# rather than held across one.
+#
+# The producing RMSNorm already width-shards into L1 and then spills back with
+# sharded_to_interleaved (see _install_prefill_norm_shard_seam above), so the bytes are paid twice
+# today; the seam re-shards on the matmul side rather than changing what the norm hands back,
+# because the norm's other consumer (FF1/FF3) is a 2D-mcast ttnn.linear that wants DRAM interleaved.
+# MEASURED AND REJECTED: block-sharding the activation into L1 over the matmul's own (10, 8) grid
+# -- ~98 KB per core, well inside the 1.5 MB budget -- went device_ms 376.72 -> 377.75 (+1.0 ms) at
+# per-token 35.14 (flat). The premise was wrong, not the sizing: minimal_matmul already streams K in
+# blocks through a REUSED in0 CB, so those repeat reads are sequential DRAM streaming at close to
+# peak bandwidth, not the random re-fetch the lever assumed, and the interleaved->sharded conversion
+# costs more than it removes. This is the same lesson the FF2 reader-count work reached from the
+# other side: on these matmuls the DRAM path is already bandwidth-saturated, so moving bytes around
+# does not help -- only doing less work does.
+#
+# Two construction traps worth keeping if this is ever revisited on another op:
+#   * ``create_sharded_memory_config`` wants the FULL tensor shape here; passing the shard shape with
+#     ``use_height_and_width_as_shard_shape=True`` mis-derives the grid.
+#   * The OUTPUT must be pinned to DRAM explicitly. Left alone, minimal_matmul carries the INPUT's
+#     shard spec onto the result, and an N=8192 result against a shard width sized for K=3840 wants
+#     8192/384 = 22 width shards on a 10-column grid -- a TT_FATAL, and one that the PCC test does
+#     not catch because it never runs the long prefill.
+
+# --- PREFILL QKV: the cpp Metalium rung -- MEASURED, CORRECT, AND SLOWER ------------------------
+# The hand kernel lives in cpp_qkv_matmul.py and is left wired but OFF, because the useful result is
+# reproducible rather than theoretical: set GEMMA3_QKV_CPP_MM=1 to route the long-prefill QKV
+# through it.
+#
+# It is CORRECT -- verified standalone at the exact 1024x3840x8192 shape against torch, PCC 0.992912
+# against ttnn's 0.993292 on the real bfloat4_b weight (0.999207 vs 0.999906 at bf16), i.e. the same
+# accuracy, not a near-miss. That matters, because the previous hand-matmul attempt on this model
+# (the 2D-mcast port on FF1/FF3) produced garbage PCC and so could never answer the question.
+#
+# And it LOSES decisively: device_ms 376.53 -> 742.97, 1.97x slower, at flat per-token (the lever is
+# prefill-only). The reason is traffic and it is structural to the simple partitioning, not a tuning
+# miss: splitting the OUTPUT tile space re-reads every A row once per output COLUMN and every B
+# column once per output ROW, ~2.5 GB per call against the ~50 MB ttnn's multicast version needs.
+# Beating ttnn here would require the mcast reuse pattern -- which is the port that has already
+# failed correctness twice on this model.
+#
+# Together with the tt-lang rung's toolchain block (ttl_qkv_matmul.py), the kernel rungs on this op
+# are exhausted: ttnn's minimal_matmul sits at 98.5% grid packing after the (10, 8) transposition and
+# nothing reachable beats it.
+_GEMMA3_QKV_CPP_MM = os.environ.get("GEMMA3_QKV_CPP_MM", "0") == "1"
+_QKV_K_N = (3840, 8192)
+
+
+def _install_qkv_cpp_matmul_seam():
+    if not _GEMMA3_QKV_CPP_MM or getattr(ttnn.experimental.minimal_matmul, "_gemma3_qkv_cpp_mm_seam", False):
+        return
+
+    from models.demos.multimodal.gemma3.tt import cpp_qkv_matmul
+
+    stock_minimal_matmul = ttnn.experimental.minimal_matmul
+
+    def _minimal_matmul(input_tensor, weight_tensor, *args, **kwargs):
+        try:
+            k, n = int(weight_tensor.shape[-2]), int(weight_tensor.shape[-1])
+            hit = (k, n) == _QKV_K_N and cpp_qkv_matmul.can_run(input_tensor, weight_tensor)
+        except Exception:
+            hit = False
+        if hit:
+            return cpp_qkv_matmul.matmul(input_tensor, weight_tensor, out_dtype=kwargs.get("dtype"))
+        return stock_minimal_matmul(input_tensor, weight_tensor, *args, **kwargs)
+
+    _minimal_matmul._gemma3_qkv_cpp_mm_seam = True
+    _minimal_matmul._stock_minimal_matmul = stock_minimal_matmul
+    ttnn.experimental.minimal_matmul = _minimal_matmul
+    logger.info("gemma3: QKV prefill cpp Metalium matmul seam installed")
+
+
+_install_qkv_cpp_matmul_seam()
+
 # --- PREFILL create-heads: land the Q/K/V slices in L1, not DRAM (knob:grid) ---------------------
 # ``nlp_create_qkv_heads`` is pure data movement -- it slices a [1, 1, S, 4096] fused QKV into
 # q[1, 16, S, 256] and k/v[1, 4, S, 256]. Both the call sites this model reaches (the text
@@ -310,6 +451,7 @@ def _create_heads_cpp_probe(msg):
             fh.write("{}\n".format(msg))
     except Exception:
         pass
+
 
 # knob:shard MEASURED AND BLOCKED (2026-08-02). Going from L1 INTERLEAVED to L1 SHARDED means
 # taking the op's ``Sharded{}`` program factory instead of ``Interleaved{}``, and that factory is
@@ -977,9 +1119,7 @@ class ModelArgs(TTModelArgs):
         dram_grid = getattr(self, "dram_grid_size", None)
         banks = int(dram_grid.x) if dram_grid is not None else 0
         aligned = lambda cores: banks > 0 and N % banks == 0 and (N // banks) % (N // cores) == 0
-        candidates = [
-            c for c in range(1, base_cores) if K % c == 0 and N % c == 0 and k_block(c) > k_block(base_cores)
-        ]
+        candidates = [c for c in range(1, base_cores) if K % c == 0 and N % c == 0 and k_block(c) > k_block(base_cores)]
         for cores in sorted(candidates, key=lambda c: (aligned(c), c), reverse=True):
             for rows in range(1, max_rows + 1):
                 if cores % rows == 0 and cores // rows <= max_cols:
@@ -1019,7 +1159,7 @@ class ModelArgs(TTModelArgs):
         rows = max((y for y in range(1, m_tiles + 1) if m_tiles % y == 0 and k_tiles % y == 0), default=1)
         if rows >= self.prefill_rows:
             return None
-        cols = self.dram_shard_grid_width
+        cols = self._SHORT_PREFILL_QKV_COLS or self.dram_shard_grid_width
         return self.matmul_config(
             m=seq_len,
             k=k,
@@ -1030,8 +1170,159 @@ class ModelArgs(TTModelArgs):
             per_core_N=math.ceil(n / (ttnn.TILE_SIZE * cols)),
         )
 
+    # knob:grid, second variant on the short-prefill QKV: unpin the COLUMNS from the weight's 8-bank
+    # DRAM shard width. The catalogued rule is that the pin is per-CONFIG, not per-weight -- widening
+    # is safe at per_core_M >= 2 and garbage at per_core_M == 1 -- and it says to RE-TEST it on each
+    # config rather than inherit a sibling's verdict. Re-tested here, and the verdict is the rule's
+    # pessimistic branch: cols 8 -> 10 (32 -> 40 cores, per_core_N 32 -> 26) measured PCC 0.009313
+    # against a 0.95 floor. per_core_M is 1 on this config -- there are only 4 M-tiles and rows must
+    # cover them -- so it lands squarely in the regime the rule says corrupts. The pin STAYS, and now
+    # on its own measurement rather than a sibling's. 0 = pinned; left at 0.
+    _SHORT_PREFILL_QKV_COLS = int(os.environ.get("GEMMA3_SHORT_PREFILL_QKV_COLS", "0"))
+
+    # The traced long-prefill QKV grid. Both stock and the trace branch below hard-code
+    # CoreCoord(8, 10) on Blackhole, and the 8 is the expensive half of that pair.
+    _QKV_MINIMAL_STOCK_GRID = (8, 10)  # (x, y), i.e. N rides 8 columns and M rides 10 rows
+
+    # K block for the traced long-prefill QKV minimal_matmul. MEASURED AND LEFT AT 4: K is the
+    # streamed axis (K_tiles = 120), so this sets the iteration count -- 4 walks it in 30 steps, 8 in
+    # 15 -- but 8 measured flat-to-worse (trace+1cq per-token 34.61/35.00 -> 35.13). Only in0/in1
+    # grow with the K block, and they grow inside the trace region prefill and decode share; this op
+    # is not K-iteration bound, so the wider block buys L1 pressure and nothing else. Note device_ms
+    # cannot see this knob at all -- the profiler runs UNTRACED and so takes the 8/8/8 branch below.
+    _QKV_TRACED_K_BLOCK = int(os.environ.get("GEMMA3_QKV_TRACED_K_BLOCK", "4"))
+
+    def _long_prefill_qkv_minimal_grid(self, seq_len: int):
+        """Pick the QKV minimal_matmul grid from the tile counts instead of hard-coding 8x10.
+
+        Same reasoning as ``_long_prefill_ff2_minimal_config``, on the other big prefill matmul.
+        ``minimal_matmul`` takes no ``per_core_N``, so there is no DRAM-shard-width pin to violate:
+        minimal_matmul_program_factory.cpp sets ``transpose_core_grid = M > N`` (false here, M=1024 <
+        N=8192), then ``M_tiles_per_core = round_up(M_tiles, grid.y)/grid.y`` and
+        ``N_tiles_per_core = round_up(N_tiles, grid.x)/grid.x``. Widening only shrinks each slice.
+
+        What the hard-coded (8, 10) costs at S=1024: M_tiles=32 over y=10 is 4 per core, but N_tiles=256
+        over x=8 is 32 per core -- 128 output tiles each. N is the axis starved of cores and M is the
+        one being padded, so the fix is to spend the SAME budget the other way round; see the cap
+        below for why this deliberately stops short of the widest grid.
+
+        Block sizes stay at the caller's -- the CB budget is per core, so moving only the grid leaves
+        L1, and the trace region it competes with, untouched.
+        """
+        # Above MAX_QKV_MM_SEQ_LEN the caller reshapes the sequence before the matmul, so the M the
+        # factory sees is no longer seq_len; leave those lengths on the stock grid.
+        if not (128 < seq_len <= getattr(self, "MAX_QKV_MM_SEQ_LEN", 2048)):
+            return None
+        n = self.qkv_size // self.cluster_shape[1]
+        if seq_len % ttnn.TILE_SIZE or n % ttnn.TILE_SIZE or seq_len >= n:
+            return None  # M >= N would transpose the axes; not the case reasoned about here
+        m_tiles, n_tiles = seq_len // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        gx, gy = self.max_grid_size.x, self.max_grid_size.y
+
+        def _smallest_best(tiles, cap):
+            best = min(math.ceil(tiles / c) for c in range(1, cap + 1))
+            return min(c for c in range(1, cap + 1) if math.ceil(tiles / c) == best)
+
+        stock_cols, stock_rows = self._QKV_MINIMAL_STOCK_GRID
+
+        # Rank by per-core OUTPUT TILES, not core count: that is what the factory hands each core,
+        # and a wider grid that rounds up worse would be a regression dressed up as more cores.
+        def _per_core_tiles(c, r):
+            return math.ceil(m_tiles / r) * math.ceil(n_tiles / c)
+
+        # ...and do NOT spend cores to get there. MEASURED 2026-08-02: the unconstrained pick is
+        # (11, 8) = 88 cores at 96 tiles per core, and it is a real prefill win -- the op goes
+        # 405.8 -> 325.2 us/call and device_ms 377.08 -> 373.31. But prefill and decode share one
+        # trace region, the CB budget is per core, and 8 extra cores' worth of CBs came out of it:
+        # trace+1cq per-token went 35.08 -> 35.48 (+1.15%), and that is the metric that ships.
+        # So hold the core count at stock's and buy the win from the AXIS ASSIGNMENT alone, which is
+        # free: stock spends its 80 cores as 8 columns x 10 rows, but here N_tiles=256 is the axis
+        # starved for cores and M_tiles=32 is the one being padded (10 rows cover 32 tiles as 4 each,
+        # wasting 8 phantom tiles). Transposing that same budget to 10 x 8 gives 4 x 26 = 104 tiles
+        # per core against stock's 4 x 32 = 128, for identical L1.
+        budget = stock_cols * stock_rows
+        best = min(
+            (
+                (_per_core_tiles(c, r), c * r, c, r)
+                for c in range(1, gx + 1)
+                for r in range(1, gy + 1)
+                if c * r <= budget
+            ),
+            default=None,
+        )
+        if best is None or best[0] >= _per_core_tiles(stock_cols, stock_rows):
+            return None
+        return ttnn.CoreCoord(best[2], best[3])
+
+    # knob:grid on the SHORT-prefill QKV (MatmulDeviceOperation 128 x 3840 x 8192): MEASURED AND
+    # REJECTED. The sibling ``_short_prefill_qkv_prg_config`` above already takes every core the
+    # 2D-mcast config can reach, and the 32-of-110 ceiling it stops at is structural, not a tuning
+    # miss: ROWS are bounded by the 4 M-tiles that exist (so per_core_M = 1), and COLUMNS are pinned
+    # to ``dram_shard_grid_width`` = 8 because unpinning per_core_N is garbage at per_core_M == 1
+    # (PCC 0.15-0.22 on this weight, and an exactly-dividing width is garbage there too, so it is
+    # the per_core_M=1 regime and not raggedness that breaks it).
+    #
+    # ``minimal_matmul`` is the only way off that ceiling -- it has no per_core_N and therefore no
+    # pin -- so the short prefill was routed through it (overriding ``use_minimal_qkv_prefill_matmul``
+    # at 128, which stock reserves for seq_len > 128) on the grid the tile counts ask for: N rides
+    # grid.x, ceil(256/11) = 24 N-tiles per core against the pinned 8 columns' 32, on (11, 4) = 44
+    # cores against 32. Fewer output tiles per core AND more cores, and it still LOST: device_ms
+    # 376.65 -> 383.79 (+1.9%) at PCC 0.9674 (correct, just slower).
+    #
+    # Why, and the reason not to retry this shape: the op is bound_by=memory, and its cost is
+    # reading the 3840x8192 weight, not the output tiles. 2D-mcast MULTICASTS in0 and reads each
+    # weight tile once per column; minimal_matmul has no mcast, so 44 cores each stream their own
+    # slice and the extra cores buy more DRAM traffic, not more throughput. A grid=partial tag on a
+    # memory-bound matmul is not idle silicon when every core would re-read the same stream.
+
+    # knob:grid, third variant on the short-prefill QKV: leave 2D-mcast altogether. minimal_matmul
+    # has no per_core_N and therefore no DRAM-shard pin, so it is the only way past the 32-core
+    # ceiling the pin re-test above confirmed. N rides grid.x, and 11 columns give ceil(256/11) = 24
+    # N-tiles per core against the pinned 8 columns' 32, on (11, 4) = 44 cores against 32.
+    #
+    # MEASURED AND REJECTED, deterministically: 376.65 -> 383.79 ms (+1.9%) at PCC 0.9674 -- correct,
+    # just slower -- reproducing an identical earlier reading to 0.0003 ms. More cores AND less work
+    # per core, and it still loses, because this op is bound_by=memory and its cost is reading the
+    # 16MB bfloat4_b weight rather than producing output tiles: 2D-mcast MULTICASTS in0 and reads each
+    # weight tile once per column, whereas minimal_matmul has no mcast, so 44 cores each stream their
+    # own slice and the extra readers buy DRAM traffic, not throughput. Left off; 0/1 to re-measure.
+    _SHORT_PREFILL_QKV_MINIMAL = os.environ.get("GEMMA3_SHORT_PREFILL_QKV_MINIMAL", "0") == "1"
+
+    def _short_prefill_qkv_minimal_config(self, seq_len: int):
+        if not self._SHORT_PREFILL_QKV_MINIMAL or seq_len != 128 or not is_blackhole():
+            return None
+        n = self.qkv_size // self.cluster_shape[1]
+        if seq_len % ttnn.TILE_SIZE or n % ttnn.TILE_SIZE or seq_len >= n:
+            return None  # M >= N would transpose the axes
+        m_tiles, n_tiles = seq_len // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        gx, gy = self.max_grid_size.x, self.max_grid_size.y
+
+        def _smallest_best(tiles, cap):
+            best = min(math.ceil(tiles / c) for c in range(1, cap + 1))
+            return min(c for c in range(1, cap + 1) if math.ceil(tiles / c) == best)
+
+        rows, cols = _smallest_best(m_tiles, gy), _smallest_best(n_tiles, gx)
+        if math.ceil(n_tiles / cols) >= math.ceil(n_tiles / self.dram_shard_grid_width):
+            return None
+        block = 4 if self._enable_program_trace else 8
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=block,
+            K_block_size=block,
+            N_block_size=block,
+            compute_with_storage_grid_size=ttnn.CoreCoord(cols, rows),
+        )
+
+    def use_minimal_qkv_prefill_matmul(self, seq_len: int) -> bool:
+        if super().use_minimal_qkv_prefill_matmul(seq_len):
+            return True
+        return self._short_prefill_qkv_minimal_config(seq_len) is not None
+
     def get_attn_qkv_program_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
         """Smaller MinimalMatmul blocks for traced long prefill (default 8³ overflows static CB vs L1)."""
+        if mode == Mode.PREFILL and prefetcher is None and not self.is_galaxy:
+            pc = self._short_prefill_qkv_minimal_config(seq_len)
+            if pc is not None:
+                return pc
         if (
             mode == Mode.PREFILL
             and prefetcher is None
@@ -1041,12 +1332,37 @@ class ModelArgs(TTModelArgs):
             pc = self._short_prefill_qkv_prg_config(seq_len)
             if pc is not None:
                 return pc
-        if self._enable_program_trace and mode == Mode.PREFILL and seq_len > 128:
+        traced_long_prefill = self._enable_program_trace and mode == Mode.PREFILL and seq_len > 128
+        # The widened grid has to be applied on BOTH paths. Stock's minimal branch and the traced
+        # branch below hard-code the SAME CoreCoord(8, 10), so putting it only on the traced one made
+        # the lever an invisible no-op under the (untraced) profiler -- measured: still 80 cores.
+        # The two paths differ only in block size: 4 under trace, where 8**3 overflows the static CB.
+        grid = None
+        if (
+            is_blackhole()
+            and mode == Mode.PREFILL
+            and prefetcher is None
+            and not self.is_galaxy
+            and (traced_long_prefill or self.use_minimal_qkv_prefill_matmul(seq_len))
+        ):
+            grid = self._long_prefill_qkv_minimal_grid(seq_len)
+        if traced_long_prefill:
             return ttnn.MinimalMatmulConfig(
                 M_block_size=4,
-                K_block_size=4,
+                # K is the long axis here (K_tiles = 120) and it is the one streamed, so the K block
+                # sets the iteration count: 4 walks it in 30 steps, 8 in 15. M and N stay at 4 --
+                # 8**3 is what overflows the static CB under trace, and only in0/in1 grow with K.
+                K_block_size=self._QKV_TRACED_K_BLOCK,
                 N_block_size=4,
-                compute_with_storage_grid_size=ttnn.CoreCoord(8, 10) if is_blackhole() else ttnn.CoreCoord(8, 8),
+                compute_with_storage_grid_size=grid
+                or (ttnn.CoreCoord(8, 10) if is_blackhole() else ttnn.CoreCoord(8, 8)),
+            )
+        if grid is not None:
+            return ttnn.MinimalMatmulConfig(
+                M_block_size=8,
+                K_block_size=8,
+                N_block_size=8,
+                compute_with_storage_grid_size=grid,
             )
         return super().get_attn_qkv_program_config(mode, seq_len, prefetcher)
 
