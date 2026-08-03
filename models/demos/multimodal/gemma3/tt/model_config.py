@@ -374,6 +374,104 @@ def _install_create_heads_l1_seam():
 
 _install_create_heads_l1_seam()
 
+# --- PREFILL concat-heads: parallelise over HEADS instead of seq tiles (knob:grid) ---------------
+# ``nlp_concat_heads`` is the mirror image of the head split above: it folds q[1, H, S, 256] back
+# into [1, 1, S, H*256] and, like the split, does no math at all. Both call sites this model reaches
+# hard-code ``memory_config=ttnn.DRAM_MEMORY_CONFIG``, so it is a DRAM->DRAM gather.
+#
+# Why the profiler tags it ``grid=tiny``: nlp_concat_heads_program_factory.cpp:49 computes
+#   num_blocks = ashape[0] * ashape[2] / TILE_HEIGHT      # batch * seq / 32
+# and hands THAT to split_work_to_cores. The unit of work is a seq tile-row, and the head axis is
+# walked serially inside each core. This prefill runs S=128 (4 work units -> 4 cores of 110) and
+# S=1024 (32 cores). Measured on the current tree: 96 x 51.4us at 4 cores, 48 x 215.1us at 32 cores.
+#
+# The op has a SECOND program factory, taken when the input is sharded, and it splits on a different
+# axis entirely: line 57 sets num_blocks_per_core = shard_height / seq_len, i.e. one core per HEAD.
+# That is 16 cores here regardless of S, and it turns the gather into an L1->L1 shuffle instead of a
+# strided DRAM read (the current reader fetches 16 scattered head slabs per seq tile, which is why
+# it only achieves ~20 GB/s of a much larger DRAM budget).
+#
+# So the grid knob is the coordinated shard of GUIDELINES 01 sec.10/11, not a program_config kwarg
+# (this op takes none): height-shard the input into L1 one head per core, let the sharded factory
+# run, and hand the width-sharded result back to the caller in the memory config it asked for. The
+# two extra reshards read and write the same DRAM bytes the stock op already moved, but contiguously.
+#
+# Contract checked against nlp_concat_heads_device_operation.cpp validate(): shard width must equal
+# the padded last dim (head_dim), shard height must be a multiple of seq_len, num_heads must be
+# divisible by heads-per-shard, and the OUTPUT must be sharded-but-not-height-sharded (the sharded
+# kernel writes CB 16, which only exists when out_sharded) -- hence WIDTH_SHARDED L1 out.
+_GEMMA3_CONCAT_HEADS_MODE = os.environ.get("GEMMA3_CONCAT_HEADS_MODE", "shard")  # off | l1 | shard
+
+# Sharding buys cores only while the seq-tile split has fewer work units than there are heads;
+# above that the interleaved factory already spreads wider. Set to 0 to shard at every length.
+_GEMMA3_CONCAT_HEADS_SHARD_MAX_SEQ = int(os.environ.get("GEMMA3_CONCAT_HEADS_SHARD_MAX_SEQ", "0"))
+
+
+def _concat_heads_probe(msg):
+    """A guard that silently declines would fake parity with the stock op; prove which path ran."""
+    path = os.environ.get("GEMMA3_CONCAT_HEADS_PROBE", "/tmp/gemma3_concat_heads_probe.log")
+    try:
+        with open(path, "a") as fh:
+            fh.write("{}\n".format(msg))
+    except Exception:
+        pass
+
+
+def _concat_heads_shard_input(x):
+    """Height-shard [1, H, S, D] into L1 as one head per core, or None if the contract does not hold."""
+    shape = tuple(x.shape)
+    if len(shape) != 4 or x.is_sharded():
+        return None
+    batch, heads, seq, head_dim = shape
+    if batch != 1 or seq % 32 or head_dim % 32:
+        return None
+    if _GEMMA3_CONCAT_HEADS_SHARD_MAX_SEQ and seq > _GEMMA3_CONCAT_HEADS_SHARD_MAX_SEQ:
+        return None
+    grid = x.device().compute_with_storage_grid_size()
+    if heads > grid.x * grid.y:
+        return None
+    shard_spec = ttnn.ShardSpec(
+        ttnn.num_cores_to_corerangeset(heads, grid, True),
+        (seq, head_dim),
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    return ttnn.to_memory_config(
+        x, ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
+    )
+
+
+def _install_concat_heads_seam():
+    stock_concat_heads = ttnn.experimental.nlp_concat_heads
+    if _GEMMA3_CONCAT_HEADS_MODE == "off" or getattr(stock_concat_heads, "_gemma3_concat_heads_seam", False):
+        return
+
+    def _nlp_concat_heads(*args, **kwargs):
+        out_mem = kwargs.get("memory_config", ttnn.DRAM_MEMORY_CONFIG)
+        if _GEMMA3_CONCAT_HEADS_MODE == "shard" and args:
+            sharded_in = _concat_heads_shard_input(args[0])
+            if sharded_in is not None:
+                _concat_heads_probe("FIRE {}".format(tuple(args[0].shape)))
+                sharded_out = stock_concat_heads(
+                    sharded_in,
+                    memory_config=ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1),
+                )
+                ttnn.deallocate(sharded_in)
+                out = ttnn.to_memory_config(sharded_out, out_mem)
+                ttnn.deallocate(sharded_out)
+                return out
+            _concat_heads_probe("SKIP {}".format(tuple(args[0].shape)))
+        if out_mem == ttnn.DRAM_MEMORY_CONFIG:
+            kwargs = {**kwargs, "memory_config": ttnn.L1_MEMORY_CONFIG}
+        return stock_concat_heads(*args, **kwargs)
+
+    _nlp_concat_heads._gemma3_concat_heads_seam = True
+    _nlp_concat_heads._stock_nlp_concat_heads = stock_concat_heads
+    ttnn.experimental.nlp_concat_heads = _nlp_concat_heads
+    logger.info("gemma3: concat-heads seam installed (mode=%s)", _GEMMA3_CONCAT_HEADS_MODE)
+
+
+_install_concat_heads_seam()
+
 # SDPA decode k_chunk when force_fixed_decode_k_chunk is True (paged text path; see text_demo).
 _GEMMA3_SDPA_DECODE_K_CHUNK_DEFAULT = 256
 # Under program trace, use the smallest valid k_chunk (pow2, multiple of 32) to reduce L1 vs static CB limits.
