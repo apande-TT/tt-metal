@@ -451,6 +451,24 @@ _install_qkv_cpp_matmul_seam()
 # With the weight at bf4 and the output pinned at bf16 by RoPE's contract, this op -- like its
 # sibling -- has no reachable dtype axis.
 
+# --- SHORT-PREFILL QKV activation shard (knob:shard): MEASURED, EXACTLY FLAT --------------------
+# GUIDELINES 01 sec.10's coordinated edit on the input side, done in full rather than as a
+# program_config kwarg: the activation moved with to_memory_config into an L1 BLOCK shard matched to
+# the config the op already runs (per_core_M = 1 M-tile of rows, K split over the 8 pinned columns),
+# with the output pinned back to DRAM. At [1,1,128,3840] = 960 KB over the (8,4) grid that is ~30 KB
+# per core -- the cheapest L1 lever on this model, nowhere near the pressure that made the QKV-output
+# and FF1/FF3 L1 handoffs regress per-token.
+#
+# It changed NOTHING: 376.556 -> 376.557 ms at PCC 0.9688. The activation was never the cost. This op
+# is bound_by=memory on its 16MB bfloat4_b WEIGHT, and the activation is ~6% of the bytes it moves,
+# so removing that read outright could not have shown up above noise.
+#
+# Keep if this is ever revisited on another op: the coordinated edit needs BOTH halves. Sharding
+# alone crashes with
+#   TT_FATAL: shard_shape[1] / in0_tile.get_width() (15) must be divisible by in0_block_w (6)
+# because matmul_config derives in0_block_w from the FULL K and it need not divide the per-core K
+# slice the shard creates; passing in0_block_w = k_tiles // cols (the whole slice) satisfies it.
+
 # --- PREFILL create-heads: land the Q/K/V slices in L1, not DRAM (knob:grid) ---------------------
 # ``nlp_create_qkv_heads`` is pure data movement -- it slices a [1, 1, S, 4096] fused QKV into
 # q[1, 16, S, 256] and k/v[1, 4, S, 256]. Both the call sites this model reaches (the text
