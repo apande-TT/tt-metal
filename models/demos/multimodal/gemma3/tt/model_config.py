@@ -413,6 +413,44 @@ def _install_qkv_cpp_matmul_seam():
 
 _install_qkv_cpp_matmul_seam()
 
+# --- SHORT-PREFILL QKV fidelity (knob:fidelity): MEASURED OUT, BOTH AXES ------------------------
+# Same OpGroup as the long-prefill sibling (LI_QKV_PREFILL -> MathFidelitySetting.LOFI = LoFi +
+# fp32_dest_acc_en=False + packer_l1_acc=True), so the WALK is already at its floor and nothing
+# exists below LoFi. That leaves the two compute-kernel-config axes the OpGroup enum has no member
+# for. This op reaches ttnn.linear rather than minimal_matmul, so they were seamed on linear, keyed
+# on the QKV weight's (K, N) = (3840, 8192) -- which reaches all 48 layers and does not collide with
+# the FF1/FF3 seam's (3840, 15360). Both measured against a 376.55 ms baseline:
+#
+#   * ``math_approx_mode=True``  -> 376.64 ms. INERT, for the same reason as on the sibling: the flag
+#     only selects the SFPU's approximate transcendental LUT and this matmul has no fused activation.
+#   * ``packer_l1_acc=False``    -> 632.32 ms, +66%. A LARGE loss, and the magnitude is the useful
+#     part: it is ~400x the same knob's cost on the long-prefill sibling (+0.15 ms), because the
+#     (K, N) key also matches the DECODE QKV (32 x 3840 x 8192), which shares this weight. So the
+#     decode projection is where packer L1 accumulation actually pays -- do not touch it there
+#     either. Confirms GUIDELINES 01 sec.4: packer_l1_acc=True is mandatory, not optional. Without
+#     it the packer spills every K-reduction partial and reads it back, and on K=3840 that traffic
+#     dwarfs the shorter schedule.
+#
+# Expected in hindsight for an op the roofline tags bound_by=MEMORY: a fidelity knob moves the math
+# rate, and the math rate is not what this op waits on -- reading the 16MB bfloat4_b weight is.
+
+# --- SHORT-PREFILL QKV output dtype (knob:dtype): MEASURED AND HARD BLOCKED ---------------------
+# Identical situation to the long-prefill sibling above, and it fails identically. The WEIGHT is
+# already at the bfloat4_b floor (TensorGroup.WQKV: PrecisionSetting.BFP4), so the OUTPUT is the only
+# dtype axis left; this op reaches ttnn.linear, whose call site passes dtype=bfloat16, and dropping
+# that to bfloat8_b CRASHES the run with
+#
+#   TT_FATAL: All input tensors must have dtype = bfloat16
+#   (rotary_embedding_llama_device_operation.cpp:74)
+#
+# RoPE takes bfloat16 ONLY and q/k reach it straight out of the head split, so the fused QKV's dtype
+# propagates into it. The repair is the same non-starter as on the sibling: casting only q and k back
+# after the split costs about what the lever saves, and bfloat4_b is off the table regardless because
+# GUIDELINES 01 sec.13 floors KV-cache/attention-score activations at bfloat8_b.
+#
+# With the weight at bf4 and the output pinned at bf16 by RoPE's contract, this op -- like its
+# sibling -- has no reachable dtype axis.
+
 # --- PREFILL create-heads: land the Q/K/V slices in L1, not DRAM (knob:grid) ---------------------
 # ``nlp_create_qkv_heads`` is pure data movement -- it slices a [1, 1, S, 4096] fused QKV into
 # q[1, 16, S, 256] and k/v[1, 4, S, 256]. Both the call sites this model reaches (the text
