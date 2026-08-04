@@ -1041,6 +1041,133 @@ class ModelArgs(TTModelArgs):
             per_core_N=math.ceil(n / (ttnn.TILE_SIZE * cols)),
         )
 
+    # The traced long-prefill QKV grid. Both stock and the trace branch below hard-code
+    # CoreCoord(8, 10) on Blackhole, and the 8 is the expensive half of that pair.
+    _QKV_MINIMAL_STOCK_GRID = (8, 10)  # (x, y), i.e. N rides 8 columns and M rides 10 rows
+
+    # Grid variant 2 (under measurement): let the search spend more than stock's 80 cores, and fund
+    # the extra cores' circular buffers by halving the traced N block rather than out of the trace
+    # region. Both halves move together -- more cores at the SAME per-core CB is the combination
+    # already measured as a per-token regression.
+    _QKV_MINIMAL_SPEND_CORES = os.environ.get("GEMMA3_QKV_MINIMAL_SPEND_CORES", "1") == "1"
+    _QKV_MINIMAL_TRACE_N_BLOCK = int(os.environ.get("GEMMA3_QKV_MINIMAL_TRACE_N_BLOCK", "2"))
+
+    @staticmethod
+    def _minimal_matmul_subblock(
+        m_block: int, n_block: int, n_ge_m: bool, fp32_dest_acc_en: bool = False, dst_full_sync_en: bool = False
+    ):
+        """The subblock ``MinimalMatmulConfig`` silently drops when you set the block sizes.
+
+        knob:fidelity on the compute-bound prefill matmuls. ``subblock_h``/``subblock_w`` are the
+        MAC-block shape handed to ``matmul_block_init`` as (rt_dim, ct_dim) -- how many output tiles
+        the math thread accumulates in DST per unpack of in0/in1. minimal_matmul_program_factory.cpp
+        picks them itself (``determine_default_block_sizes``: 2x4 when N >= M and fp32_dest_acc_en is
+        off, i.e. EIGHT tiles) but ONLY when no config is supplied:
+
+            subblock_h = config.has_value() ? config.value().subblock_h : default_subblock_h;
+
+        Every call site here supplies a config to set the block sizes, and the nanobind signature
+        defaults ``subblock_h=1, subblock_w=1``. So asking for a block size silently also asks for a
+        1x1 MAC block -- one output tile per matmul_block call, an eighth of the DST the library
+        would have used, on ops the roofline tags bound_by=compute.
+
+        Pick the largest legal subblock instead of inheriting that 1x1. The validate() constraints
+        are ``M_block % subblock_h == 0``, ``N_block % subblock_w == 0`` and
+        ``subblock_h * subblock_w <= get_dest_reg_count(...)``, and the orientation preference
+        follows the factory's: widen along N when N >= M, along M otherwise.
+        """
+        # get_dest_reg_count(): (DEST_REGISTER_FULL_SIZE * DATUMS_PER_ROW) / tile area = 16 tiles,
+        # HALVED when dst_full_sync_en is off (it is, by default) and halved again for fp32 dest. So
+        # the real cap on this model's lofi config is EIGHT, not 16 -- asking for 16 TT_FATALs.
+        max_volume = 16
+        if not dst_full_sync_en:
+            max_volume //= 2
+        if fp32_dest_acc_en:
+            max_volume //= 2
+        divisors = lambda b: [d for d in range(1, b + 1) if b % d == 0]  # noqa: E731
+        candidates = [(h, w) for h in divisors(m_block) for w in divisors(n_block) if h * w <= max_volume]
+
+        # Largest DST volume wins. Break ties toward the factory's own 1:2 orientation -- it widens
+        # along N when N >= M and along M otherwise -- so an 8-tile budget lands on 2x4 / 4x2 rather
+        # than a degenerate 1x8, which fills DST just as full but unpacks a single in0 row per block.
+        def _rank(hw):
+            h, w = hw
+            skew = abs(w - 2 * h) if n_ge_m else abs(h - 2 * w)
+            return (h * w, -skew)
+
+        return max(candidates, key=_rank)
+
+    def _long_prefill_qkv_minimal_grid(self, seq_len: int):
+        """Pick the QKV minimal_matmul grid from the tile counts instead of hard-coding 8x10.
+
+        Same reasoning as ``_long_prefill_ff2_minimal_config``, on the other big prefill matmul.
+        ``minimal_matmul`` takes no ``per_core_N``, so there is no DRAM-shard-width pin to violate:
+        minimal_matmul_program_factory.cpp sets ``transpose_core_grid = M > N`` (false here, M=1024 <
+        N=8192), then ``M_tiles_per_core = round_up(M_tiles, grid.y)/grid.y`` and
+        ``N_tiles_per_core = round_up(N_tiles, grid.x)/grid.x``. Widening only shrinks each slice.
+
+        What the hard-coded (8, 10) costs at S=1024: M_tiles=32 over y=10 is 4 per core, but N_tiles=256
+        over x=8 is 32 per core -- 128 output tiles each. N is the axis starved of cores and M is the
+        one being padded, so the fix is to spend the SAME budget the other way round; see the cap
+        below for why this deliberately stops short of the widest grid.
+
+        Block sizes stay at the caller's -- the CB budget is per core, so moving only the grid leaves
+        L1, and the trace region it competes with, untouched.
+        """
+        # Above MAX_QKV_MM_SEQ_LEN the caller reshapes the sequence before the matmul, so the M the
+        # factory sees is no longer seq_len; leave those lengths on the stock grid.
+        if not (128 < seq_len <= getattr(self, "MAX_QKV_MM_SEQ_LEN", 2048)):
+            return None
+        n = self.qkv_size // self.cluster_shape[1]
+        if seq_len % ttnn.TILE_SIZE or n % ttnn.TILE_SIZE or seq_len >= n:
+            return None  # M >= N would transpose the axes; not the case reasoned about here
+        m_tiles, n_tiles = seq_len // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        gx, gy = self.max_grid_size.x, self.max_grid_size.y
+
+        def _smallest_best(tiles, cap):
+            best = min(math.ceil(tiles / c) for c in range(1, cap + 1))
+            return min(c for c in range(1, cap + 1) if math.ceil(tiles / c) == best)
+
+        stock_cols, stock_rows = self._QKV_MINIMAL_STOCK_GRID
+
+        # Rank by per-core OUTPUT TILES, not core count: that is what the factory hands each core,
+        # and a wider grid that rounds up worse would be a regression dressed up as more cores.
+        def _per_core_tiles(c, r):
+            return math.ceil(m_tiles / r) * math.ceil(n_tiles / c)
+
+        # ...and do NOT spend cores to get there. MEASURED 2026-08-02: the unconstrained pick is
+        # (11, 8) = 88 cores at 96 tiles per core, and it is a real prefill win -- the op goes
+        # 405.8 -> 325.2 us/call and device_ms 377.08 -> 373.31. But prefill and decode share one
+        # trace region, the CB budget is per core, and 8 extra cores' worth of CBs came out of it:
+        # trace+1cq per-token went 35.08 -> 35.48 (+1.15%), and that is the metric that ships.
+        # So hold the core count at stock's and buy the win from the AXIS ASSIGNMENT alone, which is
+        # free: stock spends its 80 cores as 8 columns x 10 rows, but here N_tiles=256 is the axis
+        # starved for cores and M_tiles=32 is the one being padded (10 rows cover 32 tiles as 4 each,
+        # wasting 8 phantom tiles). Transposing that same budget to 10 x 8 gives 4 x 26 = 104 tiles
+        # per core against stock's 4 x 32 = 128, for identical L1.
+        #
+        # CANDIDATE (grid variant 2): the rejection above was an L1 verdict, not a core-count one --
+        # 88 cores lost because 8 more cores each reserved a full CB set out of the shared trace
+        # region. So take the 88 and PAY for them out of the block size: halving N_block_size on the
+        # traced branch (see get_attn_qkv_program_config) shrinks in1 + out + intermediate by 8 tiles
+        # each per core, which is more L1 than the 8 extra cores add. The effective work per core is
+        # unchanged by that halving -- N_tiles_per_core = 24 at gx=11 divides by 2 and by 4 alike --
+        # so this is strictly the same 96-tiles-per-core prefill win at LOWER per-core L1 than the
+        # config that was measured as a per-token regression.
+        budget = gx * gy if self._QKV_MINIMAL_SPEND_CORES else stock_cols * stock_rows
+        best = min(
+            (
+                (_per_core_tiles(c, r), c * r, c, r)
+                for c in range(1, gx + 1)
+                for r in range(1, gy + 1)
+                if c * r <= budget
+            ),
+            default=None,
+        )
+        if best is None or best[0] >= _per_core_tiles(stock_cols, stock_rows):
+            return None
+        return ttnn.CoreCoord(best[2], best[3])
+
     def get_attn_qkv_program_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
         """Smaller MinimalMatmul blocks for traced long prefill (default 8³ overflows static CB vs L1)."""
         if (
@@ -1052,12 +1179,46 @@ class ModelArgs(TTModelArgs):
             pc = self._short_prefill_qkv_prg_config(seq_len)
             if pc is not None:
                 return pc
-        if self._enable_program_trace and mode == Mode.PREFILL and seq_len > 128:
+        traced_long_prefill = self._enable_program_trace and mode == Mode.PREFILL and seq_len > 128
+        # The widened grid has to be applied on BOTH paths. Stock's minimal branch and the traced
+        # branch below hard-code the SAME CoreCoord(8, 10), so putting it only on the traced one made
+        # the lever an invisible no-op under the (untraced) profiler -- measured: still 80 cores.
+        # The two paths differ only in block size: 4 under trace, where 8**3 overflows the static CB.
+        grid = None
+        if (
+            is_blackhole()
+            and mode == Mode.PREFILL
+            and prefetcher is None
+            and not self.is_galaxy
+            and (traced_long_prefill or self.use_minimal_qkv_prefill_matmul(seq_len))
+        ):
+            grid = self._long_prefill_qkv_minimal_grid(seq_len)
+        if traced_long_prefill:
+            # N_block_size is the CB axis that funds the wider grid: in1, out and intermediate are all
+            # K_block x N_block / M_block x N_block, so halving it takes 8 tiles off each of the three
+            # per core. The compute kernel clamps the last block anyway (compute.cpp sets
+            # current_N_block_tiles = n_tile_end - n_tile), so a smaller block loses no math -- and at
+            # gx=11 it divides N_tiles_per_core=24 exactly, where 4 does too.
+            n_block = self._QKV_MINIMAL_TRACE_N_BLOCK if grid is not None else 4
+            sub_h, sub_w = self._minimal_matmul_subblock(4, n_block, n_ge_m=True)
             return ttnn.MinimalMatmulConfig(
                 M_block_size=4,
                 K_block_size=4,
-                N_block_size=4,
-                compute_with_storage_grid_size=ttnn.CoreCoord(8, 10) if is_blackhole() else ttnn.CoreCoord(8, 8),
+                N_block_size=n_block,
+                subblock_h=sub_h,
+                subblock_w=sub_w,
+                compute_with_storage_grid_size=grid
+                or (ttnn.CoreCoord(8, 10) if is_blackhole() else ttnn.CoreCoord(8, 8)),
+            )
+        if grid is not None:
+            sub_h, sub_w = self._minimal_matmul_subblock(8, 8, n_ge_m=True)
+            return ttnn.MinimalMatmulConfig(
+                M_block_size=8,
+                K_block_size=8,
+                N_block_size=8,
+                subblock_h=sub_h,
+                subblock_w=sub_w,
+                compute_with_storage_grid_size=grid,
             )
         return super().get_attn_qkv_program_config(mode, seq_len, prefetcher)
 
