@@ -725,10 +725,24 @@ class ModelArgs(TTModelArgs):
         stock_rows, stock_cols = self.mlp2_grid(seq_len)
         if cols * rows <= stock_cols * stock_rows:
             return None
+        # Set the subblock EXPLICITLY, and spend the whole DST volume on N. Supplying any
+        # MinimalMatmulConfig silently also requests subblock 1x1 (the nanobind default), because the
+        # factory reads the config's value unconditionally once a config is present -- an eighth of
+        # the DST that determine_default_block_sizes would have chosen.
+        #
+        # Do NOT route this through _minimal_matmul_subblock: it ranks toward the factory's own 1:2
+        # orientation and would pick 2x4 here, which MEASURES 621.93 ms against 1x8's 369.41 (1x1 is
+        # 371.18). The difference from QKV, where 2x4 is a win, is the RAGGED last N block. FF2 has
+        # N_tiles_per_core = ceil(120/11) = 11 over an 8-wide block, so its second block is 3 tiles
+        # and the kernel clamps current_subblock_w = min(current_N_block_tiles, subblock_w) to 3 -- a
+        # non-power-of-two ct_dim into matmul_block_init. QKV's N_tiles_per_core = 24 is three exact
+        # blocks and never ragged. A subblock_w spanning the FULL block makes that clamp a no-op.
         return ttnn.MinimalMatmulConfig(
             M_block_size=8,
             K_block_size=8,
             N_block_size=8,
+            subblock_h=1,
+            subblock_w=8,
             compute_with_storage_grid_size=ttnn.CoreCoord(cols, rows),
         )
 
