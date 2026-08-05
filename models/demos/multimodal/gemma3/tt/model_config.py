@@ -53,6 +53,11 @@ _GEMMA3_FF2_DECODE_CORES = int(os.environ.get("GEMMA3_FF2_DECODE_CORES", "0"))
 # width-sharded input and do not accept an interleaved one. Left off.
 _GEMMA3_FF2_DECODE_OUT_DRAM = os.environ.get("GEMMA3_FF2_DECODE_OUT_DRAM", "0") == "1"
 
+# knob:grid on the DECODE QKV projection. attn_input_grid comes from find_grid, which ranks core
+# counts by abs(cores - 32) -- a bring-up default. See dram_shard_core_grid_for_k below for the
+# per-core-work argument and the K-block cap. 0 restores stock's 30 cores.
+_GEMMA3_QKV_DECODE_WIDE_GRID = os.environ.get("GEMMA3_QKV_DECODE_WIDE_GRID", "1") == "1"
+
 # --- FF1/FF3 OUTPUT dtype (knob:dtype for the FF1/FF3 up-projections) ---------------------------
 # These matmuls are memory-bound with their WEIGHTS already at the bfloat4_b floor, so the only bytes
 # left to cut are on the OUTPUT side: every one of them writes a [M, 15360] bf16 result that the very
@@ -940,6 +945,63 @@ class ModelArgs(TTModelArgs):
         if _GEMMA3_FF2_DECODE_OUT_DRAM and mode == Mode.DECODE and prefetcher is None:
             return ttnn.DRAM_MEMORY_CONFIG
         return super().get_mlp_ff2_mem_config(mode, prefetcher)
+
+    def dram_shard_core_grid_for_k(self, k: int):
+        """Size the DECODE QKV grid by the work each core gets, not by "closest to 32".
+
+        ``attn_input_grid`` is the only consumer of this helper on a non-galaxy build, and everything
+        the decode QKV matmul does is derived from it: ``dram_matmul_config``'s ``in0_block_w`` and
+        ``per_core_N``, the L1 width-shard of the attention input, and the sharded norm config.
+
+        Stock ``find_grid`` sorts the candidate core counts by ``abs(cores - 32)`` and takes the
+        first that fits -- a bring-up default, not a perf choice. On this P150 it lands on 30 cores
+        (3x10) for k=3840, and 30 does not divide the 256 QKV N-tiles: ``per_core_N`` rounds up to 9,
+        so 30 cores compute 270 tile-columns for 256 real ones AND each core carries 9. This matmul
+        measures roughly half DRAM / half FLOP (same as the MLP pair -- see find_grid_k_n), so the
+        FLOP half is paid per core and tracks ``per_core_N`` directly.
+
+        Ranking on per-core output tiles was tried FIRST and lost. 40 cores is the only candidate
+        that divides k in tiles and cuts per_core_N (9 -> 7, i.e. 22% less work per core) without
+        dropping in0_block_w below 3; it measured the op 15.27 -> 16.02 ms (+4.9%) with every other op
+        bit-identical. So per-core FLOP is not the constraint: 240 launches x a 17.7 MB bfloat4_b
+        weight in 15.27 ms is 278 GB/s, ~85% of an achievable DRAM-sharded read on this board, and
+        the K block is what the op is actually sensitive to. Same conclusion find_grid_k_n reached by
+        measurement on the MLP shapes.
+
+        So go the OTHER way: spend FEWER cores to raise the K block. Take the SMALLEST such step --
+        the largest core count that still buys a bigger in0_block_w -- because that first measurement
+        also sized the two effects against each other: in0_block_w -25% against per_core_N -22% netted
+        +4.9%, so they are comparable per unit and a big core cut would swamp its own K-block gain
+        (ranking on in0_block_w alone picks 15 cores, which doubles per_core_N from 9 to 18). 24 cores
+        is the mirror image of the attempt that failed: in0_block_w 4 -> 5, per_core_N 9 -> 11.
+
+        Break ties toward a core count whose per-core N slice tiles the weight's DRAM BANK shard
+        exactly -- create_dram_sharded_mem_config width-shards the weight over dram_grid_size.x banks,
+        so when N/banks is not a multiple of N/cores a core's weight stream is split across two banks'
+        read queues instead of one. At 30 cores per_core_N=9 against 32 N-tiles per bank, so it
+        straddles today.
+
+        Scoped to k == dim (the attention input). Any other k falls through to stock.
+        """
+        n_tiles = (self.qkv_size // self.num_devices) // ttnn.TILE_SIZE
+        grid = getattr(self, "max_grid_size", None)
+        if k != self.dim or grid is None or not _GEMMA3_QKV_DECODE_WIDE_GRID:
+            return super().dram_shard_core_grid_for_k(k)
+        max_rows, max_cols = int(grid.y), int(grid.x)
+        k_tiles = k // ttnn.TILE_SIZE
+        base = super().dram_shard_core_grid_for_k(k)
+        base_cores = base.x * base.y
+        per_core_n = lambda c: math.ceil(n_tiles / c)
+        block = lambda c: self.find_largest_divisor(k_tiles // c)
+        dram_grid = getattr(self, "dram_grid_size", None)
+        banks = int(dram_grid.x) if dram_grid is not None else 0
+        aligned = lambda c: banks > 0 and n_tiles % banks == 0 and (n_tiles // banks) % per_core_n(c) == 0
+        candidates = [c for c in range(1, base_cores) if k_tiles % c == 0 and block(c) > block(base_cores)]
+        for cores in sorted(candidates, key=lambda c: (c, aligned(c)), reverse=True):
+            for rows in range(1, max_rows + 1):
+                if cores % rows == 0 and cores // rows <= max_cols:
+                    return ttnn.CoreGrid(y=rows, x=cores // rows)
+        return base
 
     def find_grid_k_n(self, K: int, N: int):
         """Size the DRAM-sharded (decode) matmul grid against the REAL device grid, not a fixed 8x8.
