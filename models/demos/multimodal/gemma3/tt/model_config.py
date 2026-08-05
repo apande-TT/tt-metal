@@ -1055,6 +1055,78 @@ class ModelArgs(TTModelArgs):
             per_core_N=math.ceil(n / (ttnn.TILE_SIZE * cols)),
         )
 
+    def _prefill_wo_prg_config(self, seq_len: int):
+        """Unpin the LONG-prefill attention-output grid from the weight's DRAM shard width.
+
+        Stock builds WO's prefill config with ``per_core_N = ceil(n / (TILE * dram_shard_grid_width))``
+        behind tt_transformers' comment that other values "silently give bad PCC". That pin belongs to
+        the CONFIG, not to the weight: measured on this exact weight (4096 x 3840), unpinning is
+        bit-identical at ``per_core_M >= 2`` and garbage at ``per_core_M == 1``.
+
+        | WO config             | grid          | per_core_M | per_core_N     | result                |
+        |-----------------------|---------------|-----------:|---------------:|-----------------------|
+        | long prefill M=1024   | (10, 8) = 80  |          4 | 12 (exact)     | PCC bit-identical     |
+        | short prefill M=128   | (10, 4) = 40  |          1 | 12 (exact)     | PCC -0.040062         |
+
+        Both widths divide 120 exactly, so raggedness is ruled out -- ``per_core_M == 1`` is the
+        discriminator. Hence the hard guard below. The short-prefill config has no reachable grid rung
+        at all: the only row counts that divide its 128 K-tiles (``matmul_config`` asserts
+        ``k % (TILE * rows) == 0``) and still leave ``per_core_M >= 2`` are ``rows <= 2``, and 2 rows x
+        10 columns is 24 output tiles per core against the 15 it already has.
+
+        Rank on PER-CORE OUTPUT TILES, never on core count -- a core-count test discards a winning
+        candidate that has fewer cores because stock's rows are mostly idle. Break ties on the
+        subblock, since ``per_core_N`` also feeds ``get_out_subblock_w`` (caps at 4, needs
+        ``per_core_N % w == 0``): 15 resolves to 3, 12 resolves to 4, and a prime 11 resolves to 1.
+        """
+        stock = super().get_attn_wo_program_config(Mode.PREFILL, seq_len, None)
+        if stock is None or not hasattr(stock, "per_core_M"):
+            return None
+        m = min(seq_len, 1024)
+        k = (self.n_heads * self.head_dim) // self.num_devices
+        n = self.dim
+        if m % ttnn.TILE_SIZE or k % ttnn.TILE_SIZE or n % ttnn.TILE_SIZE:
+            return None
+        m_tiles, k_tiles, n_tiles = m // ttnn.TILE_SIZE, k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        gx, gy = self.max_grid_size.x, self.max_grid_size.y
+
+        def _subblock_w(per_core_n):
+            return max((w for w in range(4, 0, -1) if per_core_n % w == 0), default=1)
+
+        best = None
+        for rows in range(1, gy + 1):
+            # matmul_config asserts k divides by the row count, and per_core_M == 1 is the PCC cliff.
+            if m_tiles % rows or k_tiles % rows or m_tiles // rows < 2:
+                continue
+            for cols in range(1, gx + 1):
+                if n_tiles % cols:
+                    continue  # keep the width exact; a ragged width is legal but buys nothing here
+                per_core_M, per_core_N = m_tiles // rows, n_tiles // cols
+                key = (per_core_M * per_core_N, -_subblock_w(per_core_N))
+                if best is None or key < best[0]:
+                    best = (key, cols, rows, per_core_M, per_core_N)
+        if best is None:
+            return None
+        _, cols, rows, per_core_M, per_core_N = best
+        if best[0][0] >= stock.per_core_M * stock.per_core_N:
+            return None
+        return self.matmul_config(
+            m=m,
+            k=k,
+            n=n,
+            grid_size=(cols, rows),
+            fuse_batch=seq_len <= 1024,
+            per_core_M=per_core_M,
+            per_core_N=per_core_N,
+        )
+
+    def get_attn_wo_program_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
+        if mode == Mode.PREFILL and prefetcher is None and not self.is_galaxy and is_blackhole():
+            pc = self._prefill_wo_prg_config(seq_len)
+            if pc is not None:
+                return pc
+        return super().get_attn_wo_program_config(mode, seq_len, prefetcher)
+
     # The traced long-prefill QKV grid. Both stock and the trace branch below hard-code
     # CoreCoord(8, 10) on Blackhole, and the 8 is the expensive half of that pair.
     _QKV_MINIMAL_STOCK_GRID = (8, 10)  # (x, y), i.e. N rides 8 columns and M rides 10 rows
