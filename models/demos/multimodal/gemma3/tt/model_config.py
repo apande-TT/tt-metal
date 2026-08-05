@@ -469,8 +469,19 @@ _install_qkv_decode_cpp_matmul_seam()
 # re-derive the win (it is measured and reproducible above) but should attack that interaction:
 # try the (8,4)=32c and (11,3)=33c geometries, which measured 74.0 and 72.8 us, and check whether the
 # prefill trace capture is what deadlocks rather than the replay.
-_GEMMA3_QKV_PREFILL_1D_MCAST = os.environ.get("GEMMA3_QKV_PREFILL_1D_MCAST", "0") == "1"
-_GEMMA3_QKV_PREFILL_1D_GRID = (10, 4)
+#
+# 2026-08-05, structural rung, RETRY. The open question above ("is it capture or replay?") has an
+# answer, and it is neither device flakiness nor DRAM: tt/pipeline.py's `prefill_trace_step` calls
+# `generator.prefill_forward_text(..., enable_trace=True)`, so under check_full_pipeline_latency the
+# SHORT PREFILL IS ITSELF TRACE-CAPTURED, while profile_model and check_pcc run it eagerly. That is
+# exactly the split observed (both eager gates passed on the same tree that hung fullpipe twice), and
+# it means the 1D mcast has to be trace-safe, not merely fast.
+# So retry at the geometry the sweep says costs almost nothing and asks least of the trace region:
+# (8, 4) = 32 cores, per_core_N = 8, measured 74.0 us against (10, 4)'s 72.3 -- 2% of the op for 8
+# fewer cores, and 32 is FEWER cores than the stock 2D-mcast's own 40 (8 cols x rows=5), so this
+# cannot be adding core-grid footprint that stock did not already ask for.
+_GEMMA3_QKV_PREFILL_1D_MCAST = os.environ.get("GEMMA3_QKV_PREFILL_1D_MCAST", "1") == "1"
+_GEMMA3_QKV_PREFILL_1D_GRID = (8, 4)
 _GEMMA3_QKV_PREFILL_1D_BLK_W = 6
 _GEMMA3_QKV_PREFILL_1D_MAX_M_TILES = 4
 _QKV_PREFILL_INTERLEAVED_W: dict = {}
