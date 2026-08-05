@@ -614,6 +614,90 @@ def _install_qkv_prefill_interleaved_weight_seam():
 
 _install_qkv_prefill_interleaved_weight_seam()
 
+# --- DECODE create-heads: knob:shard on NLPCreateQKVHeadsDecodeDeviceOperation -------------------
+# The op has TWO program factories and select_program_factory picks between them purely on whether the
+# INPUT is sharded. gemma3 currently gets the INTERLEAVED one, because attention.py does
+# `ttnn.sharded_to_interleaved(xqkv_fused_sharded, L1_MEMORY_CONFIG, ttnn.bfloat16)` on the way in
+# (that line is only skipped when a prefetcher is present, i.e. on Galaxy). So the op takes its
+# 12.36 us on one core with a single reader.
+#
+# The SHARDED factory is a different implementation, and two things in it are worth measuring:
+#  * it splits the reader across risc0 and risc1, each pulling one sub-tile PHASE of every tile, so the
+#    ~256 sub-tile row copies are issued by two RISCs instead of one;
+#  * with overlap_qk_coregrid=False it emits TWO kernel sets on NON-OVERLAPPING core grids, one doing
+#    q+v and one doing k, which is the only way this op ever uses more than one core at batch=1.
+#
+# Requirements the sharded path validates (all satisfiable here): WIDTH_SHARDED, ROW_MAJOR, full height
+# per shard, and -- when qk coregrids do not overlap -- head_dim % shard_width == 0 so no shard holds a
+# partial head. At 8192 wide that makes 32 cores (256 = exactly one head each) the natural choice.
+#
+# Net cost is one extra interleaved_to_sharded launch, so this only pays if the sharded factory beats
+# the interleaved one by more than that.
+_GEMMA3_CREATE_HEADS_DECODE_SHARD = os.environ.get("GEMMA3_CREATE_HEADS_DECODE_SHARD", "1") == "1"
+_GEMMA3_CREATE_HEADS_DECODE_SHARD_CORES = int(os.environ.get("GEMMA3_CREATE_HEADS_DECODE_SHARD_CORES", "32"))
+
+
+def _install_create_heads_decode_shard_seam():
+    if not _GEMMA3_CREATE_HEADS_DECODE_SHARD or getattr(
+        ttnn.experimental.nlp_create_qkv_heads_decode, "_gemma3_ch_decode_shard_seam", False
+    ):
+        return
+
+    stock = ttnn.experimental.nlp_create_qkv_heads_decode
+    log_path = os.environ.get("GEMMA3_CH_DECODE_SHARD_LOG", "/tmp/gemma3_ch_decode_shard.log")
+
+    def _note(msg):
+        try:
+            with open(log_path, "a") as fh:
+                fh.write(msg + "\n")
+        except Exception:
+            pass
+
+    def _create(input_tensor, *args, **kwargs):
+        try:
+            shape = list(input_tensor.shape)
+            width = int(shape[-1])
+            cores = _GEMMA3_CREATE_HEADS_DECODE_SHARD_CORES
+            ok = (
+                len(shape) == 4
+                and int(shape[0]) == 1
+                and int(shape[1]) == 1
+                and not input_tensor.memory_config().is_sharded()
+                and width % (cores * ttnn.TILE_SIZE) == 0
+            )
+        except Exception as exc:  # noqa: BLE001
+            _note(f"reject: probe raised {exc!r}")
+            ok = False
+        if not ok:
+            return stock(input_tensor, *args, **kwargs)
+        try:
+            height = int(input_tensor.padded_shape[-2])
+            grid = ttnn.num_cores_to_corerangeset(cores, input_tensor.device().compute_with_storage_grid_size(), True)
+            sharded = ttnn.interleaved_to_sharded(
+                input_tensor,
+                ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                    ttnn.BufferType.L1,
+                    ttnn.ShardSpec(grid, [height, width // cores], ttnn.ShardOrientation.ROW_MAJOR),
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _note(f"reject: width-shard raised {type(exc).__name__}: {str(exc)[:200]}")
+            return stock(input_tensor, *args, **kwargs)
+        try:
+            return stock(sharded, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            _note(f"fallback: sharded factory raised {type(exc).__name__}: {str(exc)[:200]}")
+            return stock(input_tensor, *args, **kwargs)
+
+    _create._gemma3_ch_decode_shard_seam = True
+    _create._stock = stock
+    ttnn.experimental.nlp_create_qkv_heads_decode = _create
+    logger.info("gemma3: decode create-heads width-shard seam installed (%d cores)", _GEMMA3_CREATE_HEADS_DECODE_SHARD_CORES)
+
+
+_install_create_heads_decode_shard_seam()
+
 # --- PREFILL create-heads: land the Q/K/V slices in L1, not DRAM (knob:grid) ---------------------
 # ``nlp_create_qkv_heads`` is pure data movement -- it slices a [1, 1, S, 4096] fused QKV into
 # q[1, 16, S, 256] and k/v[1, 4, S, 256]. Both the call sites this model reaches (the text
