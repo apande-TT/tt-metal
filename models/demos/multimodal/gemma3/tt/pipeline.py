@@ -204,5 +204,11 @@ def build_pipeline(mesh_device, max_seq_len: int = 1024, batch_size: int = 1, in
     # Keep them reachable for callers that expect the llama-style attributes.
     generator.page_table = page_table
     generator.tt_kv_cache = tt_kv_cache
+    # This pipeline's contract is decode_prefill -> decode_step, i.e. it always runs a real prefill
+    # immediately after the warmup and its timed region is the STEADY-STATE token, never the first
+    # one. That is the precondition GemmaMultimodalGenerator.warmup_model_prefill documents for
+    # dropping the warmup pass of the bucket the prefill is about to run anyway -- the real pass
+    # compiles the same programs, so the warmup is a duplicate n_layers forward.
+    generator.skip_redundant_prefill_warmup = True
     _attach_decode_contract(generator, page_table, tt_kv_cache)
     return generator

@@ -602,6 +602,18 @@ class GemmaMultimodalGenerator(Generator):
             # nothing covers the prompt keeps the old behaviour for an over-long prompt.
             covering = [n for n in sequence_lengths_to_warmup if n >= imminent_seq_len]
             sequence_lengths_to_warmup = [min(covering)] if covering else sequence_lengths_to_warmup[-1:]
+            # OPT-IN, because it moves a cost rather than deleting one. When the covering bucket IS
+            # the imminent length, the caller's own prefill -- which runs the moment this returns --
+            # compiles exactly these programs itself, so the warmup pass is a duplicate n_layers
+            # forward. A caller that measures steady state (a server past its first request, this
+            # repo's perf pipeline) is strictly better off without it; a caller whose timed region
+            # is FIRST-token latency must leave the flag alone, because the compile then lands
+            # inside that region. Mark the bucket warmed either way: the real pass warms it.
+            if getattr(self, "skip_redundant_prefill_warmup", False) and sequence_lengths_to_warmup == [
+                imminent_seq_len
+            ]:
+                already_warmed.add(imminent_seq_len)
+                sequence_lengths_to_warmup = []
         sequence_lengths_to_warmup = [n for n in sequence_lengths_to_warmup if n not in already_warmed]
         if not sequence_lengths_to_warmup and self.already_warmed_up_prefill:
             return
