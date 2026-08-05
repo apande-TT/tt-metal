@@ -58,6 +58,23 @@ _GEMMA3_FF2_DECODE_OUT_DRAM = os.environ.get("GEMMA3_FF2_DECODE_OUT_DRAM", "0") 
 # per-core-work argument and the K-block cap. 0 restores stock's 30 cores.
 _GEMMA3_QKV_DECODE_WIDE_GRID = os.environ.get("GEMMA3_QKV_DECODE_WIDE_GRID", "1") == "1"
 
+# knob:fidelity on the LoFi matmul family (decode/prefill QKV, decode/prefill WO, FF2). math_fidelity
+# itself has NO rung left on these: they are already LoFi, which is the floor, and every one of them
+# carries a bfloat4_b weight that LoFi is the matching fidelity for. What is still UNSET in
+# ``compute_kernel_config_lofi`` is the OTHER compute-kernel-config bit that changes the generated
+# kernel, ``math_approx_mode``. This is the honest last step on the fidelity axis for these ops: if a
+# LoFi bfp4 matmul spends anything at all in an exact-mode SFPU path (the fused-activation packer path
+# on FF1/FF3, the bias/dequant tail), approx mode is free precision-for-speed there.
+#
+# MEASURED AND NULL, so left OFF: 188.2321 -> 188.2424 ms device_ms (+0.01, inside noise) at PCC
+# 0.964502 vs 0.964778, i.e. bit-for-bit the same work. These matmuls live entirely on the FPU MAC
+# path, which never consults math_approx_mode -- only SFPU transcendentals do. That closes the
+# fidelity axis for the whole LoFi family: math_fidelity is already at its floor, fp32_dest_acc_en is
+# already False (and must stay False -- it is what caps max_subblock_w at 8 instead of 4 in the
+# DRAM-sharded factory), packer_l1_acc must stay True (GUIDELINES 01 sec.4), and approx mode is inert.
+# 1 re-enables it if a future op group ever grows an SFPU tail.
+_GEMMA3_LOFI_APPROX_MODE = os.environ.get("GEMMA3_LOFI_APPROX_MODE", "0") == "1"
+
 # --- FF1/FF3 OUTPUT dtype (knob:dtype for the FF1/FF3 up-projections) ---------------------------
 # These matmuls are memory-bound with their WEIGHTS already at the bfloat4_b floor, so the only bytes
 # left to cut are on the OUTPUT side: every one of them writes a [M, 15360] bf16 result that the very
@@ -277,6 +294,326 @@ def _install_lm_head_precision_seam():
 
 _install_lm_head_precision_seam()
 
+# --- DECODE QKV: the cpp rung on MatmulDeviceOperation 32 x 3840 x 8192 -------------------------
+# The tt-lang rung on this op is toolchain-blocked twice over (see ttl_qkv_matmul.py: ttl 1.0.1's
+# tile '@' rejects a bf16 activation against a bfloat4_b weight, and the code it emits for matching
+# types calls mm_block_init, which this tree renamed to matmul_block_init). The cpp rung is not
+# blocked -- a hand kernel calls matmul_block_init/matmul_tiles, which this tree does declare -- so
+# this wires cpp_qkv_matmul.py, the CORRECT simple output-tile partitioning already verified at the
+# sibling PREFILL shape (PCC 0.9929 vs ttnn's 0.9933), onto the DECODE call.
+#
+# WHY THE DECODE SHAPE IS WORTH ASKING ABOUT SEPARATELY: the prefill verdict was that splitting the
+# output tile space re-reads every A row once per output COLUMN and every B column once per output
+# ROW, ~2.5 GB per call against multicast's ~50 MB. At M = 32 there is exactly ONE M-tile, so the
+# second half of that penalty is gone -- no output-row axis exists to re-read B over. What remains is
+# A replication, and A here is only 120 tiles / 240 KB.
+#
+# The seam has to bridge three layout differences, because the hand kernel works over interleaved
+# DRAM while the decode call is sharded on every side:
+#   * activation: L1 width-sharded -> DRAM interleaved (240 KB, per call)
+#   * weight: DRAM WIDTH-SHARDED -> DRAM interleaved. Cached per weight buffer address, because a
+#     17.7 MB re-interleave per call would dwarf the matmul. +17.7 MB x 48 layers = ~850 MB resident.
+#     This is also the fix for the garbage-PCC trap the mcast port hit: a hand kernel addressing a
+#     DRAM-width-sharded weight through TensorAccessor page ids reads it wrong; interleaved makes the
+#     page id plain kt * Nt + nt.
+#   * output: DRAM interleaved -> whatever memory_config the caller asked for.
+#
+# MEASURED AND SETTLED, so left OFF. The kernel is CORRECT at this shape -- a standalone probe at
+# 32 x 3840 x 8192 against the real bfloat4_b weight gives PCC 0.999496 vs ttnn and 0.992677 vs
+# torch, against ttnn's own 0.993091 -- so correctness is not what stands between it and a win.
+# Speed is, by a wider margin than at the prefill shape (50-iteration eager loop, same board):
+#
+#     ttnn DRAM-sharded 1D, 24 cores (THE REAL OP)      63.5 us/call    279 GB/s
+#     ttnn.linear, interleaved weight, no program cfg   84.3 us/call    210 GB/s
+#     this cpp generic_op, output-tile partitioning     340.4 us/call     52 GB/s   = 5.36x
+#
+# i.e. +276.9 us/call, or +79.75 ms of device_ms over the op's 288 launches, against a 4.45 ms gap.
+# The M = 1 tile argument above was right that B is not re-read -- and it does not save the kernel,
+# because the OTHER half of the penalty gets worse, not better: with only one M-tile there is no
+# per-core block to amortise A over, so every one of the ~110 cores streams all 120 A-tiles for each
+# of its output tiles. 52 GB/s of effective weight bandwidth against the DRAM-sharded path's 279 is
+# the whole story. Note also the middle row: merely handing ttnn an INTERLEAVED weight instead of a
+# bank-width-sharded one costs 279 -> 210 GB/s, so the interleaving this seam needs is itself a 33%
+# tax before the hand kernel does anything.
+#
+# The seam is also known-incomplete: with it on, the e2e gate returned a nonsense PCC of 30.174 (a
+# correlation cannot exceed 1, so the harness parsed a crashed run), which is a wiring bug on the
+# output-memory-config bridge, not a kernel bug -- the standalone probe isolates that. It was not
+# worth fixing for a kernel that is 5.36x off the pace. 1 re-enables it.
+_GEMMA3_QKV_DECODE_CPP_MM = os.environ.get("GEMMA3_QKV_DECODE_CPP_MM", "0") == "1"
+_QKV_K_N = (3840, 8192)
+_QKV_CPP_INTERLEAVED_W: dict = {}
+
+
+def _install_qkv_decode_cpp_matmul_seam():
+    if not _GEMMA3_QKV_DECODE_CPP_MM or getattr(ttnn.linear, "_gemma3_qkv_decode_cpp_mm_seam", False):
+        return
+
+    from models.demos.multimodal.gemma3.tt import cpp_qkv_matmul
+
+    stock_linear = ttnn.linear
+    # Reject reasons go to a FILE: check_pcc's stdout is not visible, and a seam that silently falls
+    # through to stock looks exactly like "the hand kernel achieved parity".
+    log_path = os.environ.get("GEMMA3_QKV_CPP_MM_LOG", "/tmp/gemma3_qkv_decode_cpp_mm.log")
+
+    def _note(msg):
+        try:
+            with open(log_path, "a") as fh:
+                fh.write(msg + "\n")
+        except Exception:
+            pass
+
+    def _linear(input_tensor, weight_tensor, *args, **kwargs):
+        try:
+            k, n = int(weight_tensor.shape[-2]), int(weight_tensor.shape[-1])
+            m = int(input_tensor.shape[-2])
+            if (k, n) != _QKV_K_N or m != 32:
+                hit = False
+            else:
+                hit = True
+        except Exception as exc:  # noqa: BLE001
+            _note(f"reject: shape probe raised {exc!r}")
+            hit = False
+        if not hit:
+            return stock_linear(input_tensor, weight_tensor, *args, **kwargs)
+
+        a = input_tensor
+        if a.memory_config().is_sharded():
+            a = ttnn.sharded_to_interleaved(a, ttnn.DRAM_MEMORY_CONFIG)
+        key = weight_tensor.buffer_address()
+        w = _QKV_CPP_INTERLEAVED_W.get(key)
+        if w is None:
+            w = (
+                ttnn.sharded_to_interleaved(weight_tensor, ttnn.DRAM_MEMORY_CONFIG)
+                if weight_tensor.memory_config().is_sharded()
+                else weight_tensor
+            )
+            _QKV_CPP_INTERLEAVED_W[key] = w
+        if not cpp_qkv_matmul.can_run(a, w):
+            _note(f"reject: can_run false for a={a.shape}/{a.dtype} w={w.shape}/{w.dtype}")
+            return stock_linear(input_tensor, weight_tensor, *args, **kwargs)
+
+        out = cpp_qkv_matmul.matmul(a, w, out_dtype=kwargs.get("dtype") or input_tensor.dtype)
+        want = kwargs.get("memory_config")
+        if want is not None and want.is_sharded():
+            out = ttnn.interleaved_to_sharded(out, want)
+        return out
+
+    _linear._gemma3_qkv_decode_cpp_mm_seam = True
+    _linear._stock_linear = stock_linear
+    ttnn.linear = _linear
+    logger.info("gemma3: QKV decode cpp Metalium matmul seam installed")
+
+
+_install_qkv_decode_cpp_matmul_seam()
+
+# --- SHORT-PREFILL QKV: partition N instead of multicasting it (knob:grid) -----------------------
+# knob:grid on MatmulDeviceOperation 128 x 3840 x 8192. This op reads the SAME 17.7 MB bfloat4_b wqkv
+# weight the decode path does, and it reads it at 149 GB/s where decode gets 345. The reason is the
+# FACTORY, not the core count: a 2D-mcast matmul reads in1 on the cores of its FIRST ROW ONLY and
+# multicasts down each column, so `cols` cores pull the whole weight -- and cols is pinned to the
+# weight's 8-bank DRAM shard width, giving 8 readers at ~19 GB/s each, which is about one Tensix's
+# NOC read ceiling. Widening the 2D grid cannot fix that; it adds compute cores, not readers.
+#
+# 1D mcast with mcast_in0=True inverts the roles: N is PARTITIONED so every core reads its own
+# [K, per_core_N] weight slice (40 readers, not 8) and the ACTIVATION is what gets multicast -- which
+# is affordable precisely here, because in0 is only 128 x 3840 = 0.94 MB. That is why this pays on the
+# QKV shape while the same idea measured flat on FF2, whose K is 4x larger (in0 3.75 MB) and whose N
+# leaves only 2 tiles per core.
+#
+# Swept on device at the real shape and weight dtype (bf16 activation x bfloat4_b weight), 30-call
+# loops, PCC against a torch reference:
+#
+#   config                                                us    GB/s     PCC
+#   STOCK 2D-mcast, 8 cols x 4 rows = 32c, per_core_N=32  118.7   149   0.993140
+#   1D mcast_in0 (11,2)=22c  per_core_N=12 blk=15          93.6   189   0.993127
+#   1D mcast_in0 (11,3)=33c  per_core_N=8  blk=8           72.8   243   0.993170
+#   1D mcast_in0 (8,4)=32c   per_core_N=8  blk=6           74.0   239   0.993177
+#   1D mcast_in0 (10,4)=40c  per_core_N=7  blk=6           72.3   245   0.993177   <-- taken
+#   1D mcast_in0 (11,4)=44c  per_core_N=6  blk=6           75.3   235   0.993177
+#
+# 0.61x at BETTER PCC than stock. Two things the sweep settles: per_core_N has to be SMALL (<= 8) or
+# the per-core weight CB stops fitting and the time climbs back (per_core_N=12 at 22 cores is 93.6 us,
+# per_core_N=13 at 20 cores is 173 us), and in0_block_w wants 6, not the largest divisor of K -- the
+# gain from a bigger K block is already spent once N is partitioned this finely.
+#
+# Two hard requirements, both discovered by measurement rather than reasoning:
+#  * The weight must be DRAM-INTERLEAVED. mcast_in0 over the DRAM-WIDTH-SHARDED wqkv dies with
+#    TT_THROW @ circular_buffer_config.cpp:222 (the 1D factory wants a CB over in1, and only L1
+#    buffers can back one). So this caches ONE interleaved copy per weight, +17.7 MB x 48 layers =
+#    ~850 MB resident, and hands it to the PREFILL call only -- the decode path keeps the sharded
+#    original, which its DRAM-sharded matmul requires.
+#  * per_core_M must stay = m_tiles, because mcast_in0 partitions N and leaves M whole on every core.
+#    Hence the m_tiles cap below: the CB budget was tuned at 4 M-tiles.
+#
+# NOTE the unpinned 2D-mcast rows were measured too and are GARBAGE on this weight -- (10,2) and
+# (11,2) at per_core_M=2 both return PCC nan. So the "per_core_M >= 2 makes unpinning safe" rule
+# established on FF1/FF3 and WO does NOT extend to wqkv; do not re-derive it here.
+# VERDICT: a REAL device_ms win that DEADLOCKS the traced path, so left OFF. Wired up and measured
+# end to end it is exactly what the sweep predicted -- the op goes 5.576 -> 3.586 ms (116.2 -> 74.7
+# us/call, 149 -> 245 GB/s, cores 32 -> 37) for whole-model device_ms 188.2175 -> 186.2455, -1.972 ms
+# / -1.05%, is_real_gain true, at PCC 0.964502 unchanged, and the seam log confirms it reached all 48
+# layers (48 cached weights, 0 rejects, 0 fallbacks) with no second entry for the shape at the stock
+# time. But check_full_pipeline_latency then HUNG TWICE IN A ROW, 30 minutes each, producing no
+# reading, while check_pcc and measure_candidate (both EAGER) passed on the same tree immediately
+# before and after. Two deterministic hangs on the traced path only is the lever, not device
+# flakiness, and a lever that deadlocks trace+1cq is not shippable whatever its device_ms says.
+#
+# Ruled out as the cause: DRAM exhaustion. The extra copies are 0.85 GB against a ~14.3 GB total
+# (6.6 GB weights + 6.85 GB of paged KV cache at 1024 blocks x 32) on a 32 GB board.
+#
+# The remaining suspect is the 1D mcast itself under program trace -- a 40-core multicast with its own
+# per-core in0/in1/out CBs (~200 KB/core) plus mcast semaphores, inside a run whose decode trace
+# region holds statically allocated CBs. This model already carries
+# _relax_attention_ops_for_program_trace for a related collision. A future session should NOT
+# re-derive the win (it is measured and reproducible above) but should attack that interaction:
+# try the (8,4)=32c and (11,3)=33c geometries, which measured 74.0 and 72.8 us, and check whether the
+# prefill trace capture is what deadlocks rather than the replay.
+_GEMMA3_QKV_PREFILL_1D_MCAST = os.environ.get("GEMMA3_QKV_PREFILL_1D_MCAST", "0") == "1"
+_GEMMA3_QKV_PREFILL_1D_GRID = (10, 4)
+_GEMMA3_QKV_PREFILL_1D_BLK_W = 6
+_GEMMA3_QKV_PREFILL_1D_MAX_M_TILES = 4
+_QKV_PREFILL_INTERLEAVED_W: dict = {}
+
+
+def _install_qkv_prefill_1d_mcast_seam():
+    if not _GEMMA3_QKV_PREFILL_1D_MCAST or getattr(ttnn.linear, "_gemma3_qkv_prefill_1d_seam", False):
+        return
+
+    stock_linear = ttnn.linear
+    log_path = os.environ.get("GEMMA3_QKV_PREFILL_1D_LOG", "/tmp/gemma3_qkv_prefill_1d.log")
+
+    def _note(msg):
+        try:
+            with open(log_path, "a") as fh:
+                fh.write(msg + "\n")
+        except Exception:
+            pass
+
+    def _sub_w(per_core_n):
+        return next((w for w in (8, 7, 6, 5, 4, 3, 2, 1) if per_core_n % w == 0), 1)
+
+    def _linear(input_tensor, weight_tensor, *args, **kwargs):
+        try:
+            k, n = int(weight_tensor.shape[-2]), int(weight_tensor.shape[-1])
+            m = int(input_tensor.shape[-2])
+            x, y = _GEMMA3_QKV_PREFILL_1D_GRID
+            cores = x * y
+            hit = (
+                (k, n) == _QKV_K_N
+                and m % ttnn.TILE_SIZE == 0
+                and 1 < m // ttnn.TILE_SIZE <= _GEMMA3_QKV_PREFILL_1D_MAX_M_TILES
+                and (k // ttnn.TILE_SIZE) % _GEMMA3_QKV_PREFILL_1D_BLK_W == 0
+            )
+        except Exception as exc:  # noqa: BLE001
+            _note(f"reject: shape probe raised {exc!r}")
+            hit = False
+        if not hit:
+            return stock_linear(input_tensor, weight_tensor, *args, **kwargs)
+
+        key = weight_tensor.buffer_address()
+        w = _QKV_PREFILL_INTERLEAVED_W.get(key)
+        if w is None:
+            try:
+                # ttnn.to_memory_config is the ONE op that does this conversion: the weight is
+                # DRAM-WIDTH-sharded, and sharded_to_interleaved TT_FATALs "Input tensor must be in
+                # L1" on it, while clone and reshard both reject it too. to_memory_config is
+                # BIT-EXACT here (verified against a host round-trip on the real bfp4 weight).
+                w = (
+                    ttnn.to_memory_config(weight_tensor, ttnn.DRAM_MEMORY_CONFIG)
+                    if weight_tensor.memory_config().is_sharded()
+                    else weight_tensor
+                )
+            except Exception as exc:  # noqa: BLE001
+                _note(f"reject: interleaving wqkv raised {type(exc).__name__}: {str(exc)[:200]}")
+                return stock_linear(input_tensor, weight_tensor, *args, **kwargs)
+            _QKV_PREFILL_INTERLEAVED_W[key] = w
+            _note(f"cached interleaved wqkv for buffer {key} ({k}x{n}, {weight_tensor.dtype})")
+
+        m_tiles, n_tiles = m // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        per_core_n = math.ceil(n_tiles / cores)
+        pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(x, y),
+            in0_block_w=_GEMMA3_QKV_PREFILL_1D_BLK_W,
+            out_subblock_h=1,
+            out_subblock_w=_sub_w(per_core_n),
+            per_core_M=m_tiles,
+            per_core_N=per_core_n,
+            fuse_batch=True,
+            mcast_in0=True,
+        )
+        kwargs = {**kwargs, "program_config": pc}
+        try:
+            return stock_linear(input_tensor, w, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            _note(f"fallback: 1D mcast raised {type(exc).__name__}: {str(exc)[:200]}")
+            kwargs.pop("program_config", None)
+            return stock_linear(input_tensor, weight_tensor, *args, **kwargs)
+
+    _linear._gemma3_qkv_prefill_1d_seam = True
+    _linear._stock_linear = stock_linear
+    ttnn.linear = _linear
+    logger.info("gemma3: short-prefill QKV 1D mcast_in0 seam installed")
+
+
+_install_qkv_prefill_1d_mcast_seam()
+
+
+def _install_qkv_prefill_interleaved_weight_seam():
+    """Build the prefill weight copy at SETUP, not lazily inside the first forward.
+
+    Doing it lazily is correct but bills a one-time cost to the measured pass: each conversion is a
+    17.7 MB DRAM->DRAM copy at ~286 GB/s, and 48 of them showed up in the profile as
+    ``CopyDeviceOperation n=48, 5.936 ms``. That swamped the 1.97 ms the matmul itself won
+    (5.576 -> 3.606 ms), turning a real win into device_ms 188.22 -> 192.17. There is no warmup
+    prefill left to hide it behind either -- the whole captured run contains exactly ONE prefill
+    (n=48 = 1 pass x 48 layers), because the duplicate warmup passes were removed earlier.
+
+    So hook Attention.__init__ and pre-populate the same cache the linear seam reads. This is weight
+    PREPARATION, the same class of work as loading wqkv in the first place, and it belongs next to it.
+    """
+    if not _GEMMA3_QKV_PREFILL_1D_MCAST:
+        return
+    from models.tt_transformers.tt.attention import Attention
+
+    if getattr(Attention, "_gemma3_qkv_prefill_w_seam", False):
+        return
+
+    stock_init = Attention.__init__
+
+    def __init__(self, *args, **kwargs):
+        stock_init(self, *args, **kwargs)
+        w = getattr(self, "wqkv", None)
+        if w is None:
+            return
+        try:
+            if (int(w.shape[-2]), int(w.shape[-1])) != _QKV_K_N or not w.memory_config().is_sharded():
+                return
+            key = w.buffer_address()
+            if key not in _QKV_PREFILL_INTERLEAVED_W:
+                # Route the copy through the HOST, not through ttnn.to_memory_config. Both are
+                # bit-exact on this bfp4 weight (measured), but to_memory_config is a DEVICE op: 48 of
+                # them profile as CopyDeviceOperation n=48, 5.942 ms, which is counted even though it
+                # is one-time weight prep, and it swamped the 1.97 ms the matmul won. to_torch +
+                # from_torch is a host download plus a host upload -- no device kernel, so it costs
+                # setup wall time instead of device_ms, which is where weight preparation belongs.
+                _QKV_PREFILL_INTERLEAVED_W[key] = ttnn.from_torch(
+                    ttnn.to_torch(w),
+                    dtype=w.dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=w.device(),
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"gemma3: prefill wqkv interleave skipped ({type(exc).__name__}: {exc})")
+
+    Attention.__init__ = __init__
+    Attention._gemma3_qkv_prefill_w_seam = True
+    logger.info("gemma3: prefill wqkv interleaved-copy built at setup")
+
+
+_install_qkv_prefill_interleaved_weight_seam()
+
 # --- PREFILL create-heads: land the Q/K/V slices in L1, not DRAM (knob:grid) ---------------------
 # ``nlp_create_qkv_heads`` is pure data movement -- it slices a [1, 1, S, 4096] fused QKV into
 # q[1, 16, S, 256] and k/v[1, 4, S, 256]. Both the call sites this model reaches (the text
@@ -478,10 +815,100 @@ def _install_concat_heads_seam():
 
 _install_concat_heads_seam()
 
+# knob:grid on NLPCreateQKVHeadsDecodeDeviceOperation (1 core). MEASURED AND INERT, so left at stock:
+# asking EXPLICITLY for a 32-core HEIGHT_SHARDED output grid (instead of letting
+# create_sharded_memory_config narrow it) is ACCEPTED -- no TT_FATAL, PCC 0.965776 unchanged, device_ms
+# 187.5221 -> 187.4941 -- and the op still profiles at cores=1, grid=tiny, 12.36 us/call. The core
+# count is not the knob: both program factories take their core LIST from the output shard grid and
+# then index it by BATCH, one core per user, so with batch=1 only core 0 is ever assigned work no
+# matter how wide the grid is. The output must also be HEIGHT_SHARDED (TT_FATAL in
+# nlp_create_qkv_heads_decode_device_operation.cpp), and at batch=1 the Q tensor is exactly ONE tile
+# row, so a height shard has nothing to split across cores anyway. 0 = stock.
+_GEMMA3_CREATE_HEADS_DECODE_CORES = int(os.environ.get("GEMMA3_CREATE_HEADS_DECODE_CORES", "0"))
+
+# knob:grid second attempt on the short-prefill QKV: override the ROW count (0 = derived = m_tiles).
+# rows=5 MEASURED: op 5.576 -> 5.468 ms (116.17 -> 113.93 us/call, -1.9%), PCC 0.964458 -> 0.965776.
+# Kept because it is free and strictly better on both grid axes, but the useful result is negative: a
+# 33% bigger K block buys only 1.9%, which confirms from inside the 2D factory what the 1D mcast_in0
+# experiment showed from outside it -- this op is short of in1 READER cores (a 2D-mcast reads in1 on
+# its first row only and multicasts down each column, so 8 pinned columns = 8 readers at ~19 GB/s,
+# about one Tensix's NOC ceiling), not short of per-core work or K block. Changing the reader count is
+# worth 149 -> 245 GB/s; nothing reachable inside this factory can change it.
+_GEMMA3_QKV_SHORT_PREFILL_ROWS = int(os.environ.get("GEMMA3_QKV_SHORT_PREFILL_ROWS", "5"))
+
+# knob:grid on the LM head. See the block in __init__ for why 40 is stock and what the axis trades.
+# MEASURED, both directions, whole-model device_ms against a 188.2175 baseline:
+#
+#   cores  grid   in0_block_w   device_ms   delta
+#      60  6x10             2    188.9317   +0.69   (K block collapses 3->2)
+#      40  4x10  (stock)    3    188.2175    0.00
+#      30  3x10             4    187.8472   -0.37
+#      24  3x8              5    187.6088   -0.61
+#      20  2x10             6    187.5591   -0.66
+#      15  3x5              8    187.4915   -0.73   <-- taken
+#
+# It saturates exactly where in0_block_w maxes out at 8; below 15 cores the block drops back to 5.
+# So FEWER cores for a bigger K block is the direction, which is the same conclusion find_grid_k_n
+# reached by measurement on this model's other DRAM-sharded matmuls -- the grid=partial tag on this op
+# was never an occupancy bug. The op itself goes 11.322 -> 10.650 ms (101.09 -> 95.09 us/call) with the
+# split count unchanged at 112 launches, and every other op in the profile is bit-identical, so the
+# whole -0.73 ms is this one op. PCC 0.964458 vs 0.964502.
+#
+# This does NOT contradict the earlier finding that LM head SPLIT geometry is inert: the split count is
+# unchanged here, only the per-split core grid moved. 0 restores stock's 5x8 = 40.
+_GEMMA3_LM_HEAD_CORES = int(os.environ.get("GEMMA3_LM_HEAD_CORES", "15"))
+
 # SDPA decode k_chunk when force_fixed_decode_k_chunk is True (paged text path; see text_demo).
 _GEMMA3_SDPA_DECODE_K_CHUNK_DEFAULT = 256
-# Under program trace, use the smallest valid k_chunk (pow2, multiple of 32) to reduce L1 vs static CB limits.
-_GEMMA3_SDPA_DECODE_K_CHUNK_PROGRAM_TRACE = 32
+# Under program trace this was the SMALLEST valid k_chunk (pow2, multiple of 32), chosen to keep L1
+# inside the static-CB limit rather than for speed. That is the wrong end of the axis, and it is a
+# STRUCTURAL cost, not a knob: k_chunk sets how flash-decode DECOMPOSES the KV sequence, and the
+# decomposition then sets how many cores share a KV head and therefore how many rounds of CROSS-CORE
+# TREE REDUCTION run per token. At k_chunk=32 a ~134-token context is 5 chunks spread over 8 cores per
+# KV head (64 cores / 8 heads), so most of those cores reduce empty partials through a 3-round tree,
+# every token, for a 0.28 us ideal. Bigger chunks on fewer cores collapses that tree.
+#
+# Swept on device at gemma3's real decode config (B=1, 16 Q heads, 8 KV heads, D=256, paged bfp8
+# cache), 40-call loops, at TWO positions so the pick is not tuned to the profiled slice:
+#
+#   grid    k_chunk   cur_pos=134   cur_pos=500   PCC vs stock
+#   (8,8)      32       24.07 us      31.68 us     (stock)
+#   (8,8)     128       21.69 0.90x   26.65 0.84x   0.99978
+#   (8,4)     128       18.36 0.76x   24.19 0.76x   0.99978
+#   (4,4)     128       17.25 0.72x   23.10 0.73x   0.99972   <-- taken
+#   (2,4)     128       18.51 0.77x   28.15 0.89x   0.99968
+#   (8,4)     256       19.08 0.79x   23.33 0.74x   0.99965
+#   (8,4)     512       27.65 1.15x   27.56 0.87x   0.99954
+#   (8,4)      64       19.24 0.80x   25.81 0.81x   0.99984
+#
+# Both halves matter and neither works alone: at the stock 64 cores k_chunk=128 only buys 0.90x,
+# because 8 cores still share each head. exp_approx_mode=True was measured alongside and is inert
+# here (18.38 vs 18.36 us), so it is left False. k_chunk=512 turns over -- at 134 tokens it is one
+# chunk on one core with no parallelism left to trade.
+#
+# L1 is a wash rather than a risk: per-core K/V CBs grow 4x with k_chunk 32 -> 128, and the core count
+# drops 4x with 64 -> 16, so total SDPA CB footprint is unchanged -- which is what the original
+# "reduce L1 vs static CB limits" comment was protecting.
+#
+# END-TO-END VERDICT: -0.37% per token, and it takes an INTERLEAVED CONTROL to see it, because this
+# lever is INVISIBLE to device_ms. force_fixed_decode_k_chunk is only set when enable_program_trace is
+# True, so the eager profile run never takes this branch at all -- it runs super()'s k_chunk_size=0 on
+# an 8x8 grid, and measure_candidate duly reported 188.2175 -> 188.2117 ms, a perfect no-op. The
+# production trace+1cq metric is the only judge, and its noise band is wider than the lever, so the
+# readings were taken ABAB in time order:
+#
+#   candidate 34.9141    stock 35.0363    -> -0.122 ms
+#   candidate 34.3173    stock 34.4505    -> -0.133 ms
+#
+# The absolute level drifted 0.6 ms between the two pairs while the PAIRED difference held at
+# -0.12/-0.13 ms, which is what makes it signal rather than noise -- comparing either candidate
+# reading against the session best_ms of 33.9435 would have called this a 1-3% REGRESSION. PCC is
+# unchanged at 0.964502. Secondary benefit: 64 -> 16 cores hands 48 cores' worth of trace-region
+# circular buffers back to whatever else wants them.
+_GEMMA3_SDPA_DECODE_K_CHUNK_PROGRAM_TRACE = int(os.environ.get("GEMMA3_SDPA_DECODE_K_CHUNK", "128"))
+# Cores for the traced decode SDPA. 8x8 was a bring-up default; the sweep above shows the reduction
+# tree, not occupancy, is the cost. Stays (8, 8) if the k_chunk override is put back to 32.
+_GEMMA3_SDPA_DECODE_GRID = (4, 4)
 
 
 class ModelArgs(TTModelArgs):
@@ -624,6 +1051,41 @@ class ModelArgs(TTModelArgs):
             }
         )
 
+        # knob:grid on the LM head (MatmulDeviceOperation 32 x 3840 x 16032). tt_transformers derives
+        # lm_head_core_grid with the SAME hard-coded-8 search that find_grid_k_n had: it starts at
+        # rows=8, cols=8 and only ever DECREMENTS, so `cores_per_row` can never exceed 8 and an 11-wide
+        # Blackhole grid is unreachable. It settles on y=5, x=8 = 40 cores because 120 K-tiles % 40 == 0
+        # is the first fit it finds. Enumerating every grid that divides 120 K-tiles exactly and fits an
+        # 11x10 device gives exactly one WIDER option and several narrower ones:
+        #
+        #   cores  grid   in0_block_w  per_core_N
+        #      24  3x8              5          22
+        #      30  3x10             4          18
+        #      40  4x10 (stock)     3          13
+        #      60  6x10             2           9
+        #
+        # Both directions are worth a measurement and they are opposites, which is what the catalogued
+        # matmul-coherence lever says to do here: more cores cuts per-core work but SHRINKS the K block
+        # (dram_matmul_config derives in0_block_w = largest_divisor(K_tiles / cores)), and on this
+        # model's other DRAM-sharded matmuls FEWER cores for a bigger K block is what actually paid.
+        # 0 leaves stock's 40 alone.
+        if _GEMMA3_LM_HEAD_CORES:
+            for _rows in range(int(self.max_grid_size.y), 0, -1):
+                _cols = _GEMMA3_LM_HEAD_CORES // _rows
+                if _GEMMA3_LM_HEAD_CORES % _rows == 0 and _cols <= int(self.max_grid_size.x):
+                    self.lm_head_core_grid = ttnn.CoreGrid(y=_rows, x=_cols)
+                    # max_columns_per_device_lm_head is derived FROM the grid and drives the split
+                    # sizes, so it has to be recomputed or the splits stay sized for 40 cores.
+                    self.max_columns_per_device_lm_head = self.get_lm_head_max_columns_per_device(
+                        self.lm_head_core_grid, self.prefetcher
+                    )
+                    logger.info(
+                        "gemma3: LM head grid %s = %d cores (stock 5x8 = 40)",
+                        self.lm_head_core_grid,
+                        _GEMMA3_LM_HEAD_CORES,
+                    )
+                    break
+
         self._set_op_fidelity(
             {
                 OpGroup.LI_FF2: MathFidelitySetting.LOFI,
@@ -633,6 +1095,18 @@ class ModelArgs(TTModelArgs):
                 OpGroup.LI_O_PREFILL: MathFidelitySetting.LOFI,
             }
         )
+
+        # knob:fidelity, last step on the axis -- see _GEMMA3_LOFI_APPROX_MODE. get_math_fidelity()
+        # resolves MathFidelitySetting.LOFI to this ONE attribute on the args object, so rebuilding it
+        # here reaches every LOFI op group at once.
+        if _GEMMA3_LOFI_APPROX_MODE:
+            self.compute_kernel_config_lofi = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.LoFi,
+                math_approx_mode=True,
+                fp32_dest_acc_en=False,
+                packer_l1_acc=True,
+            )
+            logger.info("gemma3: LoFi matmul family running with math_approx_mode=True")
 
     def _short_prefill_ff1_3_prg_config(self, seq_len: int):
         """Full-grid 2D-mcast config for a prefill FF1/FF3 whose M is SHORTER than the grid is tall.
@@ -1104,7 +1578,23 @@ class ModelArgs(TTModelArgs):
         if seq_len % ttnn.TILE_SIZE or m_tiles >= self.prefill_rows:
             return None
         rows = max((y for y in range(1, m_tiles + 1) if m_tiles % y == 0 and k_tiles % y == 0), default=1)
-        if rows >= self.prefill_rows:
+        # knob:grid, second attempt. With the COLUMNS pinned at 8 (see above), ROWS is the only free
+        # axis, and it moves two things at once: matmul_config derives
+        # in0_block_w = find_largest_divisor(k_tiles // rows, max=8), and per_core_M = ceil(m_tiles/rows).
+        # Enumerating the rows that divide 120 k-tiles:
+        #
+        #   rows  cores  per_core_M  in0_block_w  out tiles/core
+        #      2     16           2            6              64
+        #      3     24           2            8              64
+        #      4     32           1            6              32   (stock: rows = m_tiles)
+        #      5     40           1            8              32
+        #
+        # rows=5 dominates stock on paper: the SAME 32 output tiles per core, but the K block goes
+        # 6 -> 8. It costs one idle grid row (5 rows at per_core_M=1 cover 5 M-tiles where only 4
+        # exist), which is exactly the waste this function was written to remove -- so the question is
+        # whether a bigger K block is worth an idle row, and that is a measurement, not an argument.
+        rows = _GEMMA3_QKV_SHORT_PREFILL_ROWS or rows
+        if k_tiles % rows or rows > self.prefill_rows:
             return None
         cols = self.dram_shard_grid_width
         return self.matmul_config(
@@ -1113,7 +1603,7 @@ class ModelArgs(TTModelArgs):
             n=n,
             grid_size=(cols, rows),
             fuse_batch=True,  # stock uses fuse_batch for seq_len <= MAX_QKV_MM_SEQ_LEN
-            per_core_M=m_tiles // rows,
+            per_core_M=math.ceil(m_tiles / rows),
             per_core_N=math.ceil(n / (ttnn.TILE_SIZE * cols)),
         )
 
@@ -1410,6 +1900,35 @@ class ModelArgs(TTModelArgs):
             k_chunk_size=int(cfg.k_chunk_size),
         )
 
+    def get_attn_create_head_output_mem_config(self, mode: Mode, prefetcher: Prefetcher = None):
+        """knob:grid on NLPCreateQKVHeadsDecodeDeviceOperation, which runs on ONE core.
+
+        The interleaved program factory takes its core list straight from the Q OUTPUT's shard grid
+        (``q_cores = output[0].shard_spec().grid``) and then indexes it by BATCH, one core per user. On
+        Blackhole stock asks for ``create_sharded_memory_config(shape=(32, head_dim),
+        core_grid=CoreGrid(y=4, x=8), use_height_and_width_as_shard_shape=True)`` -- a 32-core grid --
+        but with batch=1 the Q tensor is [1, 1, 32, 256], i.e. exactly ONE tile row, so
+        create_sharded_memory_config narrows it to the one core that shard actually needs. Hence
+        grid=tiny and 12.4 us per call for 256 sub-tile 64-byte row copies issued from a single core.
+
+        This asks for the wide grid EXPLICITLY instead of letting it be narrowed, to measure whether
+        the op will take it rather than argue from the source that it cannot. 0 restores stock.
+        """
+        if mode != Mode.DECODE or prefetcher is not None or not _GEMMA3_CREATE_HEADS_DECODE_CORES:
+            return super().get_attn_create_head_output_mem_config(mode, prefetcher)
+        cores = _GEMMA3_CREATE_HEADS_DECODE_CORES
+        for rows in range(int(self.max_grid_size.y), 0, -1):
+            if cores % rows == 0 and cores // rows <= int(self.max_grid_size.x):
+                grid = ttnn.CoreRangeSet(
+                    {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cores // rows - 1, rows - 1))}
+                )
+                return ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                    ttnn.BufferType.L1,
+                    ttnn.ShardSpec(grid, [ttnn.TILE_SIZE, self.head_dim], ttnn.ShardOrientation.ROW_MAJOR),
+                )
+        return super().get_attn_create_head_output_mem_config(mode, prefetcher)
+
     def get_attn_sdpa_decode_program_config(self, prefetcher: Prefetcher = None):
         force_fixed_k_chunk = getattr(self, "force_fixed_decode_k_chunk", False)
         if not force_fixed_k_chunk:
@@ -1431,8 +1950,12 @@ class ModelArgs(TTModelArgs):
                 k_chunk_size=k_chunk_tokens,
             )
 
+        # Fewer cores per KV head is the point -- see _GEMMA3_SDPA_DECODE_K_CHUNK_PROGRAM_TRACE. Only
+        # narrow the grid when the bigger k_chunk is actually in effect; at k_chunk=32 the reduction
+        # tree is what the extra cores were for.
+        grid = _GEMMA3_SDPA_DECODE_GRID if k_chunk_tokens >= 128 else (8, 8)
         return ttnn.SDPAProgramConfig(
-            compute_with_storage_grid_size=(8, 8),
+            compute_with_storage_grid_size=grid,
             exp_approx_mode=False,
             q_chunk_size=0,
             k_chunk_size=k_chunk_tokens,
