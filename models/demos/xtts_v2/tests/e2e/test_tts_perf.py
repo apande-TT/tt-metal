@@ -60,7 +60,10 @@ _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
 # at device open, and 4 KB only covered the 3x3 conv2d halo -- the vocoder's k=11
 # dilated taps over 6656 samples need more, and coming up short surfaces as a
 # TT_FATAL "Out of Memory ... bank size is 0 B", not an API error.
-_DEV_PARAMS = {"l1_small_size": 32768}
+# 32768 covers the default ISL/OSL; a longer prefix fills the pool during the prefill/decode stage
+# captures and vocode's conv1d configs then find it exhausted (96 B free of 32768), so the reservation
+# is env-overridable -- test_e2e_tts.py already opens with 131072.
+_DEV_PARAMS = {"l1_small_size": int(os.environ.get("TT_PERF_L1_SMALL", "32768"))}
 if _PERF_TRACE:
     # Reserve the trace region at device-open, ONCE, for baseline and every candidate. The tool
     # measures trace+1cq end to end, so the device opens with a single command queue.
@@ -112,8 +115,7 @@ def prompt_ids_for_isl(tokenizer, n_tokens):
     """
     n = max(1, int(n_tokens))
     ids = []
-    base = ("it took me quite a long time to develop a voice and now that i have it "
-            "i am not going to be silent ")
+    base = "it took me quite a long time to develop a voice and now that i have it " "i am not going to be silent "
     try:
         chunk = list(tokenizer.encode(base, lang="en"))
         if not chunk:
@@ -198,8 +200,9 @@ def test_tts_perf():
             try:
                 # BOUNDED: AR decode capped at PERF_MAX_NEW_TOKENS audio codes, vocoder at its
                 # fixed 6-code chunk.
-                out = pipe.run_tts(cond_mel, ref_wav, text_inputs, audio_codes=None,
-                                   horizon=PERF_MAX_NEW_TOKENS, generate=True)
+                out = pipe.run_tts(
+                    cond_mel, ref_wav, text_inputs, audio_codes=None, horizon=PERF_MAX_NEW_TOKENS, generate=True
+                )
                 try:
                     ttnn.ReadDeviceProfiler(device)
                 except Exception:
@@ -212,8 +215,8 @@ def test_tts_perf():
             assert out["waveform"] is not None
 
         def _traced_forward():
-            from models.experimental.perf_automation.agent.trace_replay import measure_adapter
             from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter
+            from models.experimental.perf_automation.agent.trace_replay import measure_adapter
 
             # ISL: built to EXACTLY PERF_ISL_TOKENS tokens (same prompt the traced stages consume),
             # so the measurement condition is the tool's choice and not the generator's.
@@ -236,8 +239,7 @@ def test_tts_perf():
         _PROFILING = os.environ.get("TT_METAL_DEVICE_PROFILER") == "1"
         if _PERF_TRACE and not _PROFILING:
             if not _try_traced():
-                print("TRACE_REPLAY_FALLBACK=eager  # trace_replay isn't working — timing eagerly",
-                      flush=True)
+                print("TRACE_REPLAY_FALLBACK=eager  # trace_replay isn't working — timing eagerly", flush=True)
                 _eager_forward()
         else:
             _eager_forward()
