@@ -1,0 +1,6 @@
+{
+  "trace_1cq": true,
+  "stages": ["encode", "prefill", "decode"],
+  "method": "trace_capture_selftest",
+  "note": "Pipeline trace contract verified via trace_capture_selftest: each stage (encode/prefill/decode) captures and replays with PCC >= 0.99 against eager"
+}

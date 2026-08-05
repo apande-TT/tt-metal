@@ -1,0 +1,31 @@
+{
+  "component": "avg_pool1d",
+  "submodule_path": "model.audio_tower.avg_pooler",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "input": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          64,
+          3072
+        ],
+        "dtype": "torch.float32"
+      }
+    }
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      64,
+      1536
+    ],
+    "dtype": "torch.float32"
+  }
+}

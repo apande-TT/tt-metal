@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native TTNN stub for token embedding (language_model.embed_tokens).
+
+Simple embedding lookup: indices -> weight table -> output.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+
+def _to_device_rm(t, device):
+    try:
+        if isinstance(device, ttnn.MeshDevice):
+            return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
+                                   device=device, mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+    except (AttributeError, TypeError):
+        pass
+    return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+
+
+class TtTokenEmbed:
+    def __init__(self, device, torch_module):
+        self.device = device
+        self.weight = _to_device_rm(torch_module.weight.float(), device)
+
+    def __call__(self, x, **kwargs):
+        return ttnn.embedding(x, self.weight, layout=ttnn.TILE_LAYOUT)
+
+
+def build(device, torch_module):
+    return TtTokenEmbed(device, torch_module)

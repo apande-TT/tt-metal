@@ -1,0 +1,31 @@
+{
+  "component": "decoder_head",
+  "submodule_path": "lm_head",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          379,
+          3072
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      379,
+      131072
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

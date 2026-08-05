@@ -1,0 +1,29 @@
+{
+  "component": "voxtral_multi_modal_projector",
+  "submodule_path": "model.multi_modal_projector",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          375,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      375,
+      3072
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

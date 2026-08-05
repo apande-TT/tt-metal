@@ -1,0 +1,50 @@
+{
+  "component": "voxtral_encoder",
+  "submodule_path": "model.audio_tower",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          128,
+          3000
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "return_dict": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "True"
+      }
+    }
+  },
+  "output": {
+    "kind": "dict",
+    "items": {
+      "last_hidden_state": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1500,
+          1280
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "pooler_output": {
+        "kind": "tensor",
+        "shape": [
+          375,
+          3072
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    }
+  }
+}

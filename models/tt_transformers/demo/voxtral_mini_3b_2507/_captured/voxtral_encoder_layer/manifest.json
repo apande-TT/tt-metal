@@ -1,0 +1,35 @@
+{
+  "component": "voxtral_encoder_layer",
+  "submodule_path": "model.audio_tower.layers.0",
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1500,
+          1280
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "attention_mask": {
+        "kind": "none"
+      }
+    }
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      1500,
+      1280
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

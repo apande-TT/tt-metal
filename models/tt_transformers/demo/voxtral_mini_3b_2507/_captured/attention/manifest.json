@@ -1,0 +1,42 @@
+{
+  "component": "attention",
+  "submodule_path": "model.audio_tower.layers.0.self_attn",
+  "args": {
+    "kind": "tuple",
+    "items": []
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "hidden_states": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1500,
+          1280
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "attention_mask": {
+        "kind": "none"
+      }
+    }
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1500,
+          1280
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "none"
+      }
+    ]
+  }
+}

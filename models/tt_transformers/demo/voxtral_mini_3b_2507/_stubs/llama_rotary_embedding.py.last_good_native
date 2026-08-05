@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native TTNN stub for LlamaRotaryEmbedding (language_model.rotary_emb).
+
+Precomputes cos/sin tables in __init__; __call__ returns device-resident slices.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+
+def _to_device(t, device):
+    try:
+        if isinstance(device, ttnn.MeshDevice):
+            return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                                   device=device, mesh_mapper=ttnn.ReplicateTensorToMesh(device))
+    except (AttributeError, TypeError):
+        pass
+    return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+
+class TtLlamaRotaryEmbedding:
+    def __init__(self, device, torch_module):
+        self.device = device
+        max_seq = 256
+        with torch.no_grad():
+            pos_ids = torch.zeros(1, max_seq, dtype=torch.long)
+            dummy_x = torch.zeros(1, max_seq, 1)
+            cos_t, sin_t = torch_module(dummy_x, pos_ids)
+        self.cos_tt = _to_device(cos_t.float(), device)
+        self.sin_tt = _to_device(sin_t.float(), device)
+        self.head_dim = cos_t.shape[-1]
+
+    def __call__(self, x, **kwargs):
+        S = x.shape[1]
+        cos_s = ttnn.slice(self.cos_tt, (0, 0, 0), (1, S, self.head_dim))
+        sin_s = ttnn.slice(self.sin_tt, (0, 0, 0), (1, S, self.head_dim))
+        return (cos_s, sin_s)
+
+
+def build(device, torch_module):
+    return TtLlamaRotaryEmbedding(device, torch_module)
