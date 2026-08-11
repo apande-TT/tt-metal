@@ -275,11 +275,17 @@ class _LmLayerFromParts:
 
 
 # ------------------------------------------------------------ the pipeline
-# The first three decoder layers are built INDIVIDUALLY from graduated stubs (llama_decoder_layer,
-# and for layers 1-2 the finer llama_attention / llama_m_l_p / llama_r_m_s_norm split); everything
-# from index 3 up is one llama_model built with layer_range=(3, n_layers). The e2e gate requires
-# every routed stub to be invoked, so those three cannot be capped away -- they are the structure
-# being checked, not depth to be traded for profiling speed.
+# WHERE THE INDIVIDUALLY-ROUTED LAYERS END AND THE BULK STACK BEGINS.
+#
+# Layers 0..N-1 are built one at a time from graduated stubs (layer 0 as llama_decoder_layer; layers
+# 1-2 with the finer llama_r_m_s_norm / llama_attention / llama_m_l_p split), and everything from N
+# up is a single llama_model built with layer_range=(N, n_layers). The e2e gate requires every
+# routed stub to be INVOKED, so those layers are the structure under test, not depth that may be
+# traded away for a cheaper profile -- and below N the layer_range itself inverts.
+#
+# It is declared ONCE and used by both the range and the depth floor. Written as two literals they
+# would be free to drift, and the failure would be silent: a cap of 2 against a range starting at 3
+# builds a model whose stack is empty rather than short.
 _STUB_ROUTED_LAYERS = 3
 
 
@@ -309,9 +315,16 @@ def _profiling_depth(full_depth: int, requested: int | None = None) -> int:
     marker is printed. So only a positive integer caps, and only downward -- a value above the real
     depth is ignored rather than inventing layers that do not exist.
 
-    THE FLOOR IS STRUCTURAL, not a safety margin. Below _STUB_ROUTED_LAYERS the llama_model's
-    layer_range=(3, n_layers) inverts and the graduated stubs the e2e gate checks stop being
-    invoked; the cap would then be changing what is under test, not just how much of it runs.
+    NO FLOOR. The depth is the harness's decision -- optimize sizes it from op-signature coverage
+    (the smallest window that still surfaces every distinct block type) and proves the knob is live
+    by re-measuring the work signal. A model that quietly raised that number would be answering a
+    question it was not asked, and the harness would be told a cap took effect that did not.
+
+    An earlier revision here did clamp to _STUB_ROUTED_LAYERS, because the individually-routed
+    layers were built unconditionally and run by three straight-line calls indexing kv_slots[0..2]:
+    a two-layer build allocated two KV slots and raised IndexError on the first forward. The build
+    and the forward now follow the depth (see `_routed` and _lm_forward), so the clamp is gone and
+    any positive value below the real depth is honoured exactly.
     """
     want = requested
     if want is None:
@@ -319,7 +332,7 @@ def _profiling_depth(full_depth: int, requested: int | None = None) -> int:
         want = int(raw) if raw.isdigit() else None
     if not isinstance(want, int) or want <= 0 or want >= full_depth:
         return full_depth
-    return max(want, _STUB_ROUTED_LAYERS)
+    return want
 
 
 class VoxtralPipeline:
@@ -401,32 +414,40 @@ class VoxtralPipeline:
             S("llama_rotary_embedding").build(device, LM.rotary_emb, capacity=self.KV_C),
         )
 
+        # BUILD ONLY AS MANY INDIVIDUALLY-ROUTED LAYERS AS THE DEPTH ALLOWS. These three appends were
+        # unconditional, so a two-layer build still constructed three of them while allocating two KV
+        # slots -- the mismatch surfaced as an IndexError on the first forward, not at build time.
+        # `_routed` is what the depth actually permits, and _lm_forward iterates whatever was built.
+        _routed = min(_STUB_ROUTED_LAYERS, self.n_layers)
         self.lm_layers = []
-        self.lm_layers.append(W("llama_decoder_layer", S("llama_decoder_layer").build(device, LM.layers[0])))
-        self.lm_layers.append(
-            _LmLayerFromParts(
-                device,
-                LM.layers[1],
-                in_norm=W("llama_r_m_s_norm", S("llama_r_m_s_norm").build(device, LM.layers[1].input_layernorm)),
-                attn=W("llama_attention", S("llama_attention").build(device, LM.layers[1].self_attn)),
-                mlp=W("llama_m_l_p", S("llama_m_l_p").build(device, LM.layers[1].mlp)),
+        if _routed > 0:
+            self.lm_layers.append(W("llama_decoder_layer", S("llama_decoder_layer").build(device, LM.layers[0])))
+        if _routed > 1:
+            self.lm_layers.append(
+                _LmLayerFromParts(
+                    device,
+                    LM.layers[1],
+                    in_norm=W("llama_r_m_s_norm", S("llama_r_m_s_norm").build(device, LM.layers[1].input_layernorm)),
+                    attn=W("llama_attention", S("llama_attention").build(device, LM.layers[1].self_attn)),
+                    mlp=W("llama_m_l_p", S("llama_m_l_p").build(device, LM.layers[1].mlp)),
+                )
             )
-        )
-        self.lm_layers.append(
-            _LmLayerFromParts(
-                device,
-                LM.layers[2],
-                in_norm=None,
-                attn=W("llama_attention", S("llama_attention").build(device, LM.layers[2].self_attn)),
-                mlp=W("mlp", S("mlp").build(device, LM.layers[2].mlp)),
+        if _routed > 2:
+            self.lm_layers.append(
+                _LmLayerFromParts(
+                    device,
+                    LM.layers[2],
+                    in_norm=None,
+                    attn=W("llama_attention", S("llama_attention").build(device, LM.layers[2].self_attn)),
+                    mlp=W("mlp", S("mlp").build(device, LM.layers[2].mlp)),
+                )
             )
-        )
         self.rest = W(
             "llama_model",
             S("llama_model").build(
                 device,
                 LM,
-                layer_range=(3, self.n_layers),
+                layer_range=(_STUB_ROUTED_LAYERS, self.n_layers),
                 skip_embedding=True,
                 rope_capacity=self.KV_C,
             ),
@@ -581,9 +602,14 @@ class VoxtralPipeline:
         return ttnn.concat([head, audio_embeds, tail], dim=1)
 
     def _lm_forward(self, h, *, rope, kv_slots, mode):
-        h = self.lm_layers[0](h, rope=rope, kv=kv_slots[0], mode=mode)
-        h = self.lm_layers[1](h, rope=rope, kv=kv_slots[1], mode=mode)
-        h = self.lm_layers[2](h, rope=rope, kv=kv_slots[2], mode=mode)
+        # RUN THE INDIVIDUALLY-ROUTED LAYERS THAT WERE ACTUALLY BUILT. These were three straight-line
+        # calls indexing kv_slots[0..2] unconditionally, which fixed a floor under the depth cap: a
+        # build of two layers allocates two KV slots and the third call raised IndexError on the
+        # first forward -- so the model could be BUILT shallow and only failed when run. Iterating
+        # what exists lets the depth the harness chose stand on its own; the stub set stays the same
+        # (build_stubs decides which layers are routed), only how many of them run changes.
+        for _i, _layer in enumerate(self.lm_layers):
+            h = _layer(h, rope=rope, kv=kv_slots[_i], mode=mode)
         # NOTE: llama_model was BUILT with layer_range=(3, n_layers), so its
         # layer_weights list already IS layers 3..29.  Passing layer_range again
         # at call time would re-slice that subset (dropping layers 3,4,5).
