@@ -275,6 +275,53 @@ class _LmLayerFromParts:
 
 
 # ------------------------------------------------------------ the pipeline
+# The first three decoder layers are built INDIVIDUALLY from graduated stubs (llama_decoder_layer,
+# and for layers 1-2 the finer llama_attention / llama_m_l_p / llama_r_m_s_norm split); everything
+# from index 3 up is one llama_model built with layer_range=(3, n_layers). The e2e gate requires
+# every routed stub to be invoked, so those three cannot be capped away -- they are the structure
+# being checked, not depth to be traded for profiling speed.
+_STUB_ROUTED_LAYERS = 3
+
+
+def _profiling_depth(full_depth: int, requested: int | None = None) -> int:
+    """Cap the depth BUILT: the `layers` argument first, TT_PERF_LAYERS as the fallback.
+
+    THE ARGUMENT IS THE CONTRACT. emit-e2e specifies it directly -- "`layers` CAPS THE DEPTH BUILT,
+    and None means every layer -- never 0... Accepting `layers` is what makes that check pass rather
+    than merely be survived" -- and optimize PROVES it by capping and re-measuring the work signal,
+    reporting the knob INERT when the op count does not move. So the parameter is what a caller
+    should use; the environment variable is only the path for a test that cannot reach the builder.
+
+    WHY BOTH. This pipeline accepted neither. Depth came straight from the HF config, build_pipeline
+    filtered kwargs to {batch_size, prefill_capacity, kv_capacity} and dropped anything else
+    silently, and the generated perf test recorded the consequence in its own comment: "No depth
+    argument on this builder". The harness exported TT_PERF_LAYERS=2, nothing read it, and every
+    profile ran all 32 layers.
+
+    WHAT THAT COST, 2026-08-11: the optimize run's baseline profiled the full model for 96+ decode
+    steps, produced 35.2 million tracy zones, and was killed at the measurement backstop before the
+    device-perf CSV was written. The run then optimized for hours with no BEFORE number, because a
+    failed baseline is not fatal to the loop -- only to the meaning of its results.
+
+    ABSENT MEANS ALL LAYERS. The harness expresses "whole model" by REMOVING the variable, never by
+    sending a sentinel: "0" arrives as a truthy string and a builder that reads it as a number would
+    construct a zero-layer model, whose first prefill dies on an empty KV cache before any timing
+    marker is printed. So only a positive integer caps, and only downward -- a value above the real
+    depth is ignored rather than inventing layers that do not exist.
+
+    THE FLOOR IS STRUCTURAL, not a safety margin. Below _STUB_ROUTED_LAYERS the llama_model's
+    layer_range=(3, n_layers) inverts and the graduated stubs the e2e gate checks stop being
+    invoked; the cap would then be changing what is under test, not just how much of it runs.
+    """
+    want = requested
+    if want is None:
+        raw = (os.environ.get("TT_PERF_LAYERS") or "").strip()
+        want = int(raw) if raw.isdigit() else None
+    if not isinstance(want, int) or want <= 0 or want >= full_depth:
+        return full_depth
+    return max(want, _STUB_ROUTED_LAYERS)
+
+
 class VoxtralPipeline:
     """Resident TT pipeline: build once, run many.
 
@@ -291,6 +338,7 @@ class VoxtralPipeline:
         batch_size: int = DECODE_BATCH,
         prefill_capacity: int = PREFILL_C,
         kv_capacity: int = KV_C,
+        layers: int | None = None,
     ):
         self.device = device
         self.hf = hf_model
@@ -307,7 +355,7 @@ class VoxtralPipeline:
         self.n_kv = tcfg.num_key_value_heads
         self.head_dim = tcfg.head_dim
         self.hidden = tcfg.hidden_size
-        self.n_layers = tcfg.num_hidden_layers
+        self.n_layers = _profiling_depth(tcfg.num_hidden_layers, layers)
         self.vocab = tcfg.vocab_size
 
         inner = hf_model.model
@@ -811,7 +859,11 @@ def build_pipeline(device, model=None, **kwargs) -> VoxtralPipeline:
     Extra demo kwargs (text, prompt, language, ...) are accepted and ignored:
     the resident build derives its shapes from the config, not from a prompt.
     """
-    known = {"batch_size", "prefill_capacity", "kv_capacity"}
+    # `layers` is part of the emit-e2e build contract, not a demo nicety: optimize caps depth and
+    # re-measures the work signal to prove the knob is live, and a kwarg dropped by this filter is
+    # indistinguishable from a knob that does nothing. It stayed out of this set while the harness
+    # was setting TT_PERF_LAYERS every profiling run, so every profile built all 32 layers.
+    known = {"batch_size", "prefill_capacity", "kv_capacity", "layers"}
     opts = {k: v for k, v in kwargs.items() if k in known}
     if model is None:
         from models.tt_transformers.demo.voxtral_mini_3b_2507.tt.reference import load_hf_model
