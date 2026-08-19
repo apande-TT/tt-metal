@@ -46,3 +46,14 @@
   first for any maintainer comment/instruction on the monthly summary issue if it becomes
   readable, or any other signal that the secrecy policy config changed, before assuming this
   is still broken. If still unreadable, just call report_incomplete/noop without re-listing.
+
+## Run 2026-08-19 (run 32256696045)
+- 4th consecutive run checking the secrecy-policy blocker on issue/PR reads.
+- Still blocked: list_issues (state OPEN, apande-TT/tt-metal) returned 0 visible items; issues
+  #34-#38 all explicitly filtered with "secrecy requirements ... not authorized to access
+  private-scoped data." Confirms standing environment/config limitation across 4 runs, 2+ days.
+- All tasks (1,2,3,5,6,7,8) remain impossible — every one requires reading issue/PR state via
+  the github MCP tool, which is fully blocked.
+- Action: called report_incomplete once; no repeated hammering of list_issues/search tools.
+- Next run: do NOT re-probe repeatedly by default. Check once for signal the secrecy policy
+  changed; if still blocked, just report_incomplete/noop without extra tool calls.
