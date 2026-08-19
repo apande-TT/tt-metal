@@ -30,3 +30,19 @@
 - Next run: check again before resuming; if blocked a 3rd time, consider this a standing
   environment limitation worth escalating outside the automated loop rather than re-checking
   every run indefinitely.
+
+## Run 2026-08-19 (run 32226372452)
+- 3rd consecutive run checking the secrecy-policy blocker on issue/PR reads.
+- Still blocked: list_issues (state OPEN, apande-TT/tt-metal) returned 0 visible items, same
+  5 issues (#33-#37) explicitly filtered with "secrecy requirements ... not authorized to
+  access private-scoped data."
+- Confirms this is a standing environment/config limitation (not transient), now observed
+  across 3 separate runs on 2 different days. All tasks (1,2,3,5,6,7,8) remain impossible
+  since every one requires reading issue/PR state via the github MCP tool.
+- Action: called report_incomplete once (no repeated hammering). Escalating verbally in the
+  report that this needs a maintainer/infra fix (secrecy scope on the MCP server / token),
+  not another automated retry.
+- Next run: do NOT re-probe list_issues again on the very next run by default — instead check
+  first for any maintainer comment/instruction on the monthly summary issue if it becomes
+  readable, or any other signal that the secrecy policy config changed, before assuming this
+  is still broken. If still unreadable, just call report_incomplete/noop without re-listing.
