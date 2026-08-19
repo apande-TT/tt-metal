@@ -16,3 +16,17 @@
   rather than guessing at repo state or fabricating actions.
 - Next run: re-check whether the secrecy-policy filtering on issues/PRs has been lifted before
   resuming normal round-robin tasks. If still blocked, re-report rather than retry repeatedly.
+
+## Run 2026-08-19 (run 32206638332)
+- Re-checked whether secrecy-policy filtering on issues/PRs was lifted, per prior run's note.
+- Still blocked: `list_issues` (owner apande-TT, repo tt-metal, state OPEN) returned `[]` visible
+  items, with all 5 sampled issues (#33-#37) explicitly filtered: "Resource has secrecy
+  requirements that agent doesn't meet. The agent is not authorized to access private-scoped data."
+- This confirms the blocker is persistent/environmental, not transient. No issue/PR reads are
+  possible, so Tasks 1,2,3,5,6,7,8 (monthly summary requires searching/reading the summary issue)
+  remain impossible this run too.
+- Action: called report_incomplete again (2nd consecutive run blocked). Did not retry repeatedly
+  beyond one verification call, per guidance not to hammer a known-broken path.
+- Next run: check again before resuming; if blocked a 3rd time, consider this a standing
+  environment limitation worth escalating outside the automated loop rather than re-checking
+  every run indefinitely.
