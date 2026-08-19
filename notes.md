@@ -57,3 +57,15 @@
 - Action: called report_incomplete once; no repeated hammering of list_issues/search tools.
 - Next run: do NOT re-probe repeatedly by default. Check once for signal the secrecy policy
   changed; if still blocked, just report_incomplete/noop without extra tool calls.
+
+## Run 2026-08-19 (run 32290064024)
+- 5th consecutive run checking the secrecy-policy blocker on issue/PR reads.
+- Still blocked: github-issue_read get on issue #1 (apande-TT/tt-metal) returned
+  "filtered by secrecy policy ... not authorized to access private-scoped data."
+- Confirms standing environment/config limitation across 5 runs, 2+ days, unchanged.
+- All tasks (1,2,3,5,6,7,8) remain impossible — every one requires reading issue/PR state via
+  the github MCP tool, which is fully blocked at the secrecy-policy layer (not rate limits).
+- Action: called report_incomplete once; did not repeatedly hammer read tools.
+- Next run: do NOT re-probe every single run. Only re-check if there is external signal this
+  changed (e.g. a maintainer note elsewhere). Otherwise treat as a known standing blocker and
+  report_incomplete/noop quickly without extensive re-verification.
