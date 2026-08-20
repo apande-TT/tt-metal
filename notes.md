@@ -69,3 +69,15 @@
 - Next run: do NOT re-probe every single run. Only re-check if there is external signal this
   changed (e.g. a maintainer note elsewhere). Otherwise treat as a known standing blocker and
   report_incomplete/noop quickly without extensive re-verification.
+
+## Run 2026-08-20 (run 32322640012)
+- 6th consecutive run checking the secrecy-policy blocker on issue/PR reads.
+- Still blocked: github-issue_read get on issue #1 (apande-TT/tt-metal) returned identical
+  "filtered by secrecy policy ... not authorized to access private-scoped data" error.
+- Confirms standing environment/config limitation across 6 runs, 2+ days, unchanged. No
+  instructions were given via command mode (instructions empty), so normal scheduled workflow
+  applied but remains impossible — all tasks (1,2,3,5,6,7,8) require reading issue/PR state.
+- Action: single verification read call only (no hammering), then report_incomplete.
+- Next run: continue light-touch check (1 read call) before reporting; escalate to a human
+  if this persists much longer, as it's now a multi-day standing blocker needing infra/maintainer
+  attention (MCP server secrecy scope/token config), not something repo-assist can self-resolve.
