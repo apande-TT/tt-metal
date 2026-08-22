@@ -121,6 +121,13 @@ Authoring rules:
 | First time — understand the hardware limits (L1, grid, DST) | `01_FOUNDATIONS.md` | §1, §2, §3 |
 | Set up compute kernel config (`packer_l1_acc`, fidelity, `fp32_dest_acc_en`) | `01_FOUNDATIONS.md` | §3, §4, §5 |
 | Sweep matmul configs without producing bogus winners | `07_METHODOLOGY.md` | §2, §4, §9 |
+| Optimize a Mixture-of-Experts sparse matmul (experts, router, top-k) | `13_MOE_SPARSE_EXPERTS.md` | §1–§5 |
+| Pick a core count for an expert projection (MB/core knee) | `13_MOE_SPARSE_EXPERTS.md` | §2 |
+| Retune `in0_block_w` after a core-count change | `13_MOE_SPARSE_EXPERTS.md` | §3 |
+| Avoid silent wrong output from `out_subblock_w > 1` | `13_MOE_SPARSE_EXPERTS.md` | §4 |
+| Fuse a router / top-k / softmax / scatter cluster | `13_MOE_SPARSE_EXPERTS.md` | §6, §7 |
+| Decide whether an MoE decode path is finished | `13_MOE_SPARSE_EXPERTS.md` | §10 |
+| Cache a ProgramDescriptor so a kernel measurement is valid | `12_CPP_METALIUM_KERNELS.md` | §2 |
 | Establish a noise floor / know when a win is real | `07_METHODOLOGY.md` | §3 |
 | Wire a change into the model safely (in-model validation loop) | `07_METHODOLOGY.md` | §1 |
 | Gate a reduction-op change through full-model PCC | `07_METHODOLOGY.md` | §5 |

@@ -66,3 +66,57 @@ deadlock idle cores.
 AND verdict valid), `measure_candidate` (only a real gain that beats stock is a win — a matching or
 slower kernel is NO-GAIN, revert it), then `record_kernel_attempt(op, 'cpp', measured_ms, beat_baseline)`
 EVEN on a no-gain result (that records the rung as tried). A REJECTED/crashed measurement is never a win.
+
+---
+
+## Cache the ProgramDescriptor, or your measurement is wrong {#cpp-kernel-descriptor-cache}
+<!-- route
+op_class: other
+bound: host,slow
+rank: time
+lever_type: single-shot
+-->
+
+Building the `ProgramDescriptor` — circular buffers, `ttnn.RuntimeArgs`, core ranges —
+costs more than most kernels save. Rebuilding it per call measured **19 us at 8 cores**
+and **97 us at 80 cores**, and the cost grows with the core count, so it hides the very
+scaling you are trying to measure.
+
+This produced a wrong conclusion in one campaign: single-core ops looked "launch-bound",
+and the whole finding had to be retracted. With the descriptor cached the curve inverts.
+
+Build it once and key the cache on the buffer addresses, because a reallocated tensor
+invalidates the baked-in addresses:
+
+```python
+_PROG = {}
+
+def my_op(a, b, out):
+    key = (a.buffer_address(), b.buffer_address(), out.buffer_address(),
+           tuple(a.padded_shape), num_cores)
+    if key not in _PROG:
+        _PROG[key] = _build_descriptor(a, b, out, num_cores)   # CBs + runtime args
+    return ttnn.generic_op([a, b, out], _PROG[key])
+```
+
+Rules that follow from this:
+
+- **Never conclude "launch-bound" from wall time that includes descriptor construction.**
+  Build the descriptor, then start timing.
+- Pass `out_memcfg` in as a caller parameter. Deriving it inside the op forces a rebuild.
+- Batch the barriers. One `async_write_barrier` after all writes, not one per write.
+
+**Know the floor you are competing with.** A 1-tile `ttnn.clone` costs **9.12 us** and a
+1-tile typecast **10.49 us**. That is the dispatch floor on this hardware. A kernel that
+replaces 5 ops with 1 can only ever win about 4 floors, so measure the cluster's total
+first and stop if it is under about 1 us per token.
+
+Two authoring details that cost real debugging time:
+
+- **Sub-tile addressing.** When several logical rows share one tile (32 attention heads
+  in one tile row), the work unit must be one output **tile row**, and the kernel must
+  address face rows inside the tile. Splitting per logical row silently writes garbage.
+- **Match the producer's dtype exactly.** A kernel that reads raw bfloat16 halves from a
+  `bfloat8_b` producer gets plausible-looking but wrong values. Out-of-range indices
+  then wedge the NoC and hang the board. Force the producer's `dtype=` and clamp any
+  index the kernel writes with.
