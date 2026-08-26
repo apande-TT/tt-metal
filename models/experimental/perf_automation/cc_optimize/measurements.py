@@ -62,6 +62,55 @@ KIND_FLOOR = "modeled_floor"
 # a full-model measurement in the report.
 KIND_ACTIVE_BYTES = "active_bytes"
 
+# The COMPUTE roof's denominator -- peak FLOP/s at the math fidelity the model runs at. Anchored for
+# the same reason the floor and the bytes are, and it was the one ceiling input that never was.
+#
+# Blackhole's peak spans 4x across the modes (LoFi 702, HiFi2 351, HiFi3 234, HiFi4 175.5 TFLOPS), so
+# the `fidelity` rung moves this ceiling every time it lands. _promote_baseline already protects the
+# BAR on exactly this reasoning -- "a re-profile must not redefine what wins are graded against" --
+# and then refreshes the PICTURE the peak is read from, in the same function.
+#
+# Nothing announced it, which is why it outlived the other two. The memory roof divides by a fixed
+# 512 GB/s, so drift there prints an impossible bandwidth and gets caught. Here the peak IS what
+# moves, and the measurement moves with it: a stage that got 2x faster reports the same % of a
+# ceiling that also doubled. The error and the win cancel, and the reader sees neither.
+KIND_PEAK_FLOPS = "peak_flops"
+
+# The MEMORY roof's numerator, per stage: the bytes trace_replay observed that stage's ops reading.
+# Anchored for the third time for the same reason, because the reason has not changed and the shape
+# of the mistake is identical each time:
+#
+#   "The floor is a property of the IMPLEMENTATION, not a goal: halving a weight's dtype halves the
+#    bytes it must move, so recomputing it each round makes the target retreat ahead of the
+#    measurement and it is never reached."
+#
+# Measuring the read set instead of inferring it makes the number RIGHT; it does nothing about the
+# number MOVING, and the dtype rung moves it by construction -- bf16 -> bf8_b halves a weight, the
+# observed bytes halve, and the ceiling follows the build down. Keyed per stage, because each stage
+# has its own read set and decode's is the one that binds.
+KIND_STAGE_BYTES = "stage_bytes"
+
+# The COMPUTE roof's numerator: the parameters a matmul actually multiplies, per checkpoint section.
+#
+# THE CEILING IS PINNED OR IT IS NOT, and which roof binds is irrelevant to that. The other three
+# inputs were anchored one at a time, each after it moved something: the floor, the bytes, the peak.
+# This was the last one left loose, and it is loose for the same reason the others were -- blocks[]
+# lives in the arch mirror, written `{**prev, **keep}`, last-write-wins. The mirror calls itself safe
+# to cache without expiry because "a dtype or grid knob ... cannot change how many towers the model
+# has", which is true of the towers and NOT true of matmul_params: that figure subtracts the gathers
+# the profile OBSERVED, so a run that observes a different gather set recomputes it, and the compute
+# roof moves under a measurement that did not.
+#
+# Pinned per SECTION rather than per stage: prefill and decode share a subtree and must not be able
+# to disagree about how many parameters it multiplies.
+KIND_MATMUL_PARAMS = "matmul_params"
+
+# ITEMS ONE CALL OF A STAGE RETIRES -- the `tokens` in the compute floor's 2 x params x tokens.
+# Anchored for the same reason every other ceiling input is: the THEORETICAL column must describe
+# the state the campaign started from, and this one is re-observed from the run on every step. A
+# prefill chunk that changes size would move the ceiling under the measurement chasing it.
+KIND_STAGE_TOKENS = "stage_tokens"
+
 PHASE_BEFORE = "before"
 PHASE_AFTER = "after"
 

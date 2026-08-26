@@ -587,26 +587,40 @@ def _enumerate_task_heads(model_id: str) -> list:
     return unique
 
 
+# HOST-FALLBACK DETECTION, BY DEFAULT RATHER THAN BY LIST.
+#
+# This was six submodule names -- text_decoder, t2u_model, vocoder, speech_encoder, text_encoder,
+# lm_head -- which are SeamlessM4T's. Voxtral's are audio_tower and language_model, Gemma's are
+# vision_tower and language_model, and neither appears here, so for those models the check has never
+# fired at all: a pipeline calling `hf_model.audio_tower(...)` from its hot path -- the whole thing
+# this exists to catch, torch running on the host while the report calls it a device measurement --
+# passed silently. An allow-list of known-bad names can only produce false NEGATIVES, and every new
+# model is a new negative.
+#
+# Inverted: ANY attribute of hf_model reached from a hot function is a host fallback, because the hot
+# path is by definition what must be on device. The exemptions are the handful of accessors that
+# carry metadata rather than compute; a submodule nobody has heard of is caught by default.
+_HF_NON_COMPUTE_ATTRS = frozenset(
+    {"config", "generation_config", "device", "dtype", "name_or_path", "training", "base_model_prefix"}
+)
+_HF_ATTR = r"(?!(?:%s)\b)\w+" % "|".join(sorted(_HF_NON_COMPUTE_ATTRS))
 _G1B_HF_FALLBACK = (
-    r"(?<!\w)hf_model\.text_decoder\s*\(",
-    r"(?<!\w)hf_model\.t2u_model\s*\(",
-    r"(?<!\w)hf_model\.vocoder\s*\(",
-    r"(?<!\w)hf_model\.speech_encoder\s*\(",
-    r"(?<!\w)hf_model\.text_encoder\s*\(",
-    r"(?<!\w)hf_model\.lm_head\s*\(",
-    r"(?<!\w)self\.hf_model\.text_decoder\s*\(",
-    r"(?<!\w)self\.hf_model\.t2u_model\s*\(",
-    r"(?<!\w)self\.hf_model\.vocoder\s*\(",
-    r"(?<!\w)self\.hf_model\.speech_encoder\s*\(",
-    r"(?<!\w)self\.hf_model\.text_encoder\s*\(",
-    r"(?<!\w)self\.hf_model\.lm_head\s*\(",
-    r"(?<!\w)hf_model\.(text_decoder|t2u_model|vocoder|speech_encoder|text_encoder|lm_head)\.\w+\s*\(",
-    r"(?<!\w)self\.hf_model\.(text_decoder|t2u_model|vocoder|speech_encoder|text_encoder|lm_head)\.\w+\s*\(",
-    r"(?<!\w)hf_model\.(text_decoder|t2u_model|vocoder|speech_encoder|text_encoder)\.[\w.\[\]0-9]+\s*\(",
-    r"(?<!\w)self\.hf_model\.(text_decoder|t2u_model|vocoder|speech_encoder|text_encoder)\.[\w.\[\]0-9]+\s*\(",
+    r"(?<!\w)hf_model\.%s\s*\(" % _HF_ATTR,
+    r"(?<!\w)self\.hf_model\.%s\s*\(" % _HF_ATTR,
+    r"(?<!\w)hf_model\.%s\.[\w.\[\]0-9]+\s*\(" % _HF_ATTR,
+    r"(?<!\w)self\.hf_model\.%s\.[\w.\[\]0-9]+\s*\(" % _HF_ATTR,
 )
 
-_HF_ALIAS_ROOTS = ("text_decoder", "t2u_model", "vocoder", "speech_encoder", "text_encoder", "lm_head")
+
+def _is_hf_compute_attr(top: str) -> bool:
+    """Whether `hf_model.<top>` reached from a hot function means torch ran on the host.
+
+    Everything is, except the metadata accessors: the point of the check is that a hot path touching
+    the reference model at all is the fallback, whatever that submodule happens to be called.
+    """
+    t = str(top or "").strip()
+    return bool(t) and not t.startswith("_") and t not in _HF_NON_COMPUTE_ATTRS
+
 
 _TORCH_COMPUTE_BLOCKLIST = {
     "matmul",
@@ -756,7 +770,11 @@ def _check_hf_fallback(src: str) -> list:
         for sub in ast.walk(node):
             if isinstance(sub, ast.Assign):
                 root = _attr_root(sub.value)
-                if root and any(s in root for s in _HF_ALIAS_ROOTS):
+                if (
+                    root
+                    and "hf_model." in root
+                    and _is_hf_compute_attr(root.split("hf_model.", 1)[-1].split(".", 1)[0])
+                ):
                     for tgt in sub.targets:
                         if isinstance(tgt, ast.Name):
                             aliases[tgt.id] = root
@@ -783,7 +801,7 @@ def _check_hf_fallback(src: str) -> list:
                 if root:
                     tail = root.split("hf_model.", 1)[-1] if "hf_model." in root else ""
                     top = tail.split(".", 1)[0]
-                    if top in _HF_ALIAS_ROOTS:
+                    if _is_hf_compute_attr(top):
                         hits.append(f"{node.name}(): {_dotted_call(sub)}{via_suffix}")
                         continue
             walker = f
@@ -821,6 +839,153 @@ def _check_hf_fallback(src: str) -> list:
                     )
                     continue
     return hits
+
+
+_STACK_PROBE = """
+import json, sys
+import ttnn
+from models.experimental.perf_automation.cc_optimize._op_sig_probe import find_all_stacks
+sys.path.insert(0, {demo!r})
+from tt.pipeline import build_pipeline
+dev = ttnn.open_device(device_id=0, l1_small_size=24576)
+try:
+    pipe = build_pipeline(dev, layers=2)
+    try:
+        import torch as _t
+        _m = _t.nn.Module
+    except Exception:
+        _m = ()
+    n = 0
+    for st in find_all_stacks(pipe) or []:
+        blocks = getattr(st, "stack", None) or []
+        if not blocks:
+            continue
+        head = blocks[0]
+        if _m and isinstance(head, _m):
+            continue          # HF reference weights, never dispatched
+        if not callable(head):
+            continue          # KV slots and other data-only lists
+        n += 1
+    print("STACKS=%d" % n)
+finally:
+    try: ttnn.close_device(dev)
+    except Exception: pass
+"""
+
+
+def _missing_stack_knobs(demo_dir: Path, n_stacks: int) -> list:
+    """Per-stack depth overrides the factory should accept but does not.
+
+    Only meaningful once the model HAS more than one stack -- a single-stack model is fully described
+    by `layers`, and demanding overrides from it would be noise. The expected names come from the
+    model's own PIPELINE_STAGES, so nothing new is invented and a stage owning no repeated block
+    simply has no override to miss.
+
+    Read from the signature, not from prose: `**kwargs` is what silently swallowed `layers` on
+    Voxtral, and a promise in a docstring cannot be checked.
+    """
+    if n_stacks < 2:
+        return []
+    pipeline_py = demo_dir / "tt" / "pipeline.py"
+    if not pipeline_py.is_file():
+        return []
+    try:
+        tree = ast.parse(pipeline_py.read_text(errors="ignore"))
+    except SyntaxError:
+        return []
+    stages, params = [], set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "PIPELINE_STAGES" for t in node.targets):
+            try:
+                stages = [str(v.value) for v in node.value.elts]
+            except Exception:  # noqa: BLE001
+                stages = []
+        if isinstance(node, ast.FunctionDef) and node.name == "build_pipeline":
+            params = {a.arg for a in list(node.args.args) + list(node.args.kwonlyargs)}
+    if not stages or not params:
+        return []
+    want = ["%s_layers" % st for st in stages]
+    have = [w for w in want if w in params]
+    # A model whose stacks are fewer than its stages needs only as many overrides as it has stacks;
+    # accepting any of them is taken as the pattern being followed.
+    if have:
+        return []
+    return want[:n_stacks]
+
+
+def _block_stack_gate(demo_dir: Path, model_id: str, timeout_s: int):
+    """Every section the config declares must be visible to the profiler's walk.
+
+    Two independent facts, neither of which needs a naming convention or a marker in the model:
+
+      * the HF config declares a block depth PER SECTION (transformers has already parsed it), and
+      * building the model and walking it says how many stacks are actually discoverable.
+
+    Fewer stacks than sections means structure is hidden, and hidden structure cannot be sized,
+    capped or attributed -- it is inferred instead, silently, for the whole life of every run.
+
+    The build runs in a SUBPROCESS at layers=2: a shallow build is seconds, and a model that dies
+    building shallow is itself a finding (Voxtral crashed in the argmax reshape at depth 2 because
+    its aggregate sub-block was left holding zero layers). Either way, this command must not be taken
+    down by the model it is checking.
+
+    Returns a reason string, or None when the model is fine or the check could not run.
+    """
+    try:
+        from models.experimental.perf_automation.agent.layer_depth import declared_section_depths
+
+        sections = [int(d) for d in declared_section_depths(model_id=model_id, model_dir=str(demo_dir)) if int(d) > 0]
+    except Exception:  # noqa: BLE001
+        return None
+    if len(sections) < 2:
+        return None  # single-section model: one stack is the whole story
+    code = _STACK_PROBE.format(demo=str(demo_dir))
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=max(300, int(timeout_s or 0)),
+            cwd=str(demo_dir),
+        )
+    except Exception as exc:  # noqa: BLE001 -- an unrunnable probe is not a model defect
+        return None
+    found = None
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("STACKS="):
+            try:
+                found = int(line.split("=", 1)[1])
+            except ValueError:
+                pass
+    if found is None:
+        tail = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()[-3:]
+        return (
+            "G6 block stacks: the model could not be BUILT at layers=2 (a shallow build is what "
+            "every profile uses), so its stacks cannot be checked. Capping must leave a runnable "
+            "model, not a fragment. tail: %s" % " | ".join(t[:120] for t in tail)
+        )
+    # ONE KNOB PER STACK. A multi-stack model that accepts only `layers` forces every section to the
+    # same depth: optimize sizes a coverage window PER stack and has nowhere to put the second
+    # number, so it collapses them with max() and the shallow sections are profiled deeper than they
+    # need. Checked on the factory's SIGNATURE, the same way the depth argument itself is checked --
+    # a parameter is structure, a docstring promise is not.
+    _missing = _missing_stack_knobs(demo_dir, found)
+    if _missing:
+        return (
+            "G6 per-stack depth: %d block stacks but build_pipeline accepts only a single depth "
+            "argument (missing %s). Accept a per-stack override named for its PIPELINE_STAGES entry "
+            "(None falls back to `layers`), or the tool must force every section to one depth."
+            % (found, ", ".join(_missing))
+        )
+    if found < len(sections):
+        return (
+            "G6 block stacks: the config declares %d sections (depths %s) but only %d block "
+            "stack(s) are discoverable. Hold EACH repeated stack as a list of same-typed blocks, or "
+            "give differing per-layer wrappers a COMMON BASE. A stack the walk cannot see is never "
+            "capped, never marked, and its depth is inferred for the whole run."
+            % (len(sections), ", ".join(str(d) for d in sections[:4]), found)
+        )
+    return None
 
 
 def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
@@ -1138,6 +1303,25 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
         record_trace_verdict(demo_dir, _tg)
     except Exception as _tge:  # noqa: BLE001
         print("[emit-e2e] trace-gate evaluation skipped: %s" % _tge)
+
+    # ---- G6: the profiler can SEE every repeated stack -------------------------------------
+    # PROSE IN THIS FILE IS NOT A GUARANTEE. The spec above tells the author to cap every repeated
+    # stack and to keep each one discoverable, and Voxtral-Mini-3B was emitted violating both: its
+    # per-layer wrappers shared no base, so find_all_stacks saw ONE stack for a three-section model,
+    # full_blocks came back 0, the 2/4/8/16 ladder was climbed to recover a depth the markers give
+    # free, and a single depth capped the text decoder while both 32-layer audio encoders ran whole.
+    # That cost a day, and every gate in this file passed the entire time.
+    #
+    # The HF config is the witness and needs no device: it declares a depth per section, already
+    # parsed by transformers. Building the model at a shallow cap and walking it answers the other
+    # half -- how many stacks are actually visible -- in seconds, because a capped build is cheap
+    # (measured 7.1s on Voxtral at layers=2, against 30+ minutes at full depth).
+    #
+    # Failing here is the point. A model that reaches optimize undiscoverable is a defect in what
+    # THIS command just produced, and catching it now costs seconds instead of an hour of profiling.
+    _stack_reason = _block_stack_gate(demo_dir, os.environ.get("E2E_MODEL_ID", ""), timeout_s)
+    if _stack_reason:
+        reasons.append(_stack_reason)
 
     return (len(reasons) == 0), reasons
 
@@ -1746,15 +1930,82 @@ For EACH stage expose, ON THE PIPELINE object, the generic contract the perf eng
 AR stages ALSO keep the decode contract (decode_prefill seeds resident self- AND, for a seq2seq
 decoder, cross-attn KV; decode_step reads them, never recomputes).
 
-Expose a MODULE-LEVEL factory `build_pipeline(device, model=None, **kwargs)` in tt/pipeline.py that
+Expose a MODULE-LEVEL factory `build_pipeline(device, model=None, layers=None, **kwargs)` in
+tt/pipeline.py that
 CONSTRUCTS AND RETURNS the resident pipeline OBJECT — the one carrying PIPELINE_STAGES and the
 per-stage <stage>_trace_setup/_trace_step hooks (+ the AR decode contract). This is the
 SINGLE entry the perf harness (optimize's generated test) calls to OBTAIN that object for
 measurement. It MUST return the object, NOT run it — no generate()/run_tts()/one-shot result, which
 exposes none of the hooks and makes the trace engine skip. Accept and ignore any demo kwargs (text,
 prompt, language, …) for call-signature compatibility; the resident build derives its shapes from the
-config, not a prompt. `trace_capture_selftest` and the demo entry MUST build through this same factory
+config, not a prompt.
+
+`layers` CAPS THE DEPTH BUILT, and None means every layer -- never 0, which a builder reads as a
+zero-layer model. Build exactly `layers` repeats of EVERY repeated block the model has -- not just
+the text decoder -- and leave everything else (embeddings, norms, projectors, heads) intact, so a
+capped build still exercises every DISTINCT op the full model runs, just fewer times.
+
+EVERY STACK, because multimodal models have more than one and the singular wording here produced a
+model that could not run. Voxtral-Mini-3B has a 32-layer text decoder AND two 32-layer audio encoder
+stacks. Read as "the decoder / transformer stack", `layers=2` capped the text path and left both
+encoders at full depth -- 2 text layers behind 64 encoder layers, a configuration that exists in no
+real deployment. Measured 2026-08-12: n_layers=2, kv_slots=2, and enc_a/enc_b at 32 each, with the
+bulk llama_model resident-layer count at 0. The profile stayed large because the encoders dominate
+it, and the first forward died in the argmax reshape.
+
+A capped build must remain a MODEL, not a fragment: if capping a stack would leave an aggregate
+sub-block holding zero layers, cap to the smallest depth that keeps every stage able to run, and say
+so. "Fewer times" is the contract; "structurally absent" is not.
+
+ONE KNOB PER STACK WHEN THERE IS MORE THAN ONE STACK. `layers` is the DEFAULT depth for every
+repeated block; a model with several independent stacks must ALSO accept a per-stack override named
+after the stage it belongs to -- `<stage>_layers` for each entry in PIPELINE_STAGES that owns a
+stack (encode_layers, prefill_layers, decode_layers, ...). An override that is None falls back to
+`layers`, and `layers=None` still means every layer.
+
+A SINGLE NUMBER CANNOT DESCRIBE A MULTI-SECTION MODEL, and pretending otherwise is not neutral.
+optimize sizes a coverage depth PER STACK -- the smallest window in which every distinct op type of
+that stack appears -- and those numbers differ: an audio encoder built from one repeated conformer
+block saturates in 2, a text decoder interleaving attention and MLP variants may need 8. With one
+parameter the tool has nowhere to put the second number, so it collapses them (max) and every
+section gets the deepest one, or the model applies one value everywhere and the shallow sections are
+profiled deeper than they need while nothing is measured about them separately.
+
+Voxtral-Mini-3B is the worked example: a 32-layer text decoder and TWO 32-layer audio encoder
+stacks, one `layers` argument between them. Capping at 2 built 2 text layers behind 64 encoder
+layers before the encoders were capped too, and after they were, all three sections were forced to
+the same depth whether that suited them or not.
+
+The override names come from PIPELINE_STAGES, which the model already declares, so no new naming
+convention is introduced and nothing has to be guessed: a stage that owns no repeated stack simply
+takes no override.
+
+This exists because profiling is per-op, not per-layer: two layers surface the same op set as
+forty-eight at a fraction of the cost, and optimize profiles many times per run. Without it every
+profiling pass builds and runs the whole stack. Pipelines that omitted this parameter did not fail
+loudly -- the harness set TT_PERF_LAYERS, the builder ignored it, and the cap silently did nothing --
+so optimize now PROVES the knob works by capping and re-measuring the work signal, and reports it
+INERT when the op count does not move. Accepting `layers` is what makes that check pass rather than
+merely be survived. `trace_capture_selftest` and the demo entry MUST build through this same factory
 so there is ONE build surface.
+
+EVERY STACK MUST BE DISCOVERABLE, or the tool cannot see it to size, cap or attribute it. Hold each
+repeated block as a plain Python list (or nn.ModuleList) of SAME-TYPED elements; where graduated
+stubs must differ per layer, give them a COMMON BASE so the elements still share a type. No specific
+base class is required -- the walk reads "any same-typed object with __dict__" and runs against the
+object your factory RETURNS, so the shape is all that matters.
+
+Requiring a particular base (LightweightModule, nn.Module) was the old approach and it was a
+whitelist: two shapes were recognised, and the third model to arrive -- Voxtral-Mini-3B, whose
+blocks subclass neither -- was invisible. Its run reported full_blocks=0, climbed the 2/4/8/16
+ladder to recover a depth the markers give free, and sized ONE depth for a three-section model. A
+fourth shape would have been next. What the tool needs is a discoverable STRUCTURE, not a declared
+ancestry.
+
+The HF reference is the authority on how many sections a model has and how deep each is: walking a
+built Voxtral pipeline finds hf.model.audio_tower.layers (32) and hf.model.language_model.layers
+(30) directly, with no convention on the TT side at all. Keep that reference reachable from the
+built object -- it is ground truth for section structure, and cheaper than any marker.
 
 Expose trace_capture_selftest(device): for EACH stage in PIPELINE_STAGES, capture ONE step in
 ttnn.begin_trace_capture / end_trace_capture, execute_trace it, then RELEASE the trace before the

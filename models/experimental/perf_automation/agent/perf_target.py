@@ -56,6 +56,10 @@ _DEFAULT_BYTES_PER_ELEM = 2.0
 # dtype-independent, so it needs no such work, and xB -> xGB lands close enough to steer optimization
 # -- conservatively, since a bf4-heavy model streams less than 1 B/param and so has a HIGHER real
 # ceiling than this reports.
+# RETIRED AS A BYTE RULE. Was 1.0 -- one byte per parameter whatever the model is served at -- and
+# nothing computes a byte count from it any more. Kept for one job only: RECOGNISING a ledger anchor
+# that was written by the old rule, so the census can supersede it (see _anchor_is_placeholder). The
+# ledger stores a value and not the rule behind it, so arithmetic is the only way to tell.
 _BYTES_PER_PARAM = 1.0
 
 # The DRAM efficiency each read pattern sustains: ~80% of spec on a dense stream, ~50% on MoE, whose
@@ -176,7 +180,10 @@ class PerfTarget:
     # cheaper than the bug it prevents.
     theoretical_rate: float
     band: tuple[float, float]
-    regime: str = "decode"
+    # A LABEL, AND NOT A DEFAULTED ONE. The byte model stopped consulting this when its terms started
+    # keying on `items`, but the field still announced "decode" to every reader of a target built for
+    # any other stage. Empty means unstated, which is what an unset label is.
+    regime: str = ""
     tp_degree: int = 1
     seq_len: int = 0
     # THE UNIT THE CEILING IS PER. peak_BW / active_bytes is a rate only if `active_bytes` is what ONE
@@ -204,13 +211,42 @@ class PerfTarget:
     aggregate_rate: float = 0.0
 
 
-def active_bytes(model_facts: dict, *, regime: str = "decode", seq_len: int = 0) -> int:
-    """Bytes streamed from DRAM per decode step, summed per-tensor at each tensor's real dtype.
+def active_bytes(
+    model_facts: dict,
+    *,
+    regime: str = "",
+    seq_len: int = 0,
+    batch: int = 1,
+    items: int = 0,
+    block: dict | None = None,
+) -> int:
+    """Bytes streamed from DRAM per unit of work, summed per-tensor at each tensor's real dtype.
+
+    THE UNIT IS `items`, NOT A NAME. One unit of work streams the whole weight set exactly once --
+    that is why a decode token and a prefill request share a floor -- and adds two terms that scale
+    with the work it does: the KV it writes and the activations it carries, both linear in `items`.
+    A recurring stage passes items=1, a prompt-consuming stage passes the prompt length, an encoder
+    passes its frame count. `regime` is an optional label and is not consulted.
 
     Dense: Σ tensor_bytes(all weight tensors). MoE: shared_bytes + top_k * per_expert_bytes
-    (the reachable read set — NOT all experts). Optional KV term when seq_len>0."""
-    if regime != "decode":
-        raise NotImplementedError("perf_target models the decode regime only (prefill is FLOP-bound)")
+    (the reachable read set — NOT all experts). Optional KV term when seq_len>0.
+
+    BATCH SCALES THE KV TERM AND NOTHING ELSE, which is the whole reason batching pays: the weights
+    are read ONCE and amortised across every user in the step, while each user carries their own
+    KV history and reads all of it. So doubling the batch does not double the bytes -- it adds one
+    more KV history to a fixed weight cost, and the per-user ceiling falls only by that much.
+
+    Omitting the factor made batch free: an 8-user step was costed as a 1-user step, the ceiling came
+    out too high, and every at-floor verdict computed against it inherited the error."""
+    # NO NAME GATE. The math below has been items-driven since the KV/activation terms stopped
+    # branching on `regime == "prefill"` -- `regime` reaches nothing but this guard. It nevertheless
+    # REFUSED any stage whose name was not one of two, and the caller's `except Exception: return
+    # base` turned that refusal into a weights-only ceiling, silently: an audio encoder was priced as
+    # though it carried no activations at all, because of what it is CALLED.
+    #
+    # A stage's read set is decided by what it processes -- `seq_len`, `items`, `batch`, and the
+    # geometry of the block it runs -- every one of which the caller passes. None of them is a name.
+    # `regime` survives as a label a caller may pass for diagnostics; it is not consulted.
     mf = model_facts or {}
 
     if mf.get("is_moe"):
@@ -234,11 +270,53 @@ def active_bytes(model_facts: dict, *, regime: str = "decode", seq_len: int = 0)
             wb = float(mf.get("total_params", 0)) * _bytes_per_elem(dt)
 
     kv = 0.0
-    if seq_len and mf.get("layers") and mf.get("kv_heads") and mf.get("head_dim"):
+    # GEOMETRY COMES FROM THE BLOCK THIS STAGE RUNS, when the caller knows which one.
+    #
+    # It was read from the model root, and a multi-tower model has no geometry at its root: the
+    # extractor took `layers` from the deepest tower and the widths from another, producing a
+    # 32-layer 3072-wide model that does not exist. Every stage then priced its KV and activations
+    # with it -- the audio encoder at 0.041 ms against a 12.80 ms measurement.
+    #
+    # `block` is that stage's own {layers, hidden_size, intermediate_size, kv_heads, head_dim},
+    # established by depth rather than by name. Absent, the root is used exactly as before, which is
+    # correct for a single-block model and is the only shape that still emits root geometry.
+    _g = dict(block) if isinstance(block, dict) and block else mf
+    if seq_len and _g.get("layers") and _g.get("kv_heads") and _g.get("head_dim"):
         kv_dt = mf.get("kv_dtype") or mf.get("dominant_dtype") or "bfloat16"
-        kv = 2.0 * int(mf["layers"]) * int(mf["kv_heads"]) * int(mf["head_dim"]) * int(seq_len) * _bytes_per_elem(kv_dt)
+        kv = 2.0 * int(_g["layers"]) * int(_g["kv_heads"]) * int(_g["head_dim"]) * int(seq_len) * _bytes_per_elem(kv_dt)
+        kv *= max(1, int(batch or 1))
 
-    total = wb + kv
+    # PREFILL MOVES MORE THAN THE WEIGHTS. Refusing the regime outright meant its caller had nothing
+    # to use and fell back to the DECODE read set, so a report printed the same memory ceiling for
+    # both stages -- 21.84 ms each -- which reads as physics and is really one number used twice.
+    #
+    # Same weights (read once, whatever the prompt length), plus two terms that scale with the
+    # prompt: the KV it WRITES for every token, and activations, which are the per-token hidden and
+    # intermediate widths carried through each layer. Written from the same facts the decode path
+    # uses; no new inputs, no per-model table.
+    act = 0.0
+    # ITEMS, NOT A REGIME NAME. This read `if regime == "prefill"`, so the two terms that scale with
+    # WORK -- the KV a stage writes and the activations it carries -- existed for exactly one stage
+    # name. A third tower got neither, however much work it did, and the branch had to be edited for
+    # every stage anyone added. What actually separates them is how many items one unit of work
+    # processes: a prompt-consuming stage retires every prompt token, a recurring stage retires one,
+    # an encoder retires its frames. The caller knows that number and passes it.
+    #
+    # DEFAULT 0, so a caller that says nothing gets the weights and the KV it reads and no work
+    # term at all -- exactly what every non-prefill caller got before. Silence is not a claim
+    # that one item was processed.
+    _items = max(0, int(items or 0))
+    if _items and seq_len:
+        kv += (kv / float(seq_len)) * float(_items)  # written on the way in, then read back
+    _n, _h = _scalar(_g.get("layers", 0), 0), _scalar(_g.get("hidden_size", 0), 0)
+    _i = _scalar(_g.get("intermediate_size", 0), 0) or (4 * _h)
+    if _items and _n and _h:
+        a_dt = mf.get("dominant_dtype") or mf.get("torch_dtype") or "bfloat16"
+        # per layer: the residual stream in and out, and the MLP intermediate in and out
+        act = float(_n) * (2.0 * _h + 2.0 * _i) * float(_items) * _bytes_per_elem(a_dt)
+        act *= max(1, int(batch or 1))
+
+    total = wb + kv + act
     # Non-finite means the facts are junk (a corrupted/hand-edited perf_target_inputs.json: json.loads
     # accepts `Infinity`). int(round(inf)) raises OverflowError and took the whole ceiling path with it;
     # 0 reads as "no byte count", which is what an unusable input is.
@@ -265,12 +343,117 @@ def ceiling_params(model_facts: dict) -> int:
         if shared > 0 and per_expert > 0 and top_k > 0:
             return int(shared + top_k * per_expert)
         return 0
-    return int(_scalar(mf.get("total_params", 0), 0))
+    _tp = _scalar(mf.get("total_params", 0), 0)
+    if _tp > 0:
+        return int(_tp)
+    # DERIVED FROM THE TWO FIELDS THAT DEFINE IT. A census that walked the device records what it
+    # measured -- device_weight_bytes and the bytes each parameter occupies -- and need not also
+    # state their quotient. Requiring total_params meant such a file had NO param count at all, so
+    # every compute roof read "not measured" and the fidelity ladder said "needs a param count in
+    # perf_target_inputs.json" about a file that already contained one, twice over. Measured on
+    # voxtral: 10604865536 bytes at 2.0 bytes/param is 5.30e9 parameters, and the whole per-stage
+    # compute ceiling was withheld for want of that division.
+    _wb = _scalar(mf.get("device_weight_bytes", 0), 0) or _scalar(mf.get("weight_bytes", 0), 0)
+    _bpp = _scalar(mf.get("bytes_per_param", 0), 0)
+    if _wb > 0 and _bpp > 0:
+        return int(_wb / _bpp)
+    return 0
 
 
 def simple_active_bytes(model_facts: dict) -> int:
     """Bytes streamed per unit of work under the xB -> xGB rule. 0 when the param count is unknown."""
-    return int(round(ceiling_params(model_facts) * _BYTES_PER_PARAM))
+    params = ceiling_params(model_facts)
+    if not params:
+        return 0
+    # THE WIDTH, MEASURED. _BYTES_PER_PARAM is a placeholder -- 1 byte per parameter regardless of
+    # dtype -- and it is the whole reason voxtral published 141.8 tok/s/u against a true ~75: served
+    # bf16, it streams 2 bytes per parameter, not 1. gemma-3 is served bf8 (1.0625) so the
+    # placeholder landed within 6% and looked correct, which is why this went unnoticed.
+    #
+    # weight_census measures it from the BUILT model: every resident tensor's element count at its
+    # real dtype, so Σ(numel × width) / Σ(numel) is the average width actually in use. A model served
+    # part bf8 and part bf4 comes out at neither but at what it is.
+    #
+    # Deliberately the RATIO and not the census's byte TOTAL. The total counts everything resident --
+    # on gemma-3, 15.49 GB of which ~6.85 GB is KV cache, which the ceiling must not divide by
+    # because active_bytes prices KV separately from seq_len. Telling weights from cache needs a rule
+    # that holds for paged KV, Mamba state and architectures nobody has tested. The ratio needs none
+    # of it: cache is stored at the same widths as weights, so it barely moves the average.
+    # FLOAT default, deliberately: _scalar coerces with type(default), so an int default turns
+    # 1.0625 into 1 -- silently restoring the very placeholder this replaces. gemma-3's measured bf8
+    # width vanished that way while voxtral's 2.0 survived, so the fix appeared to work on one model
+    # and not the other. A width is fractional by nature: bf8 is 1.0625 and bf4 is 0.5625, because a
+    # 16-element tile shares an exponent.
+    _bpp = _scalar(model_facts.get("bytes_per_param", 0.0), 0.0)
+    if _bpp > 0 and model_facts.get("device_census_complete", True):
+        return int(round(params * float(_bpp)))
+    # NO 1-BYTE CONSTANT. Before the census there is still a declared width, and it is right for the
+    # dtype instead of right for one dtype: params x 1.0 is only ever correct if the model happens to
+    # be served at a 1-byte format. bf16 is 2.0, bf4 is 0.5625, and this model's measured mix is 1.32,
+    # so the constant was wrong for all three -- it published voxtral at 141.8 tok/s/u against a true
+    # ~55, and it survived review because gemma-3's bf8 (1.0625) is within 6% of 1.0 and looked fine.
+    #
+    # dominant_dtype comes from the checkpoint at phase "before", needs no device, and _bytes_per_elem
+    # already resolves its spelling. So the pre-census answer is a real width rather than a placeholder,
+    # and the census still supersedes it above once the built model has been measured.
+    _dt = model_facts.get("dominant_dtype") or model_facts.get("torch_dtype")
+    if _dt:
+        return int(round(params * _bytes_per_elem(_dt)))
+    # Nothing declares a width: the checkpoint's own byte total is the last real evidence available.
+    _wb = _scalar(model_facts.get("weight_bytes", 0), 0)
+    if _wb > 0:
+        return int(round(_wb))
+    # NO CONSTANT LAST RESORT. The xB -> xGB rule (params x 1.0) was a team decision on 2026-07-29,
+    # justified as CONSERVATIVE: TT models are typically served bf8 (1.0625) or bf4 (0.5625), both
+    # under a byte, so assuming one byte under-reports the ceiling and a run keeps optimising.
+    #
+    # That guarantee inverts the moment a model is served bf16. Voxtral-Mini-3B streams 2 bytes per
+    # parameter, so the rule reported a ceiling ABOVE what the hardware permits -- 141.8 tok/s/u
+    # against a true ~55 -- and told the run it had headroom that does not exist. Worse, the width is
+    # not even fixed for one model: a dtype rung moves it mid-run, bf16 -> bf8 -> bf4.
+    #
+    # A width is a property of the model, so it comes FROM the model or not at all: the census
+    # measures it, the checkpoint declares it, or the checkpoint's byte total states it outright. With
+    # none of those there is nothing to be right about, and 0 means "no ceiling" -- which the caller
+    # already renders as a missing roofline rather than inventing a number a reader would act on.
+    return 0
+
+
+def _anchor_is_placeholder(anchored_bytes: int, model_facts: dict) -> bool:
+    """Was this anchor the 1-byte-per-parameter guess, rather than a number derived from evidence?
+
+    Recognised by ARITHMETIC, not by a flag: the ledger records a value, not the rule that produced
+    it, and older entries predate any such flag. params x 1.0 is exact, so an anchor within half a
+    percent of the parameter count is that rule and nothing else -- no real width lands there unless
+    the model genuinely is served at one byte, in which case the census will agree and the swap is a
+    no-op.
+
+    Deliberately narrow. Only the placeholder is overridable; an anchor from the checkpoint's own byte
+    total, from measured per-op bytes, or from a previous census stays exactly as pinned.
+    """
+    params = ceiling_params(model_facts)
+    if not params or not anchored_bytes:
+        return False
+    # ANY params x <A WIDTH>, not just x 1.0.
+    #
+    # This matched 1.0 alone, because that was the only guess that existed when it was written. The
+    # pre-census width then became the model's DECLARED dtype -- correctly, 1.0 was wrong for bf16 --
+    # and the anchor started arriving as params x 2.0. The recogniser did not follow, so the guess
+    # stopped being recognised as a guess and the census could no longer replace it.
+    #
+    # Measured on voxtral, run 5, 2026-08-16: anchor 7.223 GB (3.611e9 x 2.0), census 1.718 GB, and
+    # the report printed a decode floor of 14.11 ms against a 2.89 ms measurement -- 2496.7 GB/s, or
+    # 487% of a 512 GB/s part. Worse than the bug it replaced, and invisible to the suite, because
+    # the test that guards this constructs an anchor of params x 1.0: the value the code no longer
+    # produces. The test encoded the old world and kept passing in the new one.
+    #
+    # What makes an anchor a placeholder is not the number 1.0, it is being PARAMS TIMES A CONSTANT
+    # WIDTH -- a prediction of what the loader would do, made before it did it. Every such product is
+    # superseded by the census; a checkpoint byte total, a measured per-op figure or a previous
+    # census is not one of these products and stays pinned exactly as before.
+    _widths = {float(w) for w in BYTES_PER_ELEM.values()} | {float(w) for w in _KNOWN_SPELLINGS.values()}
+    _widths.add(float(_BYTES_PER_PARAM))
+    return any(abs(float(anchored_bytes) - float(params) * w) <= 0.005 * float(params) * max(w, 1.0) for w in _widths)
 
 
 def bw_fraction(model_facts: dict) -> float:
@@ -457,9 +640,99 @@ def compute_target(
     if bytes_per_unit and float(bytes_per_unit) > 0:
         ab = int(round(float(bytes_per_unit)))
         src = "anchored baseline bytes"
+
+        # A PLACEHOLDER ANCHOR IS NOT EVIDENCE. The anchor is written at phase "before", from the
+        # checkpoint alone, because that is when the run needs a ceiling -- and it is write-once so
+        # the report and the stop gate can never score one run against two numbers. Both correct.
+        #
+        # What was wrong is that the anchor outranked the DEVICE CENSUS, which measures the built
+        # model and only becomes available afterwards. Voxtral pinned params x 1.0 = 3.61 GB, the
+        # census later measured 1.72 GB resident, and the census was never consulted: the report then
+        # printed a decode floor of 7.05 ms against a 6.11 ms measurement -- 590.9 GB/s on a 512 GB/s
+        # part, i.e. a physically impossible ceiling that no reader could act on.
+        #
+        # So the anchor is superseded exactly once, by a measurement of the same thing, and only when
+        # it is recognisably the old placeholder. Every anchor derived any other way still wins, and
+        # the value stays pinned for the rest of the run either way -- this replaces a guess with a
+    # THE MEASURED WIDTH, NOT THE MEASURED TOTAL.
+    #
+    # Both branches below used device_weight_bytes -- the census's byte TOTAL -- and
+    # simple_active_bytes twenty lines away says why that is wrong: "Deliberately the RATIO and not
+    # the census's byte TOTAL. The total counts everything resident -- on gemma-3, 15.49 GB of which
+    # ~6.85 GB is KV cache, which the ceiling must not divide by."
+    #
+    # And it is worse than that, because the total also encodes the DEPTH the census walked. The perf
+    # test drives trace_replay, and trace_replay runs the census -- so the census executes twice per
+    # cycle: once inside the full-pipeline gate, which measures every layer, and once inside the
+    # TRACY profile, which is legitimately depth-capped because an uncapped capture overflows the
+    # marker buffer. Whichever ran last wins. On voxtral that is 7.043 GB against 1.718 GB, a 4.1x
+    # swing in the ceiling's divisor decided purely by ordering; run 16 recorded one and run 17 the
+    # other, from identical code.
+    #
+    #   the RATIO  1.3228 (2 layers) vs 1.3252 (62)   0.2% apart -- an average width does not care
+    #                                                 how many layers were built
+    #   the TOTAL  1.718 GB vs 7.043 GB               4.1x apart
+    #
+    # So params x bytes_per_param keeps everything the census was added for -- it is still a
+    # MEASUREMENT of the served width, still outranks every predicted width, and still fixes the
+    # params x 1.0 placeholder that published voxtral at 141.8 tok/s/u against a true 54.7 -- while
+    # depending on the one figure that survives a capped build. Decode was the only stage to show it,
+    # because active_bytes feeds the MEMORY roof and decode is the only memory-bound stage; encode
+    # and prefill carried the same error on a non-binding row nobody reads.
+    # The WIDTH is preferred over the census's byte TOTAL, and the total is kept only as the fallback
+    # for facts that state no width. Where the census walks the whole model the two agree -- gemma-3
+    # measures 11.9 GB resident and 1.0625 B/param x 11.18B params = 11.88 GB, the same ceiling by
+    # either road. They part company only when the census is DEPTH-CAPPED, and then the width is the
+    # one that survives: an average width does not care how many layers were built, while a byte
+    # total is almost entirely a statement about how many were.
+    def _census_bytes():
+        _p = ceiling_params(mf) or 0
+        if not mf.get("device_census_complete", True):
+            return 0, 0.0, 0, ""
+        _bpp = _scalar(mf.get("bytes_per_param", 0.0), 0.0)
+        if _bpp > 0 and _p > 0:
+            return int(round(_p * _bpp)), _bpp, _p, "measured served width"
+        # No width stated. The total is all there is, and it is still a measurement of the built
+        # model -- better than any predicted width -- so it is used, but it carries the depth the
+        # census walked and says so.
+        _tot = int(_scalar(mf.get("device_weight_bytes", 0), 0))
+        if _tot > 0:
+            return _tot, ((_tot / _p) if _p else 0.0), _p, "resident total, no width stated"
+        return 0, 0.0, 0, ""
+
+    # An anchor pinned from the checkpoint alone is a placeholder, not evidence. Superseding it with a
+    # measurement before optimisation starts does not let the ceiling drift during it.
+    if _anchor_is_placeholder(ab, mf):
+        _cb, _bpp, _p, _how = _census_bytes()
+        if _cb > 0:
+            ab = _cb
+            src = "device census: %.3gB x %.4g B/param (%s, superseded a placeholder anchor)" % (
+                _p / 1e9,
+                _bpp,
+                _how,
+            )
+    # THE CENSUS OUTRANKS EVERY RULE, because it is not a rule. agent/weight_census walks the BUILT
+    # model and sums each resident tensor's element count at its REAL dtype -- the only place the
+    # served width exists, since the checkpoint records what was on disk and not what the loader
+    # decided. Every other branch here predicts that width: params x 1.0 published voxtral at
+    # 141.8 tok/s/u against a true 54.7, and the checkpoint's own byte count gives gemma-3 a 21.0
+    # ceiling for a model measuring 30.8. An INCOMPLETE census (a dtype the census has no width for)
+    # is refused rather than used as a lower bound: too few bytes reads as too HIGH a ceiling, which
+    # is the direction that ends a run early believing it is at the wall.
+    if ab <= 0:
+        _cb, _bpp, _p, _how = _census_bytes()
+        if _cb > 0:
+            ab = _cb
+            src = "device census: %.3gB x %.4g B/param (%s)" % (_p / 1e9, _bpp, _how)
     if ab <= 0:
         ab = simple_active_bytes(mf)
-        src = "params rule: %.3gB x %.2f B/param" % (ceiling_params(mf) / 1e9, _BYTES_PER_PARAM)
+        _p = ceiling_params(mf) or 0
+        _w = (ab / _p) if (_p and ab) else 0.0
+        src = "params rule: %.3gB x %.4g B/param (%s)" % (
+            _p / 1e9,
+            _w,
+            "device census" if _scalar(mf.get("bytes_per_param", 0.0), 0.0) > 0 else "declared dtype",
+        )
     if ab <= 0:
         ab = active_bytes(mf, seq_len=seq_len)
         src = "per-tensor exact bytes (no param count available)"
@@ -577,7 +850,3 @@ def score(target: PerfTarget, forward_ms: float) -> dict:
         "band": (round(target.band[0], 3), round(target.band[1], 3)),
         "effective_bw_bytes_s": eff_bw,
     }
-
-
-def prefill_ceiling(*_a, **_k):
-    raise NotImplementedError("prefill is FLOP-bound; v1 models decode only (peak_TFLOPs/model_FLOPs stub)")

@@ -27,7 +27,12 @@ import pytest
 import ttnn
 # from <model>.tt.<generator> import <Generator>   # lift the import from the demo
 
-PERF_MAX_NEW_TOKENS = int(os.environ.get("TT_PERF_MAX_NEW_TOKENS") or os.environ.get("TT_PERF_OSL_TOKENS", "128"))
+# ONE VARIABLE FOR ONE THING. There were two: PERF_OSL_TOKENS, which the test PRINTED, and
+# PERF_OSL_TOKENS, which the loop actually RAN -- with its own default of 4, from the generator's
+# first commit. So a declared OSL of 128 was reported while 4 executed, and every profile sampled a
+# thirty-second of the request it claimed to measure. Two names for one quantity is how a setting can
+# be honoured and ignored at the same time. TT_PERF_OSL_TOKENS is GONE; a probe that wants a
+# cheaper unit sets TT_PERF_OSL_TOKENS, and then the declared unit and the executed one still agree.
 PERF_FLUSH_EVERY = int(os.environ.get("TT_PERF_FLUSH_EVERY", "32"))
 # ISL / OSL -- THE MEASUREMENT CONDITIONS, and they default to a REALISTIC operating point rather
 # than to whatever example prompt reads naturally. Left unspecified, a generated perf test used the
@@ -40,6 +45,13 @@ PERF_FLUSH_EVERY = int(os.environ.get("TT_PERF_FLUSH_EVERY", "32"))
 # reader never has to guess the conditions.
 PERF_ISL_TOKENS = int(os.environ.get("TT_PERF_ISL_TOKENS", "128"))
 PERF_OSL_TOKENS = int(os.environ.get("TT_PERF_OSL_TOKENS", "128"))
+# BATCH BELONGS TO THE MODEL, not to this generator. It was written into the generated test as a
+# literal `batch=1`, so a pipeline emit-e2e built to serve 8 users was measured serving one, and its
+# aggregate throughput under-reported by 8x. 0 means "ask the pipeline" -- it already knows, via
+# max_batch_size / batch_size / batch, whichever it exposes -- and any positive value overrides, for
+# sweeping batch without rebuilding the demo. Unlike ISL and OSL, which are the TOOL's choice of
+# measurement condition, batch is a property of the artifact under test.
+PERF_BATCH = int(os.environ.get("TT_PERF_BATCH", "0"))
 # DEPTH. A POSITIVE TT_PERF_LAYERS caps the profiled window so a deep model's marker stream (x mesh
 # chips) does not overflow the profiler; the tool sends that number for tracy runs. The variable being
 # ABSENT means ALL LAYERS -- the tool expresses "whole model" by REMOVING the cap, never by sending a
@@ -54,7 +66,7 @@ PERF_LAYERS = int(_pl) if (_pl.isdigit() and int(_pl) > 0) else None
 # unset env behaves exactly as the demo does. If the source uses a `mesh_device` FIXTURE, keep that
 # fixture + its parametrize and feed this tuple in; if it SELF-OPENS, pass it to MeshShape().
 # A copied MESH_DEVICE board table on its own cannot see --devices/--mesh.
-from models.experimental.perf_automation.agent.perf_adapter import resolve_mesh_shape
+from models.experimental.perf_automation.agent.perf_adapter import resolve_batch, resolve_mesh_shape
 _MESH_SHAPE = resolve_mesh_shape(default_rows=<source rows>, default_cols=<source cols>)
 
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
@@ -68,7 +80,7 @@ if _MESH_SHAPE[0] * _MESH_SHAPE[1] > 1:
 if _PERF_TRACE:
     # Reserve the trace region at device-open, ONCE, for baseline and every candidate. The tool
     # measures trace+1cq end to end, so the device opens with a single command queue.
-    _DEV_PARAMS["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "23887872"))
+    _DEV_PARAMS["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "41943040"))
     _DEV_PARAMS["num_command_queues"] = 1
 
 @pytest.mark.parametrize("device_params", [_DEV_PARAMS], indirect=True)
@@ -98,7 +110,7 @@ def test_<task>_perf(device_params, device):
                     _orig.append((_mod, _n, _op)); setattr(_mod, _n, _draining(_op))
         _fw0 = time.monotonic()
         try:
-            out = ...  # run the pipeline BOUNDED (cap decode via PERF_MAX_NEW_TOKENS, or one forward)
+            out = ...  # run the pipeline BOUNDED (PERF_OSL_TOKENS decode steps, or one forward)
             try: ttnn.ReadDeviceProfiler(device)
             except Exception: pass
         finally:
@@ -120,7 +132,7 @@ def test_<task>_perf(device_params, device):
         print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
         # Stage adapter profiles WHATEVER emit-e2e emitted: every PIPELINE_STAGES entry gets
         # traced. Falls back to the single decode contract for pipelines that expose only decode_step.
-        measure_adapter(PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=1), device)
+        measure_adapter(PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=PERF_BATCH), device)
 
     def _try_traced():
         try:
@@ -162,7 +174,7 @@ import ttnn
 # unset env behaves exactly as the demo does. If the source uses a `mesh_device` FIXTURE, keep that
 # fixture + its parametrize and feed this tuple in; if it SELF-OPENS, pass it to MeshShape().
 # A copied MESH_DEVICE board table on its own cannot see --devices/--mesh.
-from models.experimental.perf_automation.agent.perf_adapter import resolve_mesh_shape
+from models.experimental.perf_automation.agent.perf_adapter import resolve_batch, resolve_mesh_shape
 _MESH_SHAPE = resolve_mesh_shape(default_rows=<source rows>, default_cols=<source cols>)
 
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
@@ -174,7 +186,7 @@ _DEV_PARAMS = {"l1_small_size": 24576}
 if _MESH_SHAPE[0] * _MESH_SHAPE[1] > 1:
     _DEV_PARAMS["fabric_config"] = True   # only if the SOURCE sets it
 if _PERF_TRACE:
-    _DEV_PARAMS["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "23887872"))
+    _DEV_PARAMS["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "41943040"))
     _DEV_PARAMS["num_command_queues"] = 1
 
 @pytest.mark.parametrize("device_params", [_DEV_PARAMS], indirect=True)
@@ -195,7 +207,9 @@ def test_<task>_perf(device_params, device):
     assert out is not None                              # perf only — NO PCC
     print("FORWARD_WALL_MS=%.4f" % _ms)
     print("TRACE_PER_TOKEN_MS=%.4f" % _ms)
-    print("TRACE_REPLAY_PATH=trace+1cq native batch=1")
+    # resolve_batch, not PERF_BATCH: 0 means "ask the pipeline", and printing 0 would tell the gate
+    # this run served nobody. This path has the built pipeline in hand, so it can ask.
+    print("TRACE_REPLAY_PATH=trace+1cq native batch=%d" % resolve_batch(pipe, PERF_BATCH))
 """
 
 
@@ -314,7 +328,35 @@ _TRACE_REGION_GROW_ROUNDS = 6
 # trace_gate.overflow_fix_loop (already mesh-safe). Matches the region assertion, not the separate
 # write-during-capture fatal (fd_mesh_command_queue.cpp).
 _MESH_TRACE_OVERFLOW_RE = re.compile(r"get_trace_buffers_size|mesh_trace\.cpp", re.I)
-_DEFAULT_TRACE_REGION_BYTES = 23887872
+
+
+def _skeleton_default(var: str) -> int:
+    """The default for `var` READ OUT OF THE EMITTED TEST, not written again here.
+
+    The generated test is standalone -- it cannot import from its generator -- so its defaults have
+    to be literals in `_SKELETON_REF`. That makes the skeleton the one place these numbers are
+    stated, and anything else that needs them (the report prices prefill as 2 x params x ISL) must
+    READ them from there rather than keep a second copy: two copies of a number is how the report
+    came to price a run's arithmetic against a length that run never used.
+
+    0 when the skeleton does not state one, which withholds rather than invents.
+    """
+    m = re.search(r'os\.environ\.get\(\s*"%s"\s*,\s*"(\d+)"\s*\)' % re.escape(var), _SKELETON_REF)
+    return int(m.group(1)) if m else 0
+
+
+DEFAULT_ISL_TOKENS = _skeleton_default("TT_PERF_ISL_TOKENS")
+DEFAULT_OSL_TOKENS = _skeleton_default("TT_PERF_OSL_TOKENS")
+
+# ROOM FOR EVERY STAGE'S TRACE, NOT JUST ONE. 23887872 fit a decode trace alone. A pipeline that
+# also traces its prefill needs both to co-reside -- gemma-3 asks for 24420352 -- and the shortfall
+# does not degrade, it TT_FATALs inside end_trace_capture. The failure reads as "tracing this stage
+# does not work" and is really "the region was sized for one trace", which is how traced prefill came
+# to be disabled in a model config rather than given room.
+#
+# 40 MiB, so a second stage trace is covered without anyone passing an env var. Still overridable;
+# the perf test prints what it reserved.
+_DEFAULT_TRACE_REGION_BYTES = 41943040
 
 
 def _needed_trace_region(text: str):
@@ -398,7 +440,13 @@ def _run_perf_node(node_abs: str, extra_env: dict, timeout_s: int = 2400):
     def _once(ev):
         env = dict(os.environ)
         env.setdefault("TT_PERF_TRACE", "1")
-        env.setdefault("TT_PERF_MAX_NEW_TOKENS", "4")
+        # VALIDATION, not measurement. This answers "does the generated test run at all", which four
+        # tokens establish as well as a hundred and twenty-eight, and the cap keeps a generative loop
+        # from running forever. It sets the SAME variable everything else uses -- there is no longer a
+        # second one -- so the test still reports the unit it executed. An earlier revision raised it
+        # to the declared OSL believing the PROFILE came through here; it does not (profile_model ->
+        # measure_runs -> probes.make_run_profiled), so that only made validation 32x slower.
+        env.setdefault("TT_PERF_OSL_TOKENS", "4")
         env.pop("TT_METAL_DEVICE_PROFILER", None)
         env.update(ev)
         cmd = [sys.executable, "-m", "pytest", "-o", "timeout=0", "-s", node_abs]
@@ -585,8 +633,8 @@ def skeleton_for(root: Path) -> str:
             "            # the single decode contract it does expose: decode_prefill(ids) then decode_step(state).\n",
         )
         .replace(
-            "_adapter = PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=1)",
-            "_adapter = PipelineDecodeAdapter(_build_for_perf, _prompt_ids, batch=1)",
+            "_adapter = PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=PERF_BATCH)",
+            "_adapter = PipelineDecodeAdapter(_build_for_perf, _prompt_ids, batch=PERF_BATCH)",
         )
     )
 
@@ -644,6 +692,70 @@ def _correction_feedback(reason: str, failure: str, prev_draft: str | None) -> s
         )
     parts.append("Return ONLY the corrected complete python file content — no prose, no markdown fences.")
     return "\n".join(parts)
+
+
+# The workload knobs the TOOL owns. Anything else that shrinks the work is the generator inventing a
+# measurement condition nobody asked for.
+_KNOWN_WORKLOAD_VARS = ("TT_PERF_ISL_TOKENS", "TT_PERF_OSL_TOKENS", "TT_PERF_BATCH", "TT_PERF_LAYERS", "TT_PERF_TRACE",
+                        "TT_PERF_HEADS", "TT_PERF_SEQ_LEN", "TT_PERF_TRACE_REGION", "TT_PERF_PREFILL_TRACE")  # fmt: skip
+_ENV_INT_DEFAULT_RE = re.compile(r'os\.environ\.get\(\s*"(TT_PERF_[A-Z0-9_]+)"\s*,\s*"(\d+)"\s*\)')
+
+
+def _stage_layers_var(stage) -> str:
+    """layer_depth owns this spelling. Imported lazily, not at module scope: this module is loaded
+    BY PATH in places (spec_from_file_location), where a relative import has no parent package --
+    the same failure that stopped a refusal being reported from before_loop on 2026-08-17."""
+    try:
+        from .layer_depth import stage_layers_var
+
+        return stage_layers_var(stage)
+    except Exception:  # noqa: BLE001
+        from layer_depth import stage_layers_var  # type: ignore[no-redef]
+
+        return stage_layers_var(stage)
+
+
+def invented_workload_vars(src: str, stages=()) -> list:
+    """Env-driven counts the generated test invented, with a literal default that SHRINKS the work.
+
+    BATCH BELONGS TO THE MODEL and the skeleton says so: the tool sends TT_PERF_BATCH=0 meaning "ask
+    the pipeline", and build_pipeline answers with its own DECODE_BATCH. That channel works. What
+    defeats it is a SECOND axis the tool knows nothing about.
+
+    Measured on Voxtral-Mini-3B: the generated test defined
+
+        PERF_AUDIO_STREAMS = int(os.environ.get("TT_PERF_AUDIO_STREAMS", "2"))
+
+    which appears nowhere in this repo -- the agent writing the test decided the model's heaviest
+    trimmable input was the clip count and picked 2. The pipeline was still BUILT for its declared
+    batch of 8, and then handed 2 clips, so prefill measured a quarter of the real workload and was
+    printed beside a full-batch roofline: 148.76 ms against a 7.48 ms theoretical. Nothing read the
+    variable back, so nothing could notice.
+
+    Trimming input for a tracy run is legitimate -- it is how a deep model stays under the profiler's
+    marker limit. Inventing the axis, defaulting it below the model's own batch, and never reporting
+    it is not. A per-stage depth variable is not flagged: those names come from PIPELINE_STAGES and
+    the tool sets them.
+
+    REPORTED, NOT REFUSED. Not every invented knob caps input -- the same test also defines
+    TT_PERF_FLUSH_EVERY=32, a profiler flush cadence that changes no workload -- and no static rule
+    separates the two reliably. Refusing on a heuristic would reject working tests; the defect worth
+    fixing is that nothing ever surfaced these, so a 2-clip measurement sat beside an 8-clip ceiling
+    for a week. Naming them where the run can see them is the fix.
+    """
+    allowed = (
+        set(_KNOWN_WORKLOAD_VARS)
+        | {_stage_layers_var(st) for st in (stages or ())}
+        # The per-stage trace knob, derived from the same declaration as the depth knob beside it.
+        | {"TT_PERF_%s_TRACE" % str(st).upper() for st in (stages or ())}
+    )
+    out = []
+    for var, default in _ENV_INT_DEFAULT_RE.findall(src or ""):
+        if var in allowed:
+            continue
+        if int(default) > 0:  # a positive literal is a CAP; 0 means "ask the pipeline"
+            out.append((var, int(default)))
+    return sorted(set(out))
 
 
 def validate_generated_perf_test(out_path: Path, task: str, component: bool = False) -> tuple[str, str]:
@@ -840,7 +952,7 @@ import ttnn
 
 PERF_ITERS = int(os.environ.get("TT_PERF_ITERS", "5"))
 PERF_FLUSH_EVERY = int(os.environ.get("TT_PERF_FLUSH_EVERY", "32"))
-_TRACE_REGION = int(os.environ.get("TT_PERF_TRACE_REGION", "23887872"))
+_TRACE_REGION = int(os.environ.get("TT_PERF_TRACE_REGION", "41943040"))
 
 
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 24576, "trace_region_size": _TRACE_REGION}], indirect=True)
@@ -1026,6 +1138,39 @@ def _component_prompt(
     )
 
 
+def _pipeline_is_generative(model_root, demo_src: str) -> bool:
+    """Whether this model retires tokens one at a time, from the contract its pipeline keeps.
+
+    The decode contract is the signal: decode_step(state) advances exactly one token per call, which
+    is what the perf test's capped loop is for. A declared PIPELINE_STAGES entry that is
+    autoregressive counts too -- that is the same test model_contract._c_decode_contract applies
+    before demanding the hooks.
+
+    Falls back to the demo text ONLY for the two markers that are generation APIs rather than
+    incidental words, and never for "for _ in range", which classed almost every demo generative.
+    """
+    try:
+        from .model_contract import Source
+
+        src = Source.load(model_root)
+        if src.mentions("def decode_step"):
+            return True
+        for _p, node in src.assigns("PIPELINE_STAGES"):
+            import ast as _ast
+
+            if isinstance(node.value, (_ast.List, _ast.Tuple)):
+                names = [e.value for e in node.value.elts if isinstance(e, _ast.Constant)]
+                # An AR stage is one the pipeline also gives a decode contract to; absent that, a
+                # declared stage set alone does not make a model generative -- an encoder-decoder
+                # translation model declares stages and retires one output per call.
+                if any(isinstance(n, str) and src.mentions("def %s_trace_step" % n) for n in names):
+                    return bool(src.mentions("def decode_step"))
+    except Exception:  # noqa: BLE001 -- an unreadable source falls back to the text below
+        pass
+    low = (demo_src or "").lower()
+    return ("max_new_tokens" in low) or ("decode_step" in low)
+
+
 def generate_perf_test(
     model_root: str | Path,
     task: str,
@@ -1036,11 +1181,16 @@ def generate_perf_test(
     source_abs: str | Path | None = None,
     source_kind: str = "demo",
     validate: bool | None = None,
+    stacks: list | None = None,
 ) -> str | None:
     """Write tests/e2e/test_<task>_perf.py by lifting build+run from a source — the WHOLE pipeline
     forward (prefill + a capped decode loop when the source has one). Returns the node id
     'tests/e2e/test_<task>_perf.py::test_<task>_perf' on success, else None. `runner` (prompt->str)
     overrides the default claude call (for tests).
+
+    stacks: optional list of StackInfo objects discovered by find_all_stacks(). When provided and
+    len > 1, per-stack depth variable instructions (TT_PERF_STACK0_LAYERS, TT_PERF_STACK1_LAYERS,
+    ...) are included in the LLM prompt instead of the single-stack TT_PERF_LAYERS instruction.
 
     Source: source_kind='demo' (default) lifts from `demo_rel` (under model_root); source_kind='pcc'
     lifts from `source_abs` (the e2e PCC test, which may live outside model_root) and DROPS the
@@ -1055,6 +1205,22 @@ def generate_perf_test(
     out_path = root / out_rel
     node = f"{out_rel}::test_{task}_perf"
     if out_path.exists() and not force:
+        # A REUSED TEST STILL NEEDS THE MARKS. Injection at the write point only fires when a test is
+        # GENERATED, and a test that already exists returns here first -- which is how run 23 ran an
+        # unmarked test written three hours earlier and reported "no stage signposts" for the seventh
+        # time. The injector is idempotent and refuses when it cannot place the block, so applying it
+        # to an existing file is safe and is the only way the marks reach a run that regenerates
+        # nothing.
+        try:
+            from .stage_marks import inject_stage_marks as _inject_marks
+
+            _cur = out_path.read_text()
+            _new, _why = _inject_marks(_cur)
+            if _new != _cur:
+                out_path.write_text(_new)
+                print("      · stage marks (existing test): %s" % _why, file=sys.stderr, flush=True)
+        except Exception as _mi:  # noqa: BLE001
+            print("      · stage marks (existing test): not injected (%s)" % _mi, file=sys.stderr, flush=True)
         return node
     if source_kind == "pcc":
         src_file = Path(source_abs) if source_abs else None
@@ -1129,7 +1295,10 @@ def generate_perf_test(
         "nothing recorded, so the reported throughput silently described a six-token context. Echo "
         "PERF_ISL_TOKENS= and PERF_OSL_TOKENS= so the conditions are in the log.\n"
         "- BOUNDED + profiler-safe so tracy's 12000-marker buffer never overflows: cap the work (decode "
-        "loop via env TT_PERF_MAX_NEW_TOKENS default 4, or a SINGLE forward if there's no loop), AND drain "
+        "loop via PERF_OSL_TOKENS -- the SAME value the test declares and prints, never a second variable "
+        "unit is the one the test reports -- never a smaller literal, or the profile samples a fraction "
+        "of the request and every recurring op is under-counted; or a SINGLE forward if there's no "
+        "loop), AND drain "
         "the profiler every TT_PERF_FLUSH_EVERY ops (default 32) + a final ttnn.ReadDeviceProfiler. DRAIN "
         "MUST BE MODEL-AGNOSTIC — wrap EVERY ttnn op by TYPE, not a curated list: iterate ttnn (and its op "
         "submodules ttnn.transformer / ttnn.experimental) and wrap every attribute whose "
@@ -1152,6 +1321,14 @@ def generate_perf_test(
         "magnitude slower and the host blocks in ttnn.synchronize_device for many minutes, stalling the run. "
         "Make the small size env-overridable with a SMALL default. A perf profile only needs a "
         "representative dispatch-dense pass, not the full-length run.\n"
+        "- The WORKLOAD SIZE comes from the model, never from a literal you choose. The skeleton sends "
+        "TT_PERF_BATCH=0, which means ASK THE PIPELINE -- build_pipeline answers with its own declared "
+        "batch. Do NOT introduce another environment variable that caps how much input is fed (clip "
+        "count, stream count, image count, chunk count). If the shape of the input genuinely needs a "
+        "count, DERIVE it from the batch the pipeline was built with, and let the environment override "
+        "it DOWNWARD only. A test that builds for the model's batch and then feeds a fraction of it "
+        "measures a workload nobody asked for, and its number is later compared against a full-batch "
+        "ceiling.\n"
         "- KEEP the skeleton's `_pl` / `PERF_LAYERS` depth lines VERBATIM near the top. A POSITIVE "
         "TT_PERF_LAYERS caps profiled depth for deep models so the device profiler's marker buffer does "
         "not overflow (worse on a multi-chip mesh, where markers scale x chips); the tool sends that "
@@ -1197,7 +1374,7 @@ def generate_perf_test(
         "`_DEV_PARAMS`/`device_params` fixture entirely). Keep `_build_for_perf(dev)` building the pipeline "
         "on the passed-in `dev` so both the eager forward and the trace run the SAME sharded topology.\n"
         "- MESH SHAPE — honor the tool's topology, HOWEVER this test obtains its device. The shape MUST come "
-        "from `from models.experimental.perf_automation.agent.perf_adapter import resolve_mesh_shape` / "
+        "from `from models.experimental.perf_automation.agent.perf_adapter import resolve_batch, resolve_mesh_shape` / "
         "`rows, cols = resolve_mesh_shape(default_rows=<source rows>, default_cols=<source cols>)`. That is "
         "what lets --devices/--mesh reshape the run (single->1x1, N chips->the planned TP x DP); with the env "
         "unset it returns the source's own shape, so a bare manual run behaves exactly as before. It applies "
@@ -1216,6 +1393,76 @@ def generate_perf_test(
         "- Lift the imports + build args straight from the demo above.\n\n"
         f"Use this structural skeleton (adapt the build+run to the demo):\n{skeleton_for(root)}\n"
     )
+    # Multi-stack depth variable instructions: when multiple block stacks are present, override
+    # the single TT_PERF_LAYERS instruction with per-stack variables so the LLM wires each
+    # stack's depth cap separately.
+    if stacks and len(stacks) > 1:
+        # NAMES COME FROM THE MODEL, NOT FROM A LOOP COUNTER.
+        #
+        # This used to hand the generator a positional id and a stack path -- "PERF_STACK0_LAYERS ->
+        # audio_tower.layers (32 layers)" -- and let it choose builder argument names from that. It
+        # chose `audio_layers` and `text_layers`, while the knob repair (which reads PIPELINE_STAGES
+        # and writes `<stage>_layers`) created encode_layers / prefill_layers / decode_layers. The
+        # test then passed kwargs the factory does not accept, they vanished into **kwargs, and the
+        # model built every layer: measured 18729 -> 18729 dispatched ops, a cap that capped nothing.
+        #
+        # PIPELINE_STAGES is declared in the model's own source, needs no build and no device, and is
+        # already what the repair names its parameters after. Deriving from it makes the two ends
+        # agree by construction instead of by luck. Falls back to the positional form only when the
+        # model declares no stages, which is the case that has no shared vocabulary to use.
+        # Guarded because this module is also loaded BY PATH (tests do it, and so does any caller
+        # without the package on sys.path): a bare relative import raises "attempted relative import
+        # with no known parent package" and would take generation down with it.
+        try:
+            from .stack_knob_repair import stage_names as _stage_names
+        except ImportError:  # loaded as a standalone module
+            import importlib.util as _ilu
+
+            _spec = _ilu.spec_from_file_location(
+                "_stack_knob_repair", str(Path(__file__).resolve().parent / "stack_knob_repair.py")
+            )
+            _skr = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_skr)
+            _stage_names = _skr.stage_names
+
+        _stages = [st for st in (_stage_names(root) or []) if str(st).isidentifier()]
+        if _stages:
+            _stack_lines = "\n".join(f"  TT_PERF_{st.upper()}_LAYERS -> build argument `{st}_layers`" for st in _stages)
+            _stack_var_examples = "\n".join(
+                f'_pl_{st} = (os.environ.get("TT_PERF_{st.upper()}_LAYERS") or "").strip()\n'
+                f"PERF_{st.upper()}_LAYERS = int(_pl_{st}) if (_pl_{st}.isdigit() and int(_pl_{st}) > 0) else None"
+                for st in _stages
+            )
+            prompt += (
+                f"\n\nPER-STAGE DEPTH OVERRIDE: this model runs {len(stacks)} repeating block stacks "
+                f"across the stages it declares in PIPELINE_STAGES ({', '.join(_stages)}). REPLACE the "
+                "single `_pl` / `PERF_LAYERS` lines from the skeleton with one variable per STAGE "
+                "(same None-means-all-layers contract):\n"
+                f"{_stack_var_examples}\n"
+                "Pass each one to the builder using EXACTLY these argument names -- they are the names "
+                "the tool adds to build_pipeline, and any other spelling is silently swallowed by "
+                f"**kwargs and caps nothing:\n{_stack_lines}\n"
+                "Also keep passing `layers=PERF_LAYERS` when the builder accepts it: it is the default "
+                "depth for any stack a per-stage argument does not name.\n"
+            )
+        else:
+            _stack_lines = "\n".join(
+                f"  PERF_STACK{i}_LAYERS -> {s.path} ({s.count} layers)" for i, s in enumerate(stacks)
+            )
+            _stack_var_examples = "\n".join(
+                f'_pl{i} = (os.environ.get("TT_PERF_STACK{i}_LAYERS") or "").strip()\n'
+                f"PERF_STACK{i}_LAYERS = int(_pl{i}) if (_pl{i}.isdigit() and int(_pl{i}) > 0) else None"
+                f"  # {s.path}: {s.count} total"
+                for i, s in enumerate(stacks)
+            )
+            prompt += (
+                f"\n\nMULTI-STACK DEPTH OVERRIDE: this model has {len(stacks)} repeating block stacks. "
+                "REPLACE the single `_pl` / `PERF_LAYERS` lines from the skeleton with these per-stack "
+                "variables (one env var per stack, same None-means-all-layers contract):\n"
+                f"{_stack_var_examples}\n"
+                f"Pass each depth cap to the builder:\n{_stack_lines}\n"
+                "None means all layers for that stack. Do NOT emit `PERF_LAYERS` for a multi-stack model.\n"
+            )
     inproc_ctx = _inline_inprocess_sources(demo_src, root)
     if inproc_ctx:
         prompt += (
@@ -1270,10 +1517,20 @@ def generate_perf_test(
                 f"      · agentic builder unavailable ({str(_exc)[:100]}); using one-shot", file=sys.stderr, flush=True
             )
     # A generative demo's perf test must exercise the (capped) decode loop, not a prefill-only slice.
-    demo_is_generative = any(
-        k in demo_src.lower()
-        for k in ("max_new_tokens", "generate(", ".generate", "next_token", "decode_step", "for _ in range")
-    )
+    #
+    # ASKED OF THE PIPELINE CONTRACT, NOT OF A BAG OF SUBSTRINGS. This matched any of six strings in
+    # the demo source, one of which was "for _ in range" -- present in very nearly every Python file
+    # ever written. So almost every demo was classed generative, and its perf test was then REJECTED
+    # and regenerated until it contained PERF_OSL_TOKENS: a decode-loop cap forced onto models with
+    # no decode loop, burning correction rounds on a requirement that could not be satisfied
+    # honestly. The remaining five are the same guess in kinder clothes -- ".generate" is a method
+    # any wrapper may expose, "next_token" is a variable name.
+    #
+    # What makes a pipeline generative is the contract it keeps: a decode_step(state) hook (one token
+    # per call, by definition -- PipelineDecodeAdapter raises NotTraceCapable without it), or a
+    # declared PIPELINE_STAGES set containing an autoregressive stage. model_contract already reads
+    # both, from the pipeline's own source, and _c_decode_contract already reports on them.
+    demo_is_generative = _pipeline_is_generative(model_root, demo_src)
     gen = runner or _claude
     if validate is None:
         validate = runner is None
@@ -1330,10 +1587,10 @@ def generate_perf_test(
             )
             prev_draft = content
             continue
-        if demo_is_generative and "TT_PERF_MAX_NEW_TOKENS" not in content:
+        if demo_is_generative and "PERF_OSL_TOKENS" not in content:
             stall += 1
             feedback = _correction_feedback(
-                "generative pipeline but the test omits the decode-loop cap (TT_PERF_MAX_NEW_TOKENS) — it "
+                "generative pipeline but the test omits the decode-loop cap (PERF_OSL_TOKENS) — it "
                 "would profile a prefill-only slice. Add the capped decode loop.",
                 "",
                 content,
@@ -1342,6 +1599,18 @@ def generate_perf_test(
             continue
         prev_draft = content
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        # STAGE MARKS ARE INJECTED, NOT REQUESTED. The skeleton above is a "structural reference
+        # handed to the LLM", so anything added to it is a suggestion -- and the generated test for
+        # voxtral came back with zero references to the marked pass, leaving five commits' worth of
+        # downstream machinery starved behind an emission that never ran. This puts it in after the
+        # model-specific content is written and before it is validated, so what ships is what runs.
+        try:
+            from .stage_marks import inject_stage_marks as _inject_marks
+
+            content, _why_marks = _inject_marks(content)
+            print("      · stage marks: %s" % _why_marks, file=sys.stderr, flush=True)
+        except Exception as _mi:  # noqa: BLE001
+            print("      · stage marks: not injected (%s)" % _mi, file=sys.stderr, flush=True)
         out_path.write_text(content)
         if not validate:
             return node

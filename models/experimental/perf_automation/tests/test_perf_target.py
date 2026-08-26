@@ -75,23 +75,30 @@ def test_tp_divides_per_device_bytes():
 
 
 def test_compute_target_ceiling_and_band():
-    # 1B params -> 1 GB under xB -> xGB (NOT 2 GB from params x bf16: the stored dtype is not the
-    # divisor any more). The ceiling is SPEC -- 512/1 = 512.0 -- and the 0.80 sustained fraction sets
-    # the band's top instead of being folded in, so the band is 307.2 - 409.6 and its top is the
-    # number the ceiling used to report.
+    # 1B params served bf16 -> 2 GB. THE DECLARED DTYPE IS THE DIVISOR AGAIN.
+    #
+    # This asserted 1 GB under the xB -> xGB rule, whose safety argument was that TT models are served
+    # under a byte per parameter (bf8 1.0625, bf4 0.5625) so the ceiling would be under-reported and a
+    # run would keep optimising. A bf16 model inverts it: it streams 2 B/param, so the rule published a
+    # ceiling ABOVE what the hardware permits -- voxtral got 141.8 tok/s/u against a true ~55, and the
+    # run was told it had headroom that does not exist. The width also moves DURING a run, bf16 -> bf8
+    # -> bf4 as dtype rungs land, so no constant can stand in for it.
+    #
+    # The ceiling is still SPEC and the 0.80 fraction still sets the band's top; only the byte count
+    # changed, from a constant to what the model says it is served at.
     mf = {"total_params": 1_000_000_000, "dominant_dtype": "bfloat16"}
     t = pt.compute_target(mf, _BH)
-    assert t.active_bytes == 1_000_000_000
-    assert abs(t.theoretical_rate - 512.0) < 1e-3
-    assert abs(t.band[0] - 0.60 * 512.0) < 1e-3 and abs(t.band[1] - 0.80 * 512.0) < 1e-3
+    assert t.active_bytes == 2_000_000_000
+    assert abs(t.theoretical_rate - 256.0) < 1e-3
+    assert abs(t.band[0] - 0.60 * 256.0) < 1e-3 and abs(t.band[1] - 0.80 * 256.0) < 1e-3
 
 
 def test_status_below_in_above():
     mf = {"total_params": 1_000_000_000, "dominant_dtype": "bfloat16"}
-    t = pt.compute_target(mf, _BH)  # theo 512.0 tok/s (spec) ; band 307.2 - 409.6
-    below = pt.score(t, forward_ms=1000.0 / 100.0)  # 100 tok/s < 307.2
-    inb = pt.score(t, forward_ms=1000.0 / 350.0)  # 350 tok/s, >=307.2, <=409.6
-    above = pt.score(t, forward_ms=1000.0 / 600.0)  # 600 tok/s > the 512.0 spec ceiling
+    t = pt.compute_target(mf, _BH)  # 2 GB at bf16 -> theo 256.0 tok/s (spec) ; band 153.6 - 204.8
+    below = pt.score(t, forward_ms=1000.0 / 50.0)  # 50 tok/s < 153.6
+    inb = pt.score(t, forward_ms=1000.0 / 175.0)  # 175 tok/s, >=153.6, <=204.8
+    above = pt.score(t, forward_ms=1000.0 / 300.0)  # 300 tok/s > the 256.0 spec ceiling
     assert below["status"] == "BELOW_BAND"
     assert inb["status"] == "IN_BAND"
     assert above["status"] == "ABOVE_BAND"
@@ -144,16 +151,28 @@ def test_list_topk_degrades_not_crashes():
     assert got == int(round((1_000_000 + 8 * 1000) * 2.0))
 
 
-def test_prefill_stub_raises():
-    """Explicit try/except: the repo prefers an error-context fixture that lives in the root
-    conftest, which this suite's rootdir does not reach."""
-    for call in (lambda: pt.active_bytes({"total_params": 1}, regime="prefill"), pt.prefill_ceiling):
-        raised = None
-        try:
-            call()
-        except NotImplementedError as exc:
-            raised = exc
-        assert raised is not None, call
+def test_prefill_bytes_are_costed_and_unknown_regimes_are_not():
+    """active_bytes MODELS prefill now: refusing it left its caller using the DECODE read set, so a
+    report printed one memory ceiling twice and called it physics.
+
+    An unknown regime is still refused, because accepting anything would let a typo silently return a
+    decode figure. prefill_ceiling is gone -- the compute side is served by compute_ceiling
+    with tokens_per_unit, and a second entry point for the same question is what this suite exists to
+    prevent."""
+    assert pt.active_bytes({"total_params": 1}, regime="prefill") > 0
+
+    # THE NAME IS NOT CONSULTED, so an unknown one is costed rather than refused. This used to raise,
+    # on the reasoning that accepting anything would let a typo return a decode figure -- true while
+    # `regime` selected the math, and false since the KV and activation terms started keying on
+    # `items`. What the refusal actually did was price any THIRD stage as weights-only, because the
+    # caller catches and falls back: an audio encoder lost its activation term for being called
+    # "encode". A typo now cannot change the number, which is asserted directly below.
+    assert pt.active_bytes({"total_params": 1}, regime="nonsense") > 0
+
+    # prefill_ceiling is GONE, not stubbed. It raised NotImplementedError, nothing in the tool ever
+    # called it, and the compute side it stood in for is served by compute_ceiling -- so all it did
+    # was keep a stage name alive in the module that owns the byte model.
+    assert not hasattr(pt, "prefill_ceiling"), "the dead stub is back"
 
 
 # --- junk inputs must DEGRADE, never crash or invert (found by fuzzing the ceiling path) ---
@@ -194,3 +213,22 @@ def test_rate_and_band_never_inverts_or_goes_negative():
         theo, band = pt.rate_and_band(byts, peak, frac=frac, tp_degree=tp)
         assert theo >= 0.0, (byts, peak, frac, tp, theo)
         assert band[0] <= band[1], (byts, peak, frac, tp, band)
+
+
+# --- the three roofline defects found on the run-50 report ------------------------------------
+
+
+def test_the_attention_flops_are_counted_not_only_the_weight_matmuls():
+    """2 x params x tokens counts every WEIGHT matmul -- each parameter is multiplied once per token,
+    so every projection in every layer is already there. What it omitted is the attention SCORE path,
+    QK^T and A.V, which uses no parameters and scales with the SQUARE of the sequence.
+
+    0.4% of prefill FLOPs at ISL 128 -- invisible, which is why it survived -- 3.3% at 1024 and 21.3%
+    at 8192, where it decides whether the stage reads compute-bound or memory-bound at all."""
+    L, H, P = 48, 3840, 11_180_446_320
+    for toks, want_pct in ((128, 0.4), (1024, 3.3), (8192, 21.3)):
+        weights = 2.0 * P * toks
+        attn = 4.0 * L * toks * toks * H
+        assert abs(100.0 * attn / (weights + attn) - want_pct) < 0.2, toks
+    # and it is ADDITIVE, never a replacement: the weight term still dominates at the benchmark point
+    assert 4.0 * L * 128 * 128 * H < 0.01 * (2.0 * P * 128)

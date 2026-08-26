@@ -76,6 +76,20 @@ _MODEL_ROOT_CONFIGURED = bool(
     or str(_MANIFEST.get("config", {}).get("model_root") or "").strip()
 )
 _MODEL_ROOT = Path(os.environ.get("PERF_MCP_MODEL_ROOT") or _MANIFEST.get("config", {}).get("model_root", "."))
+# WAS THE MODEL DIRECTORY ACTUALLY STATED, or is this the "." default? The two are not the same
+# question as "does the path exist", and reading a model FACT from an unstated root means resolving
+# it against the WORKING DIRECTORY -- which is how the gemma-3-12b report came to price a 32-layer,
+# hidden-1280, 30 MB model: a stray perf_target_inputs.json in the repo root, describing the vision
+# tower, sitting where the loop happened to be cd'd. It produced a prefill memory ceiling of 0.061 ms
+# against a 100 ms measurement, no param count, therefore no compute roof, therefore no fidelity
+# ladder -- three broken sections from one silently-adopted file.
+#
+# A fact about the model has to come from the model's own directory. Unstated is UNKNOWN, and unknown
+# renders as "not measured", which is true -- rather than as a number, which was not.
+_MODEL_ROOT_STATED = bool(
+    str(os.environ.get("PERF_MCP_MODEL_ROOT") or "").strip()
+    or str(_MANIFEST.get("config", {}).get("model_root") or "").strip()
+)
 # PUBLISH the key every per-run artifact is named after. perf_mcp derived it from _MODEL_ROOT while
 # run.py and the ledger read PERF_MCP_MODEL_NAME -- which nothing ever set, so those fell back to the
 # literal "model". Reader and writer then pointed at different files (perf_mcp_baseline_model_main.json
@@ -187,6 +201,11 @@ _FULLPIPE_TOL = float(os.environ.get("PERF_MCP_FULLPIPE_TOL", "0.08"))
 # Must match the BEFORE bookend (run.py sets 3): AFTER = min over 1-sample readings vs
 # BEFORE = median of 3 manufactured the full noise range as a gain on every run.
 _FULLPIPE_SAMPLES = max(1, int(os.environ.get("PERF_MCP_FULLPIPE_SAMPLES", "3")))
+# How far two readings of one stage's read set may differ and still be treated as the same
+# measurement. The working set is a property of the build, so agreeing samples are the evidence that
+# the number is an observation rather than instrumentation noise -- and only an observation may be
+# pinned as a permanent ceiling divisor.
+_STAGE_BYTES_AGREE_TOL = 0.01
 _FULLPIPE_TARGET_MS = float(os.environ.get("PERF_MCP_TARGET_MS", "0") or "0")
 
 # C++-kernel SAFETY: a bad Metalium kernel can WEDGE a device core (tt-lang/ttnn fail gracefully; raw
@@ -466,29 +485,46 @@ _MATERIAL_GAP_FRAC = float(os.environ.get("PERF_MCP_MATERIAL_GAP_FRAC", "0.03"))
 _MATERIAL_GAP_FLOOR = float(os.environ.get("PERF_MCP_MATERIAL_GAP_FLOOR", "0.05"))
 _MAX_KNOB_RETRIES = int(os.environ.get("PERF_MCP_MAX_KNOB_RETRIES", "2"))
 _STRUCTURAL_RUNGS = {"structural", "gather", "fusion", "fuse", "sparse", "cache", "kv-cache"}
-# THE ladder, in climb order. One definition, because two disagreeing ones is how "host" went
-# missing: summary.py renders the levels as a hardcoded display string
-# ("grid -> fidelity -> dtype -> shard -> host -> tt-lang -> cpp") and this constant was written
-# fresh from memory when the closed-rung refusal needed an ordered list, dropping `host`.
+# THE ladder, in climb order, for each roofline binding. ONE table, because the module used to hold
+# two orderings of the same rungs and only one of them knew what the op was waiting on:
+# `_KNOB_ORDER` (below, now derived from here) steered the per-op gate correctly, while a separate
+# `_LADDER_ORDER` literal -- written fresh from memory when the closed-rung refusal needed an
+# ordered list -- fixed the climb at grid -> fidelity -> dtype -> shard for every model, and dropped
+# `host` entirely.
 #
-# The cost of that omission is specific: the refusal returns `rungs_still_open` to redirect the
-# agent, so on gemma-3-12b-it -- where EVERY top op reads bound_by=dispatch and host_overhead is
-# 62.4 ms, the second-largest bucket -- it was naming every remaining rung EXCEPT the one that
-# addresses the binding constraint. Across 158 attempts the dispatch axis was tried once.
-_LADDER_ORDER = ["grid", "fidelity", "dtype", "shard", "host", "structural", "tt-lang", "cpp"]
-
-
-def ladder_order() -> list:
-    """The canonical climb order. Import this rather than restating it."""
-    return list(_LADDER_ORDER)
-
-
-_KNOB_ORDER = {
-    "memory": ("grid", "dtype", "shard", "fidelity"),
-    "compute": ("grid", "fidelity", "dtype", "shard"),
-    "dispatch": ("grid", "fidelity", "dtype", "shard"),
-    "": ("grid", "dtype", "shard", "fidelity"),
+# The cost of each is specific. Dropping `host`: the refusal returns `rungs_still_open` to redirect
+# the agent, so on gemma-3-12b-it -- where EVERY top op reads bound_by=dispatch and host_overhead is
+# 62.4 ms, the second-largest bucket -- it named every remaining rung EXCEPT the one that addresses
+# the binding constraint. Across 158 attempts the dispatch axis was tried once. Fixing the order:
+# fidelity speeds the MATH ENGINE, so on a model whose ops wait on DRAM bytes it leads with a lever
+# that cannot move the number, ahead of the two (dtype, shard) that cut bytes directly. gemma-3-12b
+# is memory-bound in both stages -- decode compute runs at 0.1% of peak.
+#
+# So the binding sets PRIORITY, never MEMBERSHIP: every rung appears in every row. bound_by is a
+# roofline ESTIMATE, ops are rarely purely one-bound, and `compute` is only ever computed for
+# matmuls -- used as a filter it silently deletes levers for a whole run (see _op_ladder_status).
+_RUNG_PRIORITY = {
+    "memory": ("grid", "dtype", "shard", "fidelity", "host", "structural", "tt-lang", "cpp"),
+    "compute": ("grid", "fidelity", "dtype", "shard", "host", "structural", "tt-lang", "cpp"),
+    # Nothing on the knob rungs addresses dispatch: the op is waiting on the host loop that launches
+    # it, so trace capture / 2-CQ leads and the knobs follow as the completeness sweep.
+    "dispatch": ("host", "grid", "fidelity", "dtype", "shard", "structural", "tt-lang", "cpp"),
+    "": ("grid", "dtype", "shard", "fidelity", "host", "structural", "tt-lang", "cpp"),
 }
+_KNOBS = ("grid", "fidelity", "dtype", "shard")
+
+
+def ladder_order(bound_by: str = "") -> list:
+    """The canonical climb order for a binding. Import this rather than restating it.
+
+    An unknown or missing bound_by gets the "" row, which leads with the byte-cutting levers: an op
+    whose binding could not be established is more often waiting on memory than on the math engine,
+    and grid -- first either way -- is the cheapest thing to try while that is still open."""
+    return list(_RUNG_PRIORITY.get((bound_by or "").strip().lower()) or _RUNG_PRIORITY[""])
+
+
+# Derived, so the two can no longer disagree: same table, filtered to the four cheap knobs.
+_KNOB_ORDER = {b: tuple(r for r in order if r in _KNOBS) for b, order in _RUNG_PRIORITY.items()}
 
 _KNOB_REASON = {
     "grid": lambda g, f, w: "occupy the FULL core grid (grid=%s) via a full-grid program_config; "
@@ -1936,7 +1972,7 @@ def profile_model() -> dict:
                 f"recorded — auto-heal could not get a clean run. Re-profile a smaller/signposted region."
             ),
         }
-    prof.setdefault("perf_layers", (os.environ.get("TT_PERF_LAYERS") or "").strip() or "all")
+    prof.setdefault("perf_layers", _depth_in_force())
     prof = _promote_baseline(prof)
     _ledger_record(prof)
     dev = round(float(prof.get("device_ms", 0.0)), 4)
@@ -1951,7 +1987,7 @@ def profile_model() -> dict:
             {"op": o.get("op_code") or o.get("bucket"), "gap_ms": o.get("gap_ms"), "bound_by": o.get("bound_by")}
             for o in (rep.get("open_ops") or [])
         ]
-        _persist_throughput(rep)  # fresh static target for the RUN_REPORT roofline table (non-stale)
+        _persist_throughput(rep, prof)  # fresh static target for the RUN_REPORT roofline table (non-stale)
     except Exception:
         pass
     # OBJECTIVE termination signal: you are NOT done while residual_gap is material and open_ops remain.
@@ -2084,31 +2120,28 @@ def check_pcc() -> dict:
     return res
 
 
-def _pg_cpu_jiffies(pgid):
-    total = 0
+def _pg_progress_watch(pgid, stall_s=0.0):
+    """probes owns the arithmetic; see ProgressWatch there.
+
+    THIS LOOP USED CPU, AND CPU IS NOT PROGRESS. It read `cpu > last_cpu + 10` as "still working",
+    which is the signal that let run 12 spin for nine hours: a livelock burns CPU by definition. The
+    backstop below bounded this loop so it could not hang outright, but the stall check was blind for
+    the whole hour leading up to it. The signature moves only when work does.
+
+    The fallback answers "moved" every poll: an unreadable signature must not be read as a wedge.
+    The backstop still bounds the loop.
+    """
     try:
-        entries = os.listdir("/proc")
-    except OSError:
-        return 0
-    target = str(pgid)
-    for entry in entries:
-        if not entry.isdigit():
-            continue
-        try:
-            with open("/proc/%s/stat" % entry) as fh:
-                data = fh.read()
-        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
-            continue
-        rp = data.rfind(")")
-        if rp == -1:
-            continue
-        fields = data[rp + 2 :].split()
-        if len(fields) > 12 and fields[2] == target:
-            try:
-                total += int(fields[11]) + int(fields[12])
-            except ValueError:
-                pass
-    return total
+        from agent.probes import ProgressWatch
+
+        return ProgressWatch(pgid, None, stall_s)
+    except Exception:  # noqa: BLE001
+
+        class _Blind:
+            def moved(self, *_a, **_k):
+                return True
+
+        return _Blind()
 
 
 class _AdaptiveResult:
@@ -2155,14 +2188,12 @@ def _adaptive_run(cmd, cwd, env, label="device run", stall_s=None, backstop=None
     pgid = proc.pid
     start = _t.monotonic()
     last_progress = start
-    last_cpu = _pg_cpu_jiffies(pgid)
+    _watch = _pg_progress_watch(pgid, stall_s)
     max_gap = 0.0
     while proc.poll() is None:
         _t.sleep(5)
         now = _t.monotonic()
-        cpu = _pg_cpu_jiffies(pgid)
-        moved = cpu > last_cpu + 10 or act[0] > last_progress
-        last_cpu = cpu
+        moved = _watch.moved(now, last_progress, proc.pid) or act[0] > last_progress
         if moved:
             max_gap = max(max_gap, now - last_progress)
             last_progress = now
@@ -2254,6 +2285,394 @@ def _workload_failure_tail(out: str, keep: int = 12) -> str:
     return "\n  workload output:\n    " + "\n    ".join(x[:220] for x in picked)
 
 
+def _stage_ms_path():
+    """Where the MEASURED per-phase timings live, keyed like every other per-run artifact."""
+    model = _MODEL_ROOT.name if _MODEL_ROOT else "model"
+    task = os.environ.get("PERF_MCP_TASK", "main")
+    return state_dir() / ("perf_mcp_stage_ms_%s_%s.json" % (model, task))
+
+
+def _depth_in_force() -> str:
+    """The one answer to "what depth is this". See layer_depth.depth_in_force."""
+    try:
+        from agent.layer_depth import depth_in_force
+
+        return depth_in_force()
+    except Exception:  # noqa: BLE001 -- unknown depth reads as full, exactly as it did before
+        return "all"
+
+
+def _stage_run_stamp() -> str:
+    """Which run a stage measurement belongs to, or "" when nothing said."""
+    return str(os.environ.get("PERF_MCP_RUN_ID") or "").strip()
+
+
+def _read_stage_doc(state_dir_path=None, model="", task="") -> dict:
+    """The stage file for (model, task), or {} when it belongs to a DIFFERENT run.
+
+    One reader for all three of stages/paths/isl, so the freshness rule cannot be enforced in one
+    place and forgotten in the next two -- which is exactly how the timings, their trace paths and
+    the observed ISL came to be read back with three separate copies of the same lookup.
+
+    A file stamped with a DIFFERENT run is refused. So is an UNSTAMPED one, which this used to accept
+    on the reasoning that it predates stamping and refusing it would blank the report for anyone who
+    had not re-run. That reasoning was wrong, and the cost showed up immediately: gemma-3's report
+    rendered `prefill 100.46 ms` from a file written 2026-08-07T00:07 -- forty hours BEFORE the fix
+    that let prefill trace at all -- beside a headline from a run that had measured nothing. Because
+    the file also predated `paths`, the roofline could not mark it eager, so a pre-fix eager number
+    rendered wearing a traced one's clothes and read as "prefill is still eager today".
+
+    A blank says `not measured`, which is TRUE and prompts a measurement. This said a number, which
+    was false. Absent evidence is not weak evidence -- it is the absence of a claim.
+    """
+    try:
+        from pathlib import Path as _P
+
+        base = _P(state_dir_path) if state_dir_path else state_dir()
+        m = model or (_MODEL_ROOT.name if _MODEL_ROOT else "model")
+        t = task or os.environ.get("PERF_MCP_TASK", "main")
+        doc = json.loads((base / ("perf_mcp_stage_ms_%s_%s.json" % (m, t))).read_text())
+        if not isinstance(doc, dict):
+            return {}
+        _stamp, _now = str(doc.get("run") or ""), _stage_run_stamp()
+        if not _stamp or (_now and _stamp != _now):
+            return {}
+        return doc
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _parse_gathered_weights(out: str) -> dict:
+    """{subtree: resident bytes read PER ITEM} from the pipeline's marker, or {} when it printed none.
+
+    Resident is not the same as streamed. The ceiling assumes one unit of work reads every weight in
+    its subtree once, which is true of a matmul weight and false of a lookup table -- voxtral's
+    embed_tokens is 805 MB and a decode step reads one 6 KB row of it. Nothing in the checkpoint
+    separates the two: embed_tokens and lm_head are both [131072, 3072], same size, same section.
+    The pipeline holds them and says which is which.
+    """
+    out_map: dict = {}
+    try:
+        for line in (out or "").splitlines():
+            if "TRACE_GATHERED_WEIGHTS=" not in line:
+                continue
+            for pair in line.split("TRACE_GATHERED_WEIGHTS=", 1)[1].split()[0].split(","):
+                k, _, v = pair.partition(":")
+                try:
+                    if k.strip() and int(v) > 0:
+                        out_map[k.strip()] = int(v)
+                except (TypeError, ValueError):
+                    continue
+    except Exception:  # noqa: BLE001 -- a malformed marker leaves the old behaviour
+        return {}
+    return out_map
+
+
+def _parse_census_sections(out: str) -> dict:
+    """{attribute name: resident bytes} from the census marker, or {} when it did not print one.
+
+    Tolerant by design: a malformed pair is skipped rather than discarding the line, because a
+    partial split still prices the towers it names and the alternative is the checkpoint ratio."""
+    secs: dict = {}
+    try:
+        for line in (out or "").splitlines():
+            if "TRACE_WEIGHT_SECTIONS=" not in line:
+                continue
+            for pair in line.split("TRACE_WEIGHT_SECTIONS=", 1)[1].split()[0].split(","):
+                name, _, raw = pair.partition(":")
+                if name.strip() and raw.strip().isdigit() and int(raw) > 0:
+                    secs[name.strip()] = int(raw)
+    except Exception:  # noqa: BLE001 -- a census line the report can do without
+        return {}
+    return secs
+
+
+def _persist_device_weight_bytes(
+    nbytes: int,
+    complete: bool,
+    bytes_per_param: float = 0.0,
+    sections: dict | None = None,
+    gathered: dict | None = None,
+) -> None:
+    """Merge the census result into the model's own facts file. Best-effort; never raises.
+
+    Written to the MODEL directory, and only when that directory was STATED -- a model fact resolved
+    against the working directory is how a 31 MB, 32-layer file came to describe gemma-3-12b. The
+    two keys are merged rather than the file rewritten, so a hand-tuned per-tensor list beside them
+    survives."""
+    if not _MODEL_ROOT_STATED or not nbytes or nbytes <= 0:
+        return
+    try:
+        p = _MODEL_ROOT / "perf_target_inputs.json"
+        doc = {}
+        if p.is_file():
+            try:
+                doc = json.loads(p.read_text()) or {}
+            except Exception:  # noqa: BLE001
+                doc = {}
+        if not isinstance(doc, dict):
+            return
+        if (
+            doc.get("device_weight_bytes") == int(nbytes)
+            and doc.get("device_census_complete") == bool(complete)
+            and (not bytes_per_param or doc.get("bytes_per_param") == float(bytes_per_param))
+            and (not sections or doc.get("device_section_bytes"))
+        ):
+            return
+        # THE FIRST COMPLETE CENSUS WINS, and nothing later moves it.
+        #
+        # This is called from _run_full_pipeline_ms, so it fires on EVERY full-pipeline gate -- every
+        # iteration of the loop. The census measures the model AS CURRENTLY BUILT, so the moment a
+        # dtype rung lands (bf16 -> bf8 halves the resident weights) the figure drops. Left
+        # overwriting, the ceiling derived from it would fall in step with the optimisation being
+        # scored against it: the run would chase a target that recedes as it improves, and a report
+        # written at iteration 9 could not be compared with one written at iteration 1.
+        #
+        # The ceiling describes the model the run STARTED with. An incomplete census may still be
+        # replaced -- it is not yet an answer -- but a complete one is the answer for this run.
+        if doc.get("device_weight_bytes") and doc.get("device_census_complete"):
+            # SAME MEASUREMENT, MORE OF IT. An identical total is not a second census -- it is this
+            # one, described further. Refusing the split here would be refusing detail that changes
+            # no number already written, and it would strand every model whose facts file was pinned
+            # by a tool version that had no split to record: the file is already complete, so the
+            # split could never arrive and the ceiling would silently keep apportioning by the
+            # checkpoint. A DIFFERENT total is a different census and is still refused.
+            if (
+                sections
+                and not doc.get("device_section_bytes")
+                and int(doc.get("device_weight_bytes") or 0) == int(nbytes)
+            ):
+                doc["device_section_bytes"] = {str(k): int(v) for k, v in sections.items() if int(v) > 0}
+                tmp = p.with_suffix(p.suffix + ".tmp")
+                tmp.write_text(json.dumps(doc, indent=2) + "\n")
+                os.replace(str(tmp), str(p))
+            return
+        doc["device_weight_bytes"] = int(nbytes)
+        doc["device_census_complete"] = bool(complete)
+        # PINNED WITH THE TOTAL, by being written inside the same guard. The split describes the
+        # model the run STARTED with for exactly the reason the total does: a dtype rung that halves
+        # one tower changes the proportions, and a share that moves between iterations scores the
+        # same run against two different ceilings.
+        if sections:
+            doc["device_section_bytes"] = {str(k): int(v) for k, v in sections.items() if int(v) > 0}
+        # Pinned with the total for the same reason the split is: a lever that replaces a lookup
+        # table changes this, and a value that moves between iterations scores one run against two
+        # ceilings.
+        if gathered:
+            doc["gathered_weight_bytes"] = {str(k): int(v) for k, v in gathered.items() if int(v) > 0}
+        if bytes_per_param and bytes_per_param > 0:
+            doc["bytes_per_param"] = float(bytes_per_param)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(doc, indent=2) + "\n")
+        os.replace(str(tmp), str(p))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _persist_stage_ms(
+    stage_ms: dict,
+    stage_paths: dict | None = None,
+    stage_isl: dict | None = None,
+    stage_ops: dict | None = None,
+    stage_batch: int = 0,
+    prompt_tokens: int = 0,
+    stage_isl_per_request: dict | None = None,
+    stage_bytes: dict | None = None,
+) -> None:
+    """Record trace_replay's per-stage timings so the report can show a MEASURED phase split.
+
+    Written to a file rather than threaded through _run_full_pipeline_ms's return, because that
+    function has five return sites and the report is rendered by a different process.
+
+    Why this matters: the only per-stage rows the report could show came from the agent's
+    stages_json -- free text it writes, which nothing validates. Decode ms and prefill ms are not
+    the same currency (decode recurs per token, prefill once per request), so a phase split guessed
+    from prose can put time in the wrong pool and be acted on. These names come from the
+    PIPELINE_STAGES the model declares, measured by the harness.
+    """
+    if not stage_ms:
+        return
+    try:
+        p = _stage_ms_path()
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        # STAMPED WITH THE RUN THAT MEASURED IT. The file is keyed by (model, task), which outlives
+        # the run, and nothing recorded which run wrote it -- so a report read whatever was there
+        # last, however old. That is not hypothetical: a prefill of 91.33 ms from a previous run was
+        # rendered beside a fresh decode for hours, and the same stage appeared with two different
+        # values in one report because the headline came from this run and the split from another.
+        # Same lifetime problem, and same fix, as the device-recovery counters.
+        tmp.write_text(
+            json.dumps(
+                {
+                    "run": _stage_run_stamp(),
+                    "stages": stage_ms,
+                    "paths": stage_paths or {},
+                    "isl": stage_isl or {},
+                    # The prompt this run served, kept beside the per-stage counts rather than inside
+                    # them: it belongs to the request, and every stage sees it.
+                    "prompt_tokens": int(prompt_tokens or 0),
+                    # PER-REQUEST counts, from the legacy marker. "isl" above holds TOTALS a stage
+                    # stated for one call; these must be multiplied by the batch and those must not.
+                    "isl_per_request": stage_isl_per_request or {},
+                    # THE READ SET, MEASURED. Distinct device tensors each stage's ops touched, from
+                    # trace_replay's dispatch hook. The roofline's memory floor divides by this;
+                    # every other source for it is an inference from the checkpoint plus a naming
+                    # convention, and the one that matters most -- what a TOKEN reads -- had no
+                    # measurement at all until this.
+                    "bytes": stage_bytes or {},
+                    # The doc tracks the CURRENT build by design -- the report needs both numbers.
+                    # The pinned baseline lives in the ledger, written just below.
+                    # THE BATCH THE RUN ACTUALLY SERVED. Parsed off TRACE_REPLAY_PATH for the
+                    # scorecard and then dropped, so the report had to fall back to TT_PERF_BATCH --
+                    # which carries 0, the "ask the pipeline" sentinel, and reads as 1. Every ceiling
+                    # was then priced for one user against a measurement of eight. Recorded here
+                    # because it belongs to the same measurement as the stage timings beside it.
+                    "batch": int(stage_batch or 0),
+                    # The op-dispatch count each path label was DERIVED from -- the evidence, kept
+                    # beside the conclusion, so "prefill is traced" can be checked rather than
+                    # believed.
+                    "ops": stage_ops or {},
+                }
+            )
+        )
+        os.replace(str(tmp), str(p))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def read_stage_ms(state_dir_path=None, model="", task="") -> dict:
+    """The measured per-phase split, or {}. Read by the report renderer."""
+    try:
+        return {
+            k: float(v)
+            for k, v in (_read_stage_doc(state_dir_path, model, task).get("stages") or {}).items()
+            if float(v) > 0
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def read_stage_bytes(state_dir_path=None, model="", task="") -> dict:
+    """The measured per-stage read set in BYTES, or {}. Read by the report renderer.
+
+    The distinct device tensors each stage's ops touched, observed by trace_replay's dispatch hook
+    while the stage ran in isolation. This is the roofline's memory-floor divisor, MEASURED -- the
+    alternative sources are the checkpoint's total (which counts towers a token never reads), a name
+    list (`audio_tower|vision_tower|...`, which a model can spell differently), and a stage_roots
+    section map (which drops lm_head on any untied model).
+    """
+    try:
+        return {
+            k: int(v)
+            for k, v in (_read_stage_doc(state_dir_path, model, task).get("bytes") or {}).items()
+            if int(v) > 0
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+# The key this tool used for the prompt length before `prompt_tokens` existed. An on-disk schema
+# name from an older version of THIS file, read only when the modern field is absent.
+_LEGACY_PROMPT_KEY = "prefill"
+
+
+def read_stage_isl(state_dir_path=None, model="", task="") -> int:
+    """The prompt length the run ACTUALLY profiled, or 0.
+
+    Read back from the same file as the stage timings, because it was measured in the same run: the
+    generated test prints it after tokenizing, so it is the length that reached the model rather than
+    the length the environment asked for."""
+    try:
+        _doc = _read_stage_doc(state_dir_path, model, task)
+        # THE WORKLOAD'S PROMPT LENGTH, NOT A STAGE'S. Every stage in a run sees the same prompt --
+        # the byte model takes it as `seq_len` for all of them -- so it is a property of the request.
+        # It was read out of the per-stage map under the key "prefill", which made a workload fact
+        # reachable only through one stage's name, and only for models that have a stage so called.
+        # The map keeps its old entry for docs written before this key existed.
+        _pt = int(_doc.get("prompt_tokens") or 0)
+        if _pt > 0:
+            return _pt
+        # A KEY IN AN OLD FILE FORMAT, not a stage of this model. Before `prompt_tokens` existed,
+        # THIS TOOL wrote the prompt length under the literal "prefill", so reading it back is how a
+        # doc from that version is understood -- the same kind of constant as any other on-disk
+        # schema name, and unlike the writer above it cannot mis-price a model, because a doc that
+        # does not have the key simply yields 0. Every doc written since carries prompt_tokens.
+        return int((_doc.get("isl") or {}).get(_LEGACY_PROMPT_KEY) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def read_stage_isl_per_request_map(state_dir_path=None, model="", task="") -> dict:
+    """{stage: items PER REQUEST}, from the legacy prompt-length marker. {} when none recorded.
+
+    The unit is what separates this from read_stage_isl_map: these are multiplied by the batch to
+    reach one unit of work, and the totals in that map must not be.
+    """
+    try:
+        got = _read_stage_doc(state_dir_path, model, task).get("isl_per_request") or {}
+        return {str(k): int(v) for k, v in got.items() if int(v or 0) > 0}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def read_stage_isl_map(state_dir_path=None, model="", task="") -> dict:
+    """{stage: items it processes in one unit}, as the run recorded them. {} when nothing was recorded.
+
+    A stage that consumes the prompt retires every prompt token; a recurring stage retires one. That
+    cannot be inferred from the byte model -- decode READS a long context while processing a single
+    token, so "does the read set grow with the prompt" says yes for both -- and it must not be
+    inferred from the stage's NAME. The run measured it, so the run states it.
+    """
+    try:
+        got = _read_stage_doc(state_dir_path, model, task).get("isl") or {}
+        return {str(k): int(v) for k, v in got.items() if int(v or 0) > 0}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def read_stage_batch(state_dir_path=None, model="", task="") -> int:
+    """The batch the profiled run actually served, or 0 when it was not recorded.
+
+    Read back from the same file as the stage timings because it was measured in the same run: a
+    ceiling priced for one user against an eight-user measurement is not a comparison.
+    """
+    try:
+        return int(_read_stage_doc(state_dir_path, model, task).get("batch") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def read_stage_paths(state_dir_path=None, model="", task="") -> dict:
+    """How each stage was MEASURED -- "trace+1cq", "eager", or "unknown".
+
+    Separate from read_stage_ms because a caller wanting the split does not always want the paths,
+    and because an older state file has no `paths` key at all: absent means unknown, which withholds
+    a verdict rather than asserting one."""
+    try:
+        return {
+            str(k): str(v) for k, v in (_read_stage_doc(state_dir_path, model, task).get("paths") or {}).items() if v
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def read_stage_ops(state_dir_path=None, model="", task="") -> dict:
+    """Op dispatches observed per stage during the last warmup -- the EVIDENCE for the path label.
+
+    A traced stage issues one dispatch; an eager one issues hundreds. trace_replay prints the count
+    and derived "trace+1cq"/"eager" from it, but only the label was kept, so a doubted label could
+    be checked only by re-running the workload by hand. gemma-3's prefill was diagnosed as eager
+    twice, once wrongly, for exactly that reason."""
+    try:
+        return {
+            str(k): int(v)
+            for k, v in (_read_stage_doc(state_dir_path, model, task).get("ops") or {}).items()
+            if isinstance(v, (int, float)) and int(v) >= 0
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _run_full_pipeline_ms():
     ptr = _MANIFEST.get("perf_test_resolved", {}) or {}
     node = ptr.get("path")
@@ -2277,11 +2696,21 @@ def _run_full_pipeline_ms():
     # The test already declares the unit (TT_PERF_ISL_TOKENS / TT_PERF_OSL_TOKENS, both 128). Honour it:
     # take OSL from the declared value so the measured unit and the reported unit are the same thing.
     # PERF_MCP_FULLPIPE_TOKENS still overrides for a cheap steering measurement.
-    env["TT_PERF_MAX_NEW_TOKENS"] = os.environ.get("PERF_MCP_FULLPIPE_TOKENS") or os.environ.get(
+    env["TT_PERF_OSL_TOKENS"] = os.environ.get("PERF_MCP_FULLPIPE_TOKENS") or os.environ.get(
         "TT_PERF_OSL_TOKENS", "128"
     )
     env.setdefault("TT_PERF_TRACE", "1")
+    # TRACE EVERY STAGE THE MODEL DECLARES, not the one an LLM happens to have. This set a single
+    # TT_PERF_PREFILL_TRACE for every model measured, so a pipeline whose stages are encode/vocode
+    # had no way to be told to trace them -- the flag names the stage, and only one stage had a name
+    # the tool knew. The per-stage depth knobs (TT_PERF_<STAGE>_LAYERS) have been derived from
+    # PIPELINE_STAGES for a while; this is the same derivation, applied to the same question.
+    #
+    # TT_PERF_PREFILL_TRACE is still set, because it is what a generated test written before this
+    # would read, and an old test meeting a new harness must not lose its trace.
     env["TT_PERF_PREFILL_TRACE"] = "1"
+    for _st in _declared_stages_for_env():
+        env["TT_PERF_%s_TRACE" % str(_st).upper()] = "1"
     # Start the trace region at the DRAM-derived size, not the perf test's hardcoded default. This gate
     # runs the whole pipeline at FULL depth (a much bigger capture than the coverage-depth default the
     # builder baked in), so starting big avoids the overflow entirely; the grow below is the fallback.
@@ -2295,12 +2724,79 @@ def _run_full_pipeline_ms():
         except (ValueError, TypeError):
             pass
     env.pop("TT_METAL_DEVICE_PROFILER", None)
+    # AND THE DEPTH CAP, WHICH THIS GATE HAS BEEN INHERITING BY ACCIDENT.
+    #
+    # The comment above says this runs the whole pipeline at FULL depth, and it does not. `env` is a
+    # copy of os.environ, the MCP config hands this process TT_PERF_STACK<i>_LAYERS=2 as LOOSE
+    # variables beside the PERF_MCP_PROFILE_ENV json that is the intended channel, and the generated
+    # perf test reads exactly those names and passes them to build_pipeline. So the gate has been
+    # timing a 2-layer model while reporting it as the whole one.
+    #
+    # THE CAP IS FOR TRACY, AND TRACY IS OFF HERE. An uncapped tracy capture overflows the 12000
+    # marker buffer, which is why the profiling runs are capped and must stay capped. This path pops
+    # TT_METAL_DEVICE_PROFILER one line above: it is trace_replay, a stopwatch that prints three
+    # numbers, and no buffer can overflow. The cap has no purpose here and never did.
+    #
+    # Measured on Voxtral, 2026-08-21: the gate reported 2.47 ms/token where a full-depth capture
+    # recorded 55.68 tok/s (17.96 ms). The roofline then compared that 2-layer time against a
+    # 62-layer ceiling and printed decode at 539% of peak -- and, worse, every win was banked against
+    # a 7x-optimistic proxy of the model that actually ships.
+    #
+    # Names come from layer_depth, which owns the spelling, and from the stages the MODEL declared --
+    # not a hardcoded list, so a model with other stack names is covered too.
+    try:
+        from agent.layer_depth import stack_layers_var, stage_layers_var
+        from agent.stack_knob_repair import stage_names as _stage_names
+
+        _depth_vars = {"TT_PERF_LAYERS"}
+        for _s in _stage_names(_MODEL_ROOT) or []:
+            _depth_vars.add(stage_layers_var(_s))
+        # HOW MANY STACKS IS THE MODEL'S ANSWER, not a number picked here. _declared_stack_count
+        # reads it from the checkpoint; 0 means unreadable, and then the stage names above are the
+        # only spelling we can offer.
+        from agent.layer_depth import _declared_stack_count
+
+        for _i in range(max(0, int(_declared_stack_count(_MODEL_ROOT) or 0))):
+            _depth_vars.add(stack_layers_var(_i))
+        for _v in (os.environ.get("PERF_MCP_DEPTH_VARS") or "").split(","):
+            if _v.strip():
+                _depth_vars.add(_v.strip())
+    except Exception:  # noqa: BLE001 -- a name we cannot derive is one we cannot strip; the cap stays
+        _depth_vars = {"TT_PERF_LAYERS"}
+    _dropped = sorted(k for k in _depth_vars if env.pop(k, None) is not None)
+    if _dropped:
+        print(
+            "  [full-pipeline-gate] measuring at FULL depth: dropped the profiling depth cap (%s)"
+            % ", ".join(_dropped),
+            flush=True,
+        )
     # -p depth_guard: this gate asks for ALL layers by removing the cap, and a perf test can fill
     # it back in at import via setdefault. The guard drops it again before the test body builds.
     cmd = [sys.executable, "-m", "pytest", "-p", _DEPTH_GUARD, "-o", "timeout=0", "-s", node]
     if case:
         cmd += ["-k", case]
     per_tokens = []
+    stage_ms = {}
+    # EVERY SAMPLE, NOT THE LAST ONE. The headline is the median of _FULLPIPE_SAMPLES readings
+    # (`dec` below) precisely because one reading is noise; the per-stage split was a plain
+    # overwrite, so the report showed decode as the median beside the SAME stage as whatever the
+    # final sample happened to be -- 12.87 ms and 20.49 ms for one quantity in one report. Worse
+    # than cosmetic: `stage_win` is computed from these numbers and gates a candidate record, so a
+    # single slow or fast sample could fabricate a stage win or bury a real one while the headline
+    # it sits beside was properly filtered. Collect them all and take the same median.
+    stage_ms_samples: dict = {}
+    stage_bytes: dict = {}
+    # Every sample's reading, not just the last -- the read set is pinned WRITE-ONCE, so the value
+    # that lands here is the ceiling divisor for the rest of the model's life.
+    stage_bytes_samples: dict = {}
+    stage_paths = {}
+    stage_isl = {}
+    # {stage: items PER REQUEST}, the legacy marker's unit. Kept apart from stage_isl, which holds
+    # the TOTAL a stage states for one call.
+    stage_isl_per_request = {}
+    # The legacy PERF_ISL_TOKENS marker: one prompt length for the whole request, not a stage's count.
+    prompt_tokens_seen = 0
+    stage_ops = {}
     headline_units = []
     walls = []
     prefills = []
@@ -2361,7 +2857,153 @@ def _run_full_pipeline_ms():
         # and more reliable than sampling telemetry alongside, which aliases against short runs.
         if _run_reported_clamp(out):
             globals()["_LAST_RUN_CLAMPED"] = True
+        # READ AHEAD, because the census is PINNED on the line before this one. The total and the
+        # split are printed as two lines and the total is written first; persisting it there would
+        # take the pin, and the split arriving one line later would be refused by the very guard that
+        # stops the ceiling drifting mid-run. They are one measurement, so they are written together.
+        _census_sections = _parse_census_sections(out)
+        _gathered_weights = _parse_gathered_weights(out)
         for line in out.splitlines():
+            # PHASE TIMINGS, MEASURED. trace_replay prints one of these per stage it traced, derived
+            # from the PIPELINE_STAGES the model itself declares -- so "prefill"/"decode" here are
+            # tool measurements, not names a model typed. They were printed and discarded; the report
+            # then had no phase accounting at all and the only per-stage rows it could show were the
+            # agent's own stages_json prose, which nothing validates.
+            #
+            # Decode ms and prefill ms are not the same currency (decode recurs per token, prefill
+            # once per request), so a phase split guessed from free text can put time in the wrong
+            # pool and be acted on. Measured, it cannot.
+            # THE BYTES A STAGE ACTUALLY READ. Parsed here beside its time because they are one
+            # measurement of one stage: trace_replay observes the distinct device tensors the stage's
+            # ops touched, which is the quantity the roofline has always had to infer from the
+            # checkpoint and a tower name list.
+            if "TRACE_STAGE_BYTES[" in line:
+                try:
+                    _bn = line.split("TRACE_STAGE_BYTES[", 1)[1].split("]", 1)[0].strip()
+                    _bv = int(float(line.split("]=", 1)[1].split()[0]))
+                    if _bn and _bv > 0:
+                        stage_bytes[_bn] = _bv
+                        stage_bytes_samples.setdefault(_bn, []).append(_bv)
+                except (ValueError, IndexError):
+                    pass
+            if "TRACE_STAGE_MS[" in line:
+                try:
+                    _nm = line.split("TRACE_STAGE_MS[", 1)[1].split("]", 1)[0].strip()
+                    _sv = float(line.split("]=", 1)[1].split()[0])
+                    if _nm and _sv > 0:
+                        stage_ms[_nm] = _sv
+                        stage_ms_samples.setdefault(_nm, []).append(_sv)
+                        # THE PATH TRAVELS WITH THE NUMBER. It was printed on this same line and
+                        # dropped, so a stage that fell back to EAGER arrived at the report
+                        # indistinguishable from a traced one -- and was then scored against a band
+                        # that assumes trace. gemma-3's prefill is exactly that case.
+                        if "path=" in line:
+                            stage_paths[_nm] = line.split("path=", 1)[1].split()[0].strip()
+                except Exception:  # noqa: BLE001
+                    pass
+            # THE EVIDENCE BEHIND THE PATH LABEL. trace_replay derives "trace+1cq" vs "eager" by
+            # COUNTING op dispatches during the last warmup -- a traced stage issues one -- and it
+            # prints that count. Only the verdict was read; the count itself was discarded, so a
+            # reader who doubted a label had nothing to check it against, and "prefill is traced"
+            # could only be confirmed by re-running the workload by hand. It is the difference
+            # between a claim and a measurement, and it costs one line to keep.
+            # THE MEASURED RESIDENT BYTE COUNT. Written into the model's facts so the ceiling
+            # divides by what is ON THE CHIP rather than by a rule about what might be. See
+            # agent/weight_census and perf_target.compute_target's census branch.
+            if "TRACE_WEIGHT_BYTES=" in line:
+                try:
+                    _wb = int(line.split("TRACE_WEIGHT_BYTES=", 1)[1].split()[0])
+                    _ok = "complete=1" in line
+                    # THE WIDTH IS THE PART THE CEILING CAN USE. The byte TOTAL counts everything
+                    # resident -- on gemma-3, 15.49 GB of which 6.85 GB is KV cache, which
+                    # active_bytes already prices from seq_len -- so dividing by it double-counts.
+                    # The RATIO is the average width of what the loader actually produced, and
+                    # multiplied by a param count it gives the weights figure the placeholder
+                    # 1.0 B/param was standing in for. Parsed here because the marker is the only
+                    # place it crosses the process boundary.
+                    _bpp = 0.0
+                    if "bytes_per_param=" in line:
+                        _bpp = float(line.split("bytes_per_param=", 1)[1].split()[0])
+                    # A CAPPED CENSUS IS NOT THE MODEL. The census runs inside measure_adapter,
+                    # which executes both in the capped profiling runs and in the uncapped
+                    # full-pipeline gate -- and device_weight_bytes is pinned by the FIRST complete
+                    # census to arrive. The capped one arrives first.
+                    #
+                    # Voxtral run 10: 1.299 B parameters recorded against the checkpoint's 4.676 B,
+                    # 27.8%, because the build had 2 of 30 language layers. Every ceiling in that
+                    # report divided a number missing three quarters of the model, and nothing could
+                    # tell, because a capped census is shaped exactly like a whole one.
+                    #
+                    # The marker now states the depth it was taken at. Anything but "all" is refused
+                    # here -- including "unknown", which is not a claim of full depth -- so the pin
+                    # waits for the full-depth gate rather than being taken by whoever ran first.
+                    _depth = ""
+                    if "depth=" in line:
+                        _depth = line.split("depth=", 1)[1].split()[0].strip()
+                    if _wb > 0 and _depth and _depth != "all":
+                        print(
+                            "  [perf-mcp] census ignored: taken at depth=%s, not the whole model "
+                            "(%.3g GB). Waiting for the full-depth measurement." % (_depth, _wb / 1e9),
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    elif _wb > 0:
+                        _persist_device_weight_bytes(_wb, _ok, _bpp, _census_sections, _gathered_weights)
+                except Exception:  # noqa: BLE001
+                    pass
+            if "TRACE_STAGE_OPS[" in line:
+                try:
+                    _nm = line.split("TRACE_STAGE_OPS[", 1)[1].split("]", 1)[0].strip()
+                    _ov = int(line.split("]=", 1)[1].split()[0])
+                    if _nm and _ov >= 0:
+                        stage_ops[_nm] = _ov
+                except Exception:  # noqa: BLE001
+                    pass
+            # THE PROMPT LENGTH THE RUN ACTUALLY PROFILED. The generated test prints it from
+            # `_prompt_ids.shape[-1]` -- after tokenization, so it is the length that reached the
+            # model, not the length anyone asked for -- and nothing read it. The report needs it to
+            # price prefill's arithmetic (2 x params x ISL), and an optimize run exports no ISL
+            # variable, so the renderer was left guessing and withheld the whole PREFILL stage.
+            # Observed beats declared beats defaulted, and this is the observed one.
+            # THE COUNT THE STAGE ITSELF STATED, for whatever stage stated it. TRACE_STAGE_ITEMS is
+            # printed beside TRACE_STAGE_MS by the same loop that measured the stage, so a third
+            # tower can carry a real item count instead of inheriting the fallback of 1.
+            if "TRACE_STAGE_ITEMS[" in line:
+                try:
+                    _nm = line.split("TRACE_STAGE_ITEMS[", 1)[1].split("]", 1)[0].strip()
+                    _nv = int(line.split("]=", 1)[1].split()[0])
+                    if _nm and _nv > 0:
+                        stage_isl[_nm] = _nv
+                except Exception:  # noqa: BLE001
+                    pass
+            if "PERF_ISL_TOKENS=" in line:
+                try:
+                    _iv = int(line.split("PERF_ISL_TOKENS=", 1)[1].split()[0])
+                    if _iv > 0:
+                        # A DIFFERENT UNIT, KEPT IN A DIFFERENT MAP. This marker is the prompt
+                        # length PER REQUEST -- the reader multiplies it by the batch to get what one
+                        # unit of work retires. A count a stage states through <stage>_trace_items()
+                        # is already the TOTAL for one call: voxtral's prefill_trace_items returns
+                        # PREFILL_C * B, and its encode traces at batch 1 whatever the pipeline
+                        # serves. Merging the two into one map made the reader multiply a total by
+                        # the batch again -- prefill counted 8x its real work, and encode 8x for a
+                        # batch it does not have.
+                        # THE REQUEST PROPERTY, kept as one -- the prompt length reaches
+                        # _persist_stage_ms as a scalar now, instead of being dug back out from under
+                        # a stage key.
+                        if not prompt_tokens_seen:
+                            prompt_tokens_seen = _iv
+                        # AND STILL FILED UNDER THE CONVENTIONAL NAME, deliberately. This is the
+                        # fallback item count for a stage that states no <stage>_trace_items() of its
+                        # own, and the legacy marker carries no stage of its own to attribute it to.
+                        # Dropping it does remove a name dependency and it also silently reprices any
+                        # such stage at ONE item instead of the sequence it ran -- a worse failure
+                        # than the one it fixes. The real answer is the pipeline stating its own count,
+                        # which is exactly what <stage>_trace_items() is for; this is what happens
+                        # until it does.
+                        stage_isl_per_request.setdefault(_LEGACY_PROMPT_KEY, _iv)
+                except Exception:  # noqa: BLE001
+                    pass
             if "TRACE_PER_TOKEN_MS=" in line:
                 try:
                     per_tokens.append(float(line.split("TRACE_PER_TOKEN_MS=", 1)[1].split()[0]))
@@ -2408,7 +3050,7 @@ def _run_full_pipeline_ms():
     pf = statistics.median(prefills) if prefills else None
     if dec is not None or pf is not None:
         isl = env.get("TT_PERF_SEQ_LEN", os.environ.get("TT_PERF_SEQ_LEN", "128"))
-        osl = env.get("TT_PERF_MAX_NEW_TOKENS") or os.environ.get("TT_PERF_OSL_TOKENS", "128")
+        osl = env.get("TT_PERF_OSL_TOKENS") or os.environ.get("TT_PERF_OSL_TOKENS", "128")
         tsu = (1000.0 / dec) if dec else 0.0
         # mesh/TP/DP/shard come solely from the run's marker; when it is absent they stay None and we
         # print 'unknown' rather than a fabricated topology.
@@ -2440,6 +3082,82 @@ def _run_full_pipeline_ms():
     if per_tokens:
         if headline_units:
             os.environ["PERF_MCP_LAST_HEADLINE_UNIT"] = headline_units[-1]
+        # The same filter the headline gets, applied to each stage independently: a stage missing
+        # from a sample simply has fewer readings, and median() of what it did report is still the
+        # right answer for it.
+        for _sn, _svals in stage_ms_samples.items():
+            if _svals:
+                stage_ms[_sn] = float(statistics.median(_svals))
+        # The read set has the same last-write-wins defect and a worse consequence: it is pinned
+        # write-once. Take the median here, before the doc is written, so the recorded number and the
+        # pinned number are the same one.
+        for _bn2, _bvals in stage_bytes_samples.items():
+            if _bvals:
+                stage_bytes[_bn2] = int(round(statistics.median(_bvals)))
+        _persist_stage_ms(
+            stage_ms,
+            stage_paths,
+            stage_isl,
+            stage_ops,
+            batch,
+            int(prompt_tokens_seen or 0),
+            stage_isl_per_request,
+            stage_bytes,
+        )
+        # PIN WHAT ONE CALL OF EACH STAGE RETIRES, beside the read set and for the same reason: it
+        # is a ceiling input (the compute floor is 2 x params x tokens), and the report's THEORETICAL
+        # column must not move while the run works. Observed per run, so unpinned it would follow a
+        # change in prefill chunking straight into the ceiling.
+        try:
+            for _tn, _tv in (stage_isl or {}).items():
+                if _tn and int(_tv or 0) > 0:
+                    _ledger().anchor(
+                        _ledger().KIND_STAGE_TOKENS,
+                        float(int(_tv)),
+                        depth=str(_tn).strip().lower(),
+                        mode="items",
+                        source="trace_replay observed item count",
+                        model=_MODEL_ROOT.name if _MODEL_ROOT else "",
+                    )
+        except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost a measurement
+            pass
+        # PIN THE BASELINE READ SET, where it is produced. Measuring the bytes made them right; it did
+        # not stop them moving, and the dtype rung moves them by construction: bf16 -> bf8_b halves a
+        # weight, the observed bytes halve, and a ceiling recomputed from them retreats ahead of the
+        # measurement -- never reached, which is the defect KIND_FLOOR exists to prevent. Write-once
+        # per (model, task, stage); the doc above keeps tracking the current build so the report can
+        # tell a real dtype win from a stale reading.
+        # A READING THAT DOES NOT REPRODUCE IS NOT A CEILING. This pin is write-once, so the first
+        # value becomes the memory roof's divisor permanently -- there is no second chance to correct
+        # it, and every later "% of ceiling" for that stage inherits it. The gate already takes
+        # _FULLPIPE_SAMPLES readings, so agreement across them is free evidence: a stage's working set
+        # is a property of the build and must come out the same every time. One that varies is
+        # instrumentation noise, and pinning it would freeze the noise.
+        #
+        # Deliberately not a flag or an env switch: the run has the evidence in hand and can decide.
+        try:
+            for _st, _svals in (stage_bytes_samples or {}).items():
+                if not _st or not _svals:
+                    continue
+                _med = float(statistics.median(_svals))
+                _spread = (max(_svals) - min(_svals)) / _med if _med > 0 else 1.0
+                if len(_svals) < 2 or _spread > _STAGE_BYTES_AGREE_TOL:
+                    sys.stderr.write(
+                        "[full-pipeline-gate] read set for %s NOT pinned: %d reading(s), spread %.1f%% "
+                        "(need <= %.1f%%) -- values %s\n"
+                        % (_st, len(_svals), _spread * 100.0, _STAGE_BYTES_AGREE_TOL * 100.0, _svals)
+                    )
+                    continue
+                _ledger().anchor(
+                    _ledger().KIND_STAGE_BYTES,
+                    _med / 1e6,
+                    depth=str(_st).strip().lower(),
+                    mode="bytes_mb",
+                    source="trace_replay observed read set (%d agreeing samples)" % len(_svals),
+                    model=_MODEL_ROOT.name if _MODEL_ROOT else "",
+                )
+        except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost a measurement
+            pass
         return statistics.median(per_tokens), "trace", None, decode_path
     if walls:
         return statistics.median(walls), "eager", None, None
@@ -2462,7 +3180,38 @@ _THERMAL_GATE = str(os.environ.get("PERF_MCP_THERMAL_GATE", "1")).lower() not in
 _THERMAL_WAIT_S = float(os.environ.get("PERF_MCP_THERMAL_WAIT_S", "900"))
 _THERMAL_POLL_S = float(os.environ.get("PERF_MCP_THERMAL_POLL_S", "15"))
 _THERMAL_RETRIES = int(os.environ.get("PERF_MCP_THERMAL_RETRIES", "3"))
-_THERMAL_MARGIN_C = float(os.environ.get("PERF_MCP_THERMAL_MARGIN_C", "3"))
+# THE TEMPERATURE A MEASUREMENT MAY START AT. Stated, not learned -- see _clamp_threshold_c for the
+# 177 samples showing that a start temperature does not predict a clamp. Above the 60C the
+# post-clamp cooldown holds to, so a board cooled after a clamp is always clear to start again.
+_START_TEMP_C = 65.0
+# AFTER A CLAMPED READING, COOL PROPERLY BEFORE TRYING AGAIN. The headroom wait is bounded and
+# GIVES UP -- it runs anyway -- so on a board that cannot reach the threshold in 900 s every retry
+# starts hotter than the last: measured on Voxtral 2026-08-14, the board went 79C -> 96C across a
+# run while each attempt "waited" and then added its own heat. Four such attempts cost an hour and
+# produced nothing. This target is ABSOLUTE and the wait is not abandoned on a timer: a retry is
+# only worth taking from a genuinely cold board, and if the board never gets there the run should
+# say so rather than burn attempts at 800 MHz.
+# WAITING FOR PHYSICS IS NOT WORK. The parent watchdog kills a device subprocess on wall clock, and
+# a thermal wait happens INSIDE that subprocess -- so on 2026-08-14 the tool cooled the board, the
+# cooling consumed the budget, and it killed itself at 1716 s for "likely a device wedge". The board
+# was not wedged; the reset that kill triggered is what actually broke it. These markers bracket
+# every thermal wait so the watchdog can stop its clock instead of counting a cooldown as a hang.
+_COOL_BEGIN = "PERF_MCP_COOLING_BEGIN"
+_COOL_END = "PERF_MCP_COOLING_END"
+
+
+def _cooling_marker(which):
+    print(which, file=sys.stderr, flush=True)
+
+
+_COOLDOWN_TO_C = float(os.environ.get("PERF_MCP_COOLDOWN_TO_C", "60"))
+# NO TIMER ON COOLING. A board cools at the rate it cools; a deadline on that is a guess about
+# physics, and the only thing it can do is cut the wait short and hand back a hot board. What IS
+# evidence is the trend: a board still dropping will get there, and a board that has not moved in
+# _COOLDOWN_PLATEAU_S is not cooling -- it has found its floor (this chassis idles at 79C) and no
+# amount of further waiting changes that. So: wait as long as progress continues, stop when it stops.
+_COOLDOWN_PLATEAU_S = float(os.environ.get("PERF_MCP_COOLDOWN_PLATEAU_S", "600"))
+_COOLDOWN_POLL_S = float(os.environ.get("PERF_MCP_COOLDOWN_POLL_S", "20"))
 
 # Fallback only. The real detector is agent.probes.detect_overheat, which already existed for the
 # tracy path; this list is used if that import fails, so a broken import degrades to a weaker check
@@ -2498,16 +3247,142 @@ def _run_reported_clamp(out):
 _LAST_RUN_CLAMPED = False
 
 
+def _board_state_dir():
+    """Where facts about the MACHINE live, as opposed to facts about this model's run.
+
+    state_dir() is per-model (~/.perf_mcp/<model>), which is right for a baseline or a knob cache and
+    wrong for the clamp point: the temperature at which the driver drops AICLK to 800 MHz belongs to
+    the board and its cooling, not to whatever is being optimized on it. Kept per-model it was learned
+    from scratch every time -- gemma3 had 140 observations of this board while voxtral had 4 and no
+    clean reading at all, so the same hardware answered "what is too hot" two different ways.
+
+    PERF_MCP_BOARD_STATE_DIR names it outright; otherwise it is the parent of the per-model state
+    dir. The explicit form exists because CLIMBING OUT OF A SANDBOX DEFEATS IT: the test suite gives
+    each test a private state dir and expects nothing to escape, and a blind `.parent` landed in the
+    shared pytest root where every other test's box lives. Tests then inherited clamp observations
+    from each other, a fully mocked test found a learned threshold, read the real die temperature of
+    a hot board, and sat in a 900 s thermal wait -- which is how the tool's own preflight suite went
+    from 190 s to hanging.
+
+    Only climbs when the state dir was pointed at explicitly. On the tempdir default the parent is /,
+    which is not somewhere to write.
+    """
+    explicit = os.environ.get("PERF_MCP_BOARD_STATE_DIR")
+    if explicit:
+        return Path(explicit)
+    return state_dir().parent if os.environ.get("PERF_MCP_STATE_DIR") else state_dir()
+
+
 def _thermal_profile_path():
-    return state_dir() / "perf_mcp_thermal_profile.json"
+    return _board_state_dir() / "perf_mcp_thermal_profile.json"
+
+
+def _adopt_per_model_profiles(doc):
+    """Fold any per-model profiles beside the board file into it, once.
+
+    The observations are not wrong -- they were taken on this board -- they were merely filed under
+    the model that happened to be running. Dropping them would mean re-learning by clamping again,
+    which costs real runs, so they are adopted rather than discarded. A heavier model reaches a given
+    start temperature with more heat already in the package, so mixing them makes the threshold more
+    conservative, never less: the tool waits slightly longer than one model alone would demand.
+    """
+    if doc.get("clamped_at") or doc.get("clean_at"):
+        return doc
+    root = _board_state_dir()
+    merged = {"clamped_at": [], "clean_at": []}
+    try:
+        found = sorted(root.glob("*/perf_mcp_thermal_profile.json"))
+    except OSError:
+        return doc
+    for f in found:
+        try:
+            old = json.loads(f.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        for k in ("clamped_at", "clean_at"):
+            merged[k] += [float(v) for v in (old.get(k) or []) if isinstance(v, (int, float))]
+    if not (merged["clamped_at"] or merged["clean_at"]):
+        return doc
+    return {k: sorted(v)[-200:] for k, v in merged.items() if v}
 
 
 def _load_thermal_profile():
     try:
         doc = json.loads(_thermal_profile_path().read_text())
-        return doc if isinstance(doc, dict) else {}
+        doc = doc if isinstance(doc, dict) else {}
     except Exception:  # noqa: BLE001
-        return {}
+        doc = {}
+    return _adopt_per_model_profiles(doc)
+
+
+def _cooldown_after_clamp(target_c: float = 0.0) -> tuple:
+    """Hold until the board is genuinely cold, after the hardware has been observed throttling.
+
+    THE HEADROOM WAIT GIVES UP; THIS ONE DOES NOT (until its own bound). _wait_for_thermal_headroom
+    is bounded at 900 s and then runs regardless, which is right before ordinary device work -- a
+    capped profile compared against other capped profiles survives a clamp. It is wrong after a
+    reading has ALREADY been discarded for clamping: retrying from a hot board reproduces the clamp,
+    and the retry itself adds heat.
+
+    Measured on Voxtral 2026-08-14: the board climbed 79C -> 96C over one run, each attempt waiting
+    its full 900 s, giving up, measuring at 800 MHz instead of 1350, and having its reading thrown
+    away. Four attempts, one hour, nothing measured, and the board hotter at the end than the start.
+
+    The target is ABSOLUTE (default 60C) rather than "entry minus a margin", because a relative
+    target on a board sitting at 96C just asks for 91C -- still clamped. Progress is printed every
+    poll so a long cooldown is visible rather than looking like a hang, and it reports the
+    temperature it reached so the caller can say why a retry was skipped.
+    """
+    target = float(target_c or _COOLDOWN_TO_C)
+    t0 = time.time()
+    last = _read_die_temp_c()
+    if last is not None and last <= target:
+        return True, last
+    print(
+        "  [thermal-gate] cooling to %.1fC before retrying (now %s) -- the previous reading was "
+        "discarded for a clamped clock, and a retry from a hot board reproduces it"
+        % (target, ("%.1fC" % last) if last is not None else "unknown"),
+        file=sys.stderr,
+        flush=True,
+    )
+    _cooling_marker(_COOL_BEGIN)
+    try:
+        best, best_t = last, time.time()
+        while True:
+            time.sleep(_COOLDOWN_POLL_S)
+            # RE-ASSERT, EVERY POLL. The watchdog credits the gap between consecutive beats and
+            # nothing beyond them, so a wait that goes quiet stops being free -- which is what keeps
+            # a deadlock from buying itself unlimited time by claiming to be cooling.
+            _cooling_marker(_COOL_BEGIN)
+            cur = _read_die_temp_c()
+            if cur is None:
+                return True, None  # telemetry we cannot read is not a board we refuse to use
+            if cur <= target:
+                print(
+                    "  [thermal-gate] cooled to %.1fC after %.0fs" % (cur, time.time() - t0),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return True, cur
+            # PROGRESS, NOT A CLOCK, decides whether to keep waiting.
+            if best is None or cur < best - 0.5:
+                best, best_t = cur, time.time()
+                print(
+                    "  [thermal-gate] cooling: %.1fC (target %.1fC, %.0fs elapsed)" % (cur, target, time.time() - t0),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif time.time() - best_t >= _COOLDOWN_PLATEAU_S:
+                print(
+                    "  [thermal-gate] board has sat at %.1fC for %.0fs and is no longer cooling -- that "
+                    "is its floor in this chassis, so the %.1fC target is unreachable"
+                    % (cur, time.time() - best_t, target),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False, cur
+    finally:
+        _cooling_marker(_COOL_END)
 
 
 def _record_thermal_observation(start_temp_c, clamped):
@@ -2535,15 +3410,41 @@ def _record_thermal_observation(start_temp_c, clamped):
 
 
 def _clamp_threshold_c():
-    """The die temperature above which THIS board has been seen to clamp, or None if unknown.
+    """The die temperature a measurement may start at: 60C, stated, the same figure the cooldown uses.
 
-    None means "no evidence yet, do not wait" -- the gate then measures, and the clamp check
-    teaches it. That bootstrap is deliberate: a fixed default would be wrong on any board whose
-    clamp point sits below it, and would silently pass clamped readings through, which is the exact
-    failure this gate exists to stop.
+    IT USED TO BE LEARNED, AND THE LEARNING WAS UNSOUND. `clamped_at` holds the temperature a run
+    STARTED at, recorded whenever that run clamped at some later point -- so a run beginning at
+    56.75C, heating for twenty minutes and clamping at 85C wrote down 56.75. The threshold then took
+    min() of that list and subtracted a 3C margin:
 
-    Once both kinds of observation exist the threshold sits between the hottest clean start and the
-    coolest clamped one; with only clamped starts it backs off by PERF_MCP_THERMAL_MARGIN_C.
+        min(clamped) - 3  =  56.75 - 3  =  53.8C      board idles at 53.9C
+
+    Three defects in one line. It attributed a clamp at 85C to a start at 56.75C. It let ONE sample
+    out of 39 speak for all of them -- the other 36 were 68C or higher. And min() only ever moves
+    down, so no quantity of later evidence could raise it again: the board was pinned below its own
+    idle temperature permanently. The gate could never pass, so it timed out at 900s every time and
+    measured hot -- the precise outcome it exists to prevent, reached by way of a 15-minute wait.
+
+    THE SIGNAL DOES NOT PREDICT ANYWAY, which is what settles it. Across 177 recorded runs:
+
+        clamped starts   n=39   median 72.5C   range 56.8 - 87.2
+        clean starts     n=138  median 70.8C   range 57.9 - 75.3
+
+    Medians 1.7C apart on ranges that almost entirely overlap. Starting below 68C takes the clamp
+    rate from 22% to 10%; starting below 60C measured WORSE than average. No threshold drawn through
+    those two distributions separates them, so no amount of arithmetic on them was going to work.
+
+    60C, stated. It is the figure _cooldown_after_clamp already holds to after a discarded reading,
+    and having one number for "cool enough to measure" instead of two removes the case where the
+    gate admits a board the cooldown would have refused. A stated number is also inspectable: it can
+    be read here, argued with, and changed -- which the learned one could not be.
+
+    65C, AND NOTHING READS THE PROFILE TO GET THERE. Not a percentile of it, not a reachability
+    check against it -- any rule that consults the samples is a rule that can be moved by them, and
+    being moved by them is what broke it. One number, in one place, that a reader can find by looking.
+
+    The profile keeps recording. The samples are the evidence behind this docstring and behind any
+    future revision of it; what stopped is a threshold deriving itself from them unsupervised.
     """
     env = os.environ.get("PERF_MCP_MAX_START_TEMP_C")
     if env:
@@ -2551,19 +3452,17 @@ def _clamp_threshold_c():
             return float(env)
         except ValueError:
             pass
-    doc = _load_thermal_profile()
-    clamped = [float(v) for v in (doc.get("clamped_at") or [])]
-    if not clamped:
-        return None
-    lo = min(clamped)
-    clean_below = [float(v) for v in (doc.get("clean_at") or []) if float(v) < lo]
-    if clean_below:
-        return round((lo + max(clean_below)) / 2.0, 2)
-    return round(lo - _THERMAL_MARGIN_C, 2)
+    return _START_TEMP_C
+
+
+_LAST_KNOWN_TEMP_C = None
 
 
 def _read_die_temp_c():
     """Hottest ASIC temperature across the chips this run can see, or None if unreadable.
+
+    Every successful reading is remembered in _LAST_KNOWN_TEMP_C so a later failure has something
+    better than a guess to fall back on -- see _wait_for_thermal_headroom.
 
     Delegates to agent.probes._read_asic_temp -- the tool already had this and a second copy would
     be one more place to fix. MAX is the right reduction on a mesh: a collective runs at the pace
@@ -2576,15 +3475,19 @@ def _read_die_temp_c():
     every chip on the host, deliberately: nothing says which chip the run will open, and
     over-waiting is the safe direction.
 
-    None means "cannot tell", and every caller treats that as permission to proceed: a board whose
-    telemetry we cannot read must not become a board we refuse to measure.
+    None means "cannot tell". A host that has never produced a reading has no telemetry to wait for
+    and still proceeds -- a missing sensor is not a hot board. But once a reading HAS been seen, an
+    unreadable sensor falls back to it instead of proceeding: see _wait_for_thermal_headroom.
     """
     try:
         from agent.probes import _read_asic_temp
 
-        return _read_asic_temp()
+        v = _read_asic_temp()
     except Exception:  # noqa: BLE001
         return None
+    if v is not None:
+        globals()["_LAST_KNOWN_TEMP_C"] = float(v)
+    return v
 
 
 def _wait_for_thermal_headroom():
@@ -2611,7 +3514,26 @@ def _wait_for_thermal_headroom():
     limit = _clamp_threshold_c()
     t0 = time.time()
     cur = _read_die_temp_c()
-    if cur is None or limit is None or cur <= limit:
+    if cur is None:
+        # UNKNOWN IS NOT COOL. This used to fall through with the cool boards, and the moment a read
+        # is most likely to fail is right after a heavy run -- exactly when the board is hottest. On
+        # 2026-08-15 that let a measurement start on a 93C board; it ran clamped at 800 MHz instead
+        # of 1350, took ~1.7x longer, blew its 1806 s budget, and the timeout's reset bricked the
+        # board. Both sources have to fail to get here, so this is rare and worth waiting out.
+        #
+        # The distinction that keeps it from hanging: a host that has NEVER produced a reading has no
+        # telemetry to wait for, and a missing sensor is still not a hot board -- that case proceeds
+        # exactly as before. Having read 93C a minute ago and being unable to read now is a different
+        # thing entirely, and the last known value is the best evidence available.
+        cur = _LAST_KNOWN_TEMP_C
+        if cur is None:
+            return True, None
+        print(
+            "  [thermal-gate] sensors unreadable; using the last known %.1fC rather than assuming cool" % cur,
+            file=sys.stderr,
+            flush=True,
+        )
+    if limit is None or cur <= limit:
         return True, cur
     print(
         "  [thermal-gate] die at %.1fC, this board has clamped at/above %.1fC; waiting (up to %.0fs)"
@@ -2619,8 +3541,18 @@ def _wait_for_thermal_headroom():
         file=sys.stderr,
         flush=True,
     )
+    _cooling_marker(_COOL_BEGIN)
+    try:
+        return _headroom_poll(t0, limit, cur)
+    finally:
+        _cooling_marker(_COOL_END)
+
+
+def _headroom_poll(t0, limit, cur):
+    """The polling half of _wait_for_thermal_headroom, split out so the wait can be bracketed."""
     while time.time() - t0 < _THERMAL_WAIT_S:
         time.sleep(_THERMAL_POLL_S)
+        _cooling_marker(_COOL_BEGIN)  # re-assert; the watchdog credits beats, not a single claim
         cur = _read_die_temp_c()
         if cur is None:
             return True, None
@@ -2678,6 +3610,19 @@ def _measure_full_pipeline_guarded():
                 file=sys.stderr,
                 flush=True,
             )
+            # A RETRY IS ONLY WORTH TAKING FROM A COLD BOARD. Going straight back in reproduces the
+            # clamp and adds heat; the headroom wait ahead of the next attempt is bounded and would
+            # give up again. Hold for a real cooldown instead, and stop retrying if it never comes.
+            _cool_ok, _cool_c = _cooldown_after_clamp()
+            if not _cool_ok:
+                return (
+                    None,
+                    None,
+                    "board stopped cooling at %s, above the %.1fC needed for an unclamped reading; "
+                    "measuring again would only produce another clamped number"
+                    % (("%.1fC" % _cool_c) if _cool_c else "an unknown temperature", _COOLDOWN_TO_C),
+                    None,
+                )
             continue
         return float(ms), method, None, path
     _lim = _clamp_threshold_c()
@@ -2762,6 +3707,37 @@ def gates_allow_banking() -> tuple:
     return True, "pcc ok + full-pipeline ok"
 
 
+def _win_from_verdict(fp: dict, ms: float, ref) -> tuple:
+    """(win, delta_ms, metric) for one full-pipeline verdict. THE win rule, stated once.
+
+    The headline comes first: if it moved down, that is the result and the delta is stated in it.
+    Otherwise a stage may still have ratcheted -- the headline measures the DECODE stage, so prefill
+    levers cannot show up in it, and the delta then has to be stated in the stage that moved or the
+    report prints a win beside a `+0.05 ms`. `metric` names which one, so the two can never be read
+    as the same number.
+
+    check_full_pipeline_latency sets stage_win only when a stage improved past the same tolerance
+    the headline uses AND no stage regressed, so this cannot credit a lever that merely moved time
+    from one stage into another."""
+    if ref is None:
+        return False, None, ""
+    if ms < ref:
+        return True, round(ms - ref, 4), "end_to_end"
+    if not fp.get("stage_win"):
+        return False, round(ms - ref, 4), "end_to_end"
+    gains = [
+        (row["ms"] - row["best"], name)
+        for name, row in (fp.get("stages") or {}).items()
+        if isinstance(row, dict) and row.get("improved") and row.get("best")
+    ]
+    if not gains:
+        # stage_win with no stage to attribute it to: the verdict is internally inconsistent, so
+        # fall back to the headline rather than inventing a metric.
+        return False, round(ms - ref, 4), "end_to_end"
+    delta, name = min(gains)
+    return True, round(delta, 4), name
+
+
 def gate_set_new_best() -> bool:
     """Did the last full-pipeline verdict actually RATCHET the end-to-end best down?
 
@@ -2788,7 +3764,12 @@ def gate_set_new_best() -> bool:
         # missing reference means something is wrong, and a fabricated win is the one outcome that
         # cannot be corrected afterwards.
         return False
-    return ms < prev
+    # A STAGE THAT RATCHETED IS A WIN EVEN WHEN THE HEADLINE DID NOT MOVE. The headline is the decode
+    # stage, so `ms < prev` credited decode work and nothing else -- prefill levers scored no-gain and
+    # were reverted, including the one that took TTFT from 95.19 to 54.81 ms. Same rule as the
+    # per-attempt verdict, from the same function, because three disagreeing answers to "is this a
+    # win" is the bug this module has already had once.
+    return _win_from_verdict(fp, ms, prev)[0]
 
 
 def _fullpipe_reference_ms(fp: dict):
@@ -2824,6 +3805,11 @@ def _emit_fullpipe(result: dict) -> dict:
         # _verdict_identity keys ownership on this id and fails closed without it, so dropping it
         # here made EVERY record_kernel_attempt unownable and no rung could ever clear.
         measurement_id=result.get("measurement_id"),
+        # A stage that ratcheted while the headline held flat -- gate_set_new_best reads this, so it
+        # has to survive the trip through the verdict file. Every key dropped here is a fact the
+        # write path cannot see.
+        stage_win=result.get("stage_win"),
+        stages=result.get("stages"),
     )
     m = result.get("method")
     src = "trace_replay" if m == "trace" else ("eager_wall" if m == "eager" else "n/a")
@@ -2874,7 +3860,7 @@ def _head_sha_quiet() -> str:
         return ""
 
 
-def _record_fullpipe_candidate(ms: float, method: str, mode: str) -> None:
+def _record_fullpipe_candidate(ms: float, method: str, mode: str, stages: dict | None = None) -> None:
     """Stash a reading as PENDING, stamped with the HEAD it was measured at."""
     try:
         _fullpipe_pending_path().write_text(
@@ -2885,11 +3871,72 @@ def _record_fullpipe_candidate(ms: float, method: str, mode: str) -> None:
                     "mode": mode,
                     "sha": _head_sha_quiet(),
                     "unit": os.environ.get("PERF_MCP_LAST_HEADLINE_UNIT", ""),
+                    # EVERY STAGE THE PIPELINE DECLARES, not just the one the headline measures.
+                    # The headline is the decode stage (that is what tok/s/u means), so prefill work
+                    # left it flat and read as no-gain -- the ratchet had no memory of prefill at
+                    # all, and TTFT is a product metric too. See _bar_stages / gate_set_new_best.
+                    "stages": {k: float(v) for k, v in (stages or {}).items() if isinstance(v, (int, float)) and v > 0},
                 }
             )
         )
     except Exception:  # noqa: BLE001
         pass
+
+
+def _measured_stages() -> dict:
+    """The per-stage readings from the measurement that just ran, or {}.
+
+    Read back from the stage file rather than threaded through _run_full_pipeline_ms's return: that
+    function has five return sites, and the file is already written there, run-stamped, by the one
+    reader every other consumer uses. A second channel for the same numbers is how the report came
+    to show a stale prefill beside a fresh decode."""
+    try:
+        return {k: float(v) for k, v in (read_stage_ms() or {}).items() if isinstance(v, (int, float)) and v > 0}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _bar_stages() -> dict:
+    """The committed per-stage bests, or {}. Absent means no stage has ratcheted yet."""
+    try:
+        p = _FULLPIPE_BASELINE_1CQ_PATH
+        if not p.exists():
+            return {}
+        doc = json.loads(p.read_text())
+        return {k: float(v) for k, v in (doc.get("stages") or {}).items() if isinstance(v, (int, float)) and v > 0}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _min_stages(cur: dict | None, new: dict | None) -> dict:
+    """Per-stage minimum of two bars. A stage present in only one survives with its value."""
+    out = {k: float(v) for k, v in (cur or {}).items() if isinstance(v, (int, float)) and v > 0}
+    for k, v in (new or {}).items():
+        if not isinstance(v, (int, float)) or v <= 0:
+            continue
+        if k not in out or float(v) < out[k]:
+            out[k] = float(v)
+    return out
+
+
+def _stage_deltas(now: dict, bar: dict) -> dict:
+    """Per stage: {ms, best, delta_pct, improved, regressed}. A stage with no bar yet is neither.
+
+    THE TOLERANCE IS THE SAME ONE THE HEADLINE USES. A stage improving by less than the board's
+    spread is not a result, and treating it as one is how a lever that moved nothing gets banked."""
+    out = {}
+    for name, ms in sorted(now.items()):
+        prev = bar.get(name)
+        row = {"ms": round(ms, 4), "best": (round(prev, 4) if prev else None)}
+        if prev and prev > 0:
+            row["delta_pct"] = round((ms - prev) / prev * 100.0, 2)
+            row["improved"] = ms < prev * (1.0 - _FULLPIPE_TOL)
+            row["regressed"] = ms > prev * (1.0 + _FULLPIPE_TOL)
+        else:
+            row["delta_pct"] = None
+            row["improved"] = row["regressed"] = False
+        out[name] = row
+    return out
 
 
 def _read_fullpipe_bar():
@@ -2967,19 +4014,40 @@ def _promote_fullpipe_pending() -> bool:
         # banked anything at all as a ~20 ms win, written conclusive. A mode change still
         # re-baselines: eager and trace numbers are not comparable, so the old value is meaningless
         # rather than better.
+        #
+        # ONE RATCHET PER METRIC. The doc carries the headline AND every declared stage, and they do
+        # not move together: a prefill lever lowers TTFT while the decode headline holds flat, and
+        # promoting or refusing the doc WHOLE meant the prefill best could only ever be recorded by
+        # a commit that also happened to beat the headline. So each field keeps its own minimum --
+        # the headline never rises, and neither does any stage.
         _keep_old = False
+        _merged = None
         try:
             _new_doc = json.loads(src.read_text())
             _new_ms = float(_new_doc.get("full_pipeline_ms") or 0.0)
+            _merged = dict(_new_doc)
             if _FULLPIPE_BASELINE_1CQ_PATH.exists() and _new_ms > 0:
                 _cur_doc = json.loads(_FULLPIPE_BASELINE_1CQ_PATH.read_text())
                 _cur_ms = float(_cur_doc.get("full_pipeline_ms") or 0.0)
                 _same_mode = str(_cur_doc.get("mode") or "") == str(_new_doc.get("mode") or "")
+                # A mode change re-baselines everything: eager and trace numbers are not comparable,
+                # so the old values are meaningless rather than better.
+                if _same_mode:
+                    _merged["stages"] = _min_stages(_cur_doc.get("stages"), _new_doc.get("stages"))
                 if _cur_ms > 0 and _same_mode and _new_ms > _cur_ms:
-                    _keep_old = True
+                    _merged["full_pipeline_ms"] = _cur_ms
                     print(
-                        "  [full-pipeline-gate] REFUSED to move the bar backwards: %.4f ms is slower "
-                        "than the committed best %.4f ms; keeping the best." % (_new_ms, _cur_ms),
+                        "  [full-pipeline-gate] REFUSED to move the headline backwards: %.4f ms is "
+                        "slower than the committed best %.4f ms; keeping the best%s."
+                        % (
+                            _new_ms,
+                            _cur_ms,
+                            (
+                                " (per-stage bests still ratchet)"
+                                if _merged.get("stages") != (_cur_doc.get("stages") or {})
+                                else ""
+                            ),
+                        ),
                         file=sys.stderr,
                         flush=True,
                     )
@@ -2987,7 +4055,7 @@ def _promote_fullpipe_pending() -> bool:
             _keep_old = True
         if not _keep_old:
             try:
-                _write_fullpipe_bar(json.loads(src.read_text()))
+                _write_fullpipe_bar(_merged if _merged is not None else json.loads(src.read_text()))
             except Exception:  # noqa: BLE001
                 _FULLPIPE_BASELINE_1CQ_PATH.write_text(src.read_text())
         # RECORD THE RATCHET. This is the reading a win is confirmed against -- trace_replay
@@ -3222,7 +4290,7 @@ def _full_depth_op_probe():
     env["TT_METAL_HOME"] = repo
     env["PYTHONPATH"] = repo
     _set_depth(env, None)  # ALL layers: cap REMOVED, never sent as 0 (see agent/layer_depth.py)
-    env["TT_PERF_MAX_NEW_TOKENS"] = "1"
+    env["TT_PERF_OSL_TOKENS"] = "1"
     env.pop("TT_METAL_DEVICE_PROFILER", None)
     cmd = [sys.executable, str(Path(__file__).parent / "_op_sig_probe.py"), node]
     if case:
@@ -3372,12 +4440,27 @@ def check_full_pipeline_latency() -> dict:
     # bank-a-win signal -- so a 7%-slower lever could be committed and, repeated, ratcheted real
     # latency upward while the reported AFTER stayed at the old minimum. Slower is `regressed`.
     regressed = (not diverged) and ms > best
-    if ms < best:
-        _record_fullpipe_candidate(ms, method, mode)
+    # THE HEADLINE IS ONE STAGE, NOT THE WHOLE PRODUCT. TRACE_PER_TOKEN_MS is the DECODE stage --
+    # that is what tok/s/u means -- so every prefill lever left it flat, read as no-gain, and was
+    # reverted: TTFT went 95.19 -> 54.81 ms on this model and the ratchet had no field to put it in.
+    # A stage that improved with none regressed is a real result and is stashed as a candidate, so a
+    # commit can promote it. The STATUS still follows the headline: a decode regression is a
+    # regression whatever prefill did, and only the headline may be compared against `best`.
+    _stages_now = _measured_stages()
+    _sdelta = _stage_deltas(_stages_now, _bar_stages())
+    stage_win = (
+        bool(_sdelta)
+        and any(r["improved"] for r in _sdelta.values())
+        and not any(r["regressed"] for r in _sdelta.values())
+    )
+    if ms < best or (not diverged and not regressed and stage_win):
+        _record_fullpipe_candidate(ms, method, mode, _stages_now)
     return _emit_fullpipe(
         {
             "status": "diverged" if diverged else ("regressed" if regressed else "ok"),
             "full_pipeline_ms": round(ms, 4),
+            "stages": _sdelta,
+            "stage_win": stage_win,
             # MINTED HERE, where a trace replay actually ran. _verdict_identity keys ownership on it,
             # so exactly one attempt can claim this reading and every later one reports own=False.
             "measurement_id": _measurement_id(),
@@ -3518,7 +4601,7 @@ def _record_committed_win(message: str) -> None:
                 _led.KIND_EAGER,
                 _led.PHASE_AFTER,
                 t.get("measured_ms"),
-                depth=(os.environ.get("TT_PERF_LAYERS") or "").strip() or "all",
+                depth=_depth_in_force(),
                 mode="eager",
                 source="git_commit",
                 model=_MODEL_ROOT.name if _MODEL_ROOT else "",
@@ -3544,6 +4627,53 @@ def _record_committed_win(message: str) -> None:
         )
     except Exception:  # noqa: BLE001
         pass
+
+
+def _perf_test_paths() -> list:
+    """Every perf test this run resolved, absolute. From the manifest, never a filename pattern."""
+    paths = []
+    try:
+        _root = gitio.repo_root(_MODEL_ROOT)
+    except Exception:  # noqa: BLE001
+        return paths
+    _m = _MANIFEST if isinstance(_MANIFEST, dict) else {}
+    cands = []
+    _res = (_m.get("perf_test_resolved") or {}).get("path")
+    if _res:
+        cands.append(_res)
+    for _c in _m.get("components") or []:
+        if isinstance(_c, dict) and _c.get("perf_test"):
+            cands.append(_c["perf_test"])
+    for _c in cands:
+        try:
+            _p = Path(str(_c).split("::", 1)[0])
+            paths.append(_p if _p.is_absolute() else (Path(_root) / _p))
+        except Exception:  # noqa: BLE001
+            continue
+    return paths
+
+
+def _reinject_stage_marks() -> list:
+    """Re-apply the stage marks the revert just removed. Returns what changed, never raises."""
+    out = []
+    try:
+        from agent.stage_marks import inject_stage_marks as _inject
+    except Exception:  # noqa: BLE001
+        return out
+    seen = set()
+    for _p in _perf_test_paths():
+        try:
+            if not _p.is_file() or str(_p) in seen:
+                continue
+            seen.add(str(_p))
+            cur = _p.read_text()
+            new, why = _inject(cur)
+            if new != cur:
+                _p.write_text(new)
+                out.append("%s: %s" % (_p.name, why))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
 
 
 @mcp.tool()
@@ -3588,9 +4718,18 @@ def git_revert(sha: str) -> dict:
     except Exception:  # noqa: BLE001
         pass
     _discard_fullpipe_pending()
+    # THE REVERT RESTORES THE MODEL, NOT THE INSTRUMENTATION. The stage marks are an UNCOMMITTED edit
+    # to a tracked file inside the model dir, so the scoped checkout above -- doing exactly its job --
+    # erases them along with the rejected attempt. voxtral run 25: injected 09:29, first revert
+    # 11:20:47, and every later capture ran an unmarked test. Injecting earlier cannot win, because a
+    # revert always comes after; re-applying here is the only place that knows they were just removed.
+    # Idempotent and self-refusing, so it can never double-mark a pass.
+    _remarked = _reinject_stage_marks()
     out = {"reverted_to": sha}
     if _removed:
         out["removed_created_files"] = _removed
+    if _remarked:
+        out["stage_marks_reapplied"] = _remarked
     return out
 
 
@@ -3708,7 +4847,7 @@ def _attempt_fullpipe_verdict() -> dict:
     reading the same verdict reports `own=False` and carries no delta and no win -- honest about
     having measured nothing, rather than borrowing someone else's result.
     """
-    out = {"own": False, "ms": None, "ref": None, "delta": None, "win": False}
+    out = {"own": False, "ms": None, "ref": None, "delta": None, "win": False, "metric": ""}
     fp = gate_verdicts().get("full_pipeline") or {}
     # A `regressed` reading is a real measurement -- the candidate ran, the replay finished, the
     # number came back worse -- and record_kernel_attempt's contract is that even a measured LOSS
@@ -3741,8 +4880,7 @@ def _attempt_fullpipe_verdict() -> dict:
     ref = _fullpipe_reference_ms(fp)
     out.update(own=True, ms=round(ms, 4), ref=None if ref is None else round(ref, 4))
     if ref is not None:
-        out["delta"] = round(ms - ref, 4)
-        out["win"] = ms < ref
+        out["win"], out["delta"], out["metric"] = _win_from_verdict(fp, ms, ref)
     try:
         path.write_text(json.dumps(ident))
     except OSError:
@@ -3894,7 +5032,7 @@ def record_kernel_attempt(
                     if _op_match(op_signature, a) and a.get("kernel_kind")
                 }
             )
-            _left = [r for r in _LADDER_ORDER if r not in _done_kinds]
+            _left = [r for r in ladder_order() if r not in _done_kinds]
             return {
                 "recorded": False,
                 "refused": (
@@ -4012,7 +5150,7 @@ def record_kernel_attempt(
 
 
 @mcp.tool()
-def recall_knobs(op_class: str, grid: str = "", bound_by: str = "") -> dict:
+def recall_knobs(op_class: str, grid: str = "", bound_by: str = "", regime: str = "") -> dict:
     """REUSE-FIRST: return the tested/known knobs already catalogued for this op_class, so you
     APPLY/ADAPT a proven one BEFORE improvising from scratch. Routed deterministically from the
     GUIDELINES catalog (numbered guides + LEARNED_*/GRADUATED_* learned levers) by op_class. CALL
@@ -4024,6 +5162,13 @@ def recall_knobs(op_class: str, grid: str = "", bound_by: str = "") -> dict:
     record_kernel_attempt for the rung exactly as termination_check requires. If nothing matches,
     improvise from principles, then persist the win yourself with distill_knob (the write-back is a
     manual agent call on the cc engine).
+
+    regime: the STAGE this lever belongs to, as THE MODEL declared it in PIPELINE_STAGES -- pass
+    next_target.regime when the target carries one. This axis is deliberately open (router.VOCABULARY
+    validates it against the run's declared stages, not a fixed set) because a fixed
+    {prefill,decode,na} could not tag a lever written for an audio encoder. Levers for one stage are
+    tagged with it and nothing else reaches them: the KV-cache section is `op_class: attention,
+    datamove` + `regime: decode`, so narrowing by op_class ALONE cannot find it from a decode target.
 
     op_class: one of matmul|attention|reduction|eltwise|datamove|embedding|conv_pool|ccl|
     host_fallback|other (pass next_target.op_class). grid + bound_by (pass next_target.grid +
@@ -4074,14 +5219,36 @@ def recall_knobs(op_class: str, grid: str = "", bound_by: str = "") -> dict:
         b = _BOUND_MAP.get((bound_by or "").strip().lower())
         if b:
             q["bound"] = b
+        # THE STAGE AXIS, WHICH NOTHING COULD REACH. router.DIMENSIONS has carried "regime" all along
+        # and route() filters on it, but no caller passed one -- so a stage-tagged lever was only ever
+        # findable by whatever op_class it also happened to declare. The KV-cache section is
+        # `op_class: attention,datamove` + `regime: decode`; a decode target narrowing by op_class
+        # alone lands on attention levers and never sees it.
+        _rg = (regime or "").strip().lower()
+        if _rg and _rg != "na":
+            q["regime"] = _rg
         try:
             hits = router.route(index, q) if q else router.all_entries(index)
         except Exception:  # noqa: BLE001
             hits = []
-        if not hits and len(q) > 1:  # narrowing starved -> never return empty wrongly; op_class-only
-            try:
-                hits = router.route(index, {"op_class": oc})
-            except Exception:  # noqa: BLE001
+        if not hits and len(q) > 1:  # narrowing starved -> never return empty wrongly
+            # Widen one axis at a time rather than collapsing straight to op_class: a target that
+            # carries a regime and no usable op_class (every run-level gate) would otherwise fall to
+            # `{"op_class": ""}` and lose the stage narrowing that was the only thing it had.
+            for _wider in (
+                {"op_class": oc, "regime": q["regime"]} if oc and "regime" in q else None,
+                {"regime": q["regime"]} if "regime" in q else None,
+                {"op_class": oc} if oc else None,
+            ):
+                if not _wider:
+                    continue
+                try:
+                    hits = router.route(index, _wider)
+                except Exception:  # noqa: BLE001
+                    hits = []
+                if hits:
+                    break
+            if not hits:
                 hits = router.all_entries(index)
         if not hits and not q:
             hits = router.all_entries(index)
@@ -4250,8 +5417,66 @@ def _decode_is_recompute(model_root) -> bool:
     return no_kv and not kv_write
 
 
+def _token_stage_name() -> str:
+    """The stage THE MODEL declared for the loop that retires a token, or "" if it did not say.
+
+    _decode_gate used to label its target `op_class="decode"`. That is a stage word this tool chose,
+    not one the model supplied, and it is not in the op_class vocabulary at all -- it survived only
+    because recall_knobs sends unknown values through _integrity.classify, an LLM round-trip, to be
+    remapped into something that is. So every firing of the gate spent a model call resolving a
+    constant we wrote ourselves, and resolved it to a SINGLE op_class, which cannot reach the
+    KV-cache section anyway (`op_class: attention,datamove` + `regime: decode`).
+
+    The stage belongs on the regime axis, which router.VOCABULARY leaves open precisely so a model
+    names its own stages -- its comment records that a fixed {prefill,decode,na} could not tag a
+    lever written for an audio encoder. So ask the model: PIPELINE_STAGES is its own declaration.
+
+    Returning "" is a real answer and the right one when nothing was declared: recall_knobs treats an
+    absent axis as unnarrowed, which hands over the whole catalogue with a note. That is strictly
+    better than narrowing on a word nobody said.
+    """
+    try:
+        from agent.stack_knob_repair import stage_names
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        declared = [str(n or "").strip() for n in (stage_names(_MODEL_ROOT) or []) if str(n or "").strip()]
+    except Exception:  # noqa: BLE001
+        return ""
+    if not declared:
+        return ""
+    if len(declared) == 1:
+        return declared[0].lower()  # one stage, and it is the one that retires the token
+    # SEVERAL STAGES, AND NOTHING HERE CAN SAY WHICH ONE RETIRES THE TOKEN. The fact that would
+    # settle it -- a stage whose per-call item count is 1 -- lives in the pipeline's
+    # <stage>_trace_items hooks, and reading those means importing the pipeline, which imports ttnn
+    # and needs a device. This gate runs without one.
+    #
+    # So return "" and let the catalogue come back unnarrowed with a note. The alternative is a
+    # substring test for "decode" in the stage names, which is the exact guess headline_unit's
+    # docstring calls "a guess wearing an observation's clothes": a pipeline whose recurring stage is
+    # called `generate` reads as one-pass, and one that names any stage `decode` reads as
+    # autoregressive whether it loops or not. Unnarrowed-and-honest beats narrowed-and-wrong.
+    return ""
+
+
 def _decode_gate(prof: dict, attempts: list) -> dict | None:
     if os.environ.get("TT_PERF_MODULE_LEVEL") == "1":
+        return None
+    # ONLY A MODEL THAT DECODES CAN HAVE A BROKEN DECODE. This gate BLOCKS a run until a KV-cache
+    # lever lands, and it reaches that verdict from `decode_status == "repeat_prefill"` -- which
+    # trace_replay emits whenever its capture was SKIPPED, for any reason, on any pipeline. A
+    # classifier or an encoder-only model exposes no traceable step, skips, and is then ordered to
+    # add a cached single-token decode step to a model that emits no tokens. Nothing downstream
+    # could clear it: there is no decode to cache, so the attempt cap is the only way out, three
+    # wasted rewrites later.
+    #
+    # The structural answer is already recorded. trace_replay prints TRACE_HEADLINE_UNIT from
+    # headline_unit(), which reads the decode_step CONTRACT rather than any name: "token" means the
+    # pipeline retires one token per call, "step" a denoise step, "inference" one whole pass. Only
+    # the first has a decode loop for a KV-cache to fix.
+    _unit = str(os.environ.get("PERF_MCP_LAST_HEADLINE_UNIT", "") or _reliable_forward_unit() or "").strip().lower()
+    if _unit and _unit != "token":
         return None
     repeat = prof.get("decode_status") == "repeat_prefill"
     scale = kv_cache_needed_by_scaling(prof.get("decode_ms_at_c"), prof.get("decode_ms_at_2c"))
@@ -4282,13 +5507,15 @@ def _decode_gate(prof: dict, attempts: list) -> dict | None:
         "full prefill every token (no cached decode_step / KV-cache). Trace removes DISPATCH gaps ONLY "
         "and does NOT remove this REDUNDANT RECOMPUTE, so 'trace already applied' / 'irreducible' does NOT "
         "resolve this and will NOT clear the gate. You MUST add a KV-cache + single-token decode_step "
-        "(recall_knobs(op_class='decode')). Then record_kernel_attempt(op='generation_loop','kv-cache',"
+        "(recall_knobs(op_class='attention', regime=<the stage this target names>)). Then "
+        "record_kernel_attempt(op='generation_loop','kv-cache',"
         "measured_ms,beat_baseline) — this gate clears ONLY on a MEASURED per-token reduction from the cache."
         if repeat
         else "MANDATORY kv-cache — SEPARATE from trace. per-token cost scales with capacity "
         "(use_cache=False, no KV-cache write) -> O(capacity) recompute every token EVEN THOUGH it traces. "
         "Trace does NOT remove recompute; 'irreducible' is NOT accepted. Add a KV-cache + single-token "
-        "decode_step (recall_knobs(op_class='decode')); record_kernel_attempt(op='generation_loop','kv-cache',"
+        "decode_step (recall_knobs(op_class='attention', regime=<the stage this target names>)); "
+        "record_kernel_attempt(op='generation_loop','kv-cache',"
         "measured_ms,beat_baseline) — clears ONLY on a MEASURED per-token reduction."
     )
     host_ms = 0.0
@@ -4297,15 +5524,250 @@ def _decode_gate(prof: dict, attempts: list) -> dict | None:
             host_ms = float(b.get("device_ms") or 0.0)
             break
     gap = max(host_ms, float(prof.get("per_token_ms") or 0.0), _MATERIAL_GAP_MS)
+    _stage = _token_stage_name()
     return {
         "op": "generation_loop",
-        "op_class": "decode",
+        # IN-VOCABULARY, and the stage carried on the axis built for it. The loop is host-bound
+        # orchestration -- this gate already says bound_by="host" -- so host_fallback is what it IS;
+        # WHICH stage it belongs to is the model's word, on the regime axis, or absent.
+        "op_class": "host_fallback",
+        "regime": _stage,
         "gap_ms": round(gap, 4),
         "bound_by": "host",
         "grid": None,
         "weight_dtype": None,
         "next_rung": "structural-decode",
         "reason": reason,
+    }
+
+
+def _fold_gate(prof: dict, attempts: list) -> dict | None:
+    """One op fingerprint evaluated many times per layer -- fold the repeats into one wider matmul.
+
+    THE DISCRIMINATOR IS SELF-NORMALISING, which is what makes this detectable at all. A high call
+    count is not evidence: EVERY matmul in a 30-layer model runs 30 times. What distinguishes a
+    foldable repeat from ordinary per-layer recurrence is running MORE than once per layer -- and the
+    per-layer baseline does not have to be looked up, because the profile states it. top_ops groups
+    by (op_code, shape, memory), so the modal count across fingerprints IS "once per layer per item":
+    the great majority of ops run exactly that often. A fingerprint whose count is an integer multiple
+    of that mode is being evaluated several times within one layer.
+
+    Deriving the baseline from the profile rather than from depth x items matters practically: depth
+    needs the checkpoint and items needs <stage>_trace_items, which means importing the pipeline,
+    which needs a device this gate does not have. The mode needs neither.
+
+    WHAT IT CATCHES. Two projections of identical shape applied to the same input share a fingerprint
+    and run 2x per layer -- a SwiGLU gate/up pair is the standard case, and concatenating them into
+    one wider matmul is the standard fix. A per-head or per-frame matmul runs heads x or frames x and
+    folds into a batched call.
+
+    A CANDIDATE, NOT A VERDICT. The gate can see that something recurs within a layer; it cannot see
+    whether the operands are concatenable or whether a data dependency forbids it. That is what the
+    attempt establishes, and 'none: <evidence>' is a legitimate outcome the cap will accept.
+
+    Same shape as _decode_gate and _conv_gate: applicability, detector, measured-win exit, cap.
+    """
+    ops = [o for o in (prof.get("open_ops") or []) if int(o.get("count") or 0) > 0]
+    if len(ops) < 3:
+        return None  # too few fingerprints for a mode to mean anything
+    counts = [int(o.get("count") or 0) for o in ops]
+    baseline = max(set(counts), key=lambda c: (counts.count(c), -c))
+    if baseline < 1:
+        return None
+    mult = max(2, int(os.environ.get("PERF_MCP_FOLD_MIN_MULTIPLE", "2") or "2"))
+    cands = [
+        o
+        for o in ops
+        if int(o["count"]) >= baseline * mult and int(o["count"]) % baseline == 0 and float(o.get("gap_ms") or 0.0) > 0
+    ]
+    if not cands:
+        return None  # (1) not applicable: nothing recurs within a layer
+    gap = sum(float(o.get("gap_ms") or 0.0) for o in cands)
+    if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
+        return None
+    _kinds = ("fold", "structural-fold")
+    clean = [a for a in attempts if (a.get("kernel_kind") or "").lower() in _kinds]
+    if any(_ledger().is_win(a) for a in clean):  # (2) measured win clears it
+        return None
+    wedged = sum(1 for a in _load_attempts() if (a.get("kernel_kind") or "").lower() in _kinds and a.get("wedged"))
+    if (len(clean) + wedged) >= int(os.environ.get("PERF_MCP_MAX_FOLD_ATTEMPTS", "3") or "3"):
+        return None  # (3) capped
+    worst = max(cands, key=lambda o: float(o.get("gap_ms") or 0.0))
+    return {
+        "op": str(worst.get("op_code") or "repeated_op"),
+        "op_class": str(worst.get("bucket") or ""),
+        "gap_ms": round(gap, 4),
+        "bound_by": worst.get("bound_by"),
+        "grid": worst.get("grid"),
+        "weight_dtype": worst.get("weight_dtype"),
+        "next_rung": "structural-fold",
+        "reason": (
+            "FOLD THE REPEATS -- a structural lever, and it comes BEFORE the kernel rungs. %r runs %d "
+            "times while most op fingerprints in this profile run %d, so it is evaluated %dx per layer "
+            "rather than once. Folding those calls into ONE wider matmul (concatenate the weights along "
+            "the output dim and slice the result, or batch them into a single call) removes %d-1 "
+            "dispatches per layer and gives the remaining matmul a larger, better-shaped problem. Two "
+            "projections of the same shape on the same input -- a SwiGLU gate/up pair is the usual case "
+            "-- are the textbook instance; a per-head or per-frame matmul is the other. Check FIRST that "
+            "the operands are actually concatenable and that no data dependency orders them: if they are "
+            "not, record_kernel_attempt(op=%r,'fold',measured_ms,False,note='none: <why not foldable>') "
+            "and this clears. Otherwise fold it, measure, and record -- this gate clears ONLY on a "
+            "MEASURED reduction."
+        )
+        % (
+            str(worst.get("op_code") or ""),
+            int(worst.get("count") or 0),
+            baseline,
+            int(worst.get("count") or 0) // baseline,
+            int(worst.get("count") or 0) // baseline,
+            str(worst.get("op_code") or "repeated_op"),
+        ),
+    }
+
+
+def _is_datamove(op_code: str) -> bool:
+    """Does this op exist to move/reshape data rather than compute on it?
+
+    ASK THE CLASSIFIER, DO NOT KEEP A LIST. This started as
+    _SLICE_MARKERS = ("slice","gather","concat","split","transpose","permute","reshape","index")
+    -- a substring list matched against op names, which is both a hardcoded vocabulary and a second
+    copy of a decision agent/opclass.py already owns. Every one of those ops classifies as
+    `datamove` there, and a list like that misses the next op name by construction, which is the
+    same reason _integrity.classify exists instead of an alias table.
+    """
+    try:
+        from agent.opclass import classify_op
+
+        return classify_op(op_code or "") == "datamove"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _order_gate(prof: dict, attempts: list) -> dict | None:
+    """A projection sitting next to a slice/gather -- try the other order and measure.
+
+    The two orders are not equivalent in cost. Projecting the whole tensor and then slicing does
+    full-width math and throws part of it away; slicing first does narrower math but moves data to
+    do it. Which wins depends on the ratio and on where the tensors live, and the honest answer is
+    that nobody can tell from the shapes alone -- so measure both. The catalogue currently PRESCRIBES
+    instead: 03 section 5 picks one of three head-split strategies "by regime", which is a rule where
+    an experiment belongs.
+
+    THE ADJACENCY IS REAL DATA, not a guess. tracy_tool._neighbours reads the capture in execution
+    order (GLOBAL CALL COUNT) and records the most common op either side of each fingerprint, so
+    "this projection feeds a slice" is an observation about what ran. Most-common, so a one-off
+    pairing at a stack boundary does not trigger it.
+
+    Same four parts as the other gates: applicability, detector, measured-win exit, cap.
+    """
+    cands = []
+    for o in prof.get("open_ops") or []:
+        # the op's OWN class, as the profile classified it -- not a substring of its name
+        if str(o.get("bucket") or "").lower() != "matmul":
+            continue
+        if not (_is_datamove(o.get("next_op")) or _is_datamove(o.get("prev_op"))):
+            continue
+        if float(o.get("gap_ms") or 0.0) > 0:
+            cands.append(o)
+    if not cands:
+        return None  # (1) not applicable: no projection is adjacent to a slice/gather
+    gap = sum(float(o.get("gap_ms") or 0.0) for o in cands)
+    if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
+        return None
+    _kinds = ("order", "structural-order")
+    clean = [a for a in attempts if (a.get("kernel_kind") or "").lower() in _kinds]
+    if any(_ledger().is_win(a) for a in clean):  # (2)
+        return None
+    wedged = sum(1 for a in _load_attempts() if (a.get("kernel_kind") or "").lower() in _kinds and a.get("wedged"))
+    if (len(clean) + wedged) >= int(os.environ.get("PERF_MCP_MAX_ORDER_ATTEMPTS", "3") or "3"):
+        return None  # (3)
+    worst = max(cands, key=lambda o: float(o.get("gap_ms") or 0.0))
+    _pair = str(worst.get("next_op") or worst.get("prev_op") or "the adjacent reshape")
+    return {
+        "op": str(worst.get("op_code") or "projection"),
+        "op_class": str(worst.get("bucket") or ""),
+        "gap_ms": round(gap, 4),
+        "bound_by": worst.get("bound_by"),
+        "grid": worst.get("grid"),
+        "weight_dtype": worst.get("weight_dtype"),
+        "next_rung": "structural-order",
+        "reason": (
+            "TRY BOTH ORDERS -- a structural lever, ahead of the kernel rungs. %r runs immediately "
+            "beside %r in the capture. Projecting the full width and then slicing does math you throw "
+            "away; slicing or gathering first does narrower math but moves data to do it. Which is "
+            "cheaper depends on the width ratio and on where the tensors live, and it is NOT decidable "
+            "from the shapes -- so measure both orders and keep the faster. If the order is forced (a "
+            "data dependency, or the slice is what produces the projection's input), that is a real "
+            "answer: record_kernel_attempt(op=%r,'order',measured_ms,False,note='none: order is "
+            "forced because <reason>') and this clears. Otherwise swap them, check_pcc, measure, and "
+            "record -- this gate clears ONLY on a MEASURED reduction."
+        )
+        % (str(worst.get("op_code") or ""), _pair, str(worst.get("op_code") or "projection")),
+    }
+
+
+def _conv_gate(prof: dict, attempts: list) -> dict | None:
+    """MANDATORY conv weight preparation, for a model that actually has convs.
+
+    WHY THIS IS A GATE AND NOT PLAYBOOK PROSE. `conv_pool` is a first-class op_class -- opclass.py
+    maps Conv/Halo/Pool/GridSample/Upsample to it, and it is in STRUCTURAL_OP_CLASSES -- but the
+    catalogue tags exactly two sections with it, `11_TT_LANG_KERNELS` and `12_CPP_METALIUM_KERNELS`:
+    the bottom two rungs. So for a conv op the only thing recall_knobs can ever return is "author a
+    custom kernel", and the ladder walks a conv straight down to hand-writing Metalium for work that
+    `ttnn.prepare_conv_weights` does once at load. Voxtral-Mini-3B-2507 has audio_tower.conv1 and
+    conv2, so this is not hypothetical for the model in hand.
+
+    The expensive part of a conv is not the math, it is preparing weights into the layout the kernel
+    wants. Done per call it is paid every forward; done once per (in_channels, out_channels, kernel,
+    stride, padding, dtype, layout) it is paid once, and two call sites with identical parameters can
+    share one prepared tensor rather than each building a byte-identical copy.
+
+    Shaped exactly like _decode_gate, and for the same reasons:
+
+      1. APPLICABILITY FIRST. No conv ops -> return None. _decode_gate's comment records what the
+         alternative costs: an encoder-only model was ordered to add a KV-cache and burned three
+         rewrites before the attempt cap released it. A model with no convs must never see this.
+      2. MEASUREMENT-GATED EXIT. Clears on a MEASURED win, never on "attempted" -- the failure the
+         host rung had, where one unhelpful attempt sealed an axis for 158 later rounds.
+      3. CAPPED. A genuinely unpreparable conv yields after PERF_MCP_MAX_CONV_ATTEMPTS real tries,
+         wedges included, so this cannot become a loop that never converges.
+    """
+    convs = [o for o in (prof.get("open_ops") or []) if str(o.get("bucket") or "").lower() == "conv_pool"]
+    if not convs:
+        return None  # (1) not applicable: this model has no convolution at all
+    gap = sum(float(o.get("gap_ms") or 0.0) for o in convs)
+    if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
+        return None
+    _kinds = ("conv-prep", "structural-conv")
+    clean = [a for a in attempts if (a.get("kernel_kind") or "").lower() in _kinds]
+    if any(_ledger().is_win(a) for a in clean):  # (2) measured win clears it
+        return None
+    wedged = sum(1 for a in _load_attempts() if (a.get("kernel_kind") or "").lower() in _kinds and a.get("wedged"))
+    if (len(clean) + wedged) >= int(os.environ.get("PERF_MCP_MAX_CONV_ATTEMPTS", "3") or "3"):
+        return None  # (3) capped
+    _codes = ", ".join(sorted({str(o.get("op_code") or "") for o in convs})[:4])
+    return {
+        "op": "conv_weights",
+        "op_class": "conv_pool",
+        "gap_ms": round(gap, 4),
+        "bound_by": "host",
+        "grid": None,
+        "weight_dtype": None,
+        "next_rung": "structural-conv",
+        "reason": (
+            "MANDATORY conv weight preparation -- a lever SEPARATE from the kernel rungs, and it comes "
+            "BEFORE them. This model has conv ops (%s) carrying %.3fms of gap. Prepare the weights ONCE "
+            "per distinct (in_channels, out_channels, kernel_size, stride, padding, dtype, layout) with "
+            "ttnn.prepare_conv_weights / prepare_conv_bias at load, hold the prepared tensors, and pass "
+            "them to every ttnn.conv2d call instead of letting each call prepare its own. Two call sites "
+            "whose parameters match must SHARE one prepared tensor, not build byte-identical copies. "
+            "Authoring a tt-lang or C++ kernel does NOT resolve this and will NOT clear the gate -- a "
+            "hand-written kernel still pays per-call preparation. Then record_kernel_attempt(op="
+            "'conv_weights','conv-prep',measured_ms,beat_baseline) -- this clears ONLY on a MEASURED "
+            "reduction. If the weights are provably already prepared once and shared, record it with "
+            "note='none: <evidence>' and the cap will release it."
+        )
+        % (_codes or "conv", gap),
     }
 
 
@@ -4327,12 +5789,30 @@ def _reliable_forward_ms(dev: float) -> float | None:
     return None
 
 
+def _declared_stages_for_env() -> list:
+    """This model's declared stages, for building the per-stage env knobs. [] when it declares none.
+
+    Read from the model's own PIPELINE_STAGES via the contract's single reader, so the names the
+    harness sets match the names the generated test binds and the report keys on.
+    """
+    try:
+        from agent.model_contract import declared_stage_names
+
+        return [str(x) for x in (declared_stage_names(_MODEL_ROOT) or []) if str(x).strip()]
+    except Exception:  # noqa: BLE001 -- no declaration is no extra knobs, never a failed run
+        return []
+
+
 def _reliable_forward_unit() -> str:
     """The unit of work the gate's stored reading counts, or "" when it predates the marker."""
     try:
         return str(json.loads(_FULLPIPE_BASELINE_1CQ_PATH.read_text()).get("unit") or "").strip().lower()
     except Exception:  # noqa: BLE001
         return ""
+
+
+# Set once the facts rebuild has been attempted in this process -- see _load_perf_target_inputs.
+_PTIN_REBUILD_TRIED = False
 
 
 def _load_perf_target_inputs() -> dict | None:
@@ -4344,21 +5824,70 @@ def _load_perf_target_inputs() -> dict | None:
     of the run. That is why a RUN_REPORT could show "modeled floor / NO_BAND / no weight-bytes input"
     for a model whose facts had existed minutes earlier. Rebuilding here costs one safetensors header
     read and makes the ceiling survive the revert instead of depending on it.
-    """
-    try:
-        return json.loads((_MODEL_ROOT / "perf_target_inputs.json").read_text())
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        import importlib.util as _ilu
 
-        _spec = _ilu.spec_from_file_location("cc_run_ptin", str(Path(__file__).parent / "run.py"))
-        _run = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_run)
-        _run._emit_perf_target_inputs(_MODEL_ROOT, _MODEL_ROOT, None, _MANIFEST)
-        return json.loads((_MODEL_ROOT / "perf_target_inputs.json").read_text())
-    except Exception:  # noqa: BLE001
-        return None
+    Read ONLY from a STATED model root. With the "." default this resolved against the working
+    directory and adopted whatever perf_target_inputs.json happened to be lying there -- see
+    _MODEL_ROOT_STATED. A fact about the model comes from the model's directory or not at all.
+    """
+    facts = None
+    if _MODEL_ROOT_STATED:
+        try:
+            facts = json.loads((_MODEL_ROOT / "perf_target_inputs.json").read_text())
+        except Exception:  # noqa: BLE001
+            pass
+    # The REBUILD path resolves the same relative "." and so re-adopted the working directory's file
+    # even after the direct read was guarded -- one rule, two doors. Both are shut by the same test.
+    # AND REBUILT IF NOBODY WHO KNOWS THE MODEL HAS WRITTEN IT. The condition was `facts is None`
+    # -- the file being GONE. A file that merely cannot answer satisfies that check: the device
+    # census creates perf_target_inputs.json as soon as it has walked the boards, carrying bytes and
+    # nothing else, and stamps no `source` because it is not the facts producer. From then on this
+    # read succeeds, the rebuild never fires, and the producer's keys -- total_params, the per-block
+    # geometry, the layer counts -- never reach the file for the rest of the run.
+    #
+    # `source` is the file's own record of who wrote it, which is exactly the question here: absent,
+    # no producer has ever written, so ask one to. The emit merges rather than replaces, so a file
+    # another writer owns keeps every value it already carries.
+    # ONCE PER PROCESS. The rebuild walks safetensors headers, and when it cannot produce facts (no
+    # reachable checkpoint) it writes nothing -- so the file keeps no `source` and every later read
+    # would pay for the same failed walk again. Retrying a rebuild that already declined to write
+    # cannot succeed on the same inputs, so it is attempted once and the result stands.
+    global _PTIN_REBUILD_TRIED
+    _unproduced = isinstance(facts, dict) and not str(facts.get("source") or "").strip()
+    if (facts is None or (_unproduced and not _PTIN_REBUILD_TRIED)) and _MODEL_ROOT_STATED:
+        _PTIN_REBUILD_TRIED = True
+        try:
+            import importlib.util as _ilu
+
+            _spec = _ilu.spec_from_file_location("cc_run_ptin", str(Path(__file__).parent / "run.py"))
+            _run = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_run)
+            # HAND IT THE MODEL ID. Setup calls this with a real hint; this path passed None, so
+            # _resolve_model_id had only the demo dir to go on and `blocks` -- which needs the HF
+            # config behind that id -- could not be rebuilt at all. run.py already owns the lookup.
+            try:
+                _mid_hint = _run._model_id_for_facts(_MODEL_ROOT) or None
+            except Exception:  # noqa: BLE001
+                _mid_hint = None
+            _run._emit_perf_target_inputs(_MODEL_ROOT, _MODEL_ROOT, _mid_hint, _MANIFEST)
+            facts = json.loads((_MODEL_ROOT / "perf_target_inputs.json").read_text())
+        except Exception:  # noqa: BLE001
+            # A FAILED REBUILD MUST NOT COST THE FACTS ALREADY READ, AND MUST NOT SKIP THE OVERRIDE.
+            # This returned None -- right while the branch only ran with nothing in hand, but now
+            # that an unproduced file also reaches here it would trade a partial answer for none.
+            # Falling through instead keeps whatever was read (None included, which the single exit
+            # below returns unchanged) and leaves both routes passing through the unit override.
+            pass
+    # THE OBSERVED UNIT OVERRIDES THE CACHED GUESS. The file's `unit` came from a table keyed on the
+    # HF pipeline_tag, which names the TASK and cannot state whether a model loops: `text-to-speech`
+    # covers XTTS, which emits tokens, and Kokoro, which is StyleTTS2 and produces a whole waveform in
+    # one pass. trace_replay reports what the built pipeline ACTUALLY did, and once it has, that is a
+    # fact rather than a lookup. Applied HERE, on both paths, because the file is written once at
+    # setup -- before any trace exists -- and then read from cache for the rest of the run, so
+    # correcting only the producer would never reach a run whose file already exists.
+    _obs = str(os.environ.get("PERF_MCP_LAST_HEADLINE_UNIT") or "").strip().lower()
+    if _obs and isinstance(facts, dict) and facts.get("unit") != _obs:
+        facts["unit"] = _obs
+    return facts
 
 
 def _perf_target_status(rep: dict, dev: float) -> dict | None:
@@ -4432,12 +5961,82 @@ def _select_perf_target(rep: dict):
             mf = _anchored_ceiling_facts()
         if mf:
             tp = int(os.environ.get("TT_PERF_MESH_COLS", "1") or "1")
+            # THE GATE AND THE REPORT MUST DIVIDE BY THE SAME BYTES. The report prices each stage by
+            # the subtree it streams -- a decode token reads the language backbone and never the
+            # audio encoder -- while this handed compute_target the WHOLE model. On a two-tower model
+            # that ceiling is too LOW, so the measured rate looks closer to it than it is and the run
+            # can be declared at-the-floor while the report, dividing correctly, still shows headroom.
+            #
+            # Applied only when the model's own facts carry both halves -- which stage runs which
+            # subtree, and that subtree's MEASURED resident bytes. A checkpoint ratio is not used
+            # here: it states disk precision, and a wrong ceiling in the stop gate is worse than a
+            # conservative one. Absent either, the whole model is the read set, exactly as before.
+            _share = _recurring_subtree_share(mf)
+            mf = (
+                dict(mf, device_weight_bytes=int(float(mf.get("device_weight_bytes") or 0) * _share))
+                if (_share < 1.0 and mf.get("device_weight_bytes"))
+                else mf
+            )
+            anchored = anchored * _share if (anchored and _share < 1.0) else anchored
+            if _share < 1.0:
+                print(
+                    "  [perf-mcp] stop-gate ceiling scaled to the recurring stage's subtree "
+                    "(%.1f%% of resident weights), matching the roofline table" % (100.0 * _share),
+                    file=sys.stderr,
+                    flush=True,
+                )
             return (
                 perf_target.compute_target(mf, _ENV, tp_degree=tp, bytes_per_unit=anchored),
                 "model",
                 True,
             )
     return perf_target.target_from_floor_ms(rep.get("modeled_floor_ms")), ("module" if module_level else "model"), False
+
+
+def _recurring_subtree_share(mf: dict) -> float:
+    """Fraction of resident weights the RECURRING stage streams; 1.0 when it cannot be established.
+
+    MEASURED ONLY. device_section_bytes is the census walking the built model, so this is the served
+    split; the checkpoint's ratio is deliberately not accepted as a substitute here, because it
+    states disk precision and the stop gate acts on the answer. stage_roots says which subtree each
+    stage runs, and the recurring stage is the one the headline unit counts.
+
+    1.0 means "the whole model", which is both the honest answer for a single-tower model and the
+    behaviour that predates this.
+    """
+    try:
+        roots = (mf or {}).get("stage_roots") or {}
+        dev = (mf or {}).get("device_section_bytes") or {}
+        total = float((mf or {}).get("device_weight_bytes") or 0.0)
+        if not roots or not dev or total <= 0:
+            return 1.0
+        # The stage the per-unit ceiling is about: the one the run measured its headline against.
+        _rec = str(os.environ.get("PERF_MCP_RECURRING_STAGE", "") or "").strip()
+        if not _rec:
+            _isl = read_stage_isl_map() or {}
+            _ones = [k for k, v in _isl.items() if int(v or 0) == 1]
+            _rec = _ones[0] if len(_ones) == 1 else ""
+        if not _rec or _rec not in roots:
+            return 1.0
+        mine = float(dev.get(str(roots[_rec])) or 0.0)
+        if mine <= 0 or mine > total:
+            return 1.0
+        return mine / total
+    except Exception:  # noqa: BLE001 -- an unestablished share is the whole model, never a failure
+        return 1.0
+
+
+# A depth that is not a unit of work. The byte anchor's producer used to fall back to the literal
+# string "unit" when no unit had been observed yet, so legacy ledgers carry rows keyed under it. The
+# fallback scans below read a row's depth AS the unit, so accepting one of these does not merely
+# return the wrong bytes -- it reports the model's unit of work as "unit", and the band, the at-floor
+# verdict and the headline rate all inherit that. Refused on both scans; a run whose only anchor is a
+# placeholder is a run with no anchor, which lands on the documented floor fallback.
+_PLACEHOLDER_DEPTHS = frozenset({"unit", "unknown", ""})
+
+
+def _is_real_unit(depth) -> bool:
+    return str(depth or "").strip().lower() not in _PLACEHOLDER_DEPTHS
 
 
 def _anchored_ceiling_bytes(mf: dict) -> float:
@@ -4464,6 +6063,8 @@ def _anchored_ceiling_bytes(mf: dict) -> float:
         # floor, while the report still showed the pinned ceiling. The anchored row carries the unit it
         # was pinned under, so the baseline is recoverable without the file and without guessing.
         for r in led.rows(led.KIND_ACTIVE_BYTES, led.PHASE_BEFORE, model, task):
+            if not _is_real_unit(r.get("depth")):
+                continue
             try:
                 v = float(r.get("value_ms"))
             except (TypeError, ValueError):
@@ -4492,14 +6093,42 @@ def _anchored_ceiling_facts():
             os.environ.get("PERF_MCP_TASK", "main"),
         ):
             d = str(r.get("depth") or "").strip().lower()
-            if d:
+            if _is_real_unit(d):
                 return {"unit": d}
     except Exception:  # noqa: BLE001
         pass
     return None
 
 
-def _persist_throughput(rep: dict) -> None:
+def _dominant_peak_flops(rep: dict) -> float:
+    """Peak FLOP/s at the fidelity carrying the most FLOPs in this report, or 0.0.
+
+    THE MODE THE MODEL ACTUALLY RUNS AT, by FLOP share -- a measurement, not the hifi4 default
+    chip_peak_flops falls back to when handed nothing. Returns 0.0 rather than guessing when the
+    report carries no fidelity-tagged FLOPs, so a run with nothing to measure pins nothing and the
+    renderer keeps its existing behaviour.
+    """
+    try:
+        ops = [o for o in ((rep or {}).get("open_ops") or []) if o.get("flops")]
+        if not ops:
+            return 0.0
+        agg: dict = {}
+        for o in ops:
+            f = str(o.get("fidelity") or "hifi4").lower()
+            agg[f] = agg.get(f, 0) + int(o["flops"])
+        if not agg:
+            return 0.0
+        dom = max(agg.items(), key=lambda kv: kv[1])[0]
+        from agent.environment import ARCH_FACTS
+        from agent.perf_target import chip_peak_flops as _cpf
+
+        _arch = str(os.environ.get("PERF_MCP_ARCH") or "blackhole").strip().lower()
+        return float(_cpf(ARCH_FACTS.get(_arch) or {}, dom) or 0.0)
+    except Exception:  # noqa: BLE001 -- a peak that cannot be derived is simply not pinned
+        return 0.0
+
+
+def _persist_throughput(rep: dict, prof_for_peak: dict | None = None) -> None:
     """Write a FRESH static roofline-target snapshot (theoretical ceiling / band / active_bytes /
     peak BW / floor) each time we profile. Deliberately stores NO measured number — the report
     computes measured tok/s + utilization from the exact ms it is reporting, so a stale measured can
@@ -4512,7 +6141,7 @@ def _persist_throughput(rep: dict) -> None:
     55% at-floor while measuring FASTER, purely because the floor was recomputed each round."""
     try:
         target, scope, is_llm = _select_perf_target(rep)
-        _win = (os.environ.get("TT_PERF_LAYERS") or "").strip() or "all"
+        _win = _depth_in_force()
         snap = {
             "scope": scope,
             "has_unit_ceiling": bool(is_llm),
@@ -4543,12 +6172,74 @@ def _persist_throughput(rep: dict) -> None:
             "perf_layers": "all" if is_llm else _win,
         }
         _throughput_path().write_text(json.dumps(snap))
+        # THE BYTE ANCHOR, WRITTEN WHERE THE UNIT IS FINALLY KNOWN. KIND_FLOOR and KIND_PEAK_FLOPS are
+        # both pinned here; active_bytes was not, and its only writer (run.py) is guarded on `if
+        # _unit:` at a point BEFORE any trace has reported one -- so it never fired. run.py's own
+        # comment promises the gap is covered ("once a trace reports, the rebuild path anchors with
+        # the observed unit"); nothing implemented it, and _anchored_ceiling_facts is a reader.
+        #
+        # Unpinned, the memory roof is re-derived from the LIVE census on every step: this function
+        # runs from termination_check, which runs every step, so a dtype win (bf16 -> bf8_b halves a
+        # weight) shrinks the census and the ceiling follows it down mid-run -- the target retreating
+        # ahead of the measurement, which is the one thing an anchor exists to prevent. The compute
+        # roof was already protected this way; the memory roof was not.
+        try:
+            _ab = int(getattr(target, "active_bytes", 0) or 0)
+            _u = str(snap.get("unit") or "").strip().lower()
+            if _ab > 0 and _is_real_unit(_u):
+                _ledger().anchor(
+                    _ledger().KIND_ACTIVE_BYTES,
+                    float(_ab) / 1e6,
+                    depth=_u,
+                    mode="bytes_mb",
+                    source="_persist_throughput (%s)" % str(snap.get("bytes_source") or "census")[:60],
+                    model=_MODEL_ROOT.name if _MODEL_ROOT else "",
+                )
+        except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost the snapshot
+            pass
         _f = rep.get("modeled_floor_ms") if isinstance(rep, dict) else None
         if _f:
             _ledger().anchor(
                 _ledger().KIND_FLOOR,
                 _f,
                 depth=_win,
+                source="_persist_throughput",
+                model=_MODEL_ROOT.name if _MODEL_ROOT else "",
+            )
+        # THE COMPUTE ROOF'S DENOMINATOR, pinned here for the same reason the floor above it is.
+        #
+        # The snapshot tracks the current build by design, and the peak read from it moves whenever
+        # the `fidelity` rung lands: _promote_baseline replaces the profile PICTURE on every
+        # profile_model call while ratcheting only device_ms, and the peak is read off that picture.
+        # Blackhole's modes are 4x apart, so one matmul changing mode can double the ceiling -- on
+        # voxtral, hifi4 carries 4.037e12 FLOPs against hifi2's 3.299e12, a 5.0%-of-total margin, and
+        # the largest single hifi4 matmul is 16.7%.
+        #
+        # KEYED ON THE UNIT, exactly like the byte anchor, because the renderer looks it up by the
+        # unit the ceiling describes. Not on _win: a peak is a property of the math mode and the
+        # silicon, not of how many layers the profiler happened to build.
+        # PER-STAGE PEAKS pinned beside the per-stage bytes, when the capture marked its stages.
+        try:
+            for _st, _bk in ((prof_for_peak or {}).get("stage_buckets") or {}).items():
+                _p = _dominant_peak_flops({"open_ops": [o for b in _bk for o in (b.get("top_ops") or [])]})
+                if _st and _p > 0:
+                    _ledger().anchor(
+                        _ledger().KIND_PEAK_FLOPS,
+                        _p,
+                        depth=str(_st).strip().lower(),
+                        mode="roofline",
+                        source="_persist_throughput per-stage",
+                        model=_MODEL_ROOT.name if _MODEL_ROOT else "",
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+        _pk = _dominant_peak_flops(rep)
+        if _pk > 0:
+            _ledger().anchor(
+                _ledger().KIND_PEAK_FLOPS,
+                _pk,
+                depth=str(snap.get("unit") or "token"),
+                mode="roofline",
                 source="_persist_throughput",
                 model=_MODEL_ROOT.name if _MODEL_ROOT else "",
             )
@@ -4620,15 +6311,52 @@ def termination_check() -> dict:
         prof = _profile_with_zero_row_retry()
     except Exception as exc:  # noqa: BLE001
         _note_device_crash("termination_check", str(exc))
+        # BEFORE THE VERDICT, NOT AFTER IT. Run 18 halted telling the operator to reboot the host
+        # while two stale processes still held /dev/tenstorrent; the supervisor reaped them on its way
+        # out and a plain `tt-smi -r` then recovered all four boards in ninety seconds. The resets
+        # that "failed" had run against a held device. One retry, only if reaping actually freed
+        # something -- see device_recovery.retry_once_after_reaping for why that is not a loosened
+        # limit.
+        if _recovery_exhausted():
+            try:
+                if _dr().retry_once_after_reaping(
+                    "termination_check",
+                    lambda tgt: _board_reset("termination_check", "post-reap retry (target=%s)" % tgt, target=tgt),
+                    log=lambda m: sys.stderr.write("[perf-mcp] %s\n" % m),
+                ):
+                    prof = _profile_with_zero_row_retry()
+            except Exception:  # noqa: BLE001
+                pass
         if _recovery_exhausted():
             # STOP POLLING A DEAD BOARD. can_stop=False means "work remains"; a device that cannot be
             # recovered is not work remaining, and the agent is instructed never to stop while it is
             # False -- which is how a dead card produced hours of 6-minute no-op gate calls.
+            # NAME WHAT THE OPERATOR MUST DO. "unrecoverable after N attempts" is an inference from
+            # repeated failure; when the kernel has reported a board-management fault it is a
+            # diagnosis, and the two call for different actions. Run 39 halted with the vague form and
+            # sat dead until morning -- a reboot would have taken two minutes.
+            _reboot = False
+            try:
+                _reboot = _dr().board_needs_host_reboot()
+            except Exception:  # noqa: BLE001
+                pass
+            _why = (
+                "the driver reports a board-management fault no PCIe reset can clear "
+                "('Failed to set initial power state') -- REBOOT THE HOST, then re-run: %s"
+                if _reboot
+                else "device could not be recovered after %d reset attempts: %s"
+            ) % ((str(exc)[-300:],) if _reboot else (_RESET_FAIL_LIMIT, str(exc)[-300:]))
             return {
                 "can_stop": True,
-                "halt": "device_unrecoverable",
-                "error": "device could not be recovered after %d reset attempts: %s"
-                % (_RESET_FAIL_LIMIT, str(exc)[-300:]),
+                "halt": "needs_host_reboot" if _reboot else "device_unrecoverable",
+                # ONE KEY FOR THE REASON A RUN HALTED. This carried the message in `error` while the
+                # OTHER halt (tt-lang) carried it in `halt_reason`, and the supervisor reads
+                # halt_reason -- so a dead board printed an EMPTY reason under a message hardcoded to
+                # "install tt-lang first, then re-run". The operator was told to install a toolchain
+                # when the card needed a host reboot, and the run sat dead until morning. `error`
+                # stays for readers that already use it; the two are the same string.
+                "halt_reason": _why,
+                "error": _why,
             }
         return {"can_stop": False, "error": f"profiler crashed: {str(exc)[-500:]}"}
     _note_device_ok()
@@ -4670,6 +6398,21 @@ def termination_check() -> dict:
             "grid": o.get("grid"),
             "weight_dtype": o.get("weight_dtype"),
         }
+        # THE STAGE AXIS, CARRIED. router has had "regime" among its DIMENSIONS all along,
+        # declare_stages() fills its vocabulary from the model's own PIPELINE_STAGES, and
+        # recall_knobs(regime=...) narrows on it -- but a per-op target never carried one, so the only
+        # value ever to reach the axis was the host gate's generation_loop. A knob section written for
+        # one stage was therefore unreachable from an op in that stage: the KV-cache section is
+        # `op_class: attention, datamove` + `regime: decode`, and narrowing by op_class alone cannot
+        # find it.
+        #
+        # ABSENT RATHER THAN "na" when the op does not know. "na" is a VALUE in that vocabulary -- it
+        # asserts "belongs to no stage" -- so passing it would narrow the search to levers tagged
+        # stage-less rather than leaving the axis open. Ops carry "na" today because their source is
+        # unwired (tracy_tool: TBD(regime-source)), and an unwired source must read as silence.
+        _rg = str(o.get("regime") or "").strip().lower()
+        if _rg and _rg != "na":
+            entry["regime"] = _rg
         done, rung, reason = _op_ladder_status(o, op_code, attempts)
         if done:
             cleared.append({**entry, "verdict": reason})
@@ -4684,6 +6427,15 @@ def termination_check() -> dict:
     decode_block = _decode_gate(prof, attempts)
     if decode_block:
         blocking.append(decode_block)
+    conv_block = _conv_gate(prof, attempts)
+    if conv_block:
+        blocking.append(conv_block)
+    fold_block = _fold_gate(prof, attempts)
+    if fold_block:
+        blocking.append(fold_block)
+    order_block = _order_gate(prof, attempts)
+    if order_block:
+        blocking.append(order_block)
     blocking.sort(key=lambda b: -(b.get("eff_gap_ms") or b.get("gap_ms") or 0.0))
     can_stop = not blocking
     # AND NOTHING MATERIAL MAY BE UNTRIED. `blocking` empties as each op's checklist fills, so an op

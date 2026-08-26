@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -315,9 +316,21 @@ def _derive_mesh_device_env(args) -> None:
         # find_box is CASE-SENSITIVE ('p150' raises, 'P150' works) while the CLI help suggests
         # lowercase ("e.g. p300c, T3K, Galaxy"), so match case-insensitively before looking up.
         canon = next((b.name for b in HARDWARE if b.name.lower() == str(box_name).lower()), box_name)
+    except Exception:  # noqa: BLE001 -- the table itself failed to import; nothing to validate against
+        return
+    try:
         box = find_box(canon)
     except Exception:  # noqa: BLE001
-        return
+        # A BOX NAME THAT DOES NOT RESOLVE MUST NOT PASS QUIETLY. This used to fall into the same
+        # blanket `return` as an import failure, so --box p300c -- the board series tt-smi actually
+        # prints for these chips, and the example the CLI help itself used to give -- set nothing,
+        # printed nothing, and left the model loading a default profile. The operator asked for a
+        # specific board and got silence. The names are a closed set, so this is checkable.
+        raise SystemExit(
+            "unknown --box %r. Valid boxes: %s (case-insensitive). Note this is the planner's BOX "
+            "name, not the board series tt-smi prints: four 'p300c' Blackhole chips are the box QB2."
+            % (box_name, ", ".join(b.name for b in HARDWARE))
+        )
     shape = (1, 1)
     raw = getattr(args, "mesh", None)
     if raw:
@@ -518,24 +531,142 @@ def cmd_optimize(args) -> int:
 
     if _os.environ.get("PERF_MCP_SUPERVISED") != "1" and _os.environ.get("PERF_MCP_SUPERVISE", "1") == "1":
         _max = int(_os.environ.get("PERF_MCP_MAX_RESTARTS", "3") or "3")
+        # How often the attempt's tree is re-snapshotted. It is the only record of a grandchild once
+        # the root exits, so it bounds how stale the kill list can be; a /proc scan costs microseconds
+        # against a run measured in hours.
+        _REAP_POLL_S = float(_os.environ.get("PERF_MCP_SUPERVISOR_REAP_POLL_S", "10"))
+        # Imported from the ONE definition rather than restated: a second literal here that drifted
+        # from run.py's would turn every refusal back into three device resets, silently.
+        try:
+            from models.experimental.perf_automation.cc_optimize.run import EXIT_REFUSED as _EXIT_REFUSED
+        except Exception:  # noqa: BLE001 -- a supervisor that cannot import must still supervise
+            _EXIT_REFUSED = 3
         _ttsmi = _sh.which("tt-smi")
+
+        # THE ATTEMPT IS NOT OVER WHEN MY CHILD EXITS.
+        #
+        # This was `_sp.run(...)`, and its return was taken as the attempt ending. It is not: the run
+        # spawns workers with start_new_session=True (run.py, perf_test_agent.py) so their groups can
+        # be killed independently, and that same flag means they SURVIVE their parent -- reparented
+        # to init, in their own sessions, invisible to a group kill. _reclaim_device does not see
+        # them either; it kills device HOLDERS, and a worker between device operations holds nothing.
+        #
+        # Measured 2026-08-16: attempt 1 gave up on perf-test generation (rc=1), and its orchestrator,
+        # a detached subprocess and a perf-test agent were still running 77, 70 and 37 minutes later.
+        # The supervisor launched attempt 2 into the same board. Two runs driving one board took the
+        # ARC cores down -- `tt-smi -r` then failed with "ARC core (8, 0) failed to start" until the
+        # tree was killed by hand, after which the identical reset succeeded first try.
+        #
+        # So the tree is snapshotted WHILE it lives (once the root exits the PPID links are gone for
+        # good) and reaped before anything else happens. The tool already had three tree-killers --
+        # cli.py:_kill_process_tree, cc_harness.py:_kill_agent_tree, probes.py:_kill_tree -- and this
+        # path used none of them.
+        try:
+            from models.experimental.perf_automation.agent.probes import _descendant_pids as _desc, _kill_tree as _reap
+        except Exception:  # noqa: BLE001 -- supervising without a reaper beats not supervising
+            _desc, _reap = (lambda _p: []), (lambda _p, extra=(): None)
+
+        def _alive(pid):
+            try:
+                _os.kill(int(pid), 0)
+                return True
+            except Exception:  # noqa: BLE001
+                return False
+
+        def _run_attempt(_argv, _env):
+            """Run one attempt, tracking its whole tree, and reap whatever outlives it."""
+            _p = _sp.Popen(_argv, env=_env)
+            _tree: set = set()
+            while True:
+                try:
+                    _p.wait(timeout=_REAP_POLL_S)
+                    break
+                except _sp.TimeoutExpired:
+                    _tree.update(_desc(_p.pid))
+            _tree.update(_desc(_p.pid))
+            _left = [q for q in _tree if _alive(q)]
+            if _left:
+                # REPORTED, NOT SILENT. A leaked tree is the difference between "the run crashed" and
+                # "the run is still going and about to be raced", and the operator cannot see it.
+                print(
+                    "  [optimize/supervisor] the attempt left %d process(es) running after exiting "
+                    "(%s) -- killing them before going on" % (len(_left), ", ".join(str(q) for q in sorted(_left)[:8])),
+                    flush=True,
+                )
+                _reap(_p.pid, extra=_left)
+                _t.sleep(2)
+                _still = [q for q in _left if _alive(q)]
+                if _still:
+                    # A process SIGKILL cannot clear is in D-state on the device. Starting another
+                    # attempt now is what broke the board; say so and stop instead.
+                    print(
+                        "  [optimize/supervisor] %d process(es) survived SIGKILL (%s) -- refusing to "
+                        "start another attempt on a board they may still be holding."
+                        % (len(_still), ", ".join(str(q) for q in sorted(_still)[:8])),
+                        flush=True,
+                    )
+                    return _p.returncode, _still
+            return _p.returncode, []
+
         for _n in range(_max + 1):
-            _rc = _sp.run(
+            _rc, _stuck = _run_attempt(
                 [_sys.executable, "-m", "scripts.tt_hw_planner", *_sys.argv[1:]],
-                env={**_os.environ, "PERF_MCP_SUPERVISED": "1"},
-            ).returncode
+                {**_os.environ, "PERF_MCP_SUPERVISED": "1"},
+            )
+            if _stuck:
+                return _rc or 1
             if _rc != 0:
                 _dok, _dlow, _ = _disk_gate()
                 if not _dok:
                     print(_out_of_disk_msg(_dlow), flush=True)
+                    return _rc
+            # A REFUSAL IS NOT A CRASH. The child refused to start on evidence it already gathered
+            # (a red preflight suite, a dirty tree under PERF_MCP_REQUIRE_CLEAN). Relaunching
+            # re-derives the same decision from the same evidence, so a restart can only spend three
+            # device resets and ten minutes to reach the verdict that was available at once -- and
+            # bury the reason under three "likely native crash" lines that misdescribe it. See
+            # cc_optimize/run.py:EXIT_REFUSED.
+            if _rc == _EXIT_REFUSED:
+                # A REFUSAL IS RETRIED NOW, because discovery is REGENERATED on each attempt.
+                #
+                # It used to return here, on the reasoning that "relaunching re-derives the same
+                # decision from the same evidence". That holds for a refusal grounded in something
+                # fixed -- a red preflight, a dirty tree -- and not for the one that actually fires:
+                # the lead review rejecting a plan that an AGENT wrote. The next attempt writes a
+                # different plan, so the verdict is not re-derived, it is re-earned.
+                #
+                # The harm that made this non-retryable was never the retry itself. It was run 9's
+                # sibling failure: a restart that left the previous attempt's process tree alive, so
+                # two runs loaded the model onto one board and wedged it past what tt-smi -r could
+                # restart. That is fixed at the source -- the supervisor now reaps the tree and
+                # REFUSES to start again if anything survives SIGKILL -- so a retry no longer races
+                # anything.
+                #
+                # Still bounded by the same restart limit, so a refusal that IS grounded in something
+                # fixed costs three attempts and stops, rather than looping.
+                print(
+                    f"  [optimize/supervisor] child REFUSED (rc={_rc}) — a decision, not a crash. "
+                    f"Discovery is regenerated per attempt, so retrying (restart {_n + 1}/{_max}); "
+                    "the reason is above.",
+                    flush=True,
+                )
+                if _n >= _max:
+                    print(
+                        f"  [optimize/supervisor] refused {_max + 1} times; the decision is not going to change.",
+                        flush=True,
+                    )
                     return _rc
             if _rc == 0 or _n >= _max:
                 if _rc != 0:
                     print(f"  [optimize/supervisor] child exited rc={_rc}; {_max} restart(s) exhausted.", flush=True)
                 return _rc
             print(
-                f"  [optimize/supervisor] orchestrator exited rc={_rc} (likely native crash / device wedge) "
-                f"-- resetting device + restarting (restart {_n + 1}/{_max}); ladder state is preserved on disk.",
+                # "likely native crash / device wedge" was printed for EVERY non-zero rc, including a
+                # perf-test generation failure that never touched the device. A fixed string is not a
+                # diagnosis, and it sent three separate investigations to the wrong subsystem. State
+                # the code; the reason is in the child's own output above.
+                f"  [optimize/supervisor] orchestrator exited rc={_rc} -- resetting device + restarting "
+                f"(restart {_n + 1}/{_max}); the reason is in the output above. Ladder state is preserved on disk.",
                 flush=True,
             )
             try:
@@ -621,6 +752,97 @@ def cmd_optimize(args) -> int:
             os.environ["PERF_MCP_MATMUL_SWEEP_PCC"] = str(getattr(args, "matmul_sweep_pcc", 0.99))
             os.environ["PERF_MCP_MATMUL_SWEEP_ITERS"] = str(getattr(args, "matmul_sweep_iters", 5))
             os.environ["PERF_MCP_MATMUL_SWEEP_MAX_SHAPES"] = str(getattr(args, "matmul_sweep_max_shapes", 0))
+        # --persist: keep the run's MEMORY somewhere a reboot does not erase.
+        #
+        # tmpstate.state_dir() is `PERF_MCP_STATE_DIR or tempfile.gettempdir()`, and nothing sets that
+        # variable -- so by default the attempt history, the ledger and the full-pipeline bar all live
+        # in /tmp. That is the right home for a WORKTREE, which is a disposable sandbox whose only
+        # durable output is committed to the run's branch. It is the wrong home for the record of what
+        # has already been tried: lose it and the next run re-runs every knob it had already proved
+        # useless, which is exactly what the rung-closure enforcement exists to prevent.
+        #
+        # Keyed per model so two models never share a history, and OPT-IN so the default keeps /tmp's
+        # self-cleaning. LEDGER_DIR follows it because measurements.py resolves the ledger relative to
+        # the state dir; setting one without the other splits them apart and the report then silently
+        # finds no anchors -- the defect measurements.py:213 documents. setdefault, so an operator who
+        # exported either by hand still wins.
+        if getattr(args, "persist", False):
+            _slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", (run_demo.name or "model")).strip("_") or "model"
+            # IN THE REPO, AND IN THE REAL ONE. This lived in ~/.perf_mcp, which is durable but
+            # sits apart from everything else a run produces -- the archive, the profiles, the
+            # reports are all under the repo, and the record of what was tried was somewhere else
+            # entirely. `.state/` is gitignored beside `runs/`, so it is durable AND does not
+            # dirty a tracked tree, which is what kept this out of the model directory.
+            #
+            # repo_root, NEVER run_root: run_root is the throwaway worktree under /tmp once
+            # isolation is set up, and putting the run's memory there is the bug --persist exists
+            # to fix. The whole point is a home the worktree's deletion cannot reach.
+            _persist_dir = repo_root / "models" / "experimental" / "perf_automation" / ".state" / _slug
+            _persist_dir.mkdir(parents=True, exist_ok=True)
+            # CARRY FORWARD what the old location already learned, once, rather than starting a
+            # model over because its memory moved. Copied and not moved: an older tool version
+            # pointed at ~/.perf_mcp still finds its state where it left it.
+            _legacy = Path.home() / ".perf_mcp" / _slug
+            try:
+                if _legacy.is_dir() and not any(_persist_dir.iterdir()):
+                    import shutil as _shutil
+
+                    for _f in _legacy.iterdir():
+                        (_shutil.copytree if _f.is_dir() else _shutil.copy2)(_f, _persist_dir / _f.name)
+                    print(f"  [optimize/cc] --persist: carried {_slug}'s existing memory over from {_legacy}")
+            except Exception as _exc:  # noqa: BLE001 -- a failed carry-forward is a fresh start, not a failed run
+                print(f"  [optimize/cc] --persist: WARN could not carry over {_legacy}: {_exc}")
+            os.environ.setdefault("PERF_MCP_STATE_DIR", str(_persist_dir))
+            os.environ.setdefault("PERF_MCP_LEDGER_DIR", str(_persist_dir))
+            print(f"  [optimize/cc] --persist: run memory in {_persist_dir} (survives reboots; /tmp does not)")
+        # --fresh: FORGET, then run. State is carried forward on purpose -- a baseline is expensive, a
+        # coverage window costs device probes, and the ceiling anchor is write-once so the report and
+        # the stop gate cannot score one run against two ceilings. That is right while the tool is
+        # unchanged, and wrong the moment it changes: a pinned value records WHAT it is and never
+        # WHICH RULE produced it, so a number from a superseded formula outlives the fix.
+        #
+        # Measured on Voxtral 2026-08-14: the anchor held active_bytes = 3611.48 MB
+        # ("checkpoint bytes + HF config"), which is total_params x 1.0 -- the placeholder width from
+        # before the ceiling learned to divide by the width the loader actually chose. compute_target
+        # takes that anchor ahead of every other source, so the corrected rule never ran and the run
+        # published 141.8 tok/s/u against a true ~71, making the model read as twice as close to the
+        # wall as it is -- the input to can_stop. Clearing the coverage and knob caches did not touch
+        # it: it lives in the persistent ledger.
+        if getattr(args, "fresh", False):
+            try:
+                sys.path.insert(0, str(Path(run_root) / "models" / "experimental" / "perf_automation"))
+                from agent.fresh_start import describe as _fresh_describe, wipe as _fresh_wipe
+
+                _sd = os.environ.get("PERF_MCP_STATE_DIR") or tempfile.gettempdir()
+                _removed = _fresh_wipe(
+                    _sd,
+                    tool_root=Path(run_root) / "models" / "experimental" / "perf_automation",
+                    model_dir=run_demo,
+                )
+                print("  [optimize/cc] --fresh: %s" % _fresh_describe(_removed))
+                # AND THE MODEL, back to the state it was published in. The wins are committed to the
+                # model tree and survive a restart; the baseline and the ceiling they are measured
+                # against live in the state just cleared above. Keeping the first while resetting the
+                # other two is the combination that lies: the run re-derives its ceiling from a model
+                # that already carries the optimizations, so the target moves with the work.
+                #
+                # voxtral, measured: a fidelity lever took the pinned peak from 175.5 TFLOPS (HiFi4,
+                # pre-campaign) to 702.0 (LoFi) and prefill's ceiling from 203.82 ms to 50.95 -- a 4x
+                # change in the yardstick caused by a win, while the report presented the mid-campaign
+                # checkpoint as the model's starting point and said nothing about the 38 commits
+                # already in the tree.
+                #
+                # Skipped, loudly, for a model with no published commit: there is no origin to return
+                # to and inventing one would discard work nobody agreed to lose.
+                from agent.fresh_start import reset_model_to_published as _fresh_reset
+
+                _mr = _fresh_reset(run_demo)
+                if _mr.get("changed"):
+                    print("  [optimize/cc] --fresh: model %s (baseline and ceiling now describe the same tree)" % _mr["why"])
+                else:
+                    print("  [optimize/cc] --fresh: model NOT reset -- %s" % _mr.get("why"))
+            except Exception as _fe:  # noqa: BLE001 -- a clear that cannot run must not take the run down
+                print("  [optimize/cc] --fresh skipped: %s" % str(_fe)[:160])
         result = run_cc(
             run_demo,
             run_root,

@@ -11082,7 +11082,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     popt.add_argument("--devices", default="0,1", help="single | all | explicit ids like '0,1'")
     popt.add_argument("--mesh", help="mesh shape like '2x2' for roofline calibration (needs --box)")
-    popt.add_argument("--box", help="declared TT box for roofline calibration (e.g. p300c, T3K, Galaxy)")
+    popt.add_argument(
+        "--box",
+        help=(
+            "declared TT box for roofline calibration: N150, N300, T3K, GalaxyWH, P100, P150, P300, "
+            "QB2, GalaxyBH (case-insensitive). NOT the board series tt-smi prints -- a host of four "
+            "'p300c' Blackhole chips is the 4-chip box QB2, and 'p300c' is not a box name"
+        ),
+    )
     popt.add_argument("--metric", default="device_ms", help="device_ms | wall_ms | auto")
     popt.add_argument(
         "--max-rounds",
@@ -11185,6 +11192,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     popt.add_argument("--matmul-sweep-pcc", type=float, default=0.99, help="matmul-sweep min PCC to accept a config")
     popt.add_argument("--matmul-sweep-iters", type=int, default=5, help="matmul-sweep timed reps per config")
     popt.add_argument("--matmul-sweep-max-shapes", type=int, default=0, help="matmul-sweep distinct-shape cap (0=all)")
+    popt.add_argument(
+        "--fresh",
+        action="store_true",
+        dest="fresh",
+        help="FORGET this model's run memory before starting: the measurement ledger (including the "
+        "write-once ceiling anchor), the cached baseline, the full-pipeline best-so-far, the coverage "
+        "and knob caches, the kernel log and the learned thermal profile. Use it after changing the "
+        "tool: a pinned value records what it is and never which RULE produced it, so a number from a "
+        "superseded formula outlives the fix -- voxtral kept publishing a ceiling of 141.8 tok/s/u "
+        "(params x 1.0, from before the ceiling divided by the measured width) against a true ~71, "
+        "and clearing the other caches did not touch it. Board topology and device-recovery records "
+        "are KEPT: they describe the machine, not the run. Nothing tracked by git is touched.",
+    )
+    popt.add_argument(
+        "--persist",
+        action="store_true",
+        help="keep this run's MEMORY -- which knobs and rungs have been tried, and the full-pipeline "
+        "bar -- under ~/.perf_mcp/<model>_<task>/ instead of /tmp, so a reboot or a later run resumes "
+        "instead of restarting. Off by default: /tmp self-cleans, which is right for a one-off. Use "
+        "it when you expect to run this model more than once. The worktree and build still go to "
+        "/tmp either way -- they are a disposable sandbox, and everything worth keeping is committed "
+        "to the run's branch.",
+    )
     popt.set_defaults(func=cmd_optimize)
 
     pao = sub.add_parser(

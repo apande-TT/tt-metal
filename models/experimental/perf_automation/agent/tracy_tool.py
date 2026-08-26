@@ -130,7 +130,12 @@ def host_overhead_bucket(buckets: Sequence[dict[str, Any]], device_ms: float) ->
             "op_class": "host_fallback",
             "bound": "host",
             "rank": "time",
-            "regime": "decode",
+            # NOT A STAGE. This is the gap between the device ops -- host time, belonging to no
+            # phase of the model -- and it was tagged `decode`, which is a real stage name. Any
+            # per-stage reader keying on `stage`/`regime` would then count a synthetic host row as a
+            # decode measurement. "na" is in the router's vocabulary for exactly this, and it stays
+            # correct whether or not such a reader currently exists.
+            "regime": "na",
             "source": "op_gap" if host_from_gaps else "unavailable",
         },
         "lever_state": {},
@@ -185,6 +190,44 @@ def normalize_dispatch(gaps_ns: Sequence[float]) -> str:
     if not gaps:
         return "ok"
     return "gappy" if median(gaps) > DISPATCH_GAP_NS else "ok"
+
+
+# The per-core column the raw CSV carries, in preference order. MIN is deliberately not here: it is
+# the fastest core, which is not the op's duration under any reading.
+_PER_CORE_NS_COLS = ("DEVICE KERNEL DURATION PER CORE MAX [ns]",)
+
+
+def device_time_source(members) -> str:
+    """Which definition produced these durations: "per_core_max" or "cross_core".
+
+    CARRY THE PROVENANCE, DO NOT ASSUME IT. Two ms figures may only be differenced when they measure
+    the same thing, and this changed what device_ms MEANS on hardware whose cores do not share a
+    clock. A baseline taken under the old definition and a reading taken under the new one look
+    identical -- both are "device_ms" -- and subtracting them reports a gain or a regression that
+    never happened. That is defect shape 5 in agent/integrity.py, and it has already produced four
+    wrong headlines in this tool's history.
+
+    Stamped onto the profile so the ledger and the report can refuse the comparison instead of
+    silently making it, and so the first run on a new build states plainly which column it read."""
+    for m in members or []:
+        for col in _PER_CORE_NS_COLS:
+            v = _to_float((m.get("raw") or {}).get(col))
+            if v is not None and v > 0:
+                return "per_core_max"
+    return "cross_core"
+
+
+def _member_device_us(m: dict) -> float:
+    """One op's device time in MICROSECONDS, from the per-core column when the capture has it.
+
+    See the call site for why the cross-core column is wrong on Blackhole. Returns 0.0 only when
+    neither source parses, which is the same as the old behaviour for an unreadable row."""
+    raw = m.get("raw") or {}
+    for col in _PER_CORE_NS_COLS:
+        v = _to_float(raw.get(col))
+        if v is not None and v > 0:
+            return v / 1e3  # ns -> us, matching tt-perf-report's unit
+    return _to_float((m.get("report") or {}).get("Device Time")) or 0.0
 
 
 def _rank(count: int, device_ms: float) -> str:
@@ -333,6 +376,91 @@ def _raw_index(raw_csv: str | Path) -> dict[int, dict[str, str]]:
     return out
 
 
+def _fingerprint(rep: dict, raw: dict) -> tuple:
+    """The identity _top_ops groups by: (op code, shape, input memory). Shared so the neighbour pass
+    keys on exactly the same thing the op rows do."""
+    return (rep.get("OP Code", ""), _op_shape(raw), normalize_memory(raw.get("INPUT_0_MEMORY", "")))
+
+
+def _neighbours(ordered: list) -> dict:
+    """What ran immediately before and after each fingerprint, most common first.
+
+    ADJACENCY IS IN THE CAPTURE AND WAS BEING THROWN AWAY. The report rows arrive in execution order
+    (GLOBAL CALL COUNT, which _raw_index already joins on), and grouping by op_class discards it --
+    so nothing downstream could ask "what does this op feed into", even though the playbook teaches
+    that exact technique by hand (09 section 5, "Identify a mystery op by its neighbors").
+
+    Most common, not all: an op appearing once per layer has the same neighbours every layer, so the
+    mode is the structural answer and the occasional odd pairing at a stack boundary is noise.
+    Returns {fingerprint: {"prev": op_code, "next": op_code}}.
+    """
+    from collections import Counter
+
+    prev_c: dict[tuple, Counter] = {}
+    next_c: dict[tuple, Counter] = {}
+    for i, (fp, _code) in enumerate(ordered):
+        if i > 0:
+            prev_c.setdefault(fp, Counter())[ordered[i - 1][1]] += 1
+        if i + 1 < len(ordered):
+            next_c.setdefault(fp, Counter())[ordered[i + 1][1]] += 1
+    out: dict[tuple, dict] = {}
+    for fp in set(prev_c) | set(next_c):
+        out[fp] = {
+            "prev": (prev_c.get(fp) or Counter()).most_common(1)[0][0] if prev_c.get(fp) else "",
+            "next": (next_c.get(fp) or Counter()).most_common(1)[0][0] if next_c.get(fp) else "",
+        }
+    return out
+
+
+def stage_windows(raw_csv: str | Path) -> list:
+    """[(stage, start, end)] the capture actually marked, in order. [] when unmarked.
+
+    Read from the CAPTURE, not from the stage list the harness expects: a stage that failed to run
+    leaves no marks, and pricing it from a window that is not there would invent a measurement.
+    Signposts are identified exactly as tt-perf-report identifies them -- rows whose OP TYPE is
+    "signpost" -- so the window list and the slicer agree by construction.
+    """
+    names = []
+    try:
+        with open(raw_csv, newline="") as f:
+            for row in csv.DictReader(f):
+                if str(row.get("OP TYPE") or "").strip().lower() != "signpost":
+                    continue
+                nm = str(row.get("OP CODE") or "").strip()
+                if nm and nm not in names:
+                    names.append(nm)
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for nm in names:
+        if nm.startswith("stage:") and not nm.endswith(":end"):
+            end = "%s:end" % nm
+            if end in names:
+                out.append((nm.split(":", 1)[1], nm, end))
+    return out
+
+
+def _per_stage_buckets(raw_csv, profiles_dir, available_cores, arch) -> dict:
+    """{stage: [buckets]} for every stage the capture marked. {} when it marked none.
+
+    One refine() per window over the same raw rows -- no extra device work. Best-effort per stage: a
+    window that fails to refine costs that stage its split, not the profile.
+    """
+    out = {}
+    for stage, s0, s1 in stage_windows(raw_csv):
+        try:
+            rep = Path(profiles_dir) / ("iter_baseline_report_%s.csv" % stage)
+            refine(raw_csv, rep, s0, s1, None, arch)
+            bk = build_buckets(rep, raw_csv, available_cores)
+            if bk:
+                for b in bk:
+                    b.setdefault("tags", {})["regime"] = stage
+                out[stage] = bk
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 def build_buckets(
     report_csv: str | Path,
     raw_csv: str | Path,
@@ -344,6 +472,7 @@ def build_buckets(
         report_rows = list(csv.DictReader(f))
 
     groups: dict[str, list[dict[str, Any]]] = {}
+    _ordered: list[tuple] = []  # (fingerprint, op_code) in execution order -- see _neighbours
     for rep in report_rows:
         op_code = rep.get("OP Code", "")
         if base_op_code(op_code) in SIGNPOST_CODES or not op_code:
@@ -352,13 +481,30 @@ def build_buckets(
         gcc = _to_float(rep.get("Global Call Count", ""))
         raw = raw_by_gcc.get(int(gcc)) if gcc is not None else None
         groups.setdefault(op_class, []).append({"report": rep, "raw": raw or {}})
+        _ordered.append((_fingerprint(rep, raw or {}), op_code))
+    _nbrs = _neighbours(_ordered)
 
     buckets: list[dict[str, Any]] = []
     total_ms = 0.0
     for op_class, members in groups.items():
-        # tt-perf-report "Device Time" is in MICROSECONDS (verified against raw
-        # DEVICE KERNEL DURATION [ns] on a real capture: ratio exactly 1000).
-        device_ms = sum((_to_float(m["report"].get("Device Time")) or 0.0) for m in members) / 1e3
+        # PER-CORE DURATION, NOT THE CROSS-CORE ONE. tt-perf-report's "Device Time" comes from
+        # DEVICE KERNEL DURATION [ns], which process_device_log computes with `op_first_last`: the
+        # FIRST start seen on any core to the LAST end seen on any core. Where cores do not share a
+        # clock base -- Blackhole -- that span contains the inter-core offset as well as the op, so
+        # the "duration" can be the offset rather than the work, and the error is unbounded.
+        #
+        # tt-metal already computes the correct figure and writes it out: the same post-processing
+        # runs `op_core_first_last`, which pairs each core's own start and end and never crosses
+        # cores, and emits DEVICE KERNEL DURATION PER CORE MIN/MAX/AVG [ns]. Nothing here read it.
+        #
+        # MAX, not AVG: an op is not finished until its SLOWEST core is, so the max across cores is
+        # its duration -- averaging understates every multi-core op. On hardware where the cores do
+        # share a clock the two agree, so this changes nothing there; it only removes an error that
+        # exists on Blackhole.
+        #
+        # Falls back to Device Time when the per-core columns are absent (older captures), because a
+        # missing column must not zero a bucket -- a zero device_ms reads as "infinitely fast".
+        device_ms = sum(_member_device_us(m) for m in members) / 1e3
         total_ms += device_ms
         gaps = [_to_float(m["report"].get("Op-to-Op Gap")) for m in members]
         gaps = [g for g in gaps if g is not None]
@@ -378,6 +524,7 @@ def build_buckets(
                 "_bounds": bounds,
                 "_fids": fids,
                 "_mems": mems,
+                "_nbrs": _nbrs,
                 "lever_state": parse_lever_state(rep0["raw"].get("ATTRIBUTES", "")),
             }
         )
@@ -416,11 +563,23 @@ def build_buckets(
                 "dispatch_gap_ms": round(sum(b["_gaps"]) / 1e6, 4) if b["_gaps"] else 0.0,
                 "layout_churn_ms": round(churn_ms, 4),
                 "layout_churn_count": churn_n,
-                "top_ops": _top_ops(b["members"], available_cores),
+                "top_ops": _top_ops(b["members"], available_cores, neighbours=b.get("_nbrs")),
+                # WHICH DEFINITION PRODUCED THESE MS. Two figures may only be differenced when they
+                # measure the same thing; a per-core reading and a cross-core one both call
+                # themselves device_ms. Carried per bucket so a later comparison can refuse rather
+                # than assume -- see device_time_source.
+                "device_time_source": device_time_source(b["members"]),
             }
         )
     # Stable, useful ordering: biggest device-time bucket first.
     out.sort(key=lambda x: x["device_ms"], reverse=True)
+    _srcs = {b.get("device_time_source") for b in out}
+    if _srcs:
+        print(
+            "  [tracy] device_ms from %s" % ("+".join(sorted(s for s in _srcs if s)) or "unknown"),
+            file=sys.stderr,
+            flush=True,
+        )
     return out
 
 
@@ -465,7 +624,9 @@ def _op_bytes(raw: dict) -> float:
     return sum(_tensor_bytes(raw, p) for p in ("INPUT_0", "INPUT_1", "INPUT_2", "OUTPUT_0"))
 
 
-def _top_ops(members: list[dict[str, Any]], available_cores: int, k: int | None = None) -> list[dict[str, Any]]:
+def _top_ops(
+    members: list[dict[str, Any]], available_cores: int, k: int | None = None, neighbours: dict | None = None
+) -> list[dict[str, Any]]:
     """EVERY distinct op in the bucket, by fingerprint (op + shape + memory), ranked by device-ms.
 
     This returned out[:6]. Everything past the sixth fingerprint was folded into the bucket total and
@@ -487,7 +648,8 @@ def _top_ops(members: list[dict[str, Any]], available_cores: int, k: int | None 
         shape = _op_shape(raw)
         mem = normalize_memory(raw.get("INPUT_0_MEMORY", ""))
         op = rep.get("OP Code", "")
-        key = (op, shape, mem)
+        key = _fingerprint(rep, raw)
+        _nb = (neighbours or {}).get(key) or {}
         g = groups.setdefault(
             key,
             {
@@ -500,6 +662,9 @@ def _top_ops(members: list[dict[str, Any]], available_cores: int, k: int | None 
                 "cores": int(_to_float(rep.get("Cores")) or 0),
                 "grid": normalize_grid(_to_float(rep.get("Cores")) or 0.0, available_cores),
                 "fidelity": normalize_fidelity(raw.get("MATH FIDELITY", "")),
+                # what ran either side of this op, most common -- see _neighbours
+                "prev_op": _nb.get("prev", ""),
+                "next_op": _nb.get("next", ""),
             },
         )
         g["count"] += 1
@@ -586,6 +751,18 @@ def tracy_tool(
     refine(raw_dest, report_csv, start_signpost, end_signpost, id_range, arch)
 
     buckets = build_buckets(report_csv, raw_dest, available_cores)
+    # PER-STAGE SLICES from the marks measure_adapter emits around each stage under a capture. Purely
+    # additive: an unmarked capture yields no windows, no stage_buckets, and every consumer keeps the
+    # whole-profile figure it already had.
+    stage_buckets = _per_stage_buckets(raw_dest, profiles_dir, available_cores, arch)
+    if not stage_buckets:
+        print(
+            "  [tracy] no stage signposts in the capture -- the roofline falls back to whole-profile "
+            "figures (one math-fidelity peak shared by every stack). Expected stage:<name> / "
+            "stage:<name>:end from measure_adapter; check that `tracy` imports in the workload.",
+            file=sys.stderr,
+            flush=True,
+        )
     wall_ms = warm_wall_ms(walls)
     device_ms = round(sum(b["device_ms"] for b in buckets), 4)
     host = host_overhead_bucket(buckets, device_ms)
@@ -603,6 +780,9 @@ def tracy_tool(
     return {
         "wall_ms": wall_ms,
         "forward_wall_ms": forward_wall_ms(profiles_dir, runs),
+        # The per-stage split when the capture carried marks; absent otherwise, and absence must read
+        # as "no split available" rather than as an empty one.
+        "stage_buckets": stage_buckets,
         "per_token_ms": pt_ms,
         "tokens_per_sec_per_user": tput["tokens_per_sec_per_user"],
         "tokens_per_sec": tput["tokens_per_sec"],

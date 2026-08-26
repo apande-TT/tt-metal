@@ -15,11 +15,26 @@ Two false statements were being printed for llama3_1_8b_p150:
 """
 from __future__ import annotations
 
+import re
+
 import json
 
 import importlib.util
 import sys
 from pathlib import Path
+
+
+def _flat(text):
+    """A column-width-agnostic view of the table.
+
+    The roofline pads a number and its unit into fixed sub-fields, so a published figure reads
+    "64.0      tok/s/u". These assertions are about the PAIRING -- that a value is published carrying
+    its unit -- not about the geometry, and pinning the geometry is how a column-width change becomes
+    a test failure with nothing wrong behind it. Collapsing runs of spaces keeps the claim and drops
+    the layout.
+    """
+    return re.sub(r"[ \t]+", " ", str(text))
+
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -264,9 +279,16 @@ def test_the_block_level_table_declares_its_vintage(tmp_path, monkeypatch):
         )
     )
     out = sm.render_summary(kl, model="m", task="main", finalized=True)
+    # The claim is unchanged -- these rows are the AGENT'S WORDS AND NUMBERS, frozen when it recorded
+    # the snapshot, and must not read as current measurement. What changed is WHERE that is said. It
+    # rode on the header as a 90-character disclaimer restating a total the table prints a line
+    # later; the table now carries it structurally, as a labelled block with its own total sitting
+    # beneath the one trace_replay measured.
     hdr = next(l for l in out.splitlines() if l.startswith("Block-level timing"))
-    assert "totals 172.48 ms" in hdr, hdr
-    assert "AT CAPTURE TIME" in hdr, hdr
+    assert "totals" not in hdr, hdr
+    body = out[out.index("Block-level timing") :]
+    assert "annotation, not measurement" in body, body[:400]
+    assert "172.48 ms" in body, body[:400]
 
 
 def test_utilisation_names_the_ceiling_it_is_measured_against(tmp_path, monkeypatch):
@@ -289,6 +311,9 @@ def test_utilisation_names_the_ceiling_it_is_measured_against(tmp_path, monkeypa
         "unit": "token",
     }
     out = "\n".join(sm._roofline_lines(snap, None, {"per_token_ms": 16.99}, "m", "main"))
-    line = next(l for l in out.splitlines() if l.startswith("  utilization"))
-    assert "(measured / ceiling)" in line, line
+    # Thefive-line block became a three-block table; the denominator is now printed BESIDE the bar
+    # ("345 / 512 GB/s") instead of being named in a trailing parenthetical. Same requirement --
+    # the percentage must not float free of what it is a percentage OF.
+    line = next(l for l in _flat(out).splitlines() if "decode memory" in l and "%" in l)
+    assert "/" in line and "GB/s" in line, line
     assert "70%" in line, line

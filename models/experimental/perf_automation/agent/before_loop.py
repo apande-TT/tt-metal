@@ -35,14 +35,8 @@ from .run import Run
 from .tracy_tool import profile_model, stack_report
 
 # ONE state directory for every durable temp artifact -- see cc_optimize/tmpstate.py.
-import importlib.util as _ilu_ts
-
-_ts_spec = _ilu_ts.spec_from_file_location(
-    "_tmpstate", str(Path(__file__).resolve().parent.parent / "cc_optimize" / "tmpstate.py")
-)
-_tmpstate = _ilu_ts.module_from_spec(_ts_spec)
-_ts_spec.loader.exec_module(_tmpstate)
-state_dir = _tmpstate.state_dir
+# agent/state_dir.py loads cc_optimize/tmpstate.py by path, once, for the four modules that need it.
+from .state_dir import state_dir
 
 
 PKG_ROOT = Path(__file__).parent.parent
@@ -73,9 +67,26 @@ def _seq_retry_candidates(err: str, current_seq: int) -> list[int]:
             scaled = int(round(current_seq * wanted_mt / cur_mt))
             if scaled > current_seq:
                 cands.append(scaled)
-    for s in (256, 384, 512, 768):
-        if s > current_seq and s not in cands:
-            cands.append(s)
+    # DERIVED FROM THIS MODEL'S OWN SEQUENCE, NOT A LADDER BORROWED FROM ANOTHER.
+    #
+    # This was `for s in (256, 384, 512, 768)`, four numbers that came from whichever model was in
+    # hand when it was written. On a model whose sequence is 1500 every one of them is below
+    # current_seq and the loop contributes nothing; on a model at 64 it jumps straight to 4x. The
+    # scaling branch above is already model-derived -- it reads block_h/num_cores_r/Mt out of the
+    # error and computes what the shard actually wants -- and this fallback exists only for when the
+    # error did not carry those numbers.
+    #
+    # So grow from what the model is actually running: the next tile boundary, then 1.5x, 2x, 3x,
+    # each tile-aligned because a sequence that is not a multiple of the tile height cannot shard
+    # cleanly and would only produce the same class of failure again. TILE is a hardware constant
+    # (agent/tp.py), not a model one.
+    from .tp import TILE
+
+    if current_seq > 0:
+        _next_tile = ((current_seq // TILE) + 1) * TILE
+        for s in (_next_tile, *(int(round(current_seq * f / TILE)) * TILE for f in (1.5, 2, 3))):
+            if s > current_seq and s not in cands:
+                cands.append(s)
     return cands
 
 
@@ -459,6 +470,76 @@ def before_loop(
             "the run HALTS later only if a material op actually reaches the tt-lang rung"
         )
 
+    # THE MODEL'S SHAPE, BEFORE ANYTHING IS BUILT OR RUN. Read-only, sub-second, no device: a model
+    # that cannot be measured the way this tool measures should be told so here rather than forty
+    # minutes later as a crash with no obvious connection to its cause. gemma-3's prefill decides its
+    # own traced-vs-eager from an allow-list inside the model, so a profiled run traced anyway and
+    # died with 194 x "Event Synchronization is not supported during trace capture" -- after the
+    # weights had loaded and the board had been busy for minutes. That clause is visible in the
+    # source.
+    #
+    # WARN, NOT REFUSE, for now. gemma-3 is the only model exercised end to end and it fails two
+    # clauses today; gating hard would block the work that proves the clauses are right. Set
+    # PERF_MCP_REQUIRE_CONTRACT=1 to make an unmet blocking clause stop the run, which is where this
+    # should land once the compliance cost is known.
+    stages.start("model_contract", "Checking the model against the optimize contract")
+    try:
+        from .model_contract import check as _contract_check, report as _contract_report
+
+        _cf = _contract_check(model_root)
+        _blocking = [f for f in _cf if f.blocking]
+        print(_contract_report(_cf, model_root), file=sys.stderr, flush=True)
+
+        # REPAIR WHAT THE MODEL GETS WRONG ABOUT THE HARNESS -- opt-in, and only the compatibility
+        # clauses. A blocking clause means this run WILL fail: gemma-3's trace gate ignored the
+        # harness, the profiled baseline traced anyway, and 194 fatals later there was no data and
+        # no baseline, after the weights had loaded. The edit that fixes it is the same edit every
+        # time, which is why it can be automated at all.
+        #
+        # OPT-IN, because this writes to source the tool did not author. A run that silently edits a
+        # model leaves the next reader a change nobody made, in a file they own, with no record of
+        # why -- worse than the bug. PERF_MCP_REPAIR_MODEL=1 is someone deciding.
+        #
+        # The PORTING clauses are never touched: generating PIPELINE_STAGES, the per-stage hooks and
+        # the self-tests needs the model's stage decomposition and reference outputs, which is
+        # emit-e2e's job.
+        if _blocking:
+            from .model_repair import apply as _repair_apply, plan as _repair_plan, report as _repair_report
+
+            _edits = _repair_plan(model_root)
+            print(_repair_report(_edits, model_root), file=sys.stderr, flush=True)
+            if _edits and os.environ.get("PERF_MCP_REPAIR_MODEL") == "1":
+                _res = _repair_apply(model_root, _edits)
+                # RE-CHECKED, not assumed. A repair that does not clear its clause is a failed
+                # repair, and the run must hear that now rather than discover it on the device.
+                print(
+                    "  [repair] wrote %d file(s); blocking clauses now: %s"
+                    % (len(_res["written"]), [f.clause for f in _res["remaining"]] or "none"),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _cf = _contract_check(model_root)
+                _blocking = [f for f in _cf if f.blocking]
+            elif _edits:
+                print(
+                    "  [repair] not applied — set PERF_MCP_REPAIR_MODEL=1 to write these edits, or "
+                    "make them by hand. This run will fail on the blocking clause(s) above.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        if _blocking and os.environ.get("PERF_MCP_REQUIRE_CONTRACT") == "1":
+            raise SystemExit(
+                "  [contract] %d blocking clause(s) unmet and PERF_MCP_REQUIRE_CONTRACT=1 — "
+                "refusing to optimize a model that cannot be measured as specified." % len(_blocking)
+            )
+        stages.done(
+            "meets all clauses" if not _cf else "%d unmet (%d blocking) — see above" % (len(_cf), len(_blocking))
+        )
+    except SystemExit:
+        raise
+    except Exception as _ce:  # noqa: BLE001 -- a contract check must never take the run down
+        stages.done("skipped (%s)" % str(_ce)[:120])
+
     stages.start("discover", "Mapping the model's pipelines & building perf tests")
     agent_calls_path = run.dir / "agent_calls.jsonl"
     agent_totals = {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
@@ -529,9 +610,76 @@ def before_loop(
         if os.environ.get("TT_PERF_MODULE_LEVEL", "") not in ("", "0", "false", "False"):
             _stem = Path(str(config["pcc_test"]).partition("::")[0]).stem
             _task = (_stem[5:] if _stem.startswith("test_") else _stem) or "main"
-        perf_node = generate_perf_test(model_root, _task, None, force=True, source_abs=pcc_abs, source_kind="pcc")
+        # WALK BEFORE WRITING. generate_perf_test has always accepted `stacks` and has always had a
+        # multi-stack branch behind it -- one depth variable per stack instead of a single
+        # TT_PERF_LAYERS -- and no production caller ever passed it, so that branch had never run.
+        # Every perf test this tool generated was written as if the model had one stack.
+        #
+        # Measured on Voxtral 2026-08-13: the test read only TT_PERF_LAYERS, the bridge later set
+        # TT_PERF_STACK0/1_LAYERS that nothing read, so ONE depth went to every stack and had to be
+        # max(2, 32, 3) = 32 -- the encoder's full depth. Capping to full depth changes no work, and
+        # the run concluded the knob never reached the builder.
+        #
+        # The PCC gate makes this answerable here: it is supplied by the operator, not generated, so
+        # it exists before anything is written and it builds the model. An empty answer costs nothing
+        # -- generation is then exactly as blind as it was before.
+        _survey = []
+        try:
+            from .stack_survey import (
+                describe as _survey_describe,
+                survey as _survey_stacks,
+                survey_model as _survey_build,
+            )
+
+            # BUILD THE MODEL, do not borrow a test's. Running a test and waiting for it to call
+            # build_pipeline works only for tests that build it that way -- the correctness gate does
+            # not, so the hook never fired and a two-stack model reported zero. The contract
+            # guarantees the factory; calling it directly is both correct and seconds rather than
+            # minutes.
+            _survey = _survey_build(
+                tt_root,
+                model_root,
+                env=sub_env,
+                model_id=str(config.get("model_name") or config.get("config_ref") or ""),
+            )
+            if not _survey:
+                # Fall back to walking the PCC gate: a model the factory cannot build standalone is
+                # still worth one attempt through the test that is known to build it.
+                # ABSOLUTE, not pcc_node_rel: that is MODEL-root relative and the probe runs from the
+                # REPO root, so the relative form is a path pytest cannot find.
+                _pcc_case = str(config["pcc_test"]).partition("::")[2] or pcc_node_rel.partition("::")[2]
+                _survey_node = "%s::%s" % (pcc_abs, _pcc_case) if _pcc_case else str(pcc_abs)
+                _survey = _survey_stacks(tt_root, _survey_node, env=sub_env)
+            print("      stack survey (pre-generation): %s" % _survey_describe(_survey), file=sys.stderr, flush=True)
+        except Exception as _sv_e:  # noqa: BLE001 -- never block generation on the survey
+            print("      stack survey skipped: %s" % str(_sv_e)[:120], file=sys.stderr, flush=True)
+        perf_node = generate_perf_test(
+            model_root, _task, None, force=True, source_abs=pcc_abs, source_kind="pcc", stacks=_survey or None
+        )
         if not perf_node:
             raise RuntimeError("could not auto-generate a perf test from --pcc-test (see messages above)")
+        # SAY WHAT THE TEST DECIDED FOR ITSELF. The tool owns ISL/OSL/batch/depth and sends them; a
+        # generated test that defines its OWN capped count is a measurement condition nobody asked
+        # for, and nothing read it back. Voxtral's test defined TT_PERF_AUDIO_STREAMS=2 while the
+        # pipeline was built for its declared batch of 8, so prefill measured a quarter of the real
+        # workload and was printed against a full-batch roofline. Reported rather than refused: the
+        # same test also defines TT_PERF_FLUSH_EVERY=32, which changes no workload, and no static rule
+        # tells the two apart.
+        try:
+            from .perf_test_gen import invented_workload_vars as _invented
+
+            _pp_abs = model_root / str(perf_node).partition("::")[0]
+            _inv = _invented(_pp_abs.read_text(errors="ignore"), stages=_survey and [] or [])
+            if _inv:
+                print(
+                    "      note - the generated perf test defines its own workload knob(s): %s "
+                    "(the tool does not set these; a capped default measures less than the model's "
+                    "declared batch)" % ", ".join("%s=%d" % (v, d) for v, d in _inv),
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except Exception:  # noqa: BLE001 -- never block generation on a report line
+            pass
         _pp, _, _pf = perf_node.partition("::")
         pathmap["perf_test"] = {"path": _pp, "case": _pf, "note": "auto-gen from --pcc-test"}
         pathmap["perf_tests"] = [pathmap["perf_test"]]
@@ -613,6 +761,30 @@ def before_loop(
     n_selected = preflight(tt_root, perf_rel, case, env=sub_env)
     stages.done(f"{n_selected} test(s) selected")
 
+    # STAGE MARKS GO IN HERE, at the one point every run passes. Injection at generation could not
+    # reach this model: generate_perf_test is not called for the main pipeline on a run that
+    # regenerates nothing, so run 24's test was the one written the previous evening -- unmarked, for
+    # the eighth time. THIS is where the run decides which file it will profile, whatever produced
+    # it, so it is the only placement that does not depend on how the file came to exist.
+    #
+    # BEFORE resolve_signposts, deliberately: that scan reads the test for signpost names, so the
+    # start/stop pair the injected block emits is found and configured rather than defaulted.
+    #
+    # The injector is idempotent and refuses when it cannot place the block, so running it on every
+    # run costs nothing and can never produce two marked passes.
+    stages.start("stage_marks", "Marking stage boundaries for the profiler")
+    try:
+        from .stage_marks import inject_stage_marks as _inject_marks
+
+        _pt = Path(tt_root) / perf_rel
+        _cur = _pt.read_text()
+        _new, _why = _inject_marks(_cur)
+        if _new != _cur:
+            _pt.write_text(_new)
+        stages.done(_why)
+    except Exception as _mi:  # noqa: BLE001
+        stages.done("not injected (%s: %s)" % (type(_mi).__name__, str(_mi)[:90]))
+
     stages.start("resolve_signposts", "Locating profiler signposts")
     from .probes import resolve_signposts
 
@@ -671,38 +843,80 @@ def before_loop(
             config_ref=str(config.get("config_ref") or ""),
             depth_knob=_bl_knob,
         )
-        _bl_cov_probed = _bl_cov is not None and _bl_cov != 0
+        # NO WINDOW MEANS NO WINDOW. _coverage_layers returns None for a REASON, and the commonest
+        # reason is not failure: the signpost path returns None precisely when it has proved the depth
+        # knob INERT -- the cap left the work signal unchanged, so the model builds every layer
+        # whatever is asked of it (run.py: "Profiling FULL depth"). gemma3's build_pipeline takes no
+        # layer count at all, so there is nothing for TT_PERF_LAYERS to attach to.
+        #
+        # This read that None as "the probe failed" and substituted a literal 4 -- a number nothing
+        # derived, contradicting the ladder's own fallback of 2 (run.py: _cov = 2,
+        # "unverified-floor") -- then EXPORTED it as TT_PERF_LAYERS and announced "profiled at a
+        # SUBSTITUTED depth of 4 layers" on a run that profiled all 48. The claim was wrong, the
+        # export was wrong, and only the bridge's empirical check downstream ("did not reduce work;
+        # ignoring") kept it from mattering. A value that survives solely because something later
+        # discards it should not be produced.
+        #
+        # The depth ladder OWNS this question -- signposts, then 2/4/8/16 bounded by the declared
+        # depth, then 2 -- and it has already answered. When its answer is "no cap", TT_PERF_LAYERS is
+        # REMOVED, which is how the rest of the tool spells full depth (layer_depth.set_depth: the cap
+        # is expressed by ABSENCE, never by a sentinel, because "0" arrives as a truthy string and is
+        # read as "build zero layers").
+        _bl_full = int((_bl_facts or {}).get("full_signal") or 0)
+        _bl_blocks = int((_bl_facts or {}).get("full_blocks") or 0)
         if _bl_cov is None or _bl_cov == 0:
-            _bl_cov = int(os.environ.get("PERF_MCP_DEPTH_DEFAULT_LAYERS", "4"))
+            os.environ.pop("TT_PERF_LAYERS", None)
+            # READ THE REASON, do not infer one. _coverage_layers now says which of these it is; a
+            # deliberate "no cap" and a broken probe both profile full depth, but only one of them is
+            # a problem, and a reader cannot act on a line that will not say which.
+            _why = str((_bl_facts or {}).get("no_window") or "")
+            _said = {
+                "knob_inert": "the depth knob does not reach this model's builder (capping changed no "
+                "work), so nothing can be capped",
+                "sizing_disabled": "coverage sizing is off (PERF_MCP_COVERAGE_SIZING=0)",
+                "no_node": "no perf-test node to probe",
+                "probe_failed": "the op-signature probe found nothing and no config declares a layer "
+                "pattern -- this one is NOT a decision, it is unknown",
+            }.get(_why, "reason not reported by the coverage probe (%r)" % (_why or None))
             print(
-                "      depth-bridge WARNING: the coverage probe returned %r, so the baseline is "
-                "profiled at a SUBSTITUTED depth of %d layers. Any candidate measured at a different "
-                "depth is not comparable to it (set PERF_MCP_DEPTH_DEFAULT_LAYERS to pin this)."
-                % (_bl_cov_probed and _bl_cov or None, _bl_cov),
+                "      depth-bridge: no profiling window -- %s. The baseline profiles FULL depth "
+                "(%d blocks); nothing is capped and nothing is substituted." % (_said, _bl_blocks),
                 file=sys.stderr,
                 flush=True,
             )
-        _bl_full = int((_bl_facts or {}).get("full_signal") or 0)
-        _bl_blocks = int((_bl_facts or {}).get("full_blocks") or 0)
         print(
             f"      depth-bridge: node={perf_rel} case={case} cov={_bl_cov} full_signal={_bl_full} full_blocks={_bl_blocks} knob={bool(_bl_knob)}",
             file=sys.stderr,
             flush=True,
         )
-        os.environ["TT_PERF_LAYERS"] = str(_bl_cov)
-        _bl_depth = _bridge_depth_env(
-            tt_root,
-            sub_env,
-            devices,
-            perf_rel,
-            case,
-            _bl_cov,
-            full_hint=_bl_full,
-            full_blocks=_bl_blocks,
-            knob=_bl_knob,
-        )
-        if _bl_depth:
-            os.environ["PERF_MCP_PROFILE_ENV"] = json.dumps(_bl_depth)
+        if _bl_cov:
+            # A SCALAR, BECAUSE THAT IS WHAT A MODEL READS. _coverage_layers returns a per-stack
+            # DICT, and str() of it wrote "{'stack3': 2, 'stack2': 2}" into the one variable the perf
+            # test parses -- which fails .isdigit(), yields None, and means ALL LAYERS. The BASELINE
+            # was therefore measured at FULL depth while every candidate after it was measured
+            # capped, so "before" and "after" described different models and any gain computed from
+            # the pair was meaningless. Measured on Voxtral 2026-08-13: baseline 3977 ms over ~32700
+            # device ops against a capped model of 2965 dispatched ops.
+            _bl_scalar = max(int(v) for v in _bl_cov.values()) if isinstance(_bl_cov, dict) else int(_bl_cov)
+            os.environ["TT_PERF_LAYERS"] = str(_bl_scalar)
+        # The bridge exists to find an env spelling that makes a cap REACH the builder. With no cap
+        # to apply there is nothing for it to search for, and calling it with a None depth would only
+        # rediscover -- at the price of more device probes -- what _coverage_layers already proved.
+        if _bl_cov:
+            _bl_depth = _bridge_depth_env(
+                tt_root,
+                sub_env,
+                devices,
+                perf_rel,
+                case,
+                _bl_cov,
+                full_hint=_bl_full,
+                full_blocks=_bl_blocks,
+                knob=_bl_knob,
+                stage_depths=(_bl_facts or {}).get("per_stage"),
+            )
+            if _bl_depth:
+                os.environ["PERF_MCP_PROFILE_ENV"] = json.dumps(_bl_depth)
     except Exception as _bl_e:  # noqa: BLE001
         import traceback as _tb
 
@@ -740,6 +954,33 @@ def before_loop(
             _sp_doc = json.loads(_sp_path.read_text())
             if float(_sp_doc.get("device_ms") or 0.0) > 0 and (_sp_doc.get("buckets") or []):
                 _stored_baseline = _sp_doc
+            # A BASELINE MEASURED UNDER A DIFFERENT DEFINITION IS NOT A BASELINE. device_ms used to
+            # come from DEVICE KERNEL DURATION [ns] -- first start on ANY core to last end on ANY
+            # core -- which on hardware whose cores do not share a clock includes the inter-core
+            # offset as well as the op. It now comes from the per-core column. Both are called
+            # device_ms, so a stored one and a fresh one look identical and subtracting them reports
+            # a gain or a regression that never happened.
+            #
+            # RE-MEASURED, not flagged. Carrying the old number forward with a warning attached
+            # leaves every later delta wrong and asks a human to remember why; a baseline exists to
+            # be compared against, so one that cannot be is worth nothing and the honest cost is one
+            # profiling run at start-up. Absent stamp = pre-stamp = old definition, because the
+            # stamp was added with the change.
+            if _stored_baseline is not None:
+                _srcs = {
+                    str(b.get("device_time_source") or "")
+                    for b in (_stored_baseline.get("buckets") or [])
+                    if isinstance(b, dict)
+                }
+                if _srcs and not _srcs <= {"per_core_max"}:
+                    print(
+                        "      baseline DISCARDED: its device_ms came from %s, this build measures "
+                        "per_core_max -- the two are not comparable, so it is being re-measured "
+                        "rather than differenced." % ("+".join(sorted(x for x in _srcs if x)) or "an older definition"),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _stored_baseline = None
         except Exception:  # noqa: BLE001
             _stored_baseline = None
 
@@ -759,6 +1000,15 @@ def before_loop(
     _seq_env = os.environ.get("TT_PERF_SEQ_LEN")
     if _seq_env:
         (run.dir / "perf_seq_len").write_text(_seq_env)
+    # STAMP THE DEPTH ONTO THE MEASUREMENT. A device_ms with no record of the depth it was taken at
+    # cannot be checked against anything: the baseline was measured at FULL depth for a whole day
+    # while every candidate after it ran capped, and nothing in the artifact could reveal it --
+    # _record_baseline_anchor already reads profile["perf_layers"] and had been getting None, so the
+    # anchor said "all" whatever the truth was. The cap is expressed by ABSENCE, so absent means all.
+    if isinstance(profile, dict) and "perf_layers" not in profile:
+        from .layer_depth import depth_in_force as _depth_in_force
+
+        profile["perf_layers"] = _depth_in_force()
     # Persist the tagged buckets for the loop: ROUTE reads this, not the CSVs.
     (Path(run.profiles_dir) / "baseline_profile.json").write_text(json.dumps(profile, indent=2, sort_keys=True))
     # ...and record the SAME profile as the ledger's eager anchor, right here. This file and the
@@ -1016,6 +1266,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n  ✗ discovery failed ({type(exc).__name__}):", file=sys.stderr)
         for _ln in str(exc).splitlines():
             print(f"      {_ln}", file=sys.stderr)
+        # A REJECTION IS NOT A CRASH. The lead agent stopping the run is a decision, and returning 1
+        # made the supervisor read it as a likely native crash and RESTART the child -- which on a
+        # real run meant a second optimize, still carrying the gate that had just been rejected,
+        # racing the corrected run for the same board until both wedged it.
+        from .probes import DiscoveryRejected
+
+        if isinstance(exc, DiscoveryRejected):
+            # ABSOLUTE, BECAUSE THIS FILE RUNS AS `python -m ...agent.before_loop`.
+            #
+            # The relative form raised "attempted relative import beyond top-level package" -- the
+            # package is `agent`, so `..` walks off the top -- and it raised INSIDE the handler that
+            # exists to return EXIT_REFUSED. So a refused discovery exited rc=1, the supervisor read
+            # that as a crash, and restarted it: precisely the "racing the corrected run for the
+            # same board until both wedged it" the comment above warns about, caused by the line
+            # meant to prevent it. Observed run 9, 2026-08-17, on a flaky lead-review verdict.
+            #
+            # Same import the supervisor uses, same literal fallback, so the two cannot disagree
+            # about which code means "refused" -- see optimize.py and
+            # test_r5_the_exit_code_has_one_definition.
+            try:
+                from models.experimental.perf_automation.cc_optimize.run import EXIT_REFUSED
+            except Exception:  # noqa: BLE001 -- a refusal must still be reportable without the import
+                EXIT_REFUSED = 3
+
+            return EXIT_REFUSED
         return 1
 
     p = result["profile"]

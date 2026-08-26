@@ -9,7 +9,9 @@ The signpost path computed:
 
 and 16 was the last rung of the 2/4/8/16 ladder that a568d9dcba deleted when it introduced this very
 path. Nothing computes a marker capacity anywhere in the tool; the docstring calls 16 "the marker
-limit" after the fact, and drain_sizing.py already prevents overflow by sizing TT_PERF_FLUSH_EVERY.
+limit" after the fact. What DOES handle an overflow is profiler_heal + _detect_partial_capture: the
+run degrades to a partial report and the capture is FLAGGED as partial, rather than dying on a
+TT_FATAL or -- worse -- being read as complete. A depth cap prevents neither.
 
 The cost was silence. On gemma-3-12b-it the window was reported as
 
@@ -117,8 +119,8 @@ def test_d5_absent_ops_are_measured_against_the_real_window():
     """`deep` listed ops with first_block >= 16 even when the window was not 16, so it could report
     ops as un-timed that the window actually covers -- or miss ones it does not."""
     src = (_PA / "cc_optimize" / "run.py").read_text()
-    # anchor on the COVERAGE branch: _signposts_agree also appears in _block_start_positions
-    i = src.index("first_block, _ = _first_block_map(seq)")
+    # anchor on the COVERAGE branch: per_stack_map is populated by _first_block_map
+    i = src.index("per_stack_map, _ = _first_block_map(seq)")
     body = src[i : i + 3200]
     assert "b >= _cov" in body, "`deep` still compares against a hardcoded depth"
     assert "b >= 16" not in body, "a stale 16 remains in the absent-ops filter"
@@ -126,7 +128,7 @@ def test_d5_absent_ops_are_measured_against_the_real_window():
 
 def test_d5_no_hardcoded_sixteen_left_in_the_signpost_branch():
     src = (_PA / "cc_optimize" / "run.py").read_text()
-    i = src.index("first_block, _ = _first_block_map(seq)")
+    i = src.index("per_stack_map, _ = _first_block_map(seq)")
     body = src[i : i + 3200]
     code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
     assert ", 16)" not in code, "the min(..., 16) clamp is back"

@@ -26,12 +26,27 @@ independent anchors with no per-model code.
 """
 from __future__ import annotations
 
+import re
+
 import ast
 import importlib.util
 import sys
 from pathlib import Path
 
 import pytest
+
+
+def _flat(text):
+    """A column-width-agnostic view of the table.
+
+    The roofline pads a number and its unit into fixed sub-fields, so a published figure reads
+    "64.0      tok/s/u". These assertions are about the PAIRING -- that a value is published carrying
+    its unit -- not about the geometry, and pinning the geometry is how a column-width change becomes
+    a test failure with nothing wrong behind it. Collapsing runs of spaces keeps the claim and drops
+    the layout.
+    """
+    return re.sub(r"[ \t]+", " ", str(text))
+
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
@@ -83,8 +98,73 @@ _OWNERS = {
                 # means no ceiling, which is the rule this registry exists to enforce.
                 "_anchored_ceiling_bytes",
                 "_anchored_ceiling_facts",
+                # THE OBSERVED UNIT SUPERSEDES THE FILE, and this is the single point every consumer
+                # of the facts passes through. perf_target_inputs.json records what a TABLE keyed on
+                # the HF pipeline_tag guessed at setup, before anything ran -- and a tag names the
+                # TASK, which cannot state whether a model loops: `text-to-speech` covers XTTS, which
+                # emits tokens, and Kokoro, which produces a whole waveform in one pass. Once
+                # trace_replay has reported what the built pipeline ACTUALLY did, that is a fact, and
+                # a fact outranks the lookup it is correcting. This does NOT re-derive the unit from a
+                # config -- it reads the observation and applies it, and when nothing has been
+                # observed the file's value stands untouched.
+                "_load_perf_target_inputs",
             },
             "cc_optimize/summary.py": {"_roofline_lines"},
+        },
+    ),
+    # THE COMPUTE ROOF'S DENOMINATOR. One producer (perf_mcp, which derives the dominant fidelity and
+    # pins it) and one reader (summary._stage_roofs, via _pinned_peak_flops). This is the ceiling
+    # input that had no anchor at all: _promote_baseline refreshes the profile PICTURE on every
+    # profile_model call while ratcheting only device_ms, so a peak read off that picture doubles the
+    # moment the `fidelity` rung lands -- 175.5 -> 351.0 TFLOPS on voxtral, from one matmul.
+    #
+    # It survived because it never printed anything impossible: the memory roof divides by a fixed
+    # 512 GB/s and screams when it drifts, while here the peak IS what moves and the measurement
+    # moves with it, so a stage that got 2x faster reports the same percentage.
+    "the compute peak": (
+        "peak_flops",
+        {
+            "cc_optimize/perf_mcp.py": {"_dominant_peak_flops", "_persist_throughput"},
+            # _stage_roofs reads the anchor through _pinned_peak_flops and keeps the current-picture
+            # value beside it as peak_flops_now, which is what separates a real fidelity win from a
+            # stale reading -- the same pairing _floor_anchor's caller uses.
+            # _roofline_tables only RENDERS the value _stage_roofs already put in the roofs dict --
+            # it prints the TFLOPS cell and scales the 60-80% band from it. It derives nothing, and
+            # the ratio it prints (measured / peak) is the one number a reader checks the ceiling by.
+            "cc_optimize/summary.py": {"_stage_roofs", "_pinned_peak_flops", "_roofline_tables"},
+        },
+    ),
+    # THE BYTES ONE UNIT OF WORK READS. Eleven commits have been about this single quantity, and each
+    # fixed the consumer that happened to look wrong: the census total, the anchor's key, the checkpoint
+    # inference, the pinning, the per-stage split. None was preceded by "who else reads this?", so each
+    # fix left the other consumers on a different source, and the twelfth symptom was a DECODE row
+    # quoting 2.350 GB in its floor and 4.784 GB in its bandwidth -- 2.04x apart, three lines apart.
+    #
+    # A stage's read set now has ONE owner. _stage_roofs derives it (pinned -> measured -> estimate)
+    # and puts it in the roof dict; every renderer divides by that, via _measured_bw_gbps. A renderer
+    # reaching for the model-level `active_bytes` instead is the mistake this entry exists to catch --
+    # legitimate only where the question really is model-level (the DRAM capacity panel asks what the
+    # model OCCUPIES, not what a unit reads).
+    "the per-stage read set": (
+        "bytes",
+        {
+            "cc_optimize/summary.py": {
+                # the owner, and the two helpers that read the value it produced
+                "_stage_roofs",
+                "_measured_bw_gbps",
+                "_bytes_for",
+                "_stage_measured_bytes",
+                "_measured_stage_bytes",
+                "_pinned_stage_bytes",
+                "_roofline_tables",
+                "_section_bytes_cached",
+                "_stage_share",
+                "_share_and_basis",
+                "_roofline_lines",
+                "_throughput_from_profile",
+                "_model_facts",
+                "_peak_for_stage",
+            },
         },
     ),
     "the modeled floor": (
@@ -242,13 +322,18 @@ def test_the_ledger_anchor_outranks_the_snapshot_for_the_ceiling(tmp_path, monke
         "unit": "token",
     }
     txt = "\n".join(sm._roofline_lines(snap, None, {"per_token_ms": 17.0}, "m", "main"))
-    assert "84.0 tok/s/u" in txt, txt
+    assert "84.0 tok/s/u" in _flat(txt), txt
     assert "153.8" not in txt and "92.3" not in txt, txt
 
 
 def test_no_hop_re_derives_the_unit_from_the_model(tmp_path):
-    """The unit is derived ONCE (model_bytes) and passed. A second derivation would be a second source
-    of truth that can disagree -- so only model_bytes may consult a pipeline tag or architecture."""
+    """The unit is OBSERVED once and passed. A second derivation would be a second source of truth
+    that can disagree.
+
+    unit_from_config and unit_for_architectures are gone entirely -- a class name cannot say whether a
+    model loops, and a unit in the wrong currency takes the band, the at-floor verdict and the
+    headline rate with it. unit_for_tag survives for measurement CONDITIONS only (ISL/OSL/steps), so
+    no module on this list may reach for it to answer "what does one unit of work cost"."""
     from pathlib import Path as _P
 
     root = _P(__file__).resolve().parents[1]
@@ -256,3 +341,6 @@ def test_no_hop_re_derives_the_unit_from_the_model(tmp_path):
         src = (root / rel).read_text()
         for name in ("unit_for_tag", "unit_from_config", "unit_for_architectures"):
             assert name not in src, "%s re-derives the unit via %s instead of reading it" % (rel, name)
+    mb = (root / "agent" / "model_bytes.py").read_text()
+    for gone in ("def unit_from_config", "def unit_for_architectures", "_UNIT_BY_ARCH_SUFFIX"):
+        assert gone not in mb, "%s is back; the unit has a second source again" % gone

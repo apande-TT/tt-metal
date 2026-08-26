@@ -37,6 +37,23 @@ state_dir = _tmpstate.state_dir
 PERF_DIR = "models/experimental/perf_automation"
 CC_DIR = PERF_DIR + "/cc_optimize"
 DEFAULT_MAX_ROUNDS = 3
+
+# A REFUSAL IS NOT A CRASH, and the supervisor could not tell them apart because both exited 1.
+#
+# The auto-restart supervisor exists for a native tt-metal SIGSEGV: a crash kills the whole Python
+# process, no in-process handler can catch it, and relaunching is the right answer. It reads any
+# non-zero exit as that case -- "likely native crash / device wedge" -- resets the board and runs
+# again, up to PERF_MCP_MAX_RESTARTS times.
+#
+# But a refusal is a DECISION the tool already made on evidence: the preflight suite is red, the
+# model tree is dirty under PERF_MCP_REQUIRE_CLEAN. Relaunching re-derives the same decision from
+# the same evidence and gets the same answer, so the only effect is to spend three device resets and
+# ten minutes before reporting a verdict that was available immediately -- and to bury the reason
+# under three "likely native crash" lines that misdescribe it.
+#
+# So a deliberate refusal exits with its own code and the supervisor returns it untouched. Anything
+# that is genuinely unexpected keeps exit 1 and keeps being retried.
+EXIT_REFUSED = 3
 _LAST_SCORECARD: dict = {}
 
 
@@ -193,6 +210,13 @@ def discover(
         capture=False,
         stall_s=adaptive_timer(repo_root, "build", env_key="PERF_MCP_DISCOVER_STALL_SEC"),
     )
+    if rc == EXIT_REFUSED:
+        # Discovery REFUSED — the lead agent rejected the plan (e.g. the correctness gate does not
+        # cover the perf surface). That is a verdict, not a failure to be worked around: neither the
+        # complete-manifest fallback below nor a supervisor restart may override it. Propagating the
+        # same code keeps the refusal intact all the way out of the process tree.
+        print("  [optimize/cc] discovery refused the run — not continuing, not restarting.", flush=True)
+        raise SystemExit(EXIT_REFUSED)
     mani = _latest_manifest(perf_dir)
     if mani is None or rc is None:
         return None
@@ -284,7 +308,10 @@ def _mcp_config(repo_root: Path, manifest_path: str, pipe: dict, devices: str, k
     # perf_mcp writes; the ledger is shared the same way), so a one-sided redirect points them at two
     # different directories and the report silently finds nothing. Unset on both sides they agree via
     # gettempdir(), which is why this is latent rather than broken -- forward it so it stays that way.
-    for _k in ("PERF_MCP_STATE_DIR", "PERF_MCP_LEDGER_DIR"):
+    # PERF_MCP_RUN_ID joins these because the recovery counters are scoped to a RUN, and perf_mcp
+    # counts in its OWN process -- an unforwarded stamp puts the two sides in different runs, so each
+    # would read the other's failures as zero and the backstop would never trigger.
+    for _k in ("PERF_MCP_STATE_DIR", "PERF_MCP_LEDGER_DIR", "PERF_MCP_RUN_ID"):
         if os.environ.get(_k):
             env[_k] = os.environ[_k]
     # TELL THE SERVER WHERE THE RUN IS. perf_mcp is a SEPARATE PROCESS and resolves its model dir as
@@ -340,7 +367,11 @@ def _gate_status(repo_root: Path, mcp_env: dict, devices: str) -> dict:
         "r=t()\n"
         "print('CANSTOP=' + str(bool(r.get('can_stop'))))\n"
         "print('HALT=' + str(bool(r.get('halt'))))\n"
-        "print('HALTREASON=' + str(r.get('halt_reason') or ''))"
+        # WHICH halt, not just that one happened. `halt` is a truthy STRING naming the kind
+        # (needs_host_reboot / device_unrecoverable / True for the tt-lang rung), and the supervisor
+        # used to print one hardcoded remedy for all of them.
+        "print('HALTKIND=' + ('' if r.get('halt') is True else str(r.get('halt') or '')))\n"
+        "print('HALTREASON=' + str(r.get('halt_reason') or r.get('error') or ''))"
     )
     env = cc_env(repo_root, devices)
     env.update(mcp_env)  # PERF_MCP_* so the gate targets this pipeline
@@ -352,15 +383,34 @@ def _gate_status(repo_root: Path, mcp_env: dict, devices: str) -> dict:
         _measure_backstop(repo_root),
         "termination_check",
         stall_s=adaptive_timer(repo_root, "profile", env_key="PERF_MCP_MEASURE_STALL_SEC"),
+        observe_op="profile",
+        observe_root=repo_root,
     )
     if rc is None:
-        return {"can_stop": False, "halt": False, "reason": ""}
+        return {"can_stop": False, "halt": False, "reason": "", "kind": ""}
     out = out or ""
-    reason = ""
+    reason = kind = ""
     for line in out.splitlines():
         if line.startswith("HALTREASON="):
             reason = line[len("HALTREASON=") :]
-    return {"can_stop": "CANSTOP=True" in out, "halt": "HALT=True" in out, "reason": reason}
+        elif line.startswith("HALTKIND="):
+            kind = line[len("HALTKIND=") :]
+    return {
+        "can_stop": "CANSTOP=True" in out,
+        "halt": "HALT=True" in out,
+        "reason": reason,
+        "kind": kind,
+    }
+
+
+# What the operator must DO, per halt kind. Keyed off the gate's own name for the condition, so a
+# new halt cannot silently inherit another one's remedy -- which is what "install tt-lang first"
+# did for a board that needed a host reboot.
+_HALT_REMEDY = {
+    "needs_host_reboot": "reboot the host, then re-run",
+    "device_unrecoverable": "the device could not be recovered — check the board, then re-run",
+    "": "install tt-lang first, then re-run",
+}
 
 
 def _reset_fullpipe_baselines() -> None:
@@ -468,14 +518,21 @@ def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str
         f"  [optimize/cc] measuring FULL-model end-to-end ({label}) — ALL layers (uncapped), no tracy (one slow run, minutes)..."
     )
     ms = None
+    # UNCAPPED RUN, UNCAPPED BUDGET. This builds every layer and is the one measurement whose number
+    # describes the whole model; budgeting it from the capped profile's history killed it at 1686 s
+    # (6 x a 281 s capped baseline) when it needed 1734 s. `fullpipe` has its own history and its own
+    # cold start, expressed in baseline-profile units like every other op.
+    _fp_op = "fullpipe"
     rc, out = _run_device_proc(
         [_python_bin(repo_root), "-c", code, str(repo_root / CC_DIR)],
         repo_root / PERF_DIR,
         env,
         devices,
-        _measure_backstop(repo_root),
+        adaptive_timer(repo_root, _fp_op, env_key="PERF_MCP_FULLPIPE_BACKSTOP"),
         f"full-pipeline ({label})",
-        stall_s=adaptive_timer(repo_root, "profile", env_key="PERF_MCP_MEASURE_STALL_SEC"),
+        stall_s=adaptive_timer(repo_root, _fp_op, env_key="PERF_MCP_FULLPIPE_STALL_SEC"),
+        observe_op=_fp_op,
+        observe_root=repo_root,
     )
     if rc is None:
         return (None, "")
@@ -499,7 +556,11 @@ def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str
     if ms is not None:
         print(
             f"  [optimize/cc] FULL-model end-to-end ({label}) = {ms:.1f} ms"
-            f"  (ALL layers, prefill + 1 decode{', ' + mode if mode else ''})"
+            # WHAT ONE PASS OF THIS MODEL IS. "prefill + 1 decode" was printed for every model
+            # measured, so a classifier's one forward pass and a diffusion step were both announced
+            # as an LLM's two phases. The run already records the unit trace_replay derived from the
+            # pipeline's own structure; unknown prints nothing rather than a borrowed description.
+            f"  (ALL layers{_e2e_shape()}{', ' + mode if mode else ''})"
         )
         _ledger_fullpipe(ms, mode, label)
     return ms, mode
@@ -520,6 +581,17 @@ def _ledger():
     _spec.loader.exec_module(_m)
     globals()["_LEDGER_MOD"] = _m
     return _m
+
+
+def _e2e_shape() -> str:
+    """How one measured pass is composed, from the unit the run recorded. "" when nothing said.
+
+    trace_replay derives the unit from the decode_step CONTRACT, not from any stage name, and prints
+    it as TRACE_HEADLINE_UNIT; perf_mcp keeps the last one. token -> an LLM request, step -> a
+    diffusion denoise, inference -> one forward pass.
+    """
+    _u = str(os.environ.get("PERF_MCP_LAST_HEADLINE_UNIT", "") or "").strip().lower()
+    return {"token": ", prefill + 1 decode", "step": ", 1 step", "inference": ", 1 forward pass"}.get(_u, "")
 
 
 def _ledger_fullpipe(ms: float, mode: str, label: str) -> None:
@@ -681,7 +753,7 @@ def _run_op_sigs(repo_root: Path, mcp_env: dict, devices: str, node: str, case, 
     from agent.layer_depth import set_depth as _set_depth
 
     _set_depth(env, k)
-    env["TT_PERF_MAX_NEW_TOKENS"] = "1"
+    env["TT_PERF_OSL_TOKENS"] = "1"
     env.pop("TT_METAL_DEVICE_PROFILER", None)
     cmd = [_python_bin(repo_root), str(repo_root / CC_DIR / "_op_sig_probe.py"), node]
     if case:
@@ -694,6 +766,8 @@ def _run_op_sigs(repo_root: Path, mcp_env: dict, devices: str, node: str, case, 
         _measure_backstop(repo_root),
         "coverage probe",
         stall_s=adaptive_timer(repo_root, "profile", env_key="PERF_MCP_MEASURE_STALL_SEC"),
+        observe_op="profile",
+        observe_root=repo_root,
     )
     if rc is None:
         return None, "", []
@@ -759,19 +833,43 @@ def _coverage_cache_path(repo_root: Path) -> Path:
     return repo_root / CC_DIR / ".coverage_cache.json"
 
 
-def _coverage_fingerprint(node) -> str:
+def _coverage_fingerprint(node, repo_root=None) -> str:
+    """Newest .py mtime beside the node, or "" when it cannot be established.
+
+    RESOLVED AGAINST THE REPO, AND "NOTHING FOUND" IS NOT A VALUE. `node` is repo-relative, and this
+    globbed it against the CURRENT DIRECTORY -- so a caller whose cwd was elsewhere matched no files
+    and `default=0.0` handed back the string "0", which is a perfectly valid-looking cache key.
+
+    Two callers then fingerprinted the same node differently and each wrote its own slot:
+
+        depth|...test_main_perf.py::...  {'env': {'TT_PERF_LAYERS': '2', ...}, 'fp': '0'}
+        depth|...test_main_perf.py::...  {'env': {},                          'fp': '1786856611'}
+
+    The first is the working depth knob, the second is the verdict that discarded it. The cache
+    exists precisely so the second caller reuses the first's answer instead of re-probing, and a
+    bogus fingerprint split it in two -- so the expensive probe ran twice AND the second one got the
+    wrong answer.
+
+    "" now means unfingerprintable, and the cache refuses to read or write under it rather than
+    storing an entry nothing can match.
+    """
     try:
         base = Path(str(node).split("::", 1)[0])
-        mt = max((f.stat().st_mtime for f in base.parent.rglob("*.py")), default=0.0)
-        return str(int(mt))
+        if not base.is_absolute() and repo_root:
+            base = Path(repo_root) / base
+        mts = [f.stat().st_mtime for f in base.parent.rglob("*.py")]
+        return str(int(max(mts))) if mts else ""
     except Exception:  # noqa: BLE001
         return ""
 
 
 def _coverage_cache_get(repo_root: Path, node, case):
     try:
+        _fp = _coverage_fingerprint(node, repo_root)
+        if not _fp:
+            return None  # unfingerprintable: a cache that cannot be invalidated must not be read
         entry = json.loads(_coverage_cache_path(repo_root).read_text()).get(f"{node}|{case}")
-        if entry and entry.get("fp") == _coverage_fingerprint(node):
+        if entry and entry.get("fp") == _fp:
             return int(entry["k"])
     except Exception:  # noqa: BLE001
         pass
@@ -782,7 +880,10 @@ def _coverage_cache_put(repo_root: Path, node, case, k: int) -> None:
     try:
         path = _coverage_cache_path(repo_root)
         data = json.loads(path.read_text()) if path.is_file() else {}
-        data[f"{node}|{case}"] = {"k": int(k), "fp": _coverage_fingerprint(node)}
+        _fp = _coverage_fingerprint(node, repo_root)
+        if not _fp:
+            return
+        data[f"{node}|{case}"] = {"k": int(k), "fp": _fp}
         path.write_text(json.dumps(data, indent=1))
     except Exception:  # noqa: BLE001
         pass
@@ -790,8 +891,11 @@ def _coverage_cache_put(repo_root: Path, node, case, k: int) -> None:
 
 def _depth_cache_get(repo_root: Path, node):
     try:
+        _fp = _coverage_fingerprint(node, repo_root)
+        if not _fp:
+            return None
         entry = json.loads(_coverage_cache_path(repo_root).read_text()).get(f"depth|{node}")
-        if entry and entry.get("fp") == _coverage_fingerprint(node):
+        if entry and entry.get("fp") == _fp:
             return dict(entry["env"])
     except Exception:  # noqa: BLE001
         pass
@@ -802,7 +906,10 @@ def _depth_cache_put(repo_root: Path, node, env) -> None:
     try:
         path = _coverage_cache_path(repo_root)
         data = json.loads(path.read_text()) if path.is_file() else {}
-        data[f"depth|{node}"] = {"env": dict(env), "fp": _coverage_fingerprint(node)}
+        _fp = _coverage_fingerprint(node, repo_root)
+        if not _fp:
+            return
+        data[f"depth|{node}"] = {"env": dict(env), "fp": _fp}
         path.write_text(json.dumps(data, indent=1))
     except Exception:  # noqa: BLE001
         pass
@@ -831,13 +938,26 @@ def _claude_text(prompt: str, timeout_s: int = 300):
 
 
 def _blocks_ran(seq) -> int:
+    """How deep the deepest block the model actually ran was.
+
+    TWO SIGNPOST FORMATS, AND THIS READ ONLY ONE. A single-stack model emits
+    `PERF_BLOCK_SIGNPOST:7`; the moment a SECOND stack becomes visible the emitter switches to
+    `PERF_BLOCK_SIGNPOST:stack2:7` so each block can be attributed to its own stack. Splitting on the
+    first colon then parsed "stack2:7" as an integer, raised, was swallowed, and returned 0 -- read
+    downstream as the model having no discoverable block stacks at all, which REFUSES the run.
+
+    Measured on Voxtral 2026-08-12: the visibility repair made lm_layers discoverable, the walk went
+    from 1 device stack to 2 exactly as intended, the probe emitted 155 signposts -- and the run
+    refused, because succeeding is what changed the token format. A latent bug no single-stack model
+    could ever reach.
+    """
     m = -1
     for tok in seq or []:
-        if isinstance(tok, str) and tok.startswith("PERF_BLOCK_SIGNPOST:"):
-            try:
-                m = max(m, int(tok.split(":", 1)[1]))
-            except (ValueError, IndexError):
-                pass
+        if not isinstance(tok, str) or not tok.startswith(_SIGNPOST_TOKEN):
+            continue
+        parsed = _parse_signpost_payload(tok[len(_SIGNPOST_TOKEN) :])
+        if parsed is not None:
+            m = max(m, parsed[1])
     return m + 1
 
 
@@ -893,6 +1013,43 @@ def _knob_cache_put(model_root, env) -> None:
         _knob_cache_file().write_text(json.dumps(data))
     except Exception:  # noqa: BLE001
         pass
+
+
+def _stage_layers_var(stage) -> str:
+    """layer_depth owns the spelling; lazy import for the same reason _set_depth is."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from agent.layer_depth import stage_layers_var
+
+    return stage_layers_var(stage)
+
+
+def _stack_layers_var(i) -> str:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from agent.layer_depth import stack_layers_var
+
+    return stack_layers_var(i)
+
+
+def _depth_in_force() -> str:
+    """The one answer to "what depth is this". See layer_depth.depth_in_force."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        from agent.layer_depth import depth_in_force
+
+        return depth_in_force()
+    except Exception:  # noqa: BLE001
+        return "all"
+
+
+def _active_depth_caps(env=None) -> dict:
+    """Every depth cap in force in `env`. See layer_depth.active_depth_caps."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        from agent.layer_depth import active_depth_caps
+
+        return active_depth_caps(env)
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _set_depth(env, depth, key=None):
@@ -1030,14 +1187,28 @@ def _llm_depth_env(model_root: Path, cov: int) -> dict:
     return {}
 
 
+def _is_control(tok) -> bool:
+    """A bookkeeping token the probe wrote into the sequence, not an op the device ran.
+
+    The op filter used to name ONE prefix, so every control token invented later was silently
+    counted as work. That matters more than it sounds: the work signal is what decides INERT, so
+    markers would inflate the very number used to prove a depth cap did nothing -- an uncappable
+    model could look cappable purely from its own instrumentation. Caller markers are emitted per
+    block ENTRY and EXIT, which on a 32-layer stack is 64 phantom ops.
+    """
+    return isinstance(tok, str) and tok.startswith(
+        ("PERF_BLOCK_SIGNPOST:", "PERF_BLOCK_SIGNPOST_END:", "PERF_STAGE_SIGNPOST:", "PERF_CALLER:")
+    )
+
+
 def _work_signal(seq) -> int:
-    return sum(1 for t in seq or [] if isinstance(t, str) and not t.startswith(_SIGNPOST_TOKEN))
+    return sum(1 for t in seq or [] if isinstance(t, str) and not _is_control(t))
 
 
 def _op_block_count(seq) -> int:
     from collections import Counter
 
-    ops = [t for t in seq or [] if isinstance(t, str) and not t.startswith(_SIGNPOST_TOKEN)]
+    ops = [t for t in seq or [] if isinstance(t, str) and not _is_control(t)]
     vals = [c for c in Counter(ops).values() if c > 1]
     if not vals:
         return 0
@@ -1045,6 +1216,7 @@ def _op_block_count(seq) -> int:
 
 
 _SIGNPOST_TOKEN = "PERF_BLOCK_SIGNPOST:"
+_SIGNPOST_END_TOKEN = "PERF_BLOCK_SIGNPOST_END:"
 
 
 def _signpost_entries(seq) -> int:
@@ -1074,7 +1246,7 @@ def _signposts_usable(seq) -> bool:
     # DECOUPLED SIGNPOSTS ARE NOT SIGNPOSTS. A stack whose markers all land in a clump -- typically
     # trailing the ops entirely -- delimits nothing: every op would attribute to block 0. Presence is
     # necessary, interleaving is what makes them usable.
-    return any(isinstance(t, str) and not t.startswith(_SIGNPOST_TOKEN) for t in (seq or [])[idx[0] :])
+    return any(isinstance(t, str) and not _is_control(t) for t in (seq or [])[idx[0] :])
 
 
 def _block_start_positions(seq):
@@ -1086,7 +1258,7 @@ def _block_start_positions(seq):
         return [], "none"
     from collections import Counter
 
-    ops = [t for t in seq or [] if isinstance(t, str) and not t.startswith(_SIGNPOST_TOKEN)]
+    ops = [t for t in seq or [] if isinstance(t, str) and not _is_control(t)]
     counts = Counter(ops)
     anchor = next((t for t in ops if counts.get(t) == n), None)
     if anchor is None:
@@ -1094,11 +1266,62 @@ def _block_start_positions(seq):
     return [i for i, t in enumerate(seq or []) if t == anchor], "inferred"
 
 
+def _parse_signpost_payload(raw: str):
+    """Parse the payload after 'PERF_BLOCK_SIGNPOST:'.
+
+    Supports two formats:
+      - Old (single-stack): '5'               -> ("stack0", 5)
+      - New (multi-stack):  'stack0:5'         -> ("stack0", 5)
+                            'stack1:12'        -> ("stack1", 12)
+
+    Returns (stack_id: str, block_idx: int) or None on malformed input.
+    """
+    raw = raw.strip()
+    if raw.startswith("stack"):
+        colon = raw.find(":", 5)  # find ':' after 'stack'
+        if colon == -1:
+            return None
+        stack_id = raw[:colon]
+        idx_str = raw[colon + 1 :]
+        if not idx_str.isdigit():
+            return None
+        return stack_id, int(idx_str)
+    # Old format: plain integer
+    if raw.isdigit():
+        return "stack0", int(raw)
+    return None
+
+
+def _stack_ids_from_seq(seq) -> list:
+    """Return the ordered list of distinct stack IDs seen in signpost tokens.
+
+    Scans the op sequence for PERF_BLOCK_SIGNPOST tokens and parses their stack
+    prefixes.  The list preserves first-appearance order and always contains at
+    least "stack0" (the single-stack default) even when no signposts are present,
+    so callers can always build a per-stack dict without a separate None-check.
+
+    Used by the unverified-floor and measured-ladder paths to build a full-coverage
+    dict that addresses every known stack rather than just "stack0".
+    """
+    seen: list = []
+    for tok in seq or []:
+        if not isinstance(tok, str) or not tok.startswith(_SIGNPOST_TOKEN):
+            continue
+        raw = tok[len(_SIGNPOST_TOKEN) :]
+        parsed = _parse_signpost_payload(raw)
+        if parsed is not None:
+            sid = parsed[0]
+            if sid not in seen:
+                seen.append(sid)
+    return seen if seen else ["stack0"]
+
+
 def _first_block_map(seq):
-    """{op: the block it FIRST appears in}, plus how the blocks were located.
+    """Per-stack map of {stack_id: {op: the block it FIRST appears in}}, plus source.
 
     READ THE SIGNPOST'S OWN INDEX. _tag_stack stamps each block with its position in the stack and
-    the probe emits it as "PERF_BLOCK_SIGNPOST:<i>", which is a layer index -- the same unit as
+    the probe emits it as "PERF_BLOCK_SIGNPOST:<i>" (single-stack) or
+    "PERF_BLOCK_SIGNPOST:stack{si}:<i>" (multi-stack), which is a layer index -- the same unit as
     TT_PERF_LAYERS, the knob this feeds. Counting signposts instead gives an ORDINAL, and the two
     agree only when the model is entered exactly once: a perf test that prefills and then decodes
     enters all 48 layers twice, so the ordinal runs 0..95 and decode's layer 0 reads as block 48. On
@@ -1109,33 +1332,70 @@ def _first_block_map(seq):
     authoritative and the position in the sequence is not.
 
     The ordinal path stays for sequences with no signposts (source "inferred"), where counting block
-    starts is the only information there is.
+    starts is the only information there is.  In that case the result is wrapped under "stack0" for
+    consistency: {"stack0": {op: block}}.
     """
     starts, source = _block_start_positions(seq)
-    fb: dict = {}
     if source == "signposts":
-        cur = 0
+        # Per-stack maps: {stack_id: {op: first_block_idx}}
+        # ATTRIBUTE ONLY WHAT RAN INSIDE A BLOCK. The start marker says where a block begins; the END
+        # marker says where it stops. Without the closing edge every op after a stack's last block was
+        # credited to that block -- and "after the last block" is the entire rest of the model.
+        #
+        # Measured on Voxtral 2026-08-13: a normal encoder block dispatches 20 ops, and the last one
+        # was credited with 12573 -- 67% of the whole run -- including embedding, rms_norm, silu,
+        # scaled_dot_product_attention_decode and argmax, which are language-model decode ops not
+        # present in the encoder at all. Coverage therefore reported that the 32-layer encoder needed
+        # all 32 layers, when every one of its blocks is the same class emitting identical ops and 1-2
+        # would do. max() took that 32 as the window, capping to 32 changed no work, and the run
+        # profiled the entire model.
+        #
+        # An op emitted outside every block belongs to no stack: it is prologue, epilogue or another
+        # stage, and it cannot say anything about how deep a stack must be profiled.
+        # A LIFO, NOT A SINGLE SLOT. A stack can sit INSIDE a block -- experts within a layer, a
+        # decoder nested in a wrapper -- and closing the inner block must return to the enclosing one,
+        # not to "no block". Clearing instead of popping drops every op the outer block runs after the
+        # nested call, which under-sizes it: the ops that would have demanded a deeper window are
+        # simply not counted. Flat stacks behave identically either way, which is why this is easy to
+        # get wrong and never notice.
+        per_stack: dict = {}
+        open_blocks: list = []
         for tok in seq or []:
             if not isinstance(tok, str):
                 continue
-            if tok.startswith(_SIGNPOST_TOKEN):
-                raw = tok[len(_SIGNPOST_TOKEN) :].strip()
-                # A malformed payload must not reset the walk to block 0 -- that would attribute the
-                # whole rest of the stack to the shallowest window and shrink coverage to nothing.
-                if raw.isdigit():
-                    cur = int(raw)
+            if tok.startswith(_SIGNPOST_END_TOKEN):
+                parsed = _parse_signpost_payload(tok[len(_SIGNPOST_END_TOKEN) :])
+                # Close the matching frame, not blindly the innermost: an unbalanced end (a block that
+                # raised before its start was recorded) must not unwind a frame it does not own.
+                for j in range(len(open_blocks) - 1, -1, -1):
+                    if parsed is None or open_blocks[j] == parsed:
+                        del open_blocks[j:]
+                        break
                 continue
-            fb.setdefault(tok, cur)
-        return fb, source
+            if tok.startswith(_SIGNPOST_TOKEN):
+                raw = tok[len(_SIGNPOST_TOKEN) :]
+                parsed = _parse_signpost_payload(raw)
+                # A malformed payload must not reset the walk to block 0 -- that would attribute
+                # the whole rest of the stack to the shallowest window and shrink coverage to nothing.
+                if parsed is not None:
+                    open_blocks.append(parsed)
+                continue
+            if not open_blocks or _is_control(tok):
+                continue
+            sid, idx = open_blocks[-1]
+            per_stack.setdefault(sid, {}).setdefault(tok, idx)
+        return per_stack, source
 
     import bisect
 
+    fb: dict = {}
     for i, tok in enumerate(seq or []):
-        if not isinstance(tok, str) or tok.startswith(_SIGNPOST_TOKEN):
+        if not isinstance(tok, str) or _is_control(tok):
             continue
         b = bisect.bisect_right(starts, i) - 1 if starts else 0
         fb.setdefault(tok, max(b, 0))
-    return fb, source
+    # Wrap in single-stack dict for consistent return type
+    return {"stack0": fb} if fb else {}, source
 
 
 def _bridge_depth_env(
@@ -1144,11 +1404,18 @@ def _bridge_depth_env(
     devices: str,
     node,
     case,
-    cov: int,
+    cov,
     full_hint: int = 0,
     full_blocks: int = 0,
     knob=None,
+    stage_depths=None,
 ) -> dict:
+    """Verify that the depth cap(s) actually reduce work, and return the env vars to enforce them.
+
+    `cov` may be a plain int (single-stack, backward compat) or a dict mapping stack_id to depth
+    (multi-stack).  Either way the probe is run once with ALL caps applied simultaneously and the
+    combined op-count is checked against the uncapped baseline.
+    """
     if not node or os.environ.get("PERF_MCP_DEPTH_BRIDGE", "1") != "1":
         return {}
     cached = _depth_cache_get(repo_root, node)
@@ -1161,25 +1428,64 @@ def _bridge_depth_env(
         return {}
     full_op = int(full_hint)
     full_sp = int(full_blocks)
+    _cov_int = next(iter(cov.values())) if isinstance(cov, dict) else int(cov)
     if full_op <= 0:
-        _, _, seq = _run_op_sigs(repo_root, mcp_env, devices, node, case, cov)
+        # ALL LAYERS FOR THE BASELINE. This measured the "uncapped" probe at _cov_int -- the CAP --
+        # so both halves of the comparison ran at the same depth and were identical by construction:
+        # the knob could never be shown to reduce work, and every model was profiled at full depth
+        # with "did not reduce work ... ignoring" in the log. Run 10, 2026-08-19: op-count
+        # 3572 -> 3572, on a pipeline that implements the cap correctly for BOTH towers.
+        #
+        # IT SURVIVED BECAUSE THE OTHER CALLER WORKS. before_loop passes full_hint, so its bridge
+        # gets a real baseline and enforces the cap; only this path improvises one. Both outcomes
+        # appear in the SAME run's log, on the same model and the same variables:
+        #
+        #   enforcing {'TT_PERF_LAYERS': '2', ...}  (op-count 25034->3612)     <- before_loop
+        #   ... did not reduce work (op-count 3612->3612); ignoring            <- here
+        #
+        # 3612 is the CAPPED count from the line above, arriving as this path's "full" baseline. An
+        # earlier note here blamed the model -- claiming this only bites pipelines whose knob is the
+        # tool's own env convention -- and that is disproved by the first line: those are exactly
+        # those variables, and they were enforced. The discriminator is which caller asked.
+        #
+        # set_depth(env, 0) is the established "no cap" form: it clears the depth variable and arms
+        # PERF_MCP_FORCE_ALL_LAYERS, rather than writing a literal 0 that a builder reads as "build
+        # zero layers".
+        _, _, seq = _run_op_sigs(repo_root, mcp_env, devices, node, case, 0)
         full_op = _work_signal(seq)
         full_sp = _blocks_ran(seq)
     if full_op <= 0:
         print("  [optimize/cc] depth-knob bridge: full-model work-signal is 0 (probe empty); skipping")
         _depth_cache_put(repo_root, node, {})
         return {}
-    env = dict(knob) if knob else _llm_depth_env(model_root, cov)
+    env = dict(knob) if knob else _llm_depth_env(model_root, _cov_int)
     if not env:
         print(f"  [optimize/cc] depth-knob bridge: no depth knob found (work-signal {full_op})")
         _depth_cache_put(repo_root, node, {})
         return {}
     _numkey = next((k for k, v in env.items() if str(v).isdigit()), None)
     if _numkey:
-        _set_depth(env, cov, key=_numkey)  # see _knob_at: never write the cap without clearing FORCE_ALL
+        _set_depth(env, _cov_int, key=_numkey)  # see _knob_at: never write the cap without clearing FORCE_ALL
+    # PER-STAGE FIRST, BY THE NAME THE MODEL DECLARES. The generated perf test reads
+    # TT_PERF_<STAGE>_LAYERS and forwards it as the builder's `<stage>_layers`, and the knob repair
+    # creates exactly those parameters -- all three derived from PIPELINE_STAGES, which the model
+    # states in its own source. Setting a variable nothing reads is how a cap silently caps nothing:
+    # measured 18729 -> 18729 when this set TT_PERF_STACK{i}_LAYERS while the test read names an LLM
+    # had invented from stack paths.
+    #
+    # The positional form stays for models that declare no stages, where there is no shared
+    # vocabulary to derive from -- it is no worse than what those models had.
+    _per_stage = dict(stage_depths or {})
+    if _per_stage:
+        for _stage, _depth in sorted(_per_stage.items()):
+            env[_stage_layers_var(_stage)] = str(_depth)
+    elif isinstance(cov, dict) and len(cov) > 1:
+        for _i, (_sid, _depth) in enumerate(sorted(cov.items())):
+            _stack_key = _stack_layers_var(_i)
+            env[_stack_key] = str(_depth)
     probe_env = dict(mcp_env)
     probe_env.update(env)
-    _, _, seq2 = _run_op_sigs(repo_root, probe_env, devices, node, case, cov)
+    _, _, seq2 = _run_op_sigs(repo_root, probe_env, devices, node, case, _cov_int)
     cap_op = _work_signal(seq2)
     cap_sp = _blocks_ran(seq2)
     if full_sp > 1 and cap_sp >= 1 and cap_sp <= full_sp * 0.7:
@@ -1312,6 +1618,751 @@ def _declared_depth(model_root, model_id: str = ""):
     return n if isinstance(n, int) and n > 0 else None
 
 
+def _is_emitted_model(model_root) -> bool:
+    """Did emit-e2e write this model, i.e. is it bound by emit-e2e's spec?
+
+    Structural, not a name or a flag: an emitted demo carries a _stubs/ directory of graduated
+    modules and the e2e_plan.json that routed them. A hand-written tt-metal model has neither.
+
+    This is what separates "must comply" from "measured through the ladder by design". gemma3 and
+    llama3_1_8b_p150 legitimately expose no discoverable stacks and are optimized through the
+    coverage ladder; refusing them would refuse the entire direct path. A model the tool GENERATED
+    has no such excuse -- its spec requires every repeated stack to be discoverable, and a violation
+    is a defect in what the tool just produced.
+    """
+    try:
+        root = Path(model_root)
+        return (root / "_stubs").is_dir() and (root / "e2e_plan.json").is_file()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_STAGE_TOKEN = "PERF_STAGE_SIGNPOST:"
+
+
+def stacks_by_stage(seq) -> dict:
+    """{stage: [stack ids that ran in it]}, from execution order alone.
+
+    THE LINK BETWEEN A MEASUREMENT AND A KNOB. Coverage is sized per stack -- one saturates at 2,
+    another may need 8 -- and a model can accept a depth per stage. Between them nothing said which
+    stack IS the encoder: the walk labels stacks by traversal position, the knobs are named for
+    stages. So the tool sent max() to every stack and the shallow ones were profiled several times
+    deeper than they needed.
+
+    Execution order answers it without HF, without names and without a convention: whichever blocks
+    run between the encode and prefill boundaries belong to encode.
+
+    A STACK IN TWO WINDOWS IS NOT AMBIGUOUS. A text decoder runs in prefill AND decode, and it is one
+    physical stack, so it appears under both and the caller takes the max of their depths -- deep
+    enough for either. Ambiguity would be assigning it ONE stage; listing both is the fact.
+
+    Returns {} when no stage boundaries were emitted, which is the signal to fall back to a single
+    uniform depth rather than guess.
+    """
+    out, cur = {}, None
+    for tok in seq or []:
+        if not isinstance(tok, str):
+            continue
+        if tok.startswith(_STAGE_TOKEN):
+            cur = tok[len(_STAGE_TOKEN) :]
+            out.setdefault(cur, [])
+        elif tok.startswith(_SIGNPOST_TOKEN) and cur is not None:
+            body = tok[len(_SIGNPOST_TOKEN) :]
+            sid = body.split(":")[0] if ":" in body else "stack0"
+            if sid not in out[cur]:
+                out[cur].append(sid)
+    return {k: v for k, v in out.items() if v}
+
+
+def _model_id_for_facts(model_root) -> str:
+    """The model's HF id, read from its own source. "" when there is none.
+
+    THE SECOND SITE OF THE SAME DEFECT, and it had never returned an id. This called
+    _hf_repo_ids(Path(model_root)) -- that function takes a parsed Source and does
+    `for _path, tree in src.trees.items()`, which raises AttributeError on a Path. The bare except
+    turned that into "", so every caller believed the model had no hub id.
+
+    _section_bytes_cached had the identical line and was fixed on 2026-08-17; this one was not,
+    because nothing pointed at it until stage_roots went looking. The cost: declared_sections needs
+    the id to find the checkpoint in the shared HF cache (the demo directory holds no weights), so it
+    returned {} -- and stage_roots bails on an empty section map before it ever reaches its fallback.
+    Every fix made to that fallback was therefore unreachable, across four runs.
+
+    model_id_from_source answers the same question and takes a path, which is what the callers have.
+    """
+    try:
+        from agent.stack_survey import model_id_from_source
+
+        return str(model_id_from_source(model_root) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _merge_model_facts(model_root, extra: dict) -> None:
+    """Merge keys into perf_target_inputs.json, leaving everything else in it untouched.
+
+    Merged rather than rewritten for the same reason the census does it: a hand-tuned per-tensor list
+    beside these keys has to survive. Best-effort -- a fact that cannot be written costs a ceiling,
+    never a run.
+    """
+    try:
+        p = Path(model_root) / "perf_target_inputs.json"
+        doc = {}
+        if p.is_file():
+            try:
+                doc = json.loads(p.read_text()) or {}
+            except Exception:  # noqa: BLE001
+                doc = {}
+        if not isinstance(doc, dict):
+            return
+        if all(doc.get(k) == v for k, v in (extra or {}).items()):
+            return
+        doc.update(extra or {})
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(doc, indent=2) + "\n")
+        os.replace(str(tmp), str(p))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def stage_roots(seq, model_root, model_id: str = "", perf_test=None) -> dict:
+    """{stage: the top-level module its blocks live under}, or {} when it cannot be established.
+
+    THE LINK THE ROOFLINE NEEDED. A stage streams the weights of the subtree it runs and nothing
+    else, so pricing every stage from one whole-model byte count overcharges the backbone stages and
+    leaves a third tower unpriced entirely -- an audio encoder measured at 12.8 ms with no ceiling
+    beside it. weight_census declines to guess at the split; this establishes it instead.
+
+    BY BLOCK COUNT, which is evidence rather than naming. The probe reports stacks positionally
+    (stack2, stack3) and the checkpoint reports them by path (audio_tower.layers: 32,
+    language_model.model.layers: 30), and nothing connects the two vocabularies -- but a stack of 32
+    blocks and a section of 32 blocks are the same stack. No string matching, no per-model table, and
+    it works for a tower whose name nobody has seen.
+
+    AMBIGUITY IS REFUSED, NOT RESOLVED. Two sections of equal depth cannot be told apart this way, and
+    a stage spanning two roots has no single answer, so both are left out: the roofline then falls
+    back to the whole-model figure for backbone stages and withholds the ceiling for the rest, which
+    is what it did before this existed. A wrong divisor is worse than a missing one.
+    """
+    try:
+        from agent.checkpoint_sections import declared_sections
+    except Exception:  # noqa: BLE001
+        return {}
+    secs = declared_sections(model_root, model_id) or {}
+    if not secs:
+        return {}
+    by_count: dict = {}
+    for path, n in secs.items():
+        try:
+            by_count.setdefault(int(n), []).append(str(path))
+        except (TypeError, ValueError):
+            continue
+    counts = {sid: n for sid, n, _kind in _stack_paths(seq)}
+    out: dict = {}
+    for stage, sids in (stacks_by_stage(seq) or {}).items():
+        roots = set()
+        for sid in sids or []:
+            cands = by_count.get(int(counts.get(sid) or 0)) or []
+            if len(cands) == 1:
+                roots.add(cands[0].split(".", 1)[0])
+        if len(roots) == 1:
+            out[str(stage)] = roots.pop()
+    # MERGED, NOT SHORT-CIRCUITED. This was `out or _stage_roots_from_generated(...)`, so the
+    # fallback ran only when the count join found NOTHING. A PARTIAL count join therefore suppressed
+    # a complete one: run 10, 2026-08-19, published stage_roots={'encode': 'audio_tower'} -- one
+    # stage of three -- while the generated test named all three unambiguously. prefill and decode
+    # were then unmapped on a two-tower model, which is refused rather than guessed, so the two
+    # heaviest stages lost their memory ceiling entirely.
+    #
+    # The two joins answer per STAGE, not per model, and they cannot disagree here: a stage the count
+    # join established keeps that answer, and every stage it could not reach asks the other source.
+    _gen = _stage_roots_from_generated(secs, perf_test, model_root)
+    for _st, _root in (_gen or {}).items():
+        out.setdefault(str(_st), _root)
+    return out
+
+
+def _stage_roots_from_generated(secs: dict, perf_test, model_root=None) -> dict:
+    """The same mapping, from the perf test the TOOL generated, when the probe's counts cannot give it.
+
+    THE COUNT JOIN CANNOT FIRE DURING A REAL RUN, and had never fired. It compares the block count
+    the PROBE observed against the depths the checkpoint declares -- but the probe runs
+    depth-capped, by design, so it reports the coverage depth and not the model's:
+
+        stack survey:  audio_tower.layers(32), language_model.model.layers(30)
+        the probe:     TT_PERF_LAYERS={'stack2': 2, 'stack3': 2}
+
+    2 matches no section, and both stacks report the same 2, so even a section of depth 2 would be
+    ambiguous. Measured on voxtral run 5, 2026-08-16: stage_roots returned {}, every stage fell back
+    to the whole-model byte count, and encode -- whose regime the byte model cannot price -- printed
+    "not modelled" beside a 12.80 ms measurement.
+
+    The binding exists elsewhere, written by this tool and not inferred. perf_test_gen indexes the
+    survey's stacks deepest-first and emits `PERF_STACK{i}_LAYERS -> {path}`; the generated test then
+    binds each stage to one of those indices:
+
+        PERF_ENCODE_LAYERS  = _env_layers("TT_PERF_ENCODE_LAYERS",  "TT_PERF_STACK0_LAYERS")
+        PERF_PREFILL_LAYERS = _env_layers("TT_PERF_PREFILL_LAYERS", "TT_PERF_STACK1_LAYERS")
+        PERF_DECODE_LAYERS  = _env_layers("TT_PERF_DECODE_LAYERS",  "TT_PERF_STACK1_LAYERS")
+
+    Ordering the declared sections the same way -- deepest first -- turns index into path: stack0 is
+    the 32-block audio tower, stack1 the 30-block language backbone. Both halves are artifacts this
+    tool produced, so nothing here is a guess about the model.
+
+    TIES ARE REFUSED. Two sections of equal depth cannot be ordered by depth, and an order chosen by
+    name would be a coin toss that silently prices one tower at another's bytes.
+    """
+    if not secs:
+        return {}
+    ordered = sorted(secs.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+    depths = [int(c) for _p, c in ordered]
+    if len(set(depths)) != len(depths):
+        return {}
+    # THE BINDING IS IN THE GENERATED TEST, WHEREVER THAT IS -- not in whichever node the caller
+    # happened to be given. `pipe["perf_test"]` is null on a run that falls back to the pcc gate
+    # ("no_perf_test: perf_test null; falling back to pcc.end_to_end", run 7), and the pcc test
+    # carries no stage->stack bindings at all, so keying on it returned {} while three generated
+    # perf tests sat on disk beside it holding exactly the mapping wanted.
+    #
+    # So the node is tried first, and then every generated perf test under the model root. They are
+    # written by the same generator from the same survey, so they agree; a file that disagrees is
+    # dropped rather than allowed to win a coin toss.
+    _srcs = []
+    for _cand in [
+        str(perf_test or "").split("::", 1)[0],
+        *sorted(str(x) for x in Path(model_root).glob("tests/e2e/*_perf.py")),
+    ]:
+        if not _cand:
+            continue
+        try:
+            _srcs.append(Path(_cand).read_text(errors="ignore"))
+        except OSError:
+            continue
+    if not _srcs:
+        return {}
+    out: dict = {}
+    _seen: dict = {}
+    for src in _srcs:
+        for m in re.finditer(r"PERF_([A-Z0-9_]+)_LAYERS\s*=.*?TT_PERF_STACK(\d+)_LAYERS", src):
+            stage, idx = m.group(1).lower(), int(m.group(2))
+            if not (0 <= idx < len(ordered)):
+                continue
+            _root_for = str(ordered[idx][0]).split(".", 1)[0]
+            if _seen.setdefault(stage, _root_for) != _root_for:
+                out.pop(stage, None)  # two generated tests disagree: neither is evidence
+                continue
+            out[stage] = _root_for
+    return out
+
+
+def _last_baseline_profile() -> dict:
+    """The most recent baseline profile this run wrote, or {}. Best-effort.
+
+    observed_gathered_numels needs a profile, and _perf_target_inputs is not handed one -- it runs
+    from the checkpoint. The baseline is written BEFORE the facts (run 17: profiled at line 117,
+    facts emitted at line 144), so by the time this is asked there normally IS one on disk. Read it
+    rather than thread a parameter through three layers that have no other use for it.
+
+    Absent is the ordinary pre-baseline case, not an error: the caller falls back to the name rule.
+    """
+    try:
+        _root = Path(__file__).resolve().parent.parent / "runs"
+        _cands = sorted(_root.glob("*/profiles/baseline_profile.json"), key=lambda q: q.stat().st_mtime)
+        if not _cands:
+            return {}
+        return json.loads(_cands[-1].read_text()) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def observed_gathered_numels(profile) -> list:
+    """Element counts of the tensors the DEVICE actually gathered, from the profile. [] when unknown.
+
+    WHAT THE HARDWARE DID, NOT WHAT A NAME SUGGESTS. The compute floor must exclude tensors that are
+    INDEXED rather than multiplied, and the rule for finding them was a name list --
+    embed_tokens|wte|word_embeddings|token_embedding -- which fails silently on a model that calls
+    its table something else, over-charging that tower exactly as voxtral's prefill was.
+
+    The profile already answers it by observation: ops classified `embedding` are gathers, and each
+    carries the operand shape it read. Voxtral's baseline shows EmbeddingsDeviceOperation on
+    131072x3072 and on 640x128 -- 402,653,184 and 81,920 elements, gathered, measured.
+
+    SHAPE CANNOT SAY *WHICH* TENSOR, AND DOES NOT NEED TO. embed_tokens and lm_head are both
+    131072x3072 on this model, so the shape is ambiguous by construction. But the question is how
+    many parameters are multiplied, not which object was read: ONE gather was observed, so ONE
+    tensor of that size is excluded and the head stays counted. Each distinct observed size is
+    subtracted once, never per matching tensor.
+
+    Returns element counts, so the caller can match them against the checkpoint's own numels without
+    depending on how a shape happens to be formatted.
+    """
+    out = []
+    try:
+        for b in (profile or {}).get("buckets") or []:
+            if str((b or {}).get("id") or "").lower() != "embedding":
+                continue
+            for o in b.get("top_ops") or []:
+                _sh = str(o.get("shape") or "")
+                # "1x1 @ 131072x3072" -- the operand is the side after the @, which is the table
+                _rhs = _sh.split("@")[-1].strip() if "@" in _sh else ""
+                dims = [int(x) for x in _rhs.split("x") if x.strip().isdigit()]
+                if len(dims) >= 2:
+                    n = 1
+                    for d in dims:
+                        n *= d
+                    if n > 0 and n not in out:
+                        out.append(n)
+    except Exception:  # noqa: BLE001 -- no observation is the name rule's cue, not a failure
+        return []
+    return out
+
+
+def _model_block_facts(model_root, model_id: str = "", cfg: dict | None = None, profile=None) -> dict:
+    """{root: geometry} for every block the model declares. {} when nothing can be established.
+
+    THE JOIN IS DEPTH, so nothing is recognised by name. Three independent sources each report a
+    block's depth -- the checkpoint's sections, the config's sub-dicts, and the probe's stacks -- and
+    that shared number is what lets a stage reach its own geometry:
+
+        stage -> root (stage_roots) -> depth (declared_sections) -> geometry (tower_geometry)
+
+    Voxtral: audio_tower.layers 32 -> 32x1280x5120, language_model.model.layers 30 -> 30x3072x8192.
+    A vocoder, a denoiser or a second vision stack lands here the same way, with no code change --
+    which the "vision"/"audio" name blacklist this replaces could never do.
+
+    AMBIGUITY IS REFUSED. Two sections of equal depth cannot be told apart by depth, so neither gets
+    geometry: a stage priced with its neighbour's widths is worse than a stage with no ceiling, and
+    the report already knows how to print "not modelled".
+    """
+    try:
+        from agent.checkpoint_sections import declared_sections, hf_cache_dir, tower_geometry
+    except Exception:  # noqa: BLE001
+        return {}
+    try:
+        secs = declared_sections(model_root, model_id) or {}
+        if not secs:
+            # NO SECTIONS TO NAME, which is the ordinary single-tower case: one geometry, and the
+            # model IS that block. Published under the empty root, so `len(blocks) == 1` still holds
+            # and the flat keys are emitted exactly as before -- a model with one tower loses
+            # nothing by the facts becoming per-block.
+            _snap1 = (hf_cache_dir(model_id) if model_id else None) or model_root
+            _geo1 = tower_geometry(_snap1) or tower_geometry(cfg or {}) or {}
+            return {"": dict(next(iter(_geo1.values())))} if len(_geo1) == 1 else {}
+        snap = hf_cache_dir(model_id) if model_id else None
+        geo_by_depth = tower_geometry(snap or model_root) or tower_geometry(cfg or {}) or {}
+        if not geo_by_depth:
+            return {}
+        depths = [int(d) for d in secs.values()]
+        out: dict = {}
+        for path, depth in secs.items():
+            depth = int(depth)
+            if depths.count(depth) != 1:
+                continue  # two towers of the same depth: the join cannot separate them
+            geo = geo_by_depth.get(depth) or geo_by_depth.get(str(depth))
+            if not geo:
+                continue
+            out[str(path).split(".", 1)[0]] = dict(geo)
+        # PARAMS PER BLOCK, from the checkpoint's own tensors. The compute floor is 2 x params x
+        # items, and `params` was the WHOLE model for every stage -- so the audio encoder was charged
+        # 3.611e9 parameters when its tower has 0.637e9, on top of being charged the wrong geometry.
+        # Summed per section from the same header read the numel join already uses; a block the
+        # checkpoint does not account for keeps geometry and simply has no param count, which the
+        # caller reads as "cannot price the compute term" rather than as zero work.
+        try:
+            from agent.weight_census import _checkpoint_tensor_sections
+
+            # TWO COUNTS PER TOWER, because two consumers ask different questions of it.
+            #
+            # `params` is the tower's SIZE -- what it holds -- and the memory floor divides by it.
+            # `matmul_params` is what a matmul MULTIPLIES, which excludes a lookup table: an
+            # embedding is read by INDEX, one row per token, never multiplied. The compute floor is
+            # 2 x params x tokens, so handing it the size charges work that never happens -- on
+            # voxtral prefill, 2 x 0.403B x 4096 = 3.30 TFLOP, 18.8 ms of a 222.61 ms floor.
+            #
+            # The rule is model_bytes._LOOKUP_ONLY, which total_params has always applied; blocks[]
+            # arrived later for multi-tower models and recorded only the size. Same regex, so the
+            # two definitions cannot drift.
+            try:
+                from agent.model_bytes import _LOOKUP_ONLY as _LO
+            except Exception:  # noqa: BLE001
+                _LO = None
+            # OBSERVED GATHERS FIRST, THE NAME LIST ONLY AS A FALLBACK.
+            #
+            # A name list cannot recognise a table a model calls something new, and fails SILENTLY --
+            # that tower is then over-charged exactly as voxtral's prefill was. A gather is an op the
+            # device RAN, so the profile answers it by observation whatever the tensor is called.
+            #
+            # ONE OBSERVED SIZE EXCLUDES ONE TENSOR. embed_tokens and lm_head are both 131072x3072
+            # here, so a shape cannot say which was gathered -- and does not need to. The question is
+            # how many parameters are MULTIPLIED: one gather was seen, so one tensor of that size is
+            # excluded and the head stays counted. Matching every tensor of that size would silently
+            # drop lm_head too, which is an error in the dangerous direction.
+            _obs = list(observed_gathered_numels(profile) or [])
+            _pp: dict = {}
+            _lk: dict = {}
+            _rows = list(_checkpoint_tensor_sections(snap or model_root))
+            for _t in _rows:
+                _pp[str(_t[1])] = _pp.get(str(_t[1]), 0) + int(_t[0])
+            for _n in _obs:
+                for _t in _rows:
+                    if int(_t[0]) == int(_n):
+                        _lk[str(_t[1])] = _lk.get(str(_t[1]), 0) + int(_n)
+                        break
+            if not _lk and _LO is not None:
+                # No observation: the pre-baseline emitter call, or a window that ran no gather.
+                # The name rule keeps a ceiling alive from the first second.
+                for _t in _rows:
+                    _nm = str(_t[2]) if len(_t) > 2 else ""
+                    if _nm and _LO.search(_nm):
+                        _lk[str(_t[1])] = _lk.get(str(_t[1]), 0) + int(_t[0])
+            for _root, _geo in out.items():
+                if _pp.get(_root):
+                    _geo["params"] = int(_pp[_root])
+                    if _lk.get(_root):
+                        _geo["lookup_params"] = int(_lk[_root])
+                        _mm = max(0, int(_pp[_root]) - int(_lk[_root]))
+                        # PIN IT, for the reason the bytes and the peak are pinned: this is the
+                        # compute roof's numerator, and the arch mirror it otherwise lives in is a
+                        # last-write-wins cache. matmul_params subtracts the gathers the profile
+                        # OBSERVED, so a later run that observes a different set recomputes it and
+                        # the compute ceiling moves under a measurement that did not. The ceiling is
+                        # pinned or it is not; whether this stage happens to be compute-bound is not
+                        # the question. Write-once, keyed by section so prefill and decode cannot
+                        # disagree about the subtree they share.
+                        try:
+                            _pinned_mm = _ledger_anchor_matmul_params(model_root, str(_root), _mm)
+                            if _pinned_mm:
+                                _mm = int(_pinned_mm)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _geo["matmul_params"] = _mm
+        except Exception:  # noqa: BLE001 -- geometry without params still prices the memory term
+            pass
+        return out
+    except Exception:  # noqa: BLE001 -- no blocks is the refused-ceiling path, not a failure
+        return {}
+
+
+def _ledger_anchor_matmul_params(model_root, section: str, value: int):
+    """Pin one section's multiplied-parameter count, returning whatever is pinned. 0 when unavailable.
+
+    Best-effort in both directions: a ledger that cannot be reached leaves the freshly computed value
+    in place (the behaviour before this pin existed), and a pin that already holds outranks the new
+    computation, which is the whole point.
+    """
+    try:
+        from . import measurements as _led
+    except Exception:  # noqa: BLE001
+        try:
+            import importlib.util as _ilu
+
+            _spec = _ilu.spec_from_file_location("tt_meas_mm", str(Path(__file__).with_name("measurements.py")))
+            _led = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_led)
+        except Exception:  # noqa: BLE001
+            return 0
+    try:
+        held = _led.anchor(
+            _led.KIND_MATMUL_PARAMS,
+            float(value),
+            depth=str(section).strip().lower(),
+            mode="params",
+            source="checkpoint sections minus observed gathers",
+            model=Path(model_root).name if model_root else "",
+        )
+        return int(held) if held else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _publish_stage_roots(seq, model_root, node) -> dict:
+    """Establish {stage: tower} and write it into the model's facts. Best-effort; never raises.
+
+    Split out so it can be called from one place, unconditionally. Inline inside the signpost branch
+    it inherited that branch's precondition -- a tracy signpost sequence -- which it does not use:
+    the count join needs `seq`, the generated-test join needs only the model root and the perf test.
+    A model without signposts got no mapping at all, and its towers were priced from one whole-model
+    byte count.
+    """
+    try:
+        # NARROW THE ROUTER TO THIS MODEL'S STAGES. The lever catalogue tags each lever with the
+        # stage it applies to, and that axis was a fixed {prefill, decode, na}: a lever for an audio
+        # encoder could not be tagged at all, and a model with no decode was still routed by a
+        # vocabulary that only knows decode. Declared here because this is where the model's stages
+        # are already in hand, and it is called unconditionally and early.
+        try:
+            from agent.model_contract import declared_stage_names
+            from agent.router import declare_stages
+
+            declare_stages(declared_stage_names(model_root))
+        except Exception:  # noqa: BLE001 -- an undeclared axis stays open, which is the safe default
+            pass
+        _roots = stage_roots(seq, model_root, _model_id_for_facts(model_root), node)
+        if _roots:
+            _merge_model_facts(model_root, {"stage_roots": _roots})
+            # discovery is the ONLY writer of stage_roots; mirror it here or it is lost on the
+            # first revert with no path back (the emitter never produces it).
+            _mirror_arch_facts({"stage_roots": _roots})
+            print("  [optimize/cc] stage subtrees: %s" % _roots, flush=True)
+        return _roots or {}
+    except Exception:  # noqa: BLE001 -- a missing mapping is the old behaviour, not a failure
+        return {}
+
+
+def depth_per_stage(per_stack_cov: dict, seq) -> dict:
+    """{stage: depth} -- each stage deep enough for every stack that runs in it.
+
+    Conservative by construction: a stage takes the MAX over its stacks, and a stack shared by two
+    stages makes both at least that deep. Nothing ends up shallower than the single-number behaviour
+    it replaces, so the worst case is what the tool does today and the good case is cheaper.
+
+    Empty when the stage boundaries are missing -- no signposts, an uncalled stack, interleaved
+    stages -- and an empty answer means "use one uniform depth", which is the existing path.
+    """
+    by_stage = stacks_by_stage(seq)
+    if not by_stage or not per_stack_cov:
+        return {}
+    out = {}
+    for stage, sids in by_stage.items():
+        depths = [int(per_stack_cov[s]) for s in sids if s in per_stack_cov]
+        if depths:
+            out[stage] = max(depths)
+    return out
+
+
+def _facts_from(raw, sigs, seq) -> dict:
+    """The discovery facts a probe's output yields. One place, because a re-walk must produce the
+    same shape as the first walk -- recomputing three of the four fields by hand is how a repaired
+    model gets described by its unrepaired numbers."""
+    facts = _parse_facts(raw, sigs)
+    facts["all_ops"] = sorted(sigs)
+    facts["full_signal"] = _work_signal(seq)
+    facts["full_blocks"] = _blocks_ran(seq)
+    return facts
+
+
+def _stack_census(raw) -> list:
+    """What the probe's walk saw, both device and reference stacks. [] if it emitted no census."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from agent.stack_visibility import parse_census
+
+        return parse_census(raw)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _stack_evidence(model_root, seq) -> dict:
+    """What the model's structure is, from witnesses that need no HF reference.
+
+    THE REFERENCE CENSUS ONLY SERVES MODELS THAT CARRY A REFERENCE, and a model trained in-house or
+    shipped as a bare checkpoint carries none -- leaving the walk as the only statement of how many
+    stacks exist, which is the thing being checked. Two witnesses replace it:
+
+      checkpoint   Weight keys are paths and a repeated block prints its index into every one, so
+                   grouping keys gives a section count and a depth per section. No config, no
+                   transformers, no torch, no device -- and it reads keys, never values.
+
+      observed     Each plausible container's elements were bracketed during the probe, so a
+                   container whose elements all ran and all emitted the same op subsequence IS a
+                   stack. This is the only witness that names the exact PATH of a hidden stack, which
+                   turns the repair from a search into an edit.
+    """
+    out = {"checkpoint": {}, "observed": []}
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from agent.checkpoint_sections import declared_sections as _ckpt
+
+        out["checkpoint"] = _ckpt(model_root)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from agent.caller_stacks import stacks_that_ran
+
+        out["observed"] = stacks_that_ran(seq)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def make_stacks_visible(model_root, stacks, rewalk=None, attempts: int = 2, evidence=None) -> dict:
+    """A stack the model runs and the walk cannot see -- ask for it to be held in a readable shape.
+
+    THE DISCREPANCY IS THE EVIDENCE. A pipeline built from HF weights carries the reference model,
+    whose stacks torch holds as ModuleLists of one class, so the walk always sees those. Two
+    reference stacks against one device stack is a measured fact: the model has more sections than
+    the device side exposes. It does not say what the missing stack looks like, and it does not need
+    to -- an agent reading the source can see which list is built from the reference's layers and run
+    in sequence by the forward.
+
+    WIDENING THE WALK'S RULE INSTEAD DOES NOT WORK. Two attempts on 2026-08-12: comparing attribute
+    sets scored every pair of torch modules as identical (all carry _parameters, _modules, training),
+    so three unrelated submodules registered as a stack and shadowed the real ones -- the walk went
+    from 5 stacks to 3 and lost an encoder. Comparing child-module names with framework internals
+    excluded still could not separate three wrappers around one layer kind from three submodules of a
+    model. Both made it worse than leaving it alone.
+
+    Verified by RE-WALKING, not by reading the diff: the caller supplies `rewalk`, the count either
+    falls or it did not work, and the feedback for the next round is the stack list as it now reads.
+    """
+    out = {"hidden": 0, "fixed": False, "rounds": 0}
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from agent.stack_visibility import (
+            _expected,
+            hidden_stack_count,
+            repair as _vis_repair,
+            retry_prompt,
+            stack_counts,
+        )
+
+        out["hidden"] = hidden_stack_count(stacks, _expected(evidence))
+        if out["hidden"] <= 0:
+            return out
+        _dev, _ref = stack_counts(stacks)
+        _decl = max(_ref, _expected(evidence))
+        print(
+            "  [optimize/cc] %d block stack(s) are hidden from the walk: %d exist, the device side "
+            "exposes %d. A hidden stack cannot be sized, capped or attributed, so it profiles at "
+            "FULL depth." % (out["hidden"], _decl, _dev),
+            flush=True,
+        )
+        for _o in (evidence or {}).get("observed") or []:
+            print(
+                "  [optimize/cc]   observed running: %s (%d blocks)" % (_o.get("path", "?"), _o.get("depth", 0)),
+                flush=True,
+            )
+        cur = stacks
+        for i in range(max(1, int(attempts))):
+            _vis_repair(model_root, cur, feedback=i > 0, evidence=evidence)
+            out["rounds"] = i + 1
+            if rewalk is None:
+                break
+            cur = rewalk() or cur
+            if hidden_stack_count(cur, _expected(evidence)) <= 0:
+                out["fixed"] = True
+                break
+            print(
+                "  [optimize/cc] still hidden after round %d; %s" % (i + 1, retry_prompt(cur).splitlines()[0]),
+                flush=True,
+            )
+        _d2, _r2 = stack_counts(cur)
+        print(
+            "  [optimize/cc] stack visibility after %d round(s): device stacks %d -> %d (reference %d)"
+            % (out["rounds"], _dev, _d2, _r2),
+            flush=True,
+        )
+    except Exception:  # noqa: BLE001 -- a repair that cannot run leaves the model as it was
+        pass
+    return out
+
+
+def make_model_cappable(model_root, seq=None, per_stack_cov=None, n_stacks=1) -> dict:
+    """The depth went nowhere -- get the model a knob that receives it.
+
+    CALLED ON THE INERT VERDICT, which is the only MEASURED proof that a model cannot be capped:
+    the cap was applied, the work signal did not move, so nothing consumed it. Everything else is
+    inference. A model can have five discoverable stacks and a factory that drops `layers` silently
+    (Voxtral: build_pipeline(device, model=None, **kwargs)), and it can equally have one stack and no
+    knob at all -- both land here, and both mean every profile builds the whole model. Measured on
+    Voxtral with the variable unset: n_layers=30, enc_a=32, enc_b=32, bulk=27.
+
+    The base knob is what meets the goal: ONE depth that reaches every repeated stack. Per-stage
+    overrides are added only when the run knows which stage each stack ran in, because a name taken
+    by position is worse than no name -- slicing PIPELINE_STAGES by stack count asked Voxtral for
+    `prefill_layers` when both of its visible stacks run in encode.
+
+    Opt-in, and verified by the same check that triggered it: after the edit the caller caps and
+    re-measures, so a repair that adds parameters without wiring them reports INERT exactly as an
+    unrepaired model does. Nothing here is trusted on the agent's word.
+    """
+    out = {"needed": [], "added": [], "attempted": False}
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from agent.stack_knob_repair import missing_knobs, repair as _knob_repair
+
+        stage_map = stacks_by_stage(seq) if seq else None
+        needed = missing_knobs(model_root, n_stacks, stage_map)
+        out["needed"] = needed
+        if not needed:
+            return out
+        # NOT BEHIND A FLAG. Capping is how this tool profiles at all: without a depth the builder
+        # can receive, every profile builds the whole model, and on a 3B multimodal pipeline that is
+        # 36.8M tracy zones, tracy's 32K source-location limit exceeded, a test process that never
+        # exits, and a run killed at its budget having measured nothing. An operator cannot opt in to
+        # the tool working -- either it makes the model measurable or it cannot do its job.
+        #
+        # This is not the same as editing a model for PERFORMANCE, which stays a decision. The depth
+        # argument changes no numerics at full depth (None means every layer, exactly as before); it
+        # exists so the profiler can look at a slice. It is instrumentation, and the run verifies it
+        # by re-measuring rather than trusting the edit.
+        print("  [optimize/cc] making the model cappable: adding %s" % ", ".join(needed), flush=True)
+        res = _knob_repair(model_root, _stack_paths(seq or []), needed)
+        out["attempted"] = True
+        out["added"] = res.get("added") or []
+        # SAY HOW MANY ROUNDS AND WHAT THE SIGNATURE ENDED UP AS. The first live run printed only
+        # "added nothing", which cannot distinguish "the agent was asked once and missed" from "it
+        # was asked three times and missed every time" -- and those want opposite fixes. The
+        # parameter list is the fact that decides it.
+        print(
+            "  [optimize/cc] knob repair after %d round(s): added %s; build_pipeline now takes (%s)"
+            % (res.get("rounds", 0), ", ".join(out["added"]) or "nothing", ", ".join(res.get("params") or [])),
+            flush=True,
+        )
+    except Exception:  # noqa: BLE001 -- a repair that cannot run leaves the model as it was
+        pass
+    return out
+
+
+def _stack_paths(seq) -> list:
+    """(stack id, block count) per stack, as the probe reported them -- the repair's targets."""
+    seen = {}
+    for tok in seq or []:
+        if not isinstance(tok, str) or not tok.startswith(_SIGNPOST_TOKEN):
+            continue
+        parsed = _parse_signpost_payload(tok[len(_SIGNPOST_TOKEN) :])
+        if parsed is None:
+            continue
+        sid, idx = parsed
+        seen[sid] = max(seen.get(sid, -1), idx)
+    return [(sid, top + 1, "block") for sid, top in sorted(seen.items())]
+
+
+def _declared_sections(model_root, model_id: str = "") -> list:
+    """Every block depth the config declares, per section, deepest first.
+
+    THE CONFIG IS THE AUTHORITY ON STRUCTURE, and it costs nothing: transformers has already parsed
+    it, so "how many repeated sections does this model have, and how deep is each" is answerable
+    before the device is touched -- no markers, no walk, no naming convention, no per-model code.
+
+    _walk_depths always collected this and _depth_from_mapping reduced it with max() one line later,
+    because both callers wanted a single ceiling. Voxtral-Mini-3B declares 32 for the audio tower and
+    32 for the text decoder; the tool saw one number, sized one depth, capped the text decoder and
+    left both encoders whole, and nothing could notice because the question was never asked.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from agent.layer_depth import declared_section_depths
+
+        found = [int(d) for d in declared_section_depths(model_id=model_id, model_dir=model_root) if int(d) > 0]
+    except Exception:  # noqa: BLE001
+        found = []
+    if found:
+        return found
+    # NO CONFIG IS NOT NO STRUCTURE. declared_section_depths reads a transformers config, so every
+    # model that did not come from HF -- trained in-house, exported from a research repo, shipped as a
+    # bare checkpoint -- answered "no sections" and lost the one independent witness that says how
+    # many stacks there should be. The weights themselves declare it: a repeated block prints its
+    # index into every key it owns, so grouping keys gives a section count and a depth per section
+    # with no config, no transformers, no torch and no device.
+    try:
+        from agent.checkpoint_sections import declared_sections as _ckpt_sections
+
+        return sorted((int(d) for d in _ckpt_sections(model_root).values() if int(d) > 0), reverse=True)
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _cov_ladder(model_root, model_id: str = "") -> list:
     """The coverage-search rungs, BOUNDED BY THE MODEL'S DECLARED DEPTH.
 
@@ -1336,29 +2387,6 @@ def _cov_ladder(model_root, model_id: str = "") -> list:
     out = [d for d in rungs if d < full]
     out.append(full)
     return out
-
-
-def _signpost_cap_is_inert(repo_root, mcp_env, devices, node, case, cov: int, full_signal) -> bool:
-    """One probe at the chosen window: did capping there change the work at all?
-
-    The ladder gets this observation for free -- it RUNS the model at every rung. The signpost path
-    derives its number from a single full-depth probe and never runs capped, so without this it
-    exports a window it has never seen take effect. That is how gemma-3-12b-it, whose build_pipeline
-    has no depth parameter and whose perf test parses TT_PERF_LAYERS and drops it, was profiled at
-    full depth and reported as a capped run.
-
-    One probe, not the ladder's four, and it fails OPEN: an unreadable signal returns False (assume
-    the cap worked) rather than discarding a window the model may well be honouring. The cost of a
-    false negative is a mislabelled depth; the cost of a false positive is throwing away the whole
-    coverage window and profiling everything.
-    """
-    if os.environ.get("PERF_MCP_VERIFY_SIGNPOST_CAP", "1") != "1":
-        return False
-    try:
-        _sigs, _raw, seq_at = _run_op_sigs(repo_root, mcp_env, devices, node, case, cov)
-    except Exception:  # noqa: BLE001
-        return False
-    return _cap_took_effect(_work_signal(seq_at), full_signal) is False
 
 
 def _validate_signpost_window(window: int, stack_len: int, declared) -> tuple:
@@ -1469,7 +2497,27 @@ def _measure_cov(
                 f"({full_signal}) as the full model, so the cap never reached the builder. Refusing to "
                 f"report a coverage window measured against an uncapped model."
             )
-            return None
+            # THE MEASURED MOMENT: the cap was applied and nothing consumed it. Repair here, then
+            # re-measure -- if the knob now bites, the coverage search continues on a model that can
+            # actually be capped instead of abandoning the window.
+            _fix = make_model_cappable(model_root, seq=seq_d, n_stacks=1)
+            if _fix.get("added"):
+                sigs_r, _, seq_r = _run_op_sigs(repo_root, penv, devices, node, case, d)
+                if sigs_r and not _knob_is_inert(seq_r, full_signal, d, model_root):
+                    print(
+                        "  [optimize/cc] the knob now caps: work signal moved after the repair",
+                        flush=True,
+                    )
+                    sigs_d, seq_d = sigs_r, seq_r
+                else:
+                    print(
+                        "  [optimize/cc] still INERT after the repair -- the arguments were added "
+                        "but nothing consumed them; profiling FULL depth.",
+                        flush=True,
+                    )
+                    return None
+            else:
+                return None
         got = set(sigs_d)
         if want <= got:
             return d, [], "measured"
@@ -1504,10 +2552,12 @@ def _cap_cov_depth(depth: int, model_id: str = "") -> int:
     """The profiling window, bounded only by things that are real.
 
     UNCAPPED BY DEFAULT. The old ceiling of 16 was the last rung of the 2/4/8/16 ladder this path
-    replaced; no code derives it from any profiler capacity, and marker overflow is already handled
-    elsewhere by drain_sizing (TT_PERF_FLUSH_EVERY). Capping below what the ops need does not make
-    the profile safe, it makes it BLIND -- gemma-3-12b-it was handed a 16-layer window with 54 op
-    types "present in full model, un-timed", any of which could hold the next bottleneck.
+    replaced; no code derives it from any profiler capacity. A marker overflow is handled where it
+    happens: profiler_heal patches the TT_FATAL into a warning so the run yields a PARTIAL report,
+    and _detect_partial_capture flags that capture as partial so it is never read as complete.
+    Capping below what the ops need does not make the profile safe, it makes it BLIND --
+    gemma-3-12b-it was handed a 16-layer window with 54 op types "present in full model, un-timed",
+    any of which could hold the next bottleneck.
 
     Two bounds remain, both meaningful:
       * the model's DECLARED depth -- profiling deeper than the model is nonsense, not caution;
@@ -1542,8 +2592,15 @@ def _coverage_layers(
     ops that first appear past 16 are reported as present-but-un-timed. Falls back to the config-declared
     layer pattern when the k=0 probe yields nothing (a model that reads TT_PERF_LAYERS=0 as an empty
     stack). Cached per model. Disable via PERF_MCP_COVERAGE_SIZING=0."""
+    # WHY THERE IS NO WINDOW, not merely that there is none. None is the answer for three unrelated
+    # situations -- sizing switched off, the knob proved inert, the probe found nothing -- and a caller
+    # handed a bare None cannot tell "profile everything, deliberately" from "something broke". That
+    # ambiguity is what let before_loop read a deliberate None as a failure and invent a depth of 4,
+    # export it as TT_PERF_LAYERS, and announce a 4-layer profile on a run that profiled 48. The
+    # reason was known HERE and thrown away on the way out; facts already travels, so it carries it.
     facts: dict = {}
     if os.environ.get("PERF_MCP_COVERAGE_SIZING", "1") != "1" or not node:
+        facts["no_window"] = "sizing_disabled" if node else "no_node"
         return None, facts
     cached = _coverage_cache_get(repo_root, node, case)
     if cached is not None:
@@ -1551,52 +2608,230 @@ def _coverage_layers(
         return cached, facts
     sigs, raw, seq = _run_op_sigs(repo_root, mcp_env, devices, node, case, 0)
     if sigs:
-        facts = _parse_facts(raw, sigs)
-        facts["all_ops"] = sorted(sigs)
-        facts["full_signal"] = _work_signal(seq)
-        facts["full_blocks"] = _blocks_ran(seq)
+        facts = _facts_from(raw, sigs, seq)
+        # A STACK THE MODEL RUNS AND THE WALK CANNOT SEE -- REPAIRED HERE, BEFORE ANYTHING IS SIZED.
+        #
+        # This runs ahead of every check below because all of them read the walk's output: the
+        # empty-walk refusal, the declared-sections comparison, the depth repair and the coverage
+        # sizing. A model whose sections are half-visible passes each of them on the visible part
+        # alone -- markers emitted, coverage measured, a depth sized for whichever section happened
+        # to be readable, and the rest built at FULL depth with no error anywhere. Repairing first
+        # means those checks see the model as it actually is.
+        #
+        # The probe's census carries both kinds of stack, so the discrepancy needs no naming rule and
+        # no per-model code; the re-walk below is a real probe, which is what makes the verdict
+        # evidence rather than the agent's word.
+        _root = _model_root_from_node(repo_root, node)
+        _last = {}
+
+        def _rewalk():
+            s2, r2, q2 = _run_op_sigs(repo_root, mcp_env, devices, node, case, 0)
+            if s2:
+                _last.update(sigs=s2, raw=r2, seq=q2)
+            return _stack_census(r2)
+
+        make_stacks_visible(_root, _stack_census(raw), rewalk=_rewalk, evidence=_stack_evidence(_root, seq))
+        if _last:
+            # Every number below is read off the walk, so they come from the REPAIRED model or the
+            # repair would be invisible to the run that asked for it.
+            sigs, raw, seq = _last["sigs"], _last["raw"], _last["seq"]
+            facts = _facts_from(raw, sigs, seq)
+        # SAY IT WHEN THE MODEL'S BLOCKS COULD NOT BE FOUND. The probe walks the object the factory
+        # returned and tags every repeated stack the device runs; zero blocks means that walk found
+        # nothing, and everything downstream degrades quietly -- the ladder is climbed instead of
+        # read (four extra device probes, each reloading the weights), one depth is inferred for a
+        # model that may have several sections, and per-block attribution is unavailable for the
+        # whole run. Voxtral-Mini-3B ran that way for a full day without the reason ever being
+        # printed: full_blocks=0 appeared only inside a debug line nobody reads unless they already
+        # suspect it.
+        #
+        # Structural, not a name check: the walk accepts a list of same-typed callables or a hybrid
+        # sharing a base, so this fires for any model whose blocks are held in a shape it cannot see,
+        # whatever those classes are called.
+        if not facts["full_blocks"]:
+            # REFUSE, DO NOT RECOMMEND. Printing a suggestion here is what let Voxtral run for a day
+            # with full_blocks=0 buried in a debug line: the ladder was climbed instead of read (four
+            # device probes, each reloading weights), ONE depth was inferred for a three-section
+            # model, and per-block attribution was unavailable for every round. Every downstream
+            # number was still produced, which is what makes it dangerous -- the run looks like it
+            # worked.
+            _sections = _declared_sections(_model_root_from_node(repo_root, node), model_name or config_ref)
+            _msg = (
+                "the built model exposes NO discoverable block stacks: depth can only be inferred "
+                "and per-block attribution is impossible"
+            )
+            if len(_sections) > 1:
+                _msg += "; the config declares %d sections (depths %s), so %s" % (
+                    len(_sections),
+                    ", ".join(str(d) for d in _sections[:4]),
+                    "each needs to be reachable as its own stack",
+                )
+            _root = _model_root_from_node(repo_root, node)
+            _emitted = _is_emitted_model(_root)
+            print("  [optimize/cc] %s: %s." % ("REFUSING" if _emitted else "WARNING", _msg), flush=True)
+            print(
+                "  [optimize/cc] Hold each repeated stack as a list of same-typed blocks, or give "
+                "differing per-layer wrappers a common base, so the walk can see them.",
+                flush=True,
+            )
+            # ENFORCED FOR MODELS THE TOOL WROTE, reported for the ones it did not.
+            #
+            # emit-e2e's spec requires every repeated stack to be discoverable, and the HF config
+            # says how many sections there are to find -- so for an emitted model the two can be
+            # compared and a mismatch is a defect in the tool's own output, caught before a run
+            # spends hours on it. Voxtral shipped with none discoverable and nobody knew for a day.
+            #
+            # Hand-written tt-metal models legitimately
+            # have no discoverable stacks and are measured through the ladder -- gemma3 and
+            # llama3_1_8b_p150 both are, and blocking this path refuses them outright (proved by
+            # test_coverage_source_order, which exercises exactly that shape). The contract's own
+            # rule applies: only a COMPATIBILITY defect may block, and it must block BEFORE the
+            # device is touched. So enforcement lives in the depth-knob clause, which fails a
+            # factory that cannot accept a depth at all; what is left here is a loud, specific
+            # report at the moment the walk comes back empty.
+            if _emitted and os.environ.get("PERF_MCP_ALLOW_NO_STACKS") != "1":
+                raise SystemExit(EXIT_REFUSED)
+        else:
+            # FOUND SOME -- BUT THE CONFIG SAYS HOW MANY THERE SHOULD BE. A model can expose one
+            # discoverable stack and hide the rest, which reads as success everywhere: markers are
+            # emitted, coverage is measured, and the depth is sized for the section that happened to
+            # be visible. Voxtral did exactly this before its wrappers shared a base -- one encoder
+            # stack reporting, the other silent, one depth applied to both.
+            #
+            # The HF config is the independent witness: it declares a depth per section, already
+            # parsed by transformers, needing no device, no markers and no naming convention. Fewer
+            # stacks than declared sections means structure is hidden, and for a model the tool
+            # itself generated that is a defect in its output rather than a property to work around.
+            _root = _model_root_from_node(repo_root, node)
+            _sections = _declared_sections(_root, model_name or config_ref)
+            _seen = len(_stack_ids_from_seq(seq))
+            if len(_sections) > 1 and _seen < len(_sections):
+                print(
+                    "  [optimize/cc] %s: the config declares %d sections (depths %s) but only %d "
+                    "block stack(s) are discoverable -- the rest cannot be sized, capped or "
+                    "attributed."
+                    % (
+                        "REFUSING" if _is_emitted_model(_root) else "WARNING",
+                        len(_sections),
+                        ", ".join(str(d) for d in _sections[:4]),
+                        _seen,
+                    ),
+                    flush=True,
+                )
+                if _is_emitted_model(_root) and os.environ.get("PERF_MCP_ALLOW_NO_STACKS") != "1":
+                    raise SystemExit(EXIT_REFUSED)
+            # ONE KNOB PER STACK, ADDED BY THE AGENT THAT IS ALREADY HERE.
+            #
+            # A factory with a single depth argument forces every stack to one value -- or worse, the
+            # value reaches ONE stack and the rest build at FULL depth, which is not a tidiness issue
+            # but the entire cost. Voxtral-Mini-3B profiled 18729 ops and 35.2M tracy zones that way
+            # against 2471 once every stack was capped, and its baseline was killed at the budget
+            # leaving the run with no BEFORE number at all.
+            #
+            # Detection alone would only move the manual work earlier, so the run repairs it. The
+            # optimize loop already edits model source for every lever it tries, under a PCC gate
+            # that reverts anything breaking correctness, and the walk has just produced the stack
+            # paths so nothing is guessed. Whether the new knobs actually CAP is settled immediately
+            # below by the depth bridge, which caps and re-measures the work signal and reports INERT
+            # when the op count does not move -- the one check an edit cannot talk its way past.
+            # ONE PLACE DECIDES THIS, and it is the INERT verdict. An earlier version repaired
+            # here, off the walk's result -- which never fired, because a run that cannot cap reports
+            # INERT and leaves discovery before reaching this branch. What survives here is the
+            # per-stage refinement: the walk knows how many stacks there are, and make_model_cappable
+            # uses the execution-order mapping to name the overrides that go with them.
+            try:
+                _fix = make_model_cappable(_root, seq=seq, n_stacks=_seen)
+                if _fix.get("needed") and not _fix.get("added"):
+                    print(
+                        "  [optimize/cc] %d stacks; still missing %s after the repair attempt"
+                        % (_seen, ", ".join(_fix["needed"])),
+                        flush=True,
+                    )
+            except Exception:  # noqa: BLE001 -- a repair that cannot run leaves the model as it was
+                pass
         # SIGNPOSTS BEFORE THE LADDER. Both answer the same question -- what depth still contains
         # every op type -- but at very different prices. Signposts are already paid for: the k=0
         # probe above emitted them, so reading them costs nothing. The ladder REBUILDS the model at
         # 2, 4, 8 and 16, up to four extra device probes, each reloading the weights. Running the
         # expensive one first and the free one only as its fallback was backwards.
+        # WHICH SUBTREE EACH STAGE RUNS -- published HERE, not inside the signpost branch below.
+        #
+        # It was written there, beside the per-stage depths, because both are "things learned from
+        # the probe". They are not: the depths need the signpost sequence, and this needs only the
+        # model root and the generated test. Voxtral has no tracy signposts -- "WARN signpost: no
+        # tracy signposts in .../tests -- using default 'start'/'stop'" -- so _signposts_usable(seq)
+        # is False, the whole branch is skipped, and stage_roots was never even attempted. Measured
+        # run 6, 2026-08-17: stage_roots absent from the facts, encode priced at "not modelled".
+        #
+        # Called unconditionally and early, so a mapping that does not depend on the probe does not
+        # inherit the probe's preconditions.
+        _publish_stage_roots(seq, _root, node)
         _signpost = None
         if _signposts_usable(seq):
-            first_block, _ = _first_block_map(seq)
-            deepest = max(first_block.values()) if first_block else 0
-            # THE DEPTH THE OPS ACTUALLY REQUIRE, not a ceiling inherited from a deleted algorithm.
-            # This was `min(..., 16)`, and 16 was the last rung of the 2/4/8/16 ladder that a568d9dcba
-            # replaced with this signpost path; the docstring later called it "the marker limit"
-            # although nothing computes a marker capacity, and drain_sizing.py already prevents
-            # overflow by tuning TT_PERF_FLUSH_EVERY. The cost was silent: on gemma-3-12b-it the
-            # window was reported as 16 with "54 op-type(s) still absent at max depth", and the TRUE
-            # depth -- computed right here as deepest + 1 -- was thrown away before anyone could read
-            # it. A window that omits 54 op types cannot find a bottleneck living in one of them.
-            _cov = _cap_cov_depth(max(deepest + 1, 2), model_name or config_ref)
-            # VERIFY BEFORE BELIEVING. The ladder earns its number by running the model at each rung;
-            # this path derives one from a single probe, so the two free cross-checks against the
-            # model's own declared depth are all that stand between a wrong window and a run labelled
-            # with it. Falling back to the ladder is the recovery, never an exception.
+            per_stack_map, _ = _first_block_map(seq)
+            # Compute per-stack coverage depth. per_stack_map is {stack_id: {op: block_idx}}.
+            # For single-stack models this is {"stack0": {...}}.
+            _per_stack_cov: dict = {}
+            _per_stack_deep: dict = {}
             _declared = _declared_depth(_model_root_from_node(repo_root, node), model_name or config_ref)
-            _ok, _why = _validate_signpost_window(_cov, facts.get("full_blocks") or 0, _declared)
-            if not _ok:
-                print(f"  [optimize/cc] signpost window REJECTED: {_why}; falling back to the ladder")
-            elif _signpost_cap_is_inert(repo_root, mcp_env, devices, node, case, _cov, facts["full_signal"]):
-                # The cap reached nothing. Reporting a window here would label a FULL-MODEL profile as
-                # an N-layer one, which is what put "96 layers" on a 48-layer gemma3 run and left its
-                # before/after eager readings incomparable. The ladder path has refused this since it
-                # was written; the path almost every model takes did not.
+            _signpost_ok = True
+            for _sid, _fb in per_stack_map.items():
+                _deepest = max(_fb.values()) if _fb else 0
+                _cov_s = _cap_cov_depth(max(_deepest + 1, 2), model_name or config_ref)
+                _ok, _why = _validate_signpost_window(_cov_s, facts.get("full_blocks") or 0, _declared)
+                if not _ok:
+                    print(f"  [optimize/cc] signpost window REJECTED ({_sid}): {_why}; falling back to the ladder")
+                    _signpost_ok = False
+                    break
+                _per_stack_cov[_sid] = _cov_s
+                _per_stack_deep[_sid] = sorted(op for op, b in _fb.items() if b >= _cov_s)
+            if _signpost_ok and _per_stack_cov:
+                # PRINT THE PER-STACK NUMBERS, not just the value that survives.
+                #
+                # These are the inputs to every depth decision the run makes, and only max() reached
+                # the log -- so a run that profiled full depth said "capping to 32 left the work
+                # signal unchanged" without ever showing WHICH stack asked for 32. On Voxtral that
+                # hid the whole story: the encoders may saturate in a couple of blocks while the
+                # decoder's graduated stubs sit at 28..31 and drag the maximum to the full model.
+                # Deciding what to fix required a number nobody could see.
+                _per_stage = depth_per_stage(_per_stack_cov, seq)
+                # PUBLISHED, NOT JUST PRINTED. This is the mapping that lets the bridge set the
+                # variables the generated test actually reads (TT_PERF_<STAGE>_LAYERS) and the repair
+                # actually creates (`<stage>_layers`). It used to reach the log and nothing else.
+                facts["per_stage"] = dict(_per_stage)
+                # AND WHICH SUBTREE EACH STAGE RUNS. Same publication, same reason: the mapping was
+                # derivable and reached nobody, so the roofline priced every stage from one
+                # whole-model byte count -- overcharging the backbone for a tower it never reads and
+                # leaving that tower with a measurement and no ceiling. Written into the model's own
+                # facts file, which is where the report reads facts from.
                 print(
-                    f"  [optimize/cc] depth knob is INERT on the signpost path: capping to {_cov} left the "
-                    f"work signal unchanged, so the cap never reached the builder. Profiling FULL depth."
+                    "  [optimize/cc] coverage per stack: %s%s"
+                    % (
+                        ", ".join("%s=%s" % (k, v) for k, v in sorted(_per_stack_cov.items())),
+                        (" | per stage: " + ", ".join("%s=%s" % (k, v) for k, v in sorted(_per_stage.items())))
+                        if _per_stage
+                        else " | no stage boundaries -> one uniform depth",
+                    ),
+                    flush=True,
                 )
-                _coverage_cache_put(repo_root, node, case, 0)
-                return None, facts
-            else:
-                _signpost = (_cov, sorted(op for op, b in first_block.items() if b >= _cov))
+                # NO SECOND VERIFICATION HERE. The depth bridge already applies the caps and
+                # measures: "did not reduce work ... ignoring" declines to enforce and profiles full
+                # depth, which is the same protection this used to claim -- against gemma3, whose
+                # perf test reads TT_PERF_LAYERS and whose builder drops it.
+                #
+                # This copy was worse in three ways. It probed at max(per-stack depths), which on a
+                # model whose deepest stack IS the model (Voxtral: encoder 32 of 32) asks for FULL
+                # depth, so the work signal could not move and the knob was declared dead -- a false
+                # INERT that discarded a correct window (stack0=2, stack2=32, stack3=3) and refused
+                # the run. It also threw away the WHOLE window rather than just declining to enforce
+                # it, and it spent an extra device probe to do so. One decision, measured once, in
+                # the place that applies it.
+                _signpost = (_per_stack_cov, _per_stack_deep)
         if _signpost is not None:
-            _cov, deep = _signpost
+            _cov_dict, _deep_dict = _signpost
             blk_source = "signposts"
+            # Flatten deep ops across stacks for facts/reporting
+            deep = sorted({op for ops in _deep_dict.values() for op in ops})
         else:
             measured = _measure_cov(
                 repo_root,
@@ -1609,18 +2844,48 @@ def _coverage_layers(
                 base_knob=depth_knob,
                 full_signal=facts["full_signal"],
             )
+            # Discover all stack IDs present in the k=0 probe sequence so that every
+            # stack receives a depth cap -- not just stack0. For single-stack models
+            # this returns ["stack0"] and the behaviour is identical to before.
+            _all_stacks = _stack_ids_from_seq(seq)
             if measured is not None:
-                _cov, deep, blk_source = measured
+                _cov_scalar, deep, blk_source = measured
             else:
                 deep = []
-                _cov = 2
+                _cov_scalar = 2
                 blk_source = "unverified-floor"
+            _cov_dict = {sid: _cov_scalar for sid in _all_stacks}
         facts["deep_ops"] = deep
         tail = f"; {len(deep)} op-type(s) still absent at max depth (present in full model, un-timed)" if deep else ""
-        print(f"  [optimize/cc] coverage ({blk_source}): {len(sigs)} distinct op(s) -> TT_PERF_LAYERS={_cov}{tail}")
-        _coverage_cache_put(repo_root, node, case, _cov)
-        return _cov, facts
+        _cov_repr = _cov_dict if len(_cov_dict) > 1 else next(iter(_cov_dict.values()))
+        print(
+            f"  [optimize/cc] coverage ({blk_source}): {len(sigs)} distinct op(s) -> TT_PERF_LAYERS={_cov_repr}{tail}"
+        )
+        # Cache stores the maximum depth across stacks (an int); the full per-stack dict is
+        # reconstructed on the live path and not preserved in the on-disk cache.
+        _cache_val = max(_cov_dict.values()) if isinstance(_cov_repr, dict) else _cov_repr
+        _coverage_cache_put(repo_root, node, case, _cache_val)
+        return _cov_dict, facts
     k, n_kinds = _config_layer_kinds(config_ref or model_name)
+    if k is None:
+        # THE CHECKPOINT COUNTS THE KINDS THE CONFIG WAS GUESSED FOR. _config_layer_kinds reads a
+        # per-layer pattern out of one of four attribute names and needs AutoConfig to load the
+        # model at all -- which it cannot for voxtral, whose model type this transformers does not
+        # know. Both fell through and the run ended here with "no_window: probe_failed".
+        #
+        # Two blocks are the same kind when they hold the same set of parameter names. That is
+        # visible in the checkpoint without a vocabulary, an import, or a device.
+        try:
+            from agent.checkpoint_sections import layer_kinds as _ck_kinds
+
+            k, n_kinds = _ck_kinds(_model_root_from_node(repo_root, node), model_name or config_ref)
+            if k is not None:
+                print(
+                    "  [optimize/cc] coverage (checkpoint fallback; k=0 probe empty, config silent): "
+                    "%d kind(s) -> TT_PERF_LAYERS=%d" % (n_kinds, min(k, 16))
+                )
+        except Exception:  # noqa: BLE001 -- no checkpoint is the old "probe_failed" path
+            k, n_kinds = None, 0
     if k is not None:
         _cov = min(k, 16)
         print(
@@ -1628,7 +2893,8 @@ def _coverage_layers(
             f"appears at layer {k - 1} -> TT_PERF_LAYERS={_cov}"
         )
         _coverage_cache_put(repo_root, node, case, _cov)
-        return _cov, facts
+        return {"stack0": _cov}, facts
+    facts["no_window"] = "probe_failed"
     return None, facts
 
 
@@ -1648,7 +2914,9 @@ def _print_scorecard(
         on_device = probed and not host_ops
         batch = int(os.environ.get("TT_PERF_BATCH", "1") or "1")
         isl = os.environ.get("TT_PERF_SEQ_LEN") or "(default)"
-        osl = os.environ.get("TT_PERF_MAX_NEW_TOKENS") or "4"
+        # Same fallback the skeleton uses, so the scorecard reports the OSL that RAN. "4" here printed
+        # OSL=4 on a run measuring 128 whenever the variable was unset.
+        osl = os.environ.get("TT_PERF_OSL_TOKENS", "128")
         L = ["  ┌─ optimize scorecard — pipeline: %s" % pipe.get("task", "?")]
         L.append("  │ hardware          : %s  x%s chip(s)" % (arch, chips))
         if facts.get("parallelism_known"):
@@ -1677,6 +2945,11 @@ def _print_scorecard(
         for name in ("TTFT", "T/S/U", "T/S"):
             L.append("  │ %-16s : N/A  (%s)" % (name, reason))
         L.append("  │ ISL / OSL         : %s / %s  (tokens; N/A for non-token models)" % (isl, osl))
+        # The condition a step/vision measurement is meaningless without. Printed only when the model
+        # HAS one -- a resolution line on a text model would state a condition that does not exist.
+        _res = os.environ.get("TT_PERF_RESOLUTION") or (facts or {}).get("resolution")
+        if _res:
+            L.append("  │ resolution        : %sx%s  (px per unit of work)" % (_res, _res))
         if before_ms and after_ms:
             d = (before_ms - after_ms) / before_ms * 100.0
             L.append("  │ full-model e2e    : %.1f -> %.1f ms  (%+.1f%%)" % (before_ms, after_ms, d))
@@ -1854,7 +3127,7 @@ def _dr():
     return _m
 
 
-def _reclaim_device(devices: str, error_text: str = "") -> str:
+def _reclaim_device(devices: str, error_text: str = "", after_kill: bool = False) -> str:
     """UNIVERSAL device reclaim used at EVERY recovery point: kill every process holding
     /dev/tenstorrent (except this process + its ancestors, so the supervisor/self is never killed),
     then tt-smi -r the chips. A wedge is cleared no matter WHO holds the device -- a stray child, a
@@ -1868,44 +3141,39 @@ def _reclaim_device(devices: str, error_text: str = "") -> str:
     was never reset while the healthy board was reset repeatedly for eleven hours. The reset is now
     routed through the shared primitive, so it picks the target from evidence, VERIFIES the device
     came back, and spends the same escalation budget as every other reset in the tool."""
-    import glob as _glob
-
-    protected = set()
-    _p = os.getpid()
-    for _ in range(64):
-        if _p <= 1:
-            break
-        protected.add(_p)
-        try:
-            _p = int(open("/proc/%d/stat" % _p).read().split()[3])
-        except Exception:  # noqa: BLE001
-            break
-    holders = set()
-    for _n in _glob.glob("/dev/tenstorrent/*"):
-        try:
-            _r = subprocess.run(["fuser", _n], capture_output=True, text=True, timeout=30)
-            holders.update(int(_t) for _t in (_r.stdout + " " + _r.stderr).split() if _t.strip().isdigit())
-        except Exception:  # noqa: BLE001
-            pass
-    killed = []
-    for _pid in holders - protected:
-        try:
-            os.kill(_pid, signal.SIGKILL)
-            killed.append(_pid)
-        except Exception:  # noqa: BLE001
-            pass
     _dr_mod = _dr()
+    # The reap lives in the recovery primitive now, so EVERY reset gets it rather than the three
+    # sites that happened to call this function. Kept here too because this caller reports what it
+    # killed, and `recover` below is a no-op reap by then -- the holders are already gone.
+    killed = _dr_mod.reap_device_holders()
     _status = {"last": ""}
 
     def _issue(target):
         _status["last"] = _reset_devices(target)
         return True
 
+    # A KILLED PROCESS HELD EVERY DEVICE, NOT THE ONE IT WAS ASKED TO USE. `devices` is what the run
+    # was CONFIGURED with; a ttnn process maps all enumerated chips regardless -- a single probe was
+    # observed holding /dev/tenstorrent/0,1,2,3 on a --devices 0 run. So SIGKILL can leave any of them
+    # half-initialised, and scoping the reset to the configured board resets the wrong one.
+    #
+    # Measured 2026-08-14: run 10's full-pipeline measurement was killed at its budget, the reclaim
+    # issued `tt-smi -r 0,1` (the --devices 0 board), the health check passed for THAT board and the
+    # ladder never escalated to `all`. Device 2 stayed wedged -- "tenstorrent!2: Failed to set initial
+    # power state: -22", repeating -- and the next run died at Step 1 because `tt-smi -s` blocked on
+    # it. By then `tt-smi -r` hung too, so only a host reboot cleared it.
+    #
+    # After a kill the scope is UNKNOWN, and an unverifiable target must widen rather than narrow
+    # (expand_spec's own rule): a reset covering too much is recoverable, one covering too little
+    # leaves a chip nobody touches.
     ok = _dr_mod.recover(
         "reclaim",
         _issue,
         error_text=error_text,
-        config_target=devices,
+        # NOT named `killed`: that local already holds reap_device_holders()'s list, and a
+        # parameter by the same name is overwritten before it is read -- silently, because the
+        # list is empty after a SIGKILL and an empty string is falsy.
+        config_target="all" if after_kill else devices,
     )
     return "reclaimed device (killed holders %s) + %s%s" % (
         killed or "none",
@@ -1915,30 +3183,47 @@ def _reclaim_device(devices: str, error_text: str = "") -> str:
 
 
 def _pg_cpu_jiffies(pgid: int) -> int:
-    total = 0
+    # PROBES OWNS THE /proc WALK. This was a verbatim copy of probes._pgroup_cpu_jiffies.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     try:
-        entries = os.listdir("/proc")
-    except OSError:
+        from agent.probes import _pgroup_cpu_jiffies
+
+        return _pgroup_cpu_jiffies(pgid)
+    except Exception:  # noqa: BLE001
         return 0
-    target = str(pgid)
-    for entry in entries:
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry}/stat") as fh:
-                data = fh.read()
-        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
-            continue
-        rp = data.rfind(")")
-        if rp == -1:
-            continue
-        fields = data[rp + 2 :].split()
-        if len(fields) > 12 and fields[2] == target:
-            try:
-                total += int(fields[11]) + int(fields[12])
-            except ValueError:
-                pass
-    return total
+
+
+def _hard_ceiling_mult() -> int:
+    """probes owns this too -- one number, one home. 0 means "no ceiling" if probes is unreachable,
+    and the caller treats 0 as disabled rather than as an instant kill."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        from agent.probes import _HARD_CEILING_MULT
+
+        return int(_HARD_CEILING_MULT)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _progress_watch(pgid, log_path=None, stall_s=0.0):
+    """probes owns the arithmetic; see ProgressWatch there. Lazy import, as _set_depth is.
+
+    The fallback answers "moved" for every poll, which is the safe direction: an unreadable
+    signature must not be mistaken for a wedge and kill working code. The ceiling still bounds the
+    run if the signature never becomes readable.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        from agent.probes import ProgressWatch
+
+        return ProgressWatch(pgid, log_path, stall_s)
+    except Exception:  # noqa: BLE001
+
+        class _Blind:
+            def moved(self, *_a, **_k):
+                return True
+
+        return _Blind()
 
 
 def _tree_cpu_jiffies(root_pid: int) -> int:
@@ -1947,75 +3232,129 @@ def _tree_cpu_jiffies(root_pid: int) -> int:
     (its own pgrp), so _pg_cpu_jiffies(pgid) cannot see its CPU -- and the no-output watchdog would
     then false-kill a validation that is actually pegging the device (observed on XTTS: a ~10 min
     perf-test validation killed as a wedge). Walking the tree counts that busy child as progress."""
-    ppid_of: dict[int, int] = {}
-    cpu_of: dict[int, int] = {}
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     try:
-        entries = os.listdir("/proc")
-    except OSError:
+        from agent.probes import _proc_stat_fields
+    except Exception:  # noqa: BLE001
         return 0
-    for entry in entries:
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry}/stat") as fh:
-                data = fh.read()
-        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
-            continue
-        rp = data.rfind(")")
-        if rp == -1:
-            continue
-        fields = data[rp + 2 :].split()  # [0]=state [1]=ppid [2]=pgrp ... [11]=utime [12]=stime
-        if len(fields) <= 12:
-            continue
-        try:
-            ppid_of[int(entry)] = int(fields[1])
-            cpu_of[int(entry)] = int(fields[11]) + int(fields[12])
-        except (ValueError, IndexError):
-            continue
-    children: dict[int, list] = {}
-    for pid, ppid in ppid_of.items():
-        children.setdefault(ppid, []).append(pid)
-    total = 0
-    stack = [int(root_pid)]
-    seen: set = set()
+    kids: dict = {}
+    jiff: dict = {}
+    for pid, f in _proc_stat_fields():
+        if len(f) > 12:
+            kids.setdefault(int(f[1]), []).append(pid)
+            try:
+                jiff[pid] = int(f[11]) + int(f[12])
+            except ValueError:
+                jiff[pid] = 0
+    total, stack = jiff.get(int(root_pid), 0), [int(root_pid)]
     while stack:
-        pid = stack.pop()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        total += cpu_of.get(pid, 0)
-        stack.extend(children.get(pid, []))
+        for kid in kids.get(stack.pop(), ()):
+            total += jiff.get(kid, 0)
+            stack.append(kid)
     return total
 
 
-def _llm_child_alive(pgid: int) -> bool:
-    target = str(pgid)
+# Defined by perf_mcp, which emits them; named here so the watchdog can recognise a cooling child.
+_COOL_BEGIN = "PERF_MCP_COOLING_BEGIN"
+_COOL_END = "PERF_MCP_COOLING_END"
+# A cooling child re-asserts itself every poll (perf_mcp._COOLDOWN_POLL_S, 20 s). Three missed beats
+# means it is no longer cooling, whatever it last claimed, and the clock starts again.
+_COOL_HEARTBEAT_S = float(os.environ.get("PERF_MCP_COOL_HEARTBEAT_S", "90"))
+
+
+_LIVENESS_PROBE_S = float(os.environ.get("PERF_MCP_LIVENESS_PROBE_S", "20"))
+
+
+def _device_answers() -> bool:
+    """Is the board still talking? Used to decide whether a timeout deserves a reset.
+
+    Delegates to agent.probes.device_is_responsive, which asks only whether tt-smi came back naming
+    any device -- NOT the startup probe, which raises on an unrecognised board_type and would call
+    this host's own `p300c` dead.
+
+    Failure to answer returns False, which resets exactly as before -- this only ever ADDS a reason
+    not to reset, never a reason to.
+    """
     try:
-        entries = os.listdir("/proc")
-    except OSError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from agent.probes import device_is_responsive
+
+        return bool(device_is_responsive(_LIVENESS_PROBE_S))
+    except Exception:  # noqa: BLE001 -- no answer, a slow answer, or no probe at all: reset as before
         return False
-    for entry in entries:
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry}/stat") as fh:
-                data = fh.read()
-        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
-            continue
-        rp = data.rfind(")")
-        if rp == -1:
-            continue
-        fields = data[rp + 2 :].split()
-        if len(fields) <= 2 or fields[2] != target:
-            continue
-        try:
-            with open(f"/proc/{entry}/cmdline", "rb") as fh:
-                cmd = fh.read().replace(b"\x00", b" ").decode("utf-8", "ignore").lower()
-        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
-            continue
-        if "claude" in cmd:
-            return True
-    return False
+
+
+def _wait_for_thermal_headroom_before_device_work(label: str = "") -> None:
+    """Let the board cool BEFORE any device subprocess, not just before a measurement.
+
+    THE GAP THIS CLOSES, measured on a liquid-cooled p300c. The gate existed and worked, but its
+    only caller was _measure_full_pipeline_guarded -- so it covered readings and nothing else. A
+    Voxtral perf-test build is 30-60 minutes of continuous device work (HF weights + 17 stub
+    uploads, repeated once per generator attempt) with no gate on it at all. The chips went 57C ->
+    103C and the AICLK fell 1350 -> 800, and then the FIRST measurement started on a board already
+    pinned to the clamp. gemma never showed this because its device time is mostly gated
+    measurements, which cool between readings; the build phase is where the heat actually comes
+    from.
+
+    So the gate belongs at the point where a device process is LAUNCHED -- which is here, the one
+    function every device-touching subprocess goes through -- rather than at the point where a
+    number is taken. One call site, no second copy of the policy.
+
+    BEST-EFFORT BY DESIGN. It never raises: a board whose temperature cannot be read, or one that
+    stays hot past PERF_MCP_THERMAL_WAIT_S, still runs. The clamp check downstream decides whether
+    the resulting reading counts. Refusing to launch would turn a hot board into a failed run,
+    which is worse than a reading the ledger already knows how to reject.
+
+    It also does NOT fix a NOC hang. Measured: the same soak died at 5.5 min at full rate and 36
+    min at a quarter of it. Cooler and slower delays the hang; it does not prevent it.
+    """
+    try:
+        from .perf_mcp import _wait_for_thermal_headroom
+
+        ok, temp = _wait_for_thermal_headroom()
+        if not ok and temp is not None:
+            print(
+                "  [thermal-gate] %s starting at %.1fC (still above this board's clamp threshold)"
+                % (label or "device work", temp),
+                flush=True,
+            )
+    except Exception:  # noqa: BLE001 -- a gate that cannot run must not stop the work
+        pass
+
+
+def timed_op_for(env, fallback: str = "profile") -> str:
+    """DEPRECATED -- kept only so an external caller does not break. Do not route by this.
+
+    "Uncapped" is NOT the same question as "which operation". The coverage probe removes the cap on
+    purpose (set_depth(env, 0)) to see every layer, and it is CHEAP -- one forward at OSL=1, 80-135 s.
+    Routing on the cap therefore filed those probes in the same bucket as the full-pipeline
+    measurement: [135.3, 80.1, 453.9], p95 135.3, budget 3 x 135 = 406 s for a run that needs ~1700 s.
+    That is worse than the capped bucket it replaced, which at least gave 1686 s.
+
+    An operation is named by what it IS, at the one call site that performs it.
+
+
+    THE BUCKET WAS A TYPED STRING AND THE RUNS WERE NOT THE SAME SIZE. Every device subprocess filed
+    its duration under `observe_op="profile"`, so a 25 s capped probe and a 2144 s uncapped
+    full-model measurement shared one history -- and adaptive_timer budgets an op at 6x the p95 of its
+    own bucket.
+
+    Measured on Voxtral 2026-08-14, the bucket held
+    [25.0, 55.0, 85.1, 100.2, 150.5, 281.1, 1734.2, 2143.9]: the first six are capped 2-layer runs,
+    the last two uncapped. Before those last two existed the p95 was 281.1, so the budget was
+    6 x 281.1 = 1686 s -- and the uncapped run, which needs 1734 s, was killed about fifty seconds
+    short. It pollutes the other direction too: with 2143.9 now in the bucket, the next capped probe
+    is budgeted ~12800 s, so a genuinely hung 25 s probe would sit for three hours.
+
+    The distinguishing fact is already in hand: a capped run carries TT_PERF_LAYERS in the environment
+    being launched, and an uncapped one expresses "all layers" by its ABSENCE. Reading that removes
+    the hardcode instead of adding another, and no call site can mislabel a run again.
+    """
+    try:
+        capped = bool(_active_depth_caps(env or {}))
+    except Exception:  # noqa: BLE001
+        capped = True
+    return fallback if capped else "fullpipe"
 
 
 def _run_device_proc(
@@ -2028,6 +3367,8 @@ def _run_device_proc(
     reset_on_timeout: bool = True,
     capture: bool = True,
     stall_s: int = 0,
+    observe_op: str = "",
+    observe_root: Path | None = None,
 ):
     """Run a DEVICE-touching subprocess so a device wedge can never hang the tool forever. Own session +
     hard timeout; on timeout SIGKILL the WHOLE process group + _reclaim_device (kill any holder + tt-smi
@@ -2038,6 +3379,8 @@ def _run_device_proc(
       BUILD   discover                                          -> PERF_MCP_DISCOVER_STALL_SEC (1200s), backstop PERF_MCP_DISCOVER_TIMEOUT (10800s)
       MEASURE gate / coverage / op-sig / full-pipeline runs     -> PERF_MCP_MEASURE_STALL_SEC  (600s),  backstop PERF_MCP_MEASURE_BACKSTOP (3600s)
       ROUND   agent round                                       -> PERF_MCP_ROUND_STALL_SEC   (600s)"""
+    _wait_for_thermal_headroom_before_device_work(label)
+    _obs_t0 = time.monotonic()
     _piped = bool(capture or stall_s)
     proc = subprocess.Popen(
         list(cmd),
@@ -2056,11 +3399,45 @@ def _run_device_proc(
 
             _buf: list = []
             _act = [time.monotonic()]
+            # COOLING IS NOT WORK, AND IT IS NOT A HANG. A thermal wait runs inside this subprocess,
+            # so on 2026-08-14 the tool cooled the board, the cooling ate the wall-clock budget, and
+            # this watchdog killed it at 1716 s as "likely a device wedge" -- then reset the device,
+            # which is what actually broke it. The child brackets every thermal wait with these
+            # markers; time spent between them is credited back, so a board that takes an hour to
+            # cool costs an hour of waiting and none of the op's budget.
+            # CREDIT IS EARNED PER HEARTBEAT, NEVER EXTRAPOLATED. The first version of this trusted
+            # a single BEGIN and credited every second until END arrived, which handed back the one
+            # protection the absolute cap exists to provide: a child that printed BEGIN and then
+            # busy-wait deadlocked would accrue credit as fast as wall clock, so the cap could never
+            # fire -- and the stall detector was told to ignore it too. Voxtral produced exactly that
+            # shape once before: 85 minutes, 91 minutes of CPU, no output after the first second.
+            # The child now re-asserts cooling every poll, and a gap longer than _COOL_HEARTBEAT_S
+            # earns nothing, so credit stops the moment the child does.
+            _cool = {"in": False, "last": None, "total": 0.0}
+
+            def _cool_beat():
+                now = time.monotonic()
+                prev = _cool["last"]
+                if prev is not None and now - prev <= _COOL_HEARTBEAT_S:
+                    _cool["total"] += now - prev
+                _cool["last"], _cool["in"] = now, True
+
+            def _cool_total():
+                return _cool["total"]
+
+            def _cooling_now():
+                last = _cool["last"]
+                return bool(_cool["in"] and last is not None and time.monotonic() - last <= _COOL_HEARTBEAT_S)
 
             def _pump():
                 try:
                     for _ln in proc.stdout:
                         _buf.append(_ln)
+                        if _COOL_BEGIN in _ln:
+                            _cool_beat()
+                        elif _COOL_END in _ln:
+                            _cool["in"] = False
+                            _cool["last"] = None  # no open claim survives the end of the wait
                         if not capture:
                             _sys.stdout.write(_ln)
                             _sys.stdout.flush()
@@ -2073,14 +3450,21 @@ def _run_device_proc(
             pgid = proc.pid
             start = time.monotonic()
             last_progress = start
-            last_cpu = _tree_cpu_jiffies(proc.pid)
+            # PROGRESS, NOT ACTIVITY -- probes.progress_signature. Two things counted as life here
+            # that a hang has in abundance: CPU, and the mere EXISTENCE of a child process
+            # (_llm_child_alive), which no hung run can fail. Cooling stays: it is a deliberate
+            # pause this tool asked for.
+            _watch = _progress_watch(pgid, None, stall_s)
             max_gap = 0.0
+            _over_budget = [False]
+            _ceiling_mult = _hard_ceiling_mult()
             while proc.poll() is None:
                 time.sleep(5)
                 now = time.monotonic()
-                cpu = _tree_cpu_jiffies(proc.pid)
-                moved = cpu > last_cpu + 10 or _act[0] > last_progress or _llm_child_alive(pgid)
-                last_cpu = cpu
+                # A cooling child is idle ON PURPOSE: it is sleeping against a thermometer, so it
+                # burns no CPU and prints only when the temperature moves. Both of this loop's
+                # liveness signals read that as a wedge, which is exactly wrong.
+                moved = _watch.moved(now, last_progress, proc.pid) or _act[0] > last_progress or _cooling_now()
                 if moved:
                     max_gap = max(max_gap, now - last_progress)
                     last_progress = now
@@ -2088,13 +3472,57 @@ def _run_device_proc(
                 idle = now - last_progress
                 if idle >= limit:
                     print(
-                        f"  [optimize/cc] {label or 'device subprocess'} STALLED (no output/CPU for "
+                        f"  [optimize/cc] {label or 'device subprocess'} STALLED (no output, syscalls, "
+                        f"bytes or stack movement for "
                         f"{int(idle)}s > adaptive limit {limit}s) -- treating as wedge",
                         flush=True,
                     )
                     raise subprocess.TimeoutExpired(cmd, limit)
-                if now - start >= timeout_s:
-                    raise subprocess.TimeoutExpired(cmd, timeout_s)
+                # NO WALL-CLOCK KILL WHILE THE WORK IS REAL -- BUT THERE IS A CEILING.
+                #
+                # This raised the moment `timeout_s` elapsed, regardless of what the process was
+                # doing. On 2026-08-17 that killed a full-depth measurement after three hours while
+                # its tree was burning CPU and the board sat at 97-102C -- work in progress, ended
+                # on a number. The number was not even a judgement about this measurement: it is the
+                # CEILING, taken because --fresh had wiped the observed durations meant to size it.
+                #
+                # The loop already knows the difference. `moved` is log bytes, syscalls, io bytes,
+                # stack movement or an in-progress cooldown, and the stall clock above kills the
+                # moment all of them go quiet. A process that is demonstrably working is not a
+                # wedge, and a clock cannot make it one.
+                #
+                # WHAT THIS COMMENT USED TO SAY, AND WHY IT WAS WRONG. It said `moved` was "tree CPU"
+                # and concluded the budget should be a REPORT, not a sentence -- said once, run
+                # continues, "bounded by death, not duration". Run 12 is what that costs. At 03:09,
+                # exactly 3h in, this loop printed "over its 10800s budget and STILL WORKING (tree
+                # CPU is moving) -- not killing it", and then sat silent for NINE HOURS holding the
+                # board until it was killed by hand. CPU was moving because the process was spinning;
+                # the thing being trusted as proof of work was the symptom of the wedge.
+                #
+                # So: the budget is still not a sentence, because the stall check above is now the
+                # real judge and it watches work rather than CPU. But there IS a ceiling behind it.
+                # A run that somehow keeps its signature twitching without ever finishing stops at
+                # _HARD_CEILING_MULT x its budget, and stops by RAISING -- so the caller books a
+                # failed attempt and its retries take over, rather than the run hanging forever.
+                _worked = now - start - _cool_total()
+                if not _over_budget[0] and _worked >= timeout_s:
+                    _over_budget[0] = True
+                    print(
+                        f"  [optimize/cc] {label or 'device subprocess'} is over its {int(timeout_s)}s budget "
+                        f"and STILL WORKING (output, syscalls, bytes or stack are moving) -- not killing "
+                        f"it; the stall check decides, and a hard ceiling at "
+                        f"{int(timeout_s * (_ceiling_mult or 0))}s is behind that",
+                        flush=True,
+                    )
+                if _ceiling_mult and timeout_s and _worked >= timeout_s * _ceiling_mult:
+                    print(
+                        f"  [optimize/cc] {label or 'device subprocess'} exceeded "
+                        f"{int(timeout_s * _ceiling_mult)}s -- {_ceiling_mult}x its budget -- while still "
+                        f"looking busy. Nothing legitimate takes that long: killing it and failing the "
+                        f"attempt so the retry can run.",
+                        flush=True,
+                    )
+                    raise subprocess.TimeoutExpired(cmd, int(timeout_s * _ceiling_mult))
             rc = proc.returncode
             _pt.join(timeout=30)
             out = "".join(_buf)
@@ -2114,7 +3542,23 @@ def _run_device_proc(
             proc.communicate(timeout=30)
         except Exception:  # noqa: BLE001
             pass
-        tail = _reclaim_device(devices, error_text=out) if reset_on_timeout else "process group killed"
+        # ASK THE BOARD BEFORE RESETTING IT. This used to reset unconditionally on every timeout, and
+        # the accompanying "likely a device wedge" was a fixed string, not a finding -- nothing looked
+        # at the device. On 2026-08-15 that reset four HEALTHY chips because an op ran long, and the
+        # reset is what produced `Failed to set initial power state: -22`, a fault no PCIe reset
+        # clears; the host needed a reboot. Runs 13, 17 and 20 all died that way.
+        #
+        # A timeout means SLOW. It does not mean wedged, and the difference is cheap to establish:
+        # measured on this host, a live board answers tt_smi_probe() in 0.24 s and a wedged one does
+        # not answer at all. Resetting a working board is not a neutral act, so it needs evidence.
+        if reset_on_timeout and _device_answers():
+            tail = "process group killed; device answered a liveness probe, so it was NOT reset"
+        else:
+            tail = (
+                _reclaim_device(devices, error_text=out, after_kill=True)
+                if reset_on_timeout
+                else "process group killed"
+            )
         _lim = int(getattr(_te, "timeout", None) or timeout_s)
         _why = "no-progress stall" if _lim < timeout_s else "hard limit"
         print(
@@ -2123,6 +3567,27 @@ def _run_device_proc(
         )
         return None, ""
     finally:
+        # TEACH THE TIMER WHAT THIS OP COSTS -- INCLUDING WHEN IT WAS KILLED.
+        #
+        # `_measure_backstop` derives the hard wall from "observed PROFILE durations", and nothing
+        # ever recorded one: record_observed had exactly two callers, "pcc" and "round". So
+        # _op_cost("profile") stayed 0, adaptive_timer took its `cost <= 0` cold-start branch every
+        # time, and every measurement on every model got the same 600 s guess forever.
+        #
+        # Measured on Voxtral, 2026-08-11: the baseline profile was killed at 900 s ("hard limit")
+        # while still printing decode_trace_step #96. The run then optimized for hours with no
+        # BEFORE number. A second attempt would have used the same 600 s, because a kill taught the
+        # timer nothing -- and a kill is the single strongest piece of evidence that the budget was
+        # too small.
+        #
+        # So it records in `finally`, on the timeout path as much as the success path, exactly as
+        # _fullpipe_e2e already does for "pcc". A hard-limit kill at 900 s becomes 900 s of observed
+        # cost, and the next budget is 6x that instead of a constant.
+        if observe_op and observe_root is not None:
+            try:
+                record_observed(observe_root, observe_op, time.monotonic() - _obs_t0)
+            except Exception:  # noqa: BLE001
+                pass
         # Reap any lingering group member on EVERY exit. A daemon child (profiler, not-fully-closed mesh)
         # can outlive the main subprocess and keep holding the device -- a stale holder that wedges the
         # NEXT device op (observed: a completed baseline measurement leaked a holder that blocked the
@@ -2243,13 +3708,12 @@ def _baseline_ceiling(repo_root: Path) -> tuple[float, int]:
             ceil = int(cfg.get("timeout", ceil) or ceil)
         except Exception:  # noqa: BLE001
             pass
+        # probes owns this parse; it was written out identically in three places.
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         try:
-            for ln in (mani.parent / "events.jsonl").read_text().splitlines():
-                if not ln.strip():
-                    continue
-                e = json.loads(ln)
-                if e.get("stage") == "tracy_baseline" and e.get("event") == "done" and e.get("seconds"):
-                    base = float(e["seconds"])
+            from agent.probes import observed_tracy_baseline_seconds
+
+            base = observed_tracy_baseline_seconds(mani) or base
         except Exception:  # noqa: BLE001
             pass
     return base, ceil
@@ -2272,10 +3736,13 @@ _MIN_TIMER_S = float(os.environ.get("PERF_MCP_MIN_TIMER_S", "30") or "30")
 # tolerance multiplier per op. "round" is 2.0 because _OP_IN_BASE_UNITS["round"]
 # already estimates the WHOLE cycle (pcc + measure + commit); multiplying a
 # full-cycle estimate again would compound two proxies.
-_OP_MULT = {"profile": 6.0, "pcc": 6.0, "build": 6.0, "round": 2.0, "agent": 8.0}
+_OP_MULT = {"profile": 6.0, "pcc": 6.0, "build": 6.0, "round": 2.0, "agent": 8.0, "fullpipe": 3.0}
 # fallback cost of one operation, expressed in baseline-profile units, used until the
 # operation has been observed in its own right
-_OP_IN_BASE_UNITS = {"profile": 1.0, "pcc": 9.0, "build": 6.0, "round": 12.0, "agent": 2.0}
+# fullpipe measured at 1734-2144 s against a 281 s capped baseline on Voxtral (6.2-7.6x);
+# 8.0 rounds up so the FIRST uncapped run on a model is not killed by a hair, before the
+# bucket has any history of its own.
+_OP_IN_BASE_UNITS = {"profile": 1.0, "pcc": 9.0, "build": 6.0, "round": 12.0, "agent": 2.0, "fullpipe": 8.0}
 
 
 def _timer_overrides_active() -> list:
@@ -2374,6 +3841,12 @@ def _adaptive_cap(repo_root: Path, floor: int, mult: int = 3) -> int:
         ceil = floor
     scaled = int(mult * base)
     return min(ceil, max(int(_MIN_TIMER_S), scaled or floor))
+
+
+# How many times the agent watchdog may answer "wait" and re-arm a round that has shown no real
+# progress. Each reprieve is worth one max_no_progress window. Finite, because an LLM verdict is a
+# judgement and not a bound -- see _run_round_with_watchdog.
+_MAX_WATCHDOG_REPRIEVES = 3
 
 
 def _round_hard_cap(repo_root: Path, stall_sec: int) -> int:
@@ -2594,6 +4067,8 @@ def _run_round_with_watchdog(cmd: list, repo_root: Path, devices: str, kernel_lo
     _now0 = time.monotonic()
     last_active = _now0  # last sign of life (CPU / transcript / real progress)
     last_real = _now0  # last REAL progress (commit / recorded kernel attempt)
+    _reprieves = [0]  # how many times the watchdog has re-armed this round; see below
+    _stuck_since = [None]  # when real progress was last seen; NOT rewound by a reprieve
     _t0 = _now0
     wedge_reason = ""
     try:
@@ -2608,12 +4083,15 @@ def _run_round_with_watchdog(cmd: list, repo_root: Path, devices: str, kernel_lo
                 live = _liveness()
                 if tok != last_tok:  # real progress resets BOTH clocks
                     last_tok, last_live, last_active, last_real = tok, live, _now, _now
+                    _stuck_since[0] = None  # and only real progress clears the stuck clock
                 elif live[0] != last_live[0] or (live[1] - last_live[1]) > 200:  # alive: transcript/CPU
                     last_live, last_active = live, _now
                 if _now - last_active > stall_sec:
                     wedge_reason = "FROZEN %ds — no commit, no device CPU, no agent activity (real wedge)" % stall_sec
                     break
                 if _now - last_real > max_no_progress:
+                    if _stuck_since[0] is None:
+                        _stuck_since[0] = last_real
                     # BUG 4: elapsed wall clock alone cannot tell slow-but-working from stuck --
                     # it killed a healthy llama round 4x on 2026-07-25. Ask the agent watchdog,
                     # which reads the actual evidence; the derived net still bounds it.
@@ -2621,7 +4099,11 @@ def _run_round_with_watchdog(cmd: list, repo_root: Path, devices: str, kernel_lo
                         "model": str(repo_root.name),
                         "op": "round",
                         "op_elapsed": _now - _t0,
-                        "since_commit": _now - last_real,
+                        # NOT `_now - last_real`. A reprieve rewinds last_real, so reporting from
+                        # it reset the watchdog's own operator ceiling ("a confused agent cannot wait
+                        # forever") to zero on every reprieve -- the bound was being cleared by the
+                        # thing it existed to bound. This clock is only cleared by REAL progress.
+                        "since_commit": _now - (_stuck_since[0] or _now),
                         "cpu_hist": [1 if live else 0 for _ in range(5)],
                         "txt_hist": [1 if live else 0 for _ in range(5)],
                         "actions": 1,
@@ -2631,9 +4113,39 @@ def _run_round_with_watchdog(cmd: list, repo_root: Path, devices: str, kernel_lo
                         "observed": _observed_stats(repo_root, "round"),
                         "ceiling": _baseline_ceiling(repo_root)[1],
                     }
-                    if watchdog_decide(_ev) == "wait":
-                        last_real = _now  # judged healthy: re-arm and keep going
-                        continue
+                    # AN LLM MAY NOT RE-ARM THIS FOREVER.
+                    #
+                    # "wait" resets last_real, so a watchdog that keeps answering "wait" keeps a
+                    # stuck round alive with no bound at all -- the round equivalent of the budget
+                    # that was demoted to a warning and let run 12 spin for nine hours. A judgement
+                    # is worth having; an unlimited number of them is not a bound.
+                    #
+                    # So the verdict is honoured a fixed number of times and then stops being asked.
+                    # Each reprieve is worth max_no_progress, so the round still gets
+                    # _MAX_WATCHDOG_REPRIEVES x that before it is called stuck -- generous for slow
+                    # work, finite for stuck work.
+                    _verdict = watchdog_decide(_ev)
+                    if _verdict == "wait":
+                        if _reprieves[0] < _MAX_WATCHDOG_REPRIEVES:
+                            _reprieves[0] += 1
+                            print(
+                                "  [optimize/cc] watchdog judged the round healthy — reprieve %d/%d "
+                                "(%ds each, %ds stuck)"
+                                % (
+                                    _reprieves[0],
+                                    _MAX_WATCHDOG_REPRIEVES,
+                                    max_no_progress,
+                                    int(_now - (_stuck_since[0] or _now)),
+                                ),
+                                flush=True,
+                            )
+                            last_real = _now  # judged healthy: re-arm and keep going
+                            continue
+                        wedge_reason = (
+                            "UNPRODUCTIVE %ds — the watchdog re-armed this round %d times and it "
+                            "still has no real progress; a verdict is not a bound" % (max_no_progress, _reprieves[0])
+                        )
+                        break
                     wedge_reason = (
                         "UNPRODUCTIVE %ds — agent watchdog judged the round stuck (no real progress)" % max_no_progress
                     )
@@ -2861,7 +4373,7 @@ def _emit_summary(
             # comparable to a measurement taken at the same depth. This snapshot survives between
             # runs; drop THE FLOOR when the window moved -- but keep the ceiling, which is per-unit
             # physics and never depended on the window.
-            _wl = (os.environ.get("TT_PERF_LAYERS") or "").strip() or "all"
+            _wl = _depth_in_force()
             _sl = str((_throughput or {}).get("perf_layers", "")).strip()
             _throughput = _depth_scoped_throughput(_throughput, _wl)
             if (_throughput or {}).get("modeled_floor_ms") is None:
@@ -2883,14 +4395,26 @@ def _emit_summary(
         perf_test=perf_test,
         report_csv=report_csv,
         residual=residual,
+        # THE PROFILE IS READ FROM WHERE IT IS WRITTEN. This looked beside `report_csv`; the profile
+        # is written to runs/<ts>/profiles/, so it resolved to None on every real run -- and with no
+        # profile the report silently loses its Op breakdown, its Dispatch row, its Fidelity ladder
+        # and every Utilization bar, because each of those renders nothing rather than complaining.
+        # _read_baseline_profile_for_report already resolves it correctly and was in use a few lines
+        # above for the residual; the CSV-adjacent path stays as a fallback.
         baseline_profile=(
-            json.loads(Path(report_csv).parent.joinpath("baseline_profile.json").read_text())
-            if report_csv and Path(report_csv).parent.joinpath("baseline_profile.json").is_file()
-            else None
+            _read_baseline_profile_for_report(repo_root)
+            or (
+                json.loads(Path(report_csv).parent.joinpath("baseline_profile.json").read_text())
+                if report_csv and Path(report_csv).parent.joinpath("baseline_profile.json").is_file()
+                else None
+            )
         ),
         finalized=True,
         final_override_ms=_cur_ms,
         throughput=_throughput,
+        # summary cannot find the model dir on its own under the by-path load it gets, and the
+        # compute roofs need perf_target_inputs.json that lives there.
+        model_root=str(_model_root_for_report(repo_root) or ""),
     )
     print("\n" + text + "\n")
     md = _latest_manifest(repo_root / PERF_DIR)
@@ -2990,6 +4514,34 @@ def _report_baseline_for_seed(model_name: str, task: str):
         return None
 
 
+def _model_root_for_report(repo_root):
+    """The model directory this run is optimizing, from the run manifest. None if unknown.
+
+    summary needs it for perf_target_inputs.json (params -> the compute roofs). It cannot resolve it
+    itself: loaded by path, perf_mcp's _MODEL_ROOT falls back to "." and the lookup silently misses.
+
+    _latest_manifest returns a PATH, not the parsed document. This called .get() on that Path, threw
+    AttributeError, and the bare `except` turned it into None -- on every run, silently, since the day
+    it was written. So the report never received the model directory it exists to supply, fell through
+    to perf_mcp's "." fallback, and read whatever perf_target_inputs.json was in the working directory:
+    on gemma-3 a 31 MB, 32-layer file the tool had itself written there, giving a prefill memory
+    ceiling of 0.061 ms against a 100 ms measurement, no param count, and therefore no compute roof
+    and no fidelity ladder.
+
+    The except stays -- a missing or malformed manifest must not take the report down -- but it now
+    guards a read that can actually succeed, and it no longer hides a bug in this function's own logic.
+    """
+    try:
+        md = _latest_manifest(repo_root / PERF_DIR)
+        if not md:
+            return None
+        cfg = json.loads(Path(md).read_text()).get("config", {}) or {}
+        root = str(cfg.get("model_root") or "").strip()
+        return Path(root) if root else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _read_baseline_profile_for_report(repo_root):
     """The newest baseline profile JSON for THIS run, or None. Used to derive the roofline residual at
     render time rather than reading a stale artifact."""
@@ -3034,8 +4586,84 @@ def _warn_dirty_model_tree(demo_dir, repo_root) -> list:
         "against different work. Commit or revert before trusting a gain."
     )
     if os.environ.get("PERF_MCP_REQUIRE_CLEAN") == "1":
-        raise SystemExit("  [optimize/cc] PERF_MCP_REQUIRE_CLEAN=1 and the model tree is dirty — refusing to start.")
+        print("  [optimize/cc] PERF_MCP_REQUIRE_CLEAN=1 and the model tree is dirty — refusing to start.", flush=True)
+        raise SystemExit(EXIT_REFUSED)
     return dirty
+
+
+def _preflight_tool(repo_root: Path) -> bool:
+    """Run the TOOL'S OWN test suite against the copy this run will execute. Returns True to proceed.
+
+    THE COPY THAT RUNS IS NOT THE COPY THAT WAS EDITED. The tool is developed in one checkout and
+    synced into the repo the run uses, and nothing checked that the sync landed or that what landed
+    imports. Three distinct failures came from that gap, each costing a run:
+
+      * an edit that applied to the WRONG PLACE -- DEFAULT_ISL_TOKENS landed inside a template
+        STRING rather than at module scope, so the module imported cleanly and the symbol did not
+        exist. Found hours later, from an unrelated traceback;
+      * a module reachable by package name but not by path -- the report loader uses
+        spec_from_file_location, which supplies no package context and no sys.path entry for the
+        module's own directory, so both relative and absolute imports raise. The report rendered
+        with three blank sections and every failure was silent;
+      * a `git stash` during a debugging detour that never popped, so two committed fixes were
+        absent from the tree that then ran.
+
+    Every one of them is caught by importing the tree and running its tests, which takes ~90 seconds
+    against a run measured in hours. The suite is the tool's own; a failing one means the thing about
+    to spend the night on a board is not the thing that was verified.
+
+    PERF_MCP_SKIP_PREFLIGHT=1 skips it, for a deliberate run on a knowingly-red tree.
+    """
+    if os.environ.get("PERF_MCP_SKIP_PREFLIGHT") == "1":
+        print("  [optimize/cc] preflight SKIPPED (PERF_MCP_SKIP_PREFLIGHT=1)")
+        return True
+    tests = Path(repo_root) / PERF_DIR / "tests"
+    if not tests.is_dir():
+        print(f"  [optimize/cc] preflight: no test suite at {tests} — cannot verify the tool that is about to run")
+        return os.environ.get("PERF_MCP_REQUIRE_PREFLIGHT") != "1"
+    print(f"  [optimize/cc] preflight: running the tool's own suite against {tests}")
+    # THE SUITE TESTS THE CODE, NOT THIS RUN'S STATE, so it runs with this run's configuration
+    # STRIPPED. Inheriting it is both wrong and dangerous:
+    #
+    #   WRONG -- the same test gives different answers in different shells. Under a run's env,
+    #   test_all_boards_is_the_last_resort read the ambient PERF_MCP_DEVICES, so the config target
+    #   won and the "all" fallback it exists to check was never reached. Green in a terminal, red
+    #   here, and neither result was about the code.
+    #
+    #   DANGEROUS -- _KERNEL_LOG_PATH is resolved AT IMPORT from PERF_MCP_KERNEL_LOG. With the run's
+    #   value inherited, a suite that calls record_kernel_attempt writes into the LIVE ladder: a
+    #   check meant to protect the run would corrupt the state the run resumes from. It happened not
+    #   to fire only because the tests that write were the ones failing.
+    #
+    # Stripped by prefix rather than by list, because the failure mode of a list is that the next
+    # variable someone adds is not on it. TT_METAL_HOME and PYTHONPATH stay: those locate the code,
+    # they do not configure a run.
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PERF_MCP_", "TT_PERF_"))}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", str(tests), "-q", "--no-header", "-p", "no:cacheprovider"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=int(os.environ.get("PERF_MCP_PREFLIGHT_TIMEOUT_S", "900")),
+        )
+    except Exception as exc:  # noqa: BLE001 -- a preflight that cannot RUN has cleared nothing
+        print(f"  [optimize/cc] preflight could not run ({str(exc)[:160]}) — treating as UNKNOWN, not as passed")
+        return os.environ.get("PERF_MCP_REQUIRE_PREFLIGHT") != "1"
+    tail = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()][-1:] or ["(no output)"]
+    if proc.returncode == 0:
+        print(f"  [optimize/cc] preflight OK — {tail[0]}")
+        return True
+    print(f"  [optimize/cc] preflight FAILED — {tail[0]}")
+    for ln in (proc.stdout or "").splitlines():
+        if ln.startswith("FAILED") or ln.startswith("ERROR"):
+            print("      %s" % ln)
+    print(
+        "      This is the tool that is about to run, in the repo it will run from. Fix it, re-sync, "
+        "or set PERF_MCP_SKIP_PREFLIGHT=1 to start anyway."
+    )
+    return False
 
 
 def _seed_ladder_from_cumulative(kernel_log: str, current_baseline_ms=None) -> int:
@@ -3143,14 +4771,71 @@ def optimize_pipeline(
         config_ref=config_ref,
         depth_knob=_depth_knob or None,
     )
+    # _coverage_layers returns a dict {stack_id: depth} or None/0.
+    # Wire the coverage depths into per-stack env vars.
     if _cov:
         from agent.layer_depth import set_depth as _set_depth
 
-        _set_depth(_cov_env, _cov)
-        print(f"  [optimize/cc] coverage-sized profiling window: TT_PERF_LAYERS={_cov} (covers all block types)")
-        _depth_env = _bridge_depth_env(repo_root, _cov_env, devices, pipe.get("perf_test"), pipe.get("case"), _cov)
-        if _depth_env:
-            _cov_env["PERF_MCP_PROFILE_ENV"] = json.dumps(_depth_env)
+        if isinstance(_cov, dict) and len(_cov) > 1:
+            # Multi-stack: set TT_PERF_STACK{N}_LAYERS for each stack in sorted order.
+            _profile_extra: dict = {}
+            for _i, (_sid, _depth) in enumerate(sorted(_cov.items())):
+                _stack_key = _stack_layers_var(_i)
+                _cov_env[_stack_key] = str(_depth)
+                _profile_extra[_stack_key] = str(_depth)
+            # Merge per-stack vars into PERF_MCP_PROFILE_ENV so the tracy subprocess sees them.
+            try:
+                _existing_prof = json.loads(_cov_env.get("PERF_MCP_PROFILE_ENV") or "{}")
+            except (ValueError, TypeError):
+                _existing_prof = {}
+            _existing_prof.update(_profile_extra)
+            _cov_env["PERF_MCP_PROFILE_ENV"] = json.dumps(_existing_prof)
+            _cov_repr = ", ".join(
+                f"TT_PERF_STACK{_i}_LAYERS={_d}" for _i, (_sid, _d) in enumerate(sorted(_cov.items()))
+            )
+            print(f"  [optimize/cc] coverage-sized profiling window (multi-stack): {_cov_repr}")
+            # THE FULL-MODEL SIGNAL THE COVERAGE PROBE ALREADY MEASURED. Without it the bridge has
+            # no baseline to compare its capped run against, and falls back to probing for one --
+            # which 2026-07-19 removed for the other caller as "a fragile 2nd detection probe",
+            # wiring before_loop to pass full_hint from exactly these facts. This call site predates
+            # that by a day and was never brought along, so it has been running the bridge blind
+            # ever since.
+            _depth_env = _bridge_depth_env(
+                repo_root,
+                _cov_env,
+                devices,
+                pipe.get("perf_test"),
+                pipe.get("case"),
+                _cov,
+                full_hint=int((_cov_facts or {}).get("full_signal") or 0),
+                full_blocks=int((_cov_facts or {}).get("full_blocks") or 0),
+            )
+            if _depth_env:
+                try:
+                    _ep2 = json.loads(_cov_env.get("PERF_MCP_PROFILE_ENV") or "{}")
+                except (ValueError, TypeError):
+                    _ep2 = {}
+                _ep2.update(_depth_env)
+                _cov_env["PERF_MCP_PROFILE_ENV"] = json.dumps(_ep2)
+        else:
+            # Single-stack (dict with 1 entry, or plain int): use existing TT_PERF_LAYERS convention.
+            _cov_single = next(iter(_cov.values())) if isinstance(_cov, dict) else _cov
+            _set_depth(_cov_env, _cov_single)
+            print(
+                f"  [optimize/cc] coverage-sized profiling window: TT_PERF_LAYERS={_cov_single} (covers all block types)"
+            )
+            _depth_env = _bridge_depth_env(
+                repo_root,
+                _cov_env,
+                devices,
+                pipe.get("perf_test"),
+                pipe.get("case"),
+                _cov_single,
+                full_hint=int((_cov_facts or {}).get("full_signal") or 0),
+                full_blocks=int((_cov_facts or {}).get("full_blocks") or 0),
+            )
+            if _depth_env:
+                _cov_env["PERF_MCP_PROFILE_ENV"] = json.dumps(_depth_env)
     tools = list(_ALLOWED_TOOLS)
     hitl_dir = None
     if hitl:
@@ -3202,7 +4887,8 @@ def optimize_pipeline(
     while rounds < max_rounds:
         st = _gate_status(repo_root, mcp_env, devices)
         if st.get("halt"):
-            print(f"  [optimize/cc] HALT — install tt-lang first, then re-run: {st.get('reason')}")
+            _remedy = _HALT_REMEDY.get(st.get("kind") or "") or _HALT_REMEDY[""]
+            print(f"  [optimize/cc] HALT — {_remedy}: {st.get('reason') or '(no reason reported)'}")
             halted = True
             break
         if st.get("can_stop"):
@@ -3382,7 +5068,46 @@ def _is_cached_model_id(cand) -> bool:
     return (_hf_hub_root() / f"models--{org}--{name}").is_dir()
 
 
-def _resolve_model_id(demo_dir, hint=None) -> str | None:
+def _run_test_files(demo_dir, manifest=None) -> tuple:
+    """The test files THIS RUN executes, absolute. Empty when the manifest cannot name them.
+
+    These are what make _resolve_model_id a fact rather than a scan: the model pinned in the PCC test
+    and the perf test is the model being run, whatever else the directory happens to mention."""
+    out = []
+    try:
+        # No manifest means the caller genuinely has none (a probe, a unit test). Returning ()
+        # sends _resolve_model_id to its tree scan, which is the documented last resort -- it does
+        # NOT go hunting for a manifest, because a function that finds its own inputs is a function
+        # nobody can reason about from the call site.
+        cfg = ((manifest or {}).get("config") or {}) if isinstance(manifest, dict) else {}
+        pm = ((manifest or {}).get("pathmap") or {}) if isinstance(manifest, dict) else {}
+        cands = [cfg.get("pcc_test"), cfg.get("perf_test")]
+        for key in ("pcc", "perf_test"):
+            v = pm.get(key)
+            if isinstance(v, str):
+                cands.append(v)
+            elif isinstance(v, dict):
+                cands.append(v.get("path"))
+            elif isinstance(v, (list, tuple)):
+                cands.extend(x for x in v if isinstance(x, str))
+        for c in cands:
+            if not c:
+                continue
+            p = Path(str(c).partition("::")[0])
+            for base in (
+                Path(demo_dir),
+                Path(demo_dir).parents[2] if len(Path(demo_dir).parents) > 2 else Path(demo_dir),
+            ):
+                q = p if p.is_absolute() else (base / p)
+                if q.is_file():
+                    out.append(str(q))
+                    break
+    except Exception:  # noqa: BLE001
+        return ()
+    return tuple(dict.fromkeys(out))
+
+
+def _resolve_model_id(demo_dir, hint=None, prefer_files=()) -> str | None:
     """Which HF model this run is optimizing: hint, then HF_MODEL, then the directory scan.
 
     The middle tier was missing. optimize.py passes `model_id_hint=(None if model_dir else
@@ -3403,8 +5128,30 @@ def _resolve_model_id(demo_dir, hint=None) -> str | None:
     env_id = (os.environ.get("HF_MODEL") or "").strip()
     if _is_cached_model_id(env_id):
         return env_id
+    # THE RUN'S OWN TESTS, BEFORE THE TREE. This dropped straight to "first cached id in the first
+    # .py rglob yields", and a model tree names more than one: gemma3's conftest, perf test, PCC test
+    # and host-split test all pin google/gemma-3-12b-it, while test_ci_dispatch.py lists the 4b and
+    # the 27b as a CI matrix. It returned the 4b -- because rglob reached that file first -- and every
+    # derived figure then described a 4B model.
+    #
+    # Counting which id appears in the most files was the first attempt and was rejected: a vote is a
+    # heuristic, it has no reason to be right on a tree nobody has seen, and the stress suite says so.
+    # The run already KNOWS which files it executes -- the PCC test and the perf test are named in its
+    # own config -- and the model those files pin is the model being run. That is a fact about this
+    # run, not a property of the directory layout.
+    for _f in prefer_files or ():
+        try:
+            _txt = Path(str(_f).partition("::")[0]).read_text(errors="ignore")
+        except OSError:
+            continue
+        for cand in _HF_ID_RE.findall(_txt):
+            if _is_cached_model_id(cand):
+                return cand
+    # Last resort: the tree. Unchanged -- first cached id wins -- because with nothing stating which
+    # model this is, one answer from the family beats no answer, and the callers above are what make
+    # it rare rather than what it falls back to.
     try:
-        for p in Path(demo_dir).rglob("*.py"):
+        for p in sorted(Path(demo_dir).rglob("*.py")):
             try:
                 txt = p.read_text(errors="ignore")
             except OSError:
@@ -3414,7 +5161,6 @@ def _resolve_model_id(demo_dir, hint=None) -> str | None:
                     return cand
     except Exception:  # noqa: BLE001
         return None
-    return None
 
 
 def _chip_count(devices) -> int:
@@ -3465,7 +5211,7 @@ def _hf_cache_dims(model_id: str) -> dict:
     return {}
 
 
-def _model_weight_bytes(demo_dir, hint=None) -> int:
+def _model_weight_bytes(demo_dir, hint=None, manifest=None) -> int:
     # _captured/ (golden PCC input/output tensors) and _stubs/ (graduated-stub .last_good snapshots)
     # are TEST FIXTURES, not model weights. Summing them made a tiny non-weight total short-circuit
     # the real checkpoint lookup -- XTTS's 102 captured *.pt files (133 MB) masked the true 1.868 GB
@@ -3483,7 +5229,7 @@ def _model_weight_bytes(demo_dir, hint=None) -> int:
         total = 0
     if total:
         return total
-    mid = _resolve_model_id(demo_dir, hint)
+    mid = _resolve_model_id(demo_dir, hint, _run_test_files(demo_dir, manifest))
     return _hf_cache_weight_bytes(mid) if mid else 0
 
 
@@ -3510,12 +5256,12 @@ def _decide_parallelism_route(
         chips = int(env.get("device_count") or env.get("mesh_chips") or env.get("num_devices") or 0) or _chip_count(
             devices
         )
-        weight_bytes = _model_weight_bytes(demo_dir, model_id_hint)
+        weight_bytes = _model_weight_bytes(demo_dir, model_id_hint, manifest)
         if not (cap and weight_bytes):
             return
         cfg = manifest.get("model_config") or {}
         if not cfg.get("hidden_size"):
-            mid = _resolve_model_id(demo_dir, model_id_hint)
+            mid = _resolve_model_id(demo_dir, model_id_hint, _run_test_files(demo_dir, manifest))
             if mid:
                 cfg = {**_hf_cache_dims(mid), **cfg}
         heads = int(cfg.get("num_attention_heads") or cfg.get("num_heads") or 1)
@@ -3586,14 +5332,15 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
     # `cfg` supplies the KV terms, which are unused unless a seq_len is given. So a model with no HF
     # config, or whose weights are in a format the byte-sizer cannot read, got NO ceiling at all and its
     # report fell to the band-less ms floor -- three unrelated-looking symptoms with one cause.
-    wb = _model_weight_bytes(demo_dir, model_id_hint) or 0
+    wb = _model_weight_bytes(demo_dir, model_id_hint, manifest) or 0
     cfg = dict(manifest.get("model_config") or {})
-    mid = _resolve_model_id(demo_dir, model_id_hint)
+    mid = _resolve_model_id(demo_dir, model_id_hint, _run_test_files(demo_dir, manifest))
     if mid:
         cfg = {**_hf_cache_dims(mid), **cfg}
     experts = cfg.get("num_local_experts") or cfg.get("num_experts") or cfg.get("n_routed_experts")
     src = "checkpoint bytes + HF config"
     analytic_params = 0
+    _unit = ""  # bound before the try below, which can raise before assigning it (params_basis reads it)
     # ANALYTIC FIRST: every tensor's shape and dtype from the safetensors header, with the on-device
     # widths applied per name pattern. The checkpoint's FILE SIZE counts the stored dtype -- 15.0 GB of
     # bf16 for Llama-3.1-8B, where the device streams 6.09 GB as bfp4/bfp8 -- so it understates the
@@ -3601,7 +5348,14 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
     try:
         from agent import model_bytes as _mb
 
-        _unit = _mb.unit_for_tag(
+        # THE OBSERVED UNIT HERE TOO. This exclusion drops the embedding table from the streamed
+        # bytes, because a token unit reads it by INDEX -- one row per token -- and counting the whole
+        # table overstates a decode step (gemma3's is 262144 x 3840, about 1 GB against 11 GB). But
+        # whether the model IS a token unit was decided by the tag, which is the same defect the
+        # ceiling just stopped making: Kokoro-82M is tagged text-to-speech, reads as `token`, and has
+        # no token loop at all -- so its tables would be excluded from a byte count they belong in.
+        # The tag remains only for the window before the first trace, where nothing is observed yet.
+        _unit = str(os.environ.get("PERF_MCP_LAST_HEADLINE_UNIT") or "").strip().lower() or _mb.unit_for_tag(
             cfg.get("pipeline_tag") or (manifest.get("model_meta") or {}).get("pipeline_tag") or ""
         )
         _snap = _hf_snapshots(mid)[0] if mid and _hf_snapshots(mid) else None
@@ -3627,11 +5381,63 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
                     _an["tensors"],
                     _unit,
                 )
+            # SAY IT WHEN THE NAME LIST MISSED A TOWER. _TOWER_ONLY keeps an encoder out of the
+            # per-token read set by matching names; stage_roots says, from the checkpoint's own key
+            # structure, that a non-recurring stage runs out of some section. When the second names a
+            # section the first did not exclude, that encoder is being charged to every token: the
+            # divisor is inflated, the ceiling lowered, and the run looks nearer the wall than it is.
+            #
+            # Reported, not corrected. Substituting stage_roots for the name list was tried and is
+            # worse -- it drops lm_head on any untied model, which errs the other way and by more.
+            # The real answer is an observation of what a token reads, and the profile records no
+            # phase per op, so it does not exist yet. Until it does, the choice is between guesses,
+            # and a visible wrong number beats a silent one.
+            try:
+                _sr = (read_arch_mirror() or {}).get("stage_roots") or {}
+                if not _sr:
+                    _pf = Path(demo_dir) / "perf_target_inputs.json"
+                    if _pf.is_file():
+                        _sr = (json.loads(_pf.read_text()) or {}).get("stage_roots") or {}
+                _missed = _mb.untowered_sections(_snap, _sr) if _sr else []
+                if _missed:
+                    print(
+                        "  [optimize/cc] WARNING: %s runs a separate stage but is counted in the "
+                        "per-%s read set -- the tower name list does not know it. The ceiling is "
+                        "PESSIMISTIC (divisor too large), so at-floor will read high. Add the name to "
+                        "model_bytes._TOWER_ONLY, or read the per-stage rows instead of the "
+                        "model-level one." % (", ".join(_missed), _unit or "unit"),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            except Exception:  # noqa: BLE001 -- a warning must never cost a ceiling
+                pass
             # EXACT param count, free: the header walk already sums numel. This is the params-based
             # ceiling's input, and it does not depend on the width the device serves.
             if _an.get("params"):
                 analytic_params = int(_an["params"])
-    except Exception:  # noqa: BLE001
+    except (NameError, AttributeError, TypeError) as _bug:
+        # A BUG IS NOT AN UNREADABLE CHECKPOINT, and this block swallowed both identically.
+        #
+        # `except Exception: pass` here is right for what it was written for: a truncated shard, a
+        # dtype with no width, an unreadable header -- environmental failures where falling through
+        # to the file size is the documented weaker-but-not-wrong answer. It is wrong for a
+        # programming error, because the fall-through then hides it perfectly: a NameError on one
+        # line deleted total_params for the WHOLE run and the only symptom was a ceiling computed
+        # from the checkpoint's file size instead of its param count. That is a 2.4x error on
+        # Llama-3.1-8B, printed with no warning and no traceback. One pre-existing test caught it;
+        # nothing in a real run would have.
+        #
+        # Still not raised -- a ceiling must never cost a run -- but it is now SAID, with the
+        # exception named, so the next one is visible in the first second instead of inferred from a
+        # number being oddly large.
+        print(
+            "  [optimize/cc] BUG in the analytic byte walk (%s: %s) -- falling back to the "
+            "checkpoint's file size, which counts the STORED dtype and overstates the divisor. "
+            "This is a defect in the tool, not in the model." % (type(_bug).__name__, str(_bug)[:200]),
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:  # noqa: BLE001 -- an unreadable checkpoint falls through to the file size
         pass
     override = (os.environ.get("TT_PERF_WEIGHT_BYTES") or "").strip()
     if override:
@@ -3659,6 +5465,27 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
     total_params = analytic_params or name_total
     if total_params:
         facts["total_params"] = int(total_params)
+        # SAY WHICH COUNT THIS IS. The key is named total_params and, when the header walk supplied
+        # it, the value is NOT a total: model_bytes counts the READ SET for the observed unit, which
+        # for a token unit deliberately drops lookup-only tensors (an embedding table is read one row
+        # at a time) and tower-only tensors (an encoder runs per clip, not per token).
+        #
+        # On Voxtral-Mini-3B-2507 that reads: total_params 3.611B, under two blocks declaring 0.637B
+        # and 4.014B. A total smaller than its own parts is alarming to anyone checking the ceiling,
+        # and the only way to find out it was correct was to rediscover both exclusions in
+        # model_bytes. 3.611B is exactly 4.014B (language_model) minus 0.403B (embedding); the
+        # checkpoint holds 4.676B.
+        #
+        # Nothing is renamed here: `total_params` is read by perf_target.ceiling_params,
+        # simple_active_bytes and two places in summary, and by any perf_target_inputs.json already
+        # on disk. Renaming buys a clearer word and costs a compatibility break. Stating the basis
+        # costs one string and removes the ambiguity outright -- and a reader that does not know the
+        # basis cannot tell a read set from a total, which is the actual failure.
+        facts["params_basis"] = (
+            "read set for unit=%s: lookup-only and tower-only tensors excluded" % (_unit or "unknown")
+            if analytic_params
+            else "count published by the model name (no readable checkpoint headers)"
+        )
     if experts:
         facts["is_moe"] = True
         active = _env_params("TT_PERF_ACTIVE_PARAMS") or name_active
@@ -3669,35 +5496,82 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
             # experts/top_k, making the ceiling far too low and every run read ABOVE_BAND. Returning
             # None keeps the ms-floor fallback: weaker, but not wrong.
             return None
+    # ONLY THE OBSERVATION SETS THE UNIT. It used to fall back to a table keyed on the HF
+    # pipeline_tag, and a wrong unit does not degrade the ceiling -- it puts it in the wrong currency
+    # entirely, then the band, the at-floor verdict and the headline rate all inherit that. A tag
+    # names the TASK and cannot state whether a model loops: `text-to-speech` covers XTTS, which emits
+    # tokens, and Kokoro, which is StyleTTS2 and produces a whole waveform in one pass, so the table
+    # has to pick and is wrong for the other. HunyuanImage-3.0, tagged text-to-image but
+    # autoregressive, is the same failure the other way.
+    #
+    # No observation yet means NO UNIT, which means no unit ceiling and the run lands on the ms-floor
+    # form until the first trace reports. That is the rule the rest of this code already follows --
+    # _anchored_ceiling_facts: "No recoverable unit means no ceiling, which lands on the floor
+    # fallback: weaker, but not wrong." The table contradicted it; now it does not.
+    #
+    # The tag is still read ABOVE, for default_conditions: ISL/OSL/steps/resolution must be chosen
+    # BEFORE anything runs, so nothing observed can supply them, and a wrong guess there is visible in
+    # the scorecard rather than silently rescaling the ceiling.
+    _observed = str(os.environ.get("PERF_MCP_LAST_HEADLINE_UNIT") or "").strip().lower()
+    if _observed:
+        facts["unit"] = _observed
+    # RESOLUTION IS A MEASUREMENT CONDITION, and for a step or vision unit it IS the work: a denoise
+    # step at 1024 is ~4x the step at 512, so two runs of one model differ ~4x. emit-e2e already reads
+    # image_size to build its PCC input; the perf side never received it, so a steps/s figure could
+    # not say what it described. Recorded here rather than guessed at render time, and left absent for
+    # text models, where there is no such condition to state.
     try:
-        from agent import model_bytes as _mb2
+        from agent.model_bytes import resolution_from_config as _rfc
 
-        _u = _mb2.unit_from_config(cfg)
-        if _u:
-            facts["unit"] = _u
+        _res = int(os.environ.get("TT_PERF_RESOLUTION") or 0) or _rfc(cfg)
+        if _res:
+            facts["resolution"] = int(_res)
     except Exception:  # noqa: BLE001
         pass
     # A CONFIG VALUE MAY BE A LIST. Per-layer configs carry lists where a scalar is expected, and raw
     # int() on one raises TypeError -- which the caller swallows, so the model lost its ENTIRE ceiling
     # over a KV-cache field the ceiling does not even need without a seq_len. perf_target._scalar
     # already coerces exactly this (per-layer top_k), so reuse it instead of a second rule here.
-    from agent.perf_target import _scalar as _sc
 
     # FLAT FIRST, then the nested walk. _scalar coerces a per-layer LIST into a scalar, which the
     # walk deliberately will not (int(list) is not a depth), so routing the flat keys through the walk
     # dropped a list-valued num_hidden_layers on the floor. The walk is the fallback that catches the
     # nested case -- gemma3 declares it under text_config and a flat .get() reads 0 for every
     # multimodal config, and 0 layers feeds the roofline facts.
-    from agent.layer_depth import _depth_from_mapping as _dfm
 
-    layers = _sc(cfg.get("num_hidden_layers") or cfg.get("n_layer") or cfg.get("num_layers"), 0) or _sc(_dfm(cfg), 0)
-    kv_heads = _sc(cfg.get("num_key_value_heads") or cfg.get("num_attention_heads") or cfg.get("num_heads"), 0)
-    hidden = _sc(cfg.get("hidden_size") or cfg.get("d_model"), 0)
-    heads = _sc(cfg.get("num_attention_heads") or cfg.get("num_heads"), 0)
-    head_dim = _sc(cfg.get("head_dim"), 0) or ((hidden // heads) if (hidden and heads) else 0)
-    for key, val in (("layers", layers), ("kv_heads", kv_heads), ("head_dim", head_dim)):
-        if val:
-            facts[key] = int(val)
+    # GEOMETRY IS A PROPERTY OF A BLOCK, NOT OF A MODEL, so it is no longer collected as loose keys.
+    #
+    # WHAT THIS REPLACES. Two rules picked from the same config, independently:
+    #
+    #     layers            = _depth_from_mapping(cfg)   "the DEEPEST depth anywhere"  -> 32
+    #     hidden/intermediate = first sub-config whose key says neither "vision" nor "audio" -> 3072/8192
+    #
+    # On voxtral that is the AUDIO tower's depth welded to the LANGUAGE tower's widths: a 32-layer,
+    # 3072-wide model that does not exist. Every stage then divided those numbers, so the audio
+    # encoder was priced at 0.041 ms against a 12.80 ms measurement -- 312x -- and prefill's
+    # activation term used a width its own tower does not have.
+    #
+    # The name blacklist was the tell. "vision"/"audio" is a list of towers someone had seen, and it
+    # decides geometry for every model that has any. A tower called vocoder, denoiser or projector
+    # walks straight through it.
+    #
+    # Blocks are read WHOLE instead: tower_geometry keys each tower by its DEPTH, which is the one
+    # number the checkpoint's sections, the config's sub-dicts and the probe's stacks all agree on,
+    # so a stage reaches its own geometry by structure -- stage -> root -> depth -> geometry -- with
+    # nothing recognised by name.
+    _blocks = _model_block_facts(demo_dir, mid or "", cfg, profile=_last_baseline_profile())
+    if _blocks:
+        facts["blocks"] = _blocks
+    # THE FLAT KEYS SURVIVE FOR EXACTLY ONE SHAPE: a model with a single block, where "the model's
+    # geometry" and "that block's geometry" are the same sentence and every existing caller stays
+    # correct. With two or more, no flat answer exists -- emitting one is what produced the chimera --
+    # so they are omitted and a caller that has not learned about blocks gets nothing rather than a
+    # number from the wrong tower. Missing degrades to a refused ceiling; wrong degrades to 312x.
+    if len(_blocks or {}) == 1:
+        _only = next(iter(_blocks.values()))
+        for key in ("layers", "kv_heads", "head_dim", "hidden_size", "intermediate_size"):
+            if _only.get(key):
+                facts[key] = int(_only[key])
     # A DIVISOR IS THE ONE THING THAT CANNOT BE MISSING. With neither a param count nor a byte count there
     # is nothing to divide by, so returning facts would produce a zero ceiling that renders as a real one.
     if not facts.get("total_params") and not facts.get("active_params") and not facts.get("weight_bytes"):
@@ -3705,20 +5579,268 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
     return facts
 
 
+ARCH_MIRROR_NAME = "model_blocks.json"
+ARCH_KEYS = ("blocks", "stage_roots")
+
+
+def _mirror_arch_facts(facts: dict) -> None:
+    """Keep the ARCHITECTURE MAP somewhere git_revert cannot delete.
+
+    WHAT GETS LOST AND WHY. perf_target_inputs.json is untracked and lives in the model directory,
+    and git_revert calls gitio.remove_new_untracked -- which deletes untracked files created since
+    the checkpoint. That is deliberate and correct: `git checkout <sha> -- <path>` only rewrites
+    TRACKED files, so a lever that CREATED a kernel module would otherwise survive every revert. The
+    facts file looks exactly like such a file, so every rejected attempt deletes it.
+
+    Most of it heals. The flat keys are re-derived from the checkpoint by the rebuild, and the census
+    is re-measured by the next full-pipeline run. Two do NOT: `blocks` needs a resolvable model id,
+    and `stage_roots` is never written here at all -- discovery merges it in once, and nothing
+    re-runs that. So after the first revert a stage can no longer find its own tower.
+
+    Measured on Voxtral run 16: with both gone, _stage_block("encode") returned None and the compute
+    roof fell back to the flat total_params -- 3.611B, the LANGUAGE model's per-token read set --
+    for an audio encoder that holds 0.662B. Encode was charged 5.5x its work and read 46% of a
+    ceiling it was really at ~8% of. Decode looked fine only by coincidence: total_params IS its
+    read set, so the fallback happened to be its right answer.
+
+    SAFE TO CACHE WITHOUT EXPIRY, unlike the census. These are ARCHITECTURE -- which towers exist,
+    how deep, how many params -- read from the checkpoint. A dtype or grid knob changes the bytes on
+    device; it cannot change how many towers the model has. The census is deliberately NOT mirrored
+    here for exactly that reason: it must be re-measured, and a cached one would go stale the first
+    time a precision knob lands.
+
+    The same home and the same reasoning as summary._mirror_report: outside git so no revert can
+    reach it, outside the worktree so no reboot can take it, keyed per model.
+    """
+    try:
+        import os as _os
+
+        # Same reasoning as read_arch_mirror: no import, the variable IS the contract.
+        _sd = (_os.environ.get("PERF_MCP_STATE_DIR") or "").strip()
+        if not _sd:
+            return  # without --persist there is no durable directory to mirror into
+        keep = {k: facts[k] for k in ARCH_KEYS if facts.get(k)}
+        if not keep:
+            return
+        d = Path(_sd)
+        d.mkdir(parents=True, exist_ok=True)
+        prev = {}
+        try:
+            prev = json.loads((d / ARCH_MIRROR_NAME).read_text())
+        except Exception:  # noqa: BLE001
+            prev = {}
+        merged = {**(prev if isinstance(prev, dict) else {}), **keep}
+        (d / ARCH_MIRROR_NAME).write_text(json.dumps(merged, indent=2) + "\n")
+        # PIN EACH STAGE'S PARAM COUNT, because this file is merged newest-wins and the compute
+        # ceiling divides by it: 2 x params x tokens. Everything else the THEORETICAL column rests on
+        # is anchored -- the peak, the read set, the item count -- and this was the last input still
+        # re-derived from whatever the model currently looks like. A ceiling that moves while the run
+        # works cannot be compared across rounds, which is the whole reason an anchor exists.
+        #
+        # The docstring above argues architecture is stable, and it usually is; the anchor is for the
+        # case where it is not. Write-once, so the honest first answer wins over any later one.
+        try:
+            from cc_optimize import measurements as _led
+
+            _blocks = (merged.get("blocks") or {}) if isinstance(merged, dict) else {}
+            _roots = (merged.get("stage_roots") or {}) if isinstance(merged, dict) else {}
+            for _stage, _root in _roots.items():
+                _blk = _blocks.get(_root) or {}
+                _mm = int(_blk.get("matmul_params") or 0)
+                if not _mm:
+                    _lo = int(_blk.get("lookup_params") or 0)
+                    _mm = max(0, int(_blk.get("params") or 0) - _lo) if _lo else int(_blk.get("params") or 0)
+                if _stage and _mm > 0:
+                    _led.anchor(
+                        _led.KIND_MATMUL_PARAMS,
+                        float(_mm),
+                        depth=str(_stage).strip().lower(),
+                        mode="params",
+                        source="arch mirror: %s" % str(_root)[:40],
+                        # The state dir is keyed per model (.state/<model>), which is the same
+                        # name every other anchor in this run uses. Taking it from `d` keeps the key
+                        # identical without threading the model root into a mirroring helper.
+                        model=d.name,
+                    )
+        except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost the mirror
+            pass
+    except Exception:  # noqa: BLE001 -- a mirror that cannot be written must never cost the write
+        pass
+
+
+def read_arch_mirror() -> dict:
+    """The mirrored architecture map, or {}. See _mirror_arch_facts."""
+    # NO IMPORT. The rebuild loads this module BY PATH -- spec_from_file_location, no package and
+    # often no sys.path entry -- so `from cc_optimize.tmpstate import` and `from .tmpstate import`
+    # BOTH fail there, and the reader silently returned {} in the one context it exists for. Measured
+    # on run 17: the mirror held blocks and stage_roots, the emitter rebuilt without them anyway.
+    # The variable is the whole contract, so read it directly and depend on nothing.
+    try:
+        import os as _os
+
+        _sd = (_os.environ.get("PERF_MCP_STATE_DIR") or "").strip()
+        if not _sd:
+            return {}
+        d = json.loads((Path(_sd) / ARCH_MIRROR_NAME).read_text())
+        return {k: v for k, v in d.items() if k in ARCH_KEYS and v} if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _emit_perf_target_inputs(model_root, demo_dir, model_id_hint, manifest) -> None:
     """Write perf_target_inputs.json into the model root so the decode ceiling can be computed.
 
-    Never raises and never overwrites: a file already there may have been hand-tuned with real
-    per-tensor dtypes, which is strictly better than what can be derived here.
+    Never raises. Two rules about WHERE and WHETHER, both learned the same way:
+
+    WHERE -- into a real, stated model directory or nowhere. With a relative or empty model_root this
+    wrote into the WORKING DIRECTORY, and perf_mcp's reader had the identical "." default, so the
+    file the run dropped in the repo root was then adopted as the model's facts. On gemma-3-12b that
+    meant a report priced against a 32-layer, hidden-1280, 30 MB model: prefill memory ceiling
+    0.061 ms against a 100 ms measurement, no param count, hence no compute roof and no fidelity
+    ladder. Three broken sections from one file written to the wrong place and read back from it.
+
+    WHETHER -- refresh the tool's OWN output, refuse to clobber a HAND-TUNED one. `never overwrites`
+    was written to protect a file someone had filled in with real per-tensor dtypes, which is right,
+    but applied to every file it also froze the tool's own first guess forever: the geometry keys
+    that prefill's byte model needs could never reach a model that already had a file, so the roof
+    silently degraded for exactly the models that had been run before. The file records who wrote it
+    in `source`, so the two cases are distinguishable rather than assumed.
     """
     try:
-        out = Path(model_root) / "perf_target_inputs.json"
-        if out.exists():
+        root = Path(model_root)
+        if not root.is_absolute() or not root.is_dir():
+            print(
+                "  [optimize/cc] not writing perf_target_inputs.json: model root %r is not a stated "
+                "directory (a model fact written to the working directory gets read back as some "
+                "other model's)" % str(model_root),
+                flush=True,
+            )
             return
+        out = root / "perf_target_inputs.json"
         facts = _perf_target_inputs(demo_dir, model_id_hint, manifest)
         if not facts:
             return
+        # THE CARRY-FORWARD BELOW READS THE PREVIOUS FILE, AND A REVERT DELETES IT.
+        # gitio.remove_new_untracked removes untracked files created since the checkpoint, and this
+        # file is one -- so the common case is not "overwritten with less" but "gone entirely", and
+        # then there is no _prev to carry anything forward from. The mirror survives that, because it
+        # lives outside the model directory the revert scans. Restored BEFORE the guards below so a
+        # recovered value counts as present.
+        # Best-effort, like the mirror write: a mirror that cannot be READ must never cost the
+        # facts write it exists to protect. Without this guard a raising read aborted the emit
+        # entirely -- worse than the loss it repairs.
+        try:
+            for _k, _v in (read_arch_mirror() or {}).items():
+                if _v and not facts.get(_k):
+                    facts[_k] = _v
+        except Exception:  # noqa: BLE001
+            pass
+        if out.exists():
+            try:
+                _prev = json.loads(out.read_text())
+            except Exception:  # noqa: BLE001
+                _prev = {}
+            if not isinstance(_prev, dict):
+                return  # unreadable: strictly better than what is derived here
+            # ADD WHAT IS MISSING, NEVER REPLACE WHAT IS THERE. This refused outright whenever the
+            # file's `source` was not this producer's, to protect a hand-tuned file. It also refused
+            # every file the tool's OWN device census writes, because that writer stamps no source:
+            # the census creates perf_target_inputs.json early carrying device_weight_bytes and
+            # bytes_per_param and nothing else, the producer then reads a source it does not
+            # recognise, treats the tool's own output as someone's careful manual work, and declines
+            # -- so the param count, the per-block geometry and the layer counts never arrive for the
+            # rest of the run. Measured on voxtral run 37: a census file written at 23:46 left every
+            # per-stage compute ceiling, and the entire fidelity ladder, unrenderable to the end of
+            # the run for want of a param count this producer already had.
+            #
+            # Merging key-by-key protects a hand-tuned value exactly as well -- it is present, so it
+            # is kept -- while letting a fact nobody has recorded reach the file. Copying first also
+            # means the divisor guard below can no longer fire on a key the previous file owned.
+            # A HAND-TUNED FILE NAMES ITS AUTHOR; THE CENSUS'S DOES NOT. That is the whole
+            # distinction, and it is recorded in the file rather than inferred: `source` present and
+            # not this producer's means someone stated where those facts came from, and they stay
+            # untouched exactly as before. `source` absent means no producer has ever written here,
+            # which is the census's file, and the keys it lacks are merged in.
+            _mine = str(_prev.get("source") or "") == str(facts.get("source") or "")
+            _unclaimed = not str(_prev.get("source") or "").strip()
+            if not (_mine or _unclaimed):
+                return  # hand-tuned: strictly better than what is derived here
+            # The gap-fill itself runs AFTER the divisor guard below: filling a hole first would
+            # hide the very loss that guard exists to catch -- a regeneration that dropped
+            # weight_bytes would silently inherit the old one and be written anyway.
+            if _prev == facts:
+                return
+            # A REFRESH MUST NEVER DOWNGRADE. `never overwrites` was crude but it was SAFE: it could
+            # not replace good facts with worse ones. Refreshing on the strength of "the file is
+            # mine" checks who WROTE it and never whether what is about to be written is any good --
+            # and the deriver can be wrong. It was: with four gemma-3 variants in the HF cache it
+            # resolved gemma-3-4b, so a run overwrote gemma-3-12b's facts (24.37 GB, 11.18B params,
+            # 48 layers) with `weight_bytes: 0`, 4B params and 34 layers, and every roofline number
+            # after that described a model that was not running.
+            #
+            # The divisor is the thing that cannot be lost: with no byte count and no param count
+            # there is nothing to divide by, so a file that HAS one must not be replaced by one that
+            # does not. Refuse the write and say so -- silently keeping the old file would leave the
+            # geometry keys unable to land, which is the problem the refresh exists to solve.
+            _lost = [
+                k
+                for k in ("weight_bytes", "total_params", "active_params")
+                if (_prev.get(k) or 0) > 0 and not (facts.get(k) or 0) > 0
+            ]
+            # THE STRUCTURAL FACTS ARE CARRIED FORWARD, NOT GUARDED BY REFUSAL.
+            #
+            # `blocks` and `stage_roots` say WHICH TOWER each stage runs, and neither is produced
+            # here: blocks needs a resolvable model id, and stage_roots is merged in from discovery
+            # (_merge_model_facts) by a different code path entirely. So every successful write of
+            # this file dropped them, and the guard above could not notice -- it checks the three
+            # divisor keys, which the rebuild DOES produce, so `_lost` came back empty and the write
+            # went through.
+            #
+            # Measured on run 13, 2026-08-21: a git_revert after a no-gain attempt deleted this file,
+            # perf_mcp rebuilt it, and the multi-tower shape became a flat one -- layers 32 from the
+            # audio tower beside hidden_size 3072 from the language model. Every stage then fell back
+            # to that flat geometry and to total_params, so the audio encoder was priced with the
+            # language model's 3.611B instead of its own 0.637B: 5.7x the real work, and the report
+            # showed encode at 321% of a 702 TFLOPS peak, which is not a thing that can happen.
+            #
+            # Refusing the write would be wrong here -- the refresh exists so geometry keys can land,
+            # and a legitimately updated weight_bytes must not be blocked by a key this producer was
+            # never going to emit. Carrying the old value forward keeps both. Timeline for the
+            # record: the guard is from 2026-08-09 and has never changed; blocks and stage_roots were
+            # added on 2026-08-17 without widening it.
+            for _k in ARCH_KEYS:
+                if _prev.get(_k) and not facts.get(_k):
+                    facts[_k] = _prev[_k]
+            if _lost:
+                print(
+                    "  [optimize/cc] NOT refreshing perf_target_inputs.json: the new facts drop %s "
+                    "(the ceiling's divisor). Keeping the existing file -- a regenerated file that "
+                    "lost the divisor describes no model." % ", ".join(_lost),
+                    flush=True,
+                )
+                return
+            # NOW fill the gaps: the new facts are known not to have dropped a divisor, so every key
+            # the previous file carries and these do not is added rather than lost to the rewrite.
+            for _k, _v in _prev.items():
+                # `_v not in (None, "", 0, ...)` was wrong for a BOOLEAN: False == 0 in Python, so a
+                # recorded False -- device_census_complete among them -- tested as "no value" and was
+                # dropped, and since this write REPLACES the file the key disappeared entirely. A
+                # bool is a value; only None and the empty string are not.
+                if _v is None or _v == "":
+                    continue
+                _cur = facts.get(_k, None)
+                _held = not (
+                    _k not in facts
+                    or _cur is None
+                    or _cur == ""
+                    or (isinstance(_cur, (int, float)) and not isinstance(_cur, bool) and _cur == 0)
+                )
+                if not _held:
+                    facts[_k] = _v
+            if _prev == facts:
+                return
         out.write_text(json.dumps(facts, indent=2) + "\n")
+        _mirror_arch_facts(facts)
         # ANCHOR IT IN THE LEDGER TOO. The file lives in the model directory, which the optimize loop
         # reverts between attempts -- it was rolled back twice in one run, each time restoring a
         # different vintage. The ledger is keyed, append-only and outside that directory, so the
@@ -3734,14 +5856,38 @@ def _emit_perf_target_inputs(model_root, demo_dir, model_id_hint, manifest) -> N
             from agent import perf_target as _pt_div
 
             _divisor = _pt_div.simple_active_bytes(facts) or float(facts["weight_bytes"])
-            led.anchor(
-                led.KIND_ACTIVE_BYTES,
-                float(_divisor) / 1e6,
-                depth=str(facts.get("unit") or "unit"),
-                mode="bytes_mb",
-                source=facts["source"][:120],
-                model=Path(model_root).name,
-            )
+            # NO UNIT, NO ANCHOR. This ran `depth=str(facts.get("unit") or "unit")`, so a run with no
+            # unit yet filed the anchor under the literal string "unit" -- a key nothing looks up.
+            #
+            # The unit is missing here BY DESIGN. It is set only from an observation
+            # (PERF_MCP_LAST_HEADLINE_UNIT), because an HF tag names the TASK and cannot say whether a
+            # model loops -- `text-to-speech` covers XTTS, which emits tokens, and Kokoro, which
+            # produces a whole waveform in one pass. And this function runs ONCE AT SETUP, before any
+            # trace exists. So the one moment the anchor is written is the one moment the thing it
+            # must be keyed by does not yet exist.
+            #
+            # What that cost, measured on voxtral run 18: the report looks up depth="token" and MISSES,
+            # falling back to the snapshot (4.777 GB); the gate scans rows depth-agnostically and HITS
+            # the placeholder row (7.223 GB). One run, two divisors, 1.51x apart -- the exact failure
+            # the anchor was introduced to prevent, and it passed test_the_gate_and_the_report_divide_
+            # by_the_same_bytes because both sides agreed on a key that was wrong.
+            #
+            # Declining is what the rest of this chain already does: "No recoverable unit means no
+            # ceiling, which lands on the floor fallback: weaker, but not wrong." Defaulting to
+            # "token" would be worse than the placeholder -- it is the bug that once labelled every
+            # diffusion and classifier model per-token. Nothing is lost by waiting: before the first
+            # trace there is no measurement, so there is no ceiling for the two readers to disagree
+            # about, and once a trace reports, the rebuild path anchors with the observed unit.
+            _unit = str(facts.get("unit") or "").strip().lower()
+            if _unit:
+                led.anchor(
+                    led.KIND_ACTIVE_BYTES,
+                    float(_divisor) / 1e6,
+                    depth=_unit,
+                    mode="bytes_mb",
+                    source=facts["source"][:120],
+                    model=Path(model_root).name,
+                )
         except Exception:  # noqa: BLE001
             pass
         print(
@@ -3798,6 +5944,22 @@ def _print_optimize_stop(pipe, exc) -> None:
         pass
 
 
+def _stamp_run_id() -> str:
+    """One id for this optimize run, set once and inherited by every child.
+
+    The recovery counters are scoped to it: "resets have stopped working" is a fact about THIS run
+    against THIS board, and carrying it into the next run is what turned a limit into a latch (run 39
+    left reset_fails=34 in a (model, task)-keyed file that survived the board being fixed and a host
+    reboot). Set here rather than in the CLI so every entry point -- supervisor restarts included --
+    lands in the same run, and never overwritten, so a restart does not silently get a fresh budget.
+    """
+    cur = str(os.environ.get("PERF_MCP_RUN_ID") or "").strip()
+    if not cur:
+        cur = "%d_%d" % (int(time.time()), os.getpid())
+        os.environ["PERF_MCP_RUN_ID"] = cur
+    return cur
+
+
 def run_cc_optimize(
     demo_dir: Path,
     repo_root: Path,
@@ -3821,6 +5983,12 @@ def run_cc_optimize(
     discovery (so this run recalls the latest cross-model-proven knobs), and push any GRADUATED_* back
     at the end. Off by default — learning stays local unless opted in. Both steps are best-effort and
     never fail the run; the remote/branch is fully configurable (nothing hard-coded)."""
+    _stamp_run_id()
+    # BEFORE the device is touched and before discovery spends an agent call: verify the tool this
+    # run will execute is the tool that was verified. See _preflight_tool.
+    if not _preflight_tool(repo_root):
+        print("  [optimize/cc] refusing to start against a tool whose own tests fail.", flush=True)
+        raise SystemExit(EXIT_REFUSED)
     if not os.environ.get("ANTHROPIC_API_KEY"):
         # No exported key is FINE: `claude` may be authenticated via `claude /login` (README §5.2
         # Option A). Every claude subprocess uses those stored creds; claude surfaces its own error
@@ -3846,7 +6014,7 @@ def run_cc_optimize(
     model_rel = os.path.relpath(demo_dir, repo_root)
     model_name = Path(demo_dir).name
     os.environ.setdefault("PERF_MCP_MODEL_NAME", model_name or "model")
-    _cfg_ref = _resolve_model_id(demo_dir, model_id_hint) or str(demo_dir)
+    _cfg_ref = _resolve_model_id(demo_dir, model_id_hint, _run_test_files(demo_dir, manifest)) or str(demo_dir)
     pipes = pipelines_from_manifest(manifest, model_rel)
     is_mm = manifest.get("pathmap", {}).get("is_multimodal")
     print(f"  [optimize/cc] discovered pipelines: {[p['task'] for p in pipes]} (multimodal={is_mm})")

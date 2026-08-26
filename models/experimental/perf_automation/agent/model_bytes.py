@@ -160,68 +160,103 @@ _TOWER_ONLY = re.compile(
 )
 
 
-# HF class-name suffixes -> unit. config.json carries `architectures` for every model but usually NOT
-# a pipeline_tag (that lives on the model card), so keying only on the tag meant the analytic path
-# never fired for a local checkpoint and silently fell back to the file size -- a 2.4x wrong ceiling.
-# Longest suffix first: ForConditionalGeneration must beat ForCausalLM-style generic matching.
-_UNIT_BY_ARCH_SUFFIX = (
-    ("forconditionalgeneration", "token"),
-    ("forcausallm", "token"),
-    ("lmheadmodel", "token"),
-    ("forspeechseq2seq", "token"),
-    ("forvision2seq", "token"),
-    ("fortexttospeech", "token"),
-    ("forsequenceclassification", "inference"),
-    ("fortokenclassification", "inference"),
-    ("forquestionanswering", "inference"),
-    ("forimageclassification", "inference"),
-    ("forobjectdetection", "inference"),
-    ("forsemanticsegmentation", "inference"),
-    ("forimagesegmentation", "inference"),
-    ("fordepthestimation", "inference"),
-    ("formaskedlm", "inference"),
-    ("formaskedimagemodeling", "inference"),
-    ("unet2dconditionmodel", "step"),
-    ("unet2dmodel", "step"),
-    ("transformer2dmodel", "step"),
-    ("dittransformer2dmodel", "step"),
-    ("fluxtransformer2dmodel", "step"),
-)
+def resolution_from_config(cfg: dict):
+    """The spatial size one unit of work is measured at, or None.
 
+    emit-e2e already reads this to build its PCC input (e2e_emitter: vision_config.image_size ->
+    torch.randn(1, 3, H, W)), but the value never reached the PERF side, so a steps/s or vision
+    inferences/s figure could not state the resolution it described -- and resolution IS the work: a
+    denoise step at 1024 is roughly 4x the step at 512, so two runs of one model differ ~4x with
+    nothing in the report distinguishing them.
 
-def unit_for_architectures(architectures, model_type: str = "") -> str:
-    """The unit of work implied by an HF `architectures` entry, or "".
+    Two shapes, because the two model families store it differently:
+      * vision encoders publish `image_size` (in vision_config for a multimodal config), which is the
+        PIXEL size fed to the tower;
+      * latent diffusion publishes `sample_size`, the LATENT size, whose pixel size is
+        sample_size * vae_scale_factor (8 for every SD-family VAE, so that is the default).
 
-    A class name states the head, and the head states what one unit of work is: a CausalLM emits a
-    token, a UNet takes a denoise step, a SequenceClassification does one forward pass. Unrecognised
-    heads return "" so the caller publishes no ceiling rather than assuming decode.
+    None when neither is present, which is every text model -- and None must stay None rather than
+    becoming a number, because a resolution printed for a model that has none is a claim about a
+    condition that did not exist.
     """
-    for arch in list(architectures or []) + ([model_type] if model_type else []):
-        a = str(arch or "").strip().lower()
-        if not a:
-            continue
-        for suffix, unit in _UNIT_BY_ARCH_SUFFIX:
-            if a.endswith(suffix) or suffix in a:
-                return unit
-    return ""
-
-
-def unit_from_config(cfg: dict) -> str:
-    """The unit for an HF config: its pipeline_tag when present, else its architecture head."""
     cfg = cfg if isinstance(cfg, dict) else {}
-    return unit_for_tag(cfg.get("pipeline_tag") or "") or unit_for_architectures(
-        cfg.get("architectures"), cfg.get("model_type") or ""
-    )
+    vc = cfg.get("vision_config") if isinstance(cfg.get("vision_config"), dict) else {}
+    for src in (vc, cfg):
+        px = src.get("image_size")
+        if isinstance(px, (int, float)) and px > 0:
+            return int(px)
+    latent = cfg.get("sample_size")
+    if isinstance(latent, (int, float)) and latent > 0:
+        scale = cfg.get("vae_scale_factor") or (cfg.get("vae_config") or {}).get("scale_factor") or 8
+        try:
+            return int(latent) * int(scale)
+        except (TypeError, ValueError):
+            return int(latent)
+    return None
 
 
 def unit_for_tag(pipeline_tag: str) -> str:
-    """The unit of work for an HF pipeline tag, or "" when there is no single well-defined one."""
+    """The unit of work for an HF pipeline tag, or "" when there is no single well-defined one.
+
+    ITS ONLY REMAINING JOB is the lookup-only tensor exclusion in the param-count walk: a token unit
+    reads its embedding table by INDEX, one row per token, so counting the whole table as streamed
+    bytes overstates what a decode step moves. Nothing else consults it.
+
+    IT NO LONGER FEEDS THE CEILING, and it no longer picks measurement conditions -- default_conditions
+    and its table are deleted. They had no production caller: a run takes ISL/OSL/seq_len/batch from
+    TT_PERF_* and its resolution from resolution_from_config, and the two disagreed anyway (384 vs the
+    128 that TT_PERF_SEQ_LEN actually uses), which is what a second unused source of the same fact
+    does.
+
+    THE CEILING SIDE. A tag names the TASK and cannot state whether a model loops:
+    `text-to-speech` covers XTTS, which emits tokens, and Kokoro-82M, which is StyleTTS2 and produces
+    a whole waveform in one pass. One tag, two units, so the table had to pick and was wrong for the
+    other -- and a wrong unit does not degrade a ceiling, it puts it in the wrong currency, taking the
+    band, the at-floor verdict and the headline rate with it. The unit now comes from what the built
+    pipeline actually does (perf_adapter.headline_unit), and unit_from_config / unit_for_architectures
+    -- the class-name fallback -- are deleted rather than left as a second answer to the same
+    question.
+    """
     return _UNIT_BY_TAG.get(str(pipeline_tag or "").strip().lower(), "")
 
 
 def unit_label(unit: str) -> str:
     """How the rate reads in the report: tok/s/u, steps/s, inferences/s."""
     return _UNIT_LABEL.get(str(unit or "").strip().lower(), "")
+
+
+def unit_word(unit) -> str:
+    """The vocabulary word -- token / step / inference -- behind a unit, whichever form it arrives in.
+
+    THE INVERSE OF _UNIT_LABEL, AND IT LIVES HERE SO THE TWO CANNOT DRIFT. headline_unit derives the
+    word structurally, unit_label turns it into a rate for the report, and readers downstream then
+    had to get the word back out of that label -- which they each did by pattern-matching their own
+    keyword list ("step"/"denoise"/"diffus" in one file, startswith("tok") in another). Those lists
+    were guesses about wording, they duplicated each other, and neither was derived from the table
+    that produced the label in the first place. This inverts that table instead.
+
+    Accepts the word itself, the exact label, or a rate whose work-noun (the part before the first
+    "/") names one -- so "token", "tok/s/u" and "tokens/s" all answer "token". A unit this tool never
+    produced and cannot match names no recurring work, which is what an inference is.
+    """
+    u = str(unit or "").strip().lower()
+    if u in _UNIT_LABEL:
+        return u
+    for word, label in _UNIT_LABEL.items():
+        if u == label.lower():
+            return word
+    # THE WORK-NOUN, MATCHED EXACTLY AGAINST WHAT EACH WORD CAN BE SPELLED AS: the word itself, its
+    # plural, and the noun its own label uses ("tok" for a token). This compared PREFIXES in both
+    # directions, which is unbounded at the short end -- "s" resolved to a step and "t" to a token
+    # because one letter is a prefix of "steps" and "tok" -- and unbounded at the long end, where
+    # "toked" resolved to a token. Both are the spelling guess this function exists to remove.
+    noun = u.split("/", 1)[0]
+    if noun:
+        for word, label in _UNIT_LABEL.items():
+            spellings = {word, word + "s", label.lower().split("/", 1)[0]}
+            if noun in spellings:
+                return word
+    return "inference"
 
 
 def _headers(path: Path):
@@ -328,102 +363,82 @@ def weight_bytes(
     }
 
 
-# DEFAULT MEASUREMENT CONDITIONS, keyed on the unit of work rather than on a model family.
-#
-# The distinction that decides these: a condition the model's own config STATES is read, never
-# defaulted; a condition it does NOT state needs a tool default, because otherwise whoever writes the
-# perf test picks one and nobody records it.
-#
-#   token      ISL and OSL are runtime choices, absent from every config.json -- which is exactly how
-#              a generated test ended up on a six-token prompt. 128 in / 128 out is the standard
-#              short-context benchmark point, so that is the fallback.
-#   step       50 denoise steps -- diffusers' own documented default for
-#              `StableDiffusionPipeline.__call__(num_inference_steps: int = 50)`, so the number has a
-#              citable source rather than being a round figure someone liked. The RATE is per step, so
-#              the count only bounds how long the measurement runs.
-#   inference  one forward pass at batch 1. Input size is a model property -- an image processor's
-#              `image_size` (ViT: 224) and a feature extractor's `chunk_length` (Whisper: 30 s) are
-#              read from the config, never defaulted. Only the TEXT case has no such property:
-#              `max_position_embeddings` is a cap, not a workload, and HF pipelines pad to the batch,
-#              so there is no HF number to inherit. 384 is MLPerf's BERT inference sequence length --
-#              a published reference, chosen over a figure picked for internal consistency.
-_DEFAULT_CONDITIONS = {
-    "token": {"isl": 128, "osl": 128, "batch": 1},
-    "step": {"steps": 50, "batch": 1},
-    "inference": {"batch": 1, "seq_len": 384},
-}
+def untowered_sections(snapshot_dir, stage_roots: dict) -> list:
+    """Sections a NON-recurring stage runs that _TOWER_ONLY did not exclude. Empty when consistent.
 
+    DETECTION, NOT CORRECTION. _TOWER_ONLY keeps an encoder's parameters out of a per-token read set
+    by matching names (`audio_tower`, `vision_tower`, ...). It is a good list and it is still a list:
+    a model naming its encoder off-list has that encoder charged to every token, inflating the
+    divisor, lowering the ceiling, and so making the run look closer to the wall than it is -- the
+    direction that stops a run early.
 
-def default_conditions(unit: str, cfg: dict = None) -> dict:
-    """The conditions a perf measurement should default to for this unit of work.
+    What this does NOT do is fix it by substituting stage_roots for the name list. That was tried and
+    is worse: stage_roots names the section holding a stage's BLOCK STACK, and on any untied model
+    `lm_head` is a sibling of that stack, streamed every token and named by no stage_roots entry --
+    so excluding everything outside the map silently drops it (1.0 B params on gemma-3-12b-it). One
+    silent error traded for a larger one in the opposite direction.
 
-    Anything the config states wins over the fallback: `sample_size` fixes a diffusion model's
-    resolution, `max_position_embeddings` caps a text model's sequence length. Returns {} for a unit
-    with no defined unit of work -- the same safe direction as the ceiling, where no unit means no
-    published number rather than an invented one.
+    So this only reports the disagreement, which needs no guess: stage_roots says a stage OTHER than
+    the recurring one runs out of section X -- that is derived from the checkpoint's own key
+    structure, not from anyone's naming -- while _TOWER_ONLY did not exclude X. Both statements are
+    evidence, and when they conflict a human can see it instead of the divisor quietly moving.
+
+    The honest fix is a measurement that does not exist yet: the profile records nothing about which
+    phase an op ran in ("_top_ops keys on (op_code, shape, memory)"), so there is no observation of
+    what a token actually read. Until buckets carry a stage, every route here is a guess, and the
+    least-bad guess is the one whose failure mode is known.
     """
-    unit = str(unit or "").strip().lower()
-    base = dict(_DEFAULT_CONDITIONS.get(unit) or {})
-    if not base:
-        return {}
-    cfg = cfg if isinstance(cfg, dict) else {}
-    # RESOLUTION. A UNet's `sample_size` is the LATENT size, not pixels: diffusers documents
-    # height as `unet.config.sample_size * vae_scale_factor`, so SD-1.5's sample_size=64 is a
-    # 512px image. Reporting 64px would understate the workload by 8x per side. Only convert when
-    # the scale factor is actually known -- otherwise say latent, because a guessed multiplier is
-    # how a plausible-looking wrong number gets into a report.
-    latent = cfg.get("sample_size")
-    pixels = (cfg.get("vision_config") or {}).get("image_size") or cfg.get("image_size")
-    scale = cfg.get("vae_scale_factor") or (cfg.get("vae_config") or {}).get("scale_factor")
-    if unit in ("step", "inference"):
-        if isinstance(pixels, (int, float)) and pixels > 0:
-            base["resolution"] = int(pixels)
-        elif isinstance(latent, (int, float)) and latent > 0:
-            if isinstance(scale, (int, float)) and scale > 0:
-                base["resolution"] = int(latent * scale)
-            else:
-                base["latent"] = int(latent)
-    if "resolution" in base or "latent" in base:
-        # seq_len is the TEXT fallback for a single forward pass; a model that states an image size is
-        # not a text model, and reporting both would describe a workload that does not exist.
-        base.pop("seq_len", None)
-    # AUDIO. The workload for an audio model is a DURATION -- reporting "seq_len 128" for a speech
-    # enhancer describes nothing. Read it from the feature extractor's own config (Whisper carries
-    # chunk_length=30); when absent, publish no duration rather than invent one, since a segment
-    # length is a preprocessing choice and not something to guess.
-    secs = cfg.get("chunk_length_s") or cfg.get("chunk_length") or cfg.get("max_length_s")
-    if isinstance(secs, (int, float)) and secs > 0 and unit == "inference":
-        base["seconds"] = float(secs)
-        base.pop("seq_len", None)
-    cap = cfg.get("max_position_embeddings")
-    if isinstance(cap, (int, float)) and cap > 0:
-        for k in ("isl", "osl", "seq_len"):
-            if k in base and base[k] > cap:
-                base[k] = int(cap)
-    return base
-
-
-def conditions_label(conds: dict) -> str:
-    """How the conditions read in a report: "ISL 128 / OSL 128, batch 1"."""
-    c = conds if isinstance(conds, dict) else {}
-    parts = []
-    if "isl" in c:
-        parts.append("ISL %d" % c["isl"])
-    if "osl" in c:
-        parts.append("OSL %d" % c["osl"])
-    if "steps" in c:
-        parts.append("%d steps" % c["steps"])
-    if "seq_len" in c and "isl" not in c:
-        parts.append("seq_len %d" % c["seq_len"])
-    if "resolution" in c:
-        parts.append("%dpx" % c["resolution"])
-    if "latent" in c:
-        parts.append("latent %d" % c["latent"])
-    if "seconds" in c:
-        parts.append("%gs audio" % c["seconds"])
-    if "batch" in c:
-        parts.append("batch %d" % c["batch"])
-    return ", ".join(parts)
+    try:
+        _roots = {str(v) for v in (stage_roots or {}).values() if v}
+        if len(_roots) < 2:
+            return []  # one subtree, or none: nothing can be a separate tower
+        d = Path(snapshot_dir or "")
+        files = sorted(d.glob("*.safetensors")) if d.is_dir() else []
+        _size: dict = {}
+        for f in files:
+            try:
+                with open(f, "rb") as fh:
+                    n = struct.unpack("<Q", fh.read(8))[0]
+                    if not (0 < n <= 200_000_000):
+                        continue
+                    for k, meta in json.loads(fh.read(n)).items():
+                        if k == "__metadata__" or not isinstance(meta, dict) or "." not in str(k):
+                            continue
+                        _ne = 1
+                        for _d in meta.get("shape") or []:
+                            _ne *= int(_d)
+                        if _ne > 0:
+                            _sec = str(k).split(".", 1)[0]
+                            _size[_sec] = _size.get(_sec, 0) + _ne
+            except Exception:  # noqa: BLE001
+                continue
+        _present = set(_size)
+        # WHICH SUBTREE IS THE BACKBONE, BY SIZE RATHER THAN BY NAME. The first version of this asked
+        # `k in ("decode", "prefill")` -- classifying declared stages by matching their labels, which
+        # is the thing this codebase does not do (a stage is priced by what it does, not by its name;
+        # summary only ever spells those names in its documented no-stages-declared fallback).
+        #
+        # Size answers it without a label: on every multi-tower model the per-unit backbone is the
+        # large one and the per-clip encoder is the small one -- voxtral, 4.014 B against 0.637 B. A
+        # model whose encoder outweighs its backbone would be reported spuriously, and that costs a
+        # warning line, never a number: this function changes no byte count.
+        _ranked = sorted((s for s in _roots if s in _present), key=lambda s: -_size.get(s, 0))
+        if len(_ranked) < 2:
+            return []
+        # A TIE IS "CANNOT TELL", AND A DETECTOR MUST NOT GUESS. Size separates a backbone from an
+        # encoder only when they differ by a lot -- voxtral is 4.014 B against 0.637 B, 6.3x. Two
+        # subtrees of similar size carry no signal about which one a unit streams, and picking the
+        # larger by a hair would report the BACKBONE as an unexcluded tower: the most misleading
+        # output this could produce. Silence is the honest answer, and costs only the warning.
+        if _size.get(_ranked[0], 0) < 2 * _size.get(_ranked[1], 0):
+            return []
+        _others = set(_ranked[1:])
+        # A section only counts as missed if it is REALLY in this checkpoint and the list lets it
+        # through: `_TOWER_ONLY` is anchored to a name component, so testing "<section>." is the same
+        # question the byte walk asks of every tensor in it.
+        return sorted(x for x in _others if x in _present and not _TOWER_ONLY.search(x + "."))
+    except Exception:  # noqa: BLE001 -- a detector that raises must not cost a ceiling
+        return []
 
 
 def parse_overrides(spec: str):

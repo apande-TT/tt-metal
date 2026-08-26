@@ -46,7 +46,12 @@ def model_root(tmp_path, monkeypatch):
     monkeypatch.setattr(
         _ptg,
         "generate_perf_test",
-        lambda root, task, case=None, force=False, source_abs=None, source_kind="": str(Path(root) / "test_e2e.py"),
+        # `stacks` is not optional here on purpose: the generator has always accepted it and no
+        # production caller passed it, so every generated perf test assumed one stack. A double
+        # that quietly swallowed **kwargs would let that regress unnoticed.
+        lambda root, task, case=None, force=False, source_abs=None, source_kind="", stacks=None: str(
+            Path(root) / "test_e2e.py"
+        ),
     )
     return tmp_path / "model"
 
@@ -102,9 +107,17 @@ def test_before_loop_all_mocks_produces_manifest_and_baseline(tmp_path, model_ro
         # claude_agent_sdk import before discovery touched it. There is no in-process SDK any more --
         # every model call is a `claude` CLI subprocess -- so the stage went with it.
         "ensure_tt_lang",
+        # Read-only, sub-second, no device -- and BEFORE discovery, because a model that cannot be
+        # measured the way this tool measures should be told so before the perf test is generated and
+        # the weights load, not forty minutes later as a crash whose cause is not in the message.
+        "model_contract",
         "discover",
         "lead_review",
         "preflight",
+        # Injecting the stage marks is a STEP, not a side effect: it rewrites the file the run is
+        # about to profile, and it must precede resolve_signposts so the start/stop pair it emits is
+        # found by that scan rather than defaulted.
+        "stage_marks",
         "resolve_signposts",
         "tracy_baseline",
     ]
