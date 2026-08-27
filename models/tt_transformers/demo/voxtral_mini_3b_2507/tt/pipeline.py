@@ -762,8 +762,17 @@ class VoxtralPipeline:
 
     # --------------------------------------------------------- STAGE: decode
     def _argmax_into_next_ids(self, logits):
-        """Greedy sample on device, written into the PERSISTENT id buffer."""
-        ids = ttnn.argmax(logits, dim=-1, keepdim=True)  # uint32 ROW_MAJOR [1,B,1]/[B,1,1]
+        """Greedy sample on device, written into the PERSISTENT id buffer.
+
+        ttnn.argmax picks ArgMaxSingleCoreProgramFactory whenever the input is not
+        ROW_MAJOR (see uses_multicore_path in argmax_device_operation.cpp), so taking
+        the matmul's TILE output straight to argmax scans all 131072 vocab entries on
+        ONE Tensix core.  The untilize is multicore and bandwidth-bound, so paying for
+        it buys the multicore vocab scan.
+        """
+        ids = ttnn.argmax(
+            ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT), dim=-1, keepdim=True
+        )  # uint32 ROW_MAJOR [1,B,1]/[B,1,1]
         ttnn.copy(ttnn.reshape(ids, (self.B, 1)), self.next_ids_tt)
 
     def _rope_now(self):
