@@ -21,7 +21,7 @@ class TtLMHead:
     def __init__(self, device, torch_module):
         self.device = device
         self.weight = ttnn.from_torch(
-            torch_module.weight.T.contiguous().float(),
+            torch_module.weight.T.contiguous().bfloat16(),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=device,

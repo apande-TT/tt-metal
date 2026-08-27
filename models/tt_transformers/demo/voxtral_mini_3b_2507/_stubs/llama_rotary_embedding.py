@@ -41,7 +41,24 @@ import ttnn
 _DEFAULT_CAPACITY = 1024
 
 
+def _as_bf16(t):
+    """Narrow a weight to bfloat16 ON THE HOST, before it is ever uploaded.
+
+    ``from_torch(t, dtype=ttnn.bfloat16, ...)`` does NOT convert a float32 `t` on the host: it
+    uploads the fp32 bytes, converts the LAYOUT on device in fp32, and only then emits a device
+    Typecast to bf16.  Every call site here hands over a `.float()` tensor, so the layout
+    conversion was moving 4 bytes per element to produce a 2-byte tensor and paying for a whole
+    extra device op to do it.  Handing over bf16 makes the requested dtype the dtype that arrives:
+    the conversion moves half the bytes and the typecast has nothing left to do.
+
+    The VALUES are the same either way -- the fp32 -> bf16 rounding happens regardless, on the host
+    here instead of on the device one op later.
+    """
+    return t.bfloat16() if hasattr(t, "bfloat16") else t
+
+
 def _to_device(t, device):
+    t = _as_bf16(t)
     try:
         if isinstance(device, ttnn.MeshDevice):
             return ttnn.from_torch(
@@ -57,6 +74,7 @@ def _to_device(t, device):
 
 
 def _to_device_rm(t, device):
+    t = _as_bf16(t)
     try:
         if isinstance(device, ttnn.MeshDevice):
             return ttnn.from_torch(

@@ -45,6 +45,7 @@ Stub routing (see e2e_plan.json for the full rationale):
            instead PCC-checked against torch on the real TT encoder hidden
            states by `avg_pool1d_conformance()` and reported as a hole.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -163,6 +164,13 @@ class _Counted:
 
 # ------------------------------------------------------------------- helpers
 def _to_dev(t: torch.Tensor, device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16):
+    # NARROW ON THE HOST FIRST. from_torch does not honour `dtype` on the host when a device is
+    # given: it uploads whatever `t` already is, converts the LAYOUT on device in that dtype, and
+    # only then emits a device Typecast. Handing over a tensor that is already the requested dtype
+    # means the layout conversion moves the smaller tensor and the typecast has nothing to do. The
+    # rounding is identical -- it just happens here instead of one device op later.
+    if dtype == ttnn.bfloat16 and t.dtype != torch.bfloat16:
+        t = t.bfloat16()
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
 
 
@@ -799,19 +807,15 @@ class VoxtralPipeline:
         # NOTE: this runs AFTER the forward (run_chain has already returned).  It is
         # the output boundary -- device results -> host for PCC/detokenisation -- not
         # model math, and it is never reached from a *_trace_step or the observed region.
-        # The waiver has to sit on the SAME line as the readback it waives -- that is the line the
-        # scanner reports, and a reformat that pushes the comment onto the neighbouring `dim=1,`
-        # silently un-waives it.
-        logits = torch.stack(
-            # gate1: allow-readback output boundary: TaskResult logits/ids
-            [ttnn.to_torch(x).reshape(self.B, -1).float() for x in step_logits],  # gate1: allow-readback output boundary
-            dim=1,
-        )  # [B,N,V]
-        tokens = torch.stack(
-            # gate1: allow-readback output boundary: TaskResult logits/ids
-            [ttnn.to_torch(x).reshape(self.B).long() for x in step_ids],  # gate1: allow-readback output boundary
-            dim=1,
-        )  # [B,N]
+        # THE WAIVER HAS TO SIT ON THE LINE THE READBACK IS ON -- that is the line the scanner
+        # reports.  Each ttnn.to_torch therefore gets its own SHORT statement: a call wrapped inside
+        # a torch.stack(...) argument is long enough for black to split, and the split moves the
+        # comment onto a neighbouring line, which silently un-waives it.  Short lines black leaves
+        # alone, so the annotation and the call cannot drift apart.
+        rows = [ttnn.to_torch(x) for x in step_logits]  # gate1: allow-readback output boundary
+        ids = [ttnn.to_torch(x) for x in step_ids]  # gate1: allow-readback output boundary
+        logits = torch.stack([r.reshape(self.B, -1).float() for r in rows], dim=1)  # [B,N,V]
+        tokens = torch.stack([i.reshape(self.B).long() for i in ids], dim=1)  # [B,N]
         lengths, stopped = [], []
         for b in range(self.B):
             row = tokens[b].tolist()

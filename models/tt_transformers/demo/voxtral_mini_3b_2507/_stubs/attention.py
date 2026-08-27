@@ -26,46 +26,46 @@ class TtVoxtralAttention:
         self.scaling = torch_module.head_dim**-0.5
 
         self.q_weight = ttnn.from_torch(
-            torch_module.q_proj.weight.T.contiguous().float(),
+            torch_module.q_proj.weight.T.contiguous().bfloat16(),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=device,
         )
         self.q_bias = ttnn.from_torch(
-            torch_module.q_proj.bias.unsqueeze(0).float(),
+            torch_module.q_proj.bias.unsqueeze(0).bfloat16(),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=device,
         )
 
         self.k_weight = ttnn.from_torch(
-            torch_module.k_proj.weight.T.contiguous().float(),
+            torch_module.k_proj.weight.T.contiguous().bfloat16(),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=device,
         )
 
         self.v_weight = ttnn.from_torch(
-            torch_module.v_proj.weight.T.contiguous().float(),
+            torch_module.v_proj.weight.T.contiguous().bfloat16(),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=device,
         )
         self.v_bias = ttnn.from_torch(
-            torch_module.v_proj.bias.unsqueeze(0).float(),
+            torch_module.v_proj.bias.unsqueeze(0).bfloat16(),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=device,
         )
 
         self.out_weight = ttnn.from_torch(
-            torch_module.out_proj.weight.T.contiguous().float(),
+            torch_module.out_proj.weight.T.contiguous().bfloat16(),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=device,
         )
         self.out_bias = ttnn.from_torch(
-            torch_module.out_proj.bias.unsqueeze(0).float(),
+            torch_module.out_proj.bias.unsqueeze(0).bfloat16(),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=device,
