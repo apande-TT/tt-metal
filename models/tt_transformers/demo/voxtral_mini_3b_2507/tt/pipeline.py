@@ -274,6 +274,34 @@ class _LmLayerFromParts:
         return ttnn.add(residual, h)
 
 
+class _LmBlock:
+    """Uniform holder for ONE individually-routed LM layer.
+
+    The routed layers are built from different pieces -- layer 0 is a whole graduated decoder-layer
+    stub behind its counting proxy, layers 1-2 are assembled by _LmLayerFromParts out of part-stubs
+    -- so the list held wrappers of two different classes and a structural walk read it as unrelated
+    per-layer objects rather than as one repeated block stack.  One class for every element is what
+    makes it read as a stack AT ANY LENGTH: a shared base would only count from four elements up,
+    and this list is at most _STUB_ROUTED_LAYERS long -- shorter still whenever the profiler caps
+    the depth, which is exactly when the walk has to find it.
+
+    It is a pass-through and nothing more: __call__ and attribute reads go straight to the block it
+    holds, so what each layer does, and every number it produces, is unchanged.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __call__(self, *args, **kwargs):
+        return self._inner(*args, **kwargs)
+
+    def __getattr__(self, item):
+        return getattr(object.__getattribute__(self, "_inner"), item)
+
+    def __repr__(self):  # pragma: no cover - debug only
+        return f"<LmBlock {object.__getattribute__(self, '_inner')!r}>"
+
+
 # ------------------------------------------------------------ the pipeline
 # WHERE THE INDIVIDUALLY-ROUTED LAYERS END AND THE BULK STACK BEGINS.
 #
@@ -335,6 +363,40 @@ def _profiling_depth(full_depth: int, requested: int | None = None) -> int:
     return want
 
 
+def _stack_depth(full_depth: int, requested: int | None, default: int | None) -> int:
+    """Depth for ONE stack: its own per-stage argument first, the shared `layers` default second.
+
+    None is not a value, it is a DEFERRAL. `encode_layers=None` means "whatever `layers` says", and
+    `layers=None` in turn means EVERY layer -- _profiling_depth owns that rule, along with the
+    TT_PERF_LAYERS fallback and the never-treat-0-as-a-sentinel guard, so all of it stays in one
+    place and a per-stage name cannot drift from the global one.
+
+    WHY EVERY STACK ASKS. This model has more than one repeated block stack (the 32-block audio
+    tower, the LM block stack), and only the LM one read the depth. A `layers=2` profile therefore
+    still built 32 audio blocks: the knob looked live -- the op count did move -- while the dominant
+    stack stayed at full depth, which is the difference between 2471 and 18729 dispatched ops here
+    and, under tracy, between a clean capture and a dropped-marker one with no ops CSV.
+    """
+    return _profiling_depth(full_depth, requested if requested is not None else default)
+
+
+def _cap_tower(tower, depth: int) -> None:
+    """Trim a BUILT audio tower to its last `depth` blocks, in place.
+
+    FROM THE END, and that is not cosmetic: layers[28..31] of the second tower ARE the graduated
+    voxtral_encoder_layer / layer / voxtral_attention / attention stubs. Keeping the tail keeps those
+    bodies in the chain; keeping the head would drop them, and the e2e gate would then be counting
+    invocations that can no longer happen.
+
+    A depth at or above the real one returns the tower untouched -- no new list, no reordering -- so
+    an uncapped build is the build it always was. The dropped blocks lose their last reference here,
+    so their device tensors are freed instead of merely being skipped every forward.
+    """
+    if not isinstance(depth, int) or depth >= len(tower.layers):
+        return
+    tower.layers = tower.layers[-depth:]
+
+
 class VoxtralPipeline:
     """Resident TT pipeline: build once, run many.
 
@@ -352,6 +414,9 @@ class VoxtralPipeline:
         prefill_capacity: int = PREFILL_C,
         kv_capacity: int = KV_C,
         layers: int | None = None,
+        encode_layers: int | None = None,
+        prefill_layers: int | None = None,
+        decode_layers: int | None = None,
     ):
         self.device = device
         self.hf = hf_model
@@ -368,7 +433,20 @@ class VoxtralPipeline:
         self.n_kv = tcfg.num_key_value_heads
         self.head_dim = tcfg.head_dim
         self.hidden = tcfg.hidden_size
-        self.n_layers = _profiling_depth(tcfg.num_hidden_layers, layers)
+        # PER-STAGE DEPTH. `layers` is the default for every stack; a per-stage argument overrides it
+        # for the stack that stage runs, and None defers to `layers`. So all-None builds exactly what
+        # this pipeline built before these arguments existed.
+        #
+        # The LM block stack is the SAME built stack in both phases -- decode_prefill and decode_step
+        # both call _lm_forward over self.lm_layers + self.rest -- so prefill and decode cannot be
+        # given different physical depths. Each name is an upper bound on the window that stage
+        # profiles, and the only depth that honours BOTH bounds is the tighter one; building the
+        # looser one would silently exceed a cap the harness was told took effect. With both unset
+        # they resolve to the same number and the min is that number.
+        self.n_layers = min(
+            _stack_depth(tcfg.num_hidden_layers, prefill_layers, layers),
+            _stack_depth(tcfg.num_hidden_layers, decode_layers, layers),
+        )
         self.vocab = tcfg.vocab_size
 
         inner = hf_model.model
@@ -383,7 +461,14 @@ class VoxtralPipeline:
             return _Counted(name, obj, self.counts)
 
         # ---------------- audio encode --------------------------------------
-        self.enc_a = W("voxtral_encoder", S("voxtral_encoder").build(device, AT))
+        # BOTH towers are the audio block stack: encode() routes streams 0-3 through enc_a and 4-7
+        # through enc_b, so capping one and leaving the other at 32 would cap nothing a real batch
+        # runs. They are trimmed to the same depth, which also keeps the two halves of the batch
+        # doing identical work.
+        self.n_encode_layers = _stack_depth(len(AT.layers), encode_layers, layers)
+        enc_a = S("voxtral_encoder").build(device, AT)
+        _cap_tower(enc_a, self.n_encode_layers)
+        self.enc_a = W("voxtral_encoder", enc_a)
         enc_b = S("encoder_stack").build(device, AT)
         # the byte-identical second tower carries streams 4-7; its last four
         # layers are handed to the fine-grained graduated layer stubs so those
@@ -396,6 +481,9 @@ class VoxtralPipeline:
         enc_b.layers[31] = _EncLayerWithAttnStub(
             device, AT.layers[31], W("attention", S("attention").build(device, AT.layers[31].self_attn))
         )
+        # AFTER the four graduated stubs are installed: _cap_tower keeps the tail, which is exactly
+        # where they live, so a cap of 4 or more still transports real hidden states through them.
+        _cap_tower(enc_b, self.n_encode_layers)
         self.enc_b = W("encoder_stack", enc_b)
 
         self.proj = W(
@@ -420,34 +508,54 @@ class VoxtralPipeline:
         # `_routed` is what the depth actually permits, and _lm_forward iterates whatever was built.
         _routed = min(_STUB_ROUTED_LAYERS, self.n_layers)
         self.lm_layers = []
+        # EVERY ELEMENT IS AN _LmBlock. The wrappers underneath still differ -- a counted whole-layer
+        # stub here, an _LmLayerFromParts there -- and none of them changed; _LmBlock just gives the
+        # list one class so a structural walk reads it as the repeated block stack it is, however
+        # few layers the depth cap leaves in it.
         if _routed > 0:
-            self.lm_layers.append(W("llama_decoder_layer", S("llama_decoder_layer").build(device, LM.layers[0])))
+            self.lm_layers.append(
+                _LmBlock(W("llama_decoder_layer", S("llama_decoder_layer").build(device, LM.layers[0])))
+            )
         if _routed > 1:
             self.lm_layers.append(
-                _LmLayerFromParts(
-                    device,
-                    LM.layers[1],
-                    in_norm=W("llama_r_m_s_norm", S("llama_r_m_s_norm").build(device, LM.layers[1].input_layernorm)),
-                    attn=W("llama_attention", S("llama_attention").build(device, LM.layers[1].self_attn)),
-                    mlp=W("llama_m_l_p", S("llama_m_l_p").build(device, LM.layers[1].mlp)),
+                _LmBlock(
+                    _LmLayerFromParts(
+                        device,
+                        LM.layers[1],
+                        in_norm=W(
+                            "llama_r_m_s_norm", S("llama_r_m_s_norm").build(device, LM.layers[1].input_layernorm)
+                        ),
+                        attn=W("llama_attention", S("llama_attention").build(device, LM.layers[1].self_attn)),
+                        mlp=W("llama_m_l_p", S("llama_m_l_p").build(device, LM.layers[1].mlp)),
+                    )
                 )
             )
         if _routed > 2:
             self.lm_layers.append(
-                _LmLayerFromParts(
-                    device,
-                    LM.layers[2],
-                    in_norm=None,
-                    attn=W("llama_attention", S("llama_attention").build(device, LM.layers[2].self_attn)),
-                    mlp=W("mlp", S("mlp").build(device, LM.layers[2].mlp)),
+                _LmBlock(
+                    _LmLayerFromParts(
+                        device,
+                        LM.layers[2],
+                        in_norm=None,
+                        attn=W("llama_attention", S("llama_attention").build(device, LM.layers[2].self_attn)),
+                        mlp=W("mlp", S("mlp").build(device, LM.layers[2].mlp)),
+                    )
                 )
             )
+        # THE BULK STACK KEEPS AT LEAST ONE LAYER. layer_range=(3, n) is empty for any cap at or
+        # below _STUB_ROUTED_LAYERS, which builds a "model" whose bulk stack is not short but ABSENT:
+        # llama_model would contribute nothing but its final norm, and the profile would carry no
+        # sample of the block type that is 27 of the 30 LM layers -- the one op signature the capped
+        # window exists to show. One layer keeps it a runnable model of the real thing; the routed
+        # stubs above are untouched, so a cap of 2 builds 2 routed + 1 bulk.
+        _rest_lo = _STUB_ROUTED_LAYERS
+        _rest_hi = max(self.n_layers, _rest_lo + 1)
         self.rest = W(
             "llama_model",
             S("llama_model").build(
                 device,
                 LM,
-                layer_range=(_STUB_ROUTED_LAYERS, self.n_layers),
+                layer_range=(_rest_lo, _rest_hi),
                 skip_embedding=True,
                 rope_capacity=self.KV_C,
             ),
@@ -475,7 +583,12 @@ class VoxtralPipeline:
         self.next_ids_tt = ttnn.from_torch(
             torch.zeros(self.B, 1, dtype=torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=device
         )
-        self.kv = [self._new_kv_slot() for _ in range(self.n_layers)]
+        # ONE SLOT PER LAYER THAT ACTUALLY RUNS -- the routed ones plus however many llama_model made
+        # resident (it clamps its own range, so ask it rather than recompute the clamp here). At full
+        # depth this is 3 + 27 = 30, the number this list always had; capped, it is what _lm_forward
+        # indexes, so a short build cannot walk off the end of it.
+        self.n_lm_layers = len(self.lm_layers) + int(self.rest.num_resident_layers)
+        self.kv = [self._new_kv_slot() for _ in range(self.n_lm_layers)]
         # RoPE cos/sin come from the graduated llama_rotary_embedding stub -- it
         # is the single source for every LM layer in BOTH phases.  Its table is
         # built from the real HF rotary_emb over arange(0, KV_C), so the values
@@ -617,7 +730,11 @@ class VoxtralPipeline:
             None,
             inputs_embeds=h,
             rope=rope,
-            kv_slots=kv_slots[3:],
+            # THE BULK STACK'S SLOTS START WHERE THE ROUTED LAYERS END. This was a literal 3, which
+            # is right only when all three routed layers were built; under a cap of 2 it handed
+            # llama_model the wrong slots (or none). len(self.lm_layers) IS 3 at full depth, so the
+            # slice is unchanged there.
+            kv_slots=kv_slots[len(self.lm_layers) :],
             mode=mode,
         )
 
@@ -682,13 +799,19 @@ class VoxtralPipeline:
         # NOTE: this runs AFTER the forward (run_chain has already returned).  It is
         # the output boundary -- device results -> host for PCC/detokenisation -- not
         # model math, and it is never reached from a *_trace_step or the observed region.
+        # The waiver has to sit on the SAME line as the readback it waives -- that is the line the
+        # scanner reports, and a reformat that pushes the comment onto the neighbouring `dim=1,`
+        # silently un-waives it.
         logits = torch.stack(
-            [ttnn.to_torch(x).reshape(self.B, -1).float() for x in step_logits],
-            dim=1,  # gate1: allow-readback output boundary: TaskResult logits/ids
+            # gate1: allow-readback output boundary: TaskResult logits/ids
+            [ttnn.to_torch(x).reshape(self.B, -1).float() for x in step_logits],  # gate1: allow-readback output boundary
+            dim=1,
         )  # [B,N,V]
         tokens = torch.stack(
-            [ttnn.to_torch(x).reshape(self.B).long() for x in step_ids], dim=1
-        )  # [B,N]  # gate1: allow-readback output boundary: TaskResult logits/ids
+            # gate1: allow-readback output boundary: TaskResult logits/ids
+            [ttnn.to_torch(x).reshape(self.B).long() for x in step_ids],  # gate1: allow-readback output boundary
+            dim=1,
+        )  # [B,N]
         lengths, stopped = [], []
         for b in range(self.B):
             row = tokens[b].tolist()
@@ -889,7 +1012,18 @@ def build_pipeline(device, model=None, **kwargs) -> VoxtralPipeline:
     # re-measures the work signal to prove the knob is live, and a kwarg dropped by this filter is
     # indistinguishable from a knob that does nothing. It stayed out of this set while the harness
     # was setting TT_PERF_LAYERS every profiling run, so every profile built all 32 layers.
-    known = {"batch_size", "prefill_capacity", "kv_capacity", "layers"}
+    # The per-stage names ride the same contract: the tool sets TT_PERF_<STAGE>_LAYERS, the generated
+    # perf test passes them here, and a name missing from this set is dropped SILENTLY -- which is
+    # indistinguishable from a knob that does nothing. Each is None for "use `layers`".
+    known = {
+        "batch_size",
+        "prefill_capacity",
+        "kv_capacity",
+        "layers",
+        "encode_layers",
+        "prefill_layers",
+        "decode_layers",
+    }
     opts = {k: v for k, v in kwargs.items() if k in known}
     if model is None:
         from models.tt_transformers.demo.voxtral_mini_3b_2507.tt.reference import load_hf_model
