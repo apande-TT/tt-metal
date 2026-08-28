@@ -2993,15 +2993,20 @@ def _run_full_pipeline_ms():
                         # a stage key.
                         if not prompt_tokens_seen:
                             prompt_tokens_seen = _iv
-                        # AND STILL FILED UNDER THE CONVENTIONAL NAME, deliberately. This is the
-                        # fallback item count for a stage that states no <stage>_trace_items() of its
-                        # own, and the legacy marker carries no stage of its own to attribute it to.
-                        # Dropping it does remove a name dependency and it also silently reprices any
-                        # such stage at ONE item instead of the sequence it ran -- a worse failure
-                        # than the one it fixes. The real answer is the pipeline stating its own count,
-                        # which is exactly what <stage>_trace_items() is for; this is what happens
-                        # until it does.
-                        stage_isl_per_request.setdefault(_LEGACY_PROMPT_KEY, _iv)
+                        # AND FILED AGAINST NO STAGE. This marker is printed at tokenisation, before
+                        # any stage exists, so it cannot say which stage consumes it -- and it used to
+                        # be filed under the literal "prefill" anyway. That made a workload fact
+                        # reachable through one typed name: exactly one stage per model could be
+                        # sized, and only if it happened to be called that, while every other stage
+                        # fell back to ONE item. Voxtral's encoder was priced at 1 instead of 1500 and
+                        # reported memory-bound when it is compute-bound.
+                        #
+                        # Dropping the write was previously refused because it repriced the named
+                        # stage at one item, which was the worse failure. That is no longer the
+                        # trade: summary._stage_items_observed reads the count back off the matmuls
+                        # each stage actually ran, so every stage -- named anything -- is sized from
+                        # what it did. The prompt length stays what it is, a property of the request,
+                        # carried as the scalar below.
                 except Exception:  # noqa: BLE001
                     pass
             if "TRACE_PER_TOKEN_MS=" in line:
@@ -3488,6 +3493,38 @@ def _read_die_temp_c():
     if v is not None:
         globals()["_LAST_KNOWN_TEMP_C"] = float(v)
     return v
+
+
+def report_board_over_clamp(label: str = "") -> bool:
+    """Record, from the one place that owns the threshold, that the board is above it RIGHT NOW.
+
+    A caller watching a subprocess cannot wait for the board -- the work is in flight -- but it can
+    put a timestamp on the crossing, and on 2026-08-28 that record was the only thing missing. Chip 2
+    stopped answering MID-RUN at 21:43 with all four chips at 98-103C; its telemetry went straight to
+    the 0xffffffff sentinel and the kernel said nothing until 21:51, eight minutes later, when
+    something tried to reopen it. The "Failed to set initial power state" line every previous
+    investigation treated as the failure is the post-mortem, not the event. Temperature was the only
+    warning the board ever gave.
+
+    The clamp threshold is learned from THIS board's history, so the comparison lives here rather
+    than in each watcher. Returns whether it reported, so a caller can rate-limit on real crossings.
+    """
+    try:
+        cur = _read_die_temp_c()
+        if cur is None:
+            return False
+        limit = _clamp_threshold_c()
+        if cur <= limit:
+            return False
+        print(
+            "  [thermal-watch] %s: board at %.1fC, above this board's clamp threshold %.1fC -- work in "
+            "flight is holding it there" % (label or "device subprocess", cur, limit),
+            file=sys.stderr,
+            flush=True,
+        )
+        return True
+    except Exception:  # noqa: BLE001 -- a thermometer that cannot be read must never stop the work
+        return False
 
 
 def _wait_for_thermal_headroom():

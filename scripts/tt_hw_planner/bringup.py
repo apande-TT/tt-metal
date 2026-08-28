@@ -438,6 +438,7 @@ def _prepare_non_text_family(
         model_type=model_type,
         pipeline_tag=pipeline_tag,
         architectures=architectures,
+        pipeline_class=getattr(probe, "pipeline_class", None),
         is_encoder_decoder=(probe.raw_config or {}).get("is_encoder_decoder") if probe.raw_config else None,
     )
     if backend is None:
@@ -549,10 +550,9 @@ def prepare_bringup(
             mesh_override=mesh_override,
         )
     if not probe.raw_config:
-        raise BringupError(
-            f"could not load config.json for {model_id}. "
-            "If it's a gated repo, set HF_TOKEN or `huggingface-cli login`."
-        )
+        from .probe import missing_config_reason
+
+        raise BringupError(missing_config_reason(probe, model_id))
     if probe.memory_model is None:
         return _prepare_non_text_family(
             probe=probe,

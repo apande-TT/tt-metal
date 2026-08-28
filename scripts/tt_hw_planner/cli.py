@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import copy
 import hashlib
 import json
 import os
@@ -1707,6 +1708,7 @@ def _enforce_backend_match_quality_or_abort(
         model_type=model_type,
         pipeline_tag=pipeline_tag,
         architectures=architectures,
+        pipeline_class=getattr(probe, "pipeline_class", None),
         is_encoder_decoder=is_encoder_decoder,
     )
     try:
@@ -1761,7 +1763,9 @@ def _enforce_backend_match_quality_or_abort(
         )
         return None
 
-    if getattr(backend, "routing_mode", "") == "generic":
+    from .family_backends import is_generic
+
+    if is_generic(backend):
         if probe.category != "Unknown":
             print(
                 f"  Backend match: GENERIC  ({backend.name})  "
@@ -3323,7 +3327,7 @@ def _try_auto_onboard_inline(
     the user to do something" into "if it can't find a sibling, the
     tool drafts one itself"."""
     try:
-        from .auto_onboard import auto_onboard, write_backend_into_registry
+        from .auto_onboard import auto_onboard
     except Exception as exc:
         print(f"  (auto-onboard import failed: {type(exc).__name__}: {exc}; " f"skipping inline draft)")
         return None
@@ -3403,7 +3407,14 @@ def _try_auto_onboard_inline(
                 f"{type(exc).__name__}: {exc}; falling back to closest-template path."
             )
         return None
-    ok, msg = write_backend_into_registry(proposal)
+    # Unattended mid-run onboard: record in the supplement store, not tracked
+    # source. An LLM-drafted entry written into family_backends.py during a run is
+    # unreviewed and persists in git; the registry sync's own additions go to a
+    # cache file for the same reason. `auto-onboard --accept` still writes to source
+    # because a human invoked it.
+    from .auto_onboard import write_backend_into_overlay
+
+    ok, msg = write_backend_into_overlay(proposal, onboarded_for=model_id)
     print(f"  {msg}")
     if not ok:
         print("  Falling back to closest-template path.")
@@ -8146,6 +8157,20 @@ def _warn_on_registry_drift(args=None) -> None:
             )
             if os.environ.get("TT_HW_PLANNER_VERBOSE"):
                 print(format_drift(issues))
+        # Dead template entries are a different problem from path drift: routing
+        # skips them, but they stay in the registry until a human decides whether
+        # to delete, repoint, or land the demo. Report them once, plainly.
+        try:
+            from .registry_sync import format_prunable, prune_registry
+
+            _dead, _applied = prune_registry()
+            _prune_report = format_prunable(_dead)
+            if _prune_report:
+                print(_prune_report, file=sys.stderr)
+            if _applied:
+                print("  registry: pruned the entries above.", file=sys.stderr)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -8179,6 +8204,87 @@ def _persist_graduated_demos(session_path, dest_root) -> list:
     return synced
 
 
+_COMPOSITE_FANOUT_DEPTH_CAP = 3
+
+
+def _fan_out_composite(args) -> Optional[int]:
+    """Bring up a composite repo by running the normal pipeline once per component.
+
+    A composite (a diffusers pipeline, or any repo whose parts each carry their own
+    config) has no single root model to load, so the single-root pipeline has
+    nothing to work on and scaffold refuses it. Its parts, however, ARE ordinary
+    single-root models. This walks the parts the probe discovered and re-enters
+    ``cmd_up`` for each one, so every stage -- scaffold, capture, classify,
+    graduate -- is the same code that brings up any other model. There is no
+    second pipeline to keep in sync.
+
+    Returns ``None`` when this is not a composite (caller proceeds normally), or an
+    exit code once every component has been attempted. Component names come from
+    the repo itself; nothing here assumes what they are called.
+    """
+    model_id = getattr(args, "model_id", "") or ""
+    if not model_id:
+        return None
+    depth = int(getattr(args, "_composite_depth", 0) or 0)
+    if depth >= _COMPOSITE_FANOUT_DEPTH_CAP:
+        return None
+
+    # Cheap listing-based check: probe_model() may consult an agent to classify
+    # the model, which must not run on every `up` just to answer "is this a
+    # container?". Same rule, no cost.
+    from .probe import component_targets, detect_composite_repo
+
+    is_composite, submodels = detect_composite_repo(model_id)
+    if not is_composite:
+        return None
+
+    targets = component_targets(model_id, submodels)
+    if not targets:
+        # Nothing resolvable -- let the normal path run and report why, rather
+        # than inventing a reason here.
+        return None
+
+    print("", file=sys.stderr)
+    print("=" * 78, file=sys.stderr)
+    print(f"  COMPOSITE FAN-OUT: {model_id}", file=sys.stderr)
+    print(
+        f"  {len(targets)} component(s) [{', '.join(n for n, _ in targets)}] — each is brought up "
+        f"as its own model through the standard pipeline.",
+        file=sys.stderr,
+    )
+    print("=" * 78, file=sys.stderr)
+
+    results: List[Tuple[str, int]] = []
+    for index, (name, path) in enumerate(targets, start=1):
+        print("", file=sys.stderr)
+        print(f"  [composite {index}/{len(targets)}] {model_id} :: {name}", file=sys.stderr)
+        # Materialise THIS part's weights now -- enumeration deliberately fetched
+        # configs only, so nothing was downloaded for parts that never run.
+        materialised = component_targets(model_id, [name], with_weights=True)
+        if materialised:
+            path = materialised[0][1]
+        child = copy.copy(args)
+        child.model_id = path
+        child._composite_depth = depth + 1
+        try:
+            rc = cmd_up(child)
+        except SystemExit as exc:
+            rc = int(exc.code) if exc.code not in (0, None) else 0
+        except Exception as exc:  # one bad component must not hide the others
+            print(f"  [composite] {name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            rc = 2
+        results.append((name, int(rc or 0)))
+
+    print("", file=sys.stderr)
+    print("=" * 78, file=sys.stderr)
+    print(f"  COMPOSITE SUMMARY: {model_id}", file=sys.stderr)
+    for name, rc in results:
+        print(f"    {'OK  ' if rc == 0 else f'rc={rc}'}  {name}", file=sys.stderr)
+    print("=" * 78, file=sys.stderr)
+    failed = [rc for _, rc in results if rc != 0]
+    return max(failed) if failed else 0
+
+
 def cmd_up(args) -> int:
     _quiet_framework_logging()
     _warn_on_registry_drift(args)
@@ -8196,6 +8302,11 @@ def cmd_up(args) -> int:
         # diagnostic has records to compare against if e2e PCC fails.
         # Idempotent; sets a deterministic per-model path.
         _auto_enable_tt_probe(_model_id)
+    # A composite has no single root model to bring up; fan out over its parts and
+    # run this same pipeline for each. Returns None for ordinary models.
+    _fanned = _fan_out_composite(args)
+    if _fanned is not None:
+        return _fanned
     if not getattr(args, "isolation", "none") == "worktree":
         return _cmd_up_core(args)
     return _cmd_up_isolated(args)
@@ -8688,7 +8799,9 @@ def _cmd_up_core_impl(args) -> int:
                     model_type=_model_type,
                     pipeline_tag=_pipeline_tag,
                 )
-                _generic_backend_picked = _backend is not None and getattr(_backend, "routing_mode", "") == "generic"
+                from .family_backends import is_generic as _is_generic
+
+                _generic_backend_picked = _backend is not None and _is_generic(_backend)
         except Exception as exc:
             _generic_pick_error = f"{type(exc).__name__}: {exc}"
             _generic_backend_picked = False
@@ -9388,7 +9501,22 @@ def _cmd_up_core_impl(args) -> int:
     total_components = sum(counts.values())
 
     if total_components == 0:
-        print("  VERDICT: UNKNOWN — no bringup_status.json (scaffold did not produce a plan).")
+        # Distinguish "no plan file" from "a plan with nothing in it". Reporting a
+        # missing file when the file exists and simply declares zero components
+        # names the wrong cause and sends the reader looking for the wrong thing.
+        from .bringup_loop import find_demo_dir as _find_demo_dir
+
+        _demo_dir = _find_demo_dir(MODEL)
+        _status_path = (_demo_dir / "bringup_status.json") if _demo_dir else None
+        if _status_path is not None and _status_path.is_file():
+            print(
+                f"  VERDICT: UNKNOWN — {_status_path} exists but declares no components "
+                f"(scaffold produced an empty plan; discovery found nothing to bring up)."
+            )
+        elif _demo_dir is not None:
+            print(f"  VERDICT: UNKNOWN — no bringup_status.json under {_demo_dir} (scaffold produced no plan).")
+        else:
+            print("  VERDICT: UNKNOWN — no demo folder for this model yet (scaffold has not run).")
         print()
         print(
             f"  Component classification: {counts.get('REUSE',0)} REUSE, "

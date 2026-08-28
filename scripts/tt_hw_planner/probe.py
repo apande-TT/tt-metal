@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import re
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Sequence
 
 _HF_ID_PART = r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}"
 _HF_ID_PATTERN = re.compile(rf"^{_HF_ID_PART}(/{_HF_ID_PART})?$")
@@ -541,6 +542,10 @@ class ModelProbe:
 
     is_composite: bool = False
     submodels: List[str] = field(default_factory=list)
+    # Composite repos have no root model_type. The diffusers recipe
+    # (model_index.json "_class_name", e.g. "Flux2KleinPipeline") is the only
+    # architecture identity they expose; backend routing uses it as a surrogate.
+    pipeline_class: Optional[str] = None
 
 
 def _classify_category(pipeline_tag: Optional[str], tags: List[str], library: Optional[str]) -> str:
@@ -767,11 +772,299 @@ def _maybe_fetch_config(model_id: str) -> Optional[dict]:
     try:
         from huggingface_hub import hf_hub_download
 
-        path = hf_hub_download(safe_id, "config.json")
+        path = hf_hub_download(safe_id, ROOT_CONFIG_FILE)
         with open(path) as f:
             return json.load(f)
     except Exception:
+        pass
+
+    # Last resort: read the config document directly. AutoConfig only understands
+    # transformers-style configs (keyed by ``model_type``); a component of a
+    # composite describes itself with ``_class_name`` instead, and a local model
+    # directory is not downloadable at all. Both are still perfectly good configs.
+    return fetch_repo_json(safe_id, ROOT_CONFIG_FILE)
+
+
+COMPOSITE_INDEX_FILE = "model_index.json"
+ROOT_CONFIG_FILE = "config.json"
+
+
+def fetch_repo_json(model_id: str, filename: str) -> Optional[dict]:
+    """Download and parse one JSON file from a model repo (or read it from a local
+    model dir). Returns ``None`` on any failure -- missing file, no access, bad
+    JSON. Shared by every caller that needs a raw repo-side JSON document."""
+    if isinstance(model_id, str) and os.path.isdir(model_id):
+        safe_id = model_id
+    else:
+        try:
+            safe_id = _validate_hf_id(model_id)
+        except Exception:
+            return None
+    if os.path.isdir(safe_id):
+        path = os.path.join(safe_id, filename)
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+            return doc if isinstance(doc, dict) else None
+        except Exception:
+            return None
+    try:
+        from huggingface_hub import hf_hub_download
+
+        with open(hf_hub_download(safe_id, filename)) as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else None
+    except Exception:
         return None
+
+
+def _repo_access_status(model_id: str, filename: str) -> str:
+    """Why fetching ``filename`` from ``model_id`` fails: ``"ok"``, ``"denied"``
+    (gated / private / missing repo -- an access problem), ``"absent"`` (repo is
+    readable, that file simply is not in it), or ``"unknown"``.
+
+    Classified from the hub client's own exception types, not from message text,
+    so the two cases that need OPPOSITE advice are never confused: a gated repo
+    needs credentials, a readable repo missing a config needs a different model.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception:
+        return "unknown"
+    try:
+        hf_hub_download(_validate_hf_id(model_id), filename)
+        return "ok"
+    except Exception as exc:
+        try:
+            from huggingface_hub import errors as _hf_errors
+        except Exception:
+            return "unknown"
+        denied = tuple(
+            c
+            for c in (
+                getattr(_hf_errors, "GatedRepoError", None),
+                getattr(_hf_errors, "RepositoryNotFoundError", None),
+                getattr(_hf_errors, "LocalTokenNotFoundError", None),
+            )
+            if isinstance(c, type)
+        )
+        absent = tuple(
+            c
+            for c in (
+                getattr(_hf_errors, "EntryNotFoundError", None),
+                getattr(_hf_errors, "RemoteEntryNotFoundError", None),
+            )
+            if isinstance(c, type)
+        )
+        if denied and isinstance(exc, denied):
+            return "denied"
+        if absent and isinstance(exc, absent):
+            return "absent"
+        return "unknown"
+
+
+class _FileEntry:
+    """Minimal stand-in for a hub sibling so a local directory can be fed to the
+    same composite rule the hub path uses."""
+
+    __slots__ = ("rfilename",)
+
+    def __init__(self, rfilename: str) -> None:
+        self.rfilename = rfilename
+
+
+def _local_siblings(model_dir: str, max_depth: int = 2) -> List[_FileEntry]:
+    """Repo-relative file list for a local directory, shaped like hub siblings."""
+    out: List[_FileEntry] = []
+    base = os.path.abspath(model_dir)
+    for root, dirs, files in os.walk(base):
+        rel_root = os.path.relpath(root, base)
+        depth = 0 if rel_root == "." else rel_root.count(os.sep) + 1
+        if depth >= max_depth:
+            dirs[:] = []
+        for fname in files:
+            rel = fname if rel_root == "." else f"{rel_root}/{fname}"
+            out.append(_FileEntry(rel.replace(os.sep, "/")))
+    return out
+
+
+def detect_composite_repo(model_id: str) -> Tuple[bool, List[str]]:
+    """``(is_composite, component_names)`` from the file listing alone.
+
+    :func:`probe_model` is expensive -- it may consult an agent to classify the
+    model -- so callers that only need to know whether a target is a container of
+    models use this instead. It applies the SAME rule as the full probe
+    (:func:`_detect_composite`), so the two can never disagree, and reads only the
+    file list plus the root config document. Never raises."""
+    if not isinstance(model_id, str) or not model_id:
+        return (False, [])
+    # A composite directory has no root config.json, which is exactly what
+    # _is_local_model_dir() requires -- so "is it on disk" is the local test here.
+    local = os.path.isdir(model_id)
+    if not local:
+        try:
+            model_id = _validate_hf_id(model_id)
+        except Exception:
+            return (False, [])
+    cfg = fetch_repo_json(model_id, ROOT_CONFIG_FILE)
+    try:
+        if local:
+            siblings: List[_FileEntry] = _local_siblings(model_id)
+        else:
+            from huggingface_hub import HfApi
+
+            siblings = HfApi().model_info(model_id).siblings or []
+    except Exception:
+        return (False, [])
+    try:
+        return _detect_composite(siblings, cfg)
+    except Exception:
+        return (False, [])
+
+
+def _surrogate_pipeline_class(cfg: Optional[dict]) -> Optional[str]:
+    """Routing surrogate for a config that has no ``model_type``.
+
+    A composite's component describes itself with ``_class_name`` instead. That is
+    the only architecture identity it publishes, so routing uses it the same way
+    the composite root uses ``model_index.json``'s. Whatever the class is called is
+    read from the document -- never assumed."""
+    if not isinstance(cfg, dict) or cfg.get("model_type"):
+        return None
+    cls = cfg.get("_class_name")
+    return cls if isinstance(cls, str) and cls else None
+
+
+def _component_alias(parent_id: str, name: str, target: str) -> str:
+    """A stable, uniquely-named path pointing at a component directory.
+
+    Downstream naming (demo folder, overlays, worktrees) derives from the target's
+    basename. A component directory is named after its role inside the repo, so
+    two different models both contribute a part with the same role and would land
+    in the same demo folder. Aliasing under ``<parent>__<part>`` keeps the parent's
+    identity attached without copying any weights.
+
+    Falls back to the real directory if the alias cannot be created, so a
+    read-only or unusual filesystem degrades to today's behaviour."""
+    from .scaffold_demo_folder import _slug
+
+    base = os.environ.get("TT_HW_PLANNER_COMPONENT_BASE") or os.path.join(
+        tempfile.gettempdir(), "tt_hw_planner_components"
+    )
+    # Single separator, deliberately: every downstream name (demo folder, overlay
+    # scope, worktree) is derived from this basename through _slug, which collapses
+    # any run of non-alphanumerics to one underscore. A doubled separator could
+    # therefore never survive, and the component ended up with two spellings --
+    # `<parent>__<part>` here and `<parent>_<part>` in the demo folder -- for the
+    # same thing. One separator means one name everywhere.
+    alias_name = f"{_slug(os.path.basename(parent_id.rstrip('/')))}_{_slug(name)}"
+    alias = os.path.join(base, alias_name)
+    try:
+        os.makedirs(base, exist_ok=True)
+        if os.path.islink(alias) or os.path.exists(alias):
+            if os.path.realpath(alias) == os.path.realpath(target):
+                return alias
+            os.unlink(alias)
+        os.symlink(os.path.abspath(target), alias)
+        return alias
+    except OSError:
+        return target
+
+
+def component_targets(model_id: str, submodels: Sequence[str], *, with_weights: bool = False) -> List[Tuple[str, str]]:
+    """``[(component_name, local_path)]`` for a composite's parts.
+
+    Each part of a composite repo is an ordinary single-root model: its own
+    directory with its own config and weights. Materialising nothing, this returns
+    paths the rest of the tool can treat like any local model directory, so a
+    composite is brought up by running the existing per-model pipeline once per
+    part instead of needing a parallel implementation.
+
+    Names come from the caller (discovered from the repo listing); none are
+    assumed here. Parts without a readable config are skipped rather than guessed
+    at. Returns ``[]`` when nothing can be resolved.
+
+    ``with_weights=False`` (the default) fetches only each part's config, which is
+    all that is needed to enumerate and route -- enumerating must not drag down
+    tens of GB of weights. Pass ``with_weights=True`` for the part about to be
+    brought up, so its tensors are materialised just before they are needed."""
+    names = [n for n in (submodels or []) if n and not n.startswith((".", "/"))]
+    if not names:
+        return []
+
+    root: Optional[str] = model_id if os.path.isdir(model_id) else None
+    if root is None:
+        try:
+            from huggingface_hub import snapshot_download
+
+            patterns = [f"{n}/*" for n in names] if with_weights else [f"{n}/{ROOT_CONFIG_FILE}" for n in names]
+            root = snapshot_download(_validate_hf_id(model_id), allow_patterns=patterns)
+        except Exception:
+            return []
+
+    out: List[Tuple[str, str]] = []
+    for name in names:
+        path = os.path.join(root, name)
+        if _is_local_model_dir(path):
+            out.append((name, _component_alias(model_id, name, path)))
+    return out
+
+
+def missing_config_reason(probe: "ModelProbe", model_id: str) -> str:
+    """Why this repo has no usable root config, phrased from evidence.
+
+    Three different situations produce an empty ``raw_config`` and they need
+    different answers:
+
+    * the repo could not be READ at all (gated / private / typo) -> an access
+      problem, and the only case where credentials are the answer;
+    * the repo was read and is a COMPOSITE -> it has no root config by design,
+      its architecture lives in the per-component subfolders;
+    * the repo was read but exposes no architecture identity at all (no root
+      config, no composite index, no component configs) -> it is not a standalone
+      model: an adapter/LoRA, a single-file checkpoint, or a weights-only repo.
+
+    Blaming credentials for the last two is what sent a user chasing HF_TOKEN for
+    a public repo. Readability is inferred from whether the file listing produced
+    anything, never assumed."""
+    if getattr(probe, "is_composite", False):
+        subs = ", ".join(getattr(probe, "submodels", []) or []) or COMPOSITE_INDEX_FILE
+        return (
+            f"{model_id} is a composite / multi-component repo [{subs}] -- it has no root "
+            f"{ROOT_CONFIG_FILE} by design; each component carries its own. Bring up per component."
+        )
+    # Metadata is published for gated repos, so a populated probe proves nothing
+    # about whether the FILES can be read. Ask the hub directly and let its own
+    # error type decide, because "denied" and "absent" need opposite advice.
+    status = _repo_access_status(model_id, ROOT_CONFIG_FILE)
+    if status == "denied":
+        return (
+            f"{model_id} cannot be read: access to its files is denied (gated, private, or the repo "
+            f"does not exist). Accept the model's terms on its HuggingFace page, then set HF_TOKEN or "
+            f"run `huggingface-cli login`."
+        )
+    if status == "absent":
+        return (
+            f"{model_id} is readable but exposes no architecture identity: no root {ROOT_CONFIG_FILE}, "
+            f"no {COMPOSITE_INDEX_FILE}, and no per-component configs. It is most likely not a standalone "
+            f"model (an adapter/LoRA, a single-file checkpoint, or a weights-only repo) -- point the tool "
+            f"at the base model it adapts."
+        )
+    return (
+        f"no usable {ROOT_CONFIG_FILE} could be loaded for {model_id}, and the reason could not be "
+        f"determined (network or hub error). Re-run; if it persists, check access and that the repo "
+        f"publishes a {ROOT_CONFIG_FILE} or {COMPOSITE_INDEX_FILE}."
+    )
+
+
+def _maybe_fetch_pipeline_class(model_id: str) -> Optional[str]:
+    """Read ``model_index.json["_class_name"]`` -- the pipeline class (e.g.
+    ``Flux2KleinPipeline``). For a composite repo this is the only architecture
+    identity on offer, since there is no root ``model_type``; the backend router
+    uses it as a surrogate so routing stays deterministic instead of falling
+    through to the LLM sibling ranker."""
+    cls = (fetch_repo_json(model_id, COMPOSITE_INDEX_FILE) or {}).get("_class_name")
+    return cls if isinstance(cls, str) and cls else None
 
 
 def _read_model_card_frontmatter(model_dir: str) -> dict:
@@ -921,6 +1214,7 @@ def _probe_local_model(model_id: str) -> ModelProbe:
         bytes_per_param_on_disk=bytes_per_param,
         raw_config=cfg,
     )
+    probe.pipeline_class = _surrogate_pipeline_class(cfg)
     if _is_low_confidence_category(pipeline_tag, model_type_category):
         probe.flags.append(
             f"LOW-CONFIDENCE category {category!r}: inferred from the AMBIGUOUS pipeline_tag "
@@ -1013,6 +1307,10 @@ def probe_model(model_id: str) -> ModelProbe:
     # therefore run BEFORE the config-failure early return, or diffusers-style
     # repos (model_index.json + per-subfolder configs) are never detected.
     probe.is_composite, probe.submodels = _detect_composite(info.siblings, cfg)
+    if probe.is_composite:
+        probe.pipeline_class = _maybe_fetch_pipeline_class(model_id)
+    else:
+        probe.pipeline_class = _surrogate_pipeline_class(cfg)
     if cfg is None:
         probe.config_status = "failed"
         return probe

@@ -208,10 +208,16 @@ def _extract_path(raw: Optional[str]) -> Optional[str]:
 def _registered_paths() -> List[tuple]:
     """Every (where, path) the deterministic registries point at."""
     from .compatibility import BUILDING_BLOCKS
-    from .family_backends import all_backends
+    from .family_backends import all_backends, is_generic
 
     out: List[tuple] = []
     for b in all_backends():
+        # A `generic` backend has no template to copy: it WRITES a folder per
+        # model (models/demos/<family>/<model>/) rather than reading one. Its
+        # demo_path names an output location, so "not present yet" is normal and
+        # reporting it as drift is noise that buries the real cases.
+        if is_generic(b):
+            continue
         for fld in ("demo_path", "smoke_test_entry"):
             p = _extract_path(getattr(b, fld, None))
             if p:
@@ -231,6 +237,91 @@ def _registered_paths() -> List[tuple]:
     except Exception:
         pass
     return out
+
+
+def prunable_backends() -> List[tuple]:
+    """``[(name, demo_path)]`` for registry entries that cannot ever work.
+
+    A ``template`` backend copies its demo folder; if that folder is absent the
+    entry can only produce an empty bring-up, so it is dead weight. ``generic``
+    backends are excluded -- they have no source folder by design.
+
+    Reported rather than deleted: an entry may be deliberately registered ahead of
+    the demo landing (a test can pin one, as XTTS-v2 does), and only a human knows
+    which. Routing already skips these, so a stale entry is inert either way."""
+    import os
+
+    from .family_backends import all_backends, is_generic
+
+    out: List[tuple] = []
+    for b in all_backends():
+        if is_generic(b):
+            continue
+        path = _extract_path(getattr(b, "demo_path", None))
+        if path and not os.path.exists(path):
+            out.append((b.name, path))
+    return out
+
+
+def format_prunable(entries: List[tuple]) -> str:
+    """Human-readable prune report; empty string when the registry is clean."""
+    if not entries:
+        return ""
+    lines = [
+        f"  registry: {len(entries)} template backend(s) point at a folder that is not in this checkout.",
+        "  These can never template anything; routing skips them. Delete the entry, repoint it,",
+        "  or land the demo:",
+    ]
+    for name, path in entries:
+        lines.append(f"    - {name}  ->  {path}")
+    return "\n".join(lines)
+
+
+_PRUNE_ENV = "TT_HW_PLANNER_PRUNE_REGISTRY"
+
+
+def prune_registry(*, apply: Optional[bool] = None) -> Tuple[List[tuple], bool]:
+    """Drop registry entries that can never work. Returns ``(entries, applied)``.
+
+    Called from the registry sync so every run evaluates the registry against the
+    tree it is actually running on, and DELETES what cannot work. A template
+    backend whose demo folder is absent can only ever produce an empty bring-up;
+    leaving it listed means the next reader has to rediscover that. Generic
+    backends are never touched -- they have no template by design.
+
+    Deletion rewrites ``family_backends.py``, so the run prints what it removed and
+    the change shows up in ``git status`` for review before it is committed. Set
+    ``$TT_HW_PLANNER_PRUNE_REGISTRY=0`` to report without deleting (useful when
+    registering an entry ahead of its demo landing).
+
+    Never raises: registry maintenance may not break a bring-up."""
+    entries = prunable_backends()
+    if apply is None:
+        apply = os.environ.get(_PRUNE_ENV, "1") not in ("0", "", "false", "False")
+    if not entries or not apply:
+        return entries, False
+    try:
+        removed = _delete_backend_entries({name for name, _ in entries})
+        return entries, bool(removed)
+    except Exception:
+        return entries, False
+
+
+def _delete_backend_entries(names: set) -> List[str]:
+    """Remove the named ``FamilyBackend(...)`` blocks from the registry source."""
+    import re as _re
+
+    path = Path(__file__).resolve().parent / "family_backends.py"
+    src = path.read_text()
+    removed: List[str] = []
+    for block in _re.findall(r"    FamilyBackend\(\n(?:.*?\n)*?    \),\n", src):
+        m = _re.search(r"name=['\"]([^'\"]+)['\"]", block)
+        if m and m.group(1) in names:
+            src = src.replace(block, "", 1)
+            removed.append(m.group(1))
+    if removed:
+        path.write_text(src)
+    return removed
 
 
 def check_registry_drift(repo_root, include_unmapped: bool = True, unmapped_root=None) -> List[DriftIssue]:
@@ -783,6 +874,63 @@ def refresh_registry(tree_root, sha: str = "LOCAL") -> dict:
     except Exception:
         pass
     return overlay
+
+
+def _onboarded_path() -> Path:
+    return _cache_root() / "onboarded_backends.json"
+
+
+def load_onboarded() -> dict:
+    """Backends auto-onboarded during a run. ``{}`` if none/unreadable.
+
+    Kept separate from ``registry_overlay.json`` because that file is regenerated
+    wholesale by :func:`refresh_registry` on every sync -- an entry written into it
+    would vanish on the next run. This store persists, is never regenerated from
+    the tree, and lives in the cache rather than in tracked source, so a wrong
+    entry costs a cache file instead of a commit."""
+    try:
+        doc = json.loads(_onboarded_path().read_text())
+        return doc if isinstance(doc, dict) else {}
+    except Exception:
+        return {}
+
+
+def add_onboarded(entry: dict) -> bool:
+    """Append one backend entry to the onboarded store. True if it was added.
+
+    Idempotent on ``name``: re-onboarding the same backend replaces its entry
+    rather than accumulating duplicates. Never raises -- failing to record an
+    onboarded backend must not end a bring-up."""
+    name = str((entry or {}).get("name") or "").strip()
+    if not name:
+        return False
+    try:
+        doc = load_onboarded()
+        families = [f for f in (doc.get("families") or []) if isinstance(f, dict)]
+        families = [f for f in families if str(f.get("name") or "").strip() != name]
+        families.append(dict(entry))
+        doc["families"] = families
+        p = _onboarded_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(doc, indent=2, sort_keys=True))
+        return True
+    except Exception:
+        return False
+
+
+def drop_onboarded(name: str) -> bool:
+    """Remove one onboarded backend by name. True if something was removed."""
+    try:
+        doc = load_onboarded()
+        families = [f for f in (doc.get("families") or []) if isinstance(f, dict)]
+        kept = [f for f in families if str(f.get("name") or "").strip() != str(name).strip()]
+        if len(kept) == len(families):
+            return False
+        doc["families"] = kept
+        _onboarded_path().write_text(json.dumps(doc, indent=2, sort_keys=True))
+        return True
+    except Exception:
+        return False
 
 
 def load_generated_overlay() -> dict:

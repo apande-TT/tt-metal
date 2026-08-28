@@ -146,10 +146,22 @@ def test_the_parser_records_the_count_for_whatever_stage_stated_it():
     code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
     assert "stage_isl[_nm] = _nv" in code, "the count is still keyed by a hardcoded stage name"
     assert 'stage_isl["prefill"] = _iv' not in code, "the hardcoded writer is back"
-    # The literal moved into a named constant -- it is the conventional name for the prompt-consuming
-    # stage, used only as the fallback for one that states no <stage>_trace_items() of its own.
-    assert "stage_isl_per_request.setdefault(_LEGACY_PROMPT_KEY" in code, "the legacy marker no longer feeds it"
-    assert '_LEGACY_PROMPT_KEY = "prefill"' in code, "the convention is no longer stated in one place"
+    # BEHAVIOUR CHANGE: this used to REQUIRE the legacy marker to be filed under _LEGACY_PROMPT_KEY,
+    # as the fallback for a stage stating no count of its own. That made a workload fact reachable
+    # through one typed name -- one stage per model could be sized, and only if it was called that,
+    # while every other stage fell back to a single item. summary._stage_items_observed now reads the
+    # count off the matmuls each stage actually ran, so no stage needs to be named to be sized.
+    assert (
+        "stage_isl_per_request.setdefault(_LEGACY_PROMPT_KEY" not in code
+    ), "a stage is being sized by a typed name again"
+    _sum = (_PA / "cc_optimize" / "summary.py").read_text()
+    assert "def _stage_items_observed(" in _sum, "nothing derives the count the removed writer supplied"
+    # The constant survives for ONE reason: reading a doc written before `prompt_tokens` existed. That
+    # is an on-disk schema key, not a claim about this model's stages, and it cannot mis-price -- a
+    # doc without it simply yields 0.
+    assert '_LEGACY_PROMPT_KEY = "prefill"' in code, "the on-disk compat key is no longer named once"
+    _reads = [ln for ln in code.splitlines() if "_LEGACY_PROMPT_KEY" in ln and "=" not in ln.split("_LEGACY")[0]]
+    assert all("_doc.get" in ln or "def " in ln or "_LEGACY_PROMPT_KEY =" in ln for ln in _reads), _reads
 
 
 def test_a_stated_count_is_a_total_and_is_not_multiplied_by_the_batch(monkeypatch):
@@ -488,3 +500,252 @@ def test_an_encoder_lever_is_reachable_from_an_encoder_stage():
     assert "mlp-program-config" in seen["encode"], "the ViT lever is still invisible to an encoder"
     # and the genuinely stage-specific ones stay narrow
     assert "decode-host-comm" in seen["decode"] and "decode-host-comm" not in seen["encode"]
+
+
+# ------------------------------------------------------------- the seam must reach its PRODUCERS
+
+
+def test_the_generator_asks_for_every_seam_the_engine_binds():
+    """THE HALF-BUILT FIX, and the test that would have caught it.
+
+    `_trace_items` was added in August to the adapter, the marker, the parser and the renderer --
+    every CONSUMER -- and to nothing that makes a model. The emit-e2e prompt lists the seams a
+    pipeline must expose, and it was not updated, so no model has ever emitted the marker: the
+    reader worked perfectly on a value nobody ever sent. Voxtral's encoder was therefore priced at
+    one item instead of 1500 and reported memory-bound while being compute-bound, and the suite
+    stayed green because the unit test constructs `_Stage(..., items=1500)` by hand -- proving the
+    consumer, never the chain.
+
+    This asserts the two ends agree, which is the only thing that fails when a seam is half-added.
+    """
+    from agent import stage_seams
+
+    prompt = (_PA.parent.parent.parent / "scripts" / "tt_hw_planner" / "commands" / "emit_e2e.py").read_text()
+    missing = [s for s in stage_seams.ALL if s not in prompt]
+    assert not missing, "emit-e2e never tells a model to write %s, so no model will ever have it" % missing
+
+
+def test_the_contract_asks_for_every_seam_the_engine_binds():
+    """The other producer-side end: a model already emitted can only learn of a new seam here."""
+    from agent import stage_seams
+
+    src = (_PA / "agent" / "model_contract.py").read_text()
+    missing = [s for s in stage_seams.ALL if s not in src and ("_seams" not in src)]
+    assert not missing, "the contract never asks for %s, so an existing model is never told" % missing
+
+
+def test_an_unstated_item_count_is_reported_and_never_blocks(tmp_path):
+    """Reported so a placeholder ceiling cannot pass for a measurement; porting so the direct path
+    -- hand-written models that never went through emit-e2e -- is never refused for it."""
+    from agent.model_contract import check
+
+    root = tmp_path / "m"
+    (root / "tt").mkdir(parents=True)
+    # The stage name is the MODEL'S, read back from what it declares; nothing here is a known name.
+    (root / "tt" / "pipeline.py").write_text(
+        "PIPELINE_STAGES = ['whatever_this_model_calls_it']\n"
+        "def build_pipeline(device, model=None, layers=None, **kwargs): return object()\n"
+        "def whatever_this_model_calls_it_trace_setup(i): ...\n"
+        "def whatever_this_model_calls_it_trace_step(): ...\n"
+    )
+    found = [f for f in check(root) if f.clause == "stage-items"]
+    assert found, "an unstated item count is silent again"
+    assert "whatever_this_model_calls_it" in found[0].detail, "the clause did not use the model's own name"
+    assert not any(f.blocking for f in found), "a missing optional seam must not refuse the direct path"
+
+
+# ------------------------------------------------- the item count comes off what the stage RAN
+
+
+def _prof(**stages):
+    return {"stage_buckets": {k: [{"top_ops": v}] for k, v in stages.items()}}
+
+
+def test_a_stage_states_its_item_count_through_the_matmuls_it_ran():
+    """THE COUNT WITHOUT A NAME. A stage that states no <stage>_trace_items() was priced at ONE item
+    unless a workload marker happened to be filed under its name -- so exactly one stage per model
+    could be sized, and only if it was called the name the tool typed. A matmul's M is the rows the
+    stage pushed through, which is the same quantity the seam states."""
+    from cc_optimize.summary import _stage_items_observed as obs
+
+    p = _prof(
+        zzz_tower=[{"shape": "1500x1280 @ 1280x5120", "count": 32}],
+        zzz_prompt=[{"shape": "4096x3072 @ 3072x8192", "count": 30}],
+    )
+    assert obs("zzz_tower", p) == 1500
+    assert obs("zzz_prompt", p) == 4096
+    # nothing typed: stages named anything at all are sized the same way
+    assert obs("zzz_absent", p) == 0
+
+
+def test_the_padded_vocab_head_does_not_set_the_item_count():
+    """THE REGRESSION THE FLOP RANKING WOULD HAVE SHIPPED. Ranking by FLOPs picks the widest single
+    matmul, and on a decode step that is the vocab head -- running at a TILE-PADDED 32 rows for a
+    batch of 8. The stage would have read as retiring 32 items and been labelled a request-rate
+    stage instead of one token per user. The modal row count carries the true figure."""
+    from cc_optimize.summary import _stage_items_observed as obs
+
+    p = _prof(
+        zzz_step=[
+            {"shape": "8x3072 @ 3072x8192", "count": 30},
+            {"shape": "32x3072 @ 3072x131072", "count": 1},  # the padded head, widest by far
+        ]
+    )
+    assert obs("zzz_step", p) == 8
+
+
+def test_an_unparseable_stage_gets_no_count_rather_than_a_wrong_one():
+    """A wrong divisor is worse than a missing one -- the rule stage_roots already follows when two
+    sections have equal depth. 0 means the caller keeps its own fallback."""
+    from cc_optimize.summary import _stage_items_observed as obs
+
+    assert obs("zzz", _prof(zzz=[{"shape": "?", "count": 3}])) == 0
+    assert obs("zzz", None) == 0
+    assert obs("zzz", {}) == 0
+    assert obs(None, _prof(zzz=[{"shape": "8x8 @ 8x8", "count": 1}])) == 0
+
+
+def test_a_tile_padded_row_count_is_not_the_item_count():
+    """WHAT TRACY ACTUALLY WRITES. The shape fingerprint carries the PADDED dim -- _op_shape builds it
+    from _pad(), which keeps the kernel's computed size and drops the logical one. A step retiring one
+    row per user pads 8 rows to a 32-row tile, so EVERY matmul in it reads 32 and the stage would look
+    like it retires 32 items: not one per user, so not a per-user rate. The logical count rides beside
+    the fingerprint as `rows`, and that is what an item count means."""
+    from cc_optimize.summary import _stage_items_observed as obs
+
+    padded = _prof(
+        zzz_step=[
+            {"shape": "32x3072 @ 3072x8192", "rows": 8, "count": 30},
+            {"shape": "32x3072 @ 3072x131072", "rows": 8, "count": 1},
+        ]
+    )
+    assert obs("zzz_step", padded) == 8, "the padded tile height became the item count"
+    # a tower whose rows are not a tile multiple: 1500 asked for, 1504 computed
+    assert obs("zzz_tower", _prof(zzz_tower=[{"shape": "1504x1280 @ 1280x5120", "rows": 1500, "count": 32}])) == 1500
+    # a profile written before `rows` existed still parses, from the fingerprint
+    assert obs("zzz_old", _prof(zzz_old=[{"shape": "8x3072 @ 3072x8192", "count": 30}])) == 8
+
+
+def test_the_logical_dim_is_carried_out_of_the_raw_row():
+    """_pad and _logical split '32[8]' the two ways it is needed: the kernel's size for bytes and the
+    fingerprint, the asked-for size for counting items."""
+    from agent.tracy_tool import _logical, _pad
+
+    assert (_pad("32[8]"), _logical("32[8]")) == ("32", "8")
+    assert (_pad("4096"), _logical("4096")) == ("4096", "4096")
+    assert _logical("") == "?" and _logical(None) == "?"
+
+
+def test_the_logical_rows_survive_the_whole_chain_from_a_raw_row(tmp_path):
+    """CSV -> build_buckets -> top_ops -> item count, on the shape tracy actually records.
+
+    The unit tests above hand _stage_items_observed a dict someone typed. This builds the buckets the
+    way a capture does, from a raw row whose left input reads '32[8]' -- 8 rows padded to a 32-row
+    tile, which is what a step retiring one row per user looks like on device. Nothing but the real
+    path would have caught that the fingerprint carries the padded half.
+    """
+    import csv
+
+    from agent.tracy_tool import build_buckets
+    from cc_optimize.summary import _stage_items_observed as obs
+
+    ops = [(i, "MatmulDeviceOperation", 100.0, "3072", "8192") for i in range(1, 6)]
+    ops.append((6, "MatmulDeviceOperation", 900.0, "3072", "131072"))  # the wide, padded head
+    rep, raw = tmp_path / "report.csv", tmp_path / "raw.csv"
+    with open(rep, "w", newline="") as f:
+        w = csv.DictWriter(
+            f, fieldnames=["OP Code", "Global Call Count", "Device Time", "Cores", "Bound", "Op-to-Op Gap"]
+        )
+        w.writeheader()
+        for gcc, op, us, _k, _n in ops:
+            w.writerow(
+                {
+                    "OP Code": op,
+                    "Global Call Count": gcc,
+                    "Device Time": us,
+                    "Cores": 64,
+                    "Bound": "",
+                    "Op-to-Op Gap": "",
+                }
+            )
+    with open(raw, "w", newline="") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "OP CODE",
+                "GLOBAL CALL COUNT",
+                "INPUT_0_Y_PAD[LOGICAL]",
+                "INPUT_0_X_PAD[LOGICAL]",
+                "INPUT_1_Y_PAD[LOGICAL]",
+                "INPUT_1_X_PAD[LOGICAL]",
+                "MATH FIDELITY",
+                "INPUT_0_MEMORY",
+                "ATTRIBUTES",
+                "INPUT_0_LAYOUT",
+                "OUTPUT_0_LAYOUT",
+            ],
+        )
+        w.writeheader()
+        for gcc, op, _us, k, n in ops:
+            w.writerow(
+                {
+                    "OP CODE": op,
+                    "GLOBAL CALL COUNT": gcc,
+                    "INPUT_0_Y_PAD[LOGICAL]": "32[8]",  # the tile, and what was asked for
+                    "INPUT_0_X_PAD[LOGICAL]": k,
+                    "INPUT_1_Y_PAD[LOGICAL]": k,
+                    "INPUT_1_X_PAD[LOGICAL]": n,
+                    "MATH FIDELITY": "HiFi4",
+                    "INPUT_0_MEMORY": "DRAM",
+                    "ATTRIBUTES": "",
+                    "INPUT_0_LAYOUT": "TILE",
+                    "OUTPUT_0_LAYOUT": "TILE",
+                }
+            )
+    bk = build_buckets(rep, raw, 130)
+    tops = [t for b in bk for t in (b.get("top_ops") or [])]
+    assert tops, "no ops survived bucketing"
+    assert all(t.get("shape", "").startswith("32x") for t in tops), "the fingerprint lost the padded dim"
+    assert all(int(t.get("rows") or 0) == 8 for t in tops), [t.get("rows") for t in tops]
+    assert obs("zzz", {"stage_buckets": {"zzz": bk}}) == 8, "the padded tile reached the item count"
+
+
+def test_only_matmuls_set_the_item_count():
+    """`rows` is recorded for EVERY op, matmul or not, so preferring it before the matmul test counted
+    every elementwise and movement op in the stage -- and those outnumber the matmuls many times over.
+    The shape parse IS the matmul test, so it has to come first; `rows` only supplies the value."""
+    from cc_optimize.summary import _stage_items_observed as obs
+
+    p = _prof(
+        zzz=[
+            {"shape": "1504x1280 @ 1280x5120", "rows": 1500, "count": 32},  # the arithmetic
+            {"shape": "(1, 375, 5120)", "rows": 375, "count": 400},  # datamove: no matmul fingerprint
+            {"shape": "?", "rows": 64, "count": 900},  # eltwise: no shape at all
+        ]
+    )
+    assert obs("zzz", p) == 1500, "a non-matmul carried the mode"
+
+
+def test_a_tie_errs_toward_the_larger_count():
+    """The two directions are not equally bad. Under-counting shrinks the compute roof and reports a
+    compute-bound stage as memory-bound -- the failure this path exists to fix."""
+    from cc_optimize.summary import _stage_items_observed as obs
+
+    p = _prof(
+        zzz=[
+            {"shape": "1504x1280 @ 1280x5120", "rows": 1500, "count": 10},
+            {"shape": "32x1280 @ 1280x5120", "rows": 8, "count": 10},
+        ]
+    )
+    assert obs("zzz", p) == 1500
+
+
+def test_a_field_this_did_not_write_cannot_break_the_roofline():
+    """_stage_units feeds the compute roof; an int() on a foreign profile's value must not raise
+    through it."""
+    from cc_optimize.summary import _stage_items_observed as obs
+
+    for _v in ("abc", None, -3, 8.0):
+        p = _prof(zzz=[{"shape": "1504x8 @ 8x8", "rows": _v, "count": 5}])
+        obs("zzz", p)  # must not raise
+    assert obs("zzz", _prof(zzz=[{"shape": "1504x8 @ 8x8", "rows": "abc", "count": 5}])) == 1504

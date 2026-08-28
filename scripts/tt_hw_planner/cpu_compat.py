@@ -32,6 +32,10 @@ from typing import List
 
 _MARKER = "_TT_CPU_COMPAT"
 
+# How many entries a dict must share with the real packages_distributions() mapping
+# before it is accepted as a copy of it. Shape alone is ambiguous.
+_SNAPSHOT_MIN_AGREEMENT = 5
+
 _ACCEL_PACKAGES = frozenset(
     {
         "mamba_ssm",
@@ -255,6 +259,94 @@ def _neutralize_cuda_stream_apis() -> bool:
     return patched
 
 
+def _stubbed_package_names() -> List[str]:
+    """Every accelerator package currently served by one of our stand-ins."""
+    return sorted(
+        name
+        for name in _ACCEL_PACKAGES
+        if getattr(sys.modules.get(name), _MARKER, False) or not _genuinely_importable(name)
+    )
+
+
+def _publish_stub_distributions(names: List[str]) -> None:
+    """Make our stand-ins visible to ``importlib.metadata`` as well as to imports.
+
+    A stand-in makes ``importlib.util.find_spec(pkg)`` succeed, so availability
+    probes conclude the package is installed. Those probes then often look the
+    package up in distribution metadata -- which we had NOT faked -- and the
+    disagreement raises ``KeyError`` deep inside the framework, far from anything
+    the model did. (Seen as ``KeyError: 'flash_attn'`` while importing a diffusion
+    model: the framework asked whether flash-attention was available, our stub
+    said yes, then the distribution lookup for it failed.)
+
+    Claiming a package exists obliges us to describe it consistently, so publish a
+    synthetic distribution for every stand-in, and repair any mapping a framework
+    already snapshotted from ``packages_distributions()`` before we installed.
+    Both steps are driven by the stand-in list -- no package is named here."""
+    if not names:
+        return
+    import importlib.metadata as _md
+
+    stub_entries = {n: [n.replace("_", "-")] for n in names}
+
+    real = getattr(_md, "packages_distributions", None)
+    if callable(real) and not getattr(real, _MARKER, False):
+
+        def packages_distributions():  # type: ignore[misc]
+            mapping = dict(real())
+            for k, v in stub_entries.items():
+                mapping.setdefault(k, list(v))
+            return mapping
+
+        setattr(packages_distributions, _MARKER, True)
+        _md.packages_distributions = packages_distributions
+
+    # Repair snapshots already taken by imported frameworks, identified by CONTENT
+    # rather than by module/attribute name so this keeps working if a framework
+    # renames its constant.
+    #
+    # Matching on shape alone is not enough: a dict of str -> list[str] also
+    # describes a lazy-import structure (module -> [class names]), and injecting
+    # package names into one of those makes the framework look for classes that do
+    # not exist. So a candidate must AGREE with the real mapping on several
+    # entries before it is treated as a copy of it.
+    real_mapping = real() if callable(real) else {}
+    witness = [(k, v) for k, v in real_mapping.items() if isinstance(v, list) and v][:64]
+    if len(witness) < _SNAPSHOT_MIN_AGREEMENT:
+        return
+    probe_key = next(iter(stub_entries), None)
+    # Reading a framework's module attributes can emit its own deprecation warnings
+    # (a value in some __dict__ is itself a deprecated alias). Those have nothing to
+    # do with the caller, and were surfacing against this line twice per component.
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        _repair_snapshots(stub_entries, probe_key, witness)
+
+
+def _repair_snapshots(stub_entries: dict, probe_key, witness: list) -> None:
+    """Add the stand-in entries to every already-taken copy of the real mapping."""
+    for module in list(sys.modules.values()):
+        ns = getattr(module, "__dict__", None)
+        if not isinstance(ns, dict):
+            continue
+        for value in list(ns.values()):
+            # Plain dicts only. packages_distributions() returns one, while a
+            # framework's own registries are often mapping subclasses with their
+            # own lookup semantics -- probing those can raise or trigger imports.
+            if type(value) is not dict or probe_key in value:
+                continue
+            try:
+                agree = sum(1 for k, v in witness if value.get(k) == v)
+            except Exception:
+                continue
+            if agree < _SNAPSHOT_MIN_AGREEMENT:
+                continue
+            for k, v in stub_entries.items():
+                value.setdefault(k, list(v))
+
+
 def install_cpu_compat() -> List[str]:
     """Install pure-CPU stand-ins for any known accelerator package that is
     missing. Returns the list of package names a stand-in was installed for
@@ -269,8 +361,15 @@ def install_cpu_compat() -> List[str]:
             installed.extend(provider())
         except Exception as exc:
             print(f"  [cpu-compat] failed to install stand-in for {name!r}: {type(exc).__name__}: {exc}")
+    # Snapshot which packages are stand-ins BEFORE the hollow finder is armed:
+    # once it is on sys.meta_path, find_spec() succeeds for every accelerator
+    # package and they all look genuinely installed.
+    stub_names = _stubbed_package_names()
     if _ACCEL_HOLLOW_FINDER not in sys.meta_path:
         sys.meta_path.append(_ACCEL_HOLLOW_FINDER)
+    # The finder makes find_spec() succeed for those packages, so metadata must
+    # agree or availability probes break on the mismatch.
+    _publish_stub_distributions(stub_names)
     _neutralize_cuda_stream_apis()
     return installed
 

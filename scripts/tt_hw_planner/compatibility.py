@@ -289,8 +289,20 @@ def _is_mla(cfg: dict) -> bool:
 
 
 def _is_sliding(cfg: dict) -> bool:
+    """Does this model use sliding-window attention?
+
+    Answered from ``sliding_window`` alone -- the window size the config declares,
+    where absent or zero means no window. ``layer_types`` used to be ORed in, but it
+    is a list of each layer's attention kind: it is non-empty for any config that
+    enumerates its layers at all, so its presence said nothing about sliding and
+    made every modern config read as sliding-window. FLUX.2-klein's text_encoder
+    declares 36 full-attention layers and no window, and was still reported as
+    needing sliding-window attention -- which marked that building block PARTIAL and
+    blocked the bring-up. Deciding from the values inside ``layer_types`` would mean
+    matching attention-kind tokens; the window size answers the same question
+    without interpreting any token."""
     t = _text_config(cfg)
-    return bool(t.get("sliding_window")) or bool(t.get("layer_types"))
+    return bool(t.get("sliding_window"))
 
 
 def _is_ssm(cfg: dict) -> bool:
@@ -651,7 +663,14 @@ _OVERALL_FROM_STATUSES = [
         "shared library. Plan on lifting/adapting demo code.",
     ),
     (
-        lambda _: [],
+        # Terminal catch-all: reached only when neither MISSING nor PARTIAL
+        # matched, i.e. every needed block is SUPPORTED. This predicate must
+        # stay unconditionally true -- it is what guarantees _aggregate_overall
+        # always assigns a verdict. It previously returned `[]` (an "empty list
+        # of offending blocks"), which is falsy, so READY was unreachable and a
+        # fully-supported model fell out of the loop keeping CompatReport's
+        # "UNKNOWN" default -- which scaffold then refuses.
+        lambda _: True,
         "READY",
         "All required blocks already exist in models/tt_transformers/. Likely "
         "drop-in via the existing porting checklist.",
