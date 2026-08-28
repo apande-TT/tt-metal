@@ -76,7 +76,6 @@ from __future__ import annotations
 import base64
 import functools
 import hashlib
-import inspect
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -496,33 +495,13 @@ def build_transcription_inputs(
     return _assemble("transcription", prefix, suffix, names, prompt_text, seconds=seconds)
 
 
-def build_inputs(head: str, n: int | None = None, **kw) -> BatchInputs:
-    """Dispatcher: head in {"audio_chat", "transcription"}.
-
-    THIS FUNCTION ADVERTISES ``**kw``, SO IT OWNS THE FILTERING. A caller that inspects the
-    signature to decide what is safe to pass -- the generated perf tests do exactly that, via
-    ``_supported_kwargs`` -- is told by ``**kw`` that EVERYTHING is safe. It then sent the batch
-    under its own name, ``batch_size=``, which sailed through here and hit a head builder that only
-    knows ``n=``:
-
-        TypeError: build_audio_chat_inputs() got an unexpected keyword argument 'batch_size'
-
-    That raised AFTER ``build_pipeline`` had uploaded every weight, so the profiled capture held the
-    weight upload and nothing else -- 2093 Tilize/Typecast ops, zero matmuls -- and the roofline was
-    being read off a crashed run.
-
-    So: accept the alias where the batch argument is already named, and pass each head builder only
-    the keywords it actually declares. `n` defaults to None rather than 8 so "was a batch given?" is
-    answerable; absent both names it is still 8, exactly as before.
-    """
-    alias = kw.pop("batch_size", None)
-    if n is None:
-        n = alias if isinstance(alias, int) and alias > 0 else 8
-    builder = {"audio_chat": build_audio_chat_inputs, "transcription": build_transcription_inputs}.get(head)
-    if builder is None:
-        raise ValueError(f"unknown head {head!r}, expected one of {HEADS}")
-    accepted = set(inspect.signature(builder).parameters)
-    return builder(n=n, **{k: v for k, v in kw.items() if k in accepted})
+def build_inputs(head: str, n: int = 8, **kw) -> BatchInputs:
+    """Dispatcher: head in {"audio_chat", "transcription"}."""
+    if head == "audio_chat":
+        return build_audio_chat_inputs(n=n, **kw)
+    if head == "transcription":
+        return build_transcription_inputs(n=n, **kw)
+    raise ValueError(f"unknown head {head!r}, expected one of {HEADS}")
 
 
 # --------------------------------------------------------------------------------------

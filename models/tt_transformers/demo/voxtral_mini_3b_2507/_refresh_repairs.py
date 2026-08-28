@@ -22,9 +22,7 @@ def main():
         entry["snapshot_sha256"] = hashlib.sha256(snap).hexdigest()
         entry["repaired_sha256"] = hashlib.sha256(live).hexdigest()
         print(f"{name}: repaired={entry['repaired_sha256'][:12]} snapshot={entry['snapshot_sha256'][:12]}")
-    # Trailing newline: the repo's end-of-file-fixer hook rewrites a file that lacks one, which
-    # would change the manifest AFTER the digests were stamped from it.
-    MANIFEST.write_text(json.dumps(doc, indent=2) + "\n")
+    MANIFEST.write_text(json.dumps(doc, indent=2))
     print(f"wrote {MANIFEST}")
 
 

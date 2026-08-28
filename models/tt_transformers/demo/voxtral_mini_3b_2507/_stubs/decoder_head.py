@@ -20,13 +20,11 @@ _HIFI4_CFG = ttnn.WormholeComputeKernelConfig(
 class TtLMHead:
     def __init__(self, device, torch_module):
         self.device = device
-        self.weight = ttnn.to_device(
-            ttnn.from_torch(
-                torch_module.weight.T.contiguous().bfloat16(),
-                dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT,
-            ),
-            device,
+        self.weight = ttnn.from_torch(
+            torch_module.weight.T.contiguous().float(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
         )
 
     def __call__(self, x, **kwargs):
