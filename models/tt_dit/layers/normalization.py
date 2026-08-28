@@ -559,8 +559,15 @@ class GroupNorm(Module):
         ]
         return torch.cat(torch_sharded_lst, dim=0)
 
+    #: `ttnn.group_norm` throws while BUILDING the program when its circular buffers
+    #: do not fit L1, so the throw is recoverable: nothing has executed yet.
+    _CB_OVERFLOW = "beyond max L1 size"
+
     def forward(self, x: ttnn.Tensor, num_out_blocks=-1, compute_kernel_config=None) -> ttnn.Tensor:
         batch_size, height, width, channels = x.shape
+        key = (batch_size, height, width, channels)
+        if num_out_blocks == -1:
+            num_out_blocks = self.default_num_out_blocks.get(key, -1)
         x = x.reshape([batch_size, 1, width * height, channels])
         kwargs = dict(
             weight=self.weight.data,
@@ -570,13 +577,44 @@ class GroupNorm(Module):
             epsilon=self.eps,
             core_grid=self.core_grid,
             inplace=False,
-            num_out_blocks=num_out_blocks,
             output_layout=ttnn.TILE_LAYOUT,
         )
         if compute_kernel_config is not None:
             kwargs["compute_kernel_config"] = compute_kernel_config
-        x = ttnn.group_norm(x, **kwargs)
-        x = x.reshape([batch_size, height, width, channels])
+
+        # `ttnn.group_norm`'s own heuristic sizes the per-core chunk from the RESHAPED
+        # volume -- `shape[1] * shape[2] * shape[3]`, i.e. `H * W * C` -- which never
+        # sees the leading batch.  Per-core work therefore grows with B while the
+        # chunking stays put, and the statically allocated circular buffers overrun L1
+        # as soon as B > 1.  There is no single multiplier that repairs it: measured on
+        # this model's norms, the decoder's 128ch/256x256 stage needs 2*B blocks while
+        # the encoder's shapes reject that same value, so the right count is per-SHAPE.
+        #
+        # Rather than guess, climb: ask for what was requested, and when the build
+        # throws for CB overflow (nothing has run at that point, so it is safe to
+        # retry) double the block count and try again.  The winning value is cached in
+        # `default_num_out_blocks`, which is what that table was declared for, so each
+        # distinct shape pays the search once.  Entirely inert at B == 1, where the
+        # stock heuristic already fits.
+        attempts, limit = [], 2048
+        candidate = num_out_blocks
+        while True:
+            try:
+                out = ttnn.group_norm(x, num_out_blocks=candidate, **kwargs)
+                break
+            except RuntimeError as exc:
+                if self._CB_OVERFLOW not in str(exc):
+                    raise
+                attempts.append(candidate)
+                candidate = 2 if candidate in (-1, 0, 1) else candidate * 2
+                if candidate > limit:
+                    raise RuntimeError(
+                        f"group_norm {key} does not fit L1 at any num_out_blocks up to "
+                        f"{limit} (tried {attempts}); the batch is too large for this shape"
+                    ) from exc
+        if attempts:
+            self.default_num_out_blocks[key] = candidate
+        x = out.reshape([batch_size, height, width, channels])
 
         return _apply_activation_fn(x, self.activation_fn)
 

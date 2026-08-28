@@ -472,6 +472,11 @@ class VaeAttention(Module):
         )
 
         grid_size = ctx.device.compute_with_storage_grid_size()
+        self._sdpa_grid = grid_size
+        self._sdpa_chunks = (resolved_q_chunk, resolved_k_chunk)
+        #: (batch, seq, head_width) -> the chunk pair that actually built, once the
+        #: resolved one has been shown not to.  See `_sdpa`.
+        self._sdpa_chunk_fallback: dict[tuple[int, int, int], tuple[int, int]] = {}
         self._sdpa_program_config = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=grid_size,
             q_chunk_size=resolved_q_chunk,
@@ -495,6 +500,63 @@ class VaeAttention(Module):
         self._tp_axis = ctx.tp_axis
         self._ccl_manager = ctx.ccl_manager
         self._ctx = ctx
+
+    #: `scaled_dot_product_attention` sizes its statically allocated circular buffers
+    #: from the chunk sizes and the head width, and `sdpa_chunk_size_map` is keyed on
+    #: (arch, h_factor, w_factor, tp_factor) with NO batch in it -- so a leading batch
+    #: of 32 runs a B=1 chunk schedule and its CBs overrun L1.  Both messages below are
+    #: raised while the program is BUILT (`validate_circular_buffer_region`), before
+    #: anything has executed, so halving the chunk and retrying is safe.
+    _SDPA_CB_OVERFLOW = ("clash with L1 buffers", "beyond max L1 size")
+
+    #: A chunk is a tile row; 32 is the floor, not a tuning choice.
+    _SDPA_MIN_CHUNK = 32
+
+    def _sdpa(self, q: ttnn.Tensor, k: ttnn.Tensor, v: ttnn.Tensor) -> ttnn.Tensor:
+        """SDPA at the widest chunk pair that fits L1, remembered per input shape.
+
+        Climbs DOWN rather than guessing: the resolved chunk pair is tried first, and
+        each build that reports a circular-buffer overrun halves it.  Inert wherever
+        the resolved pair already fits, which is every shape the B=1 routes run.
+        """
+        key = (int(q.shape[0]), int(q.shape[2]), int(q.shape[3]))
+        q_chunk, k_chunk = self._sdpa_chunk_fallback.get(key, self._sdpa_chunks)
+        tried = []
+        while True:
+            config = (
+                self._sdpa_program_config
+                if (q_chunk, k_chunk) == self._sdpa_chunks
+                else ttnn.SDPAProgramConfig(
+                    compute_with_storage_grid_size=self._sdpa_grid,
+                    q_chunk_size=q_chunk,
+                    k_chunk_size=k_chunk,
+                    exp_approx_mode=False,
+                )
+            )
+            try:
+                out = ttnn.transformer.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    is_causal=False,
+                    program_config=config,
+                    compute_kernel_config=self._sdpa_compute_kernel_config,
+                )
+            except RuntimeError as exc:
+                if not any(m in str(exc) for m in self._SDPA_CB_OVERFLOW):
+                    raise
+                tried.append((q_chunk, k_chunk))
+                if min(q_chunk, k_chunk) <= self._SDPA_MIN_CHUNK:
+                    raise RuntimeError(
+                        f"VaeAttention SDPA at {key} (batch, seq, width) does not fit L1 at any "
+                        f"chunk pair down to {self._SDPA_MIN_CHUNK} (tried {tried})"
+                    ) from exc
+                q_chunk = max(self._SDPA_MIN_CHUNK, q_chunk // 2)
+                k_chunk = max(self._SDPA_MIN_CHUNK, k_chunk // 2)
+                continue
+            if tried:
+                self._sdpa_chunk_fallback[key] = (q_chunk, k_chunk)
+            return out
 
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
         rename_substate(state, "to_out.0", "to_out")
@@ -571,14 +633,7 @@ class VaeAttention(Module):
         k = k.reshape([n, 1, h * w, c])
         v = v.reshape([n, 1, h * w, c])
 
-        x = ttnn.transformer.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            is_causal=False,
-            program_config=self._sdpa_program_config,
-            compute_kernel_config=self._sdpa_compute_kernel_config,
-        )
+        x = self._sdpa(q, k, v)
 
         x = self.to_out.forward(x, compute_kernel_config=self._mm_compute_kernel_config)
 

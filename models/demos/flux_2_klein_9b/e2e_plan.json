@@ -1,0 +1,757 @@
+{
+  "model": "black-forest-labs/FLUX.2-klein-9B",
+  "plan_version": 2,
+  "generated": "2026-08-28",
+  "planner_note": "Sources A+B only. Source B is NOT one bring-up dir: the tool ran three times, once per checkpoint sub-folder of the SAME snapshot, and /tmp/tt_hw_planner_components/flux_2_klein_9b_{text_encoder,transformer,vae} are symlinks into snapshots/92196c8e.../{text_encoder,transformer,vae}. So the three bring-up dirs are three stages of ONE pipeline, and the e2e package lives at models/demos/flux_2_klein_9b.",
+  "source_a": {
+    "kind": "diffusers DiffusionPipeline (not a transformers AutoModel)",
+    "model_index": {
+      "_class_name": "Flux2KleinPipeline",
+      "is_distilled": true,
+      "scheduler": "FlowMatchEulerDiscreteScheduler",
+      "text_encoder": "transformers.Qwen3ForCausalLM",
+      "tokenizer": "transformers.Qwen2TokenizerFast",
+      "transformer": "diffusers.Flux2Transformer2DModel",
+      "vae": "diffusers.AutoencoderKLFlux2"
+    },
+    "registry_conclusion": "The snapshot root has NO config.json, so transformers.AutoConfig/AutoModel can never resolve it; the task head registry is model_index.json. Two AutoModel-resolvable heads exist inside it: text_encoder/ is a real Qwen3ForCausalLM (architectures:[Qwen3ForCausalLM] + generation_config.json => .generate() is a supported head), and transformer/ + vae/ are diffusers _class_name checkpoints. diffusers in python_env is 0.35.1 and has no Flux2* classes; the Flux2 classes come from the 0.40.0 build under /home/ttuser/venvs/flux-diffusers, side-loaded by path (never on sys.path) exactly as the bring-up _reference_loader.py does.",
+    "task_heads_supported": [
+      "text -> image (Flux2KleinPipeline.__call__ with prompt only)",
+      "text + reference image(s) -> image (Flux2KleinPipeline.__call__ with image=[...]; multi-reference editing, _prepare_image_ids assigns T=10,20,30... per reference)",
+      "text -> text (text_encoder.generate(); Qwen3ForCausalLM with generation_config eos_token_id [151645,151643])",
+      "image -> image (AutoencoderKLFlux2 encode/decode round trip; the pipeline's own latent codec)"
+    ],
+    "input_construction": {
+      "text": "tokenizer.apply_chat_template([{role:user,content:prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=False) then tokenizer(padding='max_length', truncation=True, max_length=max_sequence_length) -- verbatim Flux2KleinPipeline._get_qwen3_prompt_embeds",
+      "image": "Flux2ImageProcessor(vae_scale_factor=16).preprocess(img, height, width, resize_mode='crop')",
+      "noise": "randn_tensor(shape,(generator)) with an explicit torch.Generator(seed) whose tensor is handed to BOTH sides via the pipeline's `latents=` argument, so TT and HF denoise the same sample"
+    },
+    "key_config_facts": {
+      "text_encoder": "qwen3, hidden 4096, 36 layers, 32 q heads / 8 kv heads, head_dim 128, intermediate 12288, silu, rms_norm_eps 1e-6, rope_theta 1e6, vocab 151936, max_position_embeddings 40960, dtype bf16",
+      "prompt_embeds": "stack(output.hidden_states[k] for k in (9,18,27)) then permute+reshape -> (B, L, 3*4096=12288) == transformer.joint_attention_dim. hidden_states[k] is the residual stream AFTER k layers, so ONLY layers 0..26 (27 of 36) are needed for the image heads, and lm_head is NOT on the image path.",
+      "transformer": "Flux2Transformer2DModel, inner_dim 4096 (32 heads x 128), 8 double + 24 single blocks, mlp_ratio 3.0, joint_attention_dim 12288, axes_dims_rope [32,32,32,32], rope_theta 2000, timestep_guidance_channels 256, guidance_embeds FALSE (guidance is always None), eps 1e-6, dtype bf16, 9.0786 B params",
+      "vae": "AutoencoderKLFlux2, block_out_channels [128,256,512,512], latent_channels 32, patch_size [2,2], layers_per_block 2, norm_num_groups 32, force_upcast TRUE (=> run fp32), use_quant_conv + use_post_quant_conv, plus a top-level `bn` BatchNorm the pipeline uses to normalise/denormalise packed latents",
+      "scheduler": "FlowMatchEulerDiscreteScheduler, use_dynamic_shifting true => set_timesteps(num_inference_steps, mu=compute_empirical_mu(image_seq_len, num_steps)); sigmas default np.linspace(1.0, 1/N, N)",
+      "cfg": "is_distilled=true => do_classifier_free_guidance is FALSE => exactly ONE transformer forward per denoise step, no negative branch"
+    }
+  },
+  "source_b": {
+    "bring_up_dirs": {
+      "text_encoder": "models/tt_transformers/demo/flux_2_klein_9b_text_encoder",
+      "transformer": "models/tt_dit/pipelines/flux_2_klein_9b_transformer",
+      "vae": "models/tt_dit/pipelines/flux_2_klein_9b_vae"
+    },
+    "topology": "TP=8 x DP=1, mesh 1x8, 8 chips (wormhole_b0); all three RUN_REPORT.md say `run emit-e2e / optimize with --mesh 1x8`",
+    "graduated_verification": {
+      "method": "For every entry of every bringup_status.json, checked _stubs/<name>.py plus the snapshot suffixes .last_good_native / .last_good_sharded / .best_native, and cross-checked against each RUN_REPORT.md ON_DEVICE list.",
+      "result": "43 graduated modules, ALL ON_DEVICE, KERNEL_MISSING=0, PENDING=0, CPU_REUSE=0, _runtime_fallbacks.json empty in all three dirs. Counts: text_encoder 10, transformer 18, vae 15.",
+      "note_on_the_REUSE_rule": "The task brief says 'REUSE entries have no stub and are NOT graduated work products'. That does NOT hold for this model: every REUSE/ADAPT entry here DOES have a live _stubs/<name>.py and a .last_good_sharded snapshot, and every one is listed under ON_DEVICE 'graduated - native ttnn, PCC-verified' in RUN_REPORT.md. The snapshot file is the ground truth, so all 43 are graduated work products and all 43 must be routed. Nothing is dropped and nothing is invented.",
+      "graduated": {
+        "text_encoder": [
+          {
+            "name": "token_embed",
+            "snapshot": "last_good_native",
+            "rung": "emit",
+            "submodule": "model.embed_tokens",
+            "class": "Embedding"
+          },
+          {
+            "name": "rotary_embedding",
+            "snapshot": "last_good_native",
+            "rung": "emit",
+            "submodule": "rotary_emb",
+            "class": "Qwen3RotaryEmbedding"
+          },
+          {
+            "name": "r_m_s_norm",
+            "snapshot": "last_good_native",
+            "rung": "emit",
+            "submodule": "layers.0.self_attn.q_norm",
+            "class": "Qwen3RMSNorm"
+          },
+          {
+            "name": "attention",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "model.layers.0.self_attn",
+            "class": "Qwen3Attention"
+          },
+          {
+            "name": "mlp",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "model.layers.0.mlp",
+            "class": "Qwen3MLP"
+          },
+          {
+            "name": "m_l_p",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "layers.0.mlp",
+            "class": "Qwen3MLP"
+          },
+          {
+            "name": "layer",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "model.layers.0",
+            "class": "Qwen3DecoderLayer"
+          },
+          {
+            "name": "decoder_layer",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "layers.0",
+            "class": "Qwen3DecoderLayer"
+          },
+          {
+            "name": "encoder_stack",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "model",
+            "class": "Qwen3Model"
+          },
+          {
+            "name": "decoder_head",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "lm_head",
+            "class": "Linear"
+          }
+        ],
+        "transformer": [
+          {
+            "name": "patch_embed",
+            "snapshot": "last_good_native",
+            "rung": "emit",
+            "submodule": "x_embedder",
+            "class": "Linear"
+          },
+          {
+            "name": "flux2_pos_embed",
+            "snapshot": "last_good_native",
+            "rung": "emit",
+            "submodule": "pos_embed",
+            "class": "Flux2PosEmbed"
+          },
+          {
+            "name": "flux2_timestep_guidance_embeddings",
+            "snapshot": "last_good_native",
+            "rung": "emit",
+            "submodule": "time_guidance_embed",
+            "class": "Flux2TimestepGuidanceEmbeddings"
+          },
+          {
+            "name": "timestep_embedding",
+            "snapshot": "last_good_native",
+            "rung": "emit",
+            "submodule": "time_guidance_embed.timestep_embedder",
+            "class": "TimestepEmbedding"
+          },
+          {
+            "name": "ada_layer_norm_continuous",
+            "snapshot": "last_good_native",
+            "rung": "emit",
+            "submodule": "norm_out",
+            "class": "AdaLayerNormContinuous"
+          },
+          {
+            "name": "timesteps",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "time_guidance_embed.time_proj",
+            "class": "Timesteps"
+          },
+          {
+            "name": "flux2_modulation",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "double_stream_modulation_img",
+            "class": "Flux2Modulation"
+          },
+          {
+            "name": "layer",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "transformer_blocks.0.norm1",
+            "class": "LayerNorm"
+          },
+          {
+            "name": "flux2_attention",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "transformer_blocks.0.attn",
+            "class": "Flux2Attention"
+          },
+          {
+            "name": "flux2_feed_forward",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "transformer_blocks.0.ff",
+            "class": "Flux2FeedForward"
+          },
+          {
+            "name": "mlp",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "transformer_blocks.0.ff",
+            "class": "Flux2FeedForward"
+          },
+          {
+            "name": "flux2_swi_g_l_u",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "transformer_blocks.0.ff.act_fn",
+            "class": "Flux2SwiGLU"
+          },
+          {
+            "name": "flux2_transformer_block",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "transformer_blocks.0",
+            "class": "Flux2TransformerBlock"
+          },
+          {
+            "name": "encoder_stack",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "transformer_blocks.0",
+            "class": "Flux2TransformerBlock"
+          },
+          {
+            "name": "self_attention",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "single_transformer_blocks.0.attn",
+            "class": "Flux2ParallelSelfAttention"
+          },
+          {
+            "name": "flux2_parallel_self_attention",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "single_transformer_blocks.0.attn",
+            "class": "Flux2ParallelSelfAttention"
+          },
+          {
+            "name": "flux2_single_transformer_block",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "single_transformer_blocks.0",
+            "class": "Flux2SingleTransformerBlock"
+          },
+          {
+            "name": "decoder_head",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "proj_out",
+            "class": "Linear"
+          }
+        ],
+        "vae": [
+          {
+            "name": "patch_embed",
+            "snapshot": "last_good_native",
+            "rung": "emit",
+            "submodule": "encoder.conv_in",
+            "class": "Conv2d"
+          },
+          {
+            "name": "encoder",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "encoder",
+            "class": "Encoder"
+          },
+          {
+            "name": "encoder_stack",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "encoder",
+            "class": "Encoder"
+          },
+          {
+            "name": "down_encoder_block2_d",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "encoder.down_blocks.0",
+            "class": "DownEncoderBlock2D"
+          },
+          {
+            "name": "downsample2_d",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "encoder.down_blocks.0.downsamplers.0",
+            "class": "Downsample2D"
+          },
+          {
+            "name": "resnet_block2_d",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "encoder.down_blocks.0.resnets.0",
+            "class": "ResnetBlock2D"
+          },
+          {
+            "name": "u_net_mid_block2_d",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "encoder.mid_block",
+            "class": "UNetMidBlock2D"
+          },
+          {
+            "name": "attention",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "encoder.mid_block.attentions.0",
+            "class": "Attention"
+          },
+          {
+            "name": "decoder",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "decoder",
+            "class": "Decoder"
+          },
+          {
+            "name": "decoder_head",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "decoder",
+            "class": "Decoder"
+          },
+          {
+            "name": "up_decoder_block2_d",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "decoder.up_blocks.0",
+            "class": "UpDecoderBlock2D"
+          },
+          {
+            "name": "layer",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "decoder.up_blocks.0",
+            "class": "UpDecoderBlock2D"
+          },
+          {
+            "name": "upsample2_d",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "decoder.up_blocks.0.upsamplers.0",
+            "class": "Upsample2D"
+          },
+          {
+            "name": "mlp",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "decoder.mid_block.resnets.0",
+            "class": "ResnetBlock2D"
+          },
+          {
+            "name": "self_attention",
+            "snapshot": "last_good_sharded",
+            "rung": "shard",
+            "submodule": "decoder.mid_block.attentions.0",
+            "class": "Attention"
+          }
+        ]
+      },
+      "count_check": {
+        "text_encoder": 10,
+        "transformer": 18,
+        "vae": 15,
+        "total": 43,
+        "left_out": 0
+      }
+    },
+    "alias_analysis": {
+      "problem": "13 of the 43 stubs are exact aliases of another stub (same submodule_path) or are a SUB-module of another stub. A single-route pipeline physically cannot let both an alias pair feed the same downstream value, so Gate 2 would be unreachable with one route.",
+      "alias_pairs_same_submodule": [
+        "text_encoder: mlp == m_l_p (model.layers.0.mlp); layer == decoder_layer (model.layers.0)",
+        "transformer: mlp == flux2_feed_forward (transformer_blocks.0.ff); encoder_stack == flux2_transformer_block (transformer_blocks.0); self_attention == flux2_parallel_self_attention (single_transformer_blocks.0.attn)",
+        "vae: encoder == encoder_stack (encoder); decoder == decoder_head (decoder); layer == up_decoder_block2_d (decoder.up_blocks.0)"
+      ],
+      "containment": [
+        "text_encoder: encoder_stack (model) contains token_embed, layer/decoder_layer, attention, mlp/m_l_p, r_m_s_norm, rotary_embedding",
+        "transformer: flux2_transformer_block/encoder_stack contain layer, flux2_attention, flux2_feed_forward/mlp (which contains flux2_swi_g_l_u); flux2_single_transformer_block contains self_attention/flux2_parallel_self_attention and layer; flux2_timestep_guidance_embeddings contains timesteps and timestep_embedding",
+        "vae: encoder/encoder_stack contain patch_embed, resnet_block2_d, downsample2_d, down_encoder_block2_d, u_net_mid_block2_d, attention; decoder/decoder_head contain mlp, self_attention, up_decoder_block2_d/layer, upsample2_d, u_net_mid_block2_d"
+      ],
+      "resolution": "Route by POSITION, not by name. The reference model has many instances of every repeated class (36 Qwen3DecoderLayers, 8 Flux2TransformerBlocks, 24 Flux2SingleTransformerBlocks, 4+4 VAE up/down blocks, 2 VAE mid blocks with 1 Attention each, 4 whole-VAE-half invocations across the four heads). Each graduated stub is bound to a DISTINCT position, and every position's output is the real activation the next position consumes. Composites cover contiguous runs of positions; the fine-grained stubs cover the remaining positions in decomposed form. No stub is called just to be counted, and no reference tensor is ever injected at a joint.",
+      "acknowledged_redundancy": "ONE deliberate redundancy: the transformer temb is computed twice per denoise step -- once by the composite flux2_timestep_guidance_embeddings (feeds double_stream_modulation_img/txt and norm_out) and once by the decomposed pair timesteps -> timestep_embedding (feeds single_stream_modulation). Both are real ttnn forwards of the SAME module whose outputs feed DIFFERENT downstream consumers; the extra cost is a 256->4096->4096 MLP on 1 row (~2 MFLOP/step), i.e. below noise next to the 4608-token blocks. This is the only way to give both the composite and its two children a real position, and it is recorded here rather than hidden."
+    },
+    "gaps_not_covered_by_any_graduated_stub": [
+      {
+        "where": "transformer.context_embedder (Linear 12288 -> 4096)",
+        "why": "no bring-up component was bound to it",
+        "plan": "implement natively in tt/transformer.py as a replicated ttnn.linear over the host-transposed weight; it is not a graduated stub so Gate 1 does not constrain it, but it must still be ttnn (it is)"
+      },
+      {
+        "where": "vae.quant_conv / post_quant_conv / bn / encoder.conv_norm_out+conv_out / decoder.conv_in / decoder.conv_norm_out+conv_out",
+        "why": "not bring-up components (they are leaves outside every bound submodule, or are only reachable inside the composite encoder/decoder stubs)",
+        "plan": "native ttnn conv2d/group_norm/silu in tt/vae.py, reusing models/tt_dit/models/vae/vae.py primitives that the graduated stubs already use"
+      },
+      {
+        "where": "scheduler (FlowMatchEulerDiscreteScheduler.step) and latent pack/unpack/patchify",
+        "why": "not a neural module; pure index/scale arithmetic",
+        "plan": "ttnn elementwise on device for the Euler update (latents = latents + (sigma_next - sigma) * noise_pred); pack/patchify are host-side layout prep, explicitly allowed by the contract (torch.reshape/permute/cat are prep, not compute)"
+      }
+    ],
+    "measured_constraints": {
+      "vae_resolution": "224 is UNRUNNABLE for the VAE stage: ttnn.group_norm's DRAM grid check needs Ht = N*H*W/32 to be a multiple of the core grid's virtual rows, and tt_dit's GroupNorm pins CoreGrid(8,8); a 224 image's 28x28 latent gives Ht=25, which no grid divides, so the 512-channel mid block fails before any arithmetic. The graduated VAE stubs were themselves PCC'd at 256x256 / 32x32 (test_encoder.py _NCHW_INPUT=(1,3,256,256), test_decoder.py (1,32,32,32)), not at their captured 224. Every image size in this plan is therefore a multiple of 256; measured on device 2026-08-27.",
+      "quant_conv_split": "AutoencoderKLFlux2._encode = quant_conv(encoder(x)) then DiagonalGaussian; ._decode = decoder(post_quant_conv(z)). Both quant convs sit OUTSIDE the halves, so the encode routes return the raw encoder output and the decode routes take post-quant-conv latents."
+    }
+  },
+  "definition_of_pass": {
+    "gate_1": "Every routed graduated stub body is the graduated body PLUS a declared, batch-only delta -- `_stubs/<name>.py` == apply_batch_patches(`.last_good_*` snapshot, `tt/batch_patches/<stage>.json`) -- and contains no torch compute op. A `.last_good_sharded` body counts as native and is NOT rewritten to replication. The snapshots are never edited, so they stay the record of what bring-up produced. Each declared edit must NORMALISE back to the graduated text (`<expr>.shape[0]` -> `1`, `(un)squeeze(x, 1)` -> `(un)squeeze(x, 0)`), so the only thing the delta can change is a leading-axis bound; anything else fails the gate. A separate static check forbids any surviving `ttnn.slice` whose leading end bound is the literal 1, because at B=32 that keeps sample 0 and silently drops the other 31. Enforced by tests/e2e/test_gates.py.",
+    "gate_2": "All 43 graduated stubs are invoked inside a real forward path during the run, each at its own position, with its output consumed by the next stage. Enforced by an invocation ledger: tt/pipeline.py wraps every built port in a counting proxy that records (bring_up_dir, stub_name, position, n_calls) and, for each call, the id() of the tensor it returned plus whether that tensor id was later consumed. The test asserts the routed set == the graduated set (43/43), every count >= 1, and every recorded output was consumed downstream (no dangling port).",
+    "gate_3": "Final task output PCC vs the HF reference >= 0.95, per call, printed on every run pass or fail. At BATCH=32 the condition is PER SAMPLE: every one of the 32 rows is scored against ITS OWN golden and the reported `e2e PCC=` is the WORST row, so one bad row cannot hide behind thirty-one good ones. The gate additionally requires the 32 outputs to be pairwise distinct -- a pipeline that shape-supports a batch but emits 32 identical outputs would otherwise score a perfect per-row PCC against a golden that is also row-identical."
+  },
+  "validation_metric": {
+    "primary": "PCC = torch.corrcoef of flattened (tt_output, hf_output) [1,0], computed in fp32",
+    "per_call": {
+      "call_1_t2i": "PCC of the decoded image tensor (B,3,H,W) in [0,1] vs Flux2KleinPipeline(output_type='pt'). Also reported: per-denoise-step PCC of the noise_pred, PCC of prompt_embeds, PCC of the pre-decode latents.",
+      "call_2_text": "exact token match of the greedy sequence (target 1.0) AND per-step PCC of the logits row vs the HF reference's logits over the same stop rule; the gated number is the logits PCC.",
+      "call_3_edit": "PCC of the decoded image tensor vs Flux2KleinPipeline(image=[ref...], prompt=...). Also reported: PCC of each reference image's latents.",
+      "call_4_autoencode": "PCC of the reconstructed image vs vae.decode(vae.encode(image).latent_dist.mode())"
+    },
+    "threshold": 0.95
+  },
+  "behavioral_proof": {
+    "call_1": "demo/demo_text_to_image.py writes a real PNG for a real prompt; the README records the prompt, the seed, the achieved PCC and the HF-vs-TT image pair.",
+    "call_2": "demo/demo_text_generation.py prints the decoded completion string for a real prompt and the HF reference completion beside it; a real pass means the two strings match.",
+    "call_3": "demo/demo_image_edit.py takes --image (repeatable) plus a prompt and writes the edited PNG.",
+    "call_4": "demo/demo_vae_roundtrip.py writes the reconstruction PNG beside the input.",
+    "shared": "All four demos and all four e2e tests import the SAME entry points from tt/pipeline.py; there is exactly one copy of the wiring."
+  },
+  "task_heads": [
+    {
+      "call": 1,
+      "id": "text_to_image",
+      "task": "text -> image (the model's own headline task)",
+      "hf_golden": "Flux2KleinPipeline.__call__(prompt=..., height, width, num_inference_steps, latents=<shared noise>, max_sequence_length, output_type='pt')",
+      "tt_entry": "tt.pipeline.Flux2KleinTtPipeline.run_text_to_image(prompt, height, width, num_inference_steps, latents, max_sequence_length)",
+      "chain": [
+        "tokenizer.apply_chat_template + tokenizer(padding='max_length') -> input_ids, attention_mask   [host prep]",
+        "TEXT: token_embed(input_ids) -> rotary_embedding(x, position_ids) -> layer(L0) -> [r_m_s_norm + attention + r_m_s_norm + mlp](L1) -> [r_m_s_norm + attention + r_m_s_norm + m_l_p](L2) -> decoder_layer(L3..L26), tapping the residual stream after 9, 18 and 27 layers -> ttnn.concat(taps, dim=-1) -> prompt_embeds (B,L,12288)",
+        "TRANSFORMER, once per denoise step: patch_embed(x_embedder) | native context_embedder | flux2_pos_embed(txt_ids), flux2_pos_embed(img_ids) -> concat rope | flux2_timestep_guidance_embeddings(t*1000) -> temb_d ; timesteps(t*1000) -> timestep_embedding -> temb_s | flux2_modulation x3 (img, txt, single) | double blocks: b0 = [layer(norm1) + flux2_attention + (native linear_in -> flux2_swi_g_l_u -> native linear_out) + flux2_feed_forward(ff_context)], b1 = [layer + flux2_attention + mlp(ff) + mlp(ff_context)], b2..b6 = flux2_transformer_block, b7 = encoder_stack | concat(txt, img) | single blocks: s0 = [layer(norm) + self_attention], s1 = [layer + flux2_parallel_self_attention], s2..s23 = flux2_single_transformer_block | slice off text | ada_layer_norm_continuous(norm_out, temb_d) | decoder_head(proj_out) -> noise_pred",
+        "SCHEDULER: on-device Euler step latents += (sigma_next - sigma) * noise_pred",
+        "unpack + bn denormalise + unpatchify   [host layout prep + affine]",
+        "VAE: decoder(latents) -> image (B,3,H,W)",
+        "image_processor.postprocess -> PIL / pt"
+      ],
+      "graduated_modules_routed": {
+        "text_encoder": [
+          "token_embed",
+          "rotary_embedding",
+          "layer",
+          "r_m_s_norm",
+          "attention",
+          "mlp",
+          "m_l_p",
+          "decoder_layer"
+        ],
+        "transformer": [
+          "patch_embed",
+          "flux2_pos_embed",
+          "flux2_timestep_guidance_embeddings",
+          "timesteps",
+          "timestep_embedding",
+          "flux2_modulation",
+          "layer",
+          "flux2_attention",
+          "flux2_swi_g_l_u",
+          "flux2_feed_forward",
+          "mlp",
+          "flux2_transformer_block",
+          "encoder_stack",
+          "self_attention",
+          "flux2_parallel_self_attention",
+          "flux2_single_transformer_block",
+          "ada_layer_norm_continuous",
+          "decoder_head"
+        ],
+        "vae": [
+          "decoder"
+        ]
+      },
+      "gate_config": {
+        "height": 256,
+        "width": 256,
+        "num_inference_steps": 4,
+        "max_sequence_length": 128,
+        "seed": 0
+      },
+      "demo_config": {
+        "height": 512,
+        "width": 512,
+        "num_inference_steps": 8,
+        "max_sequence_length": 512
+      }
+    },
+    {
+      "call": 2,
+      "id": "text_generation",
+      "task": "text -> text (the text_encoder is a real Qwen3ForCausalLM; this is its AutoModelForCausalLM head)",
+      "hf_golden": "text_encoder.generate(input_ids, do_sample=False, max_new_tokens=<safety cap>, eos_token_id=generation_config.eos_token_id)",
+      "tt_entry": "tt.pipeline.Flux2KleinTtPipeline.run_text_generation(prompt, max_new_tokens)",
+      "decode_horizon": "Rule 1 (stop token): generation_config.eos_token_id == [151645, 151643]; break when the on-device argmax equals either. generation_config has no max_new_tokens/max_length, so the safety cap is a config-derived bound clamped to 32 for the gate and applied IDENTICALLY to both sides (max_new_tokens=32 is passed to model.generate too), so lengths cannot diverge.",
+      "chain": [
+        "tokenizer.apply_chat_template -> input_ids   [host prep]",
+        "loop: encoder_stack(input_ids) -> h (36 layers + final RMSNorm) -> decoder_head(h[:, -1]) -> logits -> ttnn.argmax on device -> ttnn.concat the new id onto the device-resident id tensor; break on eos",
+        "tokenizer.decode(ids)   [host, output formatting]"
+      ],
+      "graduated_modules_routed": {
+        "text_encoder": [
+          "encoder_stack",
+          "decoder_head"
+        ],
+        "transformer": [],
+        "vae": []
+      },
+      "gate_config": {
+        "max_new_tokens": 32,
+        "prompt": "Describe a red apple in one short sentence."
+      }
+    },
+    {
+      "call": 3,
+      "id": "image_edit",
+      "task": "text + N reference images -> image (FLUX.2 multi-reference editing; Flux2KleinPipeline.__call__(image=[...]))",
+      "hf_golden": "Flux2KleinPipeline.__call__(image=[ref_a, ref_b, ref_c], prompt=..., latents=<shared noise>, output_type='pt')",
+      "tt_entry": "tt.pipeline.Flux2KleinTtPipeline.run_image_edit(prompt, images, height, width, num_inference_steps, latents, max_sequence_length)",
+      "chain": [
+        "Flux2ImageProcessor.preprocess each reference   [host prep]",
+        "VAE encode ref_a -> encoder ; ref_b -> encoder_stack ; ref_c -> DECOMPOSED encoder [patch_embed(conv_in) -> down_encoder_block2_d(down0..3) -> u_net_mid_block2_d(mid) -> native conv_norm_out/silu/conv_out]",
+        "for each: argmax of the DiagonalGaussian == mean == chunk(moments)[0]; patchify; (x - bn.running_mean)/sqrt(bn.running_var + eps)   [on-device affine, host layout]",
+        "_prepare_image_ids assigns T = 10,20,30 to the three references   [host prep]",
+        "TEXT + TRANSFORMER: identical shared code path as Call 1, with hidden_states = cat([latents, image_latents], dim=1) and img_ids = cat([latent_ids, image_latent_ids], dim=1)",
+        "noise_pred sliced back to the latent token count; on-device Euler step",
+        "VAE: decoder_head(latents) -> image"
+      ],
+      "graduated_modules_routed": {
+        "text_encoder": [
+          "(shares Call 1's text stage - no new stubs)"
+        ],
+        "transformer": [
+          "(shares Call 1's transformer stage - no new stubs)"
+        ],
+        "vae": [
+          "encoder",
+          "encoder_stack",
+          "patch_embed",
+          "down_encoder_block2_d",
+          "u_net_mid_block2_d",
+          "decoder_head"
+        ]
+      },
+      "gate_config": {
+        "height": 256,
+        "width": 256,
+        "num_inference_steps": 2,
+        "max_sequence_length": 128,
+        "n_reference_images": 3,
+        "reference_size": 256,
+        "seed": 0
+      }
+    },
+    {
+      "call": 4,
+      "id": "vae_roundtrip",
+      "task": "image -> image (AutoencoderKLFlux2's own encode/decode; the pipeline's latent codec)",
+      "hf_golden": "vae.decode(vae.encode(image).latent_dist.mode()).sample",
+      "tt_entry": "tt.pipeline.Flux2KleinTtPipeline.run_vae_roundtrip(image)",
+      "chain": [
+        "Flux2ImageProcessor.preprocess -> (1,3,224,224)   [host prep]",
+        "ENCODE, decomposed: native conv_in -> [resnet_block2_d(down0.resnets0) -> resnet_block2_d(down0.resnets1) -> downsample2_d(down0.downsamplers0)] -> down_encoder_block2_d(down1) -> down_encoder_block2_d(down2) -> down_encoder_block2_d(down3) -> [resnet_block2_d(mid.resnets0) -> attention(mid.attentions0) -> resnet_block2_d(mid.resnets1)] -> native conv_norm_out/silu/conv_out -> native quant_conv -> moments",
+        "mode() = chunk(moments,2)[0]   [on-device slice]",
+        "DECODE, decomposed: native post_quant_conv -> native conv_in -> [mlp(dec.mid.resnets0) -> self_attention(dec.mid.attentions0) -> mlp(dec.mid.resnets1)] -> up_decoder_block2_d(up0) -> layer(up1) -> [mlp x3(up2.resnets) -> upsample2_d(up2.upsamplers0)] -> up_decoder_block2_d(up3) -> native conv_norm_out/silu/conv_out -> image"
+      ],
+      "graduated_modules_routed": {
+        "text_encoder": [],
+        "transformer": [],
+        "vae": [
+          "resnet_block2_d",
+          "downsample2_d",
+          "down_encoder_block2_d",
+          "attention",
+          "mlp",
+          "self_attention",
+          "up_decoder_block2_d",
+          "layer",
+          "upsample2_d"
+        ]
+      },
+      "gate_config": {
+        "image_size": 256
+      }
+    }
+  ],
+  "coverage_matrix_union": {
+    "text_encoder_10_of_10": {
+      "call_1": [
+        "token_embed",
+        "rotary_embedding",
+        "layer",
+        "r_m_s_norm",
+        "attention",
+        "mlp",
+        "m_l_p",
+        "decoder_layer"
+      ],
+      "call_2": [
+        "encoder_stack",
+        "decoder_head"
+      ]
+    },
+    "transformer_18_of_18": {
+      "call_1_and_3": [
+        "patch_embed",
+        "flux2_pos_embed",
+        "flux2_timestep_guidance_embeddings",
+        "timesteps",
+        "timestep_embedding",
+        "flux2_modulation",
+        "layer",
+        "flux2_attention",
+        "flux2_swi_g_l_u",
+        "flux2_feed_forward",
+        "mlp",
+        "flux2_transformer_block",
+        "encoder_stack",
+        "self_attention",
+        "flux2_parallel_self_attention",
+        "flux2_single_transformer_block",
+        "ada_layer_norm_continuous",
+        "decoder_head"
+      ]
+    },
+    "vae_15_of_15": {
+      "call_1": [
+        "decoder"
+      ],
+      "call_3": [
+        "encoder",
+        "encoder_stack",
+        "patch_embed",
+        "down_encoder_block2_d",
+        "u_net_mid_block2_d",
+        "decoder_head"
+      ],
+      "call_4": [
+        "resnet_block2_d",
+        "downsample2_d",
+        "attention",
+        "mlp",
+        "self_attention",
+        "up_decoder_block2_d",
+        "layer",
+        "upsample2_d"
+      ]
+    },
+    "total_routed": 43,
+    "total_graduated": 43,
+    "left_out": []
+  },
+  "agent_partition": {
+    "rule": "Agents are partitioned by GRADUATED-MODULE OWNERSHIP so that no stub is touched by two agents. Calls 1 and 3 share the text and transformer stages, so those stages have exactly one owner each; Calls 1, 3 and 4 share the VAE stage, so it has exactly one owner.",
+    "agents": [
+      {
+        "agent": "A",
+        "owns": "the 10 text_encoder stubs",
+        "delivers": "tt/text_encoder.py: Flux2TextEncoderStage (Call 1/3 prompt-embed trunk, 27 layers, taps at 9/18/27) and Qwen3CausalLmStage (Call 2, encoder_stack + decoder_head)"
+      },
+      {
+        "agent": "B",
+        "owns": "the 18 transformer stubs",
+        "delivers": "tt/transformer.py: Flux2TransformerStage.forward(hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids) -> noise_pred, one full denoise-step forward over all 18 stubs"
+      },
+      {
+        "agent": "C",
+        "owns": "the 15 vae stubs",
+        "delivers": "tt/vae.py: Flux2VaeStage with encode_composite/encode_composite_alias/encode_decomposed_mid/encode_decomposed_full and decode_composite/decode_composite_alias/decode_decomposed"
+      }
+    ],
+    "orchestrator_keeps": "tt/pipeline.py (the one shared chained pipeline + invocation ledger + PIPELINE_STAGES + trace contract), tt/reference.py (Source A loaders + HF goldens), demo/*, tests/e2e/*, README.md"
+  },
+  "self_validation_plan": [
+    "S0 pre-flight (host only, no device): assert every routed (dir, stub) exists in bringup_status.json with a .last_good_* snapshot; assert filecmp(_stubs/<n>.py, snapshot) for all 43; assert the routed set equals the graduated set. Fails fast and cheap if Source B moved.",
+    "S1 reference sanity (host only): load the four Source A pieces, assert transformer param count == 9,078,581,248 and vae == 84,046,115 (real weights, not a random fallback); assert prompt_embeds width == 3*hidden_size == joint_attention_dim.",
+    "S2 stage PCC on device, one stage at a time, against the HF submodule on the SAME input: prompt_embeds PCC, one-step noise_pred PCC, vae encode PCC, vae decode PCC. Every joint is fed the previous TT stage's real output; a reference tensor is used only as the comparison target, never as an input to the next stage.",
+    "S3 gate run: the four e2e tests. Each prints `e2e PCC=<x>` on its own line immediately before the assert, pass or fail.",
+    "S4 ledger check: tests/e2e/test_gates.py runs all four calls at their cheapest gate config and asserts 43/43 stubs invoked with a consumed output; prints the full ledger table.",
+    "S5 static purity scan: AST-walk tt/*.py and every routed _stubs/*.py for model.generate, hf_model.<submodule>(...), assignment to a .forward attribute, and the torch-compute op list; assert zero hits inside any hot-path function.",
+    "S6 trace contract (Command 3): trace_capture_selftest(device) captures/executes/releases one step per PIPELINE_STAGES entry and PCC-checks each traced output; host_op_selftest() runs each head's forward under observe_host_ops with encoding and weight-build outside the observed region and asserts zero host aten ops.",
+    "S7 layers-knob proof: build_pipeline(device, layers=2) plus the per-stage overrides encode_layers/prefill_layers/decode_layers/denoise_layers; assert the built repeated-block lists shrink and every stage still runs (no zero-layer aggregate)."
+  ],
+  "pipeline_stages_declaration": {
+    "derivation": "Source A is a diffusion pipeline, not is_encoder_decoder and not a bare ForCausalLM, so the phases come from model_index.json's module graph plus the one AutoModel head inside it: encode_text (Qwen3 trunk -> prompt_embeds), denoise (one Flux2Transformer2DModel step at fixed capacity), vae_decode (latents -> image), vae_encode (reference image -> latents, the conditioning phase), and prefill+decode for the Qwen3ForCausalLM head.",
+    "PIPELINE_STAGES": [
+      "encode_text",
+      "vae_encode",
+      "denoise",
+      "vae_decode",
+      "prefill",
+      "decode"
+    ],
+    "variable_dims": {
+      "encode_text": "text sequence length, bound = max_position_embeddings (40960), pinned to C_text",
+      "vae_encode": "spatial H,W, pinned to C_img",
+      "denoise": "joint token count text+image, bound = scheduler max_image_seq_len (4096) + C_text, pinned to C_joint",
+      "vae_decode": "latent H,W, pinned",
+      "prefill": "prompt length, pinned to C_text",
+      "decode": "KV slots, pinned to C_text"
+    },
+    "items_per_step": {
+      "encode_text": "C_text tokens",
+      "vae_encode": "C_img/64 latent positions",
+      "denoise": "C_joint tokens",
+      "vae_decode": "latent positions",
+      "prefill": "C_text tokens",
+      "decode": "batch rows (1 item per stream per step)"
+    }
+  },
+  "known_holes_declared_up_front": [
+    {
+      "hole": "BATCH = 32 -- superseded, now implemented",
+      "status": "closed",
+      "detail": "Plan v1 reported the batch as a hole on the grounds that only Call 2 is an AR decode. That framing was wrong for this model: the requirement is to batch over the model's own ITERATION, and for a diffusion pipeline that iteration is the denoise loop, which takes a leading batch axis directly. The real obstacle was the graduated stubs' hardcoded leading 1, and that is a declared, auditable edit rather than an out-of-scope rewrite. See `batch_plan`."
+    }
+  ],
+  "results": {
+    "measured": "2026-08-28, 1x8 wormhole_b0, TP=8",
+    "gate_1": "20/20 static checks pass, including the new declared-batch-delta audit and the no-surviving-literal-1 check",
+    "gate_2": "43/43 graduated modules invoked (text_encoder 10/10, transformer 18/18, vae 15/15); ablation still collapses the head PCC",
+    "gate_3_b1": {
+      "call_1_text_to_image": 0.99809,
+      "call_2_text_generation": 0.99982,
+      "call_2_token_match": 1.0,
+      "call_3_image_edit": 0.99857,
+      "call_4_vae_roundtrip": 0.99985
+    },
+    "gate_3_per_sample_sweep": "Call 1 over 16 DISTINCT prompts: 14/16 >= 0.95, worst 0.86086. The two low rows reproduce ALONE at B=1 (0.867526 / 0.863190 vs 0.86487 / 0.86086 batched), so this is a pre-existing input-dependent bf16 tail in the B=1 path, NOT a batching defect -- the single-prompt Gate-3 figures above are not representative of the pipeline's accuracy across prompts.",
+    "batch_reached": {
+      "text_encoder_both_heads": 32,
+      "denoise_transformer": 32,
+      "vae_encode": 32,
+      "vae_decode": 16,
+      "vae_encode_and_decode_same_process": "<16"
+    },
+    "batch_correctness_evidence": [
+      "bit-equality: row i of a batched denoise step is torch.equal to sample i run alone (drift 0.0)",
+      "distinctness: the 16 output images correlate at most 0.547 pairwise (reference's own: 0.592)",
+      "batched vs solo e2e agree to ~3 decimal places on every sample checked"
+    ],
+    "upstream_bug_fixed": "models/tt_dit/layers/normalization.py GroupNorm.forward: ttnn.group_norm's num_out_blocks heuristic sizes the per-core chunk from H*W*C and never sees the leading batch, so its circular buffers overrun L1 at B>1. forward() now climbs the block count on CB-overflow (a build-time throw, so retry is safe) and caches the winning value in the class's own default_num_out_blocks table. Inert at B=1; the B=1 VAE PCCs are unchanged (encode 0.999172, decode 0.999772).",
+    "upstream_change_reverted": "Scaling Conv2d.slice_params by the batch was reverted: it yields num_slices > max_num_slices (bounded by ceil(W/32)) and is invalid.",
+    "open": "Calls 3 and 4 do not yet run a batch: the VAE encode and decode conv halos do not co-exist in one process. Call 1 runs 16, Call 2 runs 32."
+  },
+  "batch_plan": {
+    "batch": 32,
+    "the_axis": "This checkpoint exposes NO autoregressive contract on its image heads, so there is no per-step KV cache to index and no decode tile to fill. The axis the 32 samples stack on is the one the model's OWN loop repeats over: the denoise step. One transformer program per step processes all 32 latents together; there is no python loop over samples anywhere.",
+    "independence": "Per-sample inputs are independent: 32 distinct prompts (reference.batch_prompts / batch_text_prompts) and 32 distinct noise draws (reference.batch_latents, one generator seed per row). What the rows share is only the weights and the iteration count.",
+    "what_legitimately_stays_batch_1": "The 32 samples share the resolution and the step count, so they share the flow-match schedule and therefore the timestep at every step. The timestep embedding, the three modulation vectors and the RoPE cos/sin tables stay leading-dim 1 and BROADCAST over (B, N, W). That is shared conditioning, not a faked axis -- the prompts and the latents are what differ, and the distinctness check proves it.",
+    "call_3_references": "Flux2KleinPipeline.__call__ treats `image=[...]` as a list of reference SLOTS applied to every prompt; it has no per-sample reference support. So Call 3's 32 samples are independent through their prompts and their noise, with the three reference slots shared across the batch -- which is what Source A itself does.",
+    "tp_is_untouched": "Batch is a SEPARATE axis from the TP-sharded weight axis. The existing TP=8 split and every all_reduce are unchanged; the collectives simply carry the batch dimension.",
+    "stub_work": "The graduated stubs were PCC'd at B=1 and some wrote that 1 into a `ttnn.slice` end bound or into the rank-4 view handed to nlp_create_qkv_heads. Those bounds are now read off the tensor (x.shape[0]) / moved onto axis 1, each edit DECLARED in tt/batch_patches/<stage>.json and re-verified against the per-component PCC at B=1 as well as per-sample at B=32.",
+    "trace_contract": "Every <stage>_trace_inputs() returns tensors with a leading dim of `pipe.batch`, and every <stage>_trace_items() reports the TOTAL one step retires, batch included -- a stage that under-reported would be handed an arithmetic ceiling 32x too small and then mis-read as memory-bound."
+  }
+}

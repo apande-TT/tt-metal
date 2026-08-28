@@ -1,0 +1,293 @@
+{
+  "new_model_id": "/tmp/tt_hw_planner_components/flux_2_klein_9b_transformer",
+  "new_model_type": null,
+  "sibling_hf_id": null,
+  "sibling_model_type": null,
+  "backend": {
+    "name": "tt_dit/flux2 (auto-upstream)",
+    "demo_path": "models/tt_dit/pipelines/flux2"
+  },
+  "counts": {
+    "REUSE": 4,
+    "ADAPT": 4,
+    "NEW": 10
+  },
+  "common_reuse": [
+    {
+      "purpose": "LayerNorm / RMSNorm",
+      "path": "models/common/rmsnorm.py"
+    },
+    {
+      "purpose": "LightweightModule base",
+      "path": "models/common/lightweightmodule.py"
+    },
+    {
+      "purpose": "Tensor helpers",
+      "path": "models/common/tensor_utils.py"
+    },
+    {
+      "purpose": "Generic utility funcs",
+      "path": "models/common/utility_functions.py"
+    }
+  ],
+  "components": [
+    {
+      "name": "patch_embed",
+      "kind": "patch_embed",
+      "status": "ADAPT",
+      "new_shape": {
+        "num_attention_heads": 32,
+        "patch_size": 1
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_conv2d_patch.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: llama_conv2d_patch -> models/tt_transformers/tt/multimodal/llama_conv2d_patch.py::TtLlamaConv2dPatch (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted. | bound during bring-up: discovery left submodule_path null (diffusers MMDiT, none of the transformers/ViT candidate paths resolve); this role maps to `x_embedder` (Linear).",
+      "submodule_path": "x_embedder",
+      "class_name": "Linear"
+    },
+    {
+      "name": "self_attention",
+      "kind": "self_attention",
+      "status": "REUSE",
+      "new_shape": {
+        "num_attention_heads": 32,
+        "patch_size": 1
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | bound during bring-up: discovery left submodule_path null (diffusers MMDiT, none of the transformers/ViT candidate paths resolve); this role maps to `single_transformer_blocks.0.attn` (Flux2ParallelSelfAttention).",
+      "submodule_path": "single_transformer_blocks.0.attn",
+      "class_name": "Flux2ParallelSelfAttention"
+    },
+    {
+      "name": "mlp",
+      "kind": "mlp",
+      "status": "REUSE",
+      "new_shape": {
+        "num_attention_heads": 32,
+        "patch_size": 1
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | bound during bring-up: discovery left submodule_path null (diffusers MMDiT, none of the transformers/ViT candidate paths resolve); this role maps to `transformer_blocks.0.ff` (Flux2FeedForward).",
+      "submodule_path": "transformer_blocks.0.ff",
+      "class_name": "Flux2FeedForward"
+    },
+    {
+      "name": "layer",
+      "kind": "layer",
+      "status": "ADAPT",
+      "new_shape": {
+        "num_attention_heads": 32,
+        "patch_size": 1
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_layernorm.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: llama_layernorm -> models/tt_transformers/tt/multimodal/llama_layernorm.py::TtLayerNorm (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted. | bound during bring-up: discovery left submodule_path null (diffusers MMDiT, none of the transformers/ViT candidate paths resolve); this role maps to `transformer_blocks.0.norm1` (LayerNorm).",
+      "submodule_path": "transformer_blocks.0.norm1",
+      "class_name": "LayerNorm"
+    },
+    {
+      "name": "encoder_stack",
+      "kind": "encoder_stack",
+      "status": "ADAPT",
+      "new_shape": {
+        "num_attention_heads": 32,
+        "patch_size": 1
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_vision_encoder.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: llama_vision_encoder -> models/tt_transformers/tt/multimodal/llama_vision_encoder.py::TtLlamaVisionEncoder (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted. | bound during bring-up: discovery left submodule_path null (diffusers MMDiT, none of the transformers/ViT candidate paths resolve); this role maps to `transformer_blocks.0` (Flux2TransformerBlock).",
+      "submodule_path": "transformer_blocks.0",
+      "class_name": "Flux2TransformerBlock"
+    },
+    {
+      "name": "decoder_head",
+      "kind": "decoder_head",
+      "status": "ADAPT",
+      "new_shape": {
+        "num_attention_heads": 32,
+        "patch_size": 1
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/lm_head.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: lm_head -> models/tt_transformers/tt/lm_head.py::LMHead (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted. | bound during bring-up: discovery left submodule_path null (diffusers MMDiT, none of the transformers/ViT candidate paths resolve); this role maps to `proj_out` (Linear).",
+      "submodule_path": "proj_out",
+      "class_name": "Linear"
+    },
+    {
+      "name": "flux2_transformer_block",
+      "kind": "Flux2TransformerBlock",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=8 leaves=184 sample_paths=['transformer_blocks.0', 'transformer_blocks.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "transformer_blocks.0",
+      "class_name": "Flux2TransformerBlock"
+    },
+    {
+      "name": "flux2_single_transformer_block",
+      "kind": "Flux2SingleTransformerBlock",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=24 leaves=144 sample_paths=['single_transformer_blocks.0', 'single_transformer_blocks.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "single_transformer_blocks.0",
+      "class_name": "Flux2SingleTransformerBlock"
+    },
+    {
+      "name": "flux2_parallel_self_attention",
+      "kind": "Flux2ParallelSelfAttention",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=24 leaves=120 sample_paths=['single_transformer_blocks.0.attn', 'single_transformer_blocks.1.attn'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "single_transformer_blocks.0.attn",
+      "class_name": "Flux2ParallelSelfAttention"
+    },
+    {
+      "name": "flux2_attention",
+      "kind": "Flux2Attention",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=8 leaves=104 sample_paths=['transformer_blocks.0.attn', 'transformer_blocks.1.attn'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "transformer_blocks.0.attn",
+      "class_name": "Flux2Attention"
+    },
+    {
+      "name": "flux2_feed_forward",
+      "kind": "Flux2FeedForward",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=16 leaves=48 sample_paths=['transformer_blocks.0.ff', 'transformer_blocks.0.ff_context'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "transformer_blocks.0.ff",
+      "class_name": "Flux2FeedForward"
+    },
+    {
+      "name": "flux2_swi_g_l_u",
+      "kind": "Flux2SwiGLU",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=40 leaves=40 sample_paths=['transformer_blocks.0.ff.act_fn', 'transformer_blocks.0.ff_context.act_fn'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "transformer_blocks.0.ff.act_fn",
+      "class_name": "Flux2SwiGLU"
+    },
+    {
+      "name": "flux2_modulation",
+      "kind": "Flux2Modulation",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=3 leaves=6 sample_paths=['double_stream_modulation_img', 'double_stream_modulation_txt'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "double_stream_modulation_img",
+      "class_name": "Flux2Modulation"
+    },
+    {
+      "name": "flux2_timestep_guidance_embeddings",
+      "kind": "Flux2TimestepGuidanceEmbeddings",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=4 sample_paths=['time_guidance_embed'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "time_guidance_embed",
+      "class_name": "Flux2TimestepGuidanceEmbeddings"
+    },
+    {
+      "name": "ada_layer_norm_continuous",
+      "kind": "AdaLayerNormContinuous",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=3 sample_paths=['norm_out'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "norm_out",
+      "class_name": "AdaLayerNormContinuous"
+    },
+    {
+      "name": "timestep_embedding",
+      "kind": "TimestepEmbedding",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=3 sample_paths=['time_guidance_embed.timestep_embedder'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "time_guidance_embed.timestep_embedder",
+      "class_name": "TimestepEmbedding"
+    },
+    {
+      "name": "flux2_pos_embed",
+      "kind": "Flux2PosEmbed",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=1 sample_paths=['pos_embed'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "pos_embed",
+      "class_name": "Flux2PosEmbed"
+    },
+    {
+      "name": "timesteps",
+      "kind": "Timesteps",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=1 sample_paths=['time_guidance_embed.time_proj'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "time_guidance_embed.time_proj",
+      "class_name": "Timesteps"
+    }
+  ],
+  "notes": [
+    "Sibling config could not be fetched; classification falls back to NEW for components without a clear file match. Set HF_TOKEN or pre-download `None` and re-run for a sharper diff.",
+    "Top sibling candidates (per-component reuse targets are pulled from whichever sibling provides them, not only the first): hf_eager universal (Image / diffusion) (score 40: category 'Image' default (generic runner)); Stable Diffusion 1.4 (score 30: category 'Image' default); stable_diffusion_xl_base (auto-upstream) (score 30: category 'Image' default)"
+  ],
+  "ranked_siblings": [
+    {
+      "rank": 1,
+      "backend": "hf_eager universal (Image / diffusion)",
+      "score": 40,
+      "reason": "category 'Image' default (generic runner)"
+    },
+    {
+      "rank": 2,
+      "backend": "Stable Diffusion 1.4",
+      "score": 30,
+      "reason": "category 'Image' default"
+    },
+    {
+      "rank": 3,
+      "backend": "stable_diffusion_xl_base (auto-upstream)",
+      "score": 30,
+      "reason": "category 'Image' default"
+    }
+  ]
+}

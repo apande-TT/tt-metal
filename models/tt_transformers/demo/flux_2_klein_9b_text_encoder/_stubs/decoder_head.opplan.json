@@ -1,0 +1,23 @@
+{
+  "component": "decoder_head",
+  "class_name": "DecoderHead",
+  "module_function": "decoder_head",
+  "pre_bound": [
+    {
+      "name": "<root>",
+      "class": "Linear",
+      "kind": "linear",
+      "ttnn_target": "ttnn.linear",
+      "helper": "_apply__root_"
+    }
+  ],
+  "llm_gaps": [],
+  "palette": [
+    "self._apply__root_(x) -> ttnn.linear  (in=4096, out=151936, bias=False)"
+  ],
+  "counts": {
+    "op-REUSE": 1,
+    "op-ADAPT": 0,
+    "op-NEW": 0
+  }
+}

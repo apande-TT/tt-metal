@@ -1,0 +1,26 @@
+{
+  "attention": [
+    {
+      "old": "            x = ttnn.unsqueeze(x, 0)",
+      "new": "            x = ttnn.unsqueeze(x, 1)",
+      "why": "rank-3 (B, L, C) entry: inserting the spatial axis at 0 makes the batch the H axis, so VaeAttention's reshape([n, 1, h*w, c]) flattens all B samples into ONE attention sequence; inserting it at 1 gives (B, 1, L, C) and keeps the samples independent"
+    },
+    {
+      "old": "            y = ttnn.squeeze(y, 0)",
+      "new": "            y = ttnn.squeeze(y, 1)",
+      "why": "the matching exit for the rank-3 path: drop the inserted spatial axis, not the batch axis"
+    }
+  ],
+  "self_attention": [
+    {
+      "old": "            x = ttnn.unsqueeze(x, 0)",
+      "new": "            x = ttnn.unsqueeze(x, 1)",
+      "why": "rank-3 (B, L, C) entry: inserting the spatial axis at 0 makes the batch the H axis, so VaeAttention's reshape([n, 1, h*w, c]) flattens all B samples into ONE attention sequence; inserting it at 1 gives (B, 1, L, C) and keeps the samples independent"
+    },
+    {
+      "old": "            y = ttnn.squeeze(y, 0)",
+      "new": "            y = ttnn.squeeze(y, 1)",
+      "why": "the matching exit for the rank-3 path: drop the inserted spatial axis, not the batch axis"
+    }
+  ]
+}

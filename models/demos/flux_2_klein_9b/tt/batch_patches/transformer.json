@@ -1,0 +1,230 @@
+{
+  "flux2_attention": [
+    {
+      "old": "ttnn.unsqueeze(proj, 0)",
+      "new": "ttnn.unsqueeze(proj, 1)",
+      "why": "nlp_create_qkv_heads wants (B, 1, S, W): the packed projection's rank-4 view must promote on axis 1, not push the batch off axis 0"
+    },
+    {
+      "old": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(joint), 0)",
+      "new": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(joint), 1)",
+      "why": "nlp_concat_heads returns (B, 1, S, W): drop the head axis, not the batch axis"
+    },
+    {
+      "old": "ttnn.slice(joint, [0, 0, 0], [1, txt_len, width])",
+      "new": "ttnn.slice(joint, [0, 0, 0], [joint.shape[0], txt_len, width])",
+      "why": "text half of the joint sequence: the batch end bound comes off the tensor, a literal 1 silently keeps sample 0 only"
+    },
+    {
+      "old": "ttnn.slice(joint, [0, txt_len, 0], [1, total, width])",
+      "new": "ttnn.slice(joint, [0, txt_len, 0], [joint.shape[0], total, width])",
+      "why": "image half of the joint sequence: batch end bound off the tensor"
+    }
+  ],
+  "flux2_transformer_block": [
+    {
+      "old": "ttnn.unsqueeze(proj, 0)",
+      "new": "ttnn.unsqueeze(proj, 1)",
+      "why": "nlp_create_qkv_heads wants (B, 1, S, W): the packed projection's rank-4 view must promote on axis 1, not push the batch off axis 0"
+    },
+    {
+      "old": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(joint), 0)",
+      "new": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(joint), 1)",
+      "why": "nlp_concat_heads returns (B, 1, S, W): drop the head axis, not the batch axis"
+    },
+    {
+      "old": "ttnn.slice(joint, [0, 0, 0], [1, txt_len, width])",
+      "new": "ttnn.slice(joint, [0, 0, 0], [joint.shape[0], txt_len, width])",
+      "why": "text half of the joint sequence: the batch end bound comes off the tensor, a literal 1 silently keeps sample 0 only"
+    },
+    {
+      "old": "ttnn.slice(joint, [0, txt_len, 0], [1, total, width])",
+      "new": "ttnn.slice(joint, [0, txt_len, 0], [joint.shape[0], total, width])",
+      "why": "image half of the joint sequence: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(packed, [0, 0, 0], [1, rows, half])",
+      "new": "ttnn.slice(packed, [0, 0, 0], [packed.shape[0], rows, half])",
+      "why": "gate half of the packed feed-forward: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(packed, [0, 0, half], [1, rows, packed.shape[-1]])",
+      "new": "ttnn.slice(packed, [0, 0, half], [packed.shape[0], rows, packed.shape[-1]])",
+      "why": "up half of the packed feed-forward: batch end bound off the tensor"
+    }
+  ],
+  "encoder_stack": [
+    {
+      "old": "ttnn.unsqueeze(proj, 0)",
+      "new": "ttnn.unsqueeze(proj, 1)",
+      "why": "nlp_create_qkv_heads wants (B, 1, S, W): the packed projection's rank-4 view must promote on axis 1, not push the batch off axis 0"
+    },
+    {
+      "old": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(joint), 0)",
+      "new": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(joint), 1)",
+      "why": "nlp_concat_heads returns (B, 1, S, W): drop the head axis, not the batch axis"
+    },
+    {
+      "old": "ttnn.slice(joint, [0, 0, 0], [1, txt_len, width])",
+      "new": "ttnn.slice(joint, [0, 0, 0], [joint.shape[0], txt_len, width])",
+      "why": "text half of the joint sequence: the batch end bound comes off the tensor, a literal 1 silently keeps sample 0 only"
+    },
+    {
+      "old": "ttnn.slice(joint, [0, txt_len, 0], [1, total, width])",
+      "new": "ttnn.slice(joint, [0, txt_len, 0], [joint.shape[0], total, width])",
+      "why": "image half of the joint sequence: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(packed, [0, 0, 0], [1, rows, half])",
+      "new": "ttnn.slice(packed, [0, 0, 0], [packed.shape[0], rows, half])",
+      "why": "gate half of the packed feed-forward: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(packed, [0, 0, half], [1, rows, packed.shape[-1]])",
+      "new": "ttnn.slice(packed, [0, 0, half], [packed.shape[0], rows, packed.shape[-1]])",
+      "why": "up half of the packed feed-forward: batch end bound off the tensor"
+    }
+  ],
+  "flux2_single_transformer_block": [
+    {
+      "old": "ttnn.slice(proj, [0, 0, 0], [1, rows, split])",
+      "new": "ttnn.slice(proj, [0, 0, 0], [proj.shape[0], rows, split])",
+      "why": "qkv half of the fused qkv|mlp projection: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(proj, [0, 0, split], [1, rows, split + self.local_mlp])",
+      "new": "ttnn.slice(proj, [0, 0, split], [proj.shape[0], rows, split + self.local_mlp])",
+      "why": "mlp half of the fused qkv|mlp projection: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.unsqueeze(qkv, 0)",
+      "new": "ttnn.unsqueeze(qkv, 1)",
+      "why": "nlp_create_qkv_heads wants (B, 1, S, W): promote on axis 1 so the batch stays on axis 0"
+    },
+    {
+      "old": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(attn), 0)",
+      "new": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(attn), 1)",
+      "why": "nlp_concat_heads returns (B, 1, S, W): drop the head axis, not the batch axis"
+    },
+    {
+      "old": "ttnn.slice(mlp, [0, 0, 0], [1, rows, half])",
+      "new": "ttnn.slice(mlp, [0, 0, 0], [mlp.shape[0], rows, half])",
+      "why": "gate half of the parallel-MLP branch: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(mlp, [0, 0, half], [1, rows, self.local_mlp])",
+      "new": "ttnn.slice(mlp, [0, 0, half], [mlp.shape[0], rows, self.local_mlp])",
+      "why": "up half of the parallel-MLP branch: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(out, [0, 0, 0], [1, text_seq_len, width])",
+      "new": "ttnn.slice(out, [0, 0, 0], [out.shape[0], text_seq_len, width])",
+      "why": "split_hidden_states text half: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(out, [0, text_seq_len, 0], [1, total, width])",
+      "new": "ttnn.slice(out, [0, text_seq_len, 0], [out.shape[0], total, width])",
+      "why": "split_hidden_states image half: batch end bound off the tensor"
+    }
+  ],
+  "self_attention": [
+    {
+      "old": "ttnn.slice(proj, [0, 0, 0], [1, rows, split])",
+      "new": "ttnn.slice(proj, [0, 0, 0], [proj.shape[0], rows, split])",
+      "why": "qkv half of the fused qkv|mlp projection: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(proj, [0, 0, split], [1, rows, split + self.local_mlp])",
+      "new": "ttnn.slice(proj, [0, 0, split], [proj.shape[0], rows, split + self.local_mlp])",
+      "why": "mlp half of the fused qkv|mlp projection: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.unsqueeze(qkv, 0)",
+      "new": "ttnn.unsqueeze(qkv, 1)",
+      "why": "nlp_create_qkv_heads wants (B, 1, S, W): promote on axis 1 so the batch stays on axis 0"
+    },
+    {
+      "old": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(attn), 0)",
+      "new": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(attn), 1)",
+      "why": "nlp_concat_heads returns (B, 1, S, W): drop the head axis, not the batch axis"
+    },
+    {
+      "old": "ttnn.slice(mlp, [0, 0, 0], [1, rows, half])",
+      "new": "ttnn.slice(mlp, [0, 0, 0], [mlp.shape[0], rows, half])",
+      "why": "gate half of the parallel-MLP branch: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(mlp, [0, 0, half], [1, rows, self.local_mlp])",
+      "new": "ttnn.slice(mlp, [0, 0, half], [mlp.shape[0], rows, self.local_mlp])",
+      "why": "up half of the parallel-MLP branch: batch end bound off the tensor"
+    }
+  ],
+  "flux2_parallel_self_attention": [
+    {
+      "old": "ttnn.slice(proj, [0, 0, 0], [1, rows, split])",
+      "new": "ttnn.slice(proj, [0, 0, 0], [proj.shape[0], rows, split])",
+      "why": "qkv half of the fused qkv|mlp projection: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(proj, [0, 0, split], [1, rows, split + self.local_mlp])",
+      "new": "ttnn.slice(proj, [0, 0, split], [proj.shape[0], rows, split + self.local_mlp])",
+      "why": "mlp half of the fused qkv|mlp projection: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.unsqueeze(qkv, 0)",
+      "new": "ttnn.unsqueeze(qkv, 1)",
+      "why": "nlp_create_qkv_heads wants (B, 1, S, W): promote on axis 1 so the batch stays on axis 0"
+    },
+    {
+      "old": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(attn), 0)",
+      "new": "ttnn.squeeze(ttnn.experimental.nlp_concat_heads(attn), 1)",
+      "why": "nlp_concat_heads returns (B, 1, S, W): drop the head axis, not the batch axis"
+    },
+    {
+      "old": "ttnn.slice(mlp, [0, 0, 0], [1, rows, half])",
+      "new": "ttnn.slice(mlp, [0, 0, 0], [mlp.shape[0], rows, half])",
+      "why": "gate half of the parallel-MLP branch: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(mlp, [0, 0, half], [1, rows, self.local_mlp])",
+      "new": "ttnn.slice(mlp, [0, 0, half], [mlp.shape[0], rows, self.local_mlp])",
+      "why": "up half of the parallel-MLP branch: batch end bound off the tensor"
+    }
+  ],
+  "mlp": [
+    {
+      "old": "ttnn.slice(packed, [0, 0, 0], [1, rows, half])",
+      "new": "ttnn.slice(packed, [0, 0, 0], [packed.shape[0], rows, half])",
+      "why": "gate half of the packed feed-forward: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(packed, [0, 0, half], [1, rows, packed.shape[-1]])",
+      "new": "ttnn.slice(packed, [0, 0, half], [packed.shape[0], rows, packed.shape[-1]])",
+      "why": "up half of the packed feed-forward: batch end bound off the tensor"
+    }
+  ],
+  "flux2_feed_forward": [
+    {
+      "old": "ttnn.slice(packed, [0, 0, 0], [1, rows, half])",
+      "new": "ttnn.slice(packed, [0, 0, 0], [packed.shape[0], rows, half])",
+      "why": "gate half of the packed feed-forward: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(packed, [0, 0, half], [1, rows, packed.shape[-1]])",
+      "new": "ttnn.slice(packed, [0, 0, half], [packed.shape[0], rows, packed.shape[-1]])",
+      "why": "up half of the packed feed-forward: batch end bound off the tensor"
+    }
+  ],
+  "flux2_swi_g_l_u": [
+    {
+      "old": "ttnn.slice(x, [0, 0, 0], [1, rows, half])",
+      "new": "ttnn.slice(x, [0, 0, 0], [x.shape[0], rows, half])",
+      "why": "gate half of the packed SwiGLU input: batch end bound off the tensor"
+    },
+    {
+      "old": "ttnn.slice(x, [0, 0, half], [1, rows, 2 * half])",
+      "new": "ttnn.slice(x, [0, 0, half], [x.shape[0], rows, 2 * half])",
+      "why": "up half of the packed SwiGLU input: batch end bound off the tensor"
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "attention": [
+    {
+      "old": "ttnn.reshape(x, (1, 1, seq_len, in_shape[-1]))",
+      "new": "ttnn.reshape(x, (x.shape[0], 1, seq_len, in_shape[-1]))",
+      "why": "rank-4 attention view keeps the leading batch axis instead of collapsing 32 samples onto sample 0"
+    },
+    {
+      "old": "bias.expand(1, self.n_local_heads, seq_len, seq_len)",
+      "new": "bias.expand(bias.shape[0], self.n_local_heads, seq_len, seq_len)",
+      "why": "one score bias per sample: 32 prompts have 32 padding patterns, and expand() to a leading 1 raises on a (B,1,L,L) mask"
+    }
+  ],
+  "layer": [
+    {
+      "old": "ttnn.reshape(x, (1, 1, seq_len, in_shape[-1]))",
+      "new": "ttnn.reshape(x, (x.shape[0], 1, seq_len, in_shape[-1]))",
+      "why": "rank-4 block view keeps the leading batch axis instead of collapsing 32 samples onto sample 0"
+    },
+    {
+      "old": "bias.expand(1, self.n_local_heads, seq_len, seq_len)",
+      "new": "bias.expand(bias.shape[0], self.n_local_heads, seq_len, seq_len)",
+      "why": "one score bias per sample: 32 prompts have 32 padding patterns, and expand() to a leading 1 raises on a (B,1,L,L) mask"
+    }
+  ],
+  "decoder_layer": [
+    {
+      "old": "ttnn.reshape(x, (1, 1, seq_len, in_shape[-1]))",
+      "new": "ttnn.reshape(x, (x.shape[0], 1, seq_len, in_shape[-1]))",
+      "why": "rank-4 block view keeps the leading batch axis instead of collapsing 32 samples onto sample 0"
+    },
+    {
+      "old": "bias.expand(1, self.n_local_heads, seq_len, seq_len)",
+      "new": "bias.expand(bias.shape[0], self.n_local_heads, seq_len, seq_len)",
+      "why": "one score bias per sample: 32 prompts have 32 padding patterns, and expand() to a leading 1 raises on a (B,1,L,L) mask"
+    }
+  ],
+  "encoder_stack": [
+    {
+      "old": "ttnn.reshape(x, (1, 1, seq_len, in_shape[-1]))",
+      "new": "ttnn.reshape(x, (x.shape[0], 1, seq_len, in_shape[-1]))",
+      "why": "rank-4 stack view keeps the leading batch axis instead of collapsing 32 samples onto sample 0"
+    },
+    {
+      "old": "bias.expand(1, self.n_local_heads, seq_len, seq_len)",
+      "new": "bias.expand(bias.shape[0], self.n_local_heads, seq_len, seq_len)",
+      "why": "one score bias per sample: 32 prompts have 32 padding patterns, and expand() to a leading 1 raises on a (B,1,L,L) mask"
+    }
+  ]
+}

@@ -1,0 +1,269 @@
+{
+  "new_model_id": "/tmp/tt_hw_planner_components/flux_2_klein_9b_vae",
+  "new_model_type": null,
+  "sibling_hf_id": null,
+  "sibling_model_type": null,
+  "backend": {
+    "name": "tt_dit/flux2 (auto-upstream)",
+    "demo_path": "models/tt_dit/pipelines/flux2"
+  },
+  "counts": {
+    "REUSE": 3,
+    "ADAPT": 4,
+    "NEW": 8
+  },
+  "common_reuse": [
+    {
+      "purpose": "LayerNorm / RMSNorm",
+      "path": "models/common/rmsnorm.py"
+    },
+    {
+      "purpose": "LightweightModule base",
+      "path": "models/common/lightweightmodule.py"
+    },
+    {
+      "purpose": "Tensor helpers",
+      "path": "models/common/tensor_utils.py"
+    },
+    {
+      "purpose": "Generic utility funcs",
+      "path": "models/common/utility_functions.py"
+    }
+  ],
+  "components": [
+    {
+      "name": "patch_embed",
+      "kind": "patch_embed",
+      "status": "ADAPT",
+      "new_shape": {
+        "patch_size": [
+          2,
+          2
+        ]
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_conv2d_patch.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: llama_conv2d_patch -> models/tt_transformers/tt/multimodal/llama_conv2d_patch.py::TtLlamaConv2dPatch (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted. | bring-up binding: generic role bound by hand to `encoder.conv_in` (Conv2d) \u2014 config `patch_size=[2,2]` is a reshape of the LATENT done by the wrapper, not a module; the encoder stem conv IS this model's image->channels step.",
+      "submodule_path": "encoder.conv_in",
+      "class_name": "Conv2d"
+    },
+    {
+      "name": "self_attention",
+      "kind": "self_attention",
+      "status": "REUSE",
+      "new_shape": {
+        "patch_size": [
+          2,
+          2
+        ]
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | bring-up binding: generic role bound by hand to `decoder.mid_block.attentions.0` (Attention) \u2014 the decoder's only attention: spatial, single head with head_dim = all 512 channels.",
+      "submodule_path": "decoder.mid_block.attentions.0",
+      "class_name": "Attention"
+    },
+    {
+      "name": "mlp",
+      "kind": "mlp",
+      "status": "REUSE",
+      "new_shape": {
+        "patch_size": [
+          2,
+          2
+        ]
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | bring-up binding: generic role bound by hand to `decoder.mid_block.resnets.0` (ResnetBlock2D) \u2014 a convnet's position-wise FFN; there is no gated/SwiGLU MLP anywhere in this model.",
+      "submodule_path": "decoder.mid_block.resnets.0",
+      "class_name": "ResnetBlock2D"
+    },
+    {
+      "name": "layer",
+      "kind": "layer",
+      "status": "ADAPT",
+      "new_shape": {
+        "patch_size": [
+          2,
+          2
+        ]
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_layernorm.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: llama_layernorm -> models/tt_transformers/tt/multimodal/llama_layernorm.py::TtLayerNorm (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted. | bring-up binding: generic role bound by hand to `decoder.up_blocks.0` (UpDecoderBlock2D) \u2014 the decoder stack's repeating unit.",
+      "submodule_path": "decoder.up_blocks.0",
+      "class_name": "UpDecoderBlock2D"
+    },
+    {
+      "name": "encoder_stack",
+      "kind": "encoder_stack",
+      "status": "ADAPT",
+      "new_shape": {
+        "patch_size": [
+          2,
+          2
+        ]
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_vision_encoder.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: llama_vision_encoder -> models/tt_transformers/tt/multimodal/llama_vision_encoder.py::TtLlamaVisionEncoder (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted. | bring-up binding: generic role bound by hand to `encoder` (Encoder) \u2014 confirmed by _captured/encoder_stack/manifest.json, which recorded submodule_path=encoder.",
+      "submodule_path": "encoder",
+      "class_name": "Encoder"
+    },
+    {
+      "name": "decoder_head",
+      "kind": "decoder_head",
+      "status": "ADAPT",
+      "new_shape": {
+        "patch_size": [
+          2,
+          2
+        ]
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/lm_head.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: lm_head -> models/tt_transformers/tt/lm_head.py::LMHead (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted. | bring-up binding: generic role bound by hand to `decoder` (Decoder) \u2014 confirmed by _captured/decoder_head/manifest.json, which recorded submodule_path=decoder.",
+      "submodule_path": "decoder",
+      "class_name": "Decoder"
+    },
+    {
+      "name": "resnet_block2_d",
+      "kind": "ResnetBlock2D",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=24 leaves=148 sample_paths=['encoder.down_blocks.0.resnets.0', 'encoder.down_blocks.0.resnets.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "encoder.down_blocks.0.resnets.0",
+      "class_name": "ResnetBlock2D"
+    },
+    {
+      "name": "decoder",
+      "kind": "Decoder",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=99 sample_paths=['decoder'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "decoder",
+      "class_name": "Decoder"
+    },
+    {
+      "name": "up_decoder_block2_d",
+      "kind": "UpDecoderBlock2D",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=4 leaves=77 sample_paths=['decoder.up_blocks.0', 'decoder.up_blocks.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "decoder.up_blocks.0",
+      "class_name": "UpDecoderBlock2D"
+    },
+    {
+      "name": "encoder",
+      "kind": "Encoder",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=75 sample_paths=['encoder'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "encoder",
+      "class_name": "Encoder"
+    },
+    {
+      "name": "down_encoder_block2_d",
+      "kind": "DownEncoderBlock2D",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=4 leaves=53 sample_paths=['encoder.down_blocks.0', 'encoder.down_blocks.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "encoder.down_blocks.0",
+      "class_name": "DownEncoderBlock2D"
+    },
+    {
+      "name": "u_net_mid_block2_d",
+      "kind": "UNetMidBlock2D",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=2 leaves=36 sample_paths=['encoder.mid_block', 'decoder.mid_block'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "encoder.mid_block",
+      "class_name": "UNetMidBlock2D"
+    },
+    {
+      "name": "attention",
+      "kind": "Attention",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=2 leaves=12 sample_paths=['encoder.mid_block.attentions.0', 'decoder.mid_block.attentions.0'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "encoder.mid_block.attentions.0",
+      "class_name": "Attention"
+    },
+    {
+      "name": "downsample2_d",
+      "kind": "Downsample2D",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=3 leaves=3 sample_paths=['encoder.down_blocks.0.downsamplers.0', 'encoder.down_blocks.1.downsamplers.0'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "encoder.down_blocks.0.downsamplers.0",
+      "class_name": "Downsample2D"
+    },
+    {
+      "name": "upsample2_d",
+      "kind": "Upsample2D",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] module-tree: occ=3 leaves=3 sample_paths=['decoder.up_blocks.0.upsamplers.0', 'decoder.up_blocks.1.upsamplers.0'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "decoder.up_blocks.0.upsamplers.0",
+      "class_name": "Upsample2D"
+    }
+  ],
+  "notes": [
+    "Sibling config could not be fetched; classification falls back to NEW for components without a clear file match. Set HF_TOKEN or pre-download `None` and re-run for a sharper diff.",
+    "Top sibling candidates (per-component reuse targets are pulled from whichever sibling provides them, not only the first): hf_eager universal (Image / diffusion) (score 40: category 'Image' default (generic runner)); Stable Diffusion 1.4 (score 30: category 'Image' default); stable_diffusion_xl_base (auto-upstream) (score 30: category 'Image' default)"
+  ],
+  "ranked_siblings": [
+    {
+      "rank": 1,
+      "backend": "hf_eager universal (Image / diffusion)",
+      "score": 40,
+      "reason": "category 'Image' default (generic runner)"
+    },
+    {
+      "rank": 2,
+      "backend": "Stable Diffusion 1.4",
+      "score": 30,
+      "reason": "category 'Image' default"
+    },
+    {
+      "rank": 3,
+      "backend": "stable_diffusion_xl_base (auto-upstream)",
+      "score": 30,
+      "reason": "category 'Image' default"
+    }
+  ]
+}

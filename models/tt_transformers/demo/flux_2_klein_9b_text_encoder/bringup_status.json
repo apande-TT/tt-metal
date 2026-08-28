@@ -1,0 +1,233 @@
+{
+  "new_model_id": "/tmp/tt_hw_planner_components/flux_2_klein_9b_text_encoder",
+  "new_model_type": "qwen3",
+  "sibling_hf_id": null,
+  "sibling_model_type": null,
+  "backend": {
+    "name": "tt_transformers / simple_text_demo",
+    "demo_path": "models/tt_transformers/demo/simple_text_demo.py"
+  },
+  "counts": {
+    "REUSE": 5,
+    "ADAPT": 5,
+    "NEW": 0
+  },
+  "common_reuse": [
+    {
+      "purpose": "LayerNorm / RMSNorm",
+      "path": "models/common/rmsnorm.py"
+    },
+    {
+      "purpose": "LightweightModule base",
+      "path": "models/common/lightweightmodule.py"
+    },
+    {
+      "purpose": "Tensor helpers",
+      "path": "models/common/tensor_utils.py"
+    },
+    {
+      "purpose": "Generic utility funcs",
+      "path": "models/common/utility_functions.py"
+    }
+  ],
+  "components": [
+    {
+      "name": "token_embed",
+      "kind": "token_embed",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 4096,
+        "num_hidden_layers": 36,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 12288,
+        "hidden_act": "silu",
+        "vocab_size": 151936,
+        "max_position_embeddings": 40960
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/embedding.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: embedding -> models/tt_transformers/tt/embedding.py::ScaledEmbedding (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted. | bound to model.embed_tokens (nn.Embedding 151936x4096).",
+      "submodule_path": "model.embed_tokens",
+      "class_name": "Embedding"
+    },
+    {
+      "name": "attention",
+      "kind": "attention",
+      "status": "REUSE",
+      "new_shape": {
+        "hidden_size": 4096,
+        "num_hidden_layers": 36,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 12288,
+        "hidden_act": "silu",
+        "vocab_size": 151936,
+        "max_position_embeddings": 40960
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | bound to model.layers.0.self_attn (from _captured/attention/manifest.json).",
+      "submodule_path": "model.layers.0.self_attn",
+      "class_name": "Qwen3Attention"
+    },
+    {
+      "name": "mlp",
+      "kind": "mlp",
+      "status": "REUSE",
+      "new_shape": {
+        "hidden_size": 4096,
+        "num_hidden_layers": 36,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 12288,
+        "hidden_act": "silu",
+        "vocab_size": 151936,
+        "max_position_embeddings": 40960
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | bound to model.layers.0.mlp (from _captured/mlp/manifest.json); same module as m_l_p.",
+      "submodule_path": "model.layers.0.mlp",
+      "class_name": "Qwen3MLP"
+    },
+    {
+      "name": "layer",
+      "kind": "layer",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 4096,
+        "num_hidden_layers": 36,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 12288,
+        "hidden_act": "silu",
+        "vocab_size": 151936,
+        "max_position_embeddings": 40960
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/decoder.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: decoder_layer -> models/tt_transformers/tt/decoder.py::TransformerBlock (ADAPT). Composite Attention+MLP+RMSNorm block; tt_transformers TransformerBlock is the template (presumed adaptable \u2014 runs canonical, LLM refines via iterate loop if per-component PCC < 0.99). | bound to model.layers.0 (from _captured/layer/manifest.json); same module as decoder_layer.",
+      "submodule_path": "model.layers.0",
+      "class_name": "Qwen3DecoderLayer"
+    },
+    {
+      "name": "encoder_stack",
+      "kind": "encoder_stack",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 4096,
+        "num_hidden_layers": 36,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 12288,
+        "hidden_act": "silu",
+        "vocab_size": 151936,
+        "max_position_embeddings": 40960
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_vision_encoder.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: llama_vision_encoder -> models/tt_transformers/tt/multimodal/llama_vision_encoder.py::TtLlamaVisionEncoder (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted. | bound to `model` (Qwen3Model) \u2014 this checkpoint is decoder-only, so the stack role is model, not a vision encoder.",
+      "submodule_path": "model",
+      "class_name": "Qwen3Model"
+    },
+    {
+      "name": "decoder_head",
+      "kind": "decoder_head",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 4096,
+        "num_hidden_layers": 36,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 12288,
+        "hidden_act": "silu",
+        "vocab_size": 151936,
+        "max_position_embeddings": 40960
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/lm_head.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: lm_head -> models/tt_transformers/tt/lm_head.py::LMHead (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted. | bound to lm_head (from _captured/decoder_head/manifest.json).",
+      "submodule_path": "lm_head",
+      "class_name": "Linear"
+    },
+    {
+      "name": "decoder_layer",
+      "kind": "Qwen3DecoderLayer",
+      "status": "ADAPT",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/decoder.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: decoder_layer -> models/tt_transformers/tt/decoder.py::TransformerBlock (ADAPT). Composite Attention+MLP+RMSNorm block; tt_transformers TransformerBlock is the template (presumed adaptable \u2014 runs canonical, LLM refines via iterate loop if per-component PCC < 0.99). | module-tree: occ=36 leaves=432 sample_paths=['layers.0', 'layers.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "layers.0",
+      "class_name": "Qwen3DecoderLayer"
+    },
+    {
+      "name": "r_m_s_norm",
+      "kind": "Qwen3RMSNorm",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/common/rmsnorm.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: rmsnorm_text -> models/common/rmsnorm.py::RMSNorm (REUSE). derived from compatibility.py BUILDING_BLOCKS 'RMSNorm (text)'. ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip. | module-tree: occ=145 leaves=145 sample_paths=['layers.0.self_attn.q_norm', 'layers.0.self_attn.k_norm'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "layers.0.self_attn.q_norm",
+      "class_name": "Qwen3RMSNorm"
+    },
+    {
+      "name": "m_l_p",
+      "kind": "Qwen3MLP",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | module-tree: occ=36 leaves=144 sample_paths=['layers.0.mlp', 'layers.1.mlp'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "layers.0.mlp",
+      "class_name": "Qwen3MLP"
+    },
+    {
+      "name": "rotary_embedding",
+      "kind": "Qwen3RotaryEmbedding",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/rope.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: standard_rope -> models/tt_transformers/tt/rope.py::RotaryEmbedding (REUSE). derived from compatibility.py BUILDING_BLOCKS 'Standard RoPE'. | module-tree: occ=1 leaves=1 sample_paths=['rotary_emb'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "rotary_emb",
+      "class_name": "Qwen3RotaryEmbedding"
+    }
+  ],
+  "notes": [
+    "Sibling config could not be fetched; classification falls back to NEW for components without a clear file match. Set HF_TOKEN or pre-download `None` and re-run for a sharper diff.",
+    "Top sibling candidates (per-component reuse targets are pulled from whichever sibling provides them, not only the first): qwen3 (auto-upstream) (score 100: exact model_type 'qwen3'); tt_transformers / simple_text_demo (score 40: category 'LLM' default (generic runner)); falcon7b_common (auto-upstream) (score 30: category 'LLM' default)"
+  ],
+  "ranked_siblings": [
+    {
+      "rank": 1,
+      "backend": "qwen3 (auto-upstream)",
+      "score": 100,
+      "reason": "exact model_type 'qwen3'"
+    },
+    {
+      "rank": 2,
+      "backend": "tt_transformers / simple_text_demo",
+      "score": 40,
+      "reason": "category 'LLM' default (generic runner)"
+    },
+    {
+      "rank": 3,
+      "backend": "falcon7b_common (auto-upstream)",
+      "score": 30,
+      "reason": "category 'LLM' default"
+    }
+  ]
+}
