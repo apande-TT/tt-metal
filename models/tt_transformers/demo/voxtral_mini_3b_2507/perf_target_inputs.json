@@ -1,0 +1,51 @@
+{
+  "weight_bytes": 9356474312,
+  "dominant_dtype": "bfloat16",
+  "source": "checkpoint bytes + HF config",
+  "total_params": 3611483136,
+  "params_basis": "read set for unit=unknown: lookup-only and tower-only tensors excluded",
+  "blocks": {
+    "audio_tower": {
+      "layers": 32,
+      "hidden_size": 1280,
+      "intermediate_size": 5120,
+      "kv_heads": 20,
+      "head_dim": 64,
+      "params": 636968960
+    },
+    "language_model": {
+      "layers": 30,
+      "hidden_size": 3072,
+      "intermediate_size": 8192,
+      "kv_heads": 8,
+      "head_dim": 128,
+      "params": 4014136320,
+      "lookup_params": 402653184,
+      "matmul_params": 3611483136
+    }
+  },
+  "stage_roots": {
+    "encode": "audio_tower"
+  },
+  "device_weight_bytes": 10604853248,
+  "device_census_complete": true,
+  "device_section_bytes": {
+    "language_model": 8028272640,
+    "rest": 5775894528,
+    "layer_weights": 5775888384,
+    "audio_tower": 2526248960,
+    "layers": 2518548480,
+    "enc_b": 1263124480,
+    "enc_a": 1263124480,
+    "lm_head": 805306368,
+    "embed": 805306368,
+    "lm_layers": 641765376,
+    "inner": 641765376,
+    "mlp": 301989888,
+    "attn": 152058880,
+    "proj": 50331648,
+    "multi_modal_projector": 50331648,
+    "in_norm_stub": 6144
+  },
+  "bytes_per_param": 2.0
+}

@@ -10,6 +10,13 @@ import ttnn
 
 
 def _to_device_rm(t, device):
+    # NARROW TO bf16 ON THE HOST.  Callers hand this `.float()` tensors, but the target dtype is
+    # bf16, so ttnn used to upload fp32 and fix it up on DEVICE -- the profile showed 42 ms of
+    # fp32 Tilize plus 24 ms of fp32->bf16 Typecast doing exactly that.  Narrowing first halves
+    # the bytes tilized and removes the typecast entirely.  It is EXACT, not an approximation:
+    # both host and device round fp32->bf16 round-to-nearest-even, and these weights came from a
+    # bf16 checkpoint that `.float()` had merely widened, so this restores the original values.
+    t = t.bfloat16()
     try:
         if isinstance(device, ttnn.MeshDevice):
             return ttnn.from_torch(

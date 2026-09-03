@@ -45,6 +45,7 @@ Stub routing (see e2e_plan.json for the full rationale):
            instead PCC-checked against torch on the real TT encoder hidden
            states by `avg_pool1d_conformance()` and reported as a hole.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -57,6 +58,8 @@ from typing import Any
 import torch
 
 import ttnn
+
+from models.tt_transformers.demo.voxtral_mini_3b_2507.tt import cpp_argmax as _cpp_argmax
 
 DEMO_DIR = Path(__file__).resolve().parents[1]
 STUBS_DIR = DEMO_DIR / "_stubs"
@@ -73,6 +76,16 @@ PREFILL_C = 512
 # decode: variable dim is the KV length.
 DECODE_CAP = 32
 KV_C = 640  # PREFILL_C + 128, multiple of TILE_HEIGHT
+# THE RESIDENT KV CACHE IS THE SECOND-BIGGEST THING DECODE READS.  At B=8 x 8 kv-heads x 640
+# positions x 128 head_dim, one layer's K and V are ~21 MB, and sdpa_decode re-reads every
+# position up to the cursor on EVERY token: across 30 layers that is ~490 MB per token at bf16,
+# ~1.05 ms at this board's measured 464 GB/s, i.e. ~7% of the token.  Storing the cache as
+# bfloat8_b halves those bytes.  It is the cache ONLY -- q, the projections and the SDPA math all
+# stay where they are -- and both consumers take it natively: paged_update_cache's validate lists
+# BFLOAT8_B among the accepted cache dtypes and converts a bf16 input on the way in, and
+# sdpa_decode reads block-float K/V directly.  Prefill's ttnn.fill_cache has no such conversion,
+# so _fill_kv_prefill casts to match (see the stubs).
+KV_DTYPE = ttnn.bfloat8_b
 DECODE_BATCH = 8
 
 EOS_TOKEN_ID = 2
@@ -163,13 +176,42 @@ class _Counted:
 
 # ------------------------------------------------------------------- helpers
 def _to_dev(t: torch.Tensor, device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16):
+    # NARROW TO bf16 ON THE HOST.  Callers hand this `.float()` tensors, but the target dtype is
+    # bf16, so ttnn used to upload fp32 and fix it up on DEVICE -- the profile showed 42 ms of
+    # fp32 Tilize plus 24 ms of fp32->bf16 Typecast doing exactly that.  Narrowing first halves
+    # the bytes tilized and removes the typecast entirely.  It is EXACT, not an approximation:
+    # both host and device round fp32->bf16 round-to-nearest-even, and these weights came from a
+    # bf16 checkpoint that `.float()` had merely widened, so this restores the original values.
+    # Block-float targets (bf8_b / bf4_b) are left in fp32 on purpose: their mantissa is
+    # derived from a per-block shared exponent, so inserting a bf16 rounding step first can
+    # change the packed result.  Only the bf16 path is a pure round-trip removal.
+    if dtype == ttnn.bfloat16:
+        t = t.bfloat16()
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _readback(x):
+    """The single output-boundary readback (device -> host).
+
+    FACTORED OUT SO THE GATE-1 WAIVER CANNOT BE SEPARATED FROM ITS CALL.  gates.py matches the
+    `# gate1: allow-readback` pragma on the SAME SOURCE LINE as the flagged ttnn.to_torch, and
+    when this readback was inlined in a list comprehension inside _finish, `black` reformatted
+    the comprehension across several lines and moved the pragma onto the closing bracket.  That
+    silently turned a WAIVED readback into a hard Gate-1 failure with no meaningful source
+    change -- a trap that costs a whole debugging cycle to find, because the diff that breaks it
+    is produced by the formatter rather than by the author.  One short line cannot be split.
+    """
+    return ttnn.to_torch(x)  # gate1: allow-readback output boundary: TaskResult logits/ids
 
 
 # The repaired stubs define the KVSlot contract (k, v, cur_pos_tt, cur_pos,
 # device, paged).  Reuse THEIRS rather than a look-alike, so the pipeline and the
 # stub bodies can never drift apart on the cache layout.
 KVSlot = _load_stub_module("llama_model").KVSlot
+
+# Shared decode-layout helpers (DRAM-bank-sharded projections, width-sharded decode norm).
+# Not a graduated component -- bringup_status.json drives the inventory, not a glob of _stubs.
+_DS = _load_stub_module("_dram_sharded")
 
 
 @dataclass
@@ -262,16 +304,40 @@ class _LmLayerFromParts:
         if self.in_norm_stub is not None:
             h = self.in_norm_stub(x)
         else:
-            h = ttnn.rms_norm(x, weight=self.in_ln_w, epsilon=self.in_ln_eps, compute_kernel_config=HIFI4)
+            h = _DS.rms_norm(self.device, x, self.in_ln_w, self.in_ln_eps, HIFI4)
         a = self.attn(h, rope=rope, kv=kv, mode=mode)
         if isinstance(a, tuple):
             a = a[0]
         x = ttnn.add(residual, a)
 
         residual = x
-        h = ttnn.rms_norm(x, weight=self.post_ln_w, epsilon=self.post_ln_eps, compute_kernel_config=HIFI4)
+        h = _DS.rms_norm(self.device, x, self.post_ln_w, self.post_ln_eps, HIFI4)
         h = self.mlp(h)
         return ttnn.add(residual, h)
+
+
+class _LmBlock:
+    """ONE class for every entry of VoxtralPipeline.lm_layers.
+
+    The routed LM layers are built from different things -- layer 0 is a whole graduated
+    llama_decoder_layer stub, layers 1-2 are _LmLayerFromParts composites over the finer
+    norm/attn/mlp stubs -- so the list held three different types and a structural walk read it as
+    unrelated per-layer objects rather than one repeated block stack.  A shared base would not fix
+    that: the list is at most three long, and it gets shorter still when the profiler caps the depth
+    -- exactly when the walk matters.  So every entry is wrapped in this ONE type.
+
+    It is a pass-through: it forwards the call unchanged and holds no weights, no state and no math.
+    The inner object -- stub proxy or composite -- keeps doing exactly what it did.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __call__(self, x, *, rope=None, kv=None, mode="prefill"):
+        return self.inner(x, rope=rope, kv=kv, mode=mode)
+
+    def __repr__(self):  # pragma: no cover - debug only
+        return f"<LmBlock {self.inner!r}>"
 
 
 # ------------------------------------------------------------ the pipeline
@@ -335,6 +401,50 @@ def _profiling_depth(full_depth: int, requested: int | None = None) -> int:
     return want
 
 
+def _stack_depth(full_depth: int, *stage_requests: int | None, layers: int | None = None) -> int:
+    """Depth for ONE repeated block stack: its own stage argument(s) first, `layers` as the fallback.
+
+    WHY PER-STACK. This model has two independent repeated block stacks -- the 32-block audio tower
+    (encode) and the LM block stack (prefill and decode share it) -- and ONE depth argument cannot
+    describe them.  A single `layers` either forced both to the same number or, worse, reached only
+    the LM and left the encoder building all 32 blocks, which is the expensive half: an uncapped
+    encoder is the difference between 2471 and 18729 dispatched ops on this class of model.
+
+    PRECEDENCE. A stage argument is more specific than `layers`, so when one is present it decides
+    and `layers` is not consulted.  None means NOT REQUESTED -> fall back to `layers`, and
+    `layers=None` still means EVERY layer, so all-None reproduces the previous single-argument
+    behaviour exactly (including the TT_PERF_LAYERS fallback, which belongs to `layers`).
+
+    ZERO IS NOT A SENTINEL. The harness expresses "whole model" by REMOVING the knob, never by
+    sending 0, and a zero-layer build has no KV cache and dies before any timing marker is printed.
+    So only a positive integer is a request at all: 0 and negatives are discarded here (they fall
+    back to `layers` rather than loosening it), and a value at or above the real depth is ignored
+    rather than inventing blocks that do not exist.
+
+    TIGHTEST WINS AMONG STAGES SHARING A STACK. prefill and decode run through the SAME built LM
+    blocks, so their two arguments must collapse to one built depth; taking the minimum keeps both
+    stages at or below what each asked for, which is the direction a profiling cap has to err in.
+    """
+    given = [r for r in stage_requests if isinstance(r, int) and r > 0]
+    if given:
+        return min(_profiling_depth(full_depth, r) for r in given)
+    return _profiling_depth(full_depth, layers)
+
+
+def _cap_block_stack(owner, depth: int):
+    """Truncate a BUILT block stack to `depth` blocks, keeping the LAST ones.  Returns `owner`.
+
+    The stub holds its blocks in a plain python list that its forward iterates, so the cap is a
+    slice and no stub body changes.  It keeps the TAIL because this stack's graduated stubs are
+    assigned at fixed indices near the end (encoder layers 28..31): slicing off the tail would
+    silently drop exactly the bodies under test, and the e2e gate requires them to be INVOKED.
+    """
+    blocks = getattr(owner, "layers", None)
+    if isinstance(blocks, list) and 0 < depth < len(blocks):
+        owner.layers = blocks[-depth:]
+    return owner
+
+
 class VoxtralPipeline:
     """Resident TT pipeline: build once, run many.
 
@@ -352,6 +462,9 @@ class VoxtralPipeline:
         prefill_capacity: int = PREFILL_C,
         kv_capacity: int = KV_C,
         layers: int | None = None,
+        decode_layers: int | None = None,
+        encode_layers: int | None = None,
+        prefill_layers: int | None = None,
     ):
         self.device = device
         self.hf = hf_model
@@ -368,12 +481,18 @@ class VoxtralPipeline:
         self.n_kv = tcfg.num_key_value_heads
         self.head_dim = tcfg.head_dim
         self.hidden = tcfg.hidden_size
-        self.n_layers = _profiling_depth(tcfg.num_hidden_layers, layers)
+        # ONE RESOLVED DEPTH PER STACK. prefill and decode are the same built LM blocks, so their
+        # two arguments collapse into this one number (tightest wins); encode is the separate audio
+        # tower.  All-None leaves both at the full config depth, i.e. numerics are untouched.
+        self.n_layers = _stack_depth(tcfg.num_hidden_layers, decode_layers, prefill_layers, layers=layers)
         self.vocab = tcfg.vocab_size
 
         inner = hf_model.model
         AT = inner.audio_tower
         LM = inner.language_model
+        # len() of the real ModuleList, not a config field: the cap must be relative to the blocks
+        # that actually get built.
+        self.n_enc_layers = _stack_depth(len(AT.layers), encode_layers, layers=layers)
 
         def S(name):  # load + count-wrap a graduated stub module
             self._paths[name] = str(STUBS_DIR / f"{name}.py")
@@ -383,7 +502,7 @@ class VoxtralPipeline:
             return _Counted(name, obj, self.counts)
 
         # ---------------- audio encode --------------------------------------
-        self.enc_a = W("voxtral_encoder", S("voxtral_encoder").build(device, AT))
+        enc_a = S("voxtral_encoder").build(device, AT)
         enc_b = S("encoder_stack").build(device, AT)
         # the byte-identical second tower carries streams 4-7; its last four
         # layers are handed to the fine-grained graduated layer stubs so those
@@ -396,7 +515,10 @@ class VoxtralPipeline:
         enc_b.layers[31] = _EncLayerWithAttnStub(
             device, AT.layers[31], W("attention", S("attention").build(device, AT.layers[31].self_attn))
         )
-        self.enc_b = W("encoder_stack", enc_b)
+        # CAP AFTER the graduated bodies are in place and FROM THE END, so layers[28..31] above are
+        # the blocks a shallow encode profile keeps rather than the ones it throws away.
+        self.enc_a = W("voxtral_encoder", _cap_block_stack(enc_a, self.n_enc_layers))
+        self.enc_b = W("encoder_stack", _cap_block_stack(enc_b, self.n_enc_layers))
 
         self.proj = W(
             "voxtral_multi_modal_projector",
@@ -419,27 +541,44 @@ class VoxtralPipeline:
         # slots -- the mismatch surfaced as an IndexError on the first forward, not at build time.
         # `_routed` is what the depth actually permits, and _lm_forward iterates whatever was built.
         _routed = min(_STUB_ROUTED_LAYERS, self.n_layers)
+        # THE AGGREGATE SUB-BLOCK MUST STILL HOLD A LAYER. `rest` is one llama_model covering
+        # [_STUB_ROUTED_LAYERS, _rest_end); at a cap of <= _STUB_ROUTED_LAYERS that range is empty or
+        # inverted, which builds a bulk stack with NO layers instead of a short one -- a model that
+        # is not runnable, and fails downstream of the build rather than at it. One layer is the
+        # floor; above the floor the requested depth is honoured exactly, so nothing moves at full
+        # depth.
+        _rest_end = max(self.n_layers, _STUB_ROUTED_LAYERS + 1)
         self.lm_layers = []
+        # EVERY ENTRY IS AN _LmBlock, so the list reads as ONE repeated block stack.  The wrapper is
+        # a pass-through; what each layer is built from is unchanged.
         if _routed > 0:
-            self.lm_layers.append(W("llama_decoder_layer", S("llama_decoder_layer").build(device, LM.layers[0])))
+            self.lm_layers.append(
+                _LmBlock(W("llama_decoder_layer", S("llama_decoder_layer").build(device, LM.layers[0])))
+            )
         if _routed > 1:
             self.lm_layers.append(
-                _LmLayerFromParts(
-                    device,
-                    LM.layers[1],
-                    in_norm=W("llama_r_m_s_norm", S("llama_r_m_s_norm").build(device, LM.layers[1].input_layernorm)),
-                    attn=W("llama_attention", S("llama_attention").build(device, LM.layers[1].self_attn)),
-                    mlp=W("llama_m_l_p", S("llama_m_l_p").build(device, LM.layers[1].mlp)),
+                _LmBlock(
+                    _LmLayerFromParts(
+                        device,
+                        LM.layers[1],
+                        in_norm=W(
+                            "llama_r_m_s_norm", S("llama_r_m_s_norm").build(device, LM.layers[1].input_layernorm)
+                        ),
+                        attn=W("llama_attention", S("llama_attention").build(device, LM.layers[1].self_attn)),
+                        mlp=W("llama_m_l_p", S("llama_m_l_p").build(device, LM.layers[1].mlp)),
+                    )
                 )
             )
         if _routed > 2:
             self.lm_layers.append(
-                _LmLayerFromParts(
-                    device,
-                    LM.layers[2],
-                    in_norm=None,
-                    attn=W("llama_attention", S("llama_attention").build(device, LM.layers[2].self_attn)),
-                    mlp=W("mlp", S("mlp").build(device, LM.layers[2].mlp)),
+                _LmBlock(
+                    _LmLayerFromParts(
+                        device,
+                        LM.layers[2],
+                        in_norm=None,
+                        attn=W("llama_attention", S("llama_attention").build(device, LM.layers[2].self_attn)),
+                        mlp=W("mlp", S("mlp").build(device, LM.layers[2].mlp)),
+                    )
                 )
             )
         self.rest = W(
@@ -447,7 +586,7 @@ class VoxtralPipeline:
             S("llama_model").build(
                 device,
                 LM,
-                layer_range=(_STUB_ROUTED_LAYERS, self.n_layers),
+                layer_range=(_STUB_ROUTED_LAYERS, _rest_end),
                 skip_embedding=True,
                 rope_capacity=self.KV_C,
             ),
@@ -475,7 +614,10 @@ class VoxtralPipeline:
         self.next_ids_tt = ttnn.from_torch(
             torch.zeros(self.B, 1, dtype=torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=device
         )
-        self.kv = [self._new_kv_slot() for _ in range(self.n_layers)]
+        # ONE SLOT PER LAYER THAT CAN RUN: the routed blocks read kv[i] and `rest` reads
+        # kv[_STUB_ROUTED_LAYERS:], so the count follows _rest_end (== n_layers unless the aggregate
+        # floor lifted it) or the aggregate's first layer would index past the end on first forward.
+        self.kv = [self._new_kv_slot() for _ in range(_rest_end)]
         # RoPE cos/sin come from the graduated llama_rotary_embedding stub -- it
         # is the single source for every LM layer in BOTH phases.  Its table is
         # built from the real HF rotary_emb over arange(0, KV_C), so the values
@@ -483,6 +625,17 @@ class VoxtralPipeline:
 
         self._trace_state: dict[str, dict] = {}
         self._last_encoder_hidden = None
+        # BUILT HERE, not on first use: it allocates resident buffers and program descriptors, and
+        # the first sample can happen inside a trace capture -- where an allocation would be
+        # recorded rather than performed.  See tt/cpp_argmax.py on why those cannot be rebuilt
+        # per call.
+        # `out=self.next_ids_tt` -- pass 2 writes the sampled id straight into the resident buffer the
+        # next step embeds from, so the sampler needs no trailing copy.  See tt/cpp_argmax.py.
+        self._cpp_argmax = (
+            _cpp_argmax.CppArgmax(device, self.B, self.vocab, out=self.next_ids_tt)
+            if _cpp_argmax.enabled()
+            else None
+        )
 
     # ------------------------------------------------------------- utilities
     def _new_kv_slot(self) -> KVSlot:
@@ -494,8 +647,8 @@ class VoxtralPipeline:
         # captured decode step is genuinely re-executable instead of baking a
         # python position into the trace.
         return KVSlot(
-            k=_to_dev(z, self.device),
-            v=_to_dev(z.clone(), self.device),
+            k=_to_dev(z, self.device, dtype=KV_DTYPE),
+            v=_to_dev(z.clone(), self.device, dtype=KV_DTYPE),
             cur_pos_tt=self.cur_pos_tt,
             cur_pos=0,
             device=self.device,
@@ -544,6 +697,10 @@ class VoxtralPipeline:
 
     def _advance_on_device(self):
         """cur_pos += 1, entirely on device (trace safe, no host op)."""
+        # NOT `ttnn.add(..., output_tensor=self.cur_pos_tt)`: that would fold the copy into the add,
+        # but eltwise refuses a preallocated output on ROW_MAJOR inputs -- "Optional output tensor
+        # with Row Major input is not supported right now for Elementwise operations"
+        # (binary.cpp:695), and the cursor has to stay ROW_MAJOR int32 for the KV ops that read it.
         ttnn.copy(ttnn.add(self.cur_pos_tt, self.one_b), self.cur_pos_tt)
         for slot in self.kv:
             slot.cur_pos += 1
@@ -638,8 +795,38 @@ class VoxtralPipeline:
     # --------------------------------------------------------- STAGE: decode
     def _argmax_into_next_ids(self, logits):
         """Greedy sample on device, written into the PERSISTENT id buffer."""
-        ids = ttnn.argmax(logits, dim=-1, keepdim=True)  # uint32 ROW_MAJOR [1,B,1]/[B,1,1]
-        ttnn.copy(ttnn.reshape(ids, (self.B, 1)), self.next_ids_tt)
+        # ROW_MAJOR FIRST -- ttnn.argmax picks its SINGLE-CORE program factory whenever the input is
+        # not ROW_MAJOR, so handing it the lm_head's TILE output scans all 131072 vocab entries on
+        # ONE Tensix core.  The untilize is multicore and bandwidth-bound (~8 MB), so it costs far
+        # less than the serialised scan it replaces.  Exact, so the sampled ids are unchanged.
+        #
+        # ...AND LAND IT IN L1, because ROW_MAJOR alone only buys the multicore FACTORY, not
+        # multicore BANDWIDTH.  That factory splits the reduction dim over ~110 worker cores, but an
+        # interleaved [B, 1, 131072] tensor is paged by its last dim: one page is 131072 x 2 B =
+        # 256 kB, so the whole logits tensor is just B pages and every one of those 110 cores issues
+        # its ~2 kB read against the SAME bank for a given stream.  The scan is not bandwidth-bound
+        # at all, it is bank-contention-bound -- measured 218 us/call against a 1.04 ms roofline for
+        # the whole run's worth of calls.  In L1 the pages sit in Tensix banks the workers reach
+        # over the NOC instead of through the DRAM controller.  Pure placement: argmax returns the
+        # first maximal index either way, so the sampled ids are bit-identical.
+        rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG)
+        #
+        # ...AND THEN THE SCAN ITSELF IS THE FLOOR.  With the layout and the placement both fixed,
+        # what is left is ~22 cycles per element on the data-movement RISC-V -- the stock kernel's
+        # sign-dispatching bf16 comparison plus a second equality branch for tie-breaking, run once
+        # per vocab entry per stream.  `cpp_argmax` is a Metalium replacement that keeps the exact
+        # same contract (uint32 ROW_MAJOR [1,B,1], first maximal index) and removes both branches;
+        # see tt/cpp_argmax.py for why the stock op cannot be tuned into this.
+        head = self._cpp_argmax
+        if head is not None and int(logits.shape[-1]) != head.vocab:
+            head = None  # a width the resident buffers were not sized for; stay on the stock op
+        if head is not None:
+            # The kernel was built to write INTO next_ids_tt, so the ids are already where the next
+            # step reads them; copying would be a launch that moves 32 bytes onto themselves.
+            head(rm)
+        else:
+            ids = ttnn.argmax(rm, dim=-1, keepdim=True)
+            ttnn.copy(ttnn.reshape(ids, (self.B, 1)), self.next_ids_tt)
 
     def _rope_now(self):
         """Per-stream cos/sin at the resident position, via the graduated stub.
@@ -652,7 +839,20 @@ class VoxtralPipeline:
 
     def decode_step(self):
         """One AR step over all B streams: reads/writes ONLY resident buffers."""
-        x = self.embed(self.next_ids_tt)  # [B,1,hidden]
+        # FOLD THE STREAMS INTO THE TILE-HEIGHT DIM ONCE, HERE.  The embedding hands back
+        # [B, 1, hidden]: the stream index is the LEADING dim, which every ttnn.linear reads as
+        # BATCH, so each projection runs B independent [1, H] x [H, N] matmuls and re-streams the
+        # WHOLE weight once per stream -- at B=8 that is eight passes over the weight for eight
+        # rows of output.  [1, B, hidden] has the identical row-major element order and makes it
+        # one [B, H] x [H, N] matmul that reads the weight once.  Measured on device, the same
+        # 3072x8192 projection costs 932 us/call at [B,1,H] and 118 us/call at [1,B,H].
+        #
+        # llama_decoder_layer, llama_attention and llama_model each already did this reshape
+        # internally, so they only ever saw the fast shape; the finer part-stubs routed for layers
+        # 1-2 (llama_r_m_s_norm / llama_m_l_p / mlp) have no shape logic of their own and saw the
+        # slow one.  Folding at the entry fixes those without teaching every leaf stub about batch,
+        # and makes the internal reshapes in the bodies that already did it a no-op.
+        x = ttnn.reshape(self.embed(self.next_ids_tt), (1, self.B, self.hidden))  # [1,B,hidden]
         rope = self._rope_now()
         h = self._lm_forward(x, rope=rope, kv_slots=self.kv, mode="decode")
         logits = self.lm_head(h)  # [B,1,V]
@@ -682,13 +882,10 @@ class VoxtralPipeline:
         # NOTE: this runs AFTER the forward (run_chain has already returned).  It is
         # the output boundary -- device results -> host for PCC/detokenisation -- not
         # model math, and it is never reached from a *_trace_step or the observed region.
-        logits = torch.stack(
-            [ttnn.to_torch(x).reshape(self.B, -1).float() for x in step_logits],
-            dim=1,  # gate1: allow-readback output boundary: TaskResult logits/ids
-        )  # [B,N,V]
-        tokens = torch.stack(
-            [ttnn.to_torch(x).reshape(self.B).long() for x in step_ids], dim=1
-        )  # [B,N]  # gate1: allow-readback output boundary: TaskResult logits/ids
+        # The readback goes through _readback() so the gate-1 waiver can live on the same LINE as
+        # the ttnn.to_torch call -- see the note on that helper for why inlining it here is unsafe.
+        logits = torch.stack([_readback(x).reshape(self.B, -1).float() for x in step_logits], dim=1)
+        tokens = torch.stack([_readback(x).reshape(self.B).long() for x in step_ids], dim=1)
         lengths, stopped = [], []
         for b in range(self.B):
             row = tokens[b].tolist()
@@ -889,7 +1086,17 @@ def build_pipeline(device, model=None, **kwargs) -> VoxtralPipeline:
     # re-measures the work signal to prove the knob is live, and a kwarg dropped by this filter is
     # indistinguishable from a knob that does nothing. It stayed out of this set while the harness
     # was setting TT_PERF_LAYERS every profiling run, so every profile built all 32 layers.
-    known = {"batch_size", "prefill_capacity", "kv_capacity", "layers"}
+    # decode_layers/encode_layers/prefill_layers ride that same contract, one per repeated block
+    # stack, so a per-stage cap reaches the stack it names instead of leaving the encoder at 32.
+    known = {
+        "batch_size",
+        "prefill_capacity",
+        "kv_capacity",
+        "layers",
+        "decode_layers",
+        "encode_layers",
+        "prefill_layers",
+    }
     opts = {k: v for k, v in kwargs.items() if k in known}
     if model is None:
         from models.tt_transformers.demo.voxtral_mini_3b_2507.tt.reference import load_hf_model

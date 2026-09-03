@@ -17,6 +17,66 @@ _HIFI4_CFG = ttnn.WormholeComputeKernelConfig(
 )
 
 
+# AUDIO-TOWER SDPA FIDELITY, MATCHED TO ITS bf16 Q/K/V.  The encoder's SDPA was the last HiFi4 op
+# in the tower, so the flash kernel's QK^T and PV matmuls each took FOUR math passes over bf16
+# operands that hold two passes worth of mantissa.  HiFi2 is the documented setting for bf16
+# attention (GUIDELINES/04 section 7); what protects the numerics is fp32_dest_acc_en, NOT the
+# fidelity -- the softmax SUM is the precision-critical step and loses accuracy in fp16 DST, so
+# that flag stays True while the fidelity drops.
+#
+# SCOPED TO THE AUDIO TOWER ON PURPOSE.  Dropping the LM's SDPA too (prefill + decode) bought
+# only ~1 ms more and cost almost all of the remaining PCC margin: measured 0.9552 with all 12
+# call sites at HiFi2 versus 0.9705 with just these six, against a 0.95 gate -- and 0.9705 is
+# fractionally ABOVE the 0.9703 the tower measured at HiFi4, i.e. scoped this way the drop is
+# free.  The LM attention feeds the logits the sampler reads directly, so it keeps HiFi4; the
+# encoder's output is a 1500-frame embedding the projector then re-mixes, which tolerates it.
+_SDPA_CFG = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_approx_mode=False,
+    fp32_dest_acc_en=True,
+    packer_l1_acc=False,
+)
+
+
+# AUDIO-TOWER PROJECTION FIDELITY, MATCHED TO THE bf16 WEIGHTS.  These projections keep bf16
+# weights, and HiFi4 makes the math engine take FOUR passes over operands that hold TWO passes
+# worth of mantissa -- the profiler tags every one of them compute-bound ("SLOW", not DRAM) on a
+# full 110-core grid, so the math is the critical path and the extra passes are pure waste.
+# HiFi2 is the documented pairing for bf16 (GUIDELINES/01 section 12; LoFi rarely wins at bf16,
+# so this stops at HiFi2 rather than dropping all the way).  The layer_norms and SDPA stay at
+# HiFi4 + fp32_dest_acc_en=True: this tower's own repair history records it losing PCC when its
+# reductions ran at a lower fidelity, and softmax/variance accumulation is where that compounds.
+_PROJ_CFG = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_approx_mode=False,
+    fp32_dest_acc_en=False,
+    packer_l1_acc=True,
+)
+
+
+def _dram_sharded():
+    """Load the shared decode-layout helper that sits next to this stub.
+
+    The stubs are imported standalone BY PATH (tt/pipeline._load_stub_module), so they have no
+    package context and a relative import is not available to them.
+    """
+    import importlib.util
+    import pathlib
+    import sys
+
+    key = "_voxtral_stub__dram_sharded"
+    mod = sys.modules.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(key, pathlib.Path(__file__).with_name("_dram_sharded.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[key] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
+_DS = _dram_sharded()
+
+
 class TtVoxtralAttention:
     def __init__(self, device, torch_module):
         self.device = device
@@ -25,37 +85,20 @@ class TtVoxtralAttention:
         self.embed_dim = torch_module.embed_dim
         self.scaling = torch_module.head_dim**-0.5
 
-        self.q_weight = ttnn.from_torch(
+        # FUSED QKV -- see _dram_sharded.fuse_qkv / qkv_heads.  This body pre-scales Q and passes
+        # scale=1.0 to SDPA, so the scale folds into the Q columns and the multiply disappears.
+        _qkv_w, _qkv_b = _DS.fuse_qkv(
             torch_module.q_proj.weight.T.contiguous().float(),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
-        )
-        self.q_bias = ttnn.from_torch(
-            torch_module.q_proj.bias.unsqueeze(0).float(),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
-        )
-
-        self.k_weight = ttnn.from_torch(
             torch_module.k_proj.weight.T.contiguous().float(),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
-        )
-
-        self.v_weight = ttnn.from_torch(
             torch_module.v_proj.weight.T.contiguous().float(),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
+            qb=torch_module.q_proj.bias.float(),
+            kb=None,
+            vb=torch_module.v_proj.bias.float(),
+            scale=torch_module.head_dim**-0.5,
         )
-        self.v_bias = ttnn.from_torch(
-            torch_module.v_proj.bias.unsqueeze(0).float(),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
+        self.qkv_weight = ttnn.from_torch(_qkv_w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.qkv_bias = ttnn.from_torch(
+            _qkv_b.unsqueeze(0), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
 
         self.out_weight = ttnn.from_torch(
@@ -75,29 +118,22 @@ class TtVoxtralAttention:
         bsz = hidden_states.shape[0]
         seq_len = hidden_states.shape[1] if len(hidden_states.shape) == 3 else hidden_states.shape[-2]
 
-        q = ttnn.linear(hidden_states, self.q_weight, bias=self.q_bias, compute_kernel_config=_HIFI4_CFG)
-        q = ttnn.multiply(q, self.scaling)
-
-        k = ttnn.linear(hidden_states, self.k_weight, compute_kernel_config=_HIFI4_CFG)
-
-        v = ttnn.linear(hidden_states, self.v_weight, bias=self.v_bias, compute_kernel_config=_HIFI4_CFG)
-
-        q = ttnn.reshape(q, (bsz, seq_len, self.num_heads, self.head_dim))
-        q = ttnn.transpose(q, 1, 2)
-
-        k = ttnn.reshape(k, (bsz, seq_len, self.num_heads, self.head_dim))
-        k = ttnn.transpose(k, 1, 2)
-
-        v = ttnn.reshape(v, (bsz, seq_len, self.num_heads, self.head_dim))
-        v = ttnn.transpose(v, 1, 2)
+        qkv = _DS.mm(self.device, hidden_states, self.qkv_weight, _PROJ_CFG, bias=self.qkv_bias)
+        q, k, v = _DS.qkv_heads(qkv, self.num_heads)
 
         attn_output = ttnn.transformer.scaled_dot_product_attention(
-            q, k, v, is_causal=False, scale=1.0, compute_kernel_config=_HIFI4_CFG
+            q,
+            k,
+            v,
+            is_causal=False,
+            scale=1.0,
+            program_config=_DS.sdpa_config(self.device, q, k),
+            compute_kernel_config=_SDPA_CFG,
         )
 
         attn_output = ttnn.transformer.concatenate_heads(attn_output)
 
-        attn_output = ttnn.linear(attn_output, self.out_weight, bias=self.out_bias, compute_kernel_config=_HIFI4_CFG)
+        attn_output = _DS.mm(self.device, attn_output, self.out_weight, _PROJ_CFG, bias=self.out_bias)
 
         return attn_output
 
