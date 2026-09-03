@@ -59,6 +59,23 @@ _STRUCTURAL_KINDS = {
     "sparse",
 }
 
+
+def _structural_kinds() -> set:
+    """The set above, plus every kind the gates ACTUALLY mint, read from the table that defines them.
+
+    A gate kind missing here does not fail loudly -- it renders in the anonymous `other` column,
+    which is the exact confusion this set was added to end, so the omission looks like a report that
+    is merely vague rather than one that is wrong. perf_mcp._GATE_LEVERS is where a gate's kinds are
+    declared; taking them from there means adding a gate cannot silently un-name its own lever in the
+    report. The literals stay because they cover the kinds no gate mints (`gather`, `sparse`,
+    `kv-cache`, bare `structural`).
+
+    Resolved lazily for the reason _levels_display is: perf_mcp imports this module, so it cannot be
+    imported at load time.
+    """
+    return _STRUCTURAL_KINDS | set(getattr(_perf_mcp(), "_GATE_KINDS", None) or ())
+
+
 _REPORT_NAME = "RUN_REPORT.md"
 
 
@@ -82,9 +99,33 @@ def _latest_belongs_to(latest: Path, model_root) -> bool:
     try:
         declared = (json.loads((latest / "manifest.json").read_text()).get("config") or {}).get("model_root")
     except (OSError, ValueError, AttributeError):
-        return True
+        declared = ""
     if not str(declared or "").strip():
-        return True
+        # NO MANIFEST IS NOT A YES. Defaulting to "this run is yours" is what the docstring above
+        # describes and what it still allowed: a run whose manifest never reached this checkout --
+        # an isolated run writes its manifest inside the /tmp worktree and mirrors back only the
+        # report -- hands its directory to ANY caller. Observed twice on 2026-09-03, the tool's own
+        # suite replacing a finished 32 KB report with a 57-byte and then a 48-byte fixture, and
+        # failing two of its own tests in the checkout where a real runs/latest exists.
+        #
+        # The directory NAMES the model. Run.create builds its id as "<timestamp>-<model dir name>",
+        # so the name is a fact the run wrote about itself and survives when the manifest does not.
+        # No name to read, and no model to compare it with, still means yes -- that is the early-run
+        # case this must not regress.
+        _model_leaf = Path(model_root).name.strip()
+        try:
+            _run_leaf = latest.resolve().name.strip()
+        except OSError:
+            return True
+        if not (_model_leaf and _run_leaf):
+            return True
+        if _run_leaf.endswith(_model_leaf):
+            return True
+        # ONLY REFUSE WHEN THE NAME POSITIVELY NAMES SOMEONE ELSE. Run.create builds its id as
+        # "<timestamp>-<model dir name>", so a name carrying a model has the separator. A name
+        # without one -- a hand-made or legacy directory -- states no owner, and "no information"
+        # must keep the conservative answer this function has always given for the early-run case.
+        return "-" not in _run_leaf
     try:
         return Path(declared).resolve() == Path(model_root).resolve()
     except OSError:
@@ -281,7 +322,7 @@ def _level_of(kind: str) -> str:
     k = _normalise_kind(kind)
     if k in _LEVEL_COLS and k != "host":
         return k
-    if k in _STRUCTURAL_KINDS:
+    if k in _structural_kinds():
         return "structural"
     if k in _HOST_KINDS or k == "host":
         return "host"
