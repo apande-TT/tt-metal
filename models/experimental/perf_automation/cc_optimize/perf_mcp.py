@@ -212,6 +212,9 @@ _FULLPIPE_BASELINE_1CQ_PATH = _fullpipe_baseline_1cq_path()
 # is reported as a regression regardless (see the regressed branch below), because "within 8%
 # of the best ever" used to read as ok and let real latency ratchet upward unnoticed.
 _FULLPIPE_TOL = float(os.environ.get("PERF_MCP_FULLPIPE_TOL", "0.08"))
+# trace_replay prints this when the timed decode step neither advanced its state nor changed its
+# output. Pinned to the printing side by test_a_decode_that_is_not_decoding_is_not_timed.
+_DECODE_STUCK_MARKER = "TRACE_DECODE_ADVANCE=stuck"
 # Must match the BEFORE bookend (run.py sets 3): AFTER = min over 1-sample readings vs
 # BEFORE = median of 3 manufactured the full noise range as a gain on every run.
 _FULLPIPE_SAMPLES = max(1, int(os.environ.get("PERF_MCP_FULLPIPE_SAMPLES", "3")))
@@ -1171,10 +1174,10 @@ def _rebuild_optimize_report(model_root=None) -> None:
             throughput=_read_throughput(),
             finalized=False,
         )
-        when = (
-            f"Updated live: {_t.strftime('%Y-%m-%d %H:%M:%S %Z')} · {n_attempts} lever attempt(s) so far — "
-            "each knob is logged the instant it resolves, win OR fail, with why it was tried and why it won or failed."
-        )
+        # THE STAMP, NOT A DESCRIPTION OF THE FILE. The trailing clause explained the report's own
+        # logging policy to a reader who is here to check numbers; it is the same sentence on every
+        # run of every model and states nothing that can be validated.
+        when = f"Updated live: {_t.strftime('%Y-%m-%d %H:%M:%S %Z')} · {n_attempts} lever attempt(s) so far"
         _key = os.environ.get("PERF_MCP_REPORT_KEY", "optimize")
         _module = os.environ.get("PERF_MCP_REPORT_MODULE")
         if _module:
@@ -2801,6 +2804,12 @@ def _run_full_pipeline_ms():
     if case:
         cmd += ["-k", case]
     per_tokens = []
+    # A decode that never advanced. trace_replay refuses to time it, but the perf test's _try_traced
+    # catches Exception broadly, so the refusal alone would land as TRACE_REPLAY_SKIPPED and quietly
+    # DOWNGRADE to the eager wall -- a number, banked, measured on a step re-running one position.
+    # The marker is printed BEFORE the raise for exactly that reason: it survives the swallow, and
+    # this is what reads it.
+    decode_stuck = ""
     stage_ms = {}
     # EVERY SAMPLE, NOT THE LAST ONE. The headline is the median of _FULLPIPE_SAMPLES readings
     # (`dec` below) precisely because one reading is noise; the per-stage split was a plain
@@ -3034,6 +3043,9 @@ def _run_full_pipeline_ms():
                         # carried as the scalar below.
                 except Exception:  # noqa: BLE001
                     pass
+            # Printed by trace_replay._check_advance; keep the name verbatim on both sides.
+            if _DECODE_STUCK_MARKER in line:
+                decode_stuck = line.strip()
             if "TRACE_PER_TOKEN_MS=" in line:
                 try:
                     per_tokens.append(float(line.split("TRACE_PER_TOKEN_MS=", 1)[1].split()[0]))
@@ -3076,6 +3088,12 @@ def _run_full_pipeline_ms():
                     prefill_path = line.split("TRACE_PREFILL_PATH=", 1)[1].split()[0]
                 except Exception:  # noqa: BLE001
                     pass
+    # BEFORE any number is derived, including the eager fallback. A run whose decode stood still has
+    # no valid reading to offer: the trace refused, and the wall time that would stand in for it
+    # prices the same non-advancing step. Failing the measurement is the honest outcome -- the gate
+    # then reports no reading rather than a fast one.
+    if decode_stuck:
+        return None, None, "decode did not advance between iterations: %s" % decode_stuck, None
     dec = statistics.median(per_tokens) if per_tokens else None
     pf = statistics.median(prefills) if prefills else None
     if dec is not None or pf is not None:
@@ -6445,8 +6463,93 @@ def _ceiling_armed(target, rep: dict) -> tuple:
     return True, ""
 
 
-@mcp.tool()
-def _stage_of_op(op, profile) -> str:
+def _stages_short_of_achievable() -> list:
+    """Stages measured SLOWER than the slow end of their own achievable band, worst first.
+
+    THE MINIMUM BAR FOR A FINISHED RUN. Stopping was decided against the headline alone, and the
+    headline is ONE stage -- so a run could be cleared while every other stack sat multiples above
+    its own ceiling. voxtral 2026-09-03 finished with the recurring stage at 10.99 ms against a
+    21-28 ms band (past it, which is fine) while the prompt stage sat at 182.44 against 26-35 and
+    the audio stage at 38.49 against its own. Nothing in the gate looked at either.
+
+    Beating the band is expected and is not caught here. Being ABOVE it is.
+
+    The roofs come from summary._stage_roofs -- the one place that turns pinned bytes and peak FLOPs
+    into a per-stage roof, and the same call the report renders from, so the gate and the report can
+    never disagree about the bar. Read from THIS run's own state (baseline profile, throughput,
+    stage_ms), not from the newest directory under runs/: roofline_provenance.collect globs for one
+    and on this machine it resolves to a run five days old.
+
+    The band fractions are perf_target's own, read off the published band rather than assumed -- an
+    MoE bands at 37.5-50%, not 60-80%, and the dense pair would hold it to a bar its hardware cannot
+    reach. band[0] is the LOW rate, so roof/that fraction is the SLOWEST time still inside the band,
+    which is what "at least achievable" means.
+
+    A stage this cannot price does not appear, so a capture that marked no stages, or a model with
+    no ceiling inputs, yields [] and the gate behaves exactly as it did before.
+    """
+    try:
+        _thr = _read_throughput() or {}
+        _theo = float(_thr.get("theoretical_rate") or 0.0)
+        _band = _thr.get("band") or []
+        _lof = (float(_band[0]) / _theo) if (_theo > 0 and len(_band) == 2 and _band[0]) else 0.60
+        # THE BYTES AND THE UNIT COME FROM THEIR OWNERS, not off the throughput snapshot. That
+        # snapshot is rewritten from a file inside the model directory the optimize loop reverts, so
+        # reading it here can resurrect a stale vintage -- a 16-layer 3.33 GB one came back twice in
+        # one run and printed a ceiling beside a full-model measurement. The anchor is write-once and
+        # keyed by the unit, and _anchored_ceiling_facts refuses to default that unit.
+        # TWO SOURCES, ASKED IN ORDER, because they carry different halves. The facts FILE holds the
+        # bytes and the block map but does NOT carry a unit -- verified against a live run, where it
+        # returns weight_bytes/total_params/stage_roots and no unit at all. Only the anchor records
+        # which unit the bytes were pinned under. Taking `file or anchor` therefore resolves to the
+        # file and loses the unit, and the bar silently never applies: the worst outcome available,
+        # since a bar that never fires looks exactly like a bar that always passes.
+        _facts = _load_perf_target_inputs() or {}
+        _unit = str(_facts.get("unit") or "").strip()
+        if not _unit:
+            _unit = str((_anchored_ceiling_facts() or {}).get("unit") or "").strip()
+        _ab = _anchored_ceiling_bytes(_facts)
+        _bw = float(_thr.get("peak_bw_gbps") or 0.0)
+        if not (_lof > 0 and _ab and _bw and _unit):
+            return []
+        _sms = read_stage_ms() or {}
+        if not _sms:
+            return []
+        _roofs = _summary_mod()._stage_roofs(
+            int(_ab),
+            _bw,
+            int(_thr.get("tp_degree") or 1),
+            _unit,
+            _read_baseline_profile(),
+            _sms,
+            model=(_MODEL_ROOT.name if _MODEL_ROOT else "model"),
+            task=os.environ.get("PERF_MCP_TASK", "main"),
+        )
+        out = []
+        for _name, _r in (_roofs or {}).items():
+            _ms = _sms.get(_name)
+            _roof = _r.get("compute_ms") if _r.get("binds") == "compute" else _r.get("memory_ms")
+            if not (isinstance(_ms, (int, float)) and isinstance(_roof, (int, float))):
+                continue
+            if not (_ms > 0 and _roof > 0):
+                continue
+            _ceiling = float(_roof) / _lof
+            if float(_ms) > _ceiling:
+                out.append(
+                    {
+                        "stage": str(_name),
+                        "measured_ms": round(float(_ms), 4),
+                        "achievable_ms": round(_ceiling, 4),
+                        "over_by_ms": round(float(_ms) - _ceiling, 4),
+                        "binds": _r.get("binds"),
+                    }
+                )
+        return sorted(out, key=lambda r: -r["over_by_ms"])
+    except Exception:  # noqa: BLE001 -- a bar that cannot be read must never block a run
+        return []
+
+
+def stage_of_op(op, profile) -> str:
     """Which stage this op costs the most in, read from the capture, or "" when it cannot say.
 
     next_target names an OP and never said where it lives, and the prompt's only stage-shaped signal
@@ -6460,9 +6563,12 @@ def _stage_of_op(op, profile) -> str:
     because that is the stage where fixing it pays. Ties and unattributable ops return "", and the
     caller behaves exactly as it did before the field existed.
 
-    Matching prefers the fuller signature the target carries (op code plus shape) and falls back to
-    the code alone, so a target named by shape is not lost. Stage names come from the capture's own
-    marks -- never a name this tool typed.
+    Matched on the WHOLE name, never on a prefix. The target carries a bare op code, so a prefix test
+    buys nothing and costs correctness: real op codes nest -- MorehSoftmaxOp is a prefix of
+    MorehSoftmaxOpParallelizationStrategy -- and a prefix match would pool two different ops and
+    hand back whichever stage the other one is heaviest in. A target that ever carries code plus
+    shape still matches its own entry exactly. Stage names come from the capture's own marks --
+    never a name this tool typed.
     """
     try:
         want = str(op or "").strip()
@@ -6477,7 +6583,7 @@ def _stage_of_op(op, profile) -> str:
                         continue
                     shape = str((o or {}).get("shape") or "").strip()
                     full = ("%s %s" % (code, shape)).strip()
-                    if want in (code, full) or want.startswith(full) or want.startswith(code):
+                    if want == code or want == full:
                         by_stage[str(stage)] = by_stage.get(str(stage), 0.0) + float((o or {}).get("device_ms") or 0.0)
         if not by_stage:
             return ""
@@ -6508,6 +6614,7 @@ def _stage_gap_share(profile) -> dict:
     return out
 
 
+@mcp.tool()
 def termination_check() -> dict:
     """THE BINDING STOP GATE and SOLE authority on 'optimize more or not' — you may declare DONE ONLY
     when this returns can_stop=true. It decides PURELY from its own deterministic measurement (the
@@ -6675,6 +6782,13 @@ def termination_check() -> dict:
             can_stop = True
         else:
             pt_status["band_stop_disarmed"] = _why
+    # EVERY STACK REACHES ITS OWN BAND, OR THE RUN IS NOT DONE. Last, because it is a veto: the
+    # headline band above may set can_stop=True on the strength of ONE stage, and the whole point is
+    # that clearing the recurring stage says nothing about the others. Beating a band is fine; being
+    # above it is what blocks. Empty for a capture that marks no stages, so nothing changes there.
+    _short = _stages_short_of_achievable()
+    if _short:
+        can_stop = False
     halt = next((b for b in blocking if b.get("next_rung") == "tt-lang:install-required"), None)
     # DETERMINISTIC SELECTION: the single op+rung the agent must work next (largest-gap blocking op).
     next_target = (
@@ -6689,7 +6803,7 @@ def termination_check() -> dict:
             # WHERE THIS OP LIVES. Without it the agent has an op and a metric, and the metric names
             # only the recurring stage -- so it worked that stage regardless of where the ranking
             # pointed. Discovered from the capture's own marks; "" when the capture carried none.
-            "stage": _stage_of_op(blocking[0]["op"], prof),
+            "stage": stage_of_op(blocking[0]["op"], prof),
         }
         if blocking
         else None
@@ -6720,6 +6834,11 @@ def termination_check() -> dict:
     _persist_target(next_target)
     return {
         "can_stop": can_stop,
+        # WHICH STACKS STILL OWE THE BAND, and by how much. A veto the caller cannot see reads as
+        # "the gate refuses and will not say why", which is the shape of every silent failure this
+        # module has had. Empty list means every priced stack is inside its band, or none could be
+        # priced -- the two are distinguished by whether the report shows per-stage roofs at all.
+        "stages_short_of_achievable": _short,
         "halt": bool(halt),
         "halt_reason": halt.get("reason") if halt else None,
         "device_ms": dev,

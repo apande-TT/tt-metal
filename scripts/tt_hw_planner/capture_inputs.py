@@ -299,6 +299,80 @@ def _resolve_submodule(model: Any, component_name: str, *, demo_dir: Path) -> Op
     return None
 
 
+_SAMPLES_ENV = "TT_PLANNER_CAPTURE_SAMPLES"
+_SAMPLES_DIRNAME = "samples"
+
+# The three files that make up one captured set, in the order they are written and read. Named
+# once here because the reader and the writer disagreeing is a silent failure: the set is simply
+# treated as absent and the test drops back to synthetic inputs with nothing said.
+CAPTURE_ARTIFACT_FILES: Tuple[str, ...] = ("args.pt", "kwargs.pt", "output.pt")
+# Same reason, for the sidecar that records what was captured: writer and reader sit on opposite
+# sides of the generation boundary, so the name is stated once on each and pinned equal by a test.
+CAPTURE_MANIFEST_FILE = "manifest.json"
+
+
+def _save_capture_triple(dest: Path, capture: Dict[str, Any]) -> None:
+    """Write one captured `(args, kwargs, output)` set. One writer for the primary and the extras."""
+    import torch
+
+    dest.mkdir(parents=True, exist_ok=True)
+    values = (capture.get("args", ()), capture.get("kwargs", {}), capture["output"])
+    for name, value in zip(CAPTURE_ARTIFACT_FILES, values):
+        torch.save(value, dest / name)
+
+
+def _extra_sample_rounds() -> int:
+    """How many EXTRA input sets to capture beyond the first (total = 1 + this).
+
+    Correctness used to be established at exactly one input, so a component that is right for one
+    shape or sequence length and wrong for another passed with nothing to say so. Defaults to one
+    extra; set the env var to 1 to restore single-sample capture.
+    """
+    import os
+
+    try:
+        total = int(os.environ.get(_SAMPLES_ENV, "2"))
+    except ValueError:
+        total = 2
+    return max(0, total - 1)
+
+
+def _capture_extra_samples(*, model, pixel_values, resolved, state, seed, rounds, driver, verbose):
+    """Re-drive the model on fresh inputs to collect additional input sets per component.
+
+    The hooks are still registered at this point, so an extra set costs one more forward. Strictly
+    best-effort: a failure here means fewer samples, never a failed capture, and the primary set is
+    restored untouched whatever happens.
+    """
+    import torch
+
+    extras: Dict[str, List[Dict[str, Any]]] = {}
+    if rounds <= 0 or driver is None:
+        return extras
+    primary = {k: dict(v) for k, v in state.items()}
+    try:
+        for r in range(rounds):
+            torch.manual_seed(seed + 1 + r)
+            state.clear()
+            try:
+                driver(model, torch.randn_like(pixel_values))
+            except Exception as exc:  # noqa: BLE001 -- an extra sample is a bonus, never a failure
+                if verbose:
+                    print(
+                        f"  [capture] extra sample {r + 1} not collected: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                break
+            for comp_name, _sub, _path in resolved:
+                got = state.get(comp_name)
+                if got and "output" in got:
+                    extras.setdefault(comp_name, []).append(dict(got))
+    finally:
+        state.clear()
+        state.update(primary)
+    return extras
+
+
 def capture_real_inputs(
     *,
     model_id: str,
@@ -713,6 +787,16 @@ def capture_real_inputs(
                             file=sys.stderr,
                         )
 
+        extra_samples = _capture_extra_samples(
+            model=model,
+            pixel_values=pixel_values,
+            resolved=resolved,
+            state=state,
+            seed=_capture_seed,
+            rounds=_extra_sample_rounds(),
+            driver=_try_capture_drivers,
+            verbose=verbose,
+        )
     finally:
         for h in handles:
             try:
@@ -735,17 +819,22 @@ def capture_real_inputs(
         comp_dir = captured_root / safe
         comp_dir.mkdir(parents=True, exist_ok=True)
         try:
-            torch.save(capture.get("args", ()), comp_dir / "args.pt")
-            torch.save(capture.get("kwargs", {}), comp_dir / "kwargs.pt")
-            torch.save(capture["output"], comp_dir / "output.pt")
+            _save_capture_triple(comp_dir, capture)
+            # Extra input sets live beside the primary rather than replacing it, so everything that
+            # reads args.pt next to manifest.json keeps working and only the PCC test, which knows
+            # to look, gains the additional coverage.
+            extras = extra_samples.get(comp_name, [])
+            for idx, extra in enumerate(extras, start=1):
+                _save_capture_triple(comp_dir / _SAMPLES_DIRNAME / f"{idx:02d}", extra)
             manifest = {
                 "component": comp_name,
                 "submodule_path": path,
+                "samples": 1 + len(extras),
                 "args": _summarize_value(capture.get("args", ())),
                 "kwargs": _summarize_value(capture.get("kwargs", {})),
                 "output": _summarize_value(capture["output"]),
             }
-            (comp_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+            (comp_dir / CAPTURE_MANIFEST_FILE).write_text(json.dumps(manifest, indent=2))
             out[comp_name] = {
                 "status": "captured",
                 "submodule_path": path,
@@ -772,6 +861,26 @@ def capture_real_inputs(
 
 
 CAPTURE_LOADER_SOURCE = '''
+_ARTIFACT_FILES = ("args.pt", "kwargs.pt", "output.pt")
+_SAMPLES_SUBDIR = "samples"
+_MANIFEST_FILE = "manifest.json"
+
+
+def _component_dir(component_name):
+    """`<demo_dir>/_captured/<safe>` for a component.
+
+    One place derives it. It was worked out independently in three functions here, each repeating
+    the same safe-id rule and the same parents[2] walk from `tests/pcc/test_X.py`, so a change to
+    either would have moved some readers and not others -- and a reader looking in the wrong place
+    does not fail, it silently reports no captured inputs and drops back to synthetic ones.
+    """
+    import re as _re
+    from pathlib import Path as _Path
+
+    safe = _re.sub(r"[^A-Za-z0-9_]+", "_", component_name).strip("_").lower() or "component"
+    return _Path(__file__).resolve().parents[2] / "_captured" / safe
+
+
 def _captured_submodule_path(component_name):
     """Read the submodule_path the capture step hooked when it saved
     inputs for this component. Returns the path string or ``None``.
@@ -784,12 +893,7 @@ def _captured_submodule_path(component_name):
     the manifest's recorded path and using it as the FIRST candidate
     keeps capture's resolution and test's resolution aligned."""
     import json as _json
-    import re as _re
-    from pathlib import Path as _Path
-    safe = _re.sub(r"[^A-Za-z0-9_]+", "_", component_name).strip("_").lower() or "component"
-    here = _Path(__file__).resolve()
-    demo_dir = here.parents[2]
-    manifest_p = demo_dir / "_captured" / safe / "manifest.json"
+    manifest_p = _component_dir(component_name) / _MANIFEST_FILE
     if not manifest_p.is_file():
         return None
     try:
@@ -807,31 +911,242 @@ def _maybe_load_captured(component_name):
     if the planner's capture-inputs step produced them; return `None`
     otherwise. Lets the test bypass the synthetic-input path when we have
     REAL intermediate tensors from a live HF forward pass."""
-    import os as _os
-    import re as _re
-    from pathlib import Path as _Path
-    safe = _re.sub(r"[^A-Za-z0-9_]+", "_", component_name).strip("_").lower() or "component"
-    here = _Path(__file__).resolve()
-    # tests/pcc/test_X.py -> demo_dir = parents[2]
-    demo_dir = here.parents[2]
-    comp_dir = demo_dir / "_captured" / safe
+    comp_dir = _component_dir(component_name)
     if not comp_dir.is_dir():
         return None
-    args_p = comp_dir / "args.pt"
-    kwargs_p = comp_dir / "kwargs.pt"
-    output_p = comp_dir / "output.pt"
-    if not (args_p.is_file() and kwargs_p.is_file() and output_p.is_file()):
+    loaded = _load_sample(comp_dir)
+    if loaded is not None:
+        print(f"[bringup] using captured inputs from {comp_dir}", flush=True)
+    return loaded
+
+
+# What the captured short-circuit learned, for the forward stage to use. A dict rather than
+# globals so the short-circuit can fill it in without `global` declarations at every write.
+_CAPTURED_STATE = {"golden_out": None}
+
+
+def _is_plain_input(value):
+    """True for values a module forward takes as data rather than as live state.
+
+    Used to tell captured tensors/flags apart from objects like a KV cache WITHOUT naming any of
+    them. A name list only ever covers the models whoever wrote it had in mind; asking the value
+    what it is keeps working when a model ships a cache class nobody here has heard of.
+    """
+    import torch as _torch
+
+    if value is None or isinstance(value, (bool, int, float, str, _torch.Tensor)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_is_plain_input(_v) for _v in value)
+    return False
+
+
+def _captured_sample_dirs(component_name):
+    """Every captured input set for a component: the primary first, then any extra samples.
+
+    The primary stays exactly where it always was, so everything that reads `args.pt` next to
+    `manifest.json` is untouched; extra samples live under `samples/<n>/`.
+    """
+    comp_dir = _component_dir(component_name)
+    if not comp_dir.is_dir():
+        return []
+    dirs = [comp_dir]
+    extra_root = comp_dir / _SAMPLES_SUBDIR
+    if extra_root.is_dir():
+        dirs.extend(sorted((d for d in extra_root.iterdir() if d.is_dir()), key=lambda d: d.name))
+    return dirs
+
+
+def _load_sample(sample_dir):
+    """`(args, kwargs, output)` from one captured sample directory, or None if it is incomplete.
+
+    The one reader of a captured set: the primary and every extra come through here, so a set that
+    loads for one cannot fail to load for the other.
+    """
+    import torch as _torch
+
+    paths = [sample_dir / n for n in _ARTIFACT_FILES]
+    if not all(p.is_file() for p in paths):
         return None
     try:
-        import torch as _torch
-        args = _torch.load(args_p, map_location="cpu", weights_only=False)
-        kwargs = _torch.load(kwargs_p, map_location="cpu", weights_only=False)
-        output = _torch.load(output_p, map_location="cpu", weights_only=False)
-        print(f"[bringup] using captured inputs from {comp_dir}", flush=True)
-        return args, kwargs, output
+        return tuple(_torch.load(p, map_location="cpu", weights_only=False) for p in paths)
     except Exception as _e:
-        print(f"[bringup] captured-inputs load failed for {component_name}: {_e}", flush=True)
+        print(f"[bringup] captured sample load failed for {sample_dir}: {_e}", flush=True)
         return None
+
+
+def _captured_kwargs_and_primary(torch_module, cap_args, cap_kwargs):
+    """Turn one captured `(args, kwargs)` pair into `(kwargs, primary)` for a module call.
+
+    Shared by the first sample and every extra one. When this lived inline in the short-circuit,
+    extra samples would have needed their own copy of the dtype cast, the positional-to-name
+    mapping and the primary pick -- three chances for the samples to be prepared differently from
+    the one the test actually gates on.
+    """
+    import torch as _torch
+
+    cap_kwargs = dict(cap_kwargs or {})
+    # Cast captured floats to the live module's parameter dtype. Capture usually runs in float32
+    # while the test's model often loads in bfloat16; without this the attention forward raises on
+    # mismatched dtypes and the test skips despite the inputs being fine.
+    target_dtype = None
+    try:
+        for p in torch_module.parameters():
+            if p.is_floating_point():
+                target_dtype = p.dtype
+                break
+    except Exception:
+        target_dtype = None
+
+    def _cast(x):
+        if target_dtype is None or x is None:
+            return x
+        if isinstance(x, _torch.Tensor) and x.is_floating_point() and x.dtype != target_dtype:
+            return x.to(target_dtype)
+        if isinstance(x, (list, tuple)):
+            seq = [_cast(v) for v in x]
+            return tuple(seq) if isinstance(x, tuple) else type(x)(seq)
+        # Cache-like objects hold their tensors in attributes, so casting only the top level left
+        # those at the capture dtype -- the mismatch that made dropping the cache look necessary.
+        held = getattr(x, "__dict__", None)
+        if isinstance(held, dict) and held:
+            for attr, val in list(held.items()):
+                new = _cast(val)
+                if new is not val:
+                    try:
+                        setattr(x, attr, new)
+                    except Exception:
+                        pass
+        return x
+
+    cap_args = tuple(_cast(v) for v in cap_args) if cap_args else cap_args
+    kwargs = {k: _cast(v) for k, v in cap_kwargs.items()}
+    if cap_args:
+        import inspect as _inspect
+
+        names = [
+            p.name
+            for p in _inspect.signature(torch_module.forward).parameters.values()
+            if p.name != "self" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+        ]
+        for i, v in enumerate(cap_args):
+            if i >= len(names):
+                break
+            if names[i] not in kwargs:
+                kwargs[names[i]] = v
+    primary = None
+    for name, val in kwargs.items():
+        if isinstance(val, _torch.Tensor):
+            primary = (name, val)
+            break
+    if primary is None:
+        primary = ("(captured)", _torch.zeros(1))
+    return kwargs, primary
+
+
+def _captured_extra_samples(component_name, torch_module):
+    """Prepared `(name, kwargs, primary, golden)` for every captured input set after the first.
+
+    Correctness used to be argued from a single input, which cannot distinguish a port that is
+    right from one that happens to line up for one shape. Prepared through the SAME helper the
+    gating sample uses, so an extra sample cannot be built differently from the one it backs up.
+    """
+    out = []
+    for sample_dir in _captured_sample_dirs(component_name)[1:]:
+        loaded = _load_sample(sample_dir)
+        if loaded is None:
+            continue
+        cap_args, cap_kwargs, cap_out = loaded
+        kwargs, primary = _captured_kwargs_and_primary(torch_module, cap_args, cap_kwargs)
+        out.append((sample_dir.name, kwargs, primary, cap_out))
+    return out
+
+
+def _stateful_keys(kwargs):
+    """Which captured kwargs are live state rather than data, asked of the values themselves."""
+    return tuple(k for k, v in (kwargs or {}).items() if not _is_plain_input(v))
+
+
+def _reference_forward(torch_module, sample_kwargs):
+    """Run the reference forward, preferring the captured state and falling back without it.
+
+    Returns `(output, kwargs_actually_used)`. Raises the last exception if nothing worked, so each
+    caller phrases its own skip. Passing the captured state is what makes the reference reproduce
+    the forward the model really ran; a module that rebuilds its state internally rejects it, and
+    those components stay testable instead of skipping.
+
+    Shared because the sharded test runs the SAME reference: if only one of them knew how to retry,
+    a component needing the fallback would pass in one and skip in the other for no visible reason.
+    """
+    import torch as _torch
+
+    candidates = [sample_kwargs]
+    # Asked of the kwargs in hand rather than read off shared state, so every sample -- the one the
+    # test gates on and each extra one -- is judged by what it actually holds.
+    stateful = _stateful_keys(sample_kwargs)
+    if stateful:
+        candidates.append({_k: _v for _k, _v in sample_kwargs.items() if _k not in stateful})
+    last_exc = None
+    for cand in candidates:
+        try:
+            with _torch.no_grad():
+                out = torch_module(**cand)
+            if cand is not sample_kwargs:
+                print(
+                    f"[bringup] reference forward rejected captured state {list(stateful)}; "
+                    f"retried without it",
+                    flush=True,
+                )
+            return out, cand
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc
+
+
+def _check_captured_fidelity(torch_out):
+    """Fail if the reference forward did not reproduce the output that capture recorded.
+
+    `output.pt` was loaded and then dropped on the floor. It is the one thing that can say whether
+    the inputs this test rebuilt drive the module the way the real forward did. If the reference
+    cannot reproduce it, then whatever PCC the test prints afterwards describes a computation the
+    model never performed, and a green result means nothing.
+
+    Held to the SAME bar the component itself must meet: a reconstruction we would not accept from
+    the TT port is not good enough to be the yardstick that judges it.
+    """
+    golden = _CAPTURED_STATE.get("golden_out")
+    if golden is None or torch_out is None:
+        return
+    _g = globals()
+    _normalize, _pcc_fn, _target = _g.get("_normalize_out"), _g.get("comp_pcc"), _g.get("PCC_TARGET")
+    if _normalize is None or _pcc_fn is None or _target is None:
+        return
+    import torch as _torch
+
+    try:
+        golden = _normalize(golden)
+    except Exception:
+        return
+    if not (isinstance(golden, _torch.Tensor) and isinstance(torch_out, _torch.Tensor)):
+        return
+    if tuple(golden.shape) != tuple(torch_out.shape):
+        print(
+            f"[bringup] captured golden shape {tuple(golden.shape)} != reference "
+            f"{tuple(torch_out.shape)}; fidelity not checked",
+            flush=True,
+        )
+        return
+    _ok, _pcc = _pcc_fn(golden.to(_torch.float32), torch_out.to(_torch.float32), _target)
+    print(f"[bringup] captured-golden fidelity pcc={_pcc}", flush=True)
+    if not _ok:
+        import pytest as _pytest
+
+        _pytest.fail(
+            f"the reference forward does not reproduce the captured output for "
+            f"{_g.get('COMPONENT_NAME', '?')}: fidelity pcc={_pcc} below {_target}. The inputs "
+            f"this test rebuilt do not drive the module the way the captured forward did, so any "
+            f"PCC measured against this reference would not describe the real computation."
+        )
 '''
 
 
@@ -843,64 +1158,14 @@ _CAPTURED_SHORT_CIRCUIT_BLOCK = """
     _captured = _maybe_load_captured(COMPONENT_NAME)
     if _captured is not None:
         _cap_args, _cap_kwargs, _cap_output = _captured
-        # Drop stateful / cache kwargs that capture saved as live
-        # objects (DynamicCache, etc.) -- they carry dtypes that don't
-        # round-trip through torch.save/load reliably and cause
-        # query/key/value dtype mismatch inside the attention forward.
-        # The model will rebuild them internally from `hidden_states`.
-        _cap_kwargs = {
-            _k: _v for _k, _v in (_cap_kwargs or {}).items()
-            if _k not in ("past_key_values", "past_key_value", "use_cache",
-                          "cache_position", "output_attentions",
-                          "output_hidden_states", "return_dict")
-        }
-        # Cast captured float tensors to match the live torch_module's
-        # parameter dtype. Capture was usually run in float32; the
-        # test's HF model often loads in bfloat16 (transformers default
-        # for Qwen3 / Llama / etc.). Without this cast we hit
-        # ``expected m1 and m2 to have the same dtype, but got: float
-        # != c10::BFloat16`` and SKIP the test even though the inputs
-        # are otherwise valid.
-        _target_dtype = None
-        try:
-            for _p in torch_module.parameters():
-                if _p.is_floating_point():
-                    _target_dtype = _p.dtype
-                    break
-        except Exception:
-            _target_dtype = None
-        def _cast_to_target(_x):
-            if _target_dtype is None or _x is None:
-                return _x
-            if isinstance(_x, torch.Tensor) and _x.is_floating_point() and _x.dtype != _target_dtype:
-                return _x.to(_target_dtype)
-            if isinstance(_x, (list, tuple)):
-                _seq = [_cast_to_target(_v) for _v in _x]
-                return type(_x)(_seq) if not isinstance(_x, tuple) else tuple(_seq)
-            return _x
-        _cap_args = tuple(_cast_to_target(_v) for _v in _cap_args) if _cap_args else _cap_args
-        _cap_kwargs = {_k: _cast_to_target(_v) for _k, _v in (_cap_kwargs or {}).items()}
-        kwargs = dict(_cap_kwargs or {})
-        if _cap_args:
-            _sig = inspect.signature(torch_module.forward)
-            _names = [
-                _p.name for _p in _sig.parameters.values()
-                if _p.name != "self"
-                and _p.kind not in (_p.VAR_POSITIONAL, _p.VAR_KEYWORD)
-            ]
-            for _i, _v in enumerate(_cap_args):
-                if _i >= len(_names):
-                    break
-                if _names[_i] in kwargs:
-                    continue
-                kwargs[_names[_i]] = _v
-        primary = None
-        for _name, _val in kwargs.items():
-            if isinstance(_val, torch.Tensor):
-                primary = (_name, _val)
-                break
-        if primary is None:
-            primary = ("(captured)", torch.zeros(1))
+        # Keep EVERY captured kwarg, including the cache. These used to be dropped by name because
+        # live cache objects carry dtypes that don't round-trip through torch.save/load, which cost
+        # a dtype mismatch inside attention. But dropping them means the reference runs without the
+        # state the real forward had, so the number the test reports describes a computation the
+        # model never performed. The dtype problem is fixed at its cause in the shared preparer,
+        # and anything the live module still rejects is retried without it.
+        kwargs, primary = _captured_kwargs_and_primary(torch_module, _cap_args, _cap_kwargs)
+        _CAPTURED_STATE["golden_out"] = _cap_output
         return torch_module, kwargs, primary
 """
 

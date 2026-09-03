@@ -391,6 +391,32 @@ def _dominant_bound_by(profile: dict | None) -> str:
     return max(weight, key=weight.get) if weight else ""
 
 
+def _why_it_ended(stop_facts) -> str:
+    """One checkable sentence saying why the run ended, or "" when the driver did not say.
+
+    A run stopped by its ROUND BUDGET with the gate still reporting can_stop=false looked, in this
+    report, exactly like a run the gate had cleared: same tables, same wins, no statement either
+    way. Those mean opposite things -- "nothing left to reach" against "we ran out of turns" -- and
+    the second decides whether running again is worth anything. Nothing else on the page separates
+    them, and the renderer cannot derive it: only the loop that stopped knows.
+
+    Every number is one the driver held when it stopped, so the claim checks against the run's own
+    log rather than being believed.
+    """
+    if not isinstance(stop_facts, dict) or not stop_facts:
+        return ""
+    _r, _m = stop_facts.get("rounds"), stop_facts.get("max_rounds")
+    _used = (" — %s of %s round(s) used" % (_r, _m)) if isinstance(_r, int) and isinstance(_m, int) else ""
+    if stop_facts.get("halted"):
+        return "- run HALTED before the gate cleared it%s" % _used
+    if stop_facts.get("can_stop"):
+        return "- run ended because the gate cleared it: can_stop=true%s" % _used
+    return (
+        "- run ended on the ROUND BUDGET, not because the work was done: the gate still reported can_stop=false%s"
+        % _used
+    )
+
+
 def _levels_display(bound_by: str = "") -> str:
     """Render the ladder from its single definition in perf_mcp, not from a second hardcoded copy.
 
@@ -398,14 +424,31 @@ def _levels_display(bound_by: str = "") -> str:
     leads on a compute-bound model and trails on a memory-bound one -- so the binding travels with
     the request. Without one, perf_mcp's own default row is used; there is no display-side default,
     because a display-side default is how the two copies drifted the first time."""
-    try:
-        from .perf_mcp import ladder_order
-    except Exception:  # noqa: BLE001
-        try:
-            from perf_mcp import ladder_order  # type: ignore
-        except Exception:  # noqa: BLE001
-            return "grid -> dtype -> shard -> fidelity -> host -> structural -> tt-lang -> cpp"
+    _m = _perf_mcp()
+    if _m is None or not hasattr(_m, "ladder_order"):
+        return "grid -> dtype -> shard -> fidelity -> host -> structural -> tt-lang -> cpp"
+    ladder_order = _m.ladder_order
     return " -> ".join(_disp_level(r) if r == "tt-lang" else r for r in ladder_order(bound_by))
+
+
+def _stage_label(op, profile, width: int = 9) -> str:
+    """Which stack this op runs in, from the capture's own marks. "" when the capture cannot say.
+
+    THE SAME RULE THE TARGET USES, not a second one. perf_mcp.stage_of_op attributes an op to the
+    stage it costs the most in; a report that answered differently would disagree with the target the
+    agent was handed for the very same op. Resolved lazily through _perf_mcp: perf_mcp imports this
+    module, so it cannot be imported at load time.
+
+    Stage names come from the marks the model emitted, so a model that calls its stacks anything is
+    labelled in its own words. Truncated to the column, never renamed.
+    """
+    _m = _perf_mcp()
+    if _m is None or not hasattr(_m, "stage_of_op"):
+        return ""
+    try:
+        return str(_m.stage_of_op(op, profile) or "")[:width]
+    except Exception:  # noqa: BLE001 -- a label that cannot be derived must not cost the report
+        return ""
 
 
 def _op_label(sig: str, width: int = 34) -> str:
@@ -2084,6 +2127,13 @@ def _roofline_tables(
     # A MEASUREMENT ABOVE THE CEILING IS NOT A GOOD SCORE. The ceiling is peak bandwidth over the
     # model's bytes -- exceeding it means the pair is inconsistent (a stale target, or a reading from
     # a shallower window), not that the model beat physics.
+    #
+    # IT IS WITHHELD, NOT ANNOUNCED. This used to print its own row at the top of the table, which
+    # read as a verdict on whichever stage happened to be rendered first -- on voxtral it sat above
+    # the encode block while the inconsistent pair was decode's, and the ceiling is PINNED at the
+    # baseline read set by design, so it fired on every capture once a stage got faster than its own
+    # starting bytes. The rows below already decline to draw a ratio they cannot honestly draw; that
+    # is the whole remedy, and it needs no banner.
     _exceeds = bool(measured and theo and measured > theo)
     # TTFT IS THE PROMPT-CONSUMING STAGE'S TIME, and which stage that is follows from what it does --
     # retiring many items per unit -- not from being called "prefill". Resolved after the roofs are
@@ -2149,8 +2199,6 @@ def _roofline_tables(
     # the only number that can be drawn is not the same as being the right one.
     if tag:
         out.append(_row(" " + tag.strip()))
-    if _exceeds:
-        out.append(_row(" \u2717 measured EXCEEDS ceiling \u2014 target stale/suspect (re-profile)"))
     if note and not measured:
         # Wrapped to the LABEL field, not to the page. At W-40 the note ran past the first divider
         # and pushed the column edges out on its own rows.
@@ -3033,6 +3081,7 @@ def render_summary(
     residual: dict | None = None,
     baseline_profile: dict | None = None,
     finalized: bool = True,
+    stop_facts: dict | None = None,
     final_override_ms: float | None = None,
     throughput: dict | None = None,
     model_root: str | Path = "",
@@ -3112,9 +3161,7 @@ def render_summary(
     lines.append(title)
     lines.append("=" * len(title))
     if not finalized:
-        lines.append(
-            "optimizing… — baseline->final speedup is finalized when the module converges (per-attempt detail below is live)"
-        )
+        lines.append("optimizing…")
     else:
         _eager = _ledger_line(_ledger().KIND_EAGER, "eager per-op device time", model, task)
         if _eager:
@@ -3285,12 +3332,17 @@ def render_summary(
         # SAME FURNITURE AS THE TABLES ABOVE: ruled columns, one field per fact. Packed right-aligned
         # against each other the numbers ran together and the op name had no column edge to end at.
         # Sized to the coverage matrix above it, so the two tables in this section share a width.
-        _ar = " %-44s\u2502 %-18s\u2502 %-20s\u2502 %-22s\u2502 %s"
-        ah = _ar % ("op", "lever", "eager device_ms", "1CQ \u0394 vs current", "result")
+        # WHICH STACK THE OP RUNS IN. Without it a reader cannot tell a decode matmul from a prefill
+        # one except by decoding the shape in its name, and the ops with no shape -- SDPA, Concat,
+        # Copy, the data movers, half of a typical run -- cannot be placed at all. Read from the
+        # capture's marks; blank when the capture marked no stages, which is exactly how the column
+        # renders for a model that emits none.
+        _ar = " %-44s\u2502 %-9s\u2502 %-18s\u2502 %-20s\u2502 %-22s\u2502 %s"
+        ah = _ar % ("op", "stack", "lever", "eager device_ms", "1CQ \u0394 vs current", "result")
         lines.append(ah)
         # THE RULE IS DERIVED FROM THE HEADER, not counted by hand. Hand-counted it drifted the
         # moment a field width changed -- crosses at 33/48/64/82 under dividers at 33/49/66/85.
-        lines.append("".join("\u253c" if c == "\u2502" else "\u2500" for c in ah.ljust(128)))
+        lines.append("".join("\u253c" if c == "\u2502" else "\u2500" for c in ah.ljust(140)))
         _unmeasured = 0
         for _i, a in enumerate(attempts):
             if not isinstance(a, dict):
@@ -3332,7 +3384,9 @@ def render_summary(
                 _unmeasured += 1
                 continue
             res = "✓ win" if _i in _wins else ("· wedged" if a.get("wedged") else "· no gain")
-            lines.append((_ar % (sig, lever, ms_s, gain_s, res)).rstrip())
+            lines.append(
+                (_ar % (sig, _stage_label(a.get("op_signature"), baseline_profile), lever, ms_s, gain_s, res)).rstrip()
+            )
         if _unmeasured:
             lines.append("")
             lines.append(
@@ -3344,34 +3398,43 @@ def render_summary(
     # on a long run is thousands of lines of patch in a document read for its numbers. The diffs are
     # in the kernel log and in git; a report is not a second copy of the tree.
 
-    # --- Limitations / suggested manual next steps (#5c) ---
+    # --- Limitations (#5c) ---
+    # FINDINGS, NOT ADVICE. This section used to close each finding with a suggestion -- inspect
+    # this, consider that, the model "may already be" at its floor. A report that is read to
+    # VALIDATE a run has to be all checkable statements: a suggestion cannot be true or false, so
+    # it cannot be validated, and it crowds the findings it sits between.
     _won_ops = {attempts[i].get("op_signature") for i in _wins}
     _no_gain = sorted({o for o in by_op} - {o for o in _won_ops if o})
     lines.append("")
-    lines.append("Limitations / suggested manual next steps")
+    lines.append("Limitations")
     lines.append("─" * _REPORT_W)
+    # A SECTION WITH NOTHING IN IT SAYS SO. The old filler pointed the reader at another report
+    # instead, which is advice; "none" is the finding.
+    _limits_at = len(lines)
+    # FIRST, because it frames every finding under it: a "no lever beat baseline" list means one
+    # thing in a run the gate cleared and another in a run that was cut off mid-climb.
+    _ended = _why_it_ended(stop_facts)
+    if _ended:
+        lines.append(_ended)
     if _no_gain:
         shown = ", ".join(_op_label(o, 26) for o in _no_gain[:8]) + (" …" if len(_no_gain) > 8 else "")
         lines.append(f"- {len(_no_gain)} op(s) tried but no lever beat baseline: {shown}")
-        lines.append("  -> inspect the per-op device report and consider a hand-written kernel or a structural change.")
     _measured = [a for a in attempts if isinstance(a, dict) and a.get("measured_ms") is not None]
     _any_win = bool(_wins)
     if not _measured and attempts:
         _unmeasured = len(attempts)
         lines.append(
             f"- INCONCLUSIVE — {_unmeasured} attempt(s) were made but NONE produced a valid measurement, "
-            "so no statement about speedup or the ttnn floor is possible. See the per-attempt reasons above."
+            "so no statement about speedup or the ttnn floor is possible."
         )
     elif baseline_ms and final_ms and final_ms >= baseline_ms and _measured and not _any_win:
-        lines.append(
-            "- No net speedup recorded — the model may already be at its ttnn floor, or the dominant op needs a custom kernel."
-        )
+        lines.append("- No net speedup recorded")
     if residual:
         _rv = residual.get("verdict") or residual.get("summary") or residual.get("reason")
         if _rv:
             lines.append(f"- Roofline residual: {str(_rv)[:200]}")
-    if not _no_gain and not residual and not (baseline_ms and final_ms and final_ms >= baseline_ms):
-        lines.append("- (none flagged automatically — see the per-op device report for remaining headroom.)")
+    if len(lines) == _limits_at:
+        lines.append("- none")
 
     # --- Reproduce these numbers (#6) ---
     lines.append("")
