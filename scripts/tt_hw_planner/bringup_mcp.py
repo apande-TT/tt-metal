@@ -41,7 +41,9 @@ harness-skipped (manual).
 Config via env:
   BRINGUP_MCP_DEMO_DIR / BRINGUP_MCP_MODEL_ID / BRINGUP_MCP_STATE (required)
   BRINGUP_MCP_MAX_ATTEMPTS (base cap, default 2)
-  BRINGUP_MCP_PCC (default: pcc_targets.COMPONENT_PCC) · BRINGUP_MCP_TIMEOUT (default 1800)
+  BRINGUP_MCP_PCC (default: pcc_targets.COMPONENT_PCC) · BRINGUP_MCP_TIMEOUT (base per-run wall,
+    default 1800; scaled by the number of chips a run spans via `_adaptive_pcc_timeout` —
+    set BRINGUP_MCP_TIMEOUT_MODE=fixed to restore the flat wall)
 """
 from __future__ import annotations
 
@@ -384,6 +386,53 @@ def _ensure_shard_test(component: str) -> str | None:
         return None
 
 
+# Per extra chip a run spans, and the ceiling on that scaling. A sharded run pays a cold
+# kernel compile plus collectives for EVERY chip it opens, so its wall has to grow with the
+# mesh; the ceiling keeps a genuinely hung run bounded. Deliberately separate from the agent
+# budget's step/cap (see cli._scaled_timeout) -- a compile budget and a thinking budget are
+# unrelated quantities.
+_PCC_TIMEOUT_STEP_S = 900
+_PCC_TIMEOUT_MAX_EXTRA_S = 3600
+_TIMEOUT_MODE_ENV = "BRINGUP_MCP_TIMEOUT_MODE"
+_TIMEOUT_MODE_FIXED = "fixed"
+
+
+def _mesh_degree_bonus(shard: bool) -> int:
+    """Difficulty units for the mesh a run spans: one per chip beyond the first, 0 on a
+    single device.
+
+    Derived from the declared parallelism (TP x DP) rather than from anything about the
+    model, so no component/stage name or shape field is assumed -- a model that renames or
+    reshapes its parts still scales correctly."""
+    if not shard:
+        return 0
+    return max(max(_SHARD_TP * _SHARD_DP, 1) - 1, 0)
+
+
+def _adaptive_pcc_timeout(shard: bool) -> int:
+    """Per-run pytest wall for ONE PCC run: the flat base (``BRINGUP_MCP_TIMEOUT``) scaled by
+    how many chips the run spans.
+
+    A sharded run compiles kernels for and runs collectives across every chip it opens, so it
+    legitimately outlasts a single-device run. Under one flat wall it was hard-killed with
+    rc=124 mid-compile, which parses as no report at all -> classified ``OTHER`` -> the
+    component never graduates and is re-queued forever. Scaling the wall lets the run finish
+    and produce a real pass/fail.
+
+    A single-device run gets bonus 0 and keeps the base unchanged, so nothing that already
+    passes within the flat wall is affected.
+
+    Escape hatch: ``BRINGUP_MCP_TIMEOUT_MODE=fixed`` restores the flat wall."""
+    if os.environ.get(_TIMEOUT_MODE_ENV, "").strip().lower() == _TIMEOUT_MODE_FIXED:
+        return _TIMEOUT
+    return _cli._scaled_timeout(
+        _TIMEOUT,
+        _mesh_degree_bonus(shard),
+        step_s=_PCC_TIMEOUT_STEP_S,
+        max_extra_s=_PCC_TIMEOUT_MAX_EXTRA_S,
+    )
+
+
 def _run_pcc(component: str) -> dict:
     """Run ONE component's PCC test on device via the SAME runner the fsm loop uses and scope the
     report to this demo. Returns {ran, passed, failed, skipped, summary, details, skip_reason}.
@@ -408,7 +457,29 @@ def _run_pcc(component: str) -> dict:
             "details": "",
             "skip_reason": "",
         }
-    _cli._run_focused_pytest(model_id=_MODEL_ID, test_files=[tf], timeout_s=_TIMEOUT)
+    _timeout = _adaptive_pcc_timeout(shard)
+    if _timeout != _TIMEOUT:
+        print(
+            f"  [timeout] {key}: PCC run wall {_timeout}s (base {_TIMEOUT}s, " f"TP={_SHARD_TP} DP={_SHARD_DP})",
+            flush=True,
+        )
+    rc = _cli._run_focused_pytest(model_id=_MODEL_ID, test_files=[tf], timeout_s=_timeout)
+    if rc == 124:
+        # `_run_focused_pytest` prints WALL-CLOCK to the parent's stderr; JUnit is
+        # written at session end, so a kill mid-compile leaves no report (or a STALE
+        # previous XML). `_classify_failure` only returns HANG when it sees that
+        # phrase — without folding it in, this path is OTHER and the component is
+        # re-queued forever. Same phrases the existing detector already keys off.
+        hang = f"focused pytest WALL-CLOCK BUDGET EXHAUSTED at {_timeout}s " f"— killing process group (likely a hang)"
+        return {
+            "ran": True,
+            "passed": False,
+            "failed": True,
+            "skipped": False,
+            "summary": hang,
+            "details": hang,
+            "skip_reason": "",
+        }
     report = _cli._scope_report_to_demo(_cli._parse_pytest_report(), _DEMO_DIR)
     skip_reason = ""
     for entry in (report.get("per_skipped") or {}).values():

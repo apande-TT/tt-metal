@@ -18,6 +18,7 @@ Config via env (set in .mcp.json):
 from __future__ import annotations
 
 import atexit
+import collections
 import hashlib
 import json
 import os
@@ -223,6 +224,27 @@ _FULLPIPE_SAMPLES = max(1, int(os.environ.get("PERF_MCP_FULLPIPE_SAMPLES", "3"))
 # the number is an observation rather than instrumentation noise -- and only an observation may be
 # pinned as a permanent ceiling divisor.
 _STAGE_BYTES_AGREE_TOL = 0.01
+
+
+def _sample_spread(values) -> float | None:
+    """How far a set of readings of ONE quantity spread, as a fraction of their median.
+
+    None when fewer than two readings exist: one sample states no spread, and inventing a zero there
+    would read as a perfect measurement. The read set uses this to refuse to pin a value its samples
+    disagree about; the per-stage timings use the same number as the bar a change must clear.
+    """
+    try:
+        vals = [float(v) for v in (values or [])]
+    except (TypeError, ValueError):
+        return None
+    if len(vals) < 2:
+        return None
+    med = statistics.median(vals)
+    if med <= 0:
+        return None
+    return (max(vals) - min(vals)) / med
+
+
 _FULLPIPE_TARGET_MS = float(os.environ.get("PERF_MCP_TARGET_MS", "0") or "0")
 
 # C++-kernel SAFETY: a bad Metalium kernel can WEDGE a device core (tt-lang/ttnn fail gracefully; raw
@@ -521,14 +543,21 @@ _STRUCTURAL_RUNGS = {"structural", "gather", "fusion", "fuse", "sparse", "cache"
 # roofline ESTIMATE, ops are rarely purely one-bound, and `compute` is only ever computed for
 # matmuls -- used as a filter it silently deletes levers for a whole run (see _op_ladder_status).
 _RUNG_PRIORITY = {
-    "memory": ("grid", "dtype", "shard", "fidelity", "host", "structural", "tt-lang", "cpp"),
-    "compute": ("grid", "fidelity", "dtype", "shard", "host", "structural", "tt-lang", "cpp"),
+    "memory": ("grid", "block", "dtype", "shard", "fidelity", "host", "structural", "tt-lang", "cpp"),
+    "compute": ("grid", "block", "fidelity", "dtype", "shard", "host", "structural", "tt-lang", "cpp"),
     # Nothing on the knob rungs addresses dispatch: the op is waiting on the host loop that launches
     # it, so trace capture / 2-CQ leads and the knobs follow as the completeness sweep.
-    "dispatch": ("host", "grid", "fidelity", "dtype", "shard", "structural", "tt-lang", "cpp"),
-    "": ("grid", "dtype", "shard", "fidelity", "host", "structural", "tt-lang", "cpp"),
+    "dispatch": ("host", "grid", "block", "fidelity", "dtype", "shard", "structural", "tt-lang", "cpp"),
+    "": ("grid", "block", "dtype", "shard", "fidelity", "host", "structural", "tt-lang", "cpp"),
 }
-_KNOBS = ("grid", "fidelity", "dtype", "shard")
+# `block` sits immediately after `grid` because it is the half of the same decision that `grid` does
+# not make. Occupying every core says nothing about how the work is CARVED across them, and on
+# voxtral_mini_3b_2507 the difference is the whole remaining gap: its prefill projection already runs
+# on the full grid at the lowest fidelity and is still 12x off its floor, because naming a core grid
+# leaves ttnn a 1-D multicast with 1x1 subblocks. The run found this by hand -- one win was an
+# out_subblock table written into the model -- but a hand edit is not a rung, so the next op starts
+# from nothing.
+_KNOBS = ("grid", "block", "fidelity", "dtype", "shard")
 
 
 def ladder_order(bound_by: str = "") -> list:
@@ -546,6 +575,11 @@ _KNOB_ORDER = {b: tuple(r for r in order if r in _KNOBS) for b, order in _RUNG_P
 _KNOB_REASON = {
     "grid": lambda g, f, w: "occupy the FULL core grid (grid=%s) via a full-grid program_config; "
     "record_kernel_attempt(...,'grid',...) even on a no-gain" % (g or "unknown"),
+    "block": lambda g, f, w: "the grid is occupied; now SHAPE the work on it. Hand-write the matmul "
+    "program config rather than naming a core grid: choose in0_block_w, out_subblock_h/w and "
+    "per_core_M/N, and try BOTH multicast orientations (transpose_mcast). A named core grid gets a "
+    "1-D multicast with 1x1 subblocks, which is why a full-grid op can still sit far off its floor; "
+    "record_kernel_attempt(...,'block',...) even on a no-gain",
     "fidelity": lambda g, f, w: "lower the math fidelity (now %s) HiFi4->HiFi2->LoFi; "
     "record_kernel_attempt(...,'fidelity',...) to mark it tried (even on a PCC revert / no-gain)" % (f or "unknown"),
     "dtype": lambda g, f, w: "lower the weight dtype (now %s) to bf8_b/bf4_b; "
@@ -747,6 +781,23 @@ def _normalise_rung(rung) -> str:
 
 
 _MATMUL_SHAPE_PAT = r"(\d+)\s*x\s*(\d+)\s*x\s*(\d+)"
+
+
+def _matmul_m_tiles(open_op) -> int:
+    """How many TILE ROWS this matmul's M spans, or 0 when the op does not state a shape.
+
+    The question the block rung needs answered: an M of one tile row can be carved exactly one way,
+    so shaping it is not a lever. Read off the op's own reported shape via the shape pattern already
+    used for the warm-start table, and the tile height from agent.tp, which owns it -- no second
+    definition of either.
+    """
+    try:
+        from agent.tp import TILE
+
+        m = _re.search(_MATMUL_SHAPE_PAT, str((open_op or {}).get("shape") or (open_op or {}).get("op_code") or ""))
+        return (int(m.group(1)) + int(TILE) - 1) // int(TILE) if m else 0
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _warm_start_for(model_root, op_code: str):
@@ -1363,17 +1414,11 @@ def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool
     any other gate 'fired'."""
     matches = [a for a in attempts if _op_match(op_code, a)]
     kinds = {(a.get("kernel_kind") or "").lower() for a in matches}
-    grid_tries = sum(
-        1 for a in matches if _normalise_rung(a.get("kernel_kind")) == "grid" and not a.get("measurement_failed")
-    )
-    dtype_tries = sum(
-        1 for a in matches if _normalise_rung(a.get("kernel_kind")) == "dtype" and not a.get("measurement_failed")
-    )
-    fidelity_tries = sum(
-        1 for a in matches if _normalise_rung(a.get("kernel_kind")) == "fidelity" and not a.get("measurement_failed")
-    )
-    shard_tries = sum(
-        1 for a in matches if _normalise_rung(a.get("kernel_kind")) == "shard" and not a.get("measurement_failed")
+    # Counted straight off _KNOBS, so a rung added to the ladder cannot be left uncounted here -- the
+    # four hand-written sums this replaces were one copy per knob, and a fifth would have been a knob
+    # that is offered forever because its tries never saturate.
+    _rung_tries = collections.Counter(
+        _normalise_rung(a.get("kernel_kind")) for a in matches if not a.get("measurement_failed")
     )
     grid = (open_op.get("grid") or "").lower()
     wdtype = (open_op.get("weight_dtype") or "").lower()
@@ -1433,7 +1478,7 @@ def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool
             "blocking, the residual here is redundant recompute, reducible ONLY by a KV-cache (NOT irreducible)."
             % ("WON a measured reduction" if _host_won else "tried %d time(s), the cap" % len(_host_tried)),
         )
-    tries = {"grid": grid_tries, "fidelity": fidelity_tries, "dtype": dtype_tries, "shard": shard_tries}
+    tries = {k: _rung_tries.get(k, 0) for k in _KNOBS}
     # A DEEPER RUNG ON FILE SPENDS THE SECOND-VARIANT ALLOWANCE. _MAX_KNOB_RETRIES exists so a
     # preferred knob can be tried twice -- the first attempt reads the profile, the second acts on what
     # it learned. That is for an op still ON the knob rungs. Counted per-knob with no reference to how
@@ -1446,12 +1491,20 @@ def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool
     _went_deeper = bool(kinds & (_STRUCTURAL_RUNGS | {"tt-lang", "cpp", "tp-fracture"}))
     applicable = {
         "grid": grid != "full",
+        # Only where there is something to carve. A matmul one tile row tall has a single sensible
+        # block shape, which is why the decode projections already sit at ~1.1x their floor while the
+        # prefill and encode ones -- tens of tile rows -- do not. M comes from the op's own reported
+        # shape; nothing here assumes which stage that is.
+        "block": is_matmul and _matmul_m_tiles(open_op) > 1,
         "fidelity": True,
         "dtype": is_matmul,
         "shard": True,
     }
     preferred = {
         "grid": True,
+        # The move to make once the cores are occupied: a full-grid op that is still far from its
+        # floor has a shaping problem, not an occupancy one.
+        "block": grid == "full",
         "fidelity": bound == "compute",
         "dtype": bound == "memory" and is_matmul and wdtype not in ("bf8_b", "bf4_b"),
         "shard": bound == "memory",
@@ -2516,6 +2569,7 @@ def _persist_stage_ms(
     prompt_tokens: int = 0,
     stage_isl_per_request: dict | None = None,
     stage_bytes: dict | None = None,
+    stage_spread: dict | None = None,
 ) -> None:
     """Record trace_replay's per-stage timings so the report can show a MEASURED phase split.
 
@@ -2558,6 +2612,11 @@ def _persist_stage_ms(
                     # convention, and the one that matters most -- what a TOKEN reads -- had no
                     # measurement at all until this.
                     "bytes": stage_bytes or {},
+                    # HOW MUCH THIS STAGE'S OWN READING WOBBLED, as a fraction of its median, across
+                    # the samples that produced it. The bytes beside it already refuse to be pinned
+                    # when their samples disagree; the timings had no such evidence recorded, so the
+                    # only thing left to judge them by was a constant chosen for a different quantity.
+                    "spread": stage_spread or {},
                     # The doc tracks the CURRENT build by design -- the report needs both numbers.
                     # The pinned baseline lives in the ledger, written just below.
                     # THE BATCH THE RUN ACTUALLY SERVED. Parsed off TRACE_REPLAY_PATH for the
@@ -2584,6 +2643,24 @@ def read_stage_ms(state_dir_path=None, model="", task="") -> dict:
         return {
             k: float(v)
             for k, v in (_read_stage_doc(state_dir_path, model, task).get("stages") or {}).items()
+            if float(v) > 0
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def read_stage_spread(state_dir_path=None, model="", task="") -> dict:
+    """Each stage's own measured spread, as a fraction of its median, or {}.
+
+    The evidence for how far two readings of one stage may differ and still be the same measurement.
+    Recorded per stage because the stages do not share a spread: on voxtral 2026-09-04 decode
+    repeated to 0.04% while prefill moved several percent, and judging both against one number is
+    how a real 5% prefill gain was filed as no result.
+    """
+    try:
+        return {
+            k: float(v)
+            for k, v in (_read_stage_doc(state_dir_path, model, task).get("spread") or {}).items()
             if float(v) > 0
         }
     except Exception:  # noqa: BLE001
@@ -3143,9 +3220,14 @@ def _run_full_pipeline_ms():
         # The same filter the headline gets, applied to each stage independently: a stage missing
         # from a sample simply has fewer readings, and median() of what it did report is still the
         # right answer for it.
+        stage_spread = {}
         for _sn, _svals in stage_ms_samples.items():
             if _svals:
                 stage_ms[_sn] = float(statistics.median(_svals))
+                # The evidence for what counts as a change in THIS stage, kept beside its timing.
+                _sp = _sample_spread(_svals)
+                if _sp is not None:
+                    stage_spread[_sn] = _sp
         # The read set has the same last-write-wins defect and a worse consequence: it is pinned
         # write-once. Take the median here, before the doc is written, so the recorded number and the
         # pinned number are the same one.
@@ -3161,6 +3243,7 @@ def _run_full_pipeline_ms():
             int(prompt_tokens_seen or 0),
             stage_isl_per_request,
             stage_bytes,
+            stage_spread,
         )
         # PIN WHAT ONE CALL OF EACH STAGE RETIRES, beside the read set and for the same reason: it
         # is a ceiling input (the compute floor is 2 x params x tokens), and the report's THEORETICAL
@@ -3198,12 +3281,12 @@ def _run_full_pipeline_ms():
                 if not _st or not _svals:
                     continue
                 _med = float(statistics.median(_svals))
-                _spread = (max(_svals) - min(_svals)) / _med if _med > 0 else 1.0
-                if len(_svals) < 2 or _spread > _STAGE_BYTES_AGREE_TOL:
+                _spread = _sample_spread(_svals)
+                if _spread is None or _spread > _STAGE_BYTES_AGREE_TOL:
                     sys.stderr.write(
                         "[full-pipeline-gate] read set for %s NOT pinned: %d reading(s), spread %.1f%% "
                         "(need <= %.1f%%) -- values %s\n"
-                        % (_st, len(_svals), _spread * 100.0, _STAGE_BYTES_AGREE_TOL * 100.0, _svals)
+                        % (_st, len(_svals), (_spread or 0.0) * 100.0, _STAGE_BYTES_AGREE_TOL * 100.0, _svals)
                     )
                     continue
                 _ledger().anchor(
@@ -4067,6 +4150,14 @@ def _measured_stages() -> dict:
         return {}
 
 
+def _measured_spread() -> dict:
+    """Per-stage spread from the measurement that just ran, or {}. Same channel as _measured_stages."""
+    try:
+        return {k: float(v) for k, v in (read_stage_spread() or {}).items() if isinstance(v, (int, float)) and v > 0}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _bar_stages() -> dict:
     """The committed per-stage bests, or {}. Absent means no stage has ratcheted yet."""
     try:
@@ -4090,19 +4181,35 @@ def _min_stages(cur: dict | None, new: dict | None) -> dict:
     return out
 
 
-def _stage_deltas(now: dict, bar: dict) -> dict:
+def _stage_deltas(now: dict, bar: dict, spread: dict | None = None) -> dict:
     """Per stage: {ms, best, delta_pct, improved, regressed}. A stage with no bar yet is neither.
 
-    THE TOLERANCE IS THE SAME ONE THE HEADLINE USES. A stage improving by less than the board's
-    spread is not a result, and treating it as one is how a lever that moved nothing gets banked."""
+    EACH STAGE IS JUDGED AGAINST ITS OWN MEASURED SPREAD. A stage improving by less than its own
+    reading wobbles is not a result -- but the wobble is a property of that stage, not a constant.
+    _FULLPIPE_TOL was chosen for the whole-pipeline number in July, then inherited here when the
+    per-stage test was added, so every stage had to clear the headline's spread. On voxtral it cost
+    real work: decode repeats to 0.04% while prefill moves several percent, and prefill's genuine
+    wins are 5-6% -- under the inherited 8%, so each was filed as no result and kept only when some
+    other stage happened to clear the bar in the same measurement. Whether a 5% gain counted came
+    down to what else was running.
+
+    The samples are already taken and the read set beside these timings already refuses to be pinned
+    when its own samples disagree; this applies that same evidence to the timings. The constant
+    survives only where there is no evidence -- a single sample records no spread -- because a stage
+    that cannot state its own wobble still has to be judged by something.
+    """
     out = {}
+    _sp = spread or {}
     for name, ms in sorted(now.items()):
         prev = bar.get(name)
         row = {"ms": round(ms, 4), "best": (round(prev, 4) if prev else None)}
         if prev and prev > 0:
+            tol = _sp.get(name)
+            tol = float(tol) if isinstance(tol, (int, float)) and tol > 0 else _FULLPIPE_TOL
             row["delta_pct"] = round((ms - prev) / prev * 100.0, 2)
-            row["improved"] = ms < prev * (1.0 - _FULLPIPE_TOL)
-            row["regressed"] = ms > prev * (1.0 + _FULLPIPE_TOL)
+            row["tol_pct"] = round(tol * 100.0, 2)
+            row["improved"] = ms < prev * (1.0 - tol)
+            row["regressed"] = ms > prev * (1.0 + tol)
         else:
             row["delta_pct"] = None
             row["improved"] = row["regressed"] = False
@@ -4623,7 +4730,7 @@ def check_full_pipeline_latency() -> dict:
     # follows the headline -- a slower recurring stage is a regression whatever else improved --
     # because that is the number the product is sold on.
     _stages_now = _measured_stages()
-    _sdelta = _stage_deltas(_stages_now, _bar_stages())
+    _sdelta = _stage_deltas(_stages_now, _bar_stages(), _measured_spread())
     stage_win = (
         bool(_sdelta)
         and any(r["improved"] for r in _sdelta.values())
@@ -5194,7 +5301,9 @@ def _rung_allowance(op_signature: str, kernel_kind: str, attempts: list) -> tupl
     return tries, allowed
 
 
-_KNOB_RUNG_NAMES = {"grid", "dtype", "fidelity", "shard"}
+# Derived, not restated: a second literal list is how a rung joins the ladder and is still not
+# recognised as a knob by whatever reads this.
+_KNOB_RUNG_NAMES = frozenset(_KNOBS)
 
 
 @mcp.tool()
