@@ -838,7 +838,22 @@ class VoxtralPipeline:
         # the whole run's worth of calls.  In L1 the pages sit in Tensix banks the workers reach
         # over the NOC instead of through the DRAM controller.  Pure placement: argmax returns the
         # first maximal index either way, so the sampled ids are bit-identical.
-        rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG)
+        #
+        # ...AND ASK FOR THE UNTILIZE AND THE PLACEMENT IN ONE OP, because to_layout does not fuse
+        # them.  On a DRAM tile input it lowers to an UntilizeWithUnpadding that writes DRAM
+        # (108 cores, 28.4 us) followed by a separate copy into L1 -- and that copy runs on EIGHT
+        # cores, because a row-major [B, 1, vocab] tensor is paged by its last dim, so 2 MB moves as
+        # B pages of 256 kB while the rest of the grid idles: 32.4 us/call, the second most
+        # expensive op in the sampling tail.  untilize_with_unpadding takes the memory_config
+        # directly and writes L1 itself, so the copy disappears.  Same op, same values.
+        rm = None
+        try:
+            end = [int(d) - 1 for d in logits.shape]
+            rm = ttnn.untilize_with_unpadding(logits, end, memory_config=ttnn.L1_MEMORY_CONFIG)
+        except (RuntimeError, TypeError, ValueError):
+            rm = None
+        if rm is None:
+            rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG)
         #
         # ...AND THEN THE SCAN ITSELF IS THE FLOOR.  With the layout and the placement both fixed,
         # what is left is ~22 cycles per element on the data-movement RISC-V -- the stock kernel's

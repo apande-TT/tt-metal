@@ -440,7 +440,32 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
 # out_subblock_w from element 0 -- and it carries the ODD widths (7, 5, 3) that a short list of
 # powers of two does not.  They matter: fc1's per-core width is 15 tiles, which admits (1,5) and
 # nothing wider, and dropping to (1,1) there costs half the FPU rate.
-_SUBBLOCK_CHOICES = ((2, 4), (4, 2), (1, 8), (8, 1), (2, 2), (1, 4), (4, 1), (1, 2), (2, 1), (1, 1))
+_SUBBLOCK_CHOICES = (
+    (2, 4),
+    (4, 2),
+    (1, 8),
+    (8, 1),
+    (1, 7),
+    (7, 1),
+    (2, 3),
+    (3, 2),
+    (1, 6),
+    (6, 1),
+    (1, 5),
+    (5, 1),
+    (2, 2),
+    (1, 4),
+    (4, 1),
+    (1, 3),
+    (3, 1),
+    (1, 2),
+    (2, 1),
+    (1, 1),
+)
+# Fraction of the best cost inside which two candidates count as equal, so the tie goes to the one
+# occupying MORE cores.  The cost model cannot separate a 100-core and a 110-core plan that do the
+# same per-core work, and measured on fc1 the wider grid was 6% faster.
+_COST_TIE = 0.01
 # Bytes of circular buffer one core may hold for a 2-D mcast matmul.  Blackhole has 1,572,864 B of
 # L1 per core; this is deliberately well under half of it because the estimate below counts only
 # in0/in1/out/interm and the factory also reserves space for the reader/writer and the semaphores.
@@ -532,8 +557,13 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
                         cost = per_core_m * per_core_n * k_tiles / reuse + blocks * (
                             k_tiles / in0_block_w
                         ) * _KBLOCK_OVERHEAD
-                        if best is None or cost < best[0]:
-                            best = (cost, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w)
+                        cand = (cost, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w)
+                        if (
+                            best is None
+                            or cost < best[0] * (1.0 - _COST_TIE)
+                            or (cost < best[0] * (1.0 + _COST_TIE) and gx * gy > best[1] * best[2])
+                        ):
+                            best = cand
                         break
     cfg = None
     if best is not None:
