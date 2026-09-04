@@ -555,9 +555,19 @@ def sdpa_decode_out_config():
 
     It must be INTERLEAVED, not sharded: sdpa_decode raises `Sharded output not supported for GQA`
     the moment a sharded memory_config is asked for on a grouped-query model (32 q heads over 8 kv
-    heads), which is what makes ttnn's dedicated `nlp_concat_heads_decode` unreachable here.  L1
-    placement is the part of that lever GQA does NOT block -- it changes only which banks hold the
-    result, so the values are bit-identical.
+    heads).  L1 placement is the part of that lever GQA does NOT block -- it changes only which
+    banks hold the result, so the values are bit-identical.
+
+    THAT DOES NOT MAKE `nlp_concat_heads_decode` UNREACHABLE, which an earlier note here claimed.
+    The GQA rule binds the PRODUCER only.  The concat op's own contract is just that ITS input be
+    height-sharded one user per core with shard shape (padded_heads, head_dim), and an explicit
+    to_memory_config builds exactly that from the interleaved L1 tensor sdpa_decode is allowed to
+    write -- measured on device, it accepted all 1860 decode calls and returned [1,8,32,128] ->
+    [1,1,32,4096].  What actually stops it is its OUTPUT: it pads the user dim up to a full tile
+    (8 users -> 32 rows), so the result no longer carries the layer's logical [1, B, ...] batch and
+    converting back costs a sub-tile batch slice that eats the ~6 us the swap saves.  To claim it,
+    decode has to carry the PADDED 32-row batch as its logical shape end to end -- it is already 32
+    rows physically -- rather than slicing back per layer.  See merge_heads_decode below.
     """
     return ttnn.L1_MEMORY_CONFIG
 
