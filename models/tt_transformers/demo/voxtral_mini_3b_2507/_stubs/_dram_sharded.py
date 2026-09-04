@@ -322,9 +322,7 @@ def linear(x, weight, mirror, compute_kernel_config=None, core_grid=None, activa
             # across the WHOLE grid.  Measured on this model: fused silu here cost decode
             # 14.755 -> 15.173 ms/token (+2.8%).  So the mirror stays plain and the activation is
             # applied after it.
-            return _apply(
-                activation, mirror(x, compute_kernel_config=compute_kernel_config, keep_sharded=keep_sharded)
-            )
+            return _apply(activation, mirror(x, compute_kernel_config=compute_kernel_config, keep_sharded=keep_sharded))
     # The PLAIN path is the opposite: prefill hands ttnn.linear hundreds of tile rows, so fusing
     # removes a full-width read-modify-write of the [rows, intermediate] tensor.  Same measurement:
     # prefill 210.82 -> 196.35 ms (-6.9%).
@@ -445,20 +443,41 @@ def fuse_qkv(qw, kw, vw, qb=None, kb=None, vb=None, scale=1.0):
     return w, b
 
 
+# Bytes of q+k+v under which the head split leaves its three outputs in L1 for SDPA -- see below.
+_SDPA_L1_MAX_BYTES = 24 * 1024 * 1024
+
+
 def qkv_heads(qkv, num_heads, num_kv_heads=None):
-    """Split a fused [B, S, (nh + 2*nkv) * hd] projection into per-head Q/K/V in ONE op."""
+    """Split a fused [B, S, (nh + 2*nkv) * hd] projection into per-head Q/K/V in ONE op.
+
+    LAND THEM IN L1 WHEN THEY FIT, because flash attention does not read K and V once.  The kernel
+    loops q chunks on the OUTSIDE and streams the whole of K and V for each one, so at the audio
+    tower's 1504-long sequence with 256-wide chunks every K and V tile is pulled six times over:
+    3.85 MB each becomes ~46 MB of reads per call against a 3.85 MB tensor.  Through the DRAM
+    controller that is most of the op (measured 301 us/call at ~166 GB/s effective); out of L1 the
+    workers reach the same tiles over the NOC instead.  It costs NOTHING extra -- this is the
+    memory_config the split already had to choose, not a new op -- and it is pure placement, so the
+    values are bit-identical.  Gated on size so a shape that would not fit degrades to DRAM rather
+    than crowding out SDPA's own circular buffers.
+    """
     dims = [int(qkv.shape[i]) for i in range(len(qkv.shape))]
     b, s, w = dims[0], dims[-2], dims[-1]
+    mem = ttnn.L1_MEMORY_CONFIG if b * s * w * 2 <= _SDPA_L1_MAX_BYTES else ttnn.DRAM_MEMORY_CONFIG
     return ttnn.experimental.nlp_create_qkv_heads(
         ttnn.reshape(qkv, (b, 1, s, w)),
         num_heads=num_heads,
         num_kv_heads=num_heads if num_kv_heads is None else num_kv_heads,
         transpose_k_heads=False,
+        memory_config=mem,
     )
 
 
 _SDPA_CFGS = {}
 _SDPA_MAX_CHUNK = 256
+# Fraction of the grid the flash work units must keep busy before sdpa_config stops halving the q
+# chunk.  2/3 is the point where one more halving stops paying: it doubles the per-unit loop and CB
+# overhead to recover less than half a round.
+_SDPA_MIN_OCCUPANCY = 2.0 / 3.0
 
 
 def sdpa_config(device, q, k):
@@ -477,15 +496,42 @@ def sdpa_config(device, q, k):
     sequence keeps small chunks instead of padding itself up into wasted work.  exp_approx_mode
     is left exact: these sequences accumulate over many chunks, and the approximate exp costs
     PCC there without being faster on this arch.
+
+    BUT THE Q CHUNK IS ALSO THE UNIT OF WORK, AND THE WIDEST ONE NEED NOT FILL THE GRID.  Flash
+    hands out batch * heads * ceil(seq_q / q_chunk) independent work units and runs them in
+    ceil(units / cores) rounds, so a chunk that is too WIDE leaves the LAST round mostly idle: the
+    audio tower at 20 heads and 1504 positions produces 20 * 6 = 120 units against 110 cores, so it
+    takes two rounds to do 1.09 rounds of work and the second round is 10 busy cores and 100 idle
+    ones.  Halving the chunk doubles the units and halves each one, which is why the fix is not
+    "smallest chunk wins": per-unit loop and circular-buffer overhead is what made the stock 32
+    disastrous here in the first place.  So keep the widest chunk and halve it ONLY while the rounds
+    are badly under-filled -- occupancy at or above _SDPA_MIN_OCCUPANCY -- which trades a chunk that
+    is still wide for a last round that is nearly full.  k_chunk is untouched: it is the inner loop,
+    not a work unit.
     """
     seq_q = int(q.shape[-2])
     seq_k = int(k.shape[-2])
+    dims = [int(d) for d in q.shape]
+    units = 1
+    for d in dims[:-2]:
+        units *= d
 
     def _chunk(s):
         return max(32, min(_SDPA_MAX_CHUNK, 1 << (max(int(s), 1).bit_length() - 1)))
 
     grid = device.compute_with_storage_grid_size()
-    key = (grid.x, grid.y, _chunk(seq_q), _chunk(seq_k))
+    cores = grid.x * grid.y
+
+    def _q_chunk():
+        c = _chunk(seq_q)
+        while c > 32:
+            n = units * -(-seq_q // c)
+            if n / (-(-n // cores) * cores) >= _SDPA_MIN_OCCUPANCY:
+                break
+            c //= 2
+        return c
+
+    key = (grid.x, grid.y, _q_chunk(), _chunk(seq_k))
     cfg = _SDPA_CFGS.get(key)
     if cfg is None:
         cfg = ttnn.SDPAProgramConfig(
