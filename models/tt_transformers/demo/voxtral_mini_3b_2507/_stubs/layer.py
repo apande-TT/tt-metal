@@ -87,6 +87,19 @@ def _dram_sharded():
 
 _DS = _dram_sharded()
 
+# THE ENCODER'S RESIDUAL STREAM IS ITS LAST bf16 TENSOR, exactly as prefill's was.  The projections
+# already consume bf8_b weights and hand back bf8_b, but ttnn.add returns the WIDER of its two
+# inputs, so the running sum came back bf16 -- and ttnn.layer_norm has NO output-dtype argument
+# (its output dtype MATCHES its input), so the norm could never narrow it back and qkv/fc1 were
+# handed a bf16 in0 (visible in the capture as `LoFi BF16 x BFP8` beside `BFP8 x BFP8` on the two
+# projections fed by the residual instead of by a norm).  Narrowing the accumulator moves the two
+# adds, the two layer_norms and two of the four projections at once, on a 3.85 MB activation
+# carried through 32 blocks.  bf8_b is the FLOOR (GUIDELINES/01 section 13 names normalization
+# activations), and the increments already arrive at exactly this granularity, so this rounds a sum
+# at a width it already had.  The norms keep HiFi4 + fp32_dest_acc_en=True: this tower's repair
+# history is about the ACCUMULATOR precision inside the reduction, which is untouched here.
+_ACT_DTYPE = ttnn.bfloat8_b
+
 
 def _to_device(t, device, dtype=ttnn.bfloat16):
     # BLOCK-FLOAT TARGETS SKIP THE HOST NARROWING.  bf8_b/bf4_b derive their mantissa from a
@@ -190,7 +203,7 @@ class TtVoxtralEncoderLayer:
         attn_out = ttnn.transformer.concatenate_heads(attn_out)
         attn_out = _DS.mm(self.device, attn_out, self.out_weight, _PROJ_CFG, bias=self.out_bias)
 
-        x = ttnn.add(residual, attn_out)
+        x = ttnn.add(residual, attn_out, dtype=_ACT_DTYPE)
 
         residual = x
         x = ttnn.layer_norm(
@@ -199,7 +212,7 @@ class TtVoxtralEncoderLayer:
         x = _DS.mm(self.device, x, self.fc1_weight, _PROJ_CFG, bias=self.fc1_bias)
         x = ttnn.gelu(x)
         x = _DS.mm(self.device, x, self.fc2_weight, _PROJ_CFG, bias=self.fc2_bias)
-        x = ttnn.add(residual, x)
+        x = ttnn.add(residual, x, dtype=_ACT_DTYPE)
 
         return x
 

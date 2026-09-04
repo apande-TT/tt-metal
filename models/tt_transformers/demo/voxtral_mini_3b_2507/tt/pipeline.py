@@ -58,7 +58,6 @@ from typing import Any
 import torch
 
 import ttnn
-
 from models.tt_transformers.demo.voxtral_mini_3b_2507.tt import cpp_argmax as _cpp_argmax
 
 DEMO_DIR = Path(__file__).resolve().parents[1]
@@ -289,7 +288,10 @@ class _EncLayerWithAttnStub:
         a = self.attn(h)
         if isinstance(a, tuple):
             a = a[0]
-        x = ttnn.add(residual, a)
+        # SAME NARROWED RESIDUAL AS EVERY OTHER ENCODER BLOCK.  ttnn.add returns the WIDER of its
+        # inputs and ttnn.layer_norm has no output-dtype argument, so a bf16 accumulator here would
+        # re-widen the stream for this block and hand its own norm and fc1 a bf16 in0.
+        x = ttnn.add(residual, a, dtype=_ENC_PROJ_DTYPE)
 
         residual = x
         h = ttnn.layer_norm(x, weight=self.ln2_w, bias=self.ln2_b, epsilon=self.ln2_eps)
@@ -301,7 +303,7 @@ class _EncLayerWithAttnStub:
         h = _DS.mm(self.device, h, self.fc1_w, _ENC_PROJ_CFG, bias=self.fc1_b)
         h = ttnn.gelu(h)
         h = _DS.mm(self.device, h, self.fc2_w, _ENC_PROJ_CFG, bias=self.fc2_b)
-        return ttnn.add(residual, h)
+        return ttnn.add(residual, h, dtype=_ENC_PROJ_DTYPE)
 
 
 class _LmLayerFromParts:
@@ -332,12 +334,17 @@ class _LmLayerFromParts:
         a = self.attn(h, rope=rope, kv=kv, mode=mode)
         if isinstance(a, tuple):
             a = a[0]
-        x = ttnn.add(residual, a)
+        # THE SHARED HELPER, NOT A BARE ttnn.add.  _DS.residual_add is where this model decides the
+        # accumulator's dtype (bf8_b at the prefill height, so the following norm and projections
+        # are not handed a re-widened stream) and the decode shard plan (writing the norm's own L1
+        # width shard so the norm does not have to build it again).  A bare add here made these
+        # part-stub-assembled layers the one set that got neither.
+        x = _DS.residual_add(self.device, residual, a)
 
         residual = x
         h = _DS.rms_norm(self.device, x, self.post_ln_w, self.post_ln_eps, HIFI4)
         h = self.mlp(h)
-        return ttnn.add(residual, h)
+        return _DS.residual_add(self.device, residual, h)
 
 
 class _LmBlock:
@@ -656,9 +663,7 @@ class VoxtralPipeline:
         # `out=self.next_ids_tt` -- pass 2 writes the sampled id straight into the resident buffer the
         # next step embeds from, so the sampler needs no trailing copy.  See tt/cpp_argmax.py.
         self._cpp_argmax = (
-            _cpp_argmax.CppArgmax(device, self.B, self.vocab, out=self.next_ids_tt)
-            if _cpp_argmax.enabled()
-            else None
+            _cpp_argmax.CppArgmax(device, self.B, self.vocab, out=self.next_ids_tt) if _cpp_argmax.enabled() else None
         )
 
     # ------------------------------------------------------------- utilities
