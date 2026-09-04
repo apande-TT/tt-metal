@@ -87,6 +87,20 @@ def _dram_sharded():
 
 _DS = _dram_sharded()
 
+# THE FRONT-END CONVS WERE THE LAST HiFi4 MATH IN THE ENCODE STACK.  ttnn.conv1d takes its compute
+# config as `compute_config` and defaults to HiFi4 when it is None, which both calls left it -- so
+# the mel front-end ran the math engine over FOUR passes of mantissa against bf16 weights and a
+# bf16 activation, which hold TWO.  The profiler tags both convs HiFi4 at 160.5 us and 52.9 us per
+# call, 3.63 ms of the stage.  HiFi2 is the documented pairing for bf16 (GUIDELINES/01 section 12);
+# it stops there rather than at LoFi because these are the FIRST ops on the mel input, so their
+# error is the one every later layer inherits.  fp32_dest_acc_en stays True for the same reason.
+_CONV_CFG = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_approx_mode=False,
+    fp32_dest_acc_en=True,
+    packer_l1_acc=False,
+)
+
 
 def _to_device(t, device, dtype=ttnn.bfloat16):
     # BLOCK-FLOAT TARGETS SKIP THE HOST NARROWING.  bf8_b/bf4_b derive their mantissa from a
@@ -265,6 +279,7 @@ class TtVoxtralEncoder:
             padding=pad,
             dilation=1,
             groups=1,
+            compute_config=_CONV_CFG,
             return_weights_and_bias=prepared is None,
         )
         if prepared is None:

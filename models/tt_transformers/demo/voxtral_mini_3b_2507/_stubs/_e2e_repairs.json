@@ -48,7 +48,7 @@
       "reason": "Precision repair: raised every ttnn.linear / rms_norm / layer_norm / SDPA call in this body to the SAME compute config the graduated llama_model body already used (MathFidelity.HiFi4, fp32_dest_acc_en=True). Same ops, same order, same weights -- only the accumulation precision changes. Measured on device: composing 32 audio layers at the default fidelity held only 0.9936 PCC where torch bf16 holds 0.9997, and the lm_head alone mis-ranked 22/379 argmax positions; after this repair LM prefill logits went 0.9914 -> 0.9976 and a decode step 0.9541 -> 0.9886.  ALSO: the conv front-end now caches ttnn's PREPROCESSED conv weights on device after the first call (return_weights_and_bias=True). The graduated body kept them on host and re-uploaded per call, which is illegal inside ttnn.begin_trace_capture (TT_FATAL !trace_id_.has_value()) and made the encode stage un-traceable. Numerics unchanged (hidden PCC 0.995367 before and after); the second tower got ~9x faster.",
       "backward_compatible": "tests/pcc/test_<name>.py still passes: a compute_kernel_config only raises accumulation precision, it cannot lower PCC.",
       "snapshot_sha256": "d7c448c46af69c6d02527f0bc37f258d5456fdd79b4ef657c68e64ac009228ca",
-      "repaired_sha256": "8d5016ef397fd9d8cc1f65a1b79d976bdbfd68be41f65565929e066b7250c02f"
+      "repaired_sha256": "f3367fa5283d6017e4fd4afd700836774dd736d56557bfb11c576556a5f7603b"
     },
     "layer": {
       "snapshot": "last_good_native",
@@ -90,7 +90,7 @@
       "reason": "Precision repair: raised every ttnn.linear / rms_norm / layer_norm / SDPA call in this body to the SAME compute config the graduated llama_model body already used (MathFidelity.HiFi4, fp32_dest_acc_en=True). Same ops, same order, same weights -- only the accumulation precision changes. Measured on device: composing 32 audio layers at the default fidelity held only 0.9936 PCC where torch bf16 holds 0.9997, and the lm_head alone mis-ranked 22/379 argmax positions; after this repair LM prefill logits went 0.9914 -> 0.9976 and a decode step 0.9541 -> 0.9886.  ALSO: the conv front-end now caches ttnn's PREPROCESSED conv weights on device after the first call (return_weights_and_bias=True). The graduated body kept them on host and re-uploaded per call, which is illegal inside ttnn.begin_trace_capture (TT_FATAL !trace_id_.has_value()) and made the encode stage un-traceable. Numerics unchanged (hidden PCC 0.995367 before and after); the second tower got ~9x faster.",
       "backward_compatible": "tests/pcc/test_<name>.py still passes: a compute_kernel_config only raises accumulation precision, it cannot lower PCC.",
       "snapshot_sha256": "d7c448c46af69c6d02527f0bc37f258d5456fdd79b4ef657c68e64ac009228ca",
-      "repaired_sha256": "8d5016ef397fd9d8cc1f65a1b79d976bdbfd68be41f65565929e066b7250c02f"
+      "repaired_sha256": "f3367fa5283d6017e4fd4afd700836774dd736d56557bfb11c576556a5f7603b"
     },
     "voxtral_encoder_layer": {
       "snapshot": "last_good_native",
