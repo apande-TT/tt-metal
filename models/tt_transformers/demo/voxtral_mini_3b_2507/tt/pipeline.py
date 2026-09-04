@@ -881,7 +881,18 @@ class VoxtralPipeline:
         # 1-2 (llama_r_m_s_norm / llama_m_l_p / mlp) have no shape logic of their own and saw the
         # slow one.  Folding at the entry fixes those without teaching every leaf stub about batch,
         # and makes the internal reshapes in the bodies that already did it a no-op.
-        x = ttnn.reshape(self.embed(self.next_ids_tt), (1, self.B, self.hidden))  # [1,B,hidden]
+        #
+        # ...AND FOLD THEM BEFORE THE EMBEDDING, NOT AFTER IT.  The resident id buffer is [B, 1]
+        # because that is the shape the sampler writes, and handing THAT to the embedding makes its
+        # output [B, 1, hidden]: B separate tile ROWS, each of which the tilize then pads from 1 to
+        # 32 rows.  At B=8 and hidden=3072 that is a 1.57 MB padded tensor built to carry 48 kB of
+        # real values, and it profiled as the two most expensive ops in the decode prologue
+        # (TilizeWithValPadding 15.14 us on 96 cores, then a 6.54 us ReshapeView to undo the shape).
+        # [1, B] is the same 8 ids in the same row-major order, so the reshape is a metadata view on
+        # a ROW_MAJOR tensor, and the embedding then emits [1, B, hidden] -- ONE tile row, padded
+        # 8 -> 32 instead of 8 x (1 -> 32).  The trailing reshape below becomes a no-op.
+        ids = ttnn.reshape(self.next_ids_tt, (1, self.B))
+        x = ttnn.reshape(self.embed(ids), (1, self.B, self.hidden))  # [1,B,hidden]
         rope = self._rope_now()
         h = self._lm_forward(x, rope=rope, kv_slots=self.kv, mode="decode")
         logits = self.lm_head(h)  # [B,1,V]

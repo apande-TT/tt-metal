@@ -435,6 +435,130 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
     return linear(h, down_w, down_ds, compute_kernel_config, core_grid)
 
 
+# out_subblock (h, w) candidates, widest DEST footprint first.  This is tt-metal's own
+# SUBBLOCK_HW_CHOICES, transposed: that table is ordered (w, h) -- get_subblock_sizes reads
+# out_subblock_w from element 0 -- and it carries the ODD widths (7, 5, 3) that a short list of
+# powers of two does not.  They matter: fc1's per-core width is 15 tiles, which admits (1,5) and
+# nothing wider, and dropping to (1,1) there costs half the FPU rate.
+_SUBBLOCK_CHOICES = ((2, 4), (4, 2), (1, 8), (8, 1), (2, 2), (1, 4), (4, 1), (1, 2), (2, 1), (1, 1))
+# Bytes of circular buffer one core may hold for a 2-D mcast matmul.  Blackhole has 1,572,864 B of
+# L1 per core; this is deliberately well under half of it because the estimate below counts only
+# in0/in1/out/interm and the factory also reserves space for the reader/writer and the semaphores.
+_CB_BUDGET_BYTES = 700 * 1024
+# Tile-matmul-equivalents one K block costs in multicast plus semaphore synchronisation.  Used only
+# to RANK candidates against each other, so its exactness matters far less than its sign: it is what
+# stops the search from picking a one-tile K block, which is the shape of the config ttnn was
+# choosing on its own.
+_KBLOCK_OVERHEAD = 60.0
+_BLOCK_CFG_CACHE = {}
+
+
+def _subblock(block_h, block_w, max_dest_tiles=8):
+    for h, w in _SUBBLOCK_CHOICES:
+        if h * w <= max_dest_tiles and block_h % h == 0 and block_w % w == 0:
+            return h, w
+    return 1, 1
+
+
+def _cb_bytes(block_h, block_w, in0_block_w, tile_bytes, interm_bytes):
+    """in0 + in1 double-buffered, plus the output block and its accumulator, for one core.
+
+    Sized from the OUT BLOCK, not from what the core owns in total: the factory iterates out blocks
+    and only one is resident, which is the whole reason out_block is a separate field from
+    per_core_M/N.  Tying the two together is what made every prefill shape unservable -- at
+    per_core 13x18 the output term alone is 734 kB.
+    """
+    return (
+        2 * block_h * in0_block_w * tile_bytes
+        + 2 * in0_block_w * block_w * tile_bytes
+        + block_h * block_w * (tile_bytes + interm_bytes)
+    )
+
+
+def _divisors(n):
+    return [d for d in range(int(n), 0, -1) if n % d == 0]
+
+
+def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_bytes=2048):
+    """A 2-D mcast program config that spreads BOTH output dims and streams K in wide blocks.
+
+    WHY THIS EXISTS: NAMING THE GRID PUTS THESE MATMULS ON THE 1-D MCAST PATH, WHICH IS THE WRONG
+    SHAPE FOR THEM.  `ttnn.linear(core_grid=...)` routes to create_matmul_program_config, and that
+    function splits ONE dimension across the whole grid and gives every core the FULL other one
+    (matmul_program_config.cpp: `is_tall = m_tiles > n_tiles`, then either per_core_N = n_tiles or
+    per_core_M = m_tiles), with `in0_block_w = div_up(k_tiles, num_cores)` -- which on these shapes
+    is 1 or 2 tiles.  Measured consequence on the audio tower (M = 1504 = 47 tile rows):
+      - qkv   1504x1280x3840  is_wide -> per_core_M = 47, per_core_N = 2,  in0_block_w = 1
+      - fc1   1504x1280x5120  is_wide -> per_core_M = 47, per_core_N = 2,  in0_block_w = 1
+      - fc2   1504x5120x1280  is_tall -> per_core_M = 1,  per_core_N = 40, in0_block_w = 2
+    The tall ones then use only 47 of 110 cores (there are 47 M blocks), and every one of them
+    iterates K 40 to 80 times for a single tile of reuse.  The profile agrees: 24-42% of LoFi FLOP
+    peak with Output Subblock = 1x1, against 68% for the same model's prefill projections.
+
+    WHAT IT PICKS.  Cost of a candidate, per core, in tile-matmul-equivalents:
+        per_core_M * per_core_N * k_tiles / dest_reuse
+      + (per_core_M/out_block_h) * (per_core_N/out_block_w) * (k_tiles/in0_block_w) * overhead
+    `dest_reuse` = min(1, h*w/(h+w)) is the unpacker's side of the DEST block: an out_subblock of
+    (1,1) needs two tile loads per tile-matmul and runs the FPU at half rate, (1,4) needs 1.25 and
+    (2,4) is not load-bound at all.  The second term is the multicast and semaphore round the core
+    pays per (out block, K block) pair, which is what makes a one-tile K block so expensive.
+    Candidates that would leave a whole row or column of the grid with no work are rejected rather
+    than scored, so the count is real occupancy and not grid size.
+
+    Returns None when nothing fits, so the caller keeps its own path.
+    """
+    key = (int(m_tiles), int(k_tiles), int(n_tiles), int(tile_bytes), int(interm_bytes))
+    if key in _BLOCK_CFG_CACHE:
+        return _BLOCK_CFG_CACHE[key]
+    g = device.compute_with_storage_grid_size()
+    k_divs = _divisors(k_tiles)
+    best = None
+    for gy in range(1, int(g.y) + 1):
+        per_core_m = -(-m_tiles // gy)
+        if gy > 1 and per_core_m * (gy - 1) >= m_tiles:
+            continue
+        for gx in range(1, int(g.x) + 1):
+            per_core_n = -(-n_tiles // gx)
+            if gx > 1 and per_core_n * (gx - 1) >= n_tiles:
+                continue
+            for block_h in _divisors(per_core_m):
+                for block_w in _divisors(per_core_n):
+                    h, w = _subblock(block_h, block_w)
+                    reuse = min(1.0, (h * w) / float(h + w))
+                    blocks = (per_core_m // block_h) * (per_core_n // block_w)
+                    for in0_block_w in k_divs:
+                        if _cb_bytes(block_h, block_w, in0_block_w, tile_bytes, interm_bytes) > _CB_BUDGET_BYTES:
+                            continue
+                        cost = per_core_m * per_core_n * k_tiles / reuse + blocks * (
+                            k_tiles / in0_block_w
+                        ) * _KBLOCK_OVERHEAD
+                        if best is None or cost < best[0]:
+                            best = (cost, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w)
+                        break
+    cfg = None
+    if best is not None:
+        _, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w = best
+        cfg = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+            compute_with_storage_grid_size=(gx, gy),
+            in0_block_w=in0_block_w,
+            out_subblock_h=h,
+            out_subblock_w=w,
+            out_block_h=block_h,
+            out_block_w=block_w,
+            per_core_M=per_core_m,
+            per_core_N=per_core_n,
+            transpose_mcast=False,
+            fused_activation=None,
+        )
+    _BLOCK_CFG_CACHE[key] = cfg
+    return cfg
+
+
+# Shapes whose 2-D config ttnn refused at runtime; they fall back for the rest of the run so a
+# rejected shape costs one exception, not one per call.
+_BLOCK_CFG_REFUSED = set()
+
+
 def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, keep_sharded=False):
     """ttnn.linear routed by the height of the activation: one call site, both regimes.
 
@@ -469,6 +593,43 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
     # tens of kB and whose consumers all want the shard, not a narrower dtype.
     if m < _GRID_REQUEST_MIN_ROWS:
         return ttnn.linear(x, weight, bias=bias, compute_kernel_config=compute_kernel_config)
+    # ASK FOR THE BLOCKS, NOT JUST THE GRID -- see block_config for why naming the grid alone lands
+    # these on the 1-D mcast path with a one-tile K block and 1x1 DEST subblocks.  Best-effort: a
+    # shape ttnn refuses (an L1 circular-buffer overflow, a batch it will not broadcast) falls back
+    # to the grid request below and is remembered so the exception is paid once, not per call.
+    wshape = tuple(weight.shape)
+    k_tiles, n_tiles = int(wshape[-2]) // TILE, int(wshape[-1]) // TILE
+    m_tiles = math.ceil(m / TILE)
+    batch = 1
+    for d in tuple(x.shape)[:-2]:
+        batch *= int(d)
+    key = (m_tiles, k_tiles, n_tiles, batch)
+    # M IS THE PADDED HEIGHT, NOT THE LOGICAL ONE.  The audio tower's activation is 1500 rows, which
+    # the matmul pads to 47 tiles; requiring m % TILE == 0 here silently excluded every encoder
+    # projection -- the exact shapes this config exists for.
+    # ONE ACTIVATION, NOT A STACK OF THEM.  With a leading batch the 2-D factory runs the whole
+    # grid once PER BATCH ENTRY, so the block sizes below are chosen against a height the kernel
+    # never sees in one pass; measured on this model's 8-stream prefill it cost 0.8% where the
+    # single-stream audio tower gained 7%.  Batched shapes keep the grid request underneath.
+    if (
+        batch == 1
+        and key not in _BLOCK_CFG_REFUSED
+        and int(wshape[-2]) % TILE == 0
+        and int(wshape[-1]) % TILE == 0
+    ):
+        cfg = block_config(device, m_tiles, k_tiles, n_tiles)
+        if cfg is not None:
+            try:
+                return ttnn.linear(
+                    x,
+                    weight,
+                    bias=bias,
+                    compute_kernel_config=compute_kernel_config,
+                    program_config=cfg,
+                    dtype=_ACT_DTYPE,
+                )
+            except (RuntimeError, TypeError, ValueError):
+                _BLOCK_CFG_REFUSED.add(key)
     return ttnn.linear(
         x,
         weight,
