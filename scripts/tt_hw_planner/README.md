@@ -1,139 +1,65 @@
-# tt_hw_planner: automated TTNN model bring-up and optimization
+# Getting Started with tt_hw_planner
 
-> One command takes a HuggingFace model and brings it up on Tenstorrent hardware: it plans the port, scaffolds the demo, drives an LLM agent to rewrite each module in native TTNN, and verifies every piece numerically against the HuggingFace reference — iterating until the model runs on device. A final `optimize` stage then drives the working pipeline's **performance** toward the hardware limit, committing only PCC-verified speedups.
+New here? Start with this. For every internal stage, flag, and design detail, see **`README.md`** next to this file.
 
-Path in the repo: **`scripts/tt_hw_planner/`**
+## What this tool does
+You have an AI model on HuggingFace. You want it to **run on Tenstorrent hardware, correctly and fast**. Normally an engineer would rewrite the whole model by hand for the chip — weeks of work. This tool does that automatically: it rewrites the model piece by piece, checks each piece gives the same answers as the original, and then tunes it for speed. You mostly just start it and wait.
 
-## 1. Overview
+## The short version
+If you read nothing else:
 
-Porting a model from PyTorch/HuggingFace to Tenstorrent's TTNN normally means a human reads the model, hand-writes each layer in TTNN ops, and checks the numbers match. `tt_hw_planner` automates that loop. You give it a HuggingFace model id; it figures out the hardware fit, breaks the model into components, generates a runnable demo skeleton, and then runs an **iterate loop** where an LLM agent rewrites one component at a time into native TTNN. After each attempt it runs a real **PCC correlation test** against the HuggingFace reference on the actual device. A component is **"graduated"** only when its native TTNN output matches the reference at PCC ≥ threshold. The loop repeats — escalating to stronger models when stuck — until the whole model runs on device.
+1. **Set up once** — build `ttnn`, install the agent dependencies, log into Claude. *(→ Before you start)*
+2. **Bring it up** — `auto-up <model> --box <B> --mesh <M>` rewrites the model into native TTNN and verifies every piece on the device; `promote` resumes any leftovers, then `emit-e2e` wires the graduated pieces into the full end-to-end pipeline. *(→ Section 1)*
+3. **Make it fast** — `optimize <model> --devices all` tunes the whole pipeline toward the hardware limit (or `optimize <model> --module-level` tunes each graduated module first), keeping only verified speedups. *(→ Section 2)*
 
-It is **agent-driven, not template-driven**: the porting decisions are made by an LLM — Claude — inside a deterministic harness that handles capture, testing, roll-back, and convergence.
+That's the whole path. The rest of this guide is detail and troubleshooting. The diagram below shows the same flow, in full.
 
-Bring-up gets the model *correct on device*; the `optimize` stage then makes it *fast*. Optimization reuses the same agent-in-a-harness pattern: a deterministic loop profiles the model, picks the bottleneck, and lets an LLM choose or invent the fix, while the harness gates every change on correctness (PCC) and measurement integrity before committing it.
-
-## 2. Capabilities
-
-- **Plan** — given a model id, report memory fit, mesh shape, and which building blocks already exist in tt-metal vs. need porting.
-- **Scaffold** — generate a runnable demo folder — `demo/`, `tt/`, `tests/` — cloned from the closest existing demo "family", e.g. Whisper for speech.
-- **Capture** — run the HF model once and record each submodule's real input/output tensors, so correctness tests use genuine activations, not fabricated ones.
-- **Iterate — the core** — an LLM agent rewrites each component into native TTNN; the harness PCC-tests it on device, graduates it on pass, rolls it back on regression, and re-queues it on fail. Uses a model ladder **haiku → sonnet → opus** that escalates as a component gets stuck.
-- **End-to-end — `emit-e2e`** — once components are graduated, an LLM **builder** wires them into a full task pipeline, then an independent LLM **grader** adversarially re-verifies it; a **fixer** closes any holes.
-- **Optimize — `optimize`** — once the pipeline runs correctly, drive its **performance** to the hardware limit. Discovery auto-detects the pipeline(s) and auto-generates any missing perf test; then for each op it **reuses a proven knob from the catalog if one fits** (else improvises), and a **deterministic gate** drives it up a fixed ladder — **knob → dtype → tt-lang kernel → C++ kernel** — committing only PCC-verified, measurement-honest speedups, on **every** pipeline, until each op is at its floor. Verified improvised wins are **distilled back into the catalog** and graduate to trusted once they win on a *different* model, so the tool gets faster across runs. Works on a planner-emitted pipeline or any existing tt-metal demo (by dir or model id). See **Step 5** for the flow.
-- **Verify** — reports a **compute split**: how much of the model runs natively on the TT device vs. still on CPU via torch fallback, at both the component level and the operation level.
-- **Remember** — learned capture drivers, per-model overlays, and a learned-fix log let knowledge from one bring-up be reused on the next.
-
-## 3. Repository layout
-
-```
-scripts/tt_hw_planner/                      THE TOOL
-│
-├── __init__.py  __main__.py                # `python -m scripts.tt_hw_planner` entry
-├── cli.py                                  # argparse + all command dispatch
-│
-├── top-level pipeline stages
-│   ├── probe.py  hardware.py  parallelism.py  architecture.py
-│   ├── compatibility.py
-│   ├── kernel_constraints.py  kernel_missing.py
-│   ├── op_classifier.py  op_emitter.py
-│   ├── discovery.py  reuse_registry.py  family_backends.py
-│   ├── module_tree.py  component_decomposer.py  decomposition_consumer.py
-│   ├── meta_plan.py
-│   ├── bringup.py  bringup_plan.py  bringup_loop.py
-│   ├── scaffold.py  scaffold_demo_folder.py
-│   ├── capture_inputs.py  capture_drivers.py  auto_capture_driver_onboard.py
-│   ├── llm_synth.py  runtime_repair.py  failure_classifier.py  learning.py
-│   ├── demo_wiring.py  output_validation.py  e2e_emitter.py  e2e_harness.py
-│   ├── instrumentation.py  overlay_manager.py  worktree.py
-│   ├── final_categorization.py  auto_onboard.py
-│   └── report.py  run_report.py  verdict.py  activation_diff.py
-│
-├── commands/                               # one module per CLI subcommand
-│   ├── emit_e2e.py     ← end-to-end pipeline builder + grader
-│   ├── optimize.py     ← perf-optimization bridge → runs perf_automation
-│   ├── plan.py  compat.py  scaffold.py  prepare.py  bringup.py  promote.py
-│   ├── op_synth.py  capture_inputs.py  decompose.py  auto_onboard.py
-│   ├── tackle_skipped.py  view_state.py  list_meshes.py  commit_tool.py
-│   ├── worktree_list.py  worktree_cleanup.py
-│   └── overlay_*.py     ← apply · revert · drop · list · promote · extract
-│
-├── _cli_helpers/                           # iterate-loop internals
-│   ├── agent.py            # spawns the LLM agent, monitors progress
-│   ├── auto_iterate.py     # the main bring-up loop
-│   ├── adaptive_scheduler.py  agent_worktree_pool.py   # memory-aware parallel agents
-│   ├── ttnn_preflight.py   # ensures `import ttnn` works before any device test
-│   ├── parallel_iterate.py  runtime_repair.py  iter_prompt.py
-│   ├── error_patterns.py  llm_verify.py  skip_diagnoser.py
-│   ├── setup_step_recovery.py  late_discovery_classifier.py  env_fix.py
-│   ├── kernel_findings.py  test_scaffold_reviewer.py  sweep_cache.py
-│   └── family_template_registry.py  template_promotion.py
-│
-├── agentic/                                # the convergence brain · G7/G8
-│   ├── executor.py  actions.py  convergence.py  diverge.py  resolve.py
-│   ├── learnings.py        # learned-fix lookup/register
-│   ├── probe.py  tt_probe.py  demo_recovery.py  stale_tests.py  persistence.py  e2e.py
-│
-├── correctness/                            # per-category PCC / behavioral graders
-│   ├── engine.py  base.py  registry.py  evidence.py
-│   └── audio_asr.py  classification.py  detection.py  diffusion.py
-│       embedding.py  segmentation.py  text.py
-│
-├── constraints/                            # model-independent TTNN quirk knowledge
-│   └── catalog.py  checker.py  recipes.py  prompt_injection.py
-│
-├── learned_drivers/                        # auto-onboarded per-model capture drivers — code
-├── learned_invokers/
-├── plans/                                  # helper script + generated per-model plans
-└── tests/                                  # contract test suite
-```
-
-> **Not part of the code — gitignored, rebuilt as the tool runs:** `overlays/` captured per-model git patches, `learned_bringups.json`, `learned_chained_templates.json`, `agentic/learned_fixes.json`.
-
-## 4. How it works
-
-The whole tool as a single top-down flow — five phases, bring-up (1–4) then `optimize` (5):
+## The flow at a glance
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'primaryColor':'#ffffff','primaryTextColor':'#111111','primaryBorderColor':'#94a3b8','lineColor':'#475569','fontFamily':'Segoe UI, Arial, sans-serif','fontSize':'13px'}}}%%
 flowchart TD
   subgraph BG[" "]
   direction TB
-    IN(["auto-up &lt;model&gt; · --box T3K · --mesh 2x2"]) --> S1["STEP 1 · scaffold — clone closest demo family"]
-    S1 --> S2["STEP 2 · prepare-plan — REUSE / ADAPT / NEW split"]
-    S2 --> S3["STEP 3 · auto-onboard NEW family — unknown arch"]
-    S3 --> S4["STEP 4 · phase-1 autofill — CPU fallbacks + aliases"]
-    S4 --> S5["STEP 5 · build  ·  STEP 6 · iterate-loop engine"]
-    S5 --> CAP["capture real inputs — per-component HF I/O"]
+    IN(["auto-up &lt;model&gt; · --box T3K · --mesh 2x2 · --reverify (rerun-safe)"]) --> REG["registry sync + drift check — remote-first · non-fatal"]
+    REG --> S1["STEP 1 · plan + compat — REUSE / ADAPT / NEW split"]
+    S1 --> S2["STEP 2 · scaffold — clone closest demo family · inline auto-onboard if arch unknown"]
+    S2 --> S3["STEP 3 · LLM gate — does bring-up need an agent?"]
+    S3 --> S4["STEP 4 · phase-1 autofill — CPU torch fallbacks + aliases"]
+    S4 --> S5["STEP 5 · prepare — build the runnable pytest invocation"]
+    S5 --> S6["STEP 6 · bring-up cc engine — single agent driven by the bringup_mcp gate"]
+    S6 --> CAP["capture real inputs — per-component HF I/O"]
     CAP --> OVL1["load overlays — replay prior bring-up"]
     OVL1 --> PRE["pre-flight PCC · ttnn import check"]
     PRE --> RECON
 
-    subgraph ITER["AUTO-ITERATE · per component (N/24) · haiku → sonnet → opus"]
+    subgraph ITER["BRING-UP cc engine · per-component gate · single agent · PCC ≥ 0.99 on device"]
     direction TB
-      RECON["loop-start reconciliation"] --> PICK["pick TARGET component"]
-      PICK --> AG["🤖 spawn 4 parallel claude agents<br/>isolated worktrees · memory-aware"]
-      AG --> APP["apply responses + ttnn-import"]
+      RECON["loop-start reconciliation<br/>restore stale tests · reinject + recompose ready parents"] --> PICK["gate picks TARGET<br/>termination_check names {component · rung}"]
+      PICK --> AG["🤖 single claude agent · isolated worktree<br/>works next_target.rung — emit/repair · fix_harness · resolve_loader · shard"]
+      AG --> APP["record_result + ttnn-import<br/>native-only · torch-delegating stub refused"]
       APP --> PCC{"PCC ≥ 0.99<br/>on device?"}
-      PCC -->|pass| GRAD["graduate ✓ · .last_good_native"]
+      PCC -->|pass| GRAD["graduate ✓ · .last_good_native<br/>(shard → .last_good_sharded)"]
       GRAD --> OVL2["overlays index + patch"]
       OVL2 --> SW["regression + validation sweep<br/>compute split X / N on device"]
-      PCC -->|fail| RB["rollback .last_good_native<br/>reset · 5-attempt budget"]
-      RB --> WJ{"budget left?<br/>(waste-judge)"}
+      PCC -->|fail| RB["restore_best / rollback<br/>per-component attempt budget"]
+      RB --> WJ{"budget left?<br/>(brain G8 · extend-cap)"}
       WJ -->|retry| PICK
-      WJ -->|exhausted| DEC["decompose parent → children<br/>or no_emit + lock module"]
+      WJ -->|exhausted| DEC["decompose parent → children ·<br/>fallback-to-CPU · mark_manual + lock"]
       DEC --> PICK
     end
     SW --> MORE{"more components<br/>left?"}
     MORE -->|"yes · budget left"| RECON
-    MORE -->|"leftovers · iter budget capped"| PROM["promote — resume bring-up of the<br/>REMAINING components (fresh session · replays overlays)"]
+    MORE -->|"leftovers · iter budget capped"| PROM["promote — resume cc bring-up of the<br/>REMAINING components (fresh session · replays overlays)"]
     PROM --> RECON
-    MORE -->|"all graduated"| FC["final categorization — REUSE / ADAPT / NEW / SKIP"]
+    MORE -->|"all graduated"| FC["final categorization — ON_DEVICE / CPU_REUSE /<br/>KERNEL_MISSING / PENDING"]
 
     FC -. "optional · separate" .-> OVL3["overlays — apply (replay) · or dispose / drop"]
+    FC -. "optional · per-module" .-> MOPT["🤖 optimize --module-level — tune graduated modules one at a time<br/>module-scoped perf test · --then-e2e confirms in the pipeline"]
 
     subgraph E2E["EMIT-E2E — build the end-to-end pipeline"]
     direction TB
-      BLD["🤖 BUILDER wires graduated stubs → pipeline"] --> GR{"GRADER<br/>verdict?"}
+      BLD["🤖 BUILDER wires graduated stubs → pipeline<br/>+ exposes host_op_selftest()"] --> GR{"e2e gate · termination_check<br/>G1–G6 + host-op observer"}
       GR -->|FAIL| FIX["🤖 FIXER closes holes"]
       FIX --> GR
     end
@@ -143,9 +69,14 @@ flowchart TD
     subgraph OPT["OPTIMIZE · reuse-first · deterministic gate + kernel ladder · learns across runs · every pipeline"]
     direction TB
       PROF["discover pipeline(s) from demos + auto-generate missing perf test<br/>profile on device (tracy)"] --> OTC{"termination_check<br/>next_target = {op, op_class, rung}"}
-      OTC -->|"blocking op"| RECALL["🤖 recall_knobs(op_class, grid, bound)<br/>read THIS op's catalog slice FIRST — tuned levers ranked first"]
-      RECALL --> RUNG["🤖 apply/adapt a known knob — else improvise<br/>do the rung IN ORDER: knob:grid → knob:dtype → tt-lang → C++ kernel"]
-      RUNG --> OG{"PCC ok ·<br/>faster · honest?"}
+      OTC -->|"blocking op · gate names next_target.rung"| RECALL["🤖 recall_knobs(op_class, grid, bound)<br/>read THIS op's catalog slice FIRST — tuned levers ranked first"]
+      RECALL --> L1["🤖 rung 1 · knob:grid<br/>occupy the full core grid"]
+      L1 -->|"else"| L2["🤖 rung 2 · knob:dtype<br/>weights bf16 → bf8_b → bf4_b"]
+      L2 -->|"else"| L3["🤖 rung 3 · tt-lang kernel<br/>custom kernel via Python DSL"]
+      L3 -->|"else"| L4["🤖 rung 4 · C++ Metalium kernel<br/>raw generic_op kernel"]
+      L4 -->|"else · matmul still memory-bound on a mesh"| L5["🤖 rung 5 · tp-fracture · tensor-parallel<br/>tp_pick_degree → shard weight across chips + CCL → verify_tp_fracture"]
+      L5 -->|"else"| L6["🤖 rung 6 · structural<br/>investigate arch for reducible work"]
+      L6 --> OG{"PCC ok ·<br/>faster · honest?"}
       OG -->|no| RV["revert / discard"]
       OG -->|yes| CMT["COMMIT speedup ✓ — scoped git"]
       CMT --> DIST["🤖 distill_knob — write the IMPROVISED win back<br/>+ graduate a reused provisional → trusted"]
@@ -155,6 +86,7 @@ flowchart TD
       CAT[("knob catalog<br/>GUIDELINES + LEARNED_* / GRADUATED_*")] -. "reuse known knob" .-> RECALL
       DIST -. "provisional · graduates on a different model" .-> CAT
     end
+    MOPT -. "reuses the ladder per module" .-> OTC
     OTC -->|"can_stop · every op at floor or ladder exhausted"| DONE(["model runs natively on device — correct AND fast"])
   end
 
@@ -169,14 +101,14 @@ flowchart TD
   classDef iter  fill:#ede9fe,stroke:#7c3aed,color:#111;
   classDef post  fill:#fae8ff,stroke:#a21caf,color:#111;
   classDef opt   fill:#ffedd5,stroke:#ea580c,color:#111;
-  class AG,BLD,FIX,PROM,RUNG,RECALL,DIST agent;
+  class AG,BLD,FIX,PROM,MOPT,L1,L2,L3,L4,L5,L6,RECALL,DIST agent;
   class PCC,WJ,MORE,GR,OG,OTC gate;
   class OVL1,OVL2,OVL3,CAT ovl;
   class GRAD,CMT good;
   class RB,DEC,RV warn;
   class IN,DONE term;
-  class S1,S2,S3,S4,S5 build;
-  class CAP,PRE prep;
+  class S1,S2,S3,S4,S5,S6 build;
+  class CAP,PRE,REG prep;
   class RECON,PICK,APP,SW iter;
   class FC post;
   class PROF,REC opt;
@@ -186,289 +118,282 @@ flowchart TD
   style OPT fill:#f1f5f9,stroke:#cbd5e1,color:#334155;
 ```
 
-**Reading it:** first figure out the port, then scaffold the demo and capture real data, then loop until every component graduates to native TTNN — on-device PCC, escalating the model tier when stuck, and **resuming with `promote`** if a run's iteration budget caps before all components graduate (captured bring-up state can be replayed or disposed via **overlays** as a separate step). Once everything is graduated, `emit-e2e` wires the graduated pieces into the full pipeline and an independent grader/fixer loop proves it on device. Finally, `optimize` discovers the pipeline(s), auto-generates any missing perf test, and for every op first **recalls the bucket's catalog** to reuse a proven knob (improvising only when none fits), then climbs a deterministic ladder — **knob → dtype → tt-lang → C++ kernel** — under a gate that commits only faster, PCC-clean, trustworthy measurements and won't stop until each op is at its floor; each improvised win is **distilled back into the catalog** (graduating to trusted on a second model) so later runs reuse it (the OPTIMIZE box above).
+Each speed lever is only tried when the cheaper one above it is used up, and every change is kept **only** if it's faster *and* still gives the right answers. You don't pick these — the tool does. (TP, step 5, only kicks in for a big matrix-multiply that's still slow after the earlier steps.)
 
-## 5. Setup and prerequisites
+## Optional: drive it from the dashboard (web UI)
 
-Three things must be in place before any bring-up can work: the right machine/env, a built ttnn, and Claude credentials. The HF and exhausted-iteration items are the common run-time snags — handle them the same way.
+Prefer not to SSH into machines and babysit `tmux`? A companion web dashboard —
+**"Bring Up"** — runs everything in this guide from a browser, across several
+machines at once. It just issues the same `python -m scripts.tt_hw_planner …`
+commands remotely, so this README stays the source of truth for stages/flags.
 
-**Machine & env**
-- You're on a Tenstorrent machine with the device visible, e.g. a QuietBox or T3K.
-- The repo's Python env is active — `source python_env/bin/activate`, so `python` is the tt-metal env.
-- Run everything from the repo root, `tt-metal/`.
+**What it does**
+- **Provision a machine from scratch** — clone this fork + `feature/tt-hw-planner`,
+  `git submodule update`, `build_metal.sh`, `create_venv.sh --skip-compat-check`,
+  install `tt-lang`, then verify `tt_hw_planner` — with a live build log.
+- **Bring up → optimize** — pick a model (or search HuggingFace by name), a machine,
+  `--box`/`--mesh`, choose stages (`auto-up` → `emit-e2e` → `optimize`) and flags,
+  and launch. Each run streams its log in its own card.
+- **Many models at once** — launch different models on different devices
+  concurrently; each run has its own live log, **RUN_REPORT.md** viewer, and an
+  embedded live **optimize dashboard**.
+- **Sync the tool** — one-click `git fetch` + `pull --ff-only` of this repo on a
+  target machine.
+- Optional **Telegram** control + notifications.
 
-### 5.1 Build ttnn for your checkout
-`ttnn` is a compiled C++ extension (`_ttnn.so`) that git does **not** carry — only source is pushed/pulled. After any `git clone`, `git pull`, or hardware change you must rebuild, or `import ttnn` fails and every on-device PCC test dies at collection → 0 components graduate. The tool pre-flights this for every device command: if `import ttnn` fails it **prints a clean diagnosis of what's missing and the exact commands to fix it, then stops** — it does not auto-rebuild. Run:
+**Run it**
 ```bash
-cd ~/tt-metal
+git clone git@github.com:apande-TT/cc-dashboard.git
+cd cc-dashboard
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app:app --host 127.0.0.1 --port 8001
+```
+Open <http://127.0.0.1:8001>. It reads the machines in your `~/.ssh/config`; use
+each machine's **Connect** button once (installs your SSH key) so it can drive
+that machine. See the dashboard repo's README for `.env`/Claude-auth setup.
+
+
+## Before you start — prerequisites
+Do these once, in order, in a **fresh standalone clone** (not a linked git worktree). Following the commands literally works — the known traps are baked in. If something is still missing, the tool stops and prints the exact fix.
+
+### Machine prerequisites (before cloning)
+- A Tenstorrent board is visible: `ls /dev/tenstorrent` shows device nodes.
+- SSH access to GitHub works.
+- The **`claude` CLI is installed and logged in** — `cc` uses native Anthropic auth, so there is **no `.env.agent`**:
+  ```bash
+  curl -fsSL https://claude.ai/install.sh | bash   # only if not already installed
+  claude                                            # log in once
+  ```
+  (Or instead `export ANTHROPIC_API_KEY=…`.)
+
+### Build the environment (run in order)
+
+**1. Clone from your home dir** — NOT inside an existing repo:
+```bash
+cd ~ && git clone git@github.com:apande-TT/tt-metal.git tt-metal-xtts && cd tt-metal-xtts
+```
+
+**2–3. Check out the tool branch, then make your model branch from it:**
+```bash
+git checkout feature/tt-hw-planner
+git checkout -b xtts-v2-bringup
+```
+
+**4. Init submodules** — required for the build (the clone does NOT do this):
+```bash
 git submodule update --init --recursive
+```
+
+**5. Create the venv — `--skip-compat-check` is REQUIRED.** A harmless dependency version clash otherwise makes the script exit 1 even though the venv is fine:
+```bash
+./create_venv.sh --skip-compat-check
+```
+
+**6. Build tt-metal and verify** (compiles the C++ side):
+```bash
 ./build_metal.sh
-python -c "import ttnn; print('ok')"     # must print ok before bring-up can graduate anything
+source python_env/bin/activate
+python -c "import ttnn; print('ttnn ok')"     # must print: ttnn ok
+```
+> **Re-run this every time you update the branch** (`git pull` / `git merge`). Pulling new code changes the *source* but does **not** recompile it — running on a stale build causes silent wrong answers (tests quietly read as "OTHER").
+
+**7. Install `tt-smi` in its OWN venv** — **never** into the tt-metal venv (it drags in an older `tt-umd` that corrupts the device layer). The tool auto-discovers `~/.tenstorrent-venv/bin/tt-smi`:
+```bash
+python3 -m venv ~/.tenstorrent-venv
+~/.tenstorrent-venv/bin/pip install -U pip tt-smi
+export PATH="$HOME/.tenstorrent-venv/bin:$PATH"   # add this line to your ~/.bashrc too
+tt-smi -s | head                                   # must show your board
 ```
 
-### 5.2 Claude credentials
-**Every** command — the bring-up loop, `emit-e2e`, and `optimize` — uses Claude for its LLM steps, and they all authenticate the **same two ways** (pick one):
+**8. Confirm transformers matches tt-metal's pin.** The version is **not** hardcoded — the tool reads it from `tt_metal/python_env/requirements-dev.txt`, so it tracks upstream bumps (`5.12.1` at the time of writing). `setup_env.sh` (step 10) checks this and prints the exact `uv pip install` fix; if bring-up offers to downgrade transformers, decline it or pass `--no-env-fix`:
 ```bash
-# Option A — subscription / interactive (Pro/Max/Team)
-claude            # then complete /login once
-
-# Option B — API key (recommended for headless / long runs)
-export ANTHROPIC_API_KEY=<your-key>
+python -c "import transformers; print(transformers.__version__)"   # must match requirements-dev.txt
 ```
-**Precedence:** if `ANTHROPIC_API_KEY` is exported it is used; otherwise the `claude` login credentials are used. Put the `export` in your `~/.bashrc` so every shell and agent subprocess inherits it. The tool prints a clear "credentials confirmed" / "set ANTHROPIC_API_KEY" line at pre-flight. **These are the only two ways to authenticate — there is no `.env.agent` or LiteLLM/proxy path.** Every command — `auto-up`, `up`, `promote`, `emit-e2e`, **and `optimize`** — uses this same auth (`optimize` is no longer an exception).
 
-### 5.3 Gated HuggingFace models
-If the model is gated, HF returns 403 / "Access to model is restricted" and the tool stops with a GATED message. To unblock:
+**9. Clear any stale kernel cache:**
 ```bash
-# 1. Approve access in a browser:
-#    open  https://huggingface.co/<org>/<model>  → sign in → "Request access"
-# 2. Authenticate with a read token (https://huggingface.co/settings/tokens):
-huggingface-cli login                 # paste a read token
-#    OR, headless:
-export HF_TOKEN=hf_xxx
-# 3. Re-run the same command.
+rm -rf ~/.cache/tt-metal-cache "$TT_METAL_HOME/.cache/tt-metal-cache"
 ```
-A 401 / "invalid token" is the AUTH case — same fix: `huggingface-cli login` or `export HF_TOKEN=hf_xxx`.
 
-### 5.4 HuggingFace weight download failures
-The tool detects HF weight-download failures and bails early with remediation instead of burning iterations. If the box can't pull weights — no network, proxy, rate-limit, air-gapped — pre-download the weights on a connected machine, copy them over, and point the tool at them:
+**10. Verify the whole environment in one shot.** You must **`source`** it (do not execute it — it needs to set env vars in your shell):
 ```bash
-# on a machine WITH network:
-huggingface-cli download <org>/<model> --local-dir /data/<model>
+source models/experimental/perf_automation/setup_env.sh    # must print: environment ready
+```
+It self-detects the checkout, installs any missing agent deps, and checks ttnn/torch, the `claude` CLI + auth, `tt-smi`, transformers against tt-metal's pin (read live from `requirements-dev.txt`), and tt-lang. If any line says **FAIL**, fix it before continuing. Safe to re-run anytime.
 
-# copy /data/<model> to the offline box, then point HF at the local cache and re-run:
-export HF_HOME=/data/hf-cache          # or the dir you copied the weights into
-export HF_HUB_OFFLINE=1
+**11. Now run the tool** — bring-up → emit-e2e → optimize, all on this branch (→ Section 1 & 2 below).
+
+### tt-lang kernel rung — know this before `optimize`
+`tt-lang` (`ttl`, the optimize **rung-3** custom-kernel lever) ships **`cp312` wheels only**, but this venv is **Python 3.10** (`create_venv.sh` default) — so it cannot install, and the tool silently skips that rung.
+- **Bring-up does not need tt-lang at all**, and optimize still has the grid / dtype / C++ rungs. Staying on 3.10 is fine.
+- Only if you specifically want tt-lang kernels during optimize: rebuild the venv on **Python 3.12** — `create_venv.sh` supports it (`./create_venv.sh --python-version 3.12`).
+
+### Extra prerequisites before `optimize` (not needed for bring-up)
+- You are in a **standalone clone** (this is one) — never run `optimize` from a linked git worktree (kernel JIT mixes worktree `.cpp` with main-tree `.hpp` → no trace).
+- **Commit the model dir to git first** — optimize's REVERT needs a clean baseline.
+- Pass the right `--devices` for your board (e.g. `0,1`); a wrong partial spec trips a fabric error.
+- Perf is measured **trace + 1 command queue** end to end — the tool opens the device with a single CQ; there is **no 2-CQ track**.
+- `TT_PERF_TRACE` selects the run mode: defaults to `1` (trace mode on) when unset; set `0` for eager mode.
+
+### Handled automatically (don't chase these)
+profiler orphan-marker heal + `libtt_metal.so` rebuild, marker-buffer drain, CSV extraction, device reset (`tt-smi -r`), crash/hang/stale-CSV guards, git checkpoint/revert, fabric-wedge avoidance, the tt-lang auto-install attempt, and CPU stubs for GPU-only packages (`flash_attn`, `mamba_ssm`, …).
+
+Run everything from the `tt-metal-xtts/` folder.
+
+## Section 1 · Bring up any model
+
+Get a model running correctly on the chip. Three commands, run in order.
+
+> Optional first look (changes nothing): `python -m scripts.tt_hw_planner plan <org>/<model>` — prints the memory-fit verdict and what's already supported vs. needs porting.
+
+**Step 1 · `auto-up` — the one-command bring-up (always start here)**
+```bash
 python -m scripts.tt_hw_planner auto-up <org>/<model> --box QB2 --mesh 2,2
 ```
+Plans, scaffolds a demo, captures real inputs, then runs the **cc engine** — a single Claude agent driven by the per-component `bringup_mcp` gate that ports each component to native TTNN, PCC-testing every piece on the device and graduating the ones that pass. **When to use:** the first step for any new model. Only `--box` and `--mesh` are required; it locks in the agent and iteration budget for you. It runs a while — use `tmux`/`nohup`.
+- `--box` = one of `N150 N300 T3K QB2 Galaxy GalaxyBH`
+- `--mesh` = the **physical hardware chip arrangement**, e.g. `2,2` (4 chips in a square) or `1,4` (4 in a row); must be a *canonical* shape for `--box`, and `2,2` and `2x2` are equivalent. (This is the literal device mesh — different from optimize's `--mesh`, which is a TP×DP topology; see Section 2.)
+- `--reverify` = re-run every component's PCC gate from scratch (clears the graduation markers but keeps the ported code), so a rerun on an updated build re-earns graduation honestly instead of trusting a stale marker.
 
-### 5.5 Resuming a partial bring-up
-`auto-up` caps at `--auto-max-iters` (default 24). If it ends with some components still not graduated, you do **not** restart from scratch — the graduated stubs and captured inputs are preserved in the model's demo dir. Resume with `promote`, which re-runs the iterate loop only on the **remaining** components:
+**Step 2 · `promote` — resume if bring-up didn't finish**
 ```bash
 python -m scripts.tt_hw_planner promote <org>/<model> --box QB2 --mesh 2,2
 ```
-- `promote` picks up where `auto-up` left off — already-graduated components keep their `.last_good_native` snapshots and are not re-attempted; it focuses the budget on what's still failing.
-- It has its own iteration cap (`--auto-max-iters`, promote default 24) and the same `--auto-model-tiered` ladder, so stuck components escalate haiku → sonnet → opus.
-- Run `promote` repeatedly if needed — each pass only works the still-ungraduated set, so progress accumulates across passes.
+`auto-up` caps at 24 iterations. If some components didn't graduate, `promote` re-runs the loop **only on the leftovers** (already-graduated components keep their snapshots and aren't re-attempted). **When to use:** after `auto-up` if not everything graduated — run it repeatedly, progress accumulates each pass. Same required `--box`/`--mesh`.
 
-## 6. Usage
-
-> Run everything from the repo root, `tt-metal/` (after completing §5 Setup).
-
-### Step 1: Plan (read-only)
+**Step 3 · `emit-e2e` — wire the pieces into the full pipeline**
 ```bash
-python -m scripts.tt_hw_planner plan facebook/hf-seamless-m4t-medium
+python -m scripts.tt_hw_planner emit-e2e <org>/<model>
 ```
-Shows the memory-fit verdict, recommended mesh, and a block-by-block report of what already exists vs. what needs porting. **Nothing is modified.** Good first step to understand the model.
+Once all components are graduated, a BUILDER agent wires them into the end-to-end task pipeline (exposing a `host_op_selftest()` hook), then a deterministic **e2e gate** — `termination_check` over gates G1–G6 (including the G5 host-op observer that proves the forward runs fully on device, and the G6 trace gate) — drives a FIXER loop until it passes on device. **When to use:** after everything is graduated, to produce a working end-to-end model. Handy flags: `--task <t>` / `--all-tasks` (multi-task models), `--max-grade-rounds`, `--pcc-target`.
 
-### Step 2: Bring up the model
+### Overlays — save & replay a model's graduated work
+An **overlay** is the captured set of file changes a bring-up produced — the per-component `_stubs/` (the graduated native-TTNN code) plus any patches. When a run is worktree-isolated the tool **auto-captures** them, so a model can be **replayed later without re-running the LLM**.
 ```bash
-python -m scripts.tt_hw_planner auto-up facebook/hf-seamless-m4t-medium --box QB2 --mesh 2,2
+python -m scripts.tt_hw_planner overlay-list   <org>/<model>   # what's stored (omit model = all)
+python -m scripts.tt_hw_planner overlay-apply  <org>/<model>   # replay the graduated modules onto a clean tree
+python -m scripts.tt_hw_planner overlay-revert <org>/<model>   # undo an apply
+python -m scripts.tt_hw_planner overlay-drop   <org>/<model>   # discard the stored overlays (omit model = wipe all)
 ```
-This is the main entry. You pass the target hardware — `--box` and `--mesh` are both **required** — and it locks in the remaining defaults (auto-agent, model ladder, iter budget, per-component cap) and runs the whole flow: plan → scaffold → capture → iterate loop. It will:
-- target the box and mesh you specified,
-- create the demo folder under `models/demos/.../<model>/`,
-- launch LLM agents to port each component,
-- PCC-test each on the device and graduate the ones that pass,
-- print progress per iteration and a **compute split** of device vs CPU.
+Use **apply** to restore a previously brought-up model's graduated modules; **drop** only loses the replay shortcut, never the tool itself.
 
-It runs for a while — each component is an LLM attempt plus a device test. Leave it running. **Tip:** for long runs use `tmux` or `nohup` so it survives a dropped SSH session.
+## Section 2 · Optimize
 
-If `auto-up` hits its `--auto-max-iters` cap with some components still not graduated, you do **not** restart — resume with `promote`, which re-runs the loop only on the **remaining** components (graduated ones keep their snapshots and are not re-attempted):
+Once a model runs correctly, `optimize` profiles it on the device and climbs a per-op speed ladder — **cheap knobs (`grid` / `dtype` / `shard` i.e. tensor-parallel / `fidelity`) → algorithmic/structural restructure (the `host` lever — trace · fusion · gather · KV-cache — deliberately tried *before* any hand-written kernel) → tt-lang kernel → C++ Metalium kernel** — committing **only** PCC-verified, genuinely faster changes.
+
+The **knob** rung is not a fixed sequence. The tool classifies each op as **memory-**, **compute-**, or **dispatch-bound** (or **unknown/other** when the roofline can't tell), and uses that classification only to set the *priority* — which knob is tried first — **never to drop a knob**. Every applicable knob is still tried at least once: after the bound-appropriate knobs are exhausted, a completeness sweep offers each remaining one before the op may be declared done (a bound estimate is only a hint, and ops are rarely purely one-bound). Priority order per bound:
+- **memory-bound** (and **unknown/other**, the default): `grid → dtype → shard → fidelity`
+- **compute-bound** and **dispatch-bound**: `grid → fidelity → dtype → shard`
+
+(`grid` applies until the core grid is full; `dtype` only to matmuls; `shard` and `fidelity` always apply. `tp-fracture` — sharding a still-memory-bound matmul across the mesh — is offered after the knobs for eligible ops.)
+
+### How to read the optimize report (`RUN_REPORT.md`)
+Each optimize run writes a per-op ladder table into `RUN_REPORT.md` in the model dir. One row per op, one column per lever, and a final `best ms` (the op's best measured device time so far):
+```
+op                        grid   fidelity  dtype   shard   host   tt-lang   cpp    other    best ms
+Matmul 128x14336x4096     ·try   —         ✓win    ✓win    ·try   ·try      ·try   ·try     1061.00
+```
+Columns (this is the full lever set — the same ladder, one column each):
+- **`grid`** — core-grid occupancy (spreading work across more cores).
+- **`fidelity`** — math fidelity (HiFi ↔ LoFi).
+- **`dtype`** — weight/activation precision (`bf16 → bf8_b → bf4_b`; matmuls only).
+- **`shard`** — memory sharding / L1 pinning / memory-config changes (this is the tensor-parallel/sharding lever).
+- **`host`** — host- or dispatch-side work: **trace, fusion, gather, caching/KV-cache** (i.e. the structural/algorithmic rung is recorded here).
+- **`tt-lang`** — a custom kernel authored in the tt-lang DSL.
+- **`cpp`** — a custom C++ Metalium kernel.
+- **`other`** — catch-all for any lever that doesn't classify into the columns above; rendered only when something lands there.
+
+Cell legend: **`✓win`** = beat baseline (kept) · **`·try`** = measured, no gain · **`·wedge`** = wedged/crashed when tried · **`—`** = not attempted / not applicable.
+
+> **Important — two ways it runs: trace mode vs eager mode.** Every profiled/verification run executes in one of two modes:
+> - **Trace mode (the default).** The model's device command stream is captured once and replayed (`--enable_trace`), so timings reflect steady-state **on-device** performance with host/dispatch overhead removed. This is the fast path and the mode you want for real speed numbers.
+> - **Eager mode (`TT_PERF_TRACE=0`).** Every op is dispatched one at a time on each call (`--disable_trace`) — slower and includes host overhead, but it's the mode to use when trace isn't supported for a model or when tracing perturbs correctness (i.e. accuracy over raw speed).
+>
+> Trace mode stays on by default. Toggle it with the **`TT_PERF_TRACE`** env var (`1` = trace, `0` = eager) — `optimize` has no `--no-trace` flag of its own (that flag belongs to the bring-up commands).
+
+> **Important — one-time precondition for `optimize`.** For an existing model, `optimize` runs in a throwaway git **worktree**, which is a *clean checkout of your current branch* — it only sees **committed** files. So before you run it:
+> 1. Be on the branch that has the **`tt_hw_planner` tool committed** (`scripts/tt_hw_planner/` **and** `models/experimental/perf_automation/`) — e.g. check out the tool's branch.
+> 2. Make sure the **model's code is committed on that same branch** — bring the model baseline profile.
+>
+> If the tool or the model is only *uncommitted/untracked* on the branch you run from, the worktree won't contain it and the run fails before profiling. (This doesn't apply to `--in-place`, or to a model this tool brought up — those edit in place.)
+
+**A · a model this tool brought up — just give the model id:**
 ```bash
-python -m scripts.tt_hw_planner promote facebook/hf-seamless-m4t-medium --box QB2 --mesh 2,2
+python -m scripts.tt_hw_planner optimize <org>/<model> --devices all
 ```
-Run it repeatedly if needed — each pass only works the still-ungraduated set, so progress accumulates (see §5.5).
 
-> **Parallel agents:** when more than one component is worked at once, each agent runs in its **own isolated git worktree** (no shared-tree contention) and concurrency is **memory-aware** — the scheduler scales the number of parallel agents *down* under host-RAM pressure and *up* when there's headroom.
-
-### Step 3: Read the progress output
-Each iteration prints a banner like:
-```
-AUTO-ITERATE 6/24: `<component>` GRADUATED to native TTNN (PCC test PASSED)
-...
-Iter 6 compute split (after pytest):
-  components : 12/32 on device (37%), 20/32 on CPU (62%)
-  operations  : 34/2862 on device (1%), 2828/2862 on CPU (98%)
-```
-- **components** = how many *modules* are native — a simple headcount.
-- **operations** = how many *TTNN ops* are native — work-weighted, the real "how much of the model runs on device" number. These differ because a few small modules can graduate early while the big compute-heavy ones are still on CPU.
-
-### Step 4: Build and verify the end-to-end pipeline
-Once components are graduated, wire them into a full task pipeline and have an independent agent grade it:
+**B · an existing tt-metal model — point at its code + PCC test:**
 ```bash
-python -m scripts.tt_hw_planner emit-e2e facebook/hf-seamless-m4t-medium
-```
-You'll see a **BUILDER** phase, then a **GRADER** phase that re-runs everything fresh on device and prints a clean report:
-```
-GRADER REPORT — hf_seamless_m4t_medium
-  Call   Re-run  Final PCC                          Audit
-  s2tt   pass    0.999894 / 0.999863 / 0.999039     clean
-  t2t    pass    0.999879 / 0.999716 / 0.999669     clean
-  t2s    pass    0.999879 / 0.999854 / 0.999931     clean
-  Structure   pass
-  No-waste    pass — 23/23 graduated invoked
-  Verdict     PASS
-
-  compute split (TT device vs CPU): 25/25 on device (100%)
-  operations: 1679/1679 on device (100%)
-```
-
-### Step 5: Optimize performance
-Once the pipeline runs correctly, make it fast. `optimize` discovers the pipeline(s), profiles on device, and drives a **deterministic optimization ladder** — committing only PCC-verified, measurement-honest speedups, on every pipeline, until each op is at its floor.
-
-`optimize` uses the **same credentials as every other command** (§5.2) — `ANTHROPIC_API_KEY` if exported, otherwise `claude` login. No separate setup and no `.env.agent`.
-
-```bash
-# a planner-emitted model (resolved by model_id via bringup_status.json):
-python -m scripts.tt_hw_planner optimize facebook/hf-seamless-m4t-medium --devices all
-
-# OR any existing tt-metal demo — code + tests co-located under one dir (just point at it):
+# code + tests in ONE folder — just give the folder:
 python -m scripts.tt_hw_planner optimize models/demos/wormhole/bge_m3 --devices all
 
-# OR an existing model whose code and tests live in DIFFERENT dirs (--model-dir + --pcc-test;
-# perf test is auto-generated from the pcc gate):
+# code and tests in DIFFERENT folders — give both (the perf test is auto-generated from the PCC gate):
 python -m scripts.tt_hw_planner optimize \
   --model-dir models/demos/bge_large_en \
   --pcc-test  models/demos/wormhole/bge_large_en/tests/pcc/test_ttnn_bge_model.py::test_ttnn_bge_model \
   --devices all
 ```
 
-The same command serves both — it resolves a **directory** or a **model id** (`_resolve_target`) and detects whether the target is planner-emitted or an existing demo. Then **discovery is self-sufficient**: it finds the pipeline(s) and **always auto-generates the perf test** — from `demo/demo_<task>.py` for a planner-emitted model, or from the `--pcc-test` gate for an existing model — pairs each with its PCC gate, and optimizes **every** pipeline. (You never pass a perf test; there is no flag for one.) For each op it climbs a fixed ladder and a deterministic gate refuses to stop until the whole ladder is exhausted or the op is at its floor — this is the **OPTIMIZE** box in the §4 architecture diagram (`profile → termination_check → do next_target.rung in order → commit-or-revert → record → re-profile`, exiting only on `can_stop`).
+Options:
+- `--devices single | 0,1 | all` — which chip(s). Default `0,1`; use **`all`** on a multi-chip board (a *partial* subset can trip a fabric error); use `single` on a one-chip machine.
+- `--box` / `--mesh` — declared TT box + mesh shape (e.g. `--box p300c --mesh 2x2`) for **roofline calibration** — how close each op is to the hardware floor. **Note — this `--mesh` is not the bring-up one:** optimize uses it only for its **chip count**, then derives a kernel-viable **TP×DP** topology (`plan_parallelism` → `TP=cols`, `DP=rows`) rather than opening the literal physical arrangement.
+- `--metric device_ms | wall_ms | auto` — what to optimize for (on-device time is the usual choice).
+- `--in-place` — edit an existing demo's source directly instead of in a throwaway worktree (a tool-brought-up model is always in place).
+- `--max-rounds N` — cc engine: max `claude -p` optimization rounds per pipeline (**default `3`**; one round is a full continuous agent session that climbs the whole ladder). Use `1` for a single pass, raise for models with lots of headroom; the deterministic gate can still stop earlier once each op is at its floor.
+- `--target-band` / `--no-target-band` — **on by default.** Stop once the DRAM-bandwidth target band is reached (`IN_BAND → can_stop`), so a run ends at `min(band reached, --max-rounds)` — full-model uses the tok/s ceiling from active bytes, per-module each module's own roofline floor. Pass `--no-target-band` to keep optimizing past the band.
+- `--module-level` — optimize graduated native modules **one at a time** (against each module's per-component PCC test) instead of the full pipeline — a coarse per-module pre-pass that sidesteps the heavy e2e baseline. Combine with `--modules a,b,c` to restrict to a subset, `--then-e2e` to run one full-pipeline pass afterward confirming the per-module wins survive composition, and `--reverify` to re-optimize modules already marked optimized in a prior run (default skips them, so a restart resumes at the next unoptimized module).
+- `--hitl` — human-in-the-loop: the agent applies **one lever at a time**, then pauses at a block-level timing + rationale screen for your commit/revert/try decision before continuing (needs a live terminal).
+- `--e2e-only` — cc engine: skip all optimization and just measure + print the full-model end-to-end time. Use to recover the before/after number if a prior run was stopped or killed before its final measurement.
+- Advanced: `--perf-test path::test` (explicit perf test for models whose e2e overflows the profiler), `-k` / `--case` (pytest `-k` case override), and `--matmul-sweep` + `--matmul-sweep-pcc` / `--matmul-sweep-iters` / `--matmul-sweep-max-shapes` (a matmul fidelity×dtype pre-pass that writes a warm-start table; needs `--perf-test`).
 
-**Where the edits land** — the two target kinds are treated differently *on purpose*. A **planner-emitted** demo is a tool-owned scaffold, so it's optimized **in place** (commits land on your current branch). An **existing tt-metal demo** is *your* real source, so the cc engine **never mutates it in place**: it runs the whole loop in a throwaway git worktree on a fresh `opt/<demo>-<ts>` branch (with `python_env`/`build` symlinked in so the perf test runs), commits every kept win there, and leaves your working tree and current branch **untouched** — then prints how to `diff`/`merge`/discard. Pass `--in-place` to opt out and edit the existing source directly.
+> **Where edits land:** for an existing tt-metal demo, `optimize` runs in a **throwaway git worktree on a new branch** and leaves your files untouched — it prints how to `diff`/`merge` the kept speedups.
 
-> **Prerequisite for an existing-model run (worktree isolation):** the worktree is a *clean git checkout of your current branch*, so it contains only **committed** files. Two consequences: **(a)** the tool itself (`scripts/tt_hw_planner` + `models/experimental/perf_automation`) must be **committed on the branch you run from** — if it's untracked there, the worktree won't include it and the run fails before profiling; **(b)** the branch's tt-metal source must **match your built `build/`** (same version) or the model hits missing-kernel errors at the baseline. In short: **run from a branch that has both the tool committed and a tt-metal version matching your build.** Planner-emitted (in-place) runs don't isolate, so they're exempt.
+### Make the tool remember what it learned
+Every verified speedup the agent improvises is **distilled back into a knob catalog** under `models/experimental/perf_automation/GUIDELINES/` — first as `LEARNED_*.md`, then promoted to `GRADUATED_*.md` once the same knob wins on a **second, different** model. On later runs the tool **recalls that catalog first** and reuses proven levers before improvising, so it gets faster across runs on its own. These catalog files ship with the tool, so **committing them is what makes the learning stick** — don't discard them.
 
-The gate is the **sole stop authority**: a later rung never clears an op while a cheaper one is untried, and a measured kernel that loses still counts as *tried* (the empirical proof).
-
-Useful options (the **cc** engine is the default):
-- `--devices single|all|0,1,…` — which chip(s) to run on (default `0,1`). Use `all` (or every id) on a multi-chip board — a *partial* subset of a larger board can trip a CUSTOM-cluster fabric error.
-- `--model-dir <dir>` + `--pcc-test <path::fn>` — for an **existing tt-metal model whose code and tests live in *different* directories**: `--model-dir` is the code to optimize, `--pcc-test` is the e2e correctness gate; the perf test is auto-generated from that gate. Co-located models don't need these — just pass the directory.
-- `-k,--case` — pin the perf test's pytest case. (The perf test itself is **always auto-generated** — there is no flag to pass one.)
-- `--metric device_ms|wall_ms|auto` — the optimization axis.
-- `--in-place` — for an **existing** demo, edit its source on the current branch instead of isolating in a worktree+branch (planner-emitted demos are always in-place).
-- `--engine cc|fsm` — `cc` (default) is the Claude-Code-native engine; `fsm` is the legacy state-machine fallback.
-- **FSM-only (ignored by cc):** `--box`/`--mesh` (roofline calibration — cc auto-detects the box) and `--max-iter`/`--budget-usd` (cc stops on `can_stop`, not on caps).
-
-It's device- and budget-heavy and runs to natural exhaustion — use `tmux`/`nohup`. Trust the **ledger**, not raw before→after numbers: the loop marks crashed/partial captures as discards (it never banks a fake win).
-
-### Step 6: Verbose output (optional)
-By default an interactive run keeps the screen clean and writes the full transcript to one log file. To see everything live on screen:
+To share learning across machines or teammates, opt into the shared catalog:
 ```bash
-TT_HW_PLANNER_VERBOSE=1 python -m scripts.tt_hw_planner auto-up <model> --box QB2 --mesh 2,2
+python -m scripts.tt_hw_planner optimize <org>/<model> --devices all --sync-catalog
 ```
-Full per-agent logs are always written under the model's `_handoff/` directory regardless of verbosity.
+`--sync-catalog` **pulls** the shared `GRADUATED_*` knobs from a catalog branch before the run and **pushes** newly-graduated ones after (`--catalog-remote`, default `origin`; `--catalog-branch`, default `perf-catalog`). Off by default — learning stays local unless you pass it.
 
-## 7. Command reference
-
-**Main flow**
-
-| Command | What it does |
-|---|---|
-| `plan <model>` | memory-fit + block availability report, read-only |
-| `auto-up <model> --box <B> --mesh <M>` | the one-command full bring-up — recommended entry (box + mesh required) |
-| `up <model>` | same pipeline with manual `--auto-*` flags |
-| `bringup <model>` | brain-orchestrated bring-up |
-| `promote <model> --box <B> --mesh <M>` | resume/continue bring-up of remaining components (box + mesh required) |
-| `emit-e2e <model>` | build + independently grade the end-to-end pipeline |
-| `optimize <model\|demo_dir> --devices <D> [--engine cc\|fsm]` | profile + optimize the pipeline's device performance; **cc** engine by default (Claude-Code-native deterministic gate), `fsm` fallback; PCC-gated, commits only verified speedups |
-
-**Pipeline stages — usually run for you by `auto-up`**
-
-| Command | What it does |
-|---|---|
-| `compat <model>` | detailed TTNN compatibility analysis |
-| `scaffold <model>` | create the demo folder skeleton |
-| `prepare <model>` | build the runnable pytest invocation |
-| `capture-inputs <model>` | record real per-component HF I/O |
-| `op-synth <model>` | generate op-level stub plans |
-| `decompose <model>` | break a component into children |
-| `auto-onboard <model>` | onboard a brand-new model family |
-
-**Utilities**
-
-| Command | What it does |
-|---|---|
-| `list-meshes` | print canonical mesh topologies |
-| `view-skips` / `tackle-skipped` | inspect / retry skipped components |
-| `overlay-list/apply/revert/drop/promote/extract` | manage captured per-model patches |
-| `template-list/promote/demote` | manage demo family templates |
-| `worktree-list/cleanup` | manage isolated bring-up worktrees |
-| `commit-tool` | commit helper for tool changes |
-
-> **Mesh format:** `--mesh` accepts either `rows,cols` or `rowsxcols` — `--mesh 2,2` and `--mesh 2x2` are equivalent (so are `1,4` / `1x4`).
-
-## 8. Key terms
-
-- **Component** — one module of the model, e.g. an encoder layer. The unit the loop graduates one at a time.
-- **REUSE / ADAPT / NEW** — a component either reuses an existing tt module, adapts a sibling's, or is brand-new and needs a full port.
-- **Graduated** — a NEW component whose native TTNN output passed the PCC test; a `.last_good_native` snapshot is saved.
-- **PCC** — Pearson correlation between the TTNN output and the HF reference output. The pass gate — default ≥ 0.99 per component, ≥ 0.95 for e2e.
-- **Compute split** — device-vs-CPU breakdown, by component count and by op count.
-- **Gates — in `emit-e2e`** — Gate 1: runs native with no torch fallback; Gate 2: every graduated module is actually invoked; Gate 3: final PCC ≥ threshold.
-- **Mesh** — the chip topology used, e.g. `1,4` = 4 chips in a row.
-- **Overlay** — a captured set of git patches recording a model's bring-up state, so it can be re-applied / reused later.
-
-Optimization terms (the `optimize` stage):
-- **Bucket** — device ops grouped by op-class (matmul, attention, datamove, eltwise, …). The loop attacks the slowest bucket first.
-- **Rung / lever** — one optimization applied to an op, climbed in fixed ladder order: a **knob** (weight dtype bf16→bf8_b→bf4_b, full core grid, fusion), then a **tt-lang kernel**, then a **C++ Metalium kernel**.
-- **Gate (`termination_check`)** — the deterministic stop authority: per op it returns the `next_target` rung and refuses `can_stop` until every op's full ladder is exhausted or it's at its floor; a losing kernel still counts as *tried*.
-- **Roofline** — the hardware-limit target (peak flops / bandwidth) the loop chases; the gap-to-roofline ranks which bucket has the most attainable speedup.
-- **Measurement integrity** — a guard that rejects a crashed/partial profile capture (structural op counts dropped) instead of banking it as a fake win; only full, PCC-clean, faster captures are committed.
-
-## 9. Output locations
-
-- The model's demo folder: `models/demos/.../<model>/` — `demo/`, `tt/`, `tests/pcc/`, plus `bringup_status.json`, the source of truth for what's graduated, and `_stubs/`, the per-component TTNN code + `.last_good_native` snapshots.
-- Agent logs: `<model>/_handoff/`.
-- `emit-e2e` logs: `<model>/_handoff/emit_e2e_*.log`; report: `<model>/grader_report.{json,md}`.
-- `optimize` runs: `models/experimental/perf_automation/runs/<timestamp>/` — `ledger.jsonl` (per-iteration lever / bucket / before→after / PCC, the source of truth for what landed) and `residual_report.json` (distance from the roofline floor). Kept speedups are scoped git commits on the model dir.
-
-## 10. Overlays
-
-An **overlay** is the captured set of file changes — git-style patches — a model's bring-up produced: its `_stubs/`, tests, and any edits to shared repo files. When you run with worktree isolation — the default — the tool **auto-captures** the worktree's deltas into `overlays/<model>/` at the end of a run. This keeps your working tree clean while preserving everything, so a model can be **replayed later without redoing the LLM work**.
-
-Typical operations:
-
-```bash
-# see what's stored — one model or all
-python -m scripts.tt_hw_planner overlay-list facebook/hf-seamless-m4t-medium
-
-# re-apply a model's captured changes onto a clean working tree — replay
-python -m scripts.tt_hw_planner overlay-apply facebook/hf-seamless-m4t-medium
-
-# undo an apply — counter to overlay-apply
-python -m scripts.tt_hw_planner overlay-revert facebook/hf-seamless-m4t-medium
-
-# ── disposing ──
-# permanently delete a model's stored overlays. Omit the path to wipe ALL.
-python -m scripts.tt_hw_planner overlay-drop facebook/hf-seamless-m4t-medium
+## How to read what it prints
+During bring-up you'll see lines like:
 ```
+BRING-UP (cc) round 12: target=`encoder_layer` rung=emit  (graduated 6)
+  | 03:12 | ✓ GRADUATED  | encoder_layer                | 6/24      | 18   |
+  operations: 34/2862 on device (1%) ... on CPU (98%)
+```
+- **"graduated"** = that piece now runs on the chip and gives the right answers.
+- **"on device vs on CPU"** = how much of the model is running on the Tenstorrent chip yet. This climbs toward 100% as it works.
 
-Two advanced ones:
-- `overlay-promote` — apply an overlay's change to the **shared** repo file and remove the overlay, so you can PR that diff normally. Graduates a shared-file tweak from a per-model overlay into the real codebase.
-- `overlay-extract` — the reverse migration: pull uncommitted shared-file edits out of your working tree **into** an overlay, then revert the file, keeping the shared file clean.
+You don't need to babysit it — just check back.
 
-> Overlays are **learned data** — gitignored and rebuilt as you run. Disposing them with `overlay-drop` only loses the replay shortcut, never the tool itself.
+## If it stops with a message
+The tool is designed to **stop and tell you the fix** rather than fail silently:
 
-## 11. How the tool learns
+| Message says… | What to do |
+|---|---|
+| `import ttnn` failed | Run `./build_metal.sh` (step 2 above) |
+| Not logged in / no API key | Do the `claude` login or set `ANTHROPIC_API_KEY` |
+| Model is **gated** / 403 | Open the model page on HuggingFace, click "Request access", then `huggingface-cli login` |
+| Can't **download weights** | Download on a machine with internet, copy them over, set `export HF_HOME=/your/copy` |
+| Ran out of iterations, some pieces unfinished | Run `promote` (Section 1, Step 2) — it resumes only the leftovers |
 
-When `up --auto` successfully brings up a brand-new model, the tool writes what it learned back so the **next similar model is faster** — all best-effort and idempotent, and a failure to persist never fails the bring-up:
+## Glossary — terms you'll see
+- **Component** = one piece of the model (like one layer).
+- **Graduated** = that piece works correctly on the chip.
+- **PCC** = the score that says "the chip's answer matches the original." Higher = better; it needs ~0.99 to pass.
+- **Mesh / box** = your chip setup.
+- **Optimize** = the speed-tuning stage (after the model already works).
 
-1. **`family_backends.py`** — the matched backend's `model_type_keys` is extended with the new `model_type`, so the next model of that architecture gets an **exact** backend match instead of a category-default guess.
-2. **`compatibility.py`** — `closest_supported_model()`'s candidate map gains `new_model_type → new_model_id`, so the **scaffold** step finds a sibling immediately instead of cold-starting.
-3. **`learned_bringups.json`** — an append-only history record: timestamp, PCC details, and a "what changed" diff. Auditable/replay-friendly; never read back by the tool.
+## Where your results live
+- The generated model: `models/demos/.../<model>/`
+- Logs: inside that model's `_handoff/` folder.
+- Speed-tuning results: `models/experimental/perf_automation/runs/<timestamp>/`
 
-Alongside those, three other learned stores accumulate as you use the tool:
-- **`learned_drivers/`** — auto-onboarded per-model capture drivers; this **is** code (committed, not gitignored).
-- **`agentic/learned_fixes.json`** — reusable fixes keyed by failure shape, so a fix discovered once can be reapplied on a sibling model.
-- **`learned_chained_templates.json`** — learned multi-component template chains.
-
-**Net effect:** the first bring-up of a new architecture does the full LLM loop; the next model in the same family scaffolds from an exact sibling, may reuse learned fixes/drivers, and converges with far fewer iterations.
-
-## 12. Notes
-
-- An interactive run keeps the screen clean and writes the full transcript to one log file; set `TT_HW_PLANNER_VERBOSE=1` to see everything live on screen.
-- Long runs should use `tmux`/`nohup` so they survive SSH disconnects.
-- Multi-component bring-up runs its agents in **isolated git worktrees** with **memory-aware adaptive concurrency** (scales parallel-agent count to host-RAM headroom).
-- Learned data — `overlays/`, `learned_*.json` — is gitignored and rebuilt as the tool runs, so it is intentionally not part of the committed tool. The exceptions are `learned_drivers/`, which is code, and the in-source registry edits to `family_backends.py` / `compatibility.py`, which DO get committed.
+## Tips
+- Long runs: use `tmux` or `nohup` so they survive an SSH disconnect.
+- Want to watch everything live on screen? Prefix any command with `TT_HW_PLANNER_VERBOSE=1`.
+- Registry drift check (maintenance): `python -m scripts.tt_hw_planner sync-registry --check` — exits non-zero if any mapped backend / building-block path is missing from the checkout (add `--no-unmapped` to skip the reverse "unmapped reusable module" hints).
