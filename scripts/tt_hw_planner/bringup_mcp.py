@@ -45,6 +45,7 @@ Config via env:
     default 1800; scaled by the number of chips a run spans via `_adaptive_pcc_timeout` —
     set BRINGUP_MCP_TIMEOUT_MODE=fixed to restore the flat wall)
 """
+
 from __future__ import annotations
 
 import json
