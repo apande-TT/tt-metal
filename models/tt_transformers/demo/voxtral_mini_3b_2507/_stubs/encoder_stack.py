@@ -29,8 +29,16 @@ _HIFI4_CFG = ttnn.WormholeComputeKernelConfig(
 # fractionally ABOVE the 0.9703 the tower measured at HiFi4, i.e. scoped this way the drop is
 # free.  The LM attention feeds the logits the sampler reads directly, so it keeps HiFi4; the
 # encoder's output is a 1500-frame embedding the projector then re-mixes, which tolerates it.
+# LoFi, NOT HiFi2: THE OPERANDS ARE BLOCK-FLOAT NOW, NOT bf16.  The note above was written when
+# this tower carried bf16 Q/K/V; the projections have since narrowed to bfloat8_b, and a bf8_b
+# operand holds ONE pass worth of mantissa, so HiFi2's two passes are the same waste HiFi4's four
+# were (GUIDELINES/01 section 12: bf8b matmul -> LoFi).  The measurement says the flash kernel is
+# where it matters: 238.6 us/call for 11.6 GFLOP is 48 TFLOP/s, ~6% of this part's block-float
+# peak, against 121 GB/s of traffic -- it is math/overhead bound, not byte bound, so the passes
+# are the critical path.  fp32_dest_acc_en stays True; that, not the fidelity, is what protects
+# the softmax sum.
 _SDPA_CFG = ttnn.WormholeComputeKernelConfig(
-    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_fidelity=ttnn.MathFidelity.LoFi,
     math_approx_mode=False,
     fp32_dest_acc_en=True,
     packer_l1_acc=False,
