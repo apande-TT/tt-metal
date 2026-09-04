@@ -756,7 +756,21 @@ def residual_add(device, residual, delta):
         rows *= d
     plan = _norm_plan(device, dims[-1]) if rows <= TILE else False
     if not plan:
-        return ttnn.add(residual, delta)
+        # THE RESIDUAL STREAM IS THE LAST bf16 TENSOR IN PREFILL, AND IT IS THE WIDEST.  Every delta
+        # added into it already arrives as bf8_b (the projections are asked for that output) and
+        # every consumer is a bf8_b-weighted matmul or the RMSNorm feeding one -- but ttnn.add takes
+        # the WIDER of its two inputs, so the sum came back bf16 and the whole layer paid for it
+        # twice over: the add wrote 25 MB instead of 12.6, and `ttnn.rms_norm` has no output-dtype
+        # argument (its output dtype MATCHES its input), so the norm then read AND wrote 25 MB and
+        # handed gate/up/qkv a bf16 activation.  That last part is not just bytes: on identical
+        # shapes the profile shows `BFP8 x BFP8` down_proj at 414 TFLOP/s against `BF16 x BFP8`
+        # gate_proj at 284, because a bf16 in0 against a block-float in1 costs the unpacker extra
+        # passes at LoFi.  Narrowing the accumulator here therefore moves three ops at once.
+        #
+        # bf8_b IS THE FLOOR (GUIDELINES/01 section 13 names normalization activations as a tensor
+        # that must never go below it), and the increments are already quantised at exactly this
+        # granularity, so this rounds the running sum rather than introducing a new format.
+        return ttnn.add(residual, delta, dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None)
     try:
         return ttnn.add(residual, delta, memory_config=plan[0])
     except (RuntimeError, TypeError, AttributeError):

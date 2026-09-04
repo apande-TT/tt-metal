@@ -190,6 +190,18 @@ def _to_dev(t: torch.Tensor, device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat1
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
 
 
+# THE AUDIO TOWER'S PROJECTION FORMAT, mirrored from the graduated layer stubs so the composite
+# blocks assembled here are not the one uncovered instance of the block.  Kept as module constants
+# rather than read out of a stub so the composites do not depend on which stub happens to be loaded.
+_ENC_PROJ_DTYPE = ttnn.bfloat8_b
+_ENC_PROJ_CFG = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.LoFi,
+    math_approx_mode=False,
+    fp32_dest_acc_en=False,
+    packer_l1_acc=True,
+)
+
+
 def _readback(x):
     """The single output-boundary readback (device -> host).
 
@@ -256,9 +268,16 @@ class _EncLayerWithAttnStub:
         self.ln1_w = _to_dev(torch_layer.self_attn_layer_norm.weight.unsqueeze(0).unsqueeze(0).float(), device)
         self.ln1_b = _to_dev(torch_layer.self_attn_layer_norm.bias.unsqueeze(0).unsqueeze(0).float(), device)
         self.ln1_eps = torch_layer.self_attn_layer_norm.eps
-        self.fc1_w = _to_dev(torch_layer.fc1.weight.T.contiguous().float(), device)
+        # SAME PROJECTION WIDTH AS EVERY OTHER AUDIO-TOWER LAYER.  This composite carries layers
+        # 30 and 31 of the second tower, and its FFN was the ONE place in the encode stack still
+        # holding fc1/fc2 at bf16 and running them through a bf16 kernel: the profile shows these
+        # two calls at 160 us and 216 us against 80 us and 105 us for the byte-identical bf8_b +
+        # LoFi projections in the graduated layer stubs -- a 2x gap purely from the format.  The
+        # dtype lever has to reach EVERY instance of the block or it only speeds up the ones that
+        # happen to be routed through a stub, so this hand-assembled layer takes the same pairing.
+        self.fc1_w = _to_dev(torch_layer.fc1.weight.T.contiguous().float(), device, dtype=_ENC_PROJ_DTYPE)
         self.fc1_b = _to_dev(torch_layer.fc1.bias.unsqueeze(0).float(), device)
-        self.fc2_w = _to_dev(torch_layer.fc2.weight.T.contiguous().float(), device)
+        self.fc2_w = _to_dev(torch_layer.fc2.weight.T.contiguous().float(), device, dtype=_ENC_PROJ_DTYPE)
         self.fc2_b = _to_dev(torch_layer.fc2.bias.unsqueeze(0).float(), device)
         self.ln2_w = _to_dev(torch_layer.final_layer_norm.weight.unsqueeze(0).unsqueeze(0).float(), device)
         self.ln2_b = _to_dev(torch_layer.final_layer_norm.bias.unsqueeze(0).unsqueeze(0).float(), device)
@@ -274,9 +293,14 @@ class _EncLayerWithAttnStub:
 
         residual = x
         h = ttnn.layer_norm(x, weight=self.ln2_w, bias=self.ln2_b, epsilon=self.ln2_eps)
-        h = ttnn.linear(h, self.fc1_w, bias=self.fc1_b)
+        # ROUTE THROUGH THE SHARED PROJECTION HELPER, not a bare ttnn.linear: `_DS.mm` names the
+        # full compute grid at this height (1504 rows) and LoFi is the documented pairing for
+        # block-float operands -- 8-bit operands through a bf16 kernel make the math engine take
+        # extra passes over one pass worth of mantissa and cancel the bandwidth the narrower
+        # weight just bought.
+        h = _DS.mm(self.device, h, self.fc1_w, _ENC_PROJ_CFG, bias=self.fc1_b)
         h = ttnn.gelu(h)
-        h = ttnn.linear(h, self.fc2_w, bias=self.fc2_b)
+        h = _DS.mm(self.device, h, self.fc2_w, _ENC_PROJ_CFG, bias=self.fc2_b)
         return ttnn.add(residual, h)
 
 
