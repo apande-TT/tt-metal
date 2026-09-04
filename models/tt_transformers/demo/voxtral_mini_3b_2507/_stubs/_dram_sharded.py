@@ -84,6 +84,96 @@ def in0_grid(device, k_tiles, weight_tiles):
     return best
 
 
+_FILL_SHARD_CACHE = {}
+
+
+def _fill_shard_config(device, shp):
+    """ONE HEAD PER CORE, which is what makes the folded fill correct as well as cheap.
+
+    fill_cache splits its work into (head, seq-tile) blocks and gives each core a run of them, but
+    the writer only jumps the cache's per-head stride BETWEEN cores -- inside a core it just steps
+    one tile width at a time (fill_cache_multi_core_program_factory: the per-core cache_start_id
+    carries `num_blocks_written / input_Ht * cache_HtWt`, and the kernel comment says outright that
+    it assumes work does not spill over to the next head).  On an INTERLEAVED input the split is
+    ceil(heads * seq_tiles / cores), which on this model is 10 tiles against a 16-tile head, so
+    most cores straddle a head boundary and write the tail at the wrong offset -- measured PCC
+    0.4585.  A HEIGHT-SHARDED input takes the other branch: the split becomes shard_height /
+    TILE_HEIGHT and the core set becomes the shard grid, so one head per core makes every core's
+    run exactly one head and the assumption holds.
+    """
+    heads, seq, width = shp[0] * shp[1], shp[2], shp[3]
+    key = (heads, seq, width)
+    mem = _FILL_SHARD_CACHE.get(key)
+    if mem is None:
+        g = device.compute_with_storage_grid_size()
+        grid = ttnn.num_cores_to_corerangeset(heads, g, True)
+        mem = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(grid, [seq, width], ttnn.ShardOrientation.ROW_MAJOR),
+        )
+        _FILL_SHARD_CACHE[key] = mem
+    return mem
+
+
+def fill_kv_prefill(kv, k, v):
+    """Write a whole prefill K/V into the resident caches at sequence offset 0, in TWO launches.
+
+    ONE STREAM PER LAUNCH WAS NEVER A REQUIREMENT, ONLY A HABIT.  `ttnn.fill_cache(cache, input,
+    batch_idx)` documents a [1, n_kv, S, hd] input, so this ran a slice plus a fill per stream per
+    tensor -- 4 x B = 32 launches a layer, and on the 8-stream prefill the slices alone profiled at
+    78 us/layer moving bytes that were already in the right place.  But the op does not actually
+    constrain the input's batch: its FILL validation only checks matching dtypes, batch_idx <
+    cache.padded_shape()[0], and that the input height fits (update_cache_device_operation.cpp), and
+    its factory derives the work split from input.padded_shape()[1] * input.padded_shape()[-2] and
+    the destination from batch_idx * cache.padded_shape()[1] * cache_HtWt.  So folding the stream
+    axis into the HEAD axis -- cache [B, n_kv, C, hd] -> [1, B*n_kv, C, hd], input [B, n_kv, S, hd]
+    -> [1, B*n_kv, S, hd] -- makes batch_idx 0 address every stream's every head at offset 0, which
+    is exactly the region the loop wrote.  Both reshapes merge LEADING dims and leave the last two
+    alone, so they are metadata views on the same buffers and the write still lands in the resident
+    cache.  The cache views are built once and kept on the slot; only k and v are viewed per call.
+
+    Falls back to the per-stream loop if anything about the shapes or the op rejects the fold, so
+    correctness never depends on this holding.
+    """
+    shp = [int(d) for d in k.shape]
+    batch = shp[0]
+    # MATCH THE CACHE DTYPE ONCE, NOT PER STREAM.  update_cache's FILL path refuses a mixed
+    # precision write outright ("Input and cache tensors must have same dtype!" -- only its DECODE
+    # path has the conversion kernel), so a narrowed cache has to be met here.
+    if k.dtype != kv.k.dtype:
+        k = ttnn.typecast(k, kv.k.dtype)
+    if v.dtype != kv.v.dtype:
+        v = ttnn.typecast(v, kv.v.dtype)
+    if batch > 1:
+        try:
+            flat = getattr(kv, "_flat_views", None)
+            if flat is None:
+                kc = [int(d) for d in kv.k.shape]
+                flat = (
+                    ttnn.reshape(kv.k, (1, kc[0] * kc[1], kc[2], kc[3])),
+                    ttnn.reshape(kv.v, (1, kc[0] * kc[1], kc[2], kc[3])),
+                )
+                kv._flat_views = flat
+            mem = _fill_shard_config(k.device(), shp)
+            for cache_view, src in ((flat[0], k), (flat[1], v)):
+                folded = ttnn.reshape(src, (1, shp[0] * shp[1], shp[2], shp[3]))
+                sharded = ttnn.to_memory_config(folded, mem)
+                ttnn.fill_cache(cache_view, sharded, 0)
+                ttnn.deallocate(sharded)
+            return
+        except (RuntimeError, TypeError, AttributeError, ValueError):
+            pass
+    for b in range(batch):
+        if batch == 1:
+            kb, vb = k, v
+        else:
+            kb = ttnn.slice(k, (b, 0, 0, 0), (b + 1, shp[1], shp[2], shp[3]))
+            vb = ttnn.slice(v, (b, 0, 0, 0), (b + 1, shp[1], shp[2], shp[3]))
+        ttnn.fill_cache(kv.k, kb, b)
+        ttnn.fill_cache(kv.v, vb, b)
+
+
 def _apply(activation, x):
     """Run `activation` as a standalone unary (the decode/mirror path); None is a pass-through."""
     if activation is None:

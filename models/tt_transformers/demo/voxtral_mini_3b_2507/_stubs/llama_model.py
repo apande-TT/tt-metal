@@ -376,26 +376,10 @@ def _apply_rotary_tt(x, cos, sin, decode=False):
 
 def _fill_kv_prefill(kv, k, v):
     """Write a full prefill K/V into the resident cache at sequence offset 0.
-    k/v are [B, n_kv, S, head_dim]; ttnn.fill_cache wants [1, n_kv, S, hd]."""
-    shp = list(k.shape)
-    batch = int(shp[0])
-    # MATCH THE CACHE DTYPE ONCE, NOT PER STREAM.  update_cache's FILL path refuses a mixed
-    # precision write outright ("Input and cache tensors must have same dtype!" -- only its
-    # DECODE path has the conversion kernel), so a narrowed cache has to be met here.  Cast the
-    # whole [B, n_kv, S, hd] tensor before the loop: casting the per-stream slices instead would
-    # be 2*B launches for the same bytes.
-    if k.dtype != kv.k.dtype:
-        k = ttnn.typecast(k, kv.k.dtype)
-    if v.dtype != kv.v.dtype:
-        v = ttnn.typecast(v, kv.v.dtype)
-    for b in range(batch):
-        if batch == 1:
-            kb, vb = k, v
-        else:
-            kb = ttnn.slice(k, (b, 0, 0, 0), (b + 1, shp[1], shp[2], shp[3]))
-            vb = ttnn.slice(v, (b, 0, 0, 0), (b + 1, shp[1], shp[2], shp[3]))
-        ttnn.fill_cache(kv.k, kb, b)
-        ttnn.fill_cache(kv.v, vb, b)
+
+    Delegates to the shared helper so all three attention bodies get the same two-launch fold --
+    see _DS.fill_kv_prefill for why the per-stream loop was never necessary."""
+    _DS.fill_kv_prefill(kv, k, v)
 
 
 def _decode_shard_grid(x, device, batch):
