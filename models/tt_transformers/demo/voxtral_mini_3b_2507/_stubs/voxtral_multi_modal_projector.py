@@ -114,8 +114,7 @@ class TtVoxtralMultiModalProjector:
         # without moving the shared threshold and disturbing the call sites that depend on it.
         g = self.device.compute_with_storage_grid_size()
         grid = ttnn.CoreGrid(y=g.y, x=g.x)
-        x = _DS.linear(x, self.linear_1_weight, None, _PROJ_CFG, grid)
-        x = ttnn.gelu(x)
+        x = _DS.linear(x, self.linear_1_weight, None, _PROJ_CFG, grid, activation="gelu")
         x = _DS.linear(x, self.linear_2_weight, None, _PROJ_CFG, grid)
         return x
 

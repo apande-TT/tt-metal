@@ -300,8 +300,7 @@ class _EncLayerWithAttnStub:
         # block-float operands -- 8-bit operands through a bf16 kernel make the math engine take
         # extra passes over one pass worth of mantissa and cancel the bandwidth the narrower
         # weight just bought.
-        h = _DS.mm(self.device, h, self.fc1_w, _ENC_PROJ_CFG, bias=self.fc1_b)
-        h = ttnn.gelu(h)
+        h = _DS.mm(self.device, h, self.fc1_w, _ENC_PROJ_CFG, bias=self.fc1_b, activation="gelu")
         h = _DS.mm(self.device, h, self.fc2_w, _ENC_PROJ_CFG, bias=self.fc2_b)
         return ttnn.add(residual, h, dtype=_ENC_PROJ_DTYPE)
 

@@ -223,8 +223,7 @@ class TtEncoderLayer:
         x = ttnn.layer_norm(
             x, weight=self.ffn_ln_w, bias=self.ffn_ln_b, epsilon=self.ffn_ln_eps, compute_kernel_config=_HIFI4_CFG
         )
-        x = _DS.mm(self.device, x, self.fc1_weight, _PROJ_CFG, bias=self.fc1_bias)
-        x = ttnn.gelu(x)
+        x = _DS.mm(self.device, x, self.fc1_weight, _PROJ_CFG, bias=self.fc1_bias, activation="gelu")
         x = _DS.mm(self.device, x, self.fc2_weight, _PROJ_CFG, bias=self.fc2_bias)
         x = ttnn.add(residual, x, dtype=_ACT_DTYPE)
 

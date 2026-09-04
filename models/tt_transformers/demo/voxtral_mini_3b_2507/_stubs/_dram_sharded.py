@@ -594,7 +594,28 @@ def _divisors(n):
     return [d for d in range(int(n), 0, -1) if n % d == 0]
 
 
-def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_bytes=2048):
+def _fused_activation(activation):
+    """The program-config form of an activation name, matching ttnn.linear's own string mapping.
+
+    `string_to_unary_with_param` maps "gelu" to GELU with its approximate flag FALSE, which is
+    also what a standalone `ttnn.gelu` computes, so fusing does not silently swap the exact
+    kernel for the tanh approximation.  Returns None for a name this build cannot express, and
+    the caller then keeps the standalone unary.
+    """
+    if activation is None:
+        return None
+    name = str(activation)
+    try:
+        if name == "gelu":
+            return [ttnn.UnaryOpType.GELU, False]
+        if name == "gelu_approx":
+            return [ttnn.UnaryOpType.GELU, True]
+        return ttnn.UnaryWithParam(getattr(ttnn.UnaryOpType, name.upper()))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_bytes=2048, activation=None):
     """A 2-D mcast program config that spreads BOTH output dims and streams K in wide blocks.
 
     WHY THIS EXISTS: NAMING THE GRID PUTS THESE MATMULS ON THE 1-D MCAST PATH, WHICH IS THE WRONG
@@ -622,7 +643,7 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
 
     Returns None when nothing fits, so the caller keeps its own path.
     """
-    key = (int(m_tiles), int(k_tiles), int(n_tiles), int(tile_bytes), int(interm_bytes))
+    key = (int(m_tiles), int(k_tiles), int(n_tiles), int(tile_bytes), int(interm_bytes), str(activation))
     if key in _BLOCK_CFG_CACHE:
         return _BLOCK_CFG_CACHE[key]
     g = device.compute_with_storage_grid_size()
@@ -668,7 +689,7 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
             per_core_M=per_core_m,
             per_core_N=per_core_n,
             transpose_mcast=False,
-            fused_activation=None,
+            fused_activation=_fused_activation(activation),
         )
     _BLOCK_CFG_CACHE[key] = cfg
     return cfg
@@ -679,8 +700,15 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
 _BLOCK_CFG_REFUSED = set()
 
 
-def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, keep_sharded=False):
+def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, keep_sharded=False, activation=None):
     """ttnn.linear routed by the height of the activation: one call site, both regimes.
+
+    `activation` IS APPLIED BY THE MATMUL, NOT AFTER IT.  A standalone unary on the FFN's wide
+    intermediate is a full-width read-modify-write of a tensor the matmul had just finished
+    writing -- measured on the audio tower, `ttnn.gelu` on a [1504, 5120] bf8_b activation cost
+    107 us/layer at 153 GB/s, moving 16 MB that were already in the packer's hands.  Fusing it
+    into the program config's `fused_activation` runs it inside the pack schedule instead
+    (GUIDELINES/05 section 2).  The caller must NOT also apply it afterwards.
 
     `mirror` (optional) is the DRAM-bank-sharded decode copy of `weight`; when it serves the shape
     it wins, because at one tile row the cost is entirely the weight read.  Otherwise:
@@ -700,8 +728,13 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
         m *= d
     if mirror is not None and bias is None and mirror.serves(math.ceil(m / TILE)):
         # keep_sharded is inert off the mirror path: prefill never reaches here (serves() is
-        # decode-only), so a caller can ask for it unconditionally at a shared call site.
-        return mirror(x, compute_kernel_config=compute_kernel_config, keep_sharded=keep_sharded)
+        # decode-only), so a caller can ask for it unconditionally at a shared call site.  The
+        # activation stays a standalone unary here for the reason `linear` documents: the
+        # DRAM-sharded factory sends anything but RELU down a separate DEST path, which at one
+        # tile row costs more than the interleaved unary it replaces.
+        return _apply(
+            activation, mirror(x, compute_kernel_config=compute_kernel_config, keep_sharded=keep_sharded)
+        )
     # THE THRESHOLD WAS "ONE TILE ROW PER CORE", WHICH IS TOO STRICT.  Asking for the grid loses
     # at the decode shape (a single tile row spread over 110 cores costs more launch than it
     # recovers) but the break-even is nowhere near one row PER CORE -- the audio tower's FFN runs
@@ -712,7 +745,9 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
     # the boundary between the two regimes -- below it is the decode shape, whose activation is
     # tens of kB and whose consumers all want the shard, not a narrower dtype.
     if m < _GRID_REQUEST_MIN_ROWS:
-        return ttnn.linear(x, weight, bias=bias, compute_kernel_config=compute_kernel_config)
+        return ttnn.linear(
+            x, weight, bias=bias, compute_kernel_config=compute_kernel_config, activation=activation
+        )
     # ASK FOR THE BLOCKS, NOT JUST THE GRID -- see block_config for why naming the grid alone lands
     # these on the 1-D mcast path with a one-tile K block and 1x1 DEST subblocks.  Best-effort: a
     # shape ttnn refuses (an L1 circular-buffer overflow, a batch it will not broadcast) falls back
@@ -723,7 +758,7 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
     batch = 1
     for d in tuple(x.shape)[:-2]:
         batch *= int(d)
-    key = (m_tiles, k_tiles, n_tiles, batch)
+    key = (m_tiles, k_tiles, n_tiles, batch, str(activation))
     # M IS THE PADDED HEIGHT, NOT THE LOGICAL ONE.  The audio tower's activation is 1500 rows, which
     # the matmul pads to 47 tiles; requiring m % TILE == 0 here silently excluded every encoder
     # projection -- the exact shapes this config exists for.
@@ -737,7 +772,7 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
         and int(wshape[-2]) % TILE == 0
         and int(wshape[-1]) % TILE == 0
     ):
-        cfg = block_config(device, m_tiles, k_tiles, n_tiles)
+        cfg = block_config(device, m_tiles, k_tiles, n_tiles, activation=activation)
         if cfg is not None:
             try:
                 return ttnn.linear(
@@ -756,6 +791,7 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
         bias=bias,
         compute_kernel_config=compute_kernel_config,
         core_grid=ttnn.CoreGrid(y=g.y, x=g.x),
+        activation=activation,
         dtype=_ACT_DTYPE,
     )
 
