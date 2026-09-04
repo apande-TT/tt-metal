@@ -430,19 +430,13 @@ def _write_kv_decode(kv, k, v, device=None):
         # disjointness is checked here rather than assumed: qkv_split_decode asks for
         # non-overlapping q/k grids, but that request is only honoured when its input is sharded,
         # and a fallback head-split path would put k and v back together.
-        if _core_set(ks.memory_config().shard_spec.grid).isdisjoint(
-            _core_set(vs.memory_config().shard_spec.grid)
-        ):
+        if _core_set(ks.memory_config().shard_spec.grid).isdisjoint(_core_set(vs.memory_config().shard_spec.grid)):
             ttnn.experimental.paged_fused_update_cache(
                 kv.k, ks, kv.v, vs, update_idxs_tensor=kv.cur_pos_tt, share_cache=False
             )
             return
-        ttnn.experimental.paged_update_cache(
-            kv.k, ks, update_idxs_tensor=kv.cur_pos_tt, share_cache=False
-        )
-        ttnn.experimental.paged_update_cache(
-            kv.v, vs, update_idxs_tensor=kv.cur_pos_tt, share_cache=False
-        )
+        ttnn.experimental.paged_update_cache(kv.k, ks, update_idxs_tensor=kv.cur_pos_tt, share_cache=False)
+        ttnn.experimental.paged_update_cache(kv.v, vs, update_idxs_tensor=kv.cur_pos_tt, share_cache=False)
         return
     # ttnn.update_cache wants the BATCH axis at dim -2: [1, n_kv, B, head_dim].
     ttnn.update_cache(kv.k, ttnn.transpose(k, 1, 2), kv.cur_pos)
@@ -558,6 +552,8 @@ class TtLlamaDecoderLayer:
             if rope is not None:
                 cos_s = _rank4(rope[0])
                 sin_s = _rank4(rope[1])
+                # Broadcast over every head row -- see _DS.rope_resident.
+                cos_s, sin_s = _DS.rope_resident(cos_s, sin_s)
                 q = _apply_rotary_tt(q, cos_s, sin_s)
                 k = _apply_rotary_tt(k, cos_s, sin_s)
 

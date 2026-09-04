@@ -465,19 +465,13 @@ def _write_kv_decode(kv, k, v, device=None):
         # disjointness is checked here rather than assumed: qkv_split_decode asks for
         # non-overlapping q/k grids, but that request is only honoured when its input is sharded,
         # and a fallback head-split path would put k and v back together.
-        if _core_set(ks.memory_config().shard_spec.grid).isdisjoint(
-            _core_set(vs.memory_config().shard_spec.grid)
-        ):
+        if _core_set(ks.memory_config().shard_spec.grid).isdisjoint(_core_set(vs.memory_config().shard_spec.grid)):
             ttnn.experimental.paged_fused_update_cache(
                 kv.k, ks, kv.v, vs, update_idxs_tensor=kv.cur_pos_tt, share_cache=False
             )
             return
-        ttnn.experimental.paged_update_cache(
-            kv.k, ks, update_idxs_tensor=kv.cur_pos_tt, share_cache=False
-        )
-        ttnn.experimental.paged_update_cache(
-            kv.v, vs, update_idxs_tensor=kv.cur_pos_tt, share_cache=False
-        )
+        ttnn.experimental.paged_update_cache(kv.k, ks, update_idxs_tensor=kv.cur_pos_tt, share_cache=False)
+        ttnn.experimental.paged_update_cache(kv.v, vs, update_idxs_tensor=kv.cur_pos_tt, share_cache=False)
         return
     # ttnn.update_cache wants the BATCH axis at dim -2: [1, n_kv, B, head_dim].
     ttnn.update_cache(kv.k, ttnn.transpose(k, 1, 2), kv.cur_pos)
@@ -671,6 +665,13 @@ class LlamaModel:
         else:
             cos_s = None
             sin_s = None
+
+        # ONE COPY FOR THE WHOLE STACK.  The prefill rotary op broadcasts these [1, 1, S, hd]
+        # tables over every head row of the folded activation, so leaving them in DRAM makes the
+        # table -- not q or k -- the bulk of that op's read.  See _DS.rope_resident; hoisted above
+        # the layer loop so the copy is paid once per forward rather than once per layer.
+        if not decode and cos_s is not None:
+            cos_s, sin_s = _DS.rope_resident(cos_s, sin_s)
 
         if layer_range is None:
             layers = self.layer_weights

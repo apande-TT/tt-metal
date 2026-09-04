@@ -122,6 +122,44 @@ _L1_HANDOFF_MAX_BYTES = 256 * 1024
 _ACT_DTYPE = ttnn.bfloat8_b
 
 
+# Bytes a rope table may have before L1 residency stops being obviously free.  The prefill tables
+# are [1, 1, S, head_dim] -- 128 kB each at S=512, head_dim=128 -- against a 110 x 1.5 MB budget,
+# so this cap only exists to stop a much longer context silently filling L1 under the matmuls.
+_ROPE_L1_MAX_BYTES = 1024 * 1024
+
+
+def rope_resident(cos, sin):
+    """Put the prefill rope tables in L1, once per forward, and hand back the pair.
+
+    THE TABLE IS TINY AND IS READ ONCE PER HEAD ROW.  rotary_embedding_hf's prefill mode takes the
+    activation as [1, heads, S, hd] and cos/sin as [1, 1, S, hd], broadcasting them over dim 1 --
+    and this model folds batch into that dim, so a [8, 32, S, hd] q becomes 256 rows that all read
+    the SAME 128 kB table.  Left in DRAM that is the bulk of the op's traffic: measured at the
+    prefill shape the two calls per layer moved the 34 MB of q/k in 317 + 95 us, about 107 GB/s,
+    an order below the eltwise ops beside them, and dropping the math phases from four to two
+    (HiFi4 -> HiFi2) did not move it -- so the residual is the read, not the math.
+
+    Once per forward, not once per layer: every layer reuses the same pair, so the copy is amortised
+    over all of them.  Best-effort -- a shape or config this cannot serve keeps the DRAM tensors.
+    """
+    out = []
+    for t in (cos, sin):
+        try:
+            n = 1
+            for d in tuple(t.shape):
+                n *= int(d)
+            wide = t.dtype in (ttnn.float32, ttnn.uint32, ttnn.int32)
+            if n * (4 if wide else 2) > _ROPE_L1_MAX_BYTES or t.is_sharded():
+                out.append(t)
+            elif t.memory_config() == ttnn.L1_MEMORY_CONFIG:
+                out.append(t)
+            else:
+                out.append(ttnn.to_memory_config(t, ttnn.L1_MEMORY_CONFIG))
+        except (RuntimeError, TypeError, AttributeError):
+            out.append(t)
+    return out[0], out[1]
+
+
 def _handoff_config(elements, dtype):
     """DRAM or interleaved L1 for a decode intermediate that must leave its shard, chosen by size.
 
