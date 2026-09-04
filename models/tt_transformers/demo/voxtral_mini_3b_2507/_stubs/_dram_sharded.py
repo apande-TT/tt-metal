@@ -174,10 +174,22 @@ def fill_kv_prefill(kv, k, v):
         ttnn.fill_cache(kv.v, vb, b)
 
 
+def _linear_activation(activation):
+    """The ttnn.linear `activation=` STRING for a name, keeping gelu on the approximate kernel.
+
+    `mm`'s fallback path hands the name straight to ttnn.linear, whose own mapping reads "gelu"
+    as the exact erf -- the form _fused_activation documents as a large net loss inside a pack
+    loop.  Route it to ttnn's approximate spelling so both paths fuse the same kernel.
+    """
+    return "gelu_approx" if str(activation) == "gelu" else activation
+
+
 def _apply(activation, x):
     """Run `activation` as a standalone unary (the decode/mirror path); None is a pass-through."""
     if activation is None:
         return x
+    if str(activation) in ("gelu", "gelu_approx"):
+        return ttnn.gelu(x, variant=ttnn.GeluVariant.Tanh)
     return getattr(ttnn, str(activation))(x)
 
 
@@ -478,7 +490,7 @@ def linear(x, weight, mirror, compute_kernel_config=None, core_grid=None, activa
         weight,
         compute_kernel_config=compute_kernel_config,
         core_grid=core_grid,
-        activation=activation,
+        activation=_linear_activation(activation),
         # Same regime boundary `mm` uses: narrow the output only where the tensor is big enough for
         # the bytes to matter, so a decode shape that misses its mirror still lands in bf16.
         dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None,
@@ -595,21 +607,28 @@ def _divisors(n):
 
 
 def _fused_activation(activation):
-    """The program-config form of an activation name, matching ttnn.linear's own string mapping.
+    """The program-config form of an activation name, for fusing a unary into the pack schedule.
 
-    `string_to_unary_with_param` maps "gelu" to GELU with its approximate flag FALSE, which is
-    also what a standalone `ttnn.gelu` computes, so fusing does not silently swap the exact
-    kernel for the tanh approximation.  Returns None for a name this build cannot express, and
-    the caller then keeps the standalone unary.
+    A FUSED GELU MUST BE THE APPROXIMATE ONE, WHICH IS NOT WHAT THE STRING MAPPING GIVES.  ttnn's
+    `string_to_unary_with_param` maps "gelu" to GELU with its approximate flag FALSE, matching a
+    standalone `ttnn.gelu`; fusing THAT form is a large net loss, because the exact erf runs
+    inside the matmul's pack loop where it cannot be spread over the grid the way a standalone
+    unary is.  Measured on the audio tower's fc1 (1504x1280x5120 bf8_b): 80.2 us/call bare, 209.9
+    us/call with exact GELU fused -- 94 TFLOP/s against fc2's 303 on identical dtypes and flops --
+    where the standalone unary it was meant to replace cost only 107 us.  The approximate flag is
+    the form GUIDELINES/05 section 2 measures at +0.8 us over a bare matmul, so that is the one
+    worth fusing, and the e2e PCC gate is what licenses the swap from erf to the tanh form.
+    Returns None for a name this build cannot express, and the caller then keeps the standalone
+    unary.
     """
     if activation is None:
         return None
     name = str(activation)
     try:
-        if name == "gelu":
-            return [ttnn.UnaryOpType.GELU, False]
-        if name == "gelu_approx":
+        if name in ("gelu", "gelu_approx"):
             return [ttnn.UnaryOpType.GELU, True]
+        if name == "gelu_exact":
+            return [ttnn.UnaryOpType.GELU, False]
         return ttnn.UnaryWithParam(getattr(ttnn.UnaryOpType, name.upper()))
     except (AttributeError, TypeError, ValueError):
         return None
@@ -746,7 +765,11 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
     # tens of kB and whose consumers all want the shard, not a narrower dtype.
     if m < _GRID_REQUEST_MIN_ROWS:
         return ttnn.linear(
-            x, weight, bias=bias, compute_kernel_config=compute_kernel_config, activation=activation
+            x,
+            weight,
+            bias=bias,
+            compute_kernel_config=compute_kernel_config,
+            activation=_linear_activation(activation),
         )
     # ASK FOR THE BLOCKS, NOT JUST THE GRID -- see block_config for why naming the grid alone lands
     # these on the 1-D mcast path with a one-tile K block and 1x1 DEST subblocks.  Best-effort: a
@@ -791,7 +814,7 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
         bias=bias,
         compute_kernel_config=compute_kernel_config,
         core_grid=ttnn.CoreGrid(y=g.y, x=g.x),
-        activation=activation,
+        activation=_linear_activation(activation),
         dtype=_ACT_DTYPE,
     )
 
