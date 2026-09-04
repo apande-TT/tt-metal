@@ -105,6 +105,22 @@ def _largest_divisor(n, max_divisor=8):
 # underneath the matmul's own circular buffers.
 _L1_HANDOFF_MAX_BYTES = 256 * 1024
 
+# THE PREFILL ACTIVATION IS THE OTHER HALF OF THE STAGE, AND IT IS CARRIED AT DOUBLE WIDTH.
+# Prefill's matmuls account for ~85 ms of the stage; the ~100 ms around them is residual adds,
+# RMSNorms, rope, head splits and tilizes, and every one of those is bandwidth-bound on the SAME
+# [8, 512, 3072] bf16 tensor -- 25 MB read and 25 MB written, six or more full-width passes per
+# layer.  L1 cannot hold it (prefill SDPA's flash circular buffers already reserve ~1.03 MB of each
+# core's 1.5 MB, so an interleaved-L1 activation fails the CB region check), which leaves the other
+# axis: carry the stream at bf8_b and every one of those passes moves half the bytes.
+#
+# bf8_b IS THE FLOOR, NOT A STEP ON THE WAY DOWN.  These activations feed normalization statistics
+# and SDPA's scores, and GUIDELINES/01 section 13 names both as tensors that must never go below
+# bf8_b.  The matmuls already consume bf8_b weights, so asking for a bf8_b OUTPUT only narrows what
+# the ops BETWEEN them move; the math inside each matmul is unchanged.  Decode is deliberately
+# excluded -- its activation is one tile row of tens of kB against weights of tens of MB, so there
+# are no bytes to save there, and it is already at its DRAM floor.
+_ACT_DTYPE = ttnn.bfloat8_b
+
 
 def _handoff_config(elements, dtype):
     """DRAM or interleaved L1 for a decode intermediate that must leave its shard, chosen by size.
@@ -326,8 +342,18 @@ def linear(x, weight, mirror, compute_kernel_config=None, core_grid=None, activa
     # The PLAIN path is the opposite: prefill hands ttnn.linear hundreds of tile rows, so fusing
     # removes a full-width read-modify-write of the [rows, intermediate] tensor.  Same measurement:
     # prefill 210.82 -> 196.35 ms (-6.9%).
+    rows = 1
+    for d in tuple(x.shape)[:-1]:
+        rows *= d
     return ttnn.linear(
-        x, weight, compute_kernel_config=compute_kernel_config, core_grid=core_grid, activation=activation
+        x,
+        weight,
+        compute_kernel_config=compute_kernel_config,
+        core_grid=core_grid,
+        activation=activation,
+        # Same regime boundary `mm` uses: narrow the output only where the tensor is big enough for
+        # the bytes to matter, so a decode shape that misses its mirror still lands in bf16.
+        dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None,
     )
 
 
@@ -400,6 +426,9 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
     # 1504 rows (47 tile rows) against a 5120-wide weight, which is thousands of output tiles to
     # spread, and the old bound (110 * 32 = 3520 rows) silently excluded it.  Ask once there are
     # enough tile rows to keep a full grid busy on the OUTPUT tiles, not on the rows alone.
+    # NARROW THE OUTPUT ONLY WHERE THERE ARE BYTES TO SAVE.  _GRID_REQUEST_MIN_ROWS already marks
+    # the boundary between the two regimes -- below it is the decode shape, whose activation is
+    # tens of kB and whose consumers all want the shard, not a narrower dtype.
     if m < _GRID_REQUEST_MIN_ROWS:
         return ttnn.linear(x, weight, bias=bias, compute_kernel_config=compute_kernel_config)
     return ttnn.linear(
@@ -408,6 +437,7 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
         bias=bias,
         compute_kernel_config=compute_kernel_config,
         core_grid=ttnn.CoreGrid(y=g.y, x=g.x),
+        dtype=_ACT_DTYPE,
     )
 
 
