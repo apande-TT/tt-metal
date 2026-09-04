@@ -667,37 +667,68 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
         return _BLOCK_CFG_CACHE[key]
     g = device.compute_with_storage_grid_size()
     k_divs = _divisors(k_tiles)
+    want_transpose = n_tiles > m_tiles
     best = None
     for gy in range(1, int(g.y) + 1):
-        per_core_m = -(-m_tiles // gy)
-        if gy > 1 and per_core_m * (gy - 1) >= m_tiles:
-            continue
         for gx in range(1, int(g.x) + 1):
-            per_core_n = -(-n_tiles // gx)
-            if gx > 1 and per_core_n * (gx - 1) >= n_tiles:
-                continue
-            for block_h in _divisors(per_core_m):
-                for block_w in _divisors(per_core_n):
-                    h, w = _subblock(block_h, block_w)
-                    reuse = min(1.0, (h * w) / float(h + w))
-                    blocks = (per_core_m // block_h) * (per_core_n // block_w)
-                    for in0_block_w in k_divs:
-                        if _cb_bytes(block_h, block_w, in0_block_w, tile_bytes, interm_bytes) > _CB_BUDGET_BYTES:
-                            continue
-                        cost = per_core_m * per_core_n * k_tiles / reuse + blocks * (
-                            k_tiles / in0_block_w
-                        ) * _KBLOCK_OVERHEAD
-                        cand = (cost, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w)
-                        if (
-                            best is None
-                            or cost < best[0] * (1.0 - _COST_TIE)
-                            or (cost < best[0] * (1.0 + _COST_TIE) and gx * gy > best[1] * best[2])
-                        ):
-                            best = cand
-                        break
+            # BOTH MULTICAST ORIENTATIONS, because which grid axis carries M is a free choice and
+            # the shape decides which one is right.  transpose_mcast=False lays the output's M down
+            # the grid's y and its N across x; True swaps them (GUIDELINES/03 section 2: ROW_MAJOR
+            # when M >= N, COL_MAJOR when N >> M).  This search only ever offered the first, and on
+            # this model every WIDE-N projection is the slow one -- fc1 (N/M = 3.4) runs 243
+            # TFLOP/s against fc2's 305 on identical flops, dtypes and grid, and the LM's gate
+            # (N/M = 2) 286 against down's 415.  A 47 x 160 tile output split 11 x 10 the one way
+            # gives each core 5 x 15 tiles, and the other way 5 x 16 -- but the mcast trees, and
+            # therefore how far each operand travels, are transposed with it.
+            for transpose in (False, True):
+                m_axis, n_axis = (gy, gx) if not transpose else (gx, gy)
+                per_core_m = -(-m_tiles // m_axis)
+                per_core_n = -(-n_tiles // n_axis)
+                if m_axis > 1 and per_core_m * (m_axis - 1) >= m_tiles:
+                    continue
+                if n_axis > 1 and per_core_n * (n_axis - 1) >= n_tiles:
+                    continue
+                for block_h in _divisors(per_core_m):
+                    for block_w in _divisors(per_core_n):
+                        h, w = _subblock(block_h, block_w)
+                        reuse = min(1.0, (h * w) / float(h + w))
+                        blocks = (per_core_m // block_h) * (per_core_n // block_w)
+                        for in0_block_w in k_divs:
+                            if _cb_bytes(block_h, block_w, in0_block_w, tile_bytes, interm_bytes) > _CB_BUDGET_BYTES:
+                                continue
+                            cost = (
+                                per_core_m * per_core_n * k_tiles / reuse
+                                + blocks * (k_tiles / in0_block_w) * _KBLOCK_OVERHEAD
+                            )
+                            cand = (
+                                cost,
+                                gx,
+                                gy,
+                                per_core_m,
+                                per_core_n,
+                                block_h,
+                                block_w,
+                                in0_block_w,
+                                h,
+                                w,
+                                transpose,
+                            )
+                            near = best is not None and cost < best[0] * (1.0 + _COST_TIE)
+                            if (
+                                best is None
+                                or cost < best[0] * (1.0 - _COST_TIE)
+                                or (near and gx * gy > best[1] * best[2])
+                                # THE COST MODEL CANNOT SEE THE MULTICAST TREES, so it scores the two
+                                # orientations of the same split identically and the tie has to be
+                                # broken by the shape.  GUIDELINES/03 section 2: a WIDE output (N > M)
+                                # wants COL_MAJOR, a tall one ROW_MAJOR.
+                                or (near and gx * gy == best[1] * best[2] and transpose == want_transpose)
+                            ):
+                                best = cand
+                            break
     cfg = None
     if best is not None:
-        _, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w = best
+        _, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w, transpose = best
         cfg = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
             compute_with_storage_grid_size=(gx, gy),
             in0_block_w=in0_block_w,
@@ -707,7 +738,7 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
             out_block_w=block_w,
             per_core_M=per_core_m,
             per_core_N=per_core_n,
-            transpose_mcast=False,
+            transpose_mcast=transpose,
             fused_activation=_fused_activation(activation),
         )
     _BLOCK_CFG_CACHE[key] = cfg
@@ -751,9 +782,7 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
         # activation stays a standalone unary here for the reason `linear` documents: the
         # DRAM-sharded factory sends anything but RELU down a separate DEST path, which at one
         # tile row costs more than the interleaved unary it replaces.
-        return _apply(
-            activation, mirror(x, compute_kernel_config=compute_kernel_config, keep_sharded=keep_sharded)
-        )
+        return _apply(activation, mirror(x, compute_kernel_config=compute_kernel_config, keep_sharded=keep_sharded))
     # THE THRESHOLD WAS "ONE TILE ROW PER CORE", WHICH IS TOO STRICT.  Asking for the grid loses
     # at the decode shape (a single tile row spread over 110 cores costs more launch than it
     # recovers) but the break-even is nowhere near one row PER CORE -- the audio tower's FFN runs
@@ -778,44 +807,62 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
     wshape = tuple(weight.shape)
     k_tiles, n_tiles = int(wshape[-2]) // TILE, int(wshape[-1]) // TILE
     m_tiles = math.ceil(m / TILE)
+    # FLATTEN THE STACK BEFORE PLANNING AGAINST IT, don't refuse to plan for it.  The block search
+    # sizes its blocks against the WHOLE height, and with a leading batch the config it produces
+    # describes a height the kernel does not see in one pass -- which is why batched shapes used to
+    # skip the search entirely.  Merging the leading dims fixes that at the source and costs
+    # nothing: tile layout already stores [B, S, K] as B row-major tile grids end to end, so the
+    # reshape is byte-identical metadata (see the rank-reshape note on `qkv_heads`).  Only exact
+    # tile-row multiples are folded, so a padded height keeps the grid request underneath.
+    dims = [int(d) for d in x.shape]
+    stacked = 1
+    for d in dims[:-2]:
+        stacked *= d
+    restore = None
+    if stacked > 1 and m % TILE == 0 and m_tiles * TILE == m:
+        inp = ttnn.reshape(x, (1, m, dims[-1]))
+        restore = tuple(dims[:-1])
+    else:
+        inp = x
     batch = 1
-    for d in tuple(x.shape)[:-2]:
+    for d in tuple(inp.shape)[:-2]:
         batch *= int(d)
     key = (m_tiles, k_tiles, n_tiles, batch, str(activation))
+
+    def _restored(out):
+        if restore is None:
+            return out
+        return ttnn.reshape(out, restore + (int(out.shape[-1]),))
+
     # M IS THE PADDED HEIGHT, NOT THE LOGICAL ONE.  The audio tower's activation is 1500 rows, which
     # the matmul pads to 47 tiles; requiring m % TILE == 0 here silently excluded every encoder
     # projection -- the exact shapes this config exists for.
-    # ONE ACTIVATION, NOT A STACK OF THEM.  With a leading batch the 2-D factory runs the whole
-    # grid once PER BATCH ENTRY, so the block sizes below are chosen against a height the kernel
-    # never sees in one pass; measured on this model's 8-stream prefill it cost 0.8% where the
-    # single-stream audio tower gained 7%.  Batched shapes keep the grid request underneath.
-    if (
-        batch == 1
-        and key not in _BLOCK_CFG_REFUSED
-        and int(wshape[-2]) % TILE == 0
-        and int(wshape[-1]) % TILE == 0
-    ):
+    if batch == 1 and key not in _BLOCK_CFG_REFUSED and int(wshape[-2]) % TILE == 0 and int(wshape[-1]) % TILE == 0:
         cfg = block_config(device, m_tiles, k_tiles, n_tiles, activation=activation)
         if cfg is not None:
             try:
-                return ttnn.linear(
-                    x,
-                    weight,
-                    bias=bias,
-                    compute_kernel_config=compute_kernel_config,
-                    program_config=cfg,
-                    dtype=_ACT_DTYPE,
+                return _restored(
+                    ttnn.linear(
+                        inp,
+                        weight,
+                        bias=bias,
+                        compute_kernel_config=compute_kernel_config,
+                        program_config=cfg,
+                        dtype=_ACT_DTYPE,
+                    )
                 )
             except (RuntimeError, TypeError, ValueError):
                 _BLOCK_CFG_REFUSED.add(key)
-    return ttnn.linear(
-        x,
-        weight,
-        bias=bias,
-        compute_kernel_config=compute_kernel_config,
-        core_grid=ttnn.CoreGrid(y=g.y, x=g.x),
-        activation=_linear_activation(activation),
-        dtype=_ACT_DTYPE,
+    return _restored(
+        ttnn.linear(
+            inp,
+            weight,
+            bias=bias,
+            compute_kernel_config=compute_kernel_config,
+            core_grid=ttnn.CoreGrid(y=g.y, x=g.x),
+            activation=_linear_activation(activation),
+            dtype=_ACT_DTYPE,
+        )
     )
 
 
@@ -882,6 +929,12 @@ def qkv_heads(qkv, num_heads, num_kv_heads=None):
 
 _SDPA_CFGS = {}
 _SDPA_MAX_CHUNK = 256
+# THE K CHUNK IS NOT A WORK UNIT, SO IT DOES NOT SHARE THE Q CHUNK'S CEILING.  Widening q costs
+# occupancy (see _q_chunk); widening k costs only circular buffer bytes, and it BUYS the thing that
+# makes this kernel 54 TFLOP/s -- flash rescales its running max and sum through the SFPU once per
+# k block, so the audio tower's 1504 positions at k_chunk 256 pay six rescale passes per q chunk
+# where 512 pays three.  Capped separately, and still a power of two no larger than the sequence.
+_SDPA_MAX_K_CHUNK = 512
 # Fraction of the grid the flash work units must keep busy before sdpa_config stops halving the q
 # chunk.  2/3 is the point where one more halving stops paying: it doubles the per-unit loop and CB
 # overhead to recover less than half a round.
@@ -939,7 +992,10 @@ def sdpa_config(device, q, k):
             c //= 2
         return c
 
-    key = (grid.x, grid.y, _q_chunk(), _chunk(seq_k))
+    def _k_chunk(s):
+        return max(32, min(_SDPA_MAX_K_CHUNK, 1 << (max(int(s), 1).bit_length() - 1)))
+
+    key = (grid.x, grid.y, _q_chunk(), _k_chunk(seq_k))
     cfg = _SDPA_CFGS.get(key)
     if cfg is None:
         cfg = ttnn.SDPAProgramConfig(
