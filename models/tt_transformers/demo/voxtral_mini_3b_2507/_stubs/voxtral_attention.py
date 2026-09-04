@@ -45,8 +45,20 @@ _SDPA_CFG = ttnn.WormholeComputeKernelConfig(
 # so this stops at HiFi2 rather than dropping all the way).  The layer_norms and SDPA stay at
 # HiFi4 + fp32_dest_acc_en=True: this tower's own repair history records it losing PCC when its
 # reductions ran at a lower fidelity, and softmax/variance accumulation is where that compounds.
+# THE AUDIO TOWER'S PROJECTION WEIGHTS.  qkv/out/fc1/fc2 are the whole parameter mass of this
+# tower and the profile tags every one of them memory-bound on a full grid, so halving the stored
+# width halves the bytes each launch must pull.  The norms, the biases and SDPA's operands are NOT
+# narrowed -- normalization statistics are where a block-float rounding compounds over depth.
+_PROJ_DTYPE = ttnn.bfloat8_b
+
+
+# WEIGHTS ARE NOW bf8_b, SO THE PAIRING IS LoFi.  8-bit operands through a HiFi2 kernel make the
+# math engine take two passes over one pass worth of mantissa, which cancels the bandwidth saving
+# the narrower weight just bought (GUIDELINES/01 section 12: LoFi is the documented pairing for
+# block-float matmul operands).  The layer_norms and SDPA keep their own configs -- only the four
+# projections narrowed.
 _PROJ_CFG = ttnn.WormholeComputeKernelConfig(
-    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_fidelity=ttnn.MathFidelity.LoFi,
     math_approx_mode=False,
     fp32_dest_acc_en=False,
     packer_l1_acc=True,
@@ -76,7 +88,23 @@ def _dram_sharded():
 _DS = _dram_sharded()
 
 
-def _to_device(t, device):
+def _to_device(t, device, dtype=ttnn.bfloat16):
+    # BLOCK-FLOAT TARGETS SKIP THE HOST NARROWING.  bf8_b/bf4_b derive their mantissa from a
+    # per-block shared exponent, so rounding to bf16 first can change the packed result; only the
+    # bf16 path below is a pure round-trip removal.
+    if dtype != ttnn.bfloat16:
+        try:
+            if isinstance(device, ttnn.MeshDevice):
+                return ttnn.from_torch(
+                    t,
+                    dtype=dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=device,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+                )
+        except (AttributeError, TypeError):
+            pass
+        return ttnn.from_torch(t, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
     # NARROW TO bf16 ON THE HOST.  Callers hand this `.float()` tensors, but the target dtype is
     # bf16, so ttnn used to upload fp32 and fix it up on DEVICE -- the profile showed 42 ms of
     # fp32 Tilize plus 24 ms of fp32->bf16 Typecast doing exactly that.  Narrowing first halves
@@ -115,9 +143,9 @@ class TtVoxtralAttention:
             kb=None if torch_module.k_proj.bias is None else torch_module.k_proj.bias.float(),
             vb=None if torch_module.v_proj.bias is None else torch_module.v_proj.bias.float(),
         )
-        self.qkv_weight = _to_device(_qkv_w, device)
+        self.qkv_weight = _to_device(_qkv_w, device, _PROJ_DTYPE)
         self.qkv_bias = None if _qkv_b is None else _to_device(_qkv_b.unsqueeze(0).unsqueeze(0), device)
-        self.o_weight = _to_device(torch_module.out_proj.weight.T.contiguous().float(), device)
+        self.o_weight = _to_device(torch_module.out_proj.weight.T.contiguous().float(), device, _PROJ_DTYPE)
 
         self.q_bias = (
             _to_device(torch_module.q_proj.bias.unsqueeze(0).unsqueeze(0).float(), device)

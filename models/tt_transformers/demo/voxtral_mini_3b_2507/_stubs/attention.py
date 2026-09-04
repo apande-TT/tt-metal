@@ -46,8 +46,14 @@ _SDPA_CFG = ttnn.WormholeComputeKernelConfig(
 # so this stops at HiFi2 rather than dropping all the way).  The layer_norms and SDPA stay at
 # HiFi4 + fp32_dest_acc_en=True: this tower's own repair history records it losing PCC when its
 # reductions ran at a lower fidelity, and softmax/variance accumulation is where that compounds.
+# THE AUDIO TOWER'S PROJECTION WEIGHTS.  qkv/out are memory-bound on a full grid, so halving the
+# stored width halves the bytes each launch must pull.  Biases stay bf16.
+_PROJ_DTYPE = ttnn.bfloat8_b
+
+
+# WEIGHTS ARE NOW bf8_b, SO THE PAIRING IS LoFi (GUIDELINES/01 section 12).
 _PROJ_CFG = ttnn.WormholeComputeKernelConfig(
-    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_fidelity=ttnn.MathFidelity.LoFi,
     math_approx_mode=False,
     fp32_dest_acc_en=False,
     packer_l1_acc=True,
@@ -96,14 +102,14 @@ class TtVoxtralAttention:
             vb=torch_module.v_proj.bias.float(),
             scale=torch_module.head_dim**-0.5,
         )
-        self.qkv_weight = ttnn.from_torch(_qkv_w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.qkv_weight = ttnn.from_torch(_qkv_w, dtype=_PROJ_DTYPE, layout=ttnn.TILE_LAYOUT, device=device)
         self.qkv_bias = ttnn.from_torch(
             _qkv_b.unsqueeze(0), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
 
         self.out_weight = ttnn.from_torch(
             torch_module.out_proj.weight.T.contiguous().float(),
-            dtype=ttnn.bfloat16,
+            dtype=_PROJ_DTYPE,
             layout=ttnn.TILE_LAYOUT,
             device=device,
         )

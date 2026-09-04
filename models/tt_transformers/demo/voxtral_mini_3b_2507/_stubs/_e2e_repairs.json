@@ -34,7 +34,7 @@
       "reason": "Precision repair: raised every ttnn.linear / rms_norm / layer_norm / SDPA call in this body to the SAME compute config the graduated llama_model body already used (MathFidelity.HiFi4, fp32_dest_acc_en=True). Same ops, same order, same weights -- only the accumulation precision changes. Measured on device: composing 32 audio layers at the default fidelity held only 0.9936 PCC where torch bf16 holds 0.9997, and the lm_head alone mis-ranked 22/379 argmax positions; after this repair LM prefill logits went 0.9914 -> 0.9976 and a decode step 0.9541 -> 0.9886.",
       "backward_compatible": "tests/pcc/test_<name>.py still passes: a compute_kernel_config only raises accumulation precision, it cannot lower PCC.",
       "snapshot_sha256": "8292807413c7ec83f29f74535a6a3f4b68b1c107cb8f1a23079bd0c8a05e8e9d",
-      "repaired_sha256": "2756885664a6ad8f58859431ac16f0d2430d2bc986094df8e0d42cdc9669d717"
+      "repaired_sha256": "f3dd56aeacb65dbf2702b75c104f9ae0823c395ab06ea3f6e5ad8287c30de087"
     },
     "decoder_head": {
       "snapshot": "last_good_native",
@@ -48,14 +48,14 @@
       "reason": "Precision repair: raised every ttnn.linear / rms_norm / layer_norm / SDPA call in this body to the SAME compute config the graduated llama_model body already used (MathFidelity.HiFi4, fp32_dest_acc_en=True). Same ops, same order, same weights -- only the accumulation precision changes. Measured on device: composing 32 audio layers at the default fidelity held only 0.9936 PCC where torch bf16 holds 0.9997, and the lm_head alone mis-ranked 22/379 argmax positions; after this repair LM prefill logits went 0.9914 -> 0.9976 and a decode step 0.9541 -> 0.9886.  ALSO: the conv front-end now caches ttnn's PREPROCESSED conv weights on device after the first call (return_weights_and_bias=True). The graduated body kept them on host and re-uploaded per call, which is illegal inside ttnn.begin_trace_capture (TT_FATAL !trace_id_.has_value()) and made the encode stage un-traceable. Numerics unchanged (hidden PCC 0.995367 before and after); the second tower got ~9x faster.",
       "backward_compatible": "tests/pcc/test_<name>.py still passes: a compute_kernel_config only raises accumulation precision, it cannot lower PCC.",
       "snapshot_sha256": "d7c448c46af69c6d02527f0bc37f258d5456fdd79b4ef657c68e64ac009228ca",
-      "repaired_sha256": "3fae8b8752051b953f1753a0661b8e3fc6d6d6e1175772d891e5f02b705070aa"
+      "repaired_sha256": "8d5016ef397fd9d8cc1f65a1b79d976bdbfd68be41f65565929e066b7250c02f"
     },
     "layer": {
       "snapshot": "last_good_native",
       "reason": "Precision repair: raised every ttnn.linear / rms_norm / layer_norm / SDPA call in this body to the SAME compute config the graduated llama_model body already used (MathFidelity.HiFi4, fp32_dest_acc_en=True). Same ops, same order, same weights -- only the accumulation precision changes. Measured on device: composing 32 audio layers at the default fidelity held only 0.9936 PCC where torch bf16 holds 0.9997, and the lm_head alone mis-ranked 22/379 argmax positions; after this repair LM prefill logits went 0.9914 -> 0.9976 and a decode step 0.9541 -> 0.9886.",
       "backward_compatible": "tests/pcc/test_<name>.py still passes: a compute_kernel_config only raises accumulation precision, it cannot lower PCC.",
       "snapshot_sha256": "96da5c723141f10a55e4a24af9163dde27a40a2abdbccb320c6fa7ee41166583",
-      "repaired_sha256": "2fdba10af62cd62fca1df1123c1b41a3c95308e4a5c201def1d0f84e8cf18d5f"
+      "repaired_sha256": "a8250b1ede9a5b828f4943e3b7fe3a1bc5fc70427cf8291d4cb7186932be77f6"
     },
     "llama_m_l_p": {
       "snapshot": "last_good_native",
@@ -83,21 +83,21 @@
       "reason": "Precision repair: raised every ttnn.linear / rms_norm / layer_norm / SDPA call in this body to the SAME compute config the graduated llama_model body already used (MathFidelity.HiFi4, fp32_dest_acc_en=True). Same ops, same order, same weights -- only the accumulation precision changes. Measured on device: composing 32 audio layers at the default fidelity held only 0.9936 PCC where torch bf16 holds 0.9997, and the lm_head alone mis-ranked 22/379 argmax positions; after this repair LM prefill logits went 0.9914 -> 0.9976 and a decode step 0.9541 -> 0.9886.",
       "backward_compatible": "tests/pcc/test_<name>.py still passes: a compute_kernel_config only raises accumulation precision, it cannot lower PCC.",
       "snapshot_sha256": "3bd5e0bb5b4724323ca2a87a73faac2d40b66666992bb1016e1a9f859c5928a1",
-      "repaired_sha256": "6bad6e87b5fb41318459a8650ef8e907fa1cabcfe9911b8aa8430acf1232d9e9"
+      "repaired_sha256": "97002661dfa69ef2e8e5e7dafad19a5c0c748cb00809e901cce31f109c212083"
     },
     "voxtral_encoder": {
       "snapshot": "last_good_native",
       "reason": "Precision repair: raised every ttnn.linear / rms_norm / layer_norm / SDPA call in this body to the SAME compute config the graduated llama_model body already used (MathFidelity.HiFi4, fp32_dest_acc_en=True). Same ops, same order, same weights -- only the accumulation precision changes. Measured on device: composing 32 audio layers at the default fidelity held only 0.9936 PCC where torch bf16 holds 0.9997, and the lm_head alone mis-ranked 22/379 argmax positions; after this repair LM prefill logits went 0.9914 -> 0.9976 and a decode step 0.9541 -> 0.9886.  ALSO: the conv front-end now caches ttnn's PREPROCESSED conv weights on device after the first call (return_weights_and_bias=True). The graduated body kept them on host and re-uploaded per call, which is illegal inside ttnn.begin_trace_capture (TT_FATAL !trace_id_.has_value()) and made the encode stage un-traceable. Numerics unchanged (hidden PCC 0.995367 before and after); the second tower got ~9x faster.",
       "backward_compatible": "tests/pcc/test_<name>.py still passes: a compute_kernel_config only raises accumulation precision, it cannot lower PCC.",
       "snapshot_sha256": "d7c448c46af69c6d02527f0bc37f258d5456fdd79b4ef657c68e64ac009228ca",
-      "repaired_sha256": "3fae8b8752051b953f1753a0661b8e3fc6d6d6e1175772d891e5f02b705070aa"
+      "repaired_sha256": "8d5016ef397fd9d8cc1f65a1b79d976bdbfd68be41f65565929e066b7250c02f"
     },
     "voxtral_encoder_layer": {
       "snapshot": "last_good_native",
       "reason": "Precision repair: raised every ttnn.linear / rms_norm / layer_norm / SDPA call in this body to the SAME compute config the graduated llama_model body already used (MathFidelity.HiFi4, fp32_dest_acc_en=True). Same ops, same order, same weights -- only the accumulation precision changes. Measured on device: composing 32 audio layers at the default fidelity held only 0.9936 PCC where torch bf16 holds 0.9997, and the lm_head alone mis-ranked 22/379 argmax positions; after this repair LM prefill logits went 0.9914 -> 0.9976 and a decode step 0.9541 -> 0.9886.",
       "backward_compatible": "tests/pcc/test_<name>.py still passes: a compute_kernel_config only raises accumulation precision, it cannot lower PCC.",
       "snapshot_sha256": "8443a69c1bfa5588d3a0e579c1834d1c0f04b13289d3c8ee0bb917463c76dca1",
-      "repaired_sha256": "a7dbb6a197b240db0396b2529724a817f2fe473ac4459a8ea35699f7ef3efa39"
+      "repaired_sha256": "d7d62782546ae14e6edcb105a1f2464f791e49a712cc40eb55ca152617596e05"
     },
     "voxtral_multi_modal_projector": {
       "snapshot": "last_good_native",
