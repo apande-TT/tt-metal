@@ -202,8 +202,23 @@ class TtVoxtralEncoderLayer:
             memory_config=_DS.stream_config(x),
         )
 
-        qkv = _DS.mm(self.device, x, self.qkv_weight, _PROJ_CFG, bias=self.qkv_bias)
+        # KEEP THE CHAIN IN L1 -- the fused projection's only consumer is the head split, one op
+        # later, and that op already asks for an L1 output of its own.  ffn_config rather than
+        # stream_config because this tensor is 3x the stream width (q + k + v).
+        qkv = _DS.mm(
+            self.device,
+            x,
+            self.qkv_weight,
+            _PROJ_CFG,
+            bias=self.qkv_bias,
+            memory_config=_DS.ffn_config(S, int(self.qkv_weight.shape[-1]), _ACT_DTYPE),
+        )
         q, k, v = _DS.qkv_heads(qkv, self.num_heads)
+        # RELEASE THE FUSED PROJECTION AS SOON AS THE SPLIT HAS IT.  Now that qkv lands in L1 it is
+        # 6.1 MB, and Python would hold that binding through the whole attention AND the FFN -- L1
+        # the SDPA and matmul circular buffers underneath it have to work around.  The split has
+        # already produced its own q/k/v, so nothing reads this again.
+        ttnn.deallocate(qkv)
 
         attn_out = ttnn.transformer.scaled_dot_product_attention(
             q,
@@ -215,7 +230,15 @@ class TtVoxtralEncoderLayer:
             compute_kernel_config=_SDPA_CFG,
         )
         attn_out = ttnn.transformer.concatenate_heads(attn_out)
-        attn_out = _DS.mm(self.device, attn_out, self.out_weight, _PROJ_CFG, bias=self.out_bias)
+        # Same: the attention output goes straight into the residual add, which is already L1.
+        attn_out = _DS.mm(
+            self.device,
+            attn_out,
+            self.out_weight,
+            _PROJ_CFG,
+            bias=self.out_bias,
+            memory_config=_DS.ffn_config(S, int(self.out_weight.shape[-1]), _ACT_DTYPE),
+        )
 
         x = ttnn.add(residual, attn_out, dtype=_ACT_DTYPE, memory_config=_DS.stream_config(residual, _ACT_DTYPE))
 

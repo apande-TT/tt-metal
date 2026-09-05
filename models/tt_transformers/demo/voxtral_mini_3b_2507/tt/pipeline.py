@@ -93,12 +93,17 @@ ENCODE_FRAMES = 1500
 PREFILL_C = 448  # ceil(388 / 32) * 32 + 32
 # decode: variable dim is the KV length.
 DECODE_CAP = 32
-# DELIBERATELY NOT PREFILL_C + 128 ANY MORE: the KV capacity is its own axis and shrinking it with
-# the prefill capacity COSTS.  576 (18 tile rows) was measured at decode 10.978 -> 11.166 ms/token
-# (+1.7%) against 640 (20 tile rows) -- the resident cache's shard grids and sdpa_decode's work
-# split are chosen from how the height factorises, and 18 factorises worse than 20 across this
-# board's core counts.  Prefill does not care: it fills the cache at offset 0 for PREFILL_C rows
-# whatever the capacity behind them is.  So the prefill capacity came down and this stayed put.
+# DELIBERATELY NOT PREFILL_C + 128 ANY MORE: the KV capacity is its own axis, and 640 is a MEASURED
+# LOCAL OPTIMUM rather than a leftover -- both neighbours are worse, in both directions:
+#   576 (18 tile rows)  decode 10.978 -> 11.166 ms/token  (+1.7%)
+#   768 (24 tile rows)  decode 10.984 -> 11.188 ms/token  (+1.9%)
+# So sdpa_decode's cost tracks the CAPACITY and not only the cursor, but not monotonically: the
+# resident cache's shard grids and the op's work split come from how the height factorises, and 20
+# tile rows lands better than 18 or 24 on this board's core counts.  Prefill does not care either
+# way -- it fills the cache at offset 0 for PREFILL_C rows whatever the capacity behind them is --
+# so the prefill capacity came down to 448 and this stayed put.  The floor is the perf tests' own
+# contract: TT_PERF_OSL_TOKENS defaults to 128 and they clamp osl to KV_C - prompt_len, so anything
+# under 388 + 128 = 516 would quietly shorten the decode measurement instead of speeding it up.
 KV_C = 640
 # THE RESIDENT KV CACHE IS THE SECOND-BIGGEST THING DECODE READS.  At B=8 x 8 kv-heads x 640
 # positions x 128 head_dim, one layer's K and V are ~21 MB, and sdpa_decode re-reads every
@@ -651,6 +656,15 @@ class VoxtralPipeline:
         # ---------------- resident buffers ----------------------------------
         # persistent, allocated once: the decode step reads/writes these in
         # place so it can be captured in a trace without any host op.
+        # THE CURSOR MUST BE int32, AND THAT IS A HARD ttnn CONSTRAINT, NOT A CHOICE.  It has two
+        # readers with different dtype tastes: the KV ops read it once per LAYER, and the rope
+        # gather reads it once per TOKEN -- and that gather is an embedding, which takes uint32
+        # indices only.  So int32 costs a `ttnn.typecast` on every token and uint32 would not, and
+        # positions are counts that never go negative, which makes uint32 look free.  It is not
+        # available: paged_fused_update_cache asserts outright, "Expected update_idxs to have
+        # datatype INT32" (paged_fused_update_cache_device_operation.cpp:255), measured 2026-09-05.
+        # Mirroring the cursor into a second uint32 buffer does not help either -- it would cost an
+        # extra in-place add per token to keep in step, which is exactly the launch it would save.
         self.cur_pos_tt = ttnn.from_torch(
             torch.zeros(self.B, dtype=torch.int32), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=device
         )
@@ -751,10 +765,21 @@ class VoxtralPipeline:
     def _advance_on_device(self):
         """cur_pos += 1, entirely on device (trace safe, no host op)."""
         # NOT `ttnn.add(..., output_tensor=self.cur_pos_tt)`: that would fold the copy into the add,
-        # but eltwise refuses a preallocated output on ROW_MAJOR inputs -- "Optional output tensor
+        # but eltwise refuses a PREALLOCATED output on ROW_MAJOR inputs -- "Optional output tensor
         # with Row Major input is not supported right now for Elementwise operations"
         # (binary.cpp:695), and the cursor has to stay ROW_MAJOR int32 for the KV ops that read it.
-        ttnn.copy(ttnn.add(self.cur_pos_tt, self.one_b), self.cur_pos_tt)
+        #
+        # THE IN-PLACE FORM IS A DIFFERENT ROUTE AND IT IS ACCEPTED.  `ttnn.add_` writes back into
+        # input_tensor_a rather than taking an optional output tensor, so it does not go through the
+        # refusal above, and it turns two launches per token (add, then copy the result back over
+        # the cursor) into one.  Two launches for eight int32s is all dispatch and no work, which is
+        # exactly the kind of cost that survives trace capture -- trace removes the HOST gap, not the
+        # device-side launch.  Guarded because in-place eltwise is the sort of thing a ttnn version
+        # can decline for a given dtype/layout, and the cursor is load-bearing for the whole decode.
+        try:
+            ttnn.add_(self.cur_pos_tt, self.one_b)
+        except (RuntimeError, TypeError, AttributeError):
+            ttnn.copy(ttnn.add(self.cur_pos_tt, self.one_b), self.cur_pos_tt)
         for slot in self.kv:
             slot.cur_pos += 1
 
@@ -805,11 +830,38 @@ class VoxtralPipeline:
 
     # -------------------------------------------------------- STAGE: prefill
     def _merge_audio(self, ids_tt, audio_embeds, audio_start, n_audio, batch):
-        """embed_tokens(ids) with the audio embeds scattered in -- pure ttnn."""
-        te = self.embed(ids_tt)  # [B, C, hidden] TILE
-        head = ttnn.slice(te, (0, 0, 0), (batch, audio_start, self.hidden))
-        tail = ttnn.slice(te, (0, audio_start + n_audio, 0), (batch, self.C, self.hidden))
-        return ttnn.concat([head, audio_embeds, tail], dim=1)
+        """embed_tokens(ids) with the audio embeds scattered in -- pure ttnn.
+
+        DO THE JOIN IN ROW_MAJOR, TILIZE ONCE AT THE END.  The seam is at token `audio_start` and
+        the audio run is `n_audio` long, and neither is a multiple of 32 (3 and 375 here), so a
+        TILE-layout concat cannot cut along the row dim at all: ttnn untilizes every piece, joins
+        them row-major, and tilizes the result -- and the two slices pay their own untilize/tilize
+        pair on top, because slicing a tiled tensor at a non-tile row boundary is the same problem
+        one level down.  Profiled on the prefill embedding that was ~1.7 ms of pure layout churn on
+        a tensor the model had just built.
+
+        Asking the embedding for ROW_MAJOR instead makes the whole sequence match the data: the
+        gather is row-major anyway, both slices become contiguous row ranges, the concat is the
+        row-major one ttnn was going to do regardless, and exactly ONE tilize runs, on the joined
+        result. Only the audio embeddings still have to be converted, and they are the smallest of
+        the three pieces.
+
+        Kept behind a fallback: if any of the row-major ops refuses these shapes the original
+        tiled path still runs, so correctness never depends on the faster layout being available.
+        """
+        try:
+            te = self.embed(ids_tt, layout=ttnn.ROW_MAJOR_LAYOUT)  # [B, C, hidden] ROW_MAJOR
+            head = ttnn.slice(te, (0, 0, 0), (batch, audio_start, self.hidden))
+            tail = ttnn.slice(te, (0, audio_start + n_audio, 0), (batch, self.C, self.hidden))
+            audio_rm = ttnn.to_layout(audio_embeds, ttnn.ROW_MAJOR_LAYOUT)
+            merged = ttnn.concat([head, audio_rm, tail], dim=1)
+            ttnn.deallocate(te)
+            return ttnn.to_layout(merged, ttnn.TILE_LAYOUT)
+        except (RuntimeError, TypeError, ValueError):
+            te = self.embed(ids_tt)  # [B, C, hidden] TILE
+            head = ttnn.slice(te, (0, 0, 0), (batch, audio_start, self.hidden))
+            tail = ttnn.slice(te, (0, audio_start + n_audio, 0), (batch, self.C, self.hidden))
+            return ttnn.concat([head, audio_embeds, tail], dim=1)
 
     def _lm_forward(self, h, *, rope, kv_slots, mode):
         # RUN THE INDIVIDUALLY-ROUTED LAYERS THAT WERE ACTUALLY BUILT. These were three straight-line
@@ -870,14 +922,27 @@ class VoxtralPipeline:
         # B pages of 256 kB while the rest of the grid idles: 32.4 us/call, the second most
         # expensive op in the sampling tail.  untilize_with_unpadding takes the memory_config
         # directly and writes L1 itself, so the copy disappears.  Same op, same values.
-        rm = None
-        try:
-            end = [int(d) - 1 for d in logits.shape]
-            rm = ttnn.untilize_with_unpadding(logits, end, memory_config=ttnn.L1_MEMORY_CONFIG)
-        except (RuntimeError, TypeError, ValueError):
+        #
+        # ...AND THE HEAD MAY HAVE DONE IT ALREADY.  The lm_head has to unpad before it unfolds the
+        # streams (a tiled [1, 1, B, V] reshaped to [B, 1, V] re-pads every stream to a full tile
+        # row, 8.4 MB -> 67 MB; see decoder_head), so on that path the logits arrive ROW_MAJOR and
+        # the untilize below would have nothing to do.  They arrive in DRAM rather than L1, which is
+        # the right side of the trade ONLY because the kernel path below copies into its own
+        # resident L1 buffer anyway and that copy reads DRAM just as well; the stock-op fallback
+        # does not, so it still asks for the placement it needs.
+        if logits.layout == ttnn.ROW_MAJOR_LAYOUT:
+            rm = logits
+            if self._cpp_argmax is None:
+                rm = ttnn.to_memory_config(logits, ttnn.L1_MEMORY_CONFIG)
+        else:
             rm = None
-        if rm is None:
-            rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG)
+            try:
+                end = [int(d) - 1 for d in logits.shape]
+                rm = ttnn.untilize_with_unpadding(logits, end, memory_config=ttnn.L1_MEMORY_CONFIG)
+            except (RuntimeError, TypeError, ValueError):
+                rm = None
+            if rm is None:
+                rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG)
         #
         # ...AND THEN THE SCAN ITSELF IS THE FLOOR.  With the layout and the placement both fixed,
         # what is left is ~22 cycles per element on the data-movement RISC-V -- the stock kernel's

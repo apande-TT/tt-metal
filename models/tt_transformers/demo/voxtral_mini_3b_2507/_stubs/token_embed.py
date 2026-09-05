@@ -36,8 +36,16 @@ class TtTokenEmbed:
         self.device = device
         self.weight = _to_device_rm(torch_module.weight.float(), device)
 
-    def __call__(self, x, **kwargs):
-        return ttnn.embedding(x, self.weight, layout=ttnn.TILE_LAYOUT)
+    def __call__(self, x, layout=ttnn.TILE_LAYOUT, **kwargs):
+        # THE OUTPUT LAYOUT IS THE CALLER'S TO CHOOSE.  The gather itself is row-major -- one row of
+        # the table per id -- and `layout=TILE` makes the op tilize the result on the way out.  That
+        # is what the decode step wants (its consumer is a norm), but the prefill path immediately
+        # slices the result on the ROW dim and concatenates the audio embeddings into the gap, and
+        # neither the slice bounds nor the concat seam are tile-aligned -- so on a tiled tensor ttnn
+        # has to untilize every piece again to do the join.  Letting that caller ask for ROW_MAJOR
+        # means the [B, C, hidden] embedding is tilized ONCE, after the join, instead of tilized
+        # here and untilized piecewise straight afterwards.
+        return ttnn.embedding(x, self.weight, layout=layout)
 
 
 def build(device, torch_module):

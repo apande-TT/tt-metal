@@ -178,6 +178,16 @@ def fill_kv_prefill(kv, k, v):
 # The audio tower's stream is [1, 1504, 1280] bf8_b = 1.9 MB against 110 x 1.5 MB of L1, so this cap
 # exists only so a much longer sequence degrades to DRAM rather than crowding out SDPA's own circular
 # buffers, which reserve ~1.03 MB of each core while attention runs.
+# THE CAP EXCLUDES PREFILL ON PURPOSE, AND THAT IS MEASURED.  The audio tower's stream is
+# [1, 1504, 1280] bf8_b = 1.9 MB; prefill's is [8, 448, 3072] bf8_b = 11.7 MB, which is only ~106 kB
+# per core and looked like it should fit alongside the ~1.03 MB prefill SDPA's flash circular buffers
+# reserve.  It does not: raising this to 16 MB so the prefill norms and residual adds became
+# L1-resident CRASHED the pipeline -- "Statically allocated dataflow buffers in program 168 clash
+# with L1 buffers on core range [0-0 - 10-9]. L1 buffer allocated at 807296 and static dataflow
+# buffer region ends at 896512" (measured 2026-09-05).  The clash is with the STATIC dataflow buffer
+# region, which is reserved per program regardless of what else is live, so per-core arithmetic
+# against the 1.5 MB budget does not predict it.  4 MB keeps the audio tower in L1 and lets prefill
+# fall back to DRAM, which is exactly what the size gate below is for.
 _STREAM_L1_MAX_BYTES = 4 * 1024 * 1024
 
 # THE DECODE ATTENTION KEEPS HiFi4 EVEN THOUGH ITS CACHE IS BLOCK-FLOAT, and that is measured, not
@@ -199,6 +209,18 @@ _DTYPE_BYTES = {ttnn.bfloat4_b: 0.5625, ttnn.bfloat8_b: 1.0625, ttnn.bfloat16: 2
 
 # Bytes the FFN intermediate may have before L1 residency stops paying -- see ffn_config.
 _FFN_L1_MAX_BYTES = 12 * 1024 * 1024
+
+
+# DECODE SDPA IS LEFT WITH NO PROGRAM CONFIG, AND THAT IS MEASURED.  It carries 27.1 ms of the
+# capture at ~35 us/call and was being called with no program_config at all -- the same defaulting
+# that cost the audio tower dearly, where sdpa_program_factory falls back to one-tile chunks.  So a
+# full-grid SDPAProgramConfig looked free.  It is not worth taking: q is a single padded tile row at
+# decode so q_chunk is pinned at TILE, max_cores_per_head_batch is not binding (8 users x 8 kv heads
+# = 64 head-batch pairs against 110 cores, ~1.7 cores per pair, far under the default 16), and the
+# only real axis left -- the k chunk -- measured decode 10.986 -> 10.985 ms/token at 128, i.e.
+# nothing, while 512 BROKE THE TRACE outright (the decode stage stopped reporting; only encode and
+# prefill came back), because a 512-wide k block's flash circular buffers do not fit alongside the
+# traced program's own L1.  Neutral upside, real fragility: do not pin this op's config.
 
 
 def stream_config(x, dtype=None):
@@ -571,6 +593,14 @@ def linear(x, weight, mirror, compute_kernel_config=None, core_grid=None, activa
     rows = 1
     for d in tuple(x.shape)[:-1]:
         rows *= d
+    # AND ASK FOR THE BLOCKS HERE TOO.  This is the FFN's call site, and it was the one place that
+    # still only named a core grid: `mm` grew the 2-D block config for the attention projections and
+    # swiglu never got it, so gate/up/down -- the majority of the LM's prefill flops -- ran on the
+    # 1-D mcast path with a one-tile K block while qkv/o_proj next door did not.  Same helper, same
+    # guards; a shape it cannot serve falls through to the grid request below unchanged.
+    blocked = _block_linear(x, weight, compute_kernel_config, activation=activation, rows=rows)
+    if blocked is not None:
+        return blocked
     return ttnn.linear(
         x,
         weight,
@@ -669,6 +699,19 @@ _CB_BUDGET_BYTES = 700 * 1024
 # stops the search from picking a one-tile K block, which is the shape of the config ttnn was
 # choosing on its own.
 _KBLOCK_OVERHEAD = 60.0
+# Which output dim the 2-D factory multicasts along.  Its own axis, invisible to the cost model
+# below (which is symmetric in the two output dims), so only a measurement can choose it.
+#
+# FALSE IS THE MEASURED ANSWER ON THIS BOARD, AND IT IS NOT CLOSE.  Measured 2026-09-05 with the
+# search ranges swapped to match (see block_config): prefill 136.77 -> 158.91 ms (+16.2%) and
+# encode 16.94 -> 20.40 ms (+20.4%).  The reason is the grid, not the multicast: transposing makes
+# the M blocks fit the X extent and the N blocks the Y extent, and on an 11 x 10 grid every one of
+# these shapes then lands on 10 x 10 = 100 cores instead of 110, because M=112 tiles cannot use the
+# 11th column without leaving it short.  Losing 9% of the grid is bad enough on its own, but the
+# narrower N extent also forces a wider per_core_N, which eats the circular-buffer budget and drops
+# gate/up's K block from 8 tiles to 3.  Keep the flag -- the axis is real and a squarer grid could
+# flip it -- but leave it False here.
+_TRANSPOSE_MCAST = False
 _BLOCK_CFG_CACHE = {}
 
 
@@ -752,19 +795,38 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
     Candidates that would leave a whole row or column of the grid with no work are rejected rather
     than scored, so the count is real occupancy and not grid size.
 
+    THE MULTICAST ORIENTATION IS A SEPARATE AXIS, AND THE COST MODEL CANNOT SEE IT.  The scoring
+    below is symmetric in the two output dims, so it has no opinion on which of them the factory
+    multicasts along; only a measurement can choose.  With transpose_mcast the roles swap, so the M
+    blocks have to fit the grid's X extent and the N blocks its Y extent -- which is why the search
+    ranges swap with the flag rather than the flag simply being passed through.  On a non-square
+    grid that is not cosmetic: at 11 x 10, M=112 tiles over 11 gives per_core_M 11 and N=256 over 10
+    gives per_core_N 26, against 12 and 24 the other way round.
+
     Returns None when nothing fits, so the caller keeps its own path.
     """
-    key = (int(m_tiles), int(k_tiles), int(n_tiles), int(tile_bytes), int(interm_bytes), str(activation))
+    key = (
+        int(m_tiles),
+        int(k_tiles),
+        int(n_tiles),
+        int(tile_bytes),
+        int(interm_bytes),
+        str(activation),
+        bool(_TRANSPOSE_MCAST),
+    )
     if key in _BLOCK_CFG_CACHE:
         return _BLOCK_CFG_CACHE[key]
     g = device.compute_with_storage_grid_size()
+    # With transpose_mcast the factory counts M blocks along X and N blocks along Y, so the extent
+    # each dim must fit inside swaps.
+    m_extent, n_extent = (int(g.x), int(g.y)) if _TRANSPOSE_MCAST else (int(g.y), int(g.x))
     k_divs = _divisors(k_tiles)
     best = None
-    for gy in range(1, int(g.y) + 1):
+    for gy in range(1, m_extent + 1):
         per_core_m = -(-m_tiles // gy)
         if gy > 1 and per_core_m * (gy - 1) >= m_tiles:
             continue
-        for gx in range(1, int(g.x) + 1):
+        for gx in range(1, n_extent + 1):
             per_core_n = -(-n_tiles // gx)
             if gx > 1 and per_core_n * (gx - 1) >= n_tiles:
                 continue
@@ -792,7 +854,9 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
     if best is not None:
         _, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w = best
         cfg = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-            compute_with_storage_grid_size=(gx, gy),
+            # The grid is named in (x, y) order, so when the orientation is transposed the M blocks
+            # -- searched against the X extent above -- are what x has to carry.
+            compute_with_storage_grid_size=(gy, gx) if _TRANSPOSE_MCAST else (gx, gy),
             in0_block_w=in0_block_w,
             out_subblock_h=h,
             out_subblock_w=w,
@@ -800,7 +864,7 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
             out_block_w=block_w,
             per_core_M=per_core_m,
             per_core_N=per_core_n,
-            transpose_mcast=False,
+            transpose_mcast=_TRANSPOSE_MCAST,
             fused_activation=_fused_activation(activation),
         )
     _BLOCK_CFG_CACHE[key] = cfg
@@ -810,6 +874,73 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
 # Shapes whose 2-D config ttnn refused at runtime; they fall back for the rest of the run so a
 # rejected shape costs one exception, not one per call.
 _BLOCK_CFG_REFUSED = set()
+
+
+def _block_linear(x, weight, compute_kernel_config, bias=None, activation=None, memory_config=None, rows=None):
+    """ttnn.linear under a 2-D mcast block config, or None when this shape cannot take one.
+
+    Shared by `mm` (the attention projections) and `linear` (the FFN), because the reason for
+    wanting it is the same at both call sites and only one of them used to have it: naming a core
+    grid routes to create_matmul_program_config, which splits ONE output dim across the grid, hands
+    every core the whole other one, and sets in0_block_w = div_up(k_tiles, cores) -- one or two
+    tiles.  See block_config for the measurements.
+
+    The guards are the ones `mm` already established: below _GRID_REQUEST_MIN_ROWS this is the
+    decode shape and spreading a single tile row costs more launch than it recovers, and a weight
+    that is not tile-aligned has no exact block decomposition.  A shape ttnn refuses is remembered
+    so the exception is paid once.
+
+    A LEADING BATCH IS FOLDED, NOT REFUSED.  Handing the 2-D factory a stacked activation makes it
+    run the whole grid once PER BATCH ENTRY, so the blocks end up sized against a height the kernel
+    never sees in one pass -- measured on this model's 8-stream prefill at 0.8% WORSE, which is why
+    `mm` used to skip batched shapes outright.  But skipping is not the only answer: when the M dim
+    is tile-aligned, [B, M, K] and [1, B*M, K] have the IDENTICAL physical tile order (batch b's
+    tile row i sits at (b*M/32 + i) whichever way it is labelled), so the fold is a metadata view
+    and the matmul becomes ONE pass over a B-times-taller activation against ONE read of the
+    weight.  The attention projections already did this inside their own stubs, which is why they
+    reached the block path and the FFN -- the majority of the LM's prefill flops -- never did.
+    """
+    if rows is None:
+        rows = 1
+        for d in tuple(x.shape)[:-1]:
+            rows *= int(d)
+    if rows < _GRID_REQUEST_MIN_ROWS:
+        return None
+    wshape = tuple(weight.shape)
+    if int(wshape[-2]) % TILE or int(wshape[-1]) % TILE:
+        return None
+    dims = [int(d) for d in x.shape]
+    batch = 1
+    for d in dims[:-2]:
+        batch *= d
+    folded = x
+    if batch != 1:
+        if len(dims) < 3 or dims[-2] % TILE:
+            return None
+        folded = ttnn.reshape(x, (1, rows, dims[-1]))
+    m_tiles = math.ceil(rows / TILE)
+    k_tiles, n_tiles = int(wshape[-2]) // TILE, int(wshape[-1]) // TILE
+    key = (m_tiles, k_tiles, n_tiles, str(activation))
+    if key in _BLOCK_CFG_REFUSED:
+        return None
+    cfg = block_config(x.device(), m_tiles, k_tiles, n_tiles, activation=activation)
+    if cfg is None:
+        return None
+    try:
+        out = ttnn.linear(
+            folded,
+            weight,
+            bias=bias,
+            compute_kernel_config=compute_kernel_config,
+            program_config=cfg,
+            dtype=_ACT_DTYPE,
+            memory_config=memory_config,
+        )
+    except (RuntimeError, TypeError, ValueError):
+        _BLOCK_CFG_REFUSED.add(key)
+        return None
+    # Hand the caller back the rank it gave us; same view argument as the fold above.
+    return out if batch == 1 else ttnn.reshape(out, tuple(dims[:-1]) + (int(wshape[-1]),))
 
 
 def mm(
@@ -875,36 +1006,13 @@ def mm(
     # ASK FOR THE BLOCKS, NOT JUST THE GRID -- see block_config for why naming the grid alone lands
     # these on the 1-D mcast path with a one-tile K block and 1x1 DEST subblocks.  Best-effort: a
     # shape ttnn refuses (an L1 circular-buffer overflow, a batch it will not broadcast) falls back
-    # to the grid request below and is remembered so the exception is paid once, not per call.
-    wshape = tuple(weight.shape)
-    k_tiles, n_tiles = int(wshape[-2]) // TILE, int(wshape[-1]) // TILE
-    m_tiles = math.ceil(m / TILE)
-    batch = 1
-    for d in tuple(x.shape)[:-2]:
-        batch *= int(d)
-    key = (m_tiles, k_tiles, n_tiles, batch, str(activation))
-    # M IS THE PADDED HEIGHT, NOT THE LOGICAL ONE.  The audio tower's activation is 1500 rows, which
-    # the matmul pads to 47 tiles; requiring m % TILE == 0 here silently excluded every encoder
-    # projection -- the exact shapes this config exists for.
-    # ONE ACTIVATION, NOT A STACK OF THEM.  With a leading batch the 2-D factory runs the whole
-    # grid once PER BATCH ENTRY, so the block sizes below are chosen against a height the kernel
-    # never sees in one pass; measured on this model's 8-stream prefill it cost 0.8% where the
-    # single-stream audio tower gained 7%.  Batched shapes keep the grid request underneath.
-    if batch == 1 and key not in _BLOCK_CFG_REFUSED and int(wshape[-2]) % TILE == 0 and int(wshape[-1]) % TILE == 0:
-        cfg = block_config(device, m_tiles, k_tiles, n_tiles, activation=activation)
-        if cfg is not None:
-            try:
-                return ttnn.linear(
-                    x,
-                    weight,
-                    bias=bias,
-                    compute_kernel_config=compute_kernel_config,
-                    program_config=cfg,
-                    dtype=_ACT_DTYPE,
-                    memory_config=memory_config,
-                )
-            except (RuntimeError, TypeError, ValueError):
-                _BLOCK_CFG_REFUSED.add(key)
+    # to the grid request below.  M IS THE PADDED HEIGHT, NOT THE LOGICAL ONE -- the audio tower's
+    # activation is 1500 rows, which the matmul pads to 47 tiles.
+    blocked = _block_linear(
+        x, weight, compute_kernel_config, bias=bias, activation=activation, memory_config=memory_config, rows=m
+    )
+    if blocked is not None:
+        return blocked
     return ttnn.linear(
         x,
         weight,
@@ -1280,6 +1388,13 @@ def residual_add(device, residual, delta):
         # bf8_b IS THE FLOOR (GUIDELINES/01 section 13 names normalization activations as a tensor
         # that must never go below it), and the increments are already quantised at exactly this
         # granularity, so this rounds the running sum rather than introducing a new format.
+        #
+        # DO NOT PASS memory_config=stream_config(...) HERE.  It looks like the same placement lever
+        # that moved the audio tower's norms and adds, but at the prefill height stream_config's size
+        # gate returns DRAM, and NAMING DRAM is not the same as leaving the output alone: ttnn.add
+        # otherwise inherits its input's config, so the explicit argument forces a round trip the
+        # default never made.  Measured 2026-09-05 with the same change on rms_norm below: prefill
+        # 142.87 -> 144.48 ms (+1.13%).  Leave the output placement implicit.
         return ttnn.add(residual, delta, dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None)
     try:
         return ttnn.add(residual, delta, memory_config=plan[0])
@@ -1304,6 +1419,8 @@ def rms_norm(device, x, weight, epsilon, compute_kernel_config, keep_sharded=Fal
     h = dims[-1]
     plan = _norm_plan(device, h) if m <= TILE else False
     if not plan:
+        # Same non-lever as the add above: naming stream_config(x) here resolves to DRAM at the
+        # prefill height and costs a round trip the implicit output placement never made.
         return ttnn.rms_norm(x, weight=weight, epsilon=epsilon, compute_kernel_config=compute_kernel_config)
     shard_cfg, program_config = plan
     # BORROW AN INPUT ALREADY IN THIS LAYOUT.  The residual add that produces it can be asked to

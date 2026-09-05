@@ -203,6 +203,15 @@ class TtLMHead:
         flat = ttnn.to_memory_config(ttnn.reshape(x, (1, 1, m, self.k)), act_mem_cfg)
         # CONCAT THE SHARDS DIRECTLY.  Re-interleaving each split before the concat is a second full
         # pass over the logits for no reason -- concat reads the L1 shards and writes DRAM in one op.
+        # NARROW THE LOGITS THEMSELVES, NOT JUST THE WEIGHT.  The chunks are 32 x 32768 each, so at
+        # bf16 the four of them are 8.4 MB that get written by the matmul, read and rewritten by the
+        # concat, and read again by the untilize -- three full passes over a tensor whose only
+        # consumer is an argmax.  bf8_b halves every one of those, and costs the scan nothing: the
+        # untilize converts a BFLOAT8_B input back to BFLOAT16 on output (it is documented to), so
+        # the sampler still sees exactly the bf16 row-major block its resident buffer expects.
+        # This is the one tensor in the model where block-float rounding is checked directly by the
+        # gate rather than indirectly -- the sampled token is an argmax over these very values -- so
+        # it lives or dies on the e2e PCC number.
         parts = [
             ttnn.linear(
                 flat,
@@ -210,6 +219,7 @@ class TtLMHead:
                 program_config=program_config,
                 memory_config=out_mem_cfg,
                 compute_kernel_config=_LOFI_CFG,
+                dtype=ttnn.bfloat8_b,
             )
             for w in self.weights
         ]
@@ -221,7 +231,43 @@ class TtLMHead:
         # allocated around these buffers.  Measured 2026-09-05; do not retry without a trace-region
         # budget to match.
         out = parts[0] if len(parts) == 1 else ttnn.concat(parts, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        return ttnn.reshape(out, tuple(dims[:-1]) + (self.n,))
+        if out is not parts[0]:
+            # RELEASE THE CHUNKS ONCE THEY ARE JOINED.  Each is an L1 width shard (~1.1 MB over the
+            # compute grid) and Python keeps the list alive to the end of this frame, which used not
+            # to matter because the frame ended one reshape later; the untilize below is another op
+            # inside the same frame and the sampler's programs have to place circular buffers around
+            # whatever is still allocated.
+            for p in parts:
+                ttnn.deallocate(p)
+        # UNTILIZE BEFORE UNFOLDING THE STREAMS, NOT AFTER.  `out` is [1, 1, B, V] in TILE layout:
+        # ONE tile row carrying B=8 real rows in a 32-row pad.  Reshaping THAT to [B, 1, V] while it
+        # is still tiled does not rearrange 8 rows, it builds EIGHT tile rows -- the last two dims of
+        # each stream become (1, V), which tile layout pads straight back up to (32, V).  At
+        # V = 131072 that turns an 8.4 MB tensor into a 67 MB one, and the sampler's untilize then
+        # has to read all 67 MB to recover the same 2 MB of logits.
+        #
+        # Unpadding first collapses both: one untilize reads the single 8.4 MB tile row and writes
+        # the 2 MB of real values, and the [1, 1, B, V] -> [B, 1, V] reshape that follows is a
+        # metadata view, because a ROW_MAJOR tensor pages by its last dim and both shapes are the
+        # same B pages of V.
+        #
+        # IT STAYS IN DRAM, and that is not the timid choice -- it is the one that costs nothing.
+        # The sampler's scan needs these values in L1, but it already copies them into a RESIDENT L1
+        # buffer of its own (cpp_argmax builds its program descriptors against fixed addresses, so it
+        # cannot read a freshly-allocated tensor), and that copy takes a DRAM source just as happily
+        # as an L1 one.  Asking for L1 here instead only adds a second 2 MB L1 tenant next to that
+        # buffer, and measured 2026-09-05 it made the sampler's copy program unplaceable outright:
+        # "statically allocated circular buffers in program 200 clash with L1 buffers on core range
+        # [0-0 - 0-7]".  A ROW_MAJOR [B, 1, V] tensor is B pages of 256 kB, so both tenants land on
+        # the same eight banks whatever the grid size suggests.
+        rows = 1
+        for d in dims[:-1]:
+            rows *= d
+        try:
+            rm = ttnn.untilize_with_unpadding(out, [0, 0, rows - 1, self.n - 1])
+        except (RuntimeError, TypeError, ValueError):
+            return ttnn.reshape(out, tuple(dims[:-1]) + (self.n,))
+        return ttnn.reshape(rm, tuple(dims[:-1]) + (self.n,))
 
 
 def build(device, torch_module=None):

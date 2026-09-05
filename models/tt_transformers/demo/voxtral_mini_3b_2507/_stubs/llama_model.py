@@ -56,6 +56,16 @@ _UP_DTYPE = ttnn.bfloat4_b
 # all-three-bf4_b result (0.8724) was not dominated by up.  Do not retry gate or down at bf4_b
 # without a PCC budget won back somewhere else first.
 
+# THE FUSED QKV PROJECTION STAYS bf8_b, AND THAT IS MEASURED.  q/k/v together are 3072x6144 per
+# layer, 604 M parameters across 32 layers -- 17% of everything a decode token reads -- so bfloat4_b
+# here looked worth ~300 MB/token, the largest byte lever left after `up`.  It does not survive:
+# e2e PCC 0.9585 -> 0.9333 against a 0.95 gate (measured 2026-09-05, all three attention bodies
+# narrowed together).  That is a bigger drop than gate's (0.9598 -> 0.9382) and the reason is
+# structural rather than a matter of degree: k is written into the RESIDENT cache, so its
+# quantisation error does not stay inside one token -- it is what every later token attends to, and
+# it compounds over the whole 32-token decode.  Do not retry without a PCC budget won elsewhere.
+_QKV_DTYPE = ttnn.bfloat8_b
+
 _HIFI4_CFG = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=False,
@@ -548,7 +558,7 @@ class LlamaModel:
                 # DRAM-bank-sharded path at all: at 3072x1024 their 32 output tiles divide no
                 # valid bank-worker count, so each fell back to a plain ttnn.linear measured at
                 # 125 GB/s.  Fused, the width is 6144 = 192 tiles, which divides exactly.
-                "qkv_w": _to_device(_fuse_layer_qkv(layer.self_attn), device, ttnn.bfloat8_b),
+                "qkv_w": _to_device(_fuse_layer_qkv(layer.self_attn), device, _QKV_DTYPE),
                 "o_w": _to_device(layer.self_attn.o_proj.weight.T.contiguous().float(), device, ttnn.bfloat8_b),
                 "post_ln_w": _to_device(
                     layer.post_attention_layernorm.weight.unsqueeze(0).unsqueeze(0).float(), device
@@ -621,8 +631,9 @@ class LlamaModel:
             # ---- legacy / token-id path (numerically unchanged) ----
             B = x.shape[0]
             S = x.shape[-1]
-            h = ttnn.embedding(x, self.embed_weight)
-            h = ttnn.to_layout(h, ttnn.TILE_LAYOUT)
+            # One op, not two: ttnn.embedding tilizes inside the gather (same reason as the rope
+            # tables in llama_rotary_embedding._gather).
+            h = ttnn.embedding(x, self.embed_weight, layout=ttnn.TILE_LAYOUT)
             orig_shape = None
         else:
             h = inputs_embeds

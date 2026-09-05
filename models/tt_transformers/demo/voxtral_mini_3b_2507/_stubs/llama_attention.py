@@ -23,6 +23,16 @@ import torch
 
 import ttnn
 
+# THE FUSED QKV PROJECTION STAYS bf8_b, AND THAT IS MEASURED.  q/k/v together are 3072x6144 per
+# layer, 604 M parameters across 32 layers -- 17% of everything a decode token reads -- so bfloat4_b
+# here looked worth ~300 MB/token, the largest byte lever left after `up`.  It does not survive:
+# e2e PCC 0.9585 -> 0.9333 against a 0.95 gate (measured 2026-09-05, all three attention bodies
+# narrowed together).  That is a bigger drop than gate's (0.9598 -> 0.9382) and the reason is
+# structural rather than a matter of degree: k is written into the RESIDENT cache, so its
+# quantisation error does not stay inside one token -- it is what every later token attends to, and
+# it compounds over the whole 32-token decode.  Do not retry without a PCC budget won elsewhere.
+_QKV_DTYPE = ttnn.bfloat8_b
+
 _HIFI4_CFG = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=False,
@@ -452,7 +462,7 @@ class TtLlamaAttention:
         # one AND, decisively, it is what lets k/v reach the DRAM-bank-sharded path at all: at
         # 3072x1024 their 32 output tiles divide no valid bank-worker count, so each fell back to
         # a plain ttnn.linear measured at 125 GB/s.  Fused, 6144 = 192 tiles divides exactly.
-        self.qkv_weight = _to_device(_fuse_layer_qkv(torch_module), device, ttnn.bfloat8_b)
+        self.qkv_weight = _to_device(_fuse_layer_qkv(torch_module), device, _QKV_DTYPE)
         self.o_weight = _to_device(torch_module.o_proj.weight.T.contiguous().float(), device, ttnn.bfloat8_b)
         # Decode-only DRAM-bank-sharded mirrors -- see _dram_sharded.py.
         self.qkv_ds = _DS.attach(device, self.qkv_weight)

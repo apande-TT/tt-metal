@@ -115,8 +115,17 @@ class TtLlamaRotaryEmbedding:
     # -- helpers ------------------------------------------------------------
 
     def _gather(self, table, ids):
-        out = ttnn.embedding(ids, table)
-        return ttnn.to_layout(out, ttnn.TILE_LAYOUT)
+        # ASK THE GATHER FOR THE LAYOUT, DO NOT CONVERT AFTERWARDS.  ttnn.embedding takes the output
+        # layout as an argument and tilizes inside the op; a following `to_layout` is a SECOND
+        # launch that reads and rewrites the whole gathered block.  It is small -- [B, 1, head_dim]
+        # -- which is exactly why it hurt: the profile tags it grid=tiny and dispatch-bound, so it
+        # is very nearly pure launch, and the decode step runs one per table per token (cos then
+        # sin) for the whole generation.  Trace removes the HOST side of a launch, not the device
+        # side, so these survived trace capture.  Same values, same layout, two fewer ops a token.
+        try:
+            return ttnn.embedding(ids, table, layout=ttnn.TILE_LAYOUT)
+        except (RuntimeError, TypeError, ValueError):
+            return ttnn.to_layout(ttnn.embedding(ids, table), ttnn.TILE_LAYOUT)
 
     def _seq_len(self, x, position_ids, seq_len):
         # `x.shape[1]` first: that is what the graduated stub used.  Shape reads

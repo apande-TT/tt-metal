@@ -122,6 +122,23 @@ _CONV_CFG = ttnn.WormholeComputeKernelConfig(
     packer_l1_acc=False,
 )
 
+# THE BIAS AND THE GELU BELONG TO THE CONVOLUTION, NOT AFTER IT.  Both front-end convs were followed
+# by a standalone `ttnn.add(x, bias)` and a standalone `ttnn.gelu(x)` over the conv's own output --
+# [1, 1, 3000, 1280] bf16 is 7.7 MB, so that pair re-reads and re-writes ~31 MB per conv purely to
+# apply a channel vector and a pointwise function the convolution kernel can do inside its own pack
+# loop.  conv1d takes the bias as an operand (and hands back the PREPARED copy alongside the
+# prepared weights, so it is prepared once like they are) and the activation through Conv2dConfig.
+#
+# THE GELU IS NOT FUSED, AND THAT IS MEASURED -- ONLY THE BIAS IS.  Conv2dConfig takes an
+# activation, so folding the gelu in as well looked like the same lever; it is not.  Even in the
+# APPROXIMATE (tanh) form -- the one that is supposed to make fusing worth doing -- it cost
+# encode 16.94 -> 17.25 ms (+1.8%), measured 2026-09-05.  Same shape of result as this model's
+# fused-matmul gelu: the activation runs inside the convolution's pack loop, on the cores the conv
+# happens to hold, where a standalone unary is free to spread over the whole grid.  The bias is
+# different in kind and does pay -- it is a channel vector the kernel applies as it packs, not a
+# transcendental -- so it stays fused and the gelu stays a separate op.
+_CONV2D_CFG = ttnn.Conv2dConfig()
+
 
 def _to_device(t, device, dtype=ttnn.bfloat16):
     # BLOCK-FLOAT TARGETS SKIP THE HOST NARROWING.  bf8_b/bf4_b derive their mantissa from a
@@ -216,8 +233,23 @@ class TtEncoderLayer:
             memory_config=_DS.stream_config(x),
         )
 
-        qkv = _DS.mm(self.device, x, self.qkv_weight, _PROJ_CFG, bias=self.qkv_bias)
+        # KEEP THE CHAIN IN L1 -- the fused projection's only consumer is the head split, one op
+        # later, and that op already asks for an L1 output of its own.  ffn_config rather than
+        # stream_config because this tensor is 3x the stream width (q + k + v).
+        qkv = _DS.mm(
+            self.device,
+            x,
+            self.qkv_weight,
+            _PROJ_CFG,
+            bias=self.qkv_bias,
+            memory_config=_DS.ffn_config(S, int(self.qkv_weight.shape[-1]), _ACT_DTYPE),
+        )
         q, k, v = _DS.qkv_heads(qkv, self.num_heads)
+        # RELEASE THE FUSED PROJECTION AS SOON AS THE SPLIT HAS IT.  Now that qkv lands in L1 it is
+        # 6.1 MB, and Python would hold that binding through the whole attention AND the FFN -- L1
+        # the SDPA and matmul circular buffers underneath it have to work around.  The split has
+        # already produced its own q/k/v, so nothing reads this again.
+        ttnn.deallocate(qkv)
 
         attn_out = ttnn.transformer.scaled_dot_product_attention(
             q,
@@ -229,7 +261,15 @@ class TtEncoderLayer:
             compute_kernel_config=_SDPA_CFG,
         )
         attn_out = ttnn.transformer.concatenate_heads(attn_out)
-        attn_out = _DS.mm(self.device, attn_out, self.out_weight, _PROJ_CFG, bias=self.out_bias)
+        # Same: the attention output goes straight into the residual add, which is already L1.
+        attn_out = _DS.mm(
+            self.device,
+            attn_out,
+            self.out_weight,
+            _PROJ_CFG,
+            bias=self.out_bias,
+            memory_config=_DS.ffn_config(S, int(self.out_weight.shape[-1]), _ACT_DTYPE),
+        )
 
         x = ttnn.add(residual, attn_out, dtype=_ACT_DTYPE, memory_config=_DS.stream_config(residual, _ACT_DTYPE))
 
@@ -298,19 +338,24 @@ class TtVoxtralEncoder:
         self.ln_bias = _to_device(torch_module.layer_norm.bias.unsqueeze(0).unsqueeze(0).float(), device)
         self.ln_eps = torch_module.layer_norm.eps
 
-    def _conv1d_cached(self, x, idx, weight, in_ch, out_ch, ks, stride, pad, length):
-        """conv1d with the PREPROCESSED weights cached on device.
+    def _conv1d_cached(self, x, idx, weight, bias, in_ch, out_ch, ks, stride, pad, length):
+        """conv1d with the PREPROCESSED weights AND BIAS cached on device, gelu fused.
 
         The graduated body kept the conv weights on host and let every call
         upload/prepare them.  That host transfer is illegal inside
         ttnn.begin_trace_capture (TT_FATAL !trace_id_.has_value()), so the encode
         stage could not be traced.  Preparing once and reusing the device-resident
         weights is also strictly faster; numerics are unchanged.
+
+        The bias rides the same cache: conv1d returns the prepared weight AND the prepared bias
+        from the first call, so handing it the bias costs one preparation, not one per call, and
+        removes the full-width `add` that used to follow.  See _CONV2D_CFG for the fused gelu.
         """
         prepared = self._prepared_w.get(idx)
         res = ttnn.conv1d(
             input_tensor=x,
-            weight_tensor=prepared if prepared is not None else weight,
+            weight_tensor=prepared[0] if prepared is not None else weight,
+            bias_tensor=prepared[1] if prepared is not None else bias,
             device=self.device,
             in_channels=in_ch,
             out_channels=out_ch,
@@ -321,13 +366,14 @@ class TtVoxtralEncoder:
             padding=pad,
             dilation=1,
             groups=1,
+            conv_config=_CONV2D_CFG,
             compute_config=_CONV_CFG,
             return_weights_and_bias=prepared is None,
         )
         if prepared is None:
             out = res[0]
             wb = res[-1]
-            self._prepared_w[idx] = wb[0] if isinstance(wb, (tuple, list)) else wb
+            self._prepared_w[idx] = tuple(wb) if isinstance(wb, (tuple, list)) else (wb, None)
         else:
             out = res[0] if isinstance(res, tuple) else res
         return out
@@ -355,6 +401,7 @@ class TtVoxtralEncoder:
             x,
             1,
             self.conv1_weight,
+            self.conv1_bias_tt,
             self.conv1_in_ch,
             self.conv1_out_ch,
             self.conv1_ks,
@@ -362,8 +409,7 @@ class TtVoxtralEncoder:
             self.conv1_padding,
             3000,
         )
-        if self.conv1_bias_tt is not None:
-            x = ttnn.add(x, self.conv1_bias_tt)
+        # the bias is fused into the conv above; the gelu is not (see _CONV2D_CFG).
         x = ttnn.gelu(x)
 
         # conv2: stride=2, so 3000 -> 1500
@@ -372,6 +418,7 @@ class TtVoxtralEncoder:
             x,
             2,
             self.conv2_weight,
+            self.conv2_bias_tt,
             self.conv2_in_ch,
             self.conv2_out_ch,
             self.conv2_ks,
@@ -379,8 +426,7 @@ class TtVoxtralEncoder:
             self.conv2_padding,
             3000,
         )
-        if self.conv2_bias_tt is not None:
-            x = ttnn.add(x, self.conv2_bias_tt)
+        # the bias is fused into the conv above; the gelu is not (see _CONV2D_CFG).
         x = ttnn.gelu(x)
 
         # Reshape to (1, 1500, 1280)
