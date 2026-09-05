@@ -174,6 +174,92 @@ def fill_kv_prefill(kv, k, v):
         ttnn.fill_cache(kv.v, vb, b)
 
 
+# Bytes a full-width activation may have before interleaved L1 stops being the obviously right home.
+# The audio tower's stream is [1, 1504, 1280] bf8_b = 1.9 MB against 110 x 1.5 MB of L1, so this cap
+# exists only so a much longer sequence degrades to DRAM rather than crowding out SDPA's own circular
+# buffers, which reserve ~1.03 MB of each core while attention runs.
+_STREAM_L1_MAX_BYTES = 4 * 1024 * 1024
+
+# THE DECODE ATTENTION KEEPS HiFi4 EVEN THOUGH ITS CACHE IS BLOCK-FLOAT, and that is measured, not
+# inherited.  The KV cache is bf8_b (pipeline.KV_DTYPE) and q arrives narrow, so by the same argument
+# this file makes for the bf8_b projections -- "8-bit operands through a HiFi4 kernel make the math
+# engine take four passes over one pass worth of precision" -- HiFi2 looked like free math phases.
+# It is NOT: measured 2026-09-05 across all three decode bodies (llama_attention, llama_decoder_layer,
+# llama_model), HiFi2 + fp32_dest_acc_en cost decode 10.983 -> 11.048 ms/token (+0.6%) while e2e PCC
+# barely moved (0.9598 -> 0.9601).  sdpa_decode is dispatch- and bandwidth-bound at this shape (one
+# tile row of q against a few hundred cached positions), so cheapening the math phases buys nothing
+# and the narrower fidelity path costs something.  Do not spend another round on it.
+
+# Bytes PER ELEMENT, and the block-float entries are NOT rounded up to the next whole byte.  A
+# bf8_b tile is 1024 mantissa bytes plus a 64-byte shared-exponent header, so 1.0625 B/element,
+# and bf4_b is 0.5625.  Calling them 2 and 1 overstates the audio tower's FFN intermediate as
+# 15.4 MB when it is 8.2 MB, which silently pushed it past ffn_config's cap and made the L1
+# hand-off a no-op that still measured (profile identical to the DRAM path).
+_DTYPE_BYTES = {ttnn.bfloat4_b: 0.5625, ttnn.bfloat8_b: 1.0625, ttnn.bfloat16: 2, ttnn.float32: 4}
+
+# Bytes the FFN intermediate may have before L1 residency stops paying -- see ffn_config.
+_FFN_L1_MAX_BYTES = 12 * 1024 * 1024
+
+
+def stream_config(x, dtype=None):
+    """Interleaved L1 for the layer's full-width activation while it is small enough to live there.
+
+    THE OPS BETWEEN THE MATMULS ARE THE ONES PAYING FOR DRAM.  A layer norm and a residual add on
+    the audio tower's [1, 1504, 1280] stream each read and write the whole tensor and nothing else,
+    so their cost IS the placement: measured DRAM-interleaved they run at 119 GB/s (norm, 32 us/call)
+    and 145 GB/s (add, 40 us/call) against 3.8 MB of traffic, an order under what the matmuls beside
+    them reach.  There are four such passes per layer.  Interleaved L1 puts those pages in Tensix
+    banks the workers reach over the NoC instead of through the DRAM controller; it is pure
+    placement, so the values are bit-identical.
+
+    Interleaved and NOT sharded on purpose: 1504 rows is 47 tile rows and 47 is prime, so no
+    rectangle of this grid divides it, and naming a shard spec that one consumer wants is what
+    forces an extra reshard at the next one rather than removing one.
+
+    Size-gated, so a shape this was not sized for falls back to DRAM instead of failing.
+    """
+    n = 1
+    for d in tuple(x.shape):
+        n *= int(d)
+    width = _DTYPE_BYTES.get(dtype if dtype is not None else x.dtype, 2)
+    return ttnn.L1_MEMORY_CONFIG if n * width <= _STREAM_L1_MAX_BYTES else ttnn.DRAM_MEMORY_CONFIG
+
+
+# FOLDING THE PREFILL BATCH INTO THE TILE-HEIGHT IS A WASH -- MEASURED TWICE, DO NOT RETRY.
+# The projections are position-wise, so [B, S, K] -> [1, B*S, K] is a metadata view (tile-aligned
+# height) and it looked like two levers at once: both matmul factories iterate batch on the OUTSIDE,
+# so a 25 MB weight appeared to be re-streamed once per stream, and `mm` gates its 2-D block config
+# on batch == 1 so a batched shape can never reach it.  Both halves are false here.
+#   * bandwidth: folding alone moved 512x3072x8192 to 4096x3072x8192 at an IDENTICAL 15.45 ms, so
+#     ttnn does NOT re-read the weight per batch entry at prefill height.  (The 932 -> 118 us the
+#     decode step gets from the same reshape comes from 1-row-per-batch tile padding, not from reads.)
+#   * blocks: with the fold in place block_config reached qkv and o_proj and moved them 4.975 ->
+#     4.977 and 3.006 -> 2.804 ms -- 0.2 ms across the whole capture, against picking 99- and 88-core
+#     plans where the plain grid request had 110.
+# What this leaves standing is the SHAPE of the prefill gap: fitting 512 vs 448 rows gives a MARGINAL
+# rate of ~628 TFLOP/s (essentially peak) plus ~316 us of fixed cost per gate/up call and ~178 us per
+# down call.  That fixed part is NOT K-block synchronisation either (see _CB_BUDGET_BYTES), so
+# whatever it is, block shaping does not reach it.
+
+
+def ffn_config(rows, width, dtype=None):
+    """Interleaved L1 for the FFN's WIDE intermediate, so the second projection never reads DRAM.
+
+    THE FF1 -> FF2 HANDOFF IS THE ONE PLACE A WHOLE TENSOR IS WRITTEN AND IMMEDIATELY RE-READ.
+    GUIDELINES/05 section 7 names it: FF1 writes [rows, hidden] and FF2's very next act is to stream
+    that same tensor back in, so leaving it in DRAM costs a full write plus a full read of a value
+    with exactly one consumer, one op later.  On the audio tower that is 7.7 MB at bf8_b, and fc2
+    measured 65 us/call moving ~16 MB, i.e. 246 GB/s -- the activation half of that is what moves.
+
+    Separate cap from `stream_config` because this tensor is FOUR TIMES the width of the layer
+    stream: 110 x 1.5 MB of L1 holds it comfortably (70 kB per core against the matmul's own 700 kB
+    circular-buffer budget), but the cap has to be sized for the wide tensor rather than the narrow
+    one, and a longer sequence must still degrade to DRAM rather than crowd out those buffers.
+    """
+    width_bytes = _DTYPE_BYTES.get(dtype if dtype is not None else ttnn.bfloat8_b, 2)
+    return ttnn.L1_MEMORY_CONFIG if int(rows) * int(width) * width_bytes <= _FFN_L1_MAX_BYTES else ttnn.DRAM_MEMORY_CONFIG
+
+
 def _linear_activation(activation):
     """The ttnn.linear `activation=` STRING for a name, keeping gelu on the approximate kernel.
 
@@ -571,6 +657,12 @@ _COST_TIE = 0.01
 # Bytes of circular buffer one core may hold for a 2-D mcast matmul.  Blackhole has 1,572,864 B of
 # L1 per core; this is deliberately well under half of it because the estimate below counts only
 # in0/in1/out/interm and the factory also reserves space for the reader/writer and the semaphores.
+# 700 kB IS NOT MERELY CAUTIOUS, IT IS THE MEASURED OPTIMUM.  Raising it to 1100 kB doubles the K
+# block these shapes can afford (the audio tower's fc1 goes in0_block_w 10 -> 20), which the cost
+# model says should hide the multicast and semaphore round.  MEASURED 2026-09-05: fc2 1504x5120x1280
+# went 2.206 -> 3.432 ms (+56%) and encode 19.37 -> 19.58 -- clearly WORSE.  The wider circular
+# buffers push the real per-core footprint past what the factory has left after the reader/writer and
+# the semaphores, and these matmuls are not bound on K-block synchronisation in the first place.
 _CB_BUDGET_BYTES = 700 * 1024
 # Tile-matmul-equivalents one K block costs in multicast plus semaphore synchronisation.  Used only
 # to RANK candidates against each other, so its exactness matters far less than its sign: it is what
@@ -720,7 +812,17 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
 _BLOCK_CFG_REFUSED = set()
 
 
-def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, keep_sharded=False, activation=None):
+def mm(
+    device,
+    x,
+    weight,
+    compute_kernel_config=None,
+    bias=None,
+    mirror=None,
+    keep_sharded=False,
+    activation=None,
+    memory_config=None,
+):
     """ttnn.linear routed by the height of the activation: one call site, both regimes.
 
     `activation` IS APPLIED BY THE MATMUL, NOT AFTER IT.  A standalone unary on the FFN's wide
@@ -799,6 +901,7 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
                     compute_kernel_config=compute_kernel_config,
                     program_config=cfg,
                     dtype=_ACT_DTYPE,
+                    memory_config=memory_config,
                 )
             except (RuntimeError, TypeError, ValueError):
                 _BLOCK_CFG_REFUSED.add(key)
@@ -810,6 +913,7 @@ def mm(device, x, weight, compute_kernel_config=None, bias=None, mirror=None, ke
         core_grid=ttnn.CoreGrid(y=g.y, x=g.x),
         activation=_linear_activation(activation),
         dtype=_ACT_DTYPE,
+        memory_config=memory_config,
     )
 
 

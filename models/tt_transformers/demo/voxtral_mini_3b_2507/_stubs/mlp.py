@@ -14,6 +14,13 @@ import ttnn
 # to narrow: `down` writes straight into the residual stream and `gate` is perturbed BEFORE the
 # nonlinearity, whereas `up` enters as a plain linear factor of silu(gate).
 _UP_DTYPE = ttnn.bfloat4_b
+# GATE STAYS bf8_b, AND THAT IS MEASURED.  It is the largest byte lever left -- gate and up are read
+# in full on every decode token, so narrowing 3072x8192 from 26.7 MB to 14.2 MB is ~0.9 ms/token
+# across 32 layers, ~8% of the token -- but bfloat4_b on gate ALONE drops e2e PCC 0.9598 -> 0.9382,
+# under the 0.95 gate (measured 2026-09-05, all four MLP bodies at once).  So `up` is not merely the
+# gentlest of the three, it is the ONLY one of the three this model can afford: the earlier
+# all-three-bf4_b result (0.8724) was not dominated by up.  Do not retry gate or down at bf4_b
+# without a PCC budget won back somewhere else first.
 
 _HIFI4_CFG = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,

@@ -54,6 +54,11 @@ _LOFI_CFG = ttnn.WormholeComputeKernelConfig(
 
 _TILE = 32
 # Output tiles one DRAM-bank worker may own before its circular buffers stop fitting L1.
+# THIS NUMBER ALSO PICKS THE SPLIT COUNT, so it looks like a perf knob: at 64 the only feasible split
+# of a 4096-tile vocab is FOUR, and 128 admits TWO -- halving both the matmul launches and the concat
+# width per token.  MEASURED 2026-09-05: decode 10.9826 -> 10.9827 ms/token, i.e. exactly nothing.
+# The projection is already at 91% of its DRAM roofline and the split count costs launches, not
+# bytes, so trace has already absorbed them.  Left at 64, the value with the smaller L1 footprint.
 _MAX_TILES_PER_WORKER = 64
 # in0 is multicast to every compute core, so the activation shard has to stay small.
 _MAX_COMPUTE_CORES = 32
@@ -209,6 +214,12 @@ class TtLMHead:
             for w in self.weights
         ]
         ttnn.deallocate(flat)
+        # THE JOINED LOGITS MUST STAY IN DRAM.  Landing them in interleaved L1 instead looks free --
+        # 2.1 MB against 110 x 1.5 MB, consumed immediately by the sampler's untilize, which already
+        # asks for L1 itself -- but it BREAKS BOTH TRACED STAGES: prefill and decode stopped
+        # reporting entirely (only encode survived the measurement) because the trace's own L1 is
+        # allocated around these buffers.  Measured 2026-09-05; do not retry without a trace-region
+        # budget to match.
         out = parts[0] if len(parts) == 1 else ttnn.concat(parts, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         return ttnn.reshape(out, tuple(dims[:-1]) + (self.n,))
 

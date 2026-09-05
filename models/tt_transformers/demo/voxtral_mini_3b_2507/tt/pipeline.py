@@ -71,10 +71,35 @@ PIPELINE_STAGES = ["encode", "prefill", "decode"]
 ENCODE_C = 3000
 ENCODE_FRAMES = 1500
 # prefill: variable dim is the sequence axis (bound = text_config.max_position_embeddings).
-PREFILL_C = 512
+# SIZED FROM THE PROMPTS THIS MODEL ACTUALLY BUILDS, NOT FROM A ROUND NUMBER.  512 was a power of
+# two, and the longest prompt tt/inputs.py emits is 388 tokens (audio_chat: 3 prefix + 375 audio +
+# 10 suffix; transcription is 382), so every prefill was carrying 124 PAD positions through all 32
+# layers.  That work is pure waste rather than merely unused: attention is causal, so a padded
+# position cannot influence [0:prompt_len], and only row prompt_len-1 is read out.  Prefill's
+# projections scale with the capacity and its SDPA with the SQUARE of it, so the padding was ~24%
+# of the projections and ~41% of the attention.
+# THE LADDER IS ONE RUNG BECAUSE THE VARIABLE PART IS ONE TILE WIDE.  GUIDELINES/08 section 13 says
+# to derive the bucket from the lengths the model runs; here the audio half is FIXED (375 = a 30 s
+# chunk at 12.5 Hz) and only the instruction text varies, so a single bucket at the tile-aligned
+# ceiling of the longest prompt plus one tile of slack covers every head with 60 tokens of room for
+# a longer instruction.  A prompt past it still fails loudly on the assert in prefill_trace_setup
+# rather than silently truncating.
+# THE STAGE DOES NOT SCALE WITH THE CAPACITY ONE-FOR-ONE, so do not read this as a 12.5% cut.
+# Measured per prefill matmul, 512 -> 448 rows: gate/up 15.453 -> 14.472 ms (-6.3%), down 5.968 ->
+# 5.489 (-8.0%), qkv 5.034 -> 4.971 (-1.3%), and prefill SDPA 5.182 -> 5.141 (-0.8%) where a
+# quadratic op should have given -23%.  Roughly half of each prefill matmul call is fixed cost that
+# a shorter sequence does not touch, which is the same finding that says the remaining prefill gap
+# is per-call overhead rather than sequence length.  Stage: 152.43 -> ~150.8 ms.
+PREFILL_C = 448  # ceil(388 / 32) * 32 + 32
 # decode: variable dim is the KV length.
 DECODE_CAP = 32
-KV_C = 640  # PREFILL_C + 128, multiple of TILE_HEIGHT
+# DELIBERATELY NOT PREFILL_C + 128 ANY MORE: the KV capacity is its own axis and shrinking it with
+# the prefill capacity COSTS.  576 (18 tile rows) was measured at decode 10.978 -> 11.166 ms/token
+# (+1.7%) against 640 (20 tile rows) -- the resident cache's shard grids and sdpa_decode's work
+# split are chosen from how the height factorises, and 18 factorises worse than 20 across this
+# board's core counts.  Prefill does not care: it fills the cache at offset 0 for PREFILL_C rows
+# whatever the capacity behind them is.  So the prefill capacity came down and this stayed put.
+KV_C = 640
 # THE RESIDENT KV CACHE IS THE SECOND-BIGGEST THING DECODE READS.  At B=8 x 8 kv-heads x 640
 # positions x 128 head_dim, one layer's K and V are ~21 MB, and sdpa_decode re-reads every
 # position up to the cursor on EVERY token: across 30 layers that is ~490 MB per token at bf16,

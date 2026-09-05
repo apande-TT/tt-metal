@@ -207,7 +207,13 @@ class TtEncoderLayer:
 
         residual = x
         x = ttnn.layer_norm(
-            x, weight=self.attn_ln_w, bias=self.attn_ln_b, epsilon=self.attn_ln_eps, compute_kernel_config=_HIFI4_CFG
+            x,
+            weight=self.attn_ln_w,
+            bias=self.attn_ln_b,
+            epsilon=self.attn_ln_eps,
+            compute_kernel_config=_HIFI4_CFG,
+            # PLACEMENT, NOT MATH -- this pass is bandwidth-bound on the full-width stream; see _DS.stream_config.
+            memory_config=_DS.stream_config(x),
         )
 
         qkv = _DS.mm(self.device, x, self.qkv_weight, _PROJ_CFG, bias=self.qkv_bias)
@@ -225,15 +231,31 @@ class TtEncoderLayer:
         attn_out = ttnn.transformer.concatenate_heads(attn_out)
         attn_out = _DS.mm(self.device, attn_out, self.out_weight, _PROJ_CFG, bias=self.out_bias)
 
-        x = ttnn.add(residual, attn_out, dtype=_ACT_DTYPE)
+        x = ttnn.add(residual, attn_out, dtype=_ACT_DTYPE, memory_config=_DS.stream_config(residual, _ACT_DTYPE))
 
         residual = x
         x = ttnn.layer_norm(
-            x, weight=self.ffn_ln_w, bias=self.ffn_ln_b, epsilon=self.ffn_ln_eps, compute_kernel_config=_HIFI4_CFG
+            x,
+            weight=self.ffn_ln_w,
+            bias=self.ffn_ln_b,
+            epsilon=self.ffn_ln_eps,
+            compute_kernel_config=_HIFI4_CFG,
+            # PLACEMENT, NOT MATH -- this pass is bandwidth-bound on the full-width stream; see _DS.stream_config.
+            memory_config=_DS.stream_config(x),
         )
-        x = _DS.mm(self.device, x, self.fc1_weight, _PROJ_CFG, bias=self.fc1_bias, activation="gelu")
+        # HAND FF1 TO FF2 THROUGH L1 -- see _DS.ffn_config.  The intermediate has exactly one
+        # consumer, one op later, so a DRAM round trip is a full write plus a full read for nothing.
+        x = _DS.mm(
+            self.device,
+            x,
+            self.fc1_weight,
+            _PROJ_CFG,
+            bias=self.fc1_bias,
+            activation="gelu",
+            memory_config=_DS.ffn_config(S, int(self.fc1_weight.shape[-1]), _ACT_DTYPE),
+        )
         x = _DS.mm(self.device, x, self.fc2_weight, _PROJ_CFG, bias=self.fc2_bias)
-        x = ttnn.add(residual, x, dtype=_ACT_DTYPE)
+        x = ttnn.add(residual, x, dtype=_ACT_DTYPE, memory_config=_DS.stream_config(residual, _ACT_DTYPE))
 
         return x
 
