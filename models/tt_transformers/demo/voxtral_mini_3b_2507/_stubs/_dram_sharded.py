@@ -1220,17 +1220,78 @@ def sdpa_decode_out_config():
     return ttnn.L1_MEMORY_CONFIG
 
 
+def _row_cores(device, n):
+    """The first `n` cores of the compute grid as a CoreRangeSet, x fastest."""
+    g = device.compute_with_storage_grid_size()
+    full, rem = divmod(int(n), int(g.x))
+    ranges = []
+    if full:
+        ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(int(g.x) - 1, full - 1)))
+    if rem:
+        ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full), ttnn.CoreCoord(rem - 1, full)))
+    return ttnn.CoreRangeSet(ranges)
+
+
+def _concat_heads_decode(attn_out, batch, num_heads, head_dim):
+    """The DEDICATED head merge, or None when this build/shape will not take it.
+
+    THE GQA RULE BINDS THE PRODUCER, NOT THIS OP.  sdpa_decode refuses a sharded output on a
+    grouped-query model, so its result arrives interleaved in L1 -- but nlp_concat_heads_decode
+    only asks that ITS input be height-sharded one user per core with shard (padded_heads,
+    head_dim), and an explicit to_memory_config builds exactly that.
+
+    WHAT USED TO STOP IT IS THE OUTPUT, AND THAT IS A SUB-TILE CUT, NOT A WALL.  The op pads the
+    user dim to a full tile (8 users -> 32 rows), so the result no longer carries the layer's
+    logical [1, B, ...] batch and the residual add next door cannot broadcast against it.  Cutting
+    the real users back out is one slice of a SINGLE tile row -- 32 x 4096, ~260 kB -- against a
+    reshape that re-tilizes the whole tensor, so the question is which of the two costs more, and
+    only a measurement answers it.
+
+    Returns None on any refusal so the caller keeps the reshape; correctness never depends on this.
+    """
+    try:
+        dev = attn_out.device()
+        dims = [int(d) for d in attn_out.shape]
+        if len(dims) != 4 or dims[0] != 1 or dims[1] != int(batch):
+            return None
+        padded_heads, hd = dims[2], dims[3]
+        width = int(num_heads) * int(head_dim)
+        shard = ttnn.create_sharded_memory_config(
+            (padded_heads, hd),
+            _row_cores(dev, batch),
+            ttnn.ShardStrategy.HEIGHT,
+            ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        xs = attn_out if attn_out.memory_config() == shard else ttnn.to_memory_config(attn_out, shard)
+        joined = ttnn.experimental.nlp_concat_heads_decode(xs, num_heads=int(num_heads))
+        if xs is not attn_out:
+            ttnn.deallocate(xs)
+        jd = [int(d) for d in joined.shape]
+        if jd[-2] != int(batch):
+            joined = ttnn.slice(
+                joined, (0, 0, 0, 0), (1, 1, int(batch), width), memory_config=ttnn.L1_MEMORY_CONFIG
+            )
+        return ttnn.reshape(joined, (1, int(batch), width))
+    except (RuntimeError, TypeError, AttributeError, ValueError):
+        return None
+
+
 def merge_heads_decode(attn_out, batch, num_heads, head_dim, l1=True):
     """[1, B, padded_nh, hd] -> [1, B, nh*hd] for the o_proj, kept in L1.
 
     This reshape collapses the last TWO dims, so on TILE layout it genuinely re-tilizes rather than
     returning a view -- it is the single most expensive datamove left in the decode step (measured
-    ~20 us/call, once per layer per token).  ttnn's dedicated replacement wants a height-sharded
-    input that GQA will not let sdpa_decode produce, so the op itself cannot be swapped; what CAN
-    change is that it no longer reads and writes DRAM for a 65 kB tensor.  Shared by every attention
-    body so the placement reaches all of them rather than only the individually-routed layers.
+    ~20 us/call, once per layer per token).  ttnn has a dedicated op for exactly this shape; see
+    _concat_heads_decode for why it is reachable and what it costs to convert its padded batch back.
+    Shared by every attention body so the swap reaches all of them rather than only the
+    individually-routed layers.
     """
     shape = (1, int(batch), int(num_heads) * int(head_dim))
+    if l1:
+        swapped = _concat_heads_decode(attn_out, batch, num_heads, head_dim)
+        if swapped is not None:
+            return swapped
     if not l1:
         return ttnn.reshape(attn_out, shape)
     try:
