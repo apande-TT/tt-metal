@@ -101,9 +101,10 @@ void kernel_main() {
         // explicitly here rather than relying on the read barrier to imply it.
         asm volatile("" ::: "memory");
 
-        // TWO ELEMENTS PER LOAD.  count is a multiple of 64 and row_stride of 128, so every row is
-        // 4-byte aligned and even-length; on this little-endian core the low half of each word is
-        // the earlier vocab index, which is the order the first-maximum tie rule needs.
+        // TWO ELEMENTS PER LOAD.  The host rounds `per` to a multiple of 16 elements, so count is
+        // even and row_stride is a multiple of 32 bytes -- every row is 4-byte aligned and
+        // even-length; on this little-endian core the low half of each word is the earlier vocab
+        // index, which is the order the first-maximum tie rule needs.
         const uint32_t nwords = count >> 1;
         for (uint32_t b = 0; b < rows; ++b) {
             const tt_l1_ptr uint32_t* q = reinterpret_cast<const tt_l1_ptr uint32_t*>(base + b * row_stride);

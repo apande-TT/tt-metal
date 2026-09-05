@@ -31,10 +31,17 @@ _KERNEL_DIR = "models/tt_transformers/demo/voxtral_mini_3b_2507/_kernels"
 _SCAN_KERNEL = f"{_KERNEL_DIR}/argmax_scan.cpp"
 _REDUCE_KERNEL = f"{_KERNEL_DIR}/argmax_reduce.cpp"
 
-# Elements per core per batch row are rounded up to this. Each core's slice is halved between its
-# two data-movement processors, so the HALF has to stay 16-byte aligned (64 bf16 = 128 bytes) --
-# hence 128 here, not 64.
-_ALIGN_ELEMS = 128
+# Elements per core per batch row are rounded up to this.  The constraint is the NoC's: each core's
+# slice is halved between its two data-movement processors, and the HALF has to land 16-byte aligned
+# at both ends, so half must be a multiple of 8 elements and `per` a multiple of 16.
+#
+# IT USED TO BE 128, WHICH IS THE CONSTRAINT ROUNDED UP THREE TIMES OVER, AND THAT COST CORES.  The
+# rounding decides the split: at 128 a 131072 vocab on a 110-core grid gives per = 1280, which
+# covers the vocab in 103 cores and leaves SEVEN of them with nothing to do while the 103 each scan
+# 640 elements a row.  At 16 the same grid gives per = 1200 -- every core has work, and the critical
+# path is 600 elements a row instead of 640.  This op is scan-bound (see the header), so the
+# longest per-processor slice IS the op's time; 6% off it is 6% off the sampler.
+_ALIGN_ELEMS = 16
 
 # One (scratch, staging) circular-buffer pair per data-movement processor: the two scan instances
 # run concurrently on the same core and cannot share either buffer.

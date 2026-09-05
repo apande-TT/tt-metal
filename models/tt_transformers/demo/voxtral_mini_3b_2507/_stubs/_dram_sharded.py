@@ -647,9 +647,20 @@ def linear(
     )
     if blocked is not None:
         return blocked
+    # LOSING THE BLOCK CONFIG MUST NOT ALSO LOSE THE FOLD.  These two levers were tied together
+    # only because _block_linear happened to own both: a shape it declines dropped to a grid
+    # request holding the ORIGINAL [B, S, K], and ttnn reads that leading dim as batch, so the
+    # 1-D factory plans against S rather than B*S and runs the whole grid once per stream.
+    # Measured when an L1 hand-off made down's 2-D config unplaceable: the profile went from one
+    # `3584 x 8192 x 3072` to eight `448 x 8192 x 3072` and the op's roofline gap went 1.86 ->
+    # 4.73 ms -- most of which is the fold, not the config.  The fold is a metadata view on a
+    # tile-aligned M (see _block_linear), so it costs nothing to keep on this path too.
+    folded, dims = x, [int(d) for d in x.shape]
+    if len(dims) > 2 and rows != dims[-2] and dims[-2] % TILE == 0:
+        folded = ttnn.reshape(x, (1, rows, dims[-1]))
     kwargs = {} if memory_config is None else {"memory_config": memory_config}
-    return ttnn.linear(
-        x,
+    out = ttnn.linear(
+        folded,
         weight,
         compute_kernel_config=compute_kernel_config,
         core_grid=core_grid,
@@ -659,6 +670,9 @@ def linear(
         dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None,
         **kwargs,
     )
+    if folded is x:
+        return out
+    return ttnn.reshape(out, tuple(dims[:-1]) + (int(tuple(weight.shape)[-1]),))
 
 
 def _mirror_serves(x, mirror):
@@ -779,12 +793,22 @@ def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kerne
         # has nowhere to ride -- put it back as the standalone unary rather than dropping it.
         if deferred:
             gate = _apply("silu", gate)
-        h = ttnn.multiply(gate, up) if ffn_mem is None else ttnn.multiply(gate, up, memory_config=ffn_mem)
+        # THE PRODUCT GOES TO DRAM EVEN WHEN THE HALVES DID NOT, AND THAT IS MEASURED.  Keeping it
+        # in L1 too leaves 284 kB/core resident while `down` is trying to place ~700 kB of circular
+        # buffers, and the 2-D config is what loses that argument: ttnn refused it, _block_linear
+        # blacklisted the SHAPE, and every later call fell to the 1-D path -- where the activation
+        # is not folded either, so the profile went from one `3584 x 8192 x 3072` to eight
+        # `448 x 8192 x 3072` and the op's roofline gap went 1.86 -> 4.73 ms.  gate and up are the
+        # two passes worth having; the product's consumer wants the cores more than the placement.
+        # NAMED, NOT DEFAULTED: ttnn's binary ops inherit operand A's placement, so with the halves
+        # in L1 an unqualified multiply keeps the product there too and the change above would have
+        # been inert.
+        h = ttnn.multiply(gate, up) if ffn_mem is None else ttnn.multiply(gate, up, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         if ffn_mem is not None:
             # SAME REASON AS THE SHARDED BRANCH ABOVE, AND MORE PRESSING HERE: at prefill height the
-            # two halves are 31 MB EACH, and down's circular buffers are sized against whatever L1
-            # is still free on these cores.  multiply builds a new tensor rather than viewing its
-            # inputs, so releasing them the moment it returns is safe.
+            # two halves are 31 MB EACH of L1, and down's circular buffers are sized against
+            # whatever is still free on these cores.  multiply builds a new tensor rather than
+            # viewing its inputs, so releasing them the moment it returns is safe.
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
     return linear(h, down_w, down_ds, compute_kernel_config, core_grid)
