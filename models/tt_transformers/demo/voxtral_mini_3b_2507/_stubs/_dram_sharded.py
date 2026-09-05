@@ -885,6 +885,12 @@ _SDPA_MIN_OCCUPANCY = 2.0 / 3.0
 # is the shape that raised "circular buffers in program 74 clash with L1 buffers" by 3968 B, so
 # the fitting product is bounded above by twice the current one and below by the current one.
 # Anything at or under the current product is known to fit.
+# 512 IS AN OPTIMUM, NOT A CEILING TO KEEP RAISING.  At the same 32768 product the next step along
+# the same gradient -- q 32, k 1024, which trades two more halvings of q for one more doubling of k
+# and even raises occupancy to 95% -- measured encode 20.00 -> 24.80 ms, far WORSE.  So "wider k is
+# better" holds only while the q chunk still has enough rows to amortise its own setup; at 32 rows
+# (one tile) the per-unit cost the q chunk was supposed to be cheap at dominates instead.  Both
+# neighbours of 64 x 512 are measured and both are worse: 128 x 256 is +6.9% and 32 x 1024 is +24%.
 _SDPA_MAX_K_CHUNK = 512
 _SDPA_CHUNK_PRODUCT = 32768
 
