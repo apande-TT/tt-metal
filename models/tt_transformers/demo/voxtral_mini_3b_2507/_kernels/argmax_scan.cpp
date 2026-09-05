@@ -105,11 +105,17 @@ void kernel_main() {
             out[2 * b + 1] = 0;
         }
     } else {
-        // All rows in flight, then ONE barrier.
-        for (uint32_t b = 0; b < rows; ++b) {
-            noc.async_read(
-                s_src, src_cb, nbytes, {.page_id = b, .offset_bytes = byte_off}, {.offset_bytes = b * row_stride});
-        }
+        // ONE ROW AHEAD, NOT ALL OF THEM UP FRONT.  Issuing every row and then waiting once is
+        // already far better than the stock kernel's read-scan-read-scan, but it still spends the
+        // whole fetch with the RISC-V idle, and that fetch is not free at this fan-out: the source
+        // is interleaved with the vocab last, so it is ONE page per row on ONE bank, and every
+        // scan processor on the grid pulls its slice of row b from that same bank.  Scanning row b
+        // while row b+1 is in flight hides it behind work the core has to do anyway.
+        //
+        // Each row lands in its own region of the scratch (b * row_stride), so the read ahead never
+        // touches the row being scanned, and the barrier below is the coarse all-outstanding one --
+        // correct here precisely because only the next row is ever in flight.
+        noc.async_read(s_src, src_cb, nbytes, {.page_id = 0, .offset_bytes = byte_off}, {.offset_bytes = 0});
         noc.async_read_barrier();
         // The scan below reads through a NON-volatile pointer so the compiler is free to unroll
         // and schedule it -- with `volatile` every 2-byte load is emitted separately and in order,
@@ -124,6 +130,11 @@ void kernel_main() {
         // index, which is the order the first-maximum tie rule needs.
         const uint32_t nwords = count >> 1;
         for (uint32_t b = 0; b < rows; ++b) {
+            if (b + 1 < rows) {
+                noc.async_read(
+                    s_src, src_cb, nbytes, {.page_id = b + 1, .offset_bytes = byte_off},
+                    {.offset_bytes = (b + 1) * row_stride});
+            }
             const tt_l1_ptr uint32_t* q = reinterpret_cast<const tt_l1_ptr uint32_t*>(base + b * row_stride);
             // Seeded from element 0 rather than a sentinel, so the "first maximum wins" rule holds
             // even for a slice whose every value is the same.
@@ -150,6 +161,13 @@ void kernel_main() {
             }
             out[2 * b] = best;
             out[2 * b + 1] = start + best_i;
+            if (b + 1 < rows) {
+                // Wait for the row we prefetched above, and tell the compiler L1 moved under it --
+                // the scan reads through a non-volatile pointer, so the barrier alone is not a
+                // guarantee it may not hoist the next row's loads above this point.
+                noc.async_read_barrier();
+                asm volatile("" ::: "memory");
+            }
         }
     }
 

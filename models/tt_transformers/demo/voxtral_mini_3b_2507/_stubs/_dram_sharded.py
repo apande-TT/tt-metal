@@ -854,6 +854,24 @@ _COST_TIE = 0.01
 # went 2.206 -> 3.432 ms (+56%) and encode 19.37 -> 19.58 -- clearly WORSE.  The wider circular
 # buffers push the real per-core footprint past what the factory has left after the reader/writer and
 # the semaphores, and these matmuls are not bound on K-block synchronisation in the first place.
+#
+# ...AND IT DOES NOT MOVE FROM THE OTHER SIDE EITHER.  A bigger allowance can be spent two ways and
+# BOTH have now been measured losing, which is what makes 700 kB an empirical ceiling rather than a
+# model parameter:
+#   * on the K BLOCK (the in0 + in1 term) -- the 1100 kB run above, fc2 +56%.
+#   * on the OUT BLOCK, which is the term that decides RE-READS: the factory runs the whole K
+#     reduction inside each out block, so an out_block_w narrower than per_core_N makes the core
+#     re-stream its entire in0 slice once per N block, and gate/up pays exactly that (12x8 against a
+#     per_core_N of 24, three passes over the activation).  Widening it was tried twice.  Shrinking
+#     the K block to afford it inside 700 kB gives 12x12 at in0_block_w 4 and takes the
+#     synchronisation rounds 36 -> 48: 510.18 -> 511.64 ms.  Raising the total to 900 kB with a
+#     separate 640 kB ceiling on the K-block term -- so the extra room can ONLY buy the out block,
+#     and every encoder shape provably keeps its plan -- gives 12x12 at in0_block_w 8, which is
+#     better on BOTH axes (24 rounds, operand traffic 5760 -> 4608 tiles) and still measured
+#     509.23 -> 511.41 ms.
+# Cutting re-reads by a third and halving the rounds still lost, so the binding constraint is the
+# REAL per-core L1 footprint -- which this estimate undercounts -- and not operand traffic at all.
+# Do not raise this again without a way to measure the factory's true footprint.
 _CB_BUDGET_BYTES = 700 * 1024
 # Tile-matmul-equivalents one K block costs in multicast plus semaphore synchronisation.  Used only
 # to RANK candidates against each other, so its exactness matters far less than its sign: it is what
