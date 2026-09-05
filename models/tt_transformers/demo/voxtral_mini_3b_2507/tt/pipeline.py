@@ -856,7 +856,19 @@ class VoxtralPipeline:
             audio_rm = ttnn.to_layout(audio_embeds, ttnn.ROW_MAJOR_LAYOUT)
             merged = ttnn.concat([head, audio_rm, tail], dim=1)
             ttnn.deallocate(te)
-            return ttnn.to_layout(merged, ttnn.TILE_LAYOUT)
+            # ...AND FOLD THE STREAMS FOR THAT ONE TILIZE.  The concat cannot be folded -- every
+            # stream has its own head/audio/tail seam, so [B, C, H] and [1, B*C, H] are different
+            # joins -- but the tilize after it can, and it is the op that cares: a leading dim is
+            # BATCH to ttnn, so it tilizes B separate [C, H] blocks and the profile tags it on a
+            # tiny grid.  Both reshapes are metadata views: ROW_MAJOR pages by the last dim, so
+            # [B, C, H] and [1, B*C, H] are the same B*C pages in the same order, and afterwards
+            # the tiled [1, B*C, H] -> [B, C, H] holds because C is tile-aligned, which puts
+            # stream b's tile row i at (b*C/32 + i) whichever way it is labelled.
+            rows = int(batch) * int(self.C)
+            if int(batch) == 1 or int(self.C) % 32:
+                return ttnn.to_layout(merged, ttnn.TILE_LAYOUT)
+            tiled = ttnn.to_layout(ttnn.reshape(merged, (1, rows, self.hidden)), ttnn.TILE_LAYOUT)
+            return ttnn.reshape(tiled, (int(batch), int(self.C), self.hidden))
         except (RuntimeError, TypeError, ValueError):
             te = self.embed(ids_tt)  # [B, C, hidden] TILE
             head = ttnn.slice(te, (0, 0, 0), (batch, audio_start, self.hidden))
