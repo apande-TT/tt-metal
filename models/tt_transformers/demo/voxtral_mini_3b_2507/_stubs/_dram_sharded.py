@@ -282,6 +282,41 @@ def ffn_config(rows, width, dtype=None):
     return ttnn.L1_MEMORY_CONFIG if int(rows) * int(width) * width_bytes <= _FFN_L1_MAX_BYTES else ttnn.DRAM_MEMORY_CONFIG
 
 
+# Bytes ONE of the SwiGLU's three wide intermediates may have before L1 residency stops paying.
+# SEPARATE FROM ffn_config's CAP BECAUSE THE TENANT COUNT IS DIFFERENT.  The audio tower's FFN has
+# a single [rows, hidden] value in flight at a time, so its cap is sized against one tensor; a
+# SwiGLU has THREE -- gate, up and their product -- and the widest moment (the `up` matmul, with
+# gate already resident and the product not yet allocated) holds two of them beside that matmul's
+# own ~700 kB of circular buffers.  At the LM prefill shape one of these is 3584 x 8192 x 1.0625 B
+# = 31.2 MB, i.e. 284 kB on each of 110 cores, so two tenants plus the buffers come to ~1.27 MB of
+# the 1.5 MB each core has.  That is the real ceiling, and the cap below is set from it rather
+# than from the total L1 the board reports.
+_SWIGLU_L1_MAX_BYTES = 34 * 1024 * 1024
+# (rows, width) pairs whose L1 hand-off the allocator refused at runtime, so the fallback to DRAM
+# is paid once rather than once per call.  The estimate above counts the tensors this module knows
+# about; the trace region, the resident caches and the next op's buffers are not visible from here.
+_SWIGLU_L1_REFUSED = set()
+
+
+def _swiglu_handoff(rows, width, dtype):
+    """Interleaved L1 for the SwiGLU's gate/up/product triple, or None to leave them in DRAM.
+
+    THE LM's FFN INTERMEDIATE NEVER REACHED ffn_config.  `linear` had no memory_config to pass, so
+    gate and up were written to DRAM, read back by the multiply, written again, and read a third
+    time by the down projection -- five full passes over a tensor whose only consumers are the two
+    ops after it.  Returns None (rather than DRAM_MEMORY_CONFIG) so the caller can keep the exact
+    call it made before when the hand-off does not apply, which is what makes the fallback
+    bit-identical to the previous behaviour instead of merely equivalent.
+    """
+    rows, width = int(rows), int(width)
+    if rows < _GRID_REQUEST_MIN_ROWS or (rows, width) in _SWIGLU_L1_REFUSED:
+        return None
+    width_bytes = _DTYPE_BYTES.get(dtype if dtype is not None else ttnn.bfloat8_b, 2)
+    if rows * width * width_bytes > _SWIGLU_L1_MAX_BYTES:
+        return None
+    return ttnn.L1_MEMORY_CONFIG
+
+
 def _linear_activation(activation):
     """The ttnn.linear `activation=` STRING for a name, keeping gelu on the approximate kernel.
 
@@ -565,7 +600,16 @@ def attach(device, weight, max_m_tiles=1):
     return mirror if mirror.ok else None
 
 
-def linear(x, weight, mirror, compute_kernel_config=None, core_grid=None, activation=None, keep_sharded=False):
+def linear(
+    x,
+    weight,
+    mirror,
+    compute_kernel_config=None,
+    core_grid=None,
+    activation=None,
+    keep_sharded=False,
+    memory_config=None,
+):
     """Project through the DRAM-sharded mirror when it serves this shape, else the plain path.
 
     `activation` is fused into the MATMUL on either path -- the mirror bakes it into its program
@@ -598,9 +642,12 @@ def linear(x, weight, mirror, compute_kernel_config=None, core_grid=None, activa
     # swiglu never got it, so gate/up/down -- the majority of the LM's prefill flops -- ran on the
     # 1-D mcast path with a one-tile K block while qkv/o_proj next door did not.  Same helper, same
     # guards; a shape it cannot serve falls through to the grid request below unchanged.
-    blocked = _block_linear(x, weight, compute_kernel_config, activation=activation, rows=rows)
+    blocked = _block_linear(
+        x, weight, compute_kernel_config, activation=activation, rows=rows, memory_config=memory_config
+    )
     if blocked is not None:
         return blocked
+    kwargs = {} if memory_config is None else {"memory_config": memory_config}
     return ttnn.linear(
         x,
         weight,
@@ -610,6 +657,7 @@ def linear(x, weight, mirror, compute_kernel_config=None, core_grid=None, activa
         # Same regime boundary `mm` uses: narrow the output only where the tensor is big enough for
         # the bytes to matter, so a decode shape that misses its mirror still lands in bf16.
         dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None,
+        **kwargs,
     )
 
 
@@ -670,7 +718,31 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
     Deliberately gated on whether the MIRROR serves this shape rather than on a mode flag: the
     prefill path fuses silu into the MATMUL's program config (where it is a measured win, prefill
     210.82 -> 196.35 ms), so asking for it twice would apply it twice.
+
+    AND AT PREFILL HEIGHT THE THREE WIDE INTERMEDIATES NOW STAY IN L1.  `linear` had no
+    memory_config to pass, so on that path gate and up were written to DRAM, read back by the
+    multiply, written again, and read a third time by down -- five full passes over a tensor with
+    exactly two consumers, both one op away.  See _swiglu_handoff for the L1 budget; a shape the
+    allocator refuses falls back to the DRAM call this used to make and is remembered so the
+    exception is paid once.
     """
+    rows = 1
+    for d in tuple(x.shape)[:-1]:
+        rows *= int(d)
+    ffn_mem = _swiglu_handoff(rows, int(gate_w.shape[-1]), _ACT_DTYPE)
+    if ffn_mem is None:
+        return _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, None)
+    try:
+        return _swiglu_body(
+            x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, ffn_mem
+        )
+    except RuntimeError:
+        _SWIGLU_L1_REFUSED.add((rows, int(gate_w.shape[-1])))
+        return _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, None)
+
+
+def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, ffn_mem):
+    """The SwiGLU itself; `ffn_mem` is the hand-off placement for gate/up/product, or None for DRAM."""
     rank = len([int(d) for d in x.shape])
     deferred = _mirror_serves(x, gate_ds) and _SILU_ACT is not None
     gate = linear(
@@ -681,8 +753,9 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
         core_grid,
         activation=None if deferred else "silu",
         keep_sharded=True,
+        memory_config=ffn_mem,
     )
-    up = linear(x, up_w, up_ds, compute_kernel_config, core_grid, keep_sharded=True)
+    up = linear(x, up_w, up_ds, compute_kernel_config, core_grid, keep_sharded=True, memory_config=ffn_mem)
     if gate.is_sharded():
         # LEAVE THE SHARD, BUT NOT ALL THE WAY TO DRAM.  The multiply has to produce something
         # unsharded (down's in0 rectangle is wider than gate/up's output rectangle, so there is no
@@ -706,7 +779,14 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
         # has nowhere to ride -- put it back as the standalone unary rather than dropping it.
         if deferred:
             gate = _apply("silu", gate)
-        h = ttnn.multiply(gate, up)
+        h = ttnn.multiply(gate, up) if ffn_mem is None else ttnn.multiply(gate, up, memory_config=ffn_mem)
+        if ffn_mem is not None:
+            # SAME REASON AS THE SHARDED BRANCH ABOVE, AND MORE PRESSING HERE: at prefill height the
+            # two halves are 31 MB EACH, and down's circular buffers are sized against whatever L1
+            # is still free on these cores.  multiply builds a new tensor rather than viewing its
+            # inputs, so releasing them the moment it returns is safe.
+            ttnn.deallocate(gate)
+            ttnn.deallocate(up)
     return linear(h, down_w, down_ds, compute_kernel_config, core_grid)
 
 
@@ -983,19 +1063,29 @@ def _block_linear(x, weight, compute_kernel_config, bias=None, activation=None, 
     cfg = block_config(x.device(), m_tiles, k_tiles, n_tiles, activation=activation)
     if cfg is None:
         return None
-    try:
-        out = ttnn.linear(
-            folded,
-            weight,
-            bias=bias,
-            compute_kernel_config=compute_kernel_config,
-            program_config=cfg,
-            dtype=_ACT_DTYPE,
-            memory_config=memory_config,
-        )
-    except (RuntimeError, TypeError, ValueError):
-        _BLOCK_CFG_REFUSED.add(key)
-        return None
+    # AN OUTPUT PLACEMENT THE ALLOCATOR REFUSES IS NOT A REFUSED BLOCK CONFIG.  A caller asking for
+    # an L1 hand-off is asking for something the block path is free to decline on its own; conflating
+    # the two would blacklist the SHAPE on the first tight allocation and send every later call --
+    # including the ones that never wanted L1 -- down the 1-D mcast path this helper exists to avoid.
+    # So an L1 request is retried in DRAM first, and only a failure with no placement left standing
+    # is recorded against the shape.
+    placements = [memory_config] if memory_config is None else [memory_config, None]
+    for placement in placements:
+        try:
+            out = ttnn.linear(
+                folded,
+                weight,
+                bias=bias,
+                compute_kernel_config=compute_kernel_config,
+                program_config=cfg,
+                dtype=_ACT_DTYPE,
+                memory_config=placement,
+            )
+            break
+        except (RuntimeError, TypeError, ValueError):
+            if placement is None:
+                _BLOCK_CFG_REFUSED.add(key)
+                return None
     # Hand the caller back the rank it gave us; same view argument as the fold above.
     return out if batch == 1 else ttnn.reshape(out, tuple(dims[:-1]) + (int(wshape[-1]),))
 
