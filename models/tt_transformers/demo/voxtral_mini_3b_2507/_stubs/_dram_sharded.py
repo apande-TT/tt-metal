@@ -1421,6 +1421,15 @@ def rms_norm(device, x, weight, epsilon, compute_kernel_config, keep_sharded=Fal
     if not plan:
         # Same non-lever as the add above: naming stream_config(x) here resolves to DRAM at the
         # prefill height and costs a round trip the implicit output placement never made.
+        #
+        # AND DO NOT BOTHER FOLDING THE LEADING BATCH HERE.  The matmuls next door gained 4% from
+        # exactly that fold (see _block_linear), and the argument transfers on paper: the norm is
+        # over the LAST dim and ttnn splits its work over ROWS, so handing it [8, 448, 3072] looks
+        # like offering 448 rows where [1, 1, 3584, 3072] -- the identical buffer, since 448 is
+        # tile-aligned and both reshapes merge leading dims only -- offers 3584.  MEASURED
+        # 2026-09-05: prefill 136.49 -> 136.44 ms, i.e. nothing.  ttnn's layernorm already flattens
+        # the leading dims internally, so unlike the matmul factory it never saw a batch to walk.
+        # The fold is a matmul lever specifically, not a general one.
         return ttnn.rms_norm(x, weight=weight, epsilon=epsilon, compute_kernel_config=compute_kernel_config)
     shard_cfg, program_config = plan
     # BORROW AN INPUT ALREADY IN THIS LAYOUT.  The residual add that produces it can be asked to
