@@ -880,9 +880,16 @@ _SDPA_MAX_CHUNK = 256
 # chunk.  2/3 is the point where one more halving stops paying: it doubles the per-unit loop and CB
 # overhead to recover less than half a round.
 _SDPA_MIN_OCCUPANCY = 2.0 / 3.0
+# The widest k block that is worth asking for, and the q_chunk * k_chunk budget it has to live
+# inside.  32768 is not a guess: 128 x 256 is the shape the audio tower runs today and 128 x 512
+# is the shape that raised "circular buffers in program 74 clash with L1 buffers" by 3968 B, so
+# the fitting product is bounded above by twice the current one and below by the current one.
+# Anything at or under the current product is known to fit.
+_SDPA_MAX_K_CHUNK = 512
+_SDPA_CHUNK_PRODUCT = 32768
 
 
-def sdpa_config(device, q, k):
+def sdpa_config(device, q, k, wide_k=False):
     """Full-grid SDPAProgramConfig with tile-power-of-two flash chunks, sized from q/k.
 
     ttnn's SDPA falls back to q_chunk_size = k_chunk_size = 32 -- ONE TILE -- whenever no
@@ -895,9 +902,19 @@ def sdpa_config(device, q, k):
     to fill the grid.
 
     Chunks are capped at the largest power of two that does not exceed the sequence, so a short
-    sequence keeps small chunks instead of padding itself up into wasted work.  exp_approx_mode
-    is left exact: these sequences accumulate over many chunks, and the approximate exp costs
-    PCC there without being faster on this arch.
+    sequence keeps small chunks instead of padding itself up into wasted work.
+
+    exp_approx_mode is left exact, but NOT for the reason this comment used to give.  It claimed
+    the approximate exp "costs PCC without being faster"; that was asserted, never measured.
+    Measured 2026-09-05, scoped per-caller to the six audio-tower bodies (the same split that
+    already scopes this tower's SDPA to LoFi, so the LM's attention kept the exact exp): PCC went
+    0.9580 -> 0.9636, i.e. BETTER than baseline, and encode went 21.3734 -> 21.4023 ms, i.e. did
+    not move.  So the PCC half of the old claim is false and only the speed half holds.  What that
+    rules out is the theory behind trying it: flash re-exponentiates its score block on the SFPU
+    once per k chunk, and this kernel runs at 48 TFLOP/s -- 6% of block-float peak -- so the exp
+    looked like the thing it was bound on.  It is not.  The overhead is the chunk loop itself, so
+    the lever that would pay here is one that removes ITERATIONS, not one that cheapens the
+    exponential.  Do not spend another round on exp_approx_mode.
 
     BUT THE Q CHUNK IS ALSO THE UNIT OF WORK, AND THE WIDEST ONE NEED NOT FILL THE GRID.  Flash
     hands out batch * heads * ceil(seq_q / q_chunk) independent work units and runs them in
@@ -933,7 +950,18 @@ def sdpa_config(device, q, k):
             c //= 2
         return c
 
-    key = (grid.x, grid.y, _q_chunk(), _chunk(seq_k))
+    qc, kc = _q_chunk(), _chunk(seq_k)
+    if wide_k:
+        # TRADE Q WIDTH FOR K WIDTH AT A CONSTANT PRODUCT.  The k loop is where this kernel's
+        # overhead lives, so a wider k block is the shape worth having; it just cannot be bought
+        # with extra L1, because the next step up in product does not fit.  Widening k and paying
+        # for it out of q keeps the circular buffers inside the budget that is known to fit.
+        kc = max(32, min(_SDPA_MAX_K_CHUNK, 1 << (max(int(seq_k), 1).bit_length() - 1)))
+        while qc > 32 and qc * kc > _SDPA_CHUNK_PRODUCT:
+            qc //= 2
+        while kc > 32 and qc * kc > _SDPA_CHUNK_PRODUCT:
+            kc //= 2
+    key = (grid.x, grid.y, qc, kc)
     cfg = _SDPA_CFGS.get(key)
     if cfg is None:
         cfg = ttnn.SDPAProgramConfig(

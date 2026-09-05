@@ -189,7 +189,7 @@ class TtVoxtralAttention:
             v,
             is_causal=False,
             scale=self.scaling,
-            program_config=_DS.sdpa_config(self.device, q, k),
+            program_config=_DS.sdpa_config(self.device, q, k, wide_k=True),
             compute_kernel_config=_SDPA_CFG,
         )
         attn_out = ttnn.transformer.concatenate_heads(attn_out)
