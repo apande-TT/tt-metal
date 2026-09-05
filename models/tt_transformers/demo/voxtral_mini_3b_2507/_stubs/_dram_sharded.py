@@ -613,6 +613,37 @@ def linear(x, weight, mirror, compute_kernel_config=None, core_grid=None, activa
     )
 
 
+def _mirror_serves(x, mirror):
+    """Whether the DRAM-sharded mirror will take this activation's height (i.e. the decode shape)."""
+    if mirror is None:
+        return False
+    m = 1
+    for d in tuple(x.shape)[:-1]:
+        m *= d
+    try:
+        return bool(mirror.serves(math.ceil(m / TILE)))
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+# silu as a per-input activation the binary op can absorb, or None on a build that cannot spell it.
+try:
+    _SILU_ACT = [ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)]
+except (AttributeError, TypeError, ValueError):  # pragma: no cover - depends on the ttnn build
+    _SILU_ACT = None
+
+
+def _multiply_with_silu(gate, up, memory_config, deferred):
+    """gate * up, with silu(gate) folded into the multiply's own unpack when it was deferred."""
+    if not deferred:
+        return ttnn.multiply(gate, up, memory_config=memory_config)
+    try:
+        return ttnn.multiply(gate, up, memory_config=memory_config, input_tensor_a_activations=_SILU_ACT)
+    except (RuntimeError, TypeError, ValueError):
+        # A build whose binary op will not take per-input activations: pay the standalone unary.
+        return ttnn.multiply(_apply("silu", gate), up, memory_config=memory_config)
+
+
 def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid):
     """gate/up -> silu -> multiply -> down, keeping the two halves in L1 when the mirrors serve.
 
@@ -626,9 +657,31 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
 
     Prefill is untouched: keep_sharded only reaches the mirror path, and serves() is decode-only, so
     on prefill both halves come back interleaved and the original multiply runs.
+
+    AND ON THE DECODE PATH THE silu IS NOT A LAUNCH OF ITS OWN.  `linear` documents why it cannot be
+    fused into the DRAM-SHARDED matmul (that factory sends anything but RELU down a separate DEST
+    path, measured +2.8% on decode), so it came back as a standalone unary -- a full read-modify-
+    write of the [1, B, intermediate] shard whose ONLY consumer is the multiply on the very next
+    line, which is about to read that same tensor again.  ttnn's binary ops take per-INPUT
+    activations (binary_nanobind.cpp: input_tensor_a_activations), so the silu can ride into the
+    multiply's own unpack instead, and the launch disappears rather than moving.  Same maths -- the
+    fused form runs the identical SFPU op on operand A before the multiply.
+
+    Deliberately gated on whether the MIRROR serves this shape rather than on a mode flag: the
+    prefill path fuses silu into the MATMUL's program config (where it is a measured win, prefill
+    210.82 -> 196.35 ms), so asking for it twice would apply it twice.
     """
     rank = len([int(d) for d in x.shape])
-    gate = linear(x, gate_w, gate_ds, compute_kernel_config, core_grid, activation="silu", keep_sharded=True)
+    deferred = _mirror_serves(x, gate_ds) and _SILU_ACT is not None
+    gate = linear(
+        x,
+        gate_w,
+        gate_ds,
+        compute_kernel_config,
+        core_grid,
+        activation=None if deferred else "silu",
+        keep_sharded=True,
+    )
     up = linear(x, up_w, up_ds, compute_kernel_config, core_grid, keep_sharded=True)
     if gate.is_sharded():
         # LEAVE THE SHARD, BUT NOT ALL THE WAY TO DRAM.  The multiply has to produce something
@@ -639,7 +692,7 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
         n = 1
         for d in tuple(gate.shape):
             n *= int(d)
-        h = ttnn.multiply(gate, up, memory_config=_handoff_config(n, gate.dtype))
+        h = _multiply_with_silu(gate, up, _handoff_config(n, gate.dtype), deferred)
         # FREE THE HALVES.  multiply builds a new DRAM tensor rather than viewing its inputs, so this
         # is safe, and it matters: the down projection sizes its circular buffers against whatever L1
         # is still free on these cores.
@@ -649,6 +702,10 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
         if len(dims) > rank:
             h = ttnn.reshape(h, tuple(dims[-rank:]))
     else:
+        # The mirror did not serve after all (a shape it was not planned for), so the deferred silu
+        # has nowhere to ride -- put it back as the standalone unary rather than dropping it.
+        if deferred:
+            gate = _apply("silu", gate)
         h = ttnn.multiply(gate, up)
     return linear(h, down_w, down_ds, compute_kernel_config, core_grid)
 
