@@ -66,6 +66,19 @@ _UP_DTYPE = ttnn.bfloat4_b
 # it compounds over the whole 32-token decode.  Do not retry without a PCC budget won elsewhere.
 _QKV_DTYPE = ttnn.bfloat8_b
 
+# THE DOWN PROJECTION STAYS bf8_b, AND THAT IS NOW MEASURED ON ITS OWN.  gate and up had each been
+# measured separately at bfloat4_b (gate 0.9382, all-three 0.8724) but `down` never had, and it is
+# 3072x8192 = 25.2 M parameters per layer, 806 M across 32 layers, worth ~400 MB a decode token.
+# The structural argument said it should be the gentlest of the three -- its output is ADDED into
+# the residual stream, so the error enters linearly and once, where gate's is perturbed BEFORE the
+# nonlinearity.  The argument is wrong.  Measured 2026-09-05 across all four MLP bodies: e2e PCC
+# fails at stream 2 with 0.9193 against the 0.95 gate (streams 0/1 held at 0.963/0.962), and the
+# same-prefix per-step trace shows it decaying with depth rather than failing at one token -- the
+# residual stream is the one tensor every later layer AND every later token reads, so "enters
+# linearly and once" understates it.  All three SwiGLU branches are now measured at bf4_b and only
+# `up` survives; see _UP_DTYPE.  Do not retry without a PCC budget won back elsewhere.
+_DOWN_DTYPE = ttnn.bfloat8_b
+
 _HIFI4_CFG = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=False,
@@ -566,7 +579,7 @@ class LlamaModel:
                 "post_ln_eps": layer.post_attention_layernorm.variance_epsilon,
                 "gate_w": _to_device(layer.mlp.gate_proj.weight.T.contiguous().float(), device, ttnn.bfloat8_b),
                 "up_w": _to_device(layer.mlp.up_proj.weight.T.contiguous().float(), device, _UP_DTYPE),
-                "down_w": _to_device(layer.mlp.down_proj.weight.T.contiguous().float(), device, ttnn.bfloat8_b),
+                "down_w": _to_device(layer.mlp.down_proj.weight.T.contiguous().float(), device, _DOWN_DTYPE),
             }
             # Decode-only DRAM-bank-sharded mirrors, derived from the interleaved weights ON DEVICE
             # (no second host upload).  See _dram_sharded.py for why prefill keeps the plain path.
