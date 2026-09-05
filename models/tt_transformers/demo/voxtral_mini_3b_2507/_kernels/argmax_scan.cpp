@@ -18,8 +18,9 @@
 // it, and both are removed here:
 //
 //   1. bfloat16_greater() dispatches on the sign bits with up to three unpredictable branches per
-//      element.  bf16_key() below replaces the whole thing with a branchless monotone remap, so a
-//      single unsigned compare orders any two values.
+//      element.  bf16_key_pair() below replaces the whole thing with a branchless monotone remap,
+//      so a single unsigned compare orders any two values -- and it remaps both elements of a
+//      32-bit load together, so the remap itself costs less than the compares it feeds.
 //   2. the stock loop carries a second `else if (val == max_val) max_idx = min(...)` branch to keep
 //      the lowest index among equal maxima.  Scanning forward with a STRICT `>` already keeps the
 //      first maximum, so that branch is pure overhead.
@@ -43,9 +44,25 @@
 // magnitude gives a smaller key.  This is exact and total on the values a logit can take, and it
 // agrees with bfloat16_greater() on the -0/+0 pair (+0 compares greater), so the sampled token is
 // bit-identical to the stock op's.
-static inline uint32_t bf16_key(uint32_t v) {
-    const uint32_t mask = 0x8000u | (uint32_t)(0u - (v >> 15));
-    return (v ^ mask) & 0xFFFFu;
+//
+// ...AND BOTH LANES OF A WORD AT ONCE, IN FIVE OPERATIONS RATHER THAN TEN.  The scan loads two
+// elements per word anyway, and deriving the mask twice is most of what the inner loop costs.  Per
+// lane the mask above is 0xFFFF when the sign bit is set and 0x8000 when it is not, and it can be
+// BUILT for both lanes together:
+//
+//   s  = w & 0x80008000        isolate the two sign bits (only bits 15 and 31 can be set)
+//   s - (s >> 15)              0x7FFF in each lane whose sign was set, 0 in the others.  No borrow
+//                              can cross the lane boundary: the only nonzero minuend bit in a lane
+//                              is its top one, and the subtrahend is 1, so 0x8000 - 1 = 0x7FFF
+//                              stays inside the lane and a clear lane computes 0 - 0.
+//   | 0x80008000               makes that 0xFFFF where the sign was set and 0x8000 where it was not
+//   w ^ mask                   both lanes remapped
+//
+// Bit-identical to the per-lane form above -- same keys, so the same token -- it just stops paying
+// for the sign dispatch twice.
+static inline uint32_t bf16_key_pair(uint32_t w) {
+    const uint32_t s = w & 0x80008000u;
+    return w ^ ((s - (s >> 15)) | 0x80008000u);
 }
 
 void kernel_main() {
@@ -59,8 +76,8 @@ void kernel_main() {
     constexpr uint32_t dst_cb_idx = get_compile_time_arg_val(1);
     // Rows of the batch. The input is ROW_MAJOR with the vocab last, so one row is one page.
     constexpr uint32_t rows = get_compile_time_arg_val(2);
-    // Bytes reserved per row in the scratch buffer; a multiple of 128 so every slice the NoC
-    // lands is 16-byte aligned at both ends.
+    // Bytes reserved per row in the scratch buffer; a multiple of 32 (the host rounds `per` to 16
+    // elements) so every slice the NoC lands is 16-byte aligned at both ends.
     constexpr uint32_t row_stride = get_compile_time_arg_val(3);
 
     constexpr auto s_src_args = TensorAccessorArgs<4>();
@@ -110,22 +127,22 @@ void kernel_main() {
             const tt_l1_ptr uint32_t* q = reinterpret_cast<const tt_l1_ptr uint32_t*>(base + b * row_stride);
             // Seeded from element 0 rather than a sentinel, so the "first maximum wins" rule holds
             // even for a slice whose every value is the same.
-            uint32_t w = q[0];
-            uint32_t best = bf16_key(w & 0xFFFFu);
+            uint32_t w = bf16_key_pair(q[0]);
+            uint32_t best = w & 0xFFFFu;
             uint32_t best_i = 0;
-            uint32_t k = bf16_key(w >> 16);
+            uint32_t k = w >> 16;
             if (k > best) {
                 best = k;
                 best_i = 1;
             }
             for (uint32_t j = 1; j < nwords; ++j) {
-                w = q[j];
-                k = bf16_key(w & 0xFFFFu);
+                w = bf16_key_pair(q[j]);
+                k = w & 0xFFFFu;
                 if (k > best) {
                     best = k;
                     best_i = 2 * j;
                 }
-                k = bf16_key(w >> 16);
+                k = w >> 16;
                 if (k > best) {
                     best = k;
                     best_i = 2 * j + 1;
