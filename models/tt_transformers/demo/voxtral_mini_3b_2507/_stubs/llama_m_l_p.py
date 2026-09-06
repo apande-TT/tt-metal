@@ -68,6 +68,15 @@ _DS = _dram_sharded()
 
 # MATCHED TO bf8_b WEIGHTS.  8-bit operands through a HiFi4 kernel make the math engine take four
 # passes over one pass worth of precision, which cancels the bandwidth saving; LoFi is the pairing.
+#
+# AND THE APPROX FLAG IS NOT THE FUSED SILU's LEVER, WHICH IS MEASURED.  math_approx_mode selects
+# which SFPU implementation a fused activation compiles to, so it looked like the answer to gate
+# being the one prefill matmul off its floor: gate and up are the SAME 3584x3072x8192 shape and
+# gate runs 644.4 us/call against up's 433.5 (280 TFLOP/s against 416), where the 12 MB of extra
+# weight bytes bf8_b reads over up's bf4_b account for under 20 us of the 211.  Setting it True
+# moved NOTHING (prefill 130.40 -> 130.94 ms, decode 10.670 -> 10.663, both inside tolerance), so
+# the cost is not which sigmoid the SFPU runs -- it is the activation being in the pack loop at
+# all, which is why the fix is to defer it to the multiply (see `swiglu`).  Left False.
 _LOFI_CFG = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.LoFi,
     math_approx_mode=False,

@@ -729,9 +729,12 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
     multiply's own unpack instead, and the launch disappears rather than moving.  Same maths -- the
     fused form runs the identical SFPU op on operand A before the multiply.
 
-    Deliberately gated on whether the MIRROR serves this shape rather than on a mode flag: the
-    prefill path fuses silu into the MATMUL's program config (where it is a measured win, prefill
-    210.82 -> 196.35 ms), so asking for it twice would apply it twice.
+    AND PREFILL NOW RIDES THE SAME MULTIPLY.  It used to fuse the silu into the MATMUL's program
+    config instead -- a measured win at the time (prefill 210.82 -> 196.35 ms) because the thing it
+    replaced was a standalone unary over the whole [rows, intermediate] tensor.  But the multiply is
+    the better of the two hosts on either path, because it is the one op that reads gate anyway, and
+    the pack loop is the one place the activation cannot spread across the grid.  So the choice is
+    no longer gated on the mirror; it is unconditional, and the gate matmul asks for no activation.
 
     AND AT PREFILL HEIGHT THE THREE WIDE INTERMEDIATES NOW STAY IN L1.  `linear` had no
     memory_config to pass, so on that path gate and up were written to DRAM, read back by the
@@ -758,7 +761,18 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
 def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, ffn_mem):
     """The SwiGLU itself; `ffn_mem` is the hand-off placement for gate/up/product, or None for DRAM."""
     rank = len([int(d) for d in x.shape])
-    deferred = _mirror_serves(x, gate_ds) and _SILU_ACT is not None
+    # THE MULTIPLY IS THE RIGHT PLACE FOR THE silu ON BOTH PATHS, NOT JUST THE MIRROR'S.  This used
+    # to be gated on `_mirror_serves` because the two paths had opposite reasons: decode could not
+    # fuse into its DRAM-sharded matmul at all, while prefill's fused_activation was a measured win
+    # against a STANDALONE unary over the [rows, intermediate] tensor.  But those are not the only
+    # two placements, and the third is strictly better than either: the multiply is ALREADY reading
+    # gate, so riding in on its unpack costs no pass at all, where the pack loop is a place the
+    # activation cannot be spread across the grid.  Prefill measures gate and up at the SAME
+    # 3584x3072x8192 shape, and the fused one runs 644.4 us/call against 433.5 -- 280 TFLOP/s
+    # against 416 -- with under 20 us of that explained by bf8_b's extra weight bytes over up's
+    # bf4_b.  math_approx_mode was tried first and moved nothing (see llama_m_l_p), which is what
+    # says the cost is the pack loop rather than which sigmoid runs in it.
+    deferred = _SILU_ACT is not None
     gate = linear(
         x,
         gate_w,
@@ -789,10 +803,6 @@ def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kerne
         if len(dims) > rank:
             h = ttnn.reshape(h, tuple(dims[-rank:]))
     else:
-        # The mirror did not serve after all (a shape it was not planned for), so the deferred silu
-        # has nowhere to ride -- put it back as the standalone unary rather than dropping it.
-        if deferred:
-            gate = _apply("silu", gate)
         # THE PRODUCT GOES TO DRAM EVEN WHEN THE HALVES DID NOT, AND THAT IS MEASURED.  Keeping it
         # in L1 too leaves 284 kB/core resident while `down` is trying to place ~700 kB of circular
         # buffers, and the 2-D config is what loses that argument: ttnn refused it, _block_linear
@@ -803,7 +813,10 @@ def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kerne
         # NAMED, NOT DEFAULTED: ttnn's binary ops inherit operand A's placement, so with the halves
         # in L1 an unqualified multiply keeps the product there too and the change above would have
         # been inert.
-        h = ttnn.multiply(gate, up) if ffn_mem is None else ttnn.multiply(gate, up, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        # ...AND THE silu RIDES IN ON THIS MULTIPLY'S UNPACK, which is why the gate matmul above no
+        # longer carries a fused_activation.  _multiply_with_silu falls back to the standalone unary
+        # on a build whose binary op will not take per-input activations, so nothing is dropped.
+        h = _multiply_with_silu(gate, up, None if ffn_mem is None else ttnn.DRAM_MEMORY_CONFIG, deferred)
         if ffn_mem is not None:
             # SAME REASON AS THE SHARDED BRANCH ABOVE, AND MORE PRESSING HERE: at prefill height the
             # two halves are 31 MB EACH of L1, and down's circular buffers are sized against
