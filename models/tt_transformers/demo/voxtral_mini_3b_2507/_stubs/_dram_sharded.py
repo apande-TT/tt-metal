@@ -1313,6 +1313,20 @@ def fuse_qkv(qw, kw, vw, qb=None, kb=None, vb=None, scale=1.0):
 
 # Bytes of q+k+v under which the head split leaves its three outputs in L1 for SDPA -- see below.
 _SDPA_L1_MAX_BYTES = 24 * 1024 * 1024
+# Bytes of K PLUS V under which they are moved into L1 on their own when the three-way budget above
+# refused the split.  Counted in the REAL dtype, unlike _SDPA_L1_MAX_BYTES: this cap is being derived
+# here rather than inherited, and the failure it has to stay clear of is measured -- 23.4 MB of real
+# L1 tenancy at this point in the layer makes the next rms_norm unable to place its dataflow buffers.
+# K and V are the only two operands flash re-reads, and on a grouped-query model they are a small
+# fraction of the split (8 kv heads against 32 q heads), so the pair fits far inside that limit.
+_KV_L1_MAX_BYTES = 12 * 1024 * 1024
+
+
+def _tensor_bytes(t):
+    n = 1
+    for d in tuple(t.shape):
+        n *= int(d)
+    return n * _DTYPE_BYTES.get(t.dtype, 2)
 
 
 def qkv_heads(qkv, num_heads, num_kv_heads=None):
@@ -1341,13 +1355,33 @@ def qkv_heads(qkv, num_heads, num_kv_heads=None):
     # the width without re-deriving the cap just doubles the residency; correcting both would put the
     # cap below this shape again and change nothing.  Left as-is deliberately.
     mem = ttnn.L1_MEMORY_CONFIG if b * s * w * 2 <= _SDPA_L1_MAX_BYTES else ttnn.DRAM_MEMORY_CONFIG
-    return ttnn.experimental.nlp_create_qkv_heads(
+    q, k, v = ttnn.experimental.nlp_create_qkv_heads(
         ttnn.reshape(qkv, (b, 1, s, w)),
         num_heads=num_heads,
         num_kv_heads=num_heads if num_kv_heads is None else num_kv_heads,
         transpose_k_heads=False,
         memory_config=mem,
     )
+    if mem is ttnn.DRAM_MEMORY_CONFIG:
+        # THE SPLIT DID NOT FIT, BUT THE TWO OPERANDS THAT ARE RE-READ DO.  q is read once per call;
+        # K and V are read once per (q chunk, q head), and this model is grouped-query, so each kv
+        # head is pulled by four q heads and again by every q chunk.  On the LM's prefill shape that
+        # turns a 7.8 MB pair into ~47 MB of DRAM reads and is what holds this op at ~183 GB/s
+        # effective while the residual adds one line away reach 412.  Moving ONLY the pair costs two
+        # launches over 7.8 MB and leaves 71 kB/core resident -- a third of the footprint that made
+        # the three-way placement unplaceable -- so it buys most of the re-read back at a fraction
+        # of the L1 the whole split wanted.  Pure placement: the values are bit-identical, and a
+        # refusal falls back to the DRAM tensors the split already produced.
+        if _tensor_bytes(k) + _tensor_bytes(v) <= _KV_L1_MAX_BYTES:
+            try:
+                k_l1 = ttnn.to_memory_config(k, ttnn.L1_MEMORY_CONFIG)
+                v_l1 = ttnn.to_memory_config(v, ttnn.L1_MEMORY_CONFIG)
+                ttnn.deallocate(k)
+                ttnn.deallocate(v)
+                k, v = k_l1, v_l1
+            except RuntimeError:
+                pass
+    return q, k, v
 
 
 _SDPA_CFGS = {}
