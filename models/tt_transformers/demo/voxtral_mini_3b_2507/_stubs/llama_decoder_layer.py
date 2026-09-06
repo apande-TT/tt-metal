@@ -555,10 +555,16 @@ class TtLlamaDecoderLayer:
             q, k, v = _DS.qkv_split_decode(qkv, B, self.num_heads, self.num_kv_heads, self.head_dim)
 
             if rope is not None:
-                cos_s = _rank4(rope[0])
-                sin_s = _rank4(rope[1])
-                q = _apply_rotary_tt(q, cos_s, sin_s, decode=True)
-                k = _apply_rotary_tt(k, cos_s, sin_s, decode=True)
+                # HAND THE ROPE TABLES DOWN UNTOUCHED.  _shard_rope_pair caches its height-shard
+                # under the IDENTITY of the tensors it was given, so that the 29 layers after the
+                # first reuse one shard per core set instead of rebuilding a byte-identical one.
+                # Calling `_rank4` here defeated that: at ranks below 4 it is a `ttnn.reshape`, so
+                # every layer handed the cache a brand-new object, every lookup missed, and the pair
+                # was resharded 2 x 2 x 30 times a token instead of 2 x 2 -- 3060 launches in the
+                # profiled capture at 0.70 us each. The helper already applies `_rank4` itself on
+                # the miss path, so the fixup still happens, exactly once per token.
+                q = _apply_rotary_tt(q, rope[0], rope[1], decode=True)
+                k = _apply_rotary_tt(k, rope[0], rope[1], decode=True)
 
             _write_kv_decode(kv, k, v, self.device)
 
