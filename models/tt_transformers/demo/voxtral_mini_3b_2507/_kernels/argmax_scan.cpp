@@ -27,8 +27,10 @@
 //
 // The other structural change is the read: the stock kernel interleaves one read and one scan per
 // batch row, so each row pays full NoC latency with the RISC-V idle, and re-runs the whole
-// multicast/semaphore handshake with the reduce core once per row.  Here every row's slice is
-// fetched up front behind a single barrier, and the cross-core fold happens once, in pass 2.
+// multicast/semaphore handshake with the reduce core once per row.  Here there is no read at all --
+// the resident input is WIDTH-SHARDED onto exactly these cores, so each processor's slice is its
+// own core's L1 and `src_addr` (the same address on every core, as sharded buffers are) already
+// points at it.  The cross-core fold happens once, in pass 2.
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -72,27 +74,27 @@ void kernel_main() {
     const uint32_t count = get_arg_val<uint32_t>(3);
     const uint32_t chunk = get_arg_val<uint32_t>(4);
 
-    constexpr uint32_t src_cb_idx = get_compile_time_arg_val(0);
-    constexpr uint32_t dst_cb_idx = get_compile_time_arg_val(1);
-    // Rows of the batch. The input is ROW_MAJOR with the vocab last, so one row is one page.
-    constexpr uint32_t rows = get_compile_time_arg_val(2);
-    // Bytes reserved per row in the scratch buffer; a multiple of 32 (the host rounds `per` to 16
-    // elements) so every slice the NoC lands is 16-byte aligned at both ends.
-    constexpr uint32_t row_stride = get_compile_time_arg_val(3);
+    constexpr uint32_t dst_cb_idx = get_compile_time_arg_val(0);
+    // Rows of the batch.
+    constexpr uint32_t rows = get_compile_time_arg_val(1);
+    // Bytes between consecutive rows inside THIS CORE'S SHARD: `per` bf16 values, and `per` is a
+    // multiple of 16 elements = 32 bytes, so the stick carries no L1 alignment padding.
+    constexpr uint32_t row_stride = get_compile_time_arg_val(2);
+    // Byte offset of this processor's half within the shard's row; constant per slot.
+    constexpr uint32_t slot_off = get_compile_time_arg_val(3);
 
-    constexpr auto s_src_args = TensorAccessorArgs<4>();
-    constexpr auto s_dst_args = TensorAccessorArgs<s_src_args.next_compile_time_args_offset()>();
-
-    const auto s_src = TensorAccessor(s_src_args, src_addr);
+    constexpr auto s_dst_args = TensorAccessorArgs<4>();
     const auto s_dst = TensorAccessor(s_dst_args, dst_addr);
 
     Noc noc;
-    CircularBuffer src_cb(src_cb_idx);
     CircularBuffer dst_cb(dst_cb_idx);
 
-    const uint32_t base = src_cb.get_write_ptr();
-    const uint32_t nbytes = count << 1;
-    const uint32_t byte_off = start << 1;
+    // THE SOURCE IS THIS CORE'S OWN SHARD, SO THERE IS NOTHING TO FETCH.  The resident input is
+    // width-sharded onto exactly the cores this kernel runs on, and a sharded L1 buffer sits at the
+    // SAME address on every core -- so `src_addr` already points at the slice this processor owns.
+    // The whole read path below (a TensorAccessor, a row-ahead prefetch, and a barrier per row)
+    // existed only because an interleaved source put every core's slice on someone else's bank.
+    const uint32_t base = src_addr + slot_off;
 
     volatile tt_l1_ptr uint32_t* out = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dst_cb.get_write_ptr());
 
@@ -105,23 +107,11 @@ void kernel_main() {
             out[2 * b + 1] = 0;
         }
     } else {
-        // ONE ROW AHEAD, NOT ALL OF THEM UP FRONT.  Issuing every row and then waiting once is
-        // already far better than the stock kernel's read-scan-read-scan, but it still spends the
-        // whole fetch with the RISC-V idle, and that fetch is not free at this fan-out: the source
-        // is interleaved with the vocab last, so it is ONE page per row on ONE bank, and every
-        // scan processor on the grid pulls its slice of row b from that same bank.  Scanning row b
-        // while row b+1 is in flight hides it behind work the core has to do anyway.
-        //
-        // Each row lands in its own region of the scratch (b * row_stride), so the read ahead never
-        // touches the row being scanned, and the barrier below is the coarse all-outstanding one --
-        // correct here precisely because only the next row is ever in flight.
-        noc.async_read(s_src, src_cb, nbytes, {.page_id = 0, .offset_bytes = byte_off}, {.offset_bytes = 0});
-        noc.async_read_barrier();
-        // The scan below reads through a NON-volatile pointer so the compiler is free to unroll
-        // and schedule it -- with `volatile` every 2-byte load is emitted separately and in order,
-        // which measured ~20 cycles/element for a ~7-instruction body.  The barrier above is not
-        // by itself a guarantee to the compiler that L1 changed underneath it, so state that
-        // explicitly here rather than relying on the read barrier to imply it.
+        // The scan reads through a NON-volatile pointer so the compiler is free to unroll and
+        // schedule it -- with `volatile` every 2-byte load is emitted separately and in order,
+        // which measured ~20 cycles/element for a ~7-instruction body.  The fill op that wrote this
+        // shard is a separate program, so its writes are ordered before this kernel starts; the
+        // barrier this comment used to pair with is gone with the fetch.
         asm volatile("" ::: "memory");
 
         // TWO ELEMENTS PER LOAD.  The host rounds `per` to a multiple of 16 elements, so count is
@@ -130,11 +120,6 @@ void kernel_main() {
         // index, which is the order the first-maximum tie rule needs.
         const uint32_t nwords = count >> 1;
         for (uint32_t b = 0; b < rows; ++b) {
-            if (b + 1 < rows) {
-                noc.async_read(
-                    s_src, src_cb, nbytes, {.page_id = b + 1, .offset_bytes = byte_off},
-                    {.offset_bytes = (b + 1) * row_stride});
-            }
             const tt_l1_ptr uint32_t* q = reinterpret_cast<const tt_l1_ptr uint32_t*>(base + b * row_stride);
             // Seeded from element 0 rather than a sentinel, so the "first maximum wins" rule holds
             // even for a slice whose every value is the same.
@@ -161,13 +146,6 @@ void kernel_main() {
             }
             out[2 * b] = best;
             out[2 * b + 1] = start + best_i;
-            if (b + 1 < rows) {
-                // Wait for the row we prefetched above, and tell the compiler L1 moved under it --
-                // the scan reads through a non-volatile pointer, so the barrier alone is not a
-                // guarantee it may not hoist the next row's loads above this point.
-                noc.async_read_barrier();
-                asm volatile("" ::: "memory");
-            }
         }
     }
 

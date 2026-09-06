@@ -97,8 +97,29 @@ class CppArgmax:
         self.grid_x = grid.x
 
         l1 = ttnn.L1_MEMORY_CONFIG
+        # THE RESIDENT INPUT IS WIDTH-SHARDED ONTO THE SCAN'S OWN CORES, AND THAT DECIDES TWO OPS.
+        # An INTERLEAVED [1, rows, vocab] ROW_MAJOR tensor pages by its last dim, so at vocab =
+        # 131072 the whole 2 MB block is `rows` pages of 256 kB -- eight banks. Both ops that touch
+        # it inherit that: the fill runs on the eight cores that own the pages while the rest of the
+        # grid idles, and every one of the 220 scan processors then pulls its slice of row b over the
+        # NOC from that same single bank. Sharding it (rows, per) across the SAME `ncores` the scan
+        # already uses fixes both at once -- the fill becomes a full-grid interleaved_to_sharded, and
+        # each core's slice IS its own shard, so the scan reads local L1 with no NOC transfer and no
+        # barrier at all. `per` is unchanged, so the split, the chunk numbering and the critical path
+        # length are exactly what they were.
+        self.shard_cfg = ttnn.create_sharded_memory_config(
+            (self.rows, per),
+            self.cores,
+            ttnn.ShardStrategy.WIDTH,
+            ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
         self.src = ttnn.allocate_tensor_on_device(
-            ttnn.Shape([1, self.rows, self.vocab]), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, device, l1
+            ttnn.Shape([1, self.rows, self.vocab]),
+            ttnn.bfloat16,
+            ttnn.ROW_MAJOR_LAYOUT,
+            device,
+            self.shard_cfg,
         )
         # ONE page, not one per chunk: pass 2 then pulls every partial in a single transfer
         # instead of `nparts` serial page requests.
@@ -126,24 +147,17 @@ class CppArgmax:
         return list(acc.get_compile_time_args())
 
     def _build_scan(self):
-        row_stride = self.half * 2
+        # Bytes between consecutive rows WITHIN this core's shard.  The shard is `rows` sticks of
+        # `per` bf16 values laid out contiguously, and `per` is a multiple of 16 elements = 32 bytes,
+        # so the stick needs no L1 alignment padding and the stride is exactly its length.
+        row_stride = self.per * 2
         part_bytes = self.rows * 8
         src_addr = self.src.buffer_address()
         dst_addr = self.part.buffer_address()
-        src_acc = self._accessor_args(self.src)
         part_acc = self._accessor_args(self.part)
 
         kernels, cbs = [], []
-        for slot, (src_cb, dst_cb) in enumerate(_CB_PAIRS):
-            cbs.append(
-                ttnn.CBDescriptor(
-                    total_size=self.rows * row_stride,
-                    core_ranges=self.cores,
-                    format_descriptors=[
-                        ttnn.CBFormatDescriptor(buffer_index=src_cb, data_format=ttnn.bfloat16, page_size=row_stride)
-                    ],
-                )
-            )
+        for slot, (_src_cb, dst_cb) in enumerate(_CB_PAIRS):
             cbs.append(
                 ttnn.CBDescriptor(
                     total_size=part_bytes,
@@ -167,7 +181,9 @@ class CppArgmax:
                     kernel_source=_SCAN_KERNEL,
                     source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                     core_ranges=self.cores,
-                    compile_time_args=[src_cb, dst_cb, self.rows, row_stride] + src_acc + part_acc,
+                    # The slot's byte offset INSIDE the core's shard is constant per slot, so it is a
+                    # compile-time argument rather than a fifth runtime one.
+                    compile_time_args=[dst_cb, self.rows, row_stride, slot * self.half * 2] + part_acc,
                     runtime_args=rt,
                     # Reader binds one data-movement RISC-V, writer the other; the pair is how a
                     # single program reaches both processors on the same core.
@@ -224,6 +240,17 @@ class CppArgmax:
     def __call__(self, logits_rm):
         # The two call sites hand back [1, rows, V] and [rows, 1, V]; both page identically under
         # ROW_MAJOR (one page per row, vocab last), so one resident buffer serves both.
-        ttnn.copy(ttnn.reshape(logits_rm, (1, self.rows, self.vocab)), self.src)
+        #
+        # FILL WITH THE SHARDING OP, NOT WITH ttnn.copy.  `copy` is an ELTWISE op, so it walks the
+        # destination's pages -- eight of them at this width -- and it also refuses a preallocated
+        # ROW_MAJOR output on anything but the placement it happens to support. interleaved_to_sharded
+        # is the data-movement op for exactly this move, it spreads over every core in the shard's
+        # grid, and its `preallocated_output` writes the RESIDENT buffer the descriptors were built
+        # against, so trace safety is unchanged.
+        ttnn.interleaved_to_sharded(
+            ttnn.reshape(logits_rm, (1, self.rows, self.vocab)),
+            self.shard_cfg,
+            preallocated_output=self.src,
+        )
         ttnn.generic_op([self.src, self.part], self._scan_desc)
         return ttnn.generic_op([self.part, self.out], self._reduce_desc)
