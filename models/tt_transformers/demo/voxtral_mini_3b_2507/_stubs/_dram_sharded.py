@@ -372,6 +372,25 @@ _ACT_DTYPE = ttnn.bfloat8_b
 # so this cap only exists to stop a much longer context silently filling L1 under the matmuls.
 _ROPE_L1_MAX_BYTES = 1024 * 1024
 
+# THE ROPE HAS ITS OWN FIDELITY PAIRING, AND NOT PASSING ONE IS NOT THE SAME AS NOT HAVING ONE.
+# `rotary_embedding_hf` documents that a caller who hands it no compute_kernel_config gets
+# init_device_compute_kernel_config's default -- math_fidelity=HiFi4 -- and every call site here
+# handed it none, so the op has been running the model's HIGHEST fidelity on its cheapest maths.
+# The rotation is two multiplies and an add; HiFi4 makes the FPU take four passes over operands
+# that carry ONE pass worth of mantissa (prefill's q and k are bf8_b off the head split, decode's
+# are bf16), which is exactly the argument _NORM_CFG already made for the norms.  It shows in the
+# profile: prefill's q rope moves 15.6 MB in and 15.6 MB out -- a 46 us round trip at this board's
+# measured bandwidth -- and takes 203.4 us, so it is not the bytes that bind.
+# HiFi2 RATHER THAN LoFi because cos/sin are the one wide pair in the expression: they are the
+# rotation itself, LoFi keeps ~5 mantissa bits, and this model's e2e PCC sits at 0.9559 against a
+# 0.95 gate with no budget to spend on a rounding step that compounds over 32 layers.
+ROPE_CFG = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_approx_mode=True,
+    fp32_dest_acc_en=False,
+    packer_l1_acc=False,
+)
+
 
 def rope_resident(cos, sin):
     """Put the prefill rope tables in L1, once per forward, and hand back the pair.

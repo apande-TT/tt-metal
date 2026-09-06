@@ -312,7 +312,9 @@ def _apply_rotary_tt(x, cos, sin, decode=False):
             xs = _height_shard_decode_input(x, dev, batch, cores)
             # SHARD THE ROPE TABLES ONCE PER TOKEN, NOT ONCE PER LAYER -- see _shard_rope_pair.
             cs, ss = _shard_rope_pair(cos, sin, dev, batch, cores)
-            out = ttnn.experimental.rotary_embedding_hf(xs, cs, ss, is_decode_mode=True)
+            out = ttnn.experimental.rotary_embedding_hf(
+                xs, cs, ss, is_decode_mode=True, compute_kernel_config=_DS.ROPE_CFG
+            )
             # FREE THE PER-CALL SHARD.  Now that `out` stays resident in L1 the input that
             # produced it must not: the DRAM-sharded projections that run next size their circular
             # buffers against whatever L1 is still free on these cores, and leaving ~24 kB of dead
@@ -351,7 +353,9 @@ def _apply_rotary_tt(x, cos, sin, decode=False):
                 # so merging batch into that dim is exactly equivalent.  Both are leading dims, and
                 # tiling depends only on the last two, so the reshape is a view, not a re-tilization.
                 folded = x if b == 1 else ttnn.reshape(x, (1, b * nh, s, hd))
-                out = ttnn.experimental.rotary_embedding_hf(folded, cos4, sin4, is_decode_mode=False)
+                out = ttnn.experimental.rotary_embedding_hf(
+                    folded, cos4, sin4, is_decode_mode=False, compute_kernel_config=_DS.ROPE_CFG
+                )
                 return out if b == 1 else ttnn.reshape(out, (b, nh, s, hd))
         except (RuntimeError, TypeError, AttributeError):
             pass
