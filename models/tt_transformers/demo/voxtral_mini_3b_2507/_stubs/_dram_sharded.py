@@ -1322,6 +1322,72 @@ _SDPA_L1_MAX_BYTES = 24 * 1024 * 1024
 _KV_L1_MAX_BYTES = 12 * 1024 * 1024
 
 
+# Bytes an attention OUTPUT may have before L1 residency stops paying -- see attn_out_config.  Sized
+# for ONE tenant, not three: `release` has already dropped q/k/v by the time the head concat runs, so
+# the widest moment on this path is flash's own output beside the concat's, and at the LM prefill
+# shape that is 14.5 MB, i.e. 132 kB on each of 110 cores.
+_ATTN_OUT_L1_MAX_BYTES = 16 * 1024 * 1024
+# (shape) pairs the allocator refused, so the fallback to DRAM is paid once rather than per call.
+_ATTN_OUT_L1_REFUSED = set()
+
+
+def attn_out_config(t):
+    """Interleaved L1 for flash's output and the concat that reads it, or None to leave it in DRAM.
+
+    THE OPERANDS MOVED TO L1 AND THE RESULT DID NOT.  q/k/v come out of the head split in L1 now,
+    but flash still defaulted its output to DRAM, so the attention wrote [b, nqh, s, hd] out through
+    the DRAM controller, concatenate_heads read it back and wrote the same bytes again, and o_proj
+    read them a third time -- three full passes over a value whose only consumers are the two ops
+    after it.  Returns None rather than DRAM_MEMORY_CONFIG so a caller that does not apply keeps the
+    exact call it made before.
+    """
+    shp = tuple(int(d) for d in t.shape)
+    if shp in _ATTN_OUT_L1_REFUSED:
+        return None
+    return ttnn.L1_MEMORY_CONFIG if _tensor_bytes(t) <= _ATTN_OUT_L1_MAX_BYTES else None
+
+
+def sdpa_prefill(q, k, v, *, scale, program_config, compute_kernel_config):
+    """Causal flash prefill, landing its output where the head concat will read it."""
+    mem = attn_out_config(q)
+    if mem is not None:
+        try:
+            return ttnn.transformer.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=True,
+                scale=scale,
+                memory_config=mem,
+                program_config=program_config,
+                compute_kernel_config=compute_kernel_config,
+            )
+        except RuntimeError:
+            # The budget above counts this tensor; it cannot see the trace region, the resident
+            # caches or flash's own circular buffers, so the placement is a request.
+            _ATTN_OUT_L1_REFUSED.add(tuple(int(d) for d in q.shape))
+    return ttnn.transformer.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        is_causal=True,
+        scale=scale,
+        program_config=program_config,
+        compute_kernel_config=compute_kernel_config,
+    )
+
+
+def concat_heads(attn_out):
+    """`concatenate_heads`, keeping the projection's activation in L1 when flash left one there."""
+    mem = attn_out_config(attn_out)
+    if mem is not None:
+        try:
+            return ttnn.transformer.concatenate_heads(attn_out, memory_config=mem)
+        except (RuntimeError, TypeError):
+            _ATTN_OUT_L1_REFUSED.add(tuple(int(d) for d in attn_out.shape))
+    return ttnn.transformer.concatenate_heads(attn_out)
+
+
 def release(*tensors):
     """Drop device tensors whose last consumer has just run, ignoring anything already gone.
 

@@ -495,11 +495,12 @@ class TtLlamaAttention:
         if kv is not None:
             _fill_kv_prefill(kv, k, v)
 
-        attn_out = ttnn.transformer.scaled_dot_product_attention(
+        # Placed output -- see _DS.attn_out_config: the operands live in L1 now, so leaving the
+        # RESULT in DRAM is three passes over a value with two consumers, both one op away.
+        attn_out = _DS.sdpa_prefill(
             q,
             k,
             v,
-            is_causal=True,
             scale=self.scaling,
             program_config=_DS.sdpa_config(self.device, q, k),
             compute_kernel_config=_DS.ATTN_CFG,
@@ -508,7 +509,7 @@ class TtLlamaAttention:
         # stack: q/k/v are dead once SDPA returns, but they stay bound to locals through the whole
         # rest of the layer, which is the tenancy that kept the split out of L1.
         _DS.release(q, k, v)
-        attn_out = ttnn.transformer.concatenate_heads(attn_out)
+        attn_out = _DS.concat_heads(attn_out)
         attn_out = _DS.mm(self.device, attn_out, self.o_weight, _ATTN_PROJ_CFG, mirror=self.o_ds)
 
         return attn_out
