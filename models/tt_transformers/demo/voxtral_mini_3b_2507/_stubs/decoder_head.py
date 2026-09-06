@@ -230,6 +230,16 @@ class TtLMHead:
         # reporting entirely (only encode survived the measurement) because the trace's own L1 is
         # allocated around these buffers.  Measured 2026-09-05; do not retry without a trace-region
         # budget to match.
+        rows = 1
+        for d in dims[:-1]:
+            rows *= d
+        # UNTILIZE PER CHUNK, THEN JOIN -- see _join_unpadded.  A build whose untilize refuses an L1
+        # width shard falls back to the original tiled concat below, so the sampler's contract (a
+        # bf16 ROW_MAJOR [.., rows, V] block) never depends on this path holding.
+        try:
+            return ttnn.reshape(self._join_unpadded(parts, rows), tuple(dims[:-1]) + (self.n,))
+        except (RuntimeError, TypeError, ValueError):
+            pass
         out = parts[0] if len(parts) == 1 else ttnn.concat(parts, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         if out is not parts[0]:
             # RELEASE THE CHUNKS ONCE THEY ARE JOINED.  Each is an L1 width shard (~1.1 MB over the
@@ -268,6 +278,29 @@ class TtLMHead:
         except (RuntimeError, TypeError, ValueError):
             return ttnn.reshape(out, tuple(dims[:-1]) + (self.n,))
         return ttnn.reshape(rm, tuple(dims[:-1]) + (self.n,))
+
+    def _join_unpadded(self, parts, rows):
+        """Untilize each vocab chunk FIRST, then join the row-major pieces.
+
+        UNPADDING IS A SHRINK, SO IT BELONGS UPSTREAM OF THE JOIN.  Each chunk is one TILE row
+        carrying `rows` real values in a 32-row pad, so the tiled form is four times the bytes of
+        the values in it.  Concatenating tiled and untilizing after moves that padding twice --
+        the concat reads and rewrites all four padded chunks, and the untilize then reads the
+        joined padded block to recover the same values.  Untilizing per chunk pays the padding
+        exactly once, on the read the matmul's output has to be read for anyway, and the join
+        that follows moves only the real row-major values.
+        """
+        pieces = [ttnn.untilize_with_unpadding(p, [0, 0, rows - 1, self.split_size - 1]) for p in parts]
+        joined = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        # NOTHING IS RELEASED UNTIL THE WHOLE CHAIN HAS SUCCEEDED.  The caller keeps the tiled chunks
+        # as its fallback, so freeing them before the concat returns would leave that path holding
+        # deallocated buffers on exactly the builds the fallback exists for.
+        for p in parts:
+            ttnn.deallocate(p)
+        if joined is not pieces[0]:
+            for p in pieces:
+                ttnn.deallocate(p)
+        return joined
 
 
 def build(device, torch_module=None):
