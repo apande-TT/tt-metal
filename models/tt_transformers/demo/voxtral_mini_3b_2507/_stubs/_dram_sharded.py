@@ -937,6 +937,12 @@ _SUBBLOCK_CHOICES = (
 # A 1% window makes that unmeasurable guess decide the grid outright. Widened so a plan doing
 # strictly less per-core work on 11 more cores is allowed through; only gate/up and qkv move, and
 # whether the reuse penalty is real is then a measurement rather than a constant.
+#
+# AND IT IS NOW MEASURED, ON THE SIDE THE COMMENT ABOVE LEFT OPEN.  Narrowing the window to 0.01 --
+# which hands the grid to the model's own lowest-cost plan, 11 x 9 with a 2x3 subblock at reuse 1.0
+# -- cost prefill 106.53 -> 112.43 ms (+5.5%) and encode 16.92 -> 17.27, measured 2026-09-06.  The
+# 11 cores are worth more than the DEST subblock the model prices them against, so the wide window
+# stays: `reuse` overstates what a 1xN subblock costs on these shapes.
 _COST_TIE = 0.10
 # Bytes of circular buffer one core may hold for a 2-D mcast matmul.  Blackhole has 1,572,864 B of
 # L1 per core; this is deliberately well under half of it because the estimate below counts only
