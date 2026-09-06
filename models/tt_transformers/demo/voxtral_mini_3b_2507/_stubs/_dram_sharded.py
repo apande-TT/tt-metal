@@ -909,7 +909,16 @@ _SUBBLOCK_CHOICES = (
 # Fraction of the best cost inside which two candidates count as equal, so the tie goes to the one
 # occupying MORE cores.  The cost model cannot separate a 100-core and a 110-core plan that do the
 # same per-core work, and measured on fc1 the wider grid was 6% faster.
-_COST_TIE = 0.01
+#
+# THE WINDOW HAS TO BE WIDER THAN THE ONE TERM THE MODEL IS LEAST SURE OF.  `reuse` is a guess at how
+# much the unpacker costs a narrow DEST subblock, and it is the ONLY thing separating the two plans
+# on this model's two dominant LM shapes: at 11 x 9 gate/up gets per_core 12 x 24 with an out
+# subblock of 2x3 (reuse 1.0), at 11 x 10 it gets 11 x 24 -- 8.3% LESS per-core work -- but
+# per_core_M 11 is prime, so the subblock drops to 1x6 (reuse 0.857) and the modelled cost rises 6%.
+# A 1% window makes that unmeasurable guess decide the grid outright. Widened so a plan doing
+# strictly less per-core work on 11 more cores is allowed through; only gate/up and qkv move, and
+# whether the reuse penalty is real is then a measurement rather than a constant.
+_COST_TIE = 0.10
 # Bytes of circular buffer one core may hold for a 2-D mcast matmul.  Blackhole has 1,572,864 B of
 # L1 per core; this is deliberately well under half of it because the estimate below counts only
 # in0/in1/out/interm and the factory also reserves space for the reader/writer and the semaphores.
