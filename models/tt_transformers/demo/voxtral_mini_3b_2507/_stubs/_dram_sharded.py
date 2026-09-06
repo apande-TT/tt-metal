@@ -748,14 +748,33 @@ except (AttributeError, TypeError, ValueError):  # pragma: no cover - depends on
 
 
 def _multiply_with_silu(gate, up, memory_config, deferred):
-    """gate * up, with silu(gate) folded into the multiply's own unpack when it was deferred."""
+    """gate * up, with silu(gate) folded into the multiply's own unpack when it was deferred.
+
+    AND THE SIGMOID INSIDE IT RUNS APPROXIMATE.  Once the silu rides on this op, the multiply is no
+    longer a bandwidth-bound eltwise: at the prefill shape a bare add over the same [8, 416, 3072]
+    stream runs at 725 GB/s, which scaled to the 8192-wide intermediate is ~120 us, and this call
+    measures 307 us -- the ~190 us difference is the SFPU evaluating an exact sigmoid over 27 M
+    elements, and it is the single largest non-matmul cost in prefill.  `fast_and_approximate_mode`
+    is the binary op's own route to the SFPU's approximate path (the same axis as
+    math_approx_mode on a compute config, which the matmul-fused form was measured not to benefit
+    from -- there the cost was the pack loop, here it is the transcendental itself).  Only the
+    activated form asks for it: a plain multiply has no transcendental to approximate.
+    """
     if not deferred:
         return ttnn.multiply(gate, up, memory_config=memory_config)
-    try:
-        return ttnn.multiply(gate, up, memory_config=memory_config, input_tensor_a_activations=_SILU_ACT)
-    except (RuntimeError, TypeError, ValueError):
-        # A build whose binary op will not take per-input activations: pay the standalone unary.
-        return ttnn.multiply(_apply("silu", gate), up, memory_config=memory_config)
+    for approx in (True, False):
+        try:
+            return ttnn.multiply(
+                gate,
+                up,
+                memory_config=memory_config,
+                input_tensor_a_activations=_SILU_ACT,
+                **({"fast_and_approximate_mode": True} if approx else {}),
+            )
+        except (RuntimeError, TypeError, ValueError):
+            continue
+    # A build whose binary op will not take per-input activations: pay the standalone unary.
+    return ttnn.multiply(_apply("silu", gate), up, memory_config=memory_config)
 
 
 def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid):
