@@ -290,7 +290,31 @@ class TtLMHead:
         exactly once, on the read the matmul's output has to be read for anyway, and the join
         that follows moves only the real row-major values.
         """
-        pieces = [ttnn.untilize_with_unpadding(p, [0, 0, rows - 1, self.split_size - 1]) for p in parts]
+        # ...AND ASK THE UNTILIZE TO LAND THE PIECE WHERE THE JOIN READS IT.  Left to itself the op
+        # inherits its INPUT's placement, and the input is the matmul's L1 WIDTH shard -- so the
+        # unpadded piece came back sharded too and every one of the four then needed a separate
+        # ShardedToInterleaved before the concat could touch it.  Those four launches profiled at
+        # 2.45 us each on 32 cores and did nothing but move 512 kB onto itself in a different
+        # layout; untilize_with_unpadding takes the memory_config directly, so naming it here folds
+        # all four into the untilize the chunk was being read for anyway.
+        #
+        # DRAM RATHER THAN L1, AND THAT IS MEASURED.  L1 looked like the obvious destination -- the
+        # four pieces are ~2 MB together, they die inside this function, and the join is the op that
+        # cannot spread (a row-major tensor pages by its LAST dim, so [.., rows, split] is `rows`
+        # pages and the concat runs on that many cores whatever the grid size), which ought to make
+        # its read the one worth putting in Tensix banks.  It is not: measured 2026-09-06 the concat
+        # went 24.4 -> 29.2 us reading L1, because 8 cores pulling 8 pages scattered over a 32-core
+        # shard is more NoC hops than the same 8 cores streaming them out of the DRAM controller.
+        # DRAM keeps the concat where it was and still folds the four ShardedToInterleaved away.
+        try:
+            pieces = [
+                ttnn.untilize_with_unpadding(
+                    p, [0, 0, rows - 1, self.split_size - 1], memory_config=ttnn.DRAM_MEMORY_CONFIG
+                )
+                for p in parts
+            ]
+        except (RuntimeError, TypeError, ValueError):
+            pieces = [ttnn.untilize_with_unpadding(p, [0, 0, rows - 1, self.split_size - 1]) for p in parts]
         joined = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         # NOTHING IS RELEASED UNTIL THE WHOLE CHAIN HAS SUCCEEDED.  The caller keeps the tiled chunks
         # as its fallback, so freeing them before the concat returns would leave that path holding
