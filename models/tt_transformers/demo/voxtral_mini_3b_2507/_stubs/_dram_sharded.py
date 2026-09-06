@@ -391,6 +391,39 @@ ROPE_CFG = ttnn.WormholeComputeKernelConfig(
     packer_l1_acc=False,
 )
 
+# THE LM'S ATTENTION HAS THE SAME PAIRING PROBLEM, AND IT IS THE LARGEST INSTANCE OF IT LEFT.
+# All three LM bodies hand scaled_dot_product_attention -- and its decode form -- a HiFi4 config,
+# but every operand the op reads is block-float: q, k and v come off the head split at _ACT_DTYPE
+# and the resident KV cache is bf8_b as well.  HiFi4 makes the FPU take FOUR passes over operands
+# carrying one pass worth of mantissa, which is the argument _NORM_CFG and ROPE_CFG already made
+# for the cheaper ops; attention is where it costs the most.  Measured in the prefill profile at
+# 428 us/call on 8x32x448x128 -- ~31 TFLOP/s of causal work on a board whose block-float matmuls
+# reach 280-440 on the same dtypes -- and it is the second most expensive op in the prefill layer.
+#
+# HiFi2 RATHER THAN LoFi, and that is a dtype fact rather than caution: bfp8_b's mantissa needs two
+# FPU passes to be read exactly, so HiFi2 is the LOSSLESS pairing for this operand width where LoFi
+# truncates to ~5 bits.  The truncated values here would be the scores the softmax exponentiates,
+# so the error would not stay linear the way it does in a projection.  The audio tower does run its
+# own SDPA at LoFi, but that attention is not causal-masked and does not feed a resident cache, and
+# this model's e2e PCC sits at 0.9559 against a 0.95 gate with no budget for a compounding step.
+#
+# fp32_dest_acc_en STAYS TRUE.  It is a different knob from fidelity: it is what keeps flash's
+# running max and running sum in fp32 across the k loop, the one place in this op where the
+# accumulator's width is load-bearing rather than merely wide.
+#
+# PREFILL ONLY, AND THAT IS MEASURED RATHER THAN CAUTIOUS.  The decode form of the op reads the
+# same bf8_b operands, so the pairing argument applies to it word for word -- but it is bound on
+# DISPATCH, not on the FPU: one tile row of q against a 640-long cache is 35.4 us/call of which
+# the maths is a rounding error, and pointing it here moved the trace+1cq decode 10.6521 ->
+# 10.7506 ms/token, i.e. nothing but noise in the wrong direction.  So the decode call sites keep
+# their own _HIFI4_CFG and only the prefill ones take this.
+ATTN_CFG = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_approx_mode=False,
+    fp32_dest_acc_en=True,
+    packer_l1_acc=False,
+)
+
 
 def rope_resident(cos, sin):
     """Put the prefill rope tables in L1, once per forward, and hand back the pair.
@@ -1297,6 +1330,16 @@ def qkv_heads(qkv, num_heads, num_kv_heads=None):
     """
     dims = [int(qkv.shape[i]) for i in range(len(qkv.shape))]
     b, s, w = dims[0], dims[-2], dims[-1]
+    # THE `* 2` IS A bf16 WIDTH ON A STREAM THAT IS NO LONGER bf16, AND FIXING IT IS A LOSS.  This
+    # projection is _ACT_DTYPE now, so the LM's prefill qkv is 23.4 MB rather than the 44 MB this
+    # estimate charges it, and sizing the budget in the real dtype lets it through the 24 MB cap.
+    # It does not survive the NEXT op: measured 2026-09-06, the following rms_norm raised
+    # "statically allocated dataflow buffers in program 156 clash with L1 buffers on core range
+    # [0-0 - 10-9]" -- L1 buffer at 876032 against a dataflow region ending at 896512.  The cap was
+    # tuned WITH the bf16 overcharge in place, so 24 MB nominal has always meant ~12 MB of real
+    # tenancy, and that is the number the rest of the layer's programs were sized around.  Correcting
+    # the width without re-deriving the cap just doubles the residency; correcting both would put the
+    # cap below this shape again and change nothing.  Left as-is deliberately.
     mem = ttnn.L1_MEMORY_CONFIG if b * s * w * 2 <= _SDPA_L1_MAX_BYTES else ttnn.DRAM_MEMORY_CONFIG
     return ttnn.experimental.nlp_create_qkv_heads(
         ttnn.reshape(qkv, (b, 1, s, w)),

@@ -731,7 +731,7 @@ class LlamaModel:
                     is_causal=True,
                     scale=self.scaling,
                     program_config=_DS.sdpa_config(self.device, q, k),
-                    compute_kernel_config=_HIFI4_CFG,
+                    compute_kernel_config=_DS.ATTN_CFG,
                 )
                 attn_out = ttnn.transformer.concatenate_heads(attn_out)
                 attn_out = _DS.mm(self.device, attn_out, lw["o_w"], _ATTN_PROJ_CFG, mirror=lw["o_ds"])
