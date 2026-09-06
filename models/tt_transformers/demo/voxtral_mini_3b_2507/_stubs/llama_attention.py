@@ -481,8 +481,18 @@ class TtLlamaAttention:
 
         # One launch, and the fused output is already the layout nlp_create_qkv_heads wants,
         # so no width concat is needed to rebuild it from separate projections.
-        qkv = _DS.mm(self.device, hidden_states, self.qkv_weight, _ATTN_PROJ_CFG, mirror=self.qkv_ds)
+        # Placed output -- see _DS.qkv_out_config: the split writes L1 now, so its INPUT should not
+        # still be a DRAM round trip taken one op before it.
+        qkv = _DS.mm(
+            self.device,
+            hidden_states,
+            self.qkv_weight,
+            _ATTN_PROJ_CFG,
+            mirror=self.qkv_ds,
+            memory_config=_DS.qkv_out_config(_DS.rows_of(hidden_states), int(self.qkv_weight.shape[-1])),
+        )
         q, k, v = _DS.qkv_heads(qkv, self.num_heads, self.num_kv_heads)
+        _DS.release(qkv)
 
         if rope is not None:
             cos_s = _rank4(rope[0])

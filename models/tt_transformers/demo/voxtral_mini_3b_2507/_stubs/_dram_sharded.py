@@ -1331,6 +1331,34 @@ _ATTN_OUT_L1_MAX_BYTES = 16 * 1024 * 1024
 _ATTN_OUT_L1_REFUSED = set()
 
 
+def rows_of(t):
+    """Everything but the last dim, multiplied out -- the height a matmul actually sees."""
+    n = 1
+    for d in tuple(t.shape)[:-1]:
+        n *= int(d)
+    return n
+
+
+def qkv_out_config(rows, width, dtype=None):
+    """Interleaved L1 for the FUSED QKV projection, whose only consumer is the head split.
+
+    THE SPLIT MOVED TO L1 AND ITS INPUT DID NOT.  nlp_create_qkv_heads now writes q/k/v into L1, but
+    it was still READING the projection out of DRAM -- so the fused [B, S, (nh + 2*nkv)*hd] value
+    was written through the DRAM controller and pulled straight back by the very next op.
+
+    Shares _SDPA_L1_MAX_BYTES because it is the same tensor twice over: the projection is exactly
+    the size of the three outputs it becomes, and the two coexist only for the duration of the split
+    itself -- the caller releases the projection the moment it returns.  Gated on the prefill height
+    so the decode path (which goes through the DRAM-sharded mirror and ignores this argument anyway)
+    cannot be reached by it.  Returns None rather than DRAM_MEMORY_CONFIG so a caller that does not
+    apply keeps the exact call it made before.
+    """
+    if int(rows) < _GRID_REQUEST_MIN_ROWS:
+        return None
+    width_bytes = _DTYPE_BYTES.get(dtype if dtype is not None else _ACT_DTYPE, 2)
+    return ttnn.L1_MEMORY_CONFIG if int(rows) * int(width) * width_bytes <= _SDPA_L1_MAX_BYTES else None
+
+
 def attn_out_config(t):
     """Interleaved L1 for flash's output and the concat that reads it, or None to leave it in DRAM.
 

@@ -538,7 +538,18 @@ class TtLlamaDecoderLayer:
 
         # ONE fused projection for both regimes; only the SPLIT differs, because decode has no
         # sequence axis for nlp_create_qkv_heads to work on (its one tile row holds the batch).
-        qkv = _DS.mm(self.device, x, self.qkv_weight, _ATTN_PROJ_CFG, mirror=self.qkv_ds, keep_sharded=decode)
+        # Placed output -- see _DS.qkv_out_config: the prefill split writes L1 now, so its INPUT
+        # should not still be a DRAM round trip taken one op before it.  The config is height-gated,
+        # so the decode branch below (which takes the DRAM-sharded mirror) is handed None.
+        qkv = _DS.mm(
+            self.device,
+            x,
+            self.qkv_weight,
+            _ATTN_PROJ_CFG,
+            mirror=self.qkv_ds,
+            keep_sharded=decode,
+            memory_config=_DS.qkv_out_config(_DS.rows_of(x), int(self.qkv_weight.shape[-1])),
+        )
 
         if decode:
             q, k, v = _DS.qkv_split_decode(qkv, B, self.num_heads, self.num_kv_heads, self.head_dim)
@@ -566,6 +577,7 @@ class TtLlamaDecoderLayer:
         else:
             # the fused output is already the exact layout nlp_create_qkv_heads consumes
             q, k, v = _DS.qkv_heads(qkv, self.num_heads, self.num_kv_heads)
+            _DS.release(qkv)
 
             if rope is not None:
                 cos_s = _rank4(rope[0])

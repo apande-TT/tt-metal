@@ -710,8 +710,18 @@ class LlamaModel:
             else:
                 # One launch, and the fused output is already the exact layout
                 # nlp_create_qkv_heads consumes, so no width concat is needed to rebuild it.
-                qkv = _DS.mm(self.device, h, lw["qkv_w"], _ATTN_PROJ_CFG, mirror=lw["qkv_ds"])
+                # Placed output -- see _DS.qkv_out_config: the split writes L1 now, so its INPUT
+                # should not still be a DRAM round trip taken one op before it.
+                qkv = _DS.mm(
+                    self.device,
+                    h,
+                    lw["qkv_w"],
+                    _ATTN_PROJ_CFG,
+                    mirror=lw["qkv_ds"],
+                    memory_config=_DS.qkv_out_config(_DS.rows_of(h), int(lw["qkv_w"].shape[-1])),
+                )
                 q, k, v = _DS.qkv_heads(qkv, self.num_heads, self.num_kv_heads)
+                _DS.release(qkv)
 
                 if cos_s is not None:
                     # ROUTE THE BULK STACK THROUGH THE SHARED HELPER.  self._apply_rotary is the
