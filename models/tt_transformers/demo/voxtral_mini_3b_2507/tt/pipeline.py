@@ -90,7 +90,14 @@ ENCODE_FRAMES = 1500
 # quadratic op should have given -23%.  Roughly half of each prefill matmul call is fixed cost that
 # a shorter sequence does not touch, which is the same finding that says the remaining prefill gap
 # is per-call overhead rather than sequence length.  Stage: 152.43 -> ~150.8 ms.
-PREFILL_C = 448  # ceil(388 / 32) * 32 + 32
+# ...AND THE SPARE TILE ON TOP OF THE CEILING IS ONE RUNG TOO MANY.  448 was the tile-aligned
+# ceiling of the longest prompt PLUS a whole extra tile, i.e. 60 PAD positions carried through every
+# layer where the ceiling itself already leaves 28.  GUIDELINES/08 section 13 says to derive the
+# bucket from the lengths the model runs, and tt/inputs.py is the source of truth for those: 388 for
+# audio_chat, 382 for transcription, and the audio half of both is FIXED at 375 (a 30 s chunk at
+# 12.5 Hz), so only the instruction text varies and 28 tokens is room for it.  A longer prompt still
+# fails loudly on the assert in prefill_trace_setup rather than silently truncating.
+PREFILL_C = 416  # ceil(388 / 32) * 32
 # decode: variable dim is the KV length.
 DECODE_CAP = 32
 # DELIBERATELY NOT PREFILL_C + 128 ANY MORE: the KV capacity is its own axis, and 640 is a MEASURED
