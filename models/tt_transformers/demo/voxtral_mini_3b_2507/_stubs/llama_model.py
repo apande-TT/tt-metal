@@ -733,6 +733,12 @@ class LlamaModel:
                     program_config=_DS.sdpa_config(self.device, q, k),
                     compute_kernel_config=_DS.ATTN_CFG,
                 )
+                # END THE SPLIT'S LIFETIME AT ITS LAST READER -- see _DS.release.  q/k/v are dead
+                # the instant SDPA returns (the cache was filled above), but they are loop locals,
+                # so without this they stay allocated through concatenate_heads, o_proj, the
+                # residual add and the next norm -- which is what stopped the split from living in
+                # L1 at all.
+                _DS.release(q, k, v)
                 attn_out = ttnn.transformer.concatenate_heads(attn_out)
                 attn_out = _DS.mm(self.device, attn_out, lw["o_w"], _ATTN_PROJ_CFG, mirror=lw["o_ds"])
 

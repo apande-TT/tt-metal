@@ -587,6 +587,10 @@ class TtLlamaDecoderLayer:
                 program_config=_DS.sdpa_config(self.device, q, k),
                 compute_kernel_config=_DS.ATTN_CFG,
             )
+            # END THE SPLIT'S LIFETIME AT ITS LAST READER -- see _DS.release.  Same reason as the
+            # bulk stack: q/k/v are dead once SDPA returns, but they stay bound to locals through
+            # the whole rest of the layer, which is the tenancy that kept the split out of L1.
+            _DS.release(q, k, v)
             attn_out = ttnn.transformer.concatenate_heads(attn_out)
             attn_out = _DS.mm(self.device, attn_out, self.o_weight, _ATTN_PROJ_CFG, mirror=self.o_ds)
 

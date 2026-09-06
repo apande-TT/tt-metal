@@ -1322,6 +1322,25 @@ _SDPA_L1_MAX_BYTES = 24 * 1024 * 1024
 _KV_L1_MAX_BYTES = 12 * 1024 * 1024
 
 
+def release(*tensors):
+    """Drop device tensors whose last consumer has just run, ignoring anything already gone.
+
+    A ttnn tensor is freed when its buffer is deallocated, not when the Python name goes out of
+    scope, and a decoder body binds its q/k/v to loop LOCALS -- so the split stays resident until
+    the next iteration rebinds the name, which is four ops later than its last read.  That is the
+    whole reason the three-way L1 split did not fit: the tenancy being measured was not the
+    attention's, it was the attention's plus everything that runs after it in the same iteration.
+    Tolerant by design, so a caller may hand it a tensor another path already released.
+    """
+    for t in tensors:
+        if t is None:
+            continue
+        try:
+            ttnn.deallocate(t)
+        except (RuntimeError, TypeError, ValueError, AttributeError):
+            pass
+
+
 def _tensor_bytes(t):
     n = 1
     for d in tuple(t.shape):
@@ -1344,24 +1363,44 @@ def qkv_heads(qkv, num_heads, num_kv_heads=None):
     """
     dims = [int(qkv.shape[i]) for i in range(len(qkv.shape))]
     b, s, w = dims[0], dims[-2], dims[-1]
-    # THE `* 2` IS A bf16 WIDTH ON A STREAM THAT IS NO LONGER bf16, AND FIXING IT IS A LOSS.  This
-    # projection is _ACT_DTYPE now, so the LM's prefill qkv is 23.4 MB rather than the 44 MB this
-    # estimate charges it, and sizing the budget in the real dtype lets it through the 24 MB cap.
-    # It does not survive the NEXT op: measured 2026-09-06, the following rms_norm raised
-    # "statically allocated dataflow buffers in program 156 clash with L1 buffers on core range
-    # [0-0 - 10-9]" -- L1 buffer at 876032 against a dataflow region ending at 896512.  The cap was
-    # tuned WITH the bf16 overcharge in place, so 24 MB nominal has always meant ~12 MB of real
-    # tenancy, and that is the number the rest of the layer's programs were sized around.  Correcting
-    # the width without re-deriving the cap just doubles the residency; correcting both would put the
-    # cap below this shape again and change nothing.  Left as-is deliberately.
-    mem = ttnn.L1_MEMORY_CONFIG if b * s * w * 2 <= _SDPA_L1_MAX_BYTES else ttnn.DRAM_MEMORY_CONFIG
-    q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-        ttnn.reshape(qkv, (b, 1, s, w)),
+    # CHARGED IN THE REAL DTYPE, AND THE THING THAT MADE THAT UNAFFORDABLE IS FIXED.  The `* 2` here
+    # was a bf16 width on a stream that is _ACT_DTYPE, so the LM's prefill split was charged 44 MB
+    # against a 24 MB cap when it really occupies 23.4 MB.  Correcting it alone was measured a loss
+    # on 2026-09-06: the split fitted, and then the NEXT rms_norm raised "statically allocated
+    # dataflow buffers in program 156 clash with L1 buffers on core range [0-0 - 10-9]" -- an L1
+    # buffer at 876032 against a dataflow region ending at 896512, i.e. short by 20 kB.
+    #
+    # It was short because q/k/v OUTLIVE the attention.  The caller binds them to loop locals and
+    # Python does not drop those until the next iteration rebinds them, so 213 kB/core of split that
+    # is dead the instant SDPA returns was still resident through concatenate_heads, o_proj, the
+    # residual add and that norm.  `release` below hands the callers a way to end those lifetimes at
+    # the op that actually ends them, which is what buys the 20 kB back and a great deal more.
+    #
+    # What the placement is worth: the split writes its 21.7 MB into L1 instead of DRAM, the two
+    # separate K/V copies below disappear (they exist only to rescue the operands flash re-reads),
+    # both ropes then read AND write L1 (rotary_embedding_hf defaults its output to its input's
+    # config), and SDPA reads all three operands out of Tensix banks over the NoC.
+    mem = (
+        ttnn.L1_MEMORY_CONFIG
+        if b * s * w * _DTYPE_BYTES.get(qkv.dtype, 2) <= _SDPA_L1_MAX_BYTES
+        else ttnn.DRAM_MEMORY_CONFIG
+    )
+    folded = ttnn.reshape(qkv, (b, 1, s, w))
+    kwargs = dict(
         num_heads=num_heads,
         num_kv_heads=num_heads if num_kv_heads is None else num_kv_heads,
         transpose_k_heads=False,
-        memory_config=mem,
     )
+    try:
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(folded, memory_config=mem, **kwargs)
+    except RuntimeError:
+        # A SHAPE THE ALLOCATOR REFUSES IN L1 STILL HAS TO SPLIT.  The budget above counts the three
+        # outputs; it cannot see the trace region, the resident caches or this op's own buffers, so
+        # the placement is a request rather than a guarantee and the DRAM form is the same op.
+        if mem is ttnn.DRAM_MEMORY_CONFIG:
+            raise
+        mem = ttnn.DRAM_MEMORY_CONFIG
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(folded, memory_config=mem, **kwargs)
     if mem is ttnn.DRAM_MEMORY_CONFIG:
         # THE SPLIT DID NOT FIT, BUT THE TWO OPERANDS THAT ARE RE-READ DO.  q is read once per call;
         # K and V are read once per (q chunk, q head), and this model is grouped-query, so each kv
