@@ -65,6 +65,19 @@ def _core_count(device, k_tiles, n_tiles):
 
     The DRAM-sharded matmul gives every core an exact slice of K and of N and has NO padding
     support, so a count that does not divide both is invalid rather than merely slow.
+
+    THE k_tiles CLAUSE IS NOT LOAD-BEARING FOR THE MATMUL, AND DROPPING IT STILL LOSES.  in0 has
+    had its own rectangle since the in0_grid split, the factory takes the two shard grids as
+    independent arguments, and in0 is MULTICAST to every compute core -- so on paper a compute core
+    never owns a slice of K and this clause only pins the grid: it holds gate/up to 32 cores where
+    64 divide N, qkv to 48 where 64 do, down and o_proj to 32 where 48 do.  Measured 2026-09-07 with
+    the clause removed: every decode matmul came back at the SAME time to within noise (gate 57.69 +
+    up 38.22 = 95.9 us against 95.9; down 56.38 vs 56.36; o_proj 31.55 vs 31.52; qkv 44.36 vs 44.27;
+    lm_head 125.69 vs 125.68) and PCC was bit-identical -- yet device_ms went 474.65 -> 493.63, +4.0%.
+    So the output core count is NOT a matmul knob at one tile row (these ops are bound on the bank
+    readers, not on the cores that own N); it is a HAND-OFF knob, and widening it re-shapes every
+    consumer's borrow at once.  All 19 ms of the loss was reshards appearing around ops that had been
+    matching tile for tile.  Leave the clause in: it is what keeps the chain coherent.
     """
     g = device.compute_with_storage_grid_size()
     best = None
@@ -244,6 +257,7 @@ def tile_bytes(dtype):
     """Bytes ONE 32x32 tile of `dtype` occupies -- what an in0 mcast block is really weighed in."""
     return int(TILE * TILE * _DTYPE_BYTES.get(dtype, 2))
 
+
 # Bytes the FFN intermediate may have before L1 residency stops paying -- see ffn_config.
 _FFN_L1_MAX_BYTES = 12 * 1024 * 1024
 
@@ -316,7 +330,9 @@ def ffn_config(rows, width, dtype=None):
     one, and a longer sequence must still degrade to DRAM rather than crowd out those buffers.
     """
     width_bytes = _DTYPE_BYTES.get(dtype if dtype is not None else ttnn.bfloat8_b, 2)
-    return ttnn.L1_MEMORY_CONFIG if int(rows) * int(width) * width_bytes <= _FFN_L1_MAX_BYTES else ttnn.DRAM_MEMORY_CONFIG
+    return (
+        ttnn.L1_MEMORY_CONFIG if int(rows) * int(width) * width_bytes <= _FFN_L1_MAX_BYTES else ttnn.DRAM_MEMORY_CONFIG
+    )
 
 
 # Bytes ONE of the SwiGLU's three wide intermediates may have before L1 residency stops paying.
@@ -951,9 +967,7 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
     if ffn_mem is None:
         return _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, None)
     try:
-        return _swiglu_body(
-            x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, ffn_mem
-        )
+        return _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, ffn_mem)
     except RuntimeError:
         _SWIGLU_L1_REFUSED.add((rows, int(gate_w.shape[-1])))
         return _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, None)
@@ -1153,6 +1167,25 @@ _KBLOCK_OVERHEAD = 60.0
 # narrower N extent also forces a wider per_core_N, which eats the circular-buffer budget and drops
 # gate/up's K block from 8 tiles to 3.  Keep the flag -- the axis is real and a squarer grid could
 # flip it -- but leave it False here.
+#
+# RE-MEASURED AT THE SHAPE THAT REPLACED THE ONE ABOVE, AND IT IS STILL FALSE -- FOR A SHARPER
+# REASON.  That measurement was taken at m_tiles=112 (PREFILL_C 448); RUN72 moved the model to 416,
+# so m_tiles is 104 and the "cannot use the 11th column" argument no longer applies -- at 104 the
+# LM shapes DO keep all 110 cores under transposition, and the cost model actually prefers it
+# (5-9% cheaper on the two dominant shapes) because per_core_M stops being prime.  Measured
+# 2026-09-07 anyway, and the flip is far worse than before, +3.8% of device_ms:
+#   down   3328x8192x3072  sb 1x3 -> 1x5, 389.5 -> 383.8 us, 70.7% -> 71.8% of FPU  (a small WIN)
+#   o_proj 3328x4096x3072  sb 1x3 -> 1x5, 212.0 -> 216.0 us, 64.9% -> 63.8%         (a small LOSS)
+#   gate/up 3328x3072x8192 sb 1x6 -> 2x2, 361.0 -> 980.2 us, 76.1% -> 29.8%         (CATASTROPHIC)
+#   qkv    3328x3072x6144  sb 1x6 -> 2x4, 304.7 -> 727.1 us, 68.7% -> 30.7%
+# THE DISCRIMINANT IS N, NOT M.  Transposing gives the N blocks the Y extent (10) instead of the X
+# extent (11), so a wide-N shape's per_core_N jumps -- 8192 tiles over 10 is 26 against 24 -- and at
+# that width the out block no longer fits _CB_BUDGET_BYTES, so the core re-streams its whole in0
+# slice once per N block.  The two shapes it helps are exactly the two whose N is 96 tiles, and
+# their combined gain (-5.7 us and +4.0 us a layer) does not come close to paying for the two it
+# wrecks.  A per-shape orientation search is therefore also not worth building: it would be worth
+# about 1.7 us a layer.  The encoder confirms the same story from the other side -- every 1504-row
+# shape fell to 100 cores and fc2 went 62.3 -> 107.0 us.
 _TRANSPOSE_MCAST = False
 _BLOCK_CFG_CACHE = {}
 
@@ -1453,14 +1486,14 @@ def mm(
         # DRAM-sharded factory sends anything but RELU down a separate DEST path, which at one
         # tile row costs more than the interleaved unary it replaces.
         return _apply(
-                activation,
-                mirror(
-                    x,
-                    compute_kernel_config=compute_kernel_config,
-                    keep_sharded=keep_sharded,
-                    out_dtype=out_dtype,
-                ),
-            )
+            activation,
+            mirror(
+                x,
+                compute_kernel_config=compute_kernel_config,
+                keep_sharded=keep_sharded,
+                out_dtype=out_dtype,
+            ),
+        )
     # THE THRESHOLD WAS "ONE TILE ROW PER CORE", WHICH IS TOO STRICT.  Asking for the grid loses
     # at the decode shape (a single tile row spread over 110 cores costs more launch than it
     # recovers) but the break-even is nowhere near one row PER CORE -- the audio tower's FFN runs
