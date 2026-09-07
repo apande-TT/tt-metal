@@ -32,6 +32,25 @@ TILE = 32
 _MAX_COMPUTE_CORES = 64
 # m_tiles x n_tiles of output one DRAM-bank worker may own before its buffers stop fitting L1.
 _MAX_OUT_TILES_PER_WORKER = 128
+# Reader cores to put on each DRAM bank, widest first.  The op's own bound is [1, 3]
+# (matmul_utilities.cpp validate_num_workers_per_dram_bank) and >1 is Blackhole-only, so 3 is a
+# legal rung this planner simply never asked for -- it stopped at 2.
+_WORKERS_PER_BANK = (3, 2, 1)
+# Weight BYTES one bank reader may own before a THIRD reader on that bank stops paying.
+#
+# A THIRD READER IS NOT UNIFORMLY BETTER, AND THE SPLIT IS BY SLICE SIZE, NOT BY SHAPE.  Measured
+# 2026-09-07 by running the whole decode stack at (3, 2, 1) and reading the per-op DRAM utilisation
+# back: at 8 banks the rung reaches exactly the projections whose chunk divides 24 -- o_proj and
+# down (96 output tiles) and the fused qkv (192) -- and the three of them moved in three different
+# directions at IDENTICAL core grid, in0_block_w and dtype:
+#   o_proj (13.4 MB of weight, 0.56 MB a reader)  34.70 -> 31.62 us, 70.8% -> 77.7% of DRAM peak
+#   qkv    (20.1 MB,           0.84 MB a reader)  44.50 -> 44.24 us, 82.9% -> 83.3%  (a wash)
+#   down   (26.8 MB,           1.12 MB a reader)  56.60 -> 60.02 us, 86.9% -> 81.9%  (a LOSS)
+# so the third reader buys a third outstanding read where the bank is LATENCY-bound and fragments
+# the stream where it is already bandwidth-bound.  The two regimes are separated by the bytes one
+# reader owns, and the only quantity that changes across those three is K.  0.75 MB sits between
+# the win and the wash; qkv is inside the noise either way and keeps the pick it was measured on.
+_MAX_WEIGHT_BYTES_PER_BANK_READER = 768 * 1024
 # Weight BYTES one in0 mcast block must still stream for widening the activation shard to pay for
 # the extra block's synchronisation -- see in0_grid for the four measurements that set it, and for
 # why the bound is in bytes rather than in the tiles it used to be counted in.
@@ -518,7 +537,7 @@ class DramShardedLinear:
 
         dram_grid = device.dram_grid_size()
         dram_cores = dram_grid.x
-        plan = self._plan(device, k_tiles, n_tiles, dram_cores, max_m_tiles)
+        plan = self._plan(device, k_tiles, n_tiles, dram_cores, max_m_tiles, tile_bytes(weight.dtype))
         if plan is None:
             return
         splits, self.workers_per_bank, cores, gx, gy = plan
@@ -566,7 +585,7 @@ class DramShardedLinear:
         ]
         self.ok = True
 
-    def _plan(self, device, k_tiles, n_tiles, dram_cores, max_m_tiles):
+    def _plan(self, device, k_tiles, n_tiles, dram_cores, max_m_tiles, tile_bytes=_TILE_BYTES_BF8):
         """Fewest power-of-two chunks that divide the compute grid AND the bank workers exactly."""
         for splits in (1 << i for i in range(int(math.log2(n_tiles)) + 1)):
             chunk_tiles = n_tiles // splits
@@ -575,11 +594,13 @@ class DramShardedLinear:
             picked = _core_count(device, k_tiles, chunk_tiles)
             if picked is None:
                 continue
-            for wpb in (2, 1):
+            for wpb in _WORKERS_PER_BANK:
                 workers = dram_cores * wpb
                 if chunk_tiles % workers:
                     continue
                 if max_m_tiles * (chunk_tiles // workers) > _MAX_OUT_TILES_PER_WORKER:
+                    continue
+                if wpb > 2 and k_tiles * chunk_tiles * tile_bytes / workers > _MAX_WEIGHT_BYTES_PER_BANK_READER:
                     continue
                 return splits, wpb, picked[0], picked[1], picked[2]
         return None
