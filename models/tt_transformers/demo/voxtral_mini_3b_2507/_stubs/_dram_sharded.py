@@ -895,6 +895,21 @@ def _multiply_with_silu(gate, up, memory_config, deferred):
     from -- there the cost was the pack loop, here it is the transcendental itself).  Only the
     activated form asks for it: a plain multiply has no transcendental to approximate.
 
+    THE 307 us ABOVE IS STALE, AND THE REAL NUMBER MAKES THIS PLACEMENT A MUCH EASIER CALL.  That
+    figure predates both the approximate flag and the bf8_b activation stream; re-profiled
+    2026-09-07 this call is 101.3 us.  Measured by COUNTERFACTUAL -- the activation removed outright
+    and the model re-profiled -- the same multiply is 37.1 us, so the fused silu costs 64 us here,
+    not the ~190 the bandwidth argument above estimated.  That matters because it settles which op
+    should host it, which had never been measured on both sides at the same time:
+        silu on THIS multiply's unpack   101.3 us/call   (+64 us over the bare multiply)
+        silu in the gate MATMUL's pack   593.2 us/call   (+231 us over the bare 361.8, and the
+                                                          matmul's FPU utilisation 76.2% -> 46.4%)
+    The multiply wins by ~167 us a layer.  Moving it to the matmul was tried anyway (2026-09-07,
+    scoped to prefill height so decode kept the deferred form): prefill 106.49 -> 109.29 ms,
+    device_ms 474.65 -> 474.93.  Reverted.  The unpack really is the cheap host -- the SFPU work is
+    the same either way, but in the pack loop it serialises against the matmul's output schedule
+    where the whole grid cannot hide it.  Do not move this activation again.
+
     THE MATH FIDELITY OF THIS OP IS NOT A KNOB, AND THE PROFILE MAKES IT LOOK LIKE ONE.  Tracy
     reports fidelity=hifi4 for both instances of this multiply (prefill 416x8192 and decode
     32x8192), which reads as the model's highest fidelity spent on ONE product per element -- four
