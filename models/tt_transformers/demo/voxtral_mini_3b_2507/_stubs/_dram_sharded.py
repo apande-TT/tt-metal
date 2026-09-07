@@ -1219,17 +1219,31 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
                             per_core_m * per_core_n * k_tiles / reuse
                             + blocks * (k_tiles / in0_block_w) * _KBLOCK_OVERHEAD
                         )
-                        cand = (cost, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w)
+                        work = per_core_m * per_core_n * k_tiles
+                        cand = (cost, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w, work)
                         if (
                             best is None
                             or cost < best[0] * (1.0 - _COST_TIE)
                             or (cost < best[0] * (1.0 + _COST_TIE) and gx * gy > best[1] * best[2])
+                            # MORE CORES FOR NO MORE PER-CORE WORK IS TAKEN WHATEVER `reuse` SAYS.
+                            # The window above compares reuse-ADJUSTED cost, so it can only forgive a
+                            # subblock penalty smaller than itself -- and on the two projections whose
+                            # N is 96 tiles the penalty is bigger than that: 11 x 9 gives per_core
+                            # 12x9 with a 2x3 subblock (reuse 1.0) and 11 x 10 gives 11x9 with 1x3
+                            # (reuse 0.75), so the modelled cost rises 21% on a plan that does 8.3%
+                            # LESS work per core across 11 MORE cores.  Narrowing _COST_TIE to hand
+                            # the grid to the model's own favourite was already measured LOSING 5.5%
+                            # of prefill on gate/up, which is the same trade one shape over: `reuse`
+                            # overstates a 1xN subblock, so it must not be able to veto real cores.
+                            # RAW work is the term the model is sure of -- it is the tile-matmul count
+                            # -- so a wider grid is accepted whenever that term does not get worse.
+                            or (gx * gy > best[1] * best[2] and work <= best[10])
                         ):
                             best = cand
                         break
     cfg = None
     if best is not None:
-        _, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w = best
+        _, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w, _work = best
         cfg = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
             # The grid is named in (x, y) order, so when the orientation is transposed the M blocks
             # -- searched against the X extent above -- are what x has to carry.
