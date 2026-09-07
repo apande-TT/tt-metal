@@ -895,20 +895,40 @@ def _multiply_with_silu(gate, up, memory_config, deferred):
     from -- there the cost was the pack loop, here it is the transcendental itself).  Only the
     activated form asks for it: a plain multiply has no transcendental to approximate.
 
-    THE 307 us ABOVE IS STALE, AND THE REAL NUMBER MAKES THIS PLACEMENT A MUCH EASIER CALL.  That
-    figure predates both the approximate flag and the bf8_b activation stream; re-profiled
-    2026-09-07 this call is 101.3 us.  Measured by COUNTERFACTUAL -- the activation removed outright
-    and the model re-profiled -- the same multiply is 37.1 us, so the fused silu costs 64 us here,
-    not the ~190 the bandwidth argument above estimated.  That matters because it settles which op
-    should host it, which had never been measured on both sides at the same time:
-        silu on THIS multiply's unpack   101.3 us/call   (+64 us over the bare multiply)
+    THE 307 us ABOVE IS RIGHT; THE 101.3 THAT ONCE REPLACED IT WAS A PER-LAYER FIGURE DIVIDED BY
+    THE LAYER COUNT A SECOND TIME.  A run on 2026-09-07 called 307 stale and put 101.3 us/call and a
+    37.1 us counterfactual in its place; re-measured 2026-09-08 on a fresh capture, the prefill
+    instance reads 307.1 / 307.4 / 307.2 us on the three profiled layers and the SAME counterfactual
+    -- the activation removed outright and the model re-profiled -- reads 98.1-99.0 us.  Both of the
+    old numbers are almost exactly a third of the real ones, which is the arithmetic that produced
+    them.  Re-measure before trusting a comment, INCLUDING a comment that says it re-measured.
+        silu on THIS multiply's unpack   307.2 us/call   (+209 us over the bare 98.2)
         silu in the gate MATMUL's pack   593.2 us/call   (+231 us over the bare 361.8, and the
                                                           matmul's FPU utilisation 76.2% -> 46.4%)
-    The multiply wins by ~167 us a layer.  Moving it to the matmul was tried anyway (2026-09-07,
-    scoped to prefill height so decode kept the deferred form): prefill 106.49 -> 109.29 ms,
-    device_ms 474.65 -> 474.93.  Reverted.  The unpack really is the cheap host -- the SFPU work is
-    the same either way, but in the pack loop it serialises against the matmul's output schedule
-    where the whole grid cannot hide it.  Do not move this activation again.
+    The placement verdict does NOT change -- the multiply still wins, now by 22 us a layer rather
+    than 167 -- and moving it to the matmul was tried anyway (2026-09-07, scoped to prefill height
+    so decode kept the deferred form): prefill 106.49 -> 109.29 ms, device_ms 474.65 -> 474.93.
+    Reverted.  The unpack really is the cheap host -- the SFPU work is the same either way, but in
+    the pack loop it serialises against the matmul's output schedule where the whole grid cannot
+    hide it.  Do not move this activation again.
+
+    WHAT THE CORRECTED NUMBER BUYS IS A SIZE, AND THE SIZE IS WORTH KNOWING: the silu is 209 us a
+    LAYER, 6.3 ms of prefill over 30 layers and 9.56 ms of device_ms (479.64 -> 470.08 with it
+    removed).  It is the largest single non-matmul cost in the model.  AND IT IS AT ITS FLOOR.  The
+    SFPU has a cheaper sigmoid and SILU cannot reach it: `UnaryOpType::SIGMOID` carries
+    (vector_mode, approximate) and lowers to `sigmoid_tile<VectorMode::RC, 1>` --
+    ckernel_sfpu_sigmoid_appx.h, ONE `lut` instruction plus an add -- while `UnaryOpType::SILU`
+    carries no parameter at all and ckernel_sfpu_silu.h pins it to `_sfpu_sigmoid_` in a comment of
+    its own.  So the LUT was reached the only way ttnn allows, by splitting the op:
+    multiply(g, g, a_activations=[SIGMOID_approx]) is silu(g) in one binary op, then multiply by u.
+    Measured 2026-09-08: e2e PCC 0.9576 -> **0.8214** against a 0.95 gate.  That LUT is a
+    3-coefficient piecewise fit and this model has 0.0076 of PCC margin.
+    THIS CLOSES THE KERNEL RUNGS TOO, which is the part worth writing down.  A hand-written tt-lang
+    or Metalium kernel has exactly the same two sigmoids to choose between, and the exact one is
+    ALREADY on its cheap path here: binary_ng derives fp32_dest_acc_en from the data formats
+    (binary_ng_program_factory.cpp:1205) and bf8_b operands never set it, so `_sfpu_sigmoid_` takes
+    the `_sfpu_exp_21f_bf16_` branch and a SINGLE reciprocal iteration rather than
+    `_sfpu_exp_accurate_` and two.  There is no third sigmoid to write.
 
     THE MATH FIDELITY OF THIS OP IS NOT A KNOB, AND THE PROFILE MAKES IT LOOK LIKE ONE.  Tracy
     reports fidelity=hifi4 for both instances of this multiply (prefill 416x8192 and decode
