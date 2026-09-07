@@ -652,7 +652,16 @@ class DramShardedLinear:
             self._configs[m_tiles] = cfg
         return cfg
 
-    def __call__(self, x, compute_kernel_config=None, keep_sharded=False):
+    def __call__(self, x, compute_kernel_config=None, keep_sharded=False, out_dtype=ttnn.bfloat16):
+        """`out_dtype` is NAMED rather than inherited, and bf16 is the safe default on purpose.
+
+        ttnn.linear with no dtype takes the ACTIVATION's, so once the decode stream narrows to
+        block-float every projection silently narrows with it -- including the fused QKV, whose k
+        and v go straight into the resident cache, and `update_cache` refuses a block-float INPUT
+        outright ("Data type of input tensor for update cache must be FLOAT32 or BFLOAT16"; the
+        cache itself is bf8_b, only the tensor being written in is constrained).  So the default
+        here PINS bf16 and each call site that knows its consumer opts in to `_ACT_DTYPE`.
+        """
         dims = [int(x.shape[i]) for i in range(len(x.shape))]
         m = 1
         for d in dims[:-1]:
@@ -672,6 +681,7 @@ class DramShardedLinear:
                 program_config=program_config,
                 memory_config=out_cfg,
                 compute_kernel_config=compute_kernel_config,
+                dtype=out_dtype,
             )
             for w in self.weights
         ]
@@ -711,6 +721,7 @@ def linear(
     activation=None,
     keep_sharded=False,
     memory_config=None,
+    out_dtype=ttnn.bfloat16,
 ):
     """Project through the DRAM-sharded mirror when it serves this shape, else the plain path.
 
@@ -732,7 +743,15 @@ def linear(
             # across the WHOLE grid.  Measured on this model: fused silu here cost decode
             # 14.755 -> 15.173 ms/token (+2.8%).  So the mirror stays plain and the activation is
             # applied after it.
-            return _apply(activation, mirror(x, compute_kernel_config=compute_kernel_config, keep_sharded=keep_sharded))
+            return _apply(
+                activation,
+                mirror(
+                    x,
+                    compute_kernel_config=compute_kernel_config,
+                    keep_sharded=keep_sharded,
+                    out_dtype=out_dtype,
+                ),
+            )
     # The PLAIN path is the opposite: prefill hands ttnn.linear hundreds of tile rows, so fusing
     # removes a full-width read-modify-write of the [rows, intermediate] tensor.  Same measurement:
     # prefill 210.82 -> 196.35 ms (-6.9%).
@@ -834,6 +853,7 @@ def proj_delta(device, x, weight, compute_kernel_config, mirror=None, bias=None,
             mirror=mirror,
             keep_sharded=True,
             memory_config=memory_config,
+            out_dtype=_ACT_DTYPE,
         ),
         rank,
     )
@@ -963,8 +983,18 @@ def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kerne
         activation=None if deferred else "silu",
         keep_sharded=True,
         memory_config=ffn_mem,
+        out_dtype=_ACT_DTYPE,
     )
-    up = linear(x, up_w, up_ds, compute_kernel_config, core_grid, keep_sharded=True, memory_config=ffn_mem)
+    up = linear(
+        x,
+        up_w,
+        up_ds,
+        compute_kernel_config,
+        core_grid,
+        keep_sharded=True,
+        memory_config=ffn_mem,
+        out_dtype=_ACT_DTYPE,
+    )
     if gate.is_sharded():
         # LEAVE THE SHARD, BUT NOT ALL THE WAY TO DRAM.  The multiply has to produce something
         # unsharded (down's in0 rectangle is wider than gate/up's output rectangle, so there is no
@@ -1026,7 +1056,10 @@ def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kerne
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
     # HAND THE DELTA TO THE RESIDUAL ADD AS A SHARD -- see _restore_rank.
-    return _restore_rank(linear(h, down_w, down_ds, compute_kernel_config, core_grid, keep_sharded=True), rank)
+    return _restore_rank(
+        linear(h, down_w, down_ds, compute_kernel_config, core_grid, keep_sharded=True, out_dtype=_ACT_DTYPE),
+        rank,
+    )
 
 
 # out_subblock (h, w) candidates, widest DEST footprint first.  This is tt-metal's own
@@ -1386,6 +1419,7 @@ def mm(
     keep_sharded=False,
     activation=None,
     memory_config=None,
+    out_dtype=ttnn.bfloat16,
 ):
     """ttnn.linear routed by the height of the activation: one call site, both regimes.
 
@@ -1418,7 +1452,15 @@ def mm(
         # activation stays a standalone unary here for the reason `linear` documents: the
         # DRAM-sharded factory sends anything but RELU down a separate DEST path, which at one
         # tile row costs more than the interleaved unary it replaces.
-        return _apply(activation, mirror(x, compute_kernel_config=compute_kernel_config, keep_sharded=keep_sharded))
+        return _apply(
+                activation,
+                mirror(
+                    x,
+                    compute_kernel_config=compute_kernel_config,
+                    keep_sharded=keep_sharded,
+                    out_dtype=out_dtype,
+                ),
+            )
     # THE THRESHOLD WAS "ONE TILE ROW PER CORE", WHICH IS TOO STRICT.  Asking for the grid loses
     # at the decode shape (a single tile row spread over 110 cores costs more launch than it
     # recovers) but the break-even is nowhere near one row PER CORE -- the audio tower's FFN runs
@@ -2202,7 +2244,7 @@ def residual_add(device, residual, delta):
         # 142.87 -> 144.48 ms (+1.13%).  Leave the output placement implicit.
         return ttnn.add(residual, delta, dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None)
     try:
-        return ttnn.add(residual, delta, memory_config=plan[0])
+        return ttnn.add(residual, delta, memory_config=plan[0], dtype=_ACT_DTYPE)
     except (RuntimeError, TypeError, AttributeError):
         return ttnn.add(residual, delta)
 
