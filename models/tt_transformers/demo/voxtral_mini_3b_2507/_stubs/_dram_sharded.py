@@ -920,6 +920,18 @@ def _multiply_with_silu(gate, up, memory_config, deferred):
     three activation spans, sub_core_grids and sub_device_id, and nothing else.  So the HiFi4 comes
     from the device op's own default and there is no argument to override it with; a
     compute_kernel_config= kwarg here is a TypeError, not a lever.  Do not spend a round on it.
+
+    AND WHERE THE SAME BINDING DOES EXIST, IT IS STILL INERT -- SO THE TAG IS THE PROFILER'S, NOT A
+    KNOB.  The one place to test that cleanly is the KV cache write: `paged_fused_update_cache` and
+    `paged_update_cache` BOTH take `compute_kernel_config`, both profile at HiFi4 (inherited from
+    init_device_compute_kernel_config, since no call site passed one), and the op's entire job is to
+    move one position's k and v into the resident cache and narrow them to its dtype -- no
+    accumulation, every element written once.  Measured 2026-09-07 with a LoFi + math_approx config
+    threaded to all three LM bodies: **8.22 us/call against 8.23**, PCC bit-identical, device_ms
+    474.53 against 474.65.  Nothing.  The 8.2 us is the 8 scattered partial-tile DRAM writes each
+    core issues -- the same conclusion the grid knob reached from the other side -- and neither
+    fidelity nor fan-out reaches it.  Generalise: on a datamove-shaped op a fidelity tag reports the
+    device op's default, and having the binding does not make it a lever.
     """
     if not deferred:
         return ttnn.multiply(gate, up, memory_config=memory_config)
