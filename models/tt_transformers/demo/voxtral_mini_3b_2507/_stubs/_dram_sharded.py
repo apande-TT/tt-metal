@@ -32,9 +32,11 @@ TILE = 32
 _MAX_COMPUTE_CORES = 64
 # m_tiles x n_tiles of output one DRAM-bank worker may own before its buffers stop fitting L1.
 _MAX_OUT_TILES_PER_WORKER = 128
-# Weight tiles one in0 mcast block must still stream for widening the activation shard to pay for
-# the extra block's synchronisation -- see in0_grid for the four measurements that set it.
-_MIN_WEIGHT_TILES_PER_IN0_BLOCK = 384
+# Weight BYTES one in0 mcast block must still stream for widening the activation shard to pay for
+# the extra block's synchronisation -- see in0_grid for the four measurements that set it, and for
+# why the bound is in bytes rather than in the tiles it used to be counted in.
+_TILE_BYTES_BF8 = 1088
+_MIN_WEIGHT_BYTES_PER_IN0_BLOCK = 384 * _TILE_BYTES_BF8
 # Rows below which `mm` does NOT name the core grid (see the note at its call to ttnn.linear).
 _GRID_REQUEST_MIN_ROWS = 32 * TILE
 
@@ -57,7 +59,7 @@ def _core_count(device, k_tiles, n_tiles):
     return best
 
 
-def in0_grid(device, k_tiles, weight_tiles):
+def in0_grid(device, k_tiles, weight_tiles, tile_bytes=_TILE_BYTES_BF8):
     """Widest in0 (activation) shard whose per-core slice still amortises its mcast block.
 
     The activation is width-sharded one mcast block per core, so the core count IS the number of
@@ -68,7 +70,18 @@ def in0_grid(device, k_tiles, weight_tiles):
     us and 69% -> 84% of DRAM peak; down (24576) 32 -> 64 cores took 65.9 -> 56.6 us and 75% -> 87%.
     o_proj is the counter-example that sets the floor: it has HALF the weight (12288 tiles), so at 64
     cores each block carries only 192 tiles and the block overhead stops being hidden -- 34.7 -> 51.3
-    us and 71% -> 48%.  So the bound is weight tiles PER BLOCK, not a core count.
+    us and 71% -> 48%.  So the bound is weight PER BLOCK, not a core count.
+
+    AND THE BLOCK IS BOUNDED IN BYTES, NOT IN TILES.  All four of those were taken on bf8_b weights,
+    where "384 tiles" and "418 kB" are the same sentence, and the code kept the tiles.  `up` is
+    bf4_b, whose tile is 576 bytes: at the 48 cores the tile rule hands it, one block streams 279 kB
+    -- BELOW down's 418 kB, and only a third above o_proj's 209 kB failure -- and the block is what
+    in0_block_w is pinned to, since the mcast slice IS the activation shard width (the op asserts
+    `shard_width_tiles % in0_block_w == 0`, so 2 tiles per core admits nothing wider than 2).  It
+    profiles exactly where that predicts: 60.8% of DRAM peak against its bf8_b twin's 84.5% at the
+    IDENTICAL shape, core count and program config, the only difference being the weight's format.
+    Weighing the slice in bytes moves `up` to 32 cores (in0_block_w 3, 442 kB a block) and leaves
+    every bf8_b projection's pick bit-identical, because at 1088 B/tile this threshold IS the old one.
     """
     g = device.compute_with_storage_grid_size()
     best = None
@@ -77,7 +90,7 @@ def in0_grid(device, k_tiles, weight_tiles):
             c = x * y
             if c > _MAX_COMPUTE_CORES or k_tiles % c:
                 continue
-            if weight_tiles // c < _MIN_WEIGHT_TILES_PER_IN0_BLOCK:
+            if (weight_tiles // c) * tile_bytes < _MIN_WEIGHT_BYTES_PER_IN0_BLOCK:
                 continue
             if best is None or c > best[0]:
                 best = (c, x, y)
@@ -206,6 +219,11 @@ _STREAM_L1_MAX_BYTES = 4 * 1024 * 1024
 # 15.4 MB when it is 8.2 MB, which silently pushed it past ffn_config's cap and made the L1
 # hand-off a no-op that still measured (profile identical to the DRAM path).
 _DTYPE_BYTES = {ttnn.bfloat4_b: 0.5625, ttnn.bfloat8_b: 1.0625, ttnn.bfloat16: 2, ttnn.float32: 4}
+
+
+def tile_bytes(dtype):
+    """Bytes ONE 32x32 tile of `dtype` occupies -- what an in0 mcast block is really weighed in."""
+    return int(TILE * TILE * _DTYPE_BYTES.get(dtype, 2))
 
 # Bytes the FFN intermediate may have before L1 residency stops paying -- see ffn_config.
 _FFN_L1_MAX_BYTES = 12 * 1024 * 1024
@@ -518,7 +536,7 @@ class DramShardedLinear:
         # o_proj and down_proj -- identical dtype, identical K -- sit at 69-75% on 32.  in0 gets the
         # widest rectangle dividing k_tiles, so its per-core slice (== in0_block_w, one mcast block
         # per core) is narrower and every in0/in1 circular buffer shrinks with it.
-        in0_plan = in0_grid(device, k_tiles, k_tiles * n_tiles) or (cores, gx, gy)
+        in0_plan = in0_grid(device, k_tiles, k_tiles * n_tiles, tile_bytes(weight.dtype)) or (cores, gx, gy)
         self.in0_cores, in0_gx, in0_gy = in0_plan
         self.in0_grid = ttnn.CoreGrid(y=in0_gy, x=in0_gx)
         self.in0_block_w = _largest_divisor(self.k // (TILE * self.in0_cores))

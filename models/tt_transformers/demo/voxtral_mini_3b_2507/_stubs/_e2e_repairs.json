@@ -41,7 +41,7 @@
       "reason": "Precision repair: raised every ttnn.linear / rms_norm / layer_norm / SDPA call in this body to the SAME compute config the graduated llama_model body already used (MathFidelity.HiFi4, fp32_dest_acc_en=True). Same ops, same order, same weights -- only the accumulation precision changes. Measured on device: composing 32 audio layers at the default fidelity held only 0.9936 PCC where torch bf16 holds 0.9997, and the lm_head alone mis-ranked 22/379 argmax positions; after this repair LM prefill logits went 0.9914 -> 0.9976 and a decode step 0.9541 -> 0.9886.",
       "backward_compatible": "tests/pcc/test_<name>.py still passes: a compute_kernel_config only raises accumulation precision, it cannot lower PCC.",
       "snapshot_sha256": "3bf500b2e3067ec457293d49728729506c3442105453f86903281b8d6be216ae",
-      "repaired_sha256": "beb2dac335e00a90af8fb825fc0073c0dab5ce173922d914b3deaf585c78cb4d"
+      "repaired_sha256": "d7ad9c5990b4c8aa1ab879e325ca7bacd4083f9fa5817918187a3c6707298474"
     },
     "encoder_stack": {
       "snapshot": "last_good_native",

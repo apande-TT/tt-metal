@@ -110,7 +110,9 @@ class TtLMHead:
         # one mcast block of 2 tiles per core rather than 32 blocks of 3).  Same lever, same shared
         # planner, as the LM projections in _dram_sharded.py: measured there at 69% -> 86% of DRAM
         # peak on gate/up and 75% -> 88% on down.
-        in0_plan = _DS.in0_grid(device, k_tiles, k_tiles * (self.split_size // _TILE))
+        in0_plan = _DS.in0_grid(
+            device, k_tiles, k_tiles * (self.split_size // _TILE), _DS.tile_bytes(ttnn.bfloat4_b)
+        )
         if in0_plan is None:
             in0_plan = (self.num_cores, gx, self.num_cores // gx)
         self.in0_cores, in0_gx, in0_gy = in0_plan
