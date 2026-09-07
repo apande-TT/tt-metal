@@ -837,6 +837,17 @@ def _multiply_with_silu(gate, up, memory_config, deferred):
     math_approx_mode on a compute config, which the matmul-fused form was measured not to benefit
     from -- there the cost was the pack loop, here it is the transcendental itself).  Only the
     activated form asks for it: a plain multiply has no transcendental to approximate.
+
+    THE MATH FIDELITY OF THIS OP IS NOT A KNOB, AND THE PROFILE MAKES IT LOOK LIKE ONE.  Tracy
+    reports fidelity=hifi4 for both instances of this multiply (prefill 416x8192 and decode
+    32x8192), which reads as the model's highest fidelity spent on ONE product per element -- four
+    FPU passes over operands carrying one pass worth of mantissa, exactly the pairing argument that
+    ROPE_CFG, _NORM_CFG and ATTN_CFG each acted on.  It is not reachable: `BinaryNgDeviceOperation`
+    DOES carry a `compute_kernel_config` attribute (binary_ng_device_operation.hpp), but NO eltwise
+    Python binding exposes it -- binary_nanobind.cpp offers dtype, memory_config, output_tensor, the
+    three activation spans, sub_core_grids and sub_device_id, and nothing else.  So the HiFi4 comes
+    from the device op's own default and there is no argument to override it with; a
+    compute_kernel_config= kwarg here is a TypeError, not a lever.  Do not spend a round on it.
     """
     if not deferred:
         return ttnn.multiply(gate, up, memory_config=memory_config)
