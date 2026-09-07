@@ -520,7 +520,7 @@ class TtLlamaAttention:
         # rest of the layer, which is the tenancy that kept the split out of L1.
         _DS.release(q, k, v)
         attn_out = _DS.concat_heads(attn_out)
-        attn_out = _DS.mm(self.device, attn_out, self.o_weight, _ATTN_PROJ_CFG, mirror=self.o_ds)
+        attn_out = _DS.proj_delta(self.device, attn_out, self.o_weight, _ATTN_PROJ_CFG, mirror=self.o_ds)
 
         return attn_out
 
@@ -558,7 +558,7 @@ class TtLlamaAttention:
         )
         # [1, B, padded_nh, hd] -> [1, B, nh*hd]; nh == 32 here so no padding.
         attn_out = _DS.merge_heads_decode(attn_out, B, self.num_heads, self.head_dim)
-        attn_out = _DS.mm(self.device, attn_out, self.o_weight, _ATTN_PROJ_CFG, mirror=self.o_ds)
+        attn_out = _DS.proj_delta(self.device, attn_out, self.o_weight, _ATTN_PROJ_CFG, mirror=self.o_ds)
         if orig_shape != [1, B, H]:
             attn_out = ttnn.reshape(attn_out, tuple(orig_shape))
         return attn_out

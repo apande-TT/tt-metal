@@ -579,7 +579,7 @@ class TtLlamaDecoderLayer:
             )
             # [1, B, padded_nh, hd] -> [1, B, nh*hd]; nh == 32 here so no padding.
             attn_out = _DS.merge_heads_decode(attn_out, B, self.num_heads, self.head_dim)
-            attn_out = _DS.mm(self.device, attn_out, self.o_weight, _ATTN_PROJ_CFG, mirror=self.o_ds)
+            attn_out = _DS.proj_delta(self.device, attn_out, self.o_weight, _ATTN_PROJ_CFG, mirror=self.o_ds)
         else:
             # the fused output is already the exact layout nlp_create_qkv_heads consumes
             q, k, v = _DS.qkv_heads(qkv, self.num_heads, self.num_kv_heads)
@@ -611,7 +611,7 @@ class TtLlamaDecoderLayer:
             # the whole rest of the layer, which is the tenancy that kept the split out of L1.
             _DS.release(q, k, v)
             attn_out = _DS.concat_heads(attn_out)
-            attn_out = _DS.mm(self.device, attn_out, self.o_weight, _ATTN_PROJ_CFG, mirror=self.o_ds)
+            attn_out = _DS.proj_delta(self.device, attn_out, self.o_weight, _ATTN_PROJ_CFG, mirror=self.o_ds)
 
         x = _DS.residual_add(self.device, residual, attn_out)
 

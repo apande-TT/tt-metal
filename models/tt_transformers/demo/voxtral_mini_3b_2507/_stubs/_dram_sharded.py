@@ -740,6 +740,55 @@ def _mirror_serves(x, mirror):
         return False
 
 
+def _restore_rank(out, rank):
+    """Put a kept output shard back at the caller's rank, or pass an unsharded result through.
+
+    THE RESIDUAL ADD WANTS THE SHARD, NOT A COPY OF IT.  The DRAM-sharded mirror's default tail
+    converts its own width-sharded output to interleaved L1 before returning -- profiled at
+    1.34 us/call on 32 cores, twice per layer per token (o_proj and down_proj) -- and for both of
+    those the ONLY consumer is residual_add, which names the norm's 48-core shard as its OUTPUT and
+    so has to gather whichever layout it is handed.  The conversion is a whole launch spent building
+    a layout nothing reads.
+
+    `keep_sharded` returns the raw (1, 1, m, n) shard because that is what the fused-QKV split
+    requires, so the rank the caller handed in is restored here instead: dropping a leading one-dim
+    is a metadata view on a width shard -- the same view rms_norm's own keep_sharded tail relies on
+    -- so the shard spec survives it and the residual add still sees [1, B, hidden].
+
+    Guarded on is_sharded() so the PREFILL path is untouched: there the mirror does not serve, the
+    2-D block config returns an interleaved tensor, and this is the identity.
+    """
+    if not out.is_sharded():
+        return out
+    dims = [int(d) for d in out.shape]
+    if len(dims) <= rank:
+        return out
+    return ttnn.reshape(out, tuple(dims[-rank:]))
+
+
+def proj_delta(device, x, weight, compute_kernel_config, mirror=None, bias=None, memory_config=None):
+    """A projection whose only consumer is the residual add, so it keeps its output shard.
+
+    o_proj's call site, shared by every attention body: same lever as the down projection at the end
+    of `swiglu`, and the same reason -- see _restore_rank for the measurement.  Inert at prefill
+    height, where `serves()` is false and `mm`'s keep_sharded never reaches the mirror.
+    """
+    rank = len([int(d) for d in x.shape])
+    return _restore_rank(
+        mm(
+            device,
+            x,
+            weight,
+            compute_kernel_config,
+            bias=bias,
+            mirror=mirror,
+            keep_sharded=True,
+            memory_config=memory_config,
+        ),
+        rank,
+    )
+
+
 # silu as a per-input activation the binary op can absorb, or None on a build that cannot spell it.
 try:
     _SILU_ACT = [ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)]
@@ -895,20 +944,8 @@ def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kerne
             # viewing its inputs, so releasing them the moment it returns is safe.
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-    out = linear(h, down_w, down_ds, compute_kernel_config, core_grid, keep_sharded=True)
-    # HAND THE DELTA TO THE RESIDUAL ADD AS A SHARD.  The mirror's tail otherwise converts its own
-    # output shard to interleaved L1 before returning -- profiled at 1.34 us/call on 32 cores,
-    # 30 times a token -- and the ONLY consumer is residual_add, which asks for the norm's shard as
-    # its OUTPUT anyway and so has to gather either way.  The conversion is therefore a whole launch
-    # spent putting the delta into a layout nothing reads.  keep_sharded returns the raw (1, 1, m, n)
-    # shard the fused-QKV path wants, so the rank the caller handed in is restored here: a leading
-    # one-dim reshape is a metadata view on a width shard (the same view rms_norm's keep_sharded tail
-    # relies on), so the shard spec survives it and the residual add still sees [1, B, hidden].
-    if out.is_sharded():
-        dims = [int(d) for d in out.shape]
-        if len(dims) > rank:
-            out = ttnn.reshape(out, tuple(dims[-rank:]))
-    return out
+    # HAND THE DELTA TO THE RESIDUAL ADD AS A SHARD -- see _restore_rank.
+    return _restore_rank(linear(h, down_w, down_ds, compute_kernel_config, core_grid, keep_sharded=True), rank)
 
 
 # out_subblock (h, w) candidates, widest DEST footprint first.  This is tt-metal's own
