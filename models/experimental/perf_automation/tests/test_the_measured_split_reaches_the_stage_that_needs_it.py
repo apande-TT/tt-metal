@@ -33,6 +33,14 @@ sys.path.insert(0, str(_PA))
 
 _MID = "mistralai/Voxtral-Mini-3B-2507"
 
+# THE JOIN DOES NOT CARE WHICH MODEL THIS IS. The two cases below exercise how two sources of
+# stage->root are MERGED; the id is only an argument on the way through. Passing a real one made them
+# resolve it against the local HF cache, so they passed on a machine that had voxtral downloaded and
+# failed everywhere else -- while their two siblings in this file already skip when the cache is
+# empty. A skip would have been the pattern; it also stops the join being tested at all, on every
+# machine without the weights. Stubbing the one call that reaches the cache keeps them running.
+_ANY_ID = "org/some-model"
+
 
 def _trace_replay():
     """agent.trace_replay imports ttnn at module scope, so it cannot be imported without a device
@@ -55,10 +63,33 @@ def test_a_partial_count_join_does_not_suppress_the_generated_one():
     assert "setdefault" in code, "the two joins are not merged per stage"
 
 
+def _stub_sections(monkeypatch, R):
+    """The only call in stage_roots that reads the checkpoint, so the join can be tested without one.
+
+    declared_sections(model_root, model_id) resolves the id against the HF cache. Everything else
+    these two cases touch is already stubbed; this was the one path left reaching outside the test.
+
+    Patched on its OWN module, not on run: stage_roots imports it inside the function body, so the
+    name never exists as an attribute of run to replace.
+    """
+    from agent import checkpoint_sections
+
+    # {path: block count}, shaped so the COUNT JOIN can actually answer: _stack_paths gives s0 a
+    # count of 32, and exactly one section has 32, so that stack resolves to audio_tower. A stub
+    # without a unique 32 leaves the count join empty and the cases stop testing the merge they are
+    # about -- which is what a first attempt here did.
+    monkeypatch.setattr(
+        checkpoint_sections,
+        "declared_sections",
+        lambda root, model_id="": {"audio_tower.layers": 32, "language_model.layers": 30},
+    )
+
+
 def test_the_two_joins_merge_per_stage(monkeypatch):
     """Run 10 exactly: the count join reaches encode only; the generated test names all three."""
     import cc_optimize.run as R
 
+    _stub_sections(monkeypatch, R)
     monkeypatch.setattr(R, "stacks_by_stage", lambda seq: {"encode": ["s0"]})
     monkeypatch.setattr(R, "_stack_paths", lambda seq: [("s0", 32, "k")])
     monkeypatch.setattr(
@@ -70,7 +101,7 @@ def test_the_two_joins_merge_per_stage(monkeypatch):
             "decode": "language_model",
         },
     )
-    got = R.stage_roots(None, "/nonexistent", _MID, None)
+    got = R.stage_roots(None, "/nonexistent", _ANY_ID, None)
     assert got == {"encode": "audio_tower", "prefill": "language_model", "decode": "language_model"}
 
 
@@ -78,6 +109,7 @@ def test_the_count_join_keeps_its_answer_where_it_has_one(monkeypatch):
     """Merged, not overwritten: a stage the count join established is not re-decided."""
     import cc_optimize.run as R
 
+    _stub_sections(monkeypatch, R)
     monkeypatch.setattr(R, "stacks_by_stage", lambda seq: {"encode": ["s0"]})
     monkeypatch.setattr(R, "_stack_paths", lambda seq: [("s0", 32, "k")])
     monkeypatch.setattr(
@@ -85,7 +117,7 @@ def test_the_count_join_keeps_its_answer_where_it_has_one(monkeypatch):
         "_stage_roots_from_generated",
         lambda secs, perf_test, model_root=None: {"encode": "SOMETHING_ELSE", "decode": "language_model"},
     )
-    got = R.stage_roots(None, "/nonexistent", _MID, None)
+    got = R.stage_roots(None, "/nonexistent", _ANY_ID, None)
     assert got["encode"] != "SOMETHING_ELSE" or got["encode"] == "audio_tower"
     assert got["decode"] == "language_model"
 
