@@ -569,6 +569,17 @@ class DramShardedLinear:
     def serves(self, m_tiles):
         return self.ok and 0 < m_tiles <= self.max_m_tiles
 
+    def act_config(self, m_tiles):
+        """The exact activation shard this projection will borrow, so a PRODUCER can write it.
+
+        The borrow check in __call__ compares memory configs by value, so the only way an upstream
+        op can hand this matmul an activation it does not have to reshard is to be told the config.
+        Returns None when the shape is not served, so the caller keeps whatever placement it had.
+        """
+        if not self.serves(m_tiles):
+            return None
+        return self._config_for(m_tiles)[1]
+
     def _config_for(self, m_tiles):
         cfg = self._configs.get(m_tiles)
         if cfg is None:
@@ -913,7 +924,27 @@ def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kerne
         n = 1
         for d in tuple(gate.shape):
             n *= int(d)
-        h = _multiply_with_silu(gate, up, _handoff_config(n, gate.dtype), deferred)
+        # WRITE THE SHARD down IS ABOUT TO BORROW, RATHER THAN ONE IT HAS TO REBUILD.  The comment
+        # above is right that the product cannot stay on gate/up's rectangle -- down's in0 grid is
+        # wider -- but "leave the shard" and "leave it interleaved" are not the same choice.  The
+        # multiply has to gather across cores either way, and the profile shows what interleaved
+        # costs: the product comes out L1-interleaved and down's very next act is an
+        # InterleavedToSharded on 64 cores, 1.11 us/call, once per layer per token.  Asking the
+        # multiply for down's own activation config folds that launch into the gather it was already
+        # doing, and the borrow check in DramShardedLinear.__call__ then compares equal.
+        rows = max(1, n // int(gate.shape[-1]))
+        handoff = _handoff_config(n, gate.dtype)
+        wanted = down_ds.act_config(math.ceil(rows / TILE)) if down_ds is not None else None
+        h = None
+        if wanted is not None and wanted != handoff:
+            try:
+                h = _multiply_with_silu(gate, up, wanted, deferred)
+            except (RuntimeError, TypeError, ValueError):
+                # A build or shape whose binary op will not pack this rectangle: the interleaved
+                # hand-off below is the placement this call has always made, so nothing is lost.
+                h = None
+        if h is None:
+            h = _multiply_with_silu(gate, up, handoff, deferred)
         # FREE THE HALVES.  multiply builds a new DRAM tensor rather than viewing its inputs, so this
         # is safe, and it matters: the down projection sizes its circular buffers against whatever L1
         # is still free on these cores.
