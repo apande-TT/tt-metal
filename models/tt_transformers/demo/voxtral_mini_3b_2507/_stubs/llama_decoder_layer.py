@@ -578,7 +578,7 @@ class TtLlamaDecoderLayer:
                 memory_config=_DS.sdpa_decode_out_config(),
             )
             # [1, B, padded_nh, hd] -> [1, B, nh*hd]; nh == 32 here so no padding.
-            attn_out = _DS.merge_heads_decode(attn_out, B, self.num_heads, self.head_dim)
+            attn_out = _DS.merge_heads_decode(attn_out, B, self.num_heads, self.head_dim, mirror=self.o_ds)
             attn_out = _DS.proj_delta(self.device, attn_out, self.o_weight, _ATTN_PROJ_CFG, mirror=self.o_ds)
         else:
             # the fused output is already the exact layout nlp_create_qkv_heads consumes

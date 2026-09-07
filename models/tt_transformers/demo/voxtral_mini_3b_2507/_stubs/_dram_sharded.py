@@ -1778,7 +1778,23 @@ def _row_cores(device, n):
     return ttnn.CoreRangeSet(ranges)
 
 
-def _concat_heads_decode(attn_out, batch, num_heads, head_dim):
+def _slice_into(x, end, mirror):
+    """Slice `x` down to `end`, landing directly in `mirror`'s activation shard when it will take it.
+
+    Falls back to interleaved L1 -- the placement this slice has always used -- on any build or
+    shape whose slice will not pack a width shard, so the caller never loses the dedicated head
+    merge just because the placement was refused.
+    """
+    wanted = mirror.act_config(math.ceil(int(end[-2]) / TILE)) if mirror is not None else None
+    if wanted is not None:
+        try:
+            return ttnn.slice(x, (0,) * len(end), end, memory_config=wanted)
+        except (RuntimeError, TypeError, ValueError):
+            pass
+    return ttnn.slice(x, (0,) * len(end), end, memory_config=ttnn.L1_MEMORY_CONFIG)
+
+
+def _concat_heads_decode(attn_out, batch, num_heads, head_dim, mirror=None):
     """The DEDICATED head merge, or None when this build/shape will not take it.
 
     THE GQA RULE BINDS THE PRODUCER, NOT THIS OP.  sdpa_decode refuses a sharded output on a
@@ -1815,15 +1831,19 @@ def _concat_heads_decode(attn_out, batch, num_heads, head_dim):
             ttnn.deallocate(xs)
         jd = [int(d) for d in joined.shape]
         if jd[-2] != int(batch):
-            joined = ttnn.slice(
-                joined, (0, 0, 0, 0), (1, 1, int(batch), width), memory_config=ttnn.L1_MEMORY_CONFIG
-            )
+            # AND THE UNPADDING SLICE IS THE PLACE TO BUILD o_proj's ACTIVATION SHARD, not merely a
+            # place to land in L1.  The slice has to write a new tensor whatever config it is given,
+            # and the profile shows what interleaved costs: this slice lands L1-interleaved and
+            # o_proj's very next act is an InterleavedToSharded on 32 cores, 0.80 us/call, once per
+            # layer per token.  Naming the projection's own activation config makes its borrow check
+            # compare equal and the reshard disappears into a write that was happening anyway.
+            joined = _slice_into(joined, (1, 1, int(batch), width), mirror)
         return ttnn.reshape(joined, (1, int(batch), width))
     except (RuntimeError, TypeError, AttributeError, ValueError):
         return None
 
 
-def merge_heads_decode(attn_out, batch, num_heads, head_dim, l1=True):
+def merge_heads_decode(attn_out, batch, num_heads, head_dim, l1=True, mirror=None):
     """[1, B, padded_nh, hd] -> [1, B, nh*hd] for the o_proj, kept in L1.
 
     This reshape collapses the last TWO dims, so on TILE layout it genuinely re-tilizes rather than
@@ -1835,7 +1855,7 @@ def merge_heads_decode(attn_out, batch, num_heads, head_dim, l1=True):
     """
     shape = (1, int(batch), int(num_heads) * int(head_dim))
     if l1:
-        swapped = _concat_heads_decode(attn_out, batch, num_heads, head_dim)
+        swapped = _concat_heads_decode(attn_out, batch, num_heads, head_dim, mirror)
         if swapped is not None:
             return swapped
     if not l1:

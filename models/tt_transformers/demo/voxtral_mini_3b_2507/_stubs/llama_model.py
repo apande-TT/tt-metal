@@ -624,7 +624,7 @@ class LlamaModel:
             memory_config=_DS.sdpa_decode_out_config(),
         )
         # [1, B, padded_nh, hd] -> [1, B, nh*hd]; nh == 32 here so no padding.
-        attn_out = _DS.merge_heads_decode(attn_out, B, self.num_heads, self.head_dim)
+        attn_out = _DS.merge_heads_decode(attn_out, B, self.num_heads, self.head_dim, mirror=lw["o_ds"])
         return _DS.proj_delta(self.device, attn_out, lw["o_w"], _ATTN_PROJ_CFG, mirror=lw["o_ds"])
 
     def __call__(
