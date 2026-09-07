@@ -2243,6 +2243,17 @@ def residual_add(device, residual, delta):
         # default never made.  Measured 2026-09-05 with the same change on rms_norm below: prefill
         # 142.87 -> 144.48 ms (+1.13%).  Leave the output placement implicit.
         return ttnn.add(residual, delta, dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None)
+    # THE ACCUMULATOR'S WIDTH IS THIS MODEL'S PCC EXCHANGE RATE, AND IT IS MEASURED BOTH WAYS.
+    # The four projections that feed this add were narrowed to _ACT_DTYPE at the decode height and
+    # the accumulator followed them; narrowing the SUM is the part that costs accuracy, because the
+    # FFN intermediates at bf8_b are what prefill already runs while the residual sum is a new
+    # rounding, applied once per block per layer.  Measured 2026-09-07 with everything else held:
+    #   dtype=_ACT_DTYPE here   decode 10.0775 ms/token, e2e PCC 0.9576212
+    #   dtype left implicit     decode 10.1086 ms/token, e2e PCC 0.9610618
+    # i.e. 0.31% of decode against 0.0034 of PCC, in EITHER direction -- and the bf16 form is
+    # actually ABOVE the 0.9600964 this model held before the projections were narrowed at all.
+    # Keep the narrow form while the gate has room; this is the cheapest place in the model to buy
+    # PCC BACK if a later lever needs it, and the only one whose price is already known.
     try:
         return ttnn.add(residual, delta, memory_config=plan[0], dtype=_ACT_DTYPE)
     except (RuntimeError, TypeError, AttributeError):
