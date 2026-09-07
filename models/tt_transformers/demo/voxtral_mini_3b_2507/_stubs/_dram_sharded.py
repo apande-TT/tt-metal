@@ -895,7 +895,20 @@ def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kerne
             # viewing its inputs, so releasing them the moment it returns is safe.
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-    return linear(h, down_w, down_ds, compute_kernel_config, core_grid)
+    out = linear(h, down_w, down_ds, compute_kernel_config, core_grid, keep_sharded=True)
+    # HAND THE DELTA TO THE RESIDUAL ADD AS A SHARD.  The mirror's tail otherwise converts its own
+    # output shard to interleaved L1 before returning -- profiled at 1.34 us/call on 32 cores,
+    # 30 times a token -- and the ONLY consumer is residual_add, which asks for the norm's shard as
+    # its OUTPUT anyway and so has to gather either way.  The conversion is therefore a whole launch
+    # spent putting the delta into a layout nothing reads.  keep_sharded returns the raw (1, 1, m, n)
+    # shard the fused-QKV path wants, so the rank the caller handed in is restored here: a leading
+    # one-dim reshape is a metadata view on a width shard (the same view rms_norm's keep_sharded tail
+    # relies on), so the shard spec survives it and the residual add still sees [1, B, hidden].
+    if out.is_sharded():
+        dims = [int(d) for d in out.shape]
+        if len(dims) > rank:
+            out = ttnn.reshape(out, tuple(dims[-rank:]))
+    return out
 
 
 # out_subblock (h, w) candidates, widest DEST footprint first.  This is tt-metal's own
