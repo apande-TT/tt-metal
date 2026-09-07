@@ -742,7 +742,7 @@ class LlamaModel:
                     k,
                     v,
                     scale=self.scaling,
-                    program_config=_DS.sdpa_config(self.device, q, k),
+                    program_config=_DS.sdpa_config(self.device, q, k, causal=True),
                     compute_kernel_config=_DS.ATTN_CFG,
                 )
                 # END THE SPLIT'S LIFETIME AT ITS LAST READER -- see _DS.release.  q/k/v are dead

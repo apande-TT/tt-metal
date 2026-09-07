@@ -1683,9 +1683,29 @@ _SDPA_MIN_OCCUPANCY = 2.0 / 3.0
 # neighbours of 64 x 512 are measured and both are worse: 128 x 256 is +6.9% and 32 x 1024 is +24%.
 _SDPA_MAX_K_CHUNK = 512
 _SDPA_CHUNK_PRODUCT = 32768
+# Tile-equivalents one (q chunk, k chunk) PAIR costs a core in loop setup, circular-buffer turns and
+# the running-max/running-sum rescale, over and above the qc*kc/1024 tiles of score it computes.
+# It only has to RANK the causal candidates below against each other, so its exactness matters less
+# than the fact that it is non-zero -- without it the area model would always pick the smallest chunk,
+# which is the very thing that makes ttnn's one-tile default disastrous on a long sequence.
+_SDPA_CAUSAL_PAIR_OVERHEAD = 3.0
 
 
-def sdpa_config(device, q, k, wide_k=False):
+def _causal_pairs(seq_q, chunk):
+    """(chunk-pairs, score tiles) a causal flash pass costs per (batch, head) at this chunk size.
+
+    Flash skips a (q chunk, k chunk) pair only when the WHOLE pair is above the diagonal, so q chunk
+    i still evaluates k chunks 0..i in full -- including the triangle of the diagonal pair that the
+    mask throws away.  Both terms are therefore functions of the chunk size, and they pull opposite
+    ways: n(n+1)/2 pairs of chunk^2 score elements shrinks toward the true causal area as the chunk
+    narrows, while the pair COUNT (and its per-pair overhead) grows quadratically.
+    """
+    n = -(-int(seq_q) // int(chunk))
+    pairs = n * (n + 1) // 2
+    return pairs, pairs * chunk * chunk / float(TILE * TILE)
+
+
+def sdpa_config(device, q, k, wide_k=False, causal=False):
     """Full-grid SDPAProgramConfig with tile-power-of-two flash chunks, sized from q/k.
 
     ttnn's SDPA falls back to q_chunk_size = k_chunk_size = 32 -- ONE TILE -- whenever no
@@ -1747,6 +1767,33 @@ def sdpa_config(device, q, k, wide_k=False):
         return c
 
     qc, kc = _q_chunk(), _chunk(seq_k)
+    if causal:
+        # A CAUSAL PASS PAYS FOR AREA THE MASK THROWS AWAY, SO OCCUPANCY IS NOT THE ONLY AXIS.
+        # `_q_chunk` above sizes the chunk so the LAST round of work units is nearly full, which is
+        # the right rule for the audio tower -- that attention is NOT masked, so every candidate
+        # computes the same total score area and only the round filling differs.  The LM prefill is
+        # masked, and there the chunk decides how much score the kernel computes at all: at 416
+        # positions a 256 chunk evaluates 3 pairs of 256x256 = 196 k score elements against a true
+        # causal area of 86 k, i.e. 2.27x the necessary work, because the diagonal pair is half
+        # wasted and the second q chunk is 96 rows of padding.  Halving to 128 makes it 10 pairs of
+        # 128x128 = 164 k (1.89x) and still leaves occupancy at 0.93.
+        #
+        # Both terms move, so it is a minimisation rather than "smaller is better": the score tiles
+        # fall toward the true triangle while the pair count -- and _SDPA_CAUSAL_PAIR_OVERHEAD with
+        # it -- grows as n^2.  Search only chunks the occupancy rule would also accept, so this can
+        # narrow the chunk but never un-fill the grid.
+        best = None
+        c = qc
+        while c >= 32:
+            n = units * -(-seq_q // c)
+            if n / (-(-n // cores) * cores) >= _SDPA_MIN_OCCUPANCY:
+                pairs, tiles = _causal_pairs(seq_q, c)
+                cost = pairs * _SDPA_CAUSAL_PAIR_OVERHEAD + tiles
+                if best is None or cost < best[0]:
+                    best = (cost, c)
+            c //= 2
+        if best is not None:
+            qc = kc = best[1]
     if wide_k:
         # TRADE Q WIDTH FOR K WIDTH AT A CONSTANT PRODUCT.  The k loop is where this kernel's
         # overhead lives, so a wider k block is the shape worth having; it just cannot be bought
