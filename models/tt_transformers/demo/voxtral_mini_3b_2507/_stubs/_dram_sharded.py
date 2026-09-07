@@ -1688,21 +1688,54 @@ _SDPA_CHUNK_PRODUCT = 32768
 # It only has to RANK the causal candidates below against each other, so its exactness matters less
 # than the fact that it is non-zero -- without it the area model would always pick the smallest chunk,
 # which is the very thing that makes ttnn's one-tile default disastrous on a long sequence.
-_SDPA_CAUSAL_PAIR_OVERHEAD = 3.0
+#
+# FITTED, NOT GUESSED, AND IT IS DOING TWO JOBS.  Two points on this model's LM prefill
+# (b8 h32 s416) pin it: 256x256 costs 192 score tiles + 3 pairs and measures 288.4 us/call, 128x128
+# costs 160 + 10 and measures 256.4, which solves to 1.469 us a score tile and 2.14 us a pair -- a
+# ratio of 1.46 tiles a pair.  It was first set to 3.0 by eye, which is enough to prefer 128 over
+# 256 but not enough to reach the pick below.
+#
+# WHAT IT IS STANDING IN FOR.  Narrowing the Q chunk also multiplies the GRID ROUNDS, and that cost
+# is not a pair cost.  The third measured point shows it: 64x128 (128 tiles, 16 pairs, 17 rounds
+# against 128x128's 10) came in at 249.8 us -- a real win, but only -2.6% where the pair-only model
+# had predicted -13%.  Three samples cannot separate the two terms (pairs and rounds move together
+# across them: an exact 3-term fit returns a NEGATIVE pair cost, which is over-fitting, not physics),
+# so the rounds cost stays folded into this constant.  The consequence to respect: this number
+# UNDER-prices narrowing q, so treat a pick it makes below 64 as unmeasured rather than trusted.
+_SDPA_CAUSAL_PAIR_OVERHEAD = 1.46
+# How many k chunks one q chunk may visit.  THIS IS THE PCC KNOB, AND IT IS THE ONE THE TWO CHUNK
+# AXES DO NOT SHARE.  Flash rescales its running max and running sum once per k chunk it folds in,
+# so the DEPTH of that chain -- ceil(seq_k / k_chunk) -- is what costs accuracy, and it depends on
+# the K chunk alone.  Measured: going 256x256 -> 128x128 took the depth 2 -> 4 and e2e PCC
+# 0.9636 -> 0.9601 against a 0.95 gate.  Narrowing the Q chunk instead cuts score area at CONSTANT
+# depth, which is why the search below is over both axes rather than one square chunk.  Held at the
+# depth already paid for, so the area search cannot quietly spend more accuracy.
+#
+# HOLDING IT AT 4 IS NOT COSTING MUCH, WHICH IS WHY IT CAN STAY A GUARD RATHER THAN A SWEEP.  The
+# candidates it blocks here are k=64 (depth 7), and on the honest reading they are a bad trade
+# anyway: 128x64 takes the score area only 160 -> 152 tiles (-5%) while very nearly doubling the
+# pairs 10 -> 19, and 64x64 gets 128 -> 112 (-12.5%) for 16 -> 28.  Area falls slowly on the K axis
+# because the diagonal pair is the only one a narrower k actually trims.  Untested rather than
+# refuted -- but the accuracy is on the line and the modelled saving is not there.
+_SDPA_CAUSAL_MAX_RESCALE = 4
 
 
-def _causal_pairs(seq_q, chunk):
-    """(chunk-pairs, score tiles) a causal flash pass costs per (batch, head) at this chunk size.
+def _causal_cost(seq_q, seq_k, qc, kc):
+    """(pairs, score tiles, rescale depth) for a causal flash pass at this (q, k) chunk pair.
 
     Flash skips a (q chunk, k chunk) pair only when the WHOLE pair is above the diagonal, so q chunk
-    i still evaluates k chunks 0..i in full -- including the triangle of the diagonal pair that the
-    mask throws away.  Both terms are therefore functions of the chunk size, and they pull opposite
-    ways: n(n+1)/2 pairs of chunk^2 score elements shrinks toward the true causal area as the chunk
-    narrows, while the pair COUNT (and its per-pair overhead) grows quadratically.
+    i still visits every k chunk overlapping rows 0..(i+1)*qc -- including the diagonal pair whose
+    upper triangle the mask throws away.  Score area therefore falls as EITHER chunk narrows, but
+    the two axes buy it at different prices: narrowing q multiplies the number of independent work
+    units (rounds of the grid), narrowing k multiplies the rescale depth (accuracy).
     """
-    n = -(-int(seq_q) // int(chunk))
-    pairs = n * (n + 1) // 2
-    return pairs, pairs * chunk * chunk / float(TILE * TILE)
+    pairs = 0
+    area = 0
+    for i in range(-(-int(seq_q) // int(qc))):
+        visited = -(-min((i + 1) * int(qc), int(seq_q)) // int(kc))
+        pairs += visited
+        area += visited * int(qc) * int(kc)
+    return pairs, area / float(TILE * TILE), -(-int(seq_k) // int(kc))
 
 
 def sdpa_config(device, q, k, wide_k=False, causal=False):
@@ -1782,18 +1815,32 @@ def sdpa_config(device, q, k, wide_k=False, causal=False):
         # fall toward the true triangle while the pair count -- and _SDPA_CAUSAL_PAIR_OVERHEAD with
         # it -- grows as n^2.  Search only chunks the occupancy rule would also accept, so this can
         # narrow the chunk but never un-fill the grid.
+        #
+        # AND THE TWO CHUNKS ARE SEPARATE AXES, WHICH A SINGLE SQUARE CHUNK CANNOT EXPRESS.  Area
+        # falls as either one narrows, but they are paid for out of different budgets: narrowing Q
+        # multiplies the WORK UNITS (so it is the occupancy rule's business), narrowing K multiplies
+        # the RESCALE DEPTH (so it is the PCC gate's business -- see _SDPA_CAUSAL_MAX_RESCALE).  At
+        # 416 positions the square pick 128x128 costs 160 score tiles at depth 4, while 64x128 costs
+        # 128 -- a further 20% off the area for NO extra depth, bought only with 6 more pairs. So the
+        # search runs over both axes with the depth held at what has already been paid for.
+        # The cap is never allowed to reject the plan we already have: a long enough context puts the
+        # occupancy pick's own depth past the constant, and the point of the constant is "do not spend
+        # MORE accuracy than is already being spent", not "refuse to run".
+        max_depth = max(_SDPA_CAUSAL_MAX_RESCALE, -(-seq_k // kc))
         best = None
-        c = qc
-        while c >= 32:
-            n = units * -(-seq_q // c)
-            if n / (-(-n // cores) * cores) >= _SDPA_MIN_OCCUPANCY:
-                pairs, tiles = _causal_pairs(seq_q, c)
+        for c_q in [qc >> i for i in range(16) if (qc >> i) >= 32]:
+            n = units * -(-seq_q // c_q)
+            if n / (-(-n // cores) * cores) < _SDPA_MIN_OCCUPANCY:
+                continue
+            for c_k in [kc >> i for i in range(16) if (kc >> i) >= 32]:
+                pairs, tiles, depth = _causal_cost(seq_q, seq_k, c_q, c_k)
+                if depth > max_depth:
+                    continue
                 cost = pairs * _SDPA_CAUSAL_PAIR_OVERHEAD + tiles
                 if best is None or cost < best[0]:
-                    best = (cost, c)
-            c //= 2
+                    best = (cost, c_q, c_k)
         if best is not None:
-            qc = kc = best[1]
+            qc, kc = best[1], best[2]
     if wide_k:
         # TRADE Q WIDTH FOR K WIDTH AT A CONSTANT PRODUCT.  The k loop is where this kernel's
         # overhead lives, so a wider k block is the shape worth having; it just cannot be bought
@@ -1988,6 +2035,26 @@ def qkv_split_decode(qkv, batch, num_heads, num_kv_heads, head_dim):
                 flat,
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
+                # k's CORE RANGE WRAPS THE GRID ROW, AND THAT COSTS NOTHING -- MEASURED.  The op
+                # lays q and k out in ROW-MAJOR order inside the core grid of the output_mem_config
+                # it is handed, starting k where q's (batch+1)'th core would be
+                # (nlp_create_qkv_heads_decode_device_operation.cpp: k_start_core_coord is the end
+                # of the batch+1 range).  Defaulted, that grid is the whole 11 x 10 compute grid, so
+                # q takes (0,0)-(7,0) and k takes eight cores from (8,0) -- off the end of row 0 and
+                # on to row 1.  k is therefore TWO CoreRanges with a BOUNDING BOX of 22 cores, and
+                # the profile duly tags both ops that inherit its shard spec at 22: the K rope, and
+                # paged_fused_update_cache (whose core set is input1.grid MERGED with input2.grid,
+                # then bounding-boxed, with a dummy kernel on every core in the box that owns
+                # nothing).  Passing a `batch` x 2 output_mem_config grid instead gives q row 0 and
+                # k row 1 -- one contiguous range each, and a 16-core box with nothing unused.
+                # MEASURED 2026-09-07: paged_fused_update_cache 5.8926 -> 5.8756 ms of roofline gap,
+                # K rope 2.0674 -> 2.0809, head split 3.3658 -> 3.3660, datamove bucket 40.018 ->
+                # 39.974 -- all inside the run-to-run band.  So the core count the PROFILER reports
+                # for these ops is the bounding box, not work, and a dummy kernel on an idle core is
+                # free once the program is traced.  Do not spend another round on core-range
+                # compaction; if this op is to get cheaper it has to be the 8 scattered partial-tile
+                # cache writes each core makes, not the shape of the range.
+                #
                 # NON-OVERLAPPING q/k CORE GRIDS.  v always shares q's grid (the op hard-codes
                 # v_shard_grid = q_shard_grid), so this is what makes k and v DISJOINT -- the
                 # precondition paged_fused_update_cache needs to write both caches in one launch
