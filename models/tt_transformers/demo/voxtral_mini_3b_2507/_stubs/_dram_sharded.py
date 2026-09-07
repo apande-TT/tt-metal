@@ -2259,6 +2259,19 @@ def residual_add(device, residual, delta):
     shard as its output costs it nothing and deletes the InterleavedToSharded the norm would
     otherwise run on the result.  Falls back to a plain add whenever this hidden size has no shard
     plan (prefill heights, or a hidden size no rectangle divides).
+
+    AND THIS LAUNCH CANNOT BE FUSED AWAY, WHICH IS WORTH SAYING BECAUSE THE CATALOG KEEPS OFFERING
+    IT.  `ttnn.rms_norm` really does take `residual_input_tensor` (GUIDELINES/02 section 6 and 06
+    section 1 both name add+Norm as the most reusable fusion, and the kwarg is there on this build),
+    so `norm(x + delta)` looks like one op instead of two -- worth ~2 us a layer at decode and ~78 us
+    a layer at prefill.  It does not apply to a PRE-norm block: the fused op returns ONE tensor
+    (layernorm_device_operation.cpp's compute_output_specs returns a single TensorSpec, not a
+    vector), so the SUM is consumed internally and thrown away -- and in a pre-norm residual stream
+    that sum is precisely the next residual.  Recomputing it costs the add back.  The catalog's
+    lever is written for a POST-norm block, where `LN(x + r)` has no other consumer.
+    What DOES transfer is the placement half, and this function already takes it: the add writes the
+    norm's own shard, so the pair costs one launch plus a borrow rather than one launch plus a
+    reshard.
     """
     # ONLY AT THE DECODE HEIGHT.  _norm_plan keys on the hidden size alone, but the norm itself only
     # takes the sharded path when the activation is ONE tile row; a prefill [1, 512, hidden] forced
