@@ -31,7 +31,43 @@ from pathlib import Path
 _PA = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PA))
 
-_MID = "mistralai/Voxtral-Mini-3B-2507"
+
+# THE JOIN DOES NOT CARE WHICH MODEL THIS IS. The two cases below exercise how two sources of
+# stage->root are MERGED; the id is only an argument on the way through. Passing a real one made them
+# resolve it against the local HF cache, so they passed on a machine that had voxtral downloaded and
+# failed everywhere else -- while their two siblings in this file already skip when the cache is
+# empty. A skip would have been the pattern; it also stops the join being tested at all, on every
+# machine without the weights. Stubbing the one call that reaches the cache keeps them running.
+_ANY_ID = "org/some-model"
+
+# NAMES THIS TEST INVENTED. The merge is about MAPPING, not about which model is being mapped, and
+# stage/root names typed in a case are the same defect as stage names typed in the tool: a join that
+# quietly special-cased a real tower would pass a case written in that tower's vocabulary. Nothing
+# here appears in any model.
+_TOWER_A, _TOWER_B = "tower_alpha", "tower_beta"
+_STAGE_1, _STAGE_2, _STAGE_3 = "stage_one", "stage_two", "stage_three"
+_BLOCKS_A, _BLOCKS_B = 32, 30
+
+
+def _a_cached_model():
+    """SOME model the local cache holds, whichever it is, or "" when it holds none.
+
+    The bugs below are not voxtral's. A reader that globs <arg>/*.safetensors returns empty for ANY
+    hub id, and a census that cannot find the checkpoint from a pipeline fails for ANY model -- so
+    naming one here narrowed a universal check to a machine that had downloaded that specific model,
+    and told the next model nothing. Discovered from the cache instead: the case runs wherever there
+    is anything to read, and skips only on a machine with an empty cache.
+    """
+    import re as _re
+
+    hub = Path.home() / ".cache" / "huggingface" / "hub"
+    for _d in sorted(hub.glob("models--*--*")) if hub.is_dir() else []:
+        if not any(_d.glob("snapshots/*/*.safetensors")):
+            continue
+        _m = _re.match(r"models--(.+?)--(.+)$", _d.name)
+        if _m:
+            return "%s/%s" % (_m.group(1), _m.group(2))
+    return ""
 
 
 def _trace_replay():
@@ -55,39 +91,63 @@ def test_a_partial_count_join_does_not_suppress_the_generated_one():
     assert "setdefault" in code, "the two joins are not merged per stage"
 
 
+def _stub_sections(monkeypatch, R):
+    """The only call in stage_roots that reads the checkpoint, so the join can be tested without one.
+
+    declared_sections(model_root, model_id) resolves the id against the HF cache. Everything else
+    these two cases touch is already stubbed; this was the one path left reaching outside the test.
+
+    Patched on its OWN module, not on run: stage_roots imports it inside the function body, so the
+    name never exists as an attribute of run to replace.
+    """
+    from agent import checkpoint_sections
+
+    # {path: block count}, shaped so the COUNT JOIN can actually answer: the stack below carries
+    # _BLOCKS_A, and exactly one section has that count, so it resolves to _TOWER_A. A stub whose
+    # counts are not unique leaves the count join empty and the cases stop testing the merge they
+    # exist for -- which is what a first attempt here did.
+    monkeypatch.setattr(
+        checkpoint_sections,
+        "declared_sections",
+        lambda root, model_id="": {"%s.layers" % _TOWER_A: _BLOCKS_A, "%s.layers" % _TOWER_B: _BLOCKS_B},
+    )
+
+
 def test_the_two_joins_merge_per_stage(monkeypatch):
     """Run 10 exactly: the count join reaches encode only; the generated test names all three."""
     import cc_optimize.run as R
 
-    monkeypatch.setattr(R, "stacks_by_stage", lambda seq: {"encode": ["s0"]})
-    monkeypatch.setattr(R, "_stack_paths", lambda seq: [("s0", 32, "k")])
+    _stub_sections(monkeypatch, R)
+    monkeypatch.setattr(R, "stacks_by_stage", lambda seq: {_STAGE_1: ["s0"]})
+    monkeypatch.setattr(R, "_stack_paths", lambda seq: [("s0", _BLOCKS_A, "k")])
     monkeypatch.setattr(
         R,
         "_stage_roots_from_generated",
         lambda secs, perf_test, model_root=None: {
-            "encode": "audio_tower",
-            "prefill": "language_model",
-            "decode": "language_model",
+            _STAGE_1: _TOWER_A,
+            _STAGE_2: _TOWER_B,
+            _STAGE_3: _TOWER_B,
         },
     )
-    got = R.stage_roots(None, "/nonexistent", _MID, None)
-    assert got == {"encode": "audio_tower", "prefill": "language_model", "decode": "language_model"}
+    got = R.stage_roots(None, "/nonexistent", _ANY_ID, None)
+    assert got == {_STAGE_1: _TOWER_A, _STAGE_2: _TOWER_B, _STAGE_3: _TOWER_B}
 
 
 def test_the_count_join_keeps_its_answer_where_it_has_one(monkeypatch):
     """Merged, not overwritten: a stage the count join established is not re-decided."""
     import cc_optimize.run as R
 
-    monkeypatch.setattr(R, "stacks_by_stage", lambda seq: {"encode": ["s0"]})
-    monkeypatch.setattr(R, "_stack_paths", lambda seq: [("s0", 32, "k")])
+    _stub_sections(monkeypatch, R)
+    monkeypatch.setattr(R, "stacks_by_stage", lambda seq: {_STAGE_1: ["s0"]})
+    monkeypatch.setattr(R, "_stack_paths", lambda seq: [("s0", _BLOCKS_A, "k")])
     monkeypatch.setattr(
         R,
         "_stage_roots_from_generated",
-        lambda secs, perf_test, model_root=None: {"encode": "SOMETHING_ELSE", "decode": "language_model"},
+        lambda secs, perf_test, model_root=None: {_STAGE_1: "SOMETHING_ELSE", _STAGE_3: _TOWER_B},
     )
-    got = R.stage_roots(None, "/nonexistent", _MID, None)
-    assert got["encode"] != "SOMETHING_ELSE" or got["encode"] == "audio_tower"
-    assert got["decode"] == "language_model"
+    got = R.stage_roots(None, "/nonexistent", _ANY_ID, None)
+    assert got[_STAGE_1] == _TOWER_A, "the count join's answer was overwritten by the generated one"
+    assert got[_STAGE_3] == _TOWER_B, "a stage the count join could not reach must take the fallback"
 
 
 # ------------------------------------------------------------- the checkpoint readers take an id
@@ -99,16 +159,20 @@ def test_the_checkpoint_readers_accept_a_hub_id_not_only_a_directory():
     from agent.weight_census import checkpoint_numels, checkpoint_section_numels
     from agent.checkpoint_sections import hf_cache_dir
 
-    if not hf_cache_dir(_MID):
+    mid = _a_cached_model()
+    if not mid or not hf_cache_dir(mid):
         import pytest
 
-        pytest.skip("voxtral not in the local HF cache")
+        pytest.skip("no model with weights in the local HF cache")
 
-    by_id = checkpoint_section_numels(_MID)
-    by_dir = checkpoint_section_numels(str(hf_cache_dir(_MID)))
+    by_id = checkpoint_section_numels(mid)
+    by_dir = checkpoint_section_numels(str(hf_cache_dir(mid)))
     assert by_id == by_dir and by_id, "an id and its cache directory must read the same"
-    assert {"audio_tower", "language_model"} <= set(by_id.values())
-    assert len(checkpoint_numels(_MID)) == len(checkpoint_numels(str(hf_cache_dir(_MID))))
+    # WHAT the sections are called is the model's business. That they were FOUND is the bug: a hub id
+    # used to read as a directory that does not exist, so this came back empty and was
+    # indistinguishable from a checkpoint with no tensors.
+    assert all(str(v).strip() for v in by_id.values()), "every tensor must land in a named section"
+    assert len(checkpoint_numels(mid)) == len(checkpoint_numels(str(hf_cache_dir(mid))))
 
 
 def test_an_unresolvable_name_is_still_empty_rather_than_an_error():
@@ -127,7 +191,7 @@ def test_the_census_is_called_with_a_checkpoint():
     assert "checkpoint=" in src[max(0, i - 200) : i + 300], "the census records attribute names only again"
 
 
-def test_the_checkpoint_is_found_from_the_pipeline_itself(monkeypatch):
+def test_the_checkpoint_is_found_from_the_pipeline_itself(monkeypatch, tmp_path):
     """No env var names the model root -- checked against a live run's whole process tree. The
     object being measured knows where it lives: its class's module file sits inside the model dir."""
     import sys as _sys
@@ -138,13 +202,27 @@ def test_the_checkpoint_is_found_from_the_pipeline_itself(monkeypatch):
     monkeypatch.delenv("PERF_MCP_MODEL_ROOT", raising=False)
     monkeypatch.delenv("TT_PERF_MODEL_ROOT", raising=False)
 
-    demo = _PA.parent.parent / "tt_transformers" / "demo" / "voxtral_mini_3b_2507"
-    if not (demo / "tt" / "pipeline.py").exists():
+    # A DEMO BUILT HERE, not one borrowed from the tree. This walked up from the real voxtral demo
+    # and asserted the id that demo happens to name, so it skipped wherever that model was absent and
+    # proved nothing about any other. The behaviour under test is the WALK -- pipeline module ->
+    # its file -> up to the directory whose source names a hub repo -- and that is the same walk for
+    # every model. So the fixture states its own id and the case runs everywhere.
+    mid = _a_cached_model()
+    if not mid:
         import pytest
 
-        pytest.skip("voxtral demo not in this tree")
+        pytest.skip("no model with weights in the local HF cache")
 
-    mod_name = "models.tt_transformers.demo.voxtral_mini_3b_2507.tt.pipeline"
+    # The id has to be one the cache really holds: model_id_from_source deliberately returns only an
+    # id with weights behind it, because a pipeline commonly names several repos and the weights are
+    # the one that matters. So the fixture names whatever this machine has -- any model exercises the
+    # same walk.
+    demo = tmp_path / "some_demo"
+    (demo / "tt").mkdir(parents=True)
+    (demo / "tt" / "pipeline.py").write_text("class Pipeline:\n    pass\n")
+    (demo / "model.py").write_text('MODEL_ID = "%s"\n' % mid)
+
+    mod_name = "a_demo_somewhere.tt.pipeline"
     mod = types.ModuleType(mod_name)
     mod.__file__ = str(demo / "tt" / "pipeline.py")
     monkeypatch.setitem(_sys.modules, mod_name, mod)
@@ -153,7 +231,7 @@ def test_the_checkpoint_is_found_from_the_pipeline_itself(monkeypatch):
         pass
 
     _Pipe.__module__ = mod_name
-    assert TR._checkpoint_for_census(_Pipe()) == _MID
+    assert TR._checkpoint_for_census(_Pipe()) == mid
 
 
 def test_no_pipeline_and_no_env_is_none_not_a_crash():

@@ -93,6 +93,39 @@ def test_every_allowed_tool_is_actually_registered():
     )
 
 
+# A tool the DEFAULT run must not be handed, with the reason it is withheld. Anything else that is
+# registered has to be reachable, or the prompt can ask for something the agent cannot call.
+_WITHHELD_BY_DEFAULT = {
+    # Added only under --hitl, where the loop swaps it in and drops git_commit/git_revert so the
+    # operator commits by hand. Granting it always would offer a handshake nothing is waiting on.
+    "hitl_gate",
+}
+
+
+def test_every_registered_tool_is_reachable():
+    """THE OTHER DIRECTION, which nothing checked. Its sibling above catches a tool named in the list
+    that does not exist; this catches one that exists and is never permitted.
+
+    finish_round was registered, named five times in the prompt and wired into the round guard, and
+    left off _ALLOWED_TOOLS. Every call came back a permissions refusal -- 66 in one run on
+    voxtral_mini_3b_2507 (2026-09-06/07), the only tool ever refused. So the gate never executed,
+    never recorded a verdict, and the loop read a verdict file three days old that said finished=true:
+    no round was reported as stopping early and the agent was never told what it still owed. Three
+    pieces of working machinery, silent, for one missing list entry.
+    """
+    missing = _registered_tools() - _allowed_tools() - _WITHHELD_BY_DEFAULT
+    assert not missing, (
+        f"registered with @mcp.tool() but not in _ALLOWED_TOOLS and not a declared exception: "
+        f"{sorted(missing)} -- the agent will be refused permission every time it calls one"
+    )
+
+
+def test_a_withheld_tool_is_withheld_on_purpose():
+    """The exception set must describe reality, or it becomes somewhere to hide the next drift."""
+    assert _WITHHELD_BY_DEFAULT <= _registered_tools(), "withholding something the server never registers"
+    assert not (_WITHHELD_BY_DEFAULT & _allowed_tools()), "listed as withheld yet granted by default"
+
+
 def test_no_private_helper_is_exposed_to_the_agent():
     """_record_committed_win appends beat_baseline: True with no measurement, no PCC and no
     commit. It must not be an agent-callable tool."""

@@ -83,6 +83,15 @@ _ALLOWED_TOOLS = [
     "mcp__perf-mcp__git_commit",
     "mcp__perf-mcp__git_revert",
     "mcp__perf-mcp__termination_check",
+    # THE ROUND GATE. Registered on the server and named five times in the prompt, but never listed
+    # here -- so every call came back as a permissions refusal: 66 of them in one run, and the only
+    # tool ever refused. The gate therefore never ran, never recorded a verdict, and the loop fell
+    # back to a verdict file three days old that said finished=true, so no round was ever reported as
+    # having stopped early and the agent was never told what it still owed.
+    #
+    # (Deliberately not naming the prefixed tool string in this comment: the audit suite reads this
+    # block line by line and would take the prose for an entry.)
+    "mcp__perf-mcp__finish_round",
     "mcp__perf-mcp__record_kernel_attempt",
     "mcp__perf-mcp__check_lever_coverage",
     "mcp__perf-mcp__tp_pick_degree",
