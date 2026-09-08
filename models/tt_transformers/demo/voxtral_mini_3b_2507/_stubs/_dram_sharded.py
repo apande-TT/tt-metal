@@ -940,6 +940,15 @@ def _multiply_with_silu(gate, up, memory_config, deferred):
     the `_sfpu_exp_21f_bf16_` branch and a SINGLE reciprocal iteration rather than
     `_sfpu_exp_accurate_` and two.  There is no third sigmoid to write.
 
+    AND THE KERNEL RUNGS ARE NOT JUST ARGUED CLOSED, THEY ARE MEASURED CLOSED.  `_kernels/
+    ttl_silu_mul.py` is a real ttl kernel for this exact op, run on the full 11x10 grid: 409.8
+    us/call against ttnn's 307.2 (33% slower) and e2e PCC 0.9502707 against 0.9576212.  It is kept
+    but DISABLED (env VOXTRAL_TTL_SILU_MUL=1), and its docstring carries both the reason it loses
+    -- ttl emits a one-tile-at-a-time pipeline, paying init_sfpu, the DEST acquire/release pair and
+    a write barrier PER TILE where binary_ng amortises them over blocks -- and the four ttl 1.0.1
+    gotchas the authoring cost, so the next round does not pay them again.  Its compute body is
+    `silu_tile()` then `mul_binary_tile()`: byte for byte what binary_ng already runs.
+
     THE MATH FIDELITY OF THIS OP IS NOT A KNOB, AND THE PROFILE MAKES IT LOOK LIKE ONE.  Tracy
     reports fidelity=hifi4 for both instances of this multiply (prefill 416x8192 and decode
     32x8192), which reads as the model's highest fidelity spent on ONE product per element -- four
