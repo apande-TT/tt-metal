@@ -382,7 +382,20 @@ class TtVoxtralEncoder:
         # input_features: ttnn tensor (1, 128, 3000) TILE_LAYOUT on device
         # conv1d expects (N, input_length, 1, C) format
         x = ttnn.to_layout(input_features, ttnn.ROW_MAJOR_LAYOUT)
-        x = ttnn.permute(x, (0, 2, 1))  # (1, 3000, 128)
+        # LANDING THE MEL FRAME IN L1 IS WHAT PICKS conv2d's EXECUTION PATH.
+        # ttnn::determine_conv2d_execution_path routes on ONE predicate --
+        # `input_tensor.memory_config().is_l1()` -- and with no slice_config a DRAM input takes the
+        # DRAM-slicing path, which is defined to write its result back to DRAM interleaved
+        # ("Conv2D DRAM doesn't support specifying memory config, as the output will always be DRAM
+        # Interleaved").  That is why the front-end paid for a round trip PER CONV: reshard in,
+        # convolve, shard OUT to DRAM, run the gelu against DRAM, reshard back in for the next conv.
+        # This tensor is [1, 3000, 128] bf16 = 768 kB and L1 holds 1.5 MB per core, so there is no
+        # reason for it to be in DRAM at all.  Naming L1 here flips BOTH convs onto the L1 path in
+        # one edit -- conv1 because this is its input, conv2 because conv1's output now stays in L1
+        # -- so the two ShardedToInterleaved copies and the InterleavedToSharded between them
+        # disappear and both gelus run against L1-resident shards instead of DRAM.
+        # It is a placement change: the convolution reads the same values in the same order.
+        x = ttnn.permute(x, (0, 2, 1), memory_config=ttnn.L1_MEMORY_CONFIG)  # (1, 3000, 128)
         # THE CANONICAL conv1d INPUT SHAPE IS [N, 1, L, C], NOT [N, L, 1, C].  ttnn.conv1d only
         # reshapes for you when the input is rank < 4; hand it a rank-4 tensor and it forwards the
         # shape straight to conv2d, which takes H/W from its explicit input_height=1 /
@@ -429,6 +442,11 @@ class TtVoxtralEncoder:
         # the bias is fused into the conv above; the gelu is not (see _CONV2D_CFG).
         x = ttnn.gelu(x)
 
+        # HAND THE STACK BACK ITS DRAM TENSOR.  Everything above now runs L1-resident and sharded,
+        # but the positional-embedding add and the 32 encoder layers below are written against a
+        # DRAM interleaved activation, so the shard is resolved once here rather than op by op.
+        # This is the ONE copy the L1 path still pays, in place of the three it removes.
+        x = ttnn.sharded_to_interleaved(x, ttnn.DRAM_MEMORY_CONFIG)
         # Reshape to (1, 1500, 1280)
         x = ttnn.reshape(x, (1, 1500, 1280))
         x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)

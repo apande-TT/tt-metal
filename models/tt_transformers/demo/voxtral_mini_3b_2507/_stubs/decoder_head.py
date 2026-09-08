@@ -110,7 +110,9 @@ class TtLMHead:
         # one mcast block of 2 tiles per core rather than 32 blocks of 3).  Same lever, same shared
         # planner, as the LM projections in _dram_sharded.py: measured there at 69% -> 86% of DRAM
         # peak on gate/up and 75% -> 88% on down.
-        in0_plan = _DS.in0_grid(device, k_tiles, k_tiles * (self.split_size // _TILE))
+        in0_plan = _DS.in0_grid(
+            device, k_tiles, k_tiles * (self.split_size // _TILE), _DS.tile_bytes(ttnn.bfloat4_b)
+        )
         if in0_plan is None:
             in0_plan = (self.num_cores, gx, self.num_cores // gx)
         self.in0_cores, in0_gx, in0_gy = in0_plan
@@ -315,6 +317,34 @@ class TtLMHead:
             ]
         except (RuntimeError, TypeError, ValueError):
             pieces = [ttnn.untilize_with_unpadding(p, [0, 0, rows - 1, self.split_size - 1]) for p in parts]
+        # THIS CONCAT IS NOT CORE-BOUND, AND RE-PAGING IT TO PROVE THAT COST 1%.  It is the most
+        # expensive op in the sampling tail and it runs on EIGHT cores, which looks like a grid
+        # oversight: concat_program_factory counts its parallelism as
+        # `physical_volume / padded_shape[-1]` -- one work unit per ROW-MAJOR PAGE -- and a
+        # [.., rows, 131072] output is `rows` pages of 256 kB, so eight units cap it at eight cores
+        # whatever grid it is offered (the factory takes a sub_core_grids argument and then reduces
+        # it to the largest divisor of the page count).
+        #
+        # The paging CAN be changed, and it moves almost nothing.  Concatenating on dim 2 of
+        # [1, rows, 1, split] views writes the same bytes in the same order -- joined element
+        # (b, p*split + j) is at b*n + p*split + j, and the stacked (b, p, j) is at
+        # ((b*nsplits + p)*split + j), the same linear index -- with `split`-sized pages, so the
+        # output has rows*nsplits pages and the factory spreads over 32 cores instead of 8.
+        # MEASURED 2026-09-07: the concat's roofline gap went 4.5016 -> 3.8154 ms, i.e. 24.5 -> 21.8
+        # us/call for FOUR TIMES the cores.  So the op was never work-unit starved; at 4.2 MB of
+        # traffic in 21.8 us it is sitting on ~190 GB/s of DRAM round trip and that is the floor.
+        #
+        # AND THE RESHAPE BACK IS NOT A VIEW.  A row-major reshape is free only while it rearranges
+        # LEADING dims; merging a dim INTO the last one changes the page size, and pages are
+        # distributed round-robin over the DRAM banks, so [1, rows, nsplits, split] and
+        # [1, 1, rows, n] are genuinely different physical layouts.  ttnn duly emitted a
+        # ReshapeViewDeviceOperation of 5.1673 ms roofline gap (~28 us/token, 2 MB re-paged), and the
+        # whole experiment measured device_ms 479.64 -> 484.68 (+1.05%).
+        #
+        # What is left, if this op is ever worth another round: DELETE the join rather than re-page
+        # it -- give cpp_argmax four resident sharded inputs, one per vocab chunk, and let pass 2's
+        # ascending fold do the joining it already does across cores.  Worth about 11 us/token on
+        # the numbers above, against a rewrite of the op that picks the sampled token.
         joined = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         # NOTHING IS RELEASED UNTIL THE WHOLE CHAIN HAS SUCCEEDED.  The caller keeps the tiled chunks
         # as its fallback, so freeing them before the concat returns would leave that path holding

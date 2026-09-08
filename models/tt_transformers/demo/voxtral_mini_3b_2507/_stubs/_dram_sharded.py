@@ -32,9 +32,30 @@ TILE = 32
 _MAX_COMPUTE_CORES = 64
 # m_tiles x n_tiles of output one DRAM-bank worker may own before its buffers stop fitting L1.
 _MAX_OUT_TILES_PER_WORKER = 128
-# Weight tiles one in0 mcast block must still stream for widening the activation shard to pay for
-# the extra block's synchronisation -- see in0_grid for the four measurements that set it.
-_MIN_WEIGHT_TILES_PER_IN0_BLOCK = 384
+# Reader cores to put on each DRAM bank, widest first.  The op's own bound is [1, 3]
+# (matmul_utilities.cpp validate_num_workers_per_dram_bank) and >1 is Blackhole-only, so 3 is a
+# legal rung this planner simply never asked for -- it stopped at 2.
+_WORKERS_PER_BANK = (3, 2, 1)
+# Weight BYTES one bank reader may own before a THIRD reader on that bank stops paying.
+#
+# A THIRD READER IS NOT UNIFORMLY BETTER, AND THE SPLIT IS BY SLICE SIZE, NOT BY SHAPE.  Measured
+# 2026-09-07 by running the whole decode stack at (3, 2, 1) and reading the per-op DRAM utilisation
+# back: at 8 banks the rung reaches exactly the projections whose chunk divides 24 -- o_proj and
+# down (96 output tiles) and the fused qkv (192) -- and the three of them moved in three different
+# directions at IDENTICAL core grid, in0_block_w and dtype:
+#   o_proj (13.4 MB of weight, 0.56 MB a reader)  34.70 -> 31.62 us, 70.8% -> 77.7% of DRAM peak
+#   qkv    (20.1 MB,           0.84 MB a reader)  44.50 -> 44.24 us, 82.9% -> 83.3%  (a wash)
+#   down   (26.8 MB,           1.12 MB a reader)  56.60 -> 60.02 us, 86.9% -> 81.9%  (a LOSS)
+# so the third reader buys a third outstanding read where the bank is LATENCY-bound and fragments
+# the stream where it is already bandwidth-bound.  The two regimes are separated by the bytes one
+# reader owns, and the only quantity that changes across those three is K.  0.75 MB sits between
+# the win and the wash; qkv is inside the noise either way and keeps the pick it was measured on.
+_MAX_WEIGHT_BYTES_PER_BANK_READER = 768 * 1024
+# Weight BYTES one in0 mcast block must still stream for widening the activation shard to pay for
+# the extra block's synchronisation -- see in0_grid for the four measurements that set it, and for
+# why the bound is in bytes rather than in the tiles it used to be counted in.
+_TILE_BYTES_BF8 = 1088
+_MIN_WEIGHT_BYTES_PER_IN0_BLOCK = 384 * _TILE_BYTES_BF8
 # Rows below which `mm` does NOT name the core grid (see the note at its call to ttnn.linear).
 _GRID_REQUEST_MIN_ROWS = 32 * TILE
 
@@ -44,6 +65,19 @@ def _core_count(device, k_tiles, n_tiles):
 
     The DRAM-sharded matmul gives every core an exact slice of K and of N and has NO padding
     support, so a count that does not divide both is invalid rather than merely slow.
+
+    THE k_tiles CLAUSE IS NOT LOAD-BEARING FOR THE MATMUL, AND DROPPING IT STILL LOSES.  in0 has
+    had its own rectangle since the in0_grid split, the factory takes the two shard grids as
+    independent arguments, and in0 is MULTICAST to every compute core -- so on paper a compute core
+    never owns a slice of K and this clause only pins the grid: it holds gate/up to 32 cores where
+    64 divide N, qkv to 48 where 64 do, down and o_proj to 32 where 48 do.  Measured 2026-09-07 with
+    the clause removed: every decode matmul came back at the SAME time to within noise (gate 57.69 +
+    up 38.22 = 95.9 us against 95.9; down 56.38 vs 56.36; o_proj 31.55 vs 31.52; qkv 44.36 vs 44.27;
+    lm_head 125.69 vs 125.68) and PCC was bit-identical -- yet device_ms went 474.65 -> 493.63, +4.0%.
+    So the output core count is NOT a matmul knob at one tile row (these ops are bound on the bank
+    readers, not on the cores that own N); it is a HAND-OFF knob, and widening it re-shapes every
+    consumer's borrow at once.  All 19 ms of the loss was reshards appearing around ops that had been
+    matching tile for tile.  Leave the clause in: it is what keeps the chain coherent.
     """
     g = device.compute_with_storage_grid_size()
     best = None
@@ -57,7 +91,7 @@ def _core_count(device, k_tiles, n_tiles):
     return best
 
 
-def in0_grid(device, k_tiles, weight_tiles):
+def in0_grid(device, k_tiles, weight_tiles, tile_bytes=_TILE_BYTES_BF8):
     """Widest in0 (activation) shard whose per-core slice still amortises its mcast block.
 
     The activation is width-sharded one mcast block per core, so the core count IS the number of
@@ -68,7 +102,18 @@ def in0_grid(device, k_tiles, weight_tiles):
     us and 69% -> 84% of DRAM peak; down (24576) 32 -> 64 cores took 65.9 -> 56.6 us and 75% -> 87%.
     o_proj is the counter-example that sets the floor: it has HALF the weight (12288 tiles), so at 64
     cores each block carries only 192 tiles and the block overhead stops being hidden -- 34.7 -> 51.3
-    us and 71% -> 48%.  So the bound is weight tiles PER BLOCK, not a core count.
+    us and 71% -> 48%.  So the bound is weight PER BLOCK, not a core count.
+
+    AND THE BLOCK IS BOUNDED IN BYTES, NOT IN TILES.  All four of those were taken on bf8_b weights,
+    where "384 tiles" and "418 kB" are the same sentence, and the code kept the tiles.  `up` is
+    bf4_b, whose tile is 576 bytes: at the 48 cores the tile rule hands it, one block streams 279 kB
+    -- BELOW down's 418 kB, and only a third above o_proj's 209 kB failure -- and the block is what
+    in0_block_w is pinned to, since the mcast slice IS the activation shard width (the op asserts
+    `shard_width_tiles % in0_block_w == 0`, so 2 tiles per core admits nothing wider than 2).  It
+    profiles exactly where that predicts: 60.8% of DRAM peak against its bf8_b twin's 84.5% at the
+    IDENTICAL shape, core count and program config, the only difference being the weight's format.
+    Weighing the slice in bytes moves `up` to 32 cores (in0_block_w 3, 442 kB a block) and leaves
+    every bf8_b projection's pick bit-identical, because at 1088 B/tile this threshold IS the old one.
     """
     g = device.compute_with_storage_grid_size()
     best = None
@@ -77,7 +122,7 @@ def in0_grid(device, k_tiles, weight_tiles):
             c = x * y
             if c > _MAX_COMPUTE_CORES or k_tiles % c:
                 continue
-            if weight_tiles // c < _MIN_WEIGHT_TILES_PER_IN0_BLOCK:
+            if (weight_tiles // c) * tile_bytes < _MIN_WEIGHT_BYTES_PER_IN0_BLOCK:
                 continue
             if best is None or c > best[0]:
                 best = (c, x, y)
@@ -207,6 +252,12 @@ _STREAM_L1_MAX_BYTES = 4 * 1024 * 1024
 # hand-off a no-op that still measured (profile identical to the DRAM path).
 _DTYPE_BYTES = {ttnn.bfloat4_b: 0.5625, ttnn.bfloat8_b: 1.0625, ttnn.bfloat16: 2, ttnn.float32: 4}
 
+
+def tile_bytes(dtype):
+    """Bytes ONE 32x32 tile of `dtype` occupies -- what an in0 mcast block is really weighed in."""
+    return int(TILE * TILE * _DTYPE_BYTES.get(dtype, 2))
+
+
 # Bytes the FFN intermediate may have before L1 residency stops paying -- see ffn_config.
 _FFN_L1_MAX_BYTES = 12 * 1024 * 1024
 
@@ -279,7 +330,9 @@ def ffn_config(rows, width, dtype=None):
     one, and a longer sequence must still degrade to DRAM rather than crowd out those buffers.
     """
     width_bytes = _DTYPE_BYTES.get(dtype if dtype is not None else ttnn.bfloat8_b, 2)
-    return ttnn.L1_MEMORY_CONFIG if int(rows) * int(width) * width_bytes <= _FFN_L1_MAX_BYTES else ttnn.DRAM_MEMORY_CONFIG
+    return (
+        ttnn.L1_MEMORY_CONFIG if int(rows) * int(width) * width_bytes <= _FFN_L1_MAX_BYTES else ttnn.DRAM_MEMORY_CONFIG
+    )
 
 
 # Bytes ONE of the SwiGLU's three wide intermediates may have before L1 residency stops paying.
@@ -307,6 +360,16 @@ def _swiglu_handoff(rows, width, dtype):
     ops after it.  Returns None (rather than DRAM_MEMORY_CONFIG) so the caller can keep the exact
     call it made before when the hand-off does not apply, which is what makes the fallback
     bit-identical to the previous behaviour instead of merely equivalent.
+
+    THIS HAND-OFF IS WORTH 7.36 ms OF PREFILL, NOT THE 0.3 ms ITS OWN COMMIT MESSAGE CLAIMS, AND IT
+    IS THE BEST TENANT IN PER-CORE L1.  Measured 2026-09-08 by turning it off at the prefill height
+    alone (_SWIGLU_L1_MAX_BYTES to 12 MB, which excludes the 29 MB intermediates and leaves the
+    decode height -- already excluded by the row gate -- untouched): prefill 106.49 -> 113.85 ms,
+    PCC bit-identical.  So anything that wants L1 during the FFN is bidding against 7.4 ms.
+
+    The rival is the residual chain, and the two are STRICTLY SUB-ADDITIVE -- the full 2x2 is in
+    residual_add.  Short version: the chain is worth 2.72 ms on its own and -0.45 ms once this
+    hand-off holds the same L1, so this one wins and there is no configuration where both pay.
     """
     rows, width = int(rows), int(width)
     if rows < _GRID_REQUEST_MIN_ROWS or (rows, width) in _SWIGLU_L1_REFUSED:
@@ -500,7 +563,7 @@ class DramShardedLinear:
 
         dram_grid = device.dram_grid_size()
         dram_cores = dram_grid.x
-        plan = self._plan(device, k_tiles, n_tiles, dram_cores, max_m_tiles)
+        plan = self._plan(device, k_tiles, n_tiles, dram_cores, max_m_tiles, tile_bytes(weight.dtype))
         if plan is None:
             return
         splits, self.workers_per_bank, cores, gx, gy = plan
@@ -518,7 +581,7 @@ class DramShardedLinear:
         # o_proj and down_proj -- identical dtype, identical K -- sit at 69-75% on 32.  in0 gets the
         # widest rectangle dividing k_tiles, so its per-core slice (== in0_block_w, one mcast block
         # per core) is narrower and every in0/in1 circular buffer shrinks with it.
-        in0_plan = in0_grid(device, k_tiles, k_tiles * n_tiles) or (cores, gx, gy)
+        in0_plan = in0_grid(device, k_tiles, k_tiles * n_tiles, tile_bytes(weight.dtype)) or (cores, gx, gy)
         self.in0_cores, in0_gx, in0_gy = in0_plan
         self.in0_grid = ttnn.CoreGrid(y=in0_gy, x=in0_gx)
         self.in0_block_w = _largest_divisor(self.k // (TILE * self.in0_cores))
@@ -548,7 +611,7 @@ class DramShardedLinear:
         ]
         self.ok = True
 
-    def _plan(self, device, k_tiles, n_tiles, dram_cores, max_m_tiles):
+    def _plan(self, device, k_tiles, n_tiles, dram_cores, max_m_tiles, tile_bytes=_TILE_BYTES_BF8):
         """Fewest power-of-two chunks that divide the compute grid AND the bank workers exactly."""
         for splits in (1 << i for i in range(int(math.log2(n_tiles)) + 1)):
             chunk_tiles = n_tiles // splits
@@ -557,17 +620,30 @@ class DramShardedLinear:
             picked = _core_count(device, k_tiles, chunk_tiles)
             if picked is None:
                 continue
-            for wpb in (2, 1):
+            for wpb in _WORKERS_PER_BANK:
                 workers = dram_cores * wpb
                 if chunk_tiles % workers:
                     continue
                 if max_m_tiles * (chunk_tiles // workers) > _MAX_OUT_TILES_PER_WORKER:
+                    continue
+                if wpb > 2 and k_tiles * chunk_tiles * tile_bytes / workers > _MAX_WEIGHT_BYTES_PER_BANK_READER:
                     continue
                 return splits, wpb, picked[0], picked[1], picked[2]
         return None
 
     def serves(self, m_tiles):
         return self.ok and 0 < m_tiles <= self.max_m_tiles
+
+    def act_config(self, m_tiles):
+        """The exact activation shard this projection will borrow, so a PRODUCER can write it.
+
+        The borrow check in __call__ compares memory configs by value, so the only way an upstream
+        op can hand this matmul an activation it does not have to reshard is to be told the config.
+        Returns None when the shape is not served, so the caller keeps whatever placement it had.
+        """
+        if not self.serves(m_tiles):
+            return None
+        return self._config_for(m_tiles)[1]
 
     def _config_for(self, m_tiles):
         cfg = self._configs.get(m_tiles)
@@ -602,7 +678,16 @@ class DramShardedLinear:
             self._configs[m_tiles] = cfg
         return cfg
 
-    def __call__(self, x, compute_kernel_config=None, keep_sharded=False):
+    def __call__(self, x, compute_kernel_config=None, keep_sharded=False, out_dtype=ttnn.bfloat16):
+        """`out_dtype` is NAMED rather than inherited, and bf16 is the safe default on purpose.
+
+        ttnn.linear with no dtype takes the ACTIVATION's, so once the decode stream narrows to
+        block-float every projection silently narrows with it -- including the fused QKV, whose k
+        and v go straight into the resident cache, and `update_cache` refuses a block-float INPUT
+        outright ("Data type of input tensor for update cache must be FLOAT32 or BFLOAT16"; the
+        cache itself is bf8_b, only the tensor being written in is constrained).  So the default
+        here PINS bf16 and each call site that knows its consumer opts in to `_ACT_DTYPE`.
+        """
         dims = [int(x.shape[i]) for i in range(len(x.shape))]
         m = 1
         for d in dims[:-1]:
@@ -622,6 +707,7 @@ class DramShardedLinear:
                 program_config=program_config,
                 memory_config=out_cfg,
                 compute_kernel_config=compute_kernel_config,
+                dtype=out_dtype,
             )
             for w in self.weights
         ]
@@ -661,6 +747,7 @@ def linear(
     activation=None,
     keep_sharded=False,
     memory_config=None,
+    out_dtype=ttnn.bfloat16,
 ):
     """Project through the DRAM-sharded mirror when it serves this shape, else the plain path.
 
@@ -682,7 +769,15 @@ def linear(
             # across the WHOLE grid.  Measured on this model: fused silu here cost decode
             # 14.755 -> 15.173 ms/token (+2.8%).  So the mirror stays plain and the activation is
             # applied after it.
-            return _apply(activation, mirror(x, compute_kernel_config=compute_kernel_config, keep_sharded=keep_sharded))
+            return _apply(
+                activation,
+                mirror(
+                    x,
+                    compute_kernel_config=compute_kernel_config,
+                    keep_sharded=keep_sharded,
+                    out_dtype=out_dtype,
+                ),
+            )
     # The PLAIN path is the opposite: prefill hands ttnn.linear hundreds of tile rows, so fusing
     # removes a full-width read-modify-write of the [rows, intermediate] tensor.  Same measurement:
     # prefill 210.82 -> 196.35 ms (-6.9%).
@@ -740,11 +835,90 @@ def _mirror_serves(x, mirror):
         return False
 
 
+def _restore_rank(out, rank):
+    """Put a kept output shard back at the caller's rank, or pass an unsharded result through.
+
+    THE RESIDUAL ADD WANTS THE SHARD, NOT A COPY OF IT.  The DRAM-sharded mirror's default tail
+    converts its own width-sharded output to interleaved L1 before returning -- profiled at
+    1.34 us/call on 32 cores, twice per layer per token (o_proj and down_proj) -- and for both of
+    those the ONLY consumer is residual_add, which names the norm's 48-core shard as its OUTPUT and
+    so has to gather whichever layout it is handed.  The conversion is a whole launch spent building
+    a layout nothing reads.
+
+    `keep_sharded` returns the raw (1, 1, m, n) shard because that is what the fused-QKV split
+    requires, so the rank the caller handed in is restored here instead: dropping a leading one-dim
+    is a metadata view on a width shard -- the same view rms_norm's own keep_sharded tail relies on
+    -- so the shard spec survives it and the residual add still sees [1, B, hidden].
+
+    Guarded on is_sharded() so the PREFILL path is untouched: there the mirror does not serve, the
+    2-D block config returns an interleaved tensor, and this is the identity.
+    """
+    if not out.is_sharded():
+        return out
+    dims = [int(d) for d in out.shape]
+    if len(dims) <= rank:
+        return out
+    return ttnn.reshape(out, tuple(dims[-rank:]))
+
+
+def proj_delta(device, x, weight, compute_kernel_config, mirror=None, bias=None, memory_config=None):
+    """A projection whose only consumer is the residual add, so it keeps its output shard.
+
+    o_proj's call site, shared by every attention body: same lever as the down projection at the end
+    of `swiglu`, and the same reason -- see _restore_rank for the measurement.  Inert at prefill
+    height, where `serves()` is false and `mm`'s keep_sharded never reaches the mirror.
+    """
+    rank = len([int(d) for d in x.shape])
+    return _restore_rank(
+        mm(
+            device,
+            x,
+            weight,
+            compute_kernel_config,
+            bias=bias,
+            mirror=mirror,
+            keep_sharded=True,
+            memory_config=memory_config,
+            out_dtype=_ACT_DTYPE,
+        ),
+        rank,
+    )
+
+
 # silu as a per-input activation the binary op can absorb, or None on a build that cannot spell it.
 try:
     _SILU_ACT = [ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)]
 except (AttributeError, TypeError, ValueError):  # pragma: no cover - depends on the ttnn build
     _SILU_ACT = None
+
+
+def _silu_mul_kernel():
+    """Load the hand-written SwiGLU-product kernel from ../_kernels, or None if unavailable.
+
+    Same standalone-by-path problem this file itself has, one directory over: the stubs carry no
+    package context, so the sibling `_kernels` tree has to be imported by file path too.  Returns
+    None rather than raising, so a checkout without the kernel keeps the plain ttnn call.
+    """
+    import importlib.util
+    import pathlib
+    import sys
+
+    key = "_voxtral_kernels__silu_mul"
+    if key in sys.modules:
+        return sys.modules[key]
+    path = pathlib.Path(__file__).resolve().parent.parent / "_kernels" / "silu_mul.py"
+    if not path.exists():
+        sys.modules[key] = None
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(key, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[key] = mod
+        spec.loader.exec_module(mod)
+    except Exception:  # noqa: BLE001 - a kernel this build cannot import must not break the model
+        sys.modules[key] = None
+        return None
+    return mod
 
 
 def _multiply_with_silu(gate, up, memory_config, deferred):
@@ -759,9 +933,96 @@ def _multiply_with_silu(gate, up, memory_config, deferred):
     math_approx_mode on a compute config, which the matmul-fused form was measured not to benefit
     from -- there the cost was the pack loop, here it is the transcendental itself).  Only the
     activated form asks for it: a plain multiply has no transcendental to approximate.
+
+    THE 307 us ABOVE IS RIGHT; THE 101.3 THAT ONCE REPLACED IT WAS A PER-LAYER FIGURE DIVIDED BY
+    THE LAYER COUNT A SECOND TIME.  A run on 2026-09-07 called 307 stale and put 101.3 us/call and a
+    37.1 us counterfactual in its place; re-measured 2026-09-08 on a fresh capture, the prefill
+    instance reads 307.1 / 307.4 / 307.2 us on the three profiled layers and the SAME counterfactual
+    -- the activation removed outright and the model re-profiled -- reads 98.1-99.0 us.  Both of the
+    old numbers are almost exactly a third of the real ones, which is the arithmetic that produced
+    them.  Re-measure before trusting a comment, INCLUDING a comment that says it re-measured.
+        silu on THIS multiply's unpack   307.2 us/call   (+209 us over the bare 98.2)
+        silu in the gate MATMUL's pack   593.2 us/call   (+231 us over the bare 361.8, and the
+                                                          matmul's FPU utilisation 76.2% -> 46.4%)
+    The placement verdict does NOT change -- the multiply still wins, now by 22 us a layer rather
+    than 167 -- and moving it to the matmul was tried anyway (2026-09-07, scoped to prefill height
+    so decode kept the deferred form): prefill 106.49 -> 109.29 ms, device_ms 474.65 -> 474.93.
+    Reverted.  The unpack really is the cheap host -- the SFPU work is the same either way, but in
+    the pack loop it serialises against the matmul's output schedule where the whole grid cannot
+    hide it.  Do not move this activation again.
+
+    WHAT THE CORRECTED NUMBER BUYS IS A SIZE, AND THE SIZE IS WORTH KNOWING: the silu is 209 us a
+    LAYER, 6.3 ms of prefill over 30 layers and 9.56 ms of device_ms (479.64 -> 470.08 with it
+    removed).  It is the largest single non-matmul cost in the model.  AND IT IS AT ITS FLOOR.  The
+    SFPU has a cheaper sigmoid and SILU cannot reach it: `UnaryOpType::SIGMOID` carries
+    (vector_mode, approximate) and lowers to `sigmoid_tile<VectorMode::RC, 1>` --
+    ckernel_sfpu_sigmoid_appx.h, ONE `lut` instruction plus an add -- while `UnaryOpType::SILU`
+    carries no parameter at all and ckernel_sfpu_silu.h pins it to `_sfpu_sigmoid_` in a comment of
+    its own.  So the LUT was reached the only way ttnn allows, by splitting the op:
+    multiply(g, g, a_activations=[SIGMOID_approx]) is silu(g) in one binary op, then multiply by u.
+    Measured 2026-09-08: e2e PCC 0.9576 -> **0.8214** against a 0.95 gate.  That LUT is a
+    3-coefficient piecewise fit and this model has 0.0076 of PCC margin.
+    THE SIGMOID IS AT ITS FLOOR; THE OP IS NOT, AND AN EARLIER VERSION OF THIS DOCSTRING CONFLATED
+    THE TWO.  It argued that the kernel rungs were closed because "a hand-written tt-lang or
+    Metalium kernel has exactly the same two sigmoids to choose between" and the exact one already
+    runs on its cheap path here (binary_ng derives fp32_dest_acc_en from the data formats,
+    binary_ng_program_factory.cpp:1205, and bf8_b operands never set it, so `_sfpu_sigmoid_` takes
+    the `_sfpu_exp_21f_bf16_` branch and a SINGLE reciprocal iteration rather than
+    `_sfpu_exp_accurate_` and two).  Every clause of that is still true and the CONCLUSION was
+    wrong.  A kernel does not have to beat the sigmoid to beat the op -- `_kernels/silu_mul.py`
+    keeps the exact sigmoid, byte for byte, and reaches **278.8 us/call** against 307.2 by deleting
+    the FRAMING around it: the reciprocal's `v_if (t < 0)` NaN guard (unreachable once the exp
+    argument is capped, one branch-free SFPSWAP replacing SETCC/MAD/ENDIF) and one of the library
+    path's two bf16 roundings, with silu and the product formed in ONE SFPU pass over DEST instead
+    of an activation on operand A's unpack plus a separate binary op.  e2e PCC came out slightly
+    BETTER, 0.95762 -> 0.95794.  It is ON by default; see the cpp comment at the call site.
+
+    THE TT-LANG RUNG IS THE ONE THAT IS MEASURED CLOSED.  `_kernels/ttl_silu_mul.py` is a real ttl
+    kernel for this exact op, run on the full 11x10 grid: 409.8 us/call against ttnn's 307.2 (33%
+    slower) and e2e PCC 0.9502707 against 0.9576212.  It is kept but DISABLED (env
+    VOXTRAL_TTL_SILU_MUL=1), and its docstring carries both the reason it loses -- ttl emits a
+    one-tile-at-a-time pipeline, paying init_sfpu, the DEST acquire/release pair and a write barrier
+    PER TILE where binary_ng amortises them over blocks -- and the four ttl 1.0.1 gotchas the
+    authoring cost, so the next round does not pay them again.  Its compute body is `silu_tile()`
+    then `mul_binary_tile()`: byte for byte what binary_ng already runs.  That is the difference
+    between it and the Metalium kernel that won -- ttl could not express the block framing, which
+    was the whole prize.
+
+    THE MATH FIDELITY OF THIS OP IS NOT A KNOB, AND THE PROFILE MAKES IT LOOK LIKE ONE.  Tracy
+    reports fidelity=hifi4 for both instances of this multiply (prefill 416x8192 and decode
+    32x8192), which reads as the model's highest fidelity spent on ONE product per element -- four
+    FPU passes over operands carrying one pass worth of mantissa, exactly the pairing argument that
+    ROPE_CFG, _NORM_CFG and ATTN_CFG each acted on.  It is not reachable: `BinaryNgDeviceOperation`
+    DOES carry a `compute_kernel_config` attribute (binary_ng_device_operation.hpp), but NO eltwise
+    Python binding exposes it -- binary_nanobind.cpp offers dtype, memory_config, output_tensor, the
+    three activation spans, sub_core_grids and sub_device_id, and nothing else.  So the HiFi4 comes
+    from the device op's own default and there is no argument to override it with; a
+    compute_kernel_config= kwarg here is a TypeError, not a lever.  Do not spend a round on it.
+
+    AND WHERE THE SAME BINDING DOES EXIST, IT IS STILL INERT -- SO THE TAG IS THE PROFILER'S, NOT A
+    KNOB.  The one place to test that cleanly is the KV cache write: `paged_fused_update_cache` and
+    `paged_update_cache` BOTH take `compute_kernel_config`, both profile at HiFi4 (inherited from
+    init_device_compute_kernel_config, since no call site passed one), and the op's entire job is to
+    move one position's k and v into the resident cache and narrow them to its dtype -- no
+    accumulation, every element written once.  Measured 2026-09-07 with a LoFi + math_approx config
+    threaded to all three LM bodies: **8.22 us/call against 8.23**, PCC bit-identical, device_ms
+    474.53 against 474.65.  Nothing.  The 8.2 us is the 8 scattered partial-tile DRAM writes each
+    core issues -- the same conclusion the grid knob reached from the other side -- and neither
+    fidelity nor fan-out reaches it.  Generalise: on a datamove-shaped op a fidelity tag reports the
+    device op's default, and having the binding does not make it a lever.
     """
     if not deferred:
         return ttnn.multiply(gate, up, memory_config=memory_config)
+    # THE cpp RUNG FOR THIS OP -- see _kernels/silu_mul.py.  What it removes is NOT the sigmoid
+    # (both of the SFPU's LUT sigmoids are measured too coarse for this model, the 6-entry `lut2`
+    # included) but the reciprocal's unreachable NaN guard and one of the library path's two bf16
+    # roundings.  Anything it cannot serve exactly keeps the ttnn call below, so this is additive.
+    km = _silu_mul_kernel()
+    if km is not None and km.serves(gate, up, memory_config):
+        try:
+            return km.silu_mul(gate, up, memory_config)
+        except Exception as exc:  # noqa: BLE001 - the ttnn call below is the contract; this is a bonus
+            km.note(f"silu_mul refused: {type(exc).__name__}: {exc}")
     for approx in (True, False):
         try:
             return ttnn.multiply(
@@ -821,9 +1082,7 @@ def swiglu(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_conf
     if ffn_mem is None:
         return _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, None)
     try:
-        return _swiglu_body(
-            x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, ffn_mem
-        )
+        return _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, ffn_mem)
     except RuntimeError:
         _SWIGLU_L1_REFUSED.add((rows, int(gate_w.shape[-1])))
         return _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kernel_config, core_grid, None)
@@ -853,8 +1112,18 @@ def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kerne
         activation=None if deferred else "silu",
         keep_sharded=True,
         memory_config=ffn_mem,
+        out_dtype=_ACT_DTYPE,
     )
-    up = linear(x, up_w, up_ds, compute_kernel_config, core_grid, keep_sharded=True, memory_config=ffn_mem)
+    up = linear(
+        x,
+        up_w,
+        up_ds,
+        compute_kernel_config,
+        core_grid,
+        keep_sharded=True,
+        memory_config=ffn_mem,
+        out_dtype=_ACT_DTYPE,
+    )
     if gate.is_sharded():
         # LEAVE THE SHARD, BUT NOT ALL THE WAY TO DRAM.  The multiply has to produce something
         # unsharded (down's in0 rectangle is wider than gate/up's output rectangle, so there is no
@@ -864,7 +1133,27 @@ def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kerne
         n = 1
         for d in tuple(gate.shape):
             n *= int(d)
-        h = _multiply_with_silu(gate, up, _handoff_config(n, gate.dtype), deferred)
+        # WRITE THE SHARD down IS ABOUT TO BORROW, RATHER THAN ONE IT HAS TO REBUILD.  The comment
+        # above is right that the product cannot stay on gate/up's rectangle -- down's in0 grid is
+        # wider -- but "leave the shard" and "leave it interleaved" are not the same choice.  The
+        # multiply has to gather across cores either way, and the profile shows what interleaved
+        # costs: the product comes out L1-interleaved and down's very next act is an
+        # InterleavedToSharded on 64 cores, 1.11 us/call, once per layer per token.  Asking the
+        # multiply for down's own activation config folds that launch into the gather it was already
+        # doing, and the borrow check in DramShardedLinear.__call__ then compares equal.
+        rows = max(1, n // int(gate.shape[-1]))
+        handoff = _handoff_config(n, gate.dtype)
+        wanted = down_ds.act_config(math.ceil(rows / TILE)) if down_ds is not None else None
+        h = None
+        if wanted is not None and wanted != handoff:
+            try:
+                h = _multiply_with_silu(gate, up, wanted, deferred)
+            except (RuntimeError, TypeError, ValueError):
+                # A build or shape whose binary op will not pack this rectangle: the interleaved
+                # hand-off below is the placement this call has always made, so nothing is lost.
+                h = None
+        if h is None:
+            h = _multiply_with_silu(gate, up, handoff, deferred)
         # FREE THE HALVES.  multiply builds a new DRAM tensor rather than viewing its inputs, so this
         # is safe, and it matters: the down projection sizes its circular buffers against whatever L1
         # is still free on these cores.
@@ -895,7 +1184,11 @@ def _swiglu_body(x, gate_w, gate_ds, up_w, up_ds, down_w, down_ds, compute_kerne
             # viewing its inputs, so releasing them the moment it returns is safe.
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-    return linear(h, down_w, down_ds, compute_kernel_config, core_grid)
+    # HAND THE DELTA TO THE RESIDUAL ADD AS A SHARD -- see _restore_rank.
+    return _restore_rank(
+        linear(h, down_w, down_ds, compute_kernel_config, core_grid, keep_sharded=True, out_dtype=_ACT_DTYPE),
+        rank,
+    )
 
 
 # out_subblock (h, w) candidates, widest DEST footprint first.  This is tt-metal's own
@@ -989,6 +1282,25 @@ _KBLOCK_OVERHEAD = 60.0
 # narrower N extent also forces a wider per_core_N, which eats the circular-buffer budget and drops
 # gate/up's K block from 8 tiles to 3.  Keep the flag -- the axis is real and a squarer grid could
 # flip it -- but leave it False here.
+#
+# RE-MEASURED AT THE SHAPE THAT REPLACED THE ONE ABOVE, AND IT IS STILL FALSE -- FOR A SHARPER
+# REASON.  That measurement was taken at m_tiles=112 (PREFILL_C 448); RUN72 moved the model to 416,
+# so m_tiles is 104 and the "cannot use the 11th column" argument no longer applies -- at 104 the
+# LM shapes DO keep all 110 cores under transposition, and the cost model actually prefers it
+# (5-9% cheaper on the two dominant shapes) because per_core_M stops being prime.  Measured
+# 2026-09-07 anyway, and the flip is far worse than before, +3.8% of device_ms:
+#   down   3328x8192x3072  sb 1x3 -> 1x5, 389.5 -> 383.8 us, 70.7% -> 71.8% of FPU  (a small WIN)
+#   o_proj 3328x4096x3072  sb 1x3 -> 1x5, 212.0 -> 216.0 us, 64.9% -> 63.8%         (a small LOSS)
+#   gate/up 3328x3072x8192 sb 1x6 -> 2x2, 361.0 -> 980.2 us, 76.1% -> 29.8%         (CATASTROPHIC)
+#   qkv    3328x3072x6144  sb 1x6 -> 2x4, 304.7 -> 727.1 us, 68.7% -> 30.7%
+# THE DISCRIMINANT IS N, NOT M.  Transposing gives the N blocks the Y extent (10) instead of the X
+# extent (11), so a wide-N shape's per_core_N jumps -- 8192 tiles over 10 is 26 against 24 -- and at
+# that width the out block no longer fits _CB_BUDGET_BYTES, so the core re-streams its whole in0
+# slice once per N block.  The two shapes it helps are exactly the two whose N is 96 tiles, and
+# their combined gain (-5.7 us and +4.0 us a layer) does not come close to paying for the two it
+# wrecks.  A per-shape orientation search is therefore also not worth building: it would be worth
+# about 1.7 us a layer.  The encoder confirms the same story from the other side -- every 1504-row
+# shape fell to 100 cores and fc2 went 62.3 -> 107.0 us.
 _TRANSPOSE_MCAST = False
 _BLOCK_CFG_CACHE = {}
 
@@ -1120,17 +1432,31 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
                             per_core_m * per_core_n * k_tiles / reuse
                             + blocks * (k_tiles / in0_block_w) * _KBLOCK_OVERHEAD
                         )
-                        cand = (cost, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w)
+                        work = per_core_m * per_core_n * k_tiles
+                        cand = (cost, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w, work)
                         if (
                             best is None
                             or cost < best[0] * (1.0 - _COST_TIE)
                             or (cost < best[0] * (1.0 + _COST_TIE) and gx * gy > best[1] * best[2])
+                            # MORE CORES FOR NO MORE PER-CORE WORK IS TAKEN WHATEVER `reuse` SAYS.
+                            # The window above compares reuse-ADJUSTED cost, so it can only forgive a
+                            # subblock penalty smaller than itself -- and on the two projections whose
+                            # N is 96 tiles the penalty is bigger than that: 11 x 9 gives per_core
+                            # 12x9 with a 2x3 subblock (reuse 1.0) and 11 x 10 gives 11x9 with 1x3
+                            # (reuse 0.75), so the modelled cost rises 21% on a plan that does 8.3%
+                            # LESS work per core across 11 MORE cores.  Narrowing _COST_TIE to hand
+                            # the grid to the model's own favourite was already measured LOSING 5.5%
+                            # of prefill on gate/up, which is the same trade one shape over: `reuse`
+                            # overstates a 1xN subblock, so it must not be able to veto real cores.
+                            # RAW work is the term the model is sure of -- it is the tile-matmul count
+                            # -- so a wider grid is accepted whenever that term does not get worse.
+                            or (gx * gy > best[1] * best[2] and work <= best[10])
                         ):
                             best = cand
                         break
     cfg = None
     if best is not None:
-        _, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w = best
+        _, gx, gy, per_core_m, per_core_n, block_h, block_w, in0_block_w, h, w, _work = best
         cfg = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
             # The grid is named in (x, y) order, so when the orientation is transposed the M blocks
             # -- searched against the X extent above -- are what x has to carry.
@@ -1241,6 +1567,7 @@ def mm(
     keep_sharded=False,
     activation=None,
     memory_config=None,
+    out_dtype=ttnn.bfloat16,
 ):
     """ttnn.linear routed by the height of the activation: one call site, both regimes.
 
@@ -1273,7 +1600,15 @@ def mm(
         # activation stays a standalone unary here for the reason `linear` documents: the
         # DRAM-sharded factory sends anything but RELU down a separate DEST path, which at one
         # tile row costs more than the interleaved unary it replaces.
-        return _apply(activation, mirror(x, compute_kernel_config=compute_kernel_config, keep_sharded=keep_sharded))
+        return _apply(
+            activation,
+            mirror(
+                x,
+                compute_kernel_config=compute_kernel_config,
+                keep_sharded=keep_sharded,
+                out_dtype=out_dtype,
+            ),
+        )
     # THE THRESHOLD WAS "ONE TILE ROW PER CORE", WHICH IS TOO STRICT.  Asking for the grid loses
     # at the decode shape (a single tile row spread over 110 cores costs more launch than it
     # recovers) but the break-even is nowhere near one row PER CORE -- the audio tower's FFN runs
@@ -1570,9 +1905,62 @@ _SDPA_MIN_OCCUPANCY = 2.0 / 3.0
 # neighbours of 64 x 512 are measured and both are worse: 128 x 256 is +6.9% and 32 x 1024 is +24%.
 _SDPA_MAX_K_CHUNK = 512
 _SDPA_CHUNK_PRODUCT = 32768
+# Tile-equivalents one (q chunk, k chunk) PAIR costs a core in loop setup, circular-buffer turns and
+# the running-max/running-sum rescale, over and above the qc*kc/1024 tiles of score it computes.
+# It only has to RANK the causal candidates below against each other, so its exactness matters less
+# than the fact that it is non-zero -- without it the area model would always pick the smallest chunk,
+# which is the very thing that makes ttnn's one-tile default disastrous on a long sequence.
+#
+# FITTED, NOT GUESSED, AND IT IS DOING TWO JOBS.  Two points on this model's LM prefill
+# (b8 h32 s416) pin it: 256x256 costs 192 score tiles + 3 pairs and measures 288.4 us/call, 128x128
+# costs 160 + 10 and measures 256.4, which solves to 1.469 us a score tile and 2.14 us a pair -- a
+# ratio of 1.46 tiles a pair.  It was first set to 3.0 by eye, which is enough to prefer 128 over
+# 256 but not enough to reach the pick below.
+#
+# WHAT IT IS STANDING IN FOR.  Narrowing the Q chunk also multiplies the GRID ROUNDS, and that cost
+# is not a pair cost.  The third measured point shows it: 64x128 (128 tiles, 16 pairs, 17 rounds
+# against 128x128's 10) came in at 249.8 us -- a real win, but only -2.6% where the pair-only model
+# had predicted -13%.  Three samples cannot separate the two terms (pairs and rounds move together
+# across them: an exact 3-term fit returns a NEGATIVE pair cost, which is over-fitting, not physics),
+# so the rounds cost stays folded into this constant.  The consequence to respect: this number
+# UNDER-prices narrowing q, so treat a pick it makes below 64 as unmeasured rather than trusted.
+_SDPA_CAUSAL_PAIR_OVERHEAD = 1.46
+# How many k chunks one q chunk may visit.  THIS IS THE PCC KNOB, AND IT IS THE ONE THE TWO CHUNK
+# AXES DO NOT SHARE.  Flash rescales its running max and running sum once per k chunk it folds in,
+# so the DEPTH of that chain -- ceil(seq_k / k_chunk) -- is what costs accuracy, and it depends on
+# the K chunk alone.  Measured: going 256x256 -> 128x128 took the depth 2 -> 4 and e2e PCC
+# 0.9636 -> 0.9601 against a 0.95 gate.  Narrowing the Q chunk instead cuts score area at CONSTANT
+# depth, which is why the search below is over both axes rather than one square chunk.  Held at the
+# depth already paid for, so the area search cannot quietly spend more accuracy.
+#
+# HOLDING IT AT 4 IS NOT COSTING MUCH, WHICH IS WHY IT CAN STAY A GUARD RATHER THAN A SWEEP.  The
+# candidates it blocks here are k=64 (depth 7), and on the honest reading they are a bad trade
+# anyway: 128x64 takes the score area only 160 -> 152 tiles (-5%) while very nearly doubling the
+# pairs 10 -> 19, and 64x64 gets 128 -> 112 (-12.5%) for 16 -> 28.  Area falls slowly on the K axis
+# because the diagonal pair is the only one a narrower k actually trims.  Untested rather than
+# refuted -- but the accuracy is on the line and the modelled saving is not there.
+_SDPA_CAUSAL_MAX_RESCALE = 4
 
 
-def sdpa_config(device, q, k, wide_k=False):
+def _causal_cost(seq_q, seq_k, qc, kc):
+    """(pairs, score tiles, rescale depth) for a causal flash pass at this (q, k) chunk pair.
+
+    Flash skips a (q chunk, k chunk) pair only when the WHOLE pair is above the diagonal, so q chunk
+    i still visits every k chunk overlapping rows 0..(i+1)*qc -- including the diagonal pair whose
+    upper triangle the mask throws away.  Score area therefore falls as EITHER chunk narrows, but
+    the two axes buy it at different prices: narrowing q multiplies the number of independent work
+    units (rounds of the grid), narrowing k multiplies the rescale depth (accuracy).
+    """
+    pairs = 0
+    area = 0
+    for i in range(-(-int(seq_q) // int(qc))):
+        visited = -(-min((i + 1) * int(qc), int(seq_q)) // int(kc))
+        pairs += visited
+        area += visited * int(qc) * int(kc)
+    return pairs, area / float(TILE * TILE), -(-int(seq_k) // int(kc))
+
+
+def sdpa_config(device, q, k, wide_k=False, causal=False):
     """Full-grid SDPAProgramConfig with tile-power-of-two flash chunks, sized from q/k.
 
     ttnn's SDPA falls back to q_chunk_size = k_chunk_size = 32 -- ONE TILE -- whenever no
@@ -1634,6 +2022,47 @@ def sdpa_config(device, q, k, wide_k=False):
         return c
 
     qc, kc = _q_chunk(), _chunk(seq_k)
+    if causal:
+        # A CAUSAL PASS PAYS FOR AREA THE MASK THROWS AWAY, SO OCCUPANCY IS NOT THE ONLY AXIS.
+        # `_q_chunk` above sizes the chunk so the LAST round of work units is nearly full, which is
+        # the right rule for the audio tower -- that attention is NOT masked, so every candidate
+        # computes the same total score area and only the round filling differs.  The LM prefill is
+        # masked, and there the chunk decides how much score the kernel computes at all: at 416
+        # positions a 256 chunk evaluates 3 pairs of 256x256 = 196 k score elements against a true
+        # causal area of 86 k, i.e. 2.27x the necessary work, because the diagonal pair is half
+        # wasted and the second q chunk is 96 rows of padding.  Halving to 128 makes it 10 pairs of
+        # 128x128 = 164 k (1.89x) and still leaves occupancy at 0.93.
+        #
+        # Both terms move, so it is a minimisation rather than "smaller is better": the score tiles
+        # fall toward the true triangle while the pair count -- and _SDPA_CAUSAL_PAIR_OVERHEAD with
+        # it -- grows as n^2.  Search only chunks the occupancy rule would also accept, so this can
+        # narrow the chunk but never un-fill the grid.
+        #
+        # AND THE TWO CHUNKS ARE SEPARATE AXES, WHICH A SINGLE SQUARE CHUNK CANNOT EXPRESS.  Area
+        # falls as either one narrows, but they are paid for out of different budgets: narrowing Q
+        # multiplies the WORK UNITS (so it is the occupancy rule's business), narrowing K multiplies
+        # the RESCALE DEPTH (so it is the PCC gate's business -- see _SDPA_CAUSAL_MAX_RESCALE).  At
+        # 416 positions the square pick 128x128 costs 160 score tiles at depth 4, while 64x128 costs
+        # 128 -- a further 20% off the area for NO extra depth, bought only with 6 more pairs. So the
+        # search runs over both axes with the depth held at what has already been paid for.
+        # The cap is never allowed to reject the plan we already have: a long enough context puts the
+        # occupancy pick's own depth past the constant, and the point of the constant is "do not spend
+        # MORE accuracy than is already being spent", not "refuse to run".
+        max_depth = max(_SDPA_CAUSAL_MAX_RESCALE, -(-seq_k // kc))
+        best = None
+        for c_q in [qc >> i for i in range(16) if (qc >> i) >= 32]:
+            n = units * -(-seq_q // c_q)
+            if n / (-(-n // cores) * cores) < _SDPA_MIN_OCCUPANCY:
+                continue
+            for c_k in [kc >> i for i in range(16) if (kc >> i) >= 32]:
+                pairs, tiles, depth = _causal_cost(seq_q, seq_k, c_q, c_k)
+                if depth > max_depth:
+                    continue
+                cost = pairs * _SDPA_CAUSAL_PAIR_OVERHEAD + tiles
+                if best is None or cost < best[0]:
+                    best = (cost, c_q, c_k)
+        if best is not None:
+            qc, kc = best[1], best[2]
     if wide_k:
         # TRADE Q WIDTH FOR K WIDTH AT A CONSTANT PRODUCT.  The k loop is where this kernel's
         # overhead lives, so a wider k block is the shape worth having; it just cannot be bought
@@ -1697,7 +2126,50 @@ def _row_cores(device, n):
     return ttnn.CoreRangeSet(ranges)
 
 
-def _concat_heads_decode(attn_out, batch, num_heads, head_dim):
+def _square_cores(device, n):
+    """`n` cores as the SQUAREST single rectangle anchored at (0, 0), or None if n is prime-ish.
+
+    For a gather whose every consumer reads from every one of these cores, the shape of the source
+    rectangle is the NOC hop distance: `n` cores in one row put the far end `n-1` columns away,
+    where the squarest factorisation halves the worst case.  Anchored at (0, 0) and returned as ONE
+    range on purpose -- prim::nlp_concat_heads_decode flips to `on_subcoregrids` (a different
+    program factory, which then REQUIRES an explicit sub_core_grids) the moment the input's first
+    range does not start at the origin or there is more than one of them.
+    """
+    g = device.compute_with_storage_grid_size()
+    n = int(n)
+    best = None
+    for y in range(1, int(g.y) + 1):
+        if n % y:
+            continue
+        x = n // y
+        if x > int(g.x):
+            continue
+        if best is None or max(x, y) < max(best):
+            best = (x, y)
+    if best is None:
+        return None
+    x, y = best
+    return ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(x - 1, y - 1))})
+
+
+def _slice_into(x, end, mirror):
+    """Slice `x` down to `end`, landing directly in `mirror`'s activation shard when it will take it.
+
+    Falls back to interleaved L1 -- the placement this slice has always used -- on any build or
+    shape whose slice will not pack a width shard, so the caller never loses the dedicated head
+    merge just because the placement was refused.
+    """
+    wanted = mirror.act_config(math.ceil(int(end[-2]) / TILE)) if mirror is not None else None
+    if wanted is not None:
+        try:
+            return ttnn.slice(x, (0,) * len(end), end, memory_config=wanted)
+        except (RuntimeError, TypeError, ValueError):
+            pass
+    return ttnn.slice(x, (0,) * len(end), end, memory_config=ttnn.L1_MEMORY_CONFIG)
+
+
+def _concat_heads_decode(attn_out, batch, num_heads, head_dim, mirror=None):
     """The DEDICATED head merge, or None when this build/shape will not take it.
 
     THE GQA RULE BINDS THE PRODUCER, NOT THIS OP.  sdpa_decode refuses a sharded output on a
@@ -1721,28 +2193,76 @@ def _concat_heads_decode(attn_out, batch, num_heads, head_dim):
             return None
         padded_heads, hd = dims[2], dims[3]
         width = int(num_heads) * int(head_dim)
+        # EVERY OUTPUT CORE READS EVERY ONE OF THESE CORES, so their rectangle is the hop distance.
+        # The factory hands each of the `num_heads` output cores the whole noc_x/noc_y cross product
+        # of this shard's bounding box and the reader gathers one sub-tile LINE (16 elements) per
+        # user, so the gather is `num_heads x batch` tiny reads and latency, not bytes, is what it
+        # costs.  A single 8-wide row puts the far end 7 columns away; the squarest rectangle for
+        # the same core count halves that.  Falls back to the row when the count will not factor.
         shard = ttnn.create_sharded_memory_config(
             (padded_heads, hd),
-            _row_cores(dev, batch),
+            _square_cores(dev, batch) or _row_cores(dev, batch),
             ttnn.ShardStrategy.HEIGHT,
             ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
         xs = attn_out if attn_out.memory_config() == shard else ttnn.to_memory_config(attn_out, shard)
-        joined = ttnn.experimental.nlp_concat_heads_decode(xs, num_heads=int(num_heads))
+        # PREALLOCATE THE OUTPUT AND THE PADDING SLICE DISAPPEARS WITH IT.  This op ignores
+        # `memory_config` outright (nlp_concat_heads_decode.cpp forwards it and prim:: drops it) and
+        # builds its own spec: batch padded up to a full tile, width-sharded (padded_batch, head_dim)
+        # over `num_cores_to_corerangeset(num_heads, compute_grid, row_wise)`.  That is why the merge
+        # used to need a slice afterwards -- the padded batch is not the layer's logical one.  But
+        # `output_tensor` short-circuits the whole spec: compute_output_specs returns the
+        # preallocated tensor's spec verbatim, and the factory reads its core placement back out of
+        # `output.shard_spec()` (nlp_concat_heads_decode_program_factory.cpp: `q_cores =
+        # output.shard_spec().grid`, then `grid_to_cores(num_cores, bbox.x, bbox.y, true)`), so the
+        # tensor we hand it decides BOTH the grid and the logical shape.  Hand it o_proj's own
+        # activation shard with the LOGICAL batch: the op writes exactly the `batch` rows it always
+        # wrote, the padded rows stay untouched as before, and the result already carries both the
+        # shape the residual add needs and the placement the projection borrows -- so the sub-tile
+        # slice AND the InterleavedToSharded that used to follow it are both gone.
+        #
+        # The specs coincide only when the projection's in0 rectangle happens to be `num_heads`
+        # cores of `head_dim` columns each; check it rather than assume it, and fall through to the
+        # slice when it does not hold, so this stays a placement lever and not a shape assumption.
+        # The op pads the batch to a full tile (compute_output_specs: `batch = max(batch, 32)`), and
+        # that padded height is what a one-tile-row activation shard already has -- but they are two
+        # different quantities, so compare against the padding rule rather than against the input's
+        # padded head count.
+        padded_batch = max(int(batch), TILE)
+        want = mirror.act_config(1) if mirror is not None else None
+        prealloc = None
+        if want is not None:
+            spec = want.shard_spec
+            if (
+                want.memory_layout == ttnn.TensorMemoryLayout.WIDTH_SHARDED
+                and spec is not None
+                and spec.grid.num_cores() == int(num_heads)
+                and tuple(int(v) for v in spec.shape) == (padded_batch, int(head_dim))
+            ):
+                prealloc = ttnn.allocate_tensor_on_device(
+                    ttnn.Shape([1, 1, int(batch), width]), xs.dtype, ttnn.TILE_LAYOUT, dev, want
+                )
+        joined = ttnn.experimental.nlp_concat_heads_decode(
+            xs, num_heads=int(num_heads), output_tensor=prealloc
+        )
         if xs is not attn_out:
             ttnn.deallocate(xs)
         jd = [int(d) for d in joined.shape]
         if jd[-2] != int(batch):
-            joined = ttnn.slice(
-                joined, (0, 0, 0, 0), (1, 1, int(batch), width), memory_config=ttnn.L1_MEMORY_CONFIG
-            )
+            # AND THE UNPADDING SLICE IS THE PLACE TO BUILD o_proj's ACTIVATION SHARD, not merely a
+            # place to land in L1.  The slice has to write a new tensor whatever config it is given,
+            # and the profile shows what interleaved costs: this slice lands L1-interleaved and
+            # o_proj's very next act is an InterleavedToSharded on 32 cores, 0.80 us/call, once per
+            # layer per token.  Naming the projection's own activation config makes its borrow check
+            # compare equal and the reshard disappears into a write that was happening anyway.
+            joined = _slice_into(joined, (1, 1, int(batch), width), mirror)
         return ttnn.reshape(joined, (1, int(batch), width))
     except (RuntimeError, TypeError, AttributeError, ValueError):
         return None
 
 
-def merge_heads_decode(attn_out, batch, num_heads, head_dim, l1=True):
+def merge_heads_decode(attn_out, batch, num_heads, head_dim, l1=True, mirror=None):
     """[1, B, padded_nh, hd] -> [1, B, nh*hd] for the o_proj, kept in L1.
 
     This reshape collapses the last TWO dims, so on TILE layout it genuinely re-tilizes rather than
@@ -1754,7 +2274,7 @@ def merge_heads_decode(attn_out, batch, num_heads, head_dim, l1=True):
     """
     shape = (1, int(batch), int(num_heads) * int(head_dim))
     if l1:
-        swapped = _concat_heads_decode(attn_out, batch, num_heads, head_dim)
+        swapped = _concat_heads_decode(attn_out, batch, num_heads, head_dim, mirror)
         if swapped is not None:
             return swapped
     if not l1:
@@ -1808,6 +2328,26 @@ def qkv_split_decode(qkv, batch, num_heads, num_kv_heads, head_dim):
                 flat,
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
+                # k's CORE RANGE WRAPS THE GRID ROW, AND THAT COSTS NOTHING -- MEASURED.  The op
+                # lays q and k out in ROW-MAJOR order inside the core grid of the output_mem_config
+                # it is handed, starting k where q's (batch+1)'th core would be
+                # (nlp_create_qkv_heads_decode_device_operation.cpp: k_start_core_coord is the end
+                # of the batch+1 range).  Defaulted, that grid is the whole 11 x 10 compute grid, so
+                # q takes (0,0)-(7,0) and k takes eight cores from (8,0) -- off the end of row 0 and
+                # on to row 1.  k is therefore TWO CoreRanges with a BOUNDING BOX of 22 cores, and
+                # the profile duly tags both ops that inherit its shard spec at 22: the K rope, and
+                # paged_fused_update_cache (whose core set is input1.grid MERGED with input2.grid,
+                # then bounding-boxed, with a dummy kernel on every core in the box that owns
+                # nothing).  Passing a `batch` x 2 output_mem_config grid instead gives q row 0 and
+                # k row 1 -- one contiguous range each, and a 16-core box with nothing unused.
+                # MEASURED 2026-09-07: paged_fused_update_cache 5.8926 -> 5.8756 ms of roofline gap,
+                # K rope 2.0674 -> 2.0809, head split 3.3658 -> 3.3660, datamove bucket 40.018 ->
+                # 39.974 -- all inside the run-to-run band.  So the core count the PROFILER reports
+                # for these ops is the bounding box, not work, and a dummy kernel on an idle core is
+                # free once the program is traced.  Do not spend another round on core-range
+                # compaction; if this op is to get cheaper it has to be the 8 scattered partial-tile
+                # cache writes each core makes, not the shape of the range.
+                #
                 # NON-OVERLAPPING q/k CORE GRIDS.  v always shares q's grid (the op hard-codes
                 # v_shard_grid = q_shard_grid), so this is what makes k and v DISJOINT -- the
                 # precondition paged_fused_update_cache needs to write both caches in one launch
@@ -1890,6 +2430,19 @@ def residual_add(device, residual, delta):
     shard as its output costs it nothing and deletes the InterleavedToSharded the norm would
     otherwise run on the result.  Falls back to a plain add whenever this hidden size has no shard
     plan (prefill heights, or a hidden size no rectangle divides).
+
+    AND THIS LAUNCH CANNOT BE FUSED AWAY, WHICH IS WORTH SAYING BECAUSE THE CATALOG KEEPS OFFERING
+    IT.  `ttnn.rms_norm` really does take `residual_input_tensor` (GUIDELINES/02 section 6 and 06
+    section 1 both name add+Norm as the most reusable fusion, and the kwarg is there on this build),
+    so `norm(x + delta)` looks like one op instead of two -- worth ~2 us a layer at decode and ~78 us
+    a layer at prefill.  It does not apply to a PRE-norm block: the fused op returns ONE tensor
+    (layernorm_device_operation.cpp's compute_output_specs returns a single TensorSpec, not a
+    vector), so the SUM is consumed internally and thrown away -- and in a pre-norm residual stream
+    that sum is precisely the next residual.  Recomputing it costs the add back.  The catalog's
+    lever is written for a POST-norm block, where `LN(x + r)` has no other consumer.
+    What DOES transfer is the placement half, and this function already takes it: the add writes the
+    norm's own shard, so the pair costs one launch plus a borrow rather than one launch plus a
+    reshard.
     """
     # ONLY AT THE DECODE HEIGHT.  _norm_plan keys on the hidden size alone, but the norm itself only
     # takes the sharded path when the activation is ONE tile row; a prefill [1, 512, hidden] forced
@@ -1921,9 +2474,77 @@ def residual_add(device, residual, delta):
         # otherwise inherits its input's config, so the explicit argument forces a round trip the
         # default never made.  Measured 2026-09-05 with the same change on rms_norm below: prefill
         # 142.87 -> 144.48 ms (+1.13%).  Leave the output placement implicit.
+        #
+        # AND NAMING L1 IS A DIFFERENT ARGUMENT THAT ALSO LOSES -- BUT ONLY AT DEPTH, WHICH IS THE
+        # PART WORTH RECORDING.  Naming DRAM forces a round trip; L1 is the other direction and it
+        # PROPAGATES for free, because ttnn.add inherits operand A's placement and A is the running
+        # residual, so one named output carries the whole chain and no other call site changes.  On
+        # the rates it looks like the best lever left in prefill: these two adds profile at 401 and
+        # 422 GB/s reading DRAM interleaved, against ~757 GB/s for the ops that already have an L1
+        # hand-off (nlp_create_heads, concatenate_heads) and 886 for the SwiGLU multiply on two L1
+        # operands.  And on the 3-LAYER CAPTURE it delivers exactly that: the adds go 99.6 / 81.2
+        # -> 47.6 us each and the LayerNorm that reads the sum goes 99.1 -> 62.9, i.e. 158 us a
+        # LAYER, with PCC bit-identical at 0.9576212 because nothing but placement changed.
+        #
+        # It reaches none of that at the 30-layer trace stage, and the reason is CONTENTION, which
+        # takes the whole 2x2 to see.  Measured 2026-09-08, prefill stage ms, PCC bit-identical in
+        # every cell:
+        #                          residual DRAM   residual L1
+        #     SwiGLU L1 (HEAD)         106.49         106.94
+        #     SwiGLU DRAM              113.85         111.13
+        # Read down the columns: this chain is worth 2.72 ms on its own (113.85 -> 111.13) and
+        # -0.45 ms once the SwiGLU hand-off holds the same L1 (106.49 -> 106.94).  Read across the
+        # rows: that hand-off is worth 7.36 ms alone and 4.19 ms beside the chain.  The pair is
+        # strictly SUB-ADDITIVE -- 2.72 + 7.36 = 10.1 ms of separate wins, 7.36 ms available
+        # together -- because the residual pair is 2 x 10.9 MB = 197 kB/core and has to stay
+        # resident ACROSS the SwiGLU's own 527 kB/core of gate/up, beside the down projection's
+        # ~700 kB of circular buffers.  The SwiGLU wins outright, so this stays implicit; do not
+        # re-derive the chain in isolation and conclude it is free.
+        #
+        # AND THE THREE-CELL VERSION OF THIS TABLE READ THE OPPOSITE WAY.  With only the top row
+        # and 111.13, the natural conclusion was that the chain fails at depth on its own merits --
+        # it takes the fourth cell to see that 111.13 is 2.72 ms BETTER than its true baseline, not
+        # a loss.  An A/B on two interacting levers needs all four cells; three of them will
+        # confidently support the wrong lever.
+        #
+        # SCOPING IT TO THE LINK THAT DOES NOT OVERLAP THE FFN WAS THE OBVIOUS ESCAPE, AND IT IS
+        # ALSO MEASURED.  The chain has two links a layer and only one overlaps the SwiGLU: the
+        # attention sum is the residual the MLP add reads, so it is resident through gate/up, while
+        # the MLP sum is only resident across the NEXT layer's attention block.  Tried 2026-09-08
+        # with a `place=` argument -- "l1" at the three MLP call sites, "dram" at the three
+        # attention ones (an eviction, named only when the incoming residual really is in L1, so a
+        # refused hand-off stays implicit).  Per-op it did exactly what it was designed to do:
+        #     attention add  99.6 -> 72.67 us   (its A operand now reads L1)
+        #     MLP add        81.2 -> 56.13 us
+        #     LayerNorm on the MLP sum  99.1 -> 62.7 us
+        # 88.4 us a layer, PCC bit-identical, which predicts 2.65 ms of prefill.  Delivered 0.10 ms:
+        # 106.47 -> 106.37, two samples each, within-config spread 0.02.  Reverted.
+        #
+        # SO THE CONCLUSION IS NOT ABOUT THE SwiGLU, IT IS ABOUT THE BUDGET: PREFILL L1 IS
+        # SATURATED.  Twice now, on two different links, an incremental tenant has produced a large
+        # per-op win and ~nothing at depth -- because every hand-off it displaces is worth about
+        # what it gains.  On the attention side those are qkv_out_config, the head split and
+        # attn_out_config; on the FFN side, gate/up.  Do not add another L1 tenant to prefill
+        # expecting the per-op delta to survive; the only way to win here is to make an EXISTING
+        # hand-off cheaper, not to add one.
+        #
+        # GENERALISE THE OTHER HALF TOO: TT_PERF_LAYERS caps the profile at 3 layers, so the 158
+        # us/layer above is measured against a per-core budget the 30-layer forward does not have.
+        # Judge a placement lever on the STAGE time, never on the per-op delta the capture shows.
         return ttnn.add(residual, delta, dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None)
+    # THE ACCUMULATOR'S WIDTH IS THIS MODEL'S PCC EXCHANGE RATE, AND IT IS MEASURED BOTH WAYS.
+    # The four projections that feed this add were narrowed to _ACT_DTYPE at the decode height and
+    # the accumulator followed them; narrowing the SUM is the part that costs accuracy, because the
+    # FFN intermediates at bf8_b are what prefill already runs while the residual sum is a new
+    # rounding, applied once per block per layer.  Measured 2026-09-07 with everything else held:
+    #   dtype=_ACT_DTYPE here   decode 10.0775 ms/token, e2e PCC 0.9576212
+    #   dtype left implicit     decode 10.1086 ms/token, e2e PCC 0.9610618
+    # i.e. 0.31% of decode against 0.0034 of PCC, in EITHER direction -- and the bf16 form is
+    # actually ABOVE the 0.9600964 this model held before the projections were narrowed at all.
+    # Keep the narrow form while the gate has room; this is the cheapest place in the model to buy
+    # PCC BACK if a later lever needs it, and the only one whose price is already known.
     try:
-        return ttnn.add(residual, delta, memory_config=plan[0])
+        return ttnn.add(residual, delta, memory_config=plan[0], dtype=_ACT_DTYPE)
     except (RuntimeError, TypeError, AttributeError):
         return ttnn.add(residual, delta)
 

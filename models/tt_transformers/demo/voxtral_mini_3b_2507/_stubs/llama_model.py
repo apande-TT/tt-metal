@@ -624,8 +624,8 @@ class LlamaModel:
             memory_config=_DS.sdpa_decode_out_config(),
         )
         # [1, B, padded_nh, hd] -> [1, B, nh*hd]; nh == 32 here so no padding.
-        attn_out = _DS.merge_heads_decode(attn_out, B, self.num_heads, self.head_dim)
-        return _DS.mm(self.device, attn_out, lw["o_w"], _ATTN_PROJ_CFG, mirror=lw["o_ds"])
+        attn_out = _DS.merge_heads_decode(attn_out, B, self.num_heads, self.head_dim, mirror=lw["o_ds"])
+        return _DS.proj_delta(self.device, attn_out, lw["o_w"], _ATTN_PROJ_CFG, mirror=lw["o_ds"])
 
     def __call__(
         self,
@@ -742,7 +742,7 @@ class LlamaModel:
                     k,
                     v,
                     scale=self.scaling,
-                    program_config=_DS.sdpa_config(self.device, q, k),
+                    program_config=_DS.sdpa_config(self.device, q, k, causal=True),
                     compute_kernel_config=_DS.ATTN_CFG,
                 )
                 # END THE SPLIT'S LIFETIME AT ITS LAST READER -- see _DS.release.  q/k/v are dead
@@ -752,7 +752,7 @@ class LlamaModel:
                 # L1 at all.
                 _DS.release(q, k, v)
                 attn_out = _DS.concat_heads(attn_out)
-                attn_out = _DS.mm(self.device, attn_out, lw["o_w"], _ATTN_PROJ_CFG, mirror=lw["o_ds"])
+                attn_out = _DS.proj_delta(self.device, attn_out, lw["o_w"], _ATTN_PROJ_CFG, mirror=lw["o_ds"])
 
             h = _DS.residual_add(self.device, residual, attn_out)
 
