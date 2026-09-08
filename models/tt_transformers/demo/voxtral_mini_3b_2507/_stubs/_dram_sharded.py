@@ -892,6 +892,35 @@ except (AttributeError, TypeError, ValueError):  # pragma: no cover - depends on
     _SILU_ACT = None
 
 
+def _silu_mul_kernel():
+    """Load the hand-written SwiGLU-product kernel from ../_kernels, or None if unavailable.
+
+    Same standalone-by-path problem this file itself has, one directory over: the stubs carry no
+    package context, so the sibling `_kernels` tree has to be imported by file path too.  Returns
+    None rather than raising, so a checkout without the kernel keeps the plain ttnn call.
+    """
+    import importlib.util
+    import pathlib
+    import sys
+
+    key = "_voxtral_kernels__silu_mul"
+    if key in sys.modules:
+        return sys.modules[key]
+    path = pathlib.Path(__file__).resolve().parent.parent / "_kernels" / "silu_mul.py"
+    if not path.exists():
+        sys.modules[key] = None
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(key, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[key] = mod
+        spec.loader.exec_module(mod)
+    except Exception:  # noqa: BLE001 - a kernel this build cannot import must not break the model
+        sys.modules[key] = None
+        return None
+    return mod
+
+
 def _multiply_with_silu(gate, up, memory_config, deferred):
     """gate * up, with silu(gate) folded into the multiply's own unpack when it was deferred.
 
@@ -974,6 +1003,16 @@ def _multiply_with_silu(gate, up, memory_config, deferred):
     """
     if not deferred:
         return ttnn.multiply(gate, up, memory_config=memory_config)
+    # THE cpp RUNG FOR THIS OP -- see _kernels/silu_mul.py.  What it removes is NOT the sigmoid
+    # (both of the SFPU's LUT sigmoids are measured too coarse for this model, the 6-entry `lut2`
+    # included) but the reciprocal's unreachable NaN guard and one of the library path's two bf16
+    # roundings.  Anything it cannot serve exactly keeps the ttnn call below, so this is additive.
+    km = _silu_mul_kernel()
+    if km is not None and km.serves(gate, up, memory_config):
+        try:
+            return km.silu_mul(gate, up, memory_config)
+        except Exception as exc:  # noqa: BLE001 - the ttnn call below is the contract; this is a bonus
+            km.note(f"silu_mul refused: {type(exc).__name__}: {exc}")
     for approx in (True, False):
         try:
             return ttnn.multiply(
