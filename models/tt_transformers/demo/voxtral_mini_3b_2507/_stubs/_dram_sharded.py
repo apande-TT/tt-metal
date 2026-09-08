@@ -360,6 +360,14 @@ def _swiglu_handoff(rows, width, dtype):
     ops after it.  Returns None (rather than DRAM_MEMORY_CONFIG) so the caller can keep the exact
     call it made before when the hand-off does not apply, which is what makes the fallback
     bit-identical to the previous behaviour instead of merely equivalent.
+
+    THIS HAND-OFF IS WORTH 4.64 ms OF PREFILL, NOT THE 0.3 ms ITS COMMIT MESSAGE CLAIMS, AND IT IS
+    THE BEST TENANT IN L1.  Measured 2026-09-08 by turning it off at the prefill height alone
+    (_SWIGLU_L1_MAX_BYTES to 12 MB, which excludes the 29 MB intermediates and leaves the decode
+    height -- already excluded by the row gate -- untouched): prefill 106.49 -> 111.13 ms, PCC
+    bit-identical.  So anything that wants per-core L1 during the FFN is bidding against 4.6 ms,
+    and the obvious rival lost: see residual_add for the residual chain, which shows a 2x per-op
+    win on a capped capture and is a net loss at depth even with this hand-off removed for it.
     """
     rows, width = int(rows), int(width)
     if rows < _GRID_REQUEST_MIN_ROWS or (rows, width) in _SWIGLU_L1_REFUSED:
@@ -2335,6 +2343,30 @@ def residual_add(device, residual, delta):
         # otherwise inherits its input's config, so the explicit argument forces a round trip the
         # default never made.  Measured 2026-09-05 with the same change on rms_norm below: prefill
         # 142.87 -> 144.48 ms (+1.13%).  Leave the output placement implicit.
+        #
+        # AND NAMING L1 IS A DIFFERENT ARGUMENT THAT ALSO LOSES -- BUT ONLY AT DEPTH, WHICH IS THE
+        # PART WORTH RECORDING.  Naming DRAM forces a round trip; L1 is the other direction and it
+        # PROPAGATES for free, because ttnn.add inherits operand A's placement and A is the running
+        # residual, so one named output carries the whole chain and no other call site changes.  On
+        # the rates it looks like the best lever left in prefill: these two adds profile at 401 and
+        # 422 GB/s reading DRAM interleaved, against ~757 GB/s for the ops that already have an L1
+        # hand-off (nlp_create_heads, concatenate_heads) and 886 for the SwiGLU multiply on two L1
+        # operands.  And on the 3-LAYER CAPTURE it delivers exactly that: the adds go 99.6 / 81.2
+        # -> 47.6 us each and the LayerNorm that reads the sum goes 99.1 -> 62.9, i.e. 158 us a
+        # LAYER, with PCC bit-identical at 0.9576212 because nothing but placement changed.
+        #
+        # It does not survive to the 30-layer trace stage.  Measured 2026-09-08:
+        #     SwiGLU L1, residual DRAM (HEAD)   prefill 106.49 ms
+        #     SwiGLU L1, residual L1            prefill 106.94 ms   (+0.45, no gain)
+        #     SwiGLU DRAM, residual L1          prefill 111.13 ms   (+4.64)
+        # The second row was first read as the two hand-offs competing for per-core L1 -- the
+        # residual pair is 2 x 10.9 MB = 197 kB/core and has to stay resident ACROSS the SwiGLU's
+        # own 527 kB/core of gate/up.  The third row REFUTES that reading: with the rival evicted
+        # the residual chain is still a loss, so the 158 us/layer is a property of the capped
+        # capture and not of the model.  GENERALISE, because it applies to every L1 lever on this
+        # model: TT_PERF_LAYERS caps the profile at 3 layers, and 3 layers of a resident chain is a
+        # per-core budget the 30-layer forward does not have.  A placement lever must be judged on
+        # the STAGE time, never on the per-op delta the capture shows.
         return ttnn.add(residual, delta, dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None)
     # THE ACCUMULATOR'S WIDTH IS THIS MODEL'S PCC EXCHANGE RATE, AND IT IS MEASURED BOTH WAYS.
     # The four projections that feed this add were narrowed to _ACT_DTYPE at the decode height and
