@@ -27,6 +27,21 @@ puts this at +102 us/call, i.e. +3.1 ms over 30 layers, but the trace+1cq prefil
 too.  Either the 409.8 includes tracy marker cost that a three-kernel generic_op pays and a
 binary_ng does not, or prefill's stage time is insensitive to op-level deltas of this size.
 
+AND TWO ttl 1.0.1 LIMITS THAT CLOSE THE tt-lang RUNG ON OTHER OPS OUTRIGHT, verified while
+looking for a second target:
+
+* **ROW_MAJOR TENSORS ARE NOT SUPPORTED AT ALL.**  `ttl.operation` takes a `tiled=` parameter, but
+  passing `tiled=False` with row-major operands raises "Only tiled tensors supported".  That closes
+  the rung on everything in the sampling tail -- the lm_head vocab `concat`, the untilized pieces
+  it joins, and the argmax itself all work on ROW_MAJOR bf16 because the scan reads sticks, not
+  tiles.  A C++ generic_op kernel has no such limit (tt/cpp_argmax.py already reads a ROW_MAJOR
+  sharded tensor), so for those ops the cpp rung is the FIRST reachable one, which is the escape
+  GUIDELINES/12 names as "tt-lang provably cannot express the op".
+* **`num_outs` MUST BE 1.**  The decorator rejects anything else, so no multi-output op is
+  expressible.  That closes the rung on `nlp_create_qkv_heads`, which returns q, k and v from one
+  launch; splitting it into three ttl operations would triple the launch count of an op that is
+  already at the ~757 GB/s L1 datamove floor.
+
 FOUR ttl 1.0.1 GOTCHAS, which cost most of the authoring time:
 
 1. `grid=` IS (x, y), NOT (rows, cols).  GUIDELINES/11 writes it `grid=(R, C)`; ttl compares the
