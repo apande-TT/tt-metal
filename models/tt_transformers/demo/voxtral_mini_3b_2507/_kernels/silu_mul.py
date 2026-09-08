@@ -249,10 +249,15 @@ def silu_mul(gate, up, memory_config):
     """silu(gate) * up through the custom kernel.  Raises on anything unexpected; caller falls back."""
     device = gate.device()
     n = _tiles(gate)
-    plan = _PLANS.get((id(device), n))
+    # KEYED ON THE GRID, NOT `id(device)`.  A plan is a pure function of (grid, tile count) -- it
+    # holds no device handle -- and `id()` is only unique while the object it named is alive, so a
+    # closed device whose address a later one reuses would serve a plan built for the wrong grid.
+    grid = device.compute_with_storage_grid_size()
+    key = (int(grid.x), int(grid.y), n)
+    plan = _PLANS.get(key)
     if plan is None:
         plan = SiluMul(device, n)
-        _PLANS[(id(device), n)] = plan
+        _PLANS[key] = plan
     out = ttnn.allocate_tensor_on_device(
         ttnn.Shape(list(gate.padded_shape)),
         gate.dtype,
@@ -260,7 +265,12 @@ def silu_mul(gate, up, memory_config):
         device,
         ttnn.DRAM_MEMORY_CONFIG if memory_config is None else memory_config,
     )
-    note(f"run tiles={n} ncores={plan.ncores} a={gate.buffer_address()} b={up.buffer_address()} y={out.buffer_address()}")
+    if _LOG is not None:
+        # Three pybind round-trips on the hot path, for a sink that is off by default.
+        note(
+            f"run tiles={n} ncores={plan.ncores} a={gate.buffer_address()} "
+            f"b={up.buffer_address()} y={out.buffer_address()}"
+        )
     ttnn.generic_op([gate, up, out], plan.descriptor(gate, up, out))
     note(f"ran ok tiles={n}")
     _selfcheck(gate, up, out)

@@ -962,21 +962,31 @@ def _multiply_with_silu(gate, up, memory_config, deferred):
     multiply(g, g, a_activations=[SIGMOID_approx]) is silu(g) in one binary op, then multiply by u.
     Measured 2026-09-08: e2e PCC 0.9576 -> **0.8214** against a 0.95 gate.  That LUT is a
     3-coefficient piecewise fit and this model has 0.0076 of PCC margin.
-    THIS CLOSES THE KERNEL RUNGS TOO, which is the part worth writing down.  A hand-written tt-lang
-    or Metalium kernel has exactly the same two sigmoids to choose between, and the exact one is
-    ALREADY on its cheap path here: binary_ng derives fp32_dest_acc_en from the data formats
-    (binary_ng_program_factory.cpp:1205) and bf8_b operands never set it, so `_sfpu_sigmoid_` takes
+    THE SIGMOID IS AT ITS FLOOR; THE OP IS NOT, AND AN EARLIER VERSION OF THIS DOCSTRING CONFLATED
+    THE TWO.  It argued that the kernel rungs were closed because "a hand-written tt-lang or
+    Metalium kernel has exactly the same two sigmoids to choose between" and the exact one already
+    runs on its cheap path here (binary_ng derives fp32_dest_acc_en from the data formats,
+    binary_ng_program_factory.cpp:1205, and bf8_b operands never set it, so `_sfpu_sigmoid_` takes
     the `_sfpu_exp_21f_bf16_` branch and a SINGLE reciprocal iteration rather than
-    `_sfpu_exp_accurate_` and two.  There is no third sigmoid to write.
+    `_sfpu_exp_accurate_` and two).  Every clause of that is still true and the CONCLUSION was
+    wrong.  A kernel does not have to beat the sigmoid to beat the op -- `_kernels/silu_mul.py`
+    keeps the exact sigmoid, byte for byte, and reaches **278.8 us/call** against 307.2 by deleting
+    the FRAMING around it: the reciprocal's `v_if (t < 0)` NaN guard (unreachable once the exp
+    argument is capped, one branch-free SFPSWAP replacing SETCC/MAD/ENDIF) and one of the library
+    path's two bf16 roundings, with silu and the product formed in ONE SFPU pass over DEST instead
+    of an activation on operand A's unpack plus a separate binary op.  e2e PCC came out slightly
+    BETTER, 0.95762 -> 0.95794.  It is ON by default; see the cpp comment at the call site.
 
-    AND THE KERNEL RUNGS ARE NOT JUST ARGUED CLOSED, THEY ARE MEASURED CLOSED.  `_kernels/
-    ttl_silu_mul.py` is a real ttl kernel for this exact op, run on the full 11x10 grid: 409.8
-    us/call against ttnn's 307.2 (33% slower) and e2e PCC 0.9502707 against 0.9576212.  It is kept
-    but DISABLED (env VOXTRAL_TTL_SILU_MUL=1), and its docstring carries both the reason it loses
-    -- ttl emits a one-tile-at-a-time pipeline, paying init_sfpu, the DEST acquire/release pair and
-    a write barrier PER TILE where binary_ng amortises them over blocks -- and the four ttl 1.0.1
-    gotchas the authoring cost, so the next round does not pay them again.  Its compute body is
-    `silu_tile()` then `mul_binary_tile()`: byte for byte what binary_ng already runs.
+    THE TT-LANG RUNG IS THE ONE THAT IS MEASURED CLOSED.  `_kernels/ttl_silu_mul.py` is a real ttl
+    kernel for this exact op, run on the full 11x10 grid: 409.8 us/call against ttnn's 307.2 (33%
+    slower) and e2e PCC 0.9502707 against 0.9576212.  It is kept but DISABLED (env
+    VOXTRAL_TTL_SILU_MUL=1), and its docstring carries both the reason it loses -- ttl emits a
+    one-tile-at-a-time pipeline, paying init_sfpu, the DEST acquire/release pair and a write barrier
+    PER TILE where binary_ng amortises them over blocks -- and the four ttl 1.0.1 gotchas the
+    authoring cost, so the next round does not pay them again.  Its compute body is `silu_tile()`
+    then `mul_binary_tile()`: byte for byte what binary_ng already runs.  That is the difference
+    between it and the Metalium kernel that won -- ttl could not express the block framing, which
+    was the whole prize.
 
     THE MATH FIDELITY OF THIS OP IS NOT A KNOB, AND THE PROFILE MAKES IT LOOK LIKE ONE.  Tracy
     reports fidelity=hifi4 for both instances of this multiply (prefill 416x8192 and decode
@@ -2164,7 +2174,45 @@ def _concat_heads_decode(attn_out, batch, num_heads, head_dim, mirror=None):
             use_height_and_width_as_shard_shape=True,
         )
         xs = attn_out if attn_out.memory_config() == shard else ttnn.to_memory_config(attn_out, shard)
-        joined = ttnn.experimental.nlp_concat_heads_decode(xs, num_heads=int(num_heads))
+        # PREALLOCATE THE OUTPUT AND THE PADDING SLICE DISAPPEARS WITH IT.  This op ignores
+        # `memory_config` outright (nlp_concat_heads_decode.cpp forwards it and prim:: drops it) and
+        # builds its own spec: batch padded up to a full tile, width-sharded (padded_batch, head_dim)
+        # over `num_cores_to_corerangeset(num_heads, compute_grid, row_wise)`.  That is why the merge
+        # used to need a slice afterwards -- the padded batch is not the layer's logical one.  But
+        # `output_tensor` short-circuits the whole spec: compute_output_specs returns the
+        # preallocated tensor's spec verbatim, and the factory reads its core placement back out of
+        # `output.shard_spec()` (nlp_concat_heads_decode_program_factory.cpp: `q_cores =
+        # output.shard_spec().grid`, then `grid_to_cores(num_cores, bbox.x, bbox.y, true)`), so the
+        # tensor we hand it decides BOTH the grid and the logical shape.  Hand it o_proj's own
+        # activation shard with the LOGICAL batch: the op writes exactly the `batch` rows it always
+        # wrote, the padded rows stay untouched as before, and the result already carries both the
+        # shape the residual add needs and the placement the projection borrows -- so the sub-tile
+        # slice AND the InterleavedToSharded that used to follow it are both gone.
+        #
+        # The specs coincide only when the projection's in0 rectangle happens to be `num_heads`
+        # cores of `head_dim` columns each; check it rather than assume it, and fall through to the
+        # slice when it does not hold, so this stays a placement lever and not a shape assumption.
+        # The op pads the batch to a full tile (compute_output_specs: `batch = max(batch, 32)`), and
+        # that padded height is what a one-tile-row activation shard already has -- but they are two
+        # different quantities, so compare against the padding rule rather than against the input's
+        # padded head count.
+        padded_batch = max(int(batch), TILE)
+        want = mirror.act_config(1) if mirror is not None else None
+        prealloc = None
+        if want is not None:
+            spec = want.shard_spec
+            if (
+                want.memory_layout == ttnn.TensorMemoryLayout.WIDTH_SHARDED
+                and spec is not None
+                and spec.grid.num_cores() == int(num_heads)
+                and tuple(int(v) for v in spec.shape) == (padded_batch, int(head_dim))
+            ):
+                prealloc = ttnn.allocate_tensor_on_device(
+                    ttnn.Shape([1, 1, int(batch), width]), xs.dtype, ttnn.TILE_LAYOUT, dev, want
+                )
+        joined = ttnn.experimental.nlp_concat_heads_decode(
+            xs, num_heads=int(num_heads), output_tensor=prealloc
+        )
         if xs is not attn_out:
             ttnn.deallocate(xs)
         jd = [int(d) for d in joined.shape]
