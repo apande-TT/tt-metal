@@ -361,13 +361,15 @@ def _swiglu_handoff(rows, width, dtype):
     call it made before when the hand-off does not apply, which is what makes the fallback
     bit-identical to the previous behaviour instead of merely equivalent.
 
-    THIS HAND-OFF IS WORTH 4.64 ms OF PREFILL, NOT THE 0.3 ms ITS COMMIT MESSAGE CLAIMS, AND IT IS
-    THE BEST TENANT IN L1.  Measured 2026-09-08 by turning it off at the prefill height alone
-    (_SWIGLU_L1_MAX_BYTES to 12 MB, which excludes the 29 MB intermediates and leaves the decode
-    height -- already excluded by the row gate -- untouched): prefill 106.49 -> 111.13 ms, PCC
-    bit-identical.  So anything that wants per-core L1 during the FFN is bidding against 4.6 ms,
-    and the obvious rival lost: see residual_add for the residual chain, which shows a 2x per-op
-    win on a capped capture and is a net loss at depth even with this hand-off removed for it.
+    THIS HAND-OFF IS WORTH 7.36 ms OF PREFILL, NOT THE 0.3 ms ITS OWN COMMIT MESSAGE CLAIMS, AND IT
+    IS THE BEST TENANT IN PER-CORE L1.  Measured 2026-09-08 by turning it off at the prefill height
+    alone (_SWIGLU_L1_MAX_BYTES to 12 MB, which excludes the 29 MB intermediates and leaves the
+    decode height -- already excluded by the row gate -- untouched): prefill 106.49 -> 113.85 ms,
+    PCC bit-identical.  So anything that wants L1 during the FFN is bidding against 7.4 ms.
+
+    The rival is the residual chain, and the two are STRICTLY SUB-ADDITIVE -- the full 2x2 is in
+    residual_add.  Short version: the chain is worth 2.72 ms on its own and -0.45 ms once this
+    hand-off holds the same L1, so this one wins and there is no configuration where both pay.
     """
     rows, width = int(rows), int(width)
     if rows < _GRID_REQUEST_MIN_ROWS or (rows, width) in _SWIGLU_L1_REFUSED:
@@ -2355,18 +2357,30 @@ def residual_add(device, residual, delta):
         # -> 47.6 us each and the LayerNorm that reads the sum goes 99.1 -> 62.9, i.e. 158 us a
         # LAYER, with PCC bit-identical at 0.9576212 because nothing but placement changed.
         #
-        # It does not survive to the 30-layer trace stage.  Measured 2026-09-08:
-        #     SwiGLU L1, residual DRAM (HEAD)   prefill 106.49 ms
-        #     SwiGLU L1, residual L1            prefill 106.94 ms   (+0.45, no gain)
-        #     SwiGLU DRAM, residual L1          prefill 111.13 ms   (+4.64)
-        # The second row was first read as the two hand-offs competing for per-core L1 -- the
-        # residual pair is 2 x 10.9 MB = 197 kB/core and has to stay resident ACROSS the SwiGLU's
-        # own 527 kB/core of gate/up.  The third row REFUTES that reading: with the rival evicted
-        # the residual chain is still a loss, so the 158 us/layer is a property of the capped
-        # capture and not of the model.  GENERALISE, because it applies to every L1 lever on this
-        # model: TT_PERF_LAYERS caps the profile at 3 layers, and 3 layers of a resident chain is a
-        # per-core budget the 30-layer forward does not have.  A placement lever must be judged on
-        # the STAGE time, never on the per-op delta the capture shows.
+        # It reaches none of that at the 30-layer trace stage, and the reason is CONTENTION, which
+        # takes the whole 2x2 to see.  Measured 2026-09-08, prefill stage ms, PCC bit-identical in
+        # every cell:
+        #                          residual DRAM   residual L1
+        #     SwiGLU L1 (HEAD)         106.49         106.94
+        #     SwiGLU DRAM              113.85         111.13
+        # Read down the columns: this chain is worth 2.72 ms on its own (113.85 -> 111.13) and
+        # -0.45 ms once the SwiGLU hand-off holds the same L1 (106.49 -> 106.94).  Read across the
+        # rows: that hand-off is worth 7.36 ms alone and 4.19 ms beside the chain.  The pair is
+        # strictly SUB-ADDITIVE -- 2.72 + 7.36 = 10.1 ms of separate wins, 7.36 ms available
+        # together -- because the residual pair is 2 x 10.9 MB = 197 kB/core and has to stay
+        # resident ACROSS the SwiGLU's own 527 kB/core of gate/up, beside the down projection's
+        # ~700 kB of circular buffers.  The SwiGLU wins outright, so this stays implicit; do not
+        # re-derive the chain in isolation and conclude it is free.
+        #
+        # AND THE THREE-CELL VERSION OF THIS TABLE READ THE OPPOSITE WAY.  With only the top row
+        # and 111.13, the natural conclusion was that the chain fails at depth on its own merits --
+        # it takes the fourth cell to see that 111.13 is 2.72 ms BETTER than its true baseline, not
+        # a loss.  An A/B on two interacting levers needs all four cells; three of them will
+        # confidently support the wrong lever.
+        #
+        # GENERALISE THE OTHER HALF TOO: TT_PERF_LAYERS caps the profile at 3 layers, so the 158
+        # us/layer above is measured against a per-core budget the 30-layer forward does not have.
+        # Judge a placement lever on the STAGE time, never on the per-op delta the capture shows.
         return ttnn.add(residual, delta, dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None)
     # THE ACCUMULATOR'S WIDTH IS THIS MODEL'S PCC EXCHANGE RATE, AND IT IS MEASURED BOTH WAYS.
     # The four projections that feed this add were narrowed to _ACT_DTYPE at the decode height and
