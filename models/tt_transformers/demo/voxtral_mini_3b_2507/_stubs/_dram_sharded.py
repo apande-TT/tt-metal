@@ -2126,6 +2126,33 @@ def _row_cores(device, n):
     return ttnn.CoreRangeSet(ranges)
 
 
+def _square_cores(device, n):
+    """`n` cores as the SQUAREST single rectangle anchored at (0, 0), or None if n is prime-ish.
+
+    For a gather whose every consumer reads from every one of these cores, the shape of the source
+    rectangle is the NOC hop distance: `n` cores in one row put the far end `n-1` columns away,
+    where the squarest factorisation halves the worst case.  Anchored at (0, 0) and returned as ONE
+    range on purpose -- prim::nlp_concat_heads_decode flips to `on_subcoregrids` (a different
+    program factory, which then REQUIRES an explicit sub_core_grids) the moment the input's first
+    range does not start at the origin or there is more than one of them.
+    """
+    g = device.compute_with_storage_grid_size()
+    n = int(n)
+    best = None
+    for y in range(1, int(g.y) + 1):
+        if n % y:
+            continue
+        x = n // y
+        if x > int(g.x):
+            continue
+        if best is None or max(x, y) < max(best):
+            best = (x, y)
+    if best is None:
+        return None
+    x, y = best
+    return ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(x - 1, y - 1))})
+
+
 def _slice_into(x, end, mirror):
     """Slice `x` down to `end`, landing directly in `mirror`'s activation shard when it will take it.
 
@@ -2166,9 +2193,15 @@ def _concat_heads_decode(attn_out, batch, num_heads, head_dim, mirror=None):
             return None
         padded_heads, hd = dims[2], dims[3]
         width = int(num_heads) * int(head_dim)
+        # EVERY OUTPUT CORE READS EVERY ONE OF THESE CORES, so their rectangle is the hop distance.
+        # The factory hands each of the `num_heads` output cores the whole noc_x/noc_y cross product
+        # of this shard's bounding box and the reader gathers one sub-tile LINE (16 elements) per
+        # user, so the gather is `num_heads x batch` tiny reads and latency, not bytes, is what it
+        # costs.  A single 8-wide row puts the far end 7 columns away; the squarest rectangle for
+        # the same core count halves that.  Falls back to the row when the count will not factor.
         shard = ttnn.create_sharded_memory_config(
             (padded_heads, hd),
-            _row_cores(dev, batch),
+            _square_cores(dev, batch) or _row_cores(dev, batch),
             ttnn.ShardStrategy.HEIGHT,
             ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
