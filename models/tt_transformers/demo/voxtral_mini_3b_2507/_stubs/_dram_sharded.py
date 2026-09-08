@@ -2378,6 +2378,27 @@ def residual_add(device, residual, delta):
         # a loss.  An A/B on two interacting levers needs all four cells; three of them will
         # confidently support the wrong lever.
         #
+        # SCOPING IT TO THE LINK THAT DOES NOT OVERLAP THE FFN WAS THE OBVIOUS ESCAPE, AND IT IS
+        # ALSO MEASURED.  The chain has two links a layer and only one overlaps the SwiGLU: the
+        # attention sum is the residual the MLP add reads, so it is resident through gate/up, while
+        # the MLP sum is only resident across the NEXT layer's attention block.  Tried 2026-09-08
+        # with a `place=` argument -- "l1" at the three MLP call sites, "dram" at the three
+        # attention ones (an eviction, named only when the incoming residual really is in L1, so a
+        # refused hand-off stays implicit).  Per-op it did exactly what it was designed to do:
+        #     attention add  99.6 -> 72.67 us   (its A operand now reads L1)
+        #     MLP add        81.2 -> 56.13 us
+        #     LayerNorm on the MLP sum  99.1 -> 62.7 us
+        # 88.4 us a layer, PCC bit-identical, which predicts 2.65 ms of prefill.  Delivered 0.10 ms:
+        # 106.47 -> 106.37, two samples each, within-config spread 0.02.  Reverted.
+        #
+        # SO THE CONCLUSION IS NOT ABOUT THE SwiGLU, IT IS ABOUT THE BUDGET: PREFILL L1 IS
+        # SATURATED.  Twice now, on two different links, an incremental tenant has produced a large
+        # per-op win and ~nothing at depth -- because every hand-off it displaces is worth about
+        # what it gains.  On the attention side those are qkv_out_config, the head split and
+        # attn_out_config; on the FFN side, gate/up.  Do not add another L1 tenant to prefill
+        # expecting the per-op delta to survive; the only way to win here is to make an EXISTING
+        # hand-off cheaper, not to add one.
+        #
         # GENERALISE THE OTHER HALF TOO: TT_PERF_LAYERS caps the profile at 3 layers, so the 158
         # us/layer above is measured against a per-core budget the 30-layer forward does not have.
         # Judge a placement lever on the STAGE time, never on the per-op delta the capture shows.
