@@ -1820,8 +1820,17 @@ def attn_out_config(t):
     return ttnn.L1_MEMORY_CONFIG if _tensor_bytes(t) <= _ATTN_OUT_L1_MAX_BYTES else None
 
 
-def sdpa_prefill(q, k, v, *, scale, program_config, compute_kernel_config):
-    """Causal flash prefill, landing its output where the head concat will read it."""
+def sdpa_prefill(q, k, v, *, scale, program_config, compute_kernel_config, causal=True):
+    """Flash attention over a full sequence, landing its output where the head concat will read it.
+
+    `causal` DEFAULTS TO THE LM's ANSWER BUT IS THE CALLER'S TO GIVE.  The placement this helper
+    exists for -- flash writing L1 so the concat and the output projection do not each pull the
+    same bytes back through the DRAM controller -- has nothing to do with the mask, but the flag
+    was baked in, so the audio tower (a bidirectional encoder, is_causal=False) could not reach it
+    and kept the three-pass DRAM chain the docstring on attn_out_config describes. Widening the
+    contract rather than copying the body keeps ONE place where the L1 request and its refusal
+    cache live.
+    """
     mem = attn_out_config(q)
     if mem is not None:
         try:
@@ -1829,7 +1838,7 @@ def sdpa_prefill(q, k, v, *, scale, program_config, compute_kernel_config):
                 q,
                 k,
                 v,
-                is_causal=True,
+                is_causal=causal,
                 scale=scale,
                 memory_config=mem,
                 program_config=program_config,
@@ -1843,7 +1852,7 @@ def sdpa_prefill(q, k, v, *, scale, program_config, compute_kernel_config):
         q,
         k,
         v,
-        is_causal=True,
+        is_causal=causal,
         scale=scale,
         program_config=program_config,
         compute_kernel_config=compute_kernel_config,

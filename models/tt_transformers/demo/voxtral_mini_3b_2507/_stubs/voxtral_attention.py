@@ -202,16 +202,21 @@ class TtVoxtralAttention:
         # and matmul circular buffers underneath would otherwise have to work around.
         ttnn.deallocate(qkv)
 
-        attn_out = ttnn.transformer.scaled_dot_product_attention(
+        # FLASH WRITES WHERE THE CONCAT READS -- see _DS.attn_out_config.  q/k/v come out of the
+        # head split in L1, but this call defaulted its output to DRAM, so the attention wrote
+        # [b, nqh, s, hd] out through the DRAM controller, concatenate_heads read it back and
+        # wrote the same bytes again, and the output projection read them a third time.  The
+        # helper had is_causal baked in, which is why this bidirectional encoder never reached it.
+        attn_out = _DS.sdpa_prefill(
             q,
             k,
             v,
-            is_causal=False,
             scale=self.scaling,
             program_config=_DS.sdpa_config(self.device, q, k, wide_k=True),
             compute_kernel_config=_SDPA_CFG,
+            causal=False,
         )
-        attn_out = ttnn.transformer.concatenate_heads(attn_out)
+        attn_out = _DS.concat_heads(attn_out)
         # Same: the output projection feeds the block's residual add, which is L1-resident.
         attn_out = _DS.mm(
             self.device,

@@ -251,16 +251,23 @@ class TtEncoderLayer:
         # already produced its own q/k/v, so nothing reads this again.
         ttnn.deallocate(qkv)
 
-        attn_out = ttnn.transformer.scaled_dot_product_attention(
+        # FLASH WRITES WHERE THE CONCAT READS -- see _DS.attn_out_config.  q/k/v come out of the
+        # head split in L1, but this call defaulted its output to DRAM, so the attention wrote
+        # [b, nqh, s, hd] out through the DRAM controller, concatenate_heads read it back and
+        # wrote the same bytes again, and o_proj read them a third time: three full passes over a
+        # value whose only consumers are the two ops after it.  The LM's bodies have taken this
+        # placement for several rounds; the tower could not reach it only because the helper had
+        # is_causal baked in, and this encoder is bidirectional.
+        attn_out = _DS.sdpa_prefill(
             q,
             k,
             v,
-            is_causal=False,
             scale=1.0,
             program_config=_DS.sdpa_config(self.device, q, k, wide_k=True),
             compute_kernel_config=_SDPA_CFG,
+            causal=False,
         )
-        attn_out = ttnn.transformer.concatenate_heads(attn_out)
+        attn_out = _DS.concat_heads(attn_out)
         # Same: the attention output goes straight into the residual add, which is already L1.
         attn_out = _DS.mm(
             self.device,
