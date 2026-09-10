@@ -186,6 +186,13 @@ def fill_kv_prefill(kv, k, v):
     # MATCH THE CACHE DTYPE ONCE, NOT PER STREAM.  update_cache's FILL path refuses a mixed
     # precision write outright ("Input and cache tensors must have same dtype!" -- only its DECODE
     # path has the conversion kernel), so a narrowed cache has to be met here.
+    # THE CACHE CANNOT GO NARROWER THAN bfloat8_b.  sdpa_decode reads it at 287 GB/s against the
+    # 465 the projections reach, so halving its width looked worth ~0.5 ms/token, and the paged
+    # cache family accepts BFLOAT4_B (only the fill this function calls, UpdateKVCacheOperation,
+    # refuses it -- update_cache_device_operation.cpp:38).  Priced before writing that plumbing, by
+    # round-tripping the prefill fill through bfloat4_b: e2e PCC 0.9635 -> 0.9366 against a 0.95
+    # gate, and that is the PREFILL positions alone.  The earlier finding that widening the cache
+    # bf8_b -> bf16 changed PCC by 0.0000 does not extend downward; bf8_b is the floor here.
     if k.dtype != kv.k.dtype:
         k = ttnn.typecast(k, kv.k.dtype)
     if v.dtype != kv.v.dtype:
@@ -447,6 +454,15 @@ _ROPE_L1_MAX_BYTES = 1024 * 1024
 # HiFi2 RATHER THAN LoFi because cos/sin are the one wide pair in the expression: they are the
 # rotation itself, LoFi keeps ~5 mantissa bits, and this model's e2e PCC sits at 0.9559 against a
 # 0.95 gate with no budget to spend on a rounding step that compounds over 32 layers.
+#
+# THE THIRD LM BODY IS DELIBERATELY NOT GIVEN THIS CONFIG, AND THAT IS A MEASUREMENT, NOT AN
+# OVERSIGHT.  `llama_attention` calls rotary_embedding_hf with no compute_kernel_config and so
+# still runs its rope at the HiFi4 default.  Handing it ROPE_CFG for consistency -- taking one of
+# three bodies from HiFi4 to HiFi2 -- moved e2e PCC 0.9635 -> 0.9536, i.e. 0.0099 out of a budget
+# that stands at 0.0135 above the 0.95 gate, in exchange for roughly a third of ~62 us per prefill
+# layer.  Rope fidelity is one of the most PCC-DENSE knobs in this model (cos/sin really are the
+# wide pair in the expression), which makes accuracy held here worth more than the microseconds
+# it costs.  Leave that body on the default.
 ROPE_CFG = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi2,
     math_approx_mode=True,
@@ -545,16 +561,20 @@ class DramShardedLinear:
     its own path; construction never raises, so a body can adopt this without a shape audit.
     """
 
-    def __init__(self, device, weight, max_m_tiles=1):
+    def __init__(self, device, weight, max_m_tiles=1, dtype=None):
         self.device = device
         self.ok = False
         self.max_m_tiles = max_m_tiles
         try:
-            self._build(device, weight, max_m_tiles)
+            self._build(device, weight, max_m_tiles, dtype)
         except Exception:  # noqa: BLE001 - any shape this cannot serve exactly falls back
             self.ok = False
 
-    def _build(self, device, weight, max_m_tiles):
+    def _build(self, device, weight, max_m_tiles, dtype=None):
+        # Narrow BEFORE planning, not after: every block size below is weighed in tile_bytes(dtype),
+        # so a mirror requantised afterwards would be laid out for the width it no longer has.
+        if dtype is not None and weight.dtype != dtype:
+            weight = ttnn.typecast(weight, dtype)
         shape = tuple(weight.shape)
         self.k, self.n = int(shape[-2]), int(shape[-1])
         k_tiles, n_tiles = self.k // TILE, self.n // TILE
@@ -732,9 +752,19 @@ class DramShardedLinear:
         return ttnn.reshape(out, tuple(dims[:-1]) + (self.n,))
 
 
-def attach(device, weight, max_m_tiles=1):
-    """Build a mirror for `weight`, or return None when the shape cannot be served exactly."""
-    mirror = DramShardedLinear(device, weight, max_m_tiles=max_m_tiles)
+def attach(device, weight, max_m_tiles=1, dtype=None):
+    """Build a mirror for `weight`, or return None when the shape cannot be served exactly.
+
+    `dtype` NARROWS THE MIRROR ALONE, AND THAT IS THE POINT.  The mirror is the DECODE copy of a
+    weight -- `serves()` is false above one tile row, so prefill never reads it -- and decode and
+    prefill are bound by different things: a decode projection is 12 cores reading a whole weight
+    out of DRAM at 78-87% of peak, so its cost IS the stored width, while the same matmul at
+    prefill height is compute-bound and reads that weight once for 3328 rows (measured: gate at
+    bfloat8_b 362.3 us against up at bfloat4_b 360.0 us -- the width buys prefill NOTHING).
+    Narrowing a weight globally therefore pays in one regime and charges e2e PCC in both.  Passing
+    the narrow dtype here spends the accuracy only where the bytes are actually on the clock.
+    """
+    mirror = DramShardedLinear(device, weight, max_m_tiles=max_m_tiles, dtype=dtype)
     return mirror if mirror.ok else None
 
 

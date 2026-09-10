@@ -14,6 +14,21 @@ import ttnn
 # to narrow: `down` writes straight into the residual stream and `gate` is perturbed BEFORE the
 # nonlinearity, whereas `up` enters as a plain linear factor of silu(gate).
 _UP_DTYPE = ttnn.bfloat4_b
+# GATE IS bfloat4_b ON THE DECODE MIRROR ONLY, AND THE SPLIT IS WHAT MAKES IT AFFORDABLE.  The
+# note below stands on its numbers -- narrowing this weight EVERYWHERE costs e2e PCC ~0.02 and
+# lands under the 0.95 gate -- but it charges that accuracy to prefill as well as decode, and
+# prefill does not want the narrower weight: at 3328 rows the projection is compute-bound and
+# reads its weight once for the whole batch (measured: gate at bfloat8_b 362.3 us against up at
+# bfloat4_b 360.0 us, i.e. the width buys prefill NOTHING).  Decode is the opposite -- 12 cores
+# pulling the whole 26.7 MB out of DRAM at 85% of peak, where the width IS the time: 57.4 us per
+# layer against up's 38.3.  So the resident weight stays bfloat8_b for prefill and only the
+# DRAM-sharded decode mirror is requantised (_DS.attach(..., dtype=_GATE_DECODE_DTYPE)); the
+# mirror's serves() is decode-only, so the two never mix.  Half the error surface, all the bytes:
+# measured decode 10.0014 -> 9.4768 ms/token (-5.15%) with prefill unchanged at 105.28 ms, e2e
+# PCC 0.9635 -> 0.9511.  That leaves only 0.0011 over the gate, so this weight is now the
+# model's accuracy ceiling -- the next narrowing anywhere has to buy its budget first.
+_GATE_DECODE_DTYPE = ttnn.bfloat4_b
+
 # GATE STAYS bf8_b, AND THAT IS MEASURED.  It is the largest byte lever left -- gate and up are read
 # in full on every decode token, so narrowing 3072x8192 from 26.7 MB to 14.2 MB is ~0.9 ms/token
 # across 32 layers, ~8% of the token -- but bfloat4_b on gate ALONE drops e2e PCC 0.9598 -> 0.9382,
@@ -124,7 +139,17 @@ class TtLlamaMLP:
         # DECODE-ONLY MIRRORS, width-sharded across the DRAM banks and derived from the interleaved
         # weights ON DEVICE (no second host upload).  See _dram_sharded.py for why prefill keeps the
         # interleaved path.
-        self.gate_ds = _DS.attach(device, self.gate_weight)
+        # QUANTISE THE MIRROR FROM THE HOST WEIGHT, NOT FROM THE bf8_b COPY.  The other mirrors
+        # are derived on device from the interleaved weight because they keep its dtype, but
+        # gate's is narrower, and a bfloat8_b -> bfloat4_b typecast is a SECOND requantisation:
+        # the 4-bit mantissa is re-derived from values a 16-wide block exponent had already
+        # rounded, not from the original ones.  Measured across all four MLP bodies -- via the
+        # bf8_b copy e2e PCC 0.9069, straight from the host weight 0.9511, same bytes, same
+        # kernel.  One extra interleaved upload per layer, freed as soon as the mirror owns its
+        # width-sharded buffers.
+        _gate_narrow = _to_device(torch_module.gate_proj.weight.T.contiguous().float(), device, _GATE_DECODE_DTYPE)
+        self.gate_ds = _DS.attach(device, _gate_narrow)
+        ttnn.deallocate(_gate_narrow)
         self.up_ds = _DS.attach(device, self.up_weight)
         self.down_ds = _DS.attach(device, self.down_weight)
 

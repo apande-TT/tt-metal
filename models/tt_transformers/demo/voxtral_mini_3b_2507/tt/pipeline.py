@@ -121,6 +121,21 @@ KV_C = 640
 # BFLOAT8_B among the accepted cache dtypes and converts a bf16 input on the way in, and
 # sdpa_decode reads block-float K/V directly.  Prefill's ttnn.fill_cache has no such conversion,
 # so _fill_kv_prefill casts to match (see the stubs).
+#
+# bfloat4_b WOULD HALVE THEM AGAIN AND THE MODEL CANNOT PAY FOR IT.  This was the last untested
+# width on the decode path -- the WEIGHTS are done (gate/down/qkv/o_proj each measured at
+# bfloat4_b, each losing more e2e PCC than the gate has to give; only `up` survived) but the
+# CACHE never was, and it looked like the cheapest remaining 0.5 ms/token: sdpa_decode spends
+# 35.02 us per layer reading it, and the one cache-width experiment on record pointed the right
+# way (widening bf8_b -> bf16 moved e2e PCC by 0.0000, so the stored width was contributing no
+# error at bf8_b).  It does not extend downward.  Priced 2026-09-10 by round-tripping the prefill
+# fill through bfloat4_b in _dram_sharded.fill_kv_prefill -- the same quantisation a narrow cache
+# would apply, without needing the fill re-plumbed -- e2e PCC 0.9635 -> 0.9366 against the 0.95
+# gate, on the prefill positions ALONE.  bf8_b is the floor.  (Mechanically it is also blocked:
+# ttnn.fill_cache is UpdateKVCacheOperation, which rejects BFLOAT4_B outright at
+# update_cache_device_operation.cpp:38, while the whole paged family -- paged_fill_cache,
+# paged_update_cache, paged_fused_update_cache -- and sdpa_decode all accept it.  So the fill
+# would have to move onto paged_fill_cache with a page table.  There is no point.)
 KV_DTYPE = ttnn.bfloat8_b
 DECODE_BATCH = 8
 
