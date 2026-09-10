@@ -28,12 +28,21 @@ _PROJ_DTYPE = ttnn.bfloat8_b
 
 # LoFi IS THE PAIRING FOR bf8_b, not a further gamble on top of it.  8-bit operands through a
 # HiFi2 kernel make the math engine take two passes over one pass worth of mantissa, which cancels
-# the bandwidth the narrower weight just bought (GUIDELINES/01 section 12).  fp32_dest_acc_en stays
-# False as the matmul preference, which also unlocks wider subblocks.
+# the bandwidth the narrower weight just bought (GUIDELINES/01 section 12).
+#
+# BUT THE ACCUMULATION IS fp32 HERE, AGAINST THE USUAL MATMUL PREFERENCE.  These two matmuls have
+# the deepest K of anything in the encode stack -- linear_1 contracts 5120, or 160 tiles -- and the
+# 2-D block config runs that reduction in wide K blocks, so a single DEST accumulator carries far
+# more products than the one-and-two-tile blocks ttnn's 1-D routing used to hand them.  In fp16 DEST
+# that chain is where the projector's error comes from, and it is measurable end to end: the block
+# config alone took e2e PCC 0.9526 -> 0.9488 against a 0.95 gate, i.e. it was a correctness
+# regression rather than a scheduling win until the accumulator was widened.  fp32_dest_acc_en costs
+# half the DEST tile budget, which `_block_linear` now reads off this config and passes to the
+# subblock search, so the plan it picks is legal at 4 tiles instead of silently assuming 8.
 _PROJ_CFG = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.LoFi,
     math_approx_mode=False,
-    fp32_dest_acc_en=False,
+    fp32_dest_acc_en=True,
     packer_l1_acc=True,
 )
 

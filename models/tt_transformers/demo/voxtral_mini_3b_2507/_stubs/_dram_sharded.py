@@ -1389,7 +1389,9 @@ def _fused_activation(activation):
         return None
 
 
-def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_bytes=2048, activation=None):
+def block_config(
+    device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_bytes=2048, activation=None, max_dest_tiles=8
+):
     """A 2-D mcast program config that spreads BOTH output dims and streams K in wide blocks.
 
     WHY THIS EXISTS: NAMING THE GRID PUTS THESE MATMULS ON THE 1-D MCAST PATH, WHICH IS THE WRONG
@@ -1433,6 +1435,7 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
         int(interm_bytes),
         str(activation),
         bool(_TRANSPOSE_MCAST),
+        int(max_dest_tiles),
     )
     if key in _BLOCK_CFG_CACHE:
         return _BLOCK_CFG_CACHE[key]
@@ -1452,7 +1455,7 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
                 continue
             for block_h in _divisors(per_core_m):
                 for block_w in _divisors(per_core_n):
-                    h, w = _subblock(block_h, block_w)
+                    h, w = _subblock(block_h, block_w, max_dest_tiles)
                     reuse = min(1.0, (h * w) / float(h + w))
                     blocks = (per_core_m // block_h) * (per_core_n // block_w)
                     for in0_block_w in k_divs:
@@ -1509,6 +1512,28 @@ def block_config(device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_byte
 # rejected shape costs one exception, not one per call.
 _BLOCK_CFG_REFUSED = set()
 
+# THE GUARD IS ABOUT OUTPUT TILES, AND THE ROW COUNT WAS ONLY EVER A PROXY FOR THEM.
+# _GRID_REQUEST_MIN_ROWS exists to keep the DECODE shape off the 2-D path: at one tile row there is
+# a single row of blocks, so no block config can buy DEST reuse and spreading the launch costs more
+# than it recovers.  But `mm` already says in its own comment that the question is "enough OUTPUT
+# tiles to keep a full grid busy, not rows alone", and the row form of the test excluded the
+# multi-modal projector -- 384 rows against a 3072-wide weight is 12 x 96 = 1152 output tiles, about
+# ten per core.  Those two matmuls therefore ran on the path block_config exists to replace: naming
+# a core grid routes to create_matmul_program_config, which at 12 x 96 takes the is_wide branch,
+# hands every core per_core_M = 12 / per_core_N = 1 with in0_block_w = div_up(160, cores) = 2, and
+# so iterates K eighty times against a 1x1 DEST subblock.
+# ADMIT A BELOW-THRESHOLD SHAPE ONLY ON BOTH COUNTS.  m_tiles > 1 keeps out every single-tile-row
+# shape whatever its width -- the decode projections and the LM head, whose 1024 output tiles would
+# otherwise satisfy an occupancy test on their own -- and the per-core floor keeps out anything too
+# small to give each core a block to own.
+_BLOCK_MIN_OUT_TILES_PER_CORE = 4
+
+
+def _blocks_worth_it(device, m_tiles, n_tiles):
+    """Whether a shape under the row threshold still has enough output blocks to spread."""
+    g = device.compute_with_storage_grid_size()
+    return m_tiles > 1 and m_tiles * n_tiles >= int(g.x) * int(g.y) * _BLOCK_MIN_OUT_TILES_PER_CORE
+
 
 def _block_linear(x, weight, compute_kernel_config, bias=None, activation=None, memory_config=None, rows=None):
     """ttnn.linear under a 2-D mcast block config, or None when this shape cannot take one.
@@ -1519,10 +1544,11 @@ def _block_linear(x, weight, compute_kernel_config, bias=None, activation=None, 
     every core the whole other one, and sets in0_block_w = div_up(k_tiles, cores) -- one or two
     tiles.  See block_config for the measurements.
 
-    The guards are the ones `mm` already established: below _GRID_REQUEST_MIN_ROWS this is the
-    decode shape and spreading a single tile row costs more launch than it recovers, and a weight
-    that is not tile-aligned has no exact block decomposition.  A shape ttnn refuses is remembered
-    so the exception is paid once.
+    The guards are the ones `mm` already established: a weight that is not tile-aligned has no exact
+    block decomposition, and below _GRID_REQUEST_MIN_ROWS the shape is presumed to be the decode one,
+    where spreading a single tile row costs more launch than it recovers -- see _blocks_worth_it for
+    the output-tile test that lets a genuinely wide sub-threshold shape through anyway.  A shape ttnn
+    refuses is remembered so the exception is paid once.
 
     A LEADING BATCH IS FOLDED, NOT REFUSED.  Handing the 2-D factory a stacked activation makes it
     run the whole grid once PER BATCH ENTRY, so the blocks end up sized against a height the kernel
@@ -1538,10 +1564,12 @@ def _block_linear(x, weight, compute_kernel_config, bias=None, activation=None, 
         rows = 1
         for d in tuple(x.shape)[:-1]:
             rows *= int(d)
-    if rows < _GRID_REQUEST_MIN_ROWS:
-        return None
     wshape = tuple(weight.shape)
     if int(wshape[-2]) % TILE or int(wshape[-1]) % TILE:
+        return None
+    m_tiles = math.ceil(rows / TILE)
+    k_tiles, n_tiles = int(wshape[-2]) // TILE, int(wshape[-1]) // TILE
+    if rows < _GRID_REQUEST_MIN_ROWS and not _blocks_worth_it(x.device(), m_tiles, n_tiles):
         return None
     dims = [int(d) for d in x.shape]
     batch = 1
@@ -1552,12 +1580,23 @@ def _block_linear(x, weight, compute_kernel_config, bias=None, activation=None, 
         if len(dims) < 3 or dims[-2] % TILE:
             return None
         folded = ttnn.reshape(x, (1, rows, dims[-1]))
-    m_tiles = math.ceil(rows / TILE)
-    k_tiles, n_tiles = int(wshape[-2]) // TILE, int(wshape[-1]) // TILE
     key = (m_tiles, k_tiles, n_tiles, str(activation))
     if key in _BLOCK_CFG_REFUSED:
         return None
-    cfg = block_config(x.device(), m_tiles, k_tiles, n_tiles, activation=activation)
+    # THE DEST BUDGET IS THE CALLER'S TO DECLARE, NOT A CONSTANT.  An out subblock lives in DEST, and
+    # fp32 accumulation halves how many tiles fit there -- so a caller that asks for fp32_dest_acc_en
+    # cannot be handed the 8-tile subblock the search assumes by default.  Read it off the config
+    # that will actually run the kernel rather than making the search guess.  Every projection on
+    # this path today accumulates in fp16, so this changes no existing plan; it is what makes an
+    # fp32-DEST caller expressible at all.
+    cfg = block_config(
+        x.device(),
+        m_tiles,
+        k_tiles,
+        n_tiles,
+        activation=activation,
+        max_dest_tiles=4 if getattr(compute_kernel_config, "fp32_dest_acc_en", False) else 8,
+    )
     if cfg is None:
         return None
     # AN OUTPUT PLACEMENT THE ALLOCATOR REFUSES IS NOT A REFUSED BLOCK CONFIG.  A caller asking for
@@ -1575,7 +1614,14 @@ def _block_linear(x, weight, compute_kernel_config, bias=None, activation=None, 
                 bias=bias,
                 compute_kernel_config=compute_kernel_config,
                 program_config=cfg,
-                dtype=_ACT_DTYPE,
+                # THE OUTPUT WIDTH FOLLOWS THE REGIME, NOT THIS PATH.  `mm` and `linear` both narrow
+                # the output only at or above _GRID_REQUEST_MIN_ROWS -- "narrow the output only where
+                # there are bytes to save" -- so hard-coding _ACT_DTYPE here meant admitting a
+                # smaller shape to the 2-D path silently also narrowed its stored activation.  That
+                # bundles a dtype change into what is meant to be a pure scheduling lever, and this
+                # model's e2e PCC budget is measured in thousandths; the block config has to be
+                # attributable on its own.
+                dtype=_ACT_DTYPE if rows >= _GRID_REQUEST_MIN_ROWS else None,
                 memory_config=placement,
             )
             break
