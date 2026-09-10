@@ -123,7 +123,25 @@ class TtVoxtralMultiModalProjector:
         # without moving the shared threshold and disturbing the call sites that depend on it.
         g = self.device.compute_with_storage_grid_size()
         grid = ttnn.CoreGrid(y=g.y, x=g.x)
-        x = _DS.linear(x, self.linear_1_weight, None, _PROJ_CFG, grid, activation="gelu")
+        rows = 1
+        for d in tuple(x.shape)[:-1]:
+            rows *= int(d)
+        # HAND linear_1 TO linear_2 THROUGH L1.  This intermediate has exactly one consumer, one op
+        # later, so a DRAM round trip is a full write plus a full read of a value nothing else
+        # reads -- the same hand-off GUIDELINES/05 section 7 names for an FFN, and the one the
+        # audio tower's own fc1 already takes.  The capture shows linear_2 reading DRAM at 57.6 us
+        # against 91.2 for a linear_1 that reads L1, i.e. the placement is worth real time on an op
+        # the roofline tags memory-bound.  It is only 384 x 3072 x 1.0625 B = 1.25 MB, well inside
+        # ffn_config's cap, and that helper degrades to DRAM on a shape it was not sized for.
+        x = _DS.linear(
+            x,
+            self.linear_1_weight,
+            None,
+            _PROJ_CFG,
+            grid,
+            activation="gelu",
+            memory_config=_DS.ffn_config(rows, int(self.linear_1_weight.shape[-1]), _PROJ_DTYPE),
+        )
         x = _DS.linear(x, self.linear_2_weight, None, _PROJ_CFG, grid)
         return x
 
