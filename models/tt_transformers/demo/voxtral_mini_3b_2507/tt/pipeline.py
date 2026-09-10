@@ -879,6 +879,31 @@ class VoxtralPipeline:
             batch=B,
         )
 
+    def _frame_concat(self, h):
+        """The tower's 1500 frames folded four at a time into the projector's 375 x 5120 input.
+
+        DO THE FOLD IN ROW_MAJOR -- the same argument `_merge_audio` makes one stage later.  This
+        reshape splits the LAST dim, so on TILE layout it is not a view at all: ttnn widens the
+        block-float stream to bf16, untilizes, re-lays the rows out, pads and narrows it back, and
+        the capture prices that chain at 6.3 + 95.5 + 4.4 + 7.0 = 113 us PER STREAM (about 1.9 ms
+        of the profile) on a tensor the tower had just finished writing.
+
+        In ROW_MAJOR the fold is FREE: pages are the last dim, so [1, 1500, 1280] is 1500 pages of
+        1280 and [1, 375, 5120] is 375 pages of 5120 -- four consecutive old pages ARE one new
+        page, in order, in the same buffer.  That leaves one untilize and one tilize where there
+        were an untilize, a retilize, a pad and two typecasts, and the tilize runs on the SMALLER
+        of the two shapes.
+
+        Kept behind a fallback for the reason _merge_audio is: if the row-major ops refuse these
+        shapes the original reshape still runs, so correctness never depends on the faster layout.
+        """
+        shape = (1, ENCODE_FRAMES // 4, self.config.audio_config.intermediate_size)
+        try:
+            rm = ttnn.to_layout(h, ttnn.ROW_MAJOR_LAYOUT)
+            return ttnn.to_layout(ttnn.reshape(rm, shape), ttnn.TILE_LAYOUT)
+        except (RuntimeError, TypeError, ValueError):
+            return ttnn.reshape(h, shape)
+
     # --------------------------------------------------------- STAGE: encode
     def encode(self, dev_in: DeviceInputs):
         """mel -> audio embeds in the LLM hidden space.  Pure ttnn."""
@@ -888,7 +913,7 @@ class VoxtralPipeline:
             tower = self.enc_a if i < (dev_in.batch // 2) else self.enc_b
             h = tower(mel)  # (1,1500,1280)
             hidden_last = h
-            h = ttnn.reshape(h, (1, ENCODE_FRAMES // 4, self.config.audio_config.intermediate_size))
+            h = self._frame_concat(h)  # (1,375,5120)
             outs.append(self.proj(h))  # (1,375,3072)
         self._last_encoder_hidden = hidden_last
         return outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=0)  # (B,375,3072)
