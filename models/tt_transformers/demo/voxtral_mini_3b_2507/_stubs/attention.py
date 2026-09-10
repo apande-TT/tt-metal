@@ -58,6 +58,10 @@ _SDPA_CFG = ttnn.WormholeComputeKernelConfig(
 # stored width halves the bytes each launch must pull.  Biases stay bf16.
 _PROJ_DTYPE = ttnn.bfloat8_b
 
+# The width the tower carries its activations at between ops; the block that wraps this stub
+# accumulates its residual at exactly this dtype, so the projections hand it back unwidened.
+_ACT_DTYPE = ttnn.bfloat8_b
+
 
 # WEIGHTS ARE NOW bf8_b, SO THE PAIRING IS LoFi (GUIDELINES/01 section 12).
 _PROJ_CFG = ttnn.WormholeComputeKernelConfig(
@@ -132,8 +136,23 @@ class TtVoxtralAttention:
         bsz = hidden_states.shape[0]
         seq_len = hidden_states.shape[1] if len(hidden_states.shape) == 3 else hidden_states.shape[-2]
 
-        qkv = _DS.mm(self.device, hidden_states, self.qkv_weight, _PROJ_CFG, bias=self.qkv_bias)
+        # KEEP THE CHAIN IN L1, as the tower's inline blocks already do.  The fused projection's
+        # only consumer is the head split one op later, so a DRAM round trip here is a full write
+        # plus a full read of a value nothing else reads; measured on byte-identical calls in the
+        # same capture, this projection costs 60.4 us with a DRAM in0/out against 43.2 in L1.
+        # ffn_config rather than stream_config because this tensor is 3x the stream width.
+        qkv = _DS.mm(
+            self.device,
+            hidden_states,
+            self.qkv_weight,
+            _PROJ_CFG,
+            bias=self.qkv_bias,
+            memory_config=_DS.ffn_config(seq_len, int(self.qkv_weight.shape[-1]), _ACT_DTYPE),
+        )
         q, k, v = _DS.qkv_heads(qkv, self.num_heads)
+        # Release the fused projection the moment the split has it: in L1 it is 6.1 MB the SDPA
+        # and matmul circular buffers underneath would otherwise have to work around.
+        ttnn.deallocate(qkv)
 
         attn_output = ttnn.transformer.scaled_dot_product_attention(
             q,
@@ -147,7 +166,15 @@ class TtVoxtralAttention:
 
         attn_output = ttnn.transformer.concatenate_heads(attn_output)
 
-        attn_output = _DS.mm(self.device, attn_output, self.out_weight, _PROJ_CFG, bias=self.out_bias)
+        # Same: the output projection feeds the block's residual add, which is L1-resident.
+        attn_output = _DS.mm(
+            self.device,
+            attn_output,
+            self.out_weight,
+            _PROJ_CFG,
+            bias=self.out_bias,
+            memory_config=_DS.ffn_config(seq_len, int(self.out_weight.shape[-1]), _ACT_DTYPE),
+        )
 
         return attn_output
 

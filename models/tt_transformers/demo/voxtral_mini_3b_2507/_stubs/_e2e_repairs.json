@@ -34,7 +34,7 @@
       "reason": "Precision repair: raised every ttnn.linear / rms_norm / layer_norm / SDPA call in this body to the SAME compute config the graduated llama_model body already used (MathFidelity.HiFi4, fp32_dest_acc_en=True). Same ops, same order, same weights -- only the accumulation precision changes. Measured on device: composing 32 audio layers at the default fidelity held only 0.9936 PCC where torch bf16 holds 0.9997, and the lm_head alone mis-ranked 22/379 argmax positions; after this repair LM prefill logits went 0.9914 -> 0.9976 and a decode step 0.9541 -> 0.9886.",
       "backward_compatible": "tests/pcc/test_<name>.py still passes: a compute_kernel_config only raises accumulation precision, it cannot lower PCC.",
       "snapshot_sha256": "8292807413c7ec83f29f74535a6a3f4b68b1c107cb8f1a23079bd0c8a05e8e9d",
-      "repaired_sha256": "6b414b7f91f14e8112fd2c86e678cdeaf6160cba8b39f7cda8e7e24a0eedf0ee"
+      "repaired_sha256": "15aafc5a538a46d540006bffb9438e1b1e2d6d60cb30fec039adf02e6872dcc1"
     },
     "decoder_head": {
       "snapshot": "last_good_native",
@@ -83,7 +83,7 @@
       "reason": "Precision repair: raised every ttnn.linear / rms_norm / layer_norm / SDPA call in this body to the SAME compute config the graduated llama_model body already used (MathFidelity.HiFi4, fp32_dest_acc_en=True). Same ops, same order, same weights -- only the accumulation precision changes. Measured on device: composing 32 audio layers at the default fidelity held only 0.9936 PCC where torch bf16 holds 0.9997, and the lm_head alone mis-ranked 22/379 argmax positions; after this repair LM prefill logits went 0.9914 -> 0.9976 and a decode step 0.9541 -> 0.9886.",
       "backward_compatible": "tests/pcc/test_<name>.py still passes: a compute_kernel_config only raises accumulation precision, it cannot lower PCC.",
       "snapshot_sha256": "3bd5e0bb5b4724323ca2a87a73faac2d40b66666992bb1016e1a9f859c5928a1",
-      "repaired_sha256": "56b0e7cc35e6e4da2ad73c257410c0567cd365c245592911e89f624710cd16ae"
+      "repaired_sha256": "aed0e6a5ee9c9f9c668cbf3bcee1a13eb6fb2dc33389f55dcc0c11d3b4d0e127"
     },
     "voxtral_encoder": {
       "snapshot": "last_good_native",

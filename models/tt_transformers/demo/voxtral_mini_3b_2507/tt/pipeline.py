@@ -335,26 +335,54 @@ class _EncLayerWithAttnStub:
         self.ln2_eps = torch_layer.final_layer_norm.eps
 
     def __call__(self, x, **_):
+        # SAME L1 RESIDENCY AS EVERY OTHER ENCODER BLOCK.  The dtype lever above reached this
+        # hand-assembled composite; the PLACEMENT lever never did, because a placement is an
+        # ABSENT kwarg rather than a wrong one and so reads as "already the same call".  The
+        # graduated bodies name `_DS.stream_config` on both norms and both residual adds and
+        # `_DS.ffn_config` on the projections; here every one of those defaulted, which leaves the
+        # whole block's activation chain DRAM-interleaved.  The capture prices the difference on
+        # byte-identical ops: fc1 81.1 us against 61.9, qkv 60.4-65.1 against 43.2-47.2, o_proj
+        # 29.3 against 22.2, each layer_norm 38.8 against 31.5 and each add ~17 against ~9.7.
+        # It is pure placement -- the same values in the same order -- so nothing here moves PCC.
+        S = int(x.shape[1] if len(x.shape) == 3 else x.shape[-2])
         residual = x
-        h = ttnn.layer_norm(x, weight=self.ln1_w, bias=self.ln1_b, epsilon=self.ln1_eps)
+        h = ttnn.layer_norm(
+            x, weight=self.ln1_w, bias=self.ln1_b, epsilon=self.ln1_eps, memory_config=_DS.stream_config(x)
+        )
         a = self.attn(h)
         if isinstance(a, tuple):
             a = a[0]
         # SAME NARROWED RESIDUAL AS EVERY OTHER ENCODER BLOCK.  ttnn.add returns the WIDER of its
         # inputs and ttnn.layer_norm has no output-dtype argument, so a bf16 accumulator here would
         # re-widen the stream for this block and hand its own norm and fc1 a bf16 in0.
-        x = ttnn.add(residual, a, dtype=_ENC_PROJ_DTYPE)
+        x = ttnn.add(
+            residual, a, dtype=_ENC_PROJ_DTYPE, memory_config=_DS.stream_config(residual, _ENC_PROJ_DTYPE)
+        )
 
         residual = x
-        h = ttnn.layer_norm(x, weight=self.ln2_w, bias=self.ln2_b, epsilon=self.ln2_eps)
+        h = ttnn.layer_norm(
+            x, weight=self.ln2_w, bias=self.ln2_b, epsilon=self.ln2_eps, memory_config=_DS.stream_config(x)
+        )
         # ROUTE THROUGH THE SHARED PROJECTION HELPER, not a bare ttnn.linear: `_DS.mm` names the
         # full compute grid at this height (1504 rows) and LoFi is the documented pairing for
         # block-float operands -- 8-bit operands through a bf16 kernel make the math engine take
         # extra passes over one pass worth of mantissa and cancel the bandwidth the narrower
         # weight just bought.
-        h = _DS.mm(self.device, h, self.fc1_w, _ENC_PROJ_CFG, bias=self.fc1_b, activation="gelu")
+        h = _DS.mm(
+            self.device,
+            h,
+            self.fc1_w,
+            _ENC_PROJ_CFG,
+            bias=self.fc1_b,
+            activation="gelu",
+            # The FF1 -> FF2 hand-off is the one tensor in the block written and immediately
+            # re-read by the very next op; see _DS.ffn_config.
+            memory_config=_DS.ffn_config(S, int(self.fc1_w.shape[-1]), _ENC_PROJ_DTYPE),
+        )
         h = _DS.mm(self.device, h, self.fc2_w, _ENC_PROJ_CFG, bias=self.fc2_b)
-        return ttnn.add(residual, h, dtype=_ENC_PROJ_DTYPE)
+        return ttnn.add(
+            residual, h, dtype=_ENC_PROJ_DTYPE, memory_config=_DS.stream_config(residual, _ENC_PROJ_DTYPE)
+        )
 
 
 class _LmLayerFromParts:
