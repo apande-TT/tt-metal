@@ -381,6 +381,20 @@ class TtVoxtralEncoder:
     def __call__(self, input_features, **kwargs):
         # input_features: ttnn tensor (1, 128, 3000) TILE_LAYOUT on device
         # conv1d expects (N, input_length, 1, C) format
+        #
+        # THE CALLER CAN HAND US [N, L, C] AND THEN NEITHER OF THE TWO PREP OPS HAS TO RUN.  The mel
+        # frame is UPLOADED -- it is the one tensor in this stage that comes from the host, and the
+        # host can transpose it for free -- so producing [N, C, L] TILE and then untilizing and
+        # transposing it on device is work the model chose to do to itself.  Both ops are pure
+        # layout: profiled at 0.288 ms (untilize_with_unpadding, because L=3000 is not tile-aligned)
+        # plus 0.338 ms (the permute) of roofline gap per capture, on a 768 kB tensor, and they run
+        # once per stream.  Detect the shape the convolution actually wants and skip straight to the
+        # placement.  A caller that still passes [N, C, L] -- the PCC harness builds the HF argument
+        # shape and knows nothing about this -- keeps the original path, so the contract is widened
+        # rather than moved.
+        if int(input_features.shape[-1]) == self.conv1_in_ch:
+            x = ttnn.to_memory_config(input_features, ttnn.L1_MEMORY_CONFIG)
+            return self._forward_from_nlc(x)
         x = ttnn.to_layout(input_features, ttnn.ROW_MAJOR_LAYOUT)
         # LANDING THE MEL FRAME IN L1 IS WHAT PICKS conv2d's EXECUTION PATH.
         # ttnn::determine_conv2d_execution_path routes on ONE predicate --
@@ -396,6 +410,14 @@ class TtVoxtralEncoder:
         # disappear and both gelus run against L1-resident shards instead of DRAM.
         # It is a placement change: the convolution reads the same values in the same order.
         x = ttnn.permute(x, (0, 2, 1), memory_config=ttnn.L1_MEMORY_CONFIG)  # (1, 3000, 128)
+        return self._forward_from_nlc(x)
+
+    def _forward_from_nlc(self, x):
+        """The tower proper, from an L1-resident [N, L, C] mel frame onwards.
+
+        Split out so the two ways of arriving at that frame -- uploaded in this layout, or
+        untilized and transposed on device from [N, C, L] -- share one body.
+        """
         # THE CANONICAL conv1d INPUT SHAPE IS [N, 1, L, C], NOT [N, L, 1, C].  ttnn.conv1d only
         # reshapes for you when the input is rank < 4; hand it a rank-4 tensor and it forwards the
         # shape straight to conv2d, which takes H/W from its explicit input_height=1 /
