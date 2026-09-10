@@ -423,7 +423,16 @@ class TtVoxtralEncoder:
             3000,
         )
         # the bias is fused into the conv above; the gelu is not (see _CONV2D_CFG).
-        x = ttnn.gelu(x)
+        # THE TANH VARIANT, LIKE EVERY OTHER GELU IN THIS MODEL.  A bare `ttnn.gelu(x)` is the
+        # EXACT erf form -- the capture records it as `UnaryOpType::GELU;param={0}` -- which the
+        # SFPU evaluates as a full erf polynomial per element.  On this tensor that is 76.0 us for
+        # 3000 x 1280 elements spread over 100 cores, nearly twice conv1's own 41.7 us, on an op
+        # that only has to touch each element once.  `_dram_sharded._apply` already routes every
+        # OTHER gelu in the tower through ttnn.GeluVariant.Tanh for exactly this reason; these two
+        # front-end calls were the ones it does not pass through.  The tanh form is the standard
+        # gelu approximation (max abs error ~1e-3 against erf), and this feeds a convolution whose
+        # own operands are bf16, which resolves ~4e-3.
+        x = ttnn.gelu(x, variant=ttnn.GeluVariant.Tanh)
 
         # conv2: stride=2, so 3000 -> 1500
         x = ttnn.reshape(x, (1, 1, 3000, 1280))  # see the shape note above: [N, 1, L, C]
@@ -440,7 +449,8 @@ class TtVoxtralEncoder:
             3000,
         )
         # the bias is fused into the conv above; the gelu is not (see _CONV2D_CFG).
-        x = ttnn.gelu(x)
+        # Tanh variant, for the reason given on conv1's gelu above.
+        x = ttnn.gelu(x, variant=ttnn.GeluVariant.Tanh)
 
         # HAND THE STACK BACK ITS DRAM TENSOR.  Everything above now runs L1-resident and sharded,
         # but the positional-embedding add and the 32 encoder layers below are written against a
