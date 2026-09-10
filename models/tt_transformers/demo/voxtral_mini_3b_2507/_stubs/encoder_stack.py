@@ -139,6 +139,18 @@ _CONV_CFG = ttnn.WormholeComputeKernelConfig(
 # transcendental -- so it stays fused and the gelu stays a separate op.
 _CONV2D_CFG = ttnn.Conv2dConfig()
 
+# conv2 IS THE LAST bf16 WEIGHT MASS IN THE ENCODE STACK.  Its kernel is 1280 x 1280 x 3 = 4.9 M
+# parameters, 9.8 MB at bf16, and the profiler prices the call at 105.2 us for 1.5 GFLOP -- 46% of
+# the bf16 FLOP peak but ~93 GB/s against the weight alone, i.e. the read is a real share of the
+# time.  Every projection in the tower behind it already stores bf8_b (GUIDELINES/01 section 12),
+# and the encoder is the part of this model that absorbs block-float rounding: its output is a
+# 1500-frame embedding the projector re-mixes, and narrowing the tower's fused QKV the same way
+# measured e2e PCC going UP rather than down.  conv1 is deliberately NOT narrowed -- it has 128
+# input channels against conv2's 1280, so it is a twentieth of the bytes and all of the dynamic
+# range of the raw mel.  The compute config stays HiFi2 either way; this changes what is stored,
+# not how many passes the math engine takes.
+_CONV2D_CFG_BF8_W = ttnn.Conv2dConfig(weights_dtype=ttnn.bfloat8_b)
+
 
 def _to_device(t, device, dtype=ttnn.bfloat16):
     # BLOCK-FLOAT TARGETS SKIP THE HOST NARROWING.  bf8_b/bf4_b derive their mantissa from a
@@ -326,8 +338,19 @@ class TtVoxtralEncoder:
         self.conv1_padding = torch_module.conv1.padding[0]
 
         self.conv2_weight = ttnn.from_torch(torch_module.conv2.weight.data.float(), dtype=ttnn.bfloat16)
+        # HOST, ROW_MAJOR, LIKE THE WEIGHT BESIDE IT -- required by the narrowing path, see
+        # _CONV2D_CFG_BF8_W.  A weights_dtype that differs from the bias's own sends conv2d through
+        # prepare_conv_bias_internal, which asserts `bias_tensor.layout() == Layout::ROW_MAJOR`
+        # ("Host conv bias layout should be in row_major layout"); the bf16 path never reached that
+        # check, so a device-resident TILE bias had been fine until now. conv1 keeps its tiled
+        # device bias because its weights are not narrowed. Both are prepared once and cached on
+        # device by the first call, so nothing here is uploaded inside the trace region.
         self.conv2_bias_tt = (
-            _to_device(torch_module.conv2.bias.data.reshape(1, 1, 1, -1).float(), device)
+            ttnn.from_torch(
+                torch_module.conv2.bias.data.reshape(1, 1, 1, -1).bfloat16(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+            )
             if torch_module.conv2.bias is not None
             else None
         )
@@ -345,7 +368,7 @@ class TtVoxtralEncoder:
         self.ln_bias = _to_device(torch_module.layer_norm.bias.unsqueeze(0).unsqueeze(0).float(), device)
         self.ln_eps = torch_module.layer_norm.eps
 
-    def _conv1d_cached(self, x, idx, weight, bias, in_ch, out_ch, ks, stride, pad, length):
+    def _conv1d_cached(self, x, idx, weight, bias, in_ch, out_ch, ks, stride, pad, length, conv_config=None):
         """conv1d with the PREPROCESSED weights AND BIAS cached on device, gelu fused.
 
         The graduated body kept the conv weights on host and let every call
@@ -373,7 +396,7 @@ class TtVoxtralEncoder:
             padding=pad,
             dilation=1,
             groups=1,
-            conv_config=_CONV2D_CFG,
+            conv_config=_CONV2D_CFG if conv_config is None else conv_config,
             compute_config=_CONV_CFG,
             return_weights_and_bias=prepared is None,
         )
@@ -476,6 +499,7 @@ class TtVoxtralEncoder:
             self.conv2_stride,
             self.conv2_padding,
             3000,
+            conv_config=_CONV2D_CFG_BF8_W,  # see _CONV2D_CFG_BF8_W: 9.8 MB of bf16 kernel, halved
         )
         # the bias is fused into the conv above; the gelu is not (see _CONV2D_CFG).
         # Tanh variant, for the reason given on conv1's gelu above.
