@@ -13,7 +13,15 @@ import ttnn
 # bfloat4_b was measured at PCC 0.8724, far under the 0.95 gate.  `up` is the gentlest of the three
 # to narrow: `down` writes straight into the residual stream and `gate` is perturbed BEFORE the
 # nonlinearity, whereas `up` enters as a plain linear factor of silu(gate).
-_UP_DTYPE = ttnn.bfloat4_b
+_UP_DTYPE = ttnn.bfloat8_b
+# UP FOLLOWS gate AND down: bfloat4_b ON THE DECODE MIRROR, bfloat8_b RESIDENT.  Narrowing the
+# resident weight as well was pure cost.  Prefill reads this weight ONCE for 3328 rows and is
+# compute-bound there, which is measurable directly on this very pair: gate at bfloat8_b runs
+# 362.3 us against up at bfloat4_b 360.0 us, the same shape and the same kernel, so the four-bit
+# resident copy was buying prefill nothing while still charging e2e PCC for it.  Decode reads it
+# through the mirror, where the width IS the time (38.3 us against a bfloat8_b 57.4).
+_UP_DECODE_DTYPE = ttnn.bfloat4_b
+
 # GATE IS bfloat4_b ON THE DECODE MIRROR ONLY, AND THE SPLIT IS WHAT MAKES IT AFFORDABLE.  The
 # note below stands on its numbers -- narrowing this weight EVERYWHERE costs e2e PCC ~0.02 and
 # lands under the 0.95 gate -- but it charges that accuracy to prefill as well as decode, and
@@ -142,7 +150,9 @@ class TtMlp:
         _gate_narrow = _to_device(torch_module.gate_proj.weight.T.contiguous().float(), device, _GATE_DECODE_DTYPE)
         self.gate_ds = _DS.attach(device, _gate_narrow)
         ttnn.deallocate(_gate_narrow)
-        self.up_ds = _DS.attach(device, self.up_weight)
+        _up_narrow = _to_device(torch_module.up_proj.weight.T.contiguous().float(), device, _UP_DECODE_DTYPE)
+        self.up_ds = _DS.attach(device, _up_narrow)
+        ttnn.deallocate(_up_narrow)
         # DOWN'S MIRROR IS NARROWER TOO -- same regime split as gate, funded the same way.
         _down_narrow = _to_device(torch_module.down_proj.weight.T.contiguous().float(), device, _DOWN_DECODE_DTYPE)
         self.down_ds = _DS.attach(device, _down_narrow)
