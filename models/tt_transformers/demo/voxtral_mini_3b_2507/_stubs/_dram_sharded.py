@@ -464,7 +464,7 @@ _ROPE_L1_MAX_BYTES = 1024 * 1024
 # wide pair in the expression), which makes accuracy held here worth more than the microseconds
 # it costs.  Leave that body on the default.
 ROPE_CFG = ttnn.WormholeComputeKernelConfig(
-    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=True,
     fp32_dest_acc_en=False,
     packer_l1_acc=False,

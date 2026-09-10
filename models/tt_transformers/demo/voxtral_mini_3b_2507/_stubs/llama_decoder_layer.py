@@ -45,6 +45,7 @@ _UP_DTYPE = ttnn.bfloat4_b
 # PCC 0.9635 -> 0.9511.  That leaves only 0.0011 over the gate, so this weight is now the
 # model's accuracy ceiling -- the next narrowing anywhere has to buy its budget first.
 _GATE_DECODE_DTYPE = ttnn.bfloat4_b
+_DOWN_DECODE_DTYPE = ttnn.bfloat4_b
 
 # GATE STAYS bf8_b, AND THAT IS MEASURED.  It is the largest byte lever left -- gate and up are read
 # in full on every decode token, so narrowing 3072x8192 from 26.7 MB to 14.2 MB is ~0.9 ms/token
@@ -141,8 +142,15 @@ _LOFI_CFG = ttnn.WormholeComputeKernelConfig(
 # are bf16 -- one pass worth of mantissa -- so HiFi4's four passes buy nothing and the norm
 # profiled as the largest reduction cost in the decode step (2 per layer, 60 per token).  HiFi2
 # with fp32_dest_acc_en STILL held is the pairing; SDPA's softmax stays at HiFi4.
+# AND HiFi4 AGAIN, BOUGHT BACK ON PURPOSE.  The pass argument above is sound about the mantissa
+# and silent about the price: the norms sit in the residual stream, two per layer, so whatever they
+# round compounds over 32 layers AND over every decode token.  Restoring HiFi4 costs almost nothing
+# in time -- the decode norm is 5.5 us on a 26 kB tensor (pure launch, not math) and the prefill
+# norm runs at 340 GB/s, i.e. bandwidth-bound, so the extra passes hide under the read -- and it
+# funds down_proj at bfloat4_b on the decode mirror, which is 26.7 MB off every layer of every
+# token.  fp32_dest_acc_en was always True and stays True.  See _DOWN_DECODE_DTYPE.
 _NORM_CFG = ttnn.WormholeComputeKernelConfig(
-    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=False,
     fp32_dest_acc_en=True,
     packer_l1_acc=False,
@@ -539,7 +547,10 @@ class TtLlamaDecoderLayer:
         self.gate_ds = _DS.attach(device, _gate_narrow)
         ttnn.deallocate(_gate_narrow)
         self.up_ds = _DS.attach(device, self.up_weight)
-        self.down_ds = _DS.attach(device, self.down_weight)
+        # DOWN'S MIRROR IS NARROWER TOO -- same regime split as gate, funded the same way.
+        _down_narrow = _to_device(mlp.down_proj.weight.T.contiguous().float(), device, _DOWN_DECODE_DTYPE)
+        self.down_ds = _DS.attach(device, _down_narrow)
+        ttnn.deallocate(_down_narrow)
 
     def __call__(self, x, *, rope=None, kv=None, mode="prefill", **legacy):
         decode = mode == "decode"

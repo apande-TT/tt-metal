@@ -28,6 +28,7 @@ _UP_DTYPE = ttnn.bfloat4_b
 # PCC 0.9635 -> 0.9511.  That leaves only 0.0011 over the gate, so this weight is now the
 # model's accuracy ceiling -- the next narrowing anywhere has to buy its budget first.
 _GATE_DECODE_DTYPE = ttnn.bfloat4_b
+_DOWN_DECODE_DTYPE = ttnn.bfloat4_b
 
 # GATE STAYS bf8_b, AND THAT IS MEASURED.  It is the largest byte lever left -- gate and up are read
 # in full on every decode token, so narrowing 3072x8192 from 26.7 MB to 14.2 MB is ~0.9 ms/token
@@ -142,7 +143,10 @@ class TtMlp:
         self.gate_ds = _DS.attach(device, _gate_narrow)
         ttnn.deallocate(_gate_narrow)
         self.up_ds = _DS.attach(device, self.up_weight)
-        self.down_ds = _DS.attach(device, self.down_weight)
+        # DOWN'S MIRROR IS NARROWER TOO -- same regime split as gate, funded the same way.
+        _down_narrow = _to_device(torch_module.down_proj.weight.T.contiguous().float(), device, _DOWN_DECODE_DTYPE)
+        self.down_ds = _DS.attach(device, _down_narrow)
+        ttnn.deallocate(_down_narrow)
 
     def __call__(self, x, **kwargs):
         g = self.device.compute_with_storage_grid_size()

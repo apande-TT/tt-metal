@@ -46,8 +46,15 @@ _DS = _dram_sharded()
 # are bf16 -- one pass worth of mantissa -- so HiFi4's four passes buy nothing and the norm
 # profiled as the largest reduction cost in the decode step (2 per layer, 60 per token).  HiFi2
 # with fp32_dest_acc_en STILL held is the pairing; SDPA's softmax stays at HiFi4.
+# AND HiFi4 AGAIN, BOUGHT BACK ON PURPOSE.  The pass argument above is sound about the mantissa
+# and silent about the price: the norms sit in the residual stream, two per layer, so whatever they
+# round compounds over 32 layers AND over every decode token.  Restoring HiFi4 costs almost nothing
+# in time -- the decode norm is 5.5 us on a 26 kB tensor (pure launch, not math) and the prefill
+# norm runs at 340 GB/s, i.e. bandwidth-bound, so the extra passes hide under the read -- and it
+# funds down_proj at bfloat4_b on the decode mirror, which is 26.7 MB off every layer of every
+# token.  fp32_dest_acc_en was always True and stays True.  See _DOWN_DECODE_DTYPE.
 _NORM_CFG = ttnn.WormholeComputeKernelConfig(
-    math_fidelity=ttnn.MathFidelity.HiFi2,
+    math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=False,
     fp32_dest_acc_en=True,
     packer_l1_acc=False,
