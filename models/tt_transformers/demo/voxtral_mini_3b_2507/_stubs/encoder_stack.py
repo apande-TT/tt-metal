@@ -552,8 +552,20 @@ class TtVoxtralEncoder:
         x = ttnn.reshape(x, (1, 1500, 1280))
         x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
 
-        # Add positional embedding
-        x = ttnn.add(x, self.embed_positions)
+        # Add positional embedding.
+        # THE ONE ADD IN THE TOWER STILL WRITING TO DRAM.  The block comment on _ACT_DTYPE put the
+        # tower's residual stream in interleaved L1, but this add -- the one that CREATES the stream
+        # the 32 layers then carry -- still defaulted its output to DRAM.  The capture prices it at
+        # 26.4 us against 8.6 for the identical [1504, 1280] add one layer down that names L1, on a
+        # 3.85 MB tensor whose only consumer is the first layer.  PURE PLACEMENT, so the values are
+        # bit-identical: e2e PCC came back at exactly 0.9545825281108185 either way.
+        #
+        # THE dtype HALF IS DELIBERATELY NOT TAKEN.  Adding `dtype=_ACT_DTYPE` here narrows layer 0's
+        # norm and residual too and is worth a further 0.114 ms (71.881 -> 71.767), but it is the
+        # tensor the whole tower is built on and it measured e2e PCC 0.9546 -> 0.9514 -- 0.0032 of a
+        # 0.0046 margin for 0.11 ms, when the same margin bought 0.353 ms on conv2's gelu.  Placement
+        # is free; the width is not, so only the free half is taken.
+        x = ttnn.add(x, self.embed_positions, memory_config=_DS.stream_config(x))
 
         # Transformer layers
         for layer in self.layers:
