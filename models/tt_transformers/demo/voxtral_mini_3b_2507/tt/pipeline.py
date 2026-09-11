@@ -983,10 +983,16 @@ class VoxtralPipeline:
             # have to plan around.  The per-stream loop never posed that question because each of
             # its pieces was a twelfth of the size.
             y = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-            y = ttnn.reshape(y, (len(folds), ENCODE_FRAMES // 4, self.hidden))
-            out = ttnn.to_layout(y, ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-            ttnn.deallocate(y)
-            return out
+            # ...AND STOP THERE, which is what the paragraph above always meant.  This used to
+            # tilize the result one more time before returning it, and its only consumer --
+            # `_merge_audio`, one op later -- opens by asking for ROW_MAJOR again, so the pair was a
+            # round trip on an 18.9 MB tensor: the capture shows the tilize at 94.8 us immediately
+            # followed by the matching untilize at 117.5 us, 212 us per call to hand back exactly
+            # the layout this line had already produced.  The reshape between them is a metadata
+            # view (row-major pages by the last dim), so it does not need TILE either.  `encode`'s
+            # other consumer path is the TILE fallback in `_merge_audio`, which calls `_tiled` and
+            # therefore accepts either layout -- so nothing downstream has to change.
+            return ttnn.reshape(y, (len(folds), ENCODE_FRAMES // 4, self.hidden))
         except (RuntimeError, TypeError, ValueError):
             return None
 
