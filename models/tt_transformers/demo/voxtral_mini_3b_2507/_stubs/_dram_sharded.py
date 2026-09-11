@@ -1390,7 +1390,16 @@ def _fused_activation(activation):
 
 
 def block_config(
-    device, m_tiles, k_tiles, n_tiles, tile_bytes=1088, interm_bytes=2048, activation=None, max_dest_tiles=8
+    device,
+    m_tiles,
+    k_tiles,
+    n_tiles,
+    tile_bytes=1088,
+    interm_bytes=2048,
+    activation=None,
+    max_dest_tiles=8,
+    cb_budget=None,
+    pin_in0_block_w=None,
 ):
     """A 2-D mcast program config that spreads BOTH output dims and streams K in wide blocks.
 
@@ -1427,6 +1436,7 @@ def block_config(
 
     Returns None when nothing fits, so the caller keeps its own path.
     """
+    cb_budget = _CB_BUDGET_BYTES if cb_budget is None else int(cb_budget)
     key = (
         int(m_tiles),
         int(k_tiles),
@@ -1436,6 +1446,8 @@ def block_config(
         str(activation),
         bool(_TRANSPOSE_MCAST),
         int(max_dest_tiles),
+        cb_budget,
+        None if pin_in0_block_w is None else int(pin_in0_block_w),
     )
     if key in _BLOCK_CFG_CACHE:
         return _BLOCK_CFG_CACHE[key]
@@ -1443,7 +1455,7 @@ def block_config(
     # With transpose_mcast the factory counts M blocks along X and N blocks along Y, so the extent
     # each dim must fit inside swaps.
     m_extent, n_extent = (int(g.x), int(g.y)) if _TRANSPOSE_MCAST else (int(g.y), int(g.x))
-    k_divs = _divisors(k_tiles)
+    k_divs = _divisors(k_tiles) if pin_in0_block_w is None else [int(pin_in0_block_w)]
     best = None
     for gy in range(1, m_extent + 1):
         per_core_m = -(-m_tiles // gy)
@@ -1459,7 +1471,7 @@ def block_config(
                     reuse = min(1.0, (h * w) / float(h + w))
                     blocks = (per_core_m // block_h) * (per_core_n // block_w)
                     for in0_block_w in k_divs:
-                        if _cb_bytes(block_h, block_w, in0_block_w, tile_bytes, interm_bytes) > _CB_BUDGET_BYTES:
+                        if _cb_bytes(block_h, block_w, in0_block_w, tile_bytes, interm_bytes) > cb_budget:
                             continue
                         cost = (
                             per_core_m * per_core_n * k_tiles / reuse
@@ -1589,13 +1601,14 @@ def _block_linear(x, weight, compute_kernel_config, bias=None, activation=None, 
     # that will actually run the kernel rather than making the search guess.  Every projection on
     # this path today accumulates in fp16, so this changes no existing plan; it is what makes an
     # fp32-DEST caller expressible at all.
+    max_dest = 4 if getattr(compute_kernel_config, "fp32_dest_acc_en", False) else 8
     cfg = block_config(
         x.device(),
         m_tiles,
         k_tiles,
         n_tiles,
         activation=activation,
-        max_dest_tiles=4 if getattr(compute_kernel_config, "fp32_dest_acc_en", False) else 8,
+        max_dest_tiles=max_dest,
     )
     if cfg is None:
         return None
@@ -1605,15 +1618,59 @@ def _block_linear(x, weight, compute_kernel_config, bias=None, activation=None, 
     # including the ones that never wanted L1 -- down the 1-D mcast path this helper exists to avoid.
     # So an L1 request is retried in DRAM first, and only a failure with no placement left standing
     # is recorded against the shape.
-    placements = [memory_config] if memory_config is None else [memory_config, None]
-    for placement in placements:
+    #
+    # ...AND BEFORE GIVING UP ON L1, SPEND LESS OF IT ON THE CIRCULAR BUFFERS.  The refusal is a
+    # budget question and the block config owns one side of that budget: a core holding ~700 kB of
+    # in0/in1/out buffers plus the op's share of a wide L1 output can fail where the SAME plan under
+    # a narrower K block fits.  The two costs are not comparable -- a smaller K block adds multicast
+    # rounds worth fractions of a percent (see _CB_BUDGET_BYTES), while losing the L1 output costs a
+    # full write plus the consumer's read of the whole tensor -- so an L1 request is worth retrying
+    # on progressively smaller CB budgets before it is downgraded.  Only DRAM at the full budget is
+    # allowed to blacklist the shape, so a shape that never wanted L1 is unaffected.
+    # THE LADDER IS FINE-GRAINED BECAUSE THE STEPS ARE NOT FREE.  Each rung narrows the out block,
+    # which makes the core re-stream its in0 slice once more per N block, so the right rung is the
+    # WIDEST one the allocator will take -- not the smallest one that is sure to fit.  And the
+    # attempts are re-run per call rather than memoised per shape: gate and up are the SAME
+    # (m, k, n, activation), so a shape key cannot distinguish the half that fits at the full budget
+    # from the half that does not, and remembering the loser's rung drags the winner down with it.
+    #
+    # THE K BLOCK IS PINNED ACROSS THE LADDER, AND THAT IS AN ACCURACY CONSTRAINT, NOT A TUNING ONE.
+    # in0_block_w is how many K tiles are reduced before the partial sum is packed out, so narrowing
+    # it re-orders a block-float accumulation and CHANGES THE VALUES -- measured on this model, a
+    # ladder that let it fall 6 -> 4 on the FFN's `up` projection moved e2e PCC 0.9546 -> 0.9506
+    # against a 0.95 gate, i.e. it spent two thirds of the remaining budget on a scheduling problem.
+    # The out block is the other half of the same footprint and is numerically inert: the K
+    # reduction inside each out block is unchanged, only the number of out blocks moves.  So the
+    # ladder buys L1 with the free axis alone and leaves the priced one where the full-budget plan
+    # put it.
+    attempts = [(memory_config, cfg)]
+    if memory_config is not None:
+        seen = {str(cfg)}
+        pin = getattr(cfg, "in0_block_w", None)
+        for num, den in ((7, 8), (3, 4), (1, 2), (1, 4)):
+            tight = block_config(
+                x.device(),
+                m_tiles,
+                k_tiles,
+                n_tiles,
+                activation=activation,
+                max_dest_tiles=max_dest,
+                cb_budget=_CB_BUDGET_BYTES * num // den,
+                pin_in0_block_w=pin,
+            )
+            if tight is not None and str(tight) not in seen:
+                seen.add(str(tight))
+                attempts.append((memory_config, tight))
+        attempts.append((None, cfg))
+    for idx in range(len(attempts)):
+        placement, plan = attempts[idx]
         try:
             out = ttnn.linear(
                 folded,
                 weight,
                 bias=bias,
                 compute_kernel_config=compute_kernel_config,
-                program_config=cfg,
+                program_config=plan,
                 # THE OUTPUT WIDTH FOLLOWS THE REGIME, NOT THIS PATH.  `mm` and `linear` both narrow
                 # the output only at or above _GRID_REQUEST_MIN_ROWS -- "narrow the output only where
                 # there are bytes to save" -- so hard-coding _ACT_DTYPE here meant admitting a
@@ -1626,7 +1683,7 @@ def _block_linear(x, weight, compute_kernel_config, bias=None, activation=None, 
             )
             break
         except (RuntimeError, TypeError, ValueError):
-            if placement is None:
+            if idx == len(attempts) - 1:
                 _BLOCK_CFG_REFUSED.add(key)
                 return None
     # Hand the caller back the rank it gave us; same view argument as the fold above.
