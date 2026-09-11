@@ -141,6 +141,9 @@ DECODE_BATCH = 8
 
 EOS_TOKEN_ID = 2
 PAD_TOKEN_ID = 11
+# Rows in one tile, i.e. the granularity at which a slice of a TILE-layout tensor stays a cheap cut
+# rather than forcing a full row-major re-lay of the operand (see VoxtralPipeline._last_row).
+TILE_HEIGHT = 32
 AUDIO_TOKEN_ID = 24
 
 ROUTED_STUBS = [
@@ -1080,11 +1083,36 @@ class VoxtralPipeline:
         rope = self.rope(seq_len=self.C)  # graduated stub, contiguous 0..C-1
         self._cur_pos_from(self.zero_b, 0)
         h = self._lm_forward(h, rope=rope, kv_slots=self.kv, mode="prefill")
-        last = ttnn.slice(h, (0, dev_in.prompt_len - 1, 0), (dev_in.batch, dev_in.prompt_len, self.hidden))
+        last = self._last_row(h, dev_in.batch, dev_in.prompt_len)
         logits = self.lm_head(last)  # [B,1,V]
         self._cur_pos_from(self.prompt_pos_tt, dev_in.prompt_len)
         self._argmax_into_next_ids(logits)
         return logits
+
+
+    def _last_row(self, h, batch, prompt_len):
+        """Row `prompt_len - 1` of every stream, without untilizing the rows around it.
+
+        SLICING A TILED TENSOR AT A NON-TILE ROW UNTILIZES THE WHOLE THING.  `h` is
+        [B, C, hidden] in TILE layout and the sampler needs one row per stream, so a direct
+        `ttnn.slice` at `prompt_len - 1` makes ttnn lay the entire tensor out row-major first: the
+        capture prices that UntilizeCodegen at 91.9 us over 10.9 MB, and the slice that follows it
+        at 1.6 us, to produce 8 rows -- 98 kB kept out of 10.9 MB rewritten.
+
+        The row's TILE ROW, though, is a tile-aligned cut, so taking it first stays in tile layout
+        and costs a metadata-cheap slice; only that [B, 32, hidden] block then has to be laid out
+        for the final row, which is a thirteenth of the bytes at C = 416.  Exact either way -- both
+        forms select the same row -- and it falls back to the direct slice when the row dim is not
+        tile-aligned, which is the only case the block cut could run off the end of.
+        """
+        row = int(prompt_len) - 1
+        lo = (row // TILE_HEIGHT) * TILE_HEIGHT
+        if int(self.C) % TILE_HEIGHT or lo + TILE_HEIGHT > int(self.C):
+            return ttnn.slice(h, (0, row, 0), (batch, row + 1, self.hidden))
+        blk = ttnn.slice(h, (0, lo, 0), (batch, lo + TILE_HEIGHT, self.hidden))
+        out = ttnn.slice(blk, (0, row - lo, 0), (batch, row - lo + 1, self.hidden))
+        ttnn.deallocate(blk)
+        return out
 
     # --------------------------------------------------------- STAGE: decode
     def _argmax_into_next_ids(self, logits):
@@ -1368,7 +1396,7 @@ class VoxtralPipeline:
         st = self._trace_state["prefill"]
         h = self._merge_audio(st["ids"], st["audio"], st["audio_start"], st["n_audio"], self.B)
         h = self._lm_forward(h, rope=self.rope(seq_len=self.C), kv_slots=self.kv, mode="prefill")
-        last = ttnn.slice(h, (0, st["prompt_len"] - 1, 0), (self.B, st["prompt_len"], self.hidden))
+        last = self._last_row(h, self.B, st["prompt_len"])
         return self.lm_head(last)
 
     # ------------------------------------------------------ stage: decode
