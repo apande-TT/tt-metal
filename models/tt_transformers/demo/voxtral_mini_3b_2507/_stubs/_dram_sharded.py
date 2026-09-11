@@ -1524,6 +1524,34 @@ def block_config(
 # rejected shape costs one exception, not one per call.
 _BLOCK_CFG_REFUSED = set()
 
+# How much of the full-budget plan's out block a CB-tightened rung must keep.  The out block is the
+# only term in that budget the L1 ladder is allowed to spend (see _block_linear), and it buys room
+# by making the core re-stream its in0 slice once more per N block -- so halving the block doubles
+# the operand traffic, and a rung that shrinks it further is not obviously better than the DRAM
+# output it is competing with.
+_MIN_TIGHT_BLOCK_FRACTION = 0.5
+
+
+def _same_plan_tighter_blocks(full, tight):
+    """Whether `tight` is `full` with a smaller OUT BLOCK and nothing else changed.
+
+    THE LADDER MUST NOT BE A SECOND PLANNER.  Re-running the search under a smaller CB budget can
+    come back with a different grid, a different per-core split or a different K block -- and those
+    are not small perturbations: measured on this model's audio-tower fc2, an unconstrained rung
+    came back on 110 cores with a 4-tile K block and ran 104 us against the full plan's 53.7.  The
+    ladder exists to keep an L1 OUTPUT, not to re-litigate the plan, so a rung is only taken when it
+    is provably the same plan with fewer out-block tiles resident.
+    """
+    try:
+        for field in ("compute_with_storage_grid_size", "in0_block_w", "per_core_M", "per_core_N"):
+            if str(getattr(full, field)) != str(getattr(tight, field)):
+                return False
+        full_area = int(full.out_block_h) * int(full.out_block_w)
+        tight_area = int(tight.out_block_h) * int(tight.out_block_w)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return 0 < tight_area < full_area and tight_area >= full_area * _MIN_TIGHT_BLOCK_FRACTION
+
 # THE GUARD IS ABOUT OUTPUT TILES, AND THE ROW COUNT WAS ONLY EVER A PROXY FOR THEM.
 # _GRID_REQUEST_MIN_ROWS exists to keep the DECODE shape off the 2-D path: at one tile row there is
 # a single row of blocks, so no block config can buy DEST reuse and spreading the launch costs more
@@ -1658,7 +1686,7 @@ def _block_linear(x, weight, compute_kernel_config, bias=None, activation=None, 
                 cb_budget=_CB_BUDGET_BYTES * num // den,
                 pin_in0_block_w=pin,
             )
-            if tight is not None and str(tight) not in seen:
+            if tight is not None and str(tight) not in seen and _same_plan_tighter_blocks(cfg, tight):
                 seen.add(str(tight))
                 attempts.append((memory_config, tight))
         attempts.append((None, cfg))
