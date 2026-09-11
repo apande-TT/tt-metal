@@ -618,23 +618,34 @@ class LlamaModel:
             }
             # Decode-only DRAM-bank-sharded mirrors, derived from the interleaved weights ON DEVICE
             # (no second host upload).  See _dram_sharded.py for why prefill keeps the plain path.
-            for _name in ("gate", "up", "down", "qkv", "o"):
+            # ONLY THE MIRRORS THAT KEEP PREFILL'S WIDTH ARE BUILT HERE.  This loop used to name all
+            # five, and the three MLP entries were then OVERWRITTEN by the narrow host-quantised
+            # mirrors below -- so every layer built a bank-sharded gate, up and down at prefill's
+            # dtype, paid the `to_memory_config` for each, and dropped the result on the next line.
+            # Three CopyDeviceOperations a layer for tensors nothing ever read.
+            for _name in ("qkv", "o"):
                 lw[f"{_name}_ds"] = _DS.attach(device, lw[f"{_name}_w"])
             # GATE'S MIRROR IS NARROWER THAN GATE'S RESIDENT WEIGHT -- see _GATE_DECODE_DTYPE --
             # and it is quantised FROM THE HOST WEIGHT rather than from the bf8_b copy beside it.
             # A bfloat8_b -> bfloat4_b typecast re-derives the 4-bit mantissa from values a 16-wide
             # block exponent had already rounded; measured across all four MLP bodies that second
             # requantisation costs e2e PCC 0.9511 -> 0.9069 for identical bytes and kernel.
-            _gate_narrow = _to_device(layer.mlp.gate_proj.weight.T.contiguous().float(), device, _GATE_DECODE_DTYPE)
-            lw["gate_ds"] = _DS.attach(device, _gate_narrow)
-            ttnn.deallocate(_gate_narrow)
+            # ...AND IT IS UPLOADED STRAIGHT INTO THE BANK SHARDS.  The interleaved copy this used to
+            # build was staging and nothing else -- attach() resharded it on device and the next line
+            # freed it -- so that reshard was a CopyDeviceOperation spent on bytes which had just
+            # crossed PCIe anyway.  attach() takes the host tensor now and lands it in the width-sharded
+            # buffers directly, with the dtype named because there is no device tensor to read a stored
+            # width off.  See _DS.attach.
+            lw["gate_ds"] = _DS.attach(
+                device, layer.mlp.gate_proj.weight.T.contiguous().float(), dtype=_GATE_DECODE_DTYPE
+            )
             # down's mirror is narrower too -- same regime split, same host-side quantisation.
-            _down_narrow = _to_device(layer.mlp.down_proj.weight.T.contiguous().float(), device, _DOWN_DECODE_DTYPE)
-            lw["down_ds"] = _DS.attach(device, _down_narrow)
-            ttnn.deallocate(_down_narrow)
-            _up_narrow = _to_device(layer.mlp.up_proj.weight.T.contiguous().float(), device, _UP_DECODE_DTYPE)
-            lw["up_ds"] = _DS.attach(device, _up_narrow)
-            ttnn.deallocate(_up_narrow)
+            lw["down_ds"] = _DS.attach(
+                device, layer.mlp.down_proj.weight.T.contiguous().float(), dtype=_DOWN_DECODE_DTYPE
+            )
+            lw["up_ds"] = _DS.attach(
+                device, layer.mlp.up_proj.weight.T.contiguous().float(), dtype=_UP_DECODE_DTYPE
+            )
             self.layer_weights.append(lw)
 
         self.norm_w = _to_device(torch_module.norm.weight.unsqueeze(0).unsqueeze(0).float(), device)

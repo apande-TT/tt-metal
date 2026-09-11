@@ -571,9 +571,21 @@ class DramShardedLinear:
             self.ok = False
 
     def _build(self, device, weight, max_m_tiles, dtype=None):
+        # A HOST WEIGHT IS UPLOADED STRAIGHT INTO THE BANK SHARDS, NOT RESHARDED ON DEVICE.  The
+        # mirror is derived on device when the interleaved copy is a tensor PREFILL also reads --
+        # there the copy is the only way to get a second layout without a second PCIe upload.  But
+        # the narrowed MLP mirrors have no such twin: their interleaved tensor is built from the
+        # host weight, handed straight here, and deallocated on the next line, so it is pure staging
+        # and the `to_memory_config` that reads it is pure device time.  Uploading the host tensor
+        # into `mem_cfg` directly moves the SAME bytes over PCIe once and skips the device copy
+        # entirely -- measured 1.28 ms of CopyDeviceOperation across the profiled layers.
+        # `dtype` is required on this path because there is no device tensor to read a width off.
+        host = not isinstance(weight, ttnn.Tensor)
+        if host and dtype is None:
+            return
         # Narrow BEFORE planning, not after: every block size below is weighed in tile_bytes(dtype),
         # so a mirror requantised afterwards would be laid out for the width it no longer has.
-        if dtype is not None and weight.dtype != dtype:
+        if not host and dtype is not None and weight.dtype != dtype:
             weight = ttnn.typecast(weight, dtype)
         shape = tuple(weight.shape)
         self.k, self.n = int(shape[-2]), int(shape[-1])
@@ -583,7 +595,8 @@ class DramShardedLinear:
 
         dram_grid = device.dram_grid_size()
         dram_cores = dram_grid.x
-        plan = self._plan(device, k_tiles, n_tiles, dram_cores, max_m_tiles, tile_bytes(weight.dtype))
+        stored_dtype = dtype if host else weight.dtype
+        plan = self._plan(device, k_tiles, n_tiles, dram_cores, max_m_tiles, tile_bytes(stored_dtype))
         if plan is None:
             return
         splits, self.workers_per_bank, cores, gx, gy = plan
@@ -601,7 +614,7 @@ class DramShardedLinear:
         # o_proj and down_proj -- identical dtype, identical K -- sit at 69-75% on 32.  in0 gets the
         # widest rectangle dividing k_tiles, so its per-core slice (== in0_block_w, one mcast block
         # per core) is narrower and every in0/in1 circular buffer shrinks with it.
-        in0_plan = in0_grid(device, k_tiles, k_tiles * n_tiles, tile_bytes(weight.dtype)) or (cores, gx, gy)
+        in0_plan = in0_grid(device, k_tiles, k_tiles * n_tiles, tile_bytes(stored_dtype)) or (cores, gx, gy)
         self.in0_cores, in0_gx, in0_gy = in0_plan
         self.in0_grid = ttnn.CoreGrid(y=in0_gy, x=in0_gx)
         self.in0_block_w = _largest_divisor(self.k // (TILE * self.in0_cores))
@@ -616,6 +629,33 @@ class DramShardedLinear:
             ttnn.BufferType.DRAM,
             ttnn.ShardSpec(dram_range, (self.k, padded // dram_cores), ttnn.ShardOrientation.ROW_MAJOR),
         )
+        staged = None
+        if host:
+            flat = weight.reshape(self.k, self.n)
+            try:
+                self.weights = [
+                    ttnn.from_torch(
+                        (
+                            flat if splits == 1 else flat[:, i * self.split_size : (i + 1) * self.split_size]
+                        ).contiguous(),
+                        dtype=dtype,
+                        layout=ttnn.TILE_LAYOUT,
+                        device=device,
+                        memory_config=mem_cfg,
+                    )
+                    for i in range(splits)
+                ]
+                self.ok = True
+                return
+            except Exception:  # noqa: BLE001
+                # FALL BACK TO THE COPY, NOT TO NO MIRROR.  __init__ turns any exception in here
+                # into ok = False, which silently costs the whole decode regime its DRAM-bank-sharded
+                # projections -- a large, correct-looking slowdown.  A direct upload this build
+                # cannot place must therefore degrade to the staged device reshard the callers used
+                # to do by hand, so only a shape that neither path can serve disables the mirror.
+                self.weights = []
+                staged = ttnn.from_torch(flat.contiguous(), dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
+                weight, shape = staged, (self.k, self.n)
         base = ttnn.reshape(weight, (self.k, self.n)) if len(shape) != 2 else weight
         # Do not slice when there is only one chunk: a full-width slice is pure work, and on a
         # block-float weight it is not merely wasteful -- ttnn.slice does not handle every
@@ -629,6 +669,8 @@ class DramShardedLinear:
             )
             for i in range(splits)
         ]
+        if staged is not None:
+            ttnn.deallocate(staged)
         self.ok = True
 
     def _plan(self, device, k_tiles, n_tiles, dram_cores, max_m_tiles, tile_bytes=_TILE_BYTES_BF8):
@@ -763,6 +805,15 @@ def attach(device, weight, max_m_tiles=1, dtype=None):
     bfloat8_b 362.3 us against up at bfloat4_b 360.0 us -- the width buys prefill NOTHING).
     Narrowing a weight globally therefore pays in one regime and charges e2e PCC in both.  Passing
     the narrow dtype here spends the accuracy only where the bytes are actually on the clock.
+
+    AND `weight` MAY BE THE HOST TENSOR, which is the right form to pass whenever the mirror is the
+    ONLY reader of that width.  A caller that uploads an interleaved copy purely so this function
+    can reshard it is paying a device `to_memory_config` for a tensor it deallocates one line later;
+    handing the torch tensor over instead moves the same bytes across PCIe once and lands them in
+    the bank shards directly.  `dtype` is REQUIRED on that path -- there is no device tensor to read
+    a stored width off, and every block size in the plan is weighed in it.  Pass the DEVICE tensor
+    when prefill reads the same weight (qkv, o_proj), because there the interleaved copy is not
+    staging and the device reshard is what avoids a second upload.
     """
     mirror = DramShardedLinear(device, weight, max_m_tiles=max_m_tiles, dtype=dtype)
     return mirror if mirror.ok else None

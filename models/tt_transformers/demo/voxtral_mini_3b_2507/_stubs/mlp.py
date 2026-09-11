@@ -147,16 +147,22 @@ class TtMlp:
         # bf8_b copy e2e PCC 0.9069, straight from the host weight 0.9511, same bytes, same
         # kernel.  One extra interleaved upload per layer, freed as soon as the mirror owns its
         # width-sharded buffers.
-        _gate_narrow = _to_device(torch_module.gate_proj.weight.T.contiguous().float(), device, _GATE_DECODE_DTYPE)
-        self.gate_ds = _DS.attach(device, _gate_narrow)
-        ttnn.deallocate(_gate_narrow)
-        _up_narrow = _to_device(torch_module.up_proj.weight.T.contiguous().float(), device, _UP_DECODE_DTYPE)
-        self.up_ds = _DS.attach(device, _up_narrow)
-        ttnn.deallocate(_up_narrow)
+        # ...AND IT IS UPLOADED STRAIGHT INTO THE BANK SHARDS.  The interleaved copy this used to
+        # build was staging and nothing else -- attach() resharded it on device and the next line
+        # freed it -- so that reshard was a CopyDeviceOperation spent on bytes which had just
+        # crossed PCIe anyway.  attach() takes the host tensor now and lands it in the width-sharded
+        # buffers directly, with the dtype named because there is no device tensor to read a stored
+        # width off.  See _DS.attach.
+        self.gate_ds = _DS.attach(
+            device, torch_module.gate_proj.weight.T.contiguous().float(), dtype=_GATE_DECODE_DTYPE
+        )
+        self.up_ds = _DS.attach(
+            device, torch_module.up_proj.weight.T.contiguous().float(), dtype=_UP_DECODE_DTYPE
+        )
         # DOWN'S MIRROR IS NARROWER TOO -- same regime split as gate, funded the same way.
-        _down_narrow = _to_device(torch_module.down_proj.weight.T.contiguous().float(), device, _DOWN_DECODE_DTYPE)
-        self.down_ds = _DS.attach(device, _down_narrow)
-        ttnn.deallocate(_down_narrow)
+        self.down_ds = _DS.attach(
+            device, torch_module.down_proj.weight.T.contiguous().float(), dtype=_DOWN_DECODE_DTYPE
+        )
 
     def __call__(self, x, **kwargs):
         g = self.device.compute_with_storage_grid_size()
