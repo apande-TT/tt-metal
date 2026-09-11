@@ -110,6 +110,31 @@ _ACT_DTYPE = ttnn.bfloat8_b
 
 
 def _to_device(t, device, dtype=ttnn.bfloat16):
+    # TILIZE A VECTOR ON THE HOST, NOT ON THE CHIP.  `ttnn.from_torch(..., layout=TILE_LAYOUT,
+    # device=...)` uploads row-major and runs a TilizeWithValPadding on device to lay it out, and for
+    # the biases and norm vectors that is a [1, N] tensor being padded up to a whole 32-row tile: the
+    # capture opens with 538 of them -- 405 at width 1280, 67 at 3840, 66 at 5120 -- at 2.6-4.8 us
+    # each, 1.64 ms of device time before the model has seen an input.  Every one moves 32x more
+    # bytes than the vector holds, purely to reach tile layout.  Host tilization produces the
+    # IDENTICAL tensor (same dtype, same padding, same values) and costs the device nothing, so the
+    # upload becomes a plain to_device.  Gated to sub-tile heights so the real weight matrices --
+    # where the device tilize is amortised over a full tile grid and the host copy would be large --
+    # keep the path they have.  Falls back to that path on any refusal, so this can only be faster.
+    _rows = 1
+    for _d in tuple(t.shape)[:-1]:
+        _rows *= int(_d)
+    if _rows <= 32:
+        try:
+            _src = t.bfloat16() if dtype == ttnn.bfloat16 else t
+            if isinstance(device, ttnn.MeshDevice):
+                _host = ttnn.from_torch(
+                    _src, dtype=dtype, layout=ttnn.TILE_LAYOUT, mesh_mapper=ttnn.ReplicateTensorToMesh(device)
+                )
+            else:
+                _host = ttnn.from_torch(_src, dtype=dtype, layout=ttnn.TILE_LAYOUT)
+            return ttnn.to_device(_host, device)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pass
     # BLOCK-FLOAT TARGETS SKIP THE HOST NARROWING.  bf8_b/bf4_b derive their mantissa from a
     # per-block shared exponent, so rounding to bf16 first can change the packed result; only the
     # bf16 path below is a pure round-trip removal.
