@@ -142,7 +142,21 @@ class TtVoxtralMultiModalProjector:
             activation="gelu",
             memory_config=_DS.ffn_config(rows, int(self.linear_1_weight.shape[-1]), _PROJ_DTYPE),
         )
-        x = _DS.linear(x, self.linear_2_weight, None, _PROJ_CFG, grid)
+        # linear_2 WRITES WHERE ITS CONSUMER READS, for the same reason linear_1 does.  This was the
+        # one call in the projector still defaulting its output to DRAM while its sibling one line
+        # up named a placement, and the profile shows what reads it next: a Copy, so the value was
+        # written out through the DRAM controller only to be pulled straight back in.  Its output is
+        # 384 x 3072 x 1.0625 B = 1.25 MB, the same order as the linear_1 intermediate already held
+        # in L1 and far inside ffn_config's cap, and that helper degrades to DRAM on a shape it was
+        # not sized for, so a longer audio context still falls back rather than crowding L1.
+        x = _DS.linear(
+            x,
+            self.linear_2_weight,
+            None,
+            _PROJ_CFG,
+            grid,
+            memory_config=_DS.ffn_config(rows, int(self.linear_2_weight.shape[-1]), _PROJ_DTYPE),
+        )
         return x
 
 
