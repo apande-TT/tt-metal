@@ -183,7 +183,18 @@ _CONV2D_CFG = ttnn.Conv2dConfig(
 # input channels against conv2's 1280, so it is a twentieth of the bytes and all of the dynamic
 # range of the raw mel.  The compute config stays HiFi2 either way; this changes what is stored,
 # not how many passes the math engine takes.
-_CONV2D_CFG_BF8_W = ttnn.Conv2dConfig(weights_dtype=ttnn.bfloat8_b)
+# ...AND IT CAN AFFORD THE DOUBLE BUFFERS NOW THAT IT IS HALF THE BYTES.  _CONV2D_CFG keeps the two
+# double-buffer flags on conv1 only, because when that split was made conv2 carried a 9.8 MB bf16
+# kernel and the second buffer "would be a real capacity trade".  The kernel is 4.9 MB at bf8_b, and
+# the profile shows conv2 running with BOTH buffers off and its act block at 5 x 12 tiles on a
+# 10 x 10 grid -- so the reader stalls the compute once per block on an op that is now the cheaper
+# half of the pair to feed.  Pure scheduling: the flags change when operands arrive, not what they
+# are, so the values are bit-identical.
+_CONV2D_CFG_BF8_W = ttnn.Conv2dConfig(
+    weights_dtype=ttnn.bfloat8_b,
+    enable_act_double_buffer=True,
+    enable_weights_double_buffer=True,
+)
 
 
 def _to_device(t, device, dtype=ttnn.bfloat16):
