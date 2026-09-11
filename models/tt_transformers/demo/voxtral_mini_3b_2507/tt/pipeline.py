@@ -1431,11 +1431,24 @@ class VoxtralPipeline:
         # a 5.6 MB bf8_b slot -- 37.4 us per copy, two per layer, on a tensor that is all zeros.
         # KV_DTYPE makes it a same-format copy of half the bytes, and zero is exactly representable
         # in every one of these formats, so the cache it leaves behind is identical.
+        #
+        # ONCE PER PROCESS, NOT ONCE PER PROMPT, AND THAT IS A CONTRACT RATHER THAN AN OPTIMISATION.
+        # Nothing reads a cache position above cur_pos: prefill's attention runs on the q/k/v it
+        # just projected (the fill only SEEDS decode), and sdpa_decode is handed cur_pos and masks
+        # everything past it -- which has to be true independently of this function, because a
+        # zeroed K would score 0 and exp(0) = 1, i.e. zeros pollute a softmax just as surely as
+        # stale values do.  So re-zeroing between prompts cannot be what makes the next prompt
+        # correct; it was writing the whole cache (5.6 MB a slot, two slots a layer) for a region
+        # the next prompt overwrites or ignores.  The first call still runs, so the buffers are
+        # never read as freshly-allocated DRAM.
+        if getattr(self, "_kv_zeroed", False):
+            return
         z = torch.zeros(self.B, self.n_kv, self.KV_C, self.head_dim)
         zt = _to_dev(z, self.device, dtype=KV_DTYPE)
         for slot in self.kv:
             ttnn.copy(zt, slot.k)
             ttnn.copy(zt, slot.v)
+        self._kv_zeroed = True
 
     # ------------------------------------------- excluded-stub conformance
     def avg_pool1d_conformance(self):
