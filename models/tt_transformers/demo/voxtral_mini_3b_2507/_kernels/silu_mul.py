@@ -213,6 +213,44 @@ def _core_ranges(grid_x: int, n: int):
 
 _PLANS: dict = {}
 
+# THE PRODUCT BUFFER IS REBUILT EVERY LAYER, AND ITS ADDRESS IS WHAT THE CONSUMER PAYS FOR.  This
+# kernel owns its output, so a fresh `allocate_tensor_on_device` per call hands the allocator a
+# 29 MB request thirty-two times a prefill and takes whatever region is free at that moment -- and
+# `down`, which reads it as a 256-tile-deep in0, is the one op in the layer whose cost tracks that
+# choice.  The capture shows it: `3328 x 8192 x 3072` runs 417.5 us on the six calls before the
+# decode trace region is resident and 553.0 us on the six after, with a BIT-IDENTICAL program
+# config, placement and dtype, and the whole 32% lands on NCRISC -- the reader goes 373 -> 537 us
+# while the compute simply waits on it.  Its siblings do not move (gate/up 362.0 -> 365.4, o_proj
+# 211.9 -> 211.9), and `down` is the only op reading a 29 MB operand, so it is the only one whose
+# bank spread the late-region DRAM pressure can spoil.
+#
+# A CACHED BUFFER FIXES THE ADDRESS instead of re-bidding for one: the first call allocates while
+# DRAM is still unfragmented and every later call -- including every later PROMPT -- reuses that
+# exact region.  Keyed like _PLANS, on (grid, tiles, dtype, placement) rather than `id(device)`,
+# and validated by reading the address back so a stale tensor from a closed device reallocates
+# instead of being handed to a kernel.
+#
+# SAFE BECAUSE THE PRODUCT HAS EXACTLY ONE CONSUMER, ONE OP LATER.  `_swiglu_body` hands it straight
+# to the down projection and never holds it across another SwiGLU, so no two live products share a
+# key; the decode shape has its own tile count and therefore its own buffer.  And a FIXED address is
+# strictly better for trace than a floating one: generic_op's custom_program_hash keys on the three
+# buffer addresses, so pinning this one turns a rebuild into a cache hit.
+_OUTS: dict = {}
+
+
+def _cached_out(key, shape, dtype, device, mem_cfg):
+    """The resident product buffer for `key`, allocated once."""
+    out = _OUTS.get(key)
+    if out is not None:
+        try:
+            out.buffer_address()
+            return out
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            _OUTS.pop(key, None)
+    out = ttnn.allocate_tensor_on_device(shape, dtype, ttnn.TILE_LAYOUT, device, mem_cfg)
+    _OUTS[key] = out
+    return out
+
 
 def serves(gate, up, memory_config) -> bool:
     """Whether this kernel can run THIS call exactly -- otherwise the caller keeps ttnn.multiply."""
@@ -258,12 +296,13 @@ def silu_mul(gate, up, memory_config):
     if plan is None:
         plan = SiluMul(device, n)
         _PLANS[key] = plan
-    out = ttnn.allocate_tensor_on_device(
+    wanted = ttnn.DRAM_MEMORY_CONFIG if memory_config is None else memory_config
+    out = _cached_out(
+        key + (str(gate.dtype), str(wanted)),
         ttnn.Shape(list(gate.padded_shape)),
         gate.dtype,
-        ttnn.TILE_LAYOUT,
         device,
-        ttnn.DRAM_MEMORY_CONFIG if memory_config is None else memory_config,
+        wanted,
     )
     if _LOG is not None:
         # Three pybind round-trips on the hot path, for a sink that is off by default.
