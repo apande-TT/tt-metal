@@ -122,6 +122,25 @@ _CONV_CFG = ttnn.WormholeComputeKernelConfig(
     packer_l1_acc=False,
 )
 
+# ...BUT conv2's WEIGHTS ARE NO LONGER bf16, SO ITS PAIRING IS NOT conv1's.  The config above was
+# written when both convs carried bf16 kernels; _CONV2D_CFG_BF8_W has since narrowed conv2's to
+# bfloat8_b, and its own comment says outright that it "changes what is stored, not how many passes
+# the math engine takes" -- which is exactly the pairing every other narrowed op in this tower
+# corrected (see _PROJ_CFG and _SDPA_CFG).  A bf8_b operand holds ONE pass worth of mantissa, so
+# HiFi2's two passes cancel part of the bandwidth the narrower kernel just bought, and the profile
+# agrees the passes are what bind: 96.6 us/call for 14.8 GFLOP is 153 TFLOP/s where the fc2 matmul
+# one op away -- same activation width, same bf8_b weight -- reaches 366.
+# conv1 KEEPS HiFi2, and that is the same scoping argument as the gelu pair: conv1 has 128 input
+# channels against conv2's 1280, its kernel is still bf16, and it is the FIRST op on the raw mel,
+# where the dynamic range is widest and the error has a stride-2 convolution plus 32 layers to
+# compound through.  Only the op whose stored width already changed gets the matching fidelity.
+_CONV_CFG_BF8_W = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.LoFi,
+    math_approx_mode=False,
+    fp32_dest_acc_en=True,
+    packer_l1_acc=False,
+)
+
 # THE BIAS AND THE GELU BELONG TO THE CONVOLUTION, NOT AFTER IT.  Both front-end convs were followed
 # by a standalone `ttnn.add(x, bias)` and a standalone `ttnn.gelu(x)` over the conv's own output --
 # [1, 1, 3000, 1280] bf16 is 7.7 MB, so that pair re-reads and re-writes ~31 MB per conv purely to
@@ -422,7 +441,9 @@ class TtVoxtralEncoder:
         self.ln_bias = _to_device(torch_module.layer_norm.bias.unsqueeze(0).unsqueeze(0).float(), device)
         self.ln_eps = torch_module.layer_norm.eps
 
-    def _conv1d_cached(self, x, idx, weight, bias, in_ch, out_ch, ks, stride, pad, length, conv_config=None):
+    def _conv1d_cached(
+        self, x, idx, weight, bias, in_ch, out_ch, ks, stride, pad, length, conv_config=None, compute_config=None
+    ):
         """conv1d with the PREPROCESSED weights AND BIAS cached on device, gelu fused.
 
         The graduated body kept the conv weights on host and let every call
@@ -451,7 +472,7 @@ class TtVoxtralEncoder:
             dilation=1,
             groups=1,
             conv_config=_CONV2D_CFG if conv_config is None else conv_config,
-            compute_config=_CONV_CFG,
+            compute_config=_CONV_CFG if compute_config is None else compute_config,
             return_weights_and_bias=prepared is None,
         )
         if prepared is None:
@@ -559,6 +580,7 @@ class TtVoxtralEncoder:
             self.conv2_padding,
             3000,
             conv_config=_CONV2D_CFG_BF8_W,  # see _CONV2D_CFG_BF8_W: 9.8 MB of bf16 kernel, halved
+            compute_config=_CONV_CFG_BF8_W,  # ...and the fidelity that pairs with it
         )
         # the bias is fused into the conv above; the gelu is not (see _CONV2D_CFG).
         # FastLut HERE, WHERE THE ERROR HAS NOWHERE LEFT TO COMPOUND.  The Tanh variant is still an
