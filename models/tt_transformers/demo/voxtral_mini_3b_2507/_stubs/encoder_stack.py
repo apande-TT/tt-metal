@@ -513,6 +513,11 @@ class TtVoxtralEncoder:
         # front-end calls were the ones it does not pass through.  The tanh form is the standard
         # gelu approximation (max abs error ~1e-3 against erf), and this feeds a convolution whose
         # own operands are bf16, which resolves ~4e-3.
+        # TANH ON conv1's, FastLut ONLY ON conv2's.  MEASURED, not assumed: both gelus at FastLut is
+        # 1.06 ms faster and takes e2e PCC 0.9530 -> 0.9476 (gate 0.95); conv1's ALONE at FastLut is
+        # 0.9479, i.e. THIS call site owns essentially the whole loss and conv2's owns ~0.0003.  The
+        # LUT's ~1% error lands on the tensor that still has a stride-2 convolution and 32 encoder
+        # layers to propagate through, so it is the one place in the pair the budget cannot cover.
         x = ttnn.gelu(x, variant=ttnn.GeluVariant.Tanh)
 
         # conv2: stride=2, so 3000 -> 1500
@@ -531,8 +536,12 @@ class TtVoxtralEncoder:
             conv_config=_CONV2D_CFG_BF8_W,  # see _CONV2D_CFG_BF8_W: 9.8 MB of bf16 kernel, halved
         )
         # the bias is fused into the conv above; the gelu is not (see _CONV2D_CFG).
-        # Tanh variant, for the reason given on conv1's gelu above.
-        x = ttnn.gelu(x, variant=ttnn.GeluVariant.Tanh)
+        # FastLut HERE, WHERE THE ERROR HAS NOWHERE LEFT TO COMPOUND.  The Tanh variant is still an
+        # FP32 polynomial -- a cube, a multiply and a full tanh per element -- which is why this op
+        # costs 39.6 us for 1504 x 1280 on 110 cores.  FastLut is a 6-segment piecewise-linear
+        # lookup, so the SFPU does one compare-and-interpolate instead.  Measured cost to e2e PCC:
+        # 0.0003 (see the note on conv1's gelu above, which is why the pair is split).
+        x = ttnn.gelu(x, variant=ttnn.GeluVariant.FastLut)
 
         # HAND THE STACK BACK ITS DRAM TENSOR.  Everything above now runs L1-resident and sharded,
         # but the positional-embedding add and the 32 encoder layers below are written against a
