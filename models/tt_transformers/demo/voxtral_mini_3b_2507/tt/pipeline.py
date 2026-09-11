@@ -1009,12 +1009,28 @@ class VoxtralPipeline:
         tiled path still runs, so correctness never depends on the faster layout being available.
         """
         try:
-            te = self.embed(ids_tt, layout=ttnn.ROW_MAJOR_LAYOUT)  # [B, C, hidden] ROW_MAJOR
-            head = ttnn.slice(te, (0, 0, 0), (batch, audio_start, self.hidden))
-            tail = ttnn.slice(te, (0, audio_start + n_audio, 0), (batch, self.C, self.hidden))
+            # SLICE THE IDS, NOT THE EMBEDDINGS.  The audio run is `n_audio` of the `C` prefill
+            # positions -- 375 of 416 here -- and every one of those rows is a placeholder id whose
+            # embedding the concat below throws straight back away in favour of `audio_embeds`.  So
+            # the gather was reading and writing 416/41 = ten times the rows anything downstream
+            # reads: the capture prices it at 356.9 us for [8, 416] -> [8, 416, 3072], which is
+            # 20.4 MB of table rows fetched and 20.4 MB written for 2.0 MB the model keeps.
+            # Cutting the id tensor first is exact -- an embedding is position-wise, so gathering
+            # rows [0:audio_start] and [audio_start+n_audio:C] gives byte-identical values to
+            # gathering all C and slicing afterwards -- and the ids are uint32 [B, C], 13 kB, so the
+            # two slices that replace it are the cheapest ops in the stage.
             audio_rm = ttnn.to_layout(audio_embeds, ttnn.ROW_MAJOR_LAYOUT)
-            merged = ttnn.concat([head, audio_rm, tail], dim=1)
-            ttnn.deallocate(te)
+            pieces = []
+            if int(audio_start) > 0:
+                head_ids = ttnn.slice(ids_tt, (0, 0), (batch, int(audio_start)))
+                pieces.append(self.embed(head_ids, layout=ttnn.ROW_MAJOR_LAYOUT))
+                ttnn.deallocate(head_ids)
+            pieces.append(audio_rm)
+            if int(audio_start) + int(n_audio) < int(self.C):
+                tail_ids = ttnn.slice(ids_tt, (0, int(audio_start) + int(n_audio)), (batch, int(self.C)))
+                pieces.append(self.embed(tail_ids, layout=ttnn.ROW_MAJOR_LAYOUT))
+                ttnn.deallocate(tail_ids)
+            merged = ttnn.concat(pieces, dim=1) if len(pieces) > 1 else pieces[0]
             # ...AND FOLD THE STREAMS FOR THAT ONE TILIZE.  The concat cannot be folded -- every
             # stream has its own head/audio/tail seam, so [B, C, H] and [1, B*C, H] are different
             # joins -- but the tilize after it can, and it is the op that cares: a leading dim is
