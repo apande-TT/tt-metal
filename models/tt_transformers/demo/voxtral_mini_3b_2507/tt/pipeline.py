@@ -1420,8 +1420,13 @@ class VoxtralPipeline:
         return self.decode_step()
 
     def _reset_kv(self):
+        # ZERO THE CACHE IN THE CACHE'S OWN DTYPE.  `_to_dev` defaults to bf16, so the source of
+        # every one of these copies was a 10.5 MB bf16 tensor being read, converted and packed into
+        # a 5.6 MB bf8_b slot -- 37.4 us per copy, two per layer, on a tensor that is all zeros.
+        # KV_DTYPE makes it a same-format copy of half the bytes, and zero is exactly representable
+        # in every one of these formats, so the cache it leaves behind is identical.
         z = torch.zeros(self.B, self.n_kv, self.KV_C, self.head_dim)
-        zt = _to_dev(z, self.device)
+        zt = _to_dev(z, self.device, dtype=KV_DTYPE)
         for slot in self.kv:
             ttnn.copy(zt, slot.k)
             ttnn.copy(zt, slot.v)
