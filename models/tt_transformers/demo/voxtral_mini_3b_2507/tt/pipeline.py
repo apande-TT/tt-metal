@@ -879,7 +879,7 @@ class VoxtralPipeline:
             batch=B,
         )
 
-    def _frame_concat(self, h):
+    def _frame_fold(self, h):
         """The tower's 1500 frames folded four at a time into the projector's 375 x 5120 input.
 
         DO THE FOLD IN ROW_MAJOR -- the same argument `_merge_audio` makes one stage later.  This
@@ -890,33 +890,102 @@ class VoxtralPipeline:
 
         In ROW_MAJOR the fold is FREE: pages are the last dim, so [1, 1500, 1280] is 1500 pages of
         1280 and [1, 375, 5120] is 375 pages of 5120 -- four consecutive old pages ARE one new
-        page, in order, in the same buffer.  That leaves one untilize and one tilize where there
-        were an untilize, a retilize, a pad and two typecasts, and the tilize runs on the SMALLER
-        of the two shapes.
+        page, in order, in the same buffer.
 
-        Kept behind a fallback for the reason _merge_audio is: if the row-major ops refuse these
+        AND IT STOPS SHORT OF THE TILIZE, which used to be part of this helper.  The tilize is the
+        part `_project_batched` wants to do ONCE for the whole batch rather than once per stream,
+        and it can only join the streams while they are still row-major -- 375 is not a multiple of
+        32, so in TILE layout the streams do not meet at a tile boundary at all.  So this returns
+        the row-major fold when the layout ops take these shapes and the TILE fallback tensor
+        otherwise, and the caller tests the LAYOUT rather than a flag.
+
+        Kept behind that fallback for the reason _merge_audio is: if the row-major ops refuse these
         shapes the original reshape still runs, so correctness never depends on the faster layout.
         """
         shape = (1, ENCODE_FRAMES // 4, self.config.audio_config.intermediate_size)
         try:
-            rm = ttnn.to_layout(h, ttnn.ROW_MAJOR_LAYOUT)
-            return ttnn.to_layout(ttnn.reshape(rm, shape), ttnn.TILE_LAYOUT)
+            return ttnn.reshape(ttnn.to_layout(h, ttnn.ROW_MAJOR_LAYOUT), shape)
         except (RuntimeError, TypeError, ValueError):
             return ttnn.reshape(h, shape)
 
     # --------------------------------------------------------- STAGE: encode
     def encode(self, dev_in: DeviceInputs):
         """mel -> audio embeds in the LLM hidden space.  Pure ttnn."""
-        outs = []
+        folds = []
         hidden_last = None
         for i, mel in enumerate(dev_in.mel_tt):
             tower = self.enc_a if i < (dev_in.batch // 2) else self.enc_b
             h = tower(mel)  # (1,1500,1280)
             hidden_last = h
-            h = self._frame_concat(h)  # (1,375,5120)
-            outs.append(self.proj(h))  # (1,375,3072)
+            folds.append(self._frame_fold(h))  # (1,375,5120), row-major if it can be
         self._last_encoder_hidden = hidden_last
+
+        batched = self._project_batched(folds)
+        if batched is not None:
+            return batched
+        outs = [self.proj(self._tiled(f)) for f in folds]  # (1,375,3072) each
         return outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=0)  # (B,375,3072)
+
+    @staticmethod
+    def _tiled(t):
+        return t if t.layout == ttnn.TILE_LAYOUT else ttnn.to_layout(t, ttnn.TILE_LAYOUT)
+
+    def _project_batched(self, folds):
+        """The projector's TWO matmuls for all B streams in ONE launch each, or None.
+
+        THE PROJECTOR WAS INSIDE THE PER-STREAM LOOP, AND IT DOES NOT BELONG THERE.  It is two
+        position-wise linears -- 5120 -> 3072 and 3072 -> 3072 -- so which stream a row came from
+        is not information either matmul uses; running them per stream buys nothing and costs a
+        launch, a weight pass and a block plan sized for a twelfth of the rows.  The capture prices
+        the pair at 91.2 + 57.6 us per stream, and the plan is the reason: 375 rows is 12 tile rows
+        against a 96-tile-wide weight, about ten output tiles per core on a 110-core grid, so most
+        of each core's DEST and most of the in0 multicast are idle whatever block config is chosen.
+        Joined, the same maths is 94 tile rows against the same weight -- eighty-odd output tiles
+        per core, one pass over each weight instead of eight, and two launches instead of sixteen.
+        This is the projector's `structural` rung: the arithmetic is untouched, the SCHEDULE is not.
+
+        THE JOIN HAS TO HAPPEN ROW-MAJOR, which is why `_frame_fold` stops short of the tilize.
+        Each fold is 375 rows and 375 is not a multiple of 32, so in TILE layout the streams do not
+        meet at a tile boundary and `ttnn.concat` would untilize all eight, join, and retilize --
+        paying for the layout twice over to save a matmul.  Row-major pages are the last dim, so
+        eight [1, 375, 5120] folds are 3000 consecutive pages of 5120 and the join is a page
+        append; then ONE tilize runs on the joined tensor instead of eight on the pieces, and the
+        un-join afterwards is the same page-append argument read backwards, i.e. a metadata view.
+
+        Returns None (and the caller keeps the per-stream loop) for a single stream, for a fold the
+        row-major path refused, or if any of these ops declines the joined shape -- the per-stream
+        body computes the identical value from the identical folds, so correctness never depends on
+        the batched schedule being available.
+        """
+        if len(folds) < 2 or any(f.layout != ttnn.ROW_MAJOR_LAYOUT for f in folds):
+            return None
+        try:
+            joined = ttnn.concat(folds, dim=1)  # (1, B*375, 5120) ROW_MAJOR
+            # RELEASE THE PIECES THE MOMENT THE JOIN HAS THEM.  Holding all B folds is the one cost
+            # this schedule adds over the per-stream loop, which consumed each one immediately: at
+            # 375 x 5120 bf16 that is 3.8 MB per stream, and the joined copy beside them is another
+            # 30 MB, so the peak lands on top of a trace region already sized for the whole prefill.
+            for _f in folds:
+                ttnn.deallocate(_f)
+            x = ttnn.to_layout(joined, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(joined)
+            y = self.proj(x)  # (1, B*375, 3072)
+            ttnn.deallocate(x)
+            # Hand the streams back apart row-major, which is also the layout `_merge_audio` asks
+            # this tensor for one op later -- so the untilize here replaces the one it was doing.
+            # NAME DRAM ON THE WAY OUT.  The projector's own output config is sized per call, and at
+            # B times the rows it legitimately lands in L1 -- but the tensor this returns is ALIVE
+            # for the whole of prefill (its consumer is the audio/text merge), and an 18.9 MB L1
+            # tenant held across the LM stack is L1 the attention and FFN circular buffers under it
+            # have to plan around.  The per-stream loop never posed that question because each of
+            # its pieces was a twelfth of the size.
+            y = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            y = ttnn.reshape(y, (len(folds), ENCODE_FRAMES // 4, self.hidden))
+            out = ttnn.to_layout(y, ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(y)
+            return out
+        except (RuntimeError, TypeError, ValueError):
+            return None
 
     # -------------------------------------------------------- STAGE: prefill
     def _merge_audio(self, ids_tt, audio_embeds, audio_start, n_audio, batch):
@@ -963,7 +1032,9 @@ class VoxtralPipeline:
             te = self.embed(ids_tt)  # [B, C, hidden] TILE
             head = ttnn.slice(te, (0, 0, 0), (batch, audio_start, self.hidden))
             tail = ttnn.slice(te, (0, audio_start + n_audio, 0), (batch, self.C, self.hidden))
-            return ttnn.concat([head, audio_embeds, tail], dim=1)
+            # `encode` hands this tensor back in whichever layout its own fast path left it in, so
+            # the TILE fallback has to name the layout it joins in rather than assume one.
+            return ttnn.concat([head, self._tiled(audio_embeds), tail], dim=1)
 
     def _lm_forward(self, h, *, rope, kv_slots, mode):
         # RUN THE INDIVIDUALLY-ROUTED LAYERS THAT WERE ACTUALLY BUILT. These were three straight-line
