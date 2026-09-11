@@ -270,7 +270,21 @@ class TtVoxtralEncoderLayer:
             activation="gelu",
             memory_config=_DS.ffn_config(S, int(self.fc1_weight.shape[-1]), _ACT_DTYPE),
         )
-        x = _DS.mm(self.device, x, self.fc2_weight, _PROJ_CFG, bias=self.fc2_bias)
+        # FF2 WRITES WHERE THE RESIDUAL ADD READS.  Every other projection in this block already
+        # names its consumer's placement -- out_proj hands the attention residual an L1 tensor and
+        # fc1 hands fc2 one -- and fc2 was the single call still defaulting to DRAM.  Its only
+        # consumer is the add on the very next line, which asks for the L1 stream, so an
+        # interleaved-DRAM output costs a full write plus a full read of a 2.05 MB value nothing
+        # else reads, once per layer across the tower's 32 blocks.  Same helper and same width
+        # argument as out_proj above, because it is the same [rows, 1280] layer stream.
+        x = _DS.mm(
+            self.device,
+            x,
+            self.fc2_weight,
+            _PROJ_CFG,
+            bias=self.fc2_bias,
+            memory_config=_DS.ffn_config(S, int(self.fc2_weight.shape[-1]), _ACT_DTYPE),
+        )
         x = ttnn.add(residual, x, dtype=_ACT_DTYPE, memory_config=_DS.stream_config(residual, _ACT_DTYPE))
 
         return x
