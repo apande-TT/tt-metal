@@ -137,7 +137,22 @@ _CONV_CFG = ttnn.WormholeComputeKernelConfig(
 # happens to hold, where a standalone unary is free to spread over the whole grid.  The bias is
 # different in kind and does pay -- it is a channel vector the kernel applies as it packs, not a
 # transcendental -- so it stays fused and the gelu stays a separate op.
-_CONV2D_CFG = ttnn.Conv2dConfig()
+#
+# conv1 HOLDS 100 CORES AND STILL RUNS AT A THIRD OF ITS MATH PEAK -- IT IS SHORT OF OVERLAP, NOT
+# OF CORES.  The capture prices this call at 40.7 us for 2.96 GFLOP, i.e. 72.7 TFLOP/s on a part
+# whose bf16 HiFi2 ceiling is several times that, on a full-width 100-core shard.  conv2d streams
+# the halo'd activation and the prepared weight through circular buffers this config sizes, and
+# with ONE block in each the reader and the math engine take turns: the matrix engine idles while
+# the next act block arrives, then the NoC idles while it multiplies.  Double-buffering both
+# operand CBs lets the next act block and the next weight slice land during the current multiply.
+# It is affordable HERE specifically: conv1's inner dimension is 128 channels x 3 taps = 384, and
+# its prepared weight is 983 kB across the grid, so a second block of each is a small L1 tenant --
+# on conv2 (1280 channels, 9.8 MB of kernel) the same flags would be a real capacity trade, which
+# is why this sits on conv1's config and not on the shared one below.
+_CONV2D_CFG = ttnn.Conv2dConfig(
+    enable_act_double_buffer=True,
+    enable_weights_double_buffer=True,
+)
 
 # conv2 IS THE LAST bf16 WEIGHT MASS IN THE ENCODE STACK.  Its kernel is 1280 x 1280 x 3 = 4.9 M
 # parameters, 9.8 MB at bf16, and the profiler prices the call at 105.2 us for 1.5 GFLOP -- 46% of
