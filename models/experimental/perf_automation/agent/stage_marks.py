@@ -428,6 +428,82 @@ _MARK_PASS_TEMPLATE = """{i}# --- per-stage marks (injected) -------------------
 {i}    print("STAGE_MARKS_SKIPPED=%r" % (_tt_e2,), flush=True)
 """
 
+# The two lines that bound a _MARK_PASS_TEMPLATE block in already-generated text, stripped of the
+# `{i}`/`{bind}` placeholders -- derived from the template itself so the two copies cannot drift.
+_MARK_PASS_START_LINE = _MARK_PASS_TEMPLATE.splitlines()[0].replace("{i}", "").strip()
+_MARK_PASS_END_LINE = [ln for ln in _MARK_PASS_TEMPLATE.splitlines() if ln.strip()][-1].replace("{i}", "").strip()
+
+
+def _strip_mark_pass(text: str):
+    """(text with an existing per-stage pass block removed, the 1-indexed line STAGE_MARKS_ENTER
+    was on) -- or (text, None) when no such block is present."""
+    lines = text.splitlines(keepends=True)
+    start = end = None
+    for i, ln in enumerate(lines):
+        if start is None and _MARK_PASS_START_LINE in ln:
+            start = i
+        elif start is not None and _MARK_PASS_END_LINE in ln:
+            end = i
+            break
+    if start is None or end is None:
+        return text, None
+    marker = next((j + 1 for j in range(start, end + 1) if "STAGE_MARKS_ENTER" in lines[j]), None)
+    return "".join(lines[:start] + lines[end + 1 :]), marker
+
+
+def _enclosing_function_at(tree, lineno: int):
+    """The innermost function whose body spans `lineno`, or None."""
+    best = None
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.lineno <= lineno <= (node.end_lineno or node.lineno):
+            if best is None or node.lineno > best.lineno:
+                best = node
+    return best
+
+
+def _relocate_mark_pass(text: str) -> tuple:
+    """Marks already exist here -- but "there are marks" and "they are in the right place" are
+    different questions, and only the first one used to get asked. A placement rule fixed AFTER a
+    test was generated (this file's own history: nemotron's first injection landed 16 lines before
+    its pipeline existed) would otherwise stay wrong forever, because nothing ever re-examined an
+    already-marked file.
+
+    NARROW ON PURPOSE: only relocates when the pipeline genuinely did not exist yet at the marks'
+    current position -- the one confirmed failure mode. _mark_pass_site's own preferred site can
+    differ from an already-correct placement without either one being wrong (a real loop a few
+    lines after the pipeline is just as valid as landing right after it); rewriting every such file
+    to match today's preferred spot would be a silent, unasked-for behavior change to files that
+    already work. Only a marker that ran BEFORE the pipeline call it needed is unconditionally
+    wrong, so only that case is fixed.
+    """
+    stripped, marker_line = _strip_mark_pass(text)
+    if marker_line is None:
+        return text, "already injected"  # only the outer start/stop bracket exists here
+    try:
+        tree = ast.parse(stripped)
+    except SyntaxError:
+        return text, "already injected"
+    fn = _enclosing_function_at(tree, marker_line)
+    if fn is None:
+        return text, "already injected"
+    build_site = _build_pipeline_call_site(fn)
+    if build_site is None or marker_line >= build_site[0]:
+        # No direct build_pipeline call to check against (e.g. reached through a helper, as
+        # voxtral's does), or the pipeline already existed when the marks ran -- leave it alone.
+        return text, "already injected"
+    end, find = _mark_pass_site(stripped, fn.name)
+    if end is None:
+        return text, "already injected"
+    lines = stripped.splitlines(keepends=True)
+    _prep = find_input_preparer(stripped, end)
+    lines.insert(end, _MARK_PASS_TEMPLATE.format(i=find, bind=(", bind=%s" % _prep) if _prep else ""))
+    relocated = "".join(lines)
+    if relocated == text:
+        return text, "already injected"
+    return relocated, "relocated the per-stage pass in %s()" % fn.name
+
 
 def _env_value(node, env: dict):
     """os.environ.get("NAME"[, default]) evaluated against `env`, or _UNKNOWN."""
@@ -590,9 +666,13 @@ def inject_stage_marks(text: str) -> tuple:
 
     Idempotent, and refuses rather than guesses: no bare `_eager_forward()` statement, or a test that
     does not define the helpers the block needs, means no injection and a stated reason.
+
+    Re-injection RELOCATES rather than just detects: a placement bug fixed after a test already has
+    marks (see _relocate_mark_pass) must not stay wrong forever just because "some marks" is not the
+    same question as "marks in the right place".
     """
     if "_tt_sm" in text:
-        return text, "already injected"
+        return _relocate_mark_pass(text)
     lines = text.splitlines(keepends=True)
     # THE CALL THE PROFILER ACTUALLY REACHES, decided by evaluating the test's own branches under the
     # environment the tracy subprocess is given. Position is not a signal: the previous rule took the
@@ -621,6 +701,29 @@ def inject_stage_marks(text: str) -> tuple:
     return "".join(o), "injected at line %d, per-stage pass in %s()" % (k + 1, fname)
 
 
+def _build_pipeline_call_site(node):
+    """(index of the line AFTER the statement that calls a `build_pipeline`-named factory directly
+    inside `node`, that statement's own indent), or None when no such call is visible here.
+
+    `build_pipeline(device, ...)` is the one factory name perf_test_gen requires every generated
+    test to call (see its own instructions to the generator) -- not a per-model guess, the same
+    fixed contract PIPELINE_STAGES and <stage>_trace_step already are. A test that instead reaches
+    the pipeline through its own helper (e.g. `pipe = _get_pipe(device)`) has no such call visible
+    here; that shape falls through to the loop-based site below, unchanged.
+    """
+    for stmt in ast.walk(node):
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.Expr)):
+            continue
+        for call in ast.walk(stmt):
+            if not isinstance(call, ast.Call):
+                continue
+            fn = call.func
+            fname = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+            if fname == "build_pipeline":
+                return (stmt.end_lineno or stmt.lineno), " " * stmt.col_offset
+    return None
+
+
 def _mark_pass_site(text: str, name: str):
     """Where the per-stage pass goes inside `name`: (insert index, that body's indent).
 
@@ -632,12 +735,26 @@ def _mark_pass_site(text: str, name: str):
     Reproduced and fixed on device: 1 signpost before, all 7 after.
 
     The bulk of a perf pass is its loop over inputs, and the pipeline is built before that loop --
-    it is what the loop iterates against. So the first loop in the body is the earliest point that is
-    both inside the instrumentation budget and late enough for the pipeline to exist. Structural, so
-    nothing is assumed about what the test calls its stages, its pipeline or its inputs.
+    it is what the loop iterates against. So the first loop AFTER the pipeline is built is the
+    earliest point that is both inside the instrumentation budget and late enough for the pipeline
+    to exist. "The first loop in the body", full stop, only means that when the pipeline happens to
+    be built before every loop in the function -- true of some generated tests, not all: one model's
+    generated test builds the pipeline only after an earlier, unrelated loop (wrapping ttnn ops so
+    the profiler flushes periodically), and taking that first loop landed the pass before the
+    pipeline existed, so mark_stages_in_scope found no object to mark and split nothing. Structural,
+    so nothing is assumed about what the test calls its stages or its inputs -- only that a call
+    literally named build_pipeline, when visible in this function, cannot have produced the
+    pipeline until after it returns.
 
-    A body with no loop keeps the previous site (before the return), which is still correct for a
-    pass small enough not to exhaust tracy.
+    WHEN build_pipeline IS VISIBLE HERE, its site wins outright, ahead of any loop -- it is both
+    correct (the pipeline exists) and no later than any loop could be, so searching further only
+    risks landing on some unrelated loop that happens to sit after it (a `finally:` cleanup loop,
+    say) instead of the real one, or none at all if the measured call is one opaque forward with
+    its own loop hidden inside it. The loop search below is what a test without a direct
+    build_pipeline call still needs (e.g. one that reaches the pipeline through its own helper).
+
+    A body with neither a visible build_pipeline call nor a loop keeps the previous site (before
+    the return), which is still correct for a pass small enough not to exhaust tracy.
     """
     end, indent = _function_body_end(text, name)
     if end is None:
@@ -649,6 +766,9 @@ def _mark_pass_site(text: str, name: str):
     for node in ast.walk(tree):
         if not (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name and node.body):
             continue
+        build_site = _build_pipeline_call_site(node)
+        if build_site is not None:
+            return build_site
         for st in ast.walk(node):
             if isinstance(st, (ast.For, ast.AsyncFor, ast.While)):
                 # The loop's OWN indent, not the body's: the pass is a sibling of the loop, and a
