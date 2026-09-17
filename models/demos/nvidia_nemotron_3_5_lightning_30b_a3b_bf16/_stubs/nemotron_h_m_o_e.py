@@ -87,6 +87,8 @@ class TtNemotronHMOE:
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
+        cg = device.compute_with_storage_grid_size()
+        self._core_grid = ttnn.CoreGrid(y=cg.y, x=cg.x)
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -190,11 +192,11 @@ class TtNemotronHMOE:
         hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
         out = None
         for e in range(E):
-            up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self.ckc)  # (B,T,inter) bf16
+            up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self.ckc, core_grid=self._core_grid)  # (B,T,inter) bf16
             act = ttnn.relu(up)
             ttnn.deallocate(up)
             act = ttnn.multiply(act, act)  # relu2
-            down = ttnn.matmul(act, self._down[e], compute_kernel_config=self.ckc)  # (B,T,hidden) bf16
+            down = ttnn.matmul(act, self._down[e], compute_kernel_config=self.ckc, core_grid=self._core_grid)  # (B,T,hidden) bf16
             ttnn.deallocate(act)
             down_f = ttnn.typecast(down, ttnn.float32)
             ttnn.deallocate(down)
@@ -210,11 +212,11 @@ class TtNemotronHMOE:
         ttnn.deallocate(W)
 
         # ---------------- shared expert (fp32) ----------------
-        s_up = ttnn.matmul(hs_bf, self._sh_up, compute_kernel_config=self.ckc)
+        s_up = ttnn.matmul(hs_bf, self._sh_up, compute_kernel_config=self.ckc, core_grid=self._core_grid)
         s_act = ttnn.relu(s_up)
         ttnn.deallocate(s_up)
         s_act = ttnn.multiply(s_act, s_act)
-        s_down = ttnn.matmul(s_act, self._sh_down, compute_kernel_config=self.ckc)
+        s_down = ttnn.matmul(s_act, self._sh_down, compute_kernel_config=self.ckc, core_grid=self._core_grid)
         ttnn.deallocate(s_act)
         ttnn.deallocate(hs_bf)
         s_down_f = ttnn.typecast(s_down, ttnn.float32)

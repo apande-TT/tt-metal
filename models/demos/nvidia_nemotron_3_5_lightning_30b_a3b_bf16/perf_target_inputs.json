@@ -1,0 +1,41 @@
+{
+  "weight_bytes": 65827374264,
+  "dominant_dtype": "bfloat16",
+  "source": "checkpoint bytes + HF config",
+  "total_params": 32560944704,
+  "params_basis": "read set for unit=unknown: lookup-only and tower-only tensors excluded",
+  "is_moe": true,
+  "active_params": 3000000000,
+  "blocks": {
+    "backbone": {
+      "layers": 52,
+      "hidden_size": 2688,
+      "intermediate_size": 1856,
+      "kv_heads": 2,
+      "head_dim": 128,
+      "params": 31225618752,
+      "lookup_params": 352321536,
+      "matmul_params": 30873297216
+    }
+  },
+  "layers": 52,
+  "kv_heads": 2,
+  "head_dim": 128,
+  "hidden_size": 2688,
+  "intermediate_size": 1856,
+  "device_weight_bytes": 6146980864,
+  "device_census_complete": true,
+  "device_section_bytes": {
+    "unmatched": 6091401984,
+    "layers": 4033040896,
+    "experts": 2554331136,
+    "mixer": 1318535680,
+    "block": 77533184,
+    "backbone": 55578880,
+    "shared": 39911424,
+    "router": 2752512,
+    "norm": 64512,
+    "final_norm": 10752
+  },
+  "bytes_per_param": 2.2765
+}
