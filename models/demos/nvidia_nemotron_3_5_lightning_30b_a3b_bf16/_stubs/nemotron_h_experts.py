@@ -132,6 +132,14 @@ class TtNemotronHExperts:
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
+        # LoFi is safe for the bf8_b expert MLP matmuls (weights already
+        # lossy); the TP selector matmul above keeps self.ckc (HiFi4).
+        self._expert_ckc = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.LoFi,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
         cg = dev.compute_with_storage_grid_size()
         self._core_grid = ttnn.CoreGrid(y=cg.y, x=cg.x)
 
@@ -164,7 +172,7 @@ class TtNemotronHExperts:
         return ttnn.from_torch(torch_tensor, dtype=dtype, layout=layout, device=self.device)
 
     def _devw(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
-        return self._upload(torch_tensor.to(torch.bfloat16), ttnn.bfloat16, layout)
+        return self._upload(torch_tensor.to(torch.bfloat16), ttnn.bfloat8_b, layout)
 
     def _dev(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
         return self._upload(torch_tensor.float(), ttnn.float32, layout)
@@ -235,11 +243,11 @@ class TtNemotronHExperts:
         Eloc = self._Eloc
         hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
         for e in range(Eloc):
-            up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self.ckc, core_grid=self._core_grid)  # (T, inter) bf16
+            up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid)  # (T, inter) bf16
             act = ttnn.relu(up)
             ttnn.deallocate(up)
             act = ttnn.multiply(act, act)  # relu2
-            down = ttnn.matmul(act, self._down[e], compute_kernel_config=self.ckc, core_grid=self._core_grid)  # (T, hidden) bf16
+            down = ttnn.matmul(act, self._down[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid)  # (T, hidden) bf16
             ttnn.deallocate(act)
             down_f = ttnn.typecast(down, ttnn.float32)
             ttnn.deallocate(down)
