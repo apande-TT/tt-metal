@@ -240,7 +240,7 @@ def fill_kv_prefill(kv, k, v):
 # region, which is reserved per program regardless of what else is live, so per-core arithmetic
 # against the 1.5 MB budget does not predict it.  4 MB keeps the audio tower in L1 and lets prefill
 # fall back to DRAM, which is exactly what the size gate below is for.
-_STREAM_L1_MAX_BYTES = 4 * 1024 * 1024
+_STREAM_L1_MAX_BYTES = 0
 
 # THE DECODE ATTENTION KEEPS HiFi4 EVEN THOUGH ITS CACHE IS BLOCK-FLOAT, and that is measured, not
 # inherited.  The KV cache is bf8_b (pipeline.KV_DTYPE) and q arrives narrow, so by the same argument
@@ -1603,6 +1603,7 @@ def _same_plan_tighter_blocks(full, tight):
         return False
     return 0 < tight_area < full_area and tight_area >= full_area * _MIN_TIGHT_BLOCK_FRACTION
 
+
 # THE GUARD IS ABOUT OUTPUT TILES, AND THE ROW COUNT WAS ONLY EVER A PROXY FOR THEM.
 # _GRID_REQUEST_MIN_ROWS exists to keep the DECODE shape off the 2-D path: at one tile row there is
 # a single row of blocks, so no block config can buy DEST reuse and spreading the launch costs more
@@ -2464,9 +2465,7 @@ def _concat_heads_decode(attn_out, batch, num_heads, head_dim, mirror=None):
                 prealloc = ttnn.allocate_tensor_on_device(
                     ttnn.Shape([1, 1, int(batch), width]), xs.dtype, ttnn.TILE_LAYOUT, dev, want
                 )
-        joined = ttnn.experimental.nlp_concat_heads_decode(
-            xs, num_heads=int(num_heads), output_tensor=prealloc
-        )
+        joined = ttnn.experimental.nlp_concat_heads_decode(xs, num_heads=int(num_heads), output_tensor=prealloc)
         if xs is not attn_out:
             ttnn.deallocate(xs)
         jd = [int(d) for d in joined.shape]

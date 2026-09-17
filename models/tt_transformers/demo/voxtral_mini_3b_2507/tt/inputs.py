@@ -285,9 +285,11 @@ def clip_path(filename: str) -> str:
 
 def _resolve_clips(n: int, clips: list[str] | None) -> list[str]:
     if clips is None:
-        if not 1 <= n <= len(AUDIO_CLIPS):
-            raise ValueError(f"n must be in [1, {len(AUDIO_CLIPS)}] when clips is None, got {n}")
-        return list(AUDIO_CLIPS[:n])
+        if n < 1:
+            raise ValueError(f"n must be >= 1 when clips is None, got {n}")
+        if n <= len(AUDIO_CLIPS):
+            return list(AUDIO_CLIPS[:n])
+        return [AUDIO_CLIPS[i % len(AUDIO_CLIPS)] for i in range(n)]
     # An explicit clip list always wins over `n` (which keeps its default of 8).
     clips = list(clips)
     if not clips:

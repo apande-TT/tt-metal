@@ -130,7 +130,7 @@ def main(argv=None) -> int:
         device = ttnn.open_device(device_id=0, l1_small_size=L1_SMALL_SIZE, trace_region_size=TRACE_REGION_SIZE)
         try:
             print("[demo] building the pipeline (HF weights + graduated stub uploads; takes minutes)...")
-            pipe = build_pipeline(device)
+            pipe = build_pipeline(device, batch_size=args.batch_size)
             res = pipe.run_audio_chat(batch, max_new_tokens=args.max_new_tokens)
 
             print("\n" + "=" * 88)
