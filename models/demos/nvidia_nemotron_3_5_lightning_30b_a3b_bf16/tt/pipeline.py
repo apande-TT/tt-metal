@@ -563,7 +563,9 @@ class NemotronHPipeline:
 
         for step in range(N):
             logits = self.forward_logits(ids_tt, last_only=True)  # (B,1,vocab) on device
-            nxt = ttnn.argmax(logits, dim=-1)  # on-device greedy pick
+            logits_rm = ttnn.untilize(logits, use_multicore=True)
+            nxt = ttnn.argmax(logits_rm, dim=-1)  # on-device greedy pick, multicore (ROW_MAJOR last-dim)
+            ttnn.deallocate(logits_rm)
             step_logits.append(_first_shard(logits).reshape(B, -1)[:, : self.vocab_size].float())
             ttnn.deallocate(logits)
 
