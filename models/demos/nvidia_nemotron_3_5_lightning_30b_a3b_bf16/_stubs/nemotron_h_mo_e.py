@@ -156,7 +156,7 @@ class TtNemotronHMOE:
             dn_full = sd["experts.down_proj"].transpose(-1, -2).contiguous()  # (E, inter, in)
             for e in range(E):
                 self._up.append(self._devw(up_full[e]))
-                self._down.append(self._devw(dn_full[e]))
+                self._down.append(self._devw4(dn_full[e]))
             self._sel = None
             self._Eloc = E
 
@@ -215,6 +215,10 @@ class TtNemotronHMOE:
     def _devw(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
         """bf8_b weight, mesh-replicated (quarters DRAM vs fp32 for the 128 experts)."""
         return self._upload(torch_tensor.to(torch.bfloat16), ttnn.bfloat8_b, layout)
+
+    def _devw4(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
+        """bf4_b weight -- one rung lower than _devw, for the down-proj dtype knob."""
+        return self._upload(torch_tensor.to(torch.bfloat16), ttnn.bfloat4_b, layout)
 
     def _fp32(self, t):
         if isinstance(t, ttnn.Tensor):
