@@ -122,7 +122,7 @@ class TtNemotronHMOE:
                     chunk = torch.stack([stack[d * Eloc + j] for d in range(TP)], dim=0)
                     t = ttnn.from_torch(
                         chunk,
-                        dtype=ttnn.bfloat16,
+                        dtype=ttnn.bfloat8_b,
                         layout=ttnn.TILE_LAYOUT,
                         device=dev,
                         mesh_mapper=ttnn.ShardTensor2dMesh(dev, mesh_shape=_mesh_shape, dims=(None, 0)),
@@ -204,8 +204,8 @@ class TtNemotronHMOE:
         return self._upload(torch_tensor.float(), ttnn.float32, layout)
 
     def _devw(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
-        """bf16 weight, mesh-replicated (halves DRAM for the 128 experts)."""
-        return self._upload(torch_tensor.to(torch.bfloat16), ttnn.bfloat16, layout)
+        """bf8_b weight, mesh-replicated (quarters DRAM vs fp32 for the 128 experts)."""
+        return self._upload(torch_tensor.to(torch.bfloat16), ttnn.bfloat8_b, layout)
 
     def _fp32(self, t):
         if isinstance(t, ttnn.Tensor):
