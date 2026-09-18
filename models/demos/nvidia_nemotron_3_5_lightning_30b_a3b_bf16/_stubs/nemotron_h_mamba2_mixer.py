@@ -419,7 +419,10 @@ class TtNemotronHMamba2Mixer:
         M = ttnn.multiply(CB_h, L)
         ttnn.deallocate(CB_h)
         ttnn.deallocate(L)
-        Y = ttnn.matmul(M, X_disc, compute_kernel_config=self.ckc)  # (B, H, T, HD)
+        cg2 = self.device.compute_with_storage_grid_size()
+        Y = ttnn.matmul(
+            M, X_disc, compute_kernel_config=self.ckc, core_grid=ttnn.CoreGrid(y=cg2.y, x=cg2.x)
+        )  # (B, H, T, HD)
         ttnn.deallocate(M)
         ttnn.deallocate(X_disc)
         Y = ttnn.add(Y, D_res)
