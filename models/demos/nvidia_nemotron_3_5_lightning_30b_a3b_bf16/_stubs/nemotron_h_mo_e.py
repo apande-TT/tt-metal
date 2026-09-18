@@ -295,9 +295,9 @@ class TtNemotronHMOE:
         hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
         out = None
         for e in range(self._Eloc):
-            up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self._expert_ckc)  # (B,T,inter) bf16
-            act = ttnn.relu(up)
-            ttnn.deallocate(up)
+            act = ttnn.linear(
+                hs_bf, self._up[e], compute_kernel_config=self._expert_ckc, activation="relu"
+            )  # (B,T,inter) bf16, relu fused into the matmul
             act = ttnn.square(act)  # relu2
             down = ttnn.matmul(act, self._down[e], compute_kernel_config=self._expert_ckc)  # (B,T,hidden) bf16
             ttnn.deallocate(act)
@@ -320,9 +320,7 @@ class TtNemotronHMOE:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
 
         # ---------------- shared expert (fp32) ----------------
-        s_up = ttnn.matmul(hs_bf, self._sh_up, compute_kernel_config=self._expert_ckc)
-        s_act = ttnn.relu(s_up)
-        ttnn.deallocate(s_up)
+        s_act = ttnn.linear(hs_bf, self._sh_up, compute_kernel_config=self._expert_ckc, activation="relu")
         s_act = ttnn.square(s_act)
         s_down = ttnn.matmul(s_act, self._sh_down, compute_kernel_config=self._expert_ckc)
         ttnn.deallocate(s_act)
