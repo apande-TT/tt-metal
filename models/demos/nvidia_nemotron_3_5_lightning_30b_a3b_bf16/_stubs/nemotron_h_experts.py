@@ -249,11 +249,11 @@ class TtNemotronHExperts:
             act = ttnn.multiply(act, act)  # relu2
             down = ttnn.matmul(act, self._down[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid)  # (T, hidden) bf16
             ttnn.deallocate(act)
-            down_f = ttnn.typecast(down, ttnn.float32)
-            ttnn.deallocate(down)
             we = ttnn.slice(W_sh, [0, e], [num_tokens, e + 1])  # (T,1) fp32, this chip's local column
-            contrib = ttnn.multiply(down_f, we)
-            ttnn.deallocate(down_f)
+            # fuse the bf16->fp32 upcast into the routing-weight multiply (mixed-dtype
+            # multiply, fp32 output) instead of a separate per-expert typecast op.
+            contrib = ttnn.multiply(down, we, dtype=ttnn.float32)
+            ttnn.deallocate(down)
             ttnn.deallocate(we)
             out = contrib if out is None else ttnn.add(out, contrib)
         ttnn.deallocate(hs_bf)
