@@ -301,11 +301,11 @@ class TtNemotronHMOE:
             act = ttnn.multiply(act, act)  # relu2
             down = ttnn.matmul(act, self._down[e], compute_kernel_config=self._expert_ckc)  # (B,T,hidden) bf16
             ttnn.deallocate(act)
-            down_f = ttnn.typecast(down, ttnn.float32)
-            ttnn.deallocate(down)
             we = ttnn.slice(W_use, [0, 0, e], [B, T, e + 1])  # (B,T,1) fp32
-            contrib = ttnn.multiply(down_f, we, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-            ttnn.deallocate(down_f)
+            # fuse the bf16->fp32 upcast into the routing-weight multiply (mixed-dtype
+            # multiply, fp32 output) instead of a separate per-expert typecast op.
+            contrib = ttnn.multiply(down, we, dtype=ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(down)
             ttnn.deallocate(we)
             if out is None:
                 out = contrib
