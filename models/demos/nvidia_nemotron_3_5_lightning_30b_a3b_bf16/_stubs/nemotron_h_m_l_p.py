@@ -113,10 +113,8 @@ class TtNemotronHMLP:
         if hs.layout != ttnn.TILE_LAYOUT:
             hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
 
-        up = ttnn.matmul(hs, self._w_up, compute_kernel_config=self.ckc)  # (.,.,inter) local
+        act = ttnn.linear(hs, self._w_up, compute_kernel_config=self.ckc, activation="relu")  # (.,.,inter) local
         ttnn.deallocate(hs)
-        act = ttnn.relu(up)
-        ttnn.deallocate(up)
         act = ttnn.square(act)  # relu2
 
         out = ttnn.matmul(act, self._w_down, compute_kernel_config=self.ckc)  # (.,.,hidden) partial if sharded
