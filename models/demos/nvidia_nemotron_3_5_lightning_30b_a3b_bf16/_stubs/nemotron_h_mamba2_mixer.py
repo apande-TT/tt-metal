@@ -301,7 +301,10 @@ class TtNemotronHMamba2Mixer:
         consts = self._get_consts(B, T)
 
         # 1. in_proj  -> (B, T, 10304)
-        proj = ttnn.matmul(hs, self._w_in, compute_kernel_config=self.ckc)
+        cg = self.device.compute_with_storage_grid_size()
+        proj = ttnn.matmul(
+            hs, self._w_in, compute_kernel_config=self.ckc, core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x)
+        )
 
         # 2. split: gate(I) | hbc(conv_dim) | dt(H)
         gate = ttnn.slice(proj, [0, 0, 0], [B, T, I])
