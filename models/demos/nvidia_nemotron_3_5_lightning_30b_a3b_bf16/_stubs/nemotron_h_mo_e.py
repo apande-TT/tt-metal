@@ -170,6 +170,15 @@ class TtNemotronHMOE:
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
+        # LoFi is safe for the bf8_b expert MLP matmuls (weights already
+        # lossy); the router/topk-selector matmuls above keep self.ckc (HiFi4)
+        # for topk precision, matching the sibling nemotron_h_experts.py.
+        self._expert_ckc = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.LoFi,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -282,11 +291,11 @@ class TtNemotronHMOE:
         hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
         out = None
         for e in range(self._Eloc):
-            up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self.ckc)  # (B,T,inter) bf16
+            up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self._expert_ckc)  # (B,T,inter) bf16
             act = ttnn.relu(up)
             ttnn.deallocate(up)
             act = ttnn.multiply(act, act)  # relu2
-            down = ttnn.matmul(act, self._down[e], compute_kernel_config=self.ckc)  # (B,T,hidden) bf16
+            down = ttnn.matmul(act, self._down[e], compute_kernel_config=self._expert_ckc)  # (B,T,hidden) bf16
             ttnn.deallocate(act)
             down_f = ttnn.typecast(down, ttnn.float32)
             ttnn.deallocate(down)
@@ -307,11 +316,11 @@ class TtNemotronHMOE:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
 
         # ---------------- shared expert (fp32) ----------------
-        s_up = ttnn.matmul(hs_bf, self._sh_up, compute_kernel_config=self.ckc)
+        s_up = ttnn.matmul(hs_bf, self._sh_up, compute_kernel_config=self._expert_ckc)
         s_act = ttnn.relu(s_up)
         ttnn.deallocate(s_up)
         s_act = ttnn.multiply(s_act, s_act)
-        s_down = ttnn.matmul(s_act, self._sh_down, compute_kernel_config=self.ckc)
+        s_down = ttnn.matmul(s_act, self._sh_down, compute_kernel_config=self._expert_ckc)
         ttnn.deallocate(s_act)
         ttnn.deallocate(hs_bf)
         s_down_f = ttnn.typecast(s_down, ttnn.float32)
