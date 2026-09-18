@@ -224,9 +224,11 @@ class TtNemotronHAttention:
         B, T = shape[0], shape[1]
         H, D = self.num_heads, self.head_dim
 
-        q = ttnn.matmul(hs, self._w_q, compute_kernel_config=self.ckc)  # (B,T,H*D) local
-        k = ttnn.matmul(hs, self._w_k, compute_kernel_config=self.ckc)
-        v = ttnn.matmul(hs, self._w_v, compute_kernel_config=self.ckc)
+        cg_qkv = self.device.compute_with_storage_grid_size()
+        qkv_cg = ttnn.CoreGrid(y=cg_qkv.y, x=cg_qkv.x)
+        q = ttnn.matmul(hs, self._w_q, compute_kernel_config=self.ckc, core_grid=qkv_cg)  # (B,T,H*D) local
+        k = ttnn.matmul(hs, self._w_k, compute_kernel_config=self.ckc, core_grid=qkv_cg)
+        v = ttnn.matmul(hs, self._w_v, compute_kernel_config=self.ckc, core_grid=qkv_cg)
         ttnn.deallocate(hs)
 
         Qh = self._to_heads(q, B, T, H, D)  # (B,H,T,D)
