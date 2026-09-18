@@ -234,7 +234,10 @@ class TtNemotronHAttention:
         attn_flat = self._from_heads(attn, B, T, H, D)  # (B,T,H*D) local
         ttnn.deallocate(attn)
 
-        out = ttnn.matmul(attn_flat, self._w_o, compute_kernel_config=self.ckc)  # (B,T,hidden) partial if sharded
+        cg = self.device.compute_with_storage_grid_size()
+        out = ttnn.matmul(
+            attn_flat, self._w_o, compute_kernel_config=self.ckc, core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x)
+        )  # (B,T,hidden) partial if sharded
         ttnn.deallocate(attn_flat)
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
