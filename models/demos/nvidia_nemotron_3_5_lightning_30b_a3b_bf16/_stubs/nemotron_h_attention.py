@@ -105,13 +105,13 @@ class TtNemotronHAttention:
             self._w_q = self._shd(Wq, 1)
             self._w_k = self._shd(Wk_exp, 1)
             self._w_v = self._shd(Wv_exp, 1)
-            self._w_o = self._shd(Wo, 0)
+            self._w_o = self._shdw16(Wo, 0)
             self.num_heads = num_heads // TP
         else:
             self._w_q = self._dev(Wq)
             self._w_k = self._dev(Wk_exp)
             self._w_v = self._dev(Wv_exp)
-            self._w_o = self._dev(Wo)
+            self._w_o = self._devw16(Wo)
 
         self.ckc = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -156,6 +156,30 @@ class TtNemotronHAttention:
         return ttnn.from_torch(
             torch_tensor,
             dtype=ttnn.float32,
+            layout=layout,
+            device=self.device,
+            mesh_mapper=ttnn.ShardTensor2dMesh(self.device, mesh_shape=self._mesh_shape, dims=(None, dim)),
+        )
+
+    def _devw16(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
+        """bf16 projection weight (o_proj only -- Q/K/V stay fp32/native per the
+        attention score-dtype rule; o_proj is a plain post-attention linear)."""
+        t16 = torch_tensor.to(torch.bfloat16)
+        if self._is_mesh():
+            try:
+                return ttnn.from_torch(
+                    t16, dtype=ttnn.bfloat16, layout=layout, device=self.device,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.device),
+                )
+            except Exception:
+                pass
+        return ttnn.from_torch(t16, dtype=ttnn.bfloat16, layout=layout, device=self.device)
+
+    def _shdw16(self, torch_tensor, dim, layout=ttnn.TILE_LAYOUT):
+        """bf16 projection weight sharded along `dim` (see _devw16)."""
+        return ttnn.from_torch(
+            torch_tensor.to(torch.bfloat16),
+            dtype=ttnn.bfloat16,
             layout=layout,
             device=self.device,
             mesh_mapper=ttnn.ShardTensor2dMesh(self.device, mesh_shape=self._mesh_shape, dims=(None, dim)),
