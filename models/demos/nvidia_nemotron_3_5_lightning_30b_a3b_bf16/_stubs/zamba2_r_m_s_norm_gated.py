@@ -251,7 +251,7 @@ class MambaRMSNormGated:
         # Step 1: gate BEFORE norm (norm_before_gate=False) — x = hs * silu(gate)
         if gate is not None:
             gate_silu = ttnn.silu(gate)
-            x = ttnn.mul(hidden_states, gate_silu)
+            x = ttnn.mul(hidden_states, gate_silu, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         else:
             x = hidden_states
 
@@ -287,7 +287,7 @@ class MambaRMSNormGated:
         x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
 
         # Step 3: per-feature learned weight, broadcast over (B, L).
-        x = ttnn.mul(x, self.weight)
+        x = ttnn.mul(x, self.weight, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
         return x
 
