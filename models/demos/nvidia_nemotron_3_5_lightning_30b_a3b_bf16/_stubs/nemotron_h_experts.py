@@ -246,7 +246,7 @@ class TtNemotronHExperts:
             up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid)  # (T, inter) bf16
             act = ttnn.relu(up)
             ttnn.deallocate(up)
-            act = ttnn.multiply(act, act)  # relu2
+            act = ttnn.square(act)  # relu2
             down = ttnn.matmul(act, self._down[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid)  # (T, hidden) bf16
             ttnn.deallocate(act)
             we = ttnn.slice(W_sh, [0, e], [num_tokens, e + 1])  # (T,1) fp32, this chip's local column

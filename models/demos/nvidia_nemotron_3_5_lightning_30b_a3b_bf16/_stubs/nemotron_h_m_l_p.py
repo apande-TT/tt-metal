@@ -117,7 +117,7 @@ class TtNemotronHMLP:
         ttnn.deallocate(hs)
         act = ttnn.relu(up)
         ttnn.deallocate(up)
-        act = ttnn.multiply(act, act)  # relu2
+        act = ttnn.square(act)  # relu2
 
         out = ttnn.matmul(act, self._w_down, compute_kernel_config=self.ckc)  # (.,.,hidden) partial if sharded
         ttnn.deallocate(act)
