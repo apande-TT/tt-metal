@@ -528,7 +528,9 @@ class NemotronHPipeline:
             h = ttnn.slice(h, [0, T - 1, 0], [B, T, self.hidden_size])
         if h.dtype != ttnn.float32:
             h = ttnn.typecast(h, ttnn.float32)
-        return ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.ckc)
+        cg = self.device.compute_with_storage_grid_size()
+        core_grid = ttnn.CoreGrid(y=cg.y, x=cg.x)
+        return ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.ckc, core_grid=core_grid)
 
     def _ids_to_device(self, ids):
         t = ids.to(torch.int32)
