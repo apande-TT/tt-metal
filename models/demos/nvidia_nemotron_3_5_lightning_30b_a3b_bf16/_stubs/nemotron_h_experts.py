@@ -98,7 +98,7 @@ class TtNemotronHExperts:
             self._up, self._down = [], []
             for e in range(E):
                 self._up.append(self._devw4(up_t[e]))
-                self._down.append(self._devw(down_t[e]))
+                self._down.append(self._devw4(down_t[e]))
             self._Eloc = E
 
         # Per-chip expert selector for the DEVICE-SIDE routing path (see the
