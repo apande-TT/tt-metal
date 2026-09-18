@@ -530,6 +530,24 @@ class NemotronHPipeline:
             h = ttnn.typecast(h, ttnn.float32)
         cg = self.device.compute_with_storage_grid_size()
         core_grid = ttnn.CoreGrid(y=cg.y, x=cg.x)
+        num_cores = cg.x * cg.y
+        k_tiles = self.hidden_size // 32
+        n_tiles = self.vocab_size // 32
+        if n_tiles % num_cores == 0:
+            per_core_n = n_tiles // num_cores
+            out_sub_w = max(d for d in range(1, min(4, per_core_n) + 1) if per_core_n % d == 0)
+            pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                compute_with_storage_grid_size=cg,
+                in0_block_w=k_tiles,
+                out_subblock_h=1,
+                out_subblock_w=out_sub_w,
+                per_core_M=1,
+                per_core_N=per_core_n,
+                fuse_batch=True,
+                fused_activation=None,
+                mcast_in0=True,
+            )
+            return ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.ckc, program_config=pc)
         return ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.ckc, core_grid=core_grid)
 
     def _ids_to_device(self, ids):
