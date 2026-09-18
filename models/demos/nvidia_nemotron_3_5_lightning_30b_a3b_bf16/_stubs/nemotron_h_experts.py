@@ -97,7 +97,7 @@ class TtNemotronHExperts:
         else:
             self._up, self._down = [], []
             for e in range(E):
-                self._up.append(self._devw(up_t[e]))
+                self._up.append(self._devw4(up_t[e]))
                 self._down.append(self._devw(down_t[e]))
             self._Eloc = E
 
@@ -173,6 +173,9 @@ class TtNemotronHExperts:
 
     def _devw(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
         return self._upload(torch_tensor.to(torch.bfloat16), ttnn.bfloat8_b, layout)
+
+    def _devw4(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
+        return self._upload(torch_tensor.to(torch.bfloat16), ttnn.bfloat4_b, layout)
 
     def _dev(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
         return self._upload(torch_tensor.float(), ttnn.float32, layout)
