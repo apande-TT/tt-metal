@@ -407,7 +407,10 @@ class TtNemotronHMamba2Mixer:
 
         # 9. CB[h] = C[h] @ B[h]^T  (per head)
         BhT = ttnn.transpose(Bh, -2, -1)  # (B, H, N, T)
-        CB_h = ttnn.matmul(Ch, BhT, compute_kernel_config=self.ckc)  # (B, H, T, T)
+        cg = self.device.compute_with_storage_grid_size()
+        CB_h = ttnn.matmul(
+            Ch, BhT, compute_kernel_config=self.ckc, core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x)
+        )  # (B, H, T, T)
         ttnn.deallocate(BhT)
         ttnn.deallocate(Bh)
         ttnn.deallocate(Ch)
