@@ -243,9 +243,9 @@ class TtNemotronHExperts:
         Eloc = self._Eloc
         hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
         for e in range(Eloc):
-            up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid)  # (T, inter) bf16
-            act = ttnn.relu(up)
-            ttnn.deallocate(up)
+            act = ttnn.linear(
+                hs_bf, self._up[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid, activation="relu"
+            )  # (T, inter) bf16, relu fused into the matmul
             act = ttnn.square(act)  # relu2
             down = ttnn.matmul(act, self._down[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid)  # (T, hidden) bf16
             ttnn.deallocate(act)
