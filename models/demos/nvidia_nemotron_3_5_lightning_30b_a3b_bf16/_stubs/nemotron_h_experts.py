@@ -252,10 +252,10 @@ class TtNemotronHExperts:
             we = ttnn.slice(W_sh, [0, e], [num_tokens, e + 1])  # (T,1) fp32, this chip's local column
             # fuse the bf16->fp32 upcast into the routing-weight multiply (mixed-dtype
             # multiply, fp32 output) instead of a separate per-expert typecast op.
-            contrib = ttnn.multiply(down, we, dtype=ttnn.float32)
+            contrib = ttnn.multiply(down, we, dtype=ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             ttnn.deallocate(down)
             ttnn.deallocate(we)
-            out = contrib if out is None else ttnn.add(out, contrib)
+            out = contrib if out is None else ttnn.add(out, contrib, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(hs_bf)
         ttnn.deallocate(W_sh)
 
