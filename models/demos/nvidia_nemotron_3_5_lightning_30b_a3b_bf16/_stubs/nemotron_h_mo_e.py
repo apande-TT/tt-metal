@@ -298,7 +298,7 @@ class TtNemotronHMOE:
             up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self._expert_ckc)  # (B,T,inter) bf16
             act = ttnn.relu(up)
             ttnn.deallocate(up)
-            act = ttnn.multiply(act, act)  # relu2
+            act = ttnn.square(act)  # relu2
             down = ttnn.matmul(act, self._down[e], compute_kernel_config=self._expert_ckc)  # (B,T,hidden) bf16
             ttnn.deallocate(act)
             we = ttnn.slice(W_use, [0, 0, e], [B, T, e + 1])  # (B,T,1) fp32
@@ -323,7 +323,7 @@ class TtNemotronHMOE:
         s_up = ttnn.matmul(hs_bf, self._sh_up, compute_kernel_config=self._expert_ckc)
         s_act = ttnn.relu(s_up)
         ttnn.deallocate(s_up)
-        s_act = ttnn.multiply(s_act, s_act)
+        s_act = ttnn.square(s_act)
         s_down = ttnn.matmul(s_act, self._sh_down, compute_kernel_config=self._expert_ckc)
         ttnn.deallocate(s_act)
         ttnn.deallocate(hs_bf)
