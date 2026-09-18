@@ -471,7 +471,7 @@ class NemotronHPipeline:
         # lm_head in fp32: HF computes `self.lm_head(...).float()`, and a bf16
         # head visibly costs final-logit PCC.
         lm = model.lm_head.weight.detach().float().t().contiguous()  # (hidden, vocab)
-        self.lm_head_w = _replicate(device, lm, dtype=ttnn.float32)
+        self.lm_head_w = _replicate(device, lm, dtype=ttnn.bfloat8_b)
         self.vocab_size = int(lm.shape[1])
         self.hidden_size = int(lm.shape[0])
 
