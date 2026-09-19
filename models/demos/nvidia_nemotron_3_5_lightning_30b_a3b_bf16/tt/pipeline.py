@@ -111,6 +111,18 @@ def _ckc():
     )
 
 
+def _lm_head_ckc():
+    # lm_head is memory-bound (DRAM read of the huge fp32 vocab weight
+    # dominates); math fidelity doesn't change bytes moved, but HiFi4 is
+    # 2x the Tensix math cost of HiFi2 for no roofline reason here.
+    return ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.LoFi,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=True,
+    )
+
+
 def _is_mesh(device):
     try:
         return isinstance(device, ttnn.MeshDevice)
@@ -424,6 +436,7 @@ class NemotronHPipeline:
         self.hf = model  # HF reference stays reachable: ground truth for section structure
         self.config = model.config
         self.ckc = _ckc()
+        self.lm_head_ckc = _lm_head_ckc()
         self.batch = batch
         self.trace_capacity = trace_capacity
         self.sharded = bool(os.environ.get("TT_HW_PLANNER_SHARD_RUN")) and _is_mesh(device)
@@ -528,7 +541,7 @@ class NemotronHPipeline:
             h = ttnn.slice(h, [0, T - 1, 0], [B, T, self.hidden_size])
         if h.dtype != ttnn.float32:
             h = ttnn.typecast(h, ttnn.float32)
-        return ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.ckc)
+        return ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc)
 
     def _ids_to_device(self, ids):
         t = ids.to(torch.int32)
