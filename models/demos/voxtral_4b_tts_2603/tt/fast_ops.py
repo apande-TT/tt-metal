@@ -98,6 +98,13 @@ _MLP_WEIGHT_KEYS = (
     ("down", "down_proj.weight", ttnn.bfloat8_b),
 )
 
+# Attention's two weight groups. Same split as the MLP's, on the same reasoning: the FUSED qkv
+# weight feeds q/k/v, which go into flash attention and are consumed there, while `wo` is what
+# writes the attention result back into the residual stream. So qkv takes the extra step down and
+# wo holds one above it.
+_QKV_DTYPE = ttnn.bfloat4_b
+_WO_DTYPE = ttnn.bfloat8_b
+
 # The vocab projection's weight format. A decode step streams this whole weight to emit one token
 # per sample, so it is the single largest per-token DRAM read in the model and every halving of it
 # is paid straight back in per-token time.
@@ -585,7 +592,7 @@ def _patch_attention(cls, dtype):
             # the build, and would hold both widths of the result at once.
             self._wqkv = ttnn.from_torch(
                 torch.cat([state[k].t().to(torch.bfloat16) for k in qkv_keys], dim=-1).contiguous(),
-                dtype=ttnn.bfloat8_b,
+                dtype=_QKV_DTYPE,
                 layout=ttnn.TILE_LAYOUT,
                 device=self.wo.device(),
             )
@@ -598,7 +605,7 @@ def _patch_attention(cls, dtype):
             stale = self.wo
             self.wo = ttnn.from_torch(
                 state["o_proj.weight"].t().to(torch.bfloat16).contiguous(),
-                dtype=ttnn.bfloat8_b,
+                dtype=_WO_DTYPE,
                 layout=ttnn.TILE_LAYOUT,
                 device=stale.device(),
             )
