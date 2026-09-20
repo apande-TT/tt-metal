@@ -142,17 +142,55 @@ def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None):
                 continue
             if h * w > best_h * best_w:
                 best_h, best_w = h, w
+    # CAP THE OUTPUT BLOCK. out_block_h/out_block_w default to the whole per-core block, and the
+    # output CB has to hold that many tiles -- PLUS, when the output dtype is narrower than the
+    # accumulator, a second CB of the same tile count for the fp32 partials that packer_l1_acc
+    # accumulates into. A full 7x27 block is ~1.46 MB that way, over the 1.5 MB L1 budget once the
+    # in0/in1 CBs are counted, and the op then fails at trace-capture time rather than at the first
+    # eager call -- which reads as a partial profile, not as an error. Sized here instead, to the
+    # largest legal block under a tile budget; each must divide the per-core block and be a multiple
+    # of the subblock.
+    def _block(extent, sub):
+        best = sub
+        for cand in range(sub, extent + 1, sub):
+            if extent % cand == 0:
+                best = cand
+        return best
+
+    out_block_h, out_block_w = _block(per_core_m, best_h), _block(per_core_n, best_w)
+    while out_block_h * out_block_w > _OUT_BLOCK_TILE_BUDGET and out_block_w > best_w:
+        nxt = next(
+            (c for c in range(out_block_w - best_w, 0, -best_w) if c % best_w == 0 and per_core_n % c == 0),
+            best_w,
+        )
+        if nxt == out_block_w:
+            break
+        out_block_w = nxt
+    while out_block_h * out_block_w > _OUT_BLOCK_TILE_BUDGET and out_block_h > best_h:
+        nxt = next(
+            (c for c in range(out_block_h - best_h, 0, -best_h) if c % best_h == 0 and per_core_m % c == 0),
+            best_h,
+        )
+        if nxt == out_block_h:
+            break
+        out_block_h = nxt
     return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
         in0_block_w=in0_block_w,
         out_subblock_h=best_h,
         out_subblock_w=best_w,
+        out_block_h=out_block_h,
+        out_block_w=out_block_w,
         per_core_M=per_core_m,
         per_core_N=per_core_n,
         transpose_mcast=False,
         fused_activation=fused_activation,
     )
 
+
+# Output-block tile budget: 64 tiles is 256 KB at fp32, or 128 KB plus a 256 KB fp32 partials CB
+# when the output is bf16 -- either way it leaves the in0/in1 CBs room inside 1.5 MB of L1.
+_OUT_BLOCK_TILE_BUDGET = 64
 
 _SILU = ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)
 
@@ -223,6 +261,28 @@ def _patch_mlp(cls, dtype):
     cls.__call__ = __call__
 
 
+def _attn_pc(module, role, rows, weight):
+    """The block config for one of attention's projections, cached per (role, row count).
+
+    Same reason as the MLP's: without a program config ttnn routes a 1-D multicast with 1x1
+    subblocks, so an op can hold the whole grid and still be several times off its floor. Built on
+    the host and cached, so nothing allocates on device and the lookup is trace-safe.
+    """
+    cache = getattr(module, "_attn_pc_cache", None)
+    if cache is None:
+        cache = module._attn_pc_cache = {}
+    key = (role, rows)
+    pc = cache.get(key)
+    if pc is None:
+        pc = cache[key] = _block_config(
+            weight.device(),
+            -(-int(rows) // 32),
+            -(-int(weight.shape[-2]) // 32),
+            -(-int(weight.shape[-1]) // 32),
+        )
+    return pc
+
+
 def _patch_attention(cls, dtype):
     original = cls.__call__
     original_init = cls.__init__
@@ -263,6 +323,7 @@ def _patch_attention(cls, dtype):
         # shared by heads that declare it differently.
         res_dtype = hidden_states.dtype
         flat, batch = _fold(hidden_states)
+        rows = int(flat.shape[-2])
 
         # q/k/v are produced DIRECTLY in bf16 -- the flash-attention op below takes nothing wider,
         # and a projection's pack format is free, where a typecast afterwards would re-read and
@@ -276,7 +337,13 @@ def _patch_attention(cls, dtype):
             # view. `nlp_create_qkv_heads` reads the fused [B, 1, S, (nq+2nkv)*hd] once and writes
             # q/k/v already in [B, heads, S, hd], doing all three splits and transposes in a single
             # pass. transpose_k_heads=False because SDPA wants k as [b, nkv, s, dh], not k^T.
-            fused = ttnn.linear(flat, wqkv, compute_kernel_config=ck, dtype=_SDPA_DTYPE)
+            fused = ttnn.linear(
+                flat,
+                wqkv,
+                compute_kernel_config=ck,
+                program_config=_attn_pc(self, "qkv", rows, wqkv),
+                dtype=_SDPA_DTYPE,
+            )
             # Rank-4 view: the last dim is unchanged and both row counts are tile multiples.
             staged = ttnn.reshape(fused, (batch, 1, seq_len, int(fused.shape[-1])))
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
@@ -343,7 +410,13 @@ def _patch_attention(cls, dtype):
         merged = ttnn.reshape(heads, (1, batch * seq_len, self.n_heads * self.head_dim))
         # Back to the residual stream's dtype HERE, where it is one matmul's pack format, rather
         # than as a separate cast over a [B*S, hidden] tensor.
-        out = ttnn.linear(merged, self.wo, compute_kernel_config=ck, dtype=res_dtype)
+        out = ttnn.linear(
+            merged,
+            self.wo,
+            compute_kernel_config=ck,
+            program_config=_attn_pc(self, "wo", rows, self.wo),
+            dtype=res_dtype,
+        )
         # `merged` is a VIEW of `heads`, so it is left to the last reference to release rather than
         # deallocated here -- freeing a view frees the tensor it aliases, and `heads` is still in
         # scope. Both die at return.
