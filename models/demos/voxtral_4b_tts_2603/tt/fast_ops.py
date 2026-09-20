@@ -198,9 +198,10 @@ def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None):
         return _decode_block_config(gx, gy, k_tiles, n_tiles, fused_activation)
     per_core_m = -(-int(m_tiles) // gy)
     per_core_n = -(-int(n_tiles) // gx)
-    # in0_block_w must divide K in tiles. Larger means fewer K iterations but a bigger in0 CB; 2 is
-    # the largest that keeps this model's fp32 activation CB clear of the 1.5 MB L1 budget.
-    in0_block_w = next((c for c in (2, 1) if int(k_tiles) % c == 0), 1)
+    # in0_block_w must divide K in tiles. Larger means fewer K iterations but bigger in0/in1 CBs.
+    # The cap was 2 when the weights were bf16; at bf8_b the in1 block is half the bytes, so the
+    # budget that set that cap now has room for a wider K step.
+    in0_block_w = next((c for c in (4, 2, 1) if int(k_tiles) % c == 0), 1)
     # out_subblock_h * out_subblock_w <= 4 because the compute kernel runs fp32_dest_acc_en=True,
     # which halves DEST. Pick the largest legal pair that divides the per-core block.
     best_h, best_w = 1, 1
