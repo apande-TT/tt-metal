@@ -286,6 +286,10 @@ class VoxtralAcousticStack:
         """`lm_hidden [B, S, 3072]` (a device tensor) -> `(acoustic hidden, semantic logits)`."""
         position_ids, mask = self.stage_constants(int(lm_hidden.shape[-2]))
         cos, sin = self.rotary(position_ids=position_ids)
+        # bf16 tables, matching the bf16 queries and keys `rotary_embedding_hf` applies them to --
+        # the same narrowing the text stack's prefill and decode paths already do. A float32 table
+        # buys a mixed-format unpack and no accuracy.
+        cos, sin = (ttnn.typecast(cos, ttnn.bfloat16), ttnn.typecast(sin, ttnn.bfloat16))
         rope = (
             ttnn.reshape(cos, (1, 1, cos.shape[-2], cos.shape[-1])),
             ttnn.reshape(sin, (1, 1, sin.shape[-2], sin.shape[-1])),

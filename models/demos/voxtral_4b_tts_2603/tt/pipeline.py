@@ -289,8 +289,13 @@ class VoxtralPipeline:
             "ids_host": ttnn.from_torch(
                 padded.to(torch.uint32).contiguous(), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT
             ),
-            "cos": self._upload(cos.reshape(1, 1, capacity, -1), stack.act_dtype),
-            "sin": self._upload(sin.reshape(1, 1, capacity, -1), stack.act_dtype),
+            # The rotary tables go up in bfloat16, NOT in `act_dtype`, for the same reason the mask
+            # does: their only consumer is `rotary_embedding_hf`, which applies them to bf16 queries
+            # and keys and returns bf16, so a float32 table buys a mixed-format unpack and no
+            # accuracy -- the capture read "BF16, FP32 => BF16" with the op at ~110 GB/s. The decode
+            # path already stages its gather tables at bf16; this is the prefill half of that.
+            "cos": self._upload(cos.reshape(1, 1, capacity, -1), ttnn.bfloat16),
+            "sin": self._upload(sin.reshape(1, 1, capacity, -1), ttnn.bfloat16),
             # The additive mask goes up in bfloat16, NOT in `act_dtype`: its only consumer is the
             # fused flash-attention op, which takes bf16/bf8_b/bf4_b and nothing wider, and -1e9 is
             # just as absorbing after a softmax at bf16's precision as at fp32's. Uploading it wide

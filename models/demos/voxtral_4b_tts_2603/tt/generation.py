@@ -421,6 +421,13 @@ class VoxtralGenerationStack:
             owns_ids = True
 
         cos, sin = self.rotary(position_ids=position_ids)
+        # NARROW THE TABLES TO MATCH q/k. The rotary stub builds cos/sin in float32, but the queries
+        # and keys the RoPE op applies them to are bf16 and its output is bf16, so the wide table
+        # only buys a mixed-format unpack -- the capture reads "BF16, FP32 => BF16" and the op sits
+        # at ~110 GB/s. The decode path already stages its gather tables at bf16 for the same
+        # reason; this is the prefill half of that. The tables are [1, 1, S, head_dim], so the cast
+        # itself is a few tens of KB, paid once per call rather than per layer.
+        cos, sin = (ttnn.typecast(cos, ttnn.bfloat16), ttnn.typecast(sin, ttnn.bfloat16))
         # The rotary tables are position-only, so their leading dim is a broadcast against the
         # [B, heads, S, head_dim] query. A leading-dim reshape is a metadata view, not a copy.
         rope = (
