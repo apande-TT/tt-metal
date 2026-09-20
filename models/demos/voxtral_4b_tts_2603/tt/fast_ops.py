@@ -151,6 +151,34 @@ def _device_ready(*tensors):
     return True
 
 
+def _decode_block_config(gx, gy, k_tiles, n_tiles, fused_activation):
+    """The ONE-TILE-ROW case: split N over every core, not M over the grid's rows.
+
+    A 2D multicast hands each grid ROW a different block of M. A decode step has exactly one tile
+    row of M -- 32 rows, one per sample -- so there is nothing for the other gy-1 rows to own and
+    the op runs on a fraction of the chip while being bound by streaming the weight. The 1D
+    multicast is the shape that fits: in0 is broadcast to every core and each core takes a slice
+    of N, so all gx*gy cores pull on the weight at once.
+    """
+    cores = gx * gy
+    per_core_n = -(-int(n_tiles) // cores)
+    # out_subblock_h is pinned to 1 (M is one tile), so the whole subblock budget goes to width.
+    # fp32_dest_acc_en halves DEST, hence 4 rather than 8.
+    out_subblock_w = next((w for w in (4, 3, 2, 1) if per_core_n % w == 0), 1)
+    in0_block_w = next((c for c in (4, 2, 1) if int(k_tiles) % c == 0), 1)
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+        in0_block_w=in0_block_w,
+        out_subblock_h=1,
+        out_subblock_w=out_subblock_w,
+        per_core_M=1,
+        per_core_N=per_core_n,
+        fuse_batch=True,
+        fused_activation=fused_activation,
+        mcast_in0=True,
+    )
+
+
 def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None):
     """A 2D-multicast program config sized for THIS shape on the WHOLE grid.
 
@@ -166,6 +194,8 @@ def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None):
     """
     grid = device.compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
+    if int(m_tiles) == 1:
+        return _decode_block_config(gx, gy, k_tiles, n_tiles, fused_activation)
     per_core_m = -(-int(m_tiles) // gy)
     per_core_n = -(-int(n_tiles) // gx)
     # in0_block_w must divide K in tiles. Larger means fewer K iterations but a bigger in0 CB; 2 is
@@ -438,10 +468,12 @@ def _decode_call(module, hidden_states, position_embeddings, kv, cur_pos):
     batch = int(hidden_states.shape[0])
     ck = _matmul_ck(device)
     flat, folded = _fold(hidden_states)
+    rows = int(flat.shape[-2])
     fused = ttnn.linear(
         flat,
         module._wqkv,
         compute_kernel_config=ck,
+        program_config=_attn_pc(module, "qkv", rows, module._wqkv),
         dtype=_SDPA_DTYPE,
         memory_config=ttnn.L1_MEMORY_CONFIG,
     )
@@ -492,7 +524,13 @@ def _decode_call(module, hidden_states, position_embeddings, kv, cur_pos):
     ttnn.deallocate(attn_sharded)
     # [1, 1, B, nq*hd] -> [1, B, nq*hd], again a leading-dim view.
     flat_out = ttnn.reshape(merged, (1, batch, int(merged.shape[-1])))
-    out = ttnn.linear(flat_out, module.wo, compute_kernel_config=ck, dtype=res_dtype)
+    out = ttnn.linear(
+        flat_out,
+        module.wo,
+        compute_kernel_config=ck,
+        program_config=_attn_pc(module, "wo", batch, module.wo),
+        dtype=res_dtype,
+    )
     ttnn.deallocate(merged)
     return _unfold(out, folded) if folded > 1 else ttnn.reshape(out, (batch, 1, int(out.shape[-1])))
 
