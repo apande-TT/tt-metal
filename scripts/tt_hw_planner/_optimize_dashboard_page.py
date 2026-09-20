@@ -461,7 +461,7 @@ function historyChart(S, stage) {
     const c = HIST_COLOR[a.status] || "#8494ad";
     const reading = v == null ? "no measurement"
       : (rate ? `${fmtY(v)} ${rate} (${ms.toFixed(2)} ms)` : `${ms.toFixed(2)} ms`);
-    const tip = esc(`run ${i + 1} · ${a.lever} · ${a.op} — ${reading}` +
+    const tip = esc(`attempt ${i + 1} · ${a.lever} · ${a.op} — ${reading}` +
       ` (${HIST_LEGEND[a.status] || a.status})` +
       (a.commit ? ` · commit ${String(a.commit).slice(0, 7)}` : "") +
       (a.note ? "\n" + a.note : ""));
@@ -541,7 +541,7 @@ function speedupChart(S) {
       stroke-width="2" stroke-opacity="0.9" stroke-linecap="round"/>`;
     s.pts.forEach(p => {
       const sp = b / p.ms;
-      const tip = esc(`run ${p.i + 1} · ${s.name} ${sp.toFixed(2)}× — ${p.ms.toFixed(2)} ms` +
+      const tip = esc(`attempt ${p.i + 1} · ${s.name} ${sp.toFixed(2)}× — ${p.ms.toFixed(2)} ms` +
         ` (from ${b.toFixed(2)} ms)\n${p.a.lever} · ${p.a.op} — ${HIST_LEGEND[p.a.status] || p.a.status}` +
         (p.a.note ? "\n" + p.a.note : ""));
       g += `<circle cx="${X(p.i)}" cy="${Y(sp)}" r="3.4" fill="${c}" fill-opacity="0.95"
