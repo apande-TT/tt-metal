@@ -54,6 +54,8 @@ from __future__ import annotations
 
 import importlib
 
+import torch
+
 import ttnn
 
 # The stub classes to patch, keyed by the stub module that defines them. The attention and MLP
@@ -75,6 +77,75 @@ _SDPA_MASK_DTYPES = (ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b)
 # [B*S, 4*hidden] and are each consumed exactly once by the next op. Distinct from the residual
 # stream's dtype, which this file never changes.
 _WIDE_DTYPE = ttnn.bfloat16
+
+# The WEIGHT format for every projection. bfloat8_b is a block format: a shared 8-bit exponent per
+# 16-datum block with an 8-bit mantissa each, so it holds a weight's dynamic range while halving the
+# bytes. Two things follow, and both matter here:
+#   * DRAM: the checkpoint's served width drops from ~8.4 GB to ~4.7 GB, which is what every
+#     memory-bound op in the capture is waiting on.
+#   * MATH: bf8_b is the format LoFi is FOR -- one fidelity phase covers its mantissa -- so the
+#     matmul rate doubles as well. Dtype and fidelity are therefore ONE lever: bf8_b at HiFi2 buys
+#     the bytes and none of the math, and measured 153.13 ms/token against LoFi's 137.52.
+#   * L1: a bf8_b tile is 1088 B against bf16's 2048, which frees the in1 circular buffer enough to
+#     widen in0_block_w -- see `_block_config`.
+_WEIGHT_DTYPE = ttnn.bfloat8_b
+
+
+def _narrow(tensor):
+    """Return `tensor` re-packed as `_WEIGHT_DTYPE`, or the original if that is not possible."""
+    if tensor is None or tensor.dtype == _WEIGHT_DTYPE:
+        return tensor
+    try:
+        return ttnn.typecast(tensor, _WEIGHT_DTYPE)
+    except Exception:  # noqa: BLE001 - a format ttnn will not re-pack just keeps the wide weight
+        return tensor
+
+
+def _narrowing_upload(fn):
+    """Wrap a stub's weight-upload helper so a PROJECTION weight is created narrow.
+
+    Re-packing a weight after it is already on device works, but it is ~235 device typecasts over
+    8.4 GB at build time, and those land INSIDE the profiled region -- they cost 31 ms of the
+    capture's device time and slowed the build, for a re-pack that production pays once. Uploading
+    at the target format never allocates the wide copy at all.
+
+    Only 2-D tensors with both dims at least a tile wide are narrowed: that is exactly the
+    projection matrices. The RMSNorm weight, the rope tables and the mask arrive 4-D and a bias
+    arrives as [1, N], so they keep the helper's own format and pass straight through.
+    """
+
+    def upload(t, device, *args, **kwargs):
+        if getattr(t, "dim", None) and t.dim() == 2 and min(t.shape) >= 32 and "dtype" not in kwargs:
+            return ttnn.from_torch(
+                t.to(torch.bfloat16).contiguous(),
+                dtype=_WEIGHT_DTYPE,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+            )
+        return fn(t, device, *args, **kwargs)
+
+    upload._voxtral_narrowed = True
+    return upload
+
+
+def _narrow_in_place(module, names):
+    """Re-pack any weight that still arrived wide, and FREE the original.
+
+    A safety net rather than the main path: `_narrowing_upload` means these are normally already
+    narrow and every call here is a no-op. It covers a weight built through some other route.
+    """
+    for name in names:
+        wide = getattr(module, name, None)
+        if wide is None:
+            continue
+        narrow = _narrow(wide)
+        if narrow is not wide:
+            setattr(module, name, narrow)
+            try:
+                ttnn.deallocate(wide)
+            except Exception:  # noqa: BLE001
+                pass
+
 
 _installed = False
 
@@ -133,9 +204,11 @@ def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None):
     gx, gy = int(grid.x), int(grid.y)
     per_core_m = -(-int(m_tiles) // gy)
     per_core_n = -(-int(n_tiles) // gx)
-    # in0_block_w must divide K in tiles. Larger means fewer K iterations but a bigger in0 CB; 2 is
-    # the largest that keeps this model's fp32 activation CB clear of the 1.5 MB L1 budget.
-    in0_block_w = next((c for c in (2, 1) if int(k_tiles) % c == 0), 1)
+    # in0_block_w must divide K in tiles. Larger means fewer trips round the K loop but a bigger in0
+    # circular buffer. 2 was the ceiling while the weights were bf16; a bf8_b weight tile is 1088 B
+    # against 2048, which frees enough of the in1 buffer to afford 4 -- at per_core_M=7 that is a
+    # 224 KB in0 CB and a 235 KB in1 CB, which leaves the capped output block room inside 1.5 MB.
+    in0_block_w = next((c for c in (4, 2, 1) if int(k_tiles) % c == 0), 1)
     # out_subblock_h * out_subblock_w <= 4 because the compute kernel runs fp32_dest_acc_en=True,
     # which halves DEST. Pick the largest legal pair that divides the per-core block.
     best_h, best_w = 1, 1
@@ -199,10 +272,16 @@ _OUT_BLOCK_TILE_BUDGET = 64
 
 _SILU = ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)
 
-# HiFi4 is the bring-up default and it is the WRONG one for these matmuls: the weights are bf16, and
-# HiFi2 already consumes a bf16 mantissa in full, so the extra fidelity phases buy no accuracy and
-# cost ~2x the math. The capture said as much -- the gate/up projection measured 137 ms against a
-# 68.7 ms peak-FLOP floor while holding all 110 cores, a ratio no blocking knob explains.
+# The fidelity FOLLOWS THE WEIGHT FORMAT: one phase covers a bf8_b mantissa exactly as two cover
+# bf16's, and every phase beyond that is math for no accuracy. HiFi4 was the bring-up default and
+# the capture showed its cost directly -- the gate/up projection measured 137 ms against a 68.7 ms
+# peak-FLOP floor while holding all 110 cores, a ratio no blocking knob explains.
+#
+# The walk was measured a step at a time on the production per-token metric: HiFi4 -> HiFi2 over
+# bf16 weights 229.95 -> 177.04 ms, bf8_b weights at HiFi2 161.61 -> 153.13, and this last step to
+# LoFi 153.13 -> 137.52. It costs PCC 0.9999 -> 0.9989 and it buys BOTH stages ~15%, decode
+# included -- which is the stage still short of its band, and the reason the spend is the right
+# one here.
 #
 # fp32_dest_acc_en and packer_l1_acc are deliberately LEFT ON: the accumulation, not the multiply,
 # is what a 26-layer residual stack compounds, and turning fp32 DEST off is a separate lever with
@@ -214,13 +293,13 @@ _mm_ck_cache = {}
 
 
 def _matmul_ck(device):
-    """The matmuls' compute kernel config: HiFi2, cached per arch."""
+    """The matmuls' compute kernel config: LoFi over bf8_b weights. Cached per arch."""
     arch = device.arch()
     ck = _mm_ck_cache.get(arch)
     if ck is None:
         ck = _mm_ck_cache[arch] = ttnn.init_device_compute_kernel_config(
             arch,
-            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_fidelity=ttnn.MathFidelity.LoFi,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
@@ -230,6 +309,11 @@ def _matmul_ck(device):
 
 def _patch_mlp(cls, dtype):
     original = cls.__call__
+    original_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _narrow_in_place(self, ("gate", "up", "down"))
 
     def __call__(self, x, **kwargs):
         if not _device_ready(x):
@@ -279,6 +363,7 @@ def _patch_mlp(cls, dtype):
         ttnn.deallocate(prod)
         return _unfold(out, batch)
 
+    cls.__init__ = __init__
     cls.__call__ = __call__
 
 
@@ -323,9 +408,12 @@ def _patch_attention(cls, dtype):
         original_init(self, *args, **kwargs)
         self._wqkv = None
         try:
-            self._wqkv = ttnn.concat([self.wq, self.wk, self.wv], dim=-1)
+            self._wqkv = _narrow(ttnn.concat([self.wq, self.wk, self.wv], dim=-1))
         except Exception:  # noqa: BLE001 - any shape/dtype the concat rejects just keeps 3 matmuls
             self._wqkv = None
+        # The three unfused copies are narrowed too rather than left wide: the fused weight is what
+        # the fast path reads, so leaving them in bf16 would ADD storage instead of saving it.
+        _narrow_in_place(self, ("wq", "wk", "wv", "wo"))
 
     def __call__(self, hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
         if not _device_ready(hidden_states, position_embeddings, attention_mask):
@@ -449,6 +537,13 @@ def _patch_attention(cls, dtype):
 
 def _patch_head(cls, dtype):
     original = cls.__call__
+    original_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # The vocab weight is the single largest tensor in the checkpoint (3072 x 131072 = 805 MB in
+        # bf16) and the head is memory-bound, so this one re-pack is worth ~400 MB of DRAM per read.
+        _narrow_in_place(self, ("weight",))
 
     def __call__(self, hidden_states, **kwargs):
         if not _device_ready(hidden_states):
@@ -468,6 +563,7 @@ def _patch_head(cls, dtype):
         )
         return _unfold(out, batch)
 
+    cls.__init__ = __init__
     cls.__call__ = __call__
 
 
@@ -477,6 +573,14 @@ def install() -> bool:
     if _installed:
         return False
     _installed = True
+    # FIRST, so the weights are CREATED narrow rather than re-packed on device afterwards.
+    for name in dict.fromkeys(_ATTENTION_MODULES + _MLP_MODULES + _HEAD_MODULES):
+        module = importlib.import_module(f"{_STUB_PKG}.{name}")
+        for helper in ("_to_device", "_weight"):
+            fn = getattr(module, helper, None)
+            if fn is None or getattr(fn, "_voxtral_narrowed", False):
+                continue
+            setattr(module, helper, _narrowing_upload(fn))
     for name, cls_name, patch in (
         [(n, "TtAttention", _patch_attention) for n in _ATTENTION_MODULES]
         + [(n, "TtMLP", _patch_mlp) for n in _MLP_MODULES]
