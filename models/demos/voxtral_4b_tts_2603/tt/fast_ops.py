@@ -37,6 +37,18 @@ tile-padded), and it moves ~12 MB to save ~120 ms of weight re-streaming.
 Attention is NOT folded across the sequence: Q.K^T must stay per-sample, so only the four
 projections around it (q, k, v, o) are folded and the head split unfolds back to
 `[B, heads, S, head_dim]` exactly as before.
+
+WHAT IT ALSO CHANGES -- FUSED FLASH ATTENTION.
+
+The stubs' attention core is eight launches (two GQA repeat_interleaves, a k transpose,
+Q.K^T, the scale multiply, the mask add, softmax, P.V) and its two matmuls are batched
+over (sample, head), i.e. 1024 `64 x 128 x 64` products per call at B=32 x 32 heads --
+grid=tiny, dispatch-bound, 168 ms + 106 ms against a 0.07 ms floor.
+`ttnn.transformer.scaled_dot_product_attention` replaces all eight with one
+FlashAttention-2 op that parallelises over b, nqh and Q's sequence, consumes the GQA k/v
+shape directly and never materialises the score tensor. It accepts only bf16/bf8_b/bf4_b,
+so q/k/v are packed as bf16 straight out of their projections and the mask is uploaded in
+bf16 by the pipeline; the residual stream keeps the caller's own dtype.
 """
 from __future__ import annotations
 
@@ -52,6 +64,12 @@ _MLP_MODULES = ("mlp", "m_l_p", "decoder_layer", "layer", "model")
 _HEAD_MODULES = ("decoder_head",)
 
 _STUB_PKG = "models.tt_transformers.demo.voxtral_4b_tts_2603._stubs"
+
+# ttnn's flash-attention op takes q/k/v AND the mask in bf16/bf8_b/bf4_b only
+# (sdpa_device_operation.cpp validates both), so the attention core runs at bf16 -- the top of that
+# range. The residual stream is untouched and stays at whatever dtype the caller carries.
+_SDPA_DTYPE = ttnn.bfloat16
+_SDPA_MASK_DTYPES = (ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b)
 
 _installed = False
 
@@ -128,11 +146,17 @@ def _patch_attention(cls, dtype):
             )
         seq_len = int(hidden_states.shape[-2])
         ck = self.compute_kernel_config
-        extra = {} if dtype is None else {"dtype": dtype}
+        # The residual stream's dtype is READ OFF the input rather than assumed: the output
+        # projection has to hand back exactly what the residual add expects, and this override is
+        # shared by heads that declare it differently.
+        res_dtype = hidden_states.dtype
         flat, batch = _fold(hidden_states)
 
         def project(weight, n_heads):
-            proj = ttnn.linear(flat, weight, compute_kernel_config=ck, **extra)
+            # q/k/v are produced DIRECTLY in bf16 -- the flash-attention op below takes nothing
+            # wider, and the projection's pack format is free, where a typecast afterwards would
+            # re-read and re-write the whole [B, heads, S, head_dim] tensor.
+            proj = ttnn.linear(flat, weight, compute_kernel_config=ck, dtype=_SDPA_DTYPE)
             heads = ttnn.reshape(proj, (batch, seq_len, n_heads, self.head_dim))
             ttnn.deallocate(proj)
             out = ttnn.transpose(heads, 1, 2)
@@ -142,29 +166,38 @@ def _patch_attention(cls, dtype):
         q = project(self.wq, self.n_heads)
         k = project(self.wk, self.n_kv_heads)
         v = project(self.wv, self.n_kv_heads)
+        if attention_mask is not None and attention_mask.dtype not in _SDPA_MASK_DTYPES:
+            # The pipeline uploads its masks in bf16 already; this covers a caller that does not.
+            attention_mask = ttnn.typecast(attention_mask, _SDPA_DTYPE)
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
             q = ttnn.experimental.rotary_embedding_hf(q, cos, sin, is_decode_mode=False)
             k = ttnn.experimental.rotary_embedding_hf(k, cos, sin, is_decode_mode=False)
 
-        if self.n_rep > 1:
-            k = ttnn.repeat_interleave(k, self.n_rep, dim=1)
-            v = ttnn.repeat_interleave(v, self.n_rep, dim=1)
-
-        k_t = ttnn.transpose(k, -2, -1)
-        ttnn.deallocate(k)
-        scores = ttnn.matmul(q, k_t, compute_kernel_config=ck, **extra)
+        # ONE fused flash-attention op in place of the entire manual core. The hand-rolled version
+        # was repeat_interleave(k) + repeat_interleave(v) + transpose(k) + matmul + multiply +
+        # add(mask) + softmax + matmul = eight launches, and its two matmuls are BATCHED over
+        # (sample, head): at B=32 x 32 heads that is 1024 `64 x 128 x 64` products per call, which
+        # the roofline tags grid=tiny / bound_by=dispatch -- 168 ms for Q.K^T and 106 ms for P.V
+        # against a 0.07 ms floor. SDPA parallelises over b, nqh AND Q's sequence, reads the GQA
+        # k/v directly ([b x nkv x s x dh], so both repeat_interleaves go away too) and never
+        # materialises the [B, heads, S, S] score tensor at all.
+        #
+        # is_causal=False ON PURPOSE: the mask is not plain causality. The decode stage LEFT-pads,
+        # so the mask also blanks the padded KEYS; letting the kernel build its own causal mask
+        # would silently attend to the pad.
+        context = ttnn.transformer.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attention_mask,
+            is_causal=False,
+            scale=self.scaling,
+            compute_kernel_config=ck,
+        )
         ttnn.deallocate(q)
-        ttnn.deallocate(k_t)
-        scores = ttnn.multiply(scores, self.scaling)
-        if attention_mask is not None:
-            scores = ttnn.add(scores, attention_mask)
-        probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=ck)
-        ttnn.deallocate(scores)
-
-        context = ttnn.matmul(probs, v, compute_kernel_config=ck, **extra)
-        ttnn.deallocate(probs)
+        ttnn.deallocate(k)
         ttnn.deallocate(v)
         heads = ttnn.transpose(context, 1, 2)
         ttnn.deallocate(context)
@@ -172,7 +205,9 @@ def _patch_attention(cls, dtype):
         # projection as q/k/v and pays the same 32x weight re-stream if left batched.
         merged = ttnn.reshape(heads, (1, batch * seq_len, self.n_heads * self.head_dim))
         ttnn.deallocate(heads)
-        out = ttnn.linear(merged, self.wo, compute_kernel_config=ck, **extra)
+        # Back to the residual stream's dtype HERE, where it is one matmul's pack format, rather
+        # than as a separate cast over a [B*S, hidden] tensor.
+        out = ttnn.linear(merged, self.wo, compute_kernel_config=ck, dtype=res_dtype)
         ttnn.deallocate(merged)
         return _unfold(out, batch)
 

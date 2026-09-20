@@ -259,9 +259,11 @@ class VoxtralAcousticStack:
             mask = torch.zeros(seq_len, seq_len, dtype=torch.float32).masked_fill_(blocked, _MASK_NEG)
             cached = (
                 position_ids,
+                # bfloat16, not `act_dtype`: see generation.stage_constants -- the mask feeds the
+                # fused flash-attention op, which takes no format wider than bf16.
                 ttnn.from_torch(
                     mask.reshape(1, 1, seq_len, seq_len).contiguous(),
-                    dtype=self.act_dtype,
+                    dtype=ttnn.bfloat16,
                     layout=ttnn.TILE_LAYOUT,
                     device=self.device,
                 ),

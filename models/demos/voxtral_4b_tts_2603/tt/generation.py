@@ -189,9 +189,12 @@ class VoxtralGenerationStack:
             mask = torch.zeros(seq_len, seq_len, dtype=torch.float32).masked_fill_(blocked, _MASK_NEG)
             cached = (
                 position_ids,
+                # bfloat16, not `act_dtype`: the mask's only consumer is the fused
+                # flash-attention op, which takes bf16/bf8_b/bf4_b and nothing wider, and -1e9 is
+                # just as absorbing after a softmax at bf16's precision as at fp32's.
                 ttnn.from_torch(
                     mask.reshape(1, 1, seq_len, seq_len).contiguous(),
-                    dtype=self.act_dtype,
+                    dtype=ttnn.bfloat16,
                     layout=ttnn.TILE_LAYOUT,
                     device=self.device,
                 ),

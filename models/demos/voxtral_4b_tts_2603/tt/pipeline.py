@@ -273,7 +273,11 @@ class VoxtralPipeline:
             ),
             "cos": self._upload(cos.reshape(1, 1, capacity, -1), stack.act_dtype),
             "sin": self._upload(sin.reshape(1, 1, capacity, -1), stack.act_dtype),
-            "mask": self._upload(mask.reshape(mask.shape[0], 1, capacity, capacity), stack.act_dtype),
+            # The additive mask goes up in bfloat16, NOT in `act_dtype`: its only consumer is the
+            # fused flash-attention op, which takes bf16/bf8_b/bf4_b and nothing wider, and -1e9 is
+            # just as absorbing after a softmax at bf16's precision as at fp32's. Uploading it wide
+            # would buy a per-layer typecast and no accuracy.
+            "mask": self._upload(mask.reshape(mask.shape[0], 1, capacity, capacity), ttnn.bfloat16),
             "capacity": capacity,
             "real_len": real_len,
             "batch": batch,
