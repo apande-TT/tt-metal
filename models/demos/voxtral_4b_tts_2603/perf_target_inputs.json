@@ -1,0 +1,37 @@
+{
+  "weight_bytes": 8004752248,
+  "dominant_dtype": "bfloat16",
+  "source": "checkpoint bytes + HF config",
+  "total_params": 4002353392,
+  "params_basis": "read set for unit=unknown: lookup-only and tower-only tensors excluded",
+  "stage_roots": {
+    "prefill": "layers",
+    "decode": "layers"
+  },
+  "device_weight_bytes": 8431910912,
+  "device_census_complete": true,
+  "device_section_bytes": {
+    "generation": 7663349760,
+    "unmatched": 6751174656,
+    "layers": 6751150080,
+    "block": 5587107840,
+    "mlp": 4076863488,
+    "mm_audio_embeddings": 1610612736,
+    "self_attn": 1509949440,
+    "feed_forward": 849346560,
+    "head": 805306368,
+    "token_embed": 805306368,
+    "acoustic": 768430080,
+    "attention": 314572800,
+    "acoustic_transformer": 69992448,
+    "semantic_head": 51118080,
+    "llm_projection": 18874368,
+    "post_attention_layernorm": 208896,
+    "input_layernorm": 208896,
+    "audio_tokenizer": 131072,
+    "decode": 65536,
+    "prefill": 65536,
+    "final_norm": 24576
+  },
+  "bytes_per_param": 2.0
+}

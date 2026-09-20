@@ -25,14 +25,42 @@ import torch
 
 HF_MODEL_ID = "mistralai/Voxtral-4B-TTS-2603"
 
-# Source B, the bring-up tool's output for this model.
-BRINGUP_ROOT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
-    "tt_transformers",
-    "demo",
-    "voxtral_4b_tts_2603",
-)
 STUB_PKG = "models.tt_transformers.demo.voxtral_4b_tts_2603._stubs"
+BRINGUP_PKG = "models.tt_transformers.demo.voxtral_4b_tts_2603"
+
+
+def _resolve_bringup_root() -> str:
+    """Filesystem path of Source B, resolved through the IMPORT system rather than off `__file__`.
+
+    `models` is a NAMESPACE package, so this package and the bring-up subtree do not have to sit
+    in the same repo root -- a git worktree checks this package out but not the (untracked)
+    bring-up output, which then still resolves from the primary checkout. Walking up from
+    `__file__` names a sibling directory in THIS root and silently misses that, which is how
+    `_reference_loader` went missing on a worktree run while the stub imports beside it worked:
+    the stub imports go through the namespace path, and only this one path did not.
+
+    Falls back to the `__file__`-relative guess so a tree with no importable bring-up package
+    still produces the same path (and the same error message) it did before.
+    """
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec(BRINGUP_PKG)
+        for loc in list(getattr(spec, "submodule_search_locations", None) or []):
+            if os.path.isdir(loc):
+                return os.path.abspath(loc)
+    except Exception:  # noqa: BLE001 - a missing/unimportable package falls through to the guess
+        pass
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+        "tt_transformers",
+        "demo",
+        "voxtral_4b_tts_2603",
+    )
+
+
+# Source B, the bring-up tool's output for this model.
+BRINGUP_ROOT = _resolve_bringup_root()
 CAPTURED_ROOT = os.path.join(BRINGUP_ROOT, "_captured")
 
 # BATCH=32: 32 independent samples per pipeline call. A single sample wastes 31/32 of a
@@ -262,7 +290,15 @@ def import_stub(name: str):
 
 
 def build_stub(name: str, device, torch_module):
-    """Build a graduated stub through its `build(device, torch_module)` constructor."""
+    """Build a graduated stub through its `build(device, torch_module)` constructor.
+
+    `fast_ops.install()` runs first, once: it installs this package's performance overrides onto
+    the stub CLASSES, so every instance built from here carries them. Installing at build time
+    rather than at import keeps the override out of the way of anything that merely imports a stub.
+    """
+    from models.demos.voxtral_4b_tts_2603.tt import fast_ops
+
+    fast_ops.install()
     return import_stub(name).build(device, torch_module)
 
 
