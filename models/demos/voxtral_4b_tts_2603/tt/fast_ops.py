@@ -71,6 +71,11 @@ _STUB_PKG = "models.tt_transformers.demo.voxtral_4b_tts_2603._stubs"
 _SDPA_DTYPE = ttnn.bfloat16
 _SDPA_MASK_DTYPES = (ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b)
 
+# The format the model's WIDE intermediates are carried in -- the SwiGLU gate/up/product, which are
+# [B*S, 4*hidden] and are each consumed exactly once by the next op. Distinct from the residual
+# stream's dtype, which this file never changes.
+_WIDE_DTYPE = ttnn.bfloat16
+
 _installed = False
 
 
@@ -230,7 +235,9 @@ def _patch_mlp(cls, dtype):
         if not _device_ready(x):
             return original(self, x, **kwargs)
         ck = _matmul_ck(self.gate.device())
-        extra = {} if dtype is None else {"dtype": dtype}
+        # The dtype the RESIDUAL add expects. `x` is this block's norm output and rms_norm preserves
+        # its input dtype, so x.dtype IS the residual stream's dtype -- read, not assumed.
+        res_dtype = x.dtype if dtype is None else dtype
         flat, batch = _fold(x)
         # Program configs are keyed by the ONE thing that varies between calls -- the row count --
         # and cached on the instance. Built on the host, so nothing here allocates on device and the
@@ -249,12 +256,26 @@ def _patch_mlp(cls, dtype):
                 _block_config(device, m_tiles, hidden, inter),
                 _block_config(device, m_tiles, inter, hidden),
             )
-        gate = ttnn.linear(flat, self.gate, compute_kernel_config=ck, program_config=pcs[0], **extra)
-        up = ttnn.linear(flat, self.up, compute_kernel_config=ck, program_config=pcs[1], **extra)
+        # The SwiGLU intermediates are the LARGEST tensors in the model -- [B*S, 4*hidden], 75 MB
+        # each in fp32 at B=32/S=64, and three of them per block (gate, up, their product). Carrying
+        # them in bf16 halves every byte the gate/up matmuls pack, the multiply reads and writes and
+        # the down matmul unpacks: ~225 MB per block, ~11.7 GB per capture. The dtype is taken at the
+        # producing op's PACK format, so it costs no extra op.
+        #
+        # The residual stream is NOT touched: down packs straight back to `res_dtype`. What a deep
+        # residual stack cannot tolerate is a narrow ACCUMULATOR -- this stack measured PCC 0.986
+        # with a bf16 residual against 0.9996 with an fp32 one -- and an intermediate consumed once,
+        # by the next matmul, is a different thing from the running sum.
+        #
+        # This needs the output-block cap in `_block_config`: a bf16 output makes packer_l1_acc
+        # allocate a SECOND fp32 partials CB, and at the full per-core block that clashed L1 and
+        # broke trace capture.
+        gate = ttnn.linear(flat, self.gate, compute_kernel_config=ck, program_config=pcs[0], dtype=_WIDE_DTYPE)
+        up = ttnn.linear(flat, self.up, compute_kernel_config=ck, program_config=pcs[1], dtype=_WIDE_DTYPE)
         prod = ttnn.multiply(gate, up)
         ttnn.deallocate(gate)
         ttnn.deallocate(up)
-        out = ttnn.linear(prod, self.down, compute_kernel_config=ck, program_config=pcs[2], **extra)
+        out = ttnn.linear(prod, self.down, compute_kernel_config=ck, program_config=pcs[2], dtype=res_dtype)
         ttnn.deallocate(prod)
         return _unfold(out, batch)
 
