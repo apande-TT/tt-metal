@@ -235,6 +235,136 @@ class VoxtralGenerationStack:
         ttnn.deallocate(device_ids)
         return grown
 
+    # ---- the KV cache --------------------------------------------------------------
+    #
+    # Without one, a decode step is a REPEAT PREFILL: every token re-runs all C resident
+    # positions through all L blocks, so the projections and the MLP each do C times the
+    # arithmetic one token needs, and the cost per token is a prefill's cost. The cache makes a
+    # step compute seq_len=1 and read the history back instead of recomputing it; what remains
+    # is one pass of the weights, which is the band the roofline quotes.
+
+    def attention_modules(self):
+        """Every attention stub in the stack, whatever block kind holds it.
+
+        The whole-block ports keep theirs on `.self_attn`; the split blocks hold it as a part.
+        Both are counter-wrapped, so each is unwrapped to the graduated stub the override patched.
+        """
+        for block in self.layers:
+            if block.kind in ("decoder_layer", "layer"):
+                inner = common.unwrap(block.part("block"))
+                attn = getattr(inner, "self_attn", None)
+            else:
+                attn = common.unwrap(block.part("attention"))
+            if attn is not None:
+                yield common.unwrap(attn)
+
+    def kv_enable(self, batch, capacity, start):
+        """Arm every block's cache and stage the two position tensors a step advances.
+
+        ONE pair of position tensors is shared by every layer -- they all decode the same token at
+        the same index, so one buffer each is what lets a single `kv_advance()` move all 26 blocks.
+        They are DEVICE tensors, not Python ints: a literal would be compiled into the trace and
+        every replay would then write the same cache slot and read the same RoPE row. There are two
+        because the consumers want different types -- the cache update and flash-decode take a
+        signed `[B]` index, the RoPE lookup is an embedding gather and takes an unsigned one --
+        and `ttnn.plus_one` advances each in place without either leaving the device.
+        """
+        batch, start = int(batch), int(start)
+        self._kv_pos = ttnn.from_torch(
+            torch.full((batch,), start, dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
+        self._kv_rope_idx = ttnn.from_torch(
+            torch.full((1, batch), start, dtype=torch.int32).to(torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
+        self._kv_rope_tables = self._decode_rope_tables(capacity)
+        self._kv_capacity = int(capacity)
+        for attn in self.attention_modules():
+            attn.kv_enable(self._kv_pos)
+        return self._kv_pos
+
+    def kv_disable(self):
+        for attn in self.attention_modules():
+            attn.kv_disable()
+        for name in ("_kv_pos", "_kv_rope_idx"):
+            tensor = getattr(self, name, None)
+            if tensor is not None:
+                try:
+                    ttnn.deallocate(tensor)
+                except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
+                    pass
+            setattr(self, name, None)
+        for table in getattr(self, "_kv_rope_tables", None) or ():
+            try:
+                ttnn.deallocate(table)
+            except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
+                pass
+        self._kv_rope_tables = None
+
+    def _decode_rope_tables(self, capacity):
+        """cos/sin for EVERY position, as `[capacity, head_dim]` gather tables.
+
+        Decode RoPE needs the row for whatever position the step is at, and that position lives in
+        a device tensor, so the row has to be selected ON DEVICE or the step stops being traceable.
+        Staging the whole table once here turns the per-step selection into an embedding gather
+        against an index that `plus_one` advances -- no host round trip, and the same captured
+        program is correct at every position.
+        """
+        position_ids = torch.arange(int(capacity), dtype=torch.long).reshape(1, int(capacity))
+        cos, sin = self.rotary(position_ids=position_ids)
+        tables = []
+        for table in (cos, sin):
+            rows = ttnn.to_torch(table).to(torch.float32).reshape(int(capacity), -1)
+            tables.append(
+                ttnn.from_torch(
+                    rows.contiguous(),
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                    device=self.device,
+                )
+            )
+        ttnn.deallocate(cos)
+        ttnn.deallocate(sin)
+        return tuple(tables)
+
+    def decode_rope_step(self):
+        """(cos, sin) for the CURRENT position, height-sharded one user per core.
+
+        Prefill RoPE broadcasts a `[1, 1, S, hd]` table across the heads; the decode op instead
+        wants `[1, B, 1, hd]` sharded to match the head split it sits between. Every user is at the
+        same index, but the gather is per-user anyway, so a genuinely ragged batch would work here
+        unchanged.
+        """
+        from models.demos.voxtral_4b_tts_2603.tt import fast_ops
+
+        batch = self.kv_batch
+        staged = []
+        for table in self._kv_rope_tables:
+            rows = ttnn.embedding(self._kv_rope_idx, table)
+            view = ttnn.reshape(rows, (1, batch, 1, int(rows.shape[-1])))
+            tiled = ttnn.to_layout(view, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(rows)
+            staged.append(
+                ttnn.to_memory_config(tiled, fast_ops.decode_shard(self.device, batch, int(tiled.shape[-1])))
+            )
+            ttnn.deallocate(tiled)
+        return tuple(staged)
+
+    def kv_advance(self):
+        """Move both position tensors on by one, in place and on device."""
+        ttnn.plus_one(self._kv_pos)
+        ttnn.plus_one(self._kv_rope_idx)
+
+    @property
+    def kv_batch(self):
+        pos = getattr(self, "_kv_pos", None)
+        return int(pos.shape[-1]) if pos is not None else 0
+
     # ---- the real forward ----------------------------------------------------------
 
     def forward_resident(self, device_ids, position_embeddings, attention_mask):

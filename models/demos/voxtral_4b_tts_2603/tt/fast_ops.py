@@ -76,7 +76,36 @@ _SDPA_MASK_DTYPES = (ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b)
 # stream's dtype, which this file never changes.
 _WIDE_DTYPE = ttnn.bfloat16
 
+# The KV cache is carried in bf16: it is what the decode head-split, the cache update and
+# flash-decode all take, and it is the same format q/k/v already leave their projection in.
+_KV_DTYPE = ttnn.bfloat16
+
 _installed = False
+
+
+def decode_shard(device, rows, width):
+    """HEIGHT-sharded over the BATCH -- one user per core, which is the decode layout.
+
+    `nlp_create_qkv_heads_decode`, decode-mode `rotary_embedding_hf` and `nlp_concat_heads_decode`
+    are a matched set: each wants `[1, batch, heads, head_dim]` height-sharded with one 32-row tile
+    per user. A tensor that is merely interleaved is rejected by the RoPE op outright, so the shard
+    is part of the contract rather than a tuning choice.
+    """
+    grid = device.compute_with_storage_grid_size()
+    cols = min(int(grid.x), int(rows))
+    while rows % cols:
+        cols -= 1
+    # `shape` here is the PER-CORE shard, which is what use_height_and_width_as_shard_shape says.
+    # Without that flag `shape` is read as the whole tensor and divided by the core count, which
+    # for one 32-row tile over 32 cores yields a (1, head_dim) shard -- not tile-sized, and the
+    # layout rejects it outright.
+    return ttnn.create_sharded_memory_config(
+        shape=(ttnn.TILE_SIZE, int(width)),
+        core_grid=ttnn.CoreGrid(y=rows // cols, x=cols),
+        strategy=ttnn.ShardStrategy.HEIGHT,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
 
 
 def _fold(x):
@@ -304,6 +333,97 @@ def _attn_pc(module, role, rows, weight):
     return pc
 
 
+def _kv_seed(kv, k, v):
+    """Hand the prefill's post-RoPE K/V to the cache, freeing whatever it held before."""
+    for key, tensor in (("k", k), ("v", v)):
+        stale = kv.get(key)
+        if stale is not None:
+            try:
+                ttnn.deallocate(stale)
+            except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
+                pass
+        kv[key] = tensor
+
+
+def _decode_call(module, hidden_states, position_embeddings, kv, cur_pos):
+    """ONE token, attending to the CACHED context: the decode op set end to end.
+
+    The prefill path recomputes every resident position's projections, attention and MLP on every
+    step, which at capacity C is C times the arithmetic a token needs. Here the projection runs
+    over B rows instead of B*C, the new K/V is appended to the cache in place, and flash-decode
+    reads the whole history out of that cache. Prefill and decode are genuinely DIFFERENT kernels
+    (`nlp_create_qkv_heads_decode`, decode-mode RoPE, `scaled_dot_product_attention_decode`,
+    `nlp_concat_heads_decode`), and they are a matched set: each wants the batch height-sharded one
+    user per core, so the shard is part of the contract rather than a tuning choice.
+
+    `cur_pos` is a DEVICE tensor, never a Python list. A list bakes the position into the captured
+    program and every replay would then write the same cache slot; a tensor lets the position
+    advance underneath a trace that never changes.
+    """
+    device = module.wo.device()
+    res_dtype = hidden_states.dtype
+    batch = int(hidden_states.shape[0])
+    ck = _matmul_ck(device)
+    flat, folded = _fold(hidden_states)
+    fused = ttnn.linear(
+        flat,
+        module._wqkv,
+        compute_kernel_config=ck,
+        dtype=_SDPA_DTYPE,
+        memory_config=ttnn.L1_MEMORY_CONFIG,
+    )
+    # [1, B, W] -> [1, 1, B, W]: a leading-dim reshape, so a metadata view.
+    xqkv = ttnn.reshape(fused, (1, 1, batch, int(fused.shape[-1])))
+    shard = decode_shard(device, batch, module.head_dim)
+    q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
+        xqkv,
+        num_heads=module.n_heads,
+        num_kv_heads=module.n_kv_heads,
+        memory_config=shard,
+    )
+    ttnn.deallocate(fused)
+
+    if position_embeddings is not None:
+        cos, sin = position_embeddings
+        q = ttnn.experimental.rotary_embedding_hf(q, cos, sin, is_decode_mode=True)
+        k = ttnn.experimental.rotary_embedding_hf(k, cos, sin, is_decode_mode=True)
+
+    # Append this token's K/V in place. No page table: the cache is one contiguous [B, nkv, C, hd]
+    # block per layer, not a paged pool.
+    ttnn.experimental.paged_update_cache(kv["k"], k, update_idxs_tensor=cur_pos)
+    ttnn.experimental.paged_update_cache(kv["v"], v, update_idxs_tensor=cur_pos)
+    ttnn.deallocate(k)
+    ttnn.deallocate(v)
+
+    # is_causal is left at its default: flash-decode derives the valid key range from cur_pos, so
+    # the one query row attends to exactly positions [0, cur_pos] and no mask tensor is read.
+    attn = ttnn.transformer.scaled_dot_product_attention_decode(
+        q,
+        kv["k"],
+        kv["v"],
+        cur_pos_tensor=cur_pos,
+        scale=module.scaling,
+        compute_kernel_config=module.compute_kernel_config,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    ttnn.deallocate(q)
+    # Back to the one-user-per-core shard the concat wants. Flash-decode writes to DRAM (its
+    # working set wants the room); the concat is a pure shuffle and takes only a sharded input.
+    attn_sharded = ttnn.to_memory_config(attn, decode_shard(device, batch, module.head_dim))
+    ttnn.deallocate(attn)
+    merged = ttnn.experimental.nlp_concat_heads_decode(
+        attn_sharded,
+        num_heads=module.n_heads,
+        memory_config=ttnn.L1_MEMORY_CONFIG,
+    )
+    ttnn.deallocate(attn_sharded)
+    # [1, 1, B, nq*hd] -> [1, B, nq*hd], again a leading-dim view.
+    flat_out = ttnn.reshape(merged, (1, batch, int(merged.shape[-1])))
+    out = ttnn.linear(flat_out, module.wo, compute_kernel_config=ck, dtype=res_dtype)
+    ttnn.deallocate(merged)
+    return _unfold(out, folded) if folded > 1 else ttnn.reshape(out, (batch, 1, int(out.shape[-1])))
+
+
 def _patch_attention(cls, dtype):
     original = cls.__call__
     original_init = cls.__init__
@@ -326,6 +446,42 @@ def _patch_attention(cls, dtype):
             self._wqkv = ttnn.concat([self.wq, self.wk, self.wv], dim=-1)
         except Exception:  # noqa: BLE001 - any shape/dtype the concat rejects just keeps 3 matmuls
             self._wqkv = None
+        # The KV cache is OFF until a caller allocates one. Prefill then also FILLS it, and a
+        # single-token call switches to the decode op set. Nothing about the prefill-only path
+        # changes while this is None, so every existing caller is untouched.
+        self._kv = None
+
+    def kv_enable(self, cur_pos):
+        """Arm this block's K/V cache. The BUFFERS appear on the next prefill, which seeds them.
+
+        `cur_pos` is the stack's shared `[B]` position tensor. It is held on the INSTANCE rather
+        than threaded through `__call__`, because the whole-block stubs call their attention with
+        a fixed `(hidden, position_embeddings, attention_mask)` signature and forward nothing else
+        -- adding an argument would mean editing all four stub bodies, which is the thing this
+        override layer exists to avoid. The tensor's identity is stable and only its contents
+        advance, so holding it here is trace-safe.
+
+        Nothing is allocated here on purpose: the cache is the prefill's own post-RoPE K/V, so
+        letting the prefill hand its tensors over is both exactly the right shape and exactly the
+        right contents, with no copy and no chance of the two disagreeing. The prefill runs during
+        setup, i.e. before any trace capture, so by capture time the buffers exist and their
+        addresses are fixed for every replay -- which is what a traced decode step requires.
+        """
+        self._kv = {"k": None, "v": None, "pos": cur_pos}
+        return self._kv
+
+    def kv_disable(self):
+        kv = getattr(self, "_kv", None)
+        self._kv = None
+        if kv is None:
+            return
+        for key in ("k", "v"):
+            if kv.get(key) is None:
+                continue
+            try:
+                ttnn.deallocate(kv[key])
+            except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
+                pass
 
     def __call__(self, hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
         if not _device_ready(hidden_states, position_embeddings, attention_mask):
@@ -337,6 +493,11 @@ def _patch_attention(cls, dtype):
                 **kwargs,
             )
         seq_len = int(hidden_states.shape[-2])
+        # ONE token with an armed cache is the decode step; anything longer is a prefill, which
+        # still runs the full path (and, when the cache is armed, seeds it).
+        kv = getattr(self, "_kv", None)
+        if kv is not None and seq_len == 1 and kv.get("k") is not None:
+            return _decode_call(self, hidden_states, position_embeddings, kv, kv["pos"])
         ck = _matmul_ck(self.wo.device())
         sdpa_ck = self.compute_kernel_config
         # The residual stream's dtype is READ OFF the input rather than assumed: the output
@@ -418,8 +579,16 @@ def _patch_attention(cls, dtype):
             compute_kernel_config=sdpa_ck,
         )
         ttnn.deallocate(q)
-        ttnn.deallocate(k)
-        ttnn.deallocate(v)
+        if kv is None:
+            ttnn.deallocate(k)
+            ttnn.deallocate(v)
+        else:
+            # SEED THE CACHE by HANDING IT the prefill's own post-RoPE K/V rather than copying
+            # into a buffer allocated earlier. These are the very tensors a cache-less decode
+            # would recompute from scratch every token, so the cached step is the same arithmetic
+            # as the full recompute, not an approximation of it -- and taking ownership means
+            # there is no copy op and no second shape that could disagree with this one.
+            _kv_seed(kv, k, v)
         # The mirror of the split: `nlp_concat_heads` folds [B, heads, S, hd] back to
         # [B, 1, S, heads*hd] in one pass, replacing the transpose + last-dim reshape pair (107 ms
         # of ReshapeView plus its share of 39 ms of Transpose in the capture).
@@ -445,6 +614,8 @@ def _patch_attention(cls, dtype):
 
     cls.__init__ = __init__
     cls.__call__ = __call__
+    cls.kv_enable = kv_enable
+    cls.kv_disable = kv_disable
 
 
 def _patch_head(cls, dtype):
