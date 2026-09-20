@@ -515,10 +515,38 @@ def _patch_attention(cls, dtype):
         """
         original_init(self, *args, **kwargs)
         self._wqkv = None
-        try:
-            self._wqkv = ttnn.concat([self.wq, self.wk, self.wv], dim=-1)
-        except Exception:  # noqa: BLE001 - any shape/dtype the concat rejects just keeps 3 matmuls
-            self._wqkv = None
+        torch_module = kwargs.get("torch_module", args[1] if len(args) > 1 else None)
+        state = {}
+        if torch_module is not None:
+            try:
+                state = torch_module.state_dict()
+            except Exception:  # noqa: BLE001 - no state dict falls back to the device-side concat
+                state = {}
+        qkv_keys = ("q_proj.weight", "k_proj.weight", "v_proj.weight")
+        if all(k in state for k in qkv_keys):
+            # Built from the TORCH weights and uploaded once, already narrowed. Concatenating the
+            # three device copies and then typecasting would do the same work on the device inside
+            # the build, and would hold both widths of the result at once.
+            self._wqkv = ttnn.from_torch(
+                torch.cat([state[k].t().to(torch.bfloat16) for k in qkv_keys], dim=-1).contiguous(),
+                dtype=ttnn.bfloat8_b,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.wo.device(),
+            )
+        else:
+            try:
+                self._wqkv = ttnn.concat([self.wq, self.wk, self.wv], dim=-1)
+            except Exception:  # noqa: BLE001 - any shape/dtype the concat rejects keeps 3 matmuls
+                self._wqkv = None
+        if "o_proj.weight" in state:
+            stale = self.wo
+            self.wo = ttnn.from_torch(
+                state["o_proj.weight"].t().to(torch.bfloat16).contiguous(),
+                dtype=ttnn.bfloat8_b,
+                layout=ttnn.TILE_LAYOUT,
+                device=stale.device(),
+            )
+            ttnn.deallocate(stale)
         # The KV cache is OFF until a caller allocates one. Prefill then also FILLS it, and a
         # single-token call switches to the decode op set. Nothing about the prefill-only path
         # changes while this is None, so every existing caller is untouched.
@@ -693,6 +721,28 @@ def _patch_attention(cls, dtype):
 
 def _patch_head(cls, dtype):
     original = cls.__call__
+    original_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        """Build the stub, then narrow the vocab projection to bf8_b.
+
+        This single weight is 3072 x 131072 -- 805 MB at bf16, the largest tensor in the model --
+        and a decode step streams all of it to produce one token per sample. It is the one weight
+        where the dtype is worth more than everything around it.
+        """
+        original_init(self, *args, **kwargs)
+        torch_module = kwargs.get("torch_module", args[1] if len(args) > 1 else None)
+        weight = getattr(torch_module, "weight", None)
+        if weight is None or self.weight.dtype == ttnn.bfloat8_b:
+            return
+        stale = self.weight
+        self.weight = ttnn.from_torch(
+            weight.t().to(torch.bfloat16).contiguous(),
+            dtype=ttnn.bfloat8_b,
+            layout=ttnn.TILE_LAYOUT,
+            device=stale.device(),
+        )
+        ttnn.deallocate(stale)
 
     def __call__(self, hidden_states, keep_folded=False, **kwargs):
         """`keep_folded` hands back `[1, B, vocab]` instead of `[B, 1, vocab]`.
@@ -722,6 +772,7 @@ def _patch_head(cls, dtype):
         )
         return out if keep_folded else _unfold(out, batch)
 
+    cls.__init__ = __init__
     cls.__call__ = __call__
 
 
