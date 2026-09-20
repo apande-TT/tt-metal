@@ -242,14 +242,15 @@ _SILU = ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)
 _mm_ck_cache = {}
 
 
-def _matmul_ck(device):
-    """The matmuls' compute kernel config: HiFi2, cached per arch."""
+def _matmul_ck(device, fidelity=ttnn.MathFidelity.HiFi2):
+    """The matmuls' compute kernel config, cached per (arch, fidelity)."""
     arch = device.arch()
-    ck = _mm_ck_cache.get(arch)
+    key = (arch, fidelity)
+    ck = _mm_ck_cache.get(key)
     if ck is None:
-        ck = _mm_ck_cache[arch] = ttnn.init_device_compute_kernel_config(
+        ck = _mm_ck_cache[key] = ttnn.init_device_compute_kernel_config(
             arch,
-            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_fidelity=fidelity,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
@@ -299,8 +300,20 @@ def _patch_mlp(cls, dtype):
         # This needs the output-block cap in `_block_config`: a bf16 output makes packer_l1_acc
         # allocate a SECOND fp32 partials CB, and at the full per-core block that clashed L1 and
         # broke trace capture.
-        gate = ttnn.linear(flat, self.gate, compute_kernel_config=ck, program_config=pcs[0], dtype=_WIDE_DTYPE)
-        up = ttnn.linear(flat, self.up, compute_kernel_config=ck, program_config=pcs[1], dtype=_WIDE_DTYPE)
+        # The gate/up pair is the one COMPUTE-bound matmul left in the profile, and it is the whole
+        # SwiGLU expansion, so a fidelity phase costs more here than anywhere else. LoFi for these
+        # two only: the DOWN projection keeps HiFi2 because it is what writes back into the
+        # residual stream, which is the accumulation a 26-layer stack compounds.
+        #
+        # ONLY when M spans more than one tile row. A fidelity phase is MATH time, so dropping one
+        # pays exactly where the op is compute-bound -- the prefill shape, 64 tile rows. The decode
+        # shape is a single tile row per token and is bound by streaming the weight, where the math
+        # is already hidden behind the read: there the knob buys nothing and only perturbs the
+        # number that the per-token metric is read from.
+        fidelity = ttnn.MathFidelity.LoFi if m_tiles > 1 else ttnn.MathFidelity.HiFi2
+        lo = _matmul_ck(self.gate.device(), fidelity)
+        gate = ttnn.linear(flat, self.gate, compute_kernel_config=lo, program_config=pcs[0], dtype=_WIDE_DTYPE)
+        up = ttnn.linear(flat, self.up, compute_kernel_config=lo, program_config=pcs[1], dtype=_WIDE_DTYPE)
         prod = ttnn.multiply(gate, up)
         ttnn.deallocate(gate)
         ttnn.deallocate(up)
