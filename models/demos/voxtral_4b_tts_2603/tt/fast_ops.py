@@ -111,6 +111,52 @@ def _device_ready(*tensors):
     return True
 
 
+def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None):
+    """A 2D-multicast program config sized for THIS shape on the WHOLE grid.
+
+    Naming a `core_grid` instead leaves ttnn a 1-D multicast with 1x1 subblocks, so the work is not
+    actually shaped -- "it already occupies every core" and "the blocks are the right size" are
+    different claims. The grid itself is read off the device, never hard-coded: per_core_M/N derived
+    for one arch's core count are wrong on another's.
+
+    `fused_activation` is the real prize here rather than the blocking. Without a program config
+    `ttnn.linear(activation="silu")` cannot fuse and runs silu as a SEPARATE op over the full
+    [B*S, 4*hidden] intermediate -- 31 ms of UnaryDeviceOperation in the capture, sitting between
+    two instances of the same matmul. Fused, it happens as the matmul packs each output tile.
+    """
+    grid = device.compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    per_core_m = -(-int(m_tiles) // gy)
+    per_core_n = -(-int(n_tiles) // gx)
+    # in0_block_w must divide K in tiles. Larger means fewer K iterations but a bigger in0 CB; 2 is
+    # the largest that keeps this model's fp32 activation CB clear of the 1.5 MB L1 budget.
+    in0_block_w = next((c for c in (2, 1) if int(k_tiles) % c == 0), 1)
+    # out_subblock_h * out_subblock_w <= 4 because the compute kernel runs fp32_dest_acc_en=True,
+    # which halves DEST. Pick the largest legal pair that divides the per-core block.
+    best_h, best_w = 1, 1
+    for h in range(1, per_core_m + 1):
+        if per_core_m % h:
+            continue
+        for w in range(1, per_core_n + 1):
+            if per_core_n % w or h * w > 4:
+                continue
+            if h * w > best_h * best_w:
+                best_h, best_w = h, w
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+        in0_block_w=in0_block_w,
+        out_subblock_h=best_h,
+        out_subblock_w=best_w,
+        per_core_M=per_core_m,
+        per_core_N=per_core_n,
+        transpose_mcast=False,
+        fused_activation=fused_activation,
+    )
+
+
+_SILU = ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)
+
+
 def _patch_mlp(cls, dtype):
     original = cls.__call__
 
@@ -120,12 +166,29 @@ def _patch_mlp(cls, dtype):
         ck = self.compute_kernel_config
         extra = {} if dtype is None else {"dtype": dtype}
         flat, batch = _fold(x)
-        gate = ttnn.linear(flat, self.gate, compute_kernel_config=ck, activation="silu", **extra)
-        up = ttnn.linear(flat, self.up, compute_kernel_config=ck, **extra)
+        # Program configs are keyed by the ONE thing that varies between calls -- the row count --
+        # and cached on the instance. Built on the host, so nothing here allocates on device and the
+        # lookup is trace-safe.
+        cache = getattr(self, "_pc_cache", None)
+        if cache is None:
+            cache = self._pc_cache = {}
+        m_tiles = -(-int(flat.shape[-2]) // 32)
+        pcs = cache.get(m_tiles)
+        if pcs is None:
+            device = self.gate.device()
+            hidden = -(-int(self.gate.shape[-2]) // 32)
+            inter = -(-int(self.gate.shape[-1]) // 32)
+            pcs = cache[m_tiles] = (
+                _block_config(device, m_tiles, hidden, inter, fused_activation=_SILU),
+                _block_config(device, m_tiles, hidden, inter),
+                _block_config(device, m_tiles, inter, hidden),
+            )
+        gate = ttnn.linear(flat, self.gate, compute_kernel_config=ck, program_config=pcs[0], **extra)
+        up = ttnn.linear(flat, self.up, compute_kernel_config=ck, program_config=pcs[1], **extra)
         prod = ttnn.multiply(gate, up)
         ttnn.deallocate(gate)
         ttnn.deallocate(up)
-        out = ttnn.linear(prod, self.down, compute_kernel_config=ck, **extra)
+        out = ttnn.linear(prod, self.down, compute_kernel_config=ck, program_config=pcs[2], **extra)
         ttnn.deallocate(prod)
         return _unfold(out, batch)
 
