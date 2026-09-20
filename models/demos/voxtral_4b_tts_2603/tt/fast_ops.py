@@ -86,6 +86,11 @@ _KV_DTYPE = ttnn.bfloat16
 # narrowed copy can be made at the upload instead of by converting the device tensor.
 _MLP_WEIGHT_KEYS = (("gate", "gate_proj.weight"), ("up", "up_proj.weight"), ("down", "down_proj.weight"))
 
+# The vocab projection's weight format. A decode step streams this whole weight to emit one token
+# per sample, so it is the single largest per-token DRAM read in the model and every halving of it
+# is paid straight back in per-token time.
+_HEAD_DTYPE = ttnn.bfloat4_b
+
 _installed = False
 
 
@@ -772,12 +777,12 @@ def _patch_head(cls, dtype):
         original_init(self, *args, **kwargs)
         torch_module = kwargs.get("torch_module", args[1] if len(args) > 1 else None)
         weight = getattr(torch_module, "weight", None)
-        if weight is None or self.weight.dtype == ttnn.bfloat8_b:
+        if weight is None or self.weight.dtype == _HEAD_DTYPE:
             return
         stale = self.weight
         self.weight = ttnn.from_torch(
             weight.t().to(torch.bfloat16).contiguous(),
-            dtype=ttnn.bfloat8_b,
+            dtype=_HEAD_DTYPE,
             layout=ttnn.TILE_LAYOUT,
             device=stale.device(),
         )
