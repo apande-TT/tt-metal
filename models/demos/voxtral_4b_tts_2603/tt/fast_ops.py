@@ -156,6 +156,34 @@ def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None):
 
 _SILU = ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)
 
+# HiFi4 is the bring-up default and it is the WRONG one for these matmuls: the weights are bf16, and
+# HiFi2 already consumes a bf16 mantissa in full, so the extra fidelity phases buy no accuracy and
+# cost ~2x the math. The capture said as much -- the gate/up projection measured 137 ms against a
+# 68.7 ms peak-FLOP floor while holding all 110 cores, a ratio no blocking knob explains.
+#
+# fp32_dest_acc_en and packer_l1_acc are deliberately LEFT ON: the accumulation, not the multiply,
+# is what a 26-layer residual stack compounds, and turning fp32 DEST off is a separate lever with
+# its own PCC price (it would also relax the subblock limit in _block_config).
+#
+# The NORMS keep their own HiFi4 config. Normalisation reductions are the documented hard floor --
+# they compound to a PCC failure over depth in a way a projection does not.
+_mm_ck_cache = {}
+
+
+def _matmul_ck(device):
+    """The matmuls' compute kernel config: HiFi2, cached per arch."""
+    arch = device.arch()
+    ck = _mm_ck_cache.get(arch)
+    if ck is None:
+        ck = _mm_ck_cache[arch] = ttnn.init_device_compute_kernel_config(
+            arch,
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+    return ck
+
 
 def _patch_mlp(cls, dtype):
     original = cls.__call__
@@ -163,7 +191,7 @@ def _patch_mlp(cls, dtype):
     def __call__(self, x, **kwargs):
         if not _device_ready(x):
             return original(self, x, **kwargs)
-        ck = self.compute_kernel_config
+        ck = _matmul_ck(self.gate.device())
         extra = {} if dtype is None else {"dtype": dtype}
         flat, batch = _fold(x)
         # Program configs are keyed by the ONE thing that varies between calls -- the row count --
@@ -228,7 +256,8 @@ def _patch_attention(cls, dtype):
                 **kwargs,
             )
         seq_len = int(hidden_states.shape[-2])
-        ck = self.compute_kernel_config
+        ck = _matmul_ck(self.wo.device())
+        sdpa_ck = self.compute_kernel_config
         # The residual stream's dtype is READ OFF the input rather than assumed: the output
         # projection has to hand back exactly what the residual add expects, and this override is
         # shared by heads that declare it differently.
@@ -298,7 +327,7 @@ def _patch_attention(cls, dtype):
             attn_mask=attention_mask,
             is_causal=False,
             scale=self.scaling,
-            compute_kernel_config=ck,
+            compute_kernel_config=sdpa_ck,
         )
         ttnn.deallocate(q)
         ttnn.deallocate(k)
@@ -331,6 +360,7 @@ def _patch_head(cls, dtype):
         if not _device_ready(hidden_states):
             return original(self, hidden_states, **kwargs)
         extra = {} if dtype is None else {"dtype": dtype}
+        ck = _matmul_ck(self.weight.device())
         # `flat` is NOT deallocated here. When the fold is a metadata view it shares the caller's
         # buffer, so freeing it would free the caller's tensor; when it is a real relayout it is a
         # local that the last reference releases on return. One rule covers both.
@@ -339,7 +369,7 @@ def _patch_head(cls, dtype):
             flat,
             self.weight,
             bias=self.bias,
-            compute_kernel_config=self.compute_kernel_config,
+            compute_kernel_config=ck,
             **extra,
         )
         return _unfold(out, batch)
