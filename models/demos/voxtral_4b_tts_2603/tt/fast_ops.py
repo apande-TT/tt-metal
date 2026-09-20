@@ -634,7 +634,17 @@ def _patch_attention(cls, dtype):
 def _patch_head(cls, dtype):
     original = cls.__call__
 
-    def __call__(self, hidden_states, **kwargs):
+    def __call__(self, hidden_states, keep_folded=False, **kwargs):
+        """`keep_folded` hands back `[1, B, vocab]` instead of `[B, 1, vocab]`.
+
+        The unfold is the single most expensive movement left in a decode step. Everywhere else a
+        fold is free, because the last dim is unchanged and the row counts are tile multiples --
+        but `[1, B, vocab] -> [B, 1, vocab]` turns one 32-row tile row into B slabs of a single
+        row each, every one padded back out to a tile, and it does that across a 131072-wide
+        tensor. The sampler that consumes this does `argmax(dim=-1)` and could not care which of
+        the two leading dims carries the batch, so a caller that only samples asks for the folded
+        form and the relayout never happens.
+        """
         if not _device_ready(hidden_states):
             return original(self, hidden_states, **kwargs)
         extra = {} if dtype is None else {"dtype": dtype}
@@ -650,7 +660,7 @@ def _patch_head(cls, dtype):
             compute_kernel_config=ck,
             **extra,
         )
-        return _unfold(out, batch)
+        return out if keep_folded else _unfold(out, batch)
 
     cls.__call__ = __call__
 

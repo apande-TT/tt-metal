@@ -349,9 +349,13 @@ class VoxtralPipeline:
         hidden = stack.forward_resident(buf["step_ids"], rope, None)
         for table in rope:
             ttnn.deallocate(table)
-        logits = stack.head(hidden)
         if not sample:
-            return {"hidden": hidden, "logits": logits}
+            return {"hidden": hidden, "logits": stack.head(hidden)}
+        # FOLDED logits, because the only consumer is the argmax. Unfolding [1, B, vocab] into
+        # [B, 1, vocab] is a real relayout of a 131072-wide tensor -- B single-row slabs, each
+        # padded back to a tile -- and it was the largest movement op in the step. The reduction
+        # is over the last dim either way, so the batch can stay on whichever leading dim it is on.
+        logits = stack.head(hidden, keep_folded=True)
         ttnn.deallocate(hidden)
         row_major = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
         token = ttnn.argmax(row_major, dim=-1)
