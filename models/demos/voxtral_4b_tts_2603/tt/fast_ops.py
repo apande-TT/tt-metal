@@ -134,6 +134,26 @@ def _patch_mlp(cls, dtype):
 
 def _patch_attention(cls, dtype):
     original = cls.__call__
+    original_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        """Build the stub as it builds itself, then add the FUSED qkv weight beside the three.
+
+        One `[K, nq*hd + 2*nkv*hd]` matmul replaces three, and -- the reason this matters far more
+        than the two saved dispatches -- its single output is exactly the layout
+        `nlp_create_qkv_heads` consumes, which does the split AND the head transpose for all three
+        tensors in one pass. Done HERE, at build time, so no allocation happens inside a forward
+        (and so nothing allocates during a trace capture).
+
+        wq/wk/wv are left in place rather than freed: they are what the non-device fallback path
+        above still calls, and the fused copy is ~38 MB per block against 32 GB of device DRAM.
+        """
+        original_init(self, *args, **kwargs)
+        self._wqkv = None
+        try:
+            self._wqkv = ttnn.concat([self.wq, self.wk, self.wv], dim=-1)
+        except Exception:  # noqa: BLE001 - any shape/dtype the concat rejects just keeps 3 matmuls
+            self._wqkv = None
 
     def __call__(self, hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
         if not _device_ready(hidden_states, position_embeddings, attention_mask):
@@ -152,20 +172,41 @@ def _patch_attention(cls, dtype):
         res_dtype = hidden_states.dtype
         flat, batch = _fold(hidden_states)
 
-        def project(weight, n_heads):
-            # q/k/v are produced DIRECTLY in bf16 -- the flash-attention op below takes nothing
-            # wider, and the projection's pack format is free, where a typecast afterwards would
-            # re-read and re-write the whole [B, heads, S, head_dim] tensor.
-            proj = ttnn.linear(flat, weight, compute_kernel_config=ck, dtype=_SDPA_DTYPE)
-            heads = ttnn.reshape(proj, (batch, seq_len, n_heads, self.head_dim))
-            ttnn.deallocate(proj)
-            out = ttnn.transpose(heads, 1, 2)
-            ttnn.deallocate(heads)
-            return out
+        # q/k/v are produced DIRECTLY in bf16 -- the flash-attention op below takes nothing wider,
+        # and a projection's pack format is free, where a typecast afterwards would re-read and
+        # re-write the whole [B, heads, S, head_dim] tensor.
+        wqkv = getattr(self, "_wqkv", None)
+        if wqkv is not None:
+            # ONE fused projection, then ONE op for the head split. Splitting a projection with
+            # `reshape([B, S, heads, hd]) + transpose(1, 2)` per tensor was the single largest
+            # remaining cost in the capture -- 325 ms of ReshapeView + Transpose against ~26 ms of
+            # bytes -- because reshaping the LAST dim of a tile tensor is a full relayout, not a
+            # view. `nlp_create_qkv_heads` reads the fused [B, 1, S, (nq+2nkv)*hd] once and writes
+            # q/k/v already in [B, heads, S, hd], doing all three splits and transposes in a single
+            # pass. transpose_k_heads=False because SDPA wants k as [b, nkv, s, dh], not k^T.
+            fused = ttnn.linear(flat, wqkv, compute_kernel_config=ck, dtype=_SDPA_DTYPE)
+            # Rank-4 view: the last dim is unchanged and both row counts are tile multiples.
+            staged = ttnn.reshape(fused, (batch, 1, seq_len, int(fused.shape[-1])))
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                staged,
+                num_heads=self.n_heads,
+                num_kv_heads=self.n_kv_heads,
+                transpose_k_heads=False,
+            )
+            ttnn.deallocate(fused)
+        else:
 
-        q = project(self.wq, self.n_heads)
-        k = project(self.wk, self.n_kv_heads)
-        v = project(self.wv, self.n_kv_heads)
+            def project(weight, n_heads):
+                proj = ttnn.linear(flat, weight, compute_kernel_config=ck, dtype=_SDPA_DTYPE)
+                heads = ttnn.reshape(proj, (batch, seq_len, n_heads, self.head_dim))
+                ttnn.deallocate(proj)
+                out = ttnn.transpose(heads, 1, 2)
+                ttnn.deallocate(heads)
+                return out
+
+            q = project(self.wq, self.n_heads)
+            k = project(self.wk, self.n_kv_heads)
+            v = project(self.wv, self.n_kv_heads)
         if attention_mask is not None and attention_mask.dtype not in _SDPA_MASK_DTYPES:
             # The pipeline uploads its masks in bf16 already; this covers a caller that does not.
             attention_mask = ttnn.typecast(attention_mask, _SDPA_DTYPE)
@@ -199,18 +240,24 @@ def _patch_attention(cls, dtype):
         ttnn.deallocate(q)
         ttnn.deallocate(k)
         ttnn.deallocate(v)
-        heads = ttnn.transpose(context, 1, 2)
+        # The mirror of the split: `nlp_concat_heads` folds [B, heads, S, hd] back to
+        # [B, 1, S, heads*hd] in one pass, replacing the transpose + last-dim reshape pair (107 ms
+        # of ReshapeView plus its share of 39 ms of Transpose in the capture).
+        heads = ttnn.experimental.nlp_concat_heads(context)
         ttnn.deallocate(context)
-        # Straight into the FOLDED layout: the output projection is the same per-token
-        # projection as q/k/v and pays the same 32x weight re-stream if left batched.
+        # Straight into the FOLDED layout: the output projection is the same per-token projection
+        # as q/k/v and pays the same 32x weight re-stream if left batched. A view, since the last
+        # dim is unchanged.
         merged = ttnn.reshape(heads, (1, batch * seq_len, self.n_heads * self.head_dim))
-        ttnn.deallocate(heads)
         # Back to the residual stream's dtype HERE, where it is one matmul's pack format, rather
         # than as a separate cast over a [B*S, hidden] tensor.
         out = ttnn.linear(merged, self.wo, compute_kernel_config=ck, dtype=res_dtype)
-        ttnn.deallocate(merged)
+        # `merged` is a VIEW of `heads`, so it is left to the last reference to release rather than
+        # deallocated here -- freeing a view frees the tensor it aliases, and `heads` is still in
+        # scope. Both die at return.
         return _unfold(out, batch)
 
+    cls.__init__ = __init__
     cls.__call__ = __call__
 
 
