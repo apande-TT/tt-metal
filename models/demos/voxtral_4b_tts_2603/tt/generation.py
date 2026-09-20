@@ -381,6 +381,21 @@ class VoxtralGenerationStack:
             ttnn.deallocate(hidden)
             hidden = promoted
 
+        # FOLD THE DECODE STREAM ONCE, HERE, instead of twice per block. `[B, 1, H]` pads its
+        # middle dim out to a whole tile, so every residual add and norm in the stack touches 32x
+        # the data the step contains, and each block was relaying the tensor into `[1, B, H]` for
+        # its projections and straight back again. See fast_ops.fold_decode_stream. Gated on every
+        # block having a seeded cache, because the fold changes what a "one row" step looks like to
+        # the attention override and a prefill must not see it.
+        from models.demos.voxtral_4b_tts_2603.tt import fast_ops
+
+        # Neither the folded nor the unfolded tensor is deallocated by hand. ttnn::reshape hands
+        # back a metadata VIEW whenever it can, and freeing a view frees the buffer it aliases;
+        # the local that holds the other form dies on return either way.
+        folded = 0
+        if fast_ops.decode_stream_ready(self.attention_modules()):
+            hidden, folded = fast_ops.fold_decode_stream(hidden)
+
         for block in self.layers:
             nxt = block(hidden, position_embeddings=position_embeddings, attention_mask=attention_mask)
             ttnn.deallocate(hidden)
@@ -388,7 +403,8 @@ class VoxtralGenerationStack:
 
         out = self.final_norm(hidden)
         ttnn.deallocate(hidden)
-        return out
+        # One unfold restores the `[B, 1, H]` every caller of this function expects.
+        return fast_ops.unfold_decode_stream(out, folded)
 
     def forward_hidden(self, input_ids, position_ids=None, attention_mask=None):
         """ids -> last_hidden_state `[B, S, 3072]`, the whole prefill on device.

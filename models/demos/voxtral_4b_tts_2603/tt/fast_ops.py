@@ -156,6 +156,63 @@ def _unfold(x, batch):
     return ttnn.reshape(x, (batch, int(x.shape[-2]) // batch, int(x.shape[-1])))
 
 
+# THE DECODE STREAM'S FOLD, HOISTED OUT OF THE BLOCK STACK.
+#
+# A decode step carries one token for each of B users, and the stubs hand that around as
+# `[B, 1, H]`. In TILE layout that shape is a LIE about its size: the middle dim pads 1 -> 32, so
+# the tensor the residual add and the norm actually touch is B x 32 x H -- thirty-two times the
+# data the step contains. Measured per layer at B=32, H=3072, fp32: each residual add 0.094 ms and
+# each norm 0.11 ms, for a stream that is 384 KB of real numbers.
+#
+# Every projection already wanted the other shape, so each block was folding `[B, 1, H]` into
+# `[1, B, H]` for its matmuls and unfolding the result straight back -- and BOTH directions are a
+# real relayout, not a view, because a row count of 1 is not a tile multiple. That is four
+# relayouts a layer, 0.203 ms, paid to return to a shape nothing wanted.
+#
+# So fold ONCE at the stack entry and unfold ONCE at the exit. Everything in between -- rms_norm,
+# the residual adds, all five projections -- reduces over the last dim or is elementwise, and
+# neither cares which leading axis carries the batch. `_DECODE_FOLD` records that the stream is in
+# the folded form so the attention override still recognises a decode step, whose signature was
+# "one row" and is now "B rows with a batch of 1".
+_DECODE_FOLD = 0
+
+
+def decode_stream_ready(attentions):
+    """True when EVERY block has a seeded cache, i.e. this really is the cached decode path.
+
+    The fold changes what `seq_len` means to the attention override, so it must not be applied to
+    a stack that would take the prefill branch -- there a folded stream would read B users as B
+    sequence positions and the mask would no longer line up.
+    """
+    seen = False
+    for attn in attentions:
+        kv = getattr(attn, "_kv", None)
+        if not kv or kv.get("k") is None:
+            return False
+        seen = True
+    return seen
+
+
+def fold_decode_stream(hidden):
+    """`[B, 1, H] -> ([1, B, H], B)`. Returns `(hidden, 0)` when there is nothing to fold."""
+    global _DECODE_FOLD
+    shape = list(hidden.shape)
+    if len(shape) < 3 or int(shape[0]) <= 1 or int(shape[-2]) != 1:
+        return hidden, 0
+    batch = int(shape[0])
+    _DECODE_FOLD = batch
+    return ttnn.reshape(hidden, (1, batch, int(shape[-1]))), batch
+
+
+def unfold_decode_stream(hidden, batch):
+    """Restore `[B, 1, H]` and clear the fold state. Always call this, even on the no-fold path."""
+    global _DECODE_FOLD
+    _DECODE_FOLD = 0
+    if batch <= 1:
+        return hidden
+    return ttnn.reshape(hidden, (batch, 1, int(hidden.shape[-1])))
+
+
 def _device_ready(*tensors):
     """True when every input is already a DEVICE tensor, i.e. this is the real forward path.
 
@@ -490,10 +547,12 @@ def _decode_call(module, hidden_states, position_embeddings, kv, cur_pos):
     """
     device = module.wo.device()
     res_dtype = hidden_states.dtype
-    batch = int(hidden_states.shape[0])
     ck = _matmul_ck(device)
     flat, folded = _fold(hidden_states)
-    rows = int(flat.shape[-2])
+    # THE USER COUNT IS THE ROW COUNT, not the leading dim. Both forms of the stream -- `[B, 1, H]`
+    # and the hoisted `[1, B, H]` -- fold to the same `[1, B, H]`, so reading it off `flat` is the
+    # one expression that is right for either.
+    batch = rows = int(flat.shape[-2])
     fused = ttnn.linear(
         flat,
         module._wqkv,
@@ -557,7 +616,11 @@ def _decode_call(module, hidden_states, position_embeddings, kv, cur_pos):
         dtype=res_dtype,
     )
     ttnn.deallocate(merged)
-    return _unfold(out, folded) if folded > 1 else ttnn.reshape(out, (batch, 1, int(out.shape[-1])))
+    if folded > 1:
+        return _unfold(out, folded)
+    # Hand back the folded stream when the stack is carrying it; the unfold happens once, at the
+    # stack exit, instead of once per block.
+    return out if _DECODE_FOLD else ttnn.reshape(out, (batch, 1, int(out.shape[-1])))
 
 
 def _patch_attention(cls, dtype):
@@ -660,7 +723,7 @@ def _patch_attention(cls, dtype):
         # ONE token with an armed cache is the decode step; anything longer is a prefill, which
         # still runs the full path (and, when the cache is armed, seeds it).
         kv = getattr(self, "_kv", None)
-        if kv is not None and seq_len == 1 and kv.get("k") is not None:
+        if kv is not None and kv.get("k") is not None and (seq_len == 1 or _DECODE_FOLD):
             return _decode_call(self, hidden_states, position_embeddings, kv, kv["pos"])
         ck = _matmul_ck(self.wo.device())
         sdpa_ck = self.compute_kernel_config
