@@ -82,9 +82,21 @@ _WIDE_DTYPE = ttnn.bfloat16
 # flash-decode all take, and it is the same format q/k/v already leave their projection in.
 _KV_DTYPE = ttnn.bfloat16
 
-# The MLP's three weights, paired with the torch state-dict key each was uploaded from, so the
-# narrowed copy can be made at the upload instead of by converting the device tensor.
-_MLP_WEIGHT_KEYS = (("gate", "gate_proj.weight"), ("up", "up_proj.weight"), ("down", "down_proj.weight"))
+# The MLP's three weights, paired with the torch state-dict key each was uploaded from and the
+# format each is stored in, so the narrowed copy can be made at the upload instead of by converting
+# the device tensor.
+#
+# THE EXPANSION PAIR GOES ONE STEP FURTHER THAN THE CONTRACTION. gate and up are the two widest
+# weights in a block and the profile binds their matmul on MEMORY, so what they cost is bytes read,
+# not math done; bf4_b halves those bytes again. They are also the pair whose error is most
+# contained -- each feeds a silu/product that is consumed once by `down` and never enters the
+# running sum. `down` is what writes back INTO the residual stream, which is the accumulation a
+# 26-layer stack compounds, so it stays at bf8_b.
+_MLP_WEIGHT_KEYS = (
+    ("gate", "gate_proj.weight", ttnn.bfloat4_b),
+    ("up", "up_proj.weight", ttnn.bfloat4_b),
+    ("down", "down_proj.weight", ttnn.bfloat8_b),
+)
 
 # The vocab projection's weight format. A decode step streams this whole weight to emit one token
 # per sample, so it is the single largest per-token DRAM read in the model and every halving of it
@@ -327,9 +339,9 @@ def _patch_mlp(cls, dtype):
                 state = torch_module.state_dict()
             except Exception:  # noqa: BLE001 - no state dict just means the on-device path is used
                 state = {}
-        for name, key in _MLP_WEIGHT_KEYS:
+        for name, key, narrow_dtype in _MLP_WEIGHT_KEYS:
             weight = getattr(self, name, None)
-            if weight is None or weight.dtype == ttnn.bfloat8_b:
+            if weight is None or weight.dtype == narrow_dtype:
                 continue
             narrowed = None
             if key in state:
@@ -339,7 +351,7 @@ def _patch_mlp(cls, dtype):
                 # both widths of a 56 MB tensor. Re-uploading has neither cost.
                 narrowed = ttnn.from_torch(
                     state[key].t().to(torch.bfloat16).contiguous(),
-                    dtype=ttnn.bfloat8_b,
+                    dtype=narrow_dtype,
                     layout=ttnn.TILE_LAYOUT,
                     device=weight.device(),
                 )
@@ -348,7 +360,7 @@ def _patch_mlp(cls, dtype):
                 # device typecast rather than leaving the weight wide: a lever that silently
                 # reaches only some instances is worse than one that costs a build-time op.
                 try:
-                    narrowed = ttnn.typecast(weight, ttnn.bfloat8_b)
+                    narrowed = ttnn.typecast(weight, narrow_dtype)
                 except Exception:  # noqa: BLE001 - a format the typecast rejects keeps bf16
                     narrowed = None
             if narrowed is None:
