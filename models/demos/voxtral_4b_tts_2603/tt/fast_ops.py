@@ -458,8 +458,11 @@ _DEST_FP32 = False
 # (above it the compute is silently wrong, not rejected); fp32 DEST halves the file, hence 4.
 _SUBBLOCK_TILE_BUDGET = 4 if _DEST_FP32 else 8
 #
-# The NORMS keep their own HiFi4 config. Normalisation reductions are the documented hard floor --
-# they compound to a PCC failure over depth in a way a projection does not.
+# THE NORMS ARE NOT EXEMPT -- see `_norm_ck`. This said they "keep their own HiFi4 config" because
+# normalisation reductions are the documented hard floor, but that floor is HiFi2 + fp32 DEST, not
+# HiFi4: what compounds over depth is the ACCUMULATOR, and dropping to LoFi is what the catalogue
+# forbids. Reading the floor as "do not touch" left 44 norm launches at four phases; taking them to
+# HiFi2 with fp32 DEST and packer_l1_acc untouched measured -1.75% on decode.
 _mm_ck_cache = {}
 
 
