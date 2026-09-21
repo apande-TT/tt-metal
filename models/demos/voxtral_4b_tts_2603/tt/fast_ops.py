@@ -155,7 +155,14 @@ _KV_DTYPE = ttnn.bfloat16
 _MLP_WEIGHT_KEYS = (
     ("gate", "gate_proj.weight", ttnn.bfloat4_b),
     ("up", "up_proj.weight", ttnn.bfloat4_b),
-    ("down", "down_proj.weight", ttnn.bfloat8_b),
+    # `down` HELD one step above the other two on the argument that it writes back INTO the
+    # residual stream, and a deep stack compounds what the residual carries. That argument is
+    # about the ACCUMULATION, which is still fp32 in DEST and still bf8_b in the stream itself --
+    # it is not an argument about the width the WEIGHT is stored at. The decode step measures 98%
+    # of peak DRAM bandwidth, so what a token costs IS the bytes of weight it streams, and this is
+    # the largest weight left at bf8_b. Taking it to bf4_b moves the per-token floor rather than
+    # closing a gap to it; the full-model PCC gate is what decides whether the stack tolerates it.
+    ("down", "down_proj.weight", ttnn.bfloat4_b),
 )
 
 # Attention's two weight groups. Same split as the MLP's, on the same reasoning: the FUSED qkv
