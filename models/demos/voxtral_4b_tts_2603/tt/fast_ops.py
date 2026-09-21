@@ -1053,10 +1053,22 @@ def _patch_head(cls, dtype):
             return original(self, hidden_states, **kwargs)
         extra = {} if dtype is None else {"dtype": dtype}
         ck = _matmul_ck(self.weight.device())
+        # THE MANY-ROW HEADS GET THE SAME PAIR THE PROJECTIONS GOT. This override serves three
+        # weights: the text vocab head, which is called with ONE tile row per token and is bound by
+        # streaming a 201 MB weight, and the acoustic section's llm_projection and semantic
+        # codebook head, which are called over a whole 1024-row sequence and are the last matmuls
+        # in the model still reading an FP32 activation at HiFi2. For the second kind the coupled
+        # lever applies unchanged -- narrow the in0 so the unpacker stops feeding srcA from 4-byte
+        # tiles, and drop the phase that cap was hiding. The one-tile-row head is left exactly as
+        # it was: its activation is 32 rows against a 201 MB weight, so there are no bytes there to
+        # save, and it is on the per-token path.
         # `flat` is NOT deallocated here. When the fold is a metadata view it shares the caller's
         # buffer, so freeing it would free the caller's tensor; when it is a real relayout it is a
         # local that the last reference releases on return. One rule covers both.
         flat, batch = _fold(hidden_states)
+        if int(flat.shape[-2]) > ttnn.TILE_SIZE:
+            flat = _narrow_proj_in(flat)
+            ck = _matmul_ck(self.weight.device(), ttnn.MathFidelity.LoFi)
         out = ttnn.linear(
             flat,
             self.weight,
