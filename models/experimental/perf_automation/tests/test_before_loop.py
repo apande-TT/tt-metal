@@ -131,6 +131,105 @@ def test_before_loop_all_mocks_produces_manifest_and_baseline(tmp_path, model_ro
     assert manifest2["discovery_review"]["decision"] == "continue"
 
 
+def test_an_explicit_perf_test_skips_generation_entirely(tmp_path, model_root, monkeypatch):
+    """--perf-test used to be consulted only AFTER generate_perf_test had already run (or raised) --
+    so an operator-supplied, already-working perf test paid for a wasted (and possibly failing)
+    regeneration on every run, and a failure there could crash the whole run before --perf-test was
+    ever read. generate_perf_test must not be called at all when config['perf_test'] is set."""
+    from agent import perf_test_gen as _ptg
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("generate_perf_test was called despite an explicit --perf-test")
+
+    monkeypatch.setattr(_ptg, "generate_perf_test", _must_not_be_called)
+    result = _run(tmp_path, model_root, config_extra={"perf_test": "model/test_e2e.py::test_perf"})
+    manifest = json.loads((Path(result["run_dir"]) / "manifest.json").read_text())
+    # BARE path, not the full 'path::case' node id -- stage-mark injection and every other file-
+    # system reader downstream opens this as a .py file, and '...test_e2e.py::test_perf' is not one.
+    # Caught live: --perf-test worked right up until this exact step raised FileNotFoundError.
+    # (case is asserted separately below via _split_perf_test directly: the mock `collect` this
+    # harness wires in always self-heals any case to its own fixed collected id, so the INTEGRATION
+    # test here can only pin down path, not which of --case/the node's own case won.)
+    assert manifest["perf_test_resolved"]["path"] == "model/test_e2e.py"
+    assert "::" not in manifest["perf_test_resolved"]["path"]
+
+
+def test_the_split_helper_lets_a_separate_case_win_over_the_nodes_own(tmp_path, model_root):
+    """--case/-k is the more explicit of the two when both are given -- unit-level, since the mock
+    `collect` wired into the integration harness self-heals any case to its own fixed id and cannot
+    observe which source actually won."""
+    from agent.before_loop import _split_explicit_perf_test
+
+    path, case = _split_explicit_perf_test("model/test_e2e.py::test_perf", explicit_case="test_other")
+    assert path == "model/test_e2e.py" and case == "test_other"
+
+
+def test_the_split_helper_falls_back_to_the_nodes_own_case(tmp_path, model_root):
+    from agent.before_loop import _split_explicit_perf_test
+
+    path, case = _split_explicit_perf_test("model/test_e2e.py::test_perf", explicit_case=None)
+    assert path == "model/test_e2e.py" and case == "test_perf"
+
+
+def test_the_split_helper_handles_a_bare_path_with_no_case_suffix(tmp_path, model_root):
+    from agent.before_loop import _split_explicit_perf_test
+
+    path, case = _split_explicit_perf_test("model/test_e2e.py", explicit_case="test_perf")
+    assert path == "model/test_e2e.py" and case == "test_perf"
+
+
+def test_an_explicit_perf_test_with_no_case_suffix_still_resolves(tmp_path, model_root, monkeypatch):
+    """A bare 'path' (no '::case') for --perf-test must not crash the split, end to end."""
+    from agent import perf_test_gen as _ptg
+
+    monkeypatch.setattr(_ptg, "generate_perf_test", lambda *a, **k: (_ for _ in ()).throw(AssertionError("called")))
+    result = _run(tmp_path, model_root, config_extra={"perf_test": "model/test_e2e.py", "case": "test_perf"})
+    manifest = json.loads((Path(result["run_dir"]) / "manifest.json").read_text())
+    assert manifest["perf_test_resolved"]["path"] == "model/test_e2e.py"
+
+
+def test_an_explicit_perf_test_still_populates_pipelines_and_multimodal(tmp_path, model_root, monkeypatch):
+    """Downstream readers (run.py's pathmap["pipelines"]/["is_multimodal"]) must see the identical
+    contract whether the perf test was generated or supplied explicitly -- these were previously
+    only ever set inside the generation branch. The stored value is model-root-relative (the tail
+    after the model dir's own name, "model" in this fixture), same as a generated perf_node always
+    was -- pipelines_from_manifest (run.py) unconditionally joins it onto model_rel."""
+    from agent import perf_test_gen as _ptg
+
+    monkeypatch.setattr(_ptg, "generate_perf_test", lambda *a, **k: (_ for _ in ()).throw(AssertionError("called")))
+    result = _run(tmp_path, model_root, config_extra={"perf_test": "model/test_e2e.py::test_perf"})
+    manifest = json.loads((Path(result["run_dir"]) / "manifest.json").read_text())
+    assert manifest["pathmap"]["pipelines"] and manifest["pathmap"]["pipelines"][0]["perf_test"] == (
+        "test_e2e.py::test_perf"
+    )
+    assert manifest["pathmap"]["is_multimodal"] is False
+
+
+def test_an_explicit_perf_test_from_a_different_checkout_does_not_double_concatenate(tmp_path, model_root, monkeypatch):
+    """The bug caught live on the nemotron-3-5-lightning-30b bringup run: an operator's --perf-test
+    was absolute in a DIFFERENT checkout than the isolated worktree discovery actually runs in.
+    pipelines_from_manifest (run.py) does f"{model_rel}/{p['perf_test']}" unconditionally, so an
+    absolute (or otherwise not-yet-relative) perf_test doubled into an unresolvable node id --
+    discovery reported success, then stage-mark injection crashed one step later on the doubled
+    path. Reproduced here with an absolute path under a DIFFERENT tmp root that happens to share
+    the model dir's own basename, exactly like the real incident (both checkouts named the model
+    dir the same thing, just rooted differently on disk)."""
+    from agent import perf_test_gen as _ptg
+
+    monkeypatch.setattr(_ptg, "generate_perf_test", lambda *a, **k: (_ for _ in ()).throw(AssertionError("called")))
+    other_checkout = tmp_path / "a_totally_different_checkout" / model_root.name
+    explicit = f"{other_checkout / 'test_e2e.py'}::test_perf"
+    result = _run(tmp_path, model_root, config_extra={"perf_test": explicit})
+    manifest = json.loads((Path(result["run_dir"]) / "manifest.json").read_text())
+    stored = manifest["pathmap"]["pipelines"][0]["perf_test"]
+    assert stored == "test_e2e.py::test_perf", stored
+    # Prove the actual downstream join (run.py's own function) no longer doubles the path.
+    from cc_optimize.run import pipelines_from_manifest
+
+    out = pipelines_from_manifest(manifest, model_rel=model_root.name)
+    assert out[0]["perf_test"] == f"{model_root.name}/test_e2e.py::test_perf"
+
+
 def test_before_loop_fatal_flag_stops_run(tmp_path, model_root):
     def fatal_runner(prompt):
         return json.dumps(

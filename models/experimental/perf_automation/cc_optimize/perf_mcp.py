@@ -278,7 +278,7 @@ _PCC_BANKED = "pcc_banked"
 _DECODE_STUCK_MARKER = "TRACE_DECODE_ADVANCE=stuck"
 # Must match the BEFORE bookend (run.py sets 3): AFTER = min over 1-sample readings vs
 # BEFORE = median of 3 manufactured the full noise range as a gain on every run.
-_FULLPIPE_SAMPLES = max(1, int(os.environ.get("PERF_MCP_FULLPIPE_SAMPLES", "3")))
+_FULLPIPE_SAMPLES = max(1, int(os.environ.get("PERF_MCP_FULLPIPE_SAMPLES", "1")))
 # How far two readings of one stage's read set may differ and still be treated as the same
 # measurement. The working set is a property of the build, so agreeing samples are the evidence that
 # the number is an observation rather than instrumentation noise -- and only an observation may be
@@ -586,6 +586,10 @@ _MATERIAL_GAP_FRAC = float(os.environ.get("PERF_MCP_MATERIAL_GAP_FRAC", "0.03"))
 _MATERIAL_GAP_FLOOR = float(os.environ.get("PERF_MCP_MATERIAL_GAP_FLOOR", "0.05"))
 _MAX_KNOB_RETRIES = int(os.environ.get("PERF_MCP_MAX_KNOB_RETRIES", "2"))
 _STRUCTURAL_RUNGS = {"structural", "gather", "fusion", "fuse", "sparse", "cache", "kv-cache"}
+# The rungs whose whole claim is that a KERNEL was written, and therefore the only ones whose
+# records may be required to show one in the source. Everything else -- a knob, a structural
+# restructure, a gate lever -- changes the model without leaving a kernel marker behind.
+_KERNEL_AUTHORED_RUNGS = {"tt-lang", "ttl", "cpp", "c++", "metalium"}
 # THE ladder, in climb order, for each roofline binding. ONE table, because the module used to hold
 # two orderings of the same rungs and only one of them knew what the op was waiting on:
 # `_KNOB_ORDER` (below, now derived from here) steered the per-op gate correctly, while a separate
@@ -1460,6 +1464,22 @@ def _op_has_attempt(op_code: str, attempts: list):
         if _op_match(op_code, a):
             return a
     return None
+
+
+def _last_recorded_note(op_code: str) -> str:
+    """The most recent recorded attempt's own note for this op, from the FULL unfiltered log --
+    including a wedge/crash record (kernel_detected_in_source=False), which the per-op ladder's
+    detected-filtered `attempts` list drops before termination_check ever sees it.
+
+    A target the agent already tried carried only a generic 'a prior attempt did not clear it' --
+    the exact reason (a crash message, a wedge, a PCC failure) stayed in the log file and a fresh
+    round starting on the same target had no way to see it without going and reading the log
+    itself. This carries that exact reason forward into next_target.reason instead, same as a human
+    handing off a shift would say what actually broke, not just that something did."""
+    for a in reversed(_load_attempts_all()):
+        if _op_match(op_code, a) and a.get("note"):
+            return str(a["note"])
+    return ""
 
 
 _SEALED_OP_MARKERS = (
@@ -4429,7 +4449,10 @@ def _emit_fullpipe(result: dict) -> dict:
     if result.get("target_ms") is not None:
         parts.append("target_ms=%s gap_ms=%s" % (result.get("target_ms"), result.get("gap_to_target_ms")))
     if result.get("error"):
-        parts.append("error=%s" % str(result.get("error"))[:140])
+        # Was :140 -- truncated a real crash mid-word ("ImportError while loading con"), so the one
+        # place this gate's failures get logged carried no usable diagnosis. 600 matches the other
+        # crash-message truncations in this file (measure_candidate, _autorecord_wedge).
+        parts.append("error=%s" % str(result.get("error"))[:600])
     line = " ".join(parts)
     sys.stderr.write(line + "\n")
     sys.stderr.flush()
@@ -4660,7 +4683,14 @@ def _promote_fullpipe_pending() -> bool:
             _new_doc = json.loads(src.read_text())
             _new_ms = float(_new_doc.get("full_pipeline_ms") or 0.0)
             _merged = dict(_new_doc)
-            if _FULLPIPE_BASELINE_1CQ_PATH.exists() and _new_ms > 0:
+            # A READING WITH NO HEADLINE IS NOT A HEADLINE OF ZERO. A pipeline that declares stages
+            # but no recurring-stage rate reads ms=0 every time, and this branch used to be skipped
+            # for it -- so the pending doc was written WHOLE over the bar, replacing a positive
+            # committed best with 0.0. _read_fullpipe_bar then correctly refuses a bar of 0 as
+            # damaged, and every later check_full_pipeline_latency returns bar_unreadable: one
+            # commit on a stage-only model bricks the gate for the rest of the run. The merge runs
+            # whenever a bar exists; a missing headline simply keeps the one already banked.
+            if _FULLPIPE_BASELINE_1CQ_PATH.exists():
                 _cur_doc = json.loads(_FULLPIPE_BASELINE_1CQ_PATH.read_text())
                 _cur_ms = float(_cur_doc.get("full_pipeline_ms") or 0.0)
                 _same_mode = str(_cur_doc.get("mode") or "") == str(_new_doc.get("mode") or "")
@@ -4668,13 +4698,13 @@ def _promote_fullpipe_pending() -> bool:
                 # so the old values are meaningless rather than better.
                 if _same_mode:
                     _merged["stages"] = _min_stages(_cur_doc.get("stages"), _new_doc.get("stages"))
-                if _cur_ms > 0 and _same_mode and _new_ms > _cur_ms:
+                if _cur_ms > 0 and _same_mode and (_new_ms <= 0 or _new_ms > _cur_ms):
                     _merged["full_pipeline_ms"] = _cur_ms
                     print(
-                        "  [full-pipeline-gate] REFUSED to move the headline backwards: %.4f ms is "
-                        "slower than the committed best %.4f ms; keeping the best%s."
+                        "  [full-pipeline-gate] REFUSED to move the headline backwards: %s is "
+                        "not better than the committed best %.4f ms; keeping the best%s."
                         % (
-                            _new_ms,
+                            ("%.4f ms" % _new_ms) if _new_ms > 0 else "a reading with no headline",
                             _cur_ms,
                             (
                                 " (per-stage bests still ratchet)"
@@ -5000,12 +5030,49 @@ def check_full_pipeline_latency() -> dict:
     end_to_end_ms, via=trace_replay|eager_wall, best/delta/target) to stderr and appends it to
     $TMPDIR/perf_mcp_fullpipe_gate.log so the gated end-to-end time is visible every iteration.
     Returns {status, full_pipeline_ms, method, metric, best_ms?, delta_pct?, target_ms?,
-    gap_to_target_ms?, reached_target?}."""
+    gap_to_target_ms?, reached_target?}. An unexpected exception anywhere in the measurement is caught
+    and returned as status 'crash' with the real error text -- never left to escape as a bare
+    "Error executing tool" with no information for the caller to act on (measure_candidate already
+    guards this same way; this gate previously did not)."""
+    try:
+        return _check_full_pipeline_latency_body()
+    except Exception as exc:  # noqa: BLE001 -- surface it, do not let the MCP layer swallow the reason
+        return _emit_fullpipe({"status": "crash", "error": "gate crashed: %s" % str(exc)[-600:], "cq": 1})
+
+
+def _check_full_pipeline_latency_body() -> dict:
     # The tool is trace+1cq end to end: one track, one baseline, no 2-CQ bookend.
     cq = 1
     ms, method, err, path = _measure_full_pipeline_guarded()
     if ms is None:
         return _emit_fullpipe({"status": "crash", "error": err, "cq": cq})
+    # A HEADLINE OF ZERO IS A RUN THAT MEASURED NOTHING, and it used to be reported as `ok`. The
+    # perf test prints TRACE_PER_TOKEN_MS=0.0000 and exits PASSED when every stage's timing hook
+    # RAISED -- an L1 overflow, a bad shard, anything the capped profiling capture is too small to
+    # hit -- so the reading is 0, `ms < best` is trivially true, and the gate hands back status ok
+    # with delta -100%. Measured on voxtral_4b_tts_2603 2026-09-21: a vocab head whose kernel asked
+    # for 3.83 MB of L1 per core threw in BOTH traced stages, the gate said ok, and the edit was
+    # committed as a 7.95% win on the strength of a 2-layer tracy capture that never ran it.
+    #
+    # It also poisons the ratchet: _record_fullpipe_candidate stashes the 0 and the next commit
+    # promotes it over a positive bar, after which _read_fullpipe_bar correctly refuses the bar as
+    # damaged and every later call returns bar_unreadable.
+    if not ms > 0:
+        return _emit_fullpipe(
+            {
+                "status": "crash",
+                "full_pipeline_ms": 0.0,
+                "method": method,
+                "mode": _fullpipe_mode(method, path),
+                "cq": cq,
+                "error": (
+                    "the run produced NO end-to-end reading (headline 0). The workload ran but every "
+                    "timed stage failed -- read the perf test's own output for the raised error "
+                    "(an L1/CB overflow and a rejected shard both land here). This is NOT a pass and "
+                    "NOT a baseline: fix or revert the edit." + (" · %s" % err if err else "")
+                ),
+            }
+        )
     metric = "trace_per_token_ms" if method == "trace" else "eager_full_pipeline_ms"
     mode = _fullpipe_mode(method, path)
     base_path = _FULLPIPE_BASELINE_1CQ_PATH
@@ -7710,7 +7777,20 @@ def termination_check() -> dict:
     # resume-filtered live log, so a rung tried against an earlier baseline read as untried and got
     # handed out again -- the same matmul returned at `grid` in four consecutive runs. Verdicts still
     # come from _load_attempts(); only the tried/not-tried question reads the full history.
-    attempts = [a for a in _load_attempts_all() if a.get("kernel_detected_in_source")]
+    # AND THE DETECTED-FILTER IS FOR KERNEL RUNGS ONLY. It exists so a tt-lang/C++ claim with no
+    # kernel in the source cannot clear an op -- but a KNOB or a STRUCTURAL restructure legitimately
+    # leaves no `generic_op`/`@ttl`/`.cpp` marker behind, and dropping those rows made this ladder
+    # blind to attempts that record_kernel_attempt's OWN allowance counts. The two then disagree
+    # forever: `_rung_allowance` reads the unfiltered history, sees the cap spent and REFUSES the
+    # rung as CLOSED, while this reads the filtered history, sees nothing and keeps handing the same
+    # rung back as next_target. Observed on voxtral_4b_tts_2603 2026-09-21: the vocab head sat at
+    # `structural` with six structural attempts on file, every one of them unrecordable, and
+    # finish_round could not be satisfied by any action the agent was able to take.
+    attempts = [
+        a
+        for a in _load_attempts_all()
+        if a.get("kernel_detected_in_source") or _normalise_rung(a.get("kernel_kind")) not in _KERNEL_AUTHORED_RUNGS
+    ]
     blocking, cleared = [], []
     material = _material_gap_ms(dev)
     for o in rep.get("open_ops") or []:
@@ -7860,6 +7940,15 @@ def termination_check() -> dict:
         can_stop = False
     halt = next((b for b in blocking if b.get("next_rung") == "tt-lang:install-required"), None)
     # DETERMINISTIC SELECTION: the single op+rung the agent must work next (largest-gap blocking op).
+    # CARRY THE EXACT REASON FORWARD, not just the fact that a prior try existed. blocking[0]["reason"]
+    # is a per-gate TEMPLATE (same text on attempt 1 and attempt 5); _last_recorded_note reads what
+    # actually happened last time (a crash message, a wedge, a PCC miss) from the log and appends it,
+    # so a fresh round starting on a target someone already tried is not starting blind on WHY it
+    # failed -- it still has to prove a fix by measuring, same as ever, but it knows what broke.
+    _target_reason = blocking[0]["reason"]
+    _prior_note = _last_recorded_note(blocking[0]["op"])
+    if _prior_note and _prior_note not in _target_reason:
+        _target_reason = _target_reason.rstrip() + " | Last recorded attempt on this target: " + _prior_note
     next_target = (
         {
             "op": blocking[0]["op"],
@@ -7868,7 +7957,7 @@ def termination_check() -> dict:
             "bound_by": blocking[0]["bound_by"],
             "rung": blocking[0]["next_rung"],
             "gap_ms": blocking[0]["gap_ms"],
-            "reason": blocking[0]["reason"],
+            "reason": _target_reason,
             # WHERE THIS OP LIVES. Without it the agent has an op and a metric, and the metric names
             # only the recurring stage -- so it worked that stage regardless of where the ranking
             # pointed. Discovered from the capture's own marks; "" when the capture carried none.
