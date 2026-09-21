@@ -381,8 +381,9 @@ class VoxtralPipeline:
         if buf.get("kv"):
             return self._decode_step_cached(stack, buf, sample)
         hidden = stack.forward_resident(buf["ids"], (buf["cos"], buf["sin"]), buf["mask"])
-        width = int(hidden.shape[-1])
-        last = ttnn.slice(hidden, (0, buf["last_row"], 0), (buf["batch"], buf["last_row"] + 1, width))
+        from models.demos.voxtral_4b_tts_2603.tt import generation
+
+        last = generation.slice_row(hidden, buf["last_row"])
         # FOLDED LOGITS, sampler or not. Unfolding `[1, B, vocab]` back to `[B, 1, vocab]` turns one
         # 32-row tile row into B slabs of a single row each, every one padded out to a whole tile,
         # across a 131072-wide tensor -- it measured 2.45 ms here, the largest single op in the
@@ -551,6 +552,8 @@ class VoxtralPipeline:
         """
         from scripts.tt_hw_planner import host_op_observer
 
+        from models.demos.voxtral_4b_tts_2603.tt import generation
+
         results = {}
 
         if self.generation is not None:
@@ -560,8 +563,7 @@ class VoxtralPipeline:
             buf = self._stage_buffers["prefill"]
             with host_op_observer.observe_host_ops() as ops:
                 hidden = stack.forward_resident(buf["ids"], (buf["cos"], buf["sin"]), buf["mask"])
-                width = int(hidden.shape[-1])
-                last = ttnn.slice(hidden, (0, buf["last_row"], 0), (buf["batch"], buf["last_row"] + 1, width))
+                last = generation.slice_row(hidden, buf["last_row"])
                 logits = stack.head(last)
                 row_major = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
                 token = ttnn.argmax(row_major, dim=-1)

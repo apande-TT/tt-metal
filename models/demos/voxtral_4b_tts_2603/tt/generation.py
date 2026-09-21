@@ -46,6 +46,32 @@ from models.demos.voxtral_4b_tts_2603.tt import common
 # logit magnitudes, and it stays finite in bfloat16 so a masked row cannot become inf - inf.
 _MASK_NEG = -1e9
 
+
+def slice_row(hidden, row: int):
+    """Row `row` of every sample, as `[B, 1, W]`, without untilizing the whole sequence.
+
+    `ttnn.slice` on a TILE tensor can only cut at a tile boundary; asked for one arbitrary row it
+    untilizes the entire `[B, S, W]` tensor first, and at S=64 x 3072 in fp32 that measured 589 us
+    on 48 cores to extract 12 KB of real data. Cutting in two steps keeps the expensive step small:
+    the first slice is tile-ALIGNED, so it is a straight copy of one 32-row band, and only that
+    band -- a thirty-second of the sequence at the trace capacity -- pays the untilize.
+
+    Both the free-running loop and the traced stage step want exactly this, so it lives here rather
+    than in either of them.
+    """
+    batch, seq_len, width = (int(d) for d in hidden.shape)
+    row = int(row)
+    band = (row // ttnn.TILE_SIZE) * ttnn.TILE_SIZE
+    if band + ttnn.TILE_SIZE > seq_len:
+        # The band would run past the end; nothing to gain, and the aligned slice would be invalid.
+        return ttnn.slice(hidden, (0, row, 0), (batch, row + 1, width))
+    aligned = ttnn.slice(hidden, (0, band, 0), (batch, band + ttnn.TILE_SIZE, width))
+    # `aligned` is NOT deallocated. A tile-aligned slice can come back as a metadata VIEW of
+    # `hidden`, and freeing a view frees the tensor it aliases -- which here is the caller's hidden
+    # state, still needed after this returns. Letting the last reference release it covers both the
+    # view case and the copy case, which is the same rule the head's fold already follows.
+    return ttnn.slice(aligned, (0, row - band, 0), (batch, row - band + 1, width))
+
 # The rotary tables' width. Matched to the q/k the RoPE op applies them to, which the prefill
 # projection now packs as bf8_b -- the capture reads "BFP8, BF16 => BFP8", so the table is once
 # again the only wide operand and the op pays a mixed-format unpack for it. cos/sin live in
@@ -469,8 +495,8 @@ class VoxtralGenerationStack:
             owns_hidden = True
         else:
             owns_hidden = False
-        batch, seq_len, width = (int(d) for d in hidden.shape)
-        last = ttnn.slice(hidden, (0, seq_len - 1, 0), (batch, seq_len, width))
+        seq_len = int(hidden.shape[-2])
+        last = slice_row(hidden, seq_len - 1)
         if owns_hidden:
             ttnn.deallocate(hidden)
         logits = self.head(last, keep_folded=keep_folded)
