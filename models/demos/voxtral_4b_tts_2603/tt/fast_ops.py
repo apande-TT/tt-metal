@@ -560,7 +560,13 @@ def _patch_mlp(cls, dtype):
         ttnn.deallocate(gate)
         ttnn.deallocate(up)
         out_dtype = _RESIDUAL_DELTA_DTYPE if m_tiles > 1 else res_dtype
-        out = ttnn.linear(prod, self.down, compute_kernel_config=ck, program_config=pcs[2], dtype=out_dtype)
+        # THE CONTRACTION GETS THE SAME PHASE COUNT AS THE EXPANSION. `down` was held at HiFi2 on
+        # the argument that it writes back into the residual stream -- but that argument is about
+        # the WIDTH of what it writes, which is a separate lever and is already set. Fidelity is
+        # how many passes the multiply takes over the MANTISSA, and both of this op's operands are
+        # bf8_b: the product it feeds the residual cannot carry more than a phase or two of that.
+        # The accumulation is still fp32 in DEST, which is what a 26-layer stack compounds.
+        out = ttnn.linear(prod, self.down, compute_kernel_config=lo, program_config=pcs[2], dtype=out_dtype)
         ttnn.deallocate(prod)
         return _unfold(out, batch)
 
@@ -915,7 +921,12 @@ def _patch_attention(cls, dtype):
         out = ttnn.linear(
             merged,
             self.wo,
-            compute_kernel_config=ck,
+            # Same reasoning as the MLP's contraction: both operands are bf8_b, so the extra
+            # fidelity phase has no mantissa to consume. Prefill only -- a single-tile-row decode
+            # step is bound by streaming the weight, where the math already hides behind the read.
+            compute_kernel_config=_matmul_ck(
+                self.wo.device(), ttnn.MathFidelity.LoFi if rows > ttnn.TILE_SIZE else ttnn.MathFidelity.HiFi2
+            ),
             program_config=_attn_pc(self, "wo", rows, self.wo),
             dtype=_RESIDUAL_DELTA_DTYPE if rows > ttnn.TILE_SIZE else res_dtype,
         )
