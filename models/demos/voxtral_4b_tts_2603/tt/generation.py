@@ -46,6 +46,38 @@ from models.demos.voxtral_4b_tts_2603.tt import common
 # logit magnitudes, and it stays finite in bfloat16 so a masked row cannot become inf - inf.
 _MASK_NEG = -1e9
 
+
+def slice_row(hidden, row: int):
+    """Row `row` of every sample, as `[B, 1, W]`, without untilizing the whole sequence.
+
+    `ttnn.slice` on a TILE tensor can only cut at a tile boundary; asked for one arbitrary row it
+    untilizes the entire `[B, S, W]` tensor first, and at S=64 x 3072 in fp32 that measured 589 us
+    on 48 cores to extract 12 KB of real data. Cutting in two steps keeps the expensive step small:
+    the first slice is tile-ALIGNED, so it is a straight copy of one 32-row band, and only that
+    band -- a thirty-second of the sequence at the trace capacity -- pays the untilize.
+
+    Both the free-running loop and the traced stage step want exactly this, so it lives here rather
+    than in either of them.
+    """
+    batch, seq_len, width = (int(d) for d in hidden.shape)
+    row = int(row)
+    band = (row // ttnn.TILE_SIZE) * ttnn.TILE_SIZE
+    if band + ttnn.TILE_SIZE > seq_len:
+        # The band would run past the end; nothing to gain, and the aligned slice would be invalid.
+        return ttnn.slice(hidden, (0, row, 0), (batch, row + 1, width))
+    aligned = ttnn.slice(hidden, (0, band, 0), (batch, band + ttnn.TILE_SIZE, width))
+    # `aligned` is NOT deallocated. A tile-aligned slice can come back as a metadata VIEW of
+    # `hidden`, and freeing a view frees the tensor it aliases -- which here is the caller's hidden
+    # state, still needed after this returns. Letting the last reference release it covers both the
+    # view case and the copy case, which is the same rule the head's fold already follows.
+    return ttnn.slice(aligned, (0, row - band, 0), (batch, row - band + 1, width))
+
+# The rotary tables' width. Matched to the q/k the RoPE op applies them to, which the prefill
+# projection now packs as bf8_b -- the capture reads "BFP8, BF16 => BFP8", so the table is once
+# again the only wide operand and the op pays a mixed-format unpack for it. cos/sin live in
+# [-1, 1], which is exactly the range a block-float format represents well.
+_ROPE_DTYPE = ttnn.bfloat8_b
+
 # Call 1's stack must keep all four block kinds alive or a graduated stub becomes structurally
 # absent rather than merely built fewer times.
 MIN_LAYERS = 4
@@ -235,6 +267,136 @@ class VoxtralGenerationStack:
         ttnn.deallocate(device_ids)
         return grown
 
+    # ---- the KV cache --------------------------------------------------------------
+    #
+    # Without one, a decode step is a REPEAT PREFILL: every token re-runs all C resident
+    # positions through all L blocks, so the projections and the MLP each do C times the
+    # arithmetic one token needs, and the cost per token is a prefill's cost. The cache makes a
+    # step compute seq_len=1 and read the history back instead of recomputing it; what remains
+    # is one pass of the weights, which is the band the roofline quotes.
+
+    def attention_modules(self):
+        """Every attention stub in the stack, whatever block kind holds it.
+
+        The whole-block ports keep theirs on `.self_attn`; the split blocks hold it as a part.
+        Both are counter-wrapped, so each is unwrapped to the graduated stub the override patched.
+        """
+        for block in self.layers:
+            if block.kind in ("decoder_layer", "layer"):
+                inner = common.unwrap(block.part("block"))
+                attn = getattr(inner, "self_attn", None)
+            else:
+                attn = common.unwrap(block.part("attention"))
+            if attn is not None:
+                yield common.unwrap(attn)
+
+    def kv_enable(self, batch, capacity, start):
+        """Arm every block's cache and stage the two position tensors a step advances.
+
+        ONE pair of position tensors is shared by every layer -- they all decode the same token at
+        the same index, so one buffer each is what lets a single `kv_advance()` move all 26 blocks.
+        They are DEVICE tensors, not Python ints: a literal would be compiled into the trace and
+        every replay would then write the same cache slot and read the same RoPE row. There are two
+        because the consumers want different types -- the cache update and flash-decode take a
+        signed `[B]` index, the RoPE lookup is an embedding gather and takes an unsigned one --
+        and `ttnn.plus_one` advances each in place without either leaving the device.
+        """
+        batch, start = int(batch), int(start)
+        self._kv_pos = ttnn.from_torch(
+            torch.full((batch,), start, dtype=torch.int32),
+            dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
+        self._kv_rope_idx = ttnn.from_torch(
+            torch.full((1, batch), start, dtype=torch.int32).to(torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
+        self._kv_rope_tables = self._decode_rope_tables(capacity)
+        self._kv_capacity = int(capacity)
+        for attn in self.attention_modules():
+            attn.kv_enable(self._kv_pos)
+        return self._kv_pos
+
+    def kv_disable(self):
+        for attn in self.attention_modules():
+            attn.kv_disable()
+        for name in ("_kv_pos", "_kv_rope_idx"):
+            tensor = getattr(self, name, None)
+            if tensor is not None:
+                try:
+                    ttnn.deallocate(tensor)
+                except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
+                    pass
+            setattr(self, name, None)
+        for table in getattr(self, "_kv_rope_tables", None) or ():
+            try:
+                ttnn.deallocate(table)
+            except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
+                pass
+        self._kv_rope_tables = None
+
+    def _decode_rope_tables(self, capacity):
+        """cos/sin for EVERY position, as `[capacity, head_dim]` gather tables.
+
+        Decode RoPE needs the row for whatever position the step is at, and that position lives in
+        a device tensor, so the row has to be selected ON DEVICE or the step stops being traceable.
+        Staging the whole table once here turns the per-step selection into an embedding gather
+        against an index that `plus_one` advances -- no host round trip, and the same captured
+        program is correct at every position.
+        """
+        position_ids = torch.arange(int(capacity), dtype=torch.long).reshape(1, int(capacity))
+        cos, sin = self.rotary(position_ids=position_ids)
+        tables = []
+        for table in (cos, sin):
+            rows = ttnn.to_torch(table).to(torch.float32).reshape(int(capacity), -1)
+            tables.append(
+                ttnn.from_torch(
+                    rows.contiguous(),
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                    device=self.device,
+                )
+            )
+        ttnn.deallocate(cos)
+        ttnn.deallocate(sin)
+        return tuple(tables)
+
+    def decode_rope_step(self):
+        """(cos, sin) for the CURRENT position, height-sharded one user per core.
+
+        Prefill RoPE broadcasts a `[1, 1, S, hd]` table across the heads; the decode op instead
+        wants `[1, B, 1, hd]` sharded to match the head split it sits between. Every user is at the
+        same index, but the gather is per-user anyway, so a genuinely ragged batch would work here
+        unchanged.
+        """
+        from models.demos.voxtral_4b_tts_2603.tt import fast_ops
+
+        batch = self.kv_batch
+        staged = []
+        for table in self._kv_rope_tables:
+            rows = ttnn.embedding(self._kv_rope_idx, table)
+            view = ttnn.reshape(rows, (1, batch, 1, int(rows.shape[-1])))
+            tiled = ttnn.to_layout(view, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(rows)
+            staged.append(
+                ttnn.to_memory_config(tiled, fast_ops.decode_shard(self.device, batch, int(tiled.shape[-1])))
+            )
+            ttnn.deallocate(tiled)
+        return tuple(staged)
+
+    def kv_advance(self):
+        """Move both position tensors on by one, in place and on device."""
+        ttnn.plus_one(self._kv_pos)
+        ttnn.plus_one(self._kv_rope_idx)
+
+    @property
+    def kv_batch(self):
+        pos = getattr(self, "_kv_pos", None)
+        return int(pos.shape[-1]) if pos is not None else 0
+
     # ---- the real forward ----------------------------------------------------------
 
     def forward_resident(self, device_ids, position_embeddings, attention_mask):
@@ -251,6 +413,21 @@ class VoxtralGenerationStack:
             ttnn.deallocate(hidden)
             hidden = promoted
 
+        # FOLD THE DECODE STREAM ONCE, HERE, instead of twice per block. `[B, 1, H]` pads its
+        # middle dim out to a whole tile, so every residual add and norm in the stack touches 32x
+        # the data the step contains, and each block was relaying the tensor into `[1, B, H]` for
+        # its projections and straight back again. See fast_ops.fold_decode_stream. Gated on every
+        # block having a seeded cache, because the fold changes what a "one row" step looks like to
+        # the attention override and a prefill must not see it.
+        from models.demos.voxtral_4b_tts_2603.tt import fast_ops
+
+        # Neither the folded nor the unfolded tensor is deallocated by hand. ttnn::reshape hands
+        # back a metadata VIEW whenever it can, and freeing a view frees the buffer it aliases;
+        # the local that holds the other form dies on return either way.
+        folded = 0
+        if fast_ops.decode_stream_ready(self.attention_modules()):
+            hidden, folded = fast_ops.fold_decode_stream(hidden)
+
         for block in self.layers:
             nxt = block(hidden, position_embeddings=position_embeddings, attention_mask=attention_mask)
             ttnn.deallocate(hidden)
@@ -258,7 +435,8 @@ class VoxtralGenerationStack:
 
         out = self.final_norm(hidden)
         ttnn.deallocate(hidden)
-        return out
+        # One unfold restores the `[B, 1, H]` every caller of this function expects.
+        return fast_ops.unfold_decode_stream(out, folded)
 
     def forward_hidden(self, input_ids, position_ids=None, attention_mask=None):
         """ids -> last_hidden_state `[B, S, 3072]`, the whole prefill on device.
@@ -275,6 +453,21 @@ class VoxtralGenerationStack:
             owns_ids = True
 
         cos, sin = self.rotary(position_ids=position_ids)
+        # NARROW THE TABLES TO MATCH q/k. The rotary stub builds cos/sin in float32, but the queries
+        # and keys the RoPE op applies them to are bf16 and its output is bf16, so the wide table
+        # only buys a mixed-format unpack -- the capture reads "BF16, FP32 => BF16" and the op sits
+        # at ~110 GB/s. The decode path already stages its gather tables at bf16 for the same
+        # reason; this is the prefill half of that. The tables are [1, 1, S, head_dim], so the cast
+        # itself is a few tens of KB, paid once per call rather than per layer.
+        # AND PIN THEM IN L1 WHILE THEY ARE BEING CAST. Unlike everything else in the forward these
+        # two are not consumed once -- every layer's RoPE reads the SAME pair, so a DRAM table is
+        # re-fetched once per layer per call. They are [1, 1, S, head_dim], a quarter of a MB each
+        # at bf8_b, so residency is nearly free and the op that reads them is tagged dispatch-bound,
+        # which is the tag for waiting on an operand.
+        cos, sin = (
+            ttnn.typecast(cos, _ROPE_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            ttnn.typecast(sin, _ROPE_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG),
+        )
         # The rotary tables are position-only, so their leading dim is a broadcast against the
         # [B, heads, S, head_dim] query. A leading-dim reshape is a metadata view, not a copy.
         rope = (
@@ -290,22 +483,31 @@ class VoxtralGenerationStack:
         ttnn.deallocate(rope[1])
         return out
 
-    def forward_logits(self, input_ids, position_ids=None, attention_mask=None, hidden=None):
-        """ids -> next-token logits `[B, 1, 131072]`.
+    def forward_logits(self, input_ids, position_ids=None, attention_mask=None, hidden=None, keep_folded=False):
+        """ids -> next-token logits `[B, 1, 131072]`, or `[1, B, 131072]` when `keep_folded`.
 
         The head is applied to the LAST sequence row only. `[B, S, 131072]` would be ~1 GB at
         B=32, S=32 in float32, and every row but the last is dead weight for a next-token decision.
+
+        `keep_folded` is for the caller whose ONLY consumer is `sample_device`. The head produces
+        `[1, B, vocab]` naturally, and unfolding that to `[B, 1, vocab]` turns one 32-row tile row
+        into B slabs of a single row each, every one padded back out to a whole tile, across a
+        131072-wide tensor -- it measured 2.45 ms, the largest single op in the capture. The
+        argmax reduces over the last dim either way, so a sampler does not care which leading dim
+        carries the batch; a caller that wants the LOGITS still gets the unfolded shape by default.
+        The traced decode step already makes exactly this choice (`pipeline._decode_step_cached`);
+        this is the same choice for the free-running loop.
         """
         if hidden is None:
             hidden = self.forward_hidden(input_ids, position_ids=position_ids, attention_mask=attention_mask)
             owns_hidden = True
         else:
             owns_hidden = False
-        batch, seq_len, width = (int(d) for d in hidden.shape)
-        last = ttnn.slice(hidden, (0, seq_len - 1, 0), (batch, seq_len, width))
+        seq_len = int(hidden.shape[-2])
+        last = slice_row(hidden, seq_len - 1)
         if owns_hidden:
             ttnn.deallocate(hidden)
-        logits = self.head(last)
+        logits = self.head(last, keep_folded=keep_folded)
         ttnn.deallocate(last)
         return logits
 
@@ -313,14 +515,19 @@ class VoxtralGenerationStack:
         """Greedy sampling ON DEVICE. Returns the chosen ids as a `[B, 1]` uint32 DEVICE tensor.
 
         `ttnn.argmax` on a TILE tensor collapses onto a single core -- measured 0.386s against
-        0.003s for the same reduction in ROW_MAJOR at `[32, 1, 131072]` -- so the reduction runs in
-        ROW_MAJOR. The result never leaves the device: it is what `append_token` concatenates
+        0.003s for the same reduction in ROW_MAJOR at `[32, 1, 131072]` -- so the stock path has
+        to untilize 8.4 MB of logits before it can reduce them. `fast_argmax_last` reads the tiles
+        where the head left them instead, and falls back to that stock pair at any shape it does
+        not recognise. The result never leaves the device: it is what `append_token` concatenates
         straight back onto the context.
         """
-        row_major = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-        chosen = ttnn.argmax(row_major, dim=-1)
-        ttnn.deallocate(row_major)
-        return ttnn.reshape(chosen, (int(logits.shape[0]), 1))
+        from models.demos.voxtral_4b_tts_2603.tt import fast_ops
+
+        chosen = fast_ops.fast_argmax_last(logits)
+        # THE BATCH IS WHICHEVER LEADING DIM CARRIES IT. `[B, 1, vocab]` and the folded
+        # `[1, B, vocab]` are the two shapes a caller can hand this, and the other dim is 1 in both,
+        # so the product reads the batch off either without asking which one arrived.
+        return ttnn.reshape(chosen, (int(logits.shape[0]) * int(logits.shape[-2]), 1))
 
     def sample(self, logits):
         """`sample_device` plus a read-back, for the measurement paths that score one step."""
@@ -522,7 +729,10 @@ def run_text_generation(stack, input_ids, horizon=None, **kwargs) -> dict:
     emitted = 0
     for _ in range(horizon):
         position_ids, attention_mask = stack.stage_constants(int(device_ids.shape[-1]))
-        logits = stack.forward_logits(device_ids, position_ids=position_ids, attention_mask=attention_mask)
+        # FOLDED: the only consumer of these logits is the argmax on the next line.
+        logits = stack.forward_logits(
+            device_ids, position_ids=position_ids, attention_mask=attention_mask, keep_folded=True
+        )
         nxt = stack.sample_device(logits)
         ttnn.deallocate(logits)
         device_ids = stack.append_token(device_ids, nxt)

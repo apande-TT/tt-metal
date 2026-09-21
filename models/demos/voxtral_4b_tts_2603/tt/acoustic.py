@@ -53,6 +53,7 @@ import torch
 
 import ttnn
 from models.demos.voxtral_4b_tts_2603.tt import common
+from models.demos.voxtral_4b_tts_2603.tt.generation import _ROPE_DTYPE
 
 # The section's own tensor prefix in consolidated.safetensors.
 _PREFIX = "acoustic_transformer"
@@ -286,6 +287,16 @@ class VoxtralAcousticStack:
         """`lm_hidden [B, S, 3072]` (a device tensor) -> `(acoustic hidden, semantic logits)`."""
         position_ids, mask = self.stage_constants(int(lm_hidden.shape[-2]))
         cos, sin = self.rotary(position_ids=position_ids)
+        # bf16 tables, matching the bf16 queries and keys `rotary_embedding_hf` applies them to --
+        # the same narrowing the text stack's prefill and decode paths already do. A float32 table
+        # buys a mixed-format unpack and no accuracy.
+        # In L1, for the same reason the text stack pins them: every block's RoPE reads this SAME
+        # pair, so a DRAM table is re-fetched once per block, and a quarter of a MB each is a
+        # trivial residency against an op the roofline tags dispatch-bound.
+        cos, sin = (
+            ttnn.typecast(cos, _ROPE_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            ttnn.typecast(sin, _ROPE_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG),
+        )
         rope = (
             ttnn.reshape(cos, (1, 1, cos.shape[-2], cos.shape[-1])),
             ttnn.reshape(sin, (1, 1, sin.shape[-2], sin.shape[-1])),

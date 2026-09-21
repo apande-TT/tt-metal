@@ -65,6 +65,19 @@ DEFAULT_TRACE_CAPACITY = int(os.environ.get("VOXTRAL_TRACE_C", "64"))
 # Additive mask fill; finite in bfloat16 so a fully-masked row cannot become inf - inf.
 _MASK_NEG = -1e9
 
+# How many decode steps past the prompt the KV cache must hold. A measurement warms up, captures
+# and then replays the step, each one appending a slot, so the cache is sized for the whole run
+# rather than for the prompt alone -- about 20 steps today (3 warmup + capture + 16 replays), and
+# each measurement sample is a fresh process that re-seeds from scratch. Kept tight on purpose:
+# the seeding prefill runs at this capacity, so buying headroom nobody uses just makes setup
+# slower. Raise it if the replay count is raised.
+DECODE_STEP_HEADROOM = int(os.environ.get("VOXTRAL_DECODE_HEADROOM", "32"))
+
+
+def _tile_ceil(value: int) -> int:
+    return -(-int(value) // 32) * 32
+
+
 # Call 1's composed stack must keep all four block kinds alive (decoder_layer, layer,
 # split+mlp, split+m_l_p) or a graduated stub becomes structurally absent rather than
 # merely built fewer times.
@@ -231,12 +244,19 @@ class VoxtralPipeline:
 
     def _stage_setup(self, stage, inputs):
         """Shared body of `<stage>_trace_setup`: pin C and pre-upload every constant."""
+        from models.demos.voxtral_4b_tts_2603.tt import generation
+
         stack = self._require_generation()
         input_ids = inputs["input_ids"]
         if input_ids.dim() == 1:
             input_ids = input_ids.reshape(1, -1)
         capacity = int(inputs.get("capacity") or self.trace_capacity)
         batch, real_len = int(input_ids.shape[0]), int(input_ids.shape[1])
+        if stage == "decode":
+            # ROOM TO DECODE INTO. The position advances one slot per step, so the cache has to
+            # cover the prompt PLUS however many steps a measurement replays -- sized here rather
+            # than discovered by a cache write running off the end mid-run.
+            capacity = max(capacity, _tile_ceil(real_len + DECODE_STEP_HEADROOM))
         bound = int(self.config.max_position_embeddings)
         if capacity > bound:
             raise ValueError(f"capacity {capacity} exceeds max_position_embeddings {bound}")
@@ -247,16 +267,16 @@ class VoxtralPipeline:
         padded = torch.full((batch, capacity), pad_id, dtype=torch.long)
         keep = torch.zeros(batch, capacity, dtype=torch.long)
         positions = torch.zeros(batch, capacity, dtype=torch.long)
-        if stage == "prefill":
-            padded[:, :real_len] = input_ids
-            keep[:, :real_len] = 1
-            positions[:, :real_len] = torch.arange(real_len)
-            last_row = real_len - 1
-        else:
-            padded[:, capacity - real_len :] = input_ids
-            keep[:, capacity - real_len :] = 1
-            positions[:, capacity - real_len :] = torch.arange(real_len)
-            last_row = capacity - 1
+        # BOTH stages RIGHT-pad now. Decode used to left-pad so that the newest token sat at a
+        # fixed row C-1 and the traced step stayed index-invariant as the context grew -- the
+        # workaround for having no KV cache. With a cache the position is carried in a device
+        # tensor instead, so the step is index-invariant for the right reason, and right-padding
+        # is what the cache wants: real keys occupy slots [0, real_len) and the new token appends
+        # at real_len rather than having nowhere to go in an already-full window.
+        padded[:, :real_len] = input_ids
+        keep[:, :real_len] = 1
+        positions[:, :real_len] = torch.arange(real_len)
+        last_row = real_len - 1
 
         cos, sin = self._hf_rope(positions[:1])
         mask = self._hf_causal_mask(keep, positions, capacity)
@@ -271,8 +291,13 @@ class VoxtralPipeline:
             "ids_host": ttnn.from_torch(
                 padded.to(torch.uint32).contiguous(), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT
             ),
-            "cos": self._upload(cos.reshape(1, 1, capacity, -1), stack.act_dtype),
-            "sin": self._upload(sin.reshape(1, 1, capacity, -1), stack.act_dtype),
+            # The rotary tables go up in bfloat16, NOT in `act_dtype`, for the same reason the mask
+            # does: their only consumer is `rotary_embedding_hf`, which applies them to bf16 queries
+            # and keys and returns bf16, so a float32 table buys a mixed-format unpack and no
+            # accuracy -- the capture read "BF16, FP32 => BF16" with the op at ~110 GB/s. The decode
+            # path already stages its gather tables at bf16; this is the prefill half of that.
+            "cos": self._upload(cos.reshape(1, 1, capacity, -1), generation._ROPE_DTYPE),
+            "sin": self._upload(sin.reshape(1, 1, capacity, -1), generation._ROPE_DTYPE),
             # The additive mask goes up in bfloat16, NOT in `act_dtype`: its only consumer is the
             # fused flash-attention op, which takes bf16/bf8_b/bf4_b and nothing wider, and -1e9 is
             # just as absorbing after a softmax at bf16's precision as at fp32's. Uploading it wide
@@ -286,8 +311,66 @@ class VoxtralPipeline:
             "keep": keep,
             "positions": positions,
         }
+        if stage == "decode":
+            self._arm_decode_cache(stack, buffers)
         self._stage_buffers[stage] = buffers
         return buffers
+
+    def _arm_decode_cache(self, stack, buffers):
+        """Seed every block's K/V cache, then pin the one-token inputs the step will read.
+
+        This is the PREFILL half of the decode contract and it runs HERE, in setup, exactly once:
+        one full forward over the padded context, whose post-RoPE K/V each block keeps. From then
+        on a step computes seq_len=1 and reads the history back instead of recomputing it, which
+        is the whole point -- the old step re-ran all C positions through all L blocks for every
+        single token.
+        """
+        capacity, real_len = buffers["capacity"], buffers["real_len"]
+        # The new token appends at `real_len` and the position ADVANCES from there, so the cache
+        # has to outlast the run of steps a measurement makes, not just hold the prompt. Slots past
+        # the written region are never read: cur_pos bounds the key range on every step.
+        stack.kv_enable(buffers["batch"], capacity, real_len)
+        seeded = stack.forward_resident(buffers["ids"], (buffers["cos"], buffers["sin"]), buffers["mask"])
+        ttnn.deallocate(seeded)
+        # The step's INPUT buffer, and it is persistent on purpose: the step writes its own sampled
+        # token back into this tensor, so the next step consumes what the last one produced. That
+        # is what makes the timed loop an actual decode rather than the same position re-run.
+        buffers["step_ids"] = ttnn.from_torch(
+            buffers["padded_ids"][:, real_len - 1 : real_len].to(torch.uint32).contiguous(),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.device,
+        )
+        buffers["kv"] = True
+
+    def _decode_step_cached(self, stack, buf, sample):
+        """ONE token against the cached context, and the whole step stays on the device.
+
+        No mask: flash-decode derives the valid key range from the shared position tensor, so
+        there is nothing to broadcast over C keys here. The step closes the autoregressive loop
+        itself -- it writes its sampled token back into the input buffer and advances the position
+        -- so replaying the captured program really does decode successive tokens instead of
+        re-running one.
+        """
+        rope = stack.decode_rope_step()
+        hidden = stack.forward_resident(buf["step_ids"], rope, None)
+        for table in rope:
+            ttnn.deallocate(table)
+        if not sample:
+            return {"hidden": hidden, "logits": stack.head(hidden, keep_folded=True)}
+        # FOLDED logits, because the only consumer is the argmax. Unfolding [1, B, vocab] into
+        # [B, 1, vocab] is a real relayout of a 131072-wide tensor -- B single-row slabs, each
+        # padded back to a tile -- and it was the largest movement op in the step. The reduction
+        # is over the last dim either way, so the batch can stay on whichever leading dim it is on.
+        logits = stack.head(hidden, keep_folded=True)
+        ttnn.deallocate(hidden)
+        from models.demos.voxtral_4b_tts_2603.tt import fast_ops
+
+        token = fast_ops.fast_argmax_last(logits)
+        ttnn.deallocate(logits)
+        ttnn.copy(ttnn.reshape(token, tuple(buf["step_ids"].shape)), buf["step_ids"])
+        stack.kv_advance()
+        return {"token": token}
 
     def _stage_step(self, stage, sample):
         """Shared body of `<stage>_trace_step`: ONE host-op-free forward at the pinned shape."""
@@ -295,18 +378,35 @@ class VoxtralPipeline:
         buf = self._stage_buffers.get(stage)
         if buf is None:
             raise RuntimeError(f"call {stage}_trace_setup() before {stage}_trace_step()")
+        if buf.get("kv"):
+            return self._decode_step_cached(stack, buf, sample)
         hidden = stack.forward_resident(buf["ids"], (buf["cos"], buf["sin"]), buf["mask"])
-        width = int(hidden.shape[-1])
-        last = ttnn.slice(hidden, (0, buf["last_row"], 0), (buf["batch"], buf["last_row"] + 1, width))
-        logits = stack.head(last)
+        from models.demos.voxtral_4b_tts_2603.tt import generation
+
+        last = generation.slice_row(hidden, buf["last_row"])
+        # FOLDED LOGITS, sampler or not. Unfolding `[1, B, vocab]` back to `[B, 1, vocab]` turns one
+        # 32-row tile row into B slabs of a single row each, every one padded out to a whole tile,
+        # across a 131072-wide tensor -- it measured 2.45 ms here, the largest single op in the
+        # capture, larger than any matmul in the model.
+        #
+        # THE SAMPLING BRANCH never wanted the unfolded shape: the argmax reduces over the last dim
+        # either way. The OTHER branch turned out not to want it either -- this is the trace stage's
+        # step, whose return value exists so the harness can prove the loop advances, and it reads
+        # that as a numel + sum digest (perf_adapter.step_readings), which both leading orders give
+        # identically. `forward_logits` is the API for a caller that wants LOGITS, and it still
+        # hands back `[B, 1, vocab]` unless asked otherwise.
+        logits = stack.head(last, keep_folded=True)
         ttnn.deallocate(last)
         if not sample:
             return {"hidden": hidden, "logits": logits}
         ttnn.deallocate(hidden)
-        row_major = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-        token = ttnn.argmax(row_major, dim=-1)
-        ttnn.deallocate(row_major)
+        from models.demos.voxtral_4b_tts_2603.tt import fast_ops
+
+        token = fast_ops.fast_argmax_last(logits)
         ttnn.deallocate(logits)
+        # Back to the `[B, 1]` the caller's contract names. This is a few hundred bytes of uint32,
+        # not the 131072-wide relayout the fold above avoids.
+        token = ttnn.reshape(token, (int(buf["batch"]), 1))
         return {"token": token}
 
     def _stage_inputs(self):
@@ -433,7 +533,9 @@ class VoxtralPipeline:
         buf = self._stage_buffers.pop(stage, None)
         if not buf:
             return
-        for key in ("ids", "cos", "sin", "mask"):
+        if buf.get("kv") and self.generation is not None:
+            self.generation.kv_disable()
+        for key in ("ids", "cos", "sin", "mask", "step_ids"):
             try:
                 ttnn.deallocate(buf[key])
             except Exception:  # noqa: BLE001 - already-freed buffers are fine to skip
@@ -450,6 +552,8 @@ class VoxtralPipeline:
         """
         from scripts.tt_hw_planner import host_op_observer
 
+        from models.demos.voxtral_4b_tts_2603.tt import generation
+
         results = {}
 
         if self.generation is not None:
@@ -459,8 +563,7 @@ class VoxtralPipeline:
             buf = self._stage_buffers["prefill"]
             with host_op_observer.observe_host_ops() as ops:
                 hidden = stack.forward_resident(buf["ids"], (buf["cos"], buf["sin"]), buf["mask"])
-                width = int(hidden.shape[-1])
-                last = ttnn.slice(hidden, (0, buf["last_row"], 0), (buf["batch"], buf["last_row"] + 1, width))
+                last = generation.slice_row(hidden, buf["last_row"])
                 logits = stack.head(last)
                 row_major = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
                 token = ttnn.argmax(row_major, dim=-1)
