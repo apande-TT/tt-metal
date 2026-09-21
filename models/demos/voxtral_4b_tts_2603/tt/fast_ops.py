@@ -76,6 +76,9 @@ _SDPA_DTYPE = ttnn.bfloat8_b
 # The decode step's own q/k/v width -- see _KV_DTYPE.
 _DECODE_QKV_DTYPE = ttnn.bfloat16
 _SDPA_MASK_DTYPES = (ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b)
+# The PREFILL flash-attention op's math fidelity. See the note at its call site; the DECODE op keeps
+# the stub's own config, because the per-token metric is the one being protected.
+_SDPA_FIDELITY = ttnn.MathFidelity.HiFi2
 
 # The format the model's WIDE intermediates are carried in -- the SwiGLU gate/up/product, which are
 # [B*S, 4*hidden] and are each consumed exactly once by the next op. Distinct from the residual
@@ -802,7 +805,12 @@ def _patch_attention(cls, dtype):
         if kv is not None and kv.get("k") is not None and (seq_len == 1 or _DECODE_FOLD):
             return _decode_call(self, hidden_states, position_embeddings, kv, kv["pos"])
         ck = _matmul_ck(self.wo.device())
-        sdpa_ck = self.compute_kernel_config
+        # HiFi4 IS THE BRING-UP DEFAULT, and it is wrong for an op whose inputs are bf8_b. Four
+        # fidelity phases exist to consume an fp32 mantissa; q, k and v arrive with an 8-bit one, so
+        # phases three and four multiply bits that are not there. The scores are still accumulated
+        # in fp32 DEST (fp32_dest_acc_en is left on) -- this narrows the MULTIPLY, not the running
+        # softmax sum, which is the part attention actually cannot afford to lose.
+        sdpa_ck = _matmul_ck(self.wo.device(), _SDPA_FIDELITY)
         # The residual stream's dtype is READ OFF the input rather than assumed: the output
         # projection has to hand back exactly what the residual add expects, and this override is
         # shared by heads that declare it differently.
