@@ -165,12 +165,13 @@ _MLP_WEIGHT_KEYS = (
     ("down", "down_proj.weight", ttnn.bfloat4_b),
 )
 
-# Attention's two weight groups. Same split as the MLP's, on the same reasoning: the FUSED qkv
-# weight feeds q/k/v, which go into flash attention and are consumed there, while `wo` is what
-# writes the attention result back into the residual stream. So qkv takes the extra step down and
-# wo holds one above it.
+# Attention's two weight groups. `wo` used to hold one step above the fused qkv weight because it
+# is what writes the attention result back into the residual stream -- the same argument the MLP's
+# `down` was held on, and it fails the same way: what a deep stack compounds is the ACCUMULATOR and
+# the width of the stream, neither of which is the width the weight is STORED at. Both are now at
+# the bottom of the walk, and the full-model PCC gate is what says whether that holds.
 _QKV_DTYPE = ttnn.bfloat4_b
-_WO_DTYPE = ttnn.bfloat8_b
+_WO_DTYPE = ttnn.bfloat4_b
 
 # The vocab projection's weight format. A decode step streams this whole weight to emit one token
 # per sample, so it is the single largest per-token DRAM read in the model and every halving of it
