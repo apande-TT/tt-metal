@@ -455,6 +455,46 @@ _SUBBLOCK_TILE_BUDGET = 4 if _DEST_FP32 else 8
 _mm_ck_cache = {}
 
 
+_rope_ck_cache = {}
+
+
+def _rope_ck(device):
+    """RoPE's compute kernel config: HiFi2, not the op's own HiFi4 default.
+
+    `rotary_embedding_hf` defaults to `math_fidelity=HiFi4` when handed no config, and HiFi4 is
+    four fidelity phases -- it is the right default only for an fp32 operand. Neither operand here
+    is one: the rotary tables are staged at `generation._ROPE_DTYPE` (bf8_b, a 7-bit mantissa) and
+    the q/k they rotate are bf8_b in prefill and bf16 in decode. HiFi2 already consumes ELEVEN
+    mantissa bits of each operand, which is more than either carries, so the extra two phases have
+    nothing left to read: this is BIT-IDENTICAL, not a precision trade.
+
+    HiFi2 rather than LoFi for exactly that reason -- LoFi takes 5 bits, which WOULD truncate the
+    operand. The rest of the config is the op's own default, kept so this is a fidelity change and
+    nothing else.
+    """
+    arch = device.arch()
+    ck = _rope_ck_cache.get(arch)
+    if ck is None:
+        ck = _rope_ck_cache[arch] = ttnn.init_device_compute_kernel_config(
+            arch,
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=True,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=False,
+        )
+    return ck
+
+
+def _rope(x, cos, sin, is_decode_mode):
+    return ttnn.experimental.rotary_embedding_hf(
+        x,
+        cos,
+        sin,
+        is_decode_mode=is_decode_mode,
+        compute_kernel_config=_rope_ck(x.device()),
+    )
+
+
 def _matmul_ck(device, fidelity=ttnn.MathFidelity.HiFi2):
     """The matmuls' compute kernel config, cached per (arch, fidelity)."""
     arch = device.arch()
@@ -719,8 +759,8 @@ def _decode_call(module, hidden_states, position_embeddings, kv, cur_pos):
 
     if position_embeddings is not None:
         cos, sin = position_embeddings
-        q = ttnn.experimental.rotary_embedding_hf(q, cos, sin, is_decode_mode=True)
-        k = ttnn.experimental.rotary_embedding_hf(k, cos, sin, is_decode_mode=True)
+        q = _rope(q, cos, sin, True)
+        k = _rope(k, cos, sin, True)
 
     # Append this token's K/V in place. No page table: the cache is one contiguous [B, nkv, C, hd]
     # block per layer, not a paged pool.
@@ -950,8 +990,8 @@ def _patch_attention(cls, dtype):
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            q = ttnn.experimental.rotary_embedding_hf(q, cos, sin, is_decode_mode=False)
-            k = ttnn.experimental.rotary_embedding_hf(k, cos, sin, is_decode_mode=False)
+            q = _rope(q, cos, sin, False)
+            k = _rope(k, cos, sin, False)
 
         # ONE fused flash-attention op in place of the entire manual core. The hand-rolled version
         # was repeat_interleave(k) + repeat_interleave(v) + transpose(k) + matmul + multiply +
