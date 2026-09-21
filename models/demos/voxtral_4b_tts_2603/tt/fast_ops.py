@@ -645,7 +645,19 @@ def _patch_mlp(cls, dtype):
         # how many passes the multiply takes over the MANTISSA, and both of this op's operands are
         # bf8_b: the product it feeds the residual cannot carry more than a phase or two of that.
         # The accumulation is still fp32 in DEST, which is what a 26-layer stack compounds.
-        out = ttnn.linear(prod, self.down, compute_kernel_config=lo, program_config=pcs[2], dtype=out_dtype)
+        #
+        # AND IT PACKS WHERE THE RESIDUAL ADD READS. Same as attention's projection: the running
+        # sum is fp32 and stays in DRAM, but this increment is consumed exactly once, by the add
+        # on the next line of the block, so it has no reason to go out and come back. Prefill
+        # only -- at one tile row there is nothing to keep.
+        out = ttnn.linear(
+            prod,
+            self.down,
+            compute_kernel_config=lo,
+            program_config=pcs[2],
+            dtype=out_dtype,
+            memory_config=ttnn.L1_MEMORY_CONFIG if m_tiles > 1 else None,
+        )
         ttnn.deallocate(prod)
         return _unfold(out, batch)
 
