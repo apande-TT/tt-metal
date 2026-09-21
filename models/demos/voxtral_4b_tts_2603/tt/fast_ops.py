@@ -927,6 +927,10 @@ def _patch_attention(cls, dtype):
             is_causal=False,
             scale=self.scaling,
             compute_kernel_config=sdpa_ck,
+            # The OUT half of the same handoff: the context is the size of q, its only consumer is
+            # the head merge, and the merge's only consumer is the output projection. Keeping all
+            # three in L1 takes the last DRAM round trips out of the attention core.
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         ttnn.deallocate(q)
         if kv is None:
@@ -942,7 +946,7 @@ def _patch_attention(cls, dtype):
         # The mirror of the split: `nlp_concat_heads` folds [B, heads, S, hd] back to
         # [B, 1, S, heads*hd] in one pass, replacing the transpose + last-dim reshape pair (107 ms
         # of ReshapeView plus its share of 39 ms of Transpose in the capture).
-        heads = ttnn.experimental.nlp_concat_heads(context)
+        heads = ttnn.experimental.nlp_concat_heads(context, memory_config=ttnn.L1_MEMORY_CONFIG)
         ttnn.deallocate(context)
         # Straight into the FOLDED layout: the output projection is the same per-token projection
         # as q/k/v and pays the same 32x weight re-stream if left batched. A view, since the last
