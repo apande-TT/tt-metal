@@ -381,7 +381,13 @@ class VoxtralPipeline:
         hidden = stack.forward_resident(buf["ids"], (buf["cos"], buf["sin"]), buf["mask"])
         width = int(hidden.shape[-1])
         last = ttnn.slice(hidden, (0, buf["last_row"], 0), (buf["batch"], buf["last_row"] + 1, width))
-        logits = stack.head(last)
+        # FOLDED LOGITS WHEN THE ONLY CONSUMER IS THE SAMPLER -- the same choice the cached decode
+        # step already makes. Unfolding `[1, B, vocab]` back to `[B, 1, vocab]` turns one 32-row
+        # tile row into B slabs of a single row each, every one padded out to a whole tile, across
+        # a 131072-wide tensor: it measured 0.44 ms, the largest movement op left in the capture.
+        # The reduction is over the last dim either way, so the batch can sit on whichever leading
+        # dim it is already on. A caller that wants the LOGITS still gets the unfolded shape.
+        logits = stack.head(last, keep_folded=sample)
         ttnn.deallocate(last)
         if not sample:
             return {"hidden": hidden, "logits": logits}
@@ -390,6 +396,9 @@ class VoxtralPipeline:
         token = ttnn.argmax(row_major, dim=-1)
         ttnn.deallocate(row_major)
         ttnn.deallocate(logits)
+        # Back to the `[B, 1]` the caller's contract names. This is a few hundred bytes of uint32,
+        # not the 131072-wide relayout the fold above avoids.
+        token = ttnn.reshape(token, (int(buf["batch"]), 1))
         return {"token": token}
 
     def _stage_inputs(self):
