@@ -313,7 +313,7 @@ def _device_ready(*tensors):
     return True
 
 
-def _decode_block_config(gx, gy, k_tiles, n_tiles, fused_activation):
+def _decode_block_config(gx, gy, k_tiles, n_tiles, fused_activation, max_k_step=4):
     """The ONE-TILE-ROW case: split N over every core, not M over the grid's rows.
 
     A 2D multicast hands each grid ROW a different block of M. A decode step has exactly one tile
@@ -330,7 +330,17 @@ def _decode_block_config(gx, gy, k_tiles, n_tiles, fused_activation):
         (w for w in range(_SUBBLOCK_TILE_BUDGET, 0, -1) if per_core_n % w == 0),
         1,
     )
-    in0_block_w = next((c for c in (4, 2, 1) if int(k_tiles) % c == 0), 1)
+    # HOW FAR THE K LOOP STEPS. A decode matmul contracts over 96 to 288 tiles of K to produce
+    # one or two output tiles per core, so the K loop is where its launch time goes and a wider
+    # step means proportionally fewer iterations; the in0 CB it costs is per_core_M x step, which
+    # at ONE tile row and bf8_b is 32 KB even at 16.
+    #
+    # BUT THE STEP IS NOT THE CALLER'S ALONE TO CHOOSE. A 1-D multicast with a SHARDED in0
+    # requires in0_block_w to divide the shard's width in tiles, and attention's decode layout is
+    # one 128-wide (4-tile) shard per user -- asking for 16 there is not slower, it is a hard
+    # TT_FATAL at runtime. So the ceiling is the caller's to state: 4 unless the call site knows
+    # its activation is interleaved and nothing constrains the step.
+    in0_block_w = next((c for c in (16, 8, 4, 2, 1) if c <= max_k_step and int(k_tiles) % c == 0), 1)
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
         in0_block_w=in0_block_w,
@@ -344,7 +354,7 @@ def _decode_block_config(gx, gy, k_tiles, n_tiles, fused_activation):
     )
 
 
-def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None):
+def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None, max_k_step=4):
     """A 2D-multicast program config sized for THIS shape on the WHOLE grid.
 
     Naming a `core_grid` instead leaves ttnn a 1-D multicast with 1x1 subblocks, so the work is not
@@ -360,7 +370,7 @@ def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None):
     grid = device.compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
     if int(m_tiles) == 1:
-        return _decode_block_config(gx, gy, k_tiles, n_tiles, fused_activation)
+        return _decode_block_config(gx, gy, k_tiles, n_tiles, fused_activation, max_k_step=max_k_step)
     per_core_m = -(-int(m_tiles) // gy)
     per_core_n = -(-int(n_tiles) // gx)
     # in0_block_w must divide K in tiles. Larger means fewer K iterations but bigger in0/in1 CBs.
@@ -603,9 +613,13 @@ def _patch_mlp(cls, dtype):
             hidden = -(-int(self.gate.shape[-2]) // 32)
             inter = -(-int(self.gate.shape[-1]) // 32)
             pcs = cache[m_tiles] = (
-                _block_config(device, m_tiles, hidden, inter, fused_activation=_SILU),
-                _block_config(device, m_tiles, hidden, inter),
-                _block_config(device, m_tiles, inter, hidden),
+                # max_k_step: the MLP's activation is DRAM interleaved at every row count, so
+                # nothing constrains the decode K step here and it can take the same 16 the
+                # prefill config already walks to. Attention's cannot -- its decode layout is one
+                # 128-wide shard per user, and the 1-D multicast requires the step to divide it.
+                _block_config(device, m_tiles, hidden, inter, fused_activation=_SILU, max_k_step=16),
+                _block_config(device, m_tiles, hidden, inter, max_k_step=16),
+                _block_config(device, m_tiles, inter, hidden, max_k_step=16),
             )
         # The SwiGLU intermediates are the LARGEST tensors in the model -- [B*S, 4*hidden], 75 MB
         # each in fp32 at B=32/S=64, and three of them per block (gate, up, their product). Carrying
