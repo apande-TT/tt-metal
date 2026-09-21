@@ -64,6 +64,8 @@ import ttnn
 _ATTENTION_MODULES = ("attention", "decoder_layer", "layer", "model")
 _MLP_MODULES = ("mlp", "m_l_p", "decoder_layer", "layer", "model")
 _HEAD_MODULES = ("decoder_head",)
+# The norm is defined in its own stub AND inlined into each whole-block stub, same as the others.
+_NORM_MODULES = ("r_m_s_norm", "decoder_layer", "layer", "model")
 
 _STUB_PKG = "models.tt_transformers.demo.voxtral_4b_tts_2603._stubs"
 
@@ -977,6 +979,80 @@ def _patch_head(cls, dtype):
     cls.__call__ = __call__
 
 
+def _norm_shard_plan(device, rows, width):
+    """The largest BLOCK shard of a `[rows, width]` tile grid that divides the device grid exactly.
+
+    A block shard is the only layernorm layout that splits the WIDTH as well as the rows, and it is
+    the only way this op can hold more than `rows/32` cores -- the interleaved kernel parallelises
+    over tile rows alone, so at 2048 rows it takes 64 of 110 and at 1024 rows only 32. Both
+    extents have to divide exactly (a partial shard is rejected outright), so the plan is the
+    largest divisor of each under the real device grid, never a hard-coded one.
+
+    Returns `(memory_config, program_config)` or None when no split beats what the op already does.
+    """
+    grid = device.compute_with_storage_grid_size()
+    m_tiles, n_tiles = -(-int(rows) // 32), -(-int(width) // 32)
+    gy = max((c for c in range(1, int(grid.y) + 1) if m_tiles % c == 0), default=1)
+    gx = max((c for c in range(1, int(grid.x) + 1) if n_tiles % c == 0), default=1)
+    if gy * gx <= min(m_tiles, int(grid.x) * int(grid.y)):
+        # No more cores than the interleaved kernel already takes -- nothing for this to buy.
+        return None
+    block_h, block_w = m_tiles // gy, n_tiles // gx
+    subblock_w = next((w for w in range(min(block_w, 4), 0, -1) if block_w % w == 0), 1)
+    shard = ttnn.create_sharded_memory_config(
+        shape=(int(rows), int(width)),
+        core_grid=ttnn.CoreGrid(y=gy, x=gx),
+        strategy=ttnn.ShardStrategy.BLOCK,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    return shard, ttnn.LayerNormShardedMultiCoreProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+        subblock_w=subblock_w,
+        block_h=block_h,
+        block_w=block_w,
+        inplace=False,
+    )
+
+
+def _patch_norm(cls, dtype):
+    original = cls.__call__
+
+    def __call__(self, hidden_states, **kwargs):
+        if not isinstance(hidden_states, ttnn.Tensor):
+            return original(self, hidden_states, **kwargs)
+        rows = int(hidden_states.shape[-2]) * (int(hidden_states.shape[0]) if len(hidden_states.shape) > 2 else 1)
+        width = int(hidden_states.shape[-1])
+        plan = None
+        if rows > ttnn.TILE_SIZE:
+            cache = getattr(self, "_shard_cache", None)
+            if cache is None:
+                cache = self._shard_cache = {}
+            if (rows, width) not in cache:
+                try:
+                    cache[(rows, width)] = _norm_shard_plan(self.weight.device(), rows, width)
+                except Exception:  # noqa: BLE001 - a shape the shard helper rejects keeps the stock path
+                    cache[(rows, width)] = None
+            plan = cache[(rows, width)]
+        if plan is None:
+            return original(self, hidden_states, **kwargs)
+        shard, pc = plan
+        staged = ttnn.to_memory_config(hidden_states, shard)
+        out = ttnn.rms_norm(
+            staged,
+            epsilon=self.epsilon,
+            weight=self.weight,
+            compute_kernel_config=self.compute_kernel_config,
+            program_config=pc,
+            memory_config=shard,
+        )
+        ttnn.deallocate(staged)
+        back = ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(out)
+        return back
+
+    cls.__call__ = __call__
+
+
 def install() -> bool:
     """Install the overrides once. Idempotent; returns True the first time it patched."""
     global _installed
@@ -987,6 +1063,7 @@ def install() -> bool:
         [(n, "TtAttention", _patch_attention) for n in _ATTENTION_MODULES]
         + [(n, "TtMLP", _patch_mlp) for n in _MLP_MODULES]
         + [(n, "TtDecoderHead", _patch_head) for n in _HEAD_MODULES]
+        + [(n, "TtRMSNorm", _patch_norm) for n in _NORM_MODULES]
     ):
         module = importlib.import_module(f"{_STUB_PKG}.{name}")
         cls = getattr(module, cls_name, None)
