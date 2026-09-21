@@ -81,6 +81,10 @@ _SDPA_MASK_DTYPES = (ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b)
 # The PREFILL flash-attention op's math fidelity. See the note at its call site; the DECODE op keeps
 # the stub's own config, because the per-token metric is the one being protected.
 _SDPA_FIDELITY = ttnn.MathFidelity.HiFi2
+# The flash kernel's chunk size, capped at the sequence length by `_sdpa_pc`. `exp_approx_mode`
+# stays False: the polynomial exp's error accumulates across chunk merges, and exact measured no
+# slower on this arch.
+_SDPA_CHUNK = 128
 
 # The format the model's WIDE intermediates are carried in -- the SwiGLU gate/up/product, which are
 # [B*S, 4*hidden] and are each consumed exactly once by the next op. Distinct from the residual
@@ -608,6 +612,34 @@ def _attn_pc(module, role, rows, weight):
     return pc
 
 
+def _sdpa_pc(module, device, seq_len):
+    """Flash attention's chunk sizing, cached per sequence length.
+
+    With no program config the op picks its own chunking, and the chunk is the WORK UNIT: a
+    (batch, head, q-chunk) triple is what gets handed to a core. Both directions cost something --
+    too small and each unit pays its own setup over a tiny slice, too large and there are fewer
+    units than cores and the grid sits idle -- so the size has to be read off the work available.
+    Here there are batch x n_heads independent (b, h) pairs before the sequence is divided at all,
+    which at B=32 and 32 heads is 1024 units for 110 cores, so the grid stays busy even when the
+    whole sequence is one chunk and the sizing can be chosen purely to amortise setup.
+    """
+    cache = getattr(module, "_sdpa_pc_cache", None)
+    if cache is None:
+        cache = module._sdpa_pc_cache = {}
+    pc = cache.get(seq_len)
+    if pc is None:
+        grid = device.compute_with_storage_grid_size()
+        chunk = max(ttnn.TILE_SIZE, min(int(seq_len), _SDPA_CHUNK))
+        chunk -= chunk % ttnn.TILE_SIZE
+        pc = cache[seq_len] = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(int(grid.x), int(grid.y)),
+            q_chunk_size=chunk,
+            k_chunk_size=chunk,
+            exp_approx_mode=False,
+        )
+    return pc
+
+
 def _kv_seed(kv, k, v):
     """Hand the prefill's post-RoPE K/V to the cache, freeing whatever it held before.
 
@@ -929,6 +961,7 @@ def _patch_attention(cls, dtype):
             is_causal=False,
             scale=self.scaling,
             compute_kernel_config=sdpa_ck,
+            program_config=_sdpa_pc(self, self.wo.device(), seq_len),
             # The OUT half of the same handoff: the context is the size of q, its only consumer is
             # the head merge, and the merge's only consumer is the output projection. Keeping all
             # three in L1 takes the last DRAM round trips out of the attention core.
