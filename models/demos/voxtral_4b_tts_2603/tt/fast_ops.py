@@ -91,7 +91,7 @@ _SDPA_FIDELITY = ttnn.MathFidelity.HiFi2
 # precision only within a block, and each of these tensors is read exactly once by the next op
 # rather than being accumulated into. The documented hard floor for narrowing an activation is a
 # normalisation or a KV cache, and this is neither.
-_WIDE_DTYPE = ttnn.bfloat8_b
+_WIDE_DTYPE = ttnn.bfloat4_b
 
 # THE PROJECTIONS' in0 -- the NORM OUTPUT, not the residual stream.
 #
