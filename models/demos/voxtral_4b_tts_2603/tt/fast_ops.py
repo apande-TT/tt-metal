@@ -958,12 +958,20 @@ def _patch_attention(cls, dtype):
             # view. `nlp_create_qkv_heads` reads the fused [B, 1, S, (nq+2nkv)*hd] once and writes
             # q/k/v already in [B, heads, S, hd], doing all three splits and transposes in a single
             # pass. transpose_k_heads=False because SDPA wants k as [b, nkv, s, dh], not k^T.
+            # THE IN half of the handoff the comment below describes. q/k/v already land in L1 and
+            # stay there through RoPE and flash attention, but the tensor the head split READS was
+            # still going out to DRAM and being fetched back -- 12.6 MB each way per block at 2048
+            # rows. `nlp_create_qkv_heads` is tagged dispatch-bound, and what a dispatch-bound op
+            # waits for is its operand arriving, so the read is exactly the wait. The projection
+            # packs to L1 instead; at bf8_b the fused [rows, (nq+2nkv)*hd] is 12.6 MB against
+            # ~165 MB of grid L1, which is the same working set q/k/v hold a moment later.
             fused = ttnn.linear(
                 flat,
                 wqkv,
                 compute_kernel_config=qkv_ck,
                 program_config=_attn_pc(self, "qkv", rows, wqkv),
                 dtype=_SDPA_DTYPE,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
             )
             # Rank-4 view: the last dim is unchanged and both row counts are tile multiples.
             staged = ttnn.reshape(fused, (batch, 1, seq_len, int(fused.shape[-1])))
