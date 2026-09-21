@@ -1239,6 +1239,114 @@ def _patch_head(cls, dtype):
     cls.__call__ = __call__
 
 
+# Repo-relative, because that is what KernelDescriptor's FILE_PATH resolves against.
+_RESHARD_KERNEL_SOURCE = "models/demos/voxtral_4b_tts_2603/tt/kernels/gather_block_shard.cpp"
+_RESHARD_TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048}
+_reshard_plan_cache = {}
+
+
+def _gather_block_shard(x, shard):
+    """`to_memory_config(x, shard)` on TWO data-movement processors per core instead of one.
+
+    The stock interleaved-to-sharded op gives each core ONE reader, which issues every tile of
+    that core's block in turn. On this model's norm staging -- 64 cores, 96 fp32 tiles each, 25 MB
+    of residual -- that lands the op at a small fraction of DRAM bandwidth, and the roofline tags
+    it memory-bound while the banks are nowhere near busy: the ceiling is the issue rate of one
+    RISCV, not the fabric. So the block's ROWS are split between the two processors, each on its
+    own NoC, and the two halves cover the block exactly once without any coordination.
+
+    Declines to anything it does not recognise -- a non-block shard, a shard that does not divide
+    the tensor, a row-major layout -- by handing the work back to the stock op, so this is a swap
+    at one shape rather than a new contract.
+    """
+    plan = _reshard_plan(x, shard)
+    if plan is None:
+        return ttnn.to_memory_config(x, shard)
+    out = ttnn.allocate_tensor_on_device(x.shape, x.dtype, ttnn.TILE_LAYOUT, x.device(), shard)
+    return ttnn.generic_op([x, out], _reshard_descriptor(x, out, plan))
+
+
+def _reshard_plan(x, shard):
+    """The per-core block geometry, cached per (shape, dtype, shard) -- or None to decline."""
+    try:
+        spec = shard.shard_spec
+        if spec is None or shard.memory_layout != ttnn.TensorMemoryLayout.BLOCK_SHARDED:
+            return None
+        if x.layout != ttnn.TILE_LAYOUT or x.is_sharded():
+            return None
+        # A tile's BYTES, which for a block-float format is not elements x width -- there is a
+        # shared-exponent header per face and `element_size()` refuses the question outright. Only
+        # the two plain formats are served; anything else keeps the stock op.
+        tile_bytes = _RESHARD_TILE_BYTES.get(x.dtype)
+        if tile_bytes is None:
+            return None
+        rows, width = int(x.shape[-2]), int(x.shape[-1])
+        for dim in list(x.shape)[:-2]:
+            rows *= int(dim)
+        shard_h, shard_w = int(spec.shape[0]), int(spec.shape[1])
+        if rows % shard_h or width % shard_w or shard_h % ttnn.TILE_SIZE or shard_w % ttnn.TILE_SIZE:
+            return None
+        key = (rows, width, shard_h, shard_w, str(x.dtype), str(spec.orientation))
+        got = _reshard_plan_cache.get(key)
+        if got is not None:
+            return got
+        block_h, block_w = shard_h // ttnn.TILE_SIZE, shard_w // ttnn.TILE_SIZE
+        if block_h < 2:
+            # Nothing to split between two processors; the stock op is already this kernel.
+            return None
+        width_tiles = width // ttnn.TILE_SIZE
+        blocks_x = width // shard_w
+        column_major = spec.orientation == ttnn.ShardOrientation.COL_MAJOR
+        cores = []
+        for core_range in spec.grid.ranges():
+            for cx in range(int(core_range.start.x), int(core_range.end.x) + 1):
+                for cy in range(int(core_range.start.y), int(core_range.end.y) + 1):
+                    block_row, block_col = (cx, cy) if column_major else (cy, cx)
+                    cores.append((cx, cy, block_row * block_h * width_tiles + block_col * block_w))
+        if len(cores) != (rows // shard_h) * blocks_x:
+            return None
+        got = _reshard_plan_cache[key] = (tuple(cores), block_h, block_w, width_tiles, spec.grid, tile_bytes)
+        return got
+    except Exception:  # noqa: BLE001 - anything unrecognised keeps the stock op
+        return None
+
+
+def _reshard_descriptor(x, out, plan):
+    """Two DM kernels over the same block, one per processor, split on the block's rows.
+
+    Built FRESH per call and given a `custom_program_hash` that names both buffer addresses:
+    `generic_op`'s default hash covers the runtime-arg COUNT and never its values, so a rebuilt
+    descriptor would otherwise hit the cache and run the previous layer's addresses. The norm is
+    called once per layer against a different residual buffer, which is exactly that case.
+    """
+    cores, block_h, block_w, width_tiles, grid, tile_bytes = plan
+    compile_args = [tile_bytes, block_w, width_tiles]
+    compile_args.extend(ttnn.TensorAccessorArgs(x).get_compile_time_args())
+    src_addr, dst_addr = x.buffer_address(), out.buffer_address()
+    halves = (block_h // 2, block_h - block_h // 2)
+    kernels = []
+    for index, (processor, noc) in enumerate(
+        ((ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0), (ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1))
+    ):
+        args = ttnn.RuntimeArgs()
+        for cx, cy, start_tile in cores:
+            args[cx][cy] = [src_addr, dst_addr, start_tile, 0 if index == 0 else halves[0], halves[index]]
+        kernels.append(
+            ttnn.KernelDescriptor(
+                kernel_source=_RESHARD_KERNEL_SOURCE,
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=grid,
+                compile_time_args=compile_args,
+                runtime_args=args,
+                config=ttnn.DataMovementConfigDescriptor(processor=processor, noc=noc),
+            )
+        )
+    descriptor = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=[])
+    # Masked non-negative: the setter takes a size_t and Python's `hash` is signed.
+    descriptor.custom_program_hash = hash((src_addr, dst_addr, tuple(compile_args), len(cores))) & ((1 << 63) - 1)
+    return descriptor
+
+
 def _norm_shard_plan(device, rows, width, narrowing=False):
     """The largest BLOCK shard of a `[rows, width]` tile grid that divides the device grid exactly.
 
@@ -1383,7 +1491,7 @@ def _norm_call(norm, original, hidden_states, out_dtype=None, **kwargs):
         out = original(norm, hidden_states, **kwargs)
         return ttnn.typecast(out, out_dtype, memory_config=landing) if narrowing else out
     shard, pc = plan
-    staged = ttnn.to_memory_config(hidden_states, shard)
+    staged = _gather_block_shard(hidden_states, shard)
     # `inplace=True`, so this aliases `staged`; do NOT deallocate staged separately.
     out = ttnn.rms_norm(
         staged,
