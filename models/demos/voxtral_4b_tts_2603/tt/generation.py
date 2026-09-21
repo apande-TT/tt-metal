@@ -515,13 +515,15 @@ class VoxtralGenerationStack:
         """Greedy sampling ON DEVICE. Returns the chosen ids as a `[B, 1]` uint32 DEVICE tensor.
 
         `ttnn.argmax` on a TILE tensor collapses onto a single core -- measured 0.386s against
-        0.003s for the same reduction in ROW_MAJOR at `[32, 1, 131072]` -- so the reduction runs in
-        ROW_MAJOR. The result never leaves the device: it is what `append_token` concatenates
+        0.003s for the same reduction in ROW_MAJOR at `[32, 1, 131072]` -- so the stock path has
+        to untilize 8.4 MB of logits before it can reduce them. `fast_argmax_last` reads the tiles
+        where the head left them instead, and falls back to that stock pair at any shape it does
+        not recognise. The result never leaves the device: it is what `append_token` concatenates
         straight back onto the context.
         """
-        row_major = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-        chosen = ttnn.argmax(row_major, dim=-1)
-        ttnn.deallocate(row_major)
+        from models.demos.voxtral_4b_tts_2603.tt import fast_ops
+
+        chosen = fast_ops.fast_argmax_last(logits)
         # THE BATCH IS WHICHEVER LEADING DIM CARRIES IT. `[B, 1, vocab]` and the folded
         # `[1, B, vocab]` are the two shapes a caller can hand this, and the other dim is 1 in both,
         # so the product reads the batch off either without asking which one arrived.

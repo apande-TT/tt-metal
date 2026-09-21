@@ -1243,6 +1243,194 @@ _RESHARD_TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048}
 _reshard_plan_cache = {}
 
 
+_ARGMAX_SCAN_SOURCE = "models/demos/voxtral_4b_tts_2603/tt/kernels/argmax_tile_scan.cpp"
+_ARGMAX_REDUCE_SOURCE = "models/demos/voxtral_4b_tts_2603/tt/kernels/argmax_tile_reduce.cpp"
+# Tiles a scan worker stages before it turns them around. The NoC round trip is paid once per
+# batch instead of once per tile; 8 bf16 tiles is 16 KB of scratch, which is nothing against L1.
+_ARGMAX_BATCH_TILES = 8
+# Bytes per (key, index) partial. Sixteen rather than eight because the record is written straight
+# into its row's page at `chunk * record`, and a NoC write wants that offset 16-byte aligned.
+_ARGMAX_RECORD_BYTES = 16
+_argmax_plan_cache = {}
+
+
+def fast_argmax_last(logits):
+    """`to_layout(ROW_MAJOR)` + `ttnn.argmax(dim=-1)` as ONE pass over the tiles.
+
+    The sampler is the last thing a decode step does and it costs two full reads of the widest
+    tensor in the model. `ttnn.argmax` collapses onto a single core on a TILE input -- 0.386 s
+    against 0.003 s for the same reduction in ROW_MAJOR -- so the stock path untilizes 8.4 MB of
+    logits purely to reach the multicore factory, then reads them again to reduce. The relayout
+    buys the reduction nothing: a scan is a commutative reduce whose only ordering requirement is
+    the tie-break, and the tie-break is carried by the INDEX, not by the order elements are
+    visited in. So this reads the tiles where the matmul left them.
+
+    What is left after that is per-element cost, and the stock scan is bound by it rather than by
+    bandwidth -- 8.4 MB in 0.45 ms is 18.6 GB/s, twenty times off the fabric. The kernels take the
+    branches out of the comparison and put both of a core's data-movement processors on it.
+
+    Declines to the stock pair for anything it does not recognise -- a non-bf16 input, a shard, an
+    unfolded batch -- so this is a swap at one shape rather than a new contract.
+    """
+    plan = _argmax_plan(logits)
+    if plan is None:
+        row_major = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+        out = ttnn.argmax(row_major, dim=-1)
+        ttnn.deallocate(row_major)
+        return out
+    device, rows = logits.device(), plan["rows"]
+    part = ttnn.allocate_tensor_on_device(
+        ttnn.Shape([1, rows, plan["chunks"] * 4]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, device, ttnn.L1_MEMORY_CONFIG
+    )
+    out = ttnn.allocate_tensor_on_device(
+        ttnn.Shape([1, rows, 1]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, device, ttnn.L1_MEMORY_CONFIG
+    )
+    ttnn.generic_op([logits, part], _argmax_scan_descriptor(logits, part, plan))
+    ttnn.generic_op([part, out], _argmax_reduce_descriptor(part, out, plan))
+    ttnn.deallocate(part)
+    return out
+
+
+def _argmax_plan(logits):
+    """Tiles per worker and the record geometry, cached per (rows, width) -- or None to decline."""
+    try:
+        if logits.layout != ttnn.TILE_LAYOUT or logits.dtype != ttnn.bfloat16 or logits.is_sharded():
+            return None
+        shape = [int(d) for d in logits.shape]
+        # THE FOLDED LOGITS ONLY. `[1, batch, vocab]` is one tile row, so a tile carries 32 batch
+        # rows side by side and the whole batch is scanned by one pass over the tiles. The
+        # unfolded `[batch, 1, vocab]` is 32 tile rows of which 31/32 of every tile is padding --
+        # a different op, and not the one on the per-token path.
+        if len(shape) < 2 or any(d != 1 for d in shape[:-2]):
+            return None
+        rows, width = shape[-2], shape[-1]
+        if rows < 1 or rows > ttnn.TILE_SIZE or width % ttnn.TILE_SIZE:
+            return None
+        key = (rows, width)
+        got = _argmax_plan_cache.get(key)
+        if got is not None:
+            return got
+        grid = logits.device().compute_with_storage_grid_size()
+        gx, gy = int(grid.x), int(grid.y)
+        # Two chunks per core, one per data-movement processor, numbered so the chunk index
+        # ASCENDS with the vocab offset -- that is what lets the fold keep the lowest index among
+        # equal maxima with a single forward strict-greater scan.
+        chunks = gx * gy * 2
+        tiles = width // ttnn.TILE_SIZE
+        got = _argmax_plan_cache[key] = {
+            "rows": rows,
+            "gx": gx,
+            "gy": gy,
+            "chunks": chunks,
+            "per_worker": -(-tiles // chunks),
+            "tiles": tiles,
+            "part_page": chunks * _ARGMAX_RECORD_BYTES,
+        }
+        return got
+    except Exception:  # noqa: BLE001 - anything unrecognised keeps the stock pair
+        return None
+
+
+def _argmax_scan_descriptor(logits, part, plan):
+    """Two DM kernels per core over a half-open range of the logits' tile columns."""
+    gx, gy = plan["gx"], plan["gy"]
+    core_ranges = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))})
+    tiles, per_worker = plan["tiles"], plan["per_worker"]
+    src_addr, part_addr = logits.buffer_address(), part.buffer_address()
+    accessor_args = list(ttnn.TensorAccessorArgs(logits).get_compile_time_args())
+    accessor_args += list(ttnn.TensorAccessorArgs(part).get_compile_time_args())
+    kernels, cbs = [], []
+    for index, (processor, noc) in enumerate(
+        ((ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0), (ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1))
+    ):
+        cb_id = index
+        cbs.append(
+            ttnn.CBDescriptor(
+                # One slot past the staging ring, reused by the kernel as its outgoing records.
+                total_size=(_ARGMAX_BATCH_TILES + 1) * 2048,
+                core_ranges=core_ranges,
+                format_descriptors=[
+                    ttnn.CBFormatDescriptor(buffer_index=cb_id, data_format=ttnn.bfloat16, page_size=2048)
+                ],
+            )
+        )
+        args = ttnn.RuntimeArgs()
+        for cy in range(gy):
+            for cx in range(gx):
+                chunk = (cy * gx + cx) * 2 + index
+                first = min(chunk * per_worker, tiles)
+                args[cx][cy] = [src_addr, part_addr, first, min(first + per_worker, tiles) - first, chunk]
+        kernels.append(
+            ttnn.KernelDescriptor(
+                kernel_source=_ARGMAX_SCAN_SOURCE,
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=core_ranges,
+                compile_time_args=[cb_id, 2048, _ARGMAX_BATCH_TILES, plan["rows"], _ARGMAX_RECORD_BYTES, plan["part_page"]]
+                + accessor_args,
+                runtime_args=args,
+                config=ttnn.DataMovementConfigDescriptor(processor=processor, noc=noc),
+            )
+        )
+    descriptor = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+    # Masked non-negative: the setter takes a size_t and Python's `hash` is signed. Without it a
+    # rebuilt descriptor hits the program cache and runs the PREVIOUS call's buffer addresses --
+    # `generic_op`'s default hash covers the runtime-arg count and never its values.
+    descriptor.custom_program_hash = hash((src_addr, part_addr, tiles, per_worker, plan["rows"])) & ((1 << 63) - 1)
+    return descriptor
+
+
+def _argmax_reduce_descriptor(part, out, plan):
+    """One core per batch row, each folding that row's page of records in a single transfer."""
+    gx, rows = plan["gx"], plan["rows"]
+    full, rem = divmod(rows, gx)
+    ranges = []
+    if full:
+        ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, full - 1)))
+    if rem:
+        ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full), ttnn.CoreCoord(rem - 1, full)))
+    core_ranges = ttnn.CoreRangeSet(ranges)
+    part_addr, out_addr = part.buffer_address(), out.buffer_address()
+    compile_args = [0, 1, plan["chunks"], plan["part_page"], 4]
+    compile_args += list(ttnn.TensorAccessorArgs(part).get_compile_time_args())
+    compile_args += list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
+    cbs = [
+        ttnn.CBDescriptor(
+            total_size=plan["part_page"],
+            core_ranges=core_ranges,
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=0, data_format=ttnn.uint32, page_size=plan["part_page"])
+            ],
+        ),
+        ttnn.CBDescriptor(
+            total_size=16,
+            core_ranges=core_ranges,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=1, data_format=ttnn.uint32, page_size=16)],
+        ),
+    ]
+    args = ttnn.RuntimeArgs()
+    for row in range(rows):
+        cy, cx = divmod(row, gx)
+        args[cx][cy] = [part_addr, out_addr, row]
+    descriptor = ttnn.ProgramDescriptor(
+        kernels=[
+            ttnn.KernelDescriptor(
+                kernel_source=_ARGMAX_REDUCE_SOURCE,
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=core_ranges,
+                compile_time_args=compile_args,
+                runtime_args=args,
+                config=ttnn.DataMovementConfigDescriptor(
+                    processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0
+                ),
+            )
+        ],
+        semaphores=[],
+        cbs=cbs,
+    )
+    descriptor.custom_program_hash = hash((part_addr, out_addr, plan["chunks"], rows)) & ((1 << 63) - 1)
+    return descriptor
+
+
 def _gather_block_shard(x, shard):
     """`to_memory_config(x, shard)` on TWO data-movement processors per core instead of one.
 

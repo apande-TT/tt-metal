@@ -364,9 +364,9 @@ class VoxtralPipeline:
         # is over the last dim either way, so the batch can stay on whichever leading dim it is on.
         logits = stack.head(hidden, keep_folded=True)
         ttnn.deallocate(hidden)
-        row_major = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-        token = ttnn.argmax(row_major, dim=-1)
-        ttnn.deallocate(row_major)
+        from models.demos.voxtral_4b_tts_2603.tt import fast_ops
+
+        token = fast_ops.fast_argmax_last(logits)
         ttnn.deallocate(logits)
         ttnn.copy(ttnn.reshape(token, tuple(buf["step_ids"].shape)), buf["step_ids"])
         stack.kv_advance()
@@ -400,9 +400,9 @@ class VoxtralPipeline:
         if not sample:
             return {"hidden": hidden, "logits": logits}
         ttnn.deallocate(hidden)
-        row_major = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-        token = ttnn.argmax(row_major, dim=-1)
-        ttnn.deallocate(row_major)
+        from models.demos.voxtral_4b_tts_2603.tt import fast_ops
+
+        token = fast_ops.fast_argmax_last(logits)
         ttnn.deallocate(logits)
         # Back to the `[B, 1]` the caller's contract names. This is a few hundred bytes of uint32,
         # not the 131072-wide relayout the fold above avoids.
