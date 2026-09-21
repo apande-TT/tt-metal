@@ -357,7 +357,7 @@ class VoxtralPipeline:
         for table in rope:
             ttnn.deallocate(table)
         if not sample:
-            return {"hidden": hidden, "logits": stack.head(hidden)}
+            return {"hidden": hidden, "logits": stack.head(hidden, keep_folded=True)}
         # FOLDED logits, because the only consumer is the argmax. Unfolding [1, B, vocab] into
         # [B, 1, vocab] is a real relayout of a 131072-wide tensor -- B single-row slabs, each
         # padded back to a tile -- and it was the largest movement op in the step. The reduction
@@ -383,13 +383,18 @@ class VoxtralPipeline:
         hidden = stack.forward_resident(buf["ids"], (buf["cos"], buf["sin"]), buf["mask"])
         width = int(hidden.shape[-1])
         last = ttnn.slice(hidden, (0, buf["last_row"], 0), (buf["batch"], buf["last_row"] + 1, width))
-        # FOLDED LOGITS WHEN THE ONLY CONSUMER IS THE SAMPLER -- the same choice the cached decode
-        # step already makes. Unfolding `[1, B, vocab]` back to `[B, 1, vocab]` turns one 32-row
-        # tile row into B slabs of a single row each, every one padded out to a whole tile, across
-        # a 131072-wide tensor: it measured 0.44 ms, the largest movement op left in the capture.
-        # The reduction is over the last dim either way, so the batch can sit on whichever leading
-        # dim it is already on. A caller that wants the LOGITS still gets the unfolded shape.
-        logits = stack.head(last, keep_folded=sample)
+        # FOLDED LOGITS, sampler or not. Unfolding `[1, B, vocab]` back to `[B, 1, vocab]` turns one
+        # 32-row tile row into B slabs of a single row each, every one padded out to a whole tile,
+        # across a 131072-wide tensor -- it measured 2.45 ms here, the largest single op in the
+        # capture, larger than any matmul in the model.
+        #
+        # THE SAMPLING BRANCH never wanted the unfolded shape: the argmax reduces over the last dim
+        # either way. The OTHER branch turned out not to want it either -- this is the trace stage's
+        # step, whose return value exists so the harness can prove the loop advances, and it reads
+        # that as a numel + sum digest (perf_adapter.step_readings), which both leading orders give
+        # identically. `forward_logits` is the API for a caller that wants LOGITS, and it still
+        # hands back `[B, 1, vocab]` unless asked otherwise.
+        logits = stack.head(last, keep_folded=True)
         ttnn.deallocate(last)
         if not sample:
             return {"hidden": hidden, "logits": logits}

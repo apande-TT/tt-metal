@@ -449,11 +449,20 @@ class VoxtralGenerationStack:
         ttnn.deallocate(rope[1])
         return out
 
-    def forward_logits(self, input_ids, position_ids=None, attention_mask=None, hidden=None):
-        """ids -> next-token logits `[B, 1, 131072]`.
+    def forward_logits(self, input_ids, position_ids=None, attention_mask=None, hidden=None, keep_folded=False):
+        """ids -> next-token logits `[B, 1, 131072]`, or `[1, B, 131072]` when `keep_folded`.
 
         The head is applied to the LAST sequence row only. `[B, S, 131072]` would be ~1 GB at
         B=32, S=32 in float32, and every row but the last is dead weight for a next-token decision.
+
+        `keep_folded` is for the caller whose ONLY consumer is `sample_device`. The head produces
+        `[1, B, vocab]` naturally, and unfolding that to `[B, 1, vocab]` turns one 32-row tile row
+        into B slabs of a single row each, every one padded back out to a whole tile, across a
+        131072-wide tensor -- it measured 2.45 ms, the largest single op in the capture. The
+        argmax reduces over the last dim either way, so a sampler does not care which leading dim
+        carries the batch; a caller that wants the LOGITS still gets the unfolded shape by default.
+        The traced decode step already makes exactly this choice (`pipeline._decode_step_cached`);
+        this is the same choice for the free-running loop.
         """
         if hidden is None:
             hidden = self.forward_hidden(input_ids, position_ids=position_ids, attention_mask=attention_mask)
@@ -464,7 +473,7 @@ class VoxtralGenerationStack:
         last = ttnn.slice(hidden, (0, seq_len - 1, 0), (batch, seq_len, width))
         if owns_hidden:
             ttnn.deallocate(hidden)
-        logits = self.head(last)
+        logits = self.head(last, keep_folded=keep_folded)
         ttnn.deallocate(last)
         return logits
 
@@ -479,7 +488,10 @@ class VoxtralGenerationStack:
         row_major = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
         chosen = ttnn.argmax(row_major, dim=-1)
         ttnn.deallocate(row_major)
-        return ttnn.reshape(chosen, (int(logits.shape[0]), 1))
+        # THE BATCH IS WHICHEVER LEADING DIM CARRIES IT. `[B, 1, vocab]` and the folded
+        # `[1, B, vocab]` are the two shapes a caller can hand this, and the other dim is 1 in both,
+        # so the product reads the batch off either without asking which one arrived.
+        return ttnn.reshape(chosen, (int(logits.shape[0]) * int(logits.shape[-2]), 1))
 
     def sample(self, logits):
         """`sample_device` plus a read-back, for the measurement paths that score one step."""
@@ -681,7 +693,10 @@ def run_text_generation(stack, input_ids, horizon=None, **kwargs) -> dict:
     emitted = 0
     for _ in range(horizon):
         position_ids, attention_mask = stack.stage_constants(int(device_ids.shape[-1]))
-        logits = stack.forward_logits(device_ids, position_ids=position_ids, attention_mask=attention_mask)
+        # FOLDED: the only consumer of these logits is the argmax on the next line.
+        logits = stack.forward_logits(
+            device_ids, position_ids=position_ids, attention_mask=attention_mask, keep_folded=True
+        )
         nxt = stack.sample_device(logits)
         ttnn.deallocate(logits)
         device_ids = stack.append_token(device_ids, nxt)
