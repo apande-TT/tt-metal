@@ -1258,7 +1258,12 @@ def _norm_shard_plan(device, rows, width, narrowing=False):
         shape=(int(rows), int(width)),
         core_grid=ttnn.CoreGrid(y=gy, x=gx),
         strategy=ttnn.ShardStrategy.BLOCK,
-        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        # WHICH WAY THE BLOCKS ARE LAID OVER THE CORES. The shard's shape is fixed by the plan
+        # above; the orientation decides whether consecutive blocks walk the grid's rows or its
+        # columns, which is what the reduction's cross-core sum has to traverse. COLUMN_MAJOR puts
+        # the cores that share a tensor ROW -- the ones a norm must sum across -- adjacent along
+        # the grid's short axis instead of its long one.
+        orientation=ttnn.ShardOrientation.COL_MAJOR,
     )
     return shard, ttnn.LayerNormShardedMultiCoreProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
