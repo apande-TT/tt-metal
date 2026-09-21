@@ -317,8 +317,11 @@ def _decode_block_config(gx, gy, k_tiles, n_tiles, fused_activation):
     cores = gx * gy
     per_core_n = -(-int(n_tiles) // cores)
     # out_subblock_h is pinned to 1 (M is one tile), so the whole subblock budget goes to width.
-    # fp32_dest_acc_en halves DEST, hence 4 rather than 8.
-    out_subblock_w = next((w for w in (4, 3, 2, 1) if per_core_n % w == 0), 1)
+    # The budget follows `_DEST_FP32` -- 4 tiles with an fp32 accumulator, 8 without.
+    out_subblock_w = next(
+        (w for w in range(_SUBBLOCK_TILE_BUDGET, 0, -1) if per_core_n % w == 0),
+        1,
+    )
     in0_block_w = next((c for c in (4, 2, 1) if int(k_tiles) % c == 0), 1)
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
@@ -358,14 +361,15 @@ def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None):
     # halved. The ACTIVATION has since gone fp32 -> bf8_b as well, which quarters the in0 block, so
     # the same L1 budget has room for another doubling.
     in0_block_w = next((c for c in (16, 8, 4, 2, 1) if int(k_tiles) % c == 0), 1)
-    # out_subblock_h * out_subblock_w <= 4 because the compute kernel runs fp32_dest_acc_en=True,
-    # which halves DEST. Pick the largest legal pair that divides the per-core block.
+    # out_subblock_h * out_subblock_w <= the DEST budget, which is what `_DEST_FP32` decides: 4
+    # tiles with an fp32 accumulator, 8 without. Pick the largest legal pair that divides the
+    # per-core block.
     best_h, best_w = 1, 1
     for h in range(1, per_core_m + 1):
         if per_core_m % h:
             continue
         for w in range(1, per_core_n + 1):
-            if per_core_n % w or h * w > 4:
+            if per_core_n % w or h * w > _SUBBLOCK_TILE_BUDGET:
                 continue
             if h * w > best_h * best_w:
                 best_h, best_w = h, w
@@ -434,9 +438,17 @@ _SILU = ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)
 # cost ~2x the math. The capture said as much -- the gate/up projection measured 137 ms against a
 # 68.7 ms peak-FLOP floor while holding all 110 cores, a ratio no blocking knob explains.
 #
-# fp32_dest_acc_en and packer_l1_acc are deliberately LEFT ON: the accumulation, not the multiply,
-# is what a 26-layer residual stack compounds, and turning fp32 DEST off is a separate lever with
-# its own PCC price (it would also relax the subblock limit in _block_config).
+# fp32 DEST IS THE LEVER THIS CONSTANT NAMES. packer_l1_acc stays on unconditionally -- the
+# cross-block partial sums are what a 26-layer stack compounds. `fp32_dest_acc_en` is different:
+# it is the width of the SUBBLOCK accumulator inside one block, and it costs twice over. It halves
+# the DEST register file, which is why `_block_config` caps the output subblock at 4 tiles instead
+# of 8, so the same per-core block is walked in twice as many subblock passes AND each pass moves
+# 4-byte tiles. Turning it off is therefore a math-fidelity step with a PCC price, and it is wired
+# to ONE constant so the subblock budget cannot drift out of step with the flag it follows.
+_DEST_FP32 = False
+# The output subblock tile budget the flag implies. 8 is the hardware maximum for a 1xN subblock
+# (above it the compute is silently wrong, not rejected); fp32 DEST halves the file, hence 4.
+_SUBBLOCK_TILE_BUDGET = 4 if _DEST_FP32 else 8
 #
 # The NORMS keep their own HiFi4 config. Normalisation reductions are the documented hard floor --
 # they compound to a PCC failure over depth in a way a projection does not.
@@ -453,7 +465,7 @@ def _matmul_ck(device, fidelity=ttnn.MathFidelity.HiFi2):
             arch,
             math_fidelity=fidelity,
             math_approx_mode=False,
-            fp32_dest_acc_en=True,
+            fp32_dest_acc_en=_DEST_FP32,
             packer_l1_acc=True,
         )
     return ck
