@@ -459,7 +459,10 @@ class NemotronHPipeline:
             print(f"[build] layer {i} {bt}/{v} in {_time.time() - _t:.1f}s", flush=True)
 
         # ---- everything outside the stack --------------------------------- #
-        emb = model.model.embeddings.weight.detach().to(torch.bfloat16).contiguous()
+        # .clone() is required: on a bf16 checkpoint the dtype cast is a no-op, so without it this is still a view
+        # into the mmapped safetensors file, and tt-metal's pinned upload of a private file-backed mapping hangs
+        # in the kernel (tt-kmd PIN_PAGES read-only pin never returns). Anonymous memory pins in milliseconds.
+        emb = model.model.embeddings.weight.detach().to(torch.bfloat16).contiguous().clone()
         self.embed_w = ttnn.from_torch(
             emb,
             dtype=ttnn.bfloat16,
