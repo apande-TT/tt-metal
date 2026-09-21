@@ -76,7 +76,15 @@ _SDPA_MASK_DTYPES = (ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b)
 # The format the model's WIDE intermediates are carried in -- the SwiGLU gate/up/product, which are
 # [B*S, 4*hidden] and are each consumed exactly once by the next op. Distinct from the residual
 # stream's dtype, which this file never changes.
-_WIDE_DTYPE = ttnn.bfloat16
+#
+# These three are the LARGEST tensors in the model, and at a prefill row count they dominate the
+# block's traffic: gate packs one, up packs one, the multiply reads both and writes a third, and
+# `down` reads that. bf8_b halves every one of those passes. It is a block-float format -- a shared
+# exponent per 16 values with an 8-bit mantissa each -- so it keeps the dynamic range and gives up
+# precision only within a block, and each of these tensors is read exactly once by the next op
+# rather than being accumulated into. The documented hard floor for narrowing an activation is a
+# normalisation or a KV cache, and this is neither.
+_WIDE_DTYPE = ttnn.bfloat8_b
 
 # The KV cache is carried in bf16: it is what the decode head-split, the cache update and
 # flash-decode all take, and it is the same format q/k/v already leave their projection in.
