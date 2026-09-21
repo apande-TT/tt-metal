@@ -1113,7 +1113,7 @@ def _patch_attention(cls, dtype):
         # The mirror of the split: `nlp_concat_heads` folds [B, heads, S, hd] back to
         # [B, 1, S, heads*hd] in one pass, replacing the transpose + last-dim reshape pair (107 ms
         # of ReshapeView plus its share of 39 ms of Transpose in the capture).
-        heads = ttnn.experimental.nlp_concat_heads(context, memory_config=ttnn.L1_MEMORY_CONFIG)
+        heads = _concat_heads(context)
         ttnn.deallocate(context)
         # Straight into the FOLDED layout: the output projection is the same per-token projection
         # as q/k/v and pays the same 32x weight re-stream if left batched. A view, since the last
@@ -1453,10 +1453,108 @@ def _gather_block_shard(x, shard):
 
 
 _SPLIT_KERNEL_SOURCE = "models/demos/voxtral_4b_tts_2603/tt/kernels/split_qkv_heads.cpp"
+_CONCAT_KERNEL_SOURCE = "models/demos/voxtral_4b_tts_2603/tt/kernels/concat_heads.cpp"
 # Tiles a processor stages before it turns them around. The NoC round trip is paid once per batch
 # instead of once per tile; 8 tiles of scratch is ~9 KB at bf8_b, which is nothing against L1.
 _SPLIT_BATCH_TILES = 8
 _split_plan_cache = {}
+_concat_plan_cache = {}
+
+
+def _concat_heads(context):
+    """`nlp_concat_heads`, parallelised over OUTPUT TILES instead of (batch, head).
+
+    The mirror of `_split_qkv_heads`, and the same argument: with a head_dim that is a whole
+    number of tiles the merge is a pure tile permutation, so the only thing that decides its cost
+    is how many copies are in flight. The library op's stride arithmetic walks (batch, head), so
+    at 32 users it has 32 units to spread over a 110-core grid however long the sequence is --
+    which is why the roofline tags it dispatch-bound on a partial grid. This one's unit is an
+    output TILE, of which there are thousands, so the whole grid is busy and both data-movement
+    processors on each core carry an independent range.
+
+    Declines to the library op for anything it does not recognise -- a sub-tile head_dim, a
+    sharded input, an unknown dtype -- so this is a swap at one shape rather than a new contract.
+    """
+    plan = _concat_plan(context)
+    if plan is None:
+        return ttnn.experimental.nlp_concat_heads(context, memory_config=ttnn.L1_MEMORY_CONFIG)
+    out = ttnn.allocate_tensor_on_device(
+        ttnn.Shape(plan["shape"]), context.dtype, ttnn.TILE_LAYOUT, context.device(), ttnn.L1_MEMORY_CONFIG
+    )
+    return ttnn.generic_op([context, out], _concat_descriptor(context, out, plan))
+
+
+def _concat_plan(context):
+    """The output shape and the per-core tile counts, cached per (shape, dtype) -- or None."""
+    try:
+        if context.layout != ttnn.TILE_LAYOUT or context.is_sharded() or len(context.shape) != 4:
+            return None
+        tile_bytes = _TILE_BYTES.get(context.dtype)
+        if tile_bytes is None:
+            return None
+        batch, heads, seq_len, head_dim = (int(d) for d in context.shape)
+        if head_dim % ttnn.TILE_SIZE or seq_len % ttnn.TILE_SIZE:
+            return None
+        key = (batch, heads, seq_len, head_dim, str(context.dtype))
+        got = _concat_plan_cache.get(key)
+        if got is not None:
+            return got
+        seq_tiles, head_dim_tiles = seq_len // ttnn.TILE_SIZE, head_dim // ttnn.TILE_SIZE
+        got = _concat_plan_cache[key] = {
+            "shape": (batch, 1, seq_len, heads * head_dim),
+            "total": batch * seq_tiles * heads * head_dim_tiles,
+            "tile_bytes": tile_bytes,
+            "compile": [heads, seq_tiles, head_dim_tiles],
+        }
+        return got
+    except Exception:  # noqa: BLE001 - anything unrecognised keeps the library op
+        return None
+
+
+def _concat_descriptor(context, out, plan):
+    """Two DM kernels per core over a flat half-open range of the merged tensor's output tiles."""
+    grid = context.device().compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    core_ranges = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))})
+    total, tile_bytes = plan["total"], plan["tile_bytes"]
+    per_worker = -(-total // (gx * gy * 2))
+    src_addr, dst_addr = context.buffer_address(), out.buffer_address()
+    accessor_args = list(ttnn.TensorAccessorArgs(context).get_compile_time_args())
+    accessor_args += list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
+    kernels, cbs = [], []
+    for index, (processor, noc) in enumerate(
+        ((ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0), (ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1))
+    ):
+        cb_id = index
+        cbs.append(
+            ttnn.CBDescriptor(
+                total_size=_SPLIT_BATCH_TILES * tile_bytes,
+                core_ranges=core_ranges,
+                format_descriptors=[
+                    ttnn.CBFormatDescriptor(buffer_index=cb_id, data_format=context.dtype, page_size=tile_bytes)
+                ],
+            )
+        )
+        args = ttnn.RuntimeArgs()
+        for cy in range(gy):
+            for cx in range(gx):
+                first = min(((cy * gx + cx) * 2 + index) * per_worker, total)
+                args[cx][cy] = [src_addr, dst_addr, first, min(first + per_worker, total) - first]
+        kernels.append(
+            ttnn.KernelDescriptor(
+                kernel_source=_CONCAT_KERNEL_SOURCE,
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=core_ranges,
+                compile_time_args=[cb_id, tile_bytes, _SPLIT_BATCH_TILES] + plan["compile"] + accessor_args,
+                runtime_args=args,
+                config=ttnn.DataMovementConfigDescriptor(processor=processor, noc=noc),
+            )
+        )
+    descriptor = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+    # Masked non-negative: the setter takes a size_t and Python's `hash` is signed. Without it a
+    # rebuilt descriptor hits the program cache and runs the PREVIOUS layer's buffer addresses.
+    descriptor.custom_program_hash = hash((src_addr, dst_addr, total, per_worker, tile_bytes)) & ((1 << 63) - 1)
+    return descriptor
 
 
 def _split_qkv_heads(staged, num_heads, num_kv_heads):
