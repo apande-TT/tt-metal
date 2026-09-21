@@ -66,6 +66,8 @@ _MLP_MODULES = ("mlp", "m_l_p", "decoder_layer", "layer", "model")
 _HEAD_MODULES = ("decoder_head",)
 # The norm is defined in its own stub AND inlined into each whole-block stub, same as the others.
 _NORM_MODULES = ("r_m_s_norm", "decoder_layer", "layer", "model")
+# The whole-block stubs, for the one edit that is a property of the BLOCK rather than of any op.
+_LAYER_MODULES = ("decoder_layer", "layer", "model")
 
 _STUB_PKG = "models.tt_transformers.demo.voxtral_4b_tts_2603._stubs"
 
@@ -410,6 +412,14 @@ def _block_config(device, m_tiles, k_tiles, n_tiles, fused_activation=None):
 # Output-block tile budget: 64 tiles is 256 KB at fp32, or 128 KB plus a 256 KB fp32 partials CB
 # when the output is bf16 -- either way it leaves the in0/in1 CBs room inside 1.5 MB of L1.
 _OUT_BLOCK_TILE_BUDGET = 64
+
+# The L1 a sharded norm may take for its ONE wide per-core shard (the in-place staged copy), before
+# the op's own CBs. 512 KB of the ~1.5 MB budget: it clears 2048x3072 fp32 at 393 KB a core and
+# would decline anything appreciably larger, which is the guard whose absence turned an overflow at
+# trace-capture time into a 62% phantom speedup with the whole 2048-row stack missing from the
+# capture.
+_FP32_TILE_BYTES = 4096
+_NORM_SHARD_L1_BUDGET = 512 * 1024
 
 _SILU = ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)
 
@@ -1009,7 +1019,7 @@ def _patch_head(cls, dtype):
     cls.__call__ = __call__
 
 
-def _norm_shard_plan(device, rows, width):
+def _norm_shard_plan(device, rows, width, narrowing=False):
     """The largest BLOCK shard of a `[rows, width]` tile grid that divides the device grid exactly.
 
     A block shard is the only layernorm layout that splits the WIDTH as well as the rows, and it is
@@ -1018,16 +1028,33 @@ def _norm_shard_plan(device, rows, width):
     extents have to divide exactly (a partial shard is rejected outright), so the plan is the
     largest divisor of each under the real device grid, never a hard-coded one.
 
-    Returns `(memory_config, program_config)` or None when no split beats what the op already does.
+    `narrowing` says the caller will also fold its consumer's typecast into this call, which changes
+    the test the plan must pass. Without it the shard has to buy CORES, because its own reshard
+    costs what the interleaved op's DRAM write costs and a wash is a loss. With it the shard buys an
+    L1 HANDOFF: the wide result never goes to DRAM and the typecast never reads it back, ~50 MB a
+    call at 2048x3072, which is worth taking even at the same core count.
+
+    AND IT MUST FIT L1. This is the guard the first attempt was missing: that version held the
+    staged input AND a separate norm output, 2 x 393 KB a core at 2048 rows before the norm's own
+    CBs, and the op then failed during TRACE CAPTURE rather than at the first eager call -- which
+    reads as a partial profile (the whole 2048-row stack absent from the census) and measures as a
+    62% speedup. So the plan is written for an IN-PLACE norm, which needs one wide shard rather
+    than two, and is declined outright when even that does not fit the budget.
+
+    Returns `(memory_config, program_config)` or None when no split is worth it or none fits.
     """
     grid = device.compute_with_storage_grid_size()
     m_tiles, n_tiles = -(-int(rows) // 32), -(-int(width) // 32)
     gy = max((c for c in range(1, int(grid.y) + 1) if m_tiles % c == 0), default=1)
     gx = max((c for c in range(1, int(grid.x) + 1) if n_tiles % c == 0), default=1)
-    if gy * gx <= min(m_tiles, int(grid.x) * int(grid.y)):
+    if gy * gx <= 1:
+        return None
+    if not narrowing and gy * gx <= min(m_tiles, int(grid.x) * int(grid.y)):
         # No more cores than the interleaved kernel already takes -- nothing for this to buy.
         return None
     block_h, block_w = m_tiles // gy, n_tiles // gx
+    if block_h * block_w * _FP32_TILE_BYTES > _NORM_SHARD_L1_BUDGET:
+        return None
     subblock_w = next((w for w in range(min(block_w, 4), 0, -1) if block_w % w == 0), 1)
     shard = ttnn.create_sharded_memory_config(
         shape=(int(rows), int(width)),
@@ -1040,47 +1067,109 @@ def _norm_shard_plan(device, rows, width):
         subblock_w=subblock_w,
         block_h=block_h,
         block_w=block_w,
-        inplace=False,
+        # IN PLACE, over the STAGED COPY -- never over the caller's tensor. `staged` is a fresh L1
+        # shard of the residual, so overwriting it cannot touch the running sum, which the next
+        # residual add still needs. This is what halves the L1 the plan has to fit.
+        inplace=True,
     )
+
+
+def _norm_call(norm, original, hidden_states, out_dtype=None, **kwargs):
+    """`rms_norm`, optionally on a block shard, optionally narrowing the result on the way out.
+
+    The narrowing is the reason the shard pays. The MLP's norm output is read by exactly one
+    consumer, which wants it at `_PROJ_IN_DTYPE`, and as two interleaved ops that is four passes
+    over a [2048, 3072] fp32 tensor: the norm reads the residual and writes a wide result, then the
+    typecast reads that wide result back and writes a narrow one. Sharded, the wide result never
+    leaves L1 -- only the residual comes in and only the narrow result goes out.
+    """
+    if not isinstance(hidden_states, ttnn.Tensor):
+        return original(norm, hidden_states, **kwargs)
+    rows = int(hidden_states.shape[-2])
+    for dim in list(hidden_states.shape)[:-2]:
+        rows *= int(dim)
+    width = int(hidden_states.shape[-1])
+    # ONE TILE ROW IS THE DECODE STEP, left bit-identical: the narrowing exists to cut bytes on a
+    # 2048-row tensor, and at 32 rows there are none to cut.
+    narrowing = out_dtype is not None and rows > ttnn.TILE_SIZE and out_dtype != hidden_states.dtype
+    plan = None
+    if rows > ttnn.TILE_SIZE:
+        cache = getattr(norm, "_shard_cache", None)
+        if cache is None:
+            cache = norm._shard_cache = {}
+        key = (rows, width, narrowing)
+        if key not in cache:
+            try:
+                cache[key] = _norm_shard_plan(norm.weight.device(), rows, width, narrowing=narrowing)
+            except Exception:  # noqa: BLE001 - a shape the shard helper rejects keeps the stock path
+                cache[key] = None
+        plan = cache[key]
+    if plan is None:
+        out = original(norm, hidden_states, **kwargs)
+        return ttnn.typecast(out, out_dtype) if narrowing else out
+    shard, pc = plan
+    staged = ttnn.to_memory_config(hidden_states, shard)
+    # `inplace=True`, so this aliases `staged`; do NOT deallocate staged separately.
+    out = ttnn.rms_norm(
+        staged,
+        epsilon=norm.epsilon,
+        weight=norm.weight,
+        compute_kernel_config=norm.compute_kernel_config,
+        program_config=pc,
+        memory_config=shard,
+    )
+    if narrowing:
+        # Still ON the shard, so this reads and writes L1 rather than the 25 MB each way it would
+        # cost between two interleaved ops.
+        out = ttnn.typecast(out, out_dtype)
+    return ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG)
+
+
+class _NarrowingNorm:
+    """The MLP's norm, with its consumer's typecast folded in. Transparent for everything else.
+
+    Wrapping the INSTANCE the decoder layer holds, rather than patching the norm class, is what
+    keeps this scoped. The same class also serves the attention block's norm and the stack's final
+    norm, and neither wants a narrow result -- attention's projection is fed by its own cast on a
+    different schedule, and the final norm feeds a slice and an fp32 head. Only this call site has
+    a consumer that was going to pay for the cast anyway.
+    """
+
+    __slots__ = ("_inner", "_original")
+
+    def __init__(self, inner, original):
+        self._inner = inner
+        self._original = original
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __call__(self, hidden_states, **kwargs):
+        return _norm_call(self._inner, self._original, hidden_states, out_dtype=_PROJ_IN_DTYPE, **kwargs)
 
 
 def _patch_norm(cls, dtype):
     original = cls.__call__
 
     def __call__(self, hidden_states, **kwargs):
-        if not isinstance(hidden_states, ttnn.Tensor):
-            return original(self, hidden_states, **kwargs)
-        rows = int(hidden_states.shape[-2]) * (int(hidden_states.shape[0]) if len(hidden_states.shape) > 2 else 1)
-        width = int(hidden_states.shape[-1])
-        plan = None
-        if rows > ttnn.TILE_SIZE:
-            cache = getattr(self, "_shard_cache", None)
-            if cache is None:
-                cache = self._shard_cache = {}
-            if (rows, width) not in cache:
-                try:
-                    cache[(rows, width)] = _norm_shard_plan(self.weight.device(), rows, width)
-                except Exception:  # noqa: BLE001 - a shape the shard helper rejects keeps the stock path
-                    cache[(rows, width)] = None
-            plan = cache[(rows, width)]
-        if plan is None:
-            return original(self, hidden_states, **kwargs)
-        shard, pc = plan
-        staged = ttnn.to_memory_config(hidden_states, shard)
-        out = ttnn.rms_norm(
-            staged,
-            epsilon=self.epsilon,
-            weight=self.weight,
-            compute_kernel_config=self.compute_kernel_config,
-            program_config=pc,
-            memory_config=shard,
-        )
-        ttnn.deallocate(staged)
-        back = ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(out)
-        return back
+        return _norm_call(self, original, hidden_states, **kwargs)
 
     cls.__call__ = __call__
+    cls._perf_original_call = staticmethod(original)
+
+
+def _patch_layer(cls, dtype):
+    """Hand the MLP's norm the narrowing its one consumer would otherwise do as a separate op."""
+    original_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        norm = getattr(self, "post_attention_layernorm", None)
+        inner_original = getattr(type(norm), "_perf_original_call", None) if norm is not None else None
+        if inner_original is not None and not isinstance(norm, _NarrowingNorm):
+            self.post_attention_layernorm = _NarrowingNorm(norm, inner_original)
+
+    cls.__init__ = __init__
 
 
 def install() -> bool:
@@ -1094,6 +1183,9 @@ def install() -> bool:
         + [(n, "TtMLP", _patch_mlp) for n in _MLP_MODULES]
         + [(n, "TtDecoderHead", _patch_head) for n in _HEAD_MODULES]
         + [(n, "TtRMSNorm", _patch_norm) for n in _NORM_MODULES]
+        # LAST: it wraps the norm INSTANCE a layer builds, so the norm class must already carry its
+        # original __call__ by the time any layer is constructed.
+        + [(n, "TtDecoderLayer", _patch_layer) for n in _LAYER_MODULES]
     ):
         module = importlib.import_module(f"{_STUB_PKG}.{name}")
         cls = getattr(module, cls_name, None)
