@@ -103,7 +103,7 @@ _WIDE_DTYPE = ttnn.bfloat8_b
 # 26-layer stack compounds (measured: bf16 residual PCC 0.986 against 0.9996 fp32). `ttnn.rms_norm`
 # has no output-dtype argument, so the narrowing is a typecast placed in the CONSUMER, once per
 # norm, shared by every projection that reads it.
-_PROJ_IN_DTYPE = ttnn.bfloat16
+_PROJ_IN_DTYPE = ttnn.bfloat8_b
 
 # The KV cache and the DECODE projection stay bf16. The decode attention op set --
 # `nlp_create_qkv_heads_decode`, decode-mode `rotary_embedding_hf`, `paged_update_cache` and
