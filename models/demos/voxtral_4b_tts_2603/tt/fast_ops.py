@@ -1159,15 +1159,23 @@ def _patch_norm(cls, dtype):
 
 
 def _patch_layer(cls, dtype):
-    """Hand the MLP's norm the narrowing its one consumer would otherwise do as a separate op."""
+    """Hand BOTH of a block's norms the narrowing their one consumer would otherwise do alone.
+
+    A pre-norm block has exactly two norms and each feeds exactly one thing: `input_layernorm` the
+    qkv projection, `post_attention_layernorm` the MLP. Both consumers now read `_PROJ_IN_DTYPE`,
+    so both were paying for the same standalone typecast over a [B*S, hidden] fp32 tensor, and
+    both can have it folded into the sharded norm instead. The stack's FINAL norm is not a block
+    norm and is deliberately left out: it feeds a slice and an fp32 head.
+    """
     original_init = cls.__init__
 
     def __init__(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
-        norm = getattr(self, "post_attention_layernorm", None)
-        inner_original = getattr(type(norm), "_perf_original_call", None) if norm is not None else None
-        if inner_original is not None and not isinstance(norm, _NarrowingNorm):
-            self.post_attention_layernorm = _NarrowingNorm(norm, inner_original)
+        for name in ("input_layernorm", "post_attention_layernorm"):
+            norm = getattr(self, name, None)
+            inner_original = getattr(type(norm), "_perf_original_call", None) if norm is not None else None
+            if inner_original is not None and not isinstance(norm, _NarrowingNorm):
+                setattr(self, name, _NarrowingNorm(norm, inner_original))
 
     cls.__init__ = __init__
 
