@@ -105,6 +105,25 @@ _WIDE_DTYPE = ttnn.bfloat8_b
 # norm, shared by every projection that reads it.
 _PROJ_IN_DTYPE = ttnn.bfloat8_b
 
+# THE LAYER'S INCREMENT -- what `down` and `wo` hand to the residual add, not what the add ACCUMULATES.
+#
+# The residual add is the model's largest eltwise cost and it is bound on bytes: it reads the running
+# sum and the increment and writes the sum back, three passes over [B*S, hidden]. Two of those three
+# are the SUM, which has to stay fp32 -- a 26-layer stack compounds the accumulator, and a bf16
+# residual measured PCC 0.986 against 0.9996. The third is the INCREMENT, which is this layer's
+# contribution alone: it is produced by one matmul, consumed by one add, and never accumulated into
+# anything itself.
+#
+# Rounding the increment is the standard mixed-precision split -- wide accumulator, narrow addend --
+# and it is cheap twice over, because a matmul's pack format is free: `down` and `wo` write a
+# quarter of the bytes AND the add reads a quarter. `ttnn.add` takes the pair directly
+# (binary_op_dtype_policy: ADD supports mixed float operands, and the output follows operand A, so
+# the sum stays fp32 without an explicit dtype).
+#
+# PREFILL ONLY. At one tile row the increment is 32 rows, the bytes are noise, and the decode step
+# is the metric being protected.
+_RESIDUAL_DELTA_DTYPE = ttnn.bfloat8_b
+
 # The KV cache and the DECODE projection stay bf16. The decode attention op set --
 # `nlp_create_qkv_heads_decode`, decode-mode `rotary_embedding_hf`, `paged_update_cache` and
 # flash-decode -- is a matched set over a one-user-per-core HEIGHT shard, and it rejects bf8_b
@@ -535,7 +554,8 @@ def _patch_mlp(cls, dtype):
         prod = ttnn.multiply(gate, up)
         ttnn.deallocate(gate)
         ttnn.deallocate(up)
-        out = ttnn.linear(prod, self.down, compute_kernel_config=ck, program_config=pcs[2], dtype=res_dtype)
+        out_dtype = _RESIDUAL_DELTA_DTYPE if m_tiles > 1 else res_dtype
+        out = ttnn.linear(prod, self.down, compute_kernel_config=ck, program_config=pcs[2], dtype=out_dtype)
         ttnn.deallocate(prod)
         return _unfold(out, batch)
 
@@ -879,14 +899,15 @@ def _patch_attention(cls, dtype):
         # as q/k/v and pays the same 32x weight re-stream if left batched. A view, since the last
         # dim is unchanged.
         merged = ttnn.reshape(heads, (1, batch * seq_len, self.n_heads * self.head_dim))
-        # Back to the residual stream's dtype HERE, where it is one matmul's pack format, rather
-        # than as a separate cast over a [B*S, hidden] tensor.
+        # Into the INCREMENT's width HERE, where it is one matmul's pack format, rather than as a
+        # separate cast over a [B*S, hidden] tensor. The residual add takes this mixed with the fp32
+        # running sum and keeps the sum's width -- see _RESIDUAL_DELTA_DTYPE.
         out = ttnn.linear(
             merged,
             self.wo,
             compute_kernel_config=ck,
             program_config=_attn_pc(self, "wo", rows, self.wo),
-            dtype=res_dtype,
+            dtype=_RESIDUAL_DELTA_DTYPE if rows > ttnn.TILE_SIZE else res_dtype,
         )
         # `merged` is a VIEW of `heads`, so it is left to the last reference to release rather than
         # deallocated here -- freeing a view frees the tensor it aliases, and `heads` is still in
