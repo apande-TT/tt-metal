@@ -1086,6 +1086,13 @@ def _patch_attention(cls, dtype):
             ),
             program_config=_attn_pc(self, "wo", rows, self.wo),
             dtype=_RESIDUAL_DELTA_DTYPE if rows > ttnn.TILE_SIZE else res_dtype,
+            # AND PACK THE INCREMENT WHERE THE RESIDUAL ADD WILL READ IT. That add is the single
+            # largest gap in the capture and the roofline tags it memory-bound, which for an op
+            # this shape means it is waiting on its operands, not computing. The running sum is
+            # 25 MB of fp32 and has to stay in DRAM; the INCREMENT is 6.3 MB at bf8_b and is
+            # consumed exactly once, by that add, so it has no reason to make the round trip.
+            # Prefill only: at one tile row there is nothing to keep.
+            memory_config=ttnn.L1_MEMORY_CONFIG if rows > ttnn.TILE_SIZE else None,
         )
         # `merged` is a VIEW of `heads`, so it is left to the last reference to release rather than
         # deallocated here -- freeing a view frees the tensor it aliases, and `heads` is still in
