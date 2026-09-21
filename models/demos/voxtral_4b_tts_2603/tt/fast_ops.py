@@ -708,6 +708,12 @@ def _attn_pc(module, role, rows, weight):
             -(-int(rows) // 32),
             -(-int(weight.shape[-2]) // 32),
             -(-int(weight.shape[-1]) // 32),
+            # THE K STEP IS A PROPERTY OF THIS PROJECTION'S in0, not of attention. `qkv` reads the
+            # residual stream, which is interleaved at every row count, so its decode config can
+            # take the wide step the MLP's just did. `wo` reads the merged heads, which the decode
+            # op set hands over HEIGHT-SHARDED one user per core, and a 1-D multicast requires the
+            # step to divide that shard's width in tiles -- so it keeps the conservative default.
+            max_k_step=16 if role == "qkv" else 4,
         )
     return pc
 
