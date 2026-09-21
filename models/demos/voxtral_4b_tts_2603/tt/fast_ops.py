@@ -88,6 +88,23 @@ _SDPA_MASK_DTYPES = (ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b)
 # normalisation or a KV cache, and this is neither.
 _WIDE_DTYPE = ttnn.bfloat8_b
 
+# THE PROJECTIONS' in0 -- the NORM OUTPUT, not the residual stream.
+#
+# Every prefill projection in the capture reads an FP32 activation, and all of them land on the SAME
+# absolute rate no matter what fidelity they were given: the qkv projection at HiFi2 does 200
+# TFLOP/s, the SwiGLU expansion at LoFi does 201, so the fidelity walk that took gate/up down to
+# LoFi bought nothing at all -- it sits at 28% of the LoFi ceiling while `down`, whose in0 is bf8_b,
+# reaches 65% of the HiFi2 one. A ceiling that is the same at one fidelity phase as at two is not a
+# MATH ceiling; what the fp32 ops share is that the unpacker has to feed srcA from 4-byte tiles,
+# which is twice the L1 traffic per MAC that a 2-byte tile costs.
+#
+# The tensor being narrowed is the rms_norm OUTPUT, which is consumed by the projections and by
+# nothing else. It is NOT the residual stream -- that stays fp32, because the running sum is what a
+# 26-layer stack compounds (measured: bf16 residual PCC 0.986 against 0.9996 fp32). `ttnn.rms_norm`
+# has no output-dtype argument, so the narrowing is a typecast placed in the CONSUMER, once per
+# norm, shared by every projection that reads it.
+_PROJ_IN_DTYPE = ttnn.bfloat16
+
 # The KV cache and the DECODE projection stay bf16. The decode attention op set --
 # `nlp_create_qkv_heads_decode`, decode-mode `rotary_embedding_hf`, `paged_update_cache` and
 # flash-decode -- is a matched set over a one-user-per-core HEIGHT shard, and it rejects bf8_b
@@ -149,6 +166,19 @@ def decode_shard(device, rows, width):
         orientation=ttnn.ShardOrientation.ROW_MAJOR,
         use_height_and_width_as_shard_shape=True,
     )
+
+
+def _narrow_proj_in(flat):
+    """Hand a projection its in0 at `_PROJ_IN_DTYPE` -- see that constant for why.
+
+    ONE tile row of M is the decode shape, which is bound by streaming the weight rather than by
+    unpacking the activation, and whose activation is 32 rows against the prefill's 2048; there the
+    cast would be a launch bought for nothing, so it is skipped and the decode step is untouched.
+    The cast is done ONCE per norm output and the result is shared by the projections that read it.
+    """
+    if int(flat.shape[-2]) <= ttnn.TILE_SIZE or flat.dtype == _PROJ_IN_DTYPE:
+        return flat
+    return ttnn.typecast(flat, _PROJ_IN_DTYPE)
 
 
 def _fold(x):
@@ -451,8 +481,12 @@ def _patch_mlp(cls, dtype):
         ck = _matmul_ck(self.gate.device())
         # The dtype the RESIDUAL add expects. `x` is this block's norm output and rms_norm preserves
         # its input dtype, so x.dtype IS the residual stream's dtype -- read, not assumed.
+        # READ THE RESIDUAL DTYPE BEFORE THE NARROWING. `down` packs straight back into the residual
+        # stream, and what that stream carries is decided by the norm's INPUT, not by the format the
+        # projections happen to read.
         res_dtype = x.dtype if dtype is None else dtype
         flat, batch = _fold(x)
+        flat = _narrow_proj_in(flat)
         # Program configs are keyed by the ONE thing that varies between calls -- the row count --
         # and cached on the instance. Built on the host, so nothing here allocates on device and the
         # lookup is trace-safe.
