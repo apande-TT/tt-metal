@@ -244,6 +244,8 @@ class VoxtralPipeline:
 
     def _stage_setup(self, stage, inputs):
         """Shared body of `<stage>_trace_setup`: pin C and pre-upload every constant."""
+        from models.demos.voxtral_4b_tts_2603.tt import generation
+
         stack = self._require_generation()
         input_ids = inputs["input_ids"]
         if input_ids.dim() == 1:
@@ -294,8 +296,8 @@ class VoxtralPipeline:
             # and keys and returns bf16, so a float32 table buys a mixed-format unpack and no
             # accuracy -- the capture read "BF16, FP32 => BF16" with the op at ~110 GB/s. The decode
             # path already stages its gather tables at bf16; this is the prefill half of that.
-            "cos": self._upload(cos.reshape(1, 1, capacity, -1), ttnn.bfloat16),
-            "sin": self._upload(sin.reshape(1, 1, capacity, -1), ttnn.bfloat16),
+            "cos": self._upload(cos.reshape(1, 1, capacity, -1), generation._ROPE_DTYPE),
+            "sin": self._upload(sin.reshape(1, 1, capacity, -1), generation._ROPE_DTYPE),
             # The additive mask goes up in bfloat16, NOT in `act_dtype`: its only consumer is the
             # fused flash-attention op, which takes bf16/bf8_b/bf4_b and nothing wider, and -1e9 is
             # just as absorbing after a softmax at bf16's precision as at fp32's. Uploading it wide

@@ -53,6 +53,7 @@ import torch
 
 import ttnn
 from models.demos.voxtral_4b_tts_2603.tt import common
+from models.demos.voxtral_4b_tts_2603.tt.generation import _ROPE_DTYPE
 
 # The section's own tensor prefix in consolidated.safetensors.
 _PREFIX = "acoustic_transformer"
@@ -289,7 +290,7 @@ class VoxtralAcousticStack:
         # bf16 tables, matching the bf16 queries and keys `rotary_embedding_hf` applies them to --
         # the same narrowing the text stack's prefill and decode paths already do. A float32 table
         # buys a mixed-format unpack and no accuracy.
-        cos, sin = (ttnn.typecast(cos, ttnn.bfloat16), ttnn.typecast(sin, ttnn.bfloat16))
+        cos, sin = (ttnn.typecast(cos, _ROPE_DTYPE), ttnn.typecast(sin, _ROPE_DTYPE))
         rope = (
             ttnn.reshape(cos, (1, 1, cos.shape[-2], cos.shape[-1])),
             ttnn.reshape(sin, (1, 1, sin.shape[-2], sin.shape[-1])),

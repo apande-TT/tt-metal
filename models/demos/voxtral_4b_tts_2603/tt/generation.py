@@ -46,6 +46,12 @@ from models.demos.voxtral_4b_tts_2603.tt import common
 # logit magnitudes, and it stays finite in bfloat16 so a masked row cannot become inf - inf.
 _MASK_NEG = -1e9
 
+# The rotary tables' width. Matched to the q/k the RoPE op applies them to, which the prefill
+# projection now packs as bf8_b -- the capture reads "BFP8, BF16 => BFP8", so the table is once
+# again the only wide operand and the op pays a mixed-format unpack for it. cos/sin live in
+# [-1, 1], which is exactly the range a block-float format represents well.
+_ROPE_DTYPE = ttnn.bfloat8_b
+
 # Call 1's stack must keep all four block kinds alive or a graduated stub becomes structurally
 # absent rather than merely built fewer times.
 MIN_LAYERS = 4
@@ -427,7 +433,7 @@ class VoxtralGenerationStack:
         # at ~110 GB/s. The decode path already stages its gather tables at bf16 for the same
         # reason; this is the prefill half of that. The tables are [1, 1, S, head_dim], so the cast
         # itself is a few tens of KB, paid once per call rather than per layer.
-        cos, sin = (ttnn.typecast(cos, ttnn.bfloat16), ttnn.typecast(sin, ttnn.bfloat16))
+        cos, sin = (ttnn.typecast(cos, _ROPE_DTYPE), ttnn.typecast(sin, _ROPE_DTYPE))
         # The rotary tables are position-only, so their leading dim is a broadcast against the
         # [B, heads, S, head_dim] query. A leading-dim reshape is a metadata view, not a copy.
         rope = (
