@@ -70,7 +70,9 @@ _STUB_PKG = "models.tt_transformers.demo.voxtral_4b_tts_2603._stubs"
 # ttnn's flash-attention op takes q/k/v AND the mask in bf16/bf8_b/bf4_b only
 # (sdpa_device_operation.cpp validates both), so the attention core runs at bf16 -- the top of that
 # range. The residual stream is untouched and stays at whatever dtype the caller carries.
-_SDPA_DTYPE = ttnn.bfloat16
+_SDPA_DTYPE = ttnn.bfloat8_b
+# The decode step's own q/k/v width -- see _KV_DTYPE.
+_DECODE_QKV_DTYPE = ttnn.bfloat16
 _SDPA_MASK_DTYPES = (ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b)
 
 # The format the model's WIDE intermediates are carried in -- the SwiGLU gate/up/product, which are
@@ -86,8 +88,11 @@ _SDPA_MASK_DTYPES = (ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b)
 # normalisation or a KV cache, and this is neither.
 _WIDE_DTYPE = ttnn.bfloat8_b
 
-# The KV cache is carried in bf16: it is what the decode head-split, the cache update and
-# flash-decode all take, and it is the same format q/k/v already leave their projection in.
+# The KV cache and the DECODE projection stay bf16. The decode attention op set --
+# `nlp_create_qkv_heads_decode`, decode-mode `rotary_embedding_hf`, `paged_update_cache` and
+# flash-decode -- is a matched set over a one-user-per-core HEIGHT shard, and it rejects bf8_b
+# outright ("Unsupported data format"), measured. So the narrowing below is the PREFILL half only,
+# and the cache is seeded back at this width.
 _KV_DTYPE = ttnn.bfloat16
 
 # The MLP's three weights, paired with the torch state-dict key each was uploaded from and the
@@ -527,7 +532,14 @@ def _attn_pc(module, role, rows, weight):
 
 
 def _kv_seed(kv, k, v):
-    """Hand the prefill's post-RoPE K/V to the cache, freeing whatever it held before."""
+    """Hand the prefill's post-RoPE K/V to the cache, freeing whatever it held before.
+
+    Widened back to the cache's own format if prefill produced something narrower: the decode op
+    set that reads this cache takes bf16 and nothing else, and this runs ONCE per prefill rather
+    than per token, so the cast is not on the step being measured.
+    """
+    k = k if k.dtype == _KV_DTYPE else ttnn.typecast(k, _KV_DTYPE)
+    v = v if v.dtype == _KV_DTYPE else ttnn.typecast(v, _KV_DTYPE)
     for key, tensor in (("k", k), ("v", v)):
         stale = kv.get(key)
         if stale is not None:
@@ -566,7 +578,7 @@ def _decode_call(module, hidden_states, position_embeddings, kv, cur_pos):
         module._wqkv,
         compute_kernel_config=ck,
         program_config=_attn_pc(module, "qkv", rows, module._wqkv),
-        dtype=_SDPA_DTYPE,
+        dtype=_DECODE_QKV_DTYPE,
         memory_config=ttnn.L1_MEMORY_CONFIG,
     )
     # [1, B, W] -> [1, 1, B, W]: a leading-dim reshape, so a metadata view.
