@@ -1326,9 +1326,15 @@ def _norm_call(norm, original, hidden_states, out_dtype=None, **kwargs):
             except Exception:  # noqa: BLE001 - a shape the shard helper rejects keeps the stock path
                 cache[key] = None
         plan = cache[key]
+    # WHERE THE NORM'S RESULT LANDS. A block norm has exactly ONE consumer -- `input_layernorm`
+    # the qkv projection, `post_attention_layernorm` the MLP expansion -- and the result is
+    # 6.3 MB at `_PROJ_IN_DTYPE`, so the same "consumed once, do not round-trip" rule that paid on
+    # the two increments and the SwiGLU intermediates applies to it. The RESIDUAL is not this
+    # tensor: that is the norm's INPUT, it is fp32 and 25 MB, and it stays in DRAM.
+    landing = ttnn.L1_MEMORY_CONFIG if (narrowing and rows > ttnn.TILE_SIZE) else ttnn.DRAM_MEMORY_CONFIG
     if plan is None:
         out = original(norm, hidden_states, **kwargs)
-        return ttnn.typecast(out, out_dtype) if narrowing else out
+        return ttnn.typecast(out, out_dtype, memory_config=landing) if narrowing else out
     shard, pc = plan
     staged = ttnn.to_memory_config(hidden_states, shard)
     # `inplace=True`, so this aliases `staged`; do NOT deallocate staged separately.
@@ -1344,7 +1350,7 @@ def _norm_call(norm, original, hidden_states, out_dtype=None, **kwargs):
         # Still ON the shard, so this reads and writes L1 rather than the 25 MB each way it would
         # cost between two interleaved ops.
         out = ttnn.typecast(out, out_dtype)
-    return ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG)
+    return ttnn.to_memory_config(out, landing)
 
 
 class _NarrowingNorm:
