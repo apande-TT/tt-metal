@@ -613,8 +613,12 @@ def _kv_seed(kv, k, v):
     set that reads this cache takes bf16 and nothing else, and this runs ONCE per prefill rather
     than per token, so the cast is not on the step being measured.
     """
-    k = k if k.dtype == _KV_DTYPE else ttnn.typecast(k, _KV_DTYPE)
-    v = v if v.dtype == _KV_DTYPE else ttnn.typecast(v, _KV_DTYPE)
+    # AND BACK TO DRAM. The prefill's q/k/v are produced in L1 so RoPE and flash attention can read
+    # them without a DRAM round trip, but a CACHE is resident for the whole generation: leaving it
+    # in L1 would hold a per-layer slab there for every layer at once, which is the memory the
+    # matmuls need. The cache's own op set reads DRAM anyway.
+    k = ttnn.typecast(k, _KV_DTYPE, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    v = ttnn.typecast(v, _KV_DTYPE, memory_config=ttnn.DRAM_MEMORY_CONFIG)
     for key, tensor in (("k", k), ("v", v)):
         stale = kv.get(key)
         if stale is not None:
@@ -866,11 +870,19 @@ def _patch_attention(cls, dtype):
             )
             # Rank-4 view: the last dim is unchanged and both row counts are tile multiples.
             staged = ttnn.reshape(fused, (batch, 1, seq_len, int(fused.shape[-1])))
+            # STRAIGHT INTO L1. q/k/v are written by the head split, read by RoPE, written again,
+            # and read by flash attention -- four passes that all went through DRAM for a working
+            # set of only ~12.6 MB at bf8_b (q 8.4, k and v 2.1 each), which is 115 KB a core on
+            # this grid. The three TM/RoPE ops around attention are tagged dispatch-bound rather
+            # than bandwidth-bound, and what a dispatch-bound op is waiting for is its operands
+            # arriving; taking them off DRAM is the lever that shortens that wait. The mask is left
+            # in DRAM because the flash-attention op hard-asserts it there.
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
                 staged,
                 num_heads=self.n_heads,
                 num_kv_heads=self.n_kv_heads,
                 transpose_k_heads=False,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
             )
             ttnn.deallocate(fused)
         else:
