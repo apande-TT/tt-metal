@@ -1211,6 +1211,44 @@ def _norm_shard_plan(device, rows, width, narrowing=False):
     )
 
 
+_norm_ck_cache = {}
+
+
+def _norm_ck(norm):
+    """The norm's compute kernel, with the bring-up default's two spare fidelity phases removed.
+
+    The stub builds every RMSNorm with `math_fidelity=HiFi4`, which is the SAFE default a bring-up
+    reaches for, not a perf choice -- and there are 44 norm launches in the capture. Fidelity is
+    how many passes the FPU makes over the operands' mantissa, and this op multiplies an
+    activation by a per-channel weight: HiFi2 carries the full mantissa of a bf16 weight, which is
+    what the weight actually is. The cap that MUST stay is `fp32_dest_acc_en=True` -- a
+    normalisation reduction sums the whole row, and that accumulator is the one thing a 26-layer
+    stack compounds (the catalogue's hard floor for norms is HiFi2 + fp32 DEST, never LoFi), so
+    the DEST width and the packer accumulation are carried over from the stub unchanged and only
+    the phase count moves.
+
+    Read off the norm's OWN config rather than rebuilt from scratch, so a norm that is already at
+    or below HiFi2 keeps whatever it has, and cached per (arch, source fidelity) so the lookup
+    allocates nothing and stays trace-safe.
+    """
+    ck = getattr(norm, "compute_kernel_config", None)
+    fidelity = getattr(ck, "math_fidelity", None)
+    if fidelity != ttnn.MathFidelity.HiFi4:
+        return ck
+    device = norm.weight.device()
+    key = (device.arch(), fidelity)
+    got = _norm_ck_cache.get(key)
+    if got is None:
+        got = _norm_ck_cache[key] = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=bool(getattr(ck, "math_approx_mode", False)),
+            fp32_dest_acc_en=bool(getattr(ck, "fp32_dest_acc_en", True)),
+            packer_l1_acc=bool(getattr(ck, "packer_l1_acc", True)),
+        )
+    return got
+
+
 def _norm_call(norm, original, hidden_states, out_dtype=None, **kwargs):
     """`rms_norm`, optionally on a block shard, optionally narrowing the result on the way out.
 
@@ -1222,6 +1260,12 @@ def _norm_call(norm, original, hidden_states, out_dtype=None, **kwargs):
     """
     if not isinstance(hidden_states, ttnn.Tensor):
         return original(norm, hidden_states, **kwargs)
+    # ON THE INSTANCE, not just on the call below. The interleaved path hands the work back to the
+    # stub's own `__call__`, which reads `self.compute_kernel_config` -- passing the narrowed
+    # config only to the sharded branch would leave every norm that declines a shard, and every
+    # decode-shaped norm, still paying four phases. One assignment covers both branches, and it is
+    # idempotent because `_norm_ck` returns the config unchanged once it is no longer HiFi4.
+    norm.compute_kernel_config = _norm_ck(norm)
     rows = int(hidden_states.shape[-2])
     for dim in list(hidden_states.shape)[:-2]:
         rows *= int(dim)
