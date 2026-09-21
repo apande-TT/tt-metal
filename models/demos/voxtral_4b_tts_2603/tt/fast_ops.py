@@ -1148,30 +1148,117 @@ def _patch_attention(cls, dtype):
     cls.kv_disable = kv_disable
 
 
+# WHERE THE VOCAB WEIGHT LIVES IN DRAM, not just what it is stored as.
+#
+# At one tile row of M the vocab head is not a matmul, it is a weight STREAM: 226 MB of bf4_b read
+# to produce 32 rows of output. A DRAM-INTERLEAVED weight is paged round-robin, so every core's
+# reader walks every bank and the banks are contended; the dedicated DRAM-sharded matmul instead
+# gives each bank one contiguous column slab and each compute core the slab in front of its own
+# bank, which is the layout that reaches the device's sequential read rate rather than its random
+# one. It is only valid where M is a single tile row, so it is gated on a VOCAB-shaped weight --
+# N many times K -- which is exactly the head that is called once per token and never with a
+# sequence. The acoustic section's two heads (3072 -> 3072 and 3072 -> ~1024) fail that test and
+# keep the interleaved path they were tuned for.
+_HEAD_DRAM_SHARD_MIN_WIDTH_RATIO = 8
+_HEAD_DRAM_SHARD_MAX_CORES = 64
+# The logits' width. The DRAM-sharded output is L1-resident (one column slab per core) so its
+# format sets whether the plan fits L1 at all -- and it is also what the untilize and the argmax
+# behind it read. Nothing accumulates into it: the only consumer reduces over it once.
+_HEAD_OUT_DTYPE = ttnn.bfloat16
+
+
+def _head_dram_plan(device, k, n):
+    """`(weight_cfg, program_cfg, in_cfg, out_cfg)` for a one-tile-row vocab head, or None.
+
+    The core count has to divide K and N in tiles both -- the activation is width-sharded over it
+    and so is the output -- and the weight's own shard is over the DRAM banks, which is a different
+    and usually smaller grid. Everything is read off the device; nothing here is hard-coded.
+    """
+    try:
+        dram = device.dram_grid_size()
+        grid = device.compute_with_storage_grid_size()
+    except Exception:  # noqa: BLE001 - a device that cannot describe its banks keeps the stock path
+        return None
+    if int(dram.y) != 1:
+        return None
+    banks = int(dram.x)
+    if k % ttnn.TILE_SIZE or n % (ttnn.TILE_SIZE * banks) or n < _HEAD_DRAM_SHARD_MIN_WIDTH_RATIO * k:
+        return None
+    k_tiles, n_tiles = k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+    limit = min(int(grid.x) * int(grid.y), _HEAD_DRAM_SHARD_MAX_CORES)
+    cores = rows = cols = 0
+    for count in range(limit, 1, -1):
+        if k_tiles % count or n_tiles % count:
+            continue
+        for y in range(1, int(grid.y) + 1):
+            if count % y == 0 and count // y <= int(grid.x):
+                cores, rows, cols = count, y, count // y
+                break
+        if cores:
+            break
+    if not cores:
+        return None
+    weight_cfg = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+        ttnn.BufferType.DRAM,
+        ttnn.ShardSpec(
+            ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))}),
+            (k, n // banks),
+            ttnn.ShardOrientation.ROW_MAJOR,
+        ),
+    )
+    per_core_k = k_tiles // cores
+    program_cfg = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+        in0_block_w=next(w for w in range(min(8, per_core_k), 0, -1) if per_core_k % w == 0),
+        per_core_M=1,
+        per_core_N=n_tiles // cores,
+        fused_activation=None,
+    )
+    core_grid = ttnn.CoreGrid(y=rows, x=cols)
+    shard = lambda width: ttnn.create_sharded_memory_config(  # noqa: E731
+        shape=(ttnn.TILE_SIZE, width),
+        core_grid=core_grid,
+        strategy=ttnn.ShardStrategy.WIDTH,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+    return weight_cfg, program_cfg, shard(k // cores), shard(n // cores)
+
+
 def _patch_head(cls, dtype):
     original = cls.__call__
     original_init = cls.__init__
 
     def __init__(self, *args, **kwargs):
-        """Build the stub, then narrow the vocab projection to bf8_b.
+        """Build the stub, then narrow the vocab projection to bf4_b and bank-shard it.
 
         This single weight is 3072 x 131072 -- 805 MB at bf16, the largest tensor in the model --
         and a decode step streams all of it to produce one token per sample. It is the one weight
-        where the dtype is worth more than everything around it.
+        where the dtype is worth more than everything around it, and the one where the DRAM LAYOUT
+        is worth more than the dtype.
         """
         original_init(self, *args, **kwargs)
         torch_module = kwargs.get("torch_module", args[1] if len(args) > 1 else None)
         weight = getattr(torch_module, "weight", None)
-        if weight is None or self.weight.dtype == _HEAD_DTYPE:
+        self._dram_plan = None
+        if weight is None:
+            return
+        device = self.weight.device()
+        plan = None
+        if self.bias is None:
+            plan = _head_dram_plan(device, int(self.weight.shape[-2]), int(self.weight.shape[-1]))
+        if self.weight.dtype == _HEAD_DTYPE and plan is None:
             return
         stale = self.weight
         self.weight = ttnn.from_torch(
             weight.t().to(torch.bfloat16).contiguous(),
             dtype=_HEAD_DTYPE,
             layout=ttnn.TILE_LAYOUT,
-            device=stale.device(),
+            device=device,
+            **({} if plan is None else {"memory_config": plan[0]}),
         )
         ttnn.deallocate(stale)
+        self._dram_plan = plan
 
     def __call__(self, hidden_states, keep_folded=False, **kwargs):
         """`keep_folded` hands back `[1, B, vocab]` instead of `[B, 1, vocab]`.
@@ -1201,6 +1288,26 @@ def _patch_head(cls, dtype):
         # buffer, so freeing it would free the caller's tensor; when it is a real relayout it is a
         # local that the last reference releases on return. One rule covers both.
         flat, batch = _fold(hidden_states)
+        plan = getattr(self, "_dram_plan", None)
+        if plan is not None and int(flat.shape[-2]) <= ttnn.TILE_SIZE:
+            _, program_cfg, in_cfg, out_cfg = plan
+            # The staged activation is 32 x 3072 -- 200 KB at bf16, a rounding error against the
+            # weight behind it -- and the bank-sharded kernel wants it width-sharded over the same
+            # cores the output is, one K slab per core.
+            staged = ttnn.to_memory_config(ttnn.typecast(flat, ttnn.bfloat16), in_cfg)
+            out = ttnn.linear(
+                staged,
+                self.weight,
+                compute_kernel_config=ck,
+                program_config=program_cfg,
+                memory_config=out_cfg,
+                dtype=_HEAD_OUT_DTYPE,
+            )
+            ttnn.deallocate(staged)
+            # Back to the interleaved tensor the sampler's untilize expects. The logits are
+            # consumed once, so they go to DRAM rather than competing with the next step's L1.
+            out = ttnn.sharded_to_interleaved(out, ttnn.DRAM_MEMORY_CONFIG)
+            return out if keep_folded else _unfold(out, batch)
         if int(flat.shape[-2]) > ttnn.TILE_SIZE:
             flat = _narrow_proj_in(flat)
             ck = _matmul_ck(self.weight.device(), ttnn.MathFidelity.LoFi)
