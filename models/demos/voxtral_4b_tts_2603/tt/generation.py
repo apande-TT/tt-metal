@@ -459,7 +459,15 @@ class VoxtralGenerationStack:
         # at ~110 GB/s. The decode path already stages its gather tables at bf16 for the same
         # reason; this is the prefill half of that. The tables are [1, 1, S, head_dim], so the cast
         # itself is a few tens of KB, paid once per call rather than per layer.
-        cos, sin = (ttnn.typecast(cos, _ROPE_DTYPE), ttnn.typecast(sin, _ROPE_DTYPE))
+        # AND PIN THEM IN L1 WHILE THEY ARE BEING CAST. Unlike everything else in the forward these
+        # two are not consumed once -- every layer's RoPE reads the SAME pair, so a DRAM table is
+        # re-fetched once per layer per call. They are [1, 1, S, head_dim], a quarter of a MB each
+        # at bf8_b, so residency is nearly free and the op that reads them is tagged dispatch-bound,
+        # which is the tag for waiting on an operand.
+        cos, sin = (
+            ttnn.typecast(cos, _ROPE_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            ttnn.typecast(sin, _ROPE_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG),
+        )
         # The rotary tables are position-only, so their leading dim is a broadcast against the
         # [B, heads, S, head_dim] query. A leading-dim reshape is a metadata view, not a copy.
         rope = (
