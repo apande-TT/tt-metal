@@ -633,9 +633,20 @@ def _patch_mlp(cls, dtype):
         # number that the per-token metric is read from.
         fidelity = ttnn.MathFidelity.LoFi if m_tiles > 1 else ttnn.MathFidelity.HiFi2
         lo = _matmul_ck(self.gate.device(), fidelity)
-        gate = ttnn.linear(flat, self.gate, compute_kernel_config=lo, program_config=pcs[0], dtype=_WIDE_DTYPE)
-        up = ttnn.linear(flat, self.up, compute_kernel_config=lo, program_config=pcs[1], dtype=_WIDE_DTYPE)
-        prod = ttnn.multiply(gate, up)
+        # AND THE THREE OF THEM NEVER LEAVE THE CHIP. gate is read once by the multiply, up once by
+        # the multiply, their product once by `down` -- three tensors, each with exactly one
+        # consumer, each of which was being written to DRAM and read straight back. At 2048 rows
+        # and bf4_b that is 9.4 MB apiece, so ~56 MB of round trip per block for a working set
+        # that fits several times over in the grid's ~165 MB of L1. Prefill only: at one tile row
+        # they are 0.3 MB and there is nothing to keep.
+        wide_mem = ttnn.L1_MEMORY_CONFIG if m_tiles > 1 else None
+        gate = ttnn.linear(
+            flat, self.gate, compute_kernel_config=lo, program_config=pcs[0], dtype=_WIDE_DTYPE, memory_config=wide_mem
+        )
+        up = ttnn.linear(
+            flat, self.up, compute_kernel_config=lo, program_config=pcs[1], dtype=_WIDE_DTYPE, memory_config=wide_mem
+        )
+        prod = ttnn.multiply(gate, up, memory_config=wide_mem)
         ttnn.deallocate(gate)
         ttnn.deallocate(up)
         out_dtype = _RESIDUAL_DELTA_DTYPE if m_tiles > 1 else res_dtype
