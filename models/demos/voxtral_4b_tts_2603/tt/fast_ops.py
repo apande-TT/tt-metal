@@ -823,6 +823,17 @@ def _patch_attention(cls, dtype):
         res_dtype = hidden_states.dtype
         flat, batch = _fold(hidden_states)
         rows = int(flat.shape[-2])
+        # NARROW THE ACTIVATION AND DROP THE PHASE TOGETHER, or neither pays. Measured separately
+        # both fail: the cast alone costs more than it saves (50.63 -> 51.09) because at HiFi2 this
+        # projection already sits at 65% of its ceiling, and LoFi alone buys nothing because an
+        # FP32 in0 caps every projection here at the same ~200 TFLOP/s whatever its fidelity says.
+        # The cap is the unpacker feeding srcA from 4-byte tiles; removing it is what makes the
+        # spare phase worth dropping, and dropping the phase is what makes the cast worth paying.
+        flat = _narrow_proj_in(flat)
+        qkv_ck = _matmul_ck(
+            self.wo.device(),
+            ttnn.MathFidelity.LoFi if rows > ttnn.TILE_SIZE else ttnn.MathFidelity.HiFi2,
+        )
 
         # q/k/v are produced DIRECTLY in bf16 -- the flash-attention op below takes nothing wider,
         # and a projection's pack format is free, where a typecast afterwards would re-read and
@@ -839,7 +850,7 @@ def _patch_attention(cls, dtype):
             fused = ttnn.linear(
                 flat,
                 wqkv,
-                compute_kernel_config=ck,
+                compute_kernel_config=qkv_ck,
                 program_config=_attn_pc(self, "qkv", rows, wqkv),
                 dtype=_SDPA_DTYPE,
             )
