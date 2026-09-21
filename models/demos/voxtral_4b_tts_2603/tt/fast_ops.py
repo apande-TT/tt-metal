@@ -950,15 +950,29 @@ def _patch_attention(cls, dtype):
         # k/v directly ([b x nkv x s x dh], so both repeat_interleaves go away too) and never
         # materialises the [B, heads, S, S] score tensor at all.
         #
-        # is_causal=False ON PURPOSE: the mask is not plain causality. The decode stage LEFT-pads,
-        # so the mask also blanks the padded KEYS; letting the kernel build its own causal mask
-        # would silently attend to the pad.
+        # NO MASK TENSOR. This used to pass one with is_causal=False, on the grounds that the mask
+        # was not plain causality -- the decode stage LEFT-padded, so it also had to blank the
+        # padded KEYS, and a kernel-built causal mask would have attended to the pad. That reason
+        # expired when the KV cache landed: `pipeline._stage_setup` now RIGHT-pads both stages
+        # ("BOTH stages RIGHT-pad now"), because the cache wants real keys in slots [0, real_len)
+        # with the new token appending at real_len.
+        #
+        # Under right padding the pad-blanking is REDUNDANT. Every padded key sits at a position
+        # >= real_len, and every row this model reads sits at a position <= real_len - 1, so
+        # causality alone already excludes it -- the two masks agree on every row that is read.
+        # (They differ on the padded ROWS, which are sliced away before the head and never enter
+        # the cache, whose contents come from the real rows.) The other two mask builders,
+        # generation.stage_constants and the acoustic stack's, are pure causality already.
+        #
+        # Handing SDPA is_causal=True and no mask is not just cheaper per byte: the op's
+        # use_provided_mask is a COMPILE-TIME constant, so the mask read and the add come out of
+        # the kernel entirely rather than being skipped at runtime.
         context = ttnn.transformer.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=attention_mask,
-            is_causal=False,
+            attn_mask=None,
+            is_causal=True,
             scale=self.scaling,
             compute_kernel_config=sdpa_ck,
             program_config=_sdpa_pc(self, self.wo.device(), seq_len),
