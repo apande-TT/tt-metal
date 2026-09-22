@@ -721,3 +721,145 @@ def test_the_resolver_is_given_tools_that_can_reach_outside_the_repo() -> None:
 
     src = inspect.getsource(rlr.resolve) if hasattr(rlr, "resolve") else inspect.getsource(rlr)
     assert '"WebSearch"' in src and '"WebFetch"' in src, "no tool can reach past the HF file list"
+
+
+# --------------------------------------------------------------------------------------------
+# Reusing a loader written to an older brief. `_validates` checked only that the file defines
+# load_reference_model, so once any loader existed the resolver never ran again. On
+# voxtral_4b_tts_2603 the loader on disk was correct and carefully verified -- it pinned the RoPE
+# permute bit-identically against the base model -- but it had explicitly declined the TTS
+# submodels as having "no transformers equivalent", written before covering the whole checkpoint
+# was part of the brief. It was reused indefinitely and the vocoder stayed unreachable. Deleting it
+# by hand is not a workflow.
+
+
+def _loader_file(tmp_path: Path, body: str) -> Path:
+    d = tmp_path / "tests" / "pcc"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "_reference_loader.py").write_text(body)
+    return tmp_path
+
+
+_DEF = "def load_reference_model(model_id):\n    return None\n"
+
+
+def test_a_loader_written_to_the_current_brief_is_reused(tmp_path: Path) -> None:
+    from scripts.tt_hw_planner.reference_loader_resolver import _LOADER_CONTRACT, _LOADER_CONTRACT_VAR, _reusable
+
+    d = _loader_file(tmp_path, f"{_LOADER_CONTRACT_VAR} = {_LOADER_CONTRACT}\n{_DEF}")
+    assert _reusable(d) is True
+
+
+def test_a_loader_that_declares_no_brief_is_regenerated(tmp_path: Path) -> None:
+    """The pre-existing case: every loader written before the brief was versioned."""
+    from scripts.tt_hw_planner.reference_loader_resolver import _reusable
+
+    assert _reusable(_loader_file(tmp_path, _DEF)) is False
+
+
+def test_a_loader_written_to_an_older_brief_is_regenerated(tmp_path: Path) -> None:
+    from scripts.tt_hw_planner.reference_loader_resolver import _LOADER_CONTRACT_VAR, _reusable
+
+    d = _loader_file(tmp_path, f"{_LOADER_CONTRACT_VAR} = 1\n{_DEF}")
+    assert _reusable(d) is False
+
+
+def test_a_newer_brief_than_this_resolver_knows_is_still_reused(tmp_path: Path) -> None:
+    """Forward compatible: a loader from a newer tool is not thrown away by an older one."""
+    from scripts.tt_hw_planner.reference_loader_resolver import _LOADER_CONTRACT, _LOADER_CONTRACT_VAR, _reusable
+
+    d = _loader_file(tmp_path, f"{_LOADER_CONTRACT_VAR} = {_LOADER_CONTRACT + 5}\n{_DEF}")
+    assert _reusable(d) is True
+
+
+def test_the_brief_still_requires_a_real_loader_function(tmp_path: Path) -> None:
+    """Stamping the contract does not excuse a file that defines nothing."""
+    from scripts.tt_hw_planner.reference_loader_resolver import _LOADER_CONTRACT, _LOADER_CONTRACT_VAR, _reusable
+
+    d = _loader_file(tmp_path, f"{_LOADER_CONTRACT_VAR} = {_LOADER_CONTRACT}\n# no definition here\n")
+    assert _reusable(d) is False
+
+
+def test_the_prompt_asks_for_the_contract_to_be_stamped(tmp_path: Path) -> None:
+    from scripts.tt_hw_planner.reference_loader_resolver import _LOADER_CONTRACT_VAR, build_prompt
+
+    text = build_prompt("some-org/some-model", tmp_path, "Unrecognized model")
+    assert _LOADER_CONTRACT_VAR in text, "the agent is never told to stamp the brief it was given"
+
+
+# --------------------------------------------------------------------------------------------
+# Importing the loader. A module executed via spec_from_file_location but never put in
+# sys.modules still names itself in every class it defines, so anything resolving a class back
+# through sys.modules[cls.__module__] gets None. @dataclass does exactly that. Latent for as long
+# as generated loaders stayed simple; the first loader that had real config objects to model --
+# the one covering the whole voxtral_4b_tts_2603 checkpoint -- used three dataclasses and died on
+# import, and discovery reported 0 components.
+
+
+def test_a_loader_using_dataclasses_imports(tmp_path: Path) -> None:
+    from scripts.tt_hw_planner.reference_loader_resolver import load_reference
+
+    d = tmp_path / "tests" / "pcc"
+    d.mkdir(parents=True)
+    (d / "_reference_loader.py").write_text(
+        "from dataclasses import dataclass\n"
+        "import torch\n"
+        "@dataclass\n"
+        "class Args:\n"
+        "    width: int = 4\n"
+        "def load_reference_model(model_id):\n"
+        "    m = torch.nn.Linear(Args().width, Args().width)\n"
+        "    return m\n"
+    )
+    ref = load_reference(tmp_path, "some-org/some-model")
+    assert ref is not None
+
+
+def test_a_failed_loader_does_not_leave_a_half_built_module_behind(tmp_path: Path, expect_error) -> None:
+    """Registering before exec must not strand a broken module for the next import to find."""
+    import sys
+
+    from scripts.tt_hw_planner.reference_loader_resolver import load_reference
+
+    d = tmp_path / "tests" / "pcc"
+    d.mkdir(parents=True)
+    (d / "_reference_loader.py").write_text("raise ValueError('boom')\n")
+    before = dict(sys.modules)
+    with expect_error(ValueError, "boom"):
+        load_reference(tmp_path, "some-org/some-model")
+    assert set(sys.modules) - set(before) == set(), "a failed import left its module registered"
+
+
+# --------------------------------------------------------------------------------------------
+# Diagnosing the failure. `.name` is the missing MODULE on an ImportError and the missing
+# ATTRIBUTE on an AttributeError (3.10+), and the package extractor read it off either -- so the
+# dataclass failure above surfaced as "needs the Python package '__dict__'", with a
+# `pip install __dict__` to fix it, hiding the real fault behind advice that cannot work.
+
+
+def test_an_import_error_still_names_its_missing_package() -> None:
+    from scripts.tt_hw_planner.module_tree import _pkg_from_import_error
+
+    assert _pkg_from_import_error(ModuleNotFoundError("No module named 'somepkg'", name="somepkg")) == "somepkg"
+
+
+def test_a_submodule_miss_reports_its_top_level_package() -> None:
+    from scripts.tt_hw_planner.module_tree import _pkg_from_import_error
+
+    assert _pkg_from_import_error(ModuleNotFoundError("nope", name="somepkg.inner.bit")) == "somepkg"
+
+
+def test_an_attribute_error_is_not_mistaken_for_a_package() -> None:
+    from scripts.tt_hw_planner.module_tree import _pkg_from_import_error
+
+    try:
+        None.__dict__["x"]
+    except AttributeError as exc:
+        assert getattr(exc, "name", None) == "__dict__", "precondition: 3.10+ sets .name here"
+        assert _pkg_from_import_error(exc) == "", "an attribute name was reported as a package"
+
+
+def test_an_unrelated_exception_names_no_package() -> None:
+    from scripts.tt_hw_planner.module_tree import _pkg_from_import_error
+
+    assert _pkg_from_import_error(ValueError("nothing to do with imports")) == ""
