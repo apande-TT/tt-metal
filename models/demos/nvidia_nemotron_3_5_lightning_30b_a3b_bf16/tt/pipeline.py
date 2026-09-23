@@ -815,11 +815,9 @@ class NemotronHPipeline:
 
     def decode_trace_setup(self, inputs):
         ids = inputs["input_ids"]
-        # warm one step eagerly (compiles every T=1 program), then reset the
-        # state in place, take the eager reference step, and reset again so the
-        # captured step replays from exactly the reference's starting state.
-        ttnn.deallocate(self.prefill_fill(ids))
-        ttnn.deallocate(self._decode_token())
+        # one eager step both compiles every T=1 program and is the reference;
+        # the second fill resets the state in place so the captured step
+        # replays from exactly the reference's starting state.
         ttnn.deallocate(self.prefill_fill(ids))
         out = self._decode_token()
         self._persistent["decode_ref"] = _first_shard(out)
