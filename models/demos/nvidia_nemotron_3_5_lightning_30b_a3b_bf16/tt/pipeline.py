@@ -382,13 +382,14 @@ class TtNemotronHLayer:
 
             if self.variant == "MOE_B":
                 _invocation.record("nemotron_h_m_l_p")
-                shared = self.shared(h)
+                shared = _dram_mm.from_rows(self.shared(_dram_mm.as_rows(h)), B, T)
             else:
                 # upcast first: the norm stub hands back bf16, and feeding a
                 # bf16 activation into these fp32 weights is what made this
                 # variant the worst layer in the chain (0.971 vs 0.990 for the
                 # MLP-stub variant, which upcasts internally).
                 hh = ttnn.typecast(h, ttnn.float32) if h.dtype != ttnn.float32 else h
+                hh = _dram_mm.as_rows(hh)  # tokens are independent: one 2-D matmul
                 up = ttnn.matmul(hh, self._sh_up, compute_kernel_config=ckc)
                 _invocation.record("re_l_u_squared_activation")
                 act = self.relu2(up)
@@ -397,6 +398,7 @@ class TtNemotronHLayer:
                 ttnn.deallocate(act)
                 if self._sh_tp:
                     shared = ttnn.all_reduce(shared, cluster_axis=1, topology=ttnn.Topology.Linear)
+                shared = _dram_mm.from_rows(shared, B, T)
 
             y = ttnn.add(ttnn.typecast(routed, ttnn.float32), ttnn.typecast(shared, ttnn.float32))
 

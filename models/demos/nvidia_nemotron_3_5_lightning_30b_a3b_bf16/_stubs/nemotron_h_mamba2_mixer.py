@@ -320,6 +320,13 @@ class TtNemotronHMamba2Mixer:
         rm = ttnn.permute(rm, (0, 2, 1, 3))
         return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
 
+    def _out_proj(self, y, B, T):
+        """out_proj over (1, B*T) token rows; the full-grid config at decode."""
+        out = ttnn.matmul(
+            _dram_mm.as_rows(y), self._w_out, compute_kernel_config=self.ckc, program_config=self._out_pc(B * T)
+        )
+        return _dram_mm.from_rows(out, B, T)
+
     def _out_pc(self, tokens):
         """Full-grid 1-D multicast config for out_proj at decode; None (ttnn's
         choice) at prefill."""
@@ -473,7 +480,16 @@ class TtNemotronHMamba2Mixer:
             pc = _dram_mm.mcast1d_config(self.device, int(hs.shape[-1]), int(self._w_in.shape[-1]))
             proj = ttnn.matmul(hs, self._w_in, compute_kernel_config=self.ckc, program_config=pc)
         else:
-            proj = ttnn.matmul(hs, self._w_in, compute_kernel_config=self.ckc, core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x))
+            proj = _dram_mm.from_rows(
+                ttnn.matmul(
+                    _dram_mm.as_rows(hs),
+                    self._w_in,
+                    compute_kernel_config=self.ckc,
+                    core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x),
+                ),
+                B,
+                T,
+            )
 
         # 2. split: gate(I) | hbc(conv_dim) | dt(H)
         gate = ttnn.slice(proj, [0, 0, 0], [B, T, I])
@@ -501,7 +517,7 @@ class TtNemotronHMamba2Mixer:
         # feeds out_proj exactly as the inline path's does.
         if getattr(self, "gated_norm", None) is not None:
             y = self.gated_norm(y, gate)
-            out = ttnn.matmul(y, self._w_out, compute_kernel_config=self.ckc, program_config=self._out_pc(B * T))
+            out = self._out_proj(y, B, T)
             ttnn.deallocate(y)
             if self._shard:
                 out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
@@ -526,9 +542,7 @@ class TtNemotronHMamba2Mixer:
 
         # 13. out_proj (row-parallel under TP): sum the per-chip partial sums so
         #     every TP chip holds the full mixer output (readback keeps chip 0).
-        out = ttnn.matmul(
-            y, self._w_out, compute_kernel_config=self.ckc, program_config=self._out_pc(B * T)
-        )  # (B, T, hidden_size)
+        out = self._out_proj(y, B, T)  # (B, T, hidden_size)
         ttnn.deallocate(y)
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)

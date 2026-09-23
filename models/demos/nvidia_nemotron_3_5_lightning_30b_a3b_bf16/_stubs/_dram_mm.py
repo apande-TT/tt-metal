@@ -22,6 +22,29 @@ import ttnn
 TILE = 32
 
 
+def as_rows(x):
+    """(B, T, K) -> (1, B*T, K) token rows, so a projection runs as one 2-D
+    matmul rather than a B-way batched one. A view when T is tile-aligned."""
+    B, T, K = [int(v) for v in x.shape]
+    if B == 1:
+        return x
+    if T % TILE == 0:
+        return ttnn.reshape(x, [1, B * T, K])
+    rm = ttnn.reshape(ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT), [1, B * T, K])
+    return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
+
+
+def from_rows(y, B, T):
+    """Inverse of as_rows: (1, B*T, N) -> (B, T, N)."""
+    if B == 1:
+        return y
+    N = int(y.shape[-1])
+    if T % TILE == 0:
+        return ttnn.reshape(y, [B, T, N])
+    rm = ttnn.reshape(ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT), [B, T, N])
+    return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
+
+
 def _banks(device):
     g = device.dram_grid_size()
     assert g.y == 1, "DRAM sharding assumes a 1-row DRAM grid"

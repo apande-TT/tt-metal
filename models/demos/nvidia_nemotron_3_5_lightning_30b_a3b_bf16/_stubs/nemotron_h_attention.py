@@ -51,7 +51,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _ssm_cache
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm, _ssm_cache
 from models.tt_transformers.tt.attention import Attention  # kept per ADAPT requirement
 
 
@@ -226,8 +226,15 @@ class TtNemotronHAttention:
         ttnn.deallocate(attn)
 
         cg = self.device.compute_with_storage_grid_size()
-        out = ttnn.matmul(
-            attn_flat, self._w_o, compute_kernel_config=self.ckc, core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x)
+        out = _dram_mm.from_rows(
+            ttnn.matmul(
+                _dram_mm.as_rows(attn_flat),
+                self._w_o,
+                compute_kernel_config=self.ckc,
+                core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x),
+            ),
+            B,
+            T,
         )  # (B,T,hidden) partial if sharded
         ttnn.deallocate(attn_flat)
         if self._shard:
@@ -245,9 +252,10 @@ class TtNemotronHAttention:
 
         cg_qkv = self.device.compute_with_storage_grid_size()
         qkv_cg = ttnn.CoreGrid(y=cg_qkv.y, x=cg_qkv.x)
-        q = ttnn.matmul(hs, self._w_q, compute_kernel_config=self.ckc, core_grid=qkv_cg)  # (B,T,H*D) local
-        k = ttnn.matmul(hs, self._w_k, compute_kernel_config=self.ckc, core_grid=qkv_cg)
-        v = ttnn.matmul(hs, self._w_v, compute_kernel_config=self.ckc, core_grid=qkv_cg)
+        rows = _dram_mm.as_rows(hs)  # projections over (1, B*T) token rows
+        q = _dram_mm.from_rows(ttnn.matmul(rows, self._w_q, compute_kernel_config=self.ckc, core_grid=qkv_cg), B, T)
+        k = _dram_mm.from_rows(ttnn.matmul(rows, self._w_k, compute_kernel_config=self.ckc, core_grid=qkv_cg), B, T)
+        v = _dram_mm.from_rows(ttnn.matmul(rows, self._w_v, compute_kernel_config=self.ckc, core_grid=qkv_cg), B, T)
         ttnn.deallocate(hs)
 
         # decode arrives as (1, B, .) token rows; its heads are per sample (B,H,1,D)

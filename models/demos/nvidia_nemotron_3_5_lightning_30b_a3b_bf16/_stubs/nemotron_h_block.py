@@ -565,13 +565,17 @@ class NemotronHBlock:
 
         # 1b. in_proj: 2688 -> 10304
         dec = B * S <= _dram_mm.TILE  # decode: one tile row, spread N over the full grid
-        proj = ttnn.linear(
-            normed,
-            self._W_in,
-            compute_kernel_config=ckc,
-            program_config=_dram_mm.mcast1d_config(self.device, int(normed.shape[-1]), int(self._W_in.shape[-1]))
-            if dec
-            else None,
+        proj = _dram_mm.from_rows(
+            ttnn.linear(
+                _dram_mm.as_rows(normed),
+                self._W_in,
+                compute_kernel_config=ckc,
+                program_config=_dram_mm.mcast1d_config(self.device, int(normed.shape[-1]), int(self._W_in.shape[-1]))
+                if dec
+                else None,
+            ),
+            B,
+            S,
         )
 
         # split: [gate(4096), hidden_states_B_C(6144), dt(64)]   (d_mlp == 0)
@@ -600,14 +604,18 @@ class NemotronHBlock:
         y = ttnn.mul(y, self._w_gnorm)  # [1,S,4096]
 
         # 5. out_proj (row-parallel under TP): 4096 -> 2688.
-        out = ttnn.linear(
-            y,
-            self._W_out,
-            compute_kernel_config=ckc,
-            program_config=_dram_mm.mcast1d_config(self.device, int(y.shape[-1]), int(self._W_out.shape[-1]))
-            if dec
-            else None,
-        )  # [1,S,2688] (partial per chip)
+        out = _dram_mm.from_rows(
+            ttnn.linear(
+                _dram_mm.as_rows(y),
+                self._W_out,
+                compute_kernel_config=ckc,
+                program_config=_dram_mm.mcast1d_config(self.device, int(y.shape[-1]), int(self._W_out.shape[-1]))
+                if dec
+                else None,
+            ),
+            B,
+            S,
+        )  # [B,S,2688] (partial per chip)
         if self._shard:
             # Sum the per-chip partial out_proj contributions so every chip holds
             # the full mixer output (the mesh readback keeps only chip 0's copy).
