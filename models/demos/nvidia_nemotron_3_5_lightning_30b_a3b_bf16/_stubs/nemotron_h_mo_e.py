@@ -117,7 +117,7 @@ class TtNemotronHMOE:
                 )
                 t = ttnn.from_torch(
                     chunk,
-                    dtype=ttnn.bfloat8_b,
+                    dtype=ttnn.bfloat4_b,
                     layout=ttnn.TILE_LAYOUT,
                     device=dev,
                     mesh_mapper=ttnn.ShardTensor2dMesh(dev, mesh_shape=_mesh_shape, dims=(None, 0)),
