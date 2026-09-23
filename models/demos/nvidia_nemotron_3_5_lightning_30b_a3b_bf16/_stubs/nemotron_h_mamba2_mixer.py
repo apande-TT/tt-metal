@@ -31,7 +31,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _ssm_cache
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm, _ssm_cache
 from models.demos.wormhole.mamba.tt.mamba_ssm import TtMambaSSM  # kept per ADAPT requirement
 
 
@@ -316,6 +316,13 @@ class TtNemotronHMamba2Mixer:
         rm = ttnn.permute(rm, (0, 2, 1, 3))
         return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
 
+    def _out_pc(self, tokens):
+        """Full-grid 1-D multicast config for out_proj at decode; None (ttnn's
+        choice) at prefill."""
+        if tokens > _dram_mm.TILE:
+            return None
+        return _dram_mm.mcast1d_config(self.device, int(self._w_out.shape[-2]), int(self._w_out.shape[-1]))
+
     def _prefill_core(self, hbc, dt, B, T, consts, fill=False):
         """Full-sequence conv + single-chunk SSD -> Y (B, H, T, HD). With
         fill=True it also writes the decode state left after position T-1."""
@@ -459,7 +466,11 @@ class TtNemotronHMamba2Mixer:
 
         # 1. in_proj  -> (B, T, 10304)
         cg = self.device.compute_with_storage_grid_size()
-        proj = ttnn.matmul(hs, self._w_in, compute_kernel_config=self.ckc, core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x))
+        if B * T <= _dram_mm.TILE:  # decode: one tile row, spread N over the full grid
+            pc = _dram_mm.mcast1d_config(self.device, int(hs.shape[-1]), int(self._w_in.shape[-1]))
+            proj = ttnn.matmul(hs, self._w_in, compute_kernel_config=self.ckc, program_config=pc)
+        else:
+            proj = ttnn.matmul(hs, self._w_in, compute_kernel_config=self.ckc, core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x))
 
         # 2. split: gate(I) | hbc(conv_dim) | dt(H)
         gate = ttnn.slice(proj, [0, 0, 0], [B, T, I])
@@ -487,7 +498,7 @@ class TtNemotronHMamba2Mixer:
         # feeds out_proj exactly as the inline path's does.
         if getattr(self, "gated_norm", None) is not None:
             y = self.gated_norm(y, gate)
-            out = ttnn.matmul(y, self._w_out, compute_kernel_config=self.ckc)
+            out = ttnn.matmul(y, self._w_out, compute_kernel_config=self.ckc, program_config=self._out_pc(B * T))
             ttnn.deallocate(y)
             if self._shard:
                 out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
@@ -512,7 +523,9 @@ class TtNemotronHMamba2Mixer:
 
         # 13. out_proj (row-parallel under TP): sum the per-chip partial sums so
         #     every TP chip holds the full mixer output (readback keeps chip 0).
-        out = ttnn.matmul(y, self._w_out, compute_kernel_config=self.ckc)  # (B, T, hidden_size)
+        out = ttnn.matmul(
+            y, self._w_out, compute_kernel_config=self.ckc, program_config=self._out_pc(B * T)
+        )  # (B, T, hidden_size)
         ttnn.deallocate(y)
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)

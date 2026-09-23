@@ -69,6 +69,25 @@ def upload_weight(device, w, mesh_shape=None, dtype=ttnn.bfloat4_b):
     )
 
 
+def mcast1d_config(device, k, n):
+    """Full-grid 1-D in0-multicast config for a one-tile-row (M<=32) matmul:
+    N spread over every core, whole K per block step of up to 8 tiles."""
+    grid = device.compute_with_storage_grid_size()
+    k_tiles, n_tiles = k // TILE, math.ceil(n / TILE)
+    per_core_n = math.ceil(n_tiles / (grid.x * grid.y))
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=grid,
+        in0_block_w=max(d for d in range(1, 9) if k_tiles % d == 0),
+        out_subblock_h=1,
+        out_subblock_w=max(d for d in range(1, min(4, per_core_n) + 1) if per_core_n % d == 0),
+        per_core_M=1,
+        per_core_N=per_core_n,
+        fuse_batch=True,
+        fused_activation=None,
+        mcast_in0=True,
+    )
+
+
 def _cores(k_tiles, n_tiles, max_cores=64):
     c = max(c for c in range(1, max_cores + 1) if k_tiles % c == 0 and n_tiles % c == 0)
     return c

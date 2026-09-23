@@ -38,7 +38,7 @@ import torch
 import transformers
 
 import ttnn
-from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _ssm_cache
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm, _ssm_cache
 
 HF_MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 _CANDIDATE_SUBMODULE_PATHS = ["backbone.layers.0"]
@@ -560,7 +560,15 @@ class NemotronHBlock:
         normed = ttnn.rms_norm(x, weight=self._w_block_norm, epsilon=1e-5, compute_kernel_config=ckc)
 
         # 1b. in_proj: 2688 -> 10304
-        proj = ttnn.linear(normed, self._W_in, compute_kernel_config=ckc)
+        dec = B * S <= _dram_mm.TILE  # decode: one tile row, spread N over the full grid
+        proj = ttnn.linear(
+            normed,
+            self._W_in,
+            compute_kernel_config=ckc,
+            program_config=_dram_mm.mcast1d_config(self.device, int(normed.shape[-1]), int(self._W_in.shape[-1]))
+            if dec
+            else None,
+        )
 
         # split: [gate(4096), hidden_states_B_C(6144), dt(64)]   (d_mlp == 0)
         gate = ttnn.slice(proj, [0, 0, 0], [B, S, INTER])
@@ -588,7 +596,14 @@ class NemotronHBlock:
         y = ttnn.mul(y, self._w_gnorm)  # [1,S,4096]
 
         # 5. out_proj (row-parallel under TP): 4096 -> 2688.
-        out = ttnn.linear(y, self._W_out, compute_kernel_config=ckc)  # [1,S,2688] (partial per chip)
+        out = ttnn.linear(
+            y,
+            self._W_out,
+            compute_kernel_config=ckc,
+            program_config=_dram_mm.mcast1d_config(self.device, int(y.shape[-1]), int(self._W_out.shape[-1]))
+            if dec
+            else None,
+        )  # [1,S,2688] (partial per chip)
         if self._shard:
             # Sum the per-chip partial out_proj contributions so every chip holds
             # the full mixer output (the mesh readback keeps only chip 0's copy).
