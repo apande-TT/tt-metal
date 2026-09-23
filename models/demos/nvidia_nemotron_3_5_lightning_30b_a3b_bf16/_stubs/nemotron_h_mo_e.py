@@ -256,12 +256,10 @@ class TtNemotronHMOE:
         # count is exact in fp32. rank_i = #{j : choice_j > choice_i}; the
         # top_k experts are those with rank < top_k.
         bb = ttnn.reshape(choice, [B, T, 1, E])  # (B,T,1,E): [.,.,0,j]=choice_j
-        b_full = ttnn.repeat(bb, [1, 1, E, 1])  # (B,T,E,E): [.,.,i,j]=choice_j
+        a_col = ttnn.transpose(bb, 2, 3)  # (B,T,E,1): [.,.,i,0]=choice_i
+        gt = ttnn.gt(bb, a_col)  # broadcast to (B,T,E,E): [.,.,i,j] = choice_j > choice_i, no E x E repeat
         ttnn.deallocate(bb)
-        a_full = ttnn.transpose(b_full, 2, 3)  # (B,T,E,E): [.,.,i,j]=choice_i
-        gt = ttnn.gt(b_full, a_full)  # [.,.,i,j] = choice_j > choice_i
-        ttnn.deallocate(b_full)
-        ttnn.deallocate(a_full)
+        ttnn.deallocate(a_col)
         gt_f = ttnn.typecast(gt, ttnn.float32)
         ttnn.deallocate(gt)
         rank = ttnn.sum(gt_f, dim=3)  # (B,T,E): rank_i = #{j: choice_j>choice_i}

@@ -307,13 +307,11 @@ class TtNemotronHLayer:
         ttnn.deallocate(logits)
         choice = ttnn.add(scores, self._bias)
 
-        bb = ttnn.reshape(choice, [1, T, 1, E])
-        b_full = ttnn.repeat(bb, [1, 1, E, 1])  # [.,.,i,j] = choice_j
+        bb = ttnn.reshape(choice, [1, T, 1, E])  # [.,.,0,j] = choice_j
+        a_col = ttnn.transpose(bb, 2, 3)  # [.,.,i,0] = choice_i
+        gt = ttnn.gt(bb, a_col)  # broadcast to [.,.,i,j] = choice_j > choice_i, no E x E repeat
         ttnn.deallocate(bb)
-        a_full = ttnn.transpose(b_full, 2, 3)  # [.,.,i,j] = choice_i
-        gt = ttnn.gt(b_full, a_full)
-        ttnn.deallocate(b_full)
-        ttnn.deallocate(a_full)
+        ttnn.deallocate(a_col)
         gt_f = ttnn.typecast(gt, ttnn.float32)
         ttnn.deallocate(gt)
         rank = ttnn.sum(gt_f, dim=3)
