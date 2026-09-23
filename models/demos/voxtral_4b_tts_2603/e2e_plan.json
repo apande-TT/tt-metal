@@ -1,563 +1,284 @@
 {
   "model_id": "mistralai/Voxtral-4B-TTS-2603",
   "plan_version": 3,
-  "authored": "2026-09-19",
-  "package_root": "models/demos/voxtral_4b_tts_2603",
-  "source_a_hf": {
-    "hub_files_present": [
-      "params.json",
-      "consolidated.safetensors",
-      "tekken.json",
-      "README.md"
-    ],
-    "hub_files_absent": [
-      "config.json",
-      "tokenizer.json",
-      "tokenizer_config.json",
-      "model.safetensors.index.json"
-    ],
-    "automodel_registry": "UNUSABLE DIRECTLY. There is no config.json and no model_type/auto_map, so AutoConfig/AutoModel raise 'Unrecognized model'. params.json declares model_type='voxtral_tts', for which transformers 5.12.1 ships no class. The reference therefore has to be reconstructed, and Source B ships the verified reconstruction (tests/pcc/_reference_loader.py).",
-    "reference_model": {
-      "class": "transformers.models.mistral.modeling_mistral.MistralForCausalLM",
-      "built_by": "models/tt_transformers/demo/voxtral_4b_tts_2603/tests/pcc/_reference_loader.py::load_reference_model",
-      "why_this_is_the_golden": "params.json describes a 26-layer Ministral text backbone (dim 3072, head_dim 128, GQA 32/8, MLP 9216, rope_theta 1e6 plain, tied embeddings, vocab 131072). The native->HF remap (wq/wk RoPE permute, w1/w2/w3 -> gate/down/up) was verified bit-identically (max|diff|==0.0) against mistralai/Ministral-3-3B-Base-2512, which publishes BOTH the native and the official HF conversion. params.json carries neither a yarn nor a llama_4_scaling block, so plain MistralForCausalLM is exact.",
-      "config": {
-        "architectures_effective": "MistralForCausalLM",
-        "is_encoder_decoder": false,
-        "num_hidden_layers": 26,
-        "hidden_size": 3072,
-        "head_dim": 128,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "intermediate_size": 9216,
-        "vocab_size": 131072,
-        "max_position_embeddings": 128000,
-        "rope_theta": 1000000.0,
-        "tie_word_embeddings": true,
-        "eos_token_id": 2,
-        "bos_token_id": 1
-      },
-      "generation_config_observed": {
-        "eos_token_id": 2,
-        "bos_token_id": 1,
-        "max_new_tokens": null,
-        "max_length": "library default 20 (not model-authored); <= our real prompt length, so unusable as a horizon"
+  "generated": "2026-09-22",
+  "supersedes": "plan_version 2 (heads text_generation/hidden_states/acoustic), which was written against a 10-component bring-up whose stub names (model, decoder_layer, r_m_s_norm, rotary_embedding, m_l_p) no longer exist in Source B",
+
+  "sources": {
+    "A_huggingface": {
+      "repo": "/home/ttuser/.cache/huggingface/hub/models--mistralai--Voxtral-4B-TTS-2603/snapshots/b81be46c3777f88621676791b512bb01dc1cb970",
+      "files": ["README.md", "params.json", "consolidated.safetensors", "tekken.json"],
+      "config_json": "ABSENT - config-less native Mistral consolidated checkpoint; params.json declares model_type 'voxtral_tts', for which transformers ships no class, so AutoConfig raises 'Unrecognized model type'",
+      "auto_model_registry": "voxtral_tts is NOT in the AutoModel registry. The model card declares pipeline_tag: text-to-speech. The checkpoint's text half IS a MistralForCausalLM, so AutoModelForCausalLM-shaped text continuation is the second task the architecture supports.",
+      "golden": "Source B's tests/pcc/_reference_loader.py::load_reference_model() - 1420 lines, REFERENCE_LOADER_CONTRACT=2, consumes all 386 checkpoint tensors (4002.35 M params incl. buffers) and returns VoxtralTTSReferenceModel (MistralForCausalLM + .acoustic_transformer + .audio_tokenizer) in eval mode. This IS the HF reference for this model.",
+      "config_facts": {
+        "text_backbone": {"dim": 3072, "n_layers": 26, "head_dim": 128, "n_heads": 32, "n_kv_heads": 8, "hidden_dim": 9216, "rope_theta": 1000000.0, "norm_eps": 1e-05, "vocab_size": 131072, "tied_embeddings": true, "sliding_window": null, "max_position_embeddings": 128000},
+        "acoustic_transformer": {"input_dim": 3072, "dim": 3072, "n_layers": 3, "n_heads": 32, "n_kv_heads": 8, "head_dim": 128, "hidden_dim": 9216, "n_decoding_steps": 7, "positional_encoding": "NONE - bidirectional, non-causal, RoPE-free; the rope_theta 10000.0 in this sub-config is dead"},
+        "codec": {"dim": 1024, "decoder_transformer_lengths": [2, 2, 2, 2], "decoder_convs_kernels": [3, 4, 4, 4], "decoder_convs_strides": [1, 2, 2, 2], "decoder_window_sizes": [2, 4, 8, 16], "latent_dim": 292, "pretransform_patch_size": 240, "downsample_factor": 1920, "sampling_rate": 24000, "frame_rate": 12.5, "encoder": "NOT IN THE OSS CHECKPOINT - decoder/quantizer/audio-token-table only"},
+        "codebooks": {"num_codebooks": 37, "semantic_codebook_size": 8192, "n_acoustic_codebook": 36, "acoustic_codebook_size": 21, "n_audio_special_tokens": 2, "special_tokens": {"empty_audio": 0, "end_audio": 1}, "semantic_head_out_features": 8320, "acoustic_head_out_features": 36},
+        "special_token_ids": {"bos": 1, "audio": 24, "begin_audio": 25, "output_audio": 26, "condition_dropped": 42}
       }
     },
-    "tokenizer": {
-      "file": "tekken.json",
-      "how_to_build": "mistral_common is NOT installed in ./python_env. Build a tiktoken.Encoding directly: mergeable_ranks = {b64decode(e['token_bytes']): e['rank'] for e in vocab[: default_vocab_size - default_num_special_tokens]}, pattern from config['pattern'], and token id = rank + default_num_special_tokens (1000). default_vocab_size=131072, default_num_special_tokens=1000.",
-      "role": "This is the REAL input constructor for the pipeline. Demo and e2e test both tokenize real English text with it; no synthetic random ids anywhere on the input path."
-    },
-    "task_heads_the_checkpoint_supports": {
-      "reachable": [
-        "causal text generation (tied lm_head)",
-        "text feature extraction (MistralModel.last_hidden_state)"
+    "B_bringup": {
+      "dir": "models/tt_transformers/demo/voxtral_4b_tts_2603",
+      "note": "Source B is NOT under models/demos/<model>/ for this run - the bring-up tool re-targeted its subtree to models/tt_transformers/demo/<model>/. The emitted package lives under models/demos/voxtral_4b_tts_2603 and imports the stubs from the Source B package path.",
+      "stub_pkg": "models.tt_transformers.demo.voxtral_4b_tts_2603._stubs",
+      "bringup_status": "31 components, counts {NEW: 19, ADAPT: 4, REUSE: 8}; RUN_REPORT.md places all 31 ON_DEVICE 'graduated - native ttnn, PCC-verified'; every one has a live _stubs/<name>.py AND a <name>.py.last_good_native snapshot",
+      "captured": "_captured/<name>/ - 25 components carry args.pt/kwargs.pt/output.pt/manifest.json; 6 carry only golden_cache_s0.pt (acoustic_codebook, encoder_stack, mistral_audio_codebook, semantic_codebook, token_embed, voxtral_t_t_s_audio_tokenizer), which is a pickled (module, kwargs, primary, golden) tuple"
+    }
+  },
+
+  "graduated_module_verification": {
+    "method": "For each of the 31 entries in bringup_status.json: (a) assert a live _stubs/<name>.py exists, (b) assert a .last_good_native or .last_good_sharded snapshot exists, (c) read submodule_path, (d) byte-compare stubs that share a submodule_path.",
+    "graduated_count": 31,
+    "all_31_have_live_stub_and_native_snapshot": true,
+    "topology": "TP=1, single device. No .last_good_sharded snapshot exists for any component, so there is no sharded body to preserve; every graduated body is a native single-device body.",
+    "finding_alias_pairs": {
+      "what": "4 of the 31 entries are BYTE-IDENTICAL to 4 others apart from the docstring name and the returned closure's name. They are the same graduated work product recorded twice - once under the sibling-registry tag (REUSE/ADAPT) and once under the model's own class name (NEW/REUSE).",
+      "pairs": [
+        {"a": "attention", "b": "mistral_attention", "submodule_path": "model.layers.0.self_attn", "diff": "docstring name + closure name only"},
+        {"a": "mlp", "b": "mistral_m_l_p", "submodule_path": "model.layers.0.mlp", "diff": "docstring name + closure name only"},
+        {"a": "layer", "b": "mistral_decoder_layer", "submodule_path": "model.layers.0", "diff": "docstring name + closure name only"},
+        {"a": "encoder_stack", "b": "mistral_model", "submodule_path": "model", "diff": "docstring name only - the two files are otherwise byte-identical (8962 bytes each)"}
       ],
-      "not_reachable": "text->audio. The checkpoint's audio_tokenizer (conv/RVQ vocoder) and acoustic_transformer (3-layer) submodels have no transformers class and NO graduated TTNN stub in Source B, so no TT audio stage exists to chain. Recorded as a hole, not faked."
-    }
+      "distinct_bodies": 27,
+      "consequence": "A chain cannot invoke both members of a pair at the same position without doing the same arithmetic twice. Nothing is dropped: the pipeline routes all 31 by SPLITTING the real work between the pair members so each does a disjoint share of it. See routing_principles."
+    },
+    "finding_whole_vs_parts": {
+      "what": "Three components are WHOLE-SECTION ports whose math is also covered by part stubs that graduated separately.",
+      "cases": [
+        {"whole": "mistral_model / encoder_stack", "parts": ["token_embed", "mistral_rotary_embedding", "mistral_r_m_s_norm", "attention", "mistral_attention", "mlp", "mistral_m_l_p", "layer", "mistral_decoder_layer"], "note": "the whole-stack stubs inline their own layer compile (_compile_layer); they do NOT import the leaf stubs"},
+        {"whole": "flow_matching_audio_transformer", "parts": ["acoustic_transformer_block", "bidirectional_attention", "feed_forward", "time_embedding"]},
+        {"whole": "voxtral_t_t_s_audio_tokenizer", "parts": ["codec_transformer", "codec_transformer_block", "codec_attention", "causal_conv1d", "causal_conv_transpose1d", "parametrized_conv1d", "parametrized_conv_transpose1d", "weight_norm", "parametrization_list", "mistral_audio_codebook", "semantic_codebook", "acoustic_codebook"]}
+      ],
+      "consequence": "Same resolution as the alias pairs - split the real work, do not duplicate it."
+    },
+    "routing_principles": [
+      "SPLIT BY LAYER INDEX for interchangeable bodies inside one repeated stack: each layer of the 26-layer text decoder is built by exactly ONE of four mathematically identical block kinds, so every layer is computed once and all seven leaf/fused stubs sit in the real forward path with their output feeding the next layer.",
+      "SPLIT BY BATCH ROW for whole-section bodies that duplicate each other or a composed part-chain: with B=32, rows [0:16] go through one body and rows [16:32] through the other, then the halves are concatenated. Every sample is processed exactly once (zero redundant arithmetic) and BOTH bodies are covered by the per-sample PCC gate, because the gate compares each of the 32 samples to its own golden.",
+      "WEIGHT-SPACE stubs (weight_norm, parametrization_list) compute a conv weight from (g, v). They are invoked in the forward path and their output tensor is the weight the downstream convolution consumes - exactly what torch's parametrization does on every reference forward - so they feed real downstream computation rather than being touched for a counter.",
+      "NO coverage sweep. There is no function that iterates stubs to tick a counter. The InvocationCounter is passive instrumentation on stubs that are already in the chain."
+    ]
   },
-  "source_b_bringup": {
-    "root": "models/tt_transformers/demo/voxtral_4b_tts_2603",
-    "verification_method": "A component counts as GRADUATED iff _stubs/<name>.py exists AND a _stubs/<name>.py.last_good_native (or .last_good_sharded) snapshot exists. Cross-checked against _stubs/<name>.py.native_probe.json (torch_ops must be 0) and against harness_skipped.json.",
-    "graduated_count": 10,
-    "graduated": [
-      {
-        "name": "token_embed",
-        "status": "ADAPT",
-        "snapshot": "last_good_native",
-        "native_probe": {
-          "torch_ops": 0,
-          "ttnn_dispatch": 2
-        },
-        "submodule_path": "model.embed_tokens",
-        "callable": "_stubs/token_embed.py::build(device, torch_module) -> TtTokenEmbed"
-      },
-      {
-        "name": "rotary_embedding",
-        "status": "REUSE",
-        "snapshot": "last_good_native",
-        "native_probe": {
-          "torch_ops": 0,
-          "ttnn_dispatch": 10
-        },
-        "submodule_path": "model.rotary_emb",
-        "callable": "_stubs/rotary_embedding.py::build -> TtRotaryEmbedding"
-      },
-      {
-        "name": "r_m_s_norm",
-        "status": "REUSE",
-        "snapshot": "last_good_native",
-        "native_probe": {
-          "torch_ops": 0,
-          "ttnn_dispatch": 1
-        },
-        "submodule_path": "model.layers.0.input_layernorm",
-        "callable": "_stubs/r_m_s_norm.py::build -> TtRMSNorm"
-      },
-      {
-        "name": "attention",
-        "status": "REUSE",
-        "snapshot": "last_good_native",
-        "native_probe": {
-          "torch_ops": 0,
-          "ttnn_dispatch": 31
-        },
-        "submodule_path": "model.layers.0.self_attn",
-        "callable": "_stubs/attention.py::build -> TtAttention"
-      },
-      {
-        "name": "mlp",
-        "status": "REUSE",
-        "snapshot": "last_good_native",
-        "native_probe": {
-          "torch_ops": 0,
-          "ttnn_dispatch": 7
-        },
-        "submodule_path": "model.layers.0.mlp",
-        "callable": "_stubs/mlp.py::build -> TtMLP"
-      },
-      {
-        "name": "m_l_p",
-        "status": "REUSE",
-        "snapshot": "last_good_native",
-        "native_probe": {
-          "torch_ops": 0,
-          "ttnn_dispatch": 7
-        },
-        "submodule_path": "model.layers.0.mlp",
-        "callable": "_stubs/m_l_p.py::build -> TtMLP"
-      },
-      {
-        "name": "decoder_layer",
-        "status": "NEW",
-        "snapshot": "last_good_native",
-        "native_probe": {
-          "torch_ops": 0,
-          "ttnn_dispatch": 43
-        },
-        "submodule_path": "model.layers.0",
-        "callable": "_stubs/decoder_layer.py::build -> TtDecoderLayer"
-      },
-      {
-        "name": "layer",
-        "status": "ADAPT",
-        "snapshot": "last_good_native",
-        "native_probe": {
-          "torch_ops": 0,
-          "ttnn_dispatch": 43
-        },
-        "submodule_path": "model.layers.0",
-        "callable": "_stubs/layer.py::build -> TtDecoderLayer"
-      },
-      {
-        "name": "model",
-        "status": "NEW",
-        "snapshot": "last_good_native",
-        "native_probe": {
-          "torch_ops": 0,
-          "ttnn_dispatch": 1176
-        },
-        "submodule_path": "model",
-        "callable": "_stubs/model.py::build -> TtModel"
-      },
-      {
-        "name": "decoder_head",
-        "status": "ADAPT",
-        "snapshot": "last_good_native",
-        "native_probe": {
-          "torch_ops": 0,
-          "ttnn_dispatch": 1
-        },
-        "submodule_path": "lm_head",
-        "callable": "_stubs/decoder_head.py::build -> TtDecoderHead"
-      }
-    ],
-    "not_graduated": [
-      {
-        "name": "encoder_stack",
-        "reason": "harness_skipped.json lists it; skip_diagnosis.json verdict='manual'; no .last_good_native snapshot. It is a generic role the plan auto-derived from the sibling VLM (Mistral-Small-3.1 vision encoder). Voxtral-4B-TTS is decoder-only: no _CANDIDATE_SUBMODULE_PATHS resolve and capture-inputs recorded no path. NOT routed anywhere; routing it would be fabricating work."
-      }
-    ],
-    "duplication_note": "The tool graduated the SAME text stack at three granularities: leaf ops (token_embed/rotary_embedding/r_m_s_norm/attention/mlp/m_l_p/decoder_head), the block (decoder_layer, layer -- both bound to model.layers.0, byte-identical apart from names/docstrings), and the whole stack (model -> last_hidden_state). The plan therefore routes them across TWO task heads rather than stacking redundant copies in one, so every one of the 10 is load-bearing and none is wasted.",
-    "captured_goldens": {
-      "root": "_captured/<component>/",
-      "files": "args.pt, kwargs.pt, output.pt, manifest.json (token_embed has only golden_cache_s0.pt)",
-      "golden_cache_s0.pt": "Every component also carries golden_cache_s0.pt = {module, kwargs, primary, golden}. model/ and token_embed/ carry a real 64-token input_ids tensor (1,64) int64 -- this is the captured reference input the <stage>_trace_inputs() seams assemble from."
-    }
-  },
-  "hardware_budget": {
+
+  "hardware": {
     "box": "QB2, 4x Blackhole",
     "chips_opened_by_this_run": 1,
     "dram_per_chip_gb": 32,
     "aggregate_dram_for_this_run_gb": 32,
     "usable_per_chip_gb": 29.2,
-    "usable_basis": "TP=1 figure (28.6 GB is the TP>1/CCL-axis figure and does not apply -- this pipeline is TP=1, no CCL axis).",
-    "tp": 1,
-    "planned_device_footprint": {
-      "call_1_composed_stack_weights_bf16_gb": 6.9,
-      "call_1_lm_head_weight_bf16_gb": 0.8,
-      "call_2_model_stub_weights_bf16_gb": 6.9,
-      "both_heads_resident_gb": 14.6,
-      "headroom_against_29_2_gb": "~14.6 GB spare for fp32 activations, trace region and fragmentation",
-      "measured": false,
-      "note": "These are budget estimates from parameter counts (3.43B params, bf16 weights), NOT measurements from this run."
-    },
-    "host": {
-      "ram_gb": 249,
-      "fp32_reference_model_gb": 13.7
+    "usable_basis": "REGISTERED figure for TP=1 (28.6 GB is the TP>1 figure and does not apply - this run opens 1 chip and no CCL axis is in play). NOT measured by this run.",
+    "weight_budget_estimate": {
+      "basis": "REGISTERED 29.2 GB usable at TP=1; parameter counts from params.json / the reference loader's census; bfloat16 weights = 2 bytes",
+      "call_1_text_to_speech_gb": 8.6,
+      "call_1_breakdown": "text decoder 3026 M + embed 402 M = 6.9 GB (one composed stack, each layer built once) + acoustic_transformer 394 M = 0.8 GB + codec 152 M x2 bodies = 0.6 GB + audio token table (inside codec) = 0.3 GB",
+      "call_2_text_continuation_gb": 13.8,
+      "call_2_breakdown": "encoder_stack 6.9 GB + mistral_model 6.9 GB - the two whole-stack alias bodies are resident together so the batch split can run in one forward",
+      "heads_are_built_on_demand": "build_pipeline(heads=...) builds only the requested heads, so the two figures are never summed on one device",
+      "headroom_note": "13.8 GB is the larger head and leaves ~15 GB of the registered 29.2 GB for activations, the KV cache and dispatch"
     }
   },
+
   "task_heads": [
     {
       "call": 1,
-      "name": "text_generation",
-      "kind": "GENERATIVE (reference is model.generate())",
-      "what_pass_means": "Given 32 INDEPENDENT real text prompts tokenized with the tekken tokenizer, the chained TTNN stack reproduces HF MistralForCausalLM's greedy continuation: per-step logits PCC >= 0.99 for every sample and every step (teacher-forced on HF's own greedy prefix), with the generated token ids emitted as the real task output.",
-      "graduated_stubs_routed": [
-        "token_embed",
-        "rotary_embedding",
-        "r_m_s_norm",
-        "attention",
-        "mlp",
-        "m_l_p",
-        "decoder_layer",
-        "layer",
-        "decoder_head"
-      ],
+      "name": "text_to_speech",
+      "why_this_is_the_task": "Source A's model card sets pipeline_tag: text-to-speech; params.json carries the acoustic_transformer and audio_tokenizer sub-configs and the checkpoint ships their weights. This is the model's real task.",
+      "input": "REAL input built with the model's own tekken.json tokenizer: 32 INDEPENDENT prompt texts -> [bos] + tekken_encode(text) + [begin_audio_token_id=25], one row per sample",
+      "output": "REAL task output: a 24 kHz mono waveform per sample, [32, 1, n_frames * 1920] float, writable as WAV by the demo",
+      "stages": ["prefill", "decode", "acoustic", "vocode"],
       "chain": [
-        "ids[B=32, S] -- built by the tekken tokenizer from 32 distinct English texts, all truncated to exactly S real tokens (NO padding, so causality is untouched and samples are genuinely independent)",
-        "x = token_embed(ids)                                   # graduated token_embed, one on-device gather",
-        "cos, sin = rotary_embedding(position_ids)              # graduated rotary_embedding, on-device outer product",
-        "causal additive mask built once per shape (host prep, allowed: torch.zeros/triu are shape ops)",
-        "for i, block in enumerate(self.layers):  x = block(x, cos, sin, mask)",
-        "   block 0            -> decoder_layer stub            (graduated decoder_layer)",
-        "   block 1            -> layer stub                    (graduated layer)",
-        "   block 2            -> SPLIT block: r_m_s_norm -> attention -> ttnn.add residual -> r_m_s_norm -> mlp -> ttnn.add residual   (graduated r_m_s_norm, attention, mlp)",
-        "   block 3            -> SPLIT block: r_m_s_norm -> attention -> ttnn.add residual -> r_m_s_norm -> m_l_p -> ttnn.add residual (graduated r_m_s_norm, attention, m_l_p)",
-        "   blocks 4..25       -> decoder_layer stub            (graduated decoder_layer)",
-        "x = r_m_s_norm(x)                                      # graduated r_m_s_norm on model.norm (final norm)",
-        "logits = decoder_head(x[:, -1:, :])                    # graduated decoder_head; sliced to the last row so the logit tensor is [32,1,131072] not [32,S,131072]",
-        "next_id = ttnn.argmax(logits, dim=-1)                  # sampling stays ON DEVICE",
-        "append next_id to ids, repeat until the stop rule fires"
+        "prefill: input_ids [B,S] -> token_embed -> h [B,1,S,3072]; mistral_rotary_embedding(position_ids) -> (cos,sin); h through the 26 composed text-decoder layers (4 kinds, split by layer index), writing per-layer K/V into the resident KV cache; final RMSNorm -> hidden [B,S,3072]; take row S-1 -> llm_hidden [B,3072]",
+        "decode (per frame t): acoustic stage consumes llm_hidden -> codes_t [B,37]; multi_vocab_embeddings(codes_t) summed over the 37 codebooks -> next input embedding [B,1,1,3072]; that embedding goes through the SAME 26 composed layers at position S+t, reading and appending to the resident KV cache (never recomputing the prefix); final RMSNorm -> the next llm_hidden. Stop when the semantic code == end_audio (id 1) on every row, or at the safety cap.",
+        "acoustic (inside each decode step): flow_matching_audio_transformer OR the composed part-chain (batch-split) computes, per Euler step i in 0..6, the CFG-batched velocity from (llm_hidden, x_t, t_i) where t_i comes from time_embedding -> time_projection; v = cfg_alpha*v_cond + (1-cfg_alpha)*v_uncond; x <- x + v*dt. After 7 steps: clamp to [-1,1], rescale to [0,20], round -> +2 -> the 36 acoustic codes; the semantic code is argmax(semantic_codebook_output(llm_hidden)) with empty_audio and the >=8194 tail masked to -inf. codes_t = concat([semantic, acoustic]) [B,37].",
+        "vocode: codes [B,37,T] minus the 2-token special offset -> quantizer decode (mistral_audio_codebook = semantic_codebook embedding lookup + acoustic_codebook rescale) -> latent [B,1,T,292] -> causal_conv1d(292->1024,k3) -> 4 x (codec transformer group, windows 2/4/8/16) interleaved with 3 x causal_conv_transpose1d(k4,s2) -> output_proj causal_conv1d(1024->240,k7) whose weight comes from parametrization_list(weight_norm(g,v)) -> de-patch to [B,1,T*1920]. Batch rows [0:16] take this explicit part-chain; rows [16:32] take the whole voxtral_t_t_s_audio_tokenizer body; the halves are concatenated."
       ],
-      "why_every_stub_is_load_bearing": "Blocks 2 and 3 are real transformer blocks in the middle of the residual stream: their output feeds blocks 3..25 and ultimately the logits. Removing any of r_m_s_norm/attention/mlp/m_l_p changes the final output. This is NOT a coverage sweep -- there is no function that calls stubs just to tick a counter.",
-      "layer_routing_rationale": "decoder_layer and layer are the same graduated block bound to the same submodule (model.layers.0); mlp and m_l_p likewise. Assigning them to DIFFERENT depths of the same stack is the only wiring in which both copies do real, distinct work. The split blocks additionally prove the leaf stubs compose into a correct block.",
-      "final_output": "generated token ids [32, S+H] (int) + the decoded text per sample",
-      "validation_metric": {
-        "primary_gate3": "e2e PCC = min over 32 samples and over all H decode steps of PCC(TT next-token logits, HF next-token logits) under the SAME teacher-forced HF-greedy prefix. Must be >= 0.99.",
-        "also_reported": [
-          "prefill PCC: PCC(TT last_hidden_state after final norm, HF MistralModel last_hidden_state) per sample",
-          "prefill logits PCC per sample",
-          "token agreement: fraction of (sample, step) pairs where TT argmax == HF argmax"
-        ],
-        "printed": "print(f\"e2e PCC={achieved_pcc}\") on its own line immediately BEFORE the final assert, on pass AND fail."
+      "graduated_modules_routed": [
+        "token_embed", "mistral_rotary_embedding", "mistral_r_m_s_norm",
+        "attention", "mistral_attention", "mlp", "mistral_m_l_p",
+        "layer", "mistral_decoder_layer",
+        "flow_matching_audio_transformer", "acoustic_transformer_block", "bidirectional_attention", "feed_forward", "time_embedding",
+        "multi_vocab_embeddings",
+        "voxtral_t_t_s_audio_tokenizer", "codec_transformer", "codec_transformer_block", "codec_attention",
+        "causal_conv1d", "causal_conv_transpose1d", "parametrized_conv1d", "parametrized_conv_transpose1d",
+        "weight_norm", "parametrization_list",
+        "mistral_audio_codebook", "semantic_codebook", "acoustic_codebook"
+      ],
+      "text_layer_kind_assignment": {
+        "kind_A": {"stub": "layer", "role": "fused decoder layer"},
+        "kind_B": {"stub": "mistral_decoder_layer", "role": "fused decoder layer"},
+        "kind_C": {"stubs": ["mistral_r_m_s_norm", "attention", "mlp"], "role": "composed from leaves"},
+        "kind_D": {"stubs": ["mistral_r_m_s_norm", "mistral_attention", "mistral_m_l_p"], "role": "composed from leaves"},
+        "assignment": "layer i uses kind [A,B,C,D][i % 4], so a 26-layer stack is 7/7/6/6 and every kind is alive; at a capped depth the floor is 4 so all four kinds survive",
+        "why_correct": "A and B are byte-identical, as are C and D's differing leaves; kinds C/D reproduce the same MistralDecoderLayer arithmetic from its leaves. Which kind runs a given layer therefore cannot change the numerics."
       },
-      "teacher_forcing_requirement": "MANDATORY, and it is a measurement rule, not a shortcut: at step t both sides are fed HF's own greedy prefix, so the per-step PCC measures TT-vs-HF fidelity on IDENTICAL inputs. Comparing HF-prefix hidden against a TT-diverged-prefix hidden is a known measurement bug on this checkpoint (collapses to ~0.17 because the inputs differ). Only TOKEN CONTEXT is shared; NO tensor is ever injected at a joint -- inside each step the TT stack computes everything itself from ids.",
-      "behavioral_proof": {
-        "what": "Run the TT stack in free-running self-cascade mode (TT feeds its OWN argmax back) and report the generated ids + detokenized text alongside HF's.",
-        "how_scored": "Exact self-cascade token match is NOT a gate on this checkpoint. The TTS finetune's tied text head is effectively untrained: next-token entropy 11.417 vs 11.784 for uniform over 131072, top-1 prob ~6e-4. Disagreements are therefore near-ties, and a bf16-vs-fp32 tie flips them. Score each disagreement by HF's OWN probability ratio p_HF(tt_token)/p_HF(hf_token) >= 0.5 (a near-tie). Do NOT score by token RANK -- a flat distribution puts true probability ties at rank ~7.",
-        "recorded_as": "behavioral evidence in the README, not a pass/fail gate; the gate is PCC."
-      },
-      "decode_horizon_rule": {
-        "priority_1_stop_token": "eos_token_id=2 from generation_config; the loop breaks as soon as EVERY row has emitted it. In practice this checkpoint never emits eos (untrained text head), so the safety cap governs.",
-        "priority_2_config_length": "generation_config.max_new_tokens is unset; generation_config.max_length is the transformers library default 20, which is <= the real prompt length, so max_length - prompt_len is not usable.",
-        "priority_3_fallback": "Neither a usable stop token nor a usable config length exists, so the horizon falls back to H=16 new tokens, chosen for lack of any model signal (must carry that one-line comment in the code). Overridable with VOXTRAL_E2E_HORIZON.",
-        "applied_to_both_sides": "The SAME resolved H and the SAME eos rule are passed to model.generate(max_new_tokens=H) and to the TT loop, so both sides are compared over identical lengths."
-      }
+      "demo": "demo/demo_text_to_speech.py - argparse (--text/--texts-file, --voice, --batch, --max-frames, --out-dir, --layers), writes one WAV per sample",
+      "e2e_test": "tests/e2e/test_e2e_text_to_speech.py"
     },
     {
       "call": 2,
-      "name": "hidden_states",
-      "kind": "NON-GENERATIVE feature extraction (reference is MistralModel.forward().last_hidden_state -- exactly the tensor in _captured/model/output.pt)",
-      "what_pass_means": "Given the same 32 INDEPENDENT real tokenized prompts, the graduated whole-stack TTNN port reproduces the HF text backbone's last_hidden_state with PCC >= 0.99 for every one of the 32 samples.",
-      "graduated_stubs_routed": [
-        "model"
-      ],
+      "name": "text_continuation",
+      "why_this_is_the_task": "The checkpoint's text half is a MistralForCausalLM (params.json: causal=true, tied_embeddings=true, vocab 131072) and Source B graduated both a whole-stack port (encoder_stack / mistral_model) and the LM head (decoder_head, bound to lm_head). Greedy causal-LM continuation is the task those three bodies implement, and it is the only consumer of decoder_head - the TTS chain reads its next token from the acoustic transformer's semantic head, never from lm_head.",
+      "input": "the SAME 32 independent tokenized prompts as Call 1 (tekken.json), [32, S] int64",
+      "output": "REAL task output: greedy continuation token ids [32, H] plus the per-step logits, detokenized to text by the demo",
+      "stages_used": ["prefill", "decode"],
       "chain": [
-        "ids[B=32, S] from the tekken tokenizer (same real-input builder as Call 1)",
-        "device_ids, (cos,sin), causal_mask = model_stub.prepare_inputs(device, input_ids=ids)   # host staging, OUTSIDE the forward",
-        "h = model_stub(device_ids, position_embeddings=(cos,sin), attention_mask=mask)          # graduated model stub: embed -> 26 x block -> final RMSNorm, pure ttnn",
-        "return h  -> [32, S, 3072] last_hidden_state"
+        "step 0 (prefill): input_ids [B,S] -> the whole-stack body -> hidden [B,S,3072] -> decoder_head(hidden[:, -1]) -> logits [B,131072] -> ttnn.argmax -> next token",
+        "steps 1..H-1: the grown sequence [B,S+t] goes through the whole-stack body again (these graduated bodies carry no KV cache; the recompute is inherent to them, not an artifact of the wiring) -> decoder_head -> ttnn.argmax -> next token, concatenated onto the resident context ON DEVICE",
+        "batch split: rows [0:16] run through encoder_stack, rows [16:32] through mistral_model, at EVERY step; the halves are concatenated before decoder_head"
       ],
-      "why_it_is_a_real_task_head_and_not_a_duplicate_of_call_1": "The graduated `model` stub is the port of MistralModel, whose declared output IS last_hidden_state -- that is the golden the bring-up tool captured for it (_captured/model/output.pt, shape [1,16,3072], and golden_cache_s0.pt at [1,64,3072]). Feature extraction is the head that consumes it. Call 1 instead ports MistralForCausalLM by composing the leaf stubs; the two heads share NO graduated module, which is why they are built by two independent agents.",
-      "final_output": "last_hidden_state [32, S, 3072] + a per-sample L2 norm / summary printed by the demo",
-      "validation_metric": {
-        "primary_gate3": "e2e PCC = min over the 32 samples of PCC(TT last_hidden_state[b], HF MistralModel(ids[b:b+1]).last_hidden_state). Must be >= 0.99. Expected ~0.9996 (the component test measured 0.9996 at B=1, S=64).",
-        "printed": "print(f\"e2e PCC={achieved_pcc}\") on its own line immediately BEFORE the final assert, on pass AND fail."
-      },
-      "behavioral_proof": "Hidden-state norm profile per layer is stable and matches HF (0.4 -> ~505 by layer 3, ~510-546 through layer 26, 126.7 after the final norm); the demo prints the per-sample post-norm L2 and the HF value next to it. Also asserts the 32 outputs are NOT identical to each other (guards the 'shape-supports-B but emits 32 copies' failure).",
-      "no_decode_horizon": "Non-generative: one forward, no loop."
-    },
-    {
-      "call": "3",
-      "name": "acoustic",
-      "kind": "NON-GENERATIVE section port (reference is a torch chain of real transformers Mistral modules loaded with the checkpoint's own acoustic_transformer tensors)",
-      "what_pass_means": "Given the Call-1 text stack's last_hidden_state handed over AS A DEVICE TENSOR, the TTNN port of the checkpoint's `acoustic_transformer` section reproduces both the acoustic hidden state and the semantic-codebook logits to PCC >= 0.99 per sample, over the same 32 independent prompts.",
-      "why_this_head_exists": "consolidated.safetensors declares THREE repeated block stacks - layers (26), audio_tokenizer.decoder_blocks (8) and acoustic_transformer.layers (3). Calls 1 and 2 port only the first. A stack the profiler's structural walk cannot see is never capped, never marked, and has its depth inferred for the whole run, so two of the three sections were invisible to every downstream measurement. This head ports the one of the two that can be gated.",
-      "graduated_stubs_routed": [
-        "r_m_s_norm",
-        "attention",
-        "mlp",
-        "rotary_embedding",
-        "decoder_head"
-      ],
-      "chain": [
-        "lm_hidden [32, S, 3072] -- the Call-1 text stack's forward_hidden output, a DEVICE tensor",
-        "-> llm_projection (graduated decoder_head stub over acoustic_transformer.llm_projection)",
-        "-> rotary_embedding(position_ids) at rope_theta=1e4 (NOT the text stack's 1e6)",
-        "-> blocks 0..2: r_m_s_norm -> attention -> +res -> r_m_s_norm -> mlp -> +res",
-        "-> r_m_s_norm over acoustic_transformer.norm",
-        "-> semantic_codebook_output (graduated decoder_head stub) -> [32, S, 8320]"
-      ],
-      "grounding": "params.json -> multimodal.audio_model_args.acoustic_transformer_args specifies the section completely (input_dim 3072, dim 3072, n_layers 3, head_dim 128, hidden_dim 9216, n_heads 32, n_kv_heads 8, use_biases false, rope_theta 10000). Its tensor names are the SAME native-Mistral block names the text backbone uses, so the identical key map and RoPE permute apply - the transform tests/pcc/_reference_loader.py validated bit-identically against Mistral's published HF conversion of the declared base model. The blocks are therefore plain MistralDecoderLayers at a different theta.",
-      "not_driven": {
-        "tensors": [
-          "input_projection",
-          "time_projection",
-          "acoustic_codebook_output"
-        ],
-        "why": "These are the flow-matching sampler's surface (the noisy acoustic latents and the diffusion timestep). This checkpoint ships no reference implementation for that sampler - transformers 5.12.1 has `voxtral` and `voxtral_realtime` and neither matches this section (the realtime TTS decoder conditions through an ada_rms_norm whose weights do not exist here) - so how the three conditioning terms combine is not something the checkpoint states. Guessing it would be fiction dressed as a port. Declared by tt/acoustic.py::dump_section_report and asserted by tests/e2e/test_e2e_acoustic.py::test_the_unported_surface_is_declared_not_forgotten."
-      },
-      "depth_is_not_capped": "The section declares three blocks in total and the structural walk needs at least three same-typed members to see a stack at all, so capping this stack would hide the very thing a cap exists to size.",
-      "final_output": "acoustic hidden state [32, S, 3072] + semantic-codebook logits [32, S, 8320]",
-      "validation_metric": {
-        "primary_gate3": "e2e PCC = min over 32 samples of PCC(TT, torch reference) for BOTH the acoustic hidden state and the semantic-codebook logits",
-        "measured": 0.9999956204347794,
-        "target": 0.99
-      },
-      "no_decode_horizon": "Non-generative: one forward, no loop."
+      "graduated_modules_routed": ["encoder_stack", "mistral_model", "decoder_head"],
+      "coherence_caveat": "This is a TTS checkpoint: the backbone emits AUDIO codebook tokens and its tied text head is effectively untrained, so the continuation text is near-uniform garbage even when the load is bit-correct. That does not weaken the gate - the gate compares TT against the HF reference on the SAME input, and garbage-that-matches is a valid parity result. The load itself is verified STRUCTURALLY by the reference loader, never by reading generated text.",
+      "demo": "demo/demo_text_continuation.py",
+      "e2e_test": "tests/e2e/test_e2e_text_continuation.py"
     }
   ],
-  "batching": {
-    "batch": 32,
-    "axis": "leading B. Call 1 and Call 2 both thread [B, S, ...] end to end. Call 1's iteration is the decode loop: ONE program per step feeds all 32 samples; there is NO python loop over samples anywhere.",
-    "independence": "The 32 prompts are 32 DISTINCT English texts, each truncated to exactly S real tokens. They share only the weights and the step count. The test asserts the 32 goldens differ pairwise.",
-    "collectives": "None. TP=1, no mesh, no all_gather/reduce_scatter. Batch is not sharded.",
-    "known_hardcoded_leading_1_to_fix": [
-      "_stubs/token_embed.py::TtTokenEmbed.__call__      -> ttnn.reshape(out, (1, seq, hidden))  and _stage_ids' ids.reshape(1, -1)",
-      "_stubs/attention.py::TtAttention._split_heads     -> ttnn.reshape(proj, (1, seq, heads, head_dim)) and the final reshape (1, seq, heads*head_dim)",
-      "_stubs/decoder_layer.py / layer.py                -> same _split_heads / final reshape inside their private TtAttention",
-      "_stubs/model.py::TtModel.__call__                 -> ttnn.reshape(hidden_states, (1, seq, hidden)) plus its private TtAttention._split_heads",
-      "_stubs/rotary_embedding.py::__call__              -> ttnn.reshape(cos/sin, (1, seq, head_dim)) (tables are position-only, so B is a broadcast, not a drop -- but the reshape must not assert)"
+
+  "call_independence": {
+    "shared_graduated_modules": [],
+    "explanation": "Call 1 routes 28 graduated modules, Call 2 routes 3, and the two sets are DISJOINT (encoder_stack, mistral_model and decoder_head appear only in Call 2). 28 + 3 = 31 = every graduated module, each in exactly one call.",
+    "agent_assignment": "Because no graduated module is shared between the calls, and because Call 1's three sections (text / acoustic / vocode) also own disjoint stub sets, the build fans out to FOUR agents. Each owns one file under tt/ and one stub set; none may touch another's.",
+    "build_units": [
+      {"agent": 1, "module": "tt/text_stack.py", "owns": ["token_embed", "mistral_rotary_embedding", "mistral_r_m_s_norm", "attention", "mistral_attention", "mlp", "mistral_m_l_p", "layer", "mistral_decoder_layer"], "deliverable": "the composed, KV-cached 26-layer text decoder used by Call 1's prefill and decode stages"},
+      {"agent": 2, "module": "tt/acoustic_stage.py", "owns": ["flow_matching_audio_transformer", "acoustic_transformer_block", "bidirectional_attention", "feed_forward", "time_embedding"], "deliverable": "the flow-matching sampler: one frame of 37 codes from llm_hidden"},
+      {"agent": 3, "module": "tt/vocode_stage.py", "owns": ["voxtral_t_t_s_audio_tokenizer", "codec_transformer", "codec_transformer_block", "codec_attention", "causal_conv1d", "causal_conv_transpose1d", "parametrized_conv1d", "parametrized_conv_transpose1d", "weight_norm", "parametrization_list", "mistral_audio_codebook", "semantic_codebook", "acoustic_codebook", "multi_vocab_embeddings"], "deliverable": "codes -> waveform, plus the audio-token feedback embedding the decode loop needs"},
+      {"agent": 4, "module": "tt/continuation.py", "owns": ["encoder_stack", "mistral_model", "decoder_head"], "deliverable": "Call 2 end to end"}
     ],
-    "fix_rule": "Take the bound from the tensor itself (x.shape[0] / proj.shape[0]), NEVER a literal 1. A hardcoded 1 SILENTLY DROPS samples 2..32. Every edit must be ADDITIVE so the B=1 path stays byte-identical and the existing per-component PCC tests still pass -- re-run them as proof.",
-    "per_stage_ceiling_policy": "No ceiling is recorded up front. If a stage cannot hold 32 at once, first exhaust the mechanisms the pipeline already has (fixed-capacity C padding, splitting the decode-step batch into chunks fed to the same program). Only a ceiling that survives that may be written down, and it must carry the measurement that forced it and be RE-TESTED before the run ends. Every test must read the batch it drives from the pipeline object, never type a literal.",
-    "if_batch_is_impossible": "Report as a hole. Do NOT fake a batch axis."
+    "composition_owner": "the orchestrator writes tt/pipeline.py, tt/common.py, tt/golden.py, the demos, the e2e tests and the README; no agent writes those"
   },
-  "trace_contract": {
-    "pipeline_stages_derivation": "Source A config: architectures -> MistralForCausalLM, is_encoder_decoder=false, no sub-configs with their own stacks reachable => PIPELINE_STAGES = ['prefill', 'decode']. NO 'encode' (decoder-only). NO 'vocode': the checkpoint's audio_tokenizer/acoustic_transformer have no graduated TTNN stub, so there is no speech-output stage to expose -- recorded as a hole rather than stubbed.",
-    "PIPELINE_STAGES": [
-      "prefill",
-      "decode"
-    ],
-    "variable_dim": "sequence axis; bound = config.max_position_embeddings = 128000. Pinned to a fixed tile-aligned capacity C (default 128, env VOXTRAL_TRACE_C). Causality means right-padding leaves rows [0:real_len] bit-identical, and the padded positions are masked, so slicing [:real_len] recovers the unpadded answer.",
-    "per_stage_hooks": {
-      "prefill_trace_setup(inputs)": "Pre-upload, into PERSISTENT device buffers OUTSIDE the trace: the right-padded ids [B, C], RoPE cos/sin taken from the HF reference itself (hf.model.rotary_emb(x, position_ids)), and the causal mask taken from the HF reference itself (hf.model._update_causal_mask / create_causal_mask) so they match the golden exactly, extended to C with the pad columns masked.",
-      "prefill_trace_step()": "ONE host-op-free forward at [B, C]: reads ONLY the persistent buffers. No ttnn.from_torch, no ttnn.zeros/arange inside.",
-      "prefill_trace_inputs()": "ZERO-ARG. Returns exactly the value prefill_trace_setup takes, assembled from _captured/model/golden_cache_s0.pt (the real 64-token input_ids) tiled/extended to B=32 distinct rows plus the fixed extras. Model-specific assembly lives HERE behind the fixed name.",
-      "prefill_trace_items()": "B * C -- prefill's repeated blocks process every one of the C positions for all 32 samples. Stating 1 would price the arithmetic ceiling B*C times too small.",
-      "decode_trace_setup(inputs)": "Same persistent-buffer discipline, seeding the resident padded context at capacity C.",
-      "decode_trace_step()": "ONE host-op-free step at fixed C.",
-      "decode_trace_inputs()": "ZERO-ARG, same assembly seam.",
-      "decode_trace_items()": "B (32) -- one token retired per sample per step."
+
+  "batch": {
+    "B": 32,
+    "independence": "32 DISTINCT prompt texts, asserted pairwise distinct. They share only the weights and the frame-iteration count.",
+    "axis": "leading. Every tensor in the path carries it: input_ids [B,S], hidden [B,1,S,3072], KV cache [B, kv_heads, C, head_dim], llm_hidden [B,3072], x_t [B,36], codes [B,37,T], waveform [B,1,T*1920]. cfg_alpha is [B] in the reference already.",
+    "the_model_iteration": "The model's own forward loop repeats over AUDIO FRAMES (12.5 Hz). All 32 samples are stacked on the leading axis through it: ONE program per frame feeds all 32, and there is no python loop over samples anywhere in the hot path.",
+    "cfg_note": "The acoustic sampler's classifier-free guidance concatenates a zero-conditioned copy on the BATCH axis, giving 2B rows inside the velocity field. That is an internal doubling of the same leading axis, not a second batch dimension.",
+    "hardcoded_leading_1_audit": "REQUIRED. encoder_stack/mistral_model reshape to [1,1,seq,dim] and return [1,seq,dim] - a hardcoded 1 that would SILENTLY DROP samples 1..31. Every stub must take its leading bound from the tensor (x.shape[0]) and be re-verified with its own tests/pcc test after the change. Known-clean already: voxtral_t_t_s_audio_tokenizer and flow_matching_audio_transformer both read batch from the input shape.",
+    "gate_requirement": "The PCC gate feeds 32 distinct inputs and compares EACH sample to its OWN golden from the reference model. 32 identical outputs is a FAIL, asserted explicitly by a pairwise-distinctness check on the emitted waveforms.",
+    "per_stage_ceilings": "NONE recorded yet. If a stage cannot hold 32 at once, the pipeline's existing mechanisms must be exhausted first (the batch split already halves the widest bodies; the vocode stage can also stream the frame axis in chunks, and the text stack can chunk the sequence axis). Any ceiling that survives that must carry the measurement that forced it, must change what the pipeline DOES rather than what a test CLAIMS, must be read by the test from the pipeline rather than typed, and must be RE-MEASURED before the run is reported."
+  },
+
+  "decode_horizon": {
+    "rule": "STOP-TOKEN (priority 1). The acoustic transformer's semantic head predicts AudioSpecialTokens.end_audio, id 1. Decode stops when every batch row has emitted it.",
+    "id_source": "the reference's own AudioSpecialTokens enum, read via the loaded model (acoustic_transformer._end_audio_token_id), not a literal",
+    "safety_cap": "derived, never magic. gate cap = ceil(codec.frame_rate * VOXTRAL_GATE_SECONDS) with VOXTRAL_GATE_SECONDS default 2.0 -> 25 frames (2 s of audio at the model's own 12.5 Hz). demo cap = the pipeline's real ceiling, 256 frames = _MASK_MAX_SEQ(2048) / 8 upsampling = 20.5 s, from the codec stub's prebuilt ALiBi mask.",
+    "both_sides": "The TT decode and the HF golden run the IDENTICAL stop rule and the IDENTICAL cap, so the two sequences are compared over the same model-grounded length. The golden is never forced to a count the TT side invented.",
+    "trace_note": "Trace capture is unaffected: it runs at a FIXED capacity C. Variable-length decode must not make the traced shapes dynamic."
+  },
+
+  "golden_construction": {
+    "who": "tt/golden.py, imported only by tests/e2e/ and by the demo's --compare flag. NOT importable from the hot path.",
+    "what": "_hf_reference_text_to_speech(ref, input_ids, x0, cfg_alpha, max_frames) and _hf_reference_text_continuation(ref, input_ids, horizon) run the SAME authored chain on the reference's own torch submodules (ref.model.layers, ref.acoustic_transformer.*, ref.audio_tokenizer.*, ref.lm_head).",
+    "why_not_model_generate": "model.generate() on this checkpoint drives the TIED TEXT head, which is not the TTS task: it cannot emit audio codes at all. Source A ships no generation loop for the TTS chain (the serving loop lives in vllm-omni, which is not one of the two permitted sources). The golden therefore runs the reference's real submodules through the chain the checkpoint's own architecture dictates. Call 2's golden DOES use the plain causal-LM chain and is cross-checked against ref(input_ids).logits.",
+    "noise_injection": "decode_one_frame draws x_0 = torch.randn INSIDE the reference module, so its output is a function of the RNG and is not comparable. The noise is drawn ONCE on the host and handed to BOTH sides, which is what a flow-matching sampler takes as input. torch.randn is input preparation, not host compute - the same category as torch.arange.",
+    "faithfulness_proof": "REQUIRED, and it is a test: seed the RNG, call the UNMODIFIED ref.acoustic_transformer(llm_hidden, cfg_alpha) -> codes_A; re-seed identically, draw x_0 = torch.randn(B, 36) (the same first draw the module would make), feed it to the golden helper -> codes_B; assert codes_A == codes_B exactly. This proves the helper's Euler loop is the reference's, not a paraphrase of it.",
+    "no_injection_at_joints": "Every TT stage is fed the previous TT stage's real output. The golden is computed as a SEPARATE end-to-end torch run from the same tokenized text and the same x_0. No reference tensor is ever spliced into the TT chain - in particular the vocode stage decodes the TT chain's OWN codes, and the golden waveform comes from the reference chain's OWN codes, so a wiring bug anywhere upstream shows up as a waveform mismatch.",
+    "blindness_check": "A prior round of this model shipped an acoustic gate whose golden was built FROM the TT hidden state, which made it blind to the whole text stack. That is explicitly forbidden here and is guarded by asserting the code sequences match exactly: if TT and HF agree on all 37 x T x 32 integer codes, then the downstream waveform comparison is not hiding a text-stack error."
+  },
+
+  "pass_criteria": {
+    "gate_1_native": {
+      "definition": "Every routed graduated stub is still real ttnn - no torch fallback in any stub forward.",
+      "how_checked": "tests/e2e/test_gates.py re-runs Source B's own runtime native probe contract on each routed stub: import the stub module, assert its source contains no torch compute wrapper, and assert the live _stubs/<name>.py is byte-identical to its .last_good_native snapshot OR, where this run had to edit a stub, that the edited file still passes its own tests/pcc/test_<name>.py and contains zero torch compute calls in the returned closure. A sharded (TP>1) body would count as native and must not be rewritten to replication - none exists here (TP=1)."
     },
-    "ar_decode_contract": "decode_prefill(...) seeds the resident context; decode_step() reads it. HONEST LIMITATION to record in the README: the graduated stubs expose NO KV-cache surface (full-attention blocks only). 'decode' therefore seeds a resident padded context recomputed on-device at fixed C each step -- host-free and traceable, but not an incremental KV cache. There is no cross-attention (decoder-only), so no cross-attn KV to seed.",
-    "build_pipeline": {
-      "signature": "build_pipeline(device, model=None, layers=None, prefill_layers=None, decode_layers=None, **kwargs)",
-      "returns": "the resident pipeline OBJECT carrying PIPELINE_STAGES, the per-stage hooks, run_text_generation, run_hidden_states, trace_capture_selftest, host_op_selftest. It MUST NOT run anything.",
-      "kwargs": "accepts and ignores demo kwargs (text, prompt, language, ...) for call-signature compatibility; shapes come from the config, not a prompt.",
-      "layers_semantics": "layers caps the depth built for EVERY repeated stack. None = every layer (26). NEVER 0. Both stacks are capped: Call 1's composed stack AND Call 2's `model`-stub stack. Everything else (embedding, norms, rotary tables, lm_head) stays intact so a capped build still exercises every DISTINCT op the full model runs.",
-      "minimum_depth": "Call 1's stack must keep all four block kinds (decoder_layer, layer, split+mlp, split+m_l_p) or a graduated stub becomes structurally absent. So layers < 4 is clamped UP to 4 and the clamp is PRINTED. Call 2's stack has one block kind, minimum 1.",
-      "per_stack_overrides": "prefill_layers / decode_layers, named after the PIPELINE_STAGES entries that own a stack. Each falls back to `layers` when None. Voxtral-4B-TTS has ONE repeated text stack shared by prefill and decode, so if the two overrides disagree the build uses the max and PRINTS that it collapsed them; this is stated in the README so the single-number trap is visible rather than silent.",
-      "discoverability": "Each stack is held as a PLAIN PYTHON LIST of SAME-TYPED elements. Call 1's blocks differ in implementation, so all 26 are instances of ONE wrapper class (a common concrete type holding the graduated stub as `.impl`), not four different classes. The built object also keeps the HF reference reachable (`.reference_model`) -- it is ground truth for section structure (hf.model.layers == 26) and cheaper than any marker."
+    "gate_2_invoked": {
+      "definition": "All 31 graduated modules are actually INVOKED inside the real forward path, with their output feeding downstream computation on the way to the final task output.",
+      "how_checked": "An InvocationCounter wraps each built stub callable and counts real calls. The e2e tests run Call 1 and Call 2 and assert the union of counted names == the full 31-name set from bringup_status.json, every count >= 1. The 31-name set is READ FROM bringup_status.json at test time, not typed into the test, so a new graduated component cannot be silently omitted.",
+      "anti_shortcut": "There is no coverage_step / invoke_all_stubs / _touch_all_graduated function anywhere in the package. A test asserts by source scan that no such function exists."
     },
-    "trace_capture_selftest(device)": "For EACH stage in PIPELINE_STAGES: capture ONE step inside ttnn.begin_trace_capture/end_trace_capture, ttnn.execute_trace it, compare the traced output to the eager reference by PCC, then ttnn.release_trace BEFORE the next stage (stage traces must not co-reside). Returns True only if every stage captured host-free AND matched. trace_region_size is sized from the LARGEST stage (pinned C x layers); on overflow, shrink C and PRINT the fallback -- never silently drop.",
-    "host_op_selftest()": "AUTHORITATIVE fully-on-device check. Runs EACH task head's forward under scripts.tt_hw_planner.host_op_observer.observe_host_ops(). OUTSIDE the observed region: tokenization and the one-time weight build. INSIDE: the whole model math from encoded ids to output, including the embedding lookup and the argmax sampling. Returns host_op_observer.verdict(ops) per head; fails if ANY head fires host aten ops."
+    "gate_3_pcc": {
+      "definition": "The pipeline's FINAL output PCC vs the HF golden is >= 0.99, for ALL 32 samples, on both calls.",
+      "call_1_final_output": "the 24 kHz waveform [32, 1, T*1920]. FINAL_PCC = min over the 32 samples of PCC(tt_waveform[i], hf_waveform[i]).",
+      "call_2_final_output": "the greedy continuation. FINAL_PCC = min over 32 samples of PCC(tt_step_logits[i], hf_step_logits[i]), with an exact match assertion on the token ids.",
+      "always_printed": "print(f\"e2e PCC={achieved_pcc}\") on its own line immediately BEFORE the final assert, on EVERY run, pass or fail.",
+      "also_reported_every_run": ["per-stage PCC (prefill hidden, per-frame llm_hidden, per-step velocity, semantic logits, waveform)", "semantic code match rate", "acoustic code match rate", "frames decoded and why decoding stopped", "the batch actually driven, read from the pipeline"],
+      "discretization_risk": "The chain passes through TWO argmax/round quantizations per frame (semantic argmax over 8194 logits; acoustic round onto 21 levels). A single flipped code makes that frame's audio diverge and collapses the waveform PCC. The mitigation is numeric, not a weaker gate: fp32 activations on the residual stream with bfloat16 weights (already what the stubs do), HiFi4 with fp32_dest_acc_en, and bfloat16 only where SDPA forces it. If codes still diverge, the fix is the fidelity ladder - NOT teacher-forcing the codes from the reference, which is forbidden."
+    }
   },
-  "strict_tt_only_contract": {
-    "forbidden_in_hot_path": "No model.generate / hf_model.<submodule>(...) / monkey-patched HF forwards; no torch compute wrappers (matmul, softmax, layer_norm, embedding, sdpa, argmax, topk, F.*). Shape/dtype prep (torch.zeros/tensor/arange/cat/reshape/no_grad/.to) is allowed.",
-    "allowed_hf": [
-      "hf_model.config.* / hf_model.generation_config.* attribute reads",
-      "weight extraction at build time (hf_model.<X>.<Y>.weight)",
-      "HF calls inside _hf_reference_text_generation() / _hf_reference_hidden_states() -- the GOLDEN helpers only",
-      "HF calls inside <stage>_trace_setup(inputs) to seed fixed-value persistent buffers before capture"
-    ],
-    "sampling": "argmax runs on device via ttnn.argmax. Per the TTNN recipe, ttnn.argmax on a TILE tensor collapses to 1 core -- convert to ROW_MAJOR first.",
-    "no_coverage_sweep": "There is no coverage_step/invoke_all_stubs helper anywhere. Gate 2 is proved by instrumenting each graduated stub's __call__ with an invocation counter and asserting the counts match the wiring the plan declares, while the stub's output is in the real data path."
-  },
-  "package_layout": {
-    "models/demos/voxtral_4b_tts_2603/tt/common.py": "SHARED, written first (no agent dependency): reference-model loader wrapper, tekken->tiktoken tokenizer, the 32-distinct-prompt batch builder, PCC helper, stub importer (re-exports models.tt_transformers.demo.voxtral_4b_tts_2603._stubs.*), and the InvocationCounter used for Gate 2.",
-    "models/demos/voxtral_4b_tts_2603/tt/generation.py": "Call 1's composed stack + run_text_generation(). Owned by agent A.",
-    "models/demos/voxtral_4b_tts_2603/tt/hidden_states.py": "Call 2's model-stub wrapper + run_hidden_states(). Owned by agent B.",
-    "models/demos/voxtral_4b_tts_2603/tt/pipeline.py": "THE single shared pipeline object: PIPELINE_STAGES, build_pipeline(), the per-stage trace hooks, trace_capture_selftest, host_op_selftest. Composes generation.py + hidden_states.py. Owned by the orchestrator.",
-    "models/demos/voxtral_4b_tts_2603/demo/demo_text_generation.py": "python -m models.demos.voxtral_4b_tts_2603.demo.demo_text_generation -- argparse + __main__, builds through build_pipeline, prints generated text for 32 samples.",
-    "models/demos/voxtral_4b_tts_2603/demo/demo_hidden_states.py": "python -m models.demos.voxtral_4b_tts_2603.demo.demo_hidden_states -- argparse + __main__, builds through build_pipeline, prints hidden-state summary for 32 samples.",
-    "models/demos/voxtral_4b_tts_2603/tests/e2e/test_e2e_text_generation.py": "Gate 1/2/3 for Call 1.",
-    "models/demos/voxtral_4b_tts_2603/tests/e2e/test_e2e_hidden_states.py": "Gate 1/2/3 for Call 2.",
-    "models/demos/voxtral_4b_tts_2603/tests/e2e/test_trace_and_host_ops.py": "Command 3: trace_capture_selftest + host_op_selftest + the layers-knob proof (cap the depth, re-measure the op/invocation count, assert it moved -- an inert knob is a defect).",
-    "models/demos/voxtral_4b_tts_2603/README.md": "What each Call does, how to run it, the achieved PCC numbers, the batch actually driven, the recorded ceilings (if any) with their measurements, and the holes (no audio head, no KV cache).",
-    "shared_pipeline_rule": "The demo and the e2e test for a Call import and call the SAME function in tt/. There is exactly one copy of the wiring. A green test must therefore guarantee a working demo."
-  },
-  "gates": {
-    "gate_1_native": "Every routed graduated stub is still real ttnn, not a torch fallback. Proof: assert every block in the stack is an instance of the graduated stub class and that its outputs are ttnn.Tensor; plus re-run _stubs/*.native_probe (torch_ops must stay 0) after any stub edit. TP=1 here, so there is no sharded body to preserve.",
-    "gate_2_invoked": "All 10 graduated modules are INVOKED inside the real forward. Expected counts for one Call-1 forward at 26 layers, recomputed from the routing (index 0 -> decoder_layer, index 1 -> layer, indices 2/3 -> split blocks, indices 4..25 -> decoder_layer, so decoder_layer is 1 + 22 = 23): token_embed x1, rotary_embedding x1, decoder_layer x23, layer x1, attention x2, r_m_s_norm x(2*2 + 1 final)=5, mlp x1, m_l_p x1, decoder_head x1. CORRECTION: plan_version 1 wrote 23 as 24; that was an arithmetic slip, caught by recomputing the count from the wiring in tt/generation.py::expected_invocation_counts, which is the single source of truth the Gate-2 test reads. For one Call-2 forward: model x1. Union over the two Calls = 10/10. Asserted from the counters, with the stubs' outputs in the data path.",
-    "gate_3_pcc": "Call 1 e2e PCC >= 0.99 and Call 2 e2e PCC >= 0.99, both vs the HF golden, both over all 32 samples. Printed on every run before the assert."
-  },
+
+  "validation_metric": "PCC (Pearson correlation of flattened tensors) per sample, plus exact integer equality on the generated discrete sequences. Threshold 0.99 on the final output of each call.",
+
+  "behavioral_proof": [
+    "demo/demo_text_to_speech.py writes 32 real WAV files at 24 kHz whose length equals frames_decoded * 1920 samples, and prints the duration in seconds = frames / 12.5 - the model's own frame rate.",
+    "The waveform is asserted to be in the audio range and NOT constant, and the 32 outputs are asserted pairwise distinct (a pipeline that shape-supports B but emits 32 identical outputs is wrong).",
+    "demo/demo_text_continuation.py prints the detokenized continuation per sample alongside the reference's, so the parity is visible and not only numeric.",
+    "Both demos call the SAME tt/pipeline.py function the e2e tests call, so a green test guarantees a working demo."
+  ],
+
   "self_validation_plan": [
-    "S0  Re-run the Source-B per-component PCC tests for every stub touched by the B=32 generalization; they must still pass at their original PCC. This is what proves the edits were additive.",
-    "S1  Shape sanity off device: assert the batch builder returns 32 DISTINCT token-id rows of equal length, and that HF's goldens for those rows are pairwise different.",
-    "S2  Gate 1 on device: every routed block is the graduated class; every intermediate is a ttnn.Tensor; native_probe torch_ops still 0.",
-    "S3  Gate 2 on device: invocation counters equal the counts declared above; additionally assert that zeroing any one stub's contribution changes the final output (spot-checked on the split blocks) so 'invoked' means 'load-bearing'.",
-    "S4  Gate 3 Call 2 first (single forward, cheapest): PCC per sample vs HF, min >= 0.99, printed.",
-    "S5  Gate 3 Call 1: prefill hidden + logits PCC per sample; then the teacher-forced decode loop to horizon H, per-step logits PCC, min >= 0.99, printed.",
-    "S6  Behavioral proof for Call 1: free-running self-cascade ids + detokenized text vs HF's, with every disagreement scored by HF's own probability ratio >= 0.5.",
-    "S7  Batch-drop guard: assert the 32 TT outputs are pairwise distinct (catches a silently dropped sample 2..32).",
-    "S8  Both demos run end to end as `python -m ...` and print real output.",
-    "S9  Command 3: trace_capture_selftest(device) True for BOTH stages (captured, executed, released, PCC matched); host_op_selftest() verdict clean for BOTH heads.",
-    "S10 layers-knob proof: build at layers=None and at layers=4, assert the per-stub invocation counts actually drop (a knob the builder ignores is INERT and is a defect); assert layers=2 is clamped up to 4 with a printed message and the pipeline still runs.",
-    "S11 Re-test every recorded ceiling before finishing; drop any that no longer reproduces."
+    "0. Source B integrity: for all 31 components assert live stub + native snapshot exist and the stub imports; byte-compare the 4 alias pairs and record them. Fail loudly if the set has changed.",
+    "1. Per-stub sanity on device: build each of the 31 stubs and run it once against its _captured golden (or golden_cache_s0.pt where that is all there is), asserting the bring-up PCC still reproduces. This catches a stub broken by the batch-axis audit before the chain is blamed.",
+    "2. Golden faithfulness: the codes_A == codes_B seeded-RNG proof for the acoustic sampler, and PCC(golden_call_2_logits, ref(input_ids).logits) == 1.0 for the continuation golden.",
+    "3. Stage-by-stage PCC at B=32, each stage fed the PREVIOUS TT stage's real output and compared against the reference stage fed the reference's own upstream output. Reported for every stage on every run.",
+    "4. Gate 1, Gate 2, Gate 3 as defined above.",
+    "5. Batch honesty: 32 distinct inputs, 32 distinct outputs, each compared to its own golden; every test states the batch it drives by READING it from the pipeline.",
+    "6. Trace contract: trace_capture_selftest(device) captures, replays and releases each stage in turn and PCC-checks each replay.",
+    "7. Fully-on-device: host_op_selftest() returns host_op_observer.verdict(ops) with ZERO host aten ops inside the observed region, for BOTH task heads.",
+    "8. Re-measure every recorded ceiling before reporting, and drop any that no longer reproduces."
   ],
-  "risks": [
-    {
-      "risk": "logits PCC is lower than hidden PCC because the tied lm_head amplifies residual error over 131072 columns",
-      "mitigation": "Run the composed stack with fp32 activations against bf16 weights (the setting that took the 26-layer stack from 0.986 to 0.9996) and keep ttnn.softmax on an explicit HiFi4 + fp32_dest_acc config -- without it the default low-fidelity softmax kernel alone cost a third of the accumulated error."
+
+  "trace_contract": {
+    "PIPELINE_STAGES": ["prefill", "decode", "acoustic", "vocode"],
+    "derivation": "Source A's reference is a MistralForCausalLM subclass with is_encoder_decoder=False, which gives [prefill, decode]; the model card's pipeline_tag is text-to-speech, which adds [vocode]. 'acoustic' is the fourth because params.json carries multimodal.audio_model_args.acoustic_transformer_args as its OWN sub-config with its OWN 3-block repeated stack - without it there would be nowhere to put that stack's depth knob, and one number cannot describe a three-section model.",
+    "variable_dim": "the sequence axis in every case. Bound = config.max_position_embeddings = 128000, far past any trace region, so each stage pins it to a fixed capacity C.",
+    "capacities": {"prefill": "C_seq = 64 (tile-aligned, covers the 32-token prompts)", "decode": "1 new token against a KV cache of capacity C_kv = 64 + max_frames", "acoustic": "3 real tokens padded to one 32-row tile, fixed", "vocode": "C_frames = 32 input frames -> 256 output frames, inside the codec stub's 2048-row ALiBi mask"},
+    "per_stage_hooks": ["<stage>_trace_setup(inputs)", "<stage>_trace_step()", "<stage>_trace_inputs()", "<stage>_trace_items()"],
+    "trace_setup_rules": "Pin the variable dim to C and PRE-UPLOAD the padded input plus every shape-dependent constant into PERSISTENT device buffers OUTSIDE the trace. Constant VALUES come from the HF reference itself: cos/sin from ref.model.rotary_emb, the additive causal mask from the reference's mask builder, the KV pad at kv_heads x head_dim, the codec ALiBi window masks from each group's own alibi_slopes, and the acoustic 3-of-32 column mask. Padded positions are masked so the output on [0:real_len] is unchanged.",
+    "trace_step_rules": "ONE host-op-free forward at the fixed shape reading ONLY those persistent buffers. NO from_torch and NO per-call ttnn.zeros/arange inside the trace. KNOWN FIX: flow_matching_audio_transformer's forward calls ttnn.zeros for the 29-row tile pad on every call - that must be hoisted to build time into a persistent buffer before the acoustic stage can be captured.",
+    "trace_inputs_rules": "ZERO-ARG, returns exactly the argument <stage>_trace_setup takes, assembled from the captured reference tensors under _captured/<name>/ - the same goldens the e2e test and demo use. This is the standard model-agnostic seam; the model-specific assembly lives behind this fixed name. It MUST exist for every stage.",
+    "trace_items": {
+      "prefill": "B * C_seq - the 26 blocks process every prompt token of every sample (32 * 64 = 2048)",
+      "decode": "B - one token per sample per step (32)",
+      "acoustic": "n_decoding_steps * 2 * B * 3 = 7 * 2 * 32 * 3 = 1344 - one _trace_step is one FULL frame, and the 3 acoustic blocks see 3 token rows per CFG-doubled batch per Euler step. Priced at 1 item this stage would be given a compute roof ~1344x too small and then misreported as memory-bound.",
+      "vocode": "B * C_frames * 8 = 32 * 32 * 8 = 8192 - the frame count at the decoder's OUTPUT rate. The four transformer groups process C, 2C, 4C and 8C frames respectively (the three transposed convolutions each double the rate), and 8C is what the last group and the output projection retire. Counting the 32 INPUT frames would undercount the repeated blocks by ~3.75x."
     },
-    {
-      "risk": "B=32 with no KV cache makes the decode loop slow (each step is a full forward at the grown length)",
-      "mitigation": "Short prompts (S=32 real tokens) and H=16; HF's side uses its own KV cache so the golden is cheap. If it is still slow, reduce H via VOXTRAL_E2E_HORIZON and say so in the README."
-    },
-    {
-      "risk": "Both heads resident at once exceed the 29.2 GB budget",
-      "mitigation": "Budgeted at ~14.6 GB of weights; the two e2e tests run in separate processes/devices anyway. If a combined build ever overflows, build the second head lazily and record the measurement."
-    },
-    {
-      "risk": "ttnn.argmax on TILE layout collapses to a single core",
-      "mitigation": "Convert to ROW_MAJOR before ttnn.argmax."
-    },
-    {
-      "risk": "Gating on coherent generated English",
-      "mitigation": "FORBIDDEN. This checkpoint's tied text head is effectively untrained (entropy 11.417 vs 11.784 uniform); gate on PCC against HF, never on coherence."
-    }
-  ],
+    "ar_decode_contract": "decode_prefill(inputs) seeds the resident self-attention KV cache for the whole prompt (there is no cross-attention: the model is decoder-only). decode_step() reads that cache, appends one slot, and NEVER recomputes the prefix.",
+    "trace_region_size": "sized from the LARGEST stage, which is prefill at C_seq x 26 layers. If a capture overflows, C is shrunk and the fallback is PRINTED - never silently dropped.",
+    "selftest": "trace_capture_selftest(device): for EACH stage, capture ONE step between ttnn.begin_trace_capture / end_trace_capture, execute_trace it, PCC-check the replay against the reference, then RELEASE the trace before the next stage. Stage traces must not co-reside. Returns True only if every stage captured host-free AND matched.",
+    "host_op_selftest": "host_op_selftest() runs both task heads' forwards under scripts.tt_hw_planner.host_op_observer.observe_host_ops(), with tokenization and the one-time weight build OUTSIDE the observed region and all model math (encoded inputs -> waveform / token ids, including the prefix embedding and the on-device argmax) INSIDE it. Returns host_op_observer.verdict(ops). Fails if EITHER head fires a host aten op."
+  },
+
+  "layers_knobs": {
+    "factory": "build_pipeline(device, model=None, layers=None, heads=None, **kwargs) is MODULE-LEVEL in tt/pipeline.py and CONSTRUCTS AND RETURNS the resident pipeline object carrying PIPELINE_STAGES and the per-stage hooks. It never runs the model. It accepts and ignores demo kwargs (text, voice, prompt, language, ...) for call-signature compatibility; the resident build derives its shapes from the config, not a prompt.",
+    "layers": "the DEFAULT depth for EVERY repeated block. None means every layer - never 0, which a builder would read as a zero-layer model.",
+    "per_stack_overrides": ["prefill_layers", "decode_layers", "acoustic_layers", "vocode_layers"],
+    "stacks": [
+      {"stage_owners": ["prefill", "decode"], "path": "hf.model.layers", "full_depth": 26, "min_depth": 4, "min_reason": "the 4 interchangeable block kinds must all stay present, and the structural stack walk needs >= 3 same-typed members", "note": "prefill and decode SHARE this one stack (same weights, two phases). Both override names are accepted; the depth is the first non-None of (decode_layers, prefill_layers, layers), and setting both to different values is an ERROR rather than a silent last-wins."},
+      {"stage_owners": ["acoustic"], "path": "hf.acoustic_transformer.layers", "full_depth": 3, "min_depth": 3, "min_reason": "3 is already the full depth and is also the structural-walk floor"},
+      {"stage_owners": ["vocode"], "path": "hf.audio_tokenizer.decoder_blocks[*].layers", "full_depth": 8, "min_depth": 4, "min_reason": "the cap applies to blocks-per-group, floored at 1; all FOUR groups must survive because each carries a different sliding window (2/4/8/16), so capping to 1 per group leaves 4 blocks - which is also above the >= 3 walk floor"}
+    ],
+    "why_one_knob_per_stack": "optimize sizes a coverage depth PER STACK - the smallest window in which every distinct op of that stack appears - and those numbers differ. With a single parameter the tool collapses them to the max and every section is profiled at the deepest one. This model is the worked case: a 26-layer text decoder, a 3-block acoustic stack and an 8-block codec stack, and a lone `layers` between them capped the text path while leaving the audio sections at full depth.",
+    "a_capped_build_is_still_a_model": "Capping caps how many times a repeated block runs. Embeddings, norms, projectors, the LM head, the codebooks, the convolutions and the de-patch all stay intact, so a capped build still exercises every DISTINCT op the full model runs. If a cap would leave an aggregate sub-block holding zero layers, the build caps to the smallest depth that keeps every stage runnable and PRINTS that it did.",
+    "discoverability": "Every repeated stack is held as a plain Python LIST of SAME-TYPED elements. The four text block kinds are different closures, so they are wrapped in a COMMON BASE class (one class, a kind tag, one __call__) and the list elements share a type. The object build_pipeline returns exposes .reference_model, so the HF reference stays reachable as ground truth for how many sections the model has and how deep each is. No base class is required by the walk - it reads any same-typed object with __dict__ - so no __slots__ anywhere on the block classes.",
+    "proving_the_knob_works": "optimize caps and re-measures the work signal and reports the knob INERT if the op count does not move. A test in tests/e2e/ builds at layers=4 and at full depth and asserts the built per-stack depths differ as requested, so an ignored cap fails here rather than silently downstream."
+  },
+
+  "package_layout": {
+    "root": "models/demos/voxtral_4b_tts_2603",
+    "demo/": ["demo.py (dispatcher)", "demo_text_to_speech.py (Call 1)", "demo_text_continuation.py (Call 2)"],
+    "tt/": ["pipeline.py (THE one shared chained pipeline + build_pipeline + PIPELINE_STAGES + trace/host selftests)", "common.py (tokenizer, 32-prompt input builder, reference loader bridge, InvocationCounter, stub import/build)", "text_stack.py", "acoustic_stage.py", "vocode_stage.py", "continuation.py", "golden.py (HF reference chains - imported by tests and the demo's --compare only)", "kernels/ (the custom C++ kernels carried over from the previous round)"],
+    "tests/e2e/": ["test_e2e_text_to_speech.py", "test_e2e_text_continuation.py", "test_gates.py (Gate 1 + Gate 2 + anti-shortcut scan + layers-knob proof)", "test_trace_and_host_ops.py (trace_capture_selftest + host_op_selftest)"],
+    "README.md": "what each Call does, how to run it, the measured PCC numbers, the recorded holes",
+    "one_pipeline_rule": "The chained forward pass lives ONLY in tt/. Both the demo entrypoints and the e2e tests import and call the same functions. No wiring is duplicated in demo/ - a second copy would drift from the test and ship a broken demo behind a green test.",
+    "retired": "The previous round's tt/{acoustic,generation,hidden_states}.py and their heads are retired: they import stub names (model, decoder_layer, r_m_s_norm, rotary_embedding, m_l_p) that no longer exist in Source B, and tt/acoustic.py ported the acoustic transformer as causal RoPE MistralDecoderLayers, which Source B's own bidirectional_attention stub shows is wrong on both counts (it is bidirectional and RoPE-free). tt/fast_ops.py's overrides are re-evaluated against the new stubs rather than carried over blind."
+  },
+
   "holes": [
     {
-      "hole": "encoder_stack is not graduated and is not routed",
-      "detail": "harness_skipped.json lists it, skip_diagnosis.json gives verdict `manual`, and it has no .last_good_native snapshot. It is a generic role the plan auto-derived from the sibling VLM (Mistral-Small-3.1's vision encoder); Voxtral-4B-TTS is decoder-only, so none of the candidate submodule paths resolve. Routing it would be fabricating work."
+      "what": "Voice conditioning",
+      "detail": "The model card advertises 20 preset voices and tekken.json's audio.voice_num_audio_tokens gives each voice's audio-token count (132-218 frames), but the voice prompts themselves are AUDIO CODES that this repo does not ship, and the checkpoint ships no codec ENCODER to derive them from a waveform. Neither Source A nor Source B contains them.",
+      "consequence": "The pipeline builds the prompt as [bos] + tekken_encode(text) + [begin_audio_token_id] with no voice prefix. The demos accept --voice for interface parity and print that it is unconditioned.",
+      "effect_on_the_gate": "NONE. TT and HF are fed the identical constructed prompt, so the PCC comparison is unaffected."
     },
     {
-      "hole": "audio_tokenizer.decoder_blocks (8 blocks) is not ported, so there is no waveform and no `vocode` stage",
-      "detail": "A weight-normed causal-conv + sliding-window-attention vocoder with layer scale and QK norm (conv_weight_norm, attn_sliding_window_size 16, layer_scale_init 0.01, decoder_convs_strides_str \"1,2,2,2\"). No transformers class matches it and the checkpoint ships no reference, so there is nothing to gate a port against. This is the ONE declared section the structural walk still cannot see, and it is recorded rather than faked."
+      "what": "Codec encoder / waveform -> codes",
+      "detail": "The OSS checkpoint ships no input_proj.* or encoder_blocks.* tensors. encode_waveforms raises in the reference itself.",
+      "consequence": "There is no audio-input task head. text-to-speech is the model's advertised task and is fully covered."
     },
     {
-      "hole": "the acoustic_transformer's flow-matching projections are not driven",
-      "detail": "input_projection / time_projection / acoustic_codebook_output - see task_heads[2].not_driven."
-    },
-    {
-      "hole": "no incremental KV cache",
-      "detail": "The graduated blocks are full-attention with no cache surface, so the decode stage recomputes a resident context at fixed capacity C each step. That is host-free and traceable - the token feed itself is on device (ttnn.argmax result concatenated straight back onto the resident context by generation.append_token, never rebuilt on the host) - but it is not an incremental cache, and there is no cross-attention KV to seed (the model is decoder-only)."
+      "what": "The serving prompt template and the interleaved text/audio segmentation",
+      "detail": "params.json carries codebook_pattern 'parallel' and interleave_{audio,text}_tokens_per_segment 8192, but the loop that applies them lives in vllm-omni, which is not one of the two permitted sources. With both limits at 8192 a short utterance is a single audio segment, so the single-segment chain the pipeline implements is the applicable case.",
+      "consequence": "Recorded here rather than papered over. A long-form multi-segment chain is out of scope for this run."
     }
-  ],
-  "results": {
-    "status": "COMPLETE - Gates 1/2/3 pass for both Calls, and the Command-3 trace contract is green.",
-    "measured_on": "QB2, 1 x Blackhole, device 0 / device 1, 2026-09-19",
-    "call_1_text_generation": {
-      "READY": true,
-      "FINAL_PCC": 0.9988631485049634,
-      "metric": "min over 32 samples x 16 decode steps of PCC(TT next-token logits, HF next-token logits), teacher-forced on HF's own greedy prefix",
-      "batch_driven": 32,
-      "prompt_len": 32,
-      "horizon": 16,
-      "horizon_provenance": "fallback (no usable stop length in config/generation_config)",
-      "prefill_hidden_pcc_per_sample": [
-        0.99998,
-        0.999997
-      ],
-      "prefill_logits_pcc_per_sample": [
-        0.999967,
-        0.999999
-      ],
-      "per_step_logits_pcc": [
-        0.998863,
-        0.999999
-      ],
-      "token_agreement_teacher_forced": "487/512 = 0.9512",
-      "disagreements_that_are_hf_near_ties": "25/25 at ratio >= 0.5, worst 0.8846",
-      "free_running_match_vs_hf": "444/512 (behavioral evidence, NOT a gate)",
-      "batch_drop_guard": "32/32 distinct prefill hidden, 32/32 distinct logit rows",
-      "tests": "models/demos/voxtral_4b_tts_2603/tests/e2e/test_e2e_text_generation.py - 6 passed"
-    },
-    "call_2_hidden_states": {
-      "READY": true,
-      "FINAL_PCC": 0.9999818067958669,
-      "metric": "min over 32 samples of PCC(TT last_hidden_state, HF last_hidden_state)",
-      "batch_driven": 32,
-      "seq_len": 32,
-      "per_sample_pcc_spread": [
-        0.999982,
-        0.999997
-      ],
-      "vs_source_b_captured_golden": 0.9998978992397038,
-      "batch_drop_guard": "TT min max|diff| 4.705, HF 4.631 over all pairs",
-      "tests": "models/demos/voxtral_4b_tts_2603/tests/e2e/test_e2e_hidden_states.py - 8 passed"
-    },
-    "gate_1": "PASS. Every routed block is an instance of the class from its OWN _stubs/<name>.py module; all intermediates are ttnn.Tensor; native_probe torch_ops still 0 for every edited stub, with ttnn_dispatch unchanged from the pre-edit values.",
-    "gate_2": {
-      "PASS": true,
-      "counts_one_call_1_forward_at_26_layers": {
-        "token_embed": 1,
-        "rotary_embedding": 1,
-        "decoder_layer": 23,
-        "layer": 1,
-        "attention": 2,
-        "r_m_s_norm": 5,
-        "mlp": 1,
-        "m_l_p": 1,
-        "decoder_head": 1
-      },
-      "counts_one_call_2_forward": {
-        "model": 1
-      },
-      "union": "10/10 graduated modules invoked",
-      "load_bearing_spot_check": "halving block 2's feed-forward moved the final logits: max|delta| 2.58, PCC vs baseline 0.9177",
-      "no_coverage_sweep": "scanned the package and _stubs for coverage_step / invoke_all_stubs / _touch_all_graduated: 0 found"
-    },
-    "gate_3": "PASS. Both Calls print `e2e PCC=<value>` on its own line immediately before the final assert, on pass and on fail.",
-    "command_3_trace_contract": {
-      "PIPELINE_STAGES": [
-        "prefill",
-        "decode"
-      ],
-      "pinned_capacity_C": 64,
-      "trace_region_size_bytes": 209715200,
-      "capacity_fallback_needed": false,
-      "trace_capture_selftest": true,
-      "traced_vs_eager_pcc": {
-        "prefill.hidden": 1.0,
-        "prefill.logits": 1.0,
-        "decode.token": 1.0
-      },
-      "trace_items": {
-        "prefill": "B*C = 32*64 = 2048",
-        "decode": "B = 32"
-      },
-      "host_op_selftest": {
-        "text_generation": {
-          "on_device": true,
-          "n_host_ops": 0
-        },
-        "hidden_states": {
-          "on_device": true,
-          "n_host_ops": 0
-        }
-      },
-      "layers_knob_proof": "layers=None -> depth 26, decoder_layer invoked 23x; layers=4 -> depth 4, invoked 1x; layers=2 clamps up to 4 with a printed message and all four block kinds still present; layers=0 raises. The knob is NOT inert.",
-      "tests": "models/demos/voxtral_4b_tts_2603/tests/e2e/test_trace_and_host_ops.py - 10 passed"
-    },
-    "batch_ceilings_recorded": "NONE. Batch 32 ran at full 26-layer depth on both heads, with both heads resident on one chip at C=64. No stage failed to hold 32, so there is no ceiling to record and none to re-test.",
-    "plan_corrections": [
-      "task_heads[0] / gates.gate_2 said decoder_layer x24; the routing the plan itself declares (index 0, then indices 4..25) is 1 + 22 = 23. Corrected in plan_version 2; tt/generation.py::expected_invocation_counts is the single source of truth the Gate-2 test reads."
-    ]
-  },
-  "revised": "2026-09-20"
+  ]
 }

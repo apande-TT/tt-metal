@@ -1,0 +1,553 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""The composed, KV-cached 26-layer Voxtral-4B-TTS-2603 text decoder, batched at B=32.
+
+Built from NINE graduated stubs and nothing else: `token_embed`, `mistral_rotary_embedding`,
+`mistral_r_m_s_norm`, `attention`, `mistral_attention`, `mlp`, `mistral_m_l_p`, `layer` and
+`mistral_decoder_layer`.
+
+ROUTING -- WHY FOUR BLOCK KINDS
+`common.alias_pairs()` detects three of those nine as byte-identical twins of three others
+(`attention`/`mistral_attention`, `mlp`/`mistral_m_l_p`, `layer`/`mistral_decoder_layer`): the
+same graduated work product recorded twice, once under the sibling-registry tag and once under the
+model's own class name. Because they are identical, WHICH member runs a given layer cannot change
+the numerics -- so nothing is gained by calling both at one position and nothing is lost by
+splitting them. The 26 layers are therefore built from FOUR interchangeable kinds, assigned BY
+LAYER INDEX (`i % 4`):
+
+    kind 0  `layer`                    -- the fused decoder-layer stub
+    kind 1  `mistral_decoder_layer`    -- its twin, the other fused stub
+    kind 2  `mistral_r_m_s_norm` -> `attention`          -> + -> `mistral_r_m_s_norm` -> `mlp`  -> +
+    kind 3  `mistral_r_m_s_norm` -> `mistral_attention`  -> + -> `mistral_r_m_s_norm` -> `mistral_m_l_p` -> +
+
+Every layer is computed exactly ONCE, and all nine stubs sit in the real forward path with their
+output feeding the next layer. There is no coverage sweep anywhere in this file.
+
+SAME-TYPED BLOCKS
+`blocks` is a plain Python list whose elements are all the SAME type (`TextBlock`), because the
+structural stack walk that finds a repeated stack identifies it that way. The four kinds are four
+different sets of closures, so they are carried by one class with a `kind` tag and one `__call__`
+rather than by four subclasses -- four subclasses would make the list heterogeneous and hide the
+stack from the walk. No `__slots__` anywhere: the walk reads `__dict__`.
+
+NUMERICS
+float32 ACTIVATIONS with bfloat16 weights. All-bfloat16 puts this 26-layer stack at PCC 0.9798 --
+about 0.4% per residual add over 52 of them. The PREFILL narrows q/k/v to bfloat16 because SDPA
+takes nothing wider (`sdpa_device_operation.cpp:43`); the DECODE branch does not call SDPA at all
+and stays float32 end to end.
+
+THE KV CACHE
+Prefill runs the graduated `is_causal=True` body unchanged and SEEDS each layer's cache from its
+own post-RoPE k/v -- the cache is that tensor with a zero tail concatenated onto the sequence
+axis, so there is no copy and no second source of truth. `decode_step` then appends ONE slot with
+`paged_update_cache` and attends over the resident history with an EXPLICIT masked
+matmul/softmax/matmul rather than `scaled_dot_product_attention_decode`, whose output measured
+systematically short of the reference's (norm ratio 0.948 at PCC 0.9999). The zero tail past the
+current position is masked from a staged `[C, C]` table; a zero key scores ZERO, which is an
+ordinary logit rather than a negligible one. Passing no
+cache leaves the prefill arithmetic bit-for-bit what the per-component PCC tests graduated on.
+
+This module NEVER opens a device.
+"""
+from __future__ import annotations
+
+import torch
+
+import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import common
+
+# The four interchangeable block kinds, in the order `i % 4` assigns them.
+BLOCK_KINDS = ("layer", "mistral_decoder_layer", "composed", "mistral_composed")
+
+# The floor the depth knob clamps UP to: all four kinds must survive a capped build, and the
+# structural stack walk needs >= 3 same-typed members to recognise a stack at all.
+MIN_LAYERS = 4
+
+# Default resident capacity C for the sequence axis of the KV cache: the prefill's 64 plus 64
+# decode slots. `kv_capacity=` overrides it.
+DEFAULT_PREFILL_CAPACITY = 64
+DEFAULT_DECODE_HEADROOM = 64
+
+# The nine stubs this module owns, as the section's own contract.
+OWNED_STUBS = (
+    "token_embed",
+    "mistral_rotary_embedding",
+    "mistral_r_m_s_norm",
+    "attention",
+    "mistral_attention",
+    "mlp",
+    "mistral_m_l_p",
+    "layer",
+    "mistral_decoder_layer",
+)
+
+
+def _tile_ceil(value: int) -> int:
+    return -(-int(value) // ttnn.TILE_SIZE) * ttnn.TILE_SIZE
+
+
+def decode_shard(device, rows: int, width: int):
+    """HEIGHT-sharded over the batch, one user per core -- the decode op set's layout.
+
+    Duplicated from the stubs on purpose: the stubs are the graduated work product and must stay
+    importable on their own, and this module needs the same layout for the `(cos, sin)` it stages.
+    """
+    grid = device.compute_with_storage_grid_size()
+    cols = min(int(grid.x), int(rows))
+    while rows % cols:
+        cols -= 1
+    return ttnn.create_sharded_memory_config(
+        shape=(ttnn.TILE_SIZE, int(width)),
+        core_grid=ttnn.CoreGrid(y=rows // cols, x=cols),
+        strategy=ttnn.ShardStrategy.HEIGHT,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+
+
+class TextBlock:
+    """ONE decoder layer, in whichever of the four interchangeable kinds built it.
+
+    A single class, a `kind` tag and one `__call__`. The four kinds differ only in which graduated
+    stubs they call, and every element of `TextStack.blocks` is an instance of THIS class so the
+    list stays same-typed for a structural walk. A plain class -- no `__slots__`, because the walk
+    reads `__dict__`.
+    """
+
+    def __init__(self, kind: str, index: int, parts: dict, stubs=()):
+        if kind not in BLOCK_KINDS:
+            raise ValueError(f"unknown block kind {kind!r}; expected one of {BLOCK_KINDS}")
+        self.kind = kind
+        self.index = index
+        self.parts = dict(parts)
+        # Which graduated stubs this block routes. Held beside `parts` rather than inside it, so
+        # everything in `parts` is a callable and a structural walk cannot trip over a tuple.
+        self.stubs = tuple(stubs) if stubs else tuple(parts)
+        # {"k": ..., "v": ..., "capacity": C, "filled": n} -- owned by this block, seeded by its
+        # own prefill, read and appended to by its own decode step.
+        self.kv = None
+
+    def part(self, name):
+        return self.parts[name]
+
+    def stub_names(self) -> tuple:
+        return self.stubs
+
+    def __call__(self, hidden_states, position_embeddings=None, position=None, decode=False):
+        if self.kind in ("layer", "mistral_decoder_layer"):
+            return self.parts[self.kind](
+                hidden_states,
+                position_embeddings=position_embeddings,
+                kv_cache=self.kv,
+                position=position,
+                decode=decode,
+            )
+        # The composed kinds spell out what the fused stubs do internally, from the leaf stubs.
+        xn = self.parts["norm_in"](hidden_states)
+        attn_out = self.parts["attention"](
+            xn,
+            position_embeddings=position_embeddings,
+            kv_cache=self.kv,
+            position=position,
+            decode=decode,
+        )
+        ttnn.deallocate(xn)
+        h = ttnn.add(hidden_states, attn_out)
+        ttnn.deallocate(attn_out)
+        hn = self.parts["norm_post"](h)
+        mlp_out = self.parts["mlp"](hn)
+        ttnn.deallocate(hn)
+        out = ttnn.add(h, mlp_out)
+        ttnn.deallocate(h)
+        ttnn.deallocate(mlp_out)
+        return out
+
+    def __repr__(self) -> str:
+        return f"TextBlock(kind={self.kind!r}, index={self.index})"
+
+
+class TextStack:
+    """embed -> rope -> N blocks -> final RMSNorm, with a resident per-layer KV cache."""
+
+    def __init__(self, device, token_embed, rotary, blocks, final_norm, hidden_size, kv_capacity):
+        self.device = device
+        self.token_embed = token_embed
+        self.rotary = rotary
+        self.blocks = blocks
+        self.final_norm = final_norm
+        self.hidden_size = int(hidden_size)
+        self.n_layers = len(blocks)
+        self.kv_capacity = int(kv_capacity)
+        self.act_dtype = ttnn.float32
+        self.filled = 0
+        # Positions for the decode gather, staged ONCE at build: row p is `[p] * max_batch`, so a
+        # step selects its own row with a `ttnn.slice` and the forward makes no host call at all.
+        self.max_batch = int(common.DEFAULT_BATCH)
+        self._decode_positions = ttnn.from_torch(
+            torch.arange(self.kv_capacity, dtype=torch.int32)
+            .reshape(self.kv_capacity, 1)
+            .repeat(1, self.max_batch)
+            .contiguous(),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=device,
+        )
+        # THE DECODE ATTENTION MASK, staged once. Row `p` is 0 through column `p` and a large
+        # negative after it: the KV cache is allocated to the full capacity and its tail is zeros,
+        # and a zero key scores ZERO, which is an ordinary logit rather than a negligible one. The
+        # table is built HERE, at construction, because building it per step would put a torch
+        # call in the forward and a host write inside a captured trace. `[C, C]` float32 at C=128
+        # is 64 KB, shared by reference across all 26 blocks.
+        rows = torch.arange(self.kv_capacity).reshape(-1, 1)
+        cols = torch.arange(self.kv_capacity).reshape(1, -1)
+        self._decode_mask = ttnn.from_torch(
+            torch.where(cols <= rows, 0.0, -1e9).to(torch.float32).contiguous(),
+            dtype=ttnn.float32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=device,
+        )
+
+    # ---- pieces ------------------------------------------------------------------------
+
+    def embed(self, input_ids_tt):
+        """`[B, S]` uint32 ROW_MAJOR -> `[B, 1, S, 3072]` float32."""
+        table_out = self.token_embed(input_ids_tt)
+        batch, seq = int(table_out.shape[0]), int(table_out.shape[-2])
+        wide = ttnn.typecast(table_out, self.act_dtype)
+        ttnn.deallocate(table_out)
+        return ttnn.reshape(wide, [batch, 1, seq, self.hidden_size])
+
+    def rope(self, position_ids_tt):
+        """`[B, S]` uint32 ROW_MAJOR -> `(cos, sin)`, each `[B, 1, S, head_dim]`."""
+        cos, sin = self.rotary(None, position_ids=position_ids_tt)
+        return tuple(ttnn.reshape(t, [int(t.shape[0]), 1, int(t.shape[-2]), int(t.shape[-1])]) for t in (cos, sin))
+
+    # ---- prefill -----------------------------------------------------------------------
+
+    def prefill_voiced(self, input_ids_tt, audio_mask, voice_embedding, position_ids_tt=None):
+        """Prefill with the speaker's voice substituted into the prompt's `[AUDIO]` rows.
+
+        THE MODEL CANNOT INVENT A VOICE. Voxtral TTS conditions on a speaker embedding carried in
+        the prompt: a contiguous block of `[AUDIO]` placeholder ids whose EMBEDDINGS are replaced
+        by that speaker's. Prefilled without it the backbone has nothing to imitate, and the chain
+        emits voice-shaped babble while every stage still measures correct -- which is exactly what
+        it did, at waveform PCC 0.9947 against the reference, because the reference was unvoiced too.
+
+        Substitution, not concatenation: the ids and therefore the positions and the causal mask are
+        the prompt's own, and only the rows under the mask change. Done on the HOST side of the one
+        marshalling point, before anything reaches the device, so the forward stays free of host ops.
+        """
+        import torch
+
+        if voice_embedding.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"voice embedding is {tuple(voice_embedding.shape)}; last dim must be the hidden "
+                f"size {self.hidden_size}"
+            )
+        slots = int(audio_mask.sum(dim=-1)[0])
+        if not bool((audio_mask.sum(dim=-1) == slots).all()):
+            raise ValueError("every row must carry the same number of [AUDIO] placeholders")
+        if slots != int(voice_embedding.shape[0]):
+            raise ValueError(
+                f"the prompt has {slots} [AUDIO] placeholders but the voice embedding has "
+                f"{voice_embedding.shape[0]} rows"
+            )
+
+        embeds = self.embed(input_ids_tt)
+        host = ttnn.to_torch(embeds).to(torch.float32)
+        ttnn.deallocate(embeds)
+        batch, _, seq, _ = host.shape
+        rows = host[:, 0, :, :]
+        rows[audio_mask[:, :seq]] = voice_embedding.to(rows.dtype).repeat(batch, 1)
+        host[:, 0, :, :] = rows
+
+        # TILE-ALIGNED, for the same reason `prefill` pads its ids: the KV cache appends on the
+        # sequence axis, so a prefill that is not a tile multiple would concat across a tile
+        # boundary. The tail is invisible to the answer -- prefill attention is causal, so no real
+        # position reads a later padded one -- and `real_len` keeps `last` and the first decode
+        # write on the real prompt.
+        tile = 32
+        padded = ((seq + tile - 1) // tile) * tile
+        if padded != seq:
+            host = torch.nn.functional.pad(host, (0, 0, 0, padded - seq))
+        voiced = ttnn.from_torch(host, dtype=self.act_dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
+        return self.prefill_embeds(voiced, position_ids_tt=position_ids_tt, real_len=seq)
+
+    def prefill(self, input_ids_tt, position_ids_tt=None):
+        """ids -> `(hidden [B, 1, S, 3072], last_hidden [B, 3072])`. Seeds the KV cache.
+
+        A REAL PROMPT IS NOT A TILE MULTIPLE. This model's prompt is `[bos] + text +
+        [BEGIN_AUDIO]`, which for the package's own 32-token texts is 33 -- and the KV cache
+        appends on the sequence axis, so it needs a tile-aligned prefill. The zero tail is added
+        HERE, to the ids, where the tensor is ROW_MAJOR and the pad is a plain row extension
+        rather than a concat across a tile boundary at row 33.
+
+        The tail is invisible to the answer on both sides of the cache: prefill attention is
+        `is_causal=True`, so no real position can see a later padded one, and decode reads
+        `[0, position]` off `cur_pos` starting at `real_len`, so the slots the tail filled are
+        either overwritten by the first decode step or never read.
+        """
+        batch, real_len = int(input_ids_tt.shape[0]), int(input_ids_tt.shape[-1])
+        padded = _tile_ceil(real_len)
+        if padded != real_len:
+            tail = padded - real_len
+            input_ids_tt = ttnn.pad(input_ids_tt, [(0, 0), (0, tail)], value=0)
+            if position_ids_tt is not None:
+                # The tail's positions are never read, so any in-range value does; 0 avoids
+                # running the rotary table past the capacity it was staged for.
+                position_ids_tt = ttnn.pad(position_ids_tt, [(0, 0), (0, tail)], value=0)
+        embeds = self.embed(input_ids_tt)
+        try:
+            return self.prefill_embeds(embeds, position_ids_tt=position_ids_tt, real_len=real_len)
+        finally:
+            ttnn.deallocate(embeds)
+
+    def prefill_embeds(self, embeds, position_ids_tt=None, real_len=None):
+        """`[B, 1, S, 3072]` -> `(hidden [B, 1, real, 3072], last_hidden [B, 3072])`.
+
+        The TTS decode feeds audio-token EMBEDDINGS rather than ids, so the embedding table is not
+        always the front of this stack; both entry points run the identical block chain.
+
+        `real_len` is the prompt length BEFORE `prefill` padded it to a tile multiple; `S` here is
+        the padded length. It drives three things that must follow the real prompt and not the
+        pad: which row is `last`, where the first decode step writes, and how much hidden state
+        comes back. `None` means the caller's sequence is already its own real length.
+        """
+        batch, seq = int(embeds.shape[0]), int(embeds.shape[-2])
+        real = seq if real_len is None else int(real_len)
+        if not 0 < real <= seq:
+            raise ValueError(f"real_len {real} must lie in [1, {seq}]")
+        if batch > self.max_batch:
+            raise ValueError(f"batch {batch} exceeds the staged decode-position width {self.max_batch}")
+        self._arm_cache(batch, seq)
+        # The rope pair is NOT deallocated by hand: the stub's default branch returns a
+        # `ttnn.slice` of its own build-time table, and freeing a view of that would take the
+        # table with it.
+        rope = self._prefill_rope(embeds, position_ids_tt)
+        hidden = embeds
+        try:
+            for block in self.blocks:
+                nxt = block(hidden, position_embeddings=rope, decode=False)
+                if hidden is not embeds:
+                    ttnn.deallocate(hidden)
+                hidden = nxt
+            out = self.final_norm(hidden)
+        finally:
+            if hidden is not embeds:
+                ttnn.deallocate(hidden)
+        # The REAL length, so the first decode step writes slot `real` and flash-decode's
+        # `[0, real]` window covers the prompt and nothing the pad wrote.
+        self.filled = real
+        last = ttnn.reshape(
+            ttnn.slice(out, [0, 0, real - 1, 0], [batch, 1, real, self.hidden_size]),
+            [batch, self.hidden_size],
+        )
+        if real != seq:
+            # NOT deallocated: `ttnn.slice` hands back a metadata VIEW whenever it can, and
+            # `last` was just sliced out of this same buffer -- freeing it here would take
+            # `last` with it.
+            out = ttnn.slice(out, [0, 0, 0, 0], [batch, 1, real, self.hidden_size])
+        return out, last
+
+    def _prefill_rope(self, embeds, position_ids_tt):
+        if position_ids_tt is not None:
+            return self.rope(position_ids_tt)
+        # The stub's own default: contiguous positions, which are the first rows of its table.
+        # Its leading dim is 1, which broadcasts across the batch in the RoPE multiply.
+        cos, sin = self.rotary(embeds)
+        return tuple(ttnn.reshape(t, [1, 1, int(t.shape[-2]), int(t.shape[-1])]) for t in (cos, sin))
+
+    # ---- decode ------------------------------------------------------------------------
+
+    def decode_step(self, embeds, position):
+        """ONE token per user: `[B, 1, 1, 3072]` -> `[B, 3072]`, from the RESIDENT cache.
+
+        Nothing recomputes the prefix. Each layer appends this token's k/v to its own cache slot
+        `position` and flash-decode reads positions `[0, position]` back out of it.
+        """
+        position = int(position)
+        batch = int(embeds.shape[0])
+        if self.blocks and self.blocks[0].kv is None:
+            raise RuntimeError("decode_step needs a seeded KV cache: run prefill first")
+        if position >= self.kv_capacity:
+            raise ValueError(f"position {position} exceeds the KV capacity {self.kv_capacity}")
+        # FOLD ONCE, at the stack entry. `[B, 1, 1, H]` is a lie about its size in TILE layout --
+        # the middle dims pad 1 -> 32, so every residual add and norm would touch 32x the data the
+        # step carries. Everything between here and the exit is elementwise or reduces over the
+        # last dim, so neither cares which leading axis holds the batch.
+        folded = ttnn.reshape(embeds, [1, 1, batch, self.hidden_size])
+        rope = self._decode_rope(batch, position)
+        hidden = folded
+        try:
+            for block in self.blocks:
+                nxt = block(hidden, position_embeddings=rope, position=position, decode=True)
+                if hidden is not folded:
+                    ttnn.deallocate(hidden)
+                hidden = nxt
+            out = self.final_norm(hidden)
+        finally:
+            if hidden is not folded:
+                ttnn.deallocate(hidden)
+        self.filled = max(self.filled, position + 1)
+        return ttnn.reshape(out, [batch, self.hidden_size])
+
+    def _decode_rope(self, batch, position):
+        """`(cos, sin)` for `position`, `[1, B, 1, head_dim]` height-sharded one user per core.
+
+        Routed through the SAME graduated rotary stub the prefill uses -- the position index is
+        selected on device out of the staged table, so this makes no host call.
+        """
+        # NOTHING HERE IS DEALLOCATED BY HAND. `ttnn.slice` and `ttnn.reshape` hand back a
+        # metadata VIEW whenever they can, and freeing a view frees the buffer it aliases -- here
+        # that buffer would be the build-time position table or the rotary stub's own cos/sin
+        # table, which every later step reads. These are `[1, B, 1, 128]` tensors; refcounting
+        # them is a few tens of KB against a buffer the whole generation depends on.
+        # ONE ROW, NOT A GATHER. Every user in a step shares one position, so the stub's
+        # single-position branch hands back `[1, 1, head_dim]` float32 straight off its table.
+        # The `position_ids` branch would gather instead, and `ttnn.embedding` requires a
+        # bfloat16 table -- which put RoPE at bfloat16 for all 26 layers of every decode step
+        # while the prefill through the same weights ran it at float32.
+        cos, sin = self.rotary(None, position=position)
+        # `[1, 1, 1, head_dim]` float32, INTERLEAVED. One position is shared by every user and
+        # every head, so the pair broadcasts across the `[B, n_kv, heads, head_dim]` q/k the
+        # attention stubs build -- there is nothing to replicate and nothing to shard. The
+        # height-sharded `[1, B, 1, head_dim]` form existed for decode-mode
+        # `rotary_embedding_hf`, which those stubs no longer call (it typecasts to bfloat16).
+        return tuple(
+            ttnn.to_layout(
+                ttnn.reshape(ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT), [1, 1, 1, int(t.shape[-1])]),
+                ttnn.TILE_LAYOUT,
+            )
+            for t in (cos, sin)
+        )
+
+    # ---- the cache ---------------------------------------------------------------------
+
+    def _arm_cache(self, batch, seq):
+        """Hand every block an empty slot for the prefill to seed, sized to the pinned capacity."""
+        capacity = self.kv_capacity
+        if capacity <= seq:
+            raise ValueError(f"kv_capacity {capacity} leaves no decode room after a prefill of {seq}")
+        if seq % ttnn.TILE_SIZE or capacity % ttnn.TILE_SIZE:
+            raise ValueError(
+                f"prefill length {seq} and capacity {capacity} must both be tile multiples "
+                f"({ttnn.TILE_SIZE}): the zero tail is concatenated on the sequence axis"
+            )
+        self.reset_cache()
+        for block in self.blocks:
+            block.kv = {
+                "k": None,
+                "v": None,
+                "capacity": capacity,
+                "filled": 0,
+                "batch": batch,
+                # By REFERENCE: one staged table, every block, never rebuilt per step.
+                "mask": self._decode_mask,
+            }
+
+    def reset_cache(self):
+        """Free every block's resident cache. The next prefill re-seeds them."""
+        for block in self.blocks:
+            kv = block.kv
+            block.kv = None
+            if not kv:
+                continue
+            for key in ("k", "v"):
+                tensor = kv.get(key)
+                if tensor is None:
+                    continue
+                try:
+                    ttnn.deallocate(tensor)
+                except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
+                    pass
+        self.filled = 0
+
+    # ---- introspection -----------------------------------------------------------------
+
+    def stub_names(self) -> tuple:
+        names = {"token_embed", "mistral_rotary_embedding", "mistral_r_m_s_norm"}
+        for block in self.blocks:
+            if block.kind in ("layer", "mistral_decoder_layer"):
+                names.add(block.kind)
+            else:
+                names.update(block.stubs)
+        return tuple(sorted(names))
+
+    def __repr__(self) -> str:
+        kinds = ",".join(str(BLOCK_KINDS.index(b.kind)) for b in self.blocks)
+        return f"TextStack(n_layers={self.n_layers}, hidden={self.hidden_size}, kinds=[{kinds}])"
+
+
+# ------------------------------------------------------------------------------------------
+# the factory
+# ------------------------------------------------------------------------------------------
+
+
+def build_text_stack(device, hf_model, layers=None, counter=None, kv_capacity=None) -> TextStack:
+    """Build the composed text decoder on `device` from `hf_model`'s own weights.
+
+    `layers=None` means EVERY layer (26) -- never 0, which a builder would read as a zero-layer
+    model. A smaller number is clamped UP to `MIN_LAYERS` with a printed message, never silently:
+    all four interchangeable kinds have to survive a capped build, and the structural stack walk
+    needs at least three same-typed members.
+    """
+    text = hf_model.model
+    full_depth = len(text.layers)
+    if layers is None:
+        depth = full_depth
+    else:
+        depth = int(layers)
+        if depth < MIN_LAYERS:
+            print(
+                f"[text_stack] layers={layers} raised to {MIN_LAYERS}: all four interchangeable "
+                f"block kinds must stay present and the stack walk needs >= 3 same-typed members"
+            )
+            depth = MIN_LAYERS
+        if depth > full_depth:
+            print(f"[text_stack] layers={layers} capped to the model's own depth {full_depth}")
+            depth = full_depth
+
+    hidden_size = int(text.embed_tokens.embedding_dim)
+    if kv_capacity is None:
+        kv_capacity = DEFAULT_PREFILL_CAPACITY + DEFAULT_DECODE_HEADROOM
+    kv_capacity = _tile_ceil(kv_capacity)
+
+    def stub(name, torch_module):
+        return common.build_stub(name, device, torch_module, counter)
+
+    token_embed = stub("token_embed", text.embed_tokens)
+    rotary = stub("mistral_rotary_embedding", text.rotary_emb)
+    final_norm = stub("mistral_r_m_s_norm", text.norm)
+
+    blocks = []
+    for index in range(depth):
+        torch_layer = text.layers[index]
+        kind = BLOCK_KINDS[index % len(BLOCK_KINDS)]
+        if kind in ("layer", "mistral_decoder_layer"):
+            parts = {kind: stub(kind, torch_layer)}
+        else:
+            attn_name = "attention" if kind == "composed" else "mistral_attention"
+            mlp_name = "mlp" if kind == "composed" else "mistral_m_l_p"
+            parts = {
+                "norm_in": stub("mistral_r_m_s_norm", torch_layer.input_layernorm),
+                "attention": stub(attn_name, torch_layer.self_attn),
+                "norm_post": stub("mistral_r_m_s_norm", torch_layer.post_attention_layernorm),
+                "mlp": stub(mlp_name, torch_layer.mlp),
+            }
+        blocks.append(
+            TextBlock(
+                kind,
+                index,
+                parts,
+                stubs=(kind,)
+                if kind in ("layer", "mistral_decoder_layer")
+                else ("mistral_r_m_s_norm", attn_name, mlp_name),
+            )
+        )
+
+    stack = TextStack(device, token_embed, rotary, blocks, final_norm, hidden_size, kv_capacity)
+    if depth >= len(BLOCK_KINDS):
+        missing = set(OWNED_STUBS) - set(stack.stub_names())
+        if missing:
+            raise AssertionError(f"routing left stubs out of the forward path: {sorted(missing)}")
+    return stack

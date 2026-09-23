@@ -6,7 +6,7 @@ import runpy
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_DEMOS = ["demo_acoustic.py", "demo_hidden_states.py", "demo_text_generation.py"]
+_DEMOS = ["demo_text_continuation.py", "demo_text_to_speech.py"]
 
 
 def main() -> None:
