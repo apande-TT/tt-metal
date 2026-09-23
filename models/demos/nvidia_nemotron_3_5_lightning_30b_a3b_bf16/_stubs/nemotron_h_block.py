@@ -521,14 +521,15 @@ class NemotronHBlock:
         return y
 
     def _decode_core(self, hsBC, dt, B):
-        """Single-token conv + SSD recurrence against the cached state -> y [B,H,1,P]."""
+        """Single-token conv + SSD recurrence against the cached state.
+        hsBC/dt are [1,B,*] token rows -> y [B,H,1,P]."""
         ckc = self.ckc
         H, P, N, K = self._H, self._P, self._N, self._K
         INTER, GGN = self._INTER, self._GGN
         conv_out = _ssm_cache.mamba_conv_step(self._state, hsBC, self._conv_taps, self._conv_bias, K)
-        xss = ttnn.slice(conv_out, [0, 0, 0], [B, 1, INTER])
-        Bg = ttnn.slice(conv_out, [0, 0, INTER], [B, 1, INTER + GGN])
-        Cg = ttnn.slice(conv_out, [0, 0, INTER + GGN], [B, 1, INTER + 2 * GGN])
+        xss = ttnn.slice(conv_out, [0, 0, 0], [1, B, INTER])
+        Bg = ttnn.slice(conv_out, [0, 0, INTER], [1, B, INTER + GGN])
+        Cg = ttnn.slice(conv_out, [0, 0, INTER + GGN], [1, B, INTER + 2 * GGN])
         Bh = ttnn.matmul(Bg, self._Esel, compute_kernel_config=ckc)
         Ch = ttnn.matmul(Cg, self._Esel, compute_kernel_config=ckc)
         dt = self._softplus(ttnn.add(dt, self._dt_bias))
@@ -568,7 +569,7 @@ class NemotronHBlock:
 
         mode = getattr(self, "_cache_mode", None)
         if mode == "decode":
-            y = self._decode_core(hsBC, dt, B)
+            y = self._decode_core(hsBC, dt, B * S)
         else:
             y = self._prefill_core(hsBC, dt, B, S, fill=(mode == "fill"))
 

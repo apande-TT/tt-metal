@@ -426,14 +426,15 @@ class TtNemotronHMamba2Mixer:
         return Y
 
     def _decode_core(self, hbc, dt, B):
-        """Single-token conv + SSD recurrence against the cached state -> Y (B, H, 1, HD)."""
+        """Single-token conv + SSD recurrence against the cached state.
+        hbc/dt are (1, B, .) token rows -> Y (B, H, 1, HD)."""
         H, HD, N = self.num_heads, self.head_dim, self.ssm_state_size
         I = self.intermediate_size
         G = self.n_groups
         hbc = _ssm_cache.mamba_conv_step(self._state, hbc, self._conv_taps, self._conv_bias, self.conv_k)
-        Xf = ttnn.slice(hbc, [0, 0, 0], [B, 1, I])
-        Bf = ttnn.slice(hbc, [0, 0, I], [B, 1, I + G * N])
-        Cf = ttnn.slice(hbc, [0, 0, I + G * N], [B, 1, I + 2 * G * N])
+        Xf = ttnn.slice(hbc, [0, 0, 0], [1, B, I])
+        Bf = ttnn.slice(hbc, [0, 0, I], [1, B, I + G * N])
+        Cf = ttnn.slice(hbc, [0, 0, I + G * N], [1, B, I + 2 * G * N])
         ttnn.deallocate(hbc)
         dt = self._softplus(ttnn.add(dt, self._dt_bias))
         Be = ttnn.matmul(Bf, self._P, compute_kernel_config=self.ckc)
@@ -468,7 +469,7 @@ class TtNemotronHMamba2Mixer:
 
         mode = getattr(self, "_cache_mode", None)
         if mode == "decode":
-            Y = self._decode_core(hbc, dt, B)
+            Y = self._decode_core(hbc, dt, B * T)
         else:
             Y = self._prefill_core(hbc, dt, B, T, consts, fill=(mode == "fill"))
 

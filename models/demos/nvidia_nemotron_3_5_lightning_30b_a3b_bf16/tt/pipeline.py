@@ -529,18 +529,26 @@ class NemotronHPipeline:
         h = ttnn.embedding(ids_tt, self.embed_w)
         return ttnn.to_layout(h, ttnn.TILE_LAYOUT)
 
-    def forward_hidden(self, ids_tt):
-        """ids (B, T) -> final-normed hidden states (B, T, H). Pure ttnn."""
+    def forward_hidden(self, ids_tt, token_rows=False):
+        """ids (B, T) -> final-normed hidden states (B, T, H). Pure ttnn.
+
+        token_rows (decode, T == 1): carry the B tokens as ONE (1, B, H) row
+        block. As (B, 1, H) every sample pads its single row to a 32-row tile,
+        so each op does ~32x the work; the stateful stubs split back to
+        per-sample heads themselves."""
         h = self.embed(ids_tt)
+        if token_rows:
+            h = _reshape_rm(h, [1, int(h.shape[0]) * int(h.shape[1]), int(h.shape[2])])
         for layer in self.layers:
             h = layer(h)
         _invocation.record("nemotron_h_r_m_s_norm")
         return self.final_norm(h)
 
-    def forward_logits(self, ids_tt, last_only=True):
-        """ids (B, T) -> lm_head logits. (B, 1, vocab) when last_only."""
-        h = self.forward_hidden(ids_tt)
-        if last_only:
+    def forward_logits(self, ids_tt, last_only=True, token_rows=False):
+        """ids (B, T) -> lm_head logits. (B, 1, vocab) when last_only;
+        (1, B, vocab) with token_rows (see forward_hidden)."""
+        h = self.forward_hidden(ids_tt, token_rows=token_rows)
+        if last_only and not token_rows:
             B, T = int(h.shape[0]), int(h.shape[1])
             h = ttnn.slice(h, [0, T - 1, 0], [B, T, self.hidden_size])
         if h.dtype != ttnn.float32:
@@ -585,8 +593,8 @@ class NemotronHPipeline:
                     m._cache_mode = mode
 
     def _greedy_ids(self, logits):
-        """(B,1,vocab) logits -> (B,1) uint32 ROW_MAJOR next ids, on device."""
-        B = int(logits.shape[0])
+        """(B,1,vocab) or (1,B,vocab) logits -> (B,1) uint32 ROW_MAJOR next ids, on device."""
+        B = int(logits.shape[0]) * int(logits.shape[1])
         nxt = ttnn.argmax(ttnn.untilize(logits, use_multicore=True), dim=-1)
         nxt = ttnn.reshape(ttnn.to_layout(nxt, ttnn.ROW_MAJOR_LAYOUT), [B, 1])
         return ttnn.typecast(nxt, ttnn.uint32)
@@ -610,10 +618,10 @@ class NemotronHPipeline:
 
     def _decode_token(self):
         """One cached decode step: consume dec_ids, advance every layer's state,
-        write the greedy next id back into dec_ids. Returns (B,1,vocab) logits."""
+        write the greedy next id back into dec_ids. Returns (1,B,vocab) logits."""
         self._set_cache_mode("decode")
         try:
-            logits = self.forward_logits(self._persistent["dec_ids"], last_only=True)
+            logits = self.forward_logits(self._persistent["dec_ids"], token_rows=True)
         finally:
             self._set_cache_mode(None)
         nxt = self._greedy_ids(logits)

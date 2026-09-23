@@ -7,7 +7,10 @@ extra modes, selected by the pipeline through `stub._cache_mode`:
 
   "fill"   : the normal full-prompt forward, which additionally writes the
              state left after the last prompt position.
-  "decode" : a single-token step (T=1) that reads that state and advances it.
+  "decode" : a single-token step that reads that state and advances it. Its
+             activations arrive as (1, B, .) -- the B tokens share one tile
+             row instead of each padding a (B, 1, .) row to 32 -- and are
+             split to per-sample (B, H, 1, d) only for the recurrent math.
 
 State tensors are allocated by the first fill and then only ever updated in
 place (ttnn.copy), so a captured decode trace keeps pointing at live buffers.
@@ -73,8 +76,9 @@ def mamba_fill(state, device, hbc_pre, cumA, B_h, x_disc, K, ckc):
     for s in range(1, K):
         if S - s >= 0:
             row = ttnn.slice(hbc_pre, [0, S - s, 0], [B, S - s + 1, C])
+            row = ttnn.to_layout(ttnn.reshape(ttnn.to_layout(row, ttnn.ROW_MAJOR_LAYOUT), [1, B, C]), ttnn.TILE_LAYOUT)
         else:
-            row = upload(device, torch.zeros(B, 1, C))
+            row = upload(device, torch.zeros(1, B, C))
         persist(state, f"prev{s}", row)
 
     H = int(cumA.shape[1])
@@ -86,7 +90,7 @@ def mamba_fill(state, device, hbc_pre, cumA, B_h, x_disc, K, ckc):
 
 def mamba_conv_step(state, hbc_t, taps, bias, K):
     """Causal depthwise conv for one token, then advance the window.
-    taps[s] multiplies x[t-s]. Returns silu(conv) (B,1,conv_dim)."""
+    taps[s] multiplies x[t-s]. hbc_t (1,B,conv_dim) -> silu(conv), same shape."""
     acc = ttnn.multiply(hbc_t, taps[0])
     for s in range(1, K):
         acc = ttnn.add(acc, ttnn.multiply(state[f"prev{s}"], taps[s]))
