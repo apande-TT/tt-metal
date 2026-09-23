@@ -362,7 +362,14 @@ class TtNemotronHLayer:
             y = self.mixer(h)
         elif self.variant == "MOE_A":
             _invocation.record("nemotron_h_mo_e")
+            # tokens are independent here: run them as one (1, B*T) row block so a
+            # short prompt does not pad every sample's T rows up to a 32-row tile
+            B, T, hid = int(h.shape[0]), int(h.shape[1]), int(h.shape[2])
+            if B > 1:
+                h = _reshape_rm(h, [1, B * T, hid])
             y = self.mixer(h)
+            if B > 1:
+                y = _reshape_rm(y, [B, T, hid])
         else:  # MOE_B / MOE_C
             B, T = int(h.shape[0]), int(h.shape[1])
             hid = int(h.shape[2])
