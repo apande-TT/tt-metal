@@ -35,6 +35,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm
 
 
 class TtNemotronHExperts:
@@ -90,10 +91,17 @@ class TtNemotronHExperts:
 
             self._up_cat = _folded(up_t, 1)  # (hidden, Eloc*inter)
             self._down_cat = _folded(down_t, 0)  # (Eloc*inter, hidden)
+            # decode copy of the down bank, DRAM-sharded (see _dram_mm)
+            self._down_dram = _dram_mm.upload_weight(
+                dev,
+                torch.stack([torch.cat([down_t[d * Eloc + j] for j in range(Eloc)], dim=0) for d in range(TP)]),
+                _mesh_shape,
+            )
             self._Eloc = Eloc
         else:
             self._up_cat = self._devw4(torch.cat(list(up_t), dim=1))
             self._down_cat = self._devw4(torch.cat(list(down_t), dim=0))
+            self._down_dram = _dram_mm.upload_weight(dev, torch.cat(list(down_t), dim=0))
             self._Eloc = E
 
         # Per-chip expert selector for the DEVICE-SIDE routing path (see the
@@ -259,13 +267,23 @@ class TtNemotronHExperts:
         w_wide = ttnn.matmul(W_sh, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat16)
         act = ttnn.multiply(act, w_wide, dtype=ttnn.bfloat8_b)  # bf8_b halves the down matmul's activation read
         ttnn.deallocate(w_wide)
-        out = ttnn.matmul(
-            act,
-            self._down_cat,
-            compute_kernel_config=self._expert_ckc,
-            core_grid=self._core_grid,
-            dtype=ttnn.float32,
-        )  # (T, hidden)
+        if num_tokens <= _dram_mm.TILE:  # decode: stream the DRAM-sharded bank
+            out = _dram_mm.matmul(
+                self.device,
+                ttnn.reshape(act, [1, num_tokens, Eloc * I]),
+                self._down_dram,
+                self.hidden_dim,
+                self._expert_ckc,
+            )
+            out = ttnn.reshape(out, [num_tokens, self.hidden_dim])
+        else:
+            out = ttnn.matmul(
+                act,
+                self._down_cat,
+                compute_kernel_config=self._expert_ckc,
+                core_grid=self._core_grid,
+                dtype=ttnn.float32,
+            )  # (T, hidden)
         ttnn.deallocate(act)
         ttnn.deallocate(W_sh)
 

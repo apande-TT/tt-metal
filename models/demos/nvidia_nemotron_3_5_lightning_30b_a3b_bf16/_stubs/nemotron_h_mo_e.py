@@ -46,6 +46,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm
 from models.tt_transformers.tt.mixtral_moe import TtMoeLayer  # kept per ADAPT requirement
 
 
@@ -126,6 +127,12 @@ class TtNemotronHMOE:
 
             self._up_cat = _folded(up_stack, 1)  # (hidden, Eloc*inter)
             self._down_cat = _folded(dn_stack, 0)  # (Eloc*inter, hidden)
+            # decode copy of the down bank, DRAM-sharded (see _dram_mm)
+            self._down_dram = _dram_mm.upload_weight(
+                dev,
+                torch.stack([torch.cat([dn_stack[d * Eloc + j] for j in range(Eloc)], dim=0) for d in range(TP)]),
+                _mesh_shape,
+            )
             # per-chip expert selector: sel[d] is a one-hot [E, Eloc] that maps the
             # replicated full router weights W (.,.,E) to this chip's Eloc columns
             # via a matmul; sharded on dim0 so chip d gets sel[d].
@@ -150,6 +157,7 @@ class TtNemotronHMOE:
             dn_full = sd["experts.down_proj"].transpose(-1, -2).contiguous()  # (E, inter, in)
             self._up_cat = self._devw(torch.cat(list(up_full), dim=1))
             self._down_cat = self._devw4(torch.cat(list(dn_full), dim=0))
+            self._down_dram = _dram_mm.upload_weight(dev, torch.cat(list(dn_full), dim=0))
             self._sel = None
             self._Eloc = E
 
@@ -301,9 +309,16 @@ class TtNemotronHMOE:
         w_wide = ttnn.matmul(W_use, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat16)
         act = ttnn.multiply(act, w_wide, dtype=ttnn.bfloat8_b)  # bf8_b halves the down matmul's activation read
         ttnn.deallocate(w_wide)
-        out = ttnn.matmul(
-            act, self._down_cat, compute_kernel_config=self._expert_ckc, dtype=ttnn.float32
-        )  # (B,T,hidden) fp32
+        if B * T <= _dram_mm.TILE:  # decode: stream the DRAM-sharded bank
+            hid = int(hs_bf.shape[-1])
+            out = _dram_mm.matmul(
+                self.device, ttnn.reshape(act, [1, B * T, int(act.shape[-1])]), self._down_dram, hid, self._expert_ckc
+            )
+            out = ttnn.reshape(out, [B, T, hid])
+        else:
+            out = ttnn.matmul(
+                act, self._down_cat, compute_kernel_config=self._expert_ckc, dtype=ttnn.float32
+            )  # (B,T,hidden) fp32
         ttnn.deallocate(act)
         ttnn.deallocate(W_use)
 
