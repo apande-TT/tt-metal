@@ -267,11 +267,11 @@ class TtNemotronHLayer:
                 tp = _mesh_shape(device)[-1] if pipeline.sharded else 1
                 self._sh_tp = pipeline.sharded and tp > 1 and up.shape[1] % tp == 0
                 if self._sh_tp:
-                    self._sh_up = _shard(device, up, 1)  # column-parallel
-                    self._sh_dn = _shard(device, dn, 0)  # row-parallel
+                    self._sh_up = _shard(device, up, 1, dtype=ttnn.bfloat8_b)  # column-parallel
+                    self._sh_dn = _shard(device, dn, 0, dtype=ttnn.bfloat8_b)  # row-parallel
                 else:
-                    self._sh_up = _replicate(device, up)
-                    self._sh_dn = _replicate(device, dn)
+                    self._sh_up = _replicate(device, up, dtype=ttnn.bfloat8_b)
+                    self._sh_dn = _replicate(device, dn, dtype=ttnn.bfloat8_b)
         else:
             raise ValueError(f"unknown variant {variant}")
 

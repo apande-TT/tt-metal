@@ -50,11 +50,11 @@ class TtNemotronHMLP:
         self._mesh_shape = _mesh_shape
 
         if shard:
-            self._w_up = self._shd(Wup, 1)
-            self._w_down = self._shd(Wdown, 0)
+            self._w_up = self._shd(Wup, 1, dtype=ttnn.bfloat8_b)
+            self._w_down = self._shd(Wdown, 0, dtype=ttnn.bfloat8_b)
         else:
-            self._w_up = self._dev(Wup)
-            self._w_down = self._dev(Wdown)
+            self._w_up = self._dev(Wup, dtype=ttnn.bfloat8_b)
+            self._w_down = self._dev(Wdown, dtype=ttnn.bfloat8_b)
 
         self.ckc = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -77,24 +77,24 @@ class TtNemotronHMLP:
             pass
         return hasattr(self.device, "get_device_ids") or hasattr(self.device, "get_devices")
 
-    def _dev(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
+    def _dev(self, torch_tensor, layout=ttnn.TILE_LAYOUT, dtype=ttnn.float32):
         if self._is_mesh():
             try:
                 return ttnn.from_torch(
                     torch_tensor,
-                    dtype=ttnn.float32,
+                    dtype=dtype,
                     layout=layout,
                     device=self.device,
                     mesh_mapper=ttnn.ReplicateTensorToMesh(self.device),
                 )
             except Exception:
                 pass
-        return ttnn.from_torch(torch_tensor, dtype=ttnn.float32, layout=layout, device=self.device)
+        return ttnn.from_torch(torch_tensor, dtype=dtype, layout=layout, device=self.device)
 
-    def _shd(self, torch_tensor, dim, layout=ttnn.TILE_LAYOUT):
+    def _shd(self, torch_tensor, dim, layout=ttnn.TILE_LAYOUT, dtype=ttnn.float32):
         return ttnn.from_torch(
             torch_tensor,
-            dtype=ttnn.float32,
+            dtype=dtype,
             layout=layout,
             device=self.device,
             mesh_mapper=ttnn.ShardTensor2dMesh(self.device, mesh_shape=self._mesh_shape, dims=(None, dim)),
