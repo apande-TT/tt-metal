@@ -1,0 +1,175 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native TTNN port of `flow_matching_audio_transformer` (`acoustic_transformer`).
+
+The deterministic core of the flow-matching sampler -- the velocity field plus the semantic head:
+
+    t_proj   = time_projection(time_embedding(t))
+    llm_proj = llm_projection(llm_hidden)
+    seq      = [input_projection(x_t), t_proj, llm_proj]     # THREE tokens
+    velocity = acoustic_codebook_output(norm(blocks(seq))[:, 0, :])
+    semantic = semantic_codebook_output(llm_hidden)          # reads the RAW hidden state
+
+The Euler loop around this is not ported here because it is not a function of its inputs: it draws
+`x_0 = torch.randn(...)` inside the module. `x_t` is supplied instead, which leaves every weight
+under test (see the note in `tests/pcc/test_flow_matching_audio_transformer.py`).
+
+**The sequence is padded to one tile.** The real sequence is 3 tokens, which in TILE layout lives
+inside a 32-row tile with 29 rows of padding. Rather than hope an op respects a sub-tile logical
+length, the sequence is explicitly built 32 rows long and attention is given an additive mask that
+blocks columns 3..31 -- so rows 0..2 attend to exactly the three real tokens, which is what the
+reference computes. Only row 0 is ever read out.
+
+The blocks are `AcousticTransformerBlock`s: bidirectional, RoPE-free, GQA 32/8, head_dim 128,
+dim 3072, hidden 9216, `norm_eps` 1e-5, no biases.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+
+import ttnn
+
+
+_SHARD_HEIGHT = 32
+_TILE = 32
+_MASK_NEG = -1.0e9
+
+
+def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if device.__class__.__name__ == "MeshDevice":
+        return ttnn.from_torch(
+            t, dtype=dtype, layout=layout, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _weight(linear, device):
+    return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
+
+
+def _norm_weight(norm, device):
+    return _from_torch(
+        norm.weight.detach().reshape(1, 1, -1, _SHARD_HEIGHT), device, layout=ttnn.ROW_MAJOR_LAYOUT
+    )
+
+
+def _compile_block(device, blk, mask):
+    """One `AcousticTransformerBlock` as a callable on `[B, 1, TILE, dim]`."""
+    attn = blk.attention
+    ff = blk.feed_forward
+    n_heads = int(attn.n_local_heads)
+    n_kv_heads = int(attn.n_local_kv_heads)
+    scale = 1.0 / math.sqrt(int(attn.head_dim))
+
+    wqkv = _from_torch(
+        torch.cat(
+            [
+                attn.wq.weight.detach().transpose(0, 1),
+                attn.wk.weight.detach().transpose(0, 1),
+                attn.wv.weight.detach().transpose(0, 1),
+            ],
+            dim=-1,
+        ).contiguous(),
+        device,
+    )
+    wo = _weight(attn.wo, device)
+    w1, w2, w3 = (_weight(m, device) for m in (ff.w1, ff.w2, ff.w3))
+    g_attn = _norm_weight(blk.attention_norm, device)
+    g_ffn = _norm_weight(blk.ffn_norm, device)
+    eps = float(blk.attention_norm.eps)
+
+    def run(h):
+        xn = ttnn.rms_norm(h, epsilon=eps, weight=g_attn)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            ttnn.linear(xn, wqkv),
+            num_heads=n_heads,
+            num_kv_heads=n_kv_heads,
+            transpose_k_heads=False,
+        )
+        a = ttnn.transformer.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, is_causal=False, scale=scale
+        )
+        h = ttnn.add(h, ttnn.linear(ttnn.experimental.nlp_concat_heads(a), wo))
+
+        hn = ttnn.rms_norm(h, epsilon=eps, weight=g_ffn)
+        gated = ttnn.multiply(ttnn.silu(ttnn.linear(hn, w1)), ttnn.linear(hn, w3))
+        return ttnn.add(h, ttnn.linear(gated, w2))
+
+    return run
+
+
+def build(device, torch_module):
+    at = getattr(torch_module, "inner", torch_module)
+    args = at.acoustic_transformer_args
+    dim = int(args.dim)
+    n_real_tokens = 3
+
+    inv_freq = _from_torch(
+        at.time_embedding.inv_freq.detach().reshape(1, -1).contiguous(), device
+    )
+    w_time = _weight(at.time_projection, device)
+    w_llm = _weight(at.llm_projection, device)
+    w_input = _weight(at.input_projection, device)
+    w_acoustic = _weight(at.acoustic_codebook_output, device)
+    w_semantic = _weight(at.semantic_codebook_output, device)
+    semantic_bias = None
+    if at.semantic_codebook_output.bias is not None:
+        semantic_bias = _from_torch(
+            at.semantic_codebook_output.bias.detach().reshape(1, 1, 1, -1), device
+        )
+
+    # Columns 3..31 of the padded tile are not real tokens; block them so rows 0..2 attend to
+    # exactly the three the reference builds.
+    mask_torch = torch.zeros(1, 1, _TILE, _TILE)
+    mask_torch[:, :, :, n_real_tokens:] = _MASK_NEG
+    mask = _from_torch(mask_torch, device)
+
+    blocks = [
+        _compile_block(device, at.layers[str(i)], mask) for i in at.layers_ids
+    ]
+    g_final = _norm_weight(at.norm, device)
+    eps_final = float(at.norm.eps)
+
+    acoustic_out = int(at.acoustic_codebook_output.out_features)
+    semantic_out = int(at.semantic_codebook_output.out_features)
+
+    def flow_matching_audio_transformer(llm_hidden, x_t=None, t=None, **kwargs):
+        batch = int(llm_hidden.shape[0])
+        h_in = ttnn.reshape(llm_hidden, [batch, 1, 1, dim])
+
+        semantic = ttnn.linear(h_in, w_semantic)
+        if semantic_bias is not None:
+            semantic = ttnn.add(semantic, semantic_bias)
+        semantic = ttnn.reshape(semantic, [batch, semantic_out])
+
+        # TimeEmbedding: outer product t (x) inv_freq, then cat(cos, sin).
+        freqs = ttnn.matmul(ttnn.reshape(t, [batch, 1, 1, int(t.shape[-1])]), inv_freq)
+        t_emb = ttnn.concat([ttnn.cos(freqs), ttnn.sin(freqs)], dim=-1)
+        t_proj = ttnn.linear(t_emb, w_time)
+        llm_proj = ttnn.linear(h_in, w_llm)
+        x_proj = ttnn.linear(ttnn.reshape(x_t, [batch, 1, 1, int(x_t.shape[-1])]), w_input)
+
+        pad = ttnn.zeros(
+            [batch, 1, _TILE - n_real_tokens, dim],
+            dtype=x_proj.dtype,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+        )
+        h = ttnn.concat([x_proj, t_proj, llm_proj, pad], dim=2)
+
+        for block in blocks:
+            h = block(h)
+        h = ttnn.rms_norm(h, epsilon=eps_final, weight=g_final)
+
+        first = ttnn.slice(h, [0, 0, 0, 0], [batch, 1, 1, dim])
+        velocity = ttnn.reshape(ttnn.linear(first, w_acoustic), [batch, acoustic_out])
+        return velocity, semantic
+
+    return flow_matching_audio_transformer

@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native TTNN port of `parametrized_conv1d` (`audio_tokenizer.decoder_blocks.0.conv`).
+
+The bare `weight_norm`-parametrized `Conv1d` INSIDE `CausalConv1d`: 292 -> 1024 channels, kernel 3,
+stride 1, **no padding of its own** (the causal wrapper does the padding), no bias. Reading
+`conv.weight` here runs the parametrization on the host, which is where weight prep belongs.
+
+Done as shifted matmuls: with the sequence channels-last as `[1, 1, L, C]`, output position `t` is
+`sum_k x[t + k] @ W_k`, so each kernel tap is one `[C_in, C_out]` matmul over a row-shifted slice.
+That keeps the forward to ttnn matmul / slice / add -- no conv sharding config to get wrong -- and
+the row-shifted slices are exact even at non-tile-aligned offsets.
+"""
+
+from __future__ import annotations
+
+import torch
+
+import ttnn
+
+
+def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if device.__class__.__name__ == "MeshDevice":
+        return ttnn.from_torch(
+            t, dtype=dtype, layout=layout, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def build(device, torch_module):
+    conv = torch_module
+
+    weight = conv.weight.detach()
+    out_channels, in_channels, kernel = (int(v) for v in weight.shape)
+    stride = int(conv.stride[0])
+    dilation = int(conv.dilation[0])
+    pad = int(conv.padding[0]) if not isinstance(conv.padding, str) else 0
+    effective_kernel = (kernel - 1) * dilation + 1
+
+    taps = [_from_torch(weight[:, :, i].transpose(0, 1).contiguous(), device) for i in range(kernel)]
+    bias = None
+    if conv.bias is not None:
+        bias = _from_torch(conv.bias.detach().reshape(1, 1, 1, out_channels), device)
+
+    def parametrized_conv1d(x, **kwargs):
+        length = int(x.shape[-1])
+        x4 = ttnn.reshape(ttnn.transpose(x, -2, -1), [1, 1, length, in_channels])
+
+        if pad > 0:
+            zeros = ttnn.zeros(
+                [1, 1, pad, in_channels], dtype=x4.dtype, layout=ttnn.TILE_LAYOUT, device=device
+            )
+            x4 = ttnn.concat([zeros, x4, zeros], dim=2)
+        padded_len = length + 2 * pad
+        out_len = (padded_len - effective_kernel) // stride + 1
+
+        acc = None
+        for i, tap in enumerate(taps):
+            begin = i * dilation
+            end = begin + (out_len - 1) * stride + 1
+            seg = ttnn.slice(
+                x4, [0, 0, begin, 0], [1, 1, end, in_channels],
+                [1, 1, stride, 1] if stride > 1 else None,
+            )
+            term = ttnn.linear(seg, tap)
+            acc = term if acc is None else ttnn.add(acc, term)
+        if bias is not None:
+            acc = ttnn.add(acc, bias)
+
+        return ttnn.reshape(ttnn.transpose(acc, -2, -1), [1, out_channels, out_len])
+
+    return parametrized_conv1d

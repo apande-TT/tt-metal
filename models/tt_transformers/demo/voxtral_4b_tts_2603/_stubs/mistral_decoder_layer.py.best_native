@@ -1,0 +1,119 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native TTNN port of `mistral_decoder_layer` -- one text-backbone `MistralDecoderLayer`
+(`model.layers.0`).
+
+    h = x + self_attn(input_layernorm(x));   out = h + mlp(post_attention_layernorm(h))
+
+GQA 32 query heads over 8 KV heads, head_dim **128** (explicitly 128, not 3072/32=96), hidden_dim
+9216, `norm_eps` 1e-5, no biases. RoPE is `rotate_half` against the `(cos, sin)` the caller passes;
+the harness marshals them onto the device, because the runtime native probe counts every torch call
+the forward makes and graduates only at zero -- a `ttnn.from_torch` in here alone costs three.
+
+Causality comes from SDPA's `is_causal`, so the additive `attention_mask` argument is accepted and
+ignored. That matches the reference for an unpadded batch; a mask carrying real PADDING would need
+to be fed through as an `attn_mask` instead.
+"""
+
+from __future__ import annotations
+
+import torch
+
+import ttnn
+
+
+_SHARD_HEIGHT = 32
+
+
+def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if device.__class__.__name__ == "MeshDevice":
+        return ttnn.from_torch(
+            t, dtype=dtype, layout=layout, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _weight(linear, device):
+    """A `[in, out]` device tensor for a torch `nn.Linear` (whose weight is `[out, in]`)."""
+    return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
+
+
+def _norm_weight(norm, device):
+    """Gamma in the `[1, 1, dim // 32, 32]` ROW_MAJOR form `ttnn.rms_norm` requires."""
+    return _from_torch(
+        norm.weight.detach().reshape(1, 1, -1, _SHARD_HEIGHT), device, layout=ttnn.ROW_MAJOR_LAYOUT
+    )
+
+
+def _rope(x, cos, sin, half):
+    """`x * cos + rotate_half(x) * sin` -- the convention `apply_rotary_pos_emb` uses."""
+    ends = list(x.shape)
+    lower = ttnn.slice(x, [0, 0, 0, 0], [ends[0], ends[1], ends[2], half])
+    upper = ttnn.slice(x, [0, 0, 0, half], ends)
+    rotated = ttnn.concat([ttnn.neg(upper), lower], dim=-1)
+    return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(rotated, sin))
+
+
+def build(device, torch_module):
+    layer = torch_module
+    attn = layer.self_attn
+    mlp = layer.mlp
+
+    dim = int(attn.q_proj.in_features)
+    n_heads = int(attn.config.num_attention_heads)
+    n_kv_heads = int(attn.config.num_key_value_heads)
+    head_dim = int(attn.head_dim)
+    half = head_dim // 2
+    scale = float(attn.scaling)
+
+    wqkv = _from_torch(
+        torch.cat(
+            [
+                attn.q_proj.weight.detach().transpose(0, 1),
+                attn.k_proj.weight.detach().transpose(0, 1),
+                attn.v_proj.weight.detach().transpose(0, 1),
+            ],
+            dim=-1,
+        ).contiguous(),
+        device,
+    )
+    wo = _weight(attn.o_proj, device)
+    w_gate = _weight(mlp.gate_proj, device)
+    w_up = _weight(mlp.up_proj, device)
+    w_down = _weight(mlp.down_proj, device)
+    g_in = _norm_weight(layer.input_layernorm, device)
+    g_post = _norm_weight(layer.post_attention_layernorm, device)
+    eps_in = float(layer.input_layernorm.variance_epsilon)
+    eps_post = float(layer.post_attention_layernorm.variance_epsilon)
+
+    def mistral_decoder_layer(hidden_states, position_embeddings=None, **kwargs):
+        seq = int(hidden_states.shape[-2])
+        h = ttnn.reshape(hidden_states, [1, 1, seq, dim])
+
+        xn = ttnn.rms_norm(h, epsilon=eps_in, weight=g_in)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            ttnn.linear(xn, wqkv),
+            num_heads=n_heads,
+            num_kv_heads=n_kv_heads,
+            transpose_k_heads=False,
+        )
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            cos = ttnn.reshape(cos, [1, 1, seq, head_dim])
+            sin = ttnn.reshape(sin, [1, 1, seq, head_dim])
+            q = _rope(q, cos, sin, half)
+            k = _rope(k, cos, sin, half)
+        a = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+        h = ttnn.add(h, ttnn.linear(ttnn.experimental.nlp_concat_heads(a), wo))
+
+        hn = ttnn.rms_norm(h, epsilon=eps_post, weight=g_post)
+        gated = ttnn.multiply(ttnn.silu(ttnn.linear(hn, w_gate)), ttnn.linear(hn, w_up))
+        h = ttnn.add(h, ttnn.linear(gated, w_down))
+
+        return ttnn.reshape(h, [1, seq, dim])
+
+    return mistral_decoder_layer

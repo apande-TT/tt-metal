@@ -1,0 +1,132 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native TTNN port of `codec_attention` (`audio_tokenizer.decoder_blocks.1.layers.0.attention`).
+
+The canonical `models/tt_transformers/tt/attention.py` cannot be reused: it builds itself from
+`ModelArgs`, which resolves the model through `AutoConfig`, and this checkpoint has no
+`config.json` / `model_type` at all. It also implements different math -- this attention is
+**ALiBi + sliding-window causal + QK-norm**, with no RoPE:
+
+  * 8 heads / 8 KV heads, head_dim 128, dim 1024, no biases.
+  * QK-norm is an `RMSNorm(eps=1e-6)` over the FULL 1024-wide `wq(x)` / `wk(x)` -- across all eight
+    heads at once, BEFORE the head split -- so the projections cannot be fused into one `wqkv`
+    matmul the way an un-normed attention's can. They are re-joined afterwards purely so
+    `nlp_create_qkv_heads` can do the split.
+  * The additive mask is `slope[h] * (j - i)`, with `-inf` wherever `j > i` (causal) or
+    `j < i - window` (window 2 for this block; the decoder's windows are 2, 4, 8, 16).
+
+The mask depends only on `j - i`, so it is translation-invariant along the diagonal: one
+`[1, H, SMAX, SMAX]` tensor is built on the host at `build` time and the top-left `[S, S]` corner is
+sliced per call. That keeps the forward pure ttnn -- the runtime native probe counts every torch
+call the forward makes and graduates only at zero, so the mask cannot be built per call.
+`-inf` is replaced by a large finite negative so a fully-masked row could never produce NaN; every
+ALiBi term is <= 2 in magnitude, so after softmax the two are indistinguishable.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+
+import ttnn
+
+
+_SHARD_HEIGHT = 32
+_MASK_MAX_SEQ = 1024
+_MASK_NEG = -1.0e9
+
+
+def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if device.__class__.__name__ == "MeshDevice":
+        return ttnn.from_torch(
+            t, dtype=dtype, layout=layout, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _weight(linear, device):
+    return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
+
+
+def _norm_weight(norm, device):
+    """Gamma in the `[1, 1, dim // 32, 32]` ROW_MAJOR form `ttnn.rms_norm` requires."""
+    return _from_torch(
+        norm.weight.detach().reshape(1, 1, -1, _SHARD_HEIGHT), device, layout=ttnn.ROW_MAJOR_LAYOUT
+    )
+
+
+def _alibi_window_mask(slopes, window, seq):
+    """`[1, H, seq, seq]` additive mask: ALiBi bias, causal, and clipped to the left window."""
+    pos = torch.arange(seq)
+    rel = pos.unsqueeze(0) - pos.unsqueeze(1)
+    bias = slopes.reshape(-1, 1, 1).float() * rel.unsqueeze(0).float()
+    blocked = (rel > 0) | (rel < -window)
+    bias = bias.masked_fill(blocked.unsqueeze(0), _MASK_NEG)
+    return bias.unsqueeze(0)
+
+
+def build(device, torch_module):
+    attn = torch_module
+    args = attn.args
+    n_heads = int(attn.n_local_heads)
+    n_kv_heads = int(attn.n_local_kv_heads)
+    head_dim = int(args.head_dim)
+    dim = int(attn.wq.in_features)
+    out_dim = int(attn.wo.out_features)
+    scale = 1.0 / math.sqrt(head_dim)
+    qk_norm = bool(args.qk_norm)
+
+    wq = _weight(attn.wq, device)
+    wk = _weight(attn.wk, device)
+    wv = _weight(attn.wv, device)
+    wo = _weight(attn.wo, device)
+    q_gamma = _norm_weight(attn.q_norm, device) if qk_norm else None
+    k_gamma = _norm_weight(attn.k_norm, device) if qk_norm else None
+    q_eps = float(attn.q_norm.eps) if qk_norm else 0.0
+    k_eps = float(attn.k_norm.eps) if qk_norm else 0.0
+
+    mask = _from_torch(
+        _alibi_window_mask(attn.alibi_slopes.detach(), int(attn.sliding_window), _MASK_MAX_SEQ),
+        device,
+    )
+
+    def codec_attention(x, **kwargs):
+        seq = int(x.shape[-2])
+        if seq > _MASK_MAX_SEQ:
+            raise NotImplementedError(
+                f"sequence {seq} exceeds the prebuilt ALiBi mask ({_MASK_MAX_SEQ}); raise "
+                f"_MASK_MAX_SEQ -- the mask cannot be rebuilt inside the forward"
+            )
+        h = ttnn.reshape(x, [1, 1, seq, dim])
+
+        q = ttnn.linear(h, wq)
+        k = ttnn.linear(h, wk)
+        v = ttnn.linear(h, wv)
+        if qk_norm:
+            q = ttnn.rms_norm(q, epsilon=q_eps, weight=q_gamma)
+            k = ttnn.rms_norm(k, epsilon=k_eps, weight=k_gamma)
+
+        qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
+            ttnn.concat([q, k, v], dim=-1),
+            num_heads=n_heads,
+            num_kv_heads=n_kv_heads,
+            transpose_k_heads=False,
+        )
+
+        a = ttnn.transformer.scaled_dot_product_attention(
+            qh,
+            kh,
+            vh,
+            attn_mask=ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq]),
+            is_causal=False,
+            scale=scale,
+        )
+        a = ttnn.experimental.nlp_concat_heads(a)
+        return ttnn.reshape(ttnn.linear(a, wo), [1, seq, out_dim])
+
+    return codec_attention

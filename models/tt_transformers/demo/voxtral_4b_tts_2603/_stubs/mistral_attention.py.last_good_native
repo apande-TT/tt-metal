@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native TTNN port of `mistral_attention` -- the text backbone's `MistralAttention`
+(`model.layers.0.self_attn`).
+
+The canonical `models/tt_transformers/tt/attention.py` cannot be reused here: it builds itself from
+`ModelArgs`, which resolves the model through `AutoConfig`, and this checkpoint is a native Mistral
+`consolidated.safetensors` with no `config.json` / `model_type` at all -- `ModelArgs` raises before
+any weight is read. So this is a direct ttnn forward over the resolved submodule's own weights.
+
+GQA: 32 query heads over 8 KV heads, head_dim 128 (explicitly 128, NOT 3072/32=96), no biases.
+RoPE is `rotate_half` against the `(cos, sin)` the caller passes -- the harness marshals them onto
+the device for us, because the native probe forbids the forward from calling `ttnn.from_torch`
+itself. Causality comes from SDPA's `is_causal`, so the additive mask argument is not needed.
+"""
+
+from __future__ import annotations
+
+import torch
+
+import ttnn
+
+
+def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if device.__class__.__name__ == "MeshDevice":
+        return ttnn.from_torch(
+            t, dtype=dtype, layout=layout, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _weight(linear, device):
+    """A `[in, out]` device tensor for a torch `nn.Linear` (whose weight is `[out, in]`)."""
+    return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
+
+
+def _rope(x, cos, sin, half):
+    """`x * cos + rotate_half(x) * sin`, the same convention `apply_rotary_pos_emb` uses.
+
+    `rotate_half` is `cat(-x[..., half:], x[..., :half])`; both halves are multiples of the tile
+    width, so the two slices are tile-aligned.
+    """
+    ends = list(x.shape)
+    starts = [0, 0, 0, 0]
+    lower = ttnn.slice(x, starts, [ends[0], ends[1], ends[2], half])
+    upper = ttnn.slice(x, [0, 0, 0, half], ends)
+    rotated = ttnn.concat([ttnn.neg(upper), lower], dim=-1)
+    return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(rotated, sin))
+
+
+def build(device, torch_module):
+    m = torch_module
+    n_heads = int(m.config.num_attention_heads)
+    n_kv_heads = int(m.config.num_key_value_heads)
+    head_dim = int(m.head_dim)
+    half = head_dim // 2
+    dim = int(m.q_proj.in_features)
+    out_dim = int(m.o_proj.out_features)
+    scale = float(m.scaling)
+
+    wqkv = _from_torch(
+        torch.cat(
+            [
+                m.q_proj.weight.detach().transpose(0, 1),
+                m.k_proj.weight.detach().transpose(0, 1),
+                m.v_proj.weight.detach().transpose(0, 1),
+            ],
+            dim=-1,
+        ).contiguous(),
+        device,
+    )
+    wo = _weight(m.o_proj, device)
+
+    def mistral_attention(hidden_states, position_embeddings=None, **kwargs):
+        seq = int(hidden_states.shape[-2])
+        x = ttnn.reshape(hidden_states, [1, 1, seq, dim])
+
+        qkv = ttnn.linear(x, wqkv)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
+        )
+
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            cos = ttnn.reshape(cos, [1, 1, seq, head_dim])
+            sin = ttnn.reshape(sin, [1, 1, seq, head_dim])
+            q = _rope(q, cos, sin, half)
+            k = _rope(k, cos, sin, half)
+
+        a = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+        a = ttnn.experimental.nlp_concat_heads(a)
+        return ttnn.reshape(ttnn.linear(a, wo), [1, seq, out_dim])
+
+    return mistral_attention

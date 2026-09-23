@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native TTNN port of `mistral_m_l_p` -- the text backbone's `MistralMLP` (`model.layers.0.mlp`).
+
+SwiGLU: `down_proj(silu(gate_proj(x)) * up_proj(x))`, 3072 -> 9216 -> 3072, no biases.
+
+The canonical `models/tt_transformers/tt/mlp.py` is not reusable here: it builds itself from
+`ModelArgs`, which resolves the model through `AutoConfig`, and this checkpoint is a native Mistral
+`consolidated.safetensors` with no `config.json` / `model_type` -- `ModelArgs` raises before
+reading a weight.
+"""
+
+from __future__ import annotations
+
+import torch
+
+import ttnn
+
+
+def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if device.__class__.__name__ == "MeshDevice":
+        return ttnn.from_torch(
+            t, dtype=dtype, layout=layout, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _weight(linear, device):
+    """A `[in, out]` device tensor for a torch `nn.Linear` (whose weight is `[out, in]`)."""
+    return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
+
+
+def build(device, torch_module):
+    mlp = torch_module
+    dim = int(mlp.gate_proj.in_features)
+    out_dim = int(mlp.down_proj.out_features)
+
+    w_gate = _weight(mlp.gate_proj, device)
+    w_up = _weight(mlp.up_proj, device)
+    w_down = _weight(mlp.down_proj, device)
+
+    def mistral_m_l_p(x, **kwargs):
+        seq = int(x.shape[-2])
+        h = ttnn.reshape(x, [1, 1, seq, dim])
+        gated = ttnn.multiply(ttnn.silu(ttnn.linear(h, w_gate)), ttnn.linear(h, w_up))
+        return ttnn.reshape(ttnn.linear(gated, w_down), [1, seq, out_dim])
+
+    return mistral_m_l_p

@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native TTNN port of `acoustic_transformer_block` (`AcousticTransformerBlock`).
+
+    r = attention(attention_norm(x)); h = x + r
+    r = feed_forward(ffn_norm(h));    out = h + r
+
+The attention inside is `BidirectionalAttention`: NO positional encoding and NO causal mask, so
+SDPA runs with `is_causal=False`. Shapes come from `params.json`'s `acoustic_transformer_args`:
+dim 3072, 32 heads / 8 KV heads, head_dim 128, hidden_dim 9216, no biases.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+
+import ttnn
+
+
+_SHARD_HEIGHT = 32
+
+
+def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if device.__class__.__name__ == "MeshDevice":
+        return ttnn.from_torch(
+            t, dtype=dtype, layout=layout, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _weight(linear, device):
+    """A `[in, out]` device tensor for a torch `nn.Linear` (whose weight is `[out, in]`)."""
+    return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
+
+
+def _norm_weight(norm, device):
+    """A norm's gamma in the `[1, 1, dim // 32, 32]` ROW_MAJOR form `ttnn.rms_norm` requires.
+
+    The layernorm op asserts `gamma.padded_shape[-1] == TILE_WIDTH`, so a flat `[dim]` gamma is
+    rejected outright (`layernorm_device_operation.cpp:106`).
+    """
+    w = norm.weight.detach().reshape(1, 1, -1, _SHARD_HEIGHT)
+    return _from_torch(w, device, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+
+def build(device, torch_module):
+    blk = torch_module
+    attn = blk.attention
+    ff = blk.feed_forward
+
+    n_heads = int(attn.n_local_heads)
+    n_kv_heads = int(attn.n_local_kv_heads)
+    head_dim = int(attn.head_dim)
+    dim = int(blk.dim)
+    scale = 1.0 / math.sqrt(head_dim)
+    eps = float(blk.attention_norm.eps)
+
+    wqkv = _from_torch(
+        torch.cat(
+            [
+                attn.wq.weight.detach().transpose(0, 1),
+                attn.wk.weight.detach().transpose(0, 1),
+                attn.wv.weight.detach().transpose(0, 1),
+            ],
+            dim=-1,
+        ).contiguous(),
+        device,
+    )
+    wo = _weight(attn.wo, device)
+    w1 = _weight(ff.w1, device)
+    w2 = _weight(ff.w2, device)
+    w3 = _weight(ff.w3, device)
+    g_attn = _norm_weight(blk.attention_norm, device)
+    g_ffn = _norm_weight(blk.ffn_norm, device)
+
+    def acoustic_transformer_block(x, **kwargs):
+        seq = int(x.shape[-2])
+        h4 = ttnn.reshape(x, [1, 1, seq, dim])
+
+        xn = ttnn.rms_norm(h4, epsilon=eps, weight=g_attn)
+        qkv = ttnn.linear(xn, wqkv)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
+        )
+        a = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=False, scale=scale)
+        a = ttnn.experimental.nlp_concat_heads(a)
+        h4 = ttnn.add(h4, ttnn.linear(a, wo))
+
+        hn = ttnn.rms_norm(h4, epsilon=eps, weight=g_ffn)
+        gate = ttnn.silu(ttnn.linear(hn, w1))
+        up = ttnn.linear(hn, w3)
+        h4 = ttnn.add(h4, ttnn.linear(ttnn.multiply(gate, up), w2))
+
+        return ttnn.reshape(h4, [1, seq, dim])
+
+    return acoustic_transformer_block

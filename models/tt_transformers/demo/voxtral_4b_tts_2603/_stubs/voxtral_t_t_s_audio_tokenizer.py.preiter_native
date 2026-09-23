@@ -1,0 +1,327 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native TTNN port of `voxtral_t_t_s_audio_tokenizer` (`audio_tokenizer`) -- the whole neural
+codec decoder, from integer codes to a waveform.
+
+    quantizer.decode -> conv(292->1024, k3) -> [transformer, upsample] x4 -> output_proj -> depatch
+
+The open-source checkpoint ships the DECODER only (no `input_proj.*` / `encoder_blocks.*`), so
+there is no encode path to port.
+
+**Everything runs channels-LAST**, `[B, 1, T, C]`. The reference permutes to channels-first around
+each convolution and back for each transformer; in ttnn the matmul-shaped convolution wants
+channels last anyway, so the whole chain stays in one layout and the only transpose left is the one
+that brings the acoustic codes' `[B, 36, T]` around.
+
+Sliding windows DOUBLE up the decoder -- 2, 4, 8, 16 -- because each transposed convolution doubles
+the frame rate. Each stage's ALiBi mask is built from that stage's own window.
+
+Two padding modes appear, and they are different:
+  * the first convolution pads `replicate` (the boundary sample repeated), and
+  * `output_proj` pads `reflect` -- `[x6, x5, x4, x3, x2, x1, x0, x1, ...]`, a mirror about index 0
+    that EXCLUDES index 0 itself.
+
+Frame arithmetic for a 64-frame input: 64 -> 64 -> 128 -> 256 -> 512 frames, then `output_proj`
+emits 240 samples per frame, de-patched to 122880 samples (12.5 Hz frames, 1920 samples each after
+the 8x upsampling, 24 kHz).
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+
+import ttnn
+
+
+_SHARD_HEIGHT = 32
+_MASK_MAX_SEQ = 2048
+_MASK_NEG = -1.0e9
+
+
+def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if device.__class__.__name__ == "MeshDevice":
+        return ttnn.from_torch(
+            t, dtype=dtype, layout=layout, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _weight(linear, device):
+    return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
+
+
+def _norm_weight(norm, device):
+    return _from_torch(
+        norm.weight.detach().reshape(1, 1, -1, _SHARD_HEIGHT), device, layout=ttnn.ROW_MAJOR_LAYOUT
+    )
+
+
+def _row(x4, index):
+    """One sequence row of a `[B, 1, T, C]` tensor, as `[B, 1, 1, C]`."""
+    batch, channels = int(x4.shape[0]), int(x4.shape[-1])
+    return ttnn.slice(x4, [0, 0, index, 0], [batch, 1, index + 1, channels])
+
+
+def _alibi_window_mask(slopes, window, seq):
+    """`[1, H, seq, seq]`: ALiBi bias `slope[h] * (j - i)`, blocked where `j > i` or `j < i - window`.
+
+    Depends only on `j - i`, so the top-left `[S, S]` corner is exactly the mask for a length-`S`
+    sequence -- which is what lets the forward stay free of torch calls (the runtime native probe
+    graduates only at zero torch ops, so a per-call rebuild is not an option).
+    """
+    pos = torch.arange(seq)
+    rel = pos.unsqueeze(0) - pos.unsqueeze(1)
+    bias = slopes.reshape(-1, 1, 1).float() * rel.unsqueeze(0).float()
+    blocked = (rel > 0) | (rel < -window)
+    return bias.masked_fill(blocked.unsqueeze(0), _MASK_NEG).unsqueeze(0)
+
+
+def _compile_codec_block(device, blk, mask):
+    """One `CodecTransformerBlock` as a callable on a `[B, 1, T, dim]` ttnn tensor."""
+    attn = blk.attention
+    ff = blk.feed_forward
+    args = blk.args
+    n_heads = int(attn.n_local_heads)
+    n_kv_heads = int(attn.n_local_kv_heads)
+    scale = 1.0 / math.sqrt(int(args.head_dim))
+    qk_norm = bool(args.qk_norm)
+    dim = int(blk.dim)
+
+    attn_gamma = _norm_weight(blk.attention_norm, device)
+    attn_eps = float(blk.attention_norm.eps)
+    ffn_gamma = _norm_weight(blk.ffn_norm, device)
+    ffn_eps = float(blk.ffn_norm.eps)
+    wq, wk, wv, wo = (_weight(m, device) for m in (attn.wq, attn.wk, attn.wv, attn.wo))
+    q_gamma = _norm_weight(attn.q_norm, device) if qk_norm else None
+    k_gamma = _norm_weight(attn.k_norm, device) if qk_norm else None
+    q_eps = float(attn.q_norm.eps) if qk_norm else 0.0
+    k_eps = float(attn.k_norm.eps) if qk_norm else 0.0
+    w1, w2, w3 = (_weight(m, device) for m in (ff.w1, ff.w2, ff.w3))
+
+    attn_scale = ffn_scale = None
+    if blk.layer_scale:
+        attn_scale = _from_torch(blk.attention_scale.detach().reshape(1, 1, 1, dim), device)
+        ffn_scale = _from_torch(blk.ffn_scale.detach().reshape(1, 1, 1, dim), device)
+    if blk.post_attention_norm is not None or blk.post_ffn_norm is not None:
+        raise NotImplementedError("post_attention_norm / post_ffn_norm are not ported")
+
+    def block(h):
+        seq = int(h.shape[-2])
+        xn = ttnn.rms_norm(h, epsilon=attn_eps, weight=attn_gamma)
+        q = ttnn.linear(xn, wq)
+        k = ttnn.linear(xn, wk)
+        v = ttnn.linear(xn, wv)
+        if qk_norm:
+            q = ttnn.rms_norm(q, epsilon=q_eps, weight=q_gamma)
+            k = ttnn.rms_norm(k, epsilon=k_eps, weight=k_gamma)
+        qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
+            ttnn.concat([q, k, v], dim=-1),
+            num_heads=n_heads,
+            num_kv_heads=n_kv_heads,
+            transpose_k_heads=False,
+        )
+        a = ttnn.transformer.scaled_dot_product_attention(
+            qh, kh, vh,
+            attn_mask=ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq]),
+            is_causal=False,
+            scale=scale,
+        )
+        r = ttnn.linear(ttnn.experimental.nlp_concat_heads(a), wo)
+        if attn_scale is not None:
+            r = ttnn.multiply(r, attn_scale)
+        h = ttnn.add(h, r)
+
+        hn = ttnn.rms_norm(h, epsilon=ffn_eps, weight=ffn_gamma)
+        r = ttnn.linear(ttnn.multiply(ttnn.silu(ttnn.linear(hn, w1)), ttnn.linear(hn, w3)), w2)
+        if ffn_scale is not None:
+            r = ttnn.multiply(r, ffn_scale)
+        return ttnn.add(h, r)
+
+    return block
+
+
+def _compile_causal_conv1d(device, mod):
+    """A `CausalConv1d` as a callable on `[B, 1, T, C_in]` -> `[B, 1, T', C_out]`."""
+    conv = mod.conv
+    weight = conv.weight.detach()
+    out_channels, in_channels, kernel = (int(v) for v in weight.shape)
+    stride = int(conv.stride[0])
+    dilation = int(conv.dilation[0])
+    effective_kernel = int(mod._effective_kernel_size)
+    padding_total = int(mod._padding_total)
+    pad_mode = str(mod.pad_mode)
+    if pad_mode not in ("replicate", "reflect"):
+        raise NotImplementedError(f"pad_mode {pad_mode!r} is not ported")
+    reflect = pad_mode == "reflect"
+
+    taps = [_from_torch(weight[:, :, i].transpose(0, 1).contiguous(), device) for i in range(kernel)]
+    bias = None
+    if conv.bias is not None:
+        bias = _from_torch(conv.bias.detach().reshape(1, 1, 1, out_channels), device)
+
+    def run(x4):
+        batch, length = int(x4.shape[0]), int(x4.shape[-2])
+        n_frames = (length - effective_kernel + padding_total) / stride + 1
+        target = (math.ceil(n_frames) - 1) * stride + (effective_kernel - padding_total)
+        extra = target - length
+
+        pieces = []
+        if padding_total > 0:
+            if reflect:
+                pieces.extend(_row(x4, i) for i in range(padding_total, 0, -1))
+            else:
+                first = _row(x4, 0)
+                pieces.append(
+                    first if padding_total == 1 else ttnn.repeat(first, [1, 1, padding_total, 1])
+                )
+        pieces.append(x4)
+        if extra > 0:
+            if reflect:
+                pieces.extend(_row(x4, length - 1 - i) for i in range(1, extra + 1))
+            else:
+                last = _row(x4, length - 1)
+                pieces.append(last if extra == 1 else ttnn.repeat(last, [1, 1, extra, 1]))
+        padded = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=2)
+
+        padded_len = length + padding_total + extra
+        out_len = (padded_len - effective_kernel) // stride + 1
+
+        acc = None
+        for i, tap in enumerate(taps):
+            begin = i * dilation
+            end = begin + (out_len - 1) * stride + 1
+            seg = ttnn.slice(
+                padded, [0, 0, begin, 0], [batch, 1, end, in_channels],
+                [1, 1, stride, 1] if stride > 1 else None,
+            )
+            term = ttnn.linear(seg, tap)
+            acc = term if acc is None else ttnn.add(acc, term)
+        return acc if bias is None else ttnn.add(acc, bias)
+
+    return run
+
+
+def _compile_causal_conv_transpose1d(device, mod):
+    """A `CausalConvTranspose1d` as a callable on `[B, 1, T, C]` -> `[B, 1, T * 2, C]`."""
+    conv = mod.conv
+    weight = conv.weight.detach()
+    in_channels, out_channels, kernel = (int(v) for v in weight.shape)
+    stride = int(conv.stride[0])
+    if stride != 2 or kernel != 4:
+        raise NotImplementedError(f"only kernel 4 / stride 2 is ported, got {kernel}/{stride}")
+    right_trim = math.ceil((kernel - stride) * float(mod.trim_ratio))
+    if (kernel - stride) - right_trim != 0:
+        raise NotImplementedError("a non-zero left trim is not ported")
+
+    taps = [_from_torch(weight[:, :, i].contiguous(), device) for i in range(kernel)]
+    bias = None
+    if conv.bias is not None:
+        bias = _from_torch(conv.bias.detach().reshape(1, 1, 1, out_channels), device)
+
+    def run(x4):
+        batch, length = int(x4.shape[0]), int(x4.shape[-2])
+        zero_row = ttnn.zeros(
+            [batch, 1, 1, out_channels], dtype=x4.dtype, layout=ttnn.TILE_LAYOUT, device=device
+        )
+
+        def _delayed(tap):
+            """`tap` applied to the PREVIOUS input step: a zero row, then steps 0..L-2."""
+            head = ttnn.slice(x4, [0, 0, 0, 0], [batch, 1, length - 1, in_channels])
+            return ttnn.concat([zero_row, ttnn.linear(head, tap)], dim=2)
+
+        even = ttnn.add(ttnn.linear(x4, taps[0]), _delayed(taps[2]))
+        odd = ttnn.add(ttnn.linear(x4, taps[1]), _delayed(taps[3]))
+        out = ttnn.reshape(
+            ttnn.concat([even, odd], dim=-1), [batch, 1, length * stride, out_channels]
+        )
+        return out if bias is None else ttnn.add(out, bias)
+
+    return run
+
+
+def build(device, torch_module):
+    codec = torch_module
+    quant = codec.quantizer
+    semantic = quant.semantic_codebook
+    acoustic = quant.acoustic_codebook
+
+    n_semantic = int(semantic.num_codebooks)
+    n_acoustic = int(acoustic.num_codebooks)
+    n_levels = int(acoustic.n_levels)
+    shift = (n_levels - 1) / 2.0
+    scale = 2.0 / (n_levels - 1)
+    latent_dim = int(codec.latent_dim)
+    patch_size = int(codec.patch_size)
+
+    table = _from_torch(
+        semantic.embedding.detach().contiguous(), device, layout=ttnn.ROW_MAJOR_LAYOUT
+    )
+
+    stages = []
+    for blk in codec.decoder_blocks:
+        name = type(blk).__name__
+        if name == "CausalConv1d":
+            stages.append(_compile_causal_conv1d(device, blk))
+        elif name == "CausalConvTranspose1d":
+            stages.append(_compile_causal_conv_transpose1d(device, blk))
+        elif name == "CodecTransformer":
+            mask = _from_torch(
+                _alibi_window_mask(
+                    blk.layers["0"].attention.alibi_slopes.detach(),
+                    int(blk.args.attn_sliding_window_size),
+                    _MASK_MAX_SEQ,
+                ),
+                device,
+            )
+            blocks = [
+                _compile_codec_block(device, blk.layers[str(i)], mask) for i in blk.layers_ids
+            ]
+
+            def _stack(x4, _blocks=blocks):
+                for b in _blocks:
+                    x4 = b(x4)
+                return x4
+
+            stages.append(_stack)
+        else:
+            raise NotImplementedError(f"decoder block {name} is not ported")
+    output_proj = _compile_causal_conv1d(device, codec.output_proj)
+
+    def voxtral_t_t_s_audio_tokenizer(codes, **kwargs):
+        batch, rows, frames = (int(v) for v in codes.shape)
+        if frames * 8 > _MASK_MAX_SEQ:
+            raise NotImplementedError(
+                f"{frames} frames upsample to {frames * 8}, past the prebuilt ALiBi mask "
+                f"({_MASK_MAX_SEQ}); raise _MASK_MAX_SEQ -- the mask cannot be rebuilt inside the "
+                f"forward"
+            )
+
+        sem_codes = ttnn.reshape(
+            ttnn.slice(codes, [0, 0, 0], [batch, n_semantic, frames]), [batch, frames]
+        )
+        sem = ttnn.embedding(sem_codes, table, layout=ttnn.TILE_LAYOUT)
+        aco_codes = ttnn.typecast(
+            ttnn.to_layout(
+                ttnn.slice(codes, [0, n_semantic, 0], [batch, n_semantic + n_acoustic, frames]),
+                ttnn.TILE_LAYOUT,
+            ),
+            ttnn.bfloat16,
+        )
+        aco = ttnn.transpose(ttnn.multiply(ttnn.subtract(aco_codes, shift), scale), -2, -1)
+
+        h = ttnn.reshape(ttnn.concat([sem, aco], dim=-1), [batch, 1, frames, latent_dim])
+        for stage in stages:
+            h = stage(h)
+        h = output_proj(h)
+
+        # "b (c h) t -> b c (t h)" with h = patch_size: channels-last, that is just a flatten.
+        out_frames = int(h.shape[-2])
+        return ttnn.reshape(h, [batch, 1, out_frames * patch_size])
+
+    return voxtral_t_t_s_audio_tokenizer

@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native TTNN port of `mistral_r_m_s_norm` (`model.layers.0.input_layernorm`).
+
+`x * rsqrt(mean(x^2) + eps) * weight`, over dim 3072 with `eps = 1e-5`. `MistralRMSNorm` does the
+reduction in float32 and casts back, so the activation is widened here to match rather than
+normalising in bfloat16.
+
+`ttnn.rms_norm` asserts `gamma.padded_shape[-1] == TILE_WIDTH`
+(`layernorm_device_operation.cpp:106`), so a flat `[dim]` gamma is rejected outright; it goes up as
+`[1, 1, dim // 32, 32]` ROW_MAJOR.
+"""
+
+from __future__ import annotations
+
+import torch
+
+import ttnn
+
+
+_SHARD_HEIGHT = 32
+
+_COMPUTE = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True
+)
+
+
+def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if device.__class__.__name__ == "MeshDevice":
+        return ttnn.from_torch(
+            t, dtype=dtype, layout=layout, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def build(device, torch_module):
+    norm = torch_module
+    dim = int(norm.weight.shape[-1])
+    eps = float(norm.variance_epsilon)
+    gamma = _from_torch(
+        norm.weight.detach().reshape(1, 1, -1, _SHARD_HEIGHT),
+        device,
+        dtype=ttnn.float32,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+    )
+
+    def mistral_r_m_s_norm(hidden_states, **kwargs):
+        seq = int(hidden_states.shape[-2])
+        x = ttnn.typecast(ttnn.reshape(hidden_states, [1, 1, seq, dim]), ttnn.float32)
+        out = ttnn.rms_norm(x, epsilon=eps, weight=gamma, compute_kernel_config=_COMPUTE)
+        return ttnn.reshape(out, [1, seq, dim])
+
+    return mistral_r_m_s_norm

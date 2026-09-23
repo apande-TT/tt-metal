@@ -1,0 +1,114 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native TTNN port of `causal_conv1d` (`audio_tokenizer.decoder_blocks.0`).
+
+`CausalConv1d` left-pads by `effective_kernel_size - stride` (plus whatever trailing padding is
+needed to make the frame count come out whole) and then runs a plain `Conv1d` with no padding of
+its own. Here: 292 -> 1024 channels, kernel 3, stride 1, `pad_mode="replicate"`, no bias, and the
+weight is the `weight_norm` reconstruction (reading `conv.weight` in `build` runs the
+parametrization on the host, which is where weight prep belongs).
+
+The convolution itself is done as **shifted matmuls**: with the sequence laid out channels-last as
+`[1, 1, L, C]`, output position `t` is `sum_k x[t + k] @ W_k`, so each tap is one `[C_in, C_out]`
+matmul over a row-shifted slice of the padded input. That keeps the whole forward in ttnn matmul /
+slice / concat -- no conv-specific sharding config to get wrong -- and the row-shifted slices are
+exact even at non-tile-aligned offsets.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+
+import ttnn
+
+
+def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if device.__class__.__name__ == "MeshDevice":
+        return ttnn.from_torch(
+            t, dtype=dtype, layout=layout, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _edge_pad(x4, rows, *, at_start):
+    """`rows` copies of the first (or last) sequence row of a `[1, 1, L, C]` tensor.
+
+    This is the `pad_mode="replicate"` edge: the padded value is the boundary sample itself.
+    """
+    length, channels = int(x4.shape[-2]), int(x4.shape[-1])
+    row_start = 0 if at_start else length - 1
+    row = ttnn.slice(x4, [0, 0, row_start, 0], [1, 1, row_start + 1, channels])
+    return row if rows == 1 else ttnn.repeat(row, [1, 1, rows, 1])
+
+
+def build(device, torch_module):
+    blk = torch_module
+    conv = blk.conv
+
+    weight = conv.weight.detach()
+    out_channels, in_channels, kernel = (int(v) for v in weight.shape)
+    stride = int(conv.stride[0])
+    dilation = int(conv.dilation[0])
+    effective_kernel = int(blk._effective_kernel_size)
+    padding_total = int(blk._padding_total)
+    pad_mode = str(blk.pad_mode)
+    if pad_mode not in ("replicate", "constant", "zeros"):
+        raise NotImplementedError(f"causal_conv1d pad_mode {pad_mode!r} is not ported")
+    replicate = pad_mode == "replicate"
+
+    taps = [_from_torch(weight[:, :, i].transpose(0, 1).contiguous(), device) for i in range(kernel)]
+    bias = None
+    if conv.bias is not None:
+        bias = _from_torch(conv.bias.detach().reshape(1, 1, 1, out_channels), device)
+
+    def causal_conv1d(x, **kwargs):
+        length = int(x.shape[-1])
+        x4 = ttnn.reshape(ttnn.transpose(x, -2, -1), [1, 1, length, in_channels])
+
+        n_frames = (length - effective_kernel + padding_total) / stride + 1
+        target = (math.ceil(n_frames) - 1) * stride + (effective_kernel - padding_total)
+        extra = target - length
+
+        pieces = []
+        if padding_total > 0:
+            pieces.append(
+                _edge_pad(x4, padding_total, at_start=True)
+                if replicate
+                else ttnn.zeros([1, 1, padding_total, in_channels], dtype=x4.dtype,
+                                layout=ttnn.TILE_LAYOUT, device=device)
+            )
+        pieces.append(x4)
+        if extra > 0:
+            pieces.append(
+                _edge_pad(x4, extra, at_start=False)
+                if replicate
+                else ttnn.zeros([1, 1, extra, in_channels], dtype=x4.dtype,
+                                layout=ttnn.TILE_LAYOUT, device=device)
+            )
+        padded = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=2)
+
+        padded_len = length + padding_total + extra
+        out_len = (padded_len - effective_kernel) // stride + 1
+
+        acc = None
+        for i, tap in enumerate(taps):
+            begin = i * dilation
+            end = begin + (out_len - 1) * stride + 1
+            seg = ttnn.slice(
+                padded, [0, 0, begin, 0], [1, 1, end, in_channels],
+                [1, 1, stride, 1] if stride > 1 else None,
+            )
+            term = ttnn.linear(seg, tap)
+            acc = term if acc is None else ttnn.add(acc, term)
+        if bias is not None:
+            acc = ttnn.add(acc, bias)
+
+        return ttnn.reshape(ttnn.transpose(acc, -2, -1), [1, out_channels, out_len])
+
+    return causal_conv1d

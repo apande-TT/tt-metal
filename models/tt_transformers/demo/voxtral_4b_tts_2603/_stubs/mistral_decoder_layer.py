@@ -1,0 +1,416 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native TTNN port of `mistral_decoder_layer` -- one text-backbone `MistralDecoderLayer`
+(`model.layers.0`).
+
+    h = x + self_attn(input_layernorm(x));   out = h + mlp(post_attention_layernorm(h))
+
+GQA 32 query heads over 8 KV heads, head_dim **128** (explicitly 128, not 3072/32=96), hidden_dim
+9216, `norm_eps` 1e-5, no biases. RoPE is `rotate_half` against the `(cos, sin)` the caller passes;
+the harness marshals them onto the device, because the runtime native probe counts every torch call
+the forward makes and graduates only at zero -- a `ttnn.from_torch` in here alone costs three.
+
+Causality comes from SDPA's `is_causal`, so the additive `attention_mask` argument is accepted and
+ignored. That matches the reference for an unpadded batch; a mask carrying real PADDING would need
+to be fed through as an `attn_mask` instead.
+
+TWO phases, one set of weights. With no `kv_cache` this is exactly the graduated prefill body.
+Given one it ALSO seeds it from its own post-RoPE k/v, and `decode=True` then runs the cached
+single-token path, which reads the resident history instead of recomputing it. The no-cache path is
+untouched, so the per-component PCC test still measures the same arithmetic it graduated on."""
+
+from __future__ import annotations
+
+import torch
+
+import ttnn
+
+
+
+# SDPA takes bfloat16 and nothing wider (`sdpa_device_operation.cpp:43`), and the KV cache is read
+# by the same op family, so q/k/v and the cache are bf16 while the residual stream stays float32.
+_SDPA_DTYPE = ttnn.bfloat16
+
+# `ttnn.linear` on its DEFAULTS leaves `fp32_dest_acc_en` off, which rounds the matmul
+# accumulator to bfloat16 at every step even though the activations are float32. Every linear
+# here passes this instead; `mistral_model.py` carries the identical config for the identical
+# arithmetic, and without it the two ports of the same layer do not agree with each other.
+_COMPUTE = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True
+)
+
+
+def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+    t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if device.__class__.__name__ == "MeshDevice":
+        return ttnn.from_torch(
+            t, dtype=dtype, layout=layout, device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _weight(linear, device):
+    """A `[in, out]` device tensor for a torch `nn.Linear` (whose weight is `[out, in]`)."""
+    return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
+
+
+def _norm_weight(norm, device):
+    """Gamma as `[1, 1, 1, dim]` float32 TILE -- the form `_rms_norm`'s final multiply takes."""
+    return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
+
+
+def _rms_norm(x, gamma, eps):
+    """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
+
+    NOT `ttnn.rms_norm`. On the real layer-0 input the stock op lands at 9.65e-4 relative error
+    against the reference and these four ops at 6.6e-8. The error is RELATIVE, so it rescales the
+    whole branch that follows, and this stack runs two per layer over 26 layers; left in, the
+    prefill's last hidden state came back at PCC 0.9971 and the 21-level acoustic quantiser
+    downstream turned that into ~26% wrong audio codes.
+
+    A zero pad row stays zero: `mean(x^2)` is 0 and `0 * rsqrt(eps)` is 0, so an off-tile
+    sequence padded up to a tile multiple neither NaNs nor leaks into a real row.
+    """
+    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
+    return ttnn.multiply(ttnn.multiply(x, scale), gamma)
+
+
+def _view4(x, dim):
+    """`[..., seq, dim]` -> `([lead, 1, seq, dim], lead, seq, rank)`.
+
+    THE LEADING BOUND IS READ OFF THE TENSOR. This used to be a literal
+    `ttnn.reshape(x, [1, 1, seq, dim])`, which is right at the batch of 1 the per-component PCC
+    harness feeds and wrong for every batched caller: at B=32 the reshape either raises on volume
+    or -- worse, once a leading 1 is folded in elsewhere -- keeps only row 0 and silently drops
+    samples 1..31. Everything downstream of here is per-row, so collapsing every leading axis into
+    one `lead` is exact for `[B, S, D]`, `[B, 1, S, D]` and the decode stream's `[1, 1, B, D]`.
+    """
+    shape = [int(s) for s in x.shape]
+    seq = shape[-2]
+    lead = 1
+    for size in shape[:-2]:
+        lead *= size
+    return ttnn.reshape(x, [lead, 1, seq, dim]), lead, seq, len(shape)
+
+
+def _restore(x, lead, seq, rank, dim):
+    """Put a `[lead, 1, seq, dim]` result back into the RANK the caller handed in."""
+    return ttnn.reshape(x, [lead, seq, dim] if rank == 3 else [lead, 1, seq, dim])
+
+
+def _broadcast4(t, seq, width):
+    """A `(cos, sin)` table as `[lead, 1, seq, width]`, its leading bound read off the tensor."""
+    volume = 1
+    for size in t.shape:
+        volume *= int(size)
+    return ttnn.reshape(t, [volume // (seq * width), 1, seq, width])
+
+
+def _rope(x, cos, sin, half):
+    """`x * cos + rotate_half(x) * sin` -- the convention `apply_rotary_pos_emb` uses.
+
+    `rotate_half` is `cat(-x[..., half:], x[..., :half])`; both halves are multiples of the tile
+    width, so the two slices are tile-aligned.
+    """
+    ends = list(x.shape)
+    lower = ttnn.slice(x, [0, 0, 0, 0], [ends[0], ends[1], ends[2], half])
+    upper = ttnn.slice(x, [0, 0, 0, half], ends)
+    rotated = ttnn.concat([ttnn.neg(upper), lower], dim=-1)
+    return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(rotated, sin))
+
+
+def _decode_shard(device, rows, width):
+    """HEIGHT-sharded over the batch, one user per core -- the decode op set's layout.
+
+    `nlp_create_qkv_heads_decode`, decode-mode `rotary_embedding_hf` and
+    `nlp_concat_heads_decode` are a matched set: each wants one 32-row tile per user, and the RoPE
+    op rejects a merely-interleaved tensor outright, so this is part of the contract.
+    """
+    grid = device.compute_with_storage_grid_size()
+    cols = min(int(grid.x), int(rows))
+    while rows % cols:
+        cols -= 1
+    return ttnn.create_sharded_memory_config(
+        shape=(ttnn.TILE_SIZE, int(width)),
+        core_grid=ttnn.CoreGrid(y=rows // cols, x=cols),
+        strategy=ttnn.ShardStrategy.HEIGHT,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+
+
+
+# THE ZERO TAIL IS A PERSISTENT BUFFER, NOT A PER-CALL `ttnn.zeros`.
+# `ttnn.zeros` builds the tensor on the host and enqueues a WRITE to get it onto the device, and a
+# write is exactly what a captured trace cannot replay: capturing a prefill that seeded its cache
+# this way died on `TT_FATAL: Writes are not supported during trace capture`. The tail is the same
+# shape of the same zeros on every call, so it is created once per (device, shape) and reused --
+# and because the pad is now shared it is NEVER deallocated by the caller, which used to free it
+# after the concat. `flow_matching_audio_transformer` hoists its tile pad for the same reason.
+_ZERO_TAIL = {}
+
+
+def _zero_tail(device, b, h, rows, width):
+    key = (id(device), b, h, rows, width)
+    buf = _ZERO_TAIL.get(key)
+    if buf is None:
+        buf = ttnn.zeros([b, h, rows, width], dtype=_SDPA_DTYPE, layout=ttnn.TILE_LAYOUT, device=device)
+        _ZERO_TAIL[key] = buf
+    return buf
+
+
+def _seed_cache(kv, k, v):
+    """Hand the prefill's POST-RoPE k/v to the cache, widened out to `kv["capacity"]`.
+
+    No copy and no second source of truth: the cache IS the prefill's own k/v with a zero tail
+    concatenated on the sequence axis, so the resident history cannot disagree with the prefill
+    that produced it. The tail slots are never READ before they are written -- a decode step
+    writes slot `position` and then attends to `[0, position]` -- so they only have to exist.
+    """
+    capacity = int(kv.get("capacity") or 0)
+    for key, tensor in (("k", k), ("v", v)):
+        if tensor.dtype != _SDPA_DTYPE:
+            tensor = ttnn.typecast(tensor, _SDPA_DTYPE)
+        shape = [int(s) for s in tensor.shape]
+        if capacity > shape[-2]:
+            pad = _zero_tail(tensor.device(), shape[0], shape[1], capacity - shape[-2], shape[-1])
+            tensor = ttnn.concat([tensor, pad], dim=2)
+        elif capacity and capacity < shape[-2]:
+            raise ValueError(f"kv capacity {capacity} is shorter than the prefill's {shape[-2]}")
+        stale = kv.get(key)
+        if stale is not None:
+            try:
+                ttnn.deallocate(stale)
+            except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
+                pass
+        kv[key] = tensor
+    kv["filled"] = int(k.shape[-2])
+
+
+# The additive mask for one decode position, `[1, 1, 1, C]`: 0 through `position`, a large
+# negative beyond it. The row comes off the `[C, C]` float32 table the text stack uploaded ONCE at
+# build time and handed to every block in its `kv` dict -- built here it would be a torch call
+# inside the forward, and a host write inside a captured trace.
+_MASK_NEG = -1e9
+
+
+def _decode_mask(kv_cache, position, cap):
+    table = kv_cache.get("mask")
+    if table is None:
+        raise RuntimeError(
+            "the decode step needs kv_cache['mask'] -- the [capacity, capacity] additive table "
+            "the text stack stages at build time; without it the zero tail of the cache is "
+            "attended as if it were real keys"
+        )
+    row = ttnn.slice(table, [int(position), 0], [int(position) + 1, cap])
+    return ttnn.to_layout(ttnn.reshape(row, [1, 1, 1, cap]), ttnn.TILE_LAYOUT)
+
+
+def _softmax(x, dim=-1):
+    """`exp(x - max) / sum(exp(x - max))`, spelled out in three ops.
+
+    NOT `ttnn.softmax`. Measured on this build against a float64 reference, the stock op's rows do
+    not sum to 1: mean 0.9943, worst 0.9611, for ~1.8e-2 relative error -- and NO flag changes it
+    (`numeric_stable=True` and `compute_kernel_config` all return the identical tensor). These
+    three ops sit at 5.5e-8, and renormalising the stock op's output only reaches 2.1e-2, so its
+    per-element values are wrong too, not just its sum.
+
+    A softmax that does not sum to 1 ATTENUATES the attention output it weights. That reads as a
+    NORM RATIO below 1 at a PCC of 0.9999, so a PCC-only gate cannot see it, and it is invisible
+    in any layer whose residual is already large. The acoustic stubs beside this file spell the
+    same three ops out for the same reason.
+    """
+    e = ttnn.exp(ttnn.subtract(x, ttnn.max(x, dim=dim, keepdim=True)))
+    return ttnn.divide(e, ttnn.sum(e, dim=dim, keepdim=True))
+
+
+def build(device, torch_module):
+    layer = torch_module
+    attn = layer.self_attn
+    mlp = layer.mlp
+
+    dim = int(attn.q_proj.in_features)
+    n_heads = int(attn.config.num_attention_heads)
+    n_kv_heads = int(attn.config.num_key_value_heads)
+    head_dim = int(attn.head_dim)
+    half = head_dim // 2
+    scale = float(attn.scaling)
+
+    wqkv = _from_torch(
+        torch.cat(
+            [
+                attn.q_proj.weight.detach().transpose(0, 1),
+                attn.k_proj.weight.detach().transpose(0, 1),
+                attn.v_proj.weight.detach().transpose(0, 1),
+            ],
+            dim=-1,
+        ).contiguous(),
+        device,
+    )
+    wo = _weight(attn.o_proj, device)
+    w_gate = _weight(mlp.gate_proj, device)
+    w_up = _weight(mlp.up_proj, device)
+    w_down = _weight(mlp.down_proj, device)
+    g_in = _norm_weight(layer.input_layernorm, device)
+    g_post = _norm_weight(layer.post_attention_layernorm, device)
+    eps_in = float(layer.input_layernorm.variance_epsilon)
+    eps_post = float(layer.post_attention_layernorm.variance_epsilon)
+
+    def _decode_attn(xn, position_embeddings, kv_cache, position):
+        """ONE token per user, attending to the RESIDENT cache instead of recomputing the prefix.
+
+        The stream arrives folded as `[1, 1, B, dim]`: `[B, 1, dim]` pads its middle dim out to a
+        whole tile, so every op would touch 32x the data the step carries.
+        """
+        # THE USER COUNT IS THE VOLUME OVER THE WIDTH, not any single leading dim. A decode step
+        # reaches here as `[1, 1, B, dim]` (the folded stream) or as `[B, 1, 1, dim]`, and reading
+        # `shape[-2]` returns B for the first and 1 for the second -- which would quietly process
+        # one user and drop the other 31.
+        held = [int(size) for size in xn.shape]
+        batch = 1
+        for size in held[:-1]:
+            batch *= size
+        # FLOAT32 ALL THE WAY THROUGH. `_SDPA_DTYPE` is bfloat16 because SDPA takes nothing wider,
+        # and this path no longer calls SDPA -- so the narrowing bought nothing and cost a bfloat16
+        # ulp on every q, k and v. The three ops that forced it are gone with it:
+        # `nlp_create_qkv_heads_decode` (its head split is three slices and a reshape, and it
+        # hands back a HEIGHT-SHARDED tensor this path would only have to interleave again) and
+        # decode-mode `rotary_embedding_hf` (which typecasts its input to bfloat16 outright --
+        # `models/tt_transformers/tt/attention.py:664`). `_rope` is the SAME rotate-half the
+        # prefill branch below runs, in float32, and every user in a step shares one position so
+        # `cos`/`sin` are `[1, 1, 1, head_dim]` and broadcast.
+        groups = n_heads // n_kv_heads
+        flat = ttnn.reshape(xn, [1, 1, batch, dim])
+        fused = ttnn.linear(flat, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+        q_width, kv_width = n_heads * head_dim, n_kv_heads * head_dim
+        rows = ttnn.to_layout(fused, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.deallocate(fused)
+
+        def _head_split(start, width, heads_per_kv):
+            part = ttnn.slice(rows, [0, 0, 0, start], [1, 1, batch, start + width])
+            return ttnn.to_layout(
+                ttnn.reshape(part, [batch, n_kv_heads, heads_per_kv, head_dim]), ttnn.TILE_LAYOUT
+            )
+
+        q = _head_split(0, q_width, groups)
+        k = _head_split(q_width, kv_width, 1)
+        v = _head_split(q_width + kv_width, kv_width, 1)
+        ttnn.deallocate(rows)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            q = _rope(q, cos, sin, half)
+            k = _rope(k, cos, sin, half)
+        idxs = [int(position)] * batch
+        # `paged_update_cache` wants the decode layout `[1, B, n_kv, head_dim]` AND it wants that
+        # tensor HEIGHT-SHARDED, one user per core -- it is part of the decode op set even though
+        # the rest of that set is gone from this path ("Expect input_tensor to be sharded"). The
+        # head split above is `[B, n_kv, 1, head_dim]`, the same elements in the same order.
+        for slot, tensor in (("k", k), ("v", v)):
+            ttnn.experimental.paged_update_cache(
+                kv_cache[slot],
+                ttnn.to_memory_config(
+                    ttnn.reshape(tensor, [1, batch, n_kv_heads, head_dim]),
+                    _decode_shard(tensor.device(), batch, head_dim),
+                ),
+                update_idxs=idxs,
+            )
+        ttnn.deallocate(k)
+        ttnn.deallocate(v)
+        # FLASH-DECODE ATTENUATES, so this path spells the attention out instead.
+        # `scaled_dot_product_attention_decode` came back with its output norm SHORT of the
+        # reference's at every layer -- measured against torch on this model, one decode step, the
+        # reference fed the same cache: norm ratio 0.9478 / 0.9781 / 0.9888 / 0.9867 / 0.9895 /
+        # 0.9942 at PCC 0.9999, i.e. almost pure attenuation, worst where the softmax is flattest.
+        # It is a denominator that carries mass the numerator does not. That is invisible wherever
+        # the residual is large, and this model puts its first three layers at hidden norms of
+        # 1.1 / 2.6 / 4.0 before layer 3 jumps to 287, so the whole error lands there: the cached
+        # decode step measured PCC 0.93 against the reference while THIS STACK'S OWN PREFILL path,
+        # same weights and same token, measured 0.9999.
+        #
+        # The query heads are GROUPED BY KV HEAD rather than repeat_interleaved: reading q as
+        # `[B, n_kv, groups, head_dim]` makes the batch dims line up with the cache's
+        # `[B, n_kv, C, head_dim]`, so the whole thing is two batched matmuls and no cache
+        # tensor is ever materialised `n_heads` times. `head // groups` IS the reference's
+        # `repeat_kv` mapping, so the grouping is the same one HF uses.
+        cap = int(kv_cache["k"].shape[-2])
+        scores = ttnn.matmul(
+            q, ttnn.transpose(kv_cache["k"], -2, -1), compute_kernel_config=_COMPUTE
+        )
+        ttnn.deallocate(q)
+        # The cache tail beyond `position` is zeros, and a zero key scores ZERO -- which is a
+        # perfectly ordinary logit, not a small one. It has to be masked explicitly.
+        scores = ttnn.add(ttnn.multiply(scores, scale), _decode_mask(kv_cache, position, cap))
+        weights = _softmax(scores)
+        ttnn.deallocate(scores)
+        ctx = ttnn.matmul(weights, kv_cache["v"], compute_kernel_config=_COMPUTE)
+        ttnn.deallocate(weights)
+        merged = ttnn.to_layout(
+            ttnn.reshape(
+                ttnn.to_layout(ctx, ttnn.ROW_MAJOR_LAYOUT), [1, 1, batch, n_heads * head_dim]
+            ),
+            ttnn.TILE_LAYOUT,
+        )
+        ttnn.deallocate(ctx)
+        out = ttnn.linear(
+            ttnn.reshape(merged, [1, 1, batch, n_heads * head_dim]), wo, dtype=xn.dtype,
+            compute_kernel_config=_COMPUTE,
+        )
+        ttnn.deallocate(merged)
+        # Back in the caller's own shape, so the residual add downstream lines up whichever form
+        # of the one-token stream came in.
+        return ttnn.reshape(out, held[:-1] + [dim])
+
+    def _prefill_attn(xn, position_embeddings, kv_cache, seq):
+        qkv = ttnn.linear(xn, wqkv, dtype=_SDPA_DTYPE, compute_kernel_config=_COMPUTE)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
+        )
+        ttnn.deallocate(qkv)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            cos = _broadcast4(cos, seq, head_dim)
+            sin = _broadcast4(sin, seq, head_dim)
+            q = _rope(q, cos, sin, half)
+            k = _rope(k, cos, sin, half)
+        a = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+        if kv_cache is not None:
+            _seed_cache(kv_cache, k, v)
+        return ttnn.linear(
+            ttnn.experimental.nlp_concat_heads(a), wo, dtype=xn.dtype,
+            compute_kernel_config=_COMPUTE,
+        )
+
+    def mistral_decoder_layer(
+        hidden_states,
+        position_embeddings=None,
+        kv_cache=None,
+        position=None,
+        decode=False,
+        **kwargs,
+    ):
+        h, lead, seq, rank = _view4(hidden_states, dim)
+
+        xn = _rms_norm(h, g_in, eps_in)
+        if decode:
+            attn_out = _decode_attn(xn, position_embeddings, kv_cache, position)
+        else:
+            attn_out = _prefill_attn(xn, position_embeddings, kv_cache, seq)
+        ttnn.deallocate(xn)
+        h = ttnn.add(h, attn_out)
+        ttnn.deallocate(attn_out)
+
+        hn = _rms_norm(h, g_post, eps_post)
+        gated = ttnn.multiply(
+            ttnn.silu(ttnn.linear(hn, w_gate, compute_kernel_config=_COMPUTE)),
+            ttnn.linear(hn, w_up, compute_kernel_config=_COMPUTE),
+        )
+        ttnn.deallocate(hn)
+        h = ttnn.add(h, ttnn.linear(gated, w_down, dtype=h.dtype, compute_kernel_config=_COMPUTE))
+        ttnn.deallocate(gated)
+
+        return _restore(h, lead, seq, rank, dim)
+
+    return mistral_decoder_layer
