@@ -534,12 +534,12 @@ class NemotronHBlock:
         xss = ttnn.slice(conv_out, [0, 0, 0], [1, B, INTER])
         Bg = ttnn.slice(conv_out, [0, 0, INTER], [1, B, INTER + GGN])
         Cg = ttnn.slice(conv_out, [0, 0, INTER + GGN], [1, B, INTER + 2 * GGN])
-        Bh = ttnn.matmul(Bg, self._Esel, compute_kernel_config=ckc)
-        Ch = ttnn.matmul(Cg, self._Esel, compute_kernel_config=ckc)
         dt = self._softplus(ttnn.add(dt, self._dt_bias))
         x_h = self._to_heads(xss, 1, P, B)
-        B_h = self._to_heads(Bh, 1, N, B)
-        C_h = self._to_heads(Ch, 1, N, B)
+        # group -> head expansion as a repeat of each group's row (no Esel read)
+        G = GGN // N
+        B_h = ttnn.repeat_interleave(_ssm_cache.to_heads(Bg, B, 1, G, N), H // G, dim=1)  # [B,H,1,N]
+        C_h = ttnn.repeat_interleave(_ssm_cache.to_heads(Cg, B, 1, G, N), H // G, dim=1)
         dt_h = self._to_heads(dt, 1, 1, B)
         return _ssm_cache.mamba_ssm_step(self._state, x_h, B_h, C_h, dt_h, self._A4, self._D4, ckc)
 
