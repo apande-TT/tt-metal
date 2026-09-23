@@ -257,7 +257,7 @@ class TtNemotronHExperts:
         # (T, Eloc) routing weights -> (T, Eloc*inter) via a one-hot expander
         # matmul; avoids tile-layout reshapes of the wide activation.
         w_wide = ttnn.matmul(W_sh, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat16)
-        act = ttnn.multiply(act, w_wide)
+        act = ttnn.multiply(act, w_wide, dtype=ttnn.bfloat8_b)  # bf8_b halves the down matmul's activation read
         ttnn.deallocate(w_wide)
         out = ttnn.matmul(
             act,

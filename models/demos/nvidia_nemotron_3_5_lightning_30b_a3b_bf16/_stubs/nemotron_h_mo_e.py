@@ -299,7 +299,7 @@ class TtNemotronHMOE:
         act = ttnn.linear(hs_bf, self._up_cat, compute_kernel_config=self._expert_ckc, activation="relu")
         act = ttnn.square(act)  # relu2, (B,T,Eloc*inter)
         w_wide = ttnn.matmul(W_use, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat16)
-        act = ttnn.multiply(act, w_wide)
+        act = ttnn.multiply(act, w_wide, dtype=ttnn.bfloat8_b)  # bf8_b halves the down matmul's activation read
         ttnn.deallocate(w_wide)
         out = ttnn.matmul(
             act, self._down_cat, compute_kernel_config=self._expert_ckc, dtype=ttnn.float32
