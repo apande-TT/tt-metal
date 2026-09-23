@@ -305,9 +305,11 @@ class TtNemotronHMOE:
         # expert's slice by its routing weight (expanded to the folded width),
         # then one down matmul whose K reduction is the weighted expert sum.
         act = ttnn.linear(hs_bf, self._up_cat, compute_kernel_config=self._expert_ckc, activation="relu")
-        act = ttnn.square(act)  # relu2, (B,T,Eloc*inter)
         w_wide = ttnn.matmul(W_use, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat16)
-        act = ttnn.multiply(act, w_wide, dtype=ttnn.bfloat8_b)  # bf8_b halves the down matmul's activation read
+        # relu2 = square fused into the routing-weight multiply (one pass over act)
+        act = ttnn.multiply(
+            act, w_wide, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]
+        )  # bf8_b halves the down matmul's activation read
         ttnn.deallocate(w_wide)
         if B * T <= _dram_mm.TILE:  # decode: stream the DRAM-sharded bank
             hid = int(hs_bf.shape[-1])

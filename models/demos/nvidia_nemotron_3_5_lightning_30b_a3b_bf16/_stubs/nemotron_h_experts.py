@@ -261,11 +261,13 @@ class TtNemotronHExperts:
             hs_bf, self._up_cat, compute_kernel_config=self._expert_ckc, core_grid=self._core_grid, activation="relu"
         )  # (T, Eloc*inter)
         ttnn.deallocate(hs_bf)
-        act = ttnn.square(act)
         # (T, Eloc) routing weights -> (T, Eloc*inter) via a one-hot expander
         # matmul; avoids tile-layout reshapes of the wide activation.
         w_wide = ttnn.matmul(W_sh, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat16)
-        act = ttnn.multiply(act, w_wide, dtype=ttnn.bfloat8_b)  # bf8_b halves the down matmul's activation read
+        # relu2 = square fused into the routing-weight multiply (one pass over act)
+        act = ttnn.multiply(
+            act, w_wide, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]
+        )  # bf8_b halves the down matmul's activation read
         ttnn.deallocate(w_wide)
         if num_tokens <= _dram_mm.TILE:  # decode: stream the DRAM-sharded bank
             out = _dram_mm.matmul(
