@@ -55,7 +55,7 @@ from pathlib import Path
 import torch
 
 import ttnn
-from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _ssm_cache
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm, _ssm_cache
 from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import nemotron_h_attention as _attn_stub
 from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import nemotron_h_block as _block_stub
 from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import nemotron_h_experts as _experts_stub
@@ -482,7 +482,13 @@ class NemotronHPipeline:
         # lm_head in fp32: HF computes `self.lm_head(...).float()`, and a bf16
         # head visibly costs final-logit PCC.
         lm = model.lm_head.weight.detach().float().t().contiguous()  # (hidden, vocab)
-        self.lm_head_w = _replicate(device, lm, dtype=ttnn.bfloat8_b)
+        # vocab-parallel on the TP axis: each chip streams half the ~350 MB head
+        # and the logits are all-gathered back before sampling
+        self._lm_tp = self.sharded and lm.shape[1] % (_mesh_shape(device)[-1] * ttnn.TILE_SIZE) == 0
+        if self._lm_tp:
+            self.lm_head_w = _shard(device, lm, 1, dtype=ttnn.bfloat8_b)
+        else:
+            self.lm_head_w = _replicate(device, lm, dtype=ttnn.bfloat8_b)
         self.vocab_size = int(lm.shape[1])
         self.hidden_size = int(lm.shape[0])
 
@@ -552,19 +558,21 @@ class NemotronHPipeline:
         return self.final_norm(h)
 
     def forward_logits(self, ids_tt, last_only=True, token_rows=False):
-        """ids (B, T) -> lm_head logits. (B, 1, vocab) when last_only;
-        (1, B, vocab) with token_rows (see forward_hidden)."""
+        """ids (B, T) -> lm_head logits: (1, B, vocab) for the last positions
+        (last_only, or token_rows decode -- see forward_hidden), else (B, T, vocab)."""
         h = self.forward_hidden(ids_tt, token_rows=token_rows)
         if last_only and not token_rows:
             B, T = int(h.shape[0]), int(h.shape[1])
             h = ttnn.slice(h, [0, T - 1, 0], [B, T, self.hidden_size])
+            # the B last positions as one (1, B, H) row block, not B padded tiles
+            h = _reshape_rm(h, [1, B, self.hidden_size])
         if h.dtype != ttnn.float32:
             h = ttnn.typecast(h, ttnn.float32)
         cg = self.device.compute_with_storage_grid_size()
         core_grid = ttnn.CoreGrid(y=cg.y, x=cg.x)
         num_cores = cg.x * cg.y
         k_tiles = self.hidden_size // 32
-        n_tiles = self.vocab_size // 32
+        n_tiles = int(self.lm_head_w.shape[-1]) // 32  # local (per-chip) vocab
         if n_tiles % num_cores == 0:
             per_core_n = n_tiles // num_cores
             out_sub_w = max(d for d in range(1, min(4, per_core_n) + 1) if per_core_n % d == 0)
@@ -579,8 +587,15 @@ class NemotronHPipeline:
                 fused_activation=None,
                 mcast_in0=True,
             )
-            return ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, program_config=pc)
-        return ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, core_grid=core_grid)
+            out = ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, program_config=pc)
+        elif int(h.shape[-2]) <= _dram_mm.TILE:  # one tile row: spread the vocab over the full grid
+            pc = _dram_mm.mcast1d_config(self.device, self.hidden_size, int(self.lm_head_w.shape[-1]))
+            out = ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, program_config=pc)
+        else:
+            out = ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, core_grid=core_grid)
+        if self._lm_tp:
+            out = ttnn.all_gather(out, dim=-1, cluster_axis=1)
+        return out
 
     def _ids_to_device(self, ids):
         t = ids.to(torch.int32)
