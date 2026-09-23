@@ -261,7 +261,7 @@ class TtNemotronHAttention:
 
         mode = getattr(self, "_cache_mode", None)
         if mode == "decode":
-            attn = _ssm_cache.attn_step(self._state, Qh, Kh, Vh, self.scaling, self.ckc)  # (B,H,1,D)
+            attn = _ssm_cache.attn_step(self._state, self.device, Qh, Kh, Vh, self.scaling, self.ckc)  # (B,H,1,D)
             ttnn.deallocate(Qh)
             ttnn.deallocate(Kh)
             ttnn.deallocate(Vh)

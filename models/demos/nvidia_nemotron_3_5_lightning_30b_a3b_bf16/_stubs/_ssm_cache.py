@@ -18,8 +18,9 @@ place (ttnn.copy), so a captured decode trace keeps pointing at live buffers.
 Mamba2 state per layer: the last K-1 PRE-conv rows (the depthwise conv's
 window) and the SSD state S[h] (N x P), updated as
     S <- exp(dt*A) * S + B^T (dt*x),     y = C S + D x.
-Attention state: K/V caches over `KV_CAPACITY` positions plus a position
-offset `rel = arange - pos` that masks the future and selects the write slot.
+Attention state: bf16 K/V caches over `KV_CAPACITY` positions, written with
+ttnn's in-place cache ops (fill_cache / paged_update_cache), an int32 write
+position, and `rel = arange - pos`, which masks the future.
 """
 from __future__ import annotations
 
@@ -120,36 +121,52 @@ def mamba_ssm_step(state, x_h, B_h, C_h, dt_h, A, D, ckc):
 #  attention
 # --------------------------------------------------------------------------- #
 def attn_fill(state, device, Kh, Vh):
-    """Seed the K/V caches from the prompt's (B,H,S,D) keys/values and set the
-    write position to S."""
+    """Seed the bf16 K/V caches (B,H,KV_CAPACITY,D) from the prompt's (B,H,S,D)
+    keys/values with ttnn.fill_cache, and set the write position to S."""
     B, H, S, D = [int(v) for v in Kh.shape]
-    pad = KV_CAPACITY - S
-    assert pad >= 0, f"prompt of {S} exceeds KV_CAPACITY={KV_CAPACITY}"
-    zeros = upload(device, torch.zeros(B, H, pad, D))
-    persist(state, "k", ttnn.concat([Kh, zeros], dim=2))
-    persist(state, "v", ttnn.concat([Vh, zeros], dim=2))
+    assert S <= KV_CAPACITY, f"prompt of {S} exceeds KV_CAPACITY={KV_CAPACITY}"
+    for name, src in (("k", Kh), ("v", Vh)):
+        if name not in state:
+            state[name] = upload(device, torch.zeros(B, H, KV_CAPACITY, D), dtype=ttnn.bfloat16)
+        src16 = ttnn.typecast(src, ttnn.bfloat16)
+        for b in range(B):
+            ttnn.fill_cache(state[name], ttnn.slice(src16, [b, 0, 0, 0], [b + 1, H, S, D]), batch_idx=b)
+        ttnn.deallocate(src16)
+    persist(state, "pos", upload(device, torch.full((B,), S, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT))
     ar = torch.arange(KV_CAPACITY, dtype=torch.float32) - S
     persist(state, "rel_row", upload(device, ar.reshape(1, 1, 1, KV_CAPACITY)))
-    persist(state, "rel_col", upload(device, ar.reshape(1, 1, KV_CAPACITY, 1)))
 
 
-def attn_step(state, q_h, k_h, v_h, scaling, ckc):
-    """One cached attention step. q_h/k_h/v_h (B,H,1,D). Returns (B,H,1,D)."""
-    slot = ttnn.typecast(ttnn.eqz(state["rel_col"]), ttnn.float32)  # (1,1,Cap,1) one-hot at pos
-    keep = ttnn.rsub(slot, 1.0)
-    k_new = ttnn.add(ttnn.multiply(state["k"], keep), ttnn.multiply(slot, k_h))
-    v_new = ttnn.add(ttnn.multiply(state["v"], keep), ttnn.multiply(slot, v_h))
-    ttnn.copy(k_new, state["k"])
-    ttnn.copy(v_new, state["v"])
-    ttnn.deallocate(k_new)
-    ttnn.deallocate(v_new)
+def _decode_rows(device, t_h):
+    """(B,H,1,D) heads -> (1,B,H,D) bf16 height-sharded one sample per core,
+    the input layout paged_update_cache expects."""
+    B, H, _, D = [int(v) for v in t_h.shape]
+    rows = ttnn.typecast(ttnn.permute(t_h, (2, 0, 1, 3)), ttnn.bfloat16)  # (1,B,H,D)
+    mem = ttnn.create_sharded_memory_config(
+        shape=(-(-H // 32) * 32, D),
+        core_grid=ttnn.num_cores_to_corerangeset(B, device.compute_with_storage_grid_size(), row_wise=True),
+        strategy=ttnn.ShardStrategy.HEIGHT,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+    return ttnn.to_memory_config(rows, mem)
+
+
+def attn_step(state, device, q_h, k_h, v_h, scaling, ckc):
+    """One cached attention step. q_h/k_h/v_h (B,H,1,D). Writes this token's K/V
+    in place at `pos` (paged_update_cache), attends over positions <= pos, then
+    advances pos. Returns (B,H,1,D)."""
+    for name, t in (("k", k_h), ("v", v_h)):
+        rows = _decode_rows(device, t)
+        ttnn.experimental.paged_update_cache(state[name], rows, update_idxs_tensor=state["pos"])
+        ttnn.deallocate(rows)
 
     future = ttnn.multiply(ttnn.typecast(ttnn.gtz(state["rel_row"]), ttnn.float32), -1e9)  # (1,1,1,Cap)
     scores = ttnn.matmul(q_h, ttnn.transpose(state["k"], -2, -1), compute_kernel_config=ckc)  # (B,H,1,Cap)
     scores = ttnn.add(ttnn.multiply(scores, scaling), future)
     probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=ckc, numeric_stable=True)
-    out = ttnn.matmul(probs, state["v"], compute_kernel_config=ckc)  # (B,H,1,D)
+    out = ttnn.matmul(probs, state["v"], compute_kernel_config=ckc, dtype=ttnn.float32)  # (B,H,1,D)
 
+    ttnn.plus_one(state["pos"])
     ttnn.copy(ttnn.subtract(state["rel_row"], 1.0), state["rel_row"])
-    ttnn.copy(ttnn.subtract(state["rel_col"], 1.0), state["rel_col"])
     return out
