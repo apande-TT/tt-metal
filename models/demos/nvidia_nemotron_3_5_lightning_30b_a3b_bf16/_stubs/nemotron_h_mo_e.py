@@ -304,8 +304,10 @@ class TtNemotronHMOE:
         # Folded bank: one up matmul over all local experts, relu2, scale each
         # expert's slice by its routing weight (expanded to the folded width),
         # then one down matmul whose K reduction is the weighted expert sum.
-        act = ttnn.linear(hs_bf, self._up_cat, compute_kernel_config=self._expert_ckc, activation="relu")
-        w_wide = ttnn.matmul(W_use, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat16)
+        act = ttnn.linear(
+            hs_bf, self._up_cat, compute_kernel_config=self._expert_ckc, activation="relu", dtype=ttnn.bfloat8_b
+        )
+        w_wide = ttnn.matmul(W_use, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat8_b)
         # relu2 = square fused into the routing-weight multiply (one pass over act)
         act = ttnn.multiply(
             act, w_wide, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]

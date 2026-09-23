@@ -258,12 +258,17 @@ class TtNemotronHExperts:
         # expert's slice by its routing weight, then one down matmul whose K
         # reduction performs the weighted sum over experts.
         act = ttnn.linear(
-            hs_bf, self._up_cat, compute_kernel_config=self._expert_ckc, core_grid=self._core_grid, activation="relu"
+            hs_bf,
+            self._up_cat,
+            compute_kernel_config=self._expert_ckc,
+            core_grid=self._core_grid,
+            activation="relu",
+            dtype=ttnn.bfloat8_b,
         )  # (T, Eloc*inter)
         ttnn.deallocate(hs_bf)
         # (T, Eloc) routing weights -> (T, Eloc*inter) via a one-hot expander
         # matmul; avoids tile-layout reshapes of the wide activation.
-        w_wide = ttnn.matmul(W_sh, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat16)
+        w_wide = ttnn.matmul(W_sh, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat8_b)
         # relu2 = square fused into the routing-weight multiply (one pass over act)
         act = ttnn.multiply(
             act, w_wide, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]
