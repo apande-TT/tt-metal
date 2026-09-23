@@ -105,15 +105,18 @@ def mamba_conv_step(state, hbc_t, taps, bias, K):
 
 def mamba_ssm_step(state, x_h, B_h, C_h, dt_h, A, D, ckc):
     """One SSD recurrence step. x_h (B,H,1,P), B_h/C_h (B,H,1,N), dt_h (B,H,1,1).
-    Returns y (B,H,1,P)."""
+    Returns y (B,H,1,P).
+
+    The (B,H,N,P) fp32 state is the traffic that matters, so it is touched as
+    few times as possible: one pass for the decay, and one addcmul that forms
+    the B^T (x dt) outer product by broadcasting and writes the sum straight
+    back into the state buffer."""
     decay = ttnn.exp(ttnn.multiply(dt_h, A))  # (B,H,1,1)
-    xdt = ttnn.multiply(x_h, dt_h)
-    upd = ttnn.matmul(ttnn.transpose(B_h, -2, -1), xdt, compute_kernel_config=ckc)  # (B,H,N,P)
-    S_new = ttnn.add(ttnn.multiply(state["ssm"], decay), upd)
-    ttnn.deallocate(upd)
-    y = ttnn.matmul(C_h, S_new, compute_kernel_config=ckc)  # (B,H,1,P)
-    ttnn.copy(S_new, state["ssm"])
-    ttnn.deallocate(S_new)
+    xdt = ttnn.multiply(x_h, dt_h)  # (B,H,1,P)
+    S_dec = ttnn.multiply(state["ssm"], decay)
+    ttnn.addcmul(S_dec, ttnn.transpose(B_h, -2, -1), xdt, output_tensor=state["ssm"])  # (B,H,N,1)*(B,H,1,P)
+    ttnn.deallocate(S_dec)
+    y = ttnn.matmul(C_h, state["ssm"], compute_kernel_config=ckc)  # (B,H,1,P)
     return ttnn.add(y, ttnn.multiply(x_h, D))
 
 
