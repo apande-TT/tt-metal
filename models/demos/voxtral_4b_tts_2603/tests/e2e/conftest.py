@@ -9,6 +9,8 @@ path creates a competing device with a different command-queue count (the
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -24,7 +26,7 @@ TRACE_REGION_SIZE = 200 * 1024 * 1024
 @pytest.fixture(scope="module")
 def device():
     dev = ttnn.open_device(
-        device_id=0,
+        device_id=int(os.environ.get("VOXTRAL_DEVICE_ID", "0")),
         l1_small_size=L1_SMALL_SIZE,
         trace_region_size=TRACE_REGION_SIZE,
         num_command_queues=1,

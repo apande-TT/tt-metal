@@ -93,7 +93,10 @@ def test_vocode_stage(device_params, device):
     hf = common.load_reference_model()
 
     input_ids, texts = common.build_batch_inputs(BATCH, SEQ_LEN)
-    n_frames, provenance = common.resolve_max_frames(hf, gate=True)
+    # A SECTION test of the codec on a fixed-length code block, not the e2e horizon (which is the
+    # model's stop rule, asserted in tests/e2e): one second of audio at the model's own frame rate.
+    n_frames = int(-(-float(hf.audio_tokenizer.frame_rate) // 1))
+    provenance = f"ceil(frame_rate {hf.audio_tokenizer.frame_rate}) -- one second, section-level"
     print(f"[vocode] frames={n_frames} ({provenance})")
 
     key = common.golden_key(

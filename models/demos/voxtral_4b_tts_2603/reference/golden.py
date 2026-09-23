@@ -12,7 +12,7 @@ loop lives in vLLM-Omni, which is not one of this run's two permitted sources. A
 all -- it is not the model's task. So the golden runs the reference's OWN submodules
 (`hf.model.layers`, `hf.acoustic_transformer.*`, `hf.audio_tokenizer.*`) through the chain the
 checkpoint's architecture dictates, and the TT pipeline runs the identical chain in ttnn. Call 2's
-golden is the plain causal-LM chain and is cross-checked against `hf(input_ids).logits`.
+golden is one plain causal-LM forward, `hf(input_ids).logits`.
 
 WHY THE NOISE IS AN ARGUMENT. `FlowMatchingAudioTransformer.decode_one_frame` draws
 `x_0 = torch.randn(...)` INSIDE the module, so its output is a function of the RNG rather than of
@@ -32,7 +32,7 @@ from models.demos.voxtral_4b_tts_2603.tt import common
 # key, so a cached reference can never outlive the code that produced it -- a stale golden silently
 # compared against new arithmetic is the failure mode that once had a PCC gate testing another
 # checkout for a whole run.
-CHAIN_VERSION = 3
+CHAIN_VERSION = 4
 
 
 def _new_cache(hf_model):
@@ -105,6 +105,40 @@ def acoustic_frame(hf_model, llm_hidden, x0, cfg_alpha):
     }
 
 
+def acoustic_spread_under_matmul_noise(hf_model, llm_hidden, x0, cfg_alpha, rel_eps, draws=4, seed=0):
+    """Per-element std of the reference's `x_final` when every Linear carries `rel_eps` noise.
+
+    The flow sampler runs 7 Euler steps under classifier-free guidance at alpha=3, and some output
+    elements are ill-conditioned: a perturbation the size of ONE device matmul's rounding moves them
+    by several 0.1-wide code bins. Whether the reference's own rounding of such an element is a
+    DECISION at all depends on the arithmetic precision available, so this measures it: the
+    reference's own chain, every `nn.Linear` output perturbed by `rel_eps * rms(row) * N(0, 1)`,
+    `draws` times. The noise is scaled by the output ROW's RMS, not by each element, because that is
+    how a matmul's rounding behaves -- a K-long dot product's error is set by the magnitudes it sums,
+    so a small output element carries the same absolute error as its large neighbours -- and it is
+    the quantity `rel_eps` is measured as (RMS error / RMS output). Returns ``[B, 36]`` std in x
+    units. Hooks are always removed.
+    """
+    at = hf_model.acoustic_transformer
+    gen = torch.Generator().manual_seed(seed)
+
+    def noisy(_module, _inputs, out):
+        scale = out.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        return out + rel_eps * scale * torch.randn(out.shape, generator=gen, dtype=out.dtype)
+
+    hooks = [m.register_forward_hook(noisy) for m in at.modules() if isinstance(m, torch.nn.Linear)]
+    try:
+        outs = []
+        for _ in range(int(draws)):
+            with torch.no_grad():
+                _, diag = acoustic_frame(hf_model, llm_hidden, x0, cfg_alpha)
+            outs.append(diag["x_final"])
+    finally:
+        for h in hooks:
+            h.remove()
+    return torch.stack(outs).std(dim=0)
+
+
 def n_special_tokens() -> int:
     """`len(AudioSpecialTokens)` -- read off the reference loader's own enum, never re-listed.
 
@@ -148,7 +182,38 @@ def draw_noise(batch: int, n_acoustic: int, max_frames: int, seed: int = 0, dtyp
     return torch.randn(max_frames, batch, n_acoustic, generator=generator, dtype=dtype)
 
 
-def hf_reference_text_to_speech(hf_model, input_ids, x0, cfg_alpha, max_frames, fed_codes=None, fed_hidden=None):
+def reference_prefill(hf_model, input_ids, audio_mask=None, voice_embedding=None):
+    """The reference's prefill over the (voiced) prompt: ``(prefill_hidden, kv_cache)``.
+
+    Both reference arms start from this identical state, so a caller running both can compute it
+    once and hand it to each via `prefill=` -- on CPU it is the single most expensive step.
+    """
+    batch = int(input_ids.shape[0])
+    cache = _new_cache(hf_model)
+    with torch.no_grad():
+        if voice_embedding is None:
+            out = hf_model.model(input_ids=input_ids, past_key_values=cache, use_cache=True)
+        else:
+            # The speaker's voice replaces the EMBEDDINGS of the prompt's `[AUDIO]` placeholders;
+            # ids, positions and the causal mask stay the prompt's own.
+            embeds = hf_model.model.embed_tokens(input_ids).clone()
+            embeds[audio_mask] = voice_embedding.to(embeds.dtype).repeat(batch, 1)
+            out = hf_model.model(inputs_embeds=embeds, past_key_values=cache, use_cache=True)
+    return out.last_hidden_state, cache
+
+
+def hf_reference_text_to_speech(
+    hf_model,
+    input_ids,
+    x0,
+    cfg_alpha,
+    max_frames,
+    fed_codes=None,
+    fed_hidden=None,
+    audio_mask=None,
+    voice_embedding=None,
+    prefill=None,
+):
     """Source A's golden for Call 1: tokenized text -> a 24 kHz waveform.
 
     Runs the real chain -- text backbone (KV-cached), then per frame the acoustic sampler, the
@@ -181,10 +246,13 @@ def hf_reference_text_to_speech(hf_model, input_ids, x0, cfg_alpha, max_frames, 
     stop_id = common.audio_stop_token_id(hf_model)
     batch, prompt_len = int(input_ids.shape[0]), int(input_ids.shape[1])
 
-    cache = _new_cache(hf_model)
-    with torch.no_grad():
-        out = hf_model.model(input_ids=input_ids, past_key_values=cache, use_cache=True)
-    prefill_hidden = out.last_hidden_state
+    if prefill is None:
+        prefill_hidden, cache = reference_prefill(hf_model, input_ids, audio_mask, voice_embedding)
+    else:
+        import copy
+
+        # A private copy: the decode loop appends to the cache, and the other arm needs it pristine.
+        prefill_hidden, cache = prefill[0], copy.deepcopy(prefill[1])
     llm_hidden = prefill_hidden[:, -1]
 
     if fed_codes is not None:
@@ -197,6 +265,7 @@ def hf_reference_text_to_speech(hf_model, input_ids, x0, cfg_alpha, max_frames, 
     finished = torch.zeros(batch, dtype=torch.bool)
     position = prompt_len
     stop_reason = f"max_frames={max_frames}"
+    end_frame = [-1] * batch
 
     for step in range(max_frames):
         # The backbone's own hidden still drives `llm_hiddens`; only what the ACOUSTIC stage is
@@ -206,6 +275,9 @@ def hf_reference_text_to_speech(hf_model, input_ids, x0, cfg_alpha, max_frames, 
             frame, diag = acoustic_frame(hf_model, acoustic_in, x0[step], cfg_alpha)
         frames.append(frame)
         diags.append(diag)
+        newly = (frame[:, 0] == stop_id) & ~finished
+        for r in torch.nonzero(newly).reshape(-1).tolist():
+            end_frame[r] = step
         finished |= frame[:, 0] == stop_id
         if fed_codes is None and bool(finished.all()):
             stop_reason = f"every row emitted end_audio (id {stop_id}) at frame {step}"
@@ -235,7 +307,9 @@ def hf_reference_text_to_speech(hf_model, input_ids, x0, cfg_alpha, max_frames, 
     # aligned mode would compare two different code sequences and measure nothing about the codec.
     rendered = codes if fed_codes is None else fed_codes[..., : codes.shape[-1]].to(codes.dtype)
     with torch.no_grad():
-        waveform = codec(rendered - offset)
+        # Clamped at 0 exactly as the TT codec stage does: a row's `end_audio` frame (and what it
+        # generated after it) is still in the batch block, and 1 - offset is not a codebook index.
+        waveform = codec((rendered - offset).clamp(min=0))
 
     return {
         "input_ids": input_ids,
@@ -247,6 +321,7 @@ def hf_reference_text_to_speech(hf_model, input_ids, x0, cfg_alpha, max_frames, 
         "diagnostics": diags,
         "frames_decoded": codes.shape[-1],
         "stop_reason": stop_reason,
+        "end_frame": end_frame,
         "sampling_rate": int(codec.sampling_rate),
     }
 
@@ -256,61 +331,13 @@ def hf_reference_text_to_speech(hf_model, input_ids, x0, cfg_alpha, max_frames, 
 # ----------------------------------------------------------------------------------------
 
 
-def hf_reference_text_continuation(hf_model, input_ids, horizon, eos_id=None, fed_tokens=None):
-    """Source A's golden for Call 2: greedy causal-LM continuation, KV-cached.
+def hf_reference_text_continuation(hf_model, input_ids):
+    """Source A's golden for Call 2: the causal LM's teacher-forced next-token prediction.
 
-    Built from `hf_model(...)` forwards rather than `hf_model.generate()`: the plan's TT-only
-    contract treats HF orchestration as a shortcut, and on this checkpoint `generate()`'s defaults
-    are meaningless anyway (the tied text head is effectively untrained and never emits eos).
-
-    `fed_tokens [B, steps]` puts the reference on a GIVEN trajectory -- same contract as
-    `hf_reference_text_to_speech`'s `fed_codes`. The reference still reports its own argmax at
-    every step; only the token APPENDED to the context comes from `fed_tokens`, so each step's
-    logits are computed from the identical context the TT side had.
+    ONE plain `hf_model(input_ids)` forward -- not `generate()`. `logits[:, s]` is the reference's
+    next-token distribution after tokens `0..s`, `next_tokens[:, s]` its greedy pick: the same
+    quantities `pipeline.run_text_continuation` returns, over every position of every row.
     """
-    cache = _new_cache(hf_model)
-    batch, prompt_len = int(input_ids.shape[0]), int(input_ids.shape[1])
-
     with torch.no_grad():
-        out = hf_model(input_ids=input_ids, past_key_values=cache, use_cache=True)
-
-    tokens, step_logits = [], []
-    position = prompt_len
-    finished = torch.zeros(batch, dtype=torch.bool)
-    if fed_tokens is not None:
-        horizon = min(int(horizon), int(fed_tokens.shape[1]))
-    stop_reason = f"horizon={horizon}"
-
-    for step in range(horizon):
-        logits = out.logits[:, -1].float()
-        step_logits.append(logits.clone())
-        nxt = logits.argmax(dim=-1)
-        tokens.append(nxt.clone())
-        if eos_id is not None and fed_tokens is None:
-            finished |= nxt == eos_id
-            if bool(finished.all()):
-                stop_reason = f"every row emitted eos (id {eos_id}) at step {step}"
-                break
-        if step + 1 == horizon:
-            break
-        if fed_tokens is not None:
-            nxt = fed_tokens[:, step].to(nxt.dtype)
-        with torch.no_grad():
-            out = hf_model(
-                input_ids=nxt.unsqueeze(1),
-                past_key_values=cache,
-                use_cache=True,
-                position_ids=torch.full((batch, 1), position, dtype=torch.long),
-            )
-        position += 1
-
-    out_tokens = torch.stack(tokens, dim=1)
-    return {
-        "tokens": out_tokens,
-        # The trajectory the context was actually built from -- its own when free-running, the
-        # given one when aligned. The gate asserts on this rather than trusting the call site.
-        "fed_tokens": out_tokens if fed_tokens is None else fed_tokens[:, : out_tokens.shape[1]].clone(),
-        "step_logits": step_logits,
-        "steps": len(tokens),
-        "stop_reason": stop_reason,
-    }
+        logits = hf_model(input_ids=input_ids).logits.float()
+    return {"logits": logits, "next_tokens": logits.argmax(dim=-1)}

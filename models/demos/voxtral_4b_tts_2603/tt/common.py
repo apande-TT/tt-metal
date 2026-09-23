@@ -198,6 +198,47 @@ PROMPT_TEXTS = [
 ]
 
 
+# 32 distinct one-sentence texts for the SPEECH task, each exactly 18 tekken tokens, so the batch
+# is rectangular with NO padding. It has to be: the prefill runs causal attention without a per-row
+# padding mask, and the previous layout -- BOS tokens left-padded into the text segment -- was
+# measured to wreck the conditioning. On device, rows needing 0-1 pad tokens came back at Whisper
+# WER 0.00-0.03 while rows needing 4-11 came back as babble that never emitted end_audio (corpus
+# WER 1.50, 29 of 32 rows ran to the 256-frame cap). Equal lengths are asserted, not assumed.
+SPEECH_TEXTS = [
+    'The lighthouse keeper wrote in his journal every evening, noting the colour of the water.',
+    'In the quiet hours before dawn the bakery ovens were already warm and waiting inside.',
+    'She tuned the old radio slowly until a gentle piano concerto finally emerged from the small speaker.',
+    'The expedition mapped the cave system for three long weeks, marking every passage with white chalk.',
+    'Autumn arrived early that year, and the tall maple trees turned copper almost overnight.',
+    'He repaired bicycles in a narrow shop behind the station, where spare wheels hung everywhere.',
+    'The letter had travelled for six months across two oceans before it reached the small farmhouse.',
+    'Astronomers watched the comet approach for weeks, adjusting their telescopes every night.',
+    'A young violinist practised the same difficult passage for hours until her fingers ached.',
+    'The archive basement held thousands of old photographs, each one carefully labelled by hand in ink.',
+    'Rain fell steadily on the glass greenhouse roof while the gardener repotted the orchids.',
+    'The ferry crossed the strait each morning, carrying commuters and crates of fish.',
+    'Engineers tested the bridge cables with careful instruments for a month before the road finally reopened.',
+    "In the museum's back room a conservator removed varnish from an old painting.",
+    'The village held a festival every summer, with paper lanterns strung across the square.',
+    'A cartographer redrew the coastline after the storm, because the old maps were wrong.',
+    'He learned to cook from his grandmother, who measured nothing at all and tasted everything twice.',
+    'The observatory sat above the treeline, and on clear nights the stars seemed close.',
+    'Librarians catalogued the donated collection for many months, discovering several very rare books.',
+    'The potter worked fast once the clay was centred, drawing the walls up at once.',
+    'Snow closed the pass for a week, so the mail was carried in on skis.',
+    'A biologist counted the nesting pairs along the tall cliff face every spring for a decade.',
+    'The orchestra rehearsed in a cold hall, and the players wore thick gloves between movements.',
+    'Workers slowly restored the old clock tower over two summers, replacing every rusted gear.',
+    'She kept a small wooden boat moored at the pier and sailed it alone on weekends.',
+    'The bookshop occupied three floors of a crooked stone building near the busy old harbour.',
+    'Geologists drilled a core sample from the lakebed, reading centuries of climate history.',
+    'A blacksmith demonstrated the old techniques at the summer fair, and the children watched closely.',
+    'The slow train ran through farmland for an hour before the first grey houses finally appeared.',
+    'Translators argued for days about a single line of the poem and never fully agreed.',
+    'The bee keeper opened each hive slowly, reading the mood of the whole colony first.',
+    'Divers surveyed the wreck at forty metres, photographing the hull before the light faded.',
+]
+
 # THE VOICE THE MODEL SPEAKS IN, which it cannot invent for itself.
 #
 # Voxtral TTS is voice-PROMPTED: the prompt carries a block of `[AUDIO]` placeholder tokens whose
@@ -217,6 +258,9 @@ PROMPT_TEXTS = [
 # N is the voice's own token count, published per voice in tekken.json's
 # `audio.voice_num_audio_tokens`, and equals the row count of its embedding -- the two are asserted
 # against each other rather than assumed.
+# The preset the package speaks in by default; one of the 20 in tekken.json's voice list.
+DEFAULT_VOICE = "casual_male"
+
 _BEGIN_AUDIO_ID = 25
 _AUDIO_ID = 24
 _NEXT_AUDIO_TEXT_ID = 36
@@ -262,23 +306,18 @@ def build_voice_prompt(texts, voice: str, model_id: str = HF_MODEL_ID):
     bos = tok.bos_id if hasattr(tok, "bos_id") else 1
     bodies = [tok.encode(text, bos=False) for text in texts]
 
-    # PADDED ON THE LEFT OF THE TEXT, so every row still ENDS with the real final tokens. Decode
-    # starts from the last prompt position, so right-padding would hand every short row a pad token
-    # as its starting context. The alternative the package took -- truncating every prompt to a
-    # common token count -- ends each one mid-sentence, and the model then speaks the fragment and
-    # invents the rest, which is heard as the output degrading partway through.
-    width = max(len(b) for b in bodies)
-    rows = []
-    for body in bodies:
-        pad = [bos] * (width - len(body))
-        rows.append(
-            [bos, _BEGIN_AUDIO_ID]
-            + [_AUDIO_ID] * n_audio
-            + [_NEXT_AUDIO_TEXT_ID]
-            + pad
-            + body
-            + [_REPEAT_AUDIO_TEXT_ID, _BEGIN_AUDIO_ID]
+    # NO PADDING. The prefill has no per-row padding mask, so a pad token is CONTENT to the model --
+    # and a BOS run in the middle of the prompt measurably destroys the conditioning (see
+    # SPEECH_TEXTS). A ragged batch is refused rather than silently degraded.
+    widths = sorted({len(b) for b in bodies})
+    if len(widths) != 1:
+        raise ValueError(
+            f"speech texts must tokenize to one common length for an unpadded batch; got widths {widths}"
         )
+    rows = [
+        [bos, _BEGIN_AUDIO_ID] + [_AUDIO_ID] * n_audio + [_NEXT_AUDIO_TEXT_ID] + body + [_REPEAT_AUDIO_TEXT_ID, _BEGIN_AUDIO_ID]
+        for body in bodies
+    ]
     input_ids = torch.tensor(rows, dtype=torch.long)
     return input_ids, input_ids == _AUDIO_ID, emb
 
@@ -308,17 +347,20 @@ def build_batch_inputs(batch: int = DEFAULT_BATCH, seq_len: int = DEFAULT_SEQ_LE
     return input_ids, texts
 
 
+def full_prompt_len(batch: int = DEFAULT_BATCH, model_id: str = HF_MODEL_ID) -> int:
+    """The longest UNPADDED rectangular length the first `batch` prompts support: the shortest of them.
+
+    Read off the prompt set, not chosen: every row stays genuine content (no pad token, which the
+    whole-stack bodies' `is_causal` cannot mask), and no prompt is truncated further than the
+    shortest one forces.
+    """
+    tok = load_tokenizer(model_id)
+    return min(len(tok.encode(text, bos=True)) for text in PROMPT_TEXTS[:batch])
+
+
 # --------------------------------------------------------------------------------------
 # Decode horizon -- see e2e_plan.json -> decode_horizon
 # --------------------------------------------------------------------------------------
-
-# Seconds of audio the PCC gate decodes. The FRAME cap is derived from the model's own frame rate
-# (12.5 Hz), so what is written down is a DURATION rather than a magic step count; the stop TOKEN
-# is the primary rule and this only bounds a run that never emits it. One second = 13 frames =
-# 13 x 32 x 37 = 15392 integer codes compared per run, which is what keeps the gate meaningful
-# while the HF golden -- a 3.4 B model on CPU -- stays inside a few minutes.
-GATE_SECONDS = float(os.environ.get("VOXTRAL_GATE_SECONDS", "1.0"))
-
 
 def begin_audio_token_id(model_id: str = HF_MODEL_ID) -> int:
     """`[BEGIN_AUDIO]` (25) -- the token that tells the backbone to start emitting audio frames.
@@ -356,26 +398,24 @@ def n_audio_special_tokens(hf_model) -> int:
     return int(max(at._end_audio_token_id, at._empty_audio_token_id) + 1)
 
 
-def resolve_max_frames(hf_model, gate: bool = True) -> tuple:
-    """Return ``(max_frames, provenance)`` -- the SAFETY CAP, not the stop rule.
+def resolve_max_frames(hf_model) -> tuple:
+    """The SAFETY CAP on the decode loop -- a backstop, never the horizon.
 
-    The stop rule is `audio_stop_token_id`. This bounds the loop if the model never emits it.
-    The gate cap is `ceil(frame_rate * GATE_SECONDS)`; the demo cap is the pipeline's real
-    ceiling, set by the codec stub's prebuilt ALiBi mask (2048 rows / 8x upsampling = 256
-    frames = 20.5 s of audio). Both are properties of the model or the port, not free constants.
+    The horizon is the model's own stop rule (`audio_stop_token_id`, per row). This only bounds a
+    run that never emits it, and a correctness run that ends HERE is a failure, not a pass: the e2e
+    test asserts the run ended on the stop rule. The cap is the tighter of the model's own context
+    (`max_position_embeddings`) and the port's real ceiling, the codec stub's prebuilt ALiBi mask
+    (2048 rows / 8x upsampling = 256 frames = 20.5 s of audio).
     """
-    import math
-
     env = os.environ.get("VOXTRAL_MAX_FRAMES")
     if env:
         return int(env), "env VOXTRAL_MAX_FRAMES"
     frame_rate = float(hf_model.audio_tokenizer.frame_rate)
-    if gate:
-        frames = int(math.ceil(frame_rate * GATE_SECONDS))
-        return frames, f"ceil(frame_rate={frame_rate} * GATE_SECONDS={GATE_SECONDS}) = {frames} frames"
-    return CODEC_MAX_FRAMES, (
-        f"codec ALiBi mask ceiling: {CODEC_MAX_FRAMES} frames "
-        f"({CODEC_MAX_FRAMES / frame_rate:.1f} s at {frame_rate} Hz)"
+    context = int(getattr(hf_model.config, "max_position_embeddings", CODEC_MAX_FRAMES) or CODEC_MAX_FRAMES)
+    frames = min(CODEC_MAX_FRAMES, context)
+    return frames, (
+        f"safety cap = min(codec ALiBi ceiling {CODEC_MAX_FRAMES}, max_position_embeddings {context}) = "
+        f"{frames} frames ({frames / frame_rate:.1f} s at {frame_rate} Hz)"
     )
 
 

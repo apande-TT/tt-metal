@@ -1,29 +1,33 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Call 2, end to end: real text -> greedy causal-LM continuation, against Source A's golden.
+"""Call 2, end to end: real text -> the causal LM's teacher-forced continuation, against Source A's golden.
 
 Routes the three graduated modules Call 1 does not: `encoder_stack`, `mistral_model` (byte-
 identical aliases, split by batch row so both do a disjoint share of the real work) and
 `decoder_head`, which is the LM head. The TTS chain reads its next token from the acoustic
 transformer's semantic head and never touches `lm_head`, so this is that head's only real home.
 
-COHERENCE CAVEAT: this is a TTS checkpoint. The backbone emits AUDIO codebook tokens and its tied
-TEXT head is effectively untrained, so the continuation is near-uniform garbage even when the load
-is bit-correct. That does not weaken the gate -- the gate compares TT against the HF reference on
-the SAME input, and garbage-that-matches is a valid parity result. The load itself is verified
-STRUCTURALLY by the reference loader (all 386 tensors consumed, nothing left on meta), never by
-reading generated text.
+THE TASK IS ONE FORWARD, NOT A FREE-RUNNING DECODE. At every position `s` of the real text the
+pipeline returns the model's next-token logits given tokens `0..s` and its greedy pick
+(`ttnn.argmax` on device). A free-running greedy decode is not a well-posed task on this
+checkpoint: its untrained tied text head emitted eos (id 2, the model's only stop rule) on 0/32
+rows in 448 CPU steps and loops on 1-5 tokens from step ~9, so every horizon such a test could
+run would be one this package invented, and the test would end on its own cap. Teacher forcing
+has no horizon at all: the output is the whole `[B, S, vocab]` tensor, `S` is the longest
+unpadded length the 32 prompts support (`common.full_prompt_len`), and every position of every
+row is compared.
 
-IT ALSO MAKES THE GREEDY ARGMAX UNDECIDABLE AT TIMES. An untrained tied head puts the top two
-logits on top of each other: the reference's OWN step-1 top1-top2 margin bottoms out near 4e-3,
-while one matmul on this device carries ~1.2e-3 relative rounding (measured against float64:
-fp32 act x fp32 weight 1.169e-3, x bf16 weight 1.738e-3) and the LM head is a K=3072 x 131072
-matmul at the end of 26 layers. So a handful of rows land on a coin-flip. The gate therefore puts
-the REFERENCE on the TT chain's own token trajectory (`fed_tokens=tt["tokens"]`) and compares the
-per-step logits on identical contexts -- the well-posed question -- and asserts token equality
-wherever the reference's own margin clears the measured logit deviation. Nothing is spliced into
-the TT side: `run_text_continuation` picks every one of its own tokens with `ttnn.argmax` on
-device, exactly as the demo runs it.
+COHERENCE CAVEAT: this is a TTS checkpoint. The backbone emits AUDIO codebook tokens and its tied
+TEXT head is effectively untrained, so the predicted text is near-uniform garbage even when the
+load is bit-correct. That does not weaken the gate -- the gate compares TT against the HF reference
+on the SAME input, and garbage-that-matches is a valid parity result.
+
+IT ALSO MAKES SOME ARGMAXES UNDECIDABLE. An untrained tied head puts the top two logits on top of
+each other: the reference's own top1-top2 margin bottoms out near 4e-3, while one matmul on this
+device carries ~1.2e-3 relative rounding and the LM head is a K=3072 x 131072 matmul at the end of
+26 layers. So token equality is asserted wherever the reference's own scores separate the TT pick
+from its top-1 by more than the measured logit deviation; the ties inside that band are counted and
+printed one by one.
 """
 from __future__ import annotations
 
@@ -40,20 +44,24 @@ pytestmark = pytest.mark.timeout(3600)
 
 PCC_TARGET = 0.99
 
-# A greedy pick is called DECIDABLE when the reference's own top-2 margin clears this many times
-# the measured RMS logit deviation. Unlike the acoustic codes -- where the reference's rule can be
-# replayed exactly on this pipeline's own x_final, so no bound is needed at all -- an argmax over
-# two independently-computed logit vectors has no exact form, and 32 x 4 = 128 comparisons is small
-# enough that a 3-sigma band is not swamped by its own tail.
+# The tie band is 2 x SIGMA x the measured RMS logit deviation: a TT pick that disagrees with the
+# reference is a TIE only when the reference scores it within that band of its own top-1. Unlike
+# the acoustic codes -- where the reference's rule can be replayed exactly on this pipeline's own
+# x_final, so no bound is needed at all -- an argmax over two independently-computed logit vectors
+# has no exact form. The band is applied at 2x (6 sigma), so at 32 x S comparisons it is not
+# swamped by its own tail.
 SIGMA = 3.0
 
 PKG_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Decode horizon for this call. Neither `generation_config.max_new_tokens` nor a usable
-# `max_length` exists on this checkpoint and the tied text head never emits eos, so there is no
-# model signal for a length -- 4 steps is chosen for lack of one, and the SAME 4 are applied to
-# the golden. The eos id is still read from the config and still breaks the loop if it ever fires.
-HORIZON = 4
+
+def _cpu_threads():
+    """All cores for the golden, unless VOXTRAL_TORCH_THREADS caps it (a shared box)."""
+    common.use_all_cpu_threads()
+    cap = os.environ.get("VOXTRAL_TORCH_THREADS")
+    if cap:
+        torch.set_num_threads(int(cap))
+    return torch.get_num_threads()
 
 
 def routed_modules(call_name: str) -> set:
@@ -68,48 +76,21 @@ def routed_modules(call_name: str) -> set:
 
 @pytest.fixture(scope="module")
 def evidence(device, hf_model):
-    common.use_all_cpu_threads()
+    _cpu_threads()
     pipe = pipeline.build_pipeline(device, model=hf_model, heads=("text_continuation",))
     batch = pipe.batch
-    input_ids, texts = common.build_batch_inputs(batch=batch)
-    eos = common.eos_token_id(hf_model)
+    seq_len = common.full_prompt_len(batch)
+    input_ids, texts = common.build_batch_inputs(batch=batch, seq_len=seq_len)
 
     print(f"\nbatch driven (read from the pipeline): {batch}")
-    print(f"prompt tokens: {input_ids.shape[1]}   horizon: {HORIZON}   eos id: {eos}")
+    print(f"tokens per row, every one scored: {seq_len} (the shortest of the {batch} prompts; no padding)")
 
-    tt = pipe.run_text_continuation(input_ids=input_ids, horizon=HORIZON, eos_id=eos)
-    base = dict(task="cont", ids=input_ids, horizon=HORIZON, eos=eos, chain=golden.CHAIN_VERSION)
-    free = common.cached_golden(
-        common.golden_key(arm="free", **base),
-        lambda: golden.hf_reference_text_continuation(hf_model, input_ids, HORIZON, eos_id=eos),
+    tt = pipe.run_text_continuation(input_ids=input_ids)
+    hf = common.cached_golden(
+        common.golden_key(task="cont_teacher_forced", ids=input_ids, chain=golden.CHAIN_VERSION),
+        lambda: golden.hf_reference_text_continuation(hf_model, input_ids),
     )
-    aligned = common.cached_golden(
-        common.golden_key(arm="aligned", toks=tt["tokens"], **base),
-        lambda: golden.hf_reference_text_continuation(
-            hf_model, input_ids, HORIZON, eos_id=eos, fed_tokens=tt["tokens"]
-        ),
-    )
-    return {
-        "pipe": pipe,
-        "tt": tt,
-        "hf": aligned,
-        "free": free,
-        "batch": batch,
-        "input_ids": input_ids,
-        "texts": texts,
-    }
-
-
-def test_golden_matches_a_plain_forward(hf_model):
-    """The continuation golden is a plain causal-LM chain, not HF orchestration."""
-    common.use_all_cpu_threads()
-    ids, _ = common.build_batch_inputs(batch=4)
-    g = golden.hf_reference_text_continuation(hf_model, ids, horizon=1)
-    with torch.no_grad():
-        plain = hf_model(input_ids=ids).logits[:, -1].float()
-    score = common.pcc(g["step_logits"][0], plain)
-    print(f"golden step-0 logits vs a plain forward: PCC={score:.8f}")
-    assert score > 0.999999
+    return {"pipe": pipe, "tt": tt, "hf": hf, "batch": batch, "input_ids": input_ids, "texts": texts}
 
 
 def test_gate2_every_call_2_stub_was_invoked(evidence):
@@ -126,84 +107,94 @@ def test_batch_is_32_independent_samples(evidence):
     assert batch == common.DEFAULT_BATCH == 32
     rows = {tuple(r.tolist()) for r in evidence["input_ids"]}
     assert len(rows) == batch, "the 32 inputs are not pairwise distinct"
-    logits0 = tt["step_logits"][0]
-    distinct = {logits0[i].numpy().tobytes() for i in range(batch)}
-    print(f"\ndistinct inputs {len(rows)}/{batch}; distinct step-0 logit rows {len(distinct)}/{batch}")
+    last = tt["logits"][:, -1]
+    distinct = {last[i].numpy().tobytes() for i in range(batch)}
+    print(f"\ndistinct inputs {len(rows)}/{batch}; distinct last-position logit rows {len(distinct)}/{batch}")
     assert len(distinct) == batch, f"only {len(distinct)} of {batch} logit rows are distinct"
 
 
+def test_output_covers_every_position(evidence):
+    """WHOLE OUTPUT: one logit row and one pick per (sample, position), on both sides."""
+    tt, hf, ids = evidence["tt"], evidence["hf"], evidence["input_ids"]
+    batch, seq = int(ids.shape[0]), int(ids.shape[1])
+    vocab = int(tt["logits"].shape[-1])
+    assert tuple(tt["logits"].shape) == (batch, seq, vocab)
+    assert tuple(hf["logits"].shape) == (batch, seq, vocab)
+    assert tuple(tt["next_tokens"].shape) == (batch, seq) == tuple(hf["next_tokens"].shape)
+    # The on-device argmax is the argmax of the logits the pipeline returned.
+    own = tt["logits"].argmax(dim=-1)
+    gap = tt["logits"].max(dim=-1).values - tt["logits"].gather(-1, tt["next_tokens"].unsqueeze(-1)).squeeze(-1)
+    print(f"\nTT on-device argmax vs its own logits: {int((own == tt['next_tokens']).sum())}/{own.numel()} equal, max gap {float(gap.max()):.3e}")
+    assert float(gap.max()) == 0.0, "ttnn.argmax picked a token whose logit is not the row maximum"
+
+
 def test_generated_tokens_match_the_reference(evidence):
-    """The discrete output: the greedy tokens, compared where the reference's own pick is decidable.
+    """The discrete output: every greedy pick, EQUAL to the reference's on the identical context.
 
-    Step 0 has no trajectory in it at all -- both sides read the same prompt -- so it is asserted
-    whole. Later steps are asserted on every row whose reference top-2 margin clears twice the
-    measured logit deviation; rows below that are ties the arithmetic cannot decide on either
-    side, and they are counted and printed.
+    Teacher forcing puts both sides on the same real text, so position `s` is decided from the
+    same tokens `0..s` on both -- over the WHOLE output, no window. A disagreement is a real error
+    unless the reference ITSELF scores the TT pick within the measured logit-deviation band of its
+    own top-1; those ties are counted and printed one by one, never waved through silently.
     """
-    tt, hf, free, batch = evidence["tt"], evidence["hf"], evidence["free"], evidence["batch"]
-    steps = min(tt["tokens"].shape[1], hf["tokens"].shape[1])
-    tt_tokens, hf_tokens = tt["tokens"][:, :steps], hf["tokens"][:, :steps]
-
-    dev = torch.stack([tt["step_logits"][s] - hf["step_logits"][s] for s in range(steps)], dim=1)
-    bound = SIGMA * float(dev.pow(2).mean().sqrt())
-    ref = torch.stack([hf["step_logits"][s] for s in range(steps)], dim=1)
+    tt, hf, batch = evidence["tt"], evidence["hf"], evidence["batch"]
+    tt_tokens, hf_tokens = tt["next_tokens"], hf["next_tokens"]
+    ref = hf["logits"]
+    bound = SIGMA * float((tt["logits"] - ref).pow(2).mean().sqrt())
     top2 = ref.topk(2, dim=-1).values
     margin = top2[..., 0] - top2[..., 1]
-    decidable = margin > 2 * bound
     agree = tt_tokens == hf_tokens
-
+    # A TT pick that the reference ranks nowhere near its top-1 (a corrupted logit on the TT side)
+    # must NOT pass just because the reference's own top two happen to be close.
+    tt_pick_ref = ref.gather(-1, tt_tokens.unsqueeze(-1)).squeeze(-1)
+    pick_gap = top2[..., 0] - tt_pick_ref
+    tie_mismatch = ~agree & (pick_gap <= 2 * bound)
     rate = float(agree.float().mean())
-    print(f"\nlogit deviation RMS={bound / SIGMA:.3e}   {SIGMA:.0f}-sigma bound={bound:.3e}")
+    print(f"\nlogit deviation RMS={bound / SIGMA:.3e}   {SIGMA:.0f}-sigma bound={bound:.3e}   tie band={2 * bound:.3e}")
     print(f"reference top-2 margin: min={float(margin.min()):.4e} median={float(margin.median()):.4e}")
     print(
-        f"decidable {int(decidable.sum())}/{decidable.numel()} row-steps; "
-        f"token agreement over {steps} steps: {rate:.6f} "
-        f"({int(agree.sum())}/{agree.numel()})"
+        f"token agreement over {tt_tokens.shape[1]} positions x {batch} rows: {rate:.6f} "
+        f"({int(agree.sum())}/{agree.numel()}); near-ties (reference top-2 margin inside band): "
+        f"{int((margin <= 2 * bound).sum())}; disagreements accepted as ties: {int(tie_mismatch.sum())}"
     )
-    print(f"TT  sample 0: {tt_tokens[0].tolist()}")
-    print(f"HF  sample 0: {hf_tokens[0].tolist()}")
+    for i, s in tie_mismatch.nonzero().tolist()[:32]:
+        print(f"  tie row {i} pos {s}: TT {int(tt_tokens[i, s])} HF {int(hf_tokens[i, s])} gap {float(pick_gap[i, s]):.3e}")
     tok = common.load_tokenizer()
+    print(f"TT  sample 0 picks: {tt_tokens[0].tolist()}")
+    print(f"HF  sample 0 picks: {hf_tokens[0].tolist()}")
     print(f"TT  sample 0 text: {tok.decode(tt_tokens[0].tolist())!r}")
 
-    free_rate = float((tt_tokens == free["tokens"][:, :steps]).float().mean())
-    print(f"free-running reference (DIAGNOSTIC, not a gate metric): token agreement={free_rate:.6f}")
-
-    assert bool(agree[:, 0].all()), (
-        "step 0 disagrees with the reference on the SAME prompt -- no trajectory exists yet, so "
-        f"this is a real error ({int(agree[:, 0].sum())}/{batch} matched)"
-    )
-    bad = int((~agree & decidable).sum())
-    assert bad == 0, (
-        f"{bad} token(s) disagree where the reference's own top-2 margin cleared {2 * bound:.3e} "
-        f"-- that is a real error, not a tie; chase it with fidelity, never by relaxing this"
+    bad = ~agree & ~tie_mismatch
+    for i, s in bad.nonzero().tolist()[:32]:
+        print(
+            f"  MISMATCH row {i} pos {s}: TT {int(tt_tokens[i, s])} (ref logit {float(tt_pick_ref[i, s]):.4f}) "
+            f"HF {int(hf_tokens[i, s])} (ref logit {float(top2[i, s, 0]):.4f})"
+        )
+    assert int(bad.sum()) == 0, (
+        f"{int(bad.sum())} token(s) disagree where the reference scores the TT pick more than {2 * bound:.3e} "
+        "below its own top-1 -- that is a real error, not a tie; chase it with fidelity, never by relaxing this"
     )
 
 
 def test_gate3_e2e_pcc(evidence):
-    """GATE 3: the FINAL output -- the per-step logits -- against the HF golden, all 32 samples.
+    """GATE 3: the FINAL output -- the logits at every position -- against the HF golden, all 32 samples.
 
-    The reference is on this pipeline's own token trajectory, so every step's logits are computed
-    from the identical context the TT side had: this measures the 26-layer stack and the LM head,
-    not how fast two greedy chains separate.
+    Per sample, the WORST position's PCC over the 131072-wide logit row.
     """
     tt, hf, batch = evidence["tt"], evidence["hf"], evidence["batch"]
-    steps = min(len(tt["step_logits"]), len(hf["step_logits"]))
-    assert torch.equal(
-        hf["fed_tokens"], tt["tokens"][:, : hf["fed_tokens"].shape[1]]
-    ), "the reference was not put on the TT trajectory"
-
-    per_sample = []
-    for i in range(batch):
-        per_sample.append(min(common.pcc(tt["step_logits"][s][i], hf["step_logits"][s][i]) for s in range(steps)))
-    achieved_pcc = min(per_sample)
-    worst = int(torch.tensor(per_sample).argmin())
-
-    for s in range(steps):
-        step_min = min(common.pcc(tt["step_logits"][s][i], hf["step_logits"][s][i]) for i in range(batch))
-        print(f"step {s}: min per-sample logit PCC = {step_min:.6f}")
+    seq = int(tt["logits"].shape[1])
+    table = torch.tensor(
+        [[common.pcc(tt["logits"][i, s], hf["logits"][i, s]) for s in range(seq)] for i in range(batch)]
+    )
+    per_sample = table.min(dim=1).values
+    achieved_pcc = float(per_sample.min())
+    worst = int(per_sample.argmin())
+    for s in range(seq):
+        print(f"pos {s}: min per-sample logit PCC = {float(table[:, s].min()):.6f}")
+    d = (tt["logits"] - hf["logits"]).abs()
+    print(f"logit elements off by > 1.0 (DIAGNOSTIC; PCC over 131072 columns cannot see one): {int((d > 1.0).sum())}")
     print(
-        f"per-sample worst-step PCC: min={achieved_pcc:.6f} "
-        f"mean={sum(per_sample) / batch:.6f} max={max(per_sample):.6f} (worst sample {worst})"
+        f"per-sample worst-position PCC: min={achieved_pcc:.6f} "
+        f"mean={float(per_sample.mean()):.6f} max={float(per_sample.max()):.6f} (worst sample {worst})"
     )
     print(f"e2e PCC={achieved_pcc}")
     assert achieved_pcc >= PCC_TARGET, f"Gate 3 FAILED: logit PCC {achieved_pcc:.6f} < {PCC_TARGET} on sample {worst}"

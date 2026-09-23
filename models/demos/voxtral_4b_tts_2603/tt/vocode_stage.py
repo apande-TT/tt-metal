@@ -442,11 +442,18 @@ class VocodeStage:
         `ttnn.subtract` on a uint32 tensor WRAPS instead of going negative, and an untilized
         integer input cannot be typecast at all, so the order is to_layout -> typecast -> subtract.
         Verified exact: the round trip reproduces `codes - offset` bit for bit over the code range.
+
+        CLAMPED AT 0, because a batch renders rows that have already ENDED: a row's `end_audio`
+        frame (semantic id 1) and anything after it are not that row's speech, but they are still in
+        the `[B, 37, T]` block, and 1 - offset = -1 is not a codebook index -- torch's embedding
+        raises on it and a uint32 gather reads out of range. `reference/golden.py` applies the same
+        clamp, so both sides render identical codes, and `pipeline.trim_to_end` cuts each row before
+        its end frame.
         """
         if not self.code_offset:
             return codes
         wide = ttnn.typecast(ttnn.to_layout(codes, ttnn.TILE_LAYOUT), ttnn.float32)
-        shifted = ttnn.subtract(wide, float(self.code_offset))
+        shifted = ttnn.relu(ttnn.subtract(wide, float(self.code_offset)))
         return ttnn.to_layout(ttnn.typecast(shifted, ttnn.uint32), ttnn.ROW_MAJOR_LAYOUT)
 
 

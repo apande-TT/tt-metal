@@ -224,18 +224,22 @@ class TextStack:
 
     # ---- prefill -----------------------------------------------------------------------
 
-    def prefill_voiced(self, input_ids_tt, audio_mask, voice_embedding, position_ids_tt=None):
-        """Prefill with the speaker's voice substituted into the prompt's `[AUDIO]` rows.
+    def stage_voice(self, audio_mask, voice_embedding):
+        """The speaker's voice as two PERSISTENT device constants, built ONCE, outside the forward.
 
-        THE MODEL CANNOT INVENT A VOICE. Voxtral TTS conditions on a speaker embedding carried in
-        the prompt: a contiguous block of `[AUDIO]` placeholder ids whose EMBEDDINGS are replaced
-        by that speaker's. Prefilled without it the backbone has nothing to imitate, and the chain
-        emits voice-shaped babble while every stage still measures correct -- which is exactly what
-        it did, at waveform PCC 0.9947 against the reference, because the reference was unvoiced too.
+        Voxtral TTS conditions on a speaker embedding carried in the prompt: a contiguous block of
+        `[AUDIO]` placeholder ids whose EMBEDDINGS are replaced by that speaker's. This is input
+        ENCODING -- the same category as tokenizing -- so it happens here, on the host, before the
+        forward runs, and the forward then does the substitution with two device ops:
 
-        Substitution, not concatenation: the ids and therefore the positions and the causal mask are
-        the prompt's own, and only the rows under the mask change. Done on the HOST side of the one
-        marshalling point, before anything reaches the device, so the forward stays free of host ops.
+            voiced = embeds * keep + placed
+
+        `keep` is 1 where the prompt keeps its token embedding and 0 under the placeholders;
+        `placed` holds the voice rows under the placeholders and 0 elsewhere. Both are
+        `[1, 1, S_pad, 3072]` float32 and broadcast over the batch, which is legal because every
+        row carries the placeholder block at the same positions (`common.build_voice_prompt` lays it
+        out right after `[BOS] [BEGIN_AUDIO]`). x*1+0 and x*0+v are exact, so this is bit-for-bit the
+        reference's `inputs_embeds[mask] = voice`.
         """
         import torch
 
@@ -244,34 +248,58 @@ class TextStack:
                 f"voice embedding is {tuple(voice_embedding.shape)}; last dim must be the hidden "
                 f"size {self.hidden_size}"
             )
-        slots = int(audio_mask.sum(dim=-1)[0])
-        if not bool((audio_mask.sum(dim=-1) == slots).all()):
-            raise ValueError("every row must carry the same number of [AUDIO] placeholders")
+        if not bool((audio_mask == audio_mask[:1]).all()):
+            raise ValueError("every row must carry the [AUDIO] placeholders at the same positions")
+        row = audio_mask[0]
+        slots = int(row.sum())
         if slots != int(voice_embedding.shape[0]):
             raise ValueError(
                 f"the prompt has {slots} [AUDIO] placeholders but the voice embedding has "
                 f"{voice_embedding.shape[0]} rows"
             )
+        seq = int(row.shape[0])
+        padded = _tile_ceil(seq)
+        keep = torch.ones(1, 1, padded, self.hidden_size, dtype=torch.float32)
+        placed = torch.zeros(1, 1, padded, self.hidden_size, dtype=torch.float32)
+        where = torch.zeros(padded, dtype=torch.bool)
+        where[:seq] = row
+        keep[0, 0, where] = 0.0
+        placed[0, 0, where] = voice_embedding.to(torch.float32)
+        upload = dict(dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+        return {
+            "keep": ttnn.from_torch(keep, **upload),
+            "placed": ttnn.from_torch(placed, **upload),
+            "seq": seq,
+            "slots": slots,
+        }
 
-        embeds = self.embed(input_ids_tt)
-        host = ttnn.to_torch(embeds).to(torch.float32)
-        ttnn.deallocate(embeds)
-        batch, _, seq, _ = host.shape
-        rows = host[:, 0, :, :]
-        rows[audio_mask[:, :seq]] = voice_embedding.to(rows.dtype).repeat(batch, 1)
-        host[:, 0, :, :] = rows
+    def prefill_voiced(self, input_ids_tt, voice, position_ids_tt=None, real_len=None):
+        """Prefill with the speaker's voice substituted into the prompt's `[AUDIO]` rows, ON DEVICE.
 
-        # TILE-ALIGNED, for the same reason `prefill` pads its ids: the KV cache appends on the
-        # sequence axis, so a prefill that is not a tile multiple would concat across a tile
-        # boundary. The tail is invisible to the answer -- prefill attention is causal, so no real
-        # position reads a later padded one -- and `real_len` keeps `last` and the first decode
-        # write on the real prompt.
-        tile = 32
-        padded = ((seq + tile - 1) // tile) * tile
+        Substitution, not concatenation: the ids and therefore the positions and the causal mask
+        are the prompt's own, and only the rows under the placeholders change. `voice` is what
+        `stage_voice` returned; the forward reads only those resident buffers.
+        `real_len` is the real prompt length when the caller already
+        padded the ids (a trace pinned at a fixed capacity); it keeps `last` on the real prompt.
+        """
+        seq = int(input_ids_tt.shape[-1])
+        if seq != int(voice["seq"]):
+            raise ValueError(f"prompt length {seq} != the staged voice layout's {voice['seq']}")
+        real_len = seq if real_len is None else int(real_len)
+        padded = _tile_ceil(seq)
         if padded != seq:
-            host = torch.nn.functional.pad(host, (0, 0, 0, padded - seq))
-        voiced = ttnn.from_torch(host, dtype=self.act_dtype, layout=ttnn.TILE_LAYOUT, device=self.device)
-        return self.prefill_embeds(voiced, position_ids_tt=position_ids_tt, real_len=seq)
+            # The same tile-aligned tail `prefill` adds: causal attention hides it and `real_len`
+            # keeps `last` and the first decode write on the real prompt.
+            input_ids_tt = ttnn.pad(input_ids_tt, [(0, 0), (0, padded - seq)], value=0)
+        embeds = self.embed(input_ids_tt)
+        kept = ttnn.multiply(embeds, voice["keep"])
+        ttnn.deallocate(embeds)
+        voiced = ttnn.add(kept, voice["placed"])
+        ttnn.deallocate(kept)
+        try:
+            return self.prefill_embeds(voiced, position_ids_tt=position_ids_tt, real_len=real_len)
+        finally:
+            ttnn.deallocate(voiced)
 
     def prefill(self, input_ids_tt, position_ids_tt=None):
         """ids -> `(hidden [B, 1, S, 3072], last_hidden [B, 3072])`. Seeds the KV cache.

@@ -65,9 +65,9 @@ _HEAD_SECTIONS = {
 
 # The pinned trace capacity for the sequence axis. The VARIABLE dim is the sequence length, whose
 # bound is `config.max_position_embeddings` (128000) -- far past anything a trace region holds, so
-# the stage pins it instead. 64 is tile-aligned and covers the package's 32-token prompts plus the
-# decode horizon. Shrunk with a PRINTED fallback if a capture overflows the region, never silently.
-DEFAULT_TRACE_CAPACITY = int(os.environ.get("VOXTRAL_TRACE_C", "64"))
+# the stage pins it instead. 256 is tile-aligned and covers the real voiced speech request (the
+# default voice's 147-token block + text + controls = 197 tokens). Shrunk with a PRINTED fallback if a capture overflows the region, never silently.
+DEFAULT_TRACE_CAPACITY = int(os.environ.get("VOXTRAL_TRACE_C", "256"))
 
 # Frames the `vocode` stage is captured at. The codec upsamples 8x, so 32 frames become 256 rows,
 # inside the stub's prebuilt ALiBi mask.
@@ -201,6 +201,14 @@ class VoxtralTTSPipeline:
         ids[:, :length] = text_ids
         return ids, texts
 
+    def speech_inputs(self, texts=None, voice=None, batch=None):
+        """The real TTS input for this pipeline's batch -- see module-level `speech_inputs`."""
+        return speech_inputs(texts=texts, voice=voice, batch=self.batch if batch is None else batch)
+
+    def stage_voice(self, audio_mask, voice_embedding):
+        """Upload the voice once, as persistent device constants, OUTSIDE the forward."""
+        return self.text.stage_voice(audio_mask, voice_embedding)
+
     def noise(self, max_frames: int, batch=None, seed: int = 0):
         """The flow-matching sampler's noise input, drawn ONCE on the host.
 
@@ -219,10 +227,8 @@ class VoxtralTTSPipeline:
         x0=None,
         cfg_alpha=None,
         max_frames=None,
-        gate=True,
         collect=False,
-        audio_mask=None,
-        voice_embedding=None,
+        voice=None,
     ):
         """THE REAL TASK: tokenized text -> a 24 kHz waveform, all on device.
 
@@ -244,7 +250,7 @@ class VoxtralTTSPipeline:
             input_ids, _ = self.default_inputs()
         batch, prompt_len = int(input_ids.shape[0]), int(input_ids.shape[1])
         if max_frames is None:
-            max_frames, _ = common.resolve_max_frames(self.reference_model, gate=gate)
+            max_frames, _ = common.resolve_max_frames(self.reference_model)
         if x0 is None:
             x0 = self.noise(max_frames, batch=batch)
 
@@ -284,15 +290,15 @@ class VoxtralTTSPipeline:
         # positions explicitly takes the `ttnn.embedding` GATHER instead, which `ttnn` requires to
         # be bfloat16. Rope was then the only bfloat16 term in a float32 residual stream and the
         # ~0.4% it costs compounds over 26 layers. It also keeps `torch.arange` out of the forward.
-        if voice_embedding is None:
+        if voice is None:
             prefill_hidden, llm_hidden = self.text.prefill(ids_tt)
         else:
             # THE VOICE GOES IN WHERE THE PLACEHOLDERS ARE, not in front of them. The prompt carries
             # a contiguous block of `[AUDIO]` ids whose EMBEDDINGS the speaker's voice replaces --
             # the token ids stay, only the rows change, so positions and the causal mask are the
-            # prompt's own. This is the substitution mistral_common's `encode_speech_request` lays
-            # the prompt out for, and the conditioning the model is unintelligible without.
-            prefill_hidden, llm_hidden = self.text.prefill_voiced(ids_tt, audio_mask, voice_embedding)
+            # prompt's own. `voice` was staged on device by `stage_voice` before this call, so the
+            # substitution here is two device ops and no host compute.
+            prefill_hidden, llm_hidden = self.text.prefill_voiced(ids_tt, voice)
 
         frames, diagnostics = [], []
         # The stop test is accumulated ON DEVICE. `finished |= semantic == stop_id` in torch would
@@ -302,7 +308,7 @@ class VoxtralTTSPipeline:
         finished_flag = ttnn.zeros([batch, 1], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
         position = prompt_len
         stop_reason = f"max_frames={max_frames}"
-        end_frame = [-1] * batch
+        live_frames = ttnn.zeros([batch, 1], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
 
         for step in range(max_frames):
             # --- acoustic: one frame of 37 codes from this hidden state
@@ -326,21 +332,15 @@ class VoxtralTTSPipeline:
             )
             hit = ttnn.eq(semantic, float(self.stop_token_id))
             finished_flag = ttnn.logical_or(finished_flag, hit)
+            # WHERE EACH ROW ENDED, counted on device: a row's end frame is the number of frames it
+            # was still live for, read ONCE after the loop. Rows that end early keep generating until
+            # the whole batch is done, and `trim_to_end` cuts each row back to its own end.
+            #
             # ONE scalar crosses to the host per frame, straight off the 0-d reduction, and it is
-            # LOOP CONTROL -- not a token feed. The codes themselves never leave the device: the
-            # next input is `vocode.audio_token_embedding(codes)` below, device tensor to device
-            # tensor. Taking the scalar off the 0-d tensor directly is deliberate: indexing it
-            # (`[0]` on a reshaped view) fires `aten.select.int`, which is NOT in the host-op
-            # observer's benign set and fails the fully-on-device check, while the scalar read is.
-            # WHERE EACH ROW ENDED, not just how many have. The loop runs until every row is done,
-            # so a batch is as long as its longest sentence -- and each shorter row kept generating
-            # past its own end_audio, which is written into its wav as speech followed by whatever
-            # the model produced after it should have stopped. Heard as the output degrading
-            # partway through, and the reason a nine-word sentence came back 20.48 s long.
-            _done_now = ttnn.to_torch(finished_flag).reshape(batch).to(torch.bool)
-            for _r in range(batch):
-                if bool(_done_now[_r]) and end_frame[_r] < 0:
-                    end_frame[_r] = step
+            # LOOP CONTROL -- not a token feed. The codes never leave the device: the next input is
+            # `vocode.audio_token_embedding(codes)` below. Indexing the flag on the host instead
+            # (`[0]`, `.to(bool)`) fires `aten.select` / `aten._to_copy` inside the forward.
+            live_frames = ttnn.add(live_frames, ttnn.rsub(finished_flag, 1.0))
             n_finished = int(ttnn.to_torch(ttnn.sum(finished_flag)))
             if n_finished >= batch:
                 stop_reason = f"every row emitted end_audio (id {self.stop_token_id}) at frame {step}"
@@ -360,6 +360,11 @@ class VoxtralTTSPipeline:
         # first frame is legal (every row emitting end_audio immediately) and must not crash here.
         codes_all = framed[0] if len(framed) == 1 else ttnn.concat(framed, dim=-1)
         waveform_tt = self.vocode.decode(codes_all)
+
+        # Loop finished: one readback of the per-row counts. A row that never stopped reports -1.
+        counts = ttnn.to_torch(live_frames).tolist()
+        flags = ttnn.to_torch(finished_flag).tolist()
+        end_frame = [int(round(c[0])) if f[0] > 0.5 else -1 for c, f in zip(counts, flags)]
 
         codes_host = ttnn.to_torch(codes_all).to(torch.int64)
         waveform = ttnn.to_torch(waveform_tt).to(torch.float32)
@@ -382,23 +387,24 @@ class VoxtralTTSPipeline:
 
     # ---- Call 2: text continuation -----------------------------------------------------
 
-    def run_text_continuation(self, input_ids=None, horizon=4, eos_id=None):
-        """Greedy causal-LM continuation over the whole-stack bodies and the graduated LM head."""
+    def run_text_continuation(self, input_ids=None):
+        """Teacher-forced causal-LM continuation over the whole-stack bodies and the graduated LM head.
+
+        One forward over the real text; `logits[:, s]` is the next-token distribution after tokens
+        `0..s` and `next_tokens[:, s]` its greedy pick (argmax on device).
+        """
         if self.continuation is None:
             raise RuntimeError("pipeline was built without the text_continuation head")
         if input_ids is None:
-            input_ids, _ = common.build_batch_inputs(batch=self.batch)
+            input_ids, _ = common.build_batch_inputs(batch=self.batch, seq_len=common.full_prompt_len(self.batch))
         batch = int(input_ids.shape[0])
 
         ids_tt = self.prepare_prompt(input_ids)
-        tokens, step_logits = self.continuation.generate(ids_tt, horizon=horizon, eos_id=eos_id)
+        picks, logits = self.continuation.score(ids_tt)
         return {
             "input_ids": input_ids,
-            "tokens": ttnn.to_torch(tokens).to(torch.int64) if not isinstance(tokens, torch.Tensor) else tokens,
-            "step_logits": [
-                ttnn.to_torch(l).to(torch.float32) if not isinstance(l, torch.Tensor) else l for l in step_logits
-            ],
-            "steps": horizon,
+            "next_tokens": ttnn.to_torch(picks).to(torch.int64).reshape(batch, -1),
+            "logits": ttnn.to_torch(logits).to(torch.float32),
             "batch": batch,
         }
 
@@ -442,10 +448,11 @@ class VoxtralTTSPipeline:
 
         The STANDARD, model-agnostic seam the perf engine calls to obtain a stage's inputs with no
         per-model knowledge: all the model-specific assembly lives here, behind this fixed name.
-        The ids come from the same real tokenizer the e2e test and demo use.
+        The REAL speech request the e2e test and demo drive: the voiced prompt from the model's
+        own tokenizer layout and Source A's preset voice embedding.
         """
-        input_ids, _ = self.default_inputs()
-        return {"input_ids": input_ids}
+        input_ids, audio_mask, voice_embedding, _ = self.speech_inputs()
+        return {"input_ids": input_ids, "audio_mask": audio_mask, "voice_embedding": voice_embedding}
 
     def prefill_trace_setup(self, inputs):
         capacity = self.trace_capacity
@@ -456,10 +463,13 @@ class VoxtralTTSPipeline:
 
         padded = torch.zeros(batch, capacity, dtype=input_ids.dtype)
         padded[:, :real_len] = input_ids
+        mask = torch.zeros(batch, capacity, dtype=torch.bool)
+        mask[:, :real_len] = inputs["audio_mask"]
         cos, sin = self._reference_rope(capacity)
 
         self._stage_buffers["prefill"] = {
             "ids": self.prepare_prompt(padded),
+            "voice": self.stage_voice(mask, inputs["voice_embedding"]),
             "positions": self._positions(0, capacity, batch),
             "cos": ttnn.from_torch(
                 cos.reshape(1, 1, capacity, -1).contiguous(),
@@ -487,7 +497,7 @@ class VoxtralTTSPipeline:
 
     def prefill_trace_step(self):
         buf = self._stage_buffers["prefill"]
-        _, last = self.text.prefill(buf["ids"])
+        _, last = self.text.prefill_voiced(buf["ids"], buf["voice"], real_len=buf["real_len"])
         return last
 
     def prefill_trace_items(self):
@@ -515,8 +525,9 @@ class VoxtralTTSPipeline:
         batch, real_len = int(input_ids.shape[0]), int(input_ids.shape[1])
         self.text.reset_cache()
         ids_tt = self.prepare_prompt(input_ids)
+        voice = self.stage_voice(inputs["audio_mask"], inputs["voice_embedding"])
         # Contiguous 0..S-1 -- the rotary stub's float32 default branch; see run_text_to_speech.
-        _, last = self.text.prefill(ids_tt)
+        _, last = self.text.prefill_voiced(ids_tt, voice)
         self._stage_buffers["decode"] = {
             "llm_hidden": last,
             "position": real_len,
@@ -699,6 +710,59 @@ class VoxtralTTSPipeline:
 # ----------------------------------------------------------------------------------------
 
 
+def speech_inputs(texts=None, voice=None, batch=None):
+    """THE REAL TTS INPUT, encoded exactly as the model's own tokenizer lays a speech request out.
+
+    `[BOS] [BEGIN_AUDIO] [AUDIO]*N [NEXT_AUDIO_TEXT] <text> [REPEAT_AUDIO_TEXT] [BEGIN_AUDIO]`,
+    with the `[AUDIO]` rows to be replaced by the speaker's voice embedding (Source A ships 20
+    presets as `voice_embedding/<id>.pt`). Returns ``(input_ids, audio_mask, voice_embedding,
+    texts)``, all host tensors -- this is ENCODING, done before the forward. Module-level so a
+    caller can size the KV cache from the prompt BEFORE building the pipeline.
+    """
+    batch = common.DEFAULT_BATCH if batch is None else int(batch)
+    texts = list(common.SPEECH_TEXTS[:batch]) if texts is None else list(texts)
+    voice = common.DEFAULT_VOICE if voice is None else voice
+    input_ids, audio_mask, emb = common.build_voice_prompt(texts, voice)
+    return input_ids, audio_mask, emb, texts
+
+
+def tts_kv_capacity(prompt_len: int, max_frames: int) -> int:
+    """KV slots one speech request needs: the whole prompt plus one per frame, tile-rounded."""
+    return _tile_ceil(int(prompt_len) + int(max_frames))
+
+
+# Text tokens a speech request may carry beyond the voice block and its five control tokens; the
+# package's 32 prompts use at most ~50.
+TTS_TEXT_BUDGET = 96
+
+
+def default_tts_kv_capacity(hf_model) -> int:
+    """The resident KV size a build needs when no caller sized it: the LONGEST preset voice block
+    (tekken.json's `voice_num_audio_tokens`), the text budget and the controls, plus the decode
+    safety cap -- so the default build can serve any preset voice for the model's full horizon."""
+    voices = common.available_voices()
+    longest = max((int(v) for v in voices.values()), default=0)
+    frames, _ = common.resolve_max_frames(hf_model)
+    return tts_kv_capacity(longest + TTS_TEXT_BUDGET + 5, frames)
+
+
+def trim_to_end(result) -> list:
+    """Each row's waveform cut at its OWN end: the frames BEFORE the one that emitted `end_audio`.
+
+    The decode loop runs until EVERY row has stopped, so the batch is as long as its longest
+    sentence; a shorter row's samples past its own stop are what the model produced after it
+    should have stopped, and are not part of that row's output.
+    """
+    per_frame = int(result["waveform"].shape[-1] // max(1, result["frames_decoded"]))
+    rows = []
+    for i, end in enumerate(result["end_frame"]):
+        wav = result["waveform"][i].reshape(-1)
+        if end >= 0:
+            wav = wav[: int(end) * per_frame]
+        rows.append(wav)
+    return rows
+
+
 def _resolve_depth(name, stage_override, default, full, floor, reason):
     """One stack's depth from (its own override, the global `layers`, its full depth).
 
@@ -802,6 +866,8 @@ def build_pipeline(
     )
 
     text = acoustic = vocode = cont = None
+    if "text" in wanted and kv_capacity is None and "text_to_speech" in heads:
+        kv_capacity = default_tts_kv_capacity(hf_model)
     if "text" in wanted:
         # SIZED FOR THE WORKLOAD, not for a constant. The resident cache was 64 prefill + 64
         # decode slots whatever the caller asked for, so a prompt longer than 64 -- which any
@@ -917,18 +983,20 @@ def host_op_selftest(device=None, pipe=None):
     # exercises only that head's path either way.
     shared = pipe if pipe is not None else build_pipeline(device)
     for head in TASK_HEADS:
-        # OUTSIDE: tokenize, draw the sampler's noise, build weights (done above).
-        input_ids, _ = (
-            shared.default_inputs() if head == "text_to_speech" else common.build_batch_inputs(batch=shared.batch)
-        )
+        # OUTSIDE: tokenize, fetch and stage the voice, draw the sampler's noise, build weights.
         max_frames = 2
-        x0 = shared.noise(max_frames) if head == "text_to_speech" else None
+        if head == "text_to_speech":
+            input_ids, audio_mask, voice_embedding, _ = shared.speech_inputs()
+            voice = shared.stage_voice(audio_mask, voice_embedding)
+            x0 = shared.noise(max_frames)
+        else:
+            input_ids, _ = common.build_batch_inputs(batch=shared.batch)
         with observe_host_ops() as ops:
             # INSIDE: the model math only.
             if head == "text_to_speech":
-                shared.run_text_to_speech(input_ids=input_ids, x0=x0, max_frames=max_frames)
+                shared.run_text_to_speech(input_ids=input_ids, x0=x0, max_frames=max_frames, voice=voice)
             else:
-                shared.run_text_continuation(input_ids=input_ids, horizon=2)
+                shared.run_text_continuation(input_ids=input_ids)
         results[head] = verdict(ops)
         print(f"[host-ops] {head}: {results[head]}")
     failing = {h: v for h, v in results.items() if not _verdict_ok(v)}

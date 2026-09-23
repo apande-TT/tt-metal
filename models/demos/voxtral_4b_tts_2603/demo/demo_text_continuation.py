@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Call 2 demo: greedy causal-LM continuation over the whole-stack bodies and the graduated LM head.
+"""Call 2 demo: teacher-forced causal-LM continuation over the whole-stack bodies and the graduated LM head.
 
-    python -m models.demos.voxtral_4b_tts_2603.demo.demo_text_continuation --horizon 4
+    python -m models.demos.voxtral_4b_tts_2603.demo.demo_text_continuation
 
-Runs the SAME `pipeline.run_text_continuation` the e2e test asserts on.
+Runs the SAME `pipeline.run_text_continuation` the e2e test asserts on: one forward over the real
+text, printing the model's greedy next-token pick at every position.
 
 READ THE OUTPUT AS A PARITY CHECK, NOT AS LANGUAGE. This is a TTS checkpoint: the backbone emits
 AUDIO codebook tokens and its tied TEXT head is effectively untrained, so the continuation is
@@ -14,6 +15,7 @@ garbage the HF reference produces, which is what `--compare` shows.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import torch
@@ -25,10 +27,9 @@ from models.demos.voxtral_4b_tts_2603.tt import common, pipeline
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Voxtral-4B-TTS-2603 text continuation on TTNN")
     parser.add_argument("--text", action="append", default=None, help="a prompt; repeat for more")
-    parser.add_argument("--horizon", type=int, default=4, help="greedy steps to decode")
     parser.add_argument("--batch", type=int, default=common.DEFAULT_BATCH)
     parser.add_argument("--layers", type=int, default=None, help="cap the depth of the text stack (None = all 26)")
-    parser.add_argument("--device-id", type=int, default=0)
+    parser.add_argument("--device-id", type=int, default=int(os.environ.get("VOXTRAL_DEVICE_ID", "0")))
     parser.add_argument("--compare", action="store_true", help="also run the HF golden and print the per-sample PCC")
     args = parser.parse_args(argv)
 
@@ -51,29 +52,28 @@ def main(argv=None):
             input_ids = torch.tensor([tok.encode(t, bos=True)[:length] for t in args.text], dtype=torch.long)
             prompts = args.text
         else:
-            input_ids, prompts = common.build_batch_inputs(batch=args.batch)
+            input_ids, prompts = common.build_batch_inputs(batch=args.batch, seq_len=common.full_prompt_len(args.batch))
 
-        eos = common.eos_token_id(hf_model)
-        print(f"batch={input_ids.shape[0]} prompt_tokens={input_ids.shape[1]} " f"horizon={args.horizon} eos={eos}")
-        result = pipe.run_text_continuation(input_ids=input_ids, horizon=args.horizon, eos_id=eos)
-
-        for i in range(min(8, result["tokens"].shape[0])):
-            ids = result["tokens"][i].tolist()
-            print(f"  [{i:02d}] {prompts[i][:48]!r} -> {ids} {tok.decode(ids)!r}")
-        if result["tokens"].shape[0] > 8:
-            print(f"  ... {result['tokens'].shape[0] - 8} more samples")
+        print(f"batch={input_ids.shape[0]} tokens per row={input_ids.shape[1]} (every position scored)")
+        result = pipe.run_text_continuation(input_ids=input_ids)
+        picks = result["next_tokens"]
+        for i in range(min(8, picks.shape[0])):
+            ids = picks[i].tolist()
+            print(f"  [{i:02d}] {prompts[i][:48]!r} -> next after each position {ids} {tok.decode(ids)!r}")
+        if picks.shape[0] > 8:
+            print(f"  ... {picks.shape[0] - 8} more samples")
 
         if args.compare:
             from models.demos.voxtral_4b_tts_2603.reference import golden
 
-            hf = golden.hf_reference_text_continuation(hf_model, input_ids, args.horizon, eos_id=eos)
-            steps = min(len(result["step_logits"]), len(hf["step_logits"]))
+            hf = golden.hf_reference_text_continuation(hf_model, input_ids)
+            seq = int(input_ids.shape[1])
             scores = [
-                min(common.pcc(result["step_logits"][s][i], hf["step_logits"][s][i]) for s in range(steps))
+                min(common.pcc(result["logits"][i, s], hf["logits"][i, s]) for s in range(seq))
                 for i in range(input_ids.shape[0])
             ]
-            match = torch.equal(result["tokens"][:, :steps], hf["tokens"][:, :steps])
-            print(f"tokens identical to the reference: {bool(match)}")
+            agree = float((picks == hf["next_tokens"]).float().mean())
+            print(f"next-token agreement with the reference: {agree:.6f}")
             print(f"e2e PCC={min(scores)}")
         return 0
     finally:

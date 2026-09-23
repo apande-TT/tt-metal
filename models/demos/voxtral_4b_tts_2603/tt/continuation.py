@@ -1,6 +1,13 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Call 2 of the `mistralai/Voxtral-4B-TTS-2603` end-to-end package: greedy TEXT CONTINUATION.
+"""Call 2 of the `mistralai/Voxtral-4B-TTS-2603` end-to-end package: TEXT CONTINUATION.
+
+The task is the causal LM's next-token prediction, TEACHER-FORCED over the real text (`score`):
+one forward, and at every position the model's continuation logits and its greedy pick. It is NOT
+run as a free-running greedy decode, because on this checkpoint that decode never terminates --
+the untrained tied text head emitted eos (id 2) on 0/32 rows in 448 CPU steps and collapses into a
+1-5 token repetition loop by step ~9, so the model's only stop rule never fires and any horizon
+would be one this package invented. `generate` is kept for the section test only.
 
 The checkpoint's text half is a `MistralForCausalLM` (26 layers, dim 3072, head_dim 128
 explicitly, 32 query heads over 8 KV heads, hidden 9216, `rope_theta` 1e6, `norm_eps` 1e-5,
@@ -168,12 +175,10 @@ class Continuation:
         return batch if batch < 2 else batch // 2
 
     # ------------------------------------------------------------------ forward
-    def forward_logits(self, input_ids_tt, attention_mask=None):
-        """`[B, S]` uint32 token ids -> `[B, vocab]` logits for the LAST position.
+    def _stack_hidden(self, input_ids_tt, attention_mask=None, last_only=True):
+        """`[B, S]` uint32 token ids -> `([B, L, hidden], batch, real_len)` off the two alias bodies.
 
-        The batch is split across the two alias bodies, each half's last position is taken, the
-        halves are concatenated, and the single concatenated `[1, B, hidden]` block goes through
-        `decoder_head` once.
+        `L` is 1 (the last real position) when `last_only`, else every real position `S`.
 
         `attention_mask` is REJECTED, not ignored. The whole-stack stubs take causality from
         SDPA's `is_causal`, which is exact for an UNPADDED batch and silently wrong for a padded
@@ -191,16 +196,16 @@ class Continuation:
         batch, real_len = int(shape[0]), int(shape[1])
         if real_len < 1:
             raise ValueError("input_ids must carry at least one token")
-        # A TILE-ALIGNED SEQUENCE, OR THE ANSWER IS SILENTLY ZERO. The prompt is 33 tokens and
-        # grows by one per generated token, so almost every step is off-tile; the whole-stack
-        # body returns zeros past the last full tile, the head turns that into a flat logit row,
-        # and `argmax` reports token 0 for every sample -- green wiring, garbage text. Padding is
-        # invisible to the answer because the body's causality is SDPA's `is_causal`: the real
-        # positions cannot see the tail, and only row `real_len - 1` is ever read back.
+        # A TILE-ALIGNED SEQUENCE, OR THE ANSWER IS SILENTLY ZERO. The whole-stack body returns
+        # zeros past the last full tile, the head turns that into a flat logit row, and `argmax`
+        # reports token 0 for every sample -- green wiring, garbage text. Padding is invisible to
+        # the answer because the body's causality is SDPA's `is_causal`: the real positions cannot
+        # see the tail, and only rows `< real_len` are ever read back.
         seq = _tile_ceil(real_len)
         if seq != real_len:
             input_ids_tt = ttnn.pad(input_ids_tt, [(0, 0), (0, seq - real_len)], value=0)
         split = self.split_for(batch)
+        lo_pos = real_len - 1 if last_only else 0
 
         halves = []
         for body, lo, hi in self._assignments(input_ids_tt, batch, seq, split):
@@ -215,24 +220,50 @@ class Continuation:
                     f"whole-stack body returned {tuple(got)} for {rows} rows x {seq} tokens -- "
                     "the leading axis is the BATCH and must be read off the input tensor"
                 )
-            # Last REAL position only -- row `real_len - 1`, not `seq - 1`, which after the pad
-            # above is a zero row.
-            halves.append(ttnn.slice(hidden, [0, real_len - 1, 0], [rows, real_len, self.hidden_size]))
+            # REAL positions only -- the tile pad above is zero rows.
+            halves.append(ttnn.slice(hidden, [0, lo_pos, 0], [rows, real_len, self.hidden_size]))
 
-        last = halves[0] if len(halves) == 1 else ttnn.concat(halves, dim=0)
-        if int(last.shape[0]) != batch:
-            raise AssertionError(f"batch split reassembled to {int(last.shape[0])} rows, expected {batch}")
+        out = halves[0] if len(halves) == 1 else ttnn.concat(halves, dim=0)
+        if int(out.shape[0]) != batch:
+            raise AssertionError(f"batch split reassembled to {int(out.shape[0])} rows, expected {batch}")
+        return out, batch, real_len
 
-        # `[B, 1, hidden]` -> `[1, B, hidden]`: the head is POSITIONWISE, so presenting one row
-        # per sample as B positions of a single batch is the same arithmetic and streams the
-        # 131072-wide weight once instead of once per sample. The hop is done in ROW_MAJOR, where
-        # the reshape is a contiguous metadata view.
-        rm = ttnn.reshape(ttnn.to_layout(last, ttnn.ROW_MAJOR_LAYOUT), [1, batch, self.hidden_size])
+    def _head_rows(self, hidden, rows: int):
+        """`[B, L, hidden]` -> `[rows, vocab]` logits, `rows = B * L`, through `decoder_head` ONCE.
+
+        The head is POSITIONWISE, so every (sample, position) row is presented as one position of
+        a single batch: the same arithmetic, and the 131072-wide weight is streamed once instead of
+        once per sample. The hop is done in ROW_MAJOR, where the reshape is a contiguous view.
+        """
+        rm = ttnn.reshape(ttnn.to_layout(hidden, ttnn.ROW_MAJOR_LAYOUT), [1, rows, self.hidden_size])
         logits = self._head(ttnn.to_layout(rm, ttnn.TILE_LAYOUT))
         out = list(logits.shape)
-        if int(out[-2]) != batch or int(out[-1]) != self.vocab_size:
-            raise AssertionError(f"decoder_head returned {tuple(out)}, expected [..., {batch}, {self.vocab_size}]")
-        return ttnn.reshape(logits, [batch, self.vocab_size])
+        if int(out[-2]) != rows or int(out[-1]) != self.vocab_size:
+            raise AssertionError(f"decoder_head returned {tuple(out)}, expected [..., {rows}, {self.vocab_size}]")
+        return ttnn.reshape(logits, [rows, self.vocab_size])
+
+    def forward_logits(self, input_ids_tt, attention_mask=None):
+        """`[B, S]` uint32 token ids -> `[B, vocab]` logits for the LAST position."""
+        last, batch, _ = self._stack_hidden(input_ids_tt, attention_mask, last_only=True)
+        return self._head_rows(last, batch)
+
+    def score(self, input_ids_tt, attention_mask=None):
+        """Teacher-forced causal-LM forward: `[B, S]` ids -> `(next [B, S] uint32, logits [B, S, vocab])`.
+
+        ONE forward over the real text: position `s` of `logits` is the model's next-token
+        distribution given tokens `0..s`, and `next[:, s]` its greedy pick, chosen with
+        `ttnn.argmax` ON DEVICE. Every position of every sample goes through the stack and the
+        LM head -- not only the last.
+        """
+        hidden, batch, real_len = self._stack_hidden(input_ids_tt, attention_mask, last_only=False)
+        rows = batch * real_len
+        logits = self._head_rows(hidden, rows)
+        # ROW_MAJOR first: the last-dim argmax is multi-core on ROW_MAJOR and SINGLE-core on TILE.
+        picks = ttnn.argmax(ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT), dim=-1, keepdim=True)
+        return (
+            ttnn.reshape(picks, [batch, real_len]),
+            ttnn.reshape(logits, [batch, real_len, self.vocab_size]),
+        )
 
     def _assignments(self, input_ids_tt, batch: int, seq: int, split: int):
         """`(body, lo, hi)` row ranges. Both alias bodies run unless the batch cannot be split."""

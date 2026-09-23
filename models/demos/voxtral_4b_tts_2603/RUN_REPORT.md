@@ -1,19 +1,17 @@
 <!-- BEGIN trace-gate -->
 # Trace gate
 
-verdict: **EAGER_WAIVED**
+verdict: **PASS**
 
-trace not engaged; eager permitted because ungraduated module(s) present: flow_matching_audio_transformer
+trace engaged
 
-graduated on-device: 30, ungraduated: 1
-
-fresh capture: no perf test to capture
+graduated on-device: 31, ungraduated: 0
 <!-- END trace-gate -->
 
 <!-- BEGIN bringup -->
 # Bring-up run report — `mistralai/Voxtral-4B-TTS-2603`
 
-_Generated: 2026-09-22 20:39:41 UTC_
+_Generated: 2026-09-23 21:14:27 UTC_
 
 ## Outcome
 
@@ -43,6 +41,7 @@ python -m pytest voxtral_4b_tts_2603/tests/e2e/test_component_pcc.py -svv
 python -m pytest voxtral_4b_tts_2603/tests/e2e/test_e2e_text_continuation.py -svv
 python -m pytest voxtral_4b_tts_2603/tests/e2e/test_e2e_text_to_speech.py -svv
 python -m pytest voxtral_4b_tts_2603/tests/e2e/test_gates.py -svv
+python -m pytest voxtral_4b_tts_2603/tests/e2e/test_text_to_speech_perf.py -svv
 python -m pytest voxtral_4b_tts_2603/tests/e2e/test_trace_and_host_ops.py -svv
 python -m pytest voxtral_4b_tts_2603/demo/demo.py::test_demo -svv
 python -m pytest voxtral_4b_tts_2603/demo/demo_text_continuation.py::test_demo -svv
@@ -55,17 +54,17 @@ python -m pytest voxtral_4b_tts_2603/demo/demo_text_to_speech.py::test_demo -svv
 <!-- BEGIN emit-e2e -->
 # E2E report — `mistralai/Voxtral-4B-TTS-2603`
 
-_Generated: 2026-09-22 20:39:41 UTC_
+_Generated: 2026-09-23 21:14:27 UTC_
 
 **Verdict: PASS**
 
 ## Pipeline placement (on-device vs CPU fallback)
 
-- components: 30/31 on device (96%), 1/31 on CPU (3%)
-- Graduated (ON_DEVICE) : 22/31 (70%) actually graduated (native stub, PCC-verified)
-- on device : REUSE-wired=8  ADAPT-wired=4  NEW-native=18  NEW-partial-CPU=0
-- on CPU    : NEW-fallback=1  REUSE/ADAPT-not-wired=0
-- operations: 30/31 on device (96%), 1/31 on CPU (3%)  (component-level estimate; run with --op-synth for op-level granularity)
+- components: 31/31 on device (100%), 0/31 on CPU (0%)
+- Graduated (ON_DEVICE) : 23/31 (74%) actually graduated (native stub, PCC-verified)
+- on device : REUSE-wired=8  ADAPT-wired=4  NEW-native=19  NEW-partial-CPU=0
+- on CPU    : NEW-fallback=0  REUSE/ADAPT-not-wired=0
+- operations: 31/31 on device (100%), 0/31 on CPU (0%)  (component-level estimate; run with --op-synth for op-level granularity)
 - CPU-fallback modules: (none — fully on device)
 
 ## Per task / demo
@@ -73,7 +72,7 @@ _Generated: 2026-09-22 20:39:41 UTC_
 | task | e2e PCC | demo (real input→output) | e2e PCC test | trace perf test |
 |---|---|---|---|---|
 | `text_continuation` | n/a | `voxtral_4b_tts_2603/demo/demo_text_continuation.py` | `voxtral_4b_tts_2603/tests/e2e/test_e2e_text_continuation.py` | (none) |
-| `text_to_speech` | n/a | `voxtral_4b_tts_2603/demo/demo_text_to_speech.py` | `voxtral_4b_tts_2603/tests/e2e/test_e2e_text_to_speech.py` | (none) |
+| `text_to_speech` | n/a | `voxtral_4b_tts_2603/demo/demo_text_to_speech.py` | `voxtral_4b_tts_2603/tests/e2e/test_e2e_text_to_speech.py` | `voxtral_4b_tts_2603/tests/e2e/test_text_to_speech_perf.py` |
 
 ## Reproduce
 
@@ -87,5 +86,6 @@ pytest voxtral_4b_tts_2603/tests/e2e/test_e2e_text_continuation.py -svv
 ```bash
 python voxtral_4b_tts_2603/demo/demo_text_to_speech.py
 pytest voxtral_4b_tts_2603/tests/e2e/test_e2e_text_to_speech.py -svv
+pytest voxtral_4b_tts_2603/tests/e2e/test_text_to_speech_perf.py -svv
 ```
 <!-- END emit-e2e -->

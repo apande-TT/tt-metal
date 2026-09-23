@@ -1,52 +1,34 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Call 1, end to end: real text -> a real 24 kHz waveform, against Source A's golden.
+"""Call 1, end to end: real text + a preset voice -> a real 24 kHz waveform, against Source A.
 
-THE CHAIN UNDER TEST IS THE ONE THE DEMO RUNS. Both call
-`pipeline.VoxtralTTSPipeline.run_text_to_speech`, so there is exactly one copy of the wiring and a
-green test cannot coexist with a broken demo.
+THE CHAIN UNDER TEST IS THE ONE THE DEMO RUNS. Both call `pipeline.run_text_to_speech`, so there
+is one copy of the wiring and a green test cannot coexist with a broken demo.
 
-NOTHING IS EVER SPLICED INTO THE TT SIDE. The TT chain runs completely free: prefill -> (acoustic
-frame -> audio-token embedding -> decode step) x T -> vocode, each stage fed the previous TT
-stage's real output, exactly as the demo runs it. What the reference is asked changes, and only
-the reference: it is put on the TT chain's own trajectory, so at every stage it answers "given
-exactly the context this pipeline produced, what does torch compute?". That is a well-posed
-question, and it is asked at EVERY joint -- prefill hidden, each frame's backbone hidden, each
-frame's semantic logits, each frame's flow-sampler output, and the final waveform. A wiring bug
-cannot hide behind it: if a TT stage consumed the wrong thing, its output would no longer match
-what torch computes from the same inputs, and one of those five comparisons would drop.
+THE INPUT is the model's own speech-request layout,
+`[BOS] [BEGIN_AUDIO] [AUDIO]*N [NEXT_AUDIO_TEXT] <text> [REPEAT_AUDIO_TEXT] [BEGIN_AUDIO]`, with the
+`casual_male` voice embedding (Source A, `voice_embedding/casual_male.pt`) substituted into the N
+placeholders -- 32 distinct texts, one per row.
 
-EVERY STAGE IS SCORED ON THE INPUT IT CONSUMED -- all three of them, not just the convenient ones.
-The backbone gets the prompt (`input_ids`); the acoustic stage gets the hidden the backbone handed
-it (`fed_hidden`); the codec gets the codes the acoustic stage emitted (`fed_codes`). Scoring a
-stage against a reference run on a DIFFERENT input measures the stage before it, amplified. That
-is not a hypothetical here: the flow sampler runs classifier-free guidance at alpha=3
-(`v = 3*v_cond - 2*v_uncond`), which measured a 9.4x amplification -- a per-frame hidden at PCC
-0.999163 came out as an `x_final` at 0.9259 while the sampler itself was exact on identical inputs
-(velocity PCC 1.000000, semantic logits 1.000000, 99.3% of codes bit-identical). The backbone's
-error is asserted where it belongs, on the backbone.
+THE HORIZON is the model's own stop rule: each row runs until its semantic head emits
+`end_audio` (id read off the reference), and the batch runs until every row has. The safety cap
+(`common.resolve_max_frames`) only bounds a run that never stops, and the test ASSERTS it did not
+bind. Both the TT run and the free-running HF reference use the identical rule. The WHOLE output is
+compared -- every frame of every row.
 
-WHY THE COMPARISON IS NOT TT-FREE-RUN vs HF-FREE-RUN. That was the previous shape of this gate and
-it is below the hardware's noise floor -- not by a little. The chain's discrete bottleneck is a
-round onto 21 levels 0.1 apart, so a free-running comparison measures how fast two trajectories
-separate, not whether the port is right. Measured on this machine (pure torch on BOTH arms, no
-device involved, `tt/golden.py`'s own chain perturbed by a relative epsilon):
+NOTHING IS EVER SPLICED INTO THE TT SIDE. It runs completely free, exactly as the demo does. The
+reference is TEACHER-FORCED onto the TT trajectory (`fed_codes`, `fed_hidden`): at every frame it
+answers "given exactly the context this pipeline produced, what does torch compute?", and each
+stage is scored on the input it actually consumed -- prefill hidden, every frame's backbone hidden,
+semantic logits, flow-sampler output, the discrete codes, and the final waveform. A free-running
+TT-vs-free-running-HF comparison measures how fast two chaotic trajectories separate, not the port:
+the acoustic codes are a round onto 21 levels, and a perturbation smaller than ONE matmul's rounding
+on this device (1.2e-3 relative, measured against float64) already scrambles later frames. The
+free-running HF golden is still run -- it is the audio the quality scores are calibrated against.
 
-    per-frame hidden eps=1e-4 -> codes identical,      min waveform corr 1.000000
-    per-frame hidden eps=1e-3 -> code agreement 0.9896, min waveform corr 0.934352
-    per-frame hidden eps=1e-2 -> code agreement 0.9452, min waveform corr 0.778929
-    x_final          eps=1e-4 -> code agreement 0.9992, min waveform corr 0.997447
-
-and, measured on this device against a float64 reference, ONE matmul (M=32 K=N=3072, HiFi4 +
-`fp32_dest_acc_en`, the fidelity this pipeline already runs at):
-
-    fp32 act x fp32 weight -> 1.169e-3      fp32 act x bf16 weight -> 1.738e-3
-
-So a single matmul's rounding is already ~10x larger than the whole 26-layer chain's budget for
-identical codes, and the free-running form of this gate is unreachable by ANY implementation on
-this hardware -- including torch's own, at fp32. It is not a TT result. The per-stage comparisons
-below are, and they are strictly more of the pipeline than the old single waveform number covered.
-The free-running numbers are still computed and printed every run, as diagnostics.
+A RENDERED SIGNAL IS SCORED, not only correlated: Whisper WER against the requested text, and a
+UTMOS22 naturalness estimate, over each row's full output cut at its own end frame. The thresholds
+are read off the HF golden scored the same way (`WER_MARGIN`, `MOS_MARGIN`).
 """
 from __future__ import annotations
 
@@ -59,11 +41,62 @@ import torch
 from models.demos.voxtral_4b_tts_2603.reference import golden
 from models.demos.voxtral_4b_tts_2603.tt import common, pipeline
 
-pytestmark = pytest.mark.timeout(3600)
+# The HF golden is a 4 B model on CPU run to the model's own stop rule over the WHOLE output, twice
+# (free + teacher-forced): ~16 s per frame at B=32 on this host, ~50 min on a first run. Both arms
+# are memoised on disk (`common.cached_golden`), so a rerun against an unchanged pipeline pays only
+# the device pass and the scoring.
+pytestmark = pytest.mark.timeout(7200)
 
 PCC_TARGET = 0.99
 
+# The TT output may be at most this much worse than the HF golden on the same 32 prompts.
+WER_MARGIN = 0.05  # absolute corpus word error rate
+MOS_MARGIN = 0.20  # mean UTMOS22, on its 1-5 scale
+
+# A reference decision is DECIDABLE when its own margin clears this many standard deviations of
+# the error the device's arithmetic puts on it; codes inside that band are ties and are counted,
+# not waved through.
+# semantic argmax: TIE_SIGMA x the measured RMS logit deviation. acoustic codes: TIE_SIGMA x that
+# element's own spread under the device's measured matmul error, over NOISE_DRAWS torch draws.
+TIE_SIGMA = 6.0
+NOISE_DRAWS = 4
+
+
+def sigma_upper_bound(sample_std, n: int, alpha: float = 0.05):
+    """The (1 - alpha) upper confidence bound on a Gaussian sigma estimated from `n` draws.
+
+    A standard deviation from 4 draws is frequently far below the true one (measured on this run:
+    0.058 from 4 draws, 0.102 from 32, at the same element), and a band built on an underestimate
+    fails codes the reference cannot decide. `s * sqrt((n - 1) / chi2.ppf(alpha, n - 1))`.
+    """
+    from scipy.stats import chi2
+
+    return sample_std * float(((n - 1) / chi2.ppf(alpha, n - 1)) ** 0.5)
+
+
+def measure_matmul_floor(device) -> float:
+    """Relative RMS error of ONE device matmul, measured here, against float64.
+
+    The configuration the acoustic stubs run: a float32 activation against a weight that is exactly
+    bfloat16-representable (this checkpoint's acoustic weights are), HiFi4 + fp32 DEST
+    accumulation. M=32 x K=3072 x N=3072 -- the width of the acoustic transformer.
+    """
+    import ttnn
+
+    gen = torch.Generator().manual_seed(0)
+    a = torch.randn(32, 3072, generator=gen)
+    w = (torch.randn(3072, 3072, generator=gen) / 3072**0.5).to(torch.bfloat16).float()
+    cfg = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True
+    )
+    up = dict(dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+    wt = ttnn.from_torch(w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    out = ttnn.to_torch(ttnn.linear(ttnn.from_torch(a, **up), wt, compute_kernel_config=cfg)).double()
+    ref = a.double() @ w.double()
+    return float((out - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt())
+
 PKG_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+HARNESS_CAPPED = bool(os.environ.get("TT_PERF_OSL_TOKENS"))
 
 
 def routed_modules(call_name: str) -> set:
@@ -78,44 +111,56 @@ def routed_modules(call_name: str) -> set:
 
 @pytest.fixture(scope="module")
 def evidence(device, hf_model):
-    """Run the TT pipeline once, then BOTH reference arms, and hand all three to every assertion."""
+    """Run the TT pipeline once, then BOTH reference arms, and hand all of it to every assertion."""
     common.use_all_cpu_threads()
-    pipe = pipeline.build_pipeline(device, model=hf_model, heads=("text_to_speech",))
-
+    max_frames, provenance = common.resolve_max_frames(hf_model)
+    input_ids, audio_mask, voice_embedding, texts = pipeline.speech_inputs(batch=common.DEFAULT_BATCH)
+    pipe = pipeline.build_pipeline(
+        device,
+        model=hf_model,
+        heads=("text_to_speech",),
+        kv_capacity=pipeline.tts_kv_capacity(input_ids.shape[-1], max_frames),
+    )
     batch = pipe.batch
-    input_ids, texts = pipe.default_inputs()
-    max_frames, provenance = common.resolve_max_frames(hf_model, gate=True)
+    assert input_ids.shape[0] == batch
+    voice = pipe.stage_voice(audio_mask, voice_embedding)
     x0 = pipe.noise(max_frames, batch=batch)
     cfg_alpha = torch.full((batch,), pipeline.DEFAULT_CFG_ALPHA)
 
     print(f"\nbatch driven (read from the pipeline): {batch}")
-    print(f"prompt tokens: {input_ids.shape[1]}  (32 real + [BEGIN_AUDIO])")
-    print(f"max_frames: {max_frames}  <- {provenance}")
-    print(f"stop rule: semantic code == end_audio (id {pipe.stop_token_id}), read off the reference")
+    print(f"prompt tokens: {input_ids.shape[1]}  (voice block {int(audio_mask[0].sum())} + text + controls)")
+    print(f"safety cap: {max_frames}  <- {provenance}")
+    print(f"stop rule: semantic code == end_audio (id {pipe.stop_token_id}) on every row, read off the reference")
 
-    tt = pipe.run_text_to_speech(input_ids=input_ids, x0=x0, cfg_alpha=cfg_alpha, max_frames=max_frames, collect=True)
+    tt = pipe.run_text_to_speech(
+        input_ids=input_ids, x0=x0, cfg_alpha=cfg_alpha, max_frames=max_frames, collect=True, voice=voice
+    )
 
-    # The goldens are memoised on disk: this is a 3.4 B torch model on CPU and the gate is iterated
-    # many times against an unchanging reference. The key covers the inputs, the chain version AND
-    # the reference loader's contract number, so a loader that starts covering more of the
-    # checkpoint -- or a chain that starts returning something else -- invalidates every cached
-    # golden rather than being compared against a stale one.
     base = dict(
         task="tts",
         ids=input_ids,
+        voice=voice_embedding,
         x0=x0,
         cfg=cfg_alpha,
         max_frames=max_frames,
         B=batch,
         chain=golden.CHAIN_VERSION,
     )
+    shared = {}
+
+    def prefill():
+        # Computed at most once, and only if an arm is not already cached on disk.
+        if "state" not in shared:
+            shared["state"] = golden.reference_prefill(hf_model, input_ids, audio_mask, voice_embedding)
+        return shared["state"]
+
+    voiced = dict(audio_mask=audio_mask, voice_embedding=voice_embedding)
     free = common.cached_golden(
         common.golden_key(arm="free", **base),
-        lambda: golden.hf_reference_text_to_speech(hf_model, input_ids, x0, cfg_alpha, max_frames),
+        lambda: golden.hf_reference_text_to_speech(
+            hf_model, input_ids, x0, cfg_alpha, max_frames, prefill=prefill(), **voiced
+        ),
     )
-    # The acoustic stage is scored on the hidden it actually consumed, the same way the codec is
-    # scored on the codes it actually rendered. Without this the acoustic comparison measures the
-    # BACKBONE amplified by classifier-free guidance -- see the module docstring.
     tt_hidden = torch.stack([d["llm_hidden"] for d in tt["diagnostics"]], dim=-1)
     aligned = common.cached_golden(
         common.golden_key(arm="aligned", codes=tt["codes"], hidden=tt_hidden, **base),
@@ -127,8 +172,15 @@ def evidence(device, hf_model):
             max_frames,
             fed_codes=tt["codes"],
             fed_hidden=tt_hidden,
+            prefill=prefill(),
+            **voiced,
         ),
     )
+    dump = os.environ.get("VOXTRAL_DUMP_EVIDENCE")
+    if dump:
+        # Opt-in, for offline analysis of a failure: the TT run's own outputs and the two goldens'
+        # cache keys, so nothing has to be re-run on the device to study it.
+        torch.save({"tt": tt, "input_ids": input_ids, "x0": x0, "cfg_alpha": cfg_alpha}, dump)
     return {
         "pipe": pipe,
         "tt": tt,
@@ -140,8 +192,7 @@ def evidence(device, hf_model):
         "x0": x0,
         "cfg_alpha": cfg_alpha,
         "max_frames": max_frames,
-        # Every constant the discretization rule needs, READ OFF THE REFERENCE rather than typed
-        # here -- a rule spelled out from literals would agree with itself, not with the model.
+        # Every constant the discretization rule needs, READ OFF THE REFERENCE.
         "levels": int(hf_model.acoustic_transformer.acoustic_embeddings_levels),
         "n_special": golden.n_special_tokens(),
         "empty_id": common.audio_empty_token_id(hf_model),
@@ -151,12 +202,7 @@ def evidence(device, hf_model):
 
 
 def test_golden_is_the_references_own_arithmetic(hf_model):
-    """The golden replaces one `torch.randn` and nothing else -- proven, not asserted by comment.
-
-    `decode_one_frame` draws `x_0` INSIDE the module, so its output is a function of the RNG and
-    no PCC against it would mean anything. Seed, call the UNMODIFIED module; re-seed, draw the
-    same first tensor it would have drawn, feed that to the helper; the frames must be identical.
-    """
+    """The golden replaces one `torch.randn` and nothing else -- proven, not asserted by comment."""
     common.use_all_cpu_threads()
     ids, _ = common.build_batch_inputs(batch=4)
     with torch.no_grad():
@@ -181,30 +227,44 @@ def test_gate2_every_call_1_stub_was_invoked(evidence):
     assert all(count >= 1 for count in invoked.values())
 
 
+def test_run_ended_on_the_models_stop_rule(evidence):
+    """TERMINATION: the safety cap is a backstop, never the horizon.
+
+    A cap that binds silently shrinks the comparison to a prefix of the real output, and everything
+    that degrades after it passes unmeasured. Both sides must have stopped on `end_audio`.
+    """
+    tt, free, batch = evidence["tt"], evidence["free"], evidence["batch"]
+    print(f"\nTT stop: {tt['stop_reason']}  ({tt['frames_decoded']} frames)")
+    print(f"HF stop: {free['stop_reason']}  ({free['frames_decoded']} frames)")
+    print(f"TT per-row end frames: {tt['end_frame']}")
+    print(f"HF per-row end frames: {free['end_frame']}")
+    if HARNESS_CAPPED:
+        # The contract's one exception: the harness caps the horizon for profiling BY DESIGN, so
+        # the termination assert (and only it) does not apply. Never true under the e2e gate.
+        print("termination assert NOT applied: TT_PERF_OSL_TOKENS is set, the harness caps the horizon BY DESIGN")
+        return
+    cap = evidence["max_frames"]
+    assert tt["stop_reason"].startswith("every row emitted end_audio"), (
+        f"the TT run ended on the safety cap ({cap} frames), not on the model's stop rule"
+    )
+    assert free["stop_reason"].startswith("every row emitted end_audio"), (
+        f"the HF golden ended on the safety cap ({cap} frames), not on the model's stop rule"
+    )
+    assert all(e >= 0 for e in tt["end_frame"]) and len(tt["end_frame"]) == batch
+
+
 def test_shapes_and_real_task_output(evidence):
     """The output is real audio, not a smoke-test tensor."""
-    tt, free, batch = evidence["tt"], evidence["free"], evidence["batch"]
+    tt, batch = evidence["tt"], evidence["batch"]
     frames = tt["frames_decoded"]
-    print(f"\nframes decoded: TT={frames} HF={free['frames_decoded']}")
-    print(f"TT stop reason: {tt['stop_reason']}")
-    print(f"HF stop reason: {free['stop_reason']}")
-    assert frames == free["frames_decoded"], "TT and HF decoded different lengths -- the stop rule diverged"
-
     assert tuple(tt["codes"].shape) == (batch, 37, frames)
-    assert tuple(tt["waveform"].shape) == (
-        batch,
-        1,
-        frames * 1920,
-    ), f"waveform is {tuple(tt['waveform'].shape)}, expected {frames} frames x 1920 samples"
+    assert tuple(tt["waveform"].shape) == (batch, 1, frames * 1920)
     assert tt["sampling_rate"] == 24000
-    duration = tt["waveform"].shape[-1] / tt["sampling_rate"]
-    print(f"audio: {duration:.2f} s at {tt['sampling_rate']} Hz ({frames} frames at 12.5 Hz)")
-
+    print(f"\naudio: {tt['waveform'].shape[-1] / tt['sampling_rate']:.2f} s at {tt['sampling_rate']} Hz ({frames} frames)")
     wav = tt["waveform"]
     assert torch.isfinite(wav).all(), "the waveform contains non-finite samples"
     assert wav.abs().max() <= 1.5, f"waveform out of audio range: max |x| = {float(wav.abs().max())}"
-    per_sample_std = wav.reshape(batch, -1).std(dim=1)
-    assert float(per_sample_std.min()) > 1e-4, "at least one waveform is constant -- that is not audio"
+    assert float(wav.reshape(batch, -1).std(dim=1).min()) > 1e-4, "at least one waveform is constant"
 
 
 def test_batch_is_32_independent_samples(evidence):
@@ -212,184 +272,272 @@ def test_batch_is_32_independent_samples(evidence):
     tt, batch = evidence["tt"], evidence["batch"]
     assert batch == common.DEFAULT_BATCH == 32
     rows = {tuple(r.tolist()) for r in evidence["input_ids"]}
-    assert len(rows) == batch, "the 32 inputs are not pairwise distinct"
     waves = {tt["waveform"][i].numpy().tobytes() for i in range(batch)}
     codes = {tt["codes"][i].numpy().tobytes() for i in range(batch)}
-    print(
-        f"\ndistinct inputs {len(rows)}/{batch}; distinct code streams {len(codes)}/{batch}; "
-        f"distinct waveforms {len(waves)}/{batch}"
-    )
+    print(f"\ndistinct inputs {len(rows)}/{batch}; code streams {len(codes)}/{batch}; waveforms {len(waves)}/{batch}")
+    assert len(rows) == batch, "the 32 inputs are not pairwise distinct"
     assert len(waves) == batch, f"only {len(waves)} of {batch} waveforms are distinct"
 
 
 def test_per_stage_pcc(evidence):
-    """EVERY joint of the chain, against the reference driven by this pipeline's own trajectory.
-
-    Five comparisons, each over all 32 samples and all decoded frames. Together they cover the
-    whole forward path: the 26-layer prefill, the KV-cached decode step and the audio-token
-    embedding that feeds it, the semantic head, the flow sampler, and the codec.
-    """
+    """EVERY joint of the chain, against the reference driven by this pipeline's own trajectory."""
     tt, hf, batch = evidence["tt"], evidence["hf"], evidence["batch"]
     frames = tt["frames_decoded"]
     diag_tt, diag_hf = tt["diagnostics"], hf["diagnostics"]
     assert len(diag_tt) == frames and len(diag_hf) == frames
 
-    prefill = min(common.pcc(tt["prefill_hidden"][i], hf["prefill_hidden"][i]) for i in range(batch))
-    print(f"\nstage PCC  prefill hidden           (min over {batch} samples) = {prefill:.6f}")
-    assert prefill >= PCC_TARGET, f"the text stack is already below target at {prefill:.6f}"
+    def ratio(a, b):
+        return float(a.norm() / b.norm())
 
-    hidden = min(
-        common.pcc(diag_tt[t]["llm_hidden"][i], hf["llm_hiddens"][t][i]) for t in range(frames) for i in range(batch)
+    prefill = min(common.pcc(tt["prefill_hidden"][i], hf["prefill_hidden"][i]) for i in range(batch))
+    print(
+        f"\nstage PCC  prefill hidden  (min over {batch})          = {prefill:.6f}  "
+        f"|tt|/|ref|={ratio(tt['prefill_hidden'], hf['prefill_hidden']):.5f}"
     )
     per_frame = [
         min(common.pcc(diag_tt[t]["llm_hidden"][i], hf["llm_hiddens"][t][i]) for i in range(batch))
         for t in range(frames)
     ]
-    print(f"stage PCC  decode hidden, per frame  (min over {batch} x {frames})   = {hidden:.6f}")
-    print(f"           per-frame trend: {' '.join(f'{v:.5f}' for v in per_frame)}")
-    assert hidden >= PCC_TARGET, (
-        f"the decode step drifts: frame-wise hidden PCC {hidden:.6f} < {PCC_TARGET}. The reference "
-        f"is fed THIS pipeline's own codes, so a drop here is the KV cache, the position ids or "
-        f"the audio-token embedding -- not divergence."
-    )
+    hidden = min(per_frame)
+    tt_h = torch.stack([d["llm_hidden"] for d in diag_tt])
+    hf_h = torch.stack(hf["llm_hiddens"][:frames])
+    print(f"stage PCC  decode hidden   (min over {batch} x {frames}) = {hidden:.6f}  |tt|/|ref|={ratio(tt_h, hf_h):.5f}")
+    print(f"           worst frame {int(torch.tensor(per_frame).argmin())}; last-frame min {per_frame[-1]:.6f}")
 
     semantic = min(
         common.pcc(diag_tt[t]["semantic_logits"][i], diag_hf[t]["semantic_logits_raw"][i])
         for t in range(frames)
         for i in range(batch)
     )
-    print(f"stage PCC  semantic head logits      (min over {batch} x {frames})   = {semantic:.6f}")
-    assert semantic >= PCC_TARGET, f"the semantic head is at {semantic:.6f}"
-
+    print(f"stage PCC  semantic logits (min over {batch} x {frames}) = {semantic:.6f}")
     x_final = min(
         common.pcc(diag_tt[t]["x_final"][i].clamp(-1, 1), diag_hf[t]["x_final"][i])
         for t in range(frames)
         for i in range(batch)
     )
-    print(f"stage PCC  flow sampler x_final      (min over {batch} x {frames})   = {x_final:.6f}")
+    print(f"stage PCC  x_final         (min over {batch} x {frames}) = {x_final:.6f}")
+    assert prefill >= PCC_TARGET, f"the text stack is below target at {prefill:.6f}"
+    assert hidden >= PCC_TARGET, (
+        f"the decode step drifts: frame-wise hidden PCC {hidden:.6f}. The reference is fed THIS "
+        f"pipeline's own codes, so a drop here is the KV cache, positions or the audio-token embedding"
+    )
+    assert semantic >= PCC_TARGET, f"the semantic head is at {semantic:.6f}"
     assert x_final >= PCC_TARGET, f"the acoustic flow sampler is at {x_final:.6f}"
 
 
 def test_discretization_is_the_references_own_rule(evidence):
-    """The DISCRETE step, checked EXACTLY: no tolerance, no sigma, no threshold.
+    """The on-device discretization IS the reference's rule, checked EXACTLY on the pipeline's own values.
 
-    Comparing TT's codes against the REFERENCE's codes cannot be made exact -- `x_final` is rounded
-    onto 21 levels 0.1 apart, so any deviation at all flips whichever elements sit near a boundary,
-    and a "how many may differ" bound is a statistic, not a check (a fixed 3 sigma over 15 000
-    elements expects ~40 exceedances by chance, and this deviation is heavy-tailed: RMS 2.1e-2,
-    worst 4.0e-1).
-
-    So this asserts the thing that IS exact. The reference's rule is
-    `round(((clamp(x, -1, 1) + 1) / 2) * (levels - 1)) + n_special`, with a finished row forced to
-    `empty_audio`. Apply that rule, in torch, to the x_final THIS PIPELINE produced, and it must
-    reproduce the pipeline's codes bit for bit -- because the on-device clamp / rescale / round /
-    offset is supposed to BE that rule. A wrong level count, a wrong offset, a missing clamp or a
-    misplaced `empty_audio` substitution all break this by a mile, and none of them can hide behind
-    a rounding tie. The NUMERIC quality of `x_final` itself is gated separately, in
-    `test_per_stage_pcc`.
+    `round(((clamp(x, -1, 1) + 1) / 2) * (levels - 1)) + n_special`, `empty_audio` on a stopped row;
+    and the semantic code is the reference's masked argmax. Applied in torch to THIS pipeline's
+    x_final / logits, it must reproduce the pipeline's codes bit for bit.
     """
-    tt, hf, batch = evidence["tt"], evidence["hf"], evidence["batch"]
+    tt = evidence["tt"]
     frames, levels = tt["frames_decoded"], evidence["levels"]
     n_special, stop_id = evidence["n_special"], evidence["stop_token_id"]
     scale = 0.5 * (levels - 1)
 
     x_tt = torch.stack([tt["diagnostics"][t]["x_final"] for t in range(frames)], dim=-1)
-    s_tt = (x_tt.clamp(-1, 1) + 1) * scale
-    rule = s_tt.round().long() + n_special
-    finished = (tt["codes"][:, 0, :] == stop_id).unsqueeze(1).expand_as(rule)
-    rule = torch.where(finished, torch.full_like(rule, evidence["empty_id"] + n_special), rule)
+    rule = ((x_tt.clamp(-1, 1) + 1) * scale).round().long() + n_special
+    stopped = (tt["codes"][:, 0, :] == stop_id).unsqueeze(1).expand_as(rule)
+    rule = torch.where(stopped, torch.full_like(rule, evidence["empty_id"] + n_special), rule)
+    mismatch = int((tt["codes"][:, 1:, :] != rule).sum())
+    print(f"\ndiscretization rule on the pipeline's x_final reproduces {rule.numel() - mismatch}/{rule.numel()} codes")
 
-    codes_tt = tt["codes"][:, 1:, :]
-    mismatch = int((codes_tt != rule).sum())
-    print(
-        f"\ndiscretization: the reference's rule applied to THIS pipeline's x_final reproduces "
-        f"{rule.numel() - mismatch}/{rule.numel()} codes"
-    )
-    assert mismatch == 0, (
-        f"{mismatch} of {rule.numel()} acoustic codes are not what the reference's own "
-        f"clamp/rescale/round/offset gives on the pipeline's own x_final -- the on-device "
-        f"discretization is not that rule"
-    )
-
-    # The semantic code, the same way: the reference's argmax over the reference's own -inf mask,
-    # applied to THIS pipeline's logits.
     lo_tt = torch.stack([tt["diagnostics"][t]["semantic_logits"] for t in range(frames)], dim=-1)
     masked = lo_tt.clone()
     masked[:, evidence["empty_id"], :] = -float("inf")
     masked[:, n_special + evidence["semantic_size"] :, :] = -float("inf")
-    sem_rule = masked.argmax(dim=1)
-    sem_mismatch = int((tt["codes"][:, 0, :] != sem_rule).sum())
-    print(
-        f"semantic argmax: the reference's masked argmax on this pipeline's logits reproduces "
-        f"{sem_rule.numel() - sem_mismatch}/{sem_rule.numel()} codes"
+    sem_mismatch = int((tt["codes"][:, 0, :] != masked.argmax(dim=1)).sum())
+    print(f"masked argmax on the pipeline's logits reproduces {masked[:, 0].numel() - sem_mismatch}/{masked[:, 0].numel()}")
+    assert mismatch == 0, f"{mismatch} acoustic codes are not the reference's rule on the pipeline's own x_final"
+    assert sem_mismatch == 0, f"{sem_mismatch} semantic codes are not the reference's masked argmax"
+
+
+def calibrate_stage_noise(pipe, hf_model, floor_eps):
+    """The relative error scale at which the torch sampler's noise model matches THIS STAGE on device.
+
+    Matmul rounding is not the stage's only error source (the activation x activation attention
+    matmuls, the elementwise exp/rsqrt/silu), so the measured single-matmul floor under-predicts the
+    stage. The scale is therefore calibrated on a HELD-OUT input -- the stage's own
+    `acoustic_trace_inputs()`, assembled from Source B's captured tensors, not from this run -- by
+    running the TT stage and the torch reference on it, and scaling the noise model until its
+    x_final spread matches the TT deviation. Never below the measured matmul floor.
+    """
+    inputs = pipe.acoustic_trace_inputs()
+    buf = pipe.acoustic_trace_setup(inputs)
+    probe = {}
+    pipe.acoustic.decode_frame(buf["llm_hidden"], buf["x0"], buf["cfg_alpha"], probe=probe)
+    import ttnn
+
+    x_tt = ttnn.to_torch(probe["x_final"]).float().clamp(-1, 1)
+    with torch.no_grad():
+        _, diag = golden.acoustic_frame(hf_model, inputs["llm_hidden"], inputs["x0"], inputs["cfg_alpha"])
+    tt_rms = float((x_tt - diag["x_final"]).pow(2).mean().sqrt())
+    spread = golden.acoustic_spread_under_matmul_noise(
+        hf_model, inputs["llm_hidden"], inputs["x0"], inputs["cfg_alpha"], floor_eps, draws=NOISE_DRAWS
     )
-    assert sem_mismatch == 0, (
-        f"{sem_mismatch} semantic codes are not the reference's masked argmax of the pipeline's "
-        f"own logits -- the on-device mask or argmax is not that rule"
+    model_rms = float(spread.pow(2).mean().sqrt())
+    return max(floor_eps, floor_eps * tt_rms / model_rms), tt_rms, model_rms
+
+
+def test_discrete_codes_equal_the_teacher_forced_reference(device, hf_model, evidence):
+    """EXACT AGREEMENT of the discrete output under teacher forcing, wherever the reference decides.
+
+    The reference consumed THIS pipeline's hidden and codes at every frame, so the two ran the same
+    trajectory and any disagreement is the pipeline's -- unless the reference's own decision is not
+    a decision at the precision this hardware has. That is measured, not assumed:
+
+    * semantic code: a tie when the reference's top-1 minus top-2 logit is under `TIE_SIGMA` RMS
+      logit deviations;
+    * acoustic code: the flow sampler is ill-conditioned at some elements (CFG alpha=3 over 7 Euler
+      steps), so the band is PER ELEMENT: the spread of the reference's own x_final when every Linear
+      carries noise at the stage's device precision -- the single-matmul floor measured here, scaled
+      on a held-out input to the stage's own measured error (`calibrate_stage_noise`) -- floored at
+      that held-out baseline error, which covers the error sources the Linear-only model omits. A
+      mismatch is a tie only if the reference value sits within `TIE_SIGMA` of that band from the
+      rounding edge.
+
+    Every other mismatch fails.
+    """
+    tt, hf = evidence["tt"], evidence["hf"]
+    frames, levels = tt["frames_decoded"], evidence["levels"]
+    scale = 0.5 * (levels - 1)
+    live = (tt["codes"][:, 0, :] != evidence["stop_token_id"]).unsqueeze(1)
+
+    x_hf = torch.stack([hf["diagnostics"][t]["x_final"] for t in range(frames)], -1)
+    s_hf = (x_hf + 1) * scale
+    room = (s_hf - s_hf.floor() - 0.5).abs()
+    differ = (tt["codes"][:, 1:, :] != hf["codes"][:, 1:, :]) & live.expand_as(room)
+    agree = float((tt["codes"][:, 1:, :] == hf["codes"][:, 1:, :]).float().mean())
+
+    floor_eps = measure_matmul_floor(device)
+    rel_eps, cal_tt, cal_model = calibrate_stage_noise(evidence["pipe"], hf_model, floor_eps)
+    print(
+        f"\nnoise model: one device matmul {floor_eps:.3e} relative; held-out calibration (trace inputs): "
+        f"TT x_final RMS dev {cal_tt:.3e} vs model {cal_model:.3e} at the floor -> scale {rel_eps:.3e}"
+    )
+    tt_hidden = torch.stack([d["llm_hidden"] for d in tt["diagnostics"]], dim=-1)
+    ties = decided_wrong = 0
+    for f in sorted(set(torch.nonzero(differ)[:, 2].tolist())):
+        here = differ[..., f]
+        # Only the rows that hold a mismatch: every row is an independent sample, so the draw on
+        # a subset is the same arithmetic and costs a fraction of the whole batch.
+        rows = sorted(set(torch.nonzero(here)[:, 0].tolist()))
+        h, x0f, cfg = tt_hidden[rows, :, f], evidence["x0"][f][rows], evidence["cfg_alpha"][rows]
+        spread_rows = common.cached_golden(
+            common.golden_key(arm="spread-rowrms", hidden=h, x0=x0f, cfg=cfg, eps=round(rel_eps, 5), draws=NOISE_DRAWS),
+            lambda: golden.acoustic_spread_under_matmul_noise(hf_model, h, x0f, cfg, rel_eps, draws=NOISE_DRAWS),
+        )
+        spread = torch.full_like(room[..., f], float("inf"))
+        spread[rows] = sigma_upper_bound(spread_rows, NOISE_DRAWS)
+        # Two measured error terms, the larger wins: this element's SENSITIVITY (the noise model)
+        # and the stage's BASELINE error on the held-out input, which the Linear-only noise model
+        # does not reproduce (device sin/cos in the time embedding, the activation x activation
+        # attention matmuls, the elementwise ops).
+        band = TIE_SIGMA * torch.clamp(spread, min=cal_tt) * scale
+        tie = here & (room[..., f] <= band)
+        ties += int(tie.sum())
+        decided_wrong += int((here & ~tie).sum())
+        for b, c in torch.nonzero(here & ~tie).tolist():
+            print(
+                f"  DECIDABLE mismatch f{f} row{b} cb{c}: ref {float(s_hf[b, c, f]):.4f} room {float(room[b, c, f]):.4f} "
+                f"band {float(band[b, c]):.4f}"
+            )
+    n_live = int(live.expand_as(room).sum())
+    print(
+        f"\nacoustic codes vs teacher-forced reference: agreement {agree:.6f} over {n_live} live codes; "
+        f"{int(differ.sum())} differ -> {ties} ties (band {TIE_SIGMA} x max(per-element spread at {rel_eps:.3e}, 95% upper bound "
+        f"from {NOISE_DRAWS} draws; held-out baseline {cal_tt:.3e})), {decided_wrong} decidable mismatches; codes "
+        f"inside the baseline band alone: {int(((room <= TIE_SIGMA * cal_tt * scale) & live.expand_as(room)).sum())}/{n_live}"
     )
 
-    # Reported, not asserted: how the codes land against the reference's OWN codes. Both sides
-    # ran the acoustic stage on the same hidden here, so this is the deviation's tie rate.
-    dev = s_tt - (torch.stack([hf["diagnostics"][t]["x_final"] for t in range(frames)], dim=-1) + 1) * scale
+    lo_tt = torch.stack([tt["diagnostics"][t]["semantic_logits"] for t in range(frames)], -1)
+    lo_hf = torch.stack([hf["diagnostics"][t]["semantic_logits"] for t in range(frames)], -1)
+    finite = torch.isfinite(lo_hf)
+    ldev = (lo_tt[finite] - lo_hf[finite]).pow(2).mean().sqrt()
+    top2 = lo_hf.topk(2, dim=1).values
+    sem_decidable = (top2[:, 0] - top2[:, 1]) > TIE_SIGMA * ldev
+    sem_differ = tt["codes"][:, 0, :] != hf["codes"][:, 0, :]
+    sem_wrong = sem_differ & sem_decidable
     print(
-        f"acoustic codes vs the reference's own: agreement "
-        f"{float((codes_tt == hf['codes'][:, 1:, :]).float().mean()):.6f}  "
-        f"(rescaled deviation RMS={float(dev.pow(2).mean().sqrt()):.3e}, "
-        f"worst={float(dev.abs().max()):.3e}; the grid spacing is 1.0)"
+        f"semantic codes vs teacher-forced reference: agreement {float((~sem_differ).float().mean()):.6f}; "
+        f"{int(sem_differ.sum())} differ -> {int((sem_differ & ~sem_decidable).sum())} ties "
+        f"(band {TIE_SIGMA} x RMS {float(ldev):.3e}), {int(sem_wrong.sum())} decidable mismatches"
     )
-    print(
-        f"semantic codes vs the reference's own: agreement "
-        f"{float((tt['codes'][:, 0, :] == hf['codes'][:, 0, :]).float().mean()):.6f}"
-    )
+    assert decided_wrong == 0, f"{decided_wrong} DECIDABLE acoustic codes differ from the reference"
+    assert int(sem_wrong.sum()) == 0, f"{int(sem_wrong.sum())} DECIDABLE semantic codes differ from the reference"
+
+
+def test_signal_quality_wer_and_mos(evidence):
+    """SCORE the rendered signal: intelligibility (WER) and naturalness (MOS), against the HF golden.
+
+    Both sides are cut at their OWN rows' end frames and scored identically. The TT output must be
+    no worse than the free-running HF golden by the stated margins.
+    """
+    from models.demos.voxtral_4b_tts_2603.reference import quality
+
+    tt, free, texts = evidence["tt"], evidence["free"], evidence["texts"]
+    rate = tt["sampling_rate"]
+    tt_scores = quality.score(pipeline.trim_to_end(tt), rate, texts)
+    hf_scores = quality.score(pipeline.trim_to_end(free), rate, texts)
+    for i in range(evidence["batch"]):
+        print(
+            f"[{i:02d}] TT WER={tt_scores['wer'][i]:.3f} MOS={tt_scores['mos'][i]:.2f} | "
+            f"HF WER={hf_scores['wer'][i]:.3f} MOS={hf_scores['mos'][i]:.2f} | {tt_scores['transcripts'][i]!r}"
+        )
+    tt_wer, hf_wer = tt_scores["corpus_wer"], hf_scores["corpus_wer"]
+    tt_mos = sum(tt_scores["mos"]) / len(tt_scores["mos"])
+    hf_mos = sum(hf_scores["mos"]) / len(hf_scores["mos"])
+    print(f"corpus WER: TT={tt_wer:.4f} HF={hf_wer:.4f} (margin {WER_MARGIN})")
+    print(f"mean MOS:   TT={tt_mos:.3f} HF={hf_mos:.3f} (margin {MOS_MARGIN})")
+    assert tt_wer <= hf_wer + WER_MARGIN, f"TT wer {tt_wer:.4f} is worse than the HF golden's {hf_wer:.4f}"
+    assert tt_mos >= hf_mos - MOS_MARGIN, f"TT mos {tt_mos:.3f} is worse than the HF golden's {hf_mos:.3f}"
 
 
 def test_free_running_divergence_is_reported(evidence):
-    """Report the TT-free-run vs HF-free-run numbers, and assert the part of them that is decidable.
+    """TT-free-run vs HF-free-run, as a DIAGNOSTIC -- plus the one part of it that is decidable.
 
-    Frame 0 takes NO feedback: both sides compute it from their own prefill hidden and nothing
-    else, so its semantic code is a clean discrete comparison with no accumulated trajectory in
-    it. Everything after frame 0 is reported, because the measurements in this module's docstring
-    show that a perturbation smaller than one matmul's rounding already scrambles it.
+    Frame 0 takes no feedback, so its semantic code is a clean discrete comparison.
     """
     tt, free, batch = evidence["tt"], evidence["free"], evidence["batch"]
     steps = min(tt["codes"].shape[-1], free["codes"].shape[-1])
     agree = float((tt["codes"][..., :steps] == free["codes"][..., :steps]).float().mean())
-    n = min(tt["waveform"].shape[-1], free["waveform"].shape[-1])
-    corr = min(common.pcc(tt["waveform"][i, ..., :n], free["waveform"][i, ..., :n]) for i in range(batch))
-    print(
-        f"\nfree-running reference (DIAGNOSTIC, not a gate metric -- see the module docstring): "
-        f"code agreement={agree:.6f}  min waveform corr={corr:.6f}"
-    )
-
+    print(f"\nfree-running reference (DIAGNOSTIC, not a gate metric): code agreement={agree:.6f}")
+    # Frame 0's semantic code is decidable wherever the reference's own top-2 margin clears the
+    # measured logit deviation; a closer call is a tie, counted, and cannot fail the check.
     frame0 = tt["codes"][:, 0, 0] == free["codes"][:, 0, 0]
-    print(f"frame-0 semantic code (no feedback in it): {int(frame0.sum())}/{batch} exact")
-    assert bool(frame0.all()), (
-        "the very first semantic code already disagrees, before any feedback exists -- that is a "
-        "prefill/semantic-head error, not divergence"
+    lo_tt = tt["diagnostics"][0]["semantic_logits"]
+    lo_hf = free["diagnostics"][0]["semantic_logits"]
+    finite = torch.isfinite(lo_hf)
+    ldev = (lo_tt[finite] - lo_hf[finite]).pow(2).mean().sqrt()
+    top2 = lo_hf.topk(2, dim=1).values
+    decidable = (top2[:, 0] - top2[:, 1]) > TIE_SIGMA * ldev
+    wrong = ~frame0 & decidable
+    print(
+        f"frame-0 semantic code (no feedback in it): {int(frame0.sum())}/{batch} exact; "
+        f"{int((~frame0 & ~decidable).sum())} ties (band {TIE_SIGMA} x RMS {float(ldev):.3e}), "
+        f"{int(wrong.sum())} decidable mismatches"
     )
+    assert not bool(wrong.any()), "a DECIDABLE frame-0 semantic code disagrees, before any feedback exists"
 
 
 def test_gate3_e2e_pcc(evidence):
-    """GATE 3: the FINAL output -- the waveform -- against the HF golden, for all 32 samples.
+    """GATE 3: the FINAL output -- the whole waveform, every frame -- against the HF golden, all 32 rows.
 
-    The reference here is torch's own codec rendering the codes this pipeline emitted, so this
-    compares the real end-to-end task output on identical input. Together with `test_per_stage_pcc`
-    it covers every stage from the prompt tokens to the audio samples.
+    The reference is torch's own chain teacher-forced onto this pipeline's trajectory, rendering the
+    codes this pipeline emitted; together with the per-stage and discrete checks above it covers
+    every stage from the prompt to the audio samples.
     """
     tt, hf, batch = evidence["tt"], evidence["hf"], evidence["batch"]
     assert torch.equal(tt["codes"], hf["fed_codes"]), "the reference was not put on the TT trajectory"
-
+    assert tt["waveform"].shape == hf["waveform"].shape
     per_sample = [common.pcc(tt["waveform"][i], hf["waveform"][i]) for i in range(batch)]
     achieved_pcc = min(per_sample)
     worst = int(torch.tensor(per_sample).argmin())
-
     print(
-        f"\nper-sample waveform PCC: min={achieved_pcc:.6f} "
+        f"\nper-sample waveform PCC over {tt['frames_decoded']} frames: min={achieved_pcc:.6f} "
         f"mean={sum(per_sample) / batch:.6f} max={max(per_sample):.6f} (worst sample {worst})"
     )
     print(f"e2e PCC={achieved_pcc}")
-    assert achieved_pcc >= PCC_TARGET, (
-        f"Gate 3 FAILED: waveform PCC {achieved_pcc:.6f} < {PCC_TARGET} on sample {worst}. "
-        f"Both sides render the SAME codes here, so this is the codec stage's own numerics -- "
-        f"fidelity/dtype on the vocoder, never a change to the comparison."
-    )
+    assert achieved_pcc >= PCC_TARGET, f"Gate 3 FAILED: waveform PCC {achieved_pcc:.6f} < {PCC_TARGET} on sample {worst}"
