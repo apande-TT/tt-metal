@@ -120,10 +120,10 @@ class TtNemotronHMamba2Mixer:
             cvcol = torch.tensor(cvcol, dtype=torch.long)
 
             Win = sd["in_proj.weight"].t().contiguous().float()[:, incol]  # (2688, 10304)
-            self._w_in = self._shd_bf16(Win, 1)  # col-parallel
+            self._w_in = self._shd_bf16(Win, 1, dtype=ttnn.bfloat8_b)  # col-parallel
             # out_proj row-parallel: heads are contiguous in d_inner, so a plain
             # dim-0 split lines each chip's input rows up with its heads' y.
-            self._w_out = self._shd_bf16(sd["out_proj.weight"].t().contiguous().float(), 0)
+            self._w_out = self._shd_bf16(sd["out_proj.weight"].t().contiguous().float(), 0, dtype=ttnn.bfloat8_b)
 
             w_conv_r = w_conv[cvcol]  # (conv_dim, K) reordered
             self._conv_taps = [self._shd(w_conv_r[:, K - 1 - s].reshape(1, 1, -1), 2) for s in range(K)]
@@ -144,8 +144,12 @@ class TtNemotronHMamba2Mixer:
             self._P = self._dev(P)
         else:
             # ---- big projection weights (stored pre-transposed: [in, out]) ----
-            self._w_in = self._devw_bf16(sd["in_proj.weight"].t().contiguous().float())  # (2688, 10304)
-            self._w_out = self._devw_bf16(sd["out_proj.weight"].t().contiguous().float())  # (4096, 2688)
+            self._w_in = self._devw_bf16(
+                sd["in_proj.weight"].t().contiguous().float(), dtype=ttnn.bfloat8_b
+            )  # (2688, 10304)
+            self._w_out = self._devw_bf16(
+                sd["out_proj.weight"].t().contiguous().float(), dtype=ttnn.bfloat8_b
+            )  # (4096, 2688)
             # tap s shifts the sequence by s (x[t-s]); its weight column is K-1-s.
             self._conv_taps = [self._dev(w_conv[:, K - 1 - s].reshape(1, 1, self.conv_dim)) for s in range(K)]
             self._conv_bias = self._dev(cb.float().reshape(1, 1, self.conv_dim)) if cb is not None else None
@@ -222,28 +226,28 @@ class TtNemotronHMamba2Mixer:
             mesh_mapper=ttnn.ShardTensor2dMesh(self.device, mesh_shape=self._mesh_shape, dims=(None, dim)),
         )
 
-    def _devw_bf16(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
-        """bf16 projection weight (in_proj/out_proj only -- NOT the SSM scan
+    def _devw_bf16(self, torch_tensor, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16):
+        """Projection weight, bf16 unless `dtype` says otherwise (in_proj/out_proj only -- NOT the SSM scan
         constants A/D/dt_bias, which stay fp32 for the decay/softplus math)."""
         t16 = torch_tensor.to(torch.bfloat16)
         if self._is_mesh():
             try:
                 return ttnn.from_torch(
                     t16,
-                    dtype=ttnn.bfloat16,
+                    dtype=dtype,
                     layout=layout,
                     device=self.device,
                     mesh_mapper=ttnn.ReplicateTensorToMesh(self.device),
                 )
             except Exception:
                 pass
-        return ttnn.from_torch(t16, dtype=ttnn.bfloat16, layout=layout, device=self.device)
+        return ttnn.from_torch(t16, dtype=dtype, layout=layout, device=self.device)
 
-    def _shd_bf16(self, torch_tensor, dim, layout=ttnn.TILE_LAYOUT):
-        """bf16 projection weight sharded along `dim` (see _shd)."""
+    def _shd_bf16(self, torch_tensor, dim, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16):
+        """Projection weight sharded along `dim` (see _shd, _devw_bf16)."""
         return ttnn.from_torch(
             torch_tensor.to(torch.bfloat16),
-            dtype=ttnn.bfloat16,
+            dtype=dtype,
             layout=layout,
             device=self.device,
             mesh_mapper=ttnn.ShardTensor2dMesh(self.device, mesh_shape=self._mesh_shape, dims=(None, dim)),

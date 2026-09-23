@@ -357,10 +357,12 @@ class NemotronHBlock:
             cvcol = torch.tensor(cvcol, dtype=torch.long)
 
             Win = sd["mixer.in_proj.weight"].t().contiguous().float()[:, incol]  # [2688, 10304]
-            self._W_in = _shd(Win, 1)  # -> [2688, 10304/TP]
+            self._W_in = _shd(Win, 1, ttnn.bfloat8_b)  # -> [2688, 10304/TP]
             # out_proj row-parallel: heads are contiguous in d_inner, so a plain
             # dim-0 split lines each chip's input rows up with its heads' y.
-            self._W_out = _shd(sd["mixer.out_proj.weight"].t().contiguous().float(), 0)  # -> [INTER/TP, 2688]
+            self._W_out = _shd(
+                sd["mixer.out_proj.weight"].t().contiguous().float(), 0, ttnn.bfloat8_b
+            )  # -> [INTER/TP, 2688]
 
             cw = sd["mixer.conv1d.weight"].squeeze(1).float()[cvcol]  # [conv_dim, K] reordered
             self._conv_taps = [_shd(cw[:, K - 1 - lag].contiguous().view(1, 1, -1), 2) for lag in range(K)]
@@ -373,8 +375,10 @@ class NemotronHBlock:
             self._dt_bias = _shd(sd["mixer.dt_bias"].float().view(1, 1, Hf).contiguous(), 2)  # -> [1,1,Hl]
             self._w_gnorm = _shd(sd["mixer.norm.weight"].view(1, 1, -1).float().contiguous(), 2)  # -> [1,1,INTER/TP]
         else:
-            self._W_in = self._dev(sd["mixer.in_proj.weight"].t().contiguous().float())  # [2688, 10304]
-            self._W_out = self._dev(sd["mixer.out_proj.weight"].t().contiguous().float())  # [4096, 2688]
+            self._W_in = self._dev(sd["mixer.in_proj.weight"].t().contiguous().float(), ttnn.bfloat8_b)  # [2688, 10304]
+            self._W_out = self._dev(
+                sd["mixer.out_proj.weight"].t().contiguous().float(), ttnn.bfloat8_b
+            )  # [4096, 2688]
             cw = sd["mixer.conv1d.weight"].squeeze(1).float()  # [conv_dim, K]
             self._conv_taps = [self._dev(cw[:, K - 1 - lag].contiguous().view(1, 1, -1)) for lag in range(K)]
             self._conv_bias = (
