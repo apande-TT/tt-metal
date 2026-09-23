@@ -31,6 +31,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _ssm_cache
 from models.demos.wormhole.mamba.tt.mamba_ssm import TtMambaSSM  # kept per ADAPT requirement
 
 
@@ -315,30 +316,14 @@ class TtNemotronHMamba2Mixer:
         rm = ttnn.permute(rm, (0, 2, 1, 3))
         return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
 
-    # ----------------------------- forward ---------------------------- #
-    def __call__(self, hidden_states, **kwargs):
-        hs = self._fp32(hidden_states)
-        if hs.layout != ttnn.TILE_LAYOUT:
-            hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
-        shape = list(hs.shape)
-        B, T = shape[0], shape[1]
+    def _prefill_core(self, hbc, dt, B, T, consts, fill=False):
+        """Full-sequence conv + single-chunk SSD -> Y (B, H, T, HD). With
+        fill=True it also writes the decode state left after position T-1."""
         H, HD, N = self.num_heads, self.head_dim, self.ssm_state_size
         I = self.intermediate_size
         G = self.n_groups
-        consts = self._get_consts(B, T)
-
-        # 1. in_proj  -> (B, T, 10304)
-        cg = self.device.compute_with_storage_grid_size()
-        proj = ttnn.matmul(
-            hs, self._w_in, compute_kernel_config=self.ckc, core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x)
-        )
-
-        # 2. split: gate(I) | hbc(conv_dim) | dt(H)
-        gate = ttnn.slice(proj, [0, 0, 0], [B, T, I])
-        hbc = ttnn.slice(proj, [0, 0, I], [B, T, I + self.conv_dim])
-        dt = ttnn.slice(proj, [0, 0, I + self.conv_dim], [B, T, I + self.conv_dim + H])
-        ttnn.deallocate(proj)
-
+        if fill:
+            self._state = getattr(self, "_state", {})
         # 3. depthwise causal conv1d via shift-matmul + per-tap channel scale
         conv_acc = None
         for s in range(self.conv_k):
@@ -346,7 +331,10 @@ class TtNemotronHMamba2Mixer:
             term = ttnn.multiply(shifted, self._conv_taps[s])
             ttnn.deallocate(shifted)
             conv_acc = term if conv_acc is None else ttnn.add(conv_acc, term)
-        ttnn.deallocate(hbc)
+        if fill:
+            hbc_pre = hbc
+        else:
+            ttnn.deallocate(hbc)
         if self._conv_bias is not None:
             conv_acc = ttnn.add(conv_acc, self._conv_bias)
         hbc = ttnn.silu(conv_acc)  # (B, T, conv_dim)
@@ -395,6 +383,9 @@ class TtNemotronHMamba2Mixer:
         ttnn.deallocate(dt_h)
         A_cum = ttnn.matmul(consts["tril"], a, compute_kernel_config=self.ckc)  # (B, H, T, 1)
         ttnn.deallocate(a)
+        if fill:
+            _ssm_cache.mamba_fill(self._state, self.device, hbc_pre, A_cum, Bh, X_disc, self.conv_k, self.ckc)
+            ttnn.deallocate(hbc_pre)
         A_cum_t = ttnn.matmul(A_cum, consts["ones_row"], compute_kernel_config=self.ckc)  # (B,H,T,T): [.,t,s]=cum[t]
         ttnn.deallocate(A_cum)
         A_cum_s = ttnn.transpose(A_cum_t, -2, -1)  # [.,t,s] = cum[s]
@@ -431,6 +422,55 @@ class TtNemotronHMamba2Mixer:
         ttnn.deallocate(X_disc)
         Y = ttnn.add(Y, D_res)
         ttnn.deallocate(D_res)
+
+        return Y
+
+    def _decode_core(self, hbc, dt, B):
+        """Single-token conv + SSD recurrence against the cached state -> Y (B, H, 1, HD)."""
+        H, HD, N = self.num_heads, self.head_dim, self.ssm_state_size
+        I = self.intermediate_size
+        G = self.n_groups
+        hbc = _ssm_cache.mamba_conv_step(self._state, hbc, self._conv_taps, self._conv_bias, self.conv_k)
+        Xf = ttnn.slice(hbc, [0, 0, 0], [B, 1, I])
+        Bf = ttnn.slice(hbc, [0, 0, I], [B, 1, I + G * N])
+        Cf = ttnn.slice(hbc, [0, 0, I + G * N], [B, 1, I + 2 * G * N])
+        ttnn.deallocate(hbc)
+        dt = self._softplus(ttnn.add(dt, self._dt_bias))
+        Be = ttnn.matmul(Bf, self._P, compute_kernel_config=self.ckc)
+        Ce = ttnn.matmul(Cf, self._P, compute_kernel_config=self.ckc)
+        X = self._to_heads(Xf, B, 1, H, HD)
+        Bh = self._to_heads(Be, B, 1, H, N)
+        Ch = self._to_heads(Ce, B, 1, H, N)
+        dt_h = self._to_heads(dt, B, 1, H, 1)
+        return _ssm_cache.mamba_ssm_step(self._state, X, Bh, Ch, dt_h, self._A, self._D, self.ckc)
+
+    # ----------------------------- forward ---------------------------- #
+    def __call__(self, hidden_states, **kwargs):
+        hs = self._fp32(hidden_states)
+        if hs.layout != ttnn.TILE_LAYOUT:
+            hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
+        shape = list(hs.shape)
+        B, T = shape[0], shape[1]
+        H, HD, N = self.num_heads, self.head_dim, self.ssm_state_size
+        I = self.intermediate_size
+        G = self.n_groups
+        consts = None if getattr(self, "_cache_mode", None) == "decode" else self._get_consts(B, T)
+
+        # 1. in_proj  -> (B, T, 10304)
+        cg = self.device.compute_with_storage_grid_size()
+        proj = ttnn.matmul(hs, self._w_in, compute_kernel_config=self.ckc, core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x))
+
+        # 2. split: gate(I) | hbc(conv_dim) | dt(H)
+        gate = ttnn.slice(proj, [0, 0, 0], [B, T, I])
+        hbc = ttnn.slice(proj, [0, 0, I], [B, T, I + self.conv_dim])
+        dt = ttnn.slice(proj, [0, 0, I + self.conv_dim], [B, T, I + self.conv_dim + H])
+        ttnn.deallocate(proj)
+
+        mode = getattr(self, "_cache_mode", None)
+        if mode == "decode":
+            Y = self._decode_core(hbc, dt, B)
+        else:
+            Y = self._prefill_core(hbc, dt, B, T, consts, fill=(mode == "fill"))
 
         # 11. back to (B, T, I)
         Y_rm = ttnn.to_layout(Y, ttnn.ROW_MAJOR_LAYOUT)

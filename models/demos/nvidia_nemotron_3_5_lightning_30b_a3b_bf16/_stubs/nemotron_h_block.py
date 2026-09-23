@@ -38,6 +38,7 @@ import torch
 import transformers
 
 import ttnn
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _ssm_cache
 
 HF_MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 _CANDIDATE_SUBMODULE_PATHS = ["backbone.layers.0"]
@@ -460,33 +461,14 @@ class NemotronHBlock:
         t = ttnn.to_layout(t, ttnn.TILE_LAYOUT)
         return t
 
-    def __call__(self, hidden_states, cache_params=None, cache_position=None, attention_mask=None, **kwargs):
-        self._ensure_consts()
-
+    def _prefill_core(self, hsBC, dt, B, S, fill=False):
+        """Full-sequence conv + single-chunk SSD -> y [B,H,S,P]. With fill=True
+        it also writes the decode state left after position S-1."""
         ckc = self.ckc
         H, P, N, K = self._H, self._P, self._N, self._K
-        INTER, GGN, GS = self._INTER, self._GGN, self._GS
-
-        # Input is bf16/TILE on device; the torch reference runs fully fp32.
-        x = ttnn.to_layout(hidden_states, ttnn.TILE_LAYOUT)
-        x = ttnn.typecast(x, ttnn.float32)
-        B = int(x.shape[0])
-        S = int(x.shape[1])
-        self._ensure_seq(B, S)
-
-        residual = x
-
-        # 1. Block pre-norm (NemotronHRMSNorm over hidden=2688, eps=1e-5).
-        normed = ttnn.rms_norm(x, weight=self._w_block_norm, epsilon=1e-5, compute_kernel_config=ckc)
-
-        # 1b. in_proj: 2688 -> 10304
-        proj = ttnn.linear(normed, self._W_in, compute_kernel_config=ckc)
-
-        # split: [gate(4096), hidden_states_B_C(6144), dt(64)]   (d_mlp == 0)
-        gate = ttnn.slice(proj, [0, 0, 0], [B, S, INTER])
-        hsBC = ttnn.slice(proj, [0, 0, INTER], [B, S, INTER + self._CONV_DIM])
-        dt = ttnn.slice(proj, [0, 0, INTER + self._CONV_DIM], [B, S, INTER + self._CONV_DIM + H])
-
+        INTER, GGN = self._INTER, self._GGN
+        if fill:
+            self._state = getattr(self, "_state", {})
         # 2. Causal depthwise conv1d (k=4) over the 6144 channels, then SiLU.
         conv_acc = None
         for lag in range(K):
@@ -530,9 +512,65 @@ class NemotronHBlock:
         M = ttnn.mul(Gmat, L)  # [1,H,S,S]
 
         x_disc = ttnn.mul(x_h, dt_h)  # [1,H,S,P]
+        if fill:
+            _ssm_cache.mamba_fill(self._state, self.device, hsBC, cumA, B_h, x_disc, K, ckc)
         Ydiag = ttnn.matmul(M, x_disc, compute_kernel_config=ckc)  # [1,H,S,P]
         Dres = ttnn.mul(self._D4, x_h)  # [1,H,S,P]
         y = ttnn.add(Ydiag, Dres)  # [1,H,S,P]
+
+        return y
+
+    def _decode_core(self, hsBC, dt, B):
+        """Single-token conv + SSD recurrence against the cached state -> y [B,H,1,P]."""
+        ckc = self.ckc
+        H, P, N, K = self._H, self._P, self._N, self._K
+        INTER, GGN = self._INTER, self._GGN
+        conv_out = _ssm_cache.mamba_conv_step(self._state, hsBC, self._conv_taps, self._conv_bias, K)
+        xss = ttnn.slice(conv_out, [0, 0, 0], [B, 1, INTER])
+        Bg = ttnn.slice(conv_out, [0, 0, INTER], [B, 1, INTER + GGN])
+        Cg = ttnn.slice(conv_out, [0, 0, INTER + GGN], [B, 1, INTER + 2 * GGN])
+        Bh = ttnn.matmul(Bg, self._Esel, compute_kernel_config=ckc)
+        Ch = ttnn.matmul(Cg, self._Esel, compute_kernel_config=ckc)
+        dt = self._softplus(ttnn.add(dt, self._dt_bias))
+        x_h = self._to_heads(xss, 1, P, B)
+        B_h = self._to_heads(Bh, 1, N, B)
+        C_h = self._to_heads(Ch, 1, N, B)
+        dt_h = self._to_heads(dt, 1, 1, B)
+        return _ssm_cache.mamba_ssm_step(self._state, x_h, B_h, C_h, dt_h, self._A4, self._D4, ckc)
+
+    def __call__(self, hidden_states, cache_params=None, cache_position=None, attention_mask=None, **kwargs):
+        self._ensure_consts()
+
+        ckc = self.ckc
+        H, P, N, K = self._H, self._P, self._N, self._K
+        INTER, GGN, GS = self._INTER, self._GGN, self._GS
+
+        # Input is bf16/TILE on device; the torch reference runs fully fp32.
+        x = ttnn.to_layout(hidden_states, ttnn.TILE_LAYOUT)
+        x = ttnn.typecast(x, ttnn.float32)
+        B = int(x.shape[0])
+        S = int(x.shape[1])
+        if getattr(self, "_cache_mode", None) != "decode":
+            self._ensure_seq(B, S)
+
+        residual = x
+
+        # 1. Block pre-norm (NemotronHRMSNorm over hidden=2688, eps=1e-5).
+        normed = ttnn.rms_norm(x, weight=self._w_block_norm, epsilon=1e-5, compute_kernel_config=ckc)
+
+        # 1b. in_proj: 2688 -> 10304
+        proj = ttnn.linear(normed, self._W_in, compute_kernel_config=ckc)
+
+        # split: [gate(4096), hidden_states_B_C(6144), dt(64)]   (d_mlp == 0)
+        gate = ttnn.slice(proj, [0, 0, 0], [B, S, INTER])
+        hsBC = ttnn.slice(proj, [0, 0, INTER], [B, S, INTER + self._CONV_DIM])
+        dt = ttnn.slice(proj, [0, 0, INTER + self._CONV_DIM], [B, S, INTER + self._CONV_DIM + H])
+
+        mode = getattr(self, "_cache_mode", None)
+        if mode == "decode":
+            y = self._decode_core(hsBC, dt, B)
+        else:
+            y = self._prefill_core(hsBC, dt, B, S, fill=(mode == "fill"))
 
         y = self._from_heads(y, S, B)  # [B,S,4096]
 

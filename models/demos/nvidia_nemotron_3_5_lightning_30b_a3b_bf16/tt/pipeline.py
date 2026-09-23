@@ -55,6 +55,7 @@ from pathlib import Path
 import torch
 
 import ttnn
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _ssm_cache
 from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import nemotron_h_attention as _attn_stub
 from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import nemotron_h_block as _block_stub
 from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import nemotron_h_experts as _experts_stub
@@ -572,6 +573,55 @@ class NemotronHPipeline:
         return ttnn.from_torch(t, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device, **kw)
 
     # ----------------------------------------------------------------- #
+    #  cached decode: prefill seeds per-layer state, then 1 token per step
+    # ----------------------------------------------------------------- #
+    def _set_cache_mode(self, mode):
+        """Route every stateful stub (Mamba2 mixers / block, attention) into
+        "fill", "decode" or the plain stateless forward (None)."""
+        for layer in self.layers:
+            for attr in ("block", "mixer"):
+                m = getattr(layer, attr, None)
+                if m is not None and layer.variant in ("MAMBA_A", "MAMBA_B", "MAMBA_C", "ATTN"):
+                    m._cache_mode = mode
+
+    def _greedy_ids(self, logits):
+        """(B,1,vocab) logits -> (B,1) uint32 ROW_MAJOR next ids, on device."""
+        B = int(logits.shape[0])
+        nxt = ttnn.argmax(ttnn.untilize(logits, use_multicore=True), dim=-1)
+        nxt = ttnn.reshape(ttnn.to_layout(nxt, ttnn.ROW_MAJOR_LAYOUT), [B, 1])
+        return ttnn.typecast(nxt, ttnn.uint32)
+
+    def prefill_fill(self, input_ids):
+        """Full-prompt forward that seeds every layer's decode state and the
+        next-token buffer. Re-running it resets the state IN PLACE, so a
+        captured decode trace stays valid. Returns the last-position logits."""
+        self._set_cache_mode("fill")
+        try:
+            logits = self.forward_logits(self._ids_to_device(input_ids), last_only=True)
+        finally:
+            self._set_cache_mode(None)
+        nxt = self._greedy_ids(logits)
+        if "dec_ids" in self._persistent:
+            ttnn.copy(nxt, self._persistent["dec_ids"])
+            ttnn.deallocate(nxt)
+        else:
+            self._persistent["dec_ids"] = nxt
+        return logits
+
+    def _decode_token(self):
+        """One cached decode step: consume dec_ids, advance every layer's state,
+        write the greedy next id back into dec_ids. Returns (B,1,vocab) logits."""
+        self._set_cache_mode("decode")
+        try:
+            logits = self.forward_logits(self._persistent["dec_ids"], last_only=True)
+        finally:
+            self._set_cache_mode(None)
+        nxt = self._greedy_ids(logits)
+        ttnn.copy(nxt, self._persistent["dec_ids"])
+        ttnn.deallocate(nxt)
+        return logits
+
+    # ----------------------------------------------------------------- #
     #  Call 1 -- text generation.  THE task entrypoint.
     # ----------------------------------------------------------------- #
     def run_text_generation(self, input_ids, max_new_tokens=None, stop_ids=None, progress=False):
@@ -590,25 +640,18 @@ class NemotronHPipeline:
         N = max_new_tokens if max_new_tokens is not None else self.decode_cap(input_ids.shape[1])
 
         B = int(input_ids.shape[0])
-        ids_tt = self._ids_to_device(input_ids)
         seq = input_ids.clone()
         finished = torch.zeros(B, dtype=torch.bool)
         step_logits = []
 
+        logits = self.prefill_fill(input_ids)
         for step in range(N):
-            logits = self.forward_logits(ids_tt, last_only=True)  # (B,1,vocab) on device
-            logits_rm = ttnn.untilize(logits, use_multicore=True)
-            nxt = ttnn.argmax(logits_rm, dim=-1)  # on-device greedy pick, multicore (ROW_MAJOR last-dim)
-            ttnn.deallocate(logits_rm)
+            if step > 0:
+                logits = self._decode_token()
             step_logits.append(_first_shard(logits).reshape(B, -1)[:, : self.vocab_size].float())
             ttnn.deallocate(logits)
 
-            nxt_rm = ttnn.to_layout(nxt, ttnn.ROW_MAJOR_LAYOUT)
-            nxt_rm = ttnn.reshape(nxt_rm, [B, 1])
-            nxt_rm = ttnn.typecast(nxt_rm, ttnn.uint32)
-            ids_tt = ttnn.concat([ids_tt, nxt_rm], dim=1)
-
-            tok = _first_shard(nxt_rm).reshape(B).to(torch.int64)
+            tok = _first_shard(self._persistent["dec_ids"]).reshape(B).to(torch.int64)
             seq = torch.cat([seq, tok.reshape(B, 1)], dim=1)
             finished |= torch.tensor([int(t) in stop_ids for t in tok.tolist()])
             if progress:
@@ -636,13 +679,11 @@ class NemotronHPipeline:
     def decode_cap(self, prompt_len):
         """Safety cap for the stop-token rule.
 
-        The graduated stubs are STATELESS full-sequence bodies (no KV / SSM
-        cache), so step k recomputes the whole prefix and decode is O(N^2) in
-        tokens. TT_E2E_MAX_NEW_TOKENS (default 16) is that hardware-forced
-        bound, clamped by the config's own context limit.
+        TT_E2E_MAX_NEW_TOKENS (default 16), clamped by the config's context
+        limit and by the attention KV cache's capacity.
         """
         env = int(os.environ.get("TT_E2E_MAX_NEW_TOKENS", "16"))
-        ctx = int(self.config.max_position_embeddings) - int(prompt_len)
+        ctx = min(int(self.config.max_position_embeddings), _ssm_cache.KV_CAPACITY) - int(prompt_len)
         return max(1, min(env, ctx))
 
     # ----------------------------------------------------------------- #
@@ -753,32 +794,29 @@ class NemotronHPipeline:
         return int(self.batch)
 
     def decode_prefill(self, inputs):
-        """AR contract: seed the resident decode state.
-
-        NOTE, honestly: the graduated stubs are stateless full-sequence bodies
-        with no KV / SSM cache to seed, so "resident state" here is the pinned
-        capacity-C id buffer that a decode step reads and never rebuilds. There
-        is no cache to recompute, so the decode contract's "reads them, never
-        recomputes" holds trivially.
-        """
+        """AR contract: seed the resident decode state (Mamba conv/SSM state,
+        attention K/V cache, next-token ids) from the prompt."""
         return self.decode_trace_setup(inputs)
 
     def decode_trace_setup(self, inputs):
-        C = self.trace_capacity
-        ids, real = self._pin(inputs["input_ids"], C)
-        buf = self._ids_to_device(ids)
-        self._persistent["decode_ids"] = buf
-        self._persistent["decode_real_len"] = real
-        out = self.forward_logits(buf, last_only=True)
+        ids = inputs["input_ids"]
+        # warm one step eagerly (compiles every T=1 program), then reset the
+        # state in place, take the eager reference step, and reset again so the
+        # captured step replays from exactly the reference's starting state.
+        ttnn.deallocate(self.prefill_fill(ids))
+        ttnn.deallocate(self._decode_token())
+        ttnn.deallocate(self.prefill_fill(ids))
+        out = self._decode_token()
         self._persistent["decode_ref"] = _first_shard(out)
         ttnn.deallocate(out)
-        return buf
+        ttnn.deallocate(self.prefill_fill(ids))
+        return self._persistent["dec_ids"]
 
     def decode_step(self):
-        return self.decode_trace_step()
+        return self._decode_token()
 
     def decode_trace_step(self):
-        return self.forward_logits(self._persistent["decode_ids"], last_only=True)
+        return self._decode_token()
 
     # ---- selftests -------------------------------------------------------- #
     def trace_capture_selftest(self, device=None):
