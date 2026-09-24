@@ -381,7 +381,8 @@ def _softmax(x, dim=-1):
     in any layer whose residual is already large. The acoustic stubs beside this file spell the
     same three ops out for the same reason.
     """
-    e = ttnn.exp(ttnn.subtract(x, ttnn.max(x, dim=dim, keepdim=True)))
+    # The exp rides on the subtract as a post-activation: one pass over x instead of two.
+    e = ttnn.subtract(x, ttnn.max(x, dim=dim, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     return ttnn.divide(e, ttnn.sum(e, dim=dim, keepdim=True))
 
 
