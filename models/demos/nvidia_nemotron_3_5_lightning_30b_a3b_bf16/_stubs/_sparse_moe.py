@@ -38,13 +38,17 @@ def routed_mix(device, hs, W, up_b, down_cat, C, ckc, arange_cache):
     table = ttnn.to_layout(ttnn.typecast(hs, ttnn.bfloat16), ttnn.ROW_MAJOR_LAYOUT)  # (T, H)
     xe = ttnn.reshape(ttnn.embedding(idx_rm, table, layout=ttnn.TILE_LAYOUT), [Eloc, C, H])
     ttnn.deallocate(table)
-    act = ttnn.matmul(xe, up_b, compute_kernel_config=ckc, dtype=ttnn.bfloat8_b)  # (Eloc, C, I)
+    g = device.compute_with_storage_grid_size()
+    full = ttnn.CoreGrid(y=g.y, x=g.x)  # batched per-expert matmuls: spread over every core
+    act = ttnn.matmul(xe, up_b, compute_kernel_config=ckc, dtype=ttnn.bfloat8_b, core_grid=full)  # (Eloc, C, I)
     ttnn.deallocate(xe)
     w3 = ttnn.to_layout(ttnn.reshape(ttnn.to_layout(vals, ttnn.ROW_MAJOR_LAYOUT), [Eloc, C, 1]), ttnn.TILE_LAYOUT)
     act = ttnn.multiply(
         ttnn.relu(act), w3, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]
     )  # relu2 * routing weight
-    ye = ttnn.matmul(act, ttnn.reshape(down_cat, [Eloc, I, H]), compute_kernel_config=ckc, dtype=ttnn.bfloat8_b)
+    ye = ttnn.matmul(
+        act, ttnn.reshape(down_cat, [Eloc, I, H]), compute_kernel_config=ckc, dtype=ttnn.bfloat8_b, core_grid=full
+    )
     ttnn.deallocate(act)
     # combine: out[t] = sum over (e, c) with idx[e, c] == t of ye[e, c]
     ar = arange_cache.get(T)
