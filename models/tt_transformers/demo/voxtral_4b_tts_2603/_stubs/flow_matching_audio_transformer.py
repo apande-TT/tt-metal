@@ -91,19 +91,69 @@ _COMPUTE = ttnn.WormholeComputeKernelConfig(
 )
 
 
+_TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
+_L1_BUDGET = 1_100_000
+
+
+def _mcast_cfg(x, w, rows, out_dtype):
+    """A full-grid 2D-multicast program config for a tall `[rows, K] x [K, N]` linear, or None.
+
+    Left to itself ttnn picks a partial grid with small K-blocks for these shapes. This spreads M
+    over the grid rows and N over the grid columns, takes the widest K-block whose double-buffered
+    in0/in1 blocks plus the output block fit L1, and the largest subblock fp32 DEST allows (4 tiles).
+    None when even the output block alone does not fit, so the caller keeps ttnn's default.
+    """
+    grid = x.device().compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    mt, kt, nt = rows // 32, int(w.shape[-2]) // 32, int(w.shape[-1]) // 32
+    per_m, per_n = -(-mt // gy), -(-nt // gx)
+    size = lambda dt: _TILE_BYTES.get(dt, 2048)
+    fixed = per_m * per_n * (size(out_dtype) + (0 if out_dtype == ttnn.float32 else 4096))
+    kb = next(
+        (
+            c
+            for c in (16, 8, 4, 2, 1)
+            if kt % c == 0 and fixed + 2 * c * (per_m * size(x.dtype) + per_n * size(w.dtype)) <= _L1_BUDGET
+        ),
+        None,
+    )
+    if kb is None:
+        return None
+    sub = max(
+        ((h, s) for h in range(1, 5) for s in range(1, 5) if h * s <= 4 and per_m % h == 0 and per_n % s == 0),
+        key=lambda hs: (hs[0] * hs[1], hs[1]),
+    )
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=(gx, gy),
+        in0_block_w=kb,
+        out_subblock_h=sub[0],
+        out_subblock_w=sub[1],
+        per_core_M=per_m,
+        per_core_N=per_n,
+        transpose_mcast=False,
+        fused_activation=None,
+    )
+
+
 def _lin(x, w, **kwargs):
     """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
 
     A `[B, 1, S, K]` activation against a 2-D weight runs as B separate `S x K x N` matmuls that
     each re-read the whole weight from DRAM; `[1, 1, B*S, K]` is one matmul that reads it once.
+    Tall results (>= 8 tile rows) also get a hand-sized full-grid program config.
     """
     shape = [int(d) for d in x.shape]
     lead = 1
     for d in shape[:-2]:
         lead *= d
+    rows = lead * shape[-2]
+    if rows >= 256 and rows % 32 == 0 and "program_config" not in kwargs:
+        cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
+        if cfg is not None:
+            kwargs["program_config"] = cfg
     if lead == 1:
         return ttnn.linear(x, w, **kwargs)
-    y = ttnn.linear(ttnn.reshape(x, [1, 1, lead * shape[-2], shape[-1]]), w, **kwargs)
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, rows, shape[-1]]), w, **kwargs)
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
