@@ -185,7 +185,7 @@ def _norm_weight(norm, device):
     return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
 
 
-def _rms_norm(x, gamma, eps):
+def _rms_norm(x, gamma, eps, dtype=None):
     """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
 
     NOT `ttnn.rms_norm`: on this model's real inputs the stock op sits at 9.65e-4 relative error
@@ -197,7 +197,7 @@ def _rms_norm(x, gamma, eps):
     already spell it out; this is the same four ops so the two bodies agree.
     """
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
-    return ttnn.multiply(ttnn.multiply(x, scale), gamma)
+    return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
 
 
 def _build_stub(name, device, torch_module, counter=None, **kwargs):
@@ -261,9 +261,9 @@ def _composed_block(device, torch_block, layer_id, counter):
     eps = float(torch_block.attention_norm.eps)
 
     def run(h, attn_mask):
-        xn = _rms_norm(h, g_attn, eps)
+        xn = _rms_norm(h, g_attn, eps, dtype=ttnn.bfloat16)
         h = ttnn.add(h, attn(xn, attn_mask=attn_mask))
-        hn = _rms_norm(h, g_ffn, eps)
+        hn = _rms_norm(h, g_ffn, eps, dtype=ttnn.bfloat16)
         return ttnn.add(h, ff(hn))
 
     return AcousticBlock(layer_id, "composed", run, [_ATTN_STUB, _FF_STUB])
