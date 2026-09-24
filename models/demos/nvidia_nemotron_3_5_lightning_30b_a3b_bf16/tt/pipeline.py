@@ -168,6 +168,11 @@ def _reshape_rm(t, shape):
     return t
 
 
+def _f32(t):
+    """t as fp32 -- without launching a copy when it already is."""
+    return t if t.dtype == ttnn.float32 else ttnn.typecast(t, ttnn.float32)
+
+
 def _dup(t):
     """A fresh device copy of `t` (several graduated stubs deallocate the tensor
     they were handed once no upcast copy was needed)."""
@@ -387,7 +392,7 @@ class TtNemotronHLayer:
                 # bf16 activation into these fp32 weights is what made this
                 # variant the worst layer in the chain (0.971 vs 0.990 for the
                 # MLP-stub variant, which upcasts internally).
-                hh = ttnn.typecast(h, ttnn.float32) if h.dtype != ttnn.float32 else h
+                hh = _f32(h)
                 hh = _dram_mm.as_rows(hh)  # tokens are independent: one 2-D matmul
                 up = ttnn.matmul(hh, self._sh_up, compute_kernel_config=ckc)
                 _invocation.record("re_l_u_squared_activation")
@@ -399,14 +404,14 @@ class TtNemotronHLayer:
                     shared = ttnn.all_reduce(shared, cluster_axis=1, topology=ttnn.Topology.Linear)
                 shared = _dram_mm.from_rows(shared, B, T)
 
-            y = ttnn.add(ttnn.typecast(routed, ttnn.float32), ttnn.typecast(shared, ttnn.float32))
+            y = ttnn.add(_f32(routed), _f32(shared))
 
         # Keep the residual stream in fp32. The graduated stubs each return
         # bf16, but truncating the RESIDUAL too costs ~3 decimal digits per
         # layer and compounds: measured 2026-09-06, a bf16 residual gave e2e
         # PCC 0.947 at depth 7 where the fp32 residual clears the gate. The HF
         # reference runs the whole block in fp32, so this matches it.
-        return ttnn.add(ttnn.typecast(x, ttnn.float32), ttnn.typecast(y, ttnn.float32))
+        return ttnn.add(_f32(x), _f32(y))
 
 
 # --------------------------------------------------------------------------- #
