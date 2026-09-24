@@ -178,9 +178,10 @@ def mamba_ssm_step(state, x_h, B_h, C_h, dt_h, A, D, ckc):
     S_dec = ttnn.multiply(state["ssm"], decay)
     ttnn.addcmul(S_dec, ttnn.transpose(B_h, -2, -1), xdt, output_tensor=state["ssm"])  # (B,H,N,1)*(B,H,1,P)
     ttnn.deallocate(S_dec)
-    # y = C S as broadcast-multiply + reduce over N: a 1024-way batch of
-    # (1 x N) @ (N x P) matmuls pads M to a full tile and runs far off bandwidth
-    y = ttnn.sum(ttnn.multiply(state["ssm"], ttnn.transpose(C_h, -2, -1)), dim=-2, keepdim=True)  # (B,H,1,P)
+    # y = C S as one head-spread batched matmul: it reads the state once (a
+    # multiply + reduce reads it, writes the product and reads that again);
+    # M pads to a tile, but spread over the grid the compute is negligible
+    y = heads_matmul(C_h, state["ssm"], ckc)  # (B,H,1,N) @ (B,H,N,P) -> (B,H,1,P)
     return ttnn.add(y, ttnn.multiply(x_h, D))
 
 
