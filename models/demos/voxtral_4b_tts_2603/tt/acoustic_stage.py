@@ -355,7 +355,7 @@ class AcousticStage:
         """Additive mask blocking columns 3..31 of the padded tile. float32: the scores are."""
 
         def make():
-            m = torch.zeros(1, 1, _TILE, _TILE)
+            m = torch.zeros(1, 1, 1, _TILE)
             m[:, :, :, _N_REAL_TOKENS:] = _MASK_NEG
             return _from_torch(m, self.device, dtype=ttnn.float32)
 
