@@ -434,7 +434,6 @@ class NemotronHBlock:
         # rank-4 SSD helpers (broadcast over H via batch dim 1).
         lower = torch.tril(torch.ones(S, S))  # inclusive cumsum
         self._lower4 = self._dev(lower.contiguous().view(1, 1, S, S))
-        self._ones_row4 = self._dev(torch.ones(B, self._H, 1, S))
         self._ones_col4 = self._dev(torch.ones(1, 1, S, 1))
         cmask = torch.where(lower > 0, torch.zeros(S, S), torch.full((S, S), -1e9))
         self._cmask4 = self._dev(cmask.contiguous().view(1, 1, S, S))
@@ -506,9 +505,8 @@ class NemotronHBlock:
         # 3. Single-chunk SSD.
         Adt = ttnn.mul(self._A4, dt_h)  # [1,H,S,1]
         cumA = ttnn.matmul(self._lower4, Adt, compute_kernel_config=ckc)  # [1,H,S,1] inclusive cumsum
-        cumA_col = ttnn.matmul(cumA, self._ones_row4, compute_kernel_config=ckc)  # [1,H,S,S] entry[i,j]=cumA[i]
-        cumA_row = ttnn.transpose(cumA_col, -2, -1)  # [1,H,S,S] entry[i,j]=cumA[j]
-        diff = ttnn.sub(cumA_col, cumA_row)
+        cumA_row = ttnn.transpose(cumA, -2, -1)  # [B,H,1,S]
+        diff = ttnn.sub(cumA, cumA_row)  # col - row broadcast: [i,j] = cumA[i]-cumA[j]
         diff = ttnn.add(diff, self._cmask4)  # additive causal mask
         L = ttnn.exp(diff)  # [1,H,S,S]
 

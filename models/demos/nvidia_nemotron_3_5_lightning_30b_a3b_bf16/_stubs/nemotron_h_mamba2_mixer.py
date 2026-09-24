@@ -285,15 +285,12 @@ class TtNemotronHMamba2Mixer:
         # batch 1 against rhs batch B), so a constant that is a matmul OPERAND
         # must either match the real batch or have ALL its batch dims equal to 1.
         # `tril`/`neg` therefore stay (1,1,T,T) rather than being expanded over
-        # heads; `ones_row` and `shifts` are materialised at the real batch.
+        # heads; `shifts` are materialised at the real batch.
         c = self._consts.get((B, T))
         if c is not None:
             return c
-        H = self.num_heads
         tril2d = torch.tril(torch.ones(T, T, dtype=torch.float32))  # (T,T)
         tril = tril2d.reshape(1, 1, T, T).contiguous()
-        # ones row used to broadcast cumulative sums across columns
-        ones_row = torch.ones(B, H, 1, T, dtype=torch.float32)
         # additive causal mask (0 on/below diagonal, -1e9 above); elementwise add
         neg = ((1.0 - tril2d) * (-1e9)).reshape(1, 1, T, T).contiguous()
         # shift matrices for the depthwise causal conv: Sh_s @ x => x[t-s]
@@ -306,7 +303,6 @@ class TtNemotronHMamba2Mixer:
             shifts.append(self._dev(m.reshape(1, T, T).repeat(B, 1, 1)))
         c = {
             "tril": self._dev(tril),
-            "ones_row": self._dev(ones_row),
             "neg": self._dev(neg),
             "shifts": shifts,
         }
@@ -403,11 +399,9 @@ class TtNemotronHMamba2Mixer:
         if fill:
             _ssm_cache.mamba_fill(self._state, self.device, hbc_pre, A_cum, Bh, X_disc, self.conv_k, self.ckc)
             ttnn.deallocate(hbc_pre)
-        A_cum_t = ttnn.matmul(A_cum, consts["ones_row"], compute_kernel_config=self.ckc)  # (B,H,T,T): [.,t,s]=cum[t]
+        A_cum_s = ttnn.transpose(A_cum, -2, -1)  # (B,H,1,T)
+        Dmat = ttnn.subtract(A_cum, A_cum_s)  # col - row broadcast: [.,t,s] = cum[t]-cum[s], no outer-product matmul
         ttnn.deallocate(A_cum)
-        A_cum_s = ttnn.transpose(A_cum_t, -2, -1)  # [.,t,s] = cum[s]
-        Dmat = ttnn.subtract(A_cum_t, A_cum_s)  # cum[t]-cum[s]
-        ttnn.deallocate(A_cum_t)
         ttnn.deallocate(A_cum_s)
         Dmat = ttnn.add(Dmat, consts["neg"])  # mask s>t to -inf
         L = ttnn.exp(Dmat)  # (B, H, T, T)
