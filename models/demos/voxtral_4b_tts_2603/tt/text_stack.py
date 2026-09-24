@@ -51,6 +51,8 @@ This module NEVER opens a device.
 """
 from __future__ import annotations
 
+import copy
+
 import torch
 
 import ttnn
@@ -103,6 +105,28 @@ def decode_shard(device, rows: int, width: int):
         orientation=ttnn.ShardOrientation.ROW_MAJOR,
         use_height_and_width_as_shard_shape=True,
     )
+
+
+_ATTN_IN = ("q_proj", "k_proj", "v_proj")
+_MLP_IN = ("gate_proj", "up_proj")
+
+
+def _fold_norm(norm, consumer, names):
+    """`(unit_norm, folded_consumer)`: the norm's gamma moved into the consumer's input weights.
+
+    `(x * s * g) @ W.T == (x * s) @ (W * g).T`, so the composed kinds get the same one-pass norm
+    the fused layer stubs use. Both are COPIES; the reference model is untouched. The folded
+    weights are kept float32 so the stub rounds the product to bfloat16 exactly once.
+    """
+    g = norm.weight.detach().float()
+    unit = copy.deepcopy(norm)
+    folded = copy.deepcopy(consumer)
+    with torch.no_grad():
+        unit.weight = torch.nn.Parameter(torch.ones_like(unit.weight), requires_grad=False)
+        for name in names:
+            lin = getattr(folded, name)
+            lin.weight = torch.nn.Parameter(lin.weight.detach().float() * g, requires_grad=False)
+    return unit, folded
 
 
 class TextBlock:
@@ -557,11 +581,13 @@ def build_text_stack(device, hf_model, layers=None, counter=None, kv_capacity=No
         else:
             attn_name = "attention" if kind == "composed" else "mistral_attention"
             mlp_name = "mlp" if kind == "composed" else "mistral_m_l_p"
+            norm_in, attn_mod = _fold_norm(torch_layer.input_layernorm, torch_layer.self_attn, _ATTN_IN)
+            norm_post, mlp_mod = _fold_norm(torch_layer.post_attention_layernorm, torch_layer.mlp, _MLP_IN)
             parts = {
-                "norm_in": stub("mistral_r_m_s_norm", torch_layer.input_layernorm),
-                "attention": stub(attn_name, torch_layer.self_attn),
-                "norm_post": stub("mistral_r_m_s_norm", torch_layer.post_attention_layernorm),
-                "mlp": stub(mlp_name, torch_layer.mlp),
+                "norm_in": stub("mistral_r_m_s_norm", norm_in),
+                "attention": stub(attn_name, attn_mod),
+                "norm_post": stub("mistral_r_m_s_norm", norm_post),
+                "mlp": stub(mlp_name, mlp_mod),
             }
         blocks.append(
             TextBlock(
