@@ -143,7 +143,8 @@ class TextBlock:
                 decode=decode,
             )
         # The composed kinds spell out what the fused stubs do internally, from the leaf stubs.
-        xn = self.parts["norm_in"](hidden_states)
+        # A prefill norm feeds only a matmul, so it hands over bf16; decode keeps float32.
+        xn = self.parts["norm_in"](hidden_states, dtype=None if decode else ttnn.bfloat16)
         attn_out = self.parts["attention"](
             xn,
             position_embeddings=position_embeddings,
@@ -154,7 +155,7 @@ class TextBlock:
         ttnn.deallocate(xn)
         h = ttnn.add(hidden_states, attn_out)
         ttnn.deallocate(attn_out)
-        hn = self.parts["norm_post"](h)
+        hn = self.parts["norm_post"](h, dtype=None if decode else ttnn.bfloat16)
         mlp_out = self.parts["mlp"](hn)
         ttnn.deallocate(hn)
         out = ttnn.add(h, mlp_out)
