@@ -509,7 +509,10 @@ class NemotronHBlock:
         L = ttnn.exp(diff)  # [1,H,S,S]
 
         Bt = ttnn.transpose(B_h, -2, -1)  # [1,H,N,S]
-        Gmat = _ssm_cache.heads_matmul(C_h, Bt, ckc)  # [1,H,S,S] = C·Bᵀ
+        # bf16 operands (as the mixer stub): C·Bᵀ and the (S,S) products downstream stay half-width
+        Gmat = _ssm_cache.heads_matmul(
+            ttnn.typecast(C_h, ttnn.bfloat16), ttnn.typecast(Bt, ttnn.bfloat16), ckc
+        )  # [B,H,S,S] = C·Bᵀ
         M = ttnn.mul(Gmat, L)  # [1,H,S,S]
 
         x_disc = ttnn.mul(x_h, dt_h)  # [1,H,S,P]
