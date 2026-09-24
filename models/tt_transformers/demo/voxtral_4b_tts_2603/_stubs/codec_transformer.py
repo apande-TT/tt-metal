@@ -155,7 +155,9 @@ def _from_torch(t, device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
 
 
 def _weight(linear, device):
-    return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
+    # bfloat16 weights against the float32 activation path: a float32 weight streams twice the
+    # bytes and forces the slow fp32 x fp32 unpack in every codec linear.
+    return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat16)
 
 
 def _alibi_window_mask(slopes, window, seq):
