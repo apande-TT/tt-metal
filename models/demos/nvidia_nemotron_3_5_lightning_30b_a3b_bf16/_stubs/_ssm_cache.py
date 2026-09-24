@@ -94,13 +94,20 @@ def mamba_conv_step(state, hbc_t, taps, bias, K):
     taps[s] multiplies x[t-s]. hbc_t (1,B,conv_dim) -> silu(conv), same shape."""
     acc = ttnn.multiply(hbc_t, taps[0])
     for s in range(1, K):
-        acc = ttnn.add(acc, ttnn.multiply(state[f"prev{s}"], taps[s]))
+        acc = ttnn.addcmul(acc, state[f"prev{s}"], taps[s])  # acc + prev_s * tap_s in one op
     if bias is not None:
         acc = ttnn.add(acc, bias)
     for s in range(K - 1, 1, -1):
         ttnn.copy(state[f"prev{s - 1}"], state[f"prev{s}"])
     ttnn.copy(hbc_t, state["prev1"])
     return ttnn.silu(acc)
+
+
+def softplus(x):
+    """log(1 + exp(x)) in two ops. Decode dt pre-activations sit far below
+    fp32 exp overflow (~88), so the stable relu + log1p(exp(-|x|)) form's
+    extra four ops buy nothing here."""
+    return ttnn.log1p(ttnn.exp(x))
 
 
 def mamba_ssm_step(state, x_h, B_h, C_h, dt_h, A, D, ckc):

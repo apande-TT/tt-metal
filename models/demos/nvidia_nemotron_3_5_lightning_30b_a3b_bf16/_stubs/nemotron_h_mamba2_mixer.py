@@ -454,7 +454,7 @@ class TtNemotronHMamba2Mixer:
         Bf = ttnn.slice(hbc, [0, 0, I], [1, B, I + G * N])
         Cf = ttnn.slice(hbc, [0, 0, I + G * N], [1, B, I + 2 * G * N])
         ttnn.deallocate(hbc)
-        dt = self._softplus(ttnn.add(dt, self._dt_bias))
+        dt = _ssm_cache.softplus(ttnn.add(dt, self._dt_bias))
         X = self._to_heads(Xf, B, 1, H, HD)
         # group -> head expansion as a repeat of each group's row (no P-matrix read)
         Bh = ttnn.repeat_interleave(self._to_heads(Bf, B, 1, G, N), H // G, dim=1)  # (B, H, 1, N)

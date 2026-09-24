@@ -534,7 +534,7 @@ class NemotronHBlock:
         xss = ttnn.slice(conv_out, [0, 0, 0], [1, B, INTER])
         Bg = ttnn.slice(conv_out, [0, 0, INTER], [1, B, INTER + GGN])
         Cg = ttnn.slice(conv_out, [0, 0, INTER + GGN], [1, B, INTER + 2 * GGN])
-        dt = self._softplus(ttnn.add(dt, self._dt_bias))
+        dt = _ssm_cache.softplus(ttnn.add(dt, self._dt_bias))
         x_h = self._to_heads(xss, 1, P, B)
         # group -> head expansion as a repeat of each group's row (no Esel read)
         G = GGN // N
