@@ -342,6 +342,23 @@ class AcousticStage:
             ),
         )
 
+    def _t_proj(self, body, rows, step):
+        """`time_projection(time_embedding(t_step))` for `rows` rows -- a CONSTANT, since the
+        timesteps are fixed; computed once per (body, rows, step) instead of every frame. Only the
+        compact (tile-aligned) layout consumes it."""
+        if rows % _TILE:
+            return None
+        whole = body == self._whole_body
+
+        def make():
+            t = self._t_rows(rows, step)
+            if whole:
+                return self.whole.time_projection(t)
+            t_emb = ttnn.reshape(self.parts["time_embedding"](t), [1, 1, rows, self.dim])
+            return _lin(t_emb, self.parts["w_time"], compute_kernel_config=_COMPUTE)
+
+        return self._const(("t_proj", whole, rows, step), make)
+
     def _pad(self, rows):
         """The 29 pad rows of the one-tile sequence (part-chain side)."""
         return self._const(
@@ -398,6 +415,9 @@ class AcousticStage:
             self._pad(2 * n)
             for i in range(self.n_steps):
                 self._t_rows(2 * n, i)
+        for body, a, b in self._plan(batch):
+            for i in range(self.n_steps):
+                self._t_proj(body, 2 * (b - a), i)
 
     # ---------------------------------------------------------------- routing
 
@@ -425,16 +445,16 @@ class AcousticStage:
 
     # ---------------------------------------------------------------- the two bodies
 
-    def _whole_body(self, llm, x, t, cache=None):
+    def _whole_body(self, llm, x, t, cache=None, t_proj=None):
         """The graduated whole-section port: `velocity [R, 36]`, `semantic_logits [R, 8320]`."""
-        return self.whole(llm, x_t=x, t=t, step_cache=cache)
+        return self.whole(llm, x_t=x, t=t, step_cache=cache, t_proj=t_proj)
 
-    def _part_body(self, llm, x, t, cache=None):
+    def _part_body(self, llm, x, t, cache=None, t_proj=None):
         """The same field, composed from the part stubs plus this file's norms and projections."""
         p = self.parts
         rows = int(llm.shape[0])
         if rows % _TILE == 0:
-            return self._part_body_compact(llm, x, t, rows, cache)
+            return self._part_body_compact(llm, x, t, rows, cache, t_proj)
         h_in = ttnn.reshape(llm, [rows, 1, 1, self.dim])
         if h_in.dtype != ttnn.float32:
             h_in = ttnn.typecast(h_in, ttnn.float32)
@@ -466,7 +486,7 @@ class AcousticStage:
         )
         return velocity, semantic
 
-    def _part_body_compact(self, llm, x, t, rows, cache=None):
+    def _part_body_compact(self, llm, x, t, rows, cache=None, t_proj=None):
         """`_part_body` on the COMPACT layout: token k of every sample in rows k*rows.., no pad.
 
         Every linear, norm and eltwise in the blocks then runs on 3*rows real rows instead of
@@ -489,12 +509,14 @@ class AcousticStage:
             if cache is not None:
                 cache["semantic"], cache["llm_proj"] = semantic, llm_proj
 
-        t_emb = ttnn.reshape(p["time_embedding"](t), [1, 1, rows, self.dim])
+        if t_proj is None:
+            t_emb = ttnn.reshape(p["time_embedding"](t), [1, 1, rows, self.dim])
+            t_proj = _lin(t_emb, p["w_time"], compute_kernel_config=_COMPUTE)
         x_in = ttnn.typecast(ttnn.reshape(x, [1, 1, rows, self.n_acoustic]), ttnn.float32)
         h = ttnn.concat(
             [
                 _lin(x_in, p["w_input"], compute_kernel_config=_COMPUTE),
-                _lin(t_emb, p["w_time"], compute_kernel_config=_COMPUTE),
+                t_proj,
                 llm_proj,
             ],
             dim=2,
@@ -591,7 +613,11 @@ class AcousticStage:
             for st in states:
                 n = st["n"]
                 v_all, sem = st["body"](
-                    st["llm_cfg"], ttnn.concat([st["x"], st["x"]], dim=0), self._t_rows(2 * n, i), cache=st["cache"]
+                    st["llm_cfg"],
+                    ttnn.concat([st["x"], st["x"]], dim=0),
+                    self._t_rows(2 * n, i),
+                    cache=st["cache"],
+                    t_proj=self._t_proj(st["body"], 2 * n, i),
                 )
                 v_cond = ttnn.slice(v_all, [0, 0], [n, self.n_acoustic])
                 v_unc = ttnn.slice(v_all, [n, 0], [2 * n, self.n_acoustic])
