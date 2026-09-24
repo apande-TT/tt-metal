@@ -157,7 +157,7 @@ def matmul(device, x, w, n_out, ckc, dtype=ttnn.bfloat16, fused_activation=None)
     assert planned == n_pad, f"weight padded to {n_pad}, plan says {planned}"
     core_grid = _core_grid(device.compute_with_storage_grid_size(), cores)
     x4 = ttnn.reshape(x, [1, 1, M, k])
-    if x4.dtype != ttnn.bfloat16:
+    if x4.dtype not in (ttnn.bfloat16, ttnn.bfloat8_b):  # a bf8_b activation streams as-is: half the in0 gather
         x4 = ttnn.typecast(x4, ttnn.bfloat16)
     in_mem = ttnn.create_sharded_memory_config(
         (1, 1, TILE, k),
