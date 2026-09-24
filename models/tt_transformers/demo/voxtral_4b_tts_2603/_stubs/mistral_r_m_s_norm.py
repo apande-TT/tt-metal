@@ -59,6 +59,8 @@ def build(device, torch_module):
     dim = int(norm.weight.shape[-1])
     eps = float(norm.variance_epsilon)
     gamma = _from_torch(norm.weight.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32)
+    # A unit gamma (one the caller folded into the consuming weights) costs a full pass for nothing.
+    unit = bool(torch.all(norm.weight.detach() == 1))
 
     def mistral_r_m_s_norm(hidden_states, dtype=None, **kwargs):
         """`dtype` narrows only the OUTPUT (e.g. bf16 for a norm that feeds a matmul); the
@@ -72,7 +74,10 @@ def build(device, torch_module):
         if x.dtype != ttnn.float32:
             x = ttnn.typecast(x, ttnn.float32)
         scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
-        out = ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
+        if unit:
+            out = ttnn.multiply(x, scale, dtype=dtype or ttnn.float32)
+        else:
+            out = ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
         return ttnn.reshape(out, [lead, seq, dim] if len(shape) == 3 else [lead, 1, seq, dim])
 
     return mistral_r_m_s_norm

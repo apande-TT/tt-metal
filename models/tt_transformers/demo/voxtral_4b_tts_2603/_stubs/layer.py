@@ -176,6 +176,8 @@ def _rms_norm(x, gamma, eps, dtype=None):
     sequence padded up to a tile multiple neither NaNs nor leaks into a real row.
     """
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
+    if gamma is None:  # folded into the consuming weights
+        return ttnn.multiply(x, scale, dtype=dtype or ttnn.float32)
     return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
 
 
@@ -395,23 +397,34 @@ def build(device, torch_module):
     half = head_dim // 2
     scale = float(attn.scaling)
 
+    # Each RMSNorm's gamma is FOLDED into the input rows of the weights it feeds (`x*s*g @ W` ==
+    # `x*s @ diag(g) W`), so the norm is one scaling pass over the residual, not two. The product
+    # is formed in float32 and rounded to bfloat16 once.
+    g_in_t = layer.input_layernorm.weight.detach().float().reshape(-1, 1)
+    g_post_t = layer.post_attention_layernorm.weight.detach().float().reshape(-1, 1)
+
+    def _folded(linear, g):
+        return _from_torch((linear.weight.detach().float().transpose(0, 1) * g).contiguous(), device)
+
     wqkv = _from_torch(
         torch.cat(
             [
-                attn.q_proj.weight.detach().transpose(0, 1),
-                attn.k_proj.weight.detach().transpose(0, 1),
-                attn.v_proj.weight.detach().transpose(0, 1),
+                attn.q_proj.weight.detach().float().transpose(0, 1),
+                attn.k_proj.weight.detach().float().transpose(0, 1),
+                attn.v_proj.weight.detach().float().transpose(0, 1),
             ],
             dim=-1,
-        ).contiguous(),
+        )
+        .mul(g_in_t)
+        .contiguous(),
         device,
     )
     wo = _weight(attn.o_proj, device)
-    w_gate = _weight(mlp.gate_proj, device)
-    w_up = _weight(mlp.up_proj, device)
+    w_gate = _folded(mlp.gate_proj, g_post_t)
+    w_up = _folded(mlp.up_proj, g_post_t)
     w_down = _weight(mlp.down_proj, device)
-    g_in = _norm_weight(layer.input_layernorm, device)
-    g_post = _norm_weight(layer.post_attention_layernorm, device)
+    g_in = None
+    g_post = None
     eps_in = float(layer.input_layernorm.variance_epsilon)
     eps_post = float(layer.post_attention_layernorm.variance_epsilon)
 
