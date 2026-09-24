@@ -83,6 +83,23 @@ def _weight(linear, device):
     return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
 
 
+def _fold_linear(x, w, **kwargs):
+    """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
+
+    A `[B, 1, T, K]` activation against a 2-D weight runs as B separate matmuls that each re-read
+    the whole weight; `[1, 1, B*T, K]` is one matmul. Only when T is tile-aligned, where the fold
+    is a free view. The part-chain stubs' `_lin` does the same.
+    """
+    shape = [int(d) for d in x.shape]
+    lead = 1
+    for d in shape[:-2]:
+        lead *= d
+    if lead == 1 or shape[-2] % 32 != 0:
+        return ttnn.linear(x, w, **kwargs)
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, lead * shape[-2], shape[-1]]), w, **kwargs)
+    return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
+
+
 _COMPUTE = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True
 )
@@ -140,9 +157,9 @@ def _compile_codec_block(device, blk, mask):
     def block(h):
         seq = int(h.shape[-2])
         xn = _rms_norm(h, attn_gamma, attn_eps)
-        q = ttnn.linear(xn, wq, compute_kernel_config=_COMPUTE)
-        k = ttnn.linear(xn, wk, compute_kernel_config=_COMPUTE)
-        v = ttnn.linear(xn, wv, compute_kernel_config=_COMPUTE)
+        q = _fold_linear(xn, wq, compute_kernel_config=_COMPUTE)
+        k = _fold_linear(xn, wk, compute_kernel_config=_COMPUTE)
+        v = _fold_linear(xn, wv, compute_kernel_config=_COMPUTE)
         if qk_norm:
             q = _rms_norm(q, q_gamma, q_eps)
             k = _rms_norm(k, k_gamma, k_eps)
@@ -164,7 +181,7 @@ def _compile_codec_block(device, blk, mask):
         )
         a = ttnn.matmul(_softmax(scores), vh, compute_kernel_config=_COMPUTE)
         ttnn.deallocate(scores)
-        r = ttnn.linear(
+        r = _fold_linear(
             ttnn.experimental.nlp_concat_heads(a),
             wo,
             dtype=ttnn.float32,
@@ -175,10 +192,11 @@ def _compile_codec_block(device, blk, mask):
         h = ttnn.add(h, r)
 
         hn = _rms_norm(h, ffn_gamma, ffn_eps)
-        r = ttnn.linear(
+        r = _fold_linear(
             ttnn.multiply(
-                ttnn.silu(ttnn.linear(hn, w1, compute_kernel_config=_COMPUTE)),
-                ttnn.linear(hn, w3, compute_kernel_config=_COMPUTE),
+                _fold_linear(hn, w1, compute_kernel_config=_COMPUTE),
+                _fold_linear(hn, w3, compute_kernel_config=_COMPUTE),
+                input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             ),
             w2,
             compute_kernel_config=_COMPUTE,
@@ -244,7 +262,7 @@ def _compile_causal_conv1d(device, mod):
                 [batch, 1, end, in_channels],
                 [1, 1, stride, 1] if stride > 1 else None,
             )
-            term = ttnn.linear(seg, tap, compute_kernel_config=_COMPUTE)
+            term = _fold_linear(seg, tap, compute_kernel_config=_COMPUTE)
             acc = term if acc is None else ttnn.add(acc, term)
         return acc if bias is None else ttnn.add(acc, bias)
 
@@ -275,10 +293,10 @@ def _compile_causal_conv_transpose1d(device, mod):
         def _delayed(tap):
             """`tap` applied to the PREVIOUS input step: a zero row, then steps 0..L-2."""
             head = ttnn.slice(x4, [0, 0, 0, 0], [batch, 1, length - 1, in_channels])
-            return ttnn.concat([zero_row, ttnn.linear(head, tap, compute_kernel_config=_COMPUTE)], dim=2)
+            return ttnn.concat([zero_row, _fold_linear(head, tap, compute_kernel_config=_COMPUTE)], dim=2)
 
-        even = ttnn.add(ttnn.linear(x4, taps[0], compute_kernel_config=_COMPUTE), _delayed(taps[2]))
-        odd = ttnn.add(ttnn.linear(x4, taps[1], compute_kernel_config=_COMPUTE), _delayed(taps[3]))
+        even = ttnn.add(_fold_linear(x4, taps[0], compute_kernel_config=_COMPUTE), _delayed(taps[2]))
+        odd = ttnn.add(_fold_linear(x4, taps[1], compute_kernel_config=_COMPUTE), _delayed(taps[3]))
         out = ttnn.reshape(ttnn.concat([even, odd], dim=-1), [batch, 1, length * stride, out_channels])
         return out if bias is None else ttnn.add(out, bias)
 
