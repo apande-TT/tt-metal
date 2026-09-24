@@ -49,6 +49,12 @@ pytestmark = pytest.mark.timeout(7200)
 
 PCC_TARGET = 0.99
 
+# The one test a consumer that takes a SINGLE node should run as the correctness gate -- optimize
+# re-runs it after every change and reverts whatever fails it. It is the discrete-code test, not
+# the waveform PCC: the waveform golden is teacher-forced onto THIS pipeline's own codes, so it
+# moves with the pipeline and cannot fail for the stages that produce those codes.
+E2E_CORRECTNESS_GATE = "test_discrete_codes_equal_the_teacher_forced_reference"
+
 # The TT output may be at most this much worse than the HF golden on the same 32 prompts.
 WER_MARGIN = 0.05  # absolute corpus word error rate
 MOS_MARGIN = 0.20  # mean UTMOS22, on its 1-5 scale
@@ -94,6 +100,7 @@ def measure_matmul_floor(device) -> float:
     out = ttnn.to_torch(ttnn.linear(ttnn.from_torch(a, **up), wt, compute_kernel_config=cfg)).double()
     ref = a.double() @ w.double()
     return float((out - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt())
+
 
 PKG_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 HARNESS_CAPPED = bool(os.environ.get("TT_PERF_OSL_TOKENS"))
@@ -244,12 +251,12 @@ def test_run_ended_on_the_models_stop_rule(evidence):
         print("termination assert NOT applied: TT_PERF_OSL_TOKENS is set, the harness caps the horizon BY DESIGN")
         return
     cap = evidence["max_frames"]
-    assert tt["stop_reason"].startswith("every row emitted end_audio"), (
-        f"the TT run ended on the safety cap ({cap} frames), not on the model's stop rule"
-    )
-    assert free["stop_reason"].startswith("every row emitted end_audio"), (
-        f"the HF golden ended on the safety cap ({cap} frames), not on the model's stop rule"
-    )
+    assert tt["stop_reason"].startswith(
+        "every row emitted end_audio"
+    ), f"the TT run ended on the safety cap ({cap} frames), not on the model's stop rule"
+    assert free["stop_reason"].startswith(
+        "every row emitted end_audio"
+    ), f"the HF golden ended on the safety cap ({cap} frames), not on the model's stop rule"
     assert all(e >= 0 for e in tt["end_frame"]) and len(tt["end_frame"]) == batch
 
 
@@ -260,7 +267,9 @@ def test_shapes_and_real_task_output(evidence):
     assert tuple(tt["codes"].shape) == (batch, 37, frames)
     assert tuple(tt["waveform"].shape) == (batch, 1, frames * 1920)
     assert tt["sampling_rate"] == 24000
-    print(f"\naudio: {tt['waveform'].shape[-1] / tt['sampling_rate']:.2f} s at {tt['sampling_rate']} Hz ({frames} frames)")
+    print(
+        f"\naudio: {tt['waveform'].shape[-1] / tt['sampling_rate']:.2f} s at {tt['sampling_rate']} Hz ({frames} frames)"
+    )
     wav = tt["waveform"]
     assert torch.isfinite(wav).all(), "the waveform contains non-finite samples"
     assert wav.abs().max() <= 1.5, f"waveform out of audio range: max |x| = {float(wav.abs().max())}"
@@ -301,7 +310,9 @@ def test_per_stage_pcc(evidence):
     hidden = min(per_frame)
     tt_h = torch.stack([d["llm_hidden"] for d in diag_tt])
     hf_h = torch.stack(hf["llm_hiddens"][:frames])
-    print(f"stage PCC  decode hidden   (min over {batch} x {frames}) = {hidden:.6f}  |tt|/|ref|={ratio(tt_h, hf_h):.5f}")
+    print(
+        f"stage PCC  decode hidden   (min over {batch} x {frames}) = {hidden:.6f}  |tt|/|ref|={ratio(tt_h, hf_h):.5f}"
+    )
     print(f"           worst frame {int(torch.tensor(per_frame).argmin())}; last-frame min {per_frame[-1]:.6f}")
 
     semantic = min(
@@ -349,7 +360,9 @@ def test_discretization_is_the_references_own_rule(evidence):
     masked[:, evidence["empty_id"], :] = -float("inf")
     masked[:, n_special + evidence["semantic_size"] :, :] = -float("inf")
     sem_mismatch = int((tt["codes"][:, 0, :] != masked.argmax(dim=1)).sum())
-    print(f"masked argmax on the pipeline's logits reproduces {masked[:, 0].numel() - sem_mismatch}/{masked[:, 0].numel()}")
+    print(
+        f"masked argmax on the pipeline's logits reproduces {masked[:, 0].numel() - sem_mismatch}/{masked[:, 0].numel()}"
+    )
     assert mismatch == 0, f"{mismatch} acoustic codes are not the reference's rule on the pipeline's own x_final"
     assert sem_mismatch == 0, f"{sem_mismatch} semantic codes are not the reference's masked argmax"
 
@@ -460,6 +473,12 @@ def test_discrete_codes_equal_the_teacher_forced_reference(device, hf_model, evi
     sem_decidable = (top2[:, 0] - top2[:, 1]) > TIE_SIGMA * ldev
     sem_differ = tt["codes"][:, 0, :] != hf["codes"][:, 0, :]
     sem_wrong = sem_differ & sem_decidable
+    x_tt = torch.stack([tt["diagnostics"][t]["x_final"] for t in range(frames)], -1).clamp(-1, 1)
+    live_x = live.expand_as(x_hf)
+    pcc_x = common.pcc(x_tt[live_x], x_hf[live_x])
+    pcc_lo = common.pcc(lo_tt[finite], lo_hf[finite])
+    print(f"x_final vs teacher-forced reference PCC: {pcc_x:.6f}")
+    print(f"semantic logits vs teacher-forced reference PCC: {pcc_lo:.6f}")
     print(
         f"semantic codes vs teacher-forced reference: agreement {float((~sem_differ).float().mean()):.6f}; "
         f"{int(sem_differ.sum())} differ -> {int((sem_differ & ~sem_decidable).sum())} ties "
@@ -540,4 +559,6 @@ def test_gate3_e2e_pcc(evidence):
         f"mean={sum(per_sample) / batch:.6f} max={max(per_sample):.6f} (worst sample {worst})"
     )
     print(f"e2e PCC={achieved_pcc}")
-    assert achieved_pcc >= PCC_TARGET, f"Gate 3 FAILED: waveform PCC {achieved_pcc:.6f} < {PCC_TARGET} on sample {worst}"
+    assert (
+        achieved_pcc >= PCC_TARGET
+    ), f"Gate 3 FAILED: waveform PCC {achieved_pcc:.6f} < {PCC_TARGET} on sample {worst}"
