@@ -44,7 +44,7 @@ def routed_mix(device, hs, W, up_b, down_cat, C, ckc, arange_cache):
     act = ttnn.multiply(
         ttnn.relu(act), w3, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]
     )  # relu2 * routing weight
-    ye = ttnn.matmul(act, ttnn.reshape(down_cat, [Eloc, I, H]), compute_kernel_config=ckc, dtype=ttnn.bfloat16)
+    ye = ttnn.matmul(act, ttnn.reshape(down_cat, [Eloc, I, H]), compute_kernel_config=ckc, dtype=ttnn.bfloat8_b)
     ttnn.deallocate(act)
     # combine: out[t] = sum over (e, c) with idx[e, c] == t of ye[e, c]
     ar = arange_cache.get(T)
