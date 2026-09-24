@@ -191,11 +191,15 @@ def attn_step(state, device, q_h, k_h, v_h, scaling, ckc):
         ttnn.experimental.paged_update_cache(state[name], rows, update_idxs_tensor=state["pos"])
         ttnn.deallocate(rows)
 
+    # q K^T and P V as broadcast multiply + reduce (one dtype per product: the
+    # bf16 cache): as matmuls they are a B*H-way batch of single-row products
     future = ttnn.multiply(ttnn.typecast(ttnn.gtz(state["rel_row"]), ttnn.float32), -1e9)  # (1,1,1,Cap)
-    scores = ttnn.matmul(q_h, ttnn.transpose(state["k"], -2, -1), compute_kernel_config=ckc)  # (B,H,1,Cap)
-    scores = ttnn.add(ttnn.multiply(scores, scaling), future)
+    qk = ttnn.multiply(state["k"], ttnn.typecast(q_h, ttnn.bfloat16))  # (B,H,Cap,D)
+    scores = ttnn.typecast(ttnn.sum(qk, dim=-1, keepdim=True), ttnn.float32)  # (B,H,Cap,1)
+    scores = ttnn.add(ttnn.multiply(ttnn.transpose(scores, -2, -1), scaling), future)  # (B,H,1,Cap)
     probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=ckc, numeric_stable=True)
-    out = ttnn.matmul(probs, state["v"], compute_kernel_config=ckc, dtype=ttnn.float32)  # (B,H,1,D)
+    probs = ttnn.typecast(ttnn.transpose(probs, -2, -1), ttnn.bfloat16)  # (B,H,Cap,1)
+    out = ttnn.typecast(ttnn.sum(ttnn.multiply(state["v"], probs), dim=-2, keepdim=True), ttnn.float32)  # (B,H,1,D)
 
     ttnn.plus_one(state["pos"])
     ttnn.copy(ttnn.subtract(state["rel_row"], 1.0), state["rel_row"])
