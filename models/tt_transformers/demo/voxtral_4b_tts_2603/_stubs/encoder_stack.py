@@ -49,7 +49,6 @@ import torch
 
 import ttnn
 
-
 _MAX_POSITIONS = 8192
 
 
@@ -57,7 +56,10 @@ def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
         return ttnn.from_torch(
-            t, dtype=dtype, layout=layout, device=device,
+            t,
+            dtype=dtype,
+            layout=layout,
+            device=device,
             mesh_mapper=ttnn.ReplicateTensorToMesh(device),
         )
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
@@ -98,7 +100,7 @@ def _rms_norm(x, gamma, eps):
     Tile padding on a sequence that is not a multiple of 32 is safe here: a padded row is all
     zeros, so `mean(x^2)` is 0 and `0 * rsqrt(eps)` stays 0 -- no NaN, and nothing to leak.
     """
-    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
+    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
     return ttnn.multiply(ttnn.multiply(x, scale), gamma)
 
 
@@ -159,8 +161,10 @@ def _compile_layer(device, layer):
         h = ttnn.add(
             h,
             ttnn.linear(
-                ttnn.experimental.nlp_concat_heads(a), wo,
-                dtype=ttnn.float32, compute_kernel_config=_COMPUTE,
+                ttnn.experimental.nlp_concat_heads(a),
+                wo,
+                dtype=ttnn.float32,
+                compute_kernel_config=_COMPUTE,
             ),
         )
 
@@ -198,9 +202,7 @@ def build(device, torch_module):
     dim = int(model.config.hidden_size)
     head_dim = int(model.config.head_dim)
 
-    embed = _from_torch(
-        model.embed_tokens.weight.detach().contiguous(), device, layout=ttnn.ROW_MAJOR_LAYOUT
-    )
+    embed = _from_torch(model.embed_tokens.weight.detach().contiguous(), device, layout=ttnn.ROW_MAJOR_LAYOUT)
     cos_table, sin_table, cos_tiled, sin_tiled = _rope_tables(device, model)
     layers = [_compile_layer(device, layer) for layer in model.layers]
     g_final = _norm_weight(model.norm, device)

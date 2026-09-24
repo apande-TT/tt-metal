@@ -71,7 +71,7 @@ def build(device, torch_module):
         x = ttnn.reshape(hidden_states, [lead, 1, seq, dim])
         if x.dtype != ttnn.float32:
             x = ttnn.typecast(x, ttnn.float32)
-        scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
+        scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
         out = ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
         return ttnn.reshape(out, [lead, seq, dim] if len(shape) == 3 else [lead, 1, seq, dim])
 

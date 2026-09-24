@@ -282,7 +282,7 @@ def _rms_norm(x, gamma, eps):
     the chain looked broken. `tt/vocode_stage.py` spells out the same four ops for the same
     reason, so the two bodies agree.
     """
-    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
+    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
     return ttnn.multiply(ttnn.multiply(x, scale), gamma)
 
 

@@ -187,7 +187,7 @@ def _rms_norm(x, gamma, eps, dtype=None):
     sampler downstream rounds onto 21 levels 0.1 apart in x, so 2.7e-3 through seven norms is
     worth ~1% of the output codes and 1.2e-7 is worth none of them.
     """
-    inv = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
+    inv = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
     return ttnn.multiply(ttnn.multiply(x, inv), gamma, dtype=dtype or ttnn.float32)
 
 

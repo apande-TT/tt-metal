@@ -43,7 +43,6 @@ import torch
 
 import ttnn
 
-
 # A PERSISTENT ZERO BUFFER, NOT A PER-CALL `ttnn.zeros`.
 # `ttnn.zeros` builds its tensor on the host and enqueues a WRITE to land it on the device, and a
 # captured trace cannot replay a write -- capturing this stage died on `TT_FATAL: Writes are not
@@ -71,7 +70,10 @@ def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
         return ttnn.from_torch(
-            t, dtype=dtype, layout=layout, device=device,
+            t,
+            dtype=dtype,
+            layout=layout,
+            device=device,
             mesh_mapper=ttnn.ReplicateTensorToMesh(device),
         )
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
@@ -130,12 +132,8 @@ def _compile_codec_block(device, blk, mask):
 
     attn_scale = ffn_scale = None
     if blk.layer_scale:
-        attn_scale = _from_torch(
-            blk.attention_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32
-        )
-        ffn_scale = _from_torch(
-            blk.ffn_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32
-        )
+        attn_scale = _from_torch(blk.attention_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32)
+        ffn_scale = _from_torch(blk.ffn_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32)
     if blk.post_attention_norm is not None or blk.post_ffn_norm is not None:
         raise NotImplementedError("post_attention_norm / post_ffn_norm are not ported")
 
@@ -159,9 +157,7 @@ def _compile_codec_block(device, blk, mask):
             num_kv_heads=n_kv_heads,
             transpose_k_heads=False,
         )
-        scores = ttnn.matmul(
-            qh, ttnn.transpose(kh, -2, -1), compute_kernel_config=_COMPUTE
-        )
+        scores = ttnn.matmul(qh, ttnn.transpose(kh, -2, -1), compute_kernel_config=_COMPUTE)
         scores = ttnn.add(
             ttnn.multiply(scores, scale),
             ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq]),
@@ -169,8 +165,10 @@ def _compile_codec_block(device, blk, mask):
         a = ttnn.matmul(_softmax(scores), vh, compute_kernel_config=_COMPUTE)
         ttnn.deallocate(scores)
         r = ttnn.linear(
-            ttnn.experimental.nlp_concat_heads(a), wo,
-            dtype=ttnn.float32, compute_kernel_config=_COMPUTE,
+            ttnn.experimental.nlp_concat_heads(a),
+            wo,
+            dtype=ttnn.float32,
+            compute_kernel_config=_COMPUTE,
         )
         if attn_scale is not None:
             r = ttnn.multiply(r, attn_scale)
@@ -223,9 +221,7 @@ def _compile_causal_conv1d(device, mod):
                 pieces.extend(_row(x4, i) for i in range(padding_total, 0, -1))
             else:
                 first = _row(x4, 0)
-                pieces.append(
-                    first if padding_total == 1 else ttnn.repeat(first, [1, 1, padding_total, 1])
-                )
+                pieces.append(first if padding_total == 1 else ttnn.repeat(first, [1, 1, padding_total, 1]))
         pieces.append(x4)
         if extra > 0:
             if reflect:
@@ -243,7 +239,9 @@ def _compile_causal_conv1d(device, mod):
             begin = i * dilation
             end = begin + (out_len - 1) * stride + 1
             seg = ttnn.slice(
-                padded, [0, 0, begin, 0], [batch, 1, end, in_channels],
+                padded,
+                [0, 0, begin, 0],
+                [batch, 1, end, in_channels],
                 [1, 1, stride, 1] if stride > 1 else None,
             )
             term = ttnn.linear(seg, tap, compute_kernel_config=_COMPUTE)
@@ -277,19 +275,11 @@ def _compile_causal_conv_transpose1d(device, mod):
         def _delayed(tap):
             """`tap` applied to the PREVIOUS input step: a zero row, then steps 0..L-2."""
             head = ttnn.slice(x4, [0, 0, 0, 0], [batch, 1, length - 1, in_channels])
-            return ttnn.concat(
-                [zero_row, ttnn.linear(head, tap, compute_kernel_config=_COMPUTE)], dim=2
-            )
+            return ttnn.concat([zero_row, ttnn.linear(head, tap, compute_kernel_config=_COMPUTE)], dim=2)
 
-        even = ttnn.add(
-            ttnn.linear(x4, taps[0], compute_kernel_config=_COMPUTE), _delayed(taps[2])
-        )
-        odd = ttnn.add(
-            ttnn.linear(x4, taps[1], compute_kernel_config=_COMPUTE), _delayed(taps[3])
-        )
-        out = ttnn.reshape(
-            ttnn.concat([even, odd], dim=-1), [batch, 1, length * stride, out_channels]
-        )
+        even = ttnn.add(ttnn.linear(x4, taps[0], compute_kernel_config=_COMPUTE), _delayed(taps[2]))
+        odd = ttnn.add(ttnn.linear(x4, taps[1], compute_kernel_config=_COMPUTE), _delayed(taps[3]))
+        out = ttnn.reshape(ttnn.concat([even, odd], dim=-1), [batch, 1, length * stride, out_channels])
         return out if bias is None else ttnn.add(out, bias)
 
     return run
@@ -297,9 +287,7 @@ def _compile_causal_conv_transpose1d(device, mod):
 
 def _norm_gamma(norm, device):
     """`[1, 1, 1, dim]` float32 TILE -- the form the spelled-out RMS norm's final multiply takes."""
-    return _from_torch(
-        norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32
-    )
+    return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
 
 
 def _rms_norm(x, gamma, eps):
@@ -313,7 +301,7 @@ def _rms_norm(x, gamma, eps):
     the chain looked broken. `tt/vocode_stage.py` spells out the same four ops for the same
     reason, so the two bodies agree.
     """
-    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
+    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
     return ttnn.multiply(ttnn.multiply(x, scale), gamma)
 
 
@@ -389,9 +377,7 @@ def build(device, torch_module):
                 device,
                 dtype=ttnn.float32,
             )
-            blocks = [
-                _compile_codec_block(device, blk.layers[str(i)], mask) for i in blk.layers_ids
-            ]
+            blocks = [_compile_codec_block(device, blk.layers[str(i)], mask) for i in blk.layers_ids]
 
             def _stack(x4, _blocks=blocks):
                 for b in _blocks:
@@ -412,14 +398,10 @@ def build(device, torch_module):
                 f"forward"
             )
 
-        sem_codes = ttnn.reshape(
-            ttnn.slice(codes, [0, 0, 0], [batch, n_semantic, frames]), [batch, frames]
-        )
+        sem_codes = ttnn.reshape(ttnn.slice(codes, [0, 0, 0], [batch, n_semantic, frames]), [batch, frames])
         # `ttnn.embedding` requires a bfloat16 table (`embedding_device_operation.cpp:36`);
         # widen once here so every residual add downstream happens in float32.
-        sem = ttnn.typecast(
-            _split_embedding(sem_codes, table, layout=ttnn.TILE_LAYOUT), ttnn.float32
-        )
+        sem = ttnn.typecast(_split_embedding(sem_codes, table, layout=ttnn.TILE_LAYOUT), ttnn.float32)
         aco_codes = ttnn.typecast(
             ttnn.to_layout(
                 ttnn.slice(codes, [0, n_semantic, 0], [batch, n_semantic + n_acoustic, frames]),
