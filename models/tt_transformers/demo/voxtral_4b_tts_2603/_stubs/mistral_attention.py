@@ -227,6 +227,27 @@ def _rope_prefill(q, k, cos, sin, half):
     )
 
 
+def _bmm(a, b):
+    """Head-batched decode attention `a @ b` spread over the full grid.
+
+    Without a program config the `[B, n_kv, groups, C]` products land on a handful of cores (probs @ V
+    on four) and run the B * n_kv small matmuls back to back. The reuse config makes every
+    (batch, kv-head) output block its own work unit, so they fan out across the grid.
+    """
+    # Ceil, not floor: the grouped query is `[B, n_kv, groups, head_dim]` with groups=4 rows, one padded tile.
+    m, k, n = (-(-int(d) // 32) for d in (a.shape[-2], a.shape[-1], b.shape[-1]))
+    grid = a.device().compute_with_storage_grid_size()
+    cfg = ttnn.MatmulMultiCoreReuseProgramConfig(
+        compute_with_storage_grid_size=(grid.x, grid.y),
+        in0_block_w=k,
+        out_subblock_h=1,
+        out_subblock_w=max(s for s in range(1, 5) if n % s == 0),
+        per_core_M=m,
+        per_core_N=n,
+    )
+    return ttnn.matmul(a, b, program_config=cfg, compute_kernel_config=_COMPUTE)
+
+
 def _decode_shard(device, rows, width):
     """HEIGHT-sharded over the batch, one user per core -- the decode op set's layout.
 
@@ -429,14 +450,14 @@ def build(device, torch_module):
         # tensor is ever materialised `n_heads` times. `head // groups` IS the reference's
         # `repeat_kv` mapping, so the grouping is the same one HF uses.
         cap = int(kv_cache["k"].shape[-2])
-        scores = ttnn.matmul(q, ttnn.transpose(kv_cache["k"], -2, -1), compute_kernel_config=_COMPUTE)
+        scores = _bmm(q, ttnn.transpose(kv_cache["k"], -2, -1))
         ttnn.deallocate(q)
         # The cache tail beyond `position` is zeros, and a zero key scores ZERO -- which is a
         # perfectly ordinary logit, not a small one. It has to be masked explicitly.
         scores = ttnn.add(ttnn.multiply(scores, scale), _decode_mask(kv_cache, position, cap))
         weights = _softmax(scores)
         ttnn.deallocate(scores)
-        ctx = ttnn.matmul(weights, kv_cache["v"], compute_kernel_config=_COMPUTE)
+        ctx = _bmm(weights, kv_cache["v"])
         ttnn.deallocate(weights)
         merged = ttnn.to_layout(
             ttnn.reshape(ttnn.to_layout(ctx, ttnn.ROW_MAJOR_LAYOUT), [1, 1, batch, n_heads * head_dim]),
