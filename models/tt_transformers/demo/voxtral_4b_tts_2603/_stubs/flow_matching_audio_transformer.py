@@ -423,13 +423,21 @@ def build(device, torch_module, batch=None):
     acoustic_out = int(at.acoustic_codebook_output.out_features)
     semantic_out = int(at.semantic_codebook_output.out_features)
 
-    def _compact_forward(llm_hidden, x_t, t, batch):
+    def _compact_forward(llm_hidden, x_t, t, batch, cache=None):
         # Token t of every sample in rows t*batch.. -- no per-sample 29-row tile pad.
-        h_in = ttnn.typecast(ttnn.reshape(llm_hidden, [1, 1, batch, dim]), ttnn.float32)
-        semantic = _lin(h_in, w_semantic, compute_kernel_config=_COMPUTE)
-        if semantic_bias is not None:
-            semantic = ttnn.add(semantic, semantic_bias)
-        semantic = ttnn.reshape(semantic, [batch, semantic_out])
+        # `llm_projection(llm_hidden)` and the semantic head read only `llm_hidden`, which is the
+        # same at every Euler step of a frame: a caller-owned `cache` computes them once per frame.
+        if cache is not None and "llm_proj" in cache:
+            semantic, llm_proj = cache["semantic"], cache["llm_proj"]
+        else:
+            h_in = ttnn.typecast(ttnn.reshape(llm_hidden, [1, 1, batch, dim]), ttnn.float32)
+            semantic = _lin(h_in, w_semantic, compute_kernel_config=_COMPUTE)
+            if semantic_bias is not None:
+                semantic = ttnn.add(semantic, semantic_bias)
+            semantic = ttnn.reshape(semantic, [batch, semantic_out])
+            llm_proj = _lin(h_in, w_llm, compute_kernel_config=_COMPUTE)
+            if cache is not None:
+                cache["semantic"], cache["llm_proj"] = semantic, llm_proj
 
         freqs = ttnn.matmul(
             ttnn.typecast(ttnn.reshape(t, [1, 1, batch, int(t.shape[-1])]), ttnn.float32),
@@ -442,7 +450,7 @@ def build(device, torch_module, batch=None):
             [
                 _lin(x_in, w_input, compute_kernel_config=_COMPUTE),
                 _lin(t_emb, w_time, compute_kernel_config=_COMPUTE),
-                _lin(h_in, w_llm, compute_kernel_config=_COMPUTE),
+                llm_proj,
             ],
             dim=2,
         )
@@ -453,10 +461,10 @@ def build(device, torch_module, batch=None):
         velocity = ttnn.reshape(_lin(first, w_acoustic, compute_kernel_config=_COMPUTE), [batch, acoustic_out])
         return velocity, semantic
 
-    def flow_matching_audio_transformer(llm_hidden, x_t=None, t=None, **kwargs):
+    def flow_matching_audio_transformer(llm_hidden, x_t=None, t=None, step_cache=None, **kwargs):
         batch = int(llm_hidden.shape[0])
         if batch % _TILE == 0:
-            return _compact_forward(llm_hidden, x_t, t, batch)
+            return _compact_forward(llm_hidden, x_t, t, batch, step_cache)
         h_in = ttnn.reshape(llm_hidden, [batch, 1, 1, dim])
 
         h_in = ttnn.typecast(h_in, ttnn.float32)
