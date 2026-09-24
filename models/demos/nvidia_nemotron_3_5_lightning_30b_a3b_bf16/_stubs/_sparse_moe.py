@@ -29,7 +29,17 @@ def _tile_bytes(dtype):
     return {ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}.get(dtype, 4096)
 
 
-def bmm_config(device, M, K, N, in0_dtype, in1_dtype, out_dtype=None, cb_budget=512 * 1024):
+# per-expert up/down: bf16 dest (8 tiles, not 4) for bigger output subblocks;
+# the weights are bf4_b and the math LoFi, so fp32 accumulation buys little here
+_EXPERT_CKC = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.LoFi,
+    math_approx_mode=False,
+    fp32_dest_acc_en=False,
+    packer_l1_acc=True,
+)
+
+
+def bmm_config(device, M, K, N, in0_dtype, in1_dtype, out_dtype=None, cb_budget=512 * 1024, dest_tiles=4):
     """Hand-shaped 2-D multicast config for the sparse-MoE matmuls.
 
     Left to itself ttnn picks in0_block_w=1 here, so every K tile is its own
@@ -46,7 +56,12 @@ def bmm_config(device, M, K, N, in0_dtype, in1_dtype, out_dtype=None, cb_budget=
         cb_budget -= pm * pn * (_tile_bytes(out_dtype) + (0 if out_dtype == ttnn.float32 else 4096))
     kw = max(d for d in range(1, kt + 1) if kt % d == 0 and (d == 1 or 2 * d * (pm * b0 + pn * b1) <= cb_budget))
     sub = max(
-        ((h, w) for h in range(1, pm + 1) for w in range(1, pn + 1) if pm % h == 0 and pn % w == 0 and h * w <= 4),
+        (
+            (h, w)
+            for h in range(1, pm + 1)
+            for w in range(1, pn + 1)
+            if pm % h == 0 and pn % w == 0 and h * w <= dest_tiles
+        ),
         key=lambda s: (s[0] * s[1], s[1]),
     )
     return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
@@ -78,9 +93,9 @@ def routed_mix(device, hs, W, up_b, down_cat, C, ckc, arange_cache):
     act = ttnn.matmul(
         xe,
         up_b,
-        compute_kernel_config=ckc,
+        compute_kernel_config=_EXPERT_CKC,
         dtype=ttnn.bfloat8_b,
-        program_config=bmm_config(device, C, H, I, xe.dtype, up_b.dtype),
+        program_config=bmm_config(device, C, H, I, xe.dtype, up_b.dtype, dest_tiles=8),
     )  # (Eloc, C, I)
     ttnn.deallocate(xe)
     w3 = ttnn.to_layout(ttnn.reshape(ttnn.to_layout(vals, ttnn.ROW_MAJOR_LAYOUT), [Eloc, C, 1]), ttnn.TILE_LAYOUT)
@@ -90,9 +105,9 @@ def routed_mix(device, hs, W, up_b, down_cat, C, ckc, arange_cache):
     ye = ttnn.matmul(
         act,
         ttnn.reshape(down_cat, [Eloc, I, H]),
-        compute_kernel_config=ckc,
+        compute_kernel_config=_EXPERT_CKC,
         dtype=ttnn.bfloat8_b,
-        program_config=bmm_config(device, C, I, H, act.dtype, down_cat.dtype),
+        program_config=bmm_config(device, C, I, H, act.dtype, down_cat.dtype, dest_tiles=8),
     )
     ttnn.deallocate(act)
     # combine: out[t] = sum over (e, c) with idx[e, c] == t of ye[e, c]
