@@ -364,8 +364,8 @@ def build(device, torch_module):
         h4 = ttnn.add(h4, attn_out)
 
         hn = _rms_norm(h4, g_ffn, eps, dtype=ttnn.bfloat16)
-        gate = _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
-        up = _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+        gate = _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
+        up = _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
         h4 = ttnn.add(
             h4,
             _lin(

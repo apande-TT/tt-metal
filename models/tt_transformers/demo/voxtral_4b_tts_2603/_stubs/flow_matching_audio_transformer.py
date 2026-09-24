@@ -365,8 +365,8 @@ def _compile_block(device, blk, mask):
 
         hn = _rms_norm(h, g_ffn, eps, dtype=ttnn.bfloat16)
         gated = ttnn.multiply(
-            _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
-            _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
+            _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             # Consumed once, by the down projection: hand it over in L1, not through DRAM.
             memory_config=ttnn.L1_MEMORY_CONFIG,

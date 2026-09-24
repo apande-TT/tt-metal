@@ -190,8 +190,8 @@ def build(device, torch_module):
 
         h = ttnn.reshape(x, [batch, 1, seq, dim])
         gated = ttnn.multiply(
-            _lin(h, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
-            _lin(h, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
+            _lin(h, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            _lin(h, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             # Consumed once, by the down projection: hand it over in L1, not through DRAM.
             memory_config=ttnn.L1_MEMORY_CONFIG,
