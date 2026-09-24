@@ -29,19 +29,22 @@ def _tile_bytes(dtype):
     return {ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}.get(dtype, 4096)
 
 
-def bmm_config(device, M, K, N, in0_dtype, in1_dtype, cb_budget=512 * 1024):
-    """Hand-shaped 2-D multicast config for the batched per-expert matmuls.
+def bmm_config(device, M, K, N, in0_dtype, in1_dtype, out_dtype=None, cb_budget=512 * 1024):
+    """Hand-shaped 2-D multicast config for the sparse-MoE matmuls.
 
     Left to itself ttnn picks in0_block_w=1 here, so every K tile is its own
     multicast round trip. Take the widest K block whose double-buffered in0/in1
-    CBs fit cb_budget, and the largest subblock the fp32 dest (4 tiles) holds.
-    Rows of the grid cover M, columns cover N (same core footprint ttnn picks).
+    CBs fit cb_budget (less the resident output block when out_dtype is given),
+    and the largest subblock the fp32 dest (4 tiles) holds. Rows of the grid
+    cover M, columns cover N (same core footprint ttnn picks).
     """
     g = device.compute_with_storage_grid_size()
-    mt, kt, nt = M // TILE, K // TILE, N // TILE
+    mt, kt, nt = math.ceil(M / TILE), K // TILE, N // TILE
     pm, pn = math.ceil(mt / g.y), math.ceil(nt / g.x)
     b0, b1 = _tile_bytes(in0_dtype), _tile_bytes(in1_dtype)
-    kw = max(d for d in range(1, kt + 1) if kt % d == 0 and 2 * d * (pm * b0 + pn * b1) <= cb_budget)
+    if out_dtype is not None:  # output block (+ its fp32 partials unless the output already is fp32)
+        cb_budget -= pm * pn * (_tile_bytes(out_dtype) + (0 if out_dtype == ttnn.float32 else 4096))
+    kw = max(d for d in range(1, kt + 1) if kt % d == 0 and (d == 1 or 2 * d * (pm * b0 + pn * b1) <= cb_budget))
     sub = max(
         ((h, w) for h in range(1, pm + 1) for w in range(1, pn + 1) if pm % h == 0 and pn % w == 0 and h * w <= 4),
         key=lambda s: (s[0] * s[1], s[1]),
@@ -105,7 +108,13 @@ def routed_mix(device, hs, W, up_b, down_cat, C, ckc, arange_cache):
         )
     idx_f = ttnn.reshape(ttnn.typecast(idx, ttnn.float32), [1, Eloc * C])
     onehot = ttnn.eq(ar, idx_f, dtype=ttnn.bfloat8_b)  # (T, Eloc*C); 0/1 is exact in bf8_b
-    out = ttnn.matmul(onehot, ttnn.reshape(ye, [Eloc * C, H]), compute_kernel_config=ckc, dtype=ttnn.float32)
+    out = ttnn.matmul(
+        onehot,
+        ttnn.reshape(ye, [Eloc * C, H]),
+        compute_kernel_config=ckc,
+        dtype=ttnn.float32,
+        program_config=bmm_config(device, T, Eloc * C, H, onehot.dtype, ye.dtype, ttnn.float32, 800 * 1024),
+    )
     ttnn.deallocate(onehot)
     ttnn.deallocate(ye)
     return out
