@@ -44,19 +44,95 @@ _SHARD_HEIGHT = 32
 _SDPA_DTYPE = ttnn.bfloat16
 
 
+_TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
+_L1_BUDGET = 1_100_000
+
+
+def _divisors(n):
+    return [d for d in range(1, n + 1) if n % d == 0]
+
+
+def _mcast_cfg(x, w, rows, out_dtype):
+    """A full-grid 2D-multicast program config for a tall `[rows, K] x [K, N]` linear, or None.
+
+    M goes over the grid rows and N over the grid columns. Per-core M/N are searched a few tiles
+    above the minimum (a slightly larger block often divides into better subblocks), and when the
+    whole per-core output does not fit L1 it is split into out-blocks. Ranked by per-core work,
+    then a K-block of at least 4, then subblock area (fp32 DEST caps it at 4 tiles), then out-block area.
+    """
+    grid = x.device().compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    mt, kt, nt = rows // 32, int(w.shape[-2]) // 32, int(w.shape[-1]) // 32
+    size = lambda dt: _TILE_BYTES.get(dt, 2048)
+    xs, ws = size(x.dtype), size(w.dtype)
+    os_ = size(out_dtype) + (0 if out_dtype == ttnn.float32 else 4096)
+    best = None
+    for pm in range(-(-mt // gy), -(-mt // gy) + 5):
+        if -(-mt // pm) > gy:
+            continue
+        for pn in range(-(-nt // gx), -(-nt // gx) + 5):
+            if -(-nt // pn) > gx:
+                continue
+            for bh in _divisors(pm):
+                for bw in _divisors(pn):
+                    kb = next(
+                        (
+                            c
+                            for c in (8, 4, 2, 1)
+                            if kt % c == 0 and bh * bw * os_ + 2 * c * (bh * xs + bw * ws) <= _L1_BUDGET
+                        ),
+                        None,
+                    )
+                    if kb is None:
+                        continue
+                    sub = max(
+                        (
+                            (h, s)
+                            for h in range(1, 5)
+                            for s in range(1, 5)
+                            if h * s <= 4 and bh % h == 0 and bw % s == 0
+                        ),
+                        key=lambda hs: (hs[0] * hs[1], hs[1]),
+                    )
+                    score = (pm * pn, -min(kb, 4), -sub[0] * sub[1], -bh * bw, -kb)
+                    if best is None or score < best[0]:
+                        best = (score, pm, pn, bh, bw, kb, sub)
+    if best is None:
+        return None
+    _, pm, pn, bh, bw, kb, sub = best
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=(gx, gy),
+        in0_block_w=kb,
+        out_subblock_h=sub[0],
+        out_subblock_w=sub[1],
+        out_block_h=bh,
+        out_block_w=bw,
+        per_core_M=pm,
+        per_core_N=pn,
+        transpose_mcast=False,
+        fused_activation=None,
+    )
+
+
 def _lin(x, w, **kwargs):
     """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
 
     A `[B, 1, S, K]` activation against a 2-D weight runs as B separate `S x K x N` matmuls that
     each re-read the whole weight from DRAM; `[1, 1, B*S, K]` is one matmul that reads it once.
+    Tall results (>= 8 tile rows) also get a hand-sized full-grid program config.
     """
     shape = [int(d) for d in x.shape]
     lead = 1
     for d in shape[:-2]:
         lead *= d
+    rows = lead * shape[-2]
+    if rows >= 256 and rows % 32 == 0 and "program_config" not in kwargs:
+        cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
+        if cfg is not None:
+            kwargs["program_config"] = cfg
     if lead == 1:
         return ttnn.linear(x, w, **kwargs)
-    y = ttnn.linear(ttnn.reshape(x, [1, 1, lead * shape[-2], shape[-1]]), w, **kwargs)
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, rows, shape[-1]]), w, **kwargs)
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
