@@ -135,7 +135,14 @@ class TtNemotronHMOE:
                 mesh_mapper=ttnn.ShardTensor2dMesh(dev, mesh_shape=_mesh_shape, dims=(None, 0)),
             )
             self._down_cat = _folded(dn_stack, 0)  # (Eloc*inter, hidden)
-            # decode copy of the down bank, DRAM-sharded (see _dram_mm)
+            # decode copies of both banks, DRAM-sharded (see _dram_mm); the up bank
+            # in 2 column chunks so each bank worker's output block fits L1
+            self._up_dram = _dram_mm.upload_chunks(
+                dev,
+                torch.stack([torch.cat([up_stack[d * Eloc + j] for j in range(Eloc)], dim=1) for d in range(TP)]),
+                2,
+                _mesh_shape,
+            )
             self._down_dram = _dram_mm.upload_weight(
                 dev,
                 torch.stack([torch.cat([dn_stack[d * Eloc + j] for j in range(Eloc)], dim=0) for d in range(TP)]),
@@ -166,6 +173,7 @@ class TtNemotronHMOE:
             self._up_cat = self._devw(torch.cat(list(up_full), dim=1))
             self._up_b = self._devw4(up_full)
             self._down_cat = self._devw4(torch.cat(list(dn_full), dim=0))
+            self._up_dram = _dram_mm.upload_chunks(dev, torch.cat(list(up_full), dim=1), 2)
             self._down_dram = _dram_mm.upload_weight(dev, torch.cat(list(dn_full), dim=0))
             self._sel = None
             self._Eloc = E
@@ -270,9 +278,21 @@ class TtNemotronHMOE:
         # Folded bank: one up matmul over all local experts, relu2, scale each
         # expert's slice by its routing weight (expanded to the folded width),
         # then one down matmul whose K reduction is the weighted expert sum.
-        act = ttnn.linear(
-            hs_bf, self._up_cat, compute_kernel_config=self._expert_ckc, activation="relu", dtype=ttnn.bfloat8_b
-        )
+        if B * T <= _dram_mm.TILE:  # decode: stream the DRAM-sharded bank
+            act = _dram_mm.matmul_chunks(
+                self.device,
+                ttnn.reshape(hs_bf, [1, B * T, int(hs_bf.shape[-1])]),
+                self._up_dram,
+                self._Eloc * self._inter,
+                self._expert_ckc,
+                dtype=ttnn.bfloat8_b,
+                fused_activation=ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU),
+            )
+            act = ttnn.reshape(act, [B, T, self._Eloc * self._inter])
+        else:
+            act = ttnn.linear(
+                hs_bf, self._up_cat, compute_kernel_config=self._expert_ckc, activation="relu", dtype=ttnn.bfloat8_b
+            )
         w_wide = ttnn.matmul(W_use, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat8_b)
         # relu2 = square fused into the routing-weight multiply (one pass over act)
         act = ttnn.multiply(

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""DRAM-sharded decode matmul for the folded expert-down bank.
+"""DRAM-sharded decode matmuls for the folded expert banks.
 
 At decode the down matmul is (32 tokens) x (Eloc*inter) x hidden: one tile
 row of activation against ~160 MB of bf4_b weight per chip, i.e. pure weight
@@ -51,13 +51,46 @@ def _banks(device):
     return g.x
 
 
-def padded_n(device, n):
-    step = TILE * _banks(device)
-    return math.ceil(n / step) * step
+def _core_grid(grid, cores):
+    """A cores-sized rectangle inside the compute grid (widest first), or None."""
+    for cols in range(min(cores, grid.x), 0, -1):
+        if cores % cols == 0 and cores // cols <= grid.y:
+            return ttnn.CoreGrid(y=cores // cols, x=cols)
+    return None
+
+
+def plan(device, k, n, max_pad=0.05):
+    """(in0 cores, padded n) for a (k, n) weight. The activation is width-sharded
+    over `cores`, which must divide k's tiles and fit the grid; n is padded to a
+    multiple of both `cores` and the DRAM bank count. Take the most cores whose
+    padding stays within max_pad of n (else the least-padded option)."""
+    banks = _banks(device)
+    grid = device.compute_with_storage_grid_size()
+    k_tiles, n_tiles = k // TILE, math.ceil(n / TILE)
+    options = []
+    for c in range(1, grid.x * grid.y + 1):
+        if k_tiles % c or _core_grid(grid, c) is None:
+            continue
+        step = c * banks // math.gcd(c, banks)
+        options.append((c, math.ceil(n_tiles / step) * step))
+    ok = [o for o in options if o[1] - n_tiles <= max_pad * n_tiles]
+    c, n_pad_tiles = max(ok) if ok else min(options, key=lambda o: (o[1], -o[0]))
+    return c, n_pad_tiles * TILE
+
+
+def _workers_per_bank(device, n_tiles, max_worker_n=96):
+    """Compute runs on reader workers beside each DRAM bank, each owning its
+    bank's n/banks output tiles; split a wide bank shard over up to 3 workers
+    (the op's limit) so the per-worker output fits L1."""
+    shard = n_tiles // _banks(device)
+    for w in (1, 2, 3):
+        if shard % w == 0 and shard // w <= max_worker_n:
+            return w
+    return max(w for w in (1, 2, 3) if shard % w == 0)
 
 
 def weight_memcfg(device, k, n):
-    """(k, n) weight WIDTH-sharded over every DRAM bank; n must be padded_n()."""
+    """(k, n) weight WIDTH-sharded over every DRAM bank; n must be padded per plan()."""
     banks = _banks(device)
     grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))})
     spec = ttnn.ShardSpec(grid, (k, n // banks), ttnn.ShardOrientation.ROW_MAJOR)
@@ -75,7 +108,7 @@ def upload_weight(device, w, mesh_shape=None, dtype=ttnn.bfloat4_b):
     """Upload a torch weight DRAM-sharded for matmul(). w is (k, n) replicated,
     or (TP, k, n) with chip d of the TP (last) mesh axis getting w[d]."""
     k, n = int(w.shape[-2]), int(w.shape[-1])
-    n_pad = padded_n(device, n)
+    _, n_pad = plan(device, k, n)
     w = pad_n(w.to(torch.bfloat16), n_pad)
     if w.dim() == 3:
         mapper = ttnn.ShardTensor2dMesh(device, mesh_shape=mesh_shape, dims=(None, 0))
@@ -111,12 +144,7 @@ def mcast1d_config(device, k, n):
     )
 
 
-def _cores(k_tiles, n_tiles, max_cores=64):
-    c = max(c for c in range(1, max_cores + 1) if k_tiles % c == 0 and n_tiles % c == 0)
-    return c
-
-
-def matmul(device, x, w, n_out, ckc, dtype=ttnn.bfloat16):
+def matmul(device, x, w, n_out, ckc, dtype=ttnn.bfloat16, fused_activation=None):
     """x (1, M<=32, k) interleaved @ DRAM-sharded w (k, n_pad) -> (1, M, n_out) interleaved.
 
     Mirrors the op's unit-test contract: bf16 rank-4 activation width-sharded
@@ -125,12 +153,9 @@ def matmul(device, x, w, n_out, ckc, dtype=ttnn.bfloat16):
     M = int(x.shape[-2])
     n_pad = int(w.shape[-1])
     k_tiles, n_tiles = k // TILE, n_pad // TILE
-    cores = _cores(k_tiles, n_tiles)
-    grid = device.compute_with_storage_grid_size()
-    cols = min(cores, grid.x)
-    while cores % cols:
-        cols -= 1
-    core_grid = ttnn.CoreGrid(y=cores // cols, x=cols)
+    cores, planned = plan(device, k, n_out)
+    assert planned == n_pad, f"weight padded to {n_pad}, plan says {planned}"
+    core_grid = _core_grid(device.compute_with_storage_grid_size(), cores)
     x4 = ttnn.reshape(x, [1, 1, M, k])
     if x4.dtype != ttnn.bfloat16:
         x4 = ttnn.typecast(x4, ttnn.bfloat16)
@@ -146,7 +171,8 @@ def matmul(device, x, w, n_out, ckc, dtype=ttnn.bfloat16):
         in0_block_w=max(d for d in range(1, 9) if k_per_core % d == 0),
         per_core_M=1,
         per_core_N=n_tiles // cores,
-        fused_activation=None,
+        fused_activation=fused_activation,
+        num_workers_per_dram_bank=_workers_per_bank(device, n_tiles),
     )
     out = ttnn.matmul(
         xs,
@@ -161,3 +187,19 @@ def matmul(device, x, w, n_out, ckc, dtype=ttnn.bfloat16):
     ttnn.deallocate(xs)
     out = ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG)
     return ttnn.slice(out, [0, 0, 0, 0], [1, 1, M, n_out]) if n_out != n_pad else out
+
+
+def upload_chunks(device, w, n_chunks, mesh_shape=None, dtype=ttnn.bfloat4_b):
+    """upload_weight for a weight too wide for one DRAM-sharded call (each bank
+    worker's output block must fit L1): split N into n_chunks column blocks."""
+    n = int(w.shape[-1])
+    assert n % n_chunks == 0
+    step = n // n_chunks
+    return [upload_weight(device, w[..., i * step : (i + 1) * step], mesh_shape, dtype) for i in range(n_chunks)]
+
+
+def matmul_chunks(device, x, ws, n_out, ckc, dtype=ttnn.bfloat16, fused_activation=None):
+    """matmul() over column-block chunks from upload_chunks, concatenated along N."""
+    step = n_out // len(ws)
+    outs = [matmul(device, x, w, step, ckc, dtype, fused_activation) for w in ws]
+    return outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=-1)
