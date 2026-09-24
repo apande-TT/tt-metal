@@ -498,10 +498,11 @@ class NemotronHPipeline:
         # vocab-parallel on the TP axis: each chip streams half the ~350 MB head
         # and the logits are all-gathered back before sampling
         self._lm_tp = self.sharded and lm.shape[1] % (_mesh_shape(device)[-1] * ttnn.TILE_SIZE) == 0
+        # bf4_b: the head is pure weight streaming at decode (M = one tile row)
         if self._lm_tp:
-            self.lm_head_w = _shard(device, lm, 1, dtype=ttnn.bfloat8_b)
+            self.lm_head_w = _shard(device, lm, 1, dtype=ttnn.bfloat4_b)
         else:
-            self.lm_head_w = _replicate(device, lm, dtype=ttnn.bfloat8_b)
+            self.lm_head_w = _replicate(device, lm, dtype=ttnn.bfloat4_b)
         self.vocab_size = int(lm.shape[1])
         self.hidden_size = int(lm.shape[0])
 
