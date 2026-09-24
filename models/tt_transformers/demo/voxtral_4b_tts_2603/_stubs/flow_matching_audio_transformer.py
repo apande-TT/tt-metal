@@ -343,7 +343,11 @@ def _compile_block(device, blk, mask):
         device,
     )
     wo = _weight(attn.wo, device)
-    w1, w3 = (_weight(m, device) for m in (ff.w1, ff.w3))
+    # Weight-stream bound at 96 rows; bf8_b halves the bytes each FFN projection reads.
+    w1, w3 = (
+        _from_torch(m.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
+        for m in (ff.w1, ff.w3)
+    )
     # The down projection is DRAM-bound at 1024 rows; bf8_b halves the weight it streams.
     w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     g_attn = _gamma(blk.attention_norm, device)

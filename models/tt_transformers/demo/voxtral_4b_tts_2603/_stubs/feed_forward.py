@@ -175,10 +175,10 @@ def build(device, torch_module):
     dim = int(ff.w1.in_features)
     out_dim = int(ff.w2.out_features)
 
-    w1 = _weight(ff.w1, device)
+    w1 = _from_torch(ff.w1.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     # The down projection is DRAM-bound at 1024 rows; bf8_b halves the weight it streams.
     w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
-    w3 = _weight(ff.w3, device)
+    w3 = _from_torch(ff.w3.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     bias = None
     if ff.w2.bias is not None:
         bias = _from_torch(ff.w2.bias.detach().reshape(1, 1, 1, out_dim), device)
