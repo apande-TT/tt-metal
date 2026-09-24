@@ -32,6 +32,8 @@ is all_reduced to recover the full sum.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 
 import ttnn
@@ -97,11 +99,20 @@ class TtNemotronHExperts:
                 torch.stack([torch.cat([down_t[d * Eloc + j] for j in range(Eloc)], dim=0) for d in range(TP)]),
                 _mesh_shape,
             )
+            # prefill sparse path: per-expert (Eloc, hidden, inter) up bank
+            self._up_b = ttnn.from_torch(
+                up_t.to(torch.bfloat16),  # (E, hidden, inter): chip d's dim-0 chunk is its local experts
+                dtype=ttnn.bfloat4_b,
+                layout=ttnn.TILE_LAYOUT,
+                device=dev,
+                mesh_mapper=ttnn.ShardTensor2dMesh(dev, mesh_shape=_mesh_shape, dims=(None, 0)),
+            )
             self._Eloc = Eloc
         else:
             self._up_cat = self._devw4(torch.cat(list(up_t), dim=1))
             self._down_cat = self._devw4(torch.cat(list(down_t), dim=0))
             self._down_dram = _dram_mm.upload_weight(dev, torch.cat(list(down_t), dim=0))
+            self._up_b = self._devw4(up_t)
             self._Eloc = E
 
         # Per-chip expert selector for the DEVICE-SIDE routing path (see the
@@ -152,6 +163,10 @@ class TtNemotronHExperts:
         )
         cg = dev.compute_with_storage_grid_size()
         self._core_grid = ttnn.CoreGrid(y=cg.y, x=cg.x)
+        # routed experts per token, set by the owning block; enables the sparse
+        # prefill path (0 = dense everywhere)
+        self.top_k = 0
+        self._arange = {}
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -249,9 +264,63 @@ class TtNemotronHExperts:
 
         return self._mix(hs, W_sh, num_tokens)
 
+    def _capacity(self, num_tokens):
+        """Tokens each local expert processes on the sparse path: 4x the mean
+        load (num_tokens * top_k / num_experts), tile-aligned, capped at T."""
+        mean = num_tokens * self.top_k / self.num_experts
+        return min(num_tokens, _dram_mm.TILE * max(1, math.ceil(4 * mean / _dram_mm.TILE)))
+
+    def _mix_sparse(self, hs, W_sh, num_tokens):
+        """Prefill MoE computing only routed (token, expert) pairs.
+
+        Each local expert takes its top-C tokens by routing weight (unrouted
+        slots carry weight 0 and contribute nothing), gathers their rows,
+        runs its own up/relu2/down, and a one-hot matmul adds every row back
+        to its token. The dense form evaluates all Eloc experts on all T
+        tokens; this does Eloc*C rows, C ~ 4x the mean expert load."""
+        Eloc, I, H, T = self._Eloc, self.intermediate_dim, self.hidden_dim, num_tokens
+        C = self._capacity(T)
+        # per-expert top-C tokens: values = routing weights, indices = token ids
+        vals, idx = ttnn.topk(ttnn.typecast(ttnn.transpose(W_sh, -2, -1), ttnn.bfloat16), C, dim=-1)  # (Eloc, C)
+        ttnn.deallocate(W_sh)
+        idx_rm = ttnn.to_layout(ttnn.typecast(idx, ttnn.uint32), ttnn.ROW_MAJOR_LAYOUT)
+        idx_rm = ttnn.reshape(idx_rm, [1, Eloc * C])
+        table = ttnn.to_layout(ttnn.typecast(hs, ttnn.bfloat16), ttnn.ROW_MAJOR_LAYOUT)  # (T, H)
+        xe = ttnn.embedding(idx_rm, table, layout=ttnn.TILE_LAYOUT)  # (1, Eloc*C, H)
+        ttnn.deallocate(table)
+        xe = ttnn.reshape(xe, [Eloc, C, H])
+        act = ttnn.matmul(xe, self._up_b, compute_kernel_config=self._expert_ckc, dtype=ttnn.bfloat8_b)  # (Eloc,C,I)
+        ttnn.deallocate(xe)
+        w3 = ttnn.to_layout(
+            ttnn.reshape(ttnn.to_layout(vals, ttnn.ROW_MAJOR_LAYOUT), [Eloc, C, 1]), ttnn.TILE_LAYOUT
+        )  # (Eloc, C, 1)
+        act = ttnn.multiply(
+            ttnn.relu(act), w3, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]
+        )  # relu2 * routing weight
+        ye = ttnn.matmul(
+            act, ttnn.reshape(self._down_cat, [Eloc, I, H]), compute_kernel_config=self._expert_ckc, dtype=ttnn.bfloat16
+        )  # (Eloc, C, H)
+        ttnn.deallocate(act)
+        # combine: out[t] = sum over (e, c) with idx[e, c] == t of ye[e, c]
+        ar = self._arange.get(T)
+        if ar is None:
+            ar = self._arange[T] = self._upload(torch.arange(T, dtype=torch.float32).reshape(T, 1), ttnn.float32)
+        idx_f = ttnn.reshape(ttnn.typecast(idx, ttnn.float32), [1, Eloc * C])
+        onehot = ttnn.typecast(ttnn.eq(ar, idx_f), ttnn.bfloat16)  # (T, Eloc*C)
+        out = ttnn.matmul(
+            onehot, ttnn.reshape(ye, [Eloc * C, H]), compute_kernel_config=self._expert_ckc, dtype=ttnn.float32
+        )  # (T, H)
+        ttnn.deallocate(onehot)
+        ttnn.deallocate(ye)
+        if self._shard:
+            out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
+        return ttnn.typecast(out, ttnn.bfloat16)
+
     def _mix(self, hs, W_sh, num_tokens):
         """The expert-parallel mixture itself: pure ttnn, identical for the
         host-routing and device-routing entry paths above."""
+        if self.top_k and num_tokens > _dram_mm.TILE:
+            return self._mix_sparse(hs, W_sh, num_tokens)
         Eloc, I = self._Eloc, self.intermediate_dim
         hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
         # Folded bank: one up matmul over all local experts, relu2, scale each

@@ -247,6 +247,7 @@ class TtNemotronHLayer:
         elif variant in ("MOE_B", "MOE_C"):
             self.router = _router_stub.build(device, mixer.gate)
             self.experts = _experts_stub.build(device, mixer.experts)
+            self.experts.top_k = int(mixer.top_k)  # enables its sparse prefill path
             self.stub_names += ["nemotron_h_topk_router", "nemotron_h_experts"]
             self.top_k = int(mixer.top_k)
             self.n_experts = int(mixer.n_routed_experts)
