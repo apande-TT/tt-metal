@@ -280,7 +280,7 @@ class TtNemotronHAttention:
 
         Kt = ttnn.transpose(Kh, -2, -1)  # (B,H,D,T)
         ttnn.deallocate(Kh)
-        scores = ttnn.matmul(Qh, Kt, compute_kernel_config=self.ckc)  # (B,H,T,T)
+        scores = _ssm_cache.heads_matmul(Qh, Kt, self.ckc)  # (B,H,T,T), heads spread over the grid
         ttnn.deallocate(Qh)
         ttnn.deallocate(Kt)
         scores = ttnn.multiply(scores, self.scaling)
@@ -293,7 +293,7 @@ class TtNemotronHAttention:
         probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.ckc, numeric_stable=True)
         ttnn.deallocate(scores)
 
-        attn = ttnn.matmul(probs, Vh, compute_kernel_config=self.ckc)  # (B,H,T,D)
+        attn = _ssm_cache.heads_matmul(probs, Vh, self.ckc)  # (B,H,T,D)
         ttnn.deallocate(probs)
         ttnn.deallocate(Vh)
 
