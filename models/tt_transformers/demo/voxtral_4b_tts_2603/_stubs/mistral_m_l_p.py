@@ -281,8 +281,9 @@ def build(device, torch_module):
     def mistral_m_l_p(x, **kwargs):
         h, lead, seq, rank = _view4(x, dim)
         gated = ttnn.multiply(
-            ttnn.silu(_lin(h, w_gate, compute_kernel_config=_COMPUTE)),
+            _lin(h, w_gate, compute_kernel_config=_COMPUTE),
             _lin(h, w_up, compute_kernel_config=_COMPUTE),
+            input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
         )
         out = _lin(gated, w_down, dtype=x.dtype, compute_kernel_config=_COMPUTE)
         ttnn.deallocate(gated)

@@ -255,9 +255,16 @@ def build(device, torch_module):
         h4 = ttnn.add(h4, _attention(xn, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask))
 
         hn = _rms_norm(h4, g_ffn, eps)
-        gate = ttnn.silu(_lin(hn, w1, compute_kernel_config=_COMPUTE))
+        gate = _lin(hn, w1, compute_kernel_config=_COMPUTE)
         up = _lin(hn, w3, compute_kernel_config=_COMPUTE)
-        h4 = ttnn.add(h4, _lin(ttnn.multiply(gate, up), w2, compute_kernel_config=_COMPUTE))
+        h4 = ttnn.add(
+            h4,
+            _lin(
+                ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU]),
+                w2,
+                compute_kernel_config=_COMPUTE,
+            ),
+        )
 
         if rank >= 4:
             return h4

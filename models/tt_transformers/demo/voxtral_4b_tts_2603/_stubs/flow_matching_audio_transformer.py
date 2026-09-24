@@ -250,8 +250,9 @@ def _compile_block(device, blk, mask):
 
         hn = _rms_norm(h, g_ffn, eps)
         gated = ttnn.multiply(
-            ttnn.silu(_lin(hn, w1, compute_kernel_config=_COMPUTE)),
+            _lin(hn, w1, compute_kernel_config=_COMPUTE),
             _lin(hn, w3, compute_kernel_config=_COMPUTE),
+            input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
         )
         return ttnn.add(h, _lin(gated, w2, compute_kernel_config=_COMPUTE))
 

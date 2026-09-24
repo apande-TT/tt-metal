@@ -500,8 +500,9 @@ def build(device, torch_module):
 
         hn = _rms_norm(h, g_post, eps_post)
         gated = ttnn.multiply(
-            ttnn.silu(_lin(hn, w_gate, compute_kernel_config=_COMPUTE)),
+            _lin(hn, w_gate, compute_kernel_config=_COMPUTE),
             _lin(hn, w_up, compute_kernel_config=_COMPUTE),
+            input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
         )
         ttnn.deallocate(hn)
         h = ttnn.add(h, _lin(gated, w_down, dtype=h.dtype, compute_kernel_config=_COMPUTE))
