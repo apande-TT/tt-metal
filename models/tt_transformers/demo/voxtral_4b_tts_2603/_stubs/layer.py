@@ -221,6 +221,24 @@ def _rope(x, cos, sin, half):
     return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(rotated, sin))
 
 
+def _rope_prefill(q, k, cos, sin, half):
+    """Prefill RoPE on q and k as ONE fused kernel each when the table is shared by the batch.
+
+    `ttnn.experimental.rotary_embedding` computes the same `x * cos + rotate_half(x) * sin` in a
+    single pass, where `_rope` spends six ops (two slices, a neg, a concat, two multiplies and an
+    add) and a DRAM round-trip per op over `[B, H, S, head_dim]`. It wants a `[1, 1, S, head_dim]`
+    table in the input's dtype; a per-row table (explicit position ids) keeps the spelled-out path.
+    """
+    if int(cos.shape[0]) != 1 or q.dtype != ttnn.bfloat16 or k.dtype != ttnn.bfloat16:
+        return _rope(q, cos, sin, half), _rope(k, cos, sin, half)
+    if cos.dtype != ttnn.bfloat16:
+        cos, sin = ttnn.typecast(cos, ttnn.bfloat16), ttnn.typecast(sin, ttnn.bfloat16)
+    return (
+        ttnn.experimental.rotary_embedding(q, cos, sin),
+        ttnn.experimental.rotary_embedding(k, cos, sin),
+    )
+
+
 def _decode_shard(device, rows, width):
     """HEIGHT-sharded over the batch, one user per core -- the decode op set's layout.
 
@@ -467,8 +485,7 @@ def build(device, torch_module):
             cos, sin = position_embeddings
             cos = _broadcast4(cos, seq, head_dim)
             sin = _broadcast4(sin, seq, head_dim)
-            q = _rope(q, cos, sin, half)
-            k = _rope(k, cos, sin, half)
+            q, k = _rope_prefill(q, k, cos, sin, half)
         a = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
         if kv_cache is not None:
             _seed_cache(kv_cache, k, v)
