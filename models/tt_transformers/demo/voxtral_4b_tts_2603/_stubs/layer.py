@@ -27,8 +27,6 @@ import torch
 
 import ttnn
 
-
-
 # SDPA takes bfloat16 and nothing wider (`sdpa_device_operation.cpp:43`), and the KV cache is read
 # by the same op family, so q/k/v and the cache are bf16 while the residual stream stays float32.
 _SDPA_DTYPE = ttnn.bfloat16
@@ -42,11 +40,30 @@ _COMPUTE = ttnn.WormholeComputeKernelConfig(
 )
 
 
+def _lin(x, w, **kwargs):
+    """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
+
+    A `[B, 1, S, K]` activation against a 2-D weight runs as B separate `S x K x N` matmuls that
+    each re-read the whole weight from DRAM; `[1, 1, B*S, K]` is one matmul that reads it once.
+    """
+    shape = [int(d) for d in x.shape]
+    lead = 1
+    for d in shape[:-2]:
+        lead *= d
+    if lead == 1:
+        return ttnn.linear(x, w, **kwargs)
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, lead * shape[-2], shape[-1]]), w, **kwargs)
+    return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
+
+
 def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
         return ttnn.from_torch(
-            t, dtype=dtype, layout=layout, device=device,
+            t,
+            dtype=dtype,
+            layout=layout,
+            device=device,
             mesh_mapper=ttnn.ReplicateTensorToMesh(device),
         )
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
@@ -140,7 +157,6 @@ def _decode_shard(device, rows, width):
         orientation=ttnn.ShardOrientation.ROW_MAJOR,
         use_height_and_width_as_shard_shape=True,
     )
-
 
 
 # THE ZERO TAIL IS A PERSISTENT BUFFER, NOT A PER-CALL `ttnn.zeros`.
@@ -284,16 +300,14 @@ def build(device, torch_module):
         # `cos`/`sin` are `[1, 1, 1, head_dim]` and broadcast.
         groups = n_heads // n_kv_heads
         flat = ttnn.reshape(xn, [1, 1, batch, dim])
-        fused = ttnn.linear(flat, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+        fused = _lin(flat, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
         q_width, kv_width = n_heads * head_dim, n_kv_heads * head_dim
         rows = ttnn.to_layout(fused, ttnn.ROW_MAJOR_LAYOUT)
         ttnn.deallocate(fused)
 
         def _head_split(start, width, heads_per_kv):
             part = ttnn.slice(rows, [0, 0, 0, start], [1, 1, batch, start + width])
-            return ttnn.to_layout(
-                ttnn.reshape(part, [batch, n_kv_heads, heads_per_kv, head_dim]), ttnn.TILE_LAYOUT
-            )
+            return ttnn.to_layout(ttnn.reshape(part, [batch, n_kv_heads, heads_per_kv, head_dim]), ttnn.TILE_LAYOUT)
 
         q = _head_split(0, q_width, groups)
         k = _head_split(q_width, kv_width, 1)
@@ -336,9 +350,7 @@ def build(device, torch_module):
         # tensor is ever materialised `n_heads` times. `head // groups` IS the reference's
         # `repeat_kv` mapping, so the grouping is the same one HF uses.
         cap = int(kv_cache["k"].shape[-2])
-        scores = ttnn.matmul(
-            q, ttnn.transpose(kv_cache["k"], -2, -1), compute_kernel_config=_COMPUTE
-        )
+        scores = ttnn.matmul(q, ttnn.transpose(kv_cache["k"], -2, -1), compute_kernel_config=_COMPUTE)
         ttnn.deallocate(q)
         # The cache tail beyond `position` is zeros, and a zero key scores ZERO -- which is a
         # perfectly ordinary logit, not a small one. It has to be masked explicitly.
@@ -348,14 +360,14 @@ def build(device, torch_module):
         ctx = ttnn.matmul(weights, kv_cache["v"], compute_kernel_config=_COMPUTE)
         ttnn.deallocate(weights)
         merged = ttnn.to_layout(
-            ttnn.reshape(
-                ttnn.to_layout(ctx, ttnn.ROW_MAJOR_LAYOUT), [1, 1, batch, n_heads * head_dim]
-            ),
+            ttnn.reshape(ttnn.to_layout(ctx, ttnn.ROW_MAJOR_LAYOUT), [1, 1, batch, n_heads * head_dim]),
             ttnn.TILE_LAYOUT,
         )
         ttnn.deallocate(ctx)
-        out = ttnn.linear(
-            ttnn.reshape(merged, [1, 1, batch, n_heads * head_dim]), wo, dtype=xn.dtype,
+        out = _lin(
+            ttnn.reshape(merged, [1, 1, batch, n_heads * head_dim]),
+            wo,
+            dtype=xn.dtype,
             compute_kernel_config=_COMPUTE,
         )
         ttnn.deallocate(merged)
@@ -364,7 +376,7 @@ def build(device, torch_module):
         return ttnn.reshape(out, held[:-1] + [dim])
 
     def _prefill_attn(xn, position_embeddings, kv_cache, seq):
-        qkv = ttnn.linear(xn, wqkv, dtype=_SDPA_DTYPE, compute_kernel_config=_COMPUTE)
+        qkv = _lin(xn, wqkv, dtype=_SDPA_DTYPE, compute_kernel_config=_COMPUTE)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
         )
@@ -378,8 +390,10 @@ def build(device, torch_module):
         a = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
         if kv_cache is not None:
             _seed_cache(kv_cache, k, v)
-        return ttnn.linear(
-            ttnn.experimental.nlp_concat_heads(a), wo, dtype=xn.dtype,
+        return _lin(
+            ttnn.experimental.nlp_concat_heads(a),
+            wo,
+            dtype=xn.dtype,
             compute_kernel_config=_COMPUTE,
         )
 
@@ -404,11 +418,11 @@ def build(device, torch_module):
 
         hn = _rms_norm(h, g_post, eps_post)
         gated = ttnn.multiply(
-            ttnn.silu(ttnn.linear(hn, w_gate, compute_kernel_config=_COMPUTE)),
-            ttnn.linear(hn, w_up, compute_kernel_config=_COMPUTE),
+            ttnn.silu(_lin(hn, w_gate, compute_kernel_config=_COMPUTE)),
+            _lin(hn, w_up, compute_kernel_config=_COMPUTE),
         )
         ttnn.deallocate(hn)
-        h = ttnn.add(h, ttnn.linear(gated, w_down, dtype=h.dtype, compute_kernel_config=_COMPUTE))
+        h = ttnn.add(h, _lin(gated, w_down, dtype=h.dtype, compute_kernel_config=_COMPUTE))
         ttnn.deallocate(gated)
 
         return _restore(h, lead, seq, rank, dim)

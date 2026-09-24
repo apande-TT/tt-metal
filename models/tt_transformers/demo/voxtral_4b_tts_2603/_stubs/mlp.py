@@ -21,7 +21,6 @@ import torch
 
 import ttnn
 
-
 # `ttnn.linear`/`ttnn.matmul` on their DEFAULTS leave `fp32_dest_acc_en` off, so the accumulator
 # rounds to bfloat16 at every step even when the activations are float32. The consumer of this
 # stack resolves a top-1/top-2 margin of a few hundredths, and the audio path rounds onto 21
@@ -38,11 +37,30 @@ _SHARD_HEIGHT = 32
 _SDPA_DTYPE = ttnn.bfloat16
 
 
+def _lin(x, w, **kwargs):
+    """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
+
+    A `[B, 1, S, K]` activation against a 2-D weight runs as B separate `S x K x N` matmuls that
+    each re-read the whole weight from DRAM; `[1, 1, B*S, K]` is one matmul that reads it once.
+    """
+    shape = [int(d) for d in x.shape]
+    lead = 1
+    for d in shape[:-2]:
+        lead *= d
+    if lead == 1:
+        return ttnn.linear(x, w, **kwargs)
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, lead * shape[-2], shape[-1]]), w, **kwargs)
+    return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
+
+
 def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
         return ttnn.from_torch(
-            t, dtype=dtype, layout=layout, device=device,
+            t,
+            dtype=dtype,
+            layout=layout,
+            device=device,
             mesh_mapper=ttnn.ReplicateTensorToMesh(device),
         )
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
@@ -55,9 +73,7 @@ def _weight(linear, device):
 
 def _norm_weight(norm, device):
     """Gamma in the `[1, 1, dim // 32, 32]` ROW_MAJOR form `ttnn.rms_norm` requires."""
-    return _from_torch(
-        norm.weight.detach().reshape(1, 1, -1, _SHARD_HEIGHT), device, layout=ttnn.ROW_MAJOR_LAYOUT
-    )
+    return _from_torch(norm.weight.detach().reshape(1, 1, -1, _SHARD_HEIGHT), device, layout=ttnn.ROW_MAJOR_LAYOUT)
 
 
 def _view4(x, dim):
@@ -124,7 +140,6 @@ def _decode_shard(device, rows, width):
     )
 
 
-
 # THE ZERO TAIL IS A PERSISTENT BUFFER, NOT A PER-CALL `ttnn.zeros`.
 # `ttnn.zeros` builds the tensor on the host and enqueues a WRITE to get it onto the device, and a
 # write is exactly what a captured trace cannot replay: capturing a prefill that seeded its cache
@@ -184,10 +199,10 @@ def build(device, torch_module):
     def mlp_forward(x, **kwargs):
         h, lead, seq, rank = _view4(x, dim)
         gated = ttnn.multiply(
-            ttnn.silu(ttnn.linear(h, w_gate, compute_kernel_config=_COMPUTE)),
-            ttnn.linear(h, w_up, compute_kernel_config=_COMPUTE),
+            ttnn.silu(_lin(h, w_gate, compute_kernel_config=_COMPUTE)),
+            _lin(h, w_up, compute_kernel_config=_COMPUTE),
         )
-        out = ttnn.linear(gated, w_down, dtype=x.dtype, compute_kernel_config=_COMPUTE)
+        out = _lin(gated, w_down, dtype=x.dtype, compute_kernel_config=_COMPUTE)
         ttnn.deallocate(gated)
         return _restore(out, lead, seq, rank, out_dim)
 
