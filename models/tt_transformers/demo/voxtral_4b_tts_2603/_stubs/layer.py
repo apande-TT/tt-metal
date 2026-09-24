@@ -243,7 +243,7 @@ def _rope_prefill(q, k, cos, sin, half):
     )
 
 
-def _bmm(a, b):
+def _bmm(a, b, transpose_b=False):
     """Head-batched decode attention `a @ b` spread over the full grid.
 
     Without a program config the `[B, n_kv, groups, C]` products land on a handful of cores (probs @ V
@@ -251,7 +251,7 @@ def _bmm(a, b):
     (batch, kv-head) output block its own work unit, so they fan out across the grid.
     """
     # Ceil, not floor: the grouped query is `[B, n_kv, groups, head_dim]` with groups=4 rows, one padded tile.
-    m, k, n = (-(-int(d) // 32) for d in (a.shape[-2], a.shape[-1], b.shape[-1]))
+    m, k, n = (-(-int(d) // 32) for d in (a.shape[-2], a.shape[-1], b.shape[-2 if transpose_b else -1]))
     grid = a.device().compute_with_storage_grid_size()
     cfg = ttnn.MatmulMultiCoreReuseProgramConfig(
         compute_with_storage_grid_size=(grid.x, grid.y),
@@ -261,7 +261,7 @@ def _bmm(a, b):
         per_core_M=m,
         per_core_N=n,
     )
-    return ttnn.matmul(a, b, program_config=cfg, compute_kernel_config=_COMPUTE)
+    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE)
 
 
 def _sdpa_cfg(q):
@@ -503,7 +503,9 @@ def build(device, torch_module):
         # tensor is ever materialised `n_heads` times. `head // groups` IS the reference's
         # `repeat_kv` mapping, so the grouping is the same one HF uses.
         cap = int(kv_cache["k"].shape[-2])
-        scores = _bmm(q, ttnn.transpose(kv_cache["k"], -2, -1))
+        # The bmm reads the cache transposed in place; an explicit transpose re-wrote the whole
+        # [B, n_kv, C, head_dim] K cache every step.
+        scores = _bmm(q, kv_cache["k"], transpose_b=True)
         ttnn.deallocate(q)
         # The cache tail beyond `position` is zeros, and a zero key scores ZERO -- which is a
         # perfectly ordinary logit, not a small one. It has to be masked explicitly.
