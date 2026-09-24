@@ -343,12 +343,11 @@ class TtNemotronHMamba2Mixer:
         if fill:
             self._state = getattr(self, "_state", {})
         # 3. depthwise causal conv1d via shift-matmul + per-tap channel scale
-        conv_acc = None
-        for s in range(self.conv_k):
+        conv_acc = ttnn.multiply(hbc, self._conv_taps[0])  # lag 0: the shift is the identity
+        for s in range(1, self.conv_k):
             shifted = ttnn.matmul(consts["shifts"][s], hbc, compute_kernel_config=self.ckc)  # (B,T,conv_dim)
-            term = ttnn.multiply(shifted, self._conv_taps[s])
+            conv_acc = ttnn.addcmul(conv_acc, shifted, self._conv_taps[s])  # acc + x[t-s] * tap_s in one pass
             ttnn.deallocate(shifted)
-            conv_acc = term if conv_acc is None else ttnn.add(conv_acc, term)
         if fill:
             hbc_pre = hbc
         else:

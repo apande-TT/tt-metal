@@ -475,11 +475,11 @@ class NemotronHBlock:
         if fill:
             self._state = getattr(self, "_state", {})
         # 2. Causal depthwise conv1d (k=4) over the 6144 channels, then SiLU.
-        conv_acc = None
-        for lag in range(K):
+        conv_acc = ttnn.mul(hsBC, self._conv_taps[0])  # lag 0: the shift is the identity
+        for lag in range(1, K):
             shifted = ttnn.matmul(self._shift3[lag], hsBC, compute_kernel_config=ckc)  # [1,S,conv_dim]
-            term = ttnn.mul(shifted, self._conv_taps[lag])
-            conv_acc = term if conv_acc is None else ttnn.add(conv_acc, term)
+            conv_acc = ttnn.addcmul(conv_acc, shifted, self._conv_taps[lag])  # acc + x[t-lag] * tap in one pass
+            ttnn.deallocate(shifted)
         if self._conv_bias is not None:
             conv_acc = ttnn.add(conv_acc, self._conv_bias)
         conv_out = ttnn.silu(conv_acc)  # [1,S,6144]
