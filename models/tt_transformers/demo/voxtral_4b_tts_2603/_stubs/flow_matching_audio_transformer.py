@@ -47,7 +47,6 @@ import torch
 
 import ttnn
 
-
 _TILE = 32
 _MASK_NEG = -1.0e9
 
@@ -56,7 +55,10 @@ def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
         return ttnn.from_torch(
-            t, dtype=dtype, layout=layout, device=device,
+            t,
+            dtype=dtype,
+            layout=layout,
+            device=device,
             mesh_mapper=ttnn.ReplicateTensorToMesh(device),
         )
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
@@ -68,9 +70,7 @@ def _weight(linear, device):
 
 def _gamma(norm, device):
     """A norm's gamma as a `[1, 1, 1, dim]` float32 tile tensor, for `_rms_norm`."""
-    return _from_torch(
-        norm.weight.detach().reshape(1, 1, 1, -1).contiguous(), device, dtype=ttnn.float32
-    )
+    return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1).contiguous(), device, dtype=ttnn.float32)
 
 
 def _rms_norm(x, gamma, eps):
@@ -91,6 +91,22 @@ _COMPUTE = ttnn.WormholeComputeKernelConfig(
 )
 
 
+def _lin(x, w, **kwargs):
+    """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
+
+    A `[B, 1, S, K]` activation against a 2-D weight runs as B separate `S x K x N` matmuls that
+    each re-read the whole weight from DRAM; `[1, 1, B*S, K]` is one matmul that reads it once.
+    """
+    shape = [int(d) for d in x.shape]
+    lead = 1
+    for d in shape[:-2]:
+        lead *= d
+    if lead == 1:
+        return ttnn.linear(x, w, **kwargs)
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, lead * shape[-2], shape[-1]]), w, **kwargs)
+    return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
+
+
 def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     """GQA attention, bidirectional and non-causal, entirely in float32.
 
@@ -107,7 +123,7 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     K/V are repeated to the query head count exactly as the reference's `repeat_kv` does
     (`_repeat_interleave`: query head h reads KV head h // repeats).
     """
-    qkv = ttnn.linear(h, wqkv, compute_kernel_config=_COMPUTE)
+    qkv = _lin(h, wqkv, compute_kernel_config=_COMPUTE)
     q, k, v = ttnn.experimental.nlp_create_qkv_heads(
         qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
     )
@@ -117,9 +133,7 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
         v = ttnn.repeat_interleave(v, repeats, dim=1)
 
     # The reference scales the QUERY before the product, not the scores after it.
-    scores = ttnn.matmul(
-        ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1), compute_kernel_config=_COMPUTE
-    )
+    scores = ttnn.matmul(ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1), compute_kernel_config=_COMPUTE)
     if attn_mask is not None:
         scores = ttnn.add(scores, attn_mask)
     scores = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True))
@@ -127,8 +141,10 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
     out = ttnn.matmul(weights, v, compute_kernel_config=_COMPUTE)
-    return ttnn.linear(
-        ttnn.experimental.nlp_concat_heads(out), wo, dtype=ttnn.float32,
+    return _lin(
+        ttnn.experimental.nlp_concat_heads(out),
+        wo,
+        dtype=ttnn.float32,
         compute_kernel_config=_COMPUTE,
     )
 
@@ -164,10 +180,10 @@ def _compile_block(device, blk, mask):
 
         hn = _rms_norm(h, g_ffn, eps)
         gated = ttnn.multiply(
-            ttnn.silu(ttnn.linear(hn, w1, compute_kernel_config=_COMPUTE)),
-            ttnn.linear(hn, w3, compute_kernel_config=_COMPUTE),
+            ttnn.silu(_lin(hn, w1, compute_kernel_config=_COMPUTE)),
+            _lin(hn, w3, compute_kernel_config=_COMPUTE),
         )
-        return ttnn.add(h, ttnn.linear(gated, w2, compute_kernel_config=_COMPUTE))
+        return ttnn.add(h, _lin(gated, w2, compute_kernel_config=_COMPUTE))
 
     return run
 
@@ -181,9 +197,7 @@ def build(device, torch_module, batch=None):
     # float32, not bfloat16: `inv_freq` is COMPUTED by the module (exp of an arange), not a
     # checkpoint tensor, so bfloat16 would put 0.4% of error into the sinusoidal phase that
     # nothing downstream can recover.
-    inv_freq = _from_torch(
-        at.time_embedding.inv_freq.detach().reshape(1, -1).contiguous(), device, dtype=ttnn.float32
-    )
+    inv_freq = _from_torch(at.time_embedding.inv_freq.detach().reshape(1, -1).contiguous(), device, dtype=ttnn.float32)
     w_time = _weight(at.time_projection, device)
     w_llm = _weight(at.llm_projection, device)
     w_input = _weight(at.input_projection, device)
@@ -191,9 +205,7 @@ def build(device, torch_module, batch=None):
     w_semantic = _weight(at.semantic_codebook_output, device)
     semantic_bias = None
     if at.semantic_codebook_output.bias is not None:
-        semantic_bias = _from_torch(
-            at.semantic_codebook_output.bias.detach().reshape(1, 1, 1, -1), device
-        )
+        semantic_bias = _from_torch(at.semantic_codebook_output.bias.detach().reshape(1, 1, 1, -1), device)
 
     # Columns 3..31 of the padded tile are not real tokens; block them so rows 0..2 attend to
     # exactly the three the reference builds.
@@ -209,18 +221,14 @@ def build(device, torch_module, batch=None):
     def _pad_for(rows):
         buf = _pads.get(rows)
         if buf is None:
-            buf = _from_torch(
-                torch.zeros(rows, 1, pad_rows, dim), device, dtype=ttnn.float32
-            )
+            buf = _from_torch(torch.zeros(rows, 1, pad_rows, dim), device, dtype=ttnn.float32)
             _pads[rows] = buf
         return buf
 
     if batch is not None:
         _pad_for(int(batch))
 
-    blocks = [
-        _compile_block(device, at.layers[str(i)], mask) for i in at.layers_ids
-    ]
+    blocks = [_compile_block(device, at.layers[str(i)], mask) for i in at.layers_ids]
     g_final = _gamma(at.norm, device)
     eps_final = float(at.norm.eps)
 
@@ -232,7 +240,7 @@ def build(device, torch_module, batch=None):
         h_in = ttnn.reshape(llm_hidden, [batch, 1, 1, dim])
 
         h_in = ttnn.typecast(h_in, ttnn.float32)
-        semantic = ttnn.linear(h_in, w_semantic, compute_kernel_config=_COMPUTE)
+        semantic = _lin(h_in, w_semantic, compute_kernel_config=_COMPUTE)
         if semantic_bias is not None:
             semantic = ttnn.add(semantic, semantic_bias)
         semantic = ttnn.reshape(semantic, [batch, semantic_out])
@@ -244,9 +252,9 @@ def build(device, torch_module, batch=None):
             compute_kernel_config=_COMPUTE,
         )
         t_emb = ttnn.concat([ttnn.cos(freqs), ttnn.sin(freqs)], dim=-1)
-        t_proj = ttnn.linear(t_emb, w_time, compute_kernel_config=_COMPUTE)
-        llm_proj = ttnn.linear(h_in, w_llm, compute_kernel_config=_COMPUTE)
-        x_proj = ttnn.linear(
+        t_proj = _lin(t_emb, w_time, compute_kernel_config=_COMPUTE)
+        llm_proj = _lin(h_in, w_llm, compute_kernel_config=_COMPUTE)
+        x_proj = _lin(
             ttnn.typecast(ttnn.reshape(x_t, [batch, 1, 1, int(x_t.shape[-1])]), ttnn.float32),
             w_input,
             compute_kernel_config=_COMPUTE,
@@ -260,7 +268,7 @@ def build(device, torch_module, batch=None):
 
         first = ttnn.slice(h, [0, 0, 0, 0], [batch, 1, 1, dim])
         velocity = ttnn.reshape(
-            ttnn.linear(first, w_acoustic, compute_kernel_config=_COMPUTE),
+            _lin(first, w_acoustic, compute_kernel_config=_COMPUTE),
             [batch, acoustic_out],
         )
         return velocity, semantic
