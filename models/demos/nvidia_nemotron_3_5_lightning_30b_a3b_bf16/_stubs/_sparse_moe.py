@@ -39,7 +39,9 @@ _EXPERT_CKC = ttnn.WormholeComputeKernelConfig(
 )
 
 
-def bmm_config(device, M, K, N, in0_dtype, in1_dtype, out_dtype=None, cb_budget=512 * 1024, dest_tiles=4):
+def bmm_config(
+    device, M, K, N, in0_dtype, in1_dtype, out_dtype=None, cb_budget=512 * 1024, dest_tiles=4, fused_activation=None
+):
     """Hand-shaped 2-D multicast config for the sparse-MoE matmuls.
 
     Left to itself ttnn picks in0_block_w=1 here, so every K tile is its own
@@ -72,7 +74,7 @@ def bmm_config(device, M, K, N, in0_dtype, in1_dtype, out_dtype=None, cb_budget=
         per_core_M=pm,
         per_core_N=pn,
         transpose_mcast=False,
-        fused_activation=None,
+        fused_activation=fused_activation,
         fuse_batch=False,
     )
 
@@ -95,12 +97,21 @@ def routed_mix(device, hs, W, up_b, down_cat, C, ckc, arange_cache):
         up_b,
         compute_kernel_config=_EXPERT_CKC,
         dtype=ttnn.bfloat8_b,
-        program_config=bmm_config(device, C, H, I, xe.dtype, up_b.dtype, dest_tiles=8),
-    )  # (Eloc, C, I)
+        program_config=bmm_config(
+            device,
+            C,
+            H,
+            I,
+            xe.dtype,
+            up_b.dtype,
+            dest_tiles=8,
+            fused_activation=ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU),
+        ),
+    )  # (Eloc, C, I), relu applied in the matmul epilogue
     ttnn.deallocate(xe)
     w3 = ttnn.to_layout(ttnn.reshape(ttnn.to_layout(vals, ttnn.ROW_MAJOR_LAYOUT), [Eloc, C, 1]), ttnn.TILE_LAYOUT)
     act = ttnn.multiply(
-        ttnn.relu(act), w3, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]
+        act, w3, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]
     )  # relu2 * routing weight
     ye = ttnn.matmul(
         act,
