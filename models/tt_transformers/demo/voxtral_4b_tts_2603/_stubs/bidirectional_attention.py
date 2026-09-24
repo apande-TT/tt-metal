@@ -168,27 +168,31 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     6e-8 is worth none of them. The sequence here is one 32-row tile, so the explicit form costs
     four small ops per block and nothing measurable in time.
 
-    K/V are repeated to the query head count exactly as the reference's `repeat_kv` does
-    (`_repeat_interleave`: query head h reads KV head h // repeats).
+    The query heads are GROUPED BY KV HEAD rather than K/V being repeat_interleaved: query head
+    h reads KV head h // repeats (the reference's `repeat_kv` mapping), and those `repeats` heads
+    are contiguous, so `[B, H, S, D]` read as `[B, H_kv, repeats * S, D]` is a free view whose
+    batch dims line up with K/V's. No K/V tensor is materialised `repeats` times. The mask only
+    ever blocks COLUMNS, so its first row broadcasts over every stacked query row.
     """
     qkv = _lin(h, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
     q, k, v = ttnn.experimental.nlp_create_qkv_heads(
         qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
     )
+    batch, _, seq, head_dim = (int(d) for d in q.shape)
     repeats = n_heads // n_kv_heads
-    if repeats > 1:
-        k = ttnn.repeat_interleave(k, repeats, dim=1)
-        v = ttnn.repeat_interleave(v, repeats, dim=1)
+    q = ttnn.reshape(q, [batch, n_kv_heads, repeats * seq, head_dim])
 
     # The reference scales the QUERY before the product, not the scores after it.
     scores = _bmm(ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1))
     if attn_mask is not None:
+        if int(attn_mask.shape[-2]) != 1:
+            attn_mask = ttnn.slice(attn_mask, [0, 0, 0, 0], [1, 1, 1, int(attn_mask.shape[-1])])
         scores = ttnn.add(scores, attn_mask)
     scores = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True))
     weights = ttnn.exp(scores)
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
-    out = _bmm(weights, v)
+    out = ttnn.reshape(_bmm(weights, v), [batch, n_heads, seq, head_dim])
     return _lin(
         ttnn.experimental.nlp_concat_heads(out),
         wo,
