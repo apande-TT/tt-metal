@@ -306,7 +306,7 @@ class TtNemotronHExperts:
         if ar is None:
             ar = self._arange[T] = self._upload(torch.arange(T, dtype=torch.float32).reshape(T, 1), ttnn.float32)
         idx_f = ttnn.reshape(ttnn.typecast(idx, ttnn.float32), [1, Eloc * C])
-        onehot = ttnn.typecast(ttnn.eq(ar, idx_f), ttnn.bfloat16)  # (T, Eloc*C)
+        onehot = ttnn.eq(ar, idx_f, dtype=ttnn.bfloat8_b)  # (T, Eloc*C); 0/1 is exact in bf8_b
         out = ttnn.matmul(
             onehot, ttnn.reshape(ye, [Eloc * C, H]), compute_kernel_config=self._expert_ckc, dtype=ttnn.float32
         )  # (T, H)
