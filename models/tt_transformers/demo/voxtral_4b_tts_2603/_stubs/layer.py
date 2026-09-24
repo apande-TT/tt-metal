@@ -592,7 +592,10 @@ def build(device, torch_module):
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
         )
         ttnn.deallocate(hn)
-        h = ttnn.add(h, _lin(gated, w_down, dtype=h.dtype, compute_kernel_config=_COMPUTE))
+        # Prefill hands the down projection over in bf16, as the composed kinds' mlp and every wo
+        # already do; the residual it is added into stays float32.
+        down_dtype = h.dtype if decode else ttnn.bfloat16
+        h = ttnn.add(h, _lin(gated, w_down, dtype=down_dtype, compute_kernel_config=_COMPUTE))
         ttnn.deallocate(gated)
 
         return _restore(h, lead, seq, rank, dim)
