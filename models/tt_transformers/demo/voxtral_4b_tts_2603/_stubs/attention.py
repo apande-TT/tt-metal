@@ -428,7 +428,12 @@ def build(device, torch_module):
             part = ttnn.slice(rows, [0, 0, 0, start], [1, 1, batch, start + width])
             return ttnn.to_layout(ttnn.reshape(part, [batch, n_kv_heads, heads_per_kv, head_dim]), ttnn.TILE_LAYOUT)
 
+        # The grouped query is `groups` rows of a 32-row tile. Zero-padding it to a LOGICAL full tile
+        # costs nothing physically and lets every softmax reduction below skip its FillPad pass.
+        q_rows = -(-groups // 32) * 32
         q = _head_split(0, q_width, groups)
+        if q_rows != groups:
+            q = ttnn.pad(q, [(0, 0), (0, 0), (0, q_rows - groups), (0, 0)], 0.0)
         k = _head_split(q_width, kv_width, 1)
         v = _head_split(q_width + kv_width, kv_width, 1)
         ttnn.deallocate(rows)
@@ -481,7 +486,12 @@ def build(device, torch_module):
         ctx = _bmm(weights, kv_cache["v"])
         ttnn.deallocate(weights)
         merged = ttnn.to_layout(
-            ttnn.reshape(ttnn.to_layout(ctx, ttnn.ROW_MAJOR_LAYOUT), [1, 1, batch, n_heads * head_dim]),
+            ttnn.reshape(
+                ttnn.slice(
+                    ttnn.to_layout(ctx, ttnn.ROW_MAJOR_LAYOUT), [0, 0, 0, 0], [batch, n_kv_heads, groups, head_dim]
+                ),
+                [1, 1, batch, n_heads * head_dim],
+            ),
             ttnn.TILE_LAYOUT,
         )
         ttnn.deallocate(ctx)
