@@ -212,6 +212,62 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     )
 
 
+def _compact_weights(attn, device, n_heads, n_kv_heads, head_dim):
+    """The attention weights for `_compact_attention`, plus its two head-indicator matrices.
+
+    The query heads are reordered from the reference's `kv * repeats + r` to `r * n_kv + kv`, and
+    `wo`'s input rows with them, so the output is unchanged. In that order the query row lines up
+    with its KV row tiled `repeats` times side by side, which `ttnn.repeat` builds for free.
+    `head_sum [H*D, H]` adds each head's D columns into one; `head_bcast` is its transpose.
+    """
+    repeats = n_heads // n_kv_heads
+    order = torch.tensor([kv * repeats + r for r in range(repeats) for kv in range(n_kv_heads)])
+    wq = attn.wq.weight.detach().transpose(0, 1)
+    wq = wq.reshape(wq.shape[0], n_heads, head_dim)[:, order].reshape(wq.shape[0], -1)
+    wqkv = torch.cat([wq, attn.wk.weight.detach().transpose(0, 1), attn.wv.weight.detach().transpose(0, 1)], dim=-1)
+    wo = attn.wo.weight.detach().transpose(0, 1)
+    wo = wo.reshape(n_heads, head_dim, -1)[order].reshape(n_heads * head_dim, -1)
+    q_dim = n_heads * head_dim
+    ind = torch.zeros(q_dim, n_heads)
+    ind[torch.arange(q_dim), torch.arange(q_dim) // head_dim] = 1.0
+    return {
+        "wqkv": _from_torch(wqkv.contiguous(), device),
+        "wo": _from_torch(wo.contiguous(), device),
+        "head_sum": _from_torch(ind.reshape(1, 1, q_dim, n_heads), device, dtype=ttnn.float32),
+        "head_bcast": _from_torch(ind.t().contiguous().reshape(1, 1, n_heads, q_dim), device, dtype=ttnn.float32),
+    }
+
+
+def _compact_attention(h, cw, n_heads, n_kv_heads, head_dim, scale, tokens):
+    """The same attention on the COMPACT layout: `[1, 1, tokens * R, dim]`, token t in rows t*R..
+
+    No 32-row pad per sample, so nothing downstream computes on 29 padding rows. With only
+    `tokens` keys, every (key j, query i) pair is formed at once as `[j, i, R, H*D]`: the queries
+    broadcast over j, and ONE repeat lays each key token out under every query token AND tiles
+    its KV heads across the query heads. A head-sum matmul turns the products into scores, the
+    softmax runs over the j axis in float32, and no mask is needed: every row is real.
+    """
+    rows = int(h.shape[-2])
+    r = rows // tokens
+    q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
+    repeats = n_heads // n_kv_heads
+    qkv = _lin(h, cw["wqkv"], dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+    q = ttnn.multiply(ttnn.slice(qkv, [0, 0, 0, 0], [1, 1, rows, q_dim]), scale)
+    q = ttnn.reshape(q, [1, tokens, r, q_dim])
+
+    def _kv(off):
+        part = ttnn.reshape(ttnn.slice(qkv, [0, 0, 0, off], [1, 1, rows, off + kv_dim]), [tokens, 1, r, kv_dim])
+        return ttnn.repeat(part, [1, tokens, 1, repeats])
+
+    scores = ttnn.matmul(ttnn.multiply(q, _kv(q_dim)), cw["head_sum"], compute_kernel_config=_COMPUTE)
+    scores = ttnn.subtract(scores, ttnn.max(scores, dim=0, keepdim=True))
+    weights = ttnn.exp(scores)
+    weights = ttnn.divide(weights, ttnn.sum(weights, dim=0, keepdim=True))
+    w = ttnn.matmul(weights, cw["head_bcast"], compute_kernel_config=_COMPUTE)
+    out = ttnn.sum(ttnn.multiply(w, _kv(q_dim + kv_dim)), dim=0, keepdim=True)
+    return _lin(ttnn.reshape(out, [1, 1, rows, q_dim]), cw["wo"], dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+
+
 def _leading(shape) -> int:
     """The product of every axis before `[seq, dim]` -- the real batch, from the tensor."""
     dims = list(shape)[:-2]
@@ -251,8 +307,9 @@ def build(device, torch_module):
     w3 = _weight(ff.w3, device)
     g_attn = _gamma(blk.attention_norm, device)
     g_ffn = _gamma(blk.ffn_norm, device)
+    cw = _compact_weights(attn, device, n_heads, n_kv_heads, head_dim)
 
-    def acoustic_transformer_block(x, attn_mask=None, **kwargs):
+    def acoustic_transformer_block(x, attn_mask=None, tokens=None, **kwargs):
         seq = int(x.shape[-2])
         batch = _leading(x.shape)
         rank = len(list(x.shape))
@@ -262,7 +319,11 @@ def build(device, torch_module):
             h4 = ttnn.typecast(h4, ttnn.float32)
 
         xn = _rms_norm(h4, g_attn, eps, dtype=ttnn.bfloat16)
-        h4 = ttnn.add(h4, _attention(xn, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask))
+        if tokens:
+            attn_out = _compact_attention(xn, cw, n_heads, n_kv_heads, head_dim, scale, tokens)
+        else:
+            attn_out = _attention(xn, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask)
+        h4 = ttnn.add(h4, attn_out)
 
         hn = _rms_norm(h4, g_ffn, eps, dtype=ttnn.bfloat16)
         gate = _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)

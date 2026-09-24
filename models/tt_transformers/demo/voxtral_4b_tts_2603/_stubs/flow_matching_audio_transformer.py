@@ -228,13 +228,70 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     )
 
 
+def _compact_weights(attn, device, n_heads, n_kv_heads, head_dim):
+    """The attention weights for `_compact_attention`, plus its two head-indicator matrices.
+
+    The query heads are reordered from the reference's `kv * repeats + r` to `r * n_kv + kv`, and
+    `wo`'s input rows with them, so the output is unchanged. In that order the query row lines up
+    with its KV row tiled `repeats` times side by side, which `ttnn.repeat` builds for free.
+    `head_sum [H*D, H]` adds each head's D columns into one; `head_bcast` is its transpose.
+    """
+    repeats = n_heads // n_kv_heads
+    order = torch.tensor([kv * repeats + r for r in range(repeats) for kv in range(n_kv_heads)])
+    wq = attn.wq.weight.detach().transpose(0, 1)
+    wq = wq.reshape(wq.shape[0], n_heads, head_dim)[:, order].reshape(wq.shape[0], -1)
+    wqkv = torch.cat([wq, attn.wk.weight.detach().transpose(0, 1), attn.wv.weight.detach().transpose(0, 1)], dim=-1)
+    wo = attn.wo.weight.detach().transpose(0, 1)
+    wo = wo.reshape(n_heads, head_dim, -1)[order].reshape(n_heads * head_dim, -1)
+    q_dim = n_heads * head_dim
+    ind = torch.zeros(q_dim, n_heads)
+    ind[torch.arange(q_dim), torch.arange(q_dim) // head_dim] = 1.0
+    return {
+        "wqkv": _from_torch(wqkv.contiguous(), device),
+        "wo": _from_torch(wo.contiguous(), device),
+        "head_sum": _from_torch(ind.reshape(1, 1, q_dim, n_heads), device, dtype=ttnn.float32),
+        "head_bcast": _from_torch(ind.t().contiguous().reshape(1, 1, n_heads, q_dim), device, dtype=ttnn.float32),
+    }
+
+
+def _compact_attention(h, cw, n_heads, n_kv_heads, head_dim, scale, tokens):
+    """The same attention on the COMPACT layout: `[1, 1, tokens * R, dim]`, token t in rows t*R..
+
+    No 32-row pad per sample, so nothing downstream computes on 29 padding rows. With only
+    `tokens` keys, every (key j, query i) pair is formed at once as `[j, i, R, H*D]`: the queries
+    broadcast over j, and ONE repeat lays each key token out under every query token AND tiles
+    its KV heads across the query heads. A head-sum matmul turns the products into scores, the
+    softmax runs over the j axis in float32, and no mask is needed: every row is real.
+    """
+    rows = int(h.shape[-2])
+    r = rows // tokens
+    q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
+    repeats = n_heads // n_kv_heads
+    qkv = _lin(h, cw["wqkv"], dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+    q = ttnn.multiply(ttnn.slice(qkv, [0, 0, 0, 0], [1, 1, rows, q_dim]), scale)
+    q = ttnn.reshape(q, [1, tokens, r, q_dim])
+
+    def _kv(off):
+        part = ttnn.reshape(ttnn.slice(qkv, [0, 0, 0, off], [1, 1, rows, off + kv_dim]), [tokens, 1, r, kv_dim])
+        return ttnn.repeat(part, [1, tokens, 1, repeats])
+
+    scores = ttnn.matmul(ttnn.multiply(q, _kv(q_dim)), cw["head_sum"], compute_kernel_config=_COMPUTE)
+    scores = ttnn.subtract(scores, ttnn.max(scores, dim=0, keepdim=True))
+    weights = ttnn.exp(scores)
+    weights = ttnn.divide(weights, ttnn.sum(weights, dim=0, keepdim=True))
+    w = ttnn.matmul(weights, cw["head_bcast"], compute_kernel_config=_COMPUTE)
+    out = ttnn.sum(ttnn.multiply(w, _kv(q_dim + kv_dim)), dim=0, keepdim=True)
+    return _lin(ttnn.reshape(out, [1, 1, rows, q_dim]), cw["wo"], dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+
+
 def _compile_block(device, blk, mask):
     """One `AcousticTransformerBlock` as a callable on `[B, 1, TILE, dim]`."""
     attn = blk.attention
     ff = blk.feed_forward
     n_heads = int(attn.n_local_heads)
     n_kv_heads = int(attn.n_local_kv_heads)
-    scale = 1.0 / math.sqrt(int(attn.head_dim))
+    head_dim = int(attn.head_dim)
+    scale = 1.0 / math.sqrt(head_dim)
 
     wqkv = _from_torch(
         torch.cat(
@@ -254,10 +311,15 @@ def _compile_block(device, blk, mask):
     g_attn = _gamma(blk.attention_norm, device)
     g_ffn = _gamma(blk.ffn_norm, device)
     eps = float(blk.attention_norm.eps)
+    cw = _compact_weights(attn, device, n_heads, n_kv_heads, head_dim)
 
-    def run(h):
+    def run(h, tokens=None):
         xn = _rms_norm(h, g_attn, eps, dtype=ttnn.bfloat16)
-        h = ttnn.add(h, _attention(xn, wqkv, wo, n_heads, n_kv_heads, scale, mask))
+        if tokens:
+            attn_out = _compact_attention(xn, cw, n_heads, n_kv_heads, head_dim, scale, tokens)
+        else:
+            attn_out = _attention(xn, wqkv, wo, n_heads, n_kv_heads, scale, mask)
+        h = ttnn.add(h, attn_out)
 
         hn = _rms_norm(h, g_ffn, eps, dtype=ttnn.bfloat16)
         gated = ttnn.multiply(
@@ -319,8 +381,40 @@ def build(device, torch_module, batch=None):
     acoustic_out = int(at.acoustic_codebook_output.out_features)
     semantic_out = int(at.semantic_codebook_output.out_features)
 
+    def _compact_forward(llm_hidden, x_t, t, batch):
+        # Token t of every sample in rows t*batch.. -- no per-sample 29-row tile pad.
+        h_in = ttnn.typecast(ttnn.reshape(llm_hidden, [1, 1, batch, dim]), ttnn.float32)
+        semantic = _lin(h_in, w_semantic, compute_kernel_config=_COMPUTE)
+        if semantic_bias is not None:
+            semantic = ttnn.add(semantic, semantic_bias)
+        semantic = ttnn.reshape(semantic, [batch, semantic_out])
+
+        freqs = ttnn.matmul(
+            ttnn.typecast(ttnn.reshape(t, [1, 1, batch, int(t.shape[-1])]), ttnn.float32),
+            ttnn.typecast(inv_freq, ttnn.float32),
+            compute_kernel_config=_COMPUTE,
+        )
+        t_emb = ttnn.concat([ttnn.cos(freqs), ttnn.sin(freqs)], dim=-1)
+        x_in = ttnn.typecast(ttnn.reshape(x_t, [1, 1, batch, int(x_t.shape[-1])]), ttnn.float32)
+        h = ttnn.concat(
+            [
+                _lin(x_in, w_input, compute_kernel_config=_COMPUTE),
+                _lin(t_emb, w_time, compute_kernel_config=_COMPUTE),
+                _lin(h_in, w_llm, compute_kernel_config=_COMPUTE),
+            ],
+            dim=2,
+        )
+        for block in blocks:
+            h = block(h, tokens=n_real_tokens)
+        # The norm is per row and only token 0 is read out, so normalise just those rows.
+        first = _rms_norm(ttnn.slice(h, [0, 0, 0, 0], [1, 1, batch, dim]), g_final, eps_final)
+        velocity = ttnn.reshape(_lin(first, w_acoustic, compute_kernel_config=_COMPUTE), [batch, acoustic_out])
+        return velocity, semantic
+
     def flow_matching_audio_transformer(llm_hidden, x_t=None, t=None, **kwargs):
         batch = int(llm_hidden.shape[0])
+        if batch % _TILE == 0:
+            return _compact_forward(llm_hidden, x_t, t, batch)
         h_in = ttnn.reshape(llm_hidden, [batch, 1, 1, dim])
 
         h_in = ttnn.typecast(h_in, ttnn.float32)
