@@ -596,7 +596,9 @@ class NemotronHPipeline:
             out = ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, program_config=pc)
         elif int(h.shape[-2]) <= _dram_mm.TILE:  # one tile row: spread the vocab over the full grid
             pc = _dram_mm.mcast1d_config(self.device, self.hidden_size, int(self.lm_head_w.shape[-1]))
-            out = ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, program_config=pc)
+            out = ttnn.matmul(
+                h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, program_config=pc, dtype=ttnn.bfloat16
+            )  # bf16 logits: half the all_gather + untilize + argmax traffic per token
         else:
             out = ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, core_grid=core_grid)
         if self._lm_tp:
