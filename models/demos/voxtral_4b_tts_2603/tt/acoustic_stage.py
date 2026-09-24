@@ -425,16 +425,16 @@ class AcousticStage:
 
     # ---------------------------------------------------------------- the two bodies
 
-    def _whole_body(self, llm, x, t):
+    def _whole_body(self, llm, x, t, cache=None):
         """The graduated whole-section port: `velocity [R, 36]`, `semantic_logits [R, 8320]`."""
-        return self.whole(llm, x_t=x, t=t)
+        return self.whole(llm, x_t=x, t=t, step_cache=cache)
 
-    def _part_body(self, llm, x, t):
+    def _part_body(self, llm, x, t, cache=None):
         """The same field, composed from the part stubs plus this file's norms and projections."""
         p = self.parts
         rows = int(llm.shape[0])
         if rows % _TILE == 0:
-            return self._part_body_compact(llm, x, t, rows)
+            return self._part_body_compact(llm, x, t, rows, cache)
         h_in = ttnn.reshape(llm, [rows, 1, 1, self.dim])
         if h_in.dtype != ttnn.float32:
             h_in = ttnn.typecast(h_in, ttnn.float32)
@@ -466,22 +466,28 @@ class AcousticStage:
         )
         return velocity, semantic
 
-    def _part_body_compact(self, llm, x, t, rows):
+    def _part_body_compact(self, llm, x, t, rows, cache=None):
         """`_part_body` on the COMPACT layout: token k of every sample in rows k*rows.., no pad.
 
         Every linear, norm and eltwise in the blocks then runs on 3*rows real rows instead of
         32*rows, 29 of every 32 of which were padding. Needs `rows` to be tile-aligned.
         """
         p = self.parts
-        h_in = ttnn.reshape(llm, [1, 1, rows, self.dim])
-        if h_in.dtype != ttnn.float32:
-            h_in = ttnn.typecast(h_in, ttnn.float32)
-
-        semantic = ttnn.reshape(
-            _lin(h_in, p["w_semantic"], compute_kernel_config=_COMPUTE), [rows, self.semantic_out]
-        )
-        if p["b_semantic"] is not None:
-            semantic = ttnn.add(semantic, p["b_semantic"])
+        # `llm_proj` and the semantic head read only `llm`, identical at every Euler step of a frame.
+        if cache is not None and "llm_proj" in cache:
+            semantic, llm_proj = cache["semantic"], cache["llm_proj"]
+        else:
+            h_in = ttnn.reshape(llm, [1, 1, rows, self.dim])
+            if h_in.dtype != ttnn.float32:
+                h_in = ttnn.typecast(h_in, ttnn.float32)
+            semantic = ttnn.reshape(
+                _lin(h_in, p["w_semantic"], compute_kernel_config=_COMPUTE), [rows, self.semantic_out]
+            )
+            if p["b_semantic"] is not None:
+                semantic = ttnn.add(semantic, p["b_semantic"])
+            llm_proj = _lin(h_in, p["w_llm"], compute_kernel_config=_COMPUTE)
+            if cache is not None:
+                cache["semantic"], cache["llm_proj"] = semantic, llm_proj
 
         t_emb = ttnn.reshape(p["time_embedding"](t), [1, 1, rows, self.dim])
         x_in = ttnn.typecast(ttnn.reshape(x, [1, 1, rows, self.n_acoustic]), ttnn.float32)
@@ -489,7 +495,7 @@ class AcousticStage:
             [
                 _lin(x_in, p["w_input"], compute_kernel_config=_COMPUTE),
                 _lin(t_emb, p["w_time"], compute_kernel_config=_COMPUTE),
-                _lin(h_in, p["w_llm"], compute_kernel_config=_COMPUTE),
+                llm_proj,
             ],
             dim=2,
         )
@@ -575,6 +581,8 @@ class AcousticStage:
                     "one_minus": ttnn.subtract(self._ones(n), alpha_h),
                     "x": self._rows(x0, a, b, batch),
                     "sem": None,
+                    # Per-frame: the llm projection + semantic head, computed at step 0 and reused.
+                    "cache": {},
                 }
             )
 
@@ -582,7 +590,9 @@ class AcousticStage:
             dt = self.dts[i]
             for st in states:
                 n = st["n"]
-                v_all, sem = st["body"](st["llm_cfg"], ttnn.concat([st["x"], st["x"]], dim=0), self._t_rows(2 * n, i))
+                v_all, sem = st["body"](
+                    st["llm_cfg"], ttnn.concat([st["x"], st["x"]], dim=0), self._t_rows(2 * n, i), cache=st["cache"]
+                )
                 v_cond = ttnn.slice(v_all, [0, 0], [n, self.n_acoustic])
                 v_unc = ttnn.slice(v_all, [n, 0], [2 * n, self.n_acoustic])
                 v = ttnn.add(ttnn.multiply(v_cond, st["alpha"]), ttnn.multiply(v_unc, st["one_minus"]))
