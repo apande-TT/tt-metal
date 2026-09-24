@@ -171,7 +171,7 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     K/V are repeated to the query head count exactly as the reference's `repeat_kv` does
     (`_repeat_interleave`: query head h reads KV head h // repeats).
     """
-    qkv = _lin(h, wqkv, compute_kernel_config=_COMPUTE)
+    qkv = _lin(h, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
     q, k, v = ttnn.experimental.nlp_create_qkv_heads(
         qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
     )
@@ -224,9 +224,9 @@ def build(device, torch_module):
         batch = _leading(x.shape)
         rank = len(list(x.shape))
 
+        # A bf16 input (a norm that already narrowed its output) feeds the qkv matmul as-is; the
+        # projection writes float32, so the attention itself stays float32 either way.
         h = ttnn.reshape(x, [batch, 1, seq, dim])
-        if h.dtype != ttnn.float32:
-            h = ttnn.typecast(h, ttnn.float32)
         out = _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask)
         if rank >= 4:
             return ttnn.reshape(out, [batch, 1, seq, out_dim])

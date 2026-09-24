@@ -133,7 +133,7 @@ def _gamma(norm, device):
     return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1).contiguous(), device, dtype=ttnn.float32)
 
 
-def _rms_norm(x, gamma, eps):
+def _rms_norm(x, gamma, eps, dtype=None):
     """RMSNorm in float32: `x * rsqrt(mean(x^2) + eps) * gamma`.
 
     NOT the `ttnn` layernorm op, which carries 2.7e-3 of RELATIVE error -- measured on this chip
@@ -143,7 +143,7 @@ def _rms_norm(x, gamma, eps):
     worth ~1% of the output codes and 1.2e-7 is worth none of them.
     """
     inv = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
-    return ttnn.multiply(ttnn.multiply(x, inv), gamma)
+    return ttnn.multiply(ttnn.multiply(x, inv), gamma, dtype=dtype or ttnn.float32)
 
 
 def _bmm(a, b):
@@ -182,7 +182,7 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     K/V are repeated to the query head count exactly as the reference's `repeat_kv` does
     (`_repeat_interleave`: query head h reads KV head h // repeats).
     """
-    qkv = _lin(h, wqkv, compute_kernel_config=_COMPUTE)
+    qkv = _lin(h, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
     q, k, v = ttnn.experimental.nlp_create_qkv_heads(
         qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
     )
@@ -256,12 +256,12 @@ def build(device, torch_module):
         if h4.dtype != ttnn.float32:
             h4 = ttnn.typecast(h4, ttnn.float32)
 
-        xn = _rms_norm(h4, g_attn, eps)
+        xn = _rms_norm(h4, g_attn, eps, dtype=ttnn.bfloat16)
         h4 = ttnn.add(h4, _attention(xn, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask))
 
-        hn = _rms_norm(h4, g_ffn, eps)
-        gate = _lin(hn, w1, compute_kernel_config=_COMPUTE)
-        up = _lin(hn, w3, compute_kernel_config=_COMPUTE)
+        hn = _rms_norm(h4, g_ffn, eps, dtype=ttnn.bfloat16)
+        gate = _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+        up = _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
         h4 = ttnn.add(
             h4,
             _lin(

@@ -144,8 +144,8 @@ def build(device, torch_module):
 
         h = ttnn.reshape(x, [batch, 1, seq, dim])
         gated = ttnn.multiply(
-            _lin(h, w1, compute_kernel_config=_COMPUTE),
-            _lin(h, w3, compute_kernel_config=_COMPUTE),
+            _lin(h, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
+            _lin(h, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
         )
         out = _lin(gated, w2, compute_kernel_config=_COMPUTE)

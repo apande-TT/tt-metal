@@ -73,7 +73,7 @@ def _gamma(norm, device):
     return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1).contiguous(), device, dtype=ttnn.float32)
 
 
-def _rms_norm(x, gamma, eps):
+def _rms_norm(x, gamma, eps, dtype=None):
     """RMSNorm in float32: `x * rsqrt(mean(x^2) + eps) * gamma`.
 
     NOT the `ttnn` layernorm op, which carries 2.7e-3 of RELATIVE error -- measured on this chip
@@ -83,7 +83,7 @@ def _rms_norm(x, gamma, eps):
     worth ~1% of the output codes and 1.2e-7 is worth none of them.
     """
     inv = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
-    return ttnn.multiply(ttnn.multiply(x, inv), gamma)
+    return ttnn.multiply(ttnn.multiply(x, inv), gamma, dtype=dtype or ttnn.float32)
 
 
 _COMPUTE = ttnn.WormholeComputeKernelConfig(
@@ -198,7 +198,7 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     K/V are repeated to the query head count exactly as the reference's `repeat_kv` does
     (`_repeat_interleave`: query head h reads KV head h // repeats).
     """
-    qkv = _lin(h, wqkv, compute_kernel_config=_COMPUTE)
+    qkv = _lin(h, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
     q, k, v = ttnn.experimental.nlp_create_qkv_heads(
         qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
     )
@@ -250,13 +250,13 @@ def _compile_block(device, blk, mask):
     eps = float(blk.attention_norm.eps)
 
     def run(h):
-        xn = _rms_norm(h, g_attn, eps)
+        xn = _rms_norm(h, g_attn, eps, dtype=ttnn.bfloat16)
         h = ttnn.add(h, _attention(xn, wqkv, wo, n_heads, n_kv_heads, scale, mask))
 
-        hn = _rms_norm(h, g_ffn, eps)
+        hn = _rms_norm(h, g_ffn, eps, dtype=ttnn.bfloat16)
         gated = ttnn.multiply(
-            _lin(hn, w1, compute_kernel_config=_COMPUTE),
-            _lin(hn, w3, compute_kernel_config=_COMPUTE),
+            _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
+            _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
         )
         return ttnn.add(h, _lin(gated, w2, compute_kernel_config=_COMPUTE))
