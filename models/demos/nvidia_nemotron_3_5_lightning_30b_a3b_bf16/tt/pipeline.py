@@ -160,6 +160,9 @@ def _reshape_rm(t, shape):
     graduated stubs use this same pattern for their head reshapes.
     """
     was_tile = t.layout == ttnn.TILE_LAYOUT
+    old = [int(v) for v in t.shape]
+    if was_tile and shape[-1] == old[-1] and (shape[-2] == old[-2] or (shape[-2] % 32 == 0 and old[-2] % 32 == 0)):
+        return ttnn.reshape(t, list(shape))  # rows stay tile-aligned: a view, no round trip
     if was_tile:
         t = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
     t = ttnn.reshape(t, list(shape))
@@ -380,13 +383,17 @@ class TtNemotronHLayer:
             h_flat = _reshape_rm(h, [B * T, hid])  # tokens are independent here
             W, ntok = self._route(h_flat)
 
+            # routed and shared expert both TP-partial: sum them, all_reduce once
+            shared_tp = self.shared._shard if self.variant == "MOE_B" else self._sh_tp
+            merge = self.experts._shard and shared_tp
+
             _invocation.record("nemotron_h_experts")
-            routed = self.experts(h_flat, routing_dense=W)  # (tokens, hidden)
+            routed = self.experts(h_flat, routing_dense=W, reduce=not merge)  # (tokens, hidden)
             routed = _reshape_rm(routed, [B, T, hid])
 
             if self.variant == "MOE_B":
                 _invocation.record("nemotron_h_m_l_p")
-                shared = _dram_mm.from_rows(self.shared(_dram_mm.as_rows(h)), B, T)
+                shared = _dram_mm.from_rows(self.shared(_dram_mm.as_rows(h), reduce=not merge), B, T)
             else:
                 # upcast first: the norm stub hands back bf16, and feeding a
                 # bf16 activation into these fp32 weights is what made this
@@ -400,11 +407,13 @@ class TtNemotronHLayer:
                 ttnn.deallocate(up)
                 shared = ttnn.matmul(act, self._sh_dn, compute_kernel_config=ckc)
                 ttnn.deallocate(act)
-                if self._sh_tp:
+                if self._sh_tp and not merge:
                     shared = ttnn.all_reduce(shared, cluster_axis=1, topology=ttnn.Topology.Linear)
                 shared = _dram_mm.from_rows(shared, B, T)
 
             y = ttnn.add(_f32(routed), _f32(shared))
+            if merge:
+                y = ttnn.all_reduce(y, cluster_axis=1, topology=ttnn.Topology.Linear)
 
         # Keep the residual stream in fp32. The graduated stubs each return
         # bf16, but truncating the RESIDUAL too costs ~3 decimal digits per

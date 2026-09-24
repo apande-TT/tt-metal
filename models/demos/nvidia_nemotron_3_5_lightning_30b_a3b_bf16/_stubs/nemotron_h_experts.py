@@ -211,7 +211,10 @@ class TtNemotronHExperts:
         return self._dev(t.float())
 
     # ----------------------------- forward ---------------------------- #
-    def __call__(self, hidden_states, top_k_index=None, top_k_weights=None, routing_dense=None, **kwargs):
+    def __call__(self, hidden_states, top_k_index=None, top_k_weights=None, routing_dense=None, reduce=True, **kwargs):
+        """reduce=False returns this chip's fp32 partial mixture (no all_reduce),
+        so a caller can sum it with other TP partials and reduce once."""
+        self._reduce = reduce
         hs = self._fp32(hidden_states)
         if hs.layout != ttnn.TILE_LAYOUT:
             hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
@@ -269,6 +272,8 @@ class TtNemotronHExperts:
             self.device, hs, W_sh, self._up_b, self._down_cat, C, self._expert_ckc, self._arange
         )
         ttnn.deallocate(W_sh)
+        if not self._reduce:
+            return out
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
         return ttnn.typecast(out, ttnn.bfloat16)
@@ -320,6 +325,8 @@ class TtNemotronHExperts:
         ttnn.deallocate(act)
         ttnn.deallocate(W_sh)
 
+        if not self._reduce:
+            return out
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
         return ttnn.typecast(out, ttnn.bfloat16)

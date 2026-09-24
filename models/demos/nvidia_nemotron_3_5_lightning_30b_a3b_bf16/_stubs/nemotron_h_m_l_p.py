@@ -108,7 +108,9 @@ class TtNemotronHMLP:
         return self._dev(t.float())
 
     # ----------------------------- forward ---------------------------- #
-    def __call__(self, hidden_states, **kwargs):
+    def __call__(self, hidden_states, reduce=True, **kwargs):
+        """reduce=False returns this chip's fp32 partial (no all_reduce), so a
+        caller can sum it with other TP partials and reduce once."""
         hs = self._fp32(hidden_states)
         if hs.layout != ttnn.TILE_LAYOUT:
             hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
@@ -119,6 +121,8 @@ class TtNemotronHMLP:
 
         out = ttnn.matmul(act, self._w_down, compute_kernel_config=self.ckc)  # (.,.,hidden) partial if sharded
         ttnn.deallocate(act)
+        if not reduce:
+            return out
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
         return ttnn.typecast(out, ttnn.bfloat16)
