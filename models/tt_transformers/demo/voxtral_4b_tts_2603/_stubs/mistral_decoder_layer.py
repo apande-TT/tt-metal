@@ -161,7 +161,7 @@ def _norm_weight(norm, device):
     return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
 
 
-def _rms_norm(x, gamma, eps):
+def _rms_norm(x, gamma, eps, dtype=None):
     """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
 
     NOT `ttnn.rms_norm`. On the real layer-0 input the stock op lands at 9.65e-4 relative error
@@ -174,7 +174,7 @@ def _rms_norm(x, gamma, eps):
     sequence padded up to a tile multiple neither NaNs nor leaks into a real row.
     """
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
-    return ttnn.multiply(ttnn.multiply(x, scale), gamma)
+    return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
 
 
 def _view4(x, dim):
@@ -489,7 +489,7 @@ def build(device, torch_module):
     ):
         h, lead, seq, rank = _view4(hidden_states, dim)
 
-        xn = _rms_norm(h, g_in, eps_in)
+        xn = _rms_norm(h, g_in, eps_in, dtype=None if decode else ttnn.bfloat16)
         if decode:
             attn_out = _decode_attn(xn, position_embeddings, kv_cache, position)
         else:
@@ -498,7 +498,7 @@ def build(device, torch_module):
         h = ttnn.add(h, attn_out)
         ttnn.deallocate(attn_out)
 
-        hn = _rms_norm(h, g_post, eps_post)
+        hn = _rms_norm(h, g_post, eps_post, dtype=None if decode else ttnn.bfloat16)
         gated = ttnn.multiply(
             _lin(hn, w_gate, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
             _lin(hn, w_up, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
