@@ -540,7 +540,10 @@ class NemotronHBlock:
         dt_h = self._to_heads(dt, 1, 1, B)
         return _ssm_cache.mamba_ssm_step(self._state, x_h, B_h, C_h, dt_h, self._A4, self._D4, ckc)
 
-    def __call__(self, hidden_states, cache_params=None, cache_position=None, attention_mask=None, **kwargs):
+    def __call__(
+        self, hidden_states, cache_params=None, cache_position=None, attention_mask=None, dtype=ttnn.bfloat16, **kwargs
+    ):
+        """dtype: output dtype (the pipeline's fp32 residual stream asks for fp32)."""
         self._ensure_consts()
 
         ckc = self.ckc
@@ -621,10 +624,9 @@ class NemotronHBlock:
             # the full mixer output (the mesh readback keeps only chip 0's copy).
             out = ttnn.all_reduce(out, cluster_axis=1, topology=ttnn.Topology.Linear)
 
-        # residual add (HF: residual + hidden_states), then cast to bf16.
+        # residual add (HF: residual + hidden_states), then cast to the output dtype.
         output = ttnn.add(residual, out)
-        output = ttnn.typecast(output, ttnn.bfloat16)
-        return output
+        return output if output.dtype == dtype else ttnn.typecast(output, dtype)
 
 
 def build(device, torch_module):

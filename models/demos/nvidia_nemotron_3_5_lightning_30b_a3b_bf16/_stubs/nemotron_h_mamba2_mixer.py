@@ -453,7 +453,9 @@ class TtNemotronHMamba2Mixer:
         return _ssm_cache.mamba_ssm_step(self._state, X, Bh, Ch, dt_h, self._A, self._D, self.ckc)
 
     # ----------------------------- forward ---------------------------- #
-    def __call__(self, hidden_states, **kwargs):
+    def __call__(self, hidden_states, dtype=ttnn.bfloat16, **kwargs):
+        """dtype: output dtype (a caller that upcasts anyway asks for fp32)."""
+        self._out_dtype = dtype
         hs = self._fp32(hidden_states)
         if hs.layout != ttnn.TILE_LAYOUT:
             hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
@@ -508,7 +510,7 @@ class TtNemotronHMamba2Mixer:
             ttnn.deallocate(y)
             if self._shard:
                 out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
-            return ttnn.typecast(out, ttnn.bfloat16)
+            return self._cast_out(out)
 
         g_silu = ttnn.silu(gate)
         ttnn.deallocate(gate)
@@ -540,7 +542,11 @@ class TtNemotronHMamba2Mixer:
         ttnn.deallocate(y)
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
-        return ttnn.typecast(out, ttnn.bfloat16)
+        return self._cast_out(out)
+
+    def _cast_out(self, out):
+        dtype = getattr(self, "_out_dtype", ttnn.bfloat16)
+        return out if out.dtype == dtype else ttnn.typecast(out, dtype)
 
 
 # Module-level `build` — primary test entry point.

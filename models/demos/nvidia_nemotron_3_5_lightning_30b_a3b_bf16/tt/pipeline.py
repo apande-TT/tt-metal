@@ -350,7 +350,7 @@ class TtNemotronHLayer:
 
         if self.variant == "MAMBA_A":
             _invocation.record("nemotron_h_block")
-            return self.block(x)  # stub owns norm + mixer + residual
+            return self.block(x, dtype=ttnn.float32)  # stub owns norm + mixer + residual; fp32 residual stream
 
         # The norm stub deallocates its own working tensor, which IS the caller's
         # tensor when the input already arrives as fp32 (its `_fp32` is a no-op
@@ -361,10 +361,10 @@ class TtNemotronHLayer:
 
         if self.variant in ("MAMBA_B", "MAMBA_C"):
             _invocation.record("nemotron_h_mamba2_mixer")
-            y = self.mixer(h)
+            y = self.mixer(h, dtype=ttnn.float32)  # feeds the fp32 residual add
         elif self.variant == "ATTN":
             _invocation.record("nemotron_h_attention")
-            y = self.mixer(h)
+            y = self.mixer(h, dtype=ttnn.float32)
         elif self.variant == "MOE_A":
             _invocation.record("nemotron_h_mo_e")
             # tokens are independent here: run them as one (1, B*T) row block so a

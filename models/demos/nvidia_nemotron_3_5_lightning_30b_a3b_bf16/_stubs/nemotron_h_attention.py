@@ -233,10 +233,13 @@ class TtNemotronHAttention:
         ttnn.deallocate(attn_flat)
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
-        return ttnn.typecast(out, ttnn.bfloat16)
+        dtype = getattr(self, "_out_dtype", ttnn.bfloat16)
+        return out if out.dtype == dtype else ttnn.typecast(out, dtype)
 
     # ----------------------------- forward ---------------------------- #
-    def __call__(self, hidden_states, attention_mask=None, **kwargs):
+    def __call__(self, hidden_states, attention_mask=None, dtype=ttnn.bfloat16, **kwargs):
+        """dtype: output dtype (a caller that upcasts anyway asks for fp32)."""
+        self._out_dtype = dtype
         hs = self._fp32(hidden_states)
         if hs.layout != ttnn.TILE_LAYOUT:
             hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
