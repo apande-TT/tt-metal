@@ -408,7 +408,16 @@ class TextStack:
         # The stub's own default: contiguous positions, which are the first rows of its table.
         # Its leading dim is 1, which broadcasts across the batch in the RoPE multiply.
         cos, sin = self.rotary(embeds)
-        return tuple(ttnn.reshape(t, [1, 1, int(t.shape[-2]), int(t.shape[-1])]) for t in (cos, sin))
+        # Every layer's fused RoPE wants the table in bf16 and re-reads it for each (batch, head)
+        # tile: narrow it ONCE here rather than once per layer, and keep the result in L1.
+        return tuple(
+            ttnn.typecast(
+                ttnn.reshape(t, [1, 1, int(t.shape[-2]), int(t.shape[-1])]),
+                ttnn.bfloat16,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
+            for t in (cos, sin)
+        )
 
     # ---- decode ------------------------------------------------------------------------
 
