@@ -253,7 +253,13 @@ def _compact_attention(h, cw, n_heads, n_kv_heads, head_dim, scale, tokens):
     weights = ttnn.exp(scores)
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=0, keepdim=True))
     w = ttnn.matmul(weights, cw["head_bcast"], compute_kernel_config=_COMPUTE)
-    out = ttnn.sum(ttnn.multiply(w, _kv(q_dim + kv_dim)), dim=0, keepdim=True)
+    # The key axis is dim 0 and only `tokens` long: slicing it is a contiguous view, while
+    # `ttnn.sum(dim=0)` permutes the whole [j, i, R, H*D] product onto the tile axes first.
+    prod = ttnn.multiply(w, _kv(q_dim + kv_dim))
+    width = [1, tokens, r, q_dim]
+    out = ttnn.slice(prod, [0, 0, 0, 0], width)
+    for j in range(1, tokens):
+        out = ttnn.add(out, ttnn.slice(prod, [j, 0, 0, 0], [j + 1, tokens, r, q_dim]))
     return _lin(ttnn.reshape(out, [1, 1, rows, q_dim]), cw["wo"], dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
 
 
