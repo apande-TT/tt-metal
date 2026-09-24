@@ -399,8 +399,23 @@ def _swiglu_pairs(gate, up, tile=32):
 def _fused_swiglu(h, w_gu):
     """Prefill `silu(h @ Wg) * (h @ Wu)` as ONE matmul: no gate/up tensors are written and there
     is no separate multiply pass over them."""
+    grid = h.device().compute_with_storage_grid_size()
+    rows = 1
+    for d in list(h.shape)[:-1]:
+        rows *= int(d)
+    # Half of each core's M share per block (vs the default 8 rows) halves the weight re-reads;
+    # the default 8-tile N and K blocks keep the L1 footprint near 1 MB.
+    m_blk = -(-(-(-(rows // 32) // int(grid.y))) // 2)
+    cfg = ttnn.MinimalMatmulConfig(
+        M_block_size=m_blk,
+        K_block_size=8,
+        N_block_size=8,
+        subblock_h=1,
+        subblock_w=8,
+        compute_with_storage_grid_size=grid,
+    )
     return ttnn.experimental.minimal_matmul(
-        h, w_gu, fuse_swiglu=True, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE
+        h, w_gu, fuse_swiglu=True, config=cfg, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE
     )
 
 
