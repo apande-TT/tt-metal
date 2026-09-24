@@ -90,6 +90,22 @@ _COMPUTE = ttnn.WormholeComputeKernelConfig(
 )
 
 
+def _lin(x, w, **kwargs):
+    """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
+
+    A `[B, 1, S, K]` activation against a 2-D weight runs as B separate `S x K x N` matmuls that
+    each re-read the whole weight from DRAM; `[1, 1, B*S, K]` is one matmul that reads it once.
+    """
+    shape = [int(d) for d in x.shape]
+    lead = 1
+    for d in shape[:-2]:
+        lead *= d
+    if lead == 1:
+        return ttnn.linear(x, w, **kwargs)
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, lead * shape[-2], shape[-1]]), w, **kwargs)
+    return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
+
+
 # --------------------------------------------------------------------------------------
 # weight staging (BUILD time -- torch is allowed here, never in the forward)
 # --------------------------------------------------------------------------------------
@@ -367,15 +383,15 @@ class AcousticStage:
             h_in = ttnn.typecast(h_in, ttnn.float32)
 
         semantic = ttnn.reshape(
-            ttnn.linear(h_in, p["w_semantic"], compute_kernel_config=_COMPUTE), [rows, self.semantic_out]
+            _lin(h_in, p["w_semantic"], compute_kernel_config=_COMPUTE), [rows, self.semantic_out]
         )
         if p["b_semantic"] is not None:
             semantic = ttnn.add(semantic, p["b_semantic"])
 
         t_emb = p["time_embedding"](t)  # graduated stub: [rows, dim]
-        t_proj = ttnn.linear(ttnn.reshape(t_emb, [rows, 1, 1, self.dim]), p["w_time"], compute_kernel_config=_COMPUTE)
-        llm_proj = ttnn.linear(h_in, p["w_llm"], compute_kernel_config=_COMPUTE)
-        x_proj = ttnn.linear(
+        t_proj = _lin(ttnn.reshape(t_emb, [rows, 1, 1, self.dim]), p["w_time"], compute_kernel_config=_COMPUTE)
+        llm_proj = _lin(h_in, p["w_llm"], compute_kernel_config=_COMPUTE)
+        x_proj = _lin(
             ttnn.typecast(ttnn.reshape(x, [rows, 1, 1, self.n_acoustic]), ttnn.float32),
             p["w_input"],
             compute_kernel_config=_COMPUTE,
@@ -389,7 +405,7 @@ class AcousticStage:
 
         first = ttnn.slice(h, [0, 0, 0, 0], [rows, 1, 1, self.dim])
         velocity = ttnn.reshape(
-            ttnn.linear(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic]
+            _lin(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic]
         )
         return velocity, semantic
 

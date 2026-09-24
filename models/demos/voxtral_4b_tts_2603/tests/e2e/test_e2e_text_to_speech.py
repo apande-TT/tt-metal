@@ -460,6 +460,12 @@ def test_discrete_codes_equal_the_teacher_forced_reference(device, hf_model, evi
     sem_decidable = (top2[:, 0] - top2[:, 1]) > TIE_SIGMA * ldev
     sem_differ = tt["codes"][:, 0, :] != hf["codes"][:, 0, :]
     sem_wrong = sem_differ & sem_decidable
+    x_tt = torch.stack([tt["diagnostics"][t]["x_final"] for t in range(frames)], -1).clamp(-1, 1)
+    live_x = live.expand_as(x_hf)
+    pcc_x = common.pcc(x_tt[live_x], x_hf[live_x])
+    pcc_lo = common.pcc(lo_tt[finite], lo_hf[finite])
+    print(f"x_final vs teacher-forced reference PCC: {pcc_x:.6f}")
+    print(f"semantic logits vs teacher-forced reference PCC: {pcc_lo:.6f}")
     print(
         f"semantic codes vs teacher-forced reference: agreement {float((~sem_differ).float().mean()):.6f}; "
         f"{int(sem_differ.sum())} differ -> {int((sem_differ & ~sem_decidable).sum())} ties "
