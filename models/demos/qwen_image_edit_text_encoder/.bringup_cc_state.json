@@ -1,0 +1,64 @@
+{
+  "shard_reset_done": true,
+  "shard_attempts": {
+    "attention": 2,
+    "decoder_head": 1,
+    "encoder_stack": 1,
+    "layer": 2,
+    "m_l_p": 1,
+    "mlp": 1,
+    "v_l_attention": 1,
+    "v_l_decoder_layer": 1,
+    "v_l_m_l_p": 1,
+    "v_l_patch_merger": 1,
+    "v_l_text_model": 1,
+    "v_l_vision_attention": 1,
+    "v_l_vision_block": 1,
+    "vision_transformer_pretrained_model": 1,
+    "language_model_layers_0_mlp": 1
+  },
+  "attempts": {
+    "token_embed": 1,
+    "v_l_r_m_s_norm": 1,
+    "v_l_rotary_embedding": 1,
+    "vision_patch_embed": 1,
+    "vision_rotary_embedding": 1
+  },
+  "best_pcc": {
+    "token_embed": 1.0,
+    "v_l_r_m_s_norm": 0.999999,
+    "v_l_rotary_embedding": 0.999999,
+    "vision_patch_embed": 0.999998,
+    "vision_rotary_embedding": 1.0
+  },
+  "consecutive_same_class": {
+    "token_embed": 0,
+    "v_l_r_m_s_norm": 0,
+    "v_l_rotary_embedding": 0,
+    "vision_patch_embed": 0,
+    "vision_rotary_embedding": 0
+  },
+  "pcc_history": {
+    "token_embed": [
+      1.0
+    ],
+    "v_l_r_m_s_norm": [
+      0.999999
+    ],
+    "v_l_rotary_embedding": [
+      0.999999
+    ],
+    "vision_patch_embed": [
+      0.999998
+    ],
+    "vision_rotary_embedding": [
+      1.0
+    ]
+  },
+  "last_failure_class": {
+    "v_l_attention": "OTHER"
+  },
+  "last_failure_text": {
+    "v_l_attention": "  - FAILED  models.demos.qwen_image_edit_text_encoder.tests.pcc.test_v_l_attention_sharded::test_v_l_attention_sharded[wormhole_b0-mesh_device0-device_params0]\n      AssertionError: sharded PCC 0.9884198002192971 below target 0.99 for v_l_attention at TP=4\n### models.demos.qwen_image_edit_text_encoder.tests.pcc.test_v_l_attention_sharded::test_v_l_attention_sharded[wormhole_b0-mesh_device0-device_params0]\nAssertionError: sharded PCC 0.9884198002192971 below target 0.99 for v_l_attention at TP=4\nassert False\nmesh_device = MeshDevice(2x4 grid, 8 devices)\n\n    @pytest.mark.parametrize(\n        \"device_params\",\n        [{\"l1_small_size\": 24576, \"fabric_config\": ttnn.FabricConfig.FABRIC_1D}],\n        indirect=True,\n    )\n    @pytest.mark.parametrize(\"mesh_device\", [_MESH], indirect=True)\n    def test_v_l_attention_sharded(mesh_device):\n        torch.manual_seed(int(os.environ.get(\"TT_PLANNER_TEST_SEED\", \"0\") or \"0\"))\n    \n        torch_module, sample_kwargs, primary = _sd._build_torch_reference()\n        try:\n            torch_module = torch_module.float()\n        except Exception:\n            pass\n        for _k in list(sample_kwargs.keys()):\n            _v = sample_kwargs[_k]\n            if isinstance(_v, torch.Tensor) and _v.is_floating_point():\n                sample_kwargs[_k] = _v.to(torch.float32)\n        _pn, _pt = primary\n        if isinstance(_pt, torch.Tensor) and _pt.is_floating_point():\n            primary = (_pn, _pt.to(torch.float32))\n    \n        try:\n            torch_out, sample_kwargs = _sd._reference_forward(torch_module, sample_kwargs)\n        except Exception as exc:\n            pytest.skip(f\"HF reference forward raised {type(exc).__name__}: {exc}\")\n        torch_out = _sd._normalize_out(torch_out)\n        _sd._check_captured_fidelity(torch_out)\n    \n        ttnn_module = _sd._build_ttnn_port(mesh_device, torch_module)\n        primary_name, primary_tensor = primary\n        ttnn_input = _sd._ttnn_from_torch_mesh_safe(primary_tensor, mesh_device)\n        extra = {k: v for k, v in sample_kwargs.items() if k != primary_name}\n        ttnn_out = ttnn_module(ttnn_input, **extra)\n        if isinstance(ttnn_out, tuple) and ttnn_out:\n            ttnn_out = ttnn_out[0]\n        ttnn_out_torch = _sd._ttnn_to_torch_mesh_safe(ttnn_out, mesh_device).to(torch.float32)\n    \n        if isinstance(torch_out, torch.Tensor):\n            torch_out = torch_out.to(torch.float32)\n    \n        ok, pcc = comp_pcc(torch_out, ttnn_out_torch, _sd.PCC_TARGET)\n        print(\n            f\"[bringup] SHARDED PCC={pcc} target={_sd.PCC_TARGET} tp={_TP} \"\n            f\"component={_sd.COMPONENT_NAME}\",\n            flush=True,\n        )\n>       assert ok, f\"sharded PCC {pcc} below target {_sd.PCC_TARGET} for {_sd.COMPONENT_NAME} at TP={_TP}\"\nE       AssertionError: sharded PCC 0.9884198002192971 below target 0.99 for v_l_attention at TP=4\nE       assert False\n\nmodels/demos/qwen_image_edit_text_encoder/tests/pcc/test_v_l_attention_sharded.py:80: AssertionError"
+  }
+}

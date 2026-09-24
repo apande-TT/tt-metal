@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native, tensor-parallel TTNN port of the Qwen2.5-VL text model (`Qwen2_5_VLTextModel`,
+`model.language_model`), prefill without KV cache -- the text-encoder path of Qwen-Image-Edit.
+
+    x = inputs_embeds (or embed_tokens(input_ids))
+    cos, sin = mrope(position_ids)          default positions: arange(S) on all three (t, h, w) axes
+    x = layer_i(x, causal & attention_mask, cos, sin) for 28 layers
+    return norm(x)                          last_hidden_state
+
+TP scheme per layer (see layer.py): attention split by KV group (TP=4 -> 1 kv head + 7 q heads per
+chip), MLP intermediate split; all_reduce after each row-parallel projection. Embedding table, norms
+and rotary tables replicated. The rotary tables depend only on integer positions and are precomputed
+on host (as tt_transformers does); the residual stream stays in fp32 on device across all layers.
+"""
+from __future__ import annotations
+
+import numpy as np
+import ttnn
+
+from models.demos.qwen_image_edit_text_encoder._stubs.attention import pad_to_tile
+from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtRMSNorm, _fp32
+from models.demos.qwen_image_edit_text_encoder._stubs.layer import TtTextDecoderLayer
+from models.demos.qwen_image_edit_text_encoder._stubs.token_embed import TtTokenEmbed
+
+
+class TtTextModel:
+    def __init__(self, device, torch_module):
+        self.device = device
+        self.embed_tokens = TtTokenEmbed(device, torch_module.embed_tokens)
+        self.layers = [TtTextDecoderLayer(device, lyr) for lyr in torch_module.layers]
+        self.norm = TtRMSNorm(device, torch_module.norm)
+        rot = torch_module.rotary_emb
+        self.inv_freq = rot.inv_freq.detach().float().numpy()
+        self.rope_scale = float(getattr(rot, "attention_scaling", 1.0))
+
+    def _position_embeddings(self, position_ids, b, s):
+        """HF Qwen2_5_VLTextModel positions -> Qwen2_5_VLRotaryEmbedding (cos, sin) [3, B, S, D]."""
+        if position_ids is None:
+            pos = np.broadcast_to(np.arange(s)[None, None, :], (3, b, s))
+        else:
+            pos = position_ids.numpy()
+            if pos.ndim == 2:
+                pos = np.broadcast_to(pos[None], (3,) + pos.shape)
+            elif pos.shape[0] == 4:
+                pos = pos[1:]
+        freqs = pos.astype(np.float32)[..., None] * self.inv_freq[None, None, None, :]
+        emb = np.concatenate([freqs, freqs], axis=-1)
+        return np.cos(emb) * self.rope_scale, np.sin(emb) * self.rope_scale
+
+    def __call__(self, inputs_embeds=None, input_ids=None, attention_mask=None, position_ids=None, **kwargs):
+        x = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
+        b, s, c = x.shape
+        s_pad = pad_to_tile(s)
+        attn0 = self.layers[0].self_attn
+        tt_cos, tt_sin = attn0.rope_tables(self._position_embeddings(position_ids, b, s), s_pad)
+        tt_mask = attn0.mask(attention_mask, b, s, s_pad)
+
+        x = ttnn.reshape(x, (b, 1, s, c))
+        if s_pad != s:
+            x = ttnn.pad(x, [(0, 0), (0, 0), (0, s_pad - s), (0, 0)], 0.0)
+        x = _fp32(x)
+        for lyr in self.layers:
+            x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask)
+        x = self.norm(x)
+        if s_pad != s:
+            x = ttnn.slice(x, [0, 0, 0, 0], [b, 1, s, c])
+        return ttnn.reshape(x, (b, s, c))
+
+
+def build(device, torch_module=None):
+    return TtTextModel(device, torch_module)
+
+
+def v_l_text_model(device, torch_module=None):
+    return build(device, torch_module)

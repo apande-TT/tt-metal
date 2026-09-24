@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native, tensor-parallel TTNN port of `Qwen2_5_VisionTransformerPretrainedModel` (`model.visual`).
+
+Same module as `encoder_stack`: patch embed, window-reordered 32-block stack (heads + MLP split across
+TP with all_reduce after each row-parallel projection), merger; returns (last_hidden_state, merged).
+See encoder_stack.py.
+"""
+from __future__ import annotations
+
+from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtVisionTransformer
+
+
+def build(device, torch_module=None):
+    return TtVisionTransformer(device, torch_module)
+
+
+def vision_transformer_pretrained_model(device, torch_module=None):
+    return build(device, torch_module)

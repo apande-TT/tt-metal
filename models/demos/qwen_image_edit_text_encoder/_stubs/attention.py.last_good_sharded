@@ -1,0 +1,199 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native, tensor-parallel TTNN port of `Qwen2_5_VLVisionAttention` (`model.visual.blocks[i].attn`).
+
+Reference math (HF):
+    qkv = x @ Wqkv^T + bqkv            x: [S, C], C = num_heads * head_dim
+    q, k, v = split(qkv)               each [S, H, D]
+    q, k = rope(q, k, cos, sin)        rotate_half RoPE, cos/sin: [S, D]
+    o = softmax(q k^T / sqrt(D) + block_mask(cu_seqlens)) v
+    out = o @ Wproj^T + bproj
+
+TP scheme (heads split across the TP axis of the mesh, Megatron-style):
+    * qkv is column-parallel: each chip owns H/TP heads' q, k and v columns (weight + bias).
+    * attention runs per chip on its local heads -- no communication.
+    * proj is row-parallel: each chip owns the matching H/TP * D input rows, produces a partial
+      sum, and an all_reduce over the TP axis completes it. bproj is replicated and added after.
+Any extra (DP) mesh axis replicates everything.
+
+The sequence is padded to a tile multiple; the additive mask hides padded keys, and the
+cu_seqlens block structure (per-image / per-window attention) is expressed in the same mask.
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import torch
+import ttnn
+
+TILE = 32
+MASK_NEG = -1e9
+
+
+def pad_to_tile(n):
+    return ((n + TILE - 1) // TILE) * TILE
+
+
+def mesh_shape(device):
+    try:
+        shape = tuple(device.shape)
+        if len(shape) == 2:
+            return shape
+    except Exception:
+        pass
+    n = device.get_num_devices() if hasattr(device, "get_num_devices") else 1
+    return (1, n)
+
+
+def shard_mapper(device, dim):
+    """Shard `dim` across the TP (column) axis of the mesh, replicate across any DP (row) axis."""
+    rows, cols = mesh_shape(device)
+    if rows == 1:
+        return ttnn.ShardTensorToMesh(device, dim=dim)
+    return ttnn.ShardTensor2dMesh(device, mesh_shape=(rows, cols), dims=(None, dim))
+
+
+def replicate(device):
+    return ttnn.ReplicateTensorToMesh(device)
+
+
+def hifi4_config():
+    return ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=True,
+    )
+
+
+def upload(device, array, dtype=ttnn.bfloat16, mapper=None):
+    """numpy / torch host tensor -> tile-layout device tensor (replicated by default)."""
+    t = torch.from_numpy(np.ascontiguousarray(array)) if isinstance(array, np.ndarray) else array.contiguous()
+    return ttnn.from_torch(
+        t, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=mapper or replicate(device)
+    )
+
+
+def block_mask(cu_seqlens, s, s_pad):
+    """[1, 1, s_pad, s_pad] additive mask: 0 within a cu_seqlens segment, MASK_NEG elsewhere.
+    Padded key columns are masked; padded query rows are left unmasked (they are sliced away)."""
+    seg = np.full((s_pad,), -1, dtype=np.int64)
+    bounds = [int(v) for v in cu_seqlens]
+    for i, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:])):
+        seg[lo:hi] = i
+    mask = np.where((seg[:, None] == seg[None, :]) & (seg[None, :] >= 0), 0.0, MASK_NEG).astype(np.float32)
+    mask[s:, :] = 0.0
+    return mask.reshape(1, 1, s_pad, s_pad)
+
+
+def pad_rows(array, s_pad):
+    out = np.zeros((s_pad,) + array.shape[1:], dtype=np.float32)
+    out[: array.shape[0]] = array
+    return out
+
+
+class TtVisionAttention:
+    def __init__(self, device, torch_module):
+        self.device = device
+        _, self.tp = mesh_shape(device)
+        self.num_heads = int(torch_module.num_heads)
+        dim = torch_module.qkv.in_features
+        self.dim = dim
+        self.head_dim = dim // self.num_heads
+        assert self.num_heads % self.tp == 0, f"{self.num_heads} heads not divisible by TP={self.tp}"
+        self.local_heads = self.num_heads // self.tp
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+        H, D, hp = self.num_heads, self.head_dim, self.local_heads
+
+        w = torch_module.qkv.weight.detach().float()  # [3*C, C] rows = [q | k | v], each head-major
+        b = torch_module.qkv.bias.detach().float()
+        wq, wk, wv = (t.reshape(H, D, dim) for t in w.split(dim, dim=0))
+        bq, bk, bv = (t.reshape(H, D) for t in b.split(dim, dim=0))
+        # Regroup so chip d's contiguous column block is [q_d | k_d | v_d] for its heads.
+        w_blocks, b_blocks = [], []
+        for d in range(self.tp):
+            sl = slice(d * hp, (d + 1) * hp)
+            w_blocks += [wq[sl].reshape(-1, dim), wk[sl].reshape(-1, dim), wv[sl].reshape(-1, dim)]
+            b_blocks += [bq[sl].reshape(-1), bk[sl].reshape(-1), bv[sl].reshape(-1)]
+        wqkv_t = torch.cat(w_blocks, dim=0).t().contiguous()  # [C, 3*C] column-parallel
+        bqkv = torch.cat(b_blocks, dim=0).reshape(1, 1, 1, -1)
+        self.wqkv = upload(device, wqkv_t, mapper=shard_mapper(device, -1))
+        self.bqkv = upload(device, bqkv, mapper=shard_mapper(device, -1))
+        # proj: row-parallel -- input rows are head-major, so chip d's rows match its local heads.
+        self.wproj = upload(
+            device, torch_module.proj.weight.detach().float().t().contiguous(), mapper=shard_mapper(device, 0)
+        )
+        self.bproj = upload(device, torch_module.proj.bias.detach().float().reshape(1, 1, 1, -1))
+        # rotate_half(x) == x @ R
+        half = D // 2
+        r = np.zeros((D, D), dtype=np.float32)
+        r[np.arange(half) + half, np.arange(half)] = -1.0
+        r[np.arange(half), np.arange(half) + half] = 1.0
+        self.rot = upload(device, r.reshape(1, 1, D, D))
+        self.compute_cfg = hifi4_config()
+
+    def rope_tables(self, cos, sin, s_pad):
+        """Host cos/sin [S, D] -> padded [1, 1, s_pad, D] device tables."""
+        D = self.head_dim
+        cos = pad_rows(np.asarray(cos, dtype=np.float32), s_pad).reshape(1, 1, s_pad, D)
+        sin = pad_rows(np.asarray(sin, dtype=np.float32), s_pad).reshape(1, 1, s_pad, D)
+        return upload(self.device, cos), upload(self.device, sin)
+
+    def forward_padded(self, x, tt_cos, tt_sin, tt_mask):
+        """x: [1, 1, s_pad, C] replicated -> [1, 1, s_pad, C] replicated (bias included)."""
+        D, hp = self.head_dim, self.local_heads
+        s_pad = x.shape[-2]
+        # column-parallel qkv on local heads: [1, 1, S, 3*hp*D]
+        qkv = ttnn.linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=self.compute_cfg)
+        loc = hp * D
+
+        def _heads(i):
+            t = ttnn.slice(qkv, [0, 0, 0, i * loc], [1, 1, s_pad, (i + 1) * loc])
+            t = ttnn.reshape(t, (1, s_pad, hp, D))
+            return ttnn.permute(t, (0, 2, 1, 3))  # [1, hp, S, D]
+
+        q, k, v = _heads(0), _heads(1), _heads(2)
+
+        def _rope(t):
+            rot = ttnn.matmul(t, self.rot, compute_kernel_config=self.compute_cfg)
+            return ttnn.add(ttnn.multiply(t, tt_cos), ttnn.multiply(rot, tt_sin))
+
+        q, k = _rope(q), _rope(k)
+
+        scores = ttnn.matmul(q, ttnn.transpose(k, -2, -1), compute_kernel_config=self.compute_cfg)
+        scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask)
+        probs = ttnn.softmax(scores, dim=-1, numeric_stable=True)
+        o = ttnn.matmul(probs, v, compute_kernel_config=self.compute_cfg)  # [1, hp, S, D]
+        o = ttnn.permute(o, (0, 2, 1, 3))
+        o = ttnn.reshape(o, (1, 1, s_pad, loc))
+
+        # row-parallel proj: partial sums over local heads, then reduce across the TP axis.
+        out = ttnn.linear(o, self.wproj, compute_kernel_config=self.compute_cfg)
+        if self.tp > 1:
+            out = ttnn.all_reduce(out, cluster_axis=1, topology=ttnn.Topology.Linear)
+        return ttnn.add(out, self.bproj)
+
+    def __call__(self, hidden_states, cu_seqlens=None, position_embeddings=None, **kwargs):
+        s = hidden_states.shape[0]
+        s_pad = pad_to_tile(s)
+        cos, sin = position_embeddings
+        tt_cos, tt_sin = self.rope_tables(cos.float().numpy(), sin.float().numpy(), s_pad)
+        bounds = cu_seqlens.tolist() if cu_seqlens is not None else [0, s]
+        tt_mask = upload(self.device, block_mask(bounds, s, s_pad))
+
+        x = ttnn.reshape(hidden_states, (1, 1, s, hidden_states.shape[-1]))
+        if s_pad != s:
+            x = ttnn.pad(x, [(0, 0), (0, 0), (0, s_pad - s), (0, 0)], 0.0)
+        out = self.forward_padded(x, tt_cos, tt_sin, tt_mask)
+        if s_pad != s:
+            out = ttnn.slice(out, [0, 0, 0, 0], [1, 1, s, out.shape[-1]])
+        return ttnn.reshape(out, (s, out.shape[-1]))
+
+
+def build(device, torch_module=None):
+    return TtVisionAttention(device, torch_module)
+
+
+def attention(device, torch_module=None):
+    return TtVisionAttention(device, torch_module)

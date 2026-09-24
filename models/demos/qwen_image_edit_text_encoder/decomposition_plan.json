@@ -1,0 +1,37 @@
+[
+  {
+    "parent_name": "v_l_decoder_layer",
+    "children": [
+      {
+        "name": "m_l_p",
+        "submodule_path": "language_model.layers.0.mlp",
+        "class_name": "Qwen2MLP"
+      },
+      {
+        "name": "v_l_attention",
+        "submodule_path": "language_model.layers.0.self_attn",
+        "class_name": "Qwen2_5_VLAttention"
+      }
+    ]
+  },
+  {
+    "parent_name": "v_l_vision_block",
+    "children": [
+      {
+        "name": "v_l_m_l_p",
+        "submodule_path": "visual.blocks.0.mlp",
+        "class_name": "Qwen2_5_VLMLP"
+      },
+      {
+        "name": "v_l_r_m_s_norm",
+        "submodule_path": "visual.blocks.0.norm1",
+        "class_name": "Qwen2_5_VLRMSNorm"
+      },
+      {
+        "name": "v_l_vision_attention",
+        "submodule_path": "visual.blocks.0.attn",
+        "class_name": "Qwen2_5_VLVisionAttention"
+      }
+    ]
+  }
+]
