@@ -409,6 +409,7 @@ class NemotronHBlock:
         # (lhs batch B, rhs batch 1). A plain 2-D rhs broadcasts safely.
         self._Esel = self._dev(Esel.contiguous())
 
+        self._grp = {}  # group-RMS indicator constants (decode)
         self._consts_ready = True
 
     def _ensure_seq(self, B, S):
@@ -594,14 +595,17 @@ class NemotronHBlock:
         # 4. Gated grouped RMSNorm (norm_before_gate=False): gate first, then
         #    grouped RMS over group_size=512, then * weight.
         y = ttnn.mul(y, ttnn.silu(gate))
-        y = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT)
-        y = ttnn.reshape(y, (B, S * (INTER // GS), GS))
-        y = ttnn.to_layout(y, ttnn.TILE_LAYOUT)
-        y = ttnn.rms_norm(y, weight=self._w_ones_gs, epsilon=1e-5, compute_kernel_config=ckc)
-        y = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT)
-        y = ttnn.reshape(y, (B, S, INTER))
-        y = ttnn.to_layout(y, ttnn.TILE_LAYOUT)
-        y = ttnn.mul(y, self._w_gnorm)  # [1,S,4096]
+        if dec:  # one tile row: grouped RMS without a ROW_MAJOR round trip
+            y = _ssm_cache.group_rms(self.device, y, self._w_gnorm, GS, 1e-5, self._grp, ckc)
+        else:
+            y = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT)
+            y = ttnn.reshape(y, (B, S * (INTER // GS), GS))
+            y = ttnn.to_layout(y, ttnn.TILE_LAYOUT)
+            y = ttnn.rms_norm(y, weight=self._w_ones_gs, epsilon=1e-5, compute_kernel_config=ckc)
+            y = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT)
+            y = ttnn.reshape(y, (B, S, INTER))
+            y = ttnn.to_layout(y, ttnn.TILE_LAYOUT)
+            y = ttnn.mul(y, self._w_gnorm)  # [1,S,4096]
 
         # 5. out_proj (row-parallel under TP): 4096 -> 2688.
         out = _dram_mm.from_rows(

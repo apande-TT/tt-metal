@@ -529,6 +529,9 @@ class TtNemotronHMamba2Mixer:
         ttnn.deallocate(g_silu)
 
         gs = self.norm_group_size
+        if B * T <= _dram_mm.TILE:  # decode: one tile row, no ROW_MAJOR round trip
+            y = _ssm_cache.group_rms(self.device, y, self._norm_w_full, gs, self.norm_eps, self._consts, self.ckc)
+            return self._finish(y, B, T)
         ng = I // gs
         y_rm = ttnn.to_layout(y, ttnn.ROW_MAJOR_LAYOUT)
         y_g = ttnn.reshape(y_rm, [B, T * ng, gs])
@@ -542,6 +545,10 @@ class TtNemotronHMamba2Mixer:
 
         # 13. out_proj (row-parallel under TP): sum the per-chip partial sums so
         #     every TP chip holds the full mixer output (readback keeps chip 0).
+        return self._finish(y, B, T)
+
+    def _finish(self, y, B, T):
+        """out_proj (row-parallel under TP: all_reduce the per-chip partials)."""
         out = self._out_proj(y, B, T)  # (B, T, hidden_size)
         ttnn.deallocate(y)
         if self._shard:

@@ -103,6 +103,24 @@ def mamba_conv_step(state, hbc_t, taps, bias, K):
     return ttnn.silu(acc)
 
 
+def group_rms(device, y, w, gs, eps, cache, ckc):
+    """Grouped RMSNorm of one tile row of tokens, (1, M<=32, I), over consecutive
+    gs-wide groups, times w -- as two tiny matmuls against group-indicator
+    constants instead of a ROW_MAJOR reshape round trip to (M*ng, gs)."""
+    I = int(y.shape[-1])
+    ng = I // gs
+    key = ("grp", I, gs)
+    if key not in cache:
+        g = torch.zeros(I, ng)
+        for j in range(ng):
+            g[j * gs : (j + 1) * gs, j] = 1.0
+        cache[key] = (upload(device, g / gs), upload(device, g.t().contiguous()))
+    g_mean, g_expand = cache[key]
+    ms = ttnn.matmul(ttnn.multiply(y, y), g_mean, compute_kernel_config=ckc)  # (1, M, ng) mean of squares
+    r = ttnn.rsqrt(ttnn.add(ms, eps))
+    return ttnn.multiply(ttnn.multiply(y, ttnn.matmul(r, g_expand, compute_kernel_config=ckc)), w)
+
+
 def softplus(x):
     """log(1 + exp(x)) in two ops. Decode dt pre-activations sit far below
     fp32 exp overflow (~88), so the stable relu + log1p(exp(-|x|)) form's
