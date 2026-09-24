@@ -185,6 +185,14 @@ class TtNemotronHMamba2Mixer:
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
+        # prefill in_proj is compute-bound against a bf8_b weight: HiFi2 is half
+        # the math passes of HiFi4 at the weight's own precision
+        self._proj_ckc = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -466,7 +474,7 @@ class TtNemotronHMamba2Mixer:
                 ttnn.matmul(
                     _dram_mm.as_rows(hs),
                     self._w_in,
-                    compute_kernel_config=self.ckc,
+                    compute_kernel_config=self._proj_ckc,
                     core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x),
                 ),
                 B,

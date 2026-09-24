@@ -316,6 +316,13 @@ class NemotronHBlock:
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
+        # prefill in_proj is compute-bound against a bf8_b weight: HiFi2 is half
+        # the math passes of HiFi4 at the weight's own precision
+        self._proj_ckc = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
 
         # On this box fabric only trains on the full mesh, so the TP run lands
         # on a 2-D MeshShape(rows=DP, cols=TP). A flat ShardTensorToMesh would
@@ -559,7 +566,7 @@ class NemotronHBlock:
             ttnn.linear(
                 _dram_mm.as_rows(normed),
                 self._W_in,
-                compute_kernel_config=ckc,
+                compute_kernel_config=ckc if dec else self._proj_ckc,
                 program_config=_dram_mm.mcast1d_config(self.device, int(normed.shape[-1]), int(self._W_in.shape[-1]))
                 if dec
                 else None,
