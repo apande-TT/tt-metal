@@ -318,13 +318,11 @@ class TtNemotronHLayer:
 
         bb = ttnn.reshape(choice, [1, T, 1, E])  # [.,.,0,j] = choice_j
         a_col = ttnn.transpose(bb, 2, 3)  # [.,.,i,0] = choice_i
-        gt = ttnn.gt(bb, a_col)  # broadcast to [.,.,i,j] = choice_j > choice_i, no E x E repeat
+        gt = ttnn.gt(bb, a_col, dtype=ttnn.bfloat8_b)  # broadcast to [.,.,i,j] = choice_j > choice_i, no E x E repeat
         ttnn.deallocate(bb)
         ttnn.deallocate(a_col)
-        gt_f = ttnn.typecast(gt, ttnn.float32)
+        rank = ttnn.sum(gt, dim=3)
         ttnn.deallocate(gt)
-        rank = ttnn.sum(gt_f, dim=3)
-        ttnn.deallocate(gt_f)
         if list(rank.shape)[-1] != E:
             rank = ttnn.reshape(rank, [1, T, E])
         mask = ttnn.lt(rank, float(top_k))
