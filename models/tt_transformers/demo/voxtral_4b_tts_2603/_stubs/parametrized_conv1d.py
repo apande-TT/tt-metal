@@ -26,7 +26,6 @@ import torch
 
 import ttnn
 
-
 # A PERSISTENT ZERO BUFFER, NOT A PER-CALL `ttnn.zeros`.
 # `ttnn.zeros` builds its tensor on the host and enqueues a WRITE to land it on the device, and a
 # captured trace cannot replay a write (`TT_FATAL: Writes are not supported during trace capture`).
@@ -61,10 +60,30 @@ def _from_torch(t, device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
         return ttnn.from_torch(
-            t, dtype=dtype, layout=layout, device=device,
+            t,
+            dtype=dtype,
+            layout=layout,
+            device=device,
             mesh_mapper=ttnn.ReplicateTensorToMesh(device),
         )
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _tap_linear(x, w, **kwargs):
+    """`ttnn.linear` for one tap with the leading batch folded into M, so the tap streams ONCE.
+
+    A `[B, 1, L, C]` slice against a 2-D tap runs as B separate `L x C x C_out` matmuls that each
+    re-read the whole tap; `[1, 1, B*L, C]` is one matmul. Only when L is tile-aligned, where the
+    fold is a free view.
+    """
+    shape = [int(d) for d in x.shape]
+    lead = 1
+    for d in shape[:-2]:
+        lead *= d
+    if lead == 1 or shape[-2] % 32 != 0:
+        return ttnn.linear(x, w, **kwargs)
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, lead * shape[-2], shape[-1]]), w, **kwargs)
+    return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
 def build(device, torch_module):
@@ -123,10 +142,12 @@ def build(device, torch_module):
             begin = i * dilation
             end = begin + (out_len - 1) * stride + 1
             seg = ttnn.slice(
-                x4, [0, 0, begin, 0], [batch, 1, end, in_channels],
+                x4,
+                [0, 0, begin, 0],
+                [batch, 1, end, in_channels],
                 [1, 1, stride, 1] if stride > 1 else None,
             )
-            term = ttnn.linear(seg, tap, compute_kernel_config=_COMPUTE)
+            term = _tap_linear(seg, tap, compute_kernel_config=_COMPUTE)
             acc = term if acc is None else ttnn.add(acc, term)
         if bias is not None:
             acc = ttnn.add(acc, bias)

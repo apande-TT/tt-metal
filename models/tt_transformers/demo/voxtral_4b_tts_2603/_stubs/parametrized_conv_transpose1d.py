@@ -26,7 +26,6 @@ import torch
 
 import ttnn
 
-
 # A PERSISTENT ZERO BUFFER, NOT A PER-CALL `ttnn.zeros`.
 # `ttnn.zeros` builds its tensor on the host and enqueues a WRITE to land it on the device, and a
 # captured trace cannot replay a write (`TT_FATAL: Writes are not supported during trace capture`).
@@ -62,10 +61,30 @@ def _from_torch(t, device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
         return ttnn.from_torch(
-            t, dtype=dtype, layout=layout, device=device,
+            t,
+            dtype=dtype,
+            layout=layout,
+            device=device,
             mesh_mapper=ttnn.ReplicateTensorToMesh(device),
         )
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
+
+
+def _tap_linear(x, w, **kwargs):
+    """`ttnn.linear` for one tap with the leading batch folded into M, so the tap streams ONCE.
+
+    A `[B, 1, L, C]` slice against a 2-D tap runs as B separate `L x C x C_out` matmuls that each
+    re-read the whole tap; `[1, 1, B*L, C]` is one matmul. Only when L is tile-aligned, where the
+    fold is a free view.
+    """
+    shape = [int(d) for d in x.shape]
+    lead = 1
+    for d in shape[:-2]:
+        lead *= d
+    if lead == 1 or shape[-2] % 32 != 0:
+        return ttnn.linear(x, w, **kwargs)
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, lead * shape[-2], shape[-1]]), w, **kwargs)
+    return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
 def build(device, torch_module):
@@ -96,23 +115,17 @@ def build(device, torch_module):
 
         def _now(tap):
             """`tap` applied to input steps 0..L-1, then a zero row for output step L."""
-            return ttnn.concat(
-                [ttnn.linear(x4, tap, compute_kernel_config=_COMPUTE), zero_row], dim=2
-            )
+            return ttnn.concat([_tap_linear(x4, tap, compute_kernel_config=_COMPUTE), zero_row], dim=2)
 
         def _delayed(tap):
             """`tap` applied to the PREVIOUS input step: a zero row, then steps 0..L-1."""
-            return ttnn.concat(
-                [zero_row, ttnn.linear(x4, tap, compute_kernel_config=_COMPUTE)], dim=2
-            )
+            return ttnn.concat([zero_row, _tap_linear(x4, tap, compute_kernel_config=_COMPUTE)], dim=2)
 
         even = ttnn.add(_now(taps[0]), _delayed(taps[2]))
         odd = ttnn.add(_now(taps[1]), _delayed(taps[3]))
 
         out_len = length * stride + (kernel - stride)
-        interleaved = ttnn.reshape(
-            ttnn.concat([even, odd], dim=-1), [batch, 1, out_len, out_channels]
-        )
+        interleaved = ttnn.reshape(ttnn.concat([even, odd], dim=-1), [batch, 1, out_len, out_channels])
         if bias is not None:
             interleaved = ttnn.add(interleaved, bias)
 
