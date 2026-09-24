@@ -264,6 +264,8 @@ def _compile_block(device, blk, mask):
             _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
             _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+            # Consumed once, by the down projection: hand it over in L1, not through DRAM.
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         return ttnn.add(h, _lin(gated, w2, compute_kernel_config=_COMPUTE))
 

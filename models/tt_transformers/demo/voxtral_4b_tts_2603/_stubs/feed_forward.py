@@ -148,6 +148,8 @@ def build(device, torch_module):
             _lin(h, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
             _lin(h, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+            # Consumed once, by the down projection: hand it over in L1, not through DRAM.
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         out = _lin(gated, w2, compute_kernel_config=_COMPUTE)
         if bias is not None:

@@ -270,7 +270,12 @@ def build(device, torch_module):
         h4 = ttnn.add(
             h4,
             _lin(
-                ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU]),
+                ttnn.multiply(
+                    gate,
+                    up,
+                    input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                ),
                 w2,
                 compute_kernel_config=_COMPUTE,
             ),
