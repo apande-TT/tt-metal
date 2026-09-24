@@ -63,7 +63,8 @@ def _mcast_cfg(x, w, rows, out_dtype):
     M goes over the grid rows and N over the grid columns. Per-core M/N are searched a few tiles
     above the minimum (a slightly larger block often divides into better subblocks), and when the
     whole per-core output does not fit L1 it is split into out-blocks. Ranked by per-core work,
-    then a K-block of at least 4, then subblock area (fp32 DEST caps it at 4 tiles), then out-block area.
+    then the tiles each core re-reads across out-blocks, then a K-block of at least 4, then subblock
+    area (fp32 DEST caps it at 4 tiles).
     """
     grid = x.device().compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
@@ -99,7 +100,8 @@ def _mcast_cfg(x, w, rows, out_dtype):
                         ),
                         key=lambda hs: (hs[0] * hs[1], hs[1]),
                     )
-                    score = (pm * pn, -min(kb, 4), -sub[0] * sub[1], -bh * bw, -kb)
+                    reads = kt * (pm * (pn // bw) + pn * (pm // bh))
+                    score = (pm * pn, reads, -min(kb, 4), -sub[0] * sub[1], -kb)
                     if best is None or score < best[0]:
                         best = (score, pm, pn, bh, bw, kb, sub)
     if best is None:
