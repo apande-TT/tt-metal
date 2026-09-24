@@ -27,7 +27,32 @@ import sys
 import tempfile
 from pathlib import Path
 
+
 # Structural reference handed to the LLM (the seamless bounded-perf pattern, generic-ized).
+def prompt_ids_for_isl(tokenizer, n_tokens):
+    """EXACTLY ``n_tokens`` real token ids from the model's own tokenizer, for use as the ISL
+    measurement condition. Generated perf tests import this so the input length is the tool's
+    choice, not an example sentence baked into each test. Model-agnostic: a seed sentence is
+    encoded with the model's tokenizer and cycled, then truncated, to the requested length.
+
+    Generated tests carry this SAME contract as an inline fallback (``try: import ... except:
+    def ...``). Exporting it here means a plain top-level ``from ...perf_test_gen import
+    prompt_ids_for_isl`` resolves too, so a generated test that omits the guard still collects
+    instead of failing the whole directory's collection with an ImportError."""
+    import torch
+
+    text = "The quick brown fox jumps over the lazy dog and keeps on running. "
+    try:
+        seed = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        seed = tokenizer.encode(text)
+    seed = [int(x) for x in seed] or [1]
+    ids = []
+    while len(ids) < int(n_tokens):
+        ids.extend(seed)
+    return torch.tensor(ids[: int(n_tokens)], dtype=torch.long)
+
+
 _SKELETON_REF = """
 import os
 import time
@@ -386,12 +411,38 @@ def _needed_trace_region(text: str):
 _DEVICE_DISRUPTION_RE = re.compile(
     r"AICLK failed to settle|clamped by max-arbiter|Sysmem mapped at unexpected NOC|"
     r"pin_or_map_sysmem_to_device|failed to open device|could not open device|GetPCIeDeviceID|"
-    r"GetNumPCIeDevices",
+    r"GetNumPCIeDevices|"
+    # FW init never completing / NOC0 hung: the chip must be reset before ANY retry can work.
+    # (The first such failure on 2026-09-22 got no reset because this list lacked it.) If it
+    # persists across resets, check tt_metal/pre-compiled vs libtt_metal.so before blaming the
+    # board -- stale pre-compiled firmware produces exactly this signature.
+    r"failed to initialize FW|waiting for physical cores to finish|NOC0 is hung",
     re.IGNORECASE,
 )
 
 
 _TRACE_RAN_MARKERS = ("[perf_test_gen] WEDGE", "FORWARD_WALL_MS=", "TRACE_PER_TOKEN_MS=")
+
+_FW_INIT_FAILURE_RE = re.compile(
+    r"failed to initialize FW|waiting for physical cores to finish|NOC0 is hung", re.IGNORECASE
+)
+
+
+def _stale_fw_hint(out: str) -> str:
+    """When a disruption is a FW-init failure, say whether stale pre-compiled firmware explains it.
+
+    A reset is still issued (NOC0 stays hung otherwise), but a reset cannot fix firmware built
+    against a different L1 layout than the library that loads it -- the retry will fail the same
+    way, and on 2026-09-22 that loop ended in a false 'board wedge' verdict. Empty when the failure
+    is not FW-init-shaped or the tree is coherent."""
+    if not out or not _FW_INIT_FAILURE_RE.search(out):
+        return ""
+    try:
+        from . import device_recovery as _dr
+
+        return _dr.stale_precompiled_firmware(Path(__file__).resolve().parents[3]) or ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _is_device_disruption(rc, out: str) -> bool:
@@ -553,6 +604,9 @@ def _run_perf_node(node_abs: str, extra_env: dict, timeout_s: int = 2400):
                 file=sys.stderr,
                 flush=True,
             )
+            _hint = _stale_fw_hint(out)
+            if _hint:
+                print(f"      · {_hint}", file=sys.stderr, flush=True)
             continue
         return rc, out
 
