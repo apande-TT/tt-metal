@@ -313,7 +313,7 @@ def _softmax(x, dim=-1):
     three ops sit at 5.5e-8. A softmax that does not sum to 1 ATTENUATES the attention output it
     weights, which reads as a norm ratio below 1 at a PCC of 0.9999.
     """
-    e = ttnn.exp(ttnn.subtract(x, ttnn.max(x, dim=dim, keepdim=True)))
+    e = ttnn.subtract(x, ttnn.max(x, dim=dim, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     return ttnn.divide(e, ttnn.sum(e, dim=dim, keepdim=True))
 
 

@@ -244,8 +244,7 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
         if int(attn_mask.shape[-2]) != 1:
             attn_mask = ttnn.slice(attn_mask, [0, 0, 0, 0], [1, 1, 1, int(attn_mask.shape[-1])])
         scores = ttnn.add(scores, attn_mask)
-    scores = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True))
-    weights = ttnn.exp(scores)
+    weights = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
     out = ttnn.reshape(_bmm(weights, v), [batch, n_heads, seq, head_dim])
@@ -298,8 +297,7 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
 
     scores = _bmm(ttnn.multiply(q, scale), k, per_core_m=1, transpose_b=True)
     scores = ttnn.add(scores, _compact_mask(h.device(), rows, tokens, repeats))
-    scores = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True))
-    weights = ttnn.exp(scores)
+    weights = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
     out = ttnn.reshape(_bmm(weights, v, per_core_m=1), [1, n_heads, rows, head_dim])
