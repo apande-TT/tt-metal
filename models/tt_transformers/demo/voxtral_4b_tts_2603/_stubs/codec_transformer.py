@@ -30,7 +30,6 @@ import torch
 
 import ttnn
 
-
 _SHARD_HEIGHT = 32
 # 2048 rows = 256 codec frames after the decoder's 8x upsampling, which is the whole stage's frame
 # ceiling. The mask is translation-invariant, so a longer sequence needs a LARGER constant here
@@ -50,11 +49,106 @@ _COMPUTE = ttnn.WormholeComputeKernelConfig(
 # weight costs 1.169e-3. That 1.5x is small per op and this codec stacks eight residual blocks on
 # top of five convolutions, where it is the last error source left after the softmax and the RMS
 # norm were spelled out. No `ttnn.embedding` table is built here (those must stay bfloat16).
+_TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
+_L1_BUDGET = 1_100_000
+
+
+def _divisors(n):
+    return [d for d in range(1, n + 1) if n % d == 0]
+
+
+def _mcast_cfg(x, w, rows, out_dtype):
+    """A full-grid 2D-multicast program config for a tall `[rows, K] x [K, N]` linear, or None.
+
+    M goes over the grid rows and N over the grid columns. Per-core M/N are searched a few tiles
+    above the minimum (a slightly larger block often divides into better subblocks), and when the
+    whole per-core output does not fit L1 it is split into out-blocks. Ranked by per-core work,
+    then subblock area (fp32 DEST caps it at 4 tiles), then out-block area, then K-block width.
+    """
+    grid = x.device().compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    mt, kt, nt = rows // 32, int(w.shape[-2]) // 32, int(w.shape[-1]) // 32
+    size = lambda dt: _TILE_BYTES.get(dt, 2048)
+    xs, ws = size(x.dtype), size(w.dtype)
+    os_ = size(out_dtype) + (0 if out_dtype == ttnn.float32 else 4096)
+    best = None
+    for pm in range(-(-mt // gy), -(-mt // gy) + 5):
+        if -(-mt // pm) > gy:
+            continue
+        for pn in range(-(-nt // gx), -(-nt // gx) + 5):
+            if -(-nt // pn) > gx:
+                continue
+            for bh in _divisors(pm):
+                for bw in _divisors(pn):
+                    kb = next(
+                        (
+                            c
+                            for c in (8, 4, 2, 1)
+                            if kt % c == 0 and bh * bw * os_ + 2 * c * (bh * xs + bw * ws) <= _L1_BUDGET
+                        ),
+                        None,
+                    )
+                    if kb is None:
+                        continue
+                    sub = max(
+                        (
+                            (h, s)
+                            for h in range(1, 5)
+                            for s in range(1, 5)
+                            if h * s <= 4 and bh % h == 0 and bw % s == 0
+                        ),
+                        key=lambda hs: (hs[0] * hs[1], hs[1]),
+                    )
+                    score = (pm * pn, -sub[0] * sub[1], -bh * bw, -kb)
+                    if best is None or score < best[0]:
+                        best = (score, pm, pn, bh, bw, kb, sub)
+    if best is None:
+        return None
+    _, pm, pn, bh, bw, kb, sub = best
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=(gx, gy),
+        in0_block_w=kb,
+        out_subblock_h=sub[0],
+        out_subblock_w=sub[1],
+        out_block_h=bh,
+        out_block_w=bw,
+        per_core_M=pm,
+        per_core_N=pn,
+        transpose_mcast=False,
+        fused_activation=None,
+    )
+
+
+def _lin(x, w, **kwargs):
+    """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
+
+    A `[B, 1, S, K]` activation against a 2-D weight runs as B separate `S x K x N` matmuls that
+    each re-read the whole weight from DRAM; `[1, 1, B*S, K]` is one matmul that reads it once.
+    Tall results (>= 8 tile rows) also get a hand-sized full-grid program config.
+    """
+    shape = [int(d) for d in x.shape]
+    lead = 1
+    for d in shape[:-2]:
+        lead *= d
+    rows = lead * shape[-2]
+    if rows >= 256 and rows % 32 == 0 and "program_config" not in kwargs:
+        cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
+        if cfg is not None:
+            kwargs["program_config"] = cfg
+    if lead == 1:
+        return ttnn.linear(x, w, **kwargs)
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, rows, shape[-1]]), w, **kwargs)
+    return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
+
+
 def _from_torch(t, device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
         return ttnn.from_torch(
-            t, dtype=dtype, layout=layout, device=device,
+            t,
+            dtype=dtype,
+            layout=layout,
+            device=device,
             mesh_mapper=ttnn.ReplicateTensorToMesh(device),
         )
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
@@ -106,12 +200,8 @@ def _compile_block(device, blk, mask):
 
     attn_scale = ffn_scale = None
     if blk.layer_scale:
-        attn_scale = _from_torch(
-            blk.attention_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32
-        )
-        ffn_scale = _from_torch(
-            blk.ffn_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32
-        )
+        attn_scale = _from_torch(blk.attention_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32)
+        ffn_scale = _from_torch(blk.ffn_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32)
 
     if blk.post_attention_norm is not None or blk.post_ffn_norm is not None:
         raise NotImplementedError("post_attention_norm / post_ffn_norm are not ported")
@@ -120,9 +210,9 @@ def _compile_block(device, blk, mask):
         seq = int(h.shape[-2])
         xn = _rms_norm(h, attn_gamma, attn_eps)
 
-        q = ttnn.linear(xn, wq, compute_kernel_config=_COMPUTE)
-        k = ttnn.linear(xn, wk, compute_kernel_config=_COMPUTE)
-        v = ttnn.linear(xn, wv, compute_kernel_config=_COMPUTE)
+        q = _lin(xn, wq, compute_kernel_config=_COMPUTE)
+        k = _lin(xn, wk, compute_kernel_config=_COMPUTE)
+        v = _lin(xn, wv, compute_kernel_config=_COMPUTE)
         if qk_norm:
             q = _rms_norm(q, q_gamma, q_eps)
             k = _rms_norm(k, k_gamma, k_eps)
@@ -138,9 +228,7 @@ def _compile_block(device, blk, mask):
             num_kv_heads=n_kv_heads,
             transpose_k_heads=False,
         )
-        scores = ttnn.matmul(
-            qh, ttnn.transpose(kh, -2, -1), compute_kernel_config=_COMPUTE
-        )
+        scores = ttnn.matmul(qh, ttnn.transpose(kh, -2, -1), compute_kernel_config=_COMPUTE)
         scores = ttnn.add(
             ttnn.multiply(scores, scale),
             ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq]),
@@ -151,19 +239,22 @@ def _compile_block(device, blk, mask):
             compute_kernel_config=_COMPUTE,
         )
         ttnn.deallocate(scores)
-        r = ttnn.linear(
-            ttnn.experimental.nlp_concat_heads(a), wo,
-            dtype=ttnn.float32, compute_kernel_config=_COMPUTE,
+        r = _lin(
+            ttnn.experimental.nlp_concat_heads(a),
+            wo,
+            dtype=ttnn.float32,
+            compute_kernel_config=_COMPUTE,
         )
         if attn_scale is not None:
             r = ttnn.multiply(r, attn_scale)
         h = ttnn.add(h, r)
 
         hn = _rms_norm(h, ffn_gamma, ffn_eps)
-        r = ttnn.linear(
+        r = _lin(
             ttnn.multiply(
-                ttnn.silu(ttnn.linear(hn, w1, compute_kernel_config=_COMPUTE)),
-                ttnn.linear(hn, w3, compute_kernel_config=_COMPUTE),
+                _lin(hn, w1, compute_kernel_config=_COMPUTE),
+                _lin(hn, w3, compute_kernel_config=_COMPUTE),
+                input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             ),
             w2,
             compute_kernel_config=_COMPUTE,
@@ -177,9 +268,7 @@ def _compile_block(device, blk, mask):
 
 def _norm_gamma(norm, device):
     """`[1, 1, 1, dim]` float32 TILE -- the form the spelled-out RMS norm's final multiply takes."""
-    return _from_torch(
-        norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32
-    )
+    return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
 
 
 def _rms_norm(x, gamma, eps):
