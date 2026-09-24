@@ -471,6 +471,7 @@ class NemotronHBlock:
         ckc = self.ckc
         H, P, N, K = self._H, self._P, self._N, self._K
         INTER, GGN = self._INTER, self._GGN
+        G = GGN // N
         if fill:
             self._state = getattr(self, "_state", {})
         # 2. Causal depthwise conv1d (k=4) over the 6144 channels, then SiLU.
@@ -488,18 +489,15 @@ class NemotronHBlock:
         Bg = ttnn.slice(conv_out, [0, 0, INTER], [B, S, INTER + GGN])
         Cg = ttnn.slice(conv_out, [0, 0, INTER + GGN], [B, S, INTER + 2 * GGN])
 
-        # group -> head expansion via selection matmul (repeat_interleave).
-        Bh = ttnn.matmul(Bg, self._Esel, compute_kernel_config=ckc)  # [1,S,8192]
-        Ch = ttnn.matmul(Cg, self._Esel, compute_kernel_config=ckc)  # [1,S,8192]
-
         # dt = softplus(dt + dt_bias)   (time_step_limit=(0,inf) => no clamp)
         dt = ttnn.add(dt, self._dt_bias)
         dt = self._softplus(dt)  # [1,S,H]
 
         # head layouts [1,H,S,*]
         x_h = self._to_heads(xss, S, P, B)  # [B,H,S,P]
-        B_h = self._to_heads(Bh, S, N, B)  # [B,H,S,N]
-        C_h = self._to_heads(Ch, S, N, B)  # [B,H,S,N]
+        # group -> head expansion: to_heads on the G groups, then repeat each group's rows
+        B_h = ttnn.repeat_interleave(_ssm_cache.to_heads(Bg, B, S, G, N), H // G, dim=1)  # [B,H,S,N]
+        C_h = ttnn.repeat_interleave(_ssm_cache.to_heads(Cg, B, S, G, N), H // G, dim=1)  # [B,H,S,N]
         dt_h = self._to_heads(dt, S, 1, B)  # [B,H,S,1]
 
         # 3. Single-chunk SSD.

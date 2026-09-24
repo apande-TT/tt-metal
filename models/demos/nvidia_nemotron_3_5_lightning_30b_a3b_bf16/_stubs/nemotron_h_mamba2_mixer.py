@@ -372,17 +372,14 @@ class TtNemotronHMamba2Mixer:
                 except Exception:
                     pass
 
-        # 6. expand B/C groups->heads via P-matrix matmul, then reshape to heads
-        Be = ttnn.matmul(Bf, self._P, compute_kernel_config=self.ckc)  # (B, T, H*N)
-        Ce = ttnn.matmul(Cf, self._P, compute_kernel_config=self.ckc)  # (B, T, H*N)
-        ttnn.deallocate(Bf)
-        ttnn.deallocate(Cf)
+        # 6. B/C groups -> heads: to_heads on the G groups, then repeat each
+        #    group's rows (no selection matmul, and an 8x narrower layout trip)
         X = self._to_heads(Xf, B, T, H, HD)  # (B, H, T, HD)
         ttnn.deallocate(Xf)
-        Bh = self._to_heads(Be, B, T, H, N)  # (B, H, T, N)
-        Ch = self._to_heads(Ce, B, T, H, N)  # (B, H, T, N)
-        ttnn.deallocate(Be)
-        ttnn.deallocate(Ce)
+        Bh = ttnn.repeat_interleave(self._to_heads(Bf, B, T, G, N), H // G, dim=1)  # (B, H, T, N)
+        Ch = ttnn.repeat_interleave(self._to_heads(Cf, B, T, G, N), H // G, dim=1)  # (B, H, T, N)
+        ttnn.deallocate(Bf)
+        ttnn.deallocate(Cf)
         dt_h = self._to_heads(dt, B, T, H, 1)  # (B, H, T, 1)
         ttnn.deallocate(dt)
 
