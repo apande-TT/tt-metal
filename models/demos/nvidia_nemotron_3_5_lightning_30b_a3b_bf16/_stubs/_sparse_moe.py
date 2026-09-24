@@ -106,7 +106,7 @@ def routed_mix(device, hs, W, up_b, down_cat, C, ckc, arange_cache):
         act,
         ttnn.reshape(down_cat, [Eloc, I, H]),
         compute_kernel_config=_EXPERT_CKC,
-        dtype=ttnn.bfloat8_b,
+        dtype=ttnn.bfloat4_b,  # expert outputs: half the write here and the combine's read
         program_config=bmm_config(device, C, I, H, act.dtype, down_cat.dtype, dest_tiles=8),
     )
     ttnn.deallocate(act)
