@@ -476,11 +476,13 @@ def build(device, torch_module):
         cap = int(kv_cache["k"].shape[-2])
         # The bmm reads the cache transposed in place; an explicit transpose re-wrote the whole
         # [B, n_kv, C, head_dim] K cache every step.
-        scores = _bmm(q, kv_cache["k"], transpose_b=True)
+        # Scale the [B, n_kv, 32, head_dim] query, not the [B, n_kv, 32, C] scores: one pass over
+        # a tensor C/head_dim times smaller.
+        scores = _bmm(ttnn.multiply(q, scale), kv_cache["k"], transpose_b=True)
         ttnn.deallocate(q)
         # The cache tail beyond `position` is zeros, and a zero key scores ZERO -- which is a
         # perfectly ordinary logit, not a small one. It has to be masked explicitly.
-        scores = ttnn.add(ttnn.multiply(scores, scale), _decode_mask(kv_cache, position, cap))
+        scores = ttnn.add(scores, _decode_mask(kv_cache, position, cap))
         weights = _softmax(scores)
         ttnn.deallocate(scores)
         ctx = _bmm(weights, kv_cache["v"])
