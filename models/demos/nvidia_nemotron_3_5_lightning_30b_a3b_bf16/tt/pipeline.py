@@ -411,7 +411,7 @@ class TtNemotronHLayer:
                     shared = ttnn.all_reduce(shared, cluster_axis=1, topology=ttnn.Topology.Linear)
                 shared = _dram_mm.from_rows(shared, B, T)
 
-            y = ttnn.add(_f32(routed), _f32(shared))
+            y = ttnn.add(_f32(routed), shared, dtype=ttnn.float32)  # mixed-dtype add: no typecast pass
             if merge:
                 y = ttnn.all_reduce(y, cluster_axis=1, topology=ttnn.Topology.Linear)
 
@@ -420,7 +420,7 @@ class TtNemotronHLayer:
         # layer and compounds: measured 2026-09-06, a bf16 residual gave e2e
         # PCC 0.947 at depth 7 where the fp32 residual clears the gate. The HF
         # reference runs the whole block in fp32, so this matches it.
-        return ttnn.add(_f32(x), _f32(y))
+        return ttnn.add(_f32(x), y, dtype=ttnn.float32)  # bf16 y read as-is: no typecast pass
 
 
 # --------------------------------------------------------------------------- #
