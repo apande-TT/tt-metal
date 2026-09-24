@@ -76,6 +76,47 @@ def _mcast_cfg(x, w, rows, out_dtype):
     )
 
 
+def _short_cfg(x, w, rows, out_dtype):
+    """A 1D in0-multicast config for a SHORT (2..7 tile rows) linear, or None.
+
+    Such a linear is bound by streaming its weight, so every core should own a slice of N and
+    read only its own weight columns while the small activation is multicast to all of them.
+    Left to itself ttnn gives it small K-blocks, and each block is a multicast round trip that
+    every core waits on; this takes the widest K-block that fits L1.
+    """
+    grid = x.device().compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    mt, kt, nt = rows // 32, int(w.shape[-2]) // 32, int(w.shape[-1]) // 32
+    per_n = next(p for p in range(-(-nt // (gx * gy)), nt + 1) if nt % p == 0)
+    size = lambda dt: _TILE_BYTES.get(dt, 2048)
+    fixed = mt * per_n * (size(out_dtype) + (0 if out_dtype == ttnn.float32 else 4096))
+    kb = next(
+        (
+            c
+            for c in (32, 24, 16, 12, 8, 6, 4, 3, 2, 1)
+            if kt % c == 0 and fixed + 2 * c * (mt * size(x.dtype) + per_n * size(w.dtype)) <= _L1_BUDGET
+        ),
+        None,
+    )
+    if kb is None:
+        return None
+    sub = max(
+        ((h, s) for h in range(1, 5) for s in range(1, 5) if h * s <= 4 and mt % h == 0 and per_n % s == 0),
+        key=lambda hs: (hs[0] * hs[1], hs[1]),
+    )
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=(gx, gy),
+        in0_block_w=kb,
+        out_subblock_h=sub[0],
+        out_subblock_w=sub[1],
+        per_core_M=mt,
+        per_core_N=per_n,
+        fuse_batch=True,
+        fused_activation=None,
+        mcast_in0=True,
+    )
+
+
 def _lin(x, w, **kwargs):
     """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
 
@@ -93,6 +134,10 @@ def _lin(x, w, **kwargs):
         if cfg is not None:
             kwargs["program_config"] = cfg
         kwargs["compute_kernel_config"] = _TALL_COMPUTE
+    elif 64 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs:
+        cfg = _short_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
+        if cfg is not None:
+            kwargs["program_config"] = cfg
     if lead == 1:
         return ttnn.linear(x, w, **kwargs)
     y = ttnn.linear(ttnn.reshape(x, [1, 1, rows, shape[-1]]), w, **kwargs)
