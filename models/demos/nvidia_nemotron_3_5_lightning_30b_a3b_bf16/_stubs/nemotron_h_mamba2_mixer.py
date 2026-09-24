@@ -284,13 +284,14 @@ class TtNemotronHMamba2Mixer:
         # Keyed on (B, T). ttnn.matmul HANGS on a PARTIAL batch broadcast (lhs
         # batch 1 against rhs batch B), so a constant that is a matmul OPERAND
         # must either match the real batch or have ALL its batch dims equal to 1.
-        # `tril`/`neg` therefore stay (1,1,T,T) rather than being expanded over
-        # heads; `shifts` are materialised at the real batch.
+        # `neg` therefore stays (1,1,T,T); `tril` (the cumsum operand) and
+        # `shifts` are materialised at the real batch.
         c = self._consts.get((B, T))
         if c is not None:
             return c
         tril2d = torch.tril(torch.ones(T, T, dtype=torch.float32))  # (T,T)
-        tril = tril2d.reshape(1, 1, T, T).contiguous()
+        # at the real (B, H) batch so the cumsum runs as a head-spread heads_matmul
+        tril = tril2d.reshape(1, 1, T, T).expand(B, self.num_heads, T, T).contiguous()
         # additive causal mask (0 on/below diagonal, -1e9 above); elementwise add
         neg = ((1.0 - tril2d) * (-1e9)).reshape(1, 1, T, T).contiguous()
         # shift matrices for the depthwise causal conv: Sh_s @ x => x[t-s]
@@ -391,7 +392,7 @@ class TtNemotronHMamba2Mixer:
         # 8. decay matrix L = exp(causal-segsum(A_h * dt))
         a = ttnn.multiply(dt_h, self._A)  # (B, H, T, 1)
         ttnn.deallocate(dt_h)
-        A_cum = ttnn.matmul(consts["tril"], a, compute_kernel_config=self.ckc)  # (B, H, T, 1)
+        A_cum = _ssm_cache.heads_matmul(consts["tril"], a, self.ckc)  # (B, H, T, 1) inclusive cumsum
         ttnn.deallocate(a)
         if fill:
             _ssm_cache.mamba_fill(self._state, self.device, hbc_pre, A_cum, Bh, X_disc, self.conv_k, self.ckc)
