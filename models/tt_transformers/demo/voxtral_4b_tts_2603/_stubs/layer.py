@@ -387,6 +387,23 @@ def _softmax(x, dim=-1):
     return ttnn.divide(e, ttnn.sum(e, dim=dim, keepdim=True))
 
 
+def _swiglu_pairs(gate, up, tile=32):
+    """`[K, N]` gate and up weights as ONE `[K, 2N]` weight of interleaved column-tile pairs
+    `[gate_t0, up_t0, gate_t1, up_t1, ...]` -- the layout `minimal_matmul(fuse_swiglu=True)` reads
+    to emit `silu(gate) * up` straight from the matmul."""
+    rows, n = int(gate.shape[0]), int(gate.shape[-1])
+    pairs = torch.stack([gate.reshape(rows, n // tile, tile), up.reshape(rows, n // tile, tile)], dim=2)
+    return pairs.reshape(rows, 2 * n).contiguous()
+
+
+def _fused_swiglu(h, w_gu):
+    """Prefill `silu(h @ Wg) * (h @ Wu)` as ONE matmul: no gate/up tensors are written and there
+    is no separate multiply pass over them."""
+    return ttnn.experimental.minimal_matmul(
+        h, w_gu, fuse_swiglu=True, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE
+    )
+
+
 def build(device, torch_module):
     layer = torch_module
     attn = layer.self_attn
@@ -424,6 +441,15 @@ def build(device, torch_module):
     wo = _weight(attn.o_proj, device)
     w_gate = _folded(mlp.gate_proj, g_post_t)
     w_up = _folded(mlp.up_proj, g_post_t)
+    # Prefill's fused SwiGLU weight (bf16 like the bf16 norm output it multiplies); decode keeps
+    # the separate gate/up above, since its float32 activation cannot share a bf16-only op.
+    w_gu = _from_torch(
+        _swiglu_pairs(
+            mlp.gate_proj.weight.detach().float().transpose(0, 1) * g_post_t,
+            mlp.up_proj.weight.detach().float().transpose(0, 1) * g_post_t,
+        ),
+        device,
+    )
     w_down = _weight(mlp.down_proj, device)
     g_in = None
     g_post = None
@@ -587,11 +613,14 @@ def build(device, torch_module):
         ttnn.deallocate(attn_out)
 
         hn = _rms_norm(h, g_post, eps_post, dtype=None if decode else ttnn.bfloat16)
-        gated = ttnn.multiply(
-            _lin(hn, w_gate, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
-            _lin(hn, w_up, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
-            input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
-        )
+        if decode:
+            gated = ttnn.multiply(
+                _lin(hn, w_gate, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
+                _lin(hn, w_up, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
+                input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+            )
+        else:
+            gated = _fused_swiglu(hn, w_gu)
         ttnn.deallocate(hn)
         # Prefill hands the down projection over in bf16, as the composed kinds' mlp and every wo
         # already do; the residual it is added into stays float32.

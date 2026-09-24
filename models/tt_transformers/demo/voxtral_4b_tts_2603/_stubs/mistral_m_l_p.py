@@ -272,6 +272,23 @@ def _seed_cache(kv, k, v):
     kv["filled"] = int(k.shape[-2])
 
 
+def _swiglu_pairs(gate, up, tile=32):
+    """`[K, N]` gate and up weights as ONE `[K, 2N]` weight of interleaved column-tile pairs
+    `[gate_t0, up_t0, gate_t1, up_t1, ...]` -- the layout `minimal_matmul(fuse_swiglu=True)` reads
+    to emit `silu(gate) * up` straight from the matmul."""
+    rows, n = int(gate.shape[0]), int(gate.shape[-1])
+    pairs = torch.stack([gate.reshape(rows, n // tile, tile), up.reshape(rows, n // tile, tile)], dim=2)
+    return pairs.reshape(rows, 2 * n).contiguous()
+
+
+def _fused_swiglu(h, w_gu):
+    """Prefill `silu(h @ Wg) * (h @ Wu)` as ONE matmul: no gate/up tensors are written and there
+    is no separate multiply pass over them."""
+    return ttnn.experimental.minimal_matmul(
+        h, w_gu, fuse_swiglu=True, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE
+    )
+
+
 def build(device, torch_module):
     mlp = torch_module
     dim = int(mlp.gate_proj.in_features)
@@ -280,14 +297,24 @@ def build(device, torch_module):
     w_gate = _weight(mlp.gate_proj, device)
     w_up = _weight(mlp.up_proj, device)
     w_down = _weight(mlp.down_proj, device)
+    # Prefill's fused SwiGLU weight; the float32 decode activation keeps the separate pair above.
+    w_gu = _from_torch(
+        _swiglu_pairs(
+            mlp.gate_proj.weight.detach().float().transpose(0, 1), mlp.up_proj.weight.detach().float().transpose(0, 1)
+        ),
+        device,
+    )
 
     def mistral_m_l_p(x, **kwargs):
         h, lead, seq, rank = _view4(x, dim)
-        gated = ttnn.multiply(
-            _lin(h, w_gate, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
-            _lin(h, w_up, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
-            input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
-        )
+        if h.dtype == ttnn.bfloat16 and lead * seq >= 256:
+            gated = _fused_swiglu(h, w_gu)
+        else:
+            gated = ttnn.multiply(
+                _lin(h, w_gate, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
+                _lin(h, w_up, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
+                input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+            )
         out = _lin(gated, w_down, dtype=x.dtype, compute_kernel_config=_COMPUTE)
         ttnn.deallocate(gated)
         return _restore(out, lead, seq, rank, out_dim)
