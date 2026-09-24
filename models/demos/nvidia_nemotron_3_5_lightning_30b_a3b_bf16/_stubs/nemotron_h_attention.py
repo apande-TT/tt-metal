@@ -198,17 +198,11 @@ class TtNemotronHAttention:
 
     def _to_heads(self, t, B, T, n, d):
         """(B, T, n*d) tile -> (B, n, T, d) tile."""
-        rm = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
-        rm = ttnn.reshape(rm, [B, T, n, d])
-        rm = ttnn.permute(rm, (0, 2, 1, 3))
-        return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
+        return _ssm_cache.to_heads(t, B, T, n, d)
 
     def _from_heads(self, t, B, T, n, d):
         """(B, n, T, d) tile -> (B, T, n*d) tile."""
-        rm = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
-        rm = ttnn.permute(rm, (0, 2, 1, 3))
-        rm = ttnn.reshape(rm, [B, T, n * d])
-        return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
+        return _ssm_cache.from_heads(t, B, T, n, d)
 
     def _get_causal_mask(self, T):
         m = self._causal_masks.get(T)

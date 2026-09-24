@@ -72,8 +72,19 @@ def heads_matmul(a, b, ckc, cb_budget=256 * 1024, **kw):
     return ttnn.matmul(a, b, compute_kernel_config=ckc, program_config=pc, **kw)
 
 
+def _tile_heads(t, shape, S, d):
+    """Tile-native head split/merge applies: t really has `shape` (decode's token
+    rows reuse these helpers with other shapes) and rows/head width are tile-aligned."""
+    return S % 32 == 0 and d % 32 == 0 and [int(v) for v in t.shape] == shape
+
+
 def to_heads(t, B, S, n, d):
     """(B, S, n*d) tile -> (B, n, S, d) tile."""
+    if _tile_heads(t, [B, S, n * d], S, d):  # tile-native Q-only head split: no untilize/permute/tilize
+        heads, _, _ = ttnn.experimental.nlp_create_qkv_heads(
+            ttnn.reshape(t, [B, 1, S, n * d]), num_heads=n, num_kv_heads=0, transpose_k_heads=False
+        )
+        return heads
     rm = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
     rm = ttnn.reshape(rm, [B, S, n, d])
     rm = ttnn.permute(rm, (0, 2, 1, 3))
@@ -82,6 +93,8 @@ def to_heads(t, B, S, n, d):
 
 def from_heads(t, B, S, n, d):
     """(B, n, S, d) tile -> (B, S, n*d) tile."""
+    if _tile_heads(t, [B, n, S, d], S, d):
+        return ttnn.transformer.concatenate_heads(t)
     rm = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
     rm = ttnn.permute(rm, (0, 2, 1, 3))
     rm = ttnn.reshape(rm, [B, S, n * d])

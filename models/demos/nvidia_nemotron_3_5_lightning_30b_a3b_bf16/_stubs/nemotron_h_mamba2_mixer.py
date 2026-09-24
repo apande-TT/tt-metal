@@ -312,10 +312,7 @@ class TtNemotronHMamba2Mixer:
 
     def _to_heads(self, t, B, T, n, d):
         """(B, T, n*d) tile -> (B, n, T, d) tile."""
-        rm = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
-        rm = ttnn.reshape(rm, [B, T, n, d])
-        rm = ttnn.permute(rm, (0, 2, 1, 3))
-        return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
+        return _ssm_cache.to_heads(t, B, T, n, d)
 
     def _out_proj(self, y, B, T):
         """out_proj over (1, B*T) token rows; the full-grid config at decode."""
@@ -489,11 +486,8 @@ class TtNemotronHMamba2Mixer:
             Y = self._prefill_core(hbc, dt, B, T, consts, fill=(mode == "fill"))
 
         # 11. back to (B, T, I)
-        Y_rm = ttnn.to_layout(Y, ttnn.ROW_MAJOR_LAYOUT)
+        y = _ssm_cache.from_heads(Y, B, T, self.num_heads, self.head_dim)
         ttnn.deallocate(Y)
-        Y_rm = ttnn.permute(Y_rm, (0, 2, 1, 3))  # (B, T, H, HD)
-        Y_rm = ttnn.reshape(Y_rm, [B, T, I])
-        y = ttnn.to_layout(Y_rm, ttnn.TILE_LAYOUT)
 
         # 12. gated grouped RMSNorm (norm_before_gate=False).
         # `self.gated_norm`, when set by the composing pipeline, supplies this

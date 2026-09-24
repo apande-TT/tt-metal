@@ -451,20 +451,12 @@ class NemotronHBlock:
         return ttnn.add(ttnn.relu(x), l)
 
     def _to_heads(self, t, S, last, B=1):
-        # [B, S, H*last] -> [B, H, S, last]  (permute swaps S/H in ROW_MAJOR)
-        t = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
-        t = ttnn.reshape(t, (B, S, self._H, last))
-        t = ttnn.permute(t, (0, 2, 1, 3))
-        t = ttnn.to_layout(t, ttnn.TILE_LAYOUT)
-        return t
+        # [B, S, H*last] -> [B, H, S, last]
+        return _ssm_cache.to_heads(t, B, S, self._H, last)
 
     def _from_heads(self, t, S, B=1):
         # [B, H, S, P] -> [B, S, H*P]
-        t = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
-        t = ttnn.permute(t, (0, 2, 1, 3))
-        t = ttnn.reshape(t, (B, S, self._H * self._P))
-        t = ttnn.to_layout(t, ttnn.TILE_LAYOUT)
-        return t
+        return _ssm_cache.from_heads(t, B, S, self._H, self._P)
 
     def _prefill_core(self, hsBC, dt, B, S, fill=False):
         """Full-sequence conv + single-chunk SSD -> y [B,H,S,P]. With fill=True
