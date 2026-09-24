@@ -40,7 +40,7 @@ _SDPA_DTYPE = ttnn.bfloat16
 # Tall (prefill) linears are compute-bound, so they run at LoFi rather than the HiFi4 the
 # rest of this file uses; the one-token decode linears are weight-bandwidth-bound and keep HiFi4.
 _TALL_COMPUTE = ttnn.WormholeComputeKernelConfig(
-    math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=True
+    math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=False, packer_l1_acc=True
 )
 _TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
 _L1_BUDGET = 1_100_000
@@ -57,14 +57,15 @@ def _mcast_cfg(x, w, rows, out_dtype):
     above the minimum (a slightly larger block often divides into better subblocks), and when the
     whole per-core output does not fit L1 it is split into out-blocks. Ranked by per-core work,
     then the tiles each core re-reads across out-blocks, then a K-block of at least 4, then subblock
-    area (fp32 DEST caps it at 4 tiles).
+    area (16-bit DEST allows 8 tiles).
     """
     grid = x.device().compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
     mt, kt, nt = rows // 32, int(w.shape[-2]) // 32, int(w.shape[-1]) // 32
     size = lambda dt: _TILE_BYTES.get(dt, 2048)
     xs, ws = size(x.dtype), size(w.dtype)
-    os_ = size(out_dtype) + (0 if out_dtype == ttnn.float32 else 4096)
+    # 16-bit DEST: no separate float32 accumulation buffer beside the output block.
+    os_ = size(out_dtype)
     best = None
     for pm in range(-(-mt // gy), -(-mt // gy) + 5):
         if -(-mt // pm) > gy:
@@ -89,7 +90,7 @@ def _mcast_cfg(x, w, rows, out_dtype):
                             (h, s)
                             for h in range(1, 5)
                             for s in range(1, 5)
-                            if h * s <= 4 and bh % h == 0 and bw % s == 0
+                            if h * s <= 8 and bh % h == 0 and bw % s == 0
                         ),
                         key=lambda hs: (hs[0] * hs[1], hs[1]),
                     )
