@@ -179,8 +179,23 @@ class TtNemotronHMOE:
         )
 
         # ---- shared expert ----
-        self._sh_up = self._devw(sd["shared_experts.up_proj.weight"].t().contiguous())
-        self._sh_down = self._devw(sd["shared_experts.down_proj.weight"].t().contiguous())
+        sh_up = sd["shared_experts.up_proj.weight"].t().contiguous().to(torch.bfloat16)
+        sh_down = sd["shared_experts.down_proj.weight"].t().contiguous().to(torch.bfloat16)
+        if self._shard:
+            # TP like the routed bank: column-parallel up, row-parallel down, so
+            # the shared partial joins the routed partial in ONE all_reduce
+            def _tp(t, dim):
+                return ttnn.from_torch(
+                    t,
+                    dtype=ttnn.bfloat8_b,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.device,
+                    mesh_mapper=ttnn.ShardTensor2dMesh(self.device, mesh_shape=self._mesh_shape, dims=(None, dim)),
+                )
+
+            self._sh_up, self._sh_down = _tp(sh_up, 1), _tp(sh_down, 0)
+        else:
+            self._sh_up, self._sh_down = self._devw(sh_up), self._devw(sh_down)
 
         self.ckc = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -277,11 +292,7 @@ class TtNemotronHMOE:
         ttnn.deallocate(act)
         ttnn.deallocate(W_use)
 
-        # Sum each chip's partial expert mixture into the full 128-expert result
-        # (every chip on the TP axis then holds the complete routed sum).
-        if self._shard:
-            out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
-        return out, hs_bf
+        return out, hs_bf  # this chip's partial; reduced in __call__
 
     def __call__(self, hidden_states, **kwargs):
         hs = self._fp32(hidden_states)
@@ -358,8 +369,6 @@ class TtNemotronHMOE:
             )
             out = ttnn.reshape(out, [B, T, hid])
             ttnn.deallocate(W_use)
-            if self._shard:
-                out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
             hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
         else:
             out, hs_bf = self._dense_experts(hs, W_use, B, T)
@@ -373,8 +382,11 @@ class TtNemotronHMOE:
         s_down_f = ttnn.typecast(s_down, ttnn.float32)
         ttnn.deallocate(s_down)
 
-        out = ttnn.add(out, s_down_f)  # (B,T,hidden) fp32
+        out = ttnn.add(out, s_down_f)  # (B,T,hidden) fp32, this chip's routed + shared partial
         ttnn.deallocate(s_down_f)
+        # one all_reduce sums every chip's partials into the full result
+        if self._shard:
+            out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
         return out
 
 
