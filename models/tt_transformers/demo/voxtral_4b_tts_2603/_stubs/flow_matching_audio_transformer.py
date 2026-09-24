@@ -91,6 +91,10 @@ _COMPUTE = ttnn.WormholeComputeKernelConfig(
 )
 
 
+# Tall (>= 8 tile rows) linears are compute-bound, so they run one fidelity rung below HiFi4.
+_TALL_COMPUTE = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+)
 _TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
 _L1_BUDGET = 1_100_000
 
@@ -151,6 +155,7 @@ def _lin(x, w, **kwargs):
         cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
             kwargs["program_config"] = cfg
+        kwargs["compute_kernel_config"] = _TALL_COMPUTE
     if lead == 1:
         return ttnn.linear(x, w, **kwargs)
     y = ttnn.linear(ttnn.reshape(x, [1, 1, rows, shape[-1]]), w, **kwargs)
