@@ -91,6 +91,15 @@ def to_heads(t, B, S, n, d):
     return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
 
 
+def to_heads_t(t, B, S, n, d):
+    """(B, S, n*d) tile -> (B, n, d, S) tile: to_heads with the last two dims
+    swapped, built by the same ROW_MAJOR permute instead of a second transpose."""
+    rm = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
+    rm = ttnn.reshape(rm, [B, S, n, d])
+    rm = ttnn.permute(rm, (0, 2, 3, 1))
+    return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
+
+
 def from_heads(t, B, S, n, d):
     """(B, n, S, d) tile -> (B, S, n*d) tile."""
     if _tile_heads(t, [B, n, S, d], S, d):
@@ -165,8 +174,8 @@ def softplus(x):
     return ttnn.log1p(ttnn.exp(x))
 
 
-def mamba_ssm_step(state, x_h, B_h, C_h, dt_h, A, D, ckc):
-    """One SSD recurrence step. x_h (B,H,1,P), B_h/C_h (B,H,1,N), dt_h (B,H,1,1).
+def mamba_ssm_step(state, x_h, BT_h, C_h, dt_h, A, D, ckc):
+    """One SSD recurrence step. x_h (B,H,1,P), BT_h (B,H,N,1), C_h (B,H,1,N), dt_h (B,H,1,1).
     Returns y (B,H,1,P).
 
     The (B,H,N,P) fp32 state is the traffic that matters, so it is touched as
@@ -176,7 +185,7 @@ def mamba_ssm_step(state, x_h, B_h, C_h, dt_h, A, D, ckc):
     decay = ttnn.exp(ttnn.multiply(dt_h, A))  # (B,H,1,1)
     xdt = ttnn.multiply(x_h, dt_h)  # (B,H,1,P)
     S_dec = ttnn.multiply(state["ssm"], decay)
-    ttnn.addcmul(S_dec, ttnn.transpose(B_h, -2, -1), xdt, output_tensor=state["ssm"])  # (B,H,N,1)*(B,H,1,P)
+    ttnn.addcmul(S_dec, BT_h, xdt, output_tensor=state["ssm"])  # (B,H,N,1)*(B,H,1,P)
     ttnn.deallocate(S_dec)
     # y = C S as one head-spread batched matmul: it reads the state once (a
     # multiply + reduce reads it, writes the product and reads that again);

@@ -538,10 +538,10 @@ class NemotronHBlock:
         x_h = self._to_heads(xss, 1, P, B)
         # group -> head expansion as a repeat of each group's row (no Esel read)
         G = GGN // N
-        B_h = ttnn.repeat_interleave(_ssm_cache.to_heads(Bg, B, 1, G, N), H // G, dim=1)  # [B,H,1,N]
+        B_hT = ttnn.repeat_interleave(_ssm_cache.to_heads_t(Bg, B, 1, G, N), H // G, dim=1)  # [B,H,N,1]
         C_h = ttnn.repeat_interleave(_ssm_cache.to_heads(Cg, B, 1, G, N), H // G, dim=1)
         dt_h = self._to_heads(dt, 1, 1, B)
-        return _ssm_cache.mamba_ssm_step(self._state, x_h, B_h, C_h, dt_h, self._A4, self._D4, ckc)
+        return _ssm_cache.mamba_ssm_step(self._state, x_h, B_hT, C_h, dt_h, self._A4, self._D4, ckc)
 
     def __call__(
         self, hidden_states, cache_params=None, cache_position=None, attention_mask=None, dtype=ttnn.bfloat16, **kwargs

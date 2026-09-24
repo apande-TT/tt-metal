@@ -447,10 +447,10 @@ class TtNemotronHMamba2Mixer:
         dt = _ssm_cache.softplus(ttnn.add(dt, self._dt_bias))
         X = self._to_heads(Xf, B, 1, H, HD)
         # group -> head expansion as a repeat of each group's row (no P-matrix read)
-        Bh = ttnn.repeat_interleave(self._to_heads(Bf, B, 1, G, N), H // G, dim=1)  # (B, H, 1, N)
+        BhT = ttnn.repeat_interleave(_ssm_cache.to_heads_t(Bf, B, 1, G, N), H // G, dim=1)  # (B, H, N, 1)
         Ch = ttnn.repeat_interleave(self._to_heads(Cf, B, 1, G, N), H // G, dim=1)
         dt_h = self._to_heads(dt, B, 1, H, 1)
-        return _ssm_cache.mamba_ssm_step(self._state, X, Bh, Ch, dt_h, self._A, self._D, self.ckc)
+        return _ssm_cache.mamba_ssm_step(self._state, X, BhT, Ch, dt_h, self._A, self._D, self.ckc)
 
     # ----------------------------- forward ---------------------------- #
     def __call__(self, hidden_states, dtype=ttnn.bfloat16, **kwargs):
