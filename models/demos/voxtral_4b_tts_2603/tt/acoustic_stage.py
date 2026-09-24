@@ -236,8 +236,8 @@ class AcousticBlock:
         self.stubs = tuple(stubs)
         self._run = run
 
-    def __call__(self, h, attn_mask=None):
-        return self._run(h, attn_mask)
+    def __call__(self, h, attn_mask=None, tokens=None):
+        return self._run(h, attn_mask, tokens)
 
     def __repr__(self):
         return f"AcousticBlock(layer_id={self.layer_id}, kind={self.kind!r}, stubs={list(self.stubs)})"
@@ -246,8 +246,8 @@ class AcousticBlock:
 def _fused_block(device, torch_block, layer_id, counter):
     stub = _build_stub(_BLOCK_STUB, device, torch_block, counter)
 
-    def run(h, attn_mask):
-        return stub(h, attn_mask=attn_mask)
+    def run(h, attn_mask, tokens=None):
+        return stub(h, attn_mask=attn_mask, tokens=tokens)
 
     return AcousticBlock(layer_id, "fused", run, [_BLOCK_STUB])
 
@@ -260,9 +260,9 @@ def _composed_block(device, torch_block, layer_id, counter):
     g_ffn = _norm_weight(torch_block.ffn_norm, device)
     eps = float(torch_block.attention_norm.eps)
 
-    def run(h, attn_mask):
+    def run(h, attn_mask, tokens=None):
         xn = _rms_norm(h, g_attn, eps, dtype=ttnn.bfloat16)
-        h = ttnn.add(h, attn(xn, attn_mask=attn_mask))
+        h = ttnn.add(h, attn(xn, attn_mask=attn_mask, tokens=tokens))
         hn = _rms_norm(h, g_ffn, eps, dtype=ttnn.bfloat16)
         return ttnn.add(h, ff(hn))
 
@@ -433,6 +433,8 @@ class AcousticStage:
         """The same field, composed from the part stubs plus this file's norms and projections."""
         p = self.parts
         rows = int(llm.shape[0])
+        if rows % _TILE == 0:
+            return self._part_body_compact(llm, x, t, rows)
         h_in = ttnn.reshape(llm, [rows, 1, 1, self.dim])
         if h_in.dtype != ttnn.float32:
             h_in = ttnn.typecast(h_in, ttnn.float32)
@@ -459,6 +461,42 @@ class AcousticStage:
         h = _rms_norm(h, p["g_final"], p["eps"])
 
         first = ttnn.slice(h, [0, 0, 0, 0], [rows, 1, 1, self.dim])
+        velocity = ttnn.reshape(
+            _lin(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic]
+        )
+        return velocity, semantic
+
+    def _part_body_compact(self, llm, x, t, rows):
+        """`_part_body` on the COMPACT layout: token k of every sample in rows k*rows.., no pad.
+
+        Every linear, norm and eltwise in the blocks then runs on 3*rows real rows instead of
+        32*rows, 29 of every 32 of which were padding. Needs `rows` to be tile-aligned.
+        """
+        p = self.parts
+        h_in = ttnn.reshape(llm, [1, 1, rows, self.dim])
+        if h_in.dtype != ttnn.float32:
+            h_in = ttnn.typecast(h_in, ttnn.float32)
+
+        semantic = ttnn.reshape(
+            _lin(h_in, p["w_semantic"], compute_kernel_config=_COMPUTE), [rows, self.semantic_out]
+        )
+        if p["b_semantic"] is not None:
+            semantic = ttnn.add(semantic, p["b_semantic"])
+
+        t_emb = ttnn.reshape(p["time_embedding"](t), [1, 1, rows, self.dim])
+        x_in = ttnn.typecast(ttnn.reshape(x, [1, 1, rows, self.n_acoustic]), ttnn.float32)
+        h = ttnn.concat(
+            [
+                _lin(x_in, p["w_input"], compute_kernel_config=_COMPUTE),
+                _lin(t_emb, p["w_time"], compute_kernel_config=_COMPUTE),
+                _lin(h_in, p["w_llm"], compute_kernel_config=_COMPUTE),
+            ],
+            dim=2,
+        )
+        for block in self.blocks[: self.n_layers]:
+            h = block(h, None, tokens=_N_REAL_TOKENS)
+        # The norm is per row and only token 0 is read out, so normalise just those rows.
+        first = _rms_norm(ttnn.slice(h, [0, 0, 0, 0], [1, 1, rows, self.dim]), p["g_final"], p["eps"])
         velocity = ttnn.reshape(
             _lin(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic]
         )
