@@ -32,12 +32,10 @@ is all_reduced to recover the full sum.
 """
 from __future__ import annotations
 
-import math
-
 import torch
 
 import ttnn
-from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm, _sparse_moe
 
 
 class TtNemotronHExperts:
@@ -264,54 +262,13 @@ class TtNemotronHExperts:
 
         return self._mix(hs, W_sh, num_tokens)
 
-    def _capacity(self, num_tokens):
-        """Tokens each local expert processes on the sparse path: 4x the mean
-        load (num_tokens * top_k / num_experts), tile-aligned, capped at T."""
-        mean = num_tokens * self.top_k / self.num_experts
-        return min(num_tokens, _dram_mm.TILE * max(1, math.ceil(4 * mean / _dram_mm.TILE)))
-
     def _mix_sparse(self, hs, W_sh, num_tokens):
-        """Prefill MoE computing only routed (token, expert) pairs.
-
-        Each local expert takes its top-C tokens by routing weight (unrouted
-        slots carry weight 0 and contribute nothing), gathers their rows,
-        runs its own up/relu2/down, and a one-hot matmul adds every row back
-        to its token. The dense form evaluates all Eloc experts on all T
-        tokens; this does Eloc*C rows, C ~ 4x the mean expert load."""
-        Eloc, I, H, T = self._Eloc, self.intermediate_dim, self.hidden_dim, num_tokens
-        C = self._capacity(T)
-        # per-expert top-C tokens: values = routing weights, indices = token ids
-        vals, idx = ttnn.topk(ttnn.typecast(ttnn.transpose(W_sh, -2, -1), ttnn.bfloat16), C, dim=-1)  # (Eloc, C)
+        """Prefill MoE over routed (token, expert) pairs only (see _sparse_moe)."""
+        C = _sparse_moe.capacity(num_tokens, self.top_k, self.num_experts)
+        out = _sparse_moe.routed_mix(
+            self.device, hs, W_sh, self._up_b, self._down_cat, C, self._expert_ckc, self._arange
+        )
         ttnn.deallocate(W_sh)
-        idx_rm = ttnn.to_layout(ttnn.typecast(idx, ttnn.uint32), ttnn.ROW_MAJOR_LAYOUT)
-        idx_rm = ttnn.reshape(idx_rm, [1, Eloc * C])
-        table = ttnn.to_layout(ttnn.typecast(hs, ttnn.bfloat16), ttnn.ROW_MAJOR_LAYOUT)  # (T, H)
-        xe = ttnn.embedding(idx_rm, table, layout=ttnn.TILE_LAYOUT)  # (1, Eloc*C, H)
-        ttnn.deallocate(table)
-        xe = ttnn.reshape(xe, [Eloc, C, H])
-        act = ttnn.matmul(xe, self._up_b, compute_kernel_config=self._expert_ckc, dtype=ttnn.bfloat8_b)  # (Eloc,C,I)
-        ttnn.deallocate(xe)
-        w3 = ttnn.to_layout(
-            ttnn.reshape(ttnn.to_layout(vals, ttnn.ROW_MAJOR_LAYOUT), [Eloc, C, 1]), ttnn.TILE_LAYOUT
-        )  # (Eloc, C, 1)
-        act = ttnn.multiply(
-            ttnn.relu(act), w3, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]
-        )  # relu2 * routing weight
-        ye = ttnn.matmul(
-            act, ttnn.reshape(self._down_cat, [Eloc, I, H]), compute_kernel_config=self._expert_ckc, dtype=ttnn.bfloat16
-        )  # (Eloc, C, H)
-        ttnn.deallocate(act)
-        # combine: out[t] = sum over (e, c) with idx[e, c] == t of ye[e, c]
-        ar = self._arange.get(T)
-        if ar is None:
-            ar = self._arange[T] = self._upload(torch.arange(T, dtype=torch.float32).reshape(T, 1), ttnn.float32)
-        idx_f = ttnn.reshape(ttnn.typecast(idx, ttnn.float32), [1, Eloc * C])
-        onehot = ttnn.eq(ar, idx_f, dtype=ttnn.bfloat8_b)  # (T, Eloc*C); 0/1 is exact in bf8_b
-        out = ttnn.matmul(
-            onehot, ttnn.reshape(ye, [Eloc * C, H]), compute_kernel_config=self._expert_ckc, dtype=ttnn.float32
-        )  # (T, H)
-        ttnn.deallocate(onehot)
-        ttnn.deallocate(ye)
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
         return ttnn.typecast(out, ttnn.bfloat16)

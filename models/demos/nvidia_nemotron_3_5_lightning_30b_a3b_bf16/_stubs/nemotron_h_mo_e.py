@@ -46,7 +46,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm, _sparse_moe
 from models.tt_transformers.tt.mixtral_moe import TtMoeLayer  # kept per ADAPT requirement
 
 
@@ -126,6 +126,14 @@ class TtNemotronHMOE:
                 return ttnn.reshape(t, list(chunk.shape[1:]))
 
             self._up_cat = _folded(up_stack, 1)  # (hidden, Eloc*inter)
+            # prefill sparse path: per-expert (Eloc, hidden, inter) up bank
+            self._up_b = ttnn.from_torch(
+                up_stack,  # (E, hidden, inter): chip d's dim-0 chunk is its local experts
+                dtype=ttnn.bfloat4_b,
+                layout=ttnn.TILE_LAYOUT,
+                device=dev,
+                mesh_mapper=ttnn.ShardTensor2dMesh(dev, mesh_shape=_mesh_shape, dims=(None, 0)),
+            )
             self._down_cat = _folded(dn_stack, 0)  # (Eloc*inter, hidden)
             # decode copy of the down bank, DRAM-sharded (see _dram_mm)
             self._down_dram = _dram_mm.upload_weight(
@@ -156,6 +164,7 @@ class TtNemotronHMOE:
             up_full = sd["experts.up_proj"].transpose(-1, -2).contiguous()  # (E, in, inter)
             dn_full = sd["experts.down_proj"].transpose(-1, -2).contiguous()  # (E, inter, in)
             self._up_cat = self._devw(torch.cat(list(up_full), dim=1))
+            self._up_b = self._devw4(up_full)
             self._down_cat = self._devw4(torch.cat(list(dn_full), dim=0))
             self._down_dram = _dram_mm.upload_weight(dev, torch.cat(list(dn_full), dim=0))
             self._sel = None
@@ -164,6 +173,7 @@ class TtNemotronHMOE:
         # One-hot (Eloc, Eloc*inter) expander: row j is 1 over expert j's slice
         # of the folded activation (same on every chip -> replicated).
         self._inter = int(sd["experts.up_proj"].shape[1])
+        self._arange = {}
         self._expand = self._upload(
             torch.repeat_interleave(torch.eye(self._Eloc), self._inter, dim=1).to(torch.bfloat16), ttnn.bfloat16
         )
@@ -236,6 +246,43 @@ class TtNemotronHMOE:
         return self._dev(t)
 
     # ------------------------------ forward --------------------------- #
+    def _dense_experts(self, hs, W_use, B, T):
+        """Decode: every local expert on every token (weight-read bound anyway).
+        Returns (routed mixture, hs in bf16)."""
+        # HF sums the top-k weighted expert outputs in fp32 (topk_weights.dtype),
+        # so accumulate in fp32; bf16 expert weights/matmuls with HiFi4 fp32 acc.
+        hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
+        # Folded bank: one up matmul over all local experts, relu2, scale each
+        # expert's slice by its routing weight (expanded to the folded width),
+        # then one down matmul whose K reduction is the weighted expert sum.
+        act = ttnn.linear(
+            hs_bf, self._up_cat, compute_kernel_config=self._expert_ckc, activation="relu", dtype=ttnn.bfloat8_b
+        )
+        w_wide = ttnn.matmul(W_use, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat8_b)
+        # relu2 = square fused into the routing-weight multiply (one pass over act)
+        act = ttnn.multiply(
+            act, w_wide, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]
+        )  # bf8_b halves the down matmul's activation read
+        ttnn.deallocate(w_wide)
+        if B * T <= _dram_mm.TILE:  # decode: stream the DRAM-sharded bank
+            hid = int(hs_bf.shape[-1])
+            out = _dram_mm.matmul(
+                self.device, ttnn.reshape(act, [1, B * T, int(act.shape[-1])]), self._down_dram, hid, self._expert_ckc
+            )
+            out = ttnn.reshape(out, [B, T, hid])
+        else:
+            out = ttnn.matmul(
+                act, self._down_cat, compute_kernel_config=self._expert_ckc, dtype=ttnn.float32
+            )  # (B,T,hidden) fp32
+        ttnn.deallocate(act)
+        ttnn.deallocate(W_use)
+
+        # Sum each chip's partial expert mixture into the full 128-expert result
+        # (every chip on the TP axis then holds the complete routed sum).
+        if self._shard:
+            out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
+        return out, hs_bf
+
     def __call__(self, hidden_states, **kwargs):
         hs = self._fp32(hidden_states)
         if hs.layout != ttnn.TILE_LAYOUT:
@@ -295,39 +342,27 @@ class TtNemotronHMOE:
         else:
             W_use = W
 
-        # ---------------- experts (dense, fp32-accumulated mixture) ----------------
-        # HF sums the top-k weighted expert outputs in fp32 (topk_weights.dtype),
-        # so accumulate in fp32; bf16 expert weights/matmuls with HiFi4 fp32 acc.
-        hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
-        # Folded bank: one up matmul over all local experts, relu2, scale each
-        # expert's slice by its routing weight (expanded to the folded width),
-        # then one down matmul whose K reduction is the weighted expert sum.
-        act = ttnn.linear(
-            hs_bf, self._up_cat, compute_kernel_config=self._expert_ckc, activation="relu", dtype=ttnn.bfloat8_b
-        )
-        w_wide = ttnn.matmul(W_use, self._expand, compute_kernel_config=self.ckc, dtype=ttnn.bfloat8_b)
-        # relu2 = square fused into the routing-weight multiply (one pass over act)
-        act = ttnn.multiply(
-            act, w_wide, dtype=ttnn.bfloat8_b, input_tensor_a_activations=[ttnn.UnaryOpType.SQUARE]
-        )  # bf8_b halves the down matmul's activation read
-        ttnn.deallocate(w_wide)
-        if B * T <= _dram_mm.TILE:  # decode: stream the DRAM-sharded bank
-            hid = int(hs_bf.shape[-1])
-            out = _dram_mm.matmul(
-                self.device, ttnn.reshape(act, [1, B * T, int(act.shape[-1])]), self._down_dram, hid, self._expert_ckc
+        # ---------------- experts ----------------
+        if B * T > _dram_mm.TILE:  # prefill: routed (token, expert) pairs only
+            hid = int(hs.shape[-1])
+            C = _sparse_moe.capacity(B * T, self.top_k, self.n_routed_experts)
+            out = _sparse_moe.routed_mix(
+                self.device,
+                ttnn.reshape(hs, [B * T, hid]),
+                ttnn.reshape(W_use, [B * T, self._Eloc]),
+                self._up_b,
+                self._down_cat,
+                C,
+                self._expert_ckc,
+                self._arange,
             )
             out = ttnn.reshape(out, [B, T, hid])
+            ttnn.deallocate(W_use)
+            if self._shard:
+                out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
+            hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
         else:
-            out = ttnn.matmul(
-                act, self._down_cat, compute_kernel_config=self._expert_ckc, dtype=ttnn.float32
-            )  # (B,T,hidden) fp32
-        ttnn.deallocate(act)
-        ttnn.deallocate(W_use)
-
-        # Sum each chip's partial expert mixture into the full 128-expert result
-        # (every chip on the TP axis then holds the complete routed sum).
-        if self._shard:
-            out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
+            out, hs_bf = self._dense_experts(hs, W_use, B, T)
 
         # ---------------- shared expert (fp32) ----------------
         s_act = ttnn.linear(hs_bf, self._sh_up, compute_kernel_config=self._expert_ckc, activation="relu")
