@@ -196,7 +196,7 @@ def _rms_norm(x, gamma, eps, dtype=None):
     stubs beside this file (`flow_matching_audio_transformer`, `acoustic_transformer_block`)
     already spell it out; this is the same four ops so the two bodies agree.
     """
-    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
+    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
     return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
 
 
