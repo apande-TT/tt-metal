@@ -357,7 +357,7 @@ class TtNemotronHLayer:
         # then). The residual stream is fp32, so hand it a copy -- otherwise the
         # residual `x` is freed under us before the add below.
         _invocation.record("nemotron_h_r_m_s_norm")
-        h = self.norm(_dup(x))
+        h = self.norm(_dup(x), dtype=ttnn.float32)  # every mixer below upcasts its input to fp32 anyway
 
         if self.variant in ("MAMBA_B", "MAMBA_C"):
             _invocation.record("nemotron_h_mamba2_mixer")
@@ -569,7 +569,7 @@ class NemotronHPipeline:
         for layer in self.layers:
             h = layer(h)
         _invocation.record("nemotron_h_r_m_s_norm")
-        return self.final_norm(h)
+        return self.final_norm(h, dtype=ttnn.float32)  # the fp32 lm_head input
 
     def forward_logits(self, ids_tt, last_only=True, token_rows=False):
         """ids (B, T) -> lm_head logits: (1, B, vocab) for the last positions

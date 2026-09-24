@@ -71,13 +71,15 @@ class TtNemotronHRMSNorm:
             return t
         return self._dev(t.float())
 
-    def __call__(self, hidden_states, **kwargs):
+    def __call__(self, hidden_states, dtype=ttnn.bfloat16, **kwargs):
+        """dtype: output dtype. A caller that upcasts to fp32 anyway asks for
+        fp32 and skips a bf16 round trip (two passes, and the rounding)."""
         hs = self._fp32(hidden_states)
         if hs.layout != ttnn.TILE_LAYOUT:
             hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
         out = ttnn.rms_norm(hs, weight=self._w, epsilon=self.eps, compute_kernel_config=self.ckc)
         ttnn.deallocate(hs)
-        return ttnn.typecast(out, ttnn.bfloat16)
+        return out if dtype == ttnn.float32 else ttnn.typecast(out, dtype)
 
 
 # Module-level `build` — primary test entry point.
