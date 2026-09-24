@@ -107,6 +107,26 @@ def _lin(x, w, **kwargs):
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
+def _bmm(a, b):
+    """Head-batched `a @ b` spread over the full grid.
+
+    Without a program config the `[B, H, 32, 128] x [B, H, 128, 32]` score product lands on ONE
+    core (and probs @ V on four), running B*H tiny matmuls back to back. The reuse config makes
+    every (batch, head) output block its own work unit, so they fan out across the grid.
+    """
+    m, k, n = int(a.shape[-2]) // 32, int(a.shape[-1]) // 32, int(b.shape[-1]) // 32
+    grid = a.device().compute_with_storage_grid_size()
+    cfg = ttnn.MatmulMultiCoreReuseProgramConfig(
+        compute_with_storage_grid_size=(grid.x, grid.y),
+        in0_block_w=k,
+        out_subblock_h=1,
+        out_subblock_w=min(n, 4),
+        per_core_M=m,
+        per_core_N=n,
+    )
+    return ttnn.matmul(a, b, program_config=cfg, compute_kernel_config=_COMPUTE)
+
+
 def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     """GQA attention, bidirectional and non-causal, entirely in float32.
 
@@ -133,14 +153,14 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
         v = ttnn.repeat_interleave(v, repeats, dim=1)
 
     # The reference scales the QUERY before the product, not the scores after it.
-    scores = ttnn.matmul(ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1), compute_kernel_config=_COMPUTE)
+    scores = _bmm(ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1))
     if attn_mask is not None:
         scores = ttnn.add(scores, attn_mask)
     scores = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True))
     weights = ttnn.exp(scores)
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
-    out = ttnn.matmul(weights, v, compute_kernel_config=_COMPUTE)
+    out = _bmm(weights, v)
     return _lin(
         ttnn.experimental.nlp_concat_heads(out),
         wo,
