@@ -207,14 +207,14 @@ def _lin(x, w, **kwargs):
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
-def _bmm(a, b, per_core_m=None):
+def _bmm(a, b, per_core_m=None, transpose_b=False):
     """Head-batched `a @ b` spread over the full grid.
 
     Without a program config the `[B, H, 32, 128] x [B, H, 128, 32]` score product lands on ONE
     core (and probs @ V on four), running B*H tiny matmuls back to back. The reuse config makes
     every (batch, head) output block its own work unit, so they fan out across the grid.
     """
-    m, k, n = int(a.shape[-2]) // 32, int(a.shape[-1]) // 32, int(b.shape[-1]) // 32
+    m, k, n = int(a.shape[-2]) // 32, int(a.shape[-1]) // 32, int(b.shape[-2 if transpose_b else -1]) // 32
     grid = a.device().compute_with_storage_grid_size()
     cfg = ttnn.MatmulMultiCoreReuseProgramConfig(
         compute_with_storage_grid_size=(grid.x, grid.y),
@@ -224,7 +224,7 @@ def _bmm(a, b, per_core_m=None):
         per_core_M=per_core_m or m,
         per_core_N=n,
     )
-    return ttnn.matmul(a, b, program_config=cfg, compute_kernel_config=_COMPUTE)
+    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE)
 
 
 def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
@@ -312,7 +312,7 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
     head_dim = int(q.shape[-1])
     q = ttnn.reshape(q, [1, n_kv_heads, repeats * rows, head_dim])
 
-    scores = _bmm(ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1), per_core_m=1)
+    scores = _bmm(ttnn.multiply(q, scale), k, per_core_m=1, transpose_b=True)
     scores = ttnn.add(scores, _compact_mask(h.device(), rows, tokens, repeats))
     scores = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True))
     weights = ttnn.exp(scores)

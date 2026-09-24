@@ -157,7 +157,7 @@ def _compile_codec_block(device, blk, mask):
             num_kv_heads=n_kv_heads,
             transpose_k_heads=False,
         )
-        scores = ttnn.matmul(qh, ttnn.transpose(kh, -2, -1), compute_kernel_config=_COMPUTE)
+        scores = ttnn.matmul(qh, kh, transpose_b=True, compute_kernel_config=_COMPUTE)
         scores = ttnn.add(
             ttnn.multiply(scores, scale),
             ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq]),
