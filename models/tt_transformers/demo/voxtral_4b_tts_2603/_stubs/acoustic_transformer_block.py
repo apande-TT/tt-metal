@@ -337,8 +337,9 @@ def build(device, torch_module):
             dim=-1,
         ).contiguous(),
         device,
+        dtype=ttnn.bfloat8_b,
     )
-    wo = _weight(attn.wo, device)
+    wo = _from_torch(attn.wo.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     w1 = _from_torch(ff.w1.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     # The down projection is DRAM-bound at 1024 rows; bf8_b halves the weight it streams.
     w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)

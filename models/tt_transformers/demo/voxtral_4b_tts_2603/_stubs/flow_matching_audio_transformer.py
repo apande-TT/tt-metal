@@ -341,8 +341,9 @@ def _compile_block(device, blk, mask):
             dim=-1,
         ).contiguous(),
         device,
+        dtype=ttnn.bfloat8_b,
     )
-    wo = _weight(attn.wo, device)
+    wo = _from_torch(attn.wo.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     # Weight-stream bound at 96 rows; bf8_b halves the bytes each FFN projection reads.
     w1, w3 = (
         _from_torch(m.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)

@@ -314,8 +314,9 @@ def build(device, torch_module):
             dim=-1,
         ).contiguous(),
         device,
+        dtype=ttnn.bfloat8_b,
     )
-    wo = _from_torch(attn.wo.weight.detach().transpose(0, 1).contiguous(), device)
+    wo = _from_torch(attn.wo.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     for rows in _COMPACT_ROWS:
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
 
