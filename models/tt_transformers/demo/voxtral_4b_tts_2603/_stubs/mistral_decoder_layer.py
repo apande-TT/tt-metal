@@ -40,10 +40,10 @@ _COMPUTE = ttnn.WormholeComputeKernelConfig(
 )
 
 
-# Tall (prefill) linears are compute-bound, so they run one fidelity rung below the HiFi4 the
+# Tall (prefill) linears are compute-bound, so they run at LoFi rather than the HiFi4 the
 # rest of this file uses; the one-token decode linears are weight-bandwidth-bound and keep HiFi4.
 _TALL_COMPUTE = ttnn.WormholeComputeKernelConfig(
-    math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+    math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=True
 )
 _TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
 _L1_BUDGET = 1_100_000
