@@ -511,13 +511,13 @@ class NemotronHBlock:
         L = ttnn.exp(diff)  # [1,H,S,S]
 
         Bt = ttnn.transpose(B_h, -2, -1)  # [1,H,N,S]
-        Gmat = ttnn.matmul(C_h, Bt, compute_kernel_config=ckc)  # [1,H,S,S] = C·Bᵀ
+        Gmat = _ssm_cache.heads_matmul(C_h, Bt, ckc)  # [1,H,S,S] = C·Bᵀ
         M = ttnn.mul(Gmat, L)  # [1,H,S,S]
 
         x_disc = ttnn.mul(x_h, dt_h)  # [1,H,S,P]
         if fill:
             _ssm_cache.mamba_fill(self._state, self.device, hsBC, cumA, B_h, x_disc, K, ckc)
-        Ydiag = ttnn.matmul(M, x_disc, compute_kernel_config=ckc)  # [1,H,S,P]
+        Ydiag = _ssm_cache.heads_matmul(M, x_disc, ckc)  # [1,H,S,P]
         Dres = ttnn.mul(self._D4, x_h)  # [1,H,S,P]
         y = ttnn.add(Ydiag, Dres)  # [1,H,S,P]
 

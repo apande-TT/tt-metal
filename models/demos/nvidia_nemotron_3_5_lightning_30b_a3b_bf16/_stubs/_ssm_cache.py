@@ -48,6 +48,30 @@ def upload(device, t, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device, **kw)
 
 
+def heads_matmul(a, b, ckc, cb_budget=256 * 1024, **kw):
+    """Per-head batched matmul (..., M, K) @ (..., K, N) with the batch spread
+    over the grid: one whole (M, N) output block per core (BMM "reuse", no
+    multicast). ttnn's own choice for these parallelises only the Mt x Nt
+    output tiles of ONE head -- a handful of cores looping over B*H heads."""
+    g = a.device().compute_with_storage_grid_size()
+    mt, kt, nt = [-(-int(v) // 32) for v in (a.padded_shape[-2], a.padded_shape[-1], b.padded_shape[-1])]
+    tb = max(4096 if t.dtype == ttnn.float32 else 2048 for t in (a, b))
+    kw_blk = max(d for d in range(1, kt + 1) if kt % d == 0 and (d == 1 or 2 * d * (mt + nt) * tb <= cb_budget))
+    sub = max(
+        ((h, w) for h in range(1, mt + 1) for w in range(1, nt + 1) if mt % h == 0 and nt % w == 0 and h * w <= 4),
+        key=lambda s: (s[0] * s[1], s[1]),
+    )
+    pc = ttnn.MatmulMultiCoreReuseProgramConfig(
+        compute_with_storage_grid_size=g,
+        in0_block_w=kw_blk,
+        out_subblock_h=sub[0],
+        out_subblock_w=sub[1],
+        per_core_M=mt,
+        per_core_N=nt,
+    )
+    return ttnn.matmul(a, b, compute_kernel_config=ckc, program_config=pc, **kw)
+
+
 def to_heads(t, B, S, n, d):
     """(B, S, n*d) tile -> (B, n, S, d) tile."""
     rm = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
@@ -86,7 +110,7 @@ def mamba_fill(state, device, hbc_pre, cumA, B_h, x_disc, K, ckc):
     last = ttnn.slice(cumA, [0, 0, S - 1, 0], [B, H, S, 1])  # (B,H,1,1)
     w = ttnn.exp(ttnn.subtract(last, cumA))  # decay from s to the end, (B,H,S,1); s<=S-1 always
     Bw = ttnn.multiply(B_h, w)  # (B,H,S,N)
-    persist(state, "ssm", ttnn.matmul(ttnn.transpose(Bw, -2, -1), x_disc, compute_kernel_config=ckc))  # (B,H,N,P)
+    persist(state, "ssm", heads_matmul(ttnn.transpose(Bw, -2, -1), x_disc, ckc))  # (B,H,N,P)
 
 
 def mamba_conv_step(state, hbc_t, taps, bias, K):
