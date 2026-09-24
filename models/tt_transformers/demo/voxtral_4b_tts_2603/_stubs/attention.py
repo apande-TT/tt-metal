@@ -250,6 +250,23 @@ def _bmm(a, b):
     return ttnn.matmul(a, b, program_config=cfg, compute_kernel_config=_COMPUTE)
 
 
+def _sdpa_cfg(q):
+    """Prefill SDPA on the full grid with the widest q/k chunk (<= 128) that divides the sequence.
+
+    With no program config SDPA takes small default chunks, so each (batch, head) row is many
+    tiny work units that re-stream K/V per chunk.
+    """
+    grid = q.device().compute_with_storage_grid_size()
+    seq = int(q.shape[-2])
+    chunk = next(c for c in (128, 64, 32) if seq % c == 0)
+    return ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=(grid.x, grid.y),
+        exp_approx_mode=False,
+        q_chunk_size=chunk,
+        k_chunk_size=chunk,
+    )
+
+
 def _decode_shard(device, rows, width):
     """HEIGHT-sharded over the batch, one user per core -- the decode op set's layout.
 
@@ -501,7 +518,9 @@ def build(device, torch_module):
             sin = _broadcast4(sin, seq, head_dim)
             q, k = _rope_prefill(q, k, cos, sin, half)
 
-        a = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+        a = ttnn.transformer.scaled_dot_product_attention(
+            q, k, v, is_causal=True, scale=scale, program_config=_sdpa_cfg(q)
+        )
         if kv_cache is not None:
             _seed_cache(kv_cache, k, v)
         out = _lin(
