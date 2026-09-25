@@ -596,9 +596,13 @@ def build(device, torch_module):
         # The grouped query is `groups` rows of a 32-row tile. Zero-padding it to a LOGICAL full tile
         # costs nothing physically and lets every softmax reduction below skip its FillPad pass.
         q_rows = -(-groups // 32) * 32
-        q = _head_split(0, q_width, groups)
-        if q_rows != groups:
-            q = ttnn.pad(q, [(0, 0), (0, 0), (0, q_rows - groups), (0, 0)], 0.0)
+        # q is RoPE'd with the heads as ROWS, `[B, 1, n_heads, head_dim]` (one tile per user), and
+        # only then regrouped by kv head: the grouped `[B, n_kv, groups, head_dim]` form pads each
+        # group of `groups` rows out to a 32-row tile, 8x the tiles for the six RoPE ops.
+        q = ttnn.to_layout(
+            ttnn.reshape(ttnn.slice(rows, [0, 0, 0, 0], [1, 1, batch, q_width]), [batch, 1, n_heads, head_dim]),
+            ttnn.TILE_LAYOUT,
+        )
 
         # k and v go straight into the cache's own `[1, B, n_kv, head_dim]` layout: the n_kv heads
         # share ONE tile per user there, where `[B, n_kv, 1, head_dim]` pads every head to its own
@@ -619,6 +623,12 @@ def build(device, torch_module):
             else:
                 q = _rope(q, cos, sin, half)
                 k = _rope(k, cos, sin, half)
+        q = ttnn.to_layout(
+            ttnn.reshape(ttnn.to_layout(q, ttnn.ROW_MAJOR_LAYOUT), [batch, n_kv_heads, groups, head_dim]),
+            ttnn.TILE_LAYOUT,
+        )
+        if q_rows != groups:
+            q = ttnn.pad(q, [(0, 0), (0, 0), (0, q_rows - groups), (0, 0)], 0.0)
         idxs = [int(position)] * batch
         # `paged_update_cache` wants the decode layout `[1, B, n_kv, head_dim]` AND it wants that
         # tensor HEIGHT-SHARDED, one user per core -- it is part of the decode op set even though
