@@ -288,15 +288,15 @@ def _fused_swiglu(h, w_gu):
     rows = 1
     for d in list(h.shape)[:-1]:
         rows *= int(d)
-    # Half of each core's M share per block (vs the default 8 rows) halves the weight re-reads;
-    # the default 8-tile N and K blocks keep the L1 footprint near 1 MB.
+    # Half of each core's M share per block (vs the default 8 rows) halves the weight re-reads and
+    # 12-tile N blocks cut the activation re-reads; 4-tile K blocks keep the L1 footprint < 0.9 MB.
     m_blk = -(-(-(-(rows // 32) // int(grid.y))) // 2)
     cfg = ttnn.MinimalMatmulConfig(
         M_block_size=m_blk,
-        K_block_size=8,
-        N_block_size=8,
+        K_block_size=4,
+        N_block_size=12,
         subblock_h=1,
-        subblock_w=8,
+        subblock_w=6,
         compute_with_storage_grid_size=grid,
     )
     return ttnn.experimental.minimal_matmul(
