@@ -316,7 +316,8 @@ def build(device, torch_module):
         _from_torch(p.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
         for p in (mlp.gate_proj, mlp.up_proj)
     )
-    w_down = _weight(mlp.down_proj, device)
+    # bf8_b halves the weight both the prefill (LoFi) and decode down projections unpack.
+    w_down = _from_torch(mlp.down_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     # Prefill's fused SwiGLU weight, bf4_b against the bf16 norm output; the float32 decode
     # activation keeps the separate pair above.
     w_gu = _from_torch(

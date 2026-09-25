@@ -471,7 +471,8 @@ def build(device, torch_module):
         device,
         dtype=ttnn.bfloat4_b,
     )
-    w_down = _weight(mlp.down_proj, device)
+    # bf8_b halves the weight both the prefill (LoFi) and decode down projections unpack.
+    w_down = _from_torch(mlp.down_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     g_in = None
     g_post = None
     eps_in = float(layer.input_layernorm.variance_epsilon)
