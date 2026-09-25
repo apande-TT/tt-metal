@@ -82,7 +82,9 @@ def _rms_norm(x, gamma, eps, dtype=None):
     sampler downstream rounds onto 21 levels 0.1 apart in x, so 2.7e-3 through seven norms is
     worth ~1% of the output codes and 1.2e-7 is worth none of them.
     """
-    inv = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
+    inv = ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps, activations=[ttnn.UnaryOpType.RSQRT])
+    if gamma is None:  # folded into the consuming weights
+        return ttnn.multiply(x, inv, dtype=dtype or ttnn.float32)
     return ttnn.multiply(ttnn.multiply(x, inv), gamma, dtype=dtype or ttnn.float32)
 
 
@@ -331,15 +333,21 @@ def _compile_block(device, blk, mask):
     head_dim = int(attn.head_dim)
     scale = 1.0 / math.sqrt(head_dim)
 
+    # Each norm's gamma is folded into the weights that consume it: `(x * s * g) @ W` is
+    # `(x * s) @ (g[:, None] * W)`, one full-width multiply fewer per norm.
+    g_attn_t = blk.attention_norm.weight.detach().float().reshape(-1, 1)
+    g_ffn_t = blk.ffn_norm.weight.detach().float().reshape(-1, 1)
     wqkv = _from_torch(
         torch.cat(
             [
-                attn.wq.weight.detach().transpose(0, 1),
-                attn.wk.weight.detach().transpose(0, 1),
-                attn.wv.weight.detach().transpose(0, 1),
+                attn.wq.weight.detach().float().transpose(0, 1),
+                attn.wk.weight.detach().float().transpose(0, 1),
+                attn.wv.weight.detach().float().transpose(0, 1),
             ],
             dim=-1,
-        ).contiguous(),
+        )
+        .mul(g_attn_t)
+        .contiguous(),
         device,
         dtype=ttnn.bfloat8_b,
     )
@@ -347,13 +355,12 @@ def _compile_block(device, blk, mask):
     # Weight-stream bound at 96 rows; bf8_b halves the bytes each FFN projection reads, and HiFi2
     # (two phases, enough for a bf8_b mantissa) halves the math that sits behind the stream.
     w1, w3 = (
-        _from_torch(m.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
+        _from_torch((m.weight.detach().float().transpose(0, 1) * g_ffn_t).contiguous(), device, dtype=ttnn.bfloat8_b)
         for m in (ff.w1, ff.w3)
     )
     # The down projection is DRAM-bound at 1024 rows; bf8_b halves the weight it streams.
     w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
-    g_attn = _gamma(blk.attention_norm, device)
-    g_ffn = _gamma(blk.ffn_norm, device)
+    g_attn = g_ffn = None
     eps = float(blk.attention_norm.eps)
     for rows in _COMPACT_ROWS:
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
@@ -395,7 +402,14 @@ def build(device, torch_module, batch=None):
     w_time = _weight(at.time_projection, device)
     w_llm = _weight(at.llm_projection, device)
     w_input = _weight(at.input_projection, device)
-    w_acoustic = _weight(at.acoustic_codebook_output, device)
+    # The final norm's gamma, folded into the only weight that reads the normalised rows.
+    w_acoustic = _from_torch(
+        (
+            at.acoustic_codebook_output.weight.detach().float().transpose(0, 1)
+            * at.norm.weight.detach().float().reshape(-1, 1)
+        ).contiguous(),
+        device,
+    )
     w_semantic = _weight(at.semantic_codebook_output, device)
     semantic_bias = None
     if at.semantic_codebook_output.bias is not None:
@@ -423,7 +437,7 @@ def build(device, torch_module, batch=None):
         _pad_for(int(batch))
 
     blocks = [_compile_block(device, at.layers[str(i)], mask) for i in at.layers_ids]
-    g_final = _gamma(at.norm, device)
+    g_final = None
     eps_final = float(at.norm.eps)
 
     acoustic_out = int(at.acoustic_codebook_output.out_features)
