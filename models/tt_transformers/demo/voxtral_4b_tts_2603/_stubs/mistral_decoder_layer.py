@@ -118,6 +118,43 @@ def _mcast_cfg(x, w, rows, out_dtype):
     )
 
 
+def _row_cfg(x, w, out_dtype):
+    """A 1D in0-multicast config for a ONE-tile-row (decode) linear, or None.
+
+    Every core owns a slice of N and streams only its own weight columns while the single
+    activation row is multicast; the widest K block that fits L1 keeps the multicast rounds few.
+    """
+    grid = x.device().compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    kt, nt = int(w.shape[-2]) // 32, int(w.shape[-1]) // 32
+    per_n = next(p for p in range(-(-nt // (gx * gy)), nt + 1) if nt % p == 0)
+    if per_n > 2:  # wide N (gate/up): ttnn's own choice measured faster
+        return None
+    size = lambda dt: _TILE_BYTES.get(dt, 2048)
+    fixed = per_n * (size(out_dtype) + (0 if out_dtype == ttnn.float32 else 4096))
+    kb = next(
+        (
+            c
+            for c in (32, 24, 16, 12, 8, 6, 4, 3, 2, 1)
+            if kt % c == 0 and fixed + 2 * c * (size(x.dtype) + per_n * size(w.dtype)) <= _L1_BUDGET
+        ),
+        None,
+    )
+    if kb is None:
+        return None
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=(gx, gy),
+        in0_block_w=kb,
+        out_subblock_h=1,
+        out_subblock_w=max(s for s in range(1, 5) if per_n % s == 0),
+        per_core_M=1,
+        per_core_N=per_n,
+        fuse_batch=True,
+        fused_activation=None,
+        mcast_in0=True,
+    )
+
+
 def _lin(x, w, **kwargs):
     """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
 
@@ -135,6 +172,10 @@ def _lin(x, w, **kwargs):
         if cfg is not None:
             kwargs["program_config"] = cfg
         kwargs["compute_kernel_config"] = _TALL_COMPUTE
+    elif rows == 32 and "program_config" not in kwargs:
+        cfg = _row_cfg(x, w, kwargs.get("dtype") or x.dtype)
+        if cfg is not None:
+            kwargs["program_config"] = cfg
     if lead == 1:
         return ttnn.linear(x, w, **kwargs)
     y = ttnn.linear(ttnn.reshape(x, [1, 1, rows, shape[-1]]), w, **kwargs)
