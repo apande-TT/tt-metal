@@ -332,13 +332,13 @@ def _fused_swiglu(h, w_gu):
     for d in list(h.shape)[:-1]:
         rows *= int(d)
     # Half of each core's M share per block (vs the default 8 rows) halves the weight re-reads and
-    # 12-tile N blocks cut the activation re-reads; the bf4_b weight blocks are small enough that
-    # 8-tile K blocks (half the K steps) still keep the L1 footprint near 1 MB.
+    # 18-tile N blocks split each core's 54 fused columns (27 output tiles x 2) into exactly 3 blocks
+    # (12 left a half-empty 5th block); 4-tile K blocks keep the L1 footprint near 1 MB.
     m_blk = -(-(-(-(rows // 32) // int(grid.y))) // 2)
     cfg = ttnn.MinimalMatmulConfig(
         M_block_size=m_blk,
-        K_block_size=8,
-        N_block_size=12,
+        K_block_size=4,
+        N_block_size=18,
         subblock_h=1,
         subblock_w=6,
         compute_with_storage_grid_size=grid,
