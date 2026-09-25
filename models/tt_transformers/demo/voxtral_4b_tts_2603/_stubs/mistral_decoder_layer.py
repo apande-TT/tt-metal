@@ -93,8 +93,8 @@ def _mcast_cfg(x, w, rows, out_dtype):
                     sub = max(
                         (
                             (h, s)
-                            for h in range(1, 5)
-                            for s in range(1, 5)
+                            for h in range(1, 9)
+                            for s in range(1, 9)
                             if h * s <= 8 and bh % h == 0 and bw % s == 0
                         ),
                         key=lambda hs: (hs[0] * hs[1], hs[1]),
