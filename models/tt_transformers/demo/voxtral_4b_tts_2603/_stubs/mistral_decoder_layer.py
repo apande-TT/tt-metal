@@ -207,6 +207,30 @@ def _norm_weight(norm, device):
     return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
 
 
+_SQUARES = {}
+
+
+def _sq_mean(x):
+    """`mean(x^2, -1)` of a float32 `x`. A tall (prefill) `x` writes its square into a PERSISTENT
+    bfloat16 buffer instead of a fresh float32 one: the square is only ever averaged, over 3072
+    elements, so its bf16 rounding averages down to ~3e-5 relative on the mean while the write and
+    the mean's read both halve. Created on the first (eager) call, so a trace allocates nothing."""
+    shape = [int(d) for d in x.shape]
+    rows = 1
+    for d in shape[:-1]:
+        rows *= d
+    if rows < 256:
+        return ttnn.mean(ttnn.square(x), dim=-1, keepdim=True)
+    key = (id(x.device()), tuple(shape))
+    buf = _SQUARES.get(key)
+    if buf is None:
+        buf = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(shape), ttnn.bfloat16, ttnn.TILE_LAYOUT, x.device(), ttnn.DRAM_MEMORY_CONFIG
+        )
+        _SQUARES[key] = buf
+    return ttnn.mean(ttnn.square(x, output_tensor=buf), dim=-1, keepdim=True)
+
+
 def _rms_norm(x, gamma, eps, dtype=None):
     """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
 
@@ -219,7 +243,7 @@ def _rms_norm(x, gamma, eps, dtype=None):
     A zero pad row stays zero: `mean(x^2)` is 0 and `0 * rsqrt(eps)` is 0, so an off-tile
     sequence padded up to a tile multiple neither NaNs nor leaks into a real row.
     """
-    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
+    scale = ttnn.rsqrt(ttnn.add(_sq_mean(x), eps))
     if gamma is None:  # folded into the consuming weights
         return ttnn.multiply(x, scale, dtype=dtype or ttnn.float32)
     return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
