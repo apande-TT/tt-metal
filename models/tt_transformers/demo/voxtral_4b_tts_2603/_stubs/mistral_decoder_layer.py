@@ -453,8 +453,9 @@ def build(device, torch_module):
         .mul(g_in_t)
         .contiguous(),
         device,
+        dtype=ttnn.bfloat8_b,
     )
-    wo = _weight(attn.o_proj, device)
+    wo = _from_torch(attn.o_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     # Decode-only now (prefill runs the fused `w_gu` below): a one-token step streams these from
     # DRAM every step, so bf8_b halves what it reads.
     w_gate, w_up = (

@@ -393,8 +393,9 @@ def build(device, torch_module):
             dim=-1,
         ).contiguous(),
         device,
+        dtype=ttnn.bfloat8_b,
     )
-    wo = _weight(m.o_proj, device)
+    wo = _from_torch(m.o_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
 
     def _decode(hidden_states, position_embeddings, kv_cache, position):
         """ONE token per user, attending to the RESIDENT cache instead of recomputing the prefix.
