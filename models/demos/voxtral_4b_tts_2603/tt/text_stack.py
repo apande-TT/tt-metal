@@ -391,8 +391,12 @@ class TextStack:
         # The REAL length, so the first decode step writes slot `real` and flash-decode's
         # `[0, real]` window covers the prompt and nothing the pad wrote.
         self.filled = real
+        # The tile-aligned 32-row block holding row `real - 1` first: slicing one row straight out
+        # of the whole tiled `[B, 1, S, H]` untilizes all of it.
+        top = (real - 1) // ttnn.TILE_SIZE * ttnn.TILE_SIZE
+        block = ttnn.slice(out, [0, 0, top, 0], [batch, 1, top + ttnn.TILE_SIZE, self.hidden_size])
         last = ttnn.reshape(
-            ttnn.slice(out, [0, 0, real - 1, 0], [batch, 1, real, self.hidden_size]),
+            ttnn.slice(block, [0, 0, real - 1 - top, 0], [batch, 1, real - top, self.hidden_size]),
             [batch, self.hidden_size],
         )
         if real != seq:
