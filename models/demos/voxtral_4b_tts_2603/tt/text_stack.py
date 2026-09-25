@@ -450,8 +450,21 @@ class TextStack:
             ttnn.reshape(ttnn.slice(self._decode_mask, [position, 0], [position + 1, cap]), [1, 1, 1, cap]),
             ttnn.TILE_LAYOUT,
         )
+        # `rotate_half(x) * sin == cat(x2, x1) * cat(-sin1, sin2)`: the sign rides on a sin table
+        # built once per step, so no layer negates half its q and k.
+        sin = rope[1]
+        half = int(sin.shape[-1]) // 2
+        width = int(sin.shape[-1])
+        sin_signed = ttnn.concat(
+            [
+                ttnn.neg(ttnn.slice(sin, [0, 0, 0, 0], [1, 1, 1, half])),
+                ttnn.slice(sin, [0, 0, 0, half], [1, 1, 1, width]),
+            ],
+            dim=-1,
+        )
         for block in self.blocks:
             block.kv["mask_row"] = (position, mask_row)
+            block.kv["rope_signed"] = (position, sin_signed)
         hidden = folded
         try:
             for block in self.blocks:

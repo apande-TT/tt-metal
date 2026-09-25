@@ -293,6 +293,15 @@ def _rope(x, cos, sin, half):
     return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(rotated, sin))
 
 
+def _rope_signed(x, cos, sin_signed, half):
+    """`_rope` with the rotate-half sign already on the table: `x * cos + cat(x2, x1) * sin_signed`,
+    where `sin_signed = cat(-sin1, sin2)` -- no negation of half of `x`."""
+    ends = list(x.shape)
+    lower = ttnn.slice(x, [0, 0, 0, 0], [ends[0], ends[1], ends[2], half])
+    upper = ttnn.slice(x, [0, 0, 0, half], ends)
+    return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(ttnn.concat([upper, lower], dim=-1), sin_signed))
+
+
 def _rope_prefill(q, k, cos, sin, half):
     """Prefill RoPE on q and k as ONE fused kernel each when the table is shared by the batch.
 
@@ -595,8 +604,13 @@ def build(device, torch_module):
         ttnn.deallocate(rows)
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            q = _rope(q, cos, sin, half)
-            k = _rope(k, cos, sin, half)
+            signed = kv_cache.get("rope_signed") if kv_cache is not None else None
+            if signed is not None and signed[0] == int(position):
+                q = _rope_signed(q, cos, signed[1], half)
+                k = _rope_signed(k, cos, signed[1], half)
+            else:
+                q = _rope(q, cos, sin, half)
+                k = _rope(k, cos, sin, half)
         idxs = [int(position)] * batch
         # `paged_update_cache` wants the decode layout `[1, B, n_kv, head_dim]` AND it wants that
         # tensor HEIGHT-SHARDED, one user per core -- it is part of the decode op set even though
