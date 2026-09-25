@@ -22,14 +22,33 @@ import time
 
 import torch
 
-from models.demos.qwen_image_edit.tt.inputs import MODEL_ID, EditConfig, encode_inputs
+from models.demos.qwen_image_edit.tt.inputs import (
+    MODEL_ID,
+    SAMPLE_IMAGES,
+    EditConfig,
+    encode_inputs,
+    sample_prompts,
+    sample_seeds,
+)
 
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_golden")
 
 
 def golden_key(cfg: EditConfig) -> str:
+    """Cache key of the golden for `cfg`. It covers the INPUTS the golden is built from (the prompts,
+    seeds and source images encode_inputs draws by default), not only the config: without them, a
+    changed prompt set reused the golden of the old one and every sample was compared to another
+    prompt's reference."""
     d = dict(
-        b=cfg.batch, area=cfg.area, n=cfg.num_inference_steps, cfg=cfg.true_cfg_scale, neg=cfg.negative_prompt, v=2
+        b=cfg.batch,
+        area=cfg.area,
+        n=cfg.num_inference_steps,
+        cfg=cfg.true_cfg_scale,
+        neg=cfg.negative_prompt,
+        prompts=sample_prompts(cfg.batch),
+        seeds=sample_seeds(cfg.batch),
+        images=SAMPLE_IMAGES,
+        v=3,
     )
     h = hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:10]
     return f"golden_b{cfg.batch}_a{int(cfg.area ** 0.5)}_n{cfg.num_inference_steps}_{h}"
