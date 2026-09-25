@@ -482,6 +482,11 @@ class VocodeStage:
         # The lookup table is bfloat16 (`ttnn.embedding` requires it), so the 37-term sum is done
         # widened: `input_embedding_concat_type: "sum"` adds 37 of them and the text stack consumes
         # the result in float32.
+        if shape[2] == 1:
+            # One frame (the decode feedback): the 37 lookups come back as the ROWS of one
+            # `[B, 1, 37, D]` tile tensor and are summed over rows, 1/16 the tiles of `[B, 37, 1, D]`.
+            emb = self._multi_vocab(codes, codebooks_as_rows=True)
+            return ttnn.sum(ttnn.typecast(emb, ttnn.float32), dim=2, keepdim=True, compute_kernel_config=_COMPUTE)
         emb = self._multi_vocab(codes)
         return ttnn.sum(ttnn.typecast(emb, ttnn.float32), dim=1, keepdim=True)
 
