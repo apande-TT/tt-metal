@@ -304,7 +304,7 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
     """
     rows = int(h.shape[-2])
     repeats = n_heads // n_kv_heads
-    qkv = _lin(h, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+    qkv = _lin(h, wqkv, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
     q, k, v = ttnn.experimental.nlp_create_qkv_heads(
         qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
     )
@@ -317,7 +317,7 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
     out = ttnn.reshape(_bmm(weights, v, per_core_m=1), [1, n_heads, rows, head_dim])
-    return _lin(ttnn.experimental.nlp_concat_heads(out), wo, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+    return _lin(ttnn.experimental.nlp_concat_heads(out), wo, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
 
 
 def _compile_block(device, blk, mask):
@@ -372,7 +372,7 @@ def _compile_block(device, blk, mask):
             # Consumed once, by the down projection: hand it over in L1, not through DRAM.
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
-        return ttnn.add(h, _lin(gated, w2, compute_kernel_config=_COMPUTE))
+        return ttnn.add(h, _lin(gated, w2, compute_kernel_config=_TALL_COMPUTE))
 
     return run
 
