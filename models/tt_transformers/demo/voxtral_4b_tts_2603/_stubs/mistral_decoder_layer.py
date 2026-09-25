@@ -454,8 +454,12 @@ def build(device, torch_module):
         device,
     )
     wo = _weight(attn.o_proj, device)
-    w_gate = _folded(mlp.gate_proj, g_post_t)
-    w_up = _folded(mlp.up_proj, g_post_t)
+    # Decode-only now (prefill runs the fused `w_gu` below): a one-token step streams these from
+    # DRAM every step, so bf8_b halves what it reads.
+    w_gate, w_up = (
+        _from_torch((p.weight.detach().float().transpose(0, 1) * g_post_t).contiguous(), device, dtype=ttnn.bfloat8_b)
+        for p in (mlp.gate_proj, mlp.up_proj)
+    )
     # Prefill's fused SwiGLU weight (bf16 like the bf16 norm output it multiplies); decode keeps
     # the separate gate/up above, since its float32 activation cannot share a bf16-only op.
     w_gu = _from_torch(
