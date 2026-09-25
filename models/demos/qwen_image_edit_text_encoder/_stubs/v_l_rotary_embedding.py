@@ -8,6 +8,7 @@
 The position ids are uploaded as fp32 (exact for integer positions); the outer product, concat and
 cos/sin all run on device. A table op -- replicated on every chip of a mesh.
 """
+
 from __future__ import annotations
 
 import ttnn

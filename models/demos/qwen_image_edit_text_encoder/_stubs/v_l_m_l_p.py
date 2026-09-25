@@ -4,6 +4,7 @@
 gate/up column-parallel (intermediate zero-padded to a multiple of TP*32), down row-parallel +
 all_reduce. See encoder_stack.TtVisionMLP.
 """
+
 from __future__ import annotations
 
 from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtVisionMLP

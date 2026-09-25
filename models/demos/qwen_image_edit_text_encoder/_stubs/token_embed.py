@@ -5,6 +5,7 @@ nn.Embedding(152064, 3584)). A lookup, not a matmul; on a mesh the table is spli
 
 Input ids arrive as a uint32 row-major device tensor [B, S]; output is [B, S, 3584] bf16 tile.
 """
+
 from __future__ import annotations
 
 import ttnn

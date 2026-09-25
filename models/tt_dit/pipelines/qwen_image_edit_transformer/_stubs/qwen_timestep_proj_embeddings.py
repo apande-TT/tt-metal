@@ -8,6 +8,7 @@ QwenTimestepProjEmbeddings):
 Composes the graduated Timesteps (`timesteps`) and TimestepEmbedding (`timestep_embedding`) ports. `hidden_states` only sets the reference's
 cast dtype; the ports keep float32 activations throughout.
 """
+
 from __future__ import annotations
 
 import torch

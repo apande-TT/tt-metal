@@ -4,6 +4,7 @@
 RMSNorm(1280) -> merge 4 consecutive tokens (5120) -> Linear -> GELU -> Linear(3584).
 fc1 column-parallel, fc2 row-parallel + all_reduce over TP; norm and fc2 bias replicated.
 """
+
 from __future__ import annotations
 
 import ttnn

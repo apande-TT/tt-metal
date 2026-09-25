@@ -15,6 +15,7 @@ TP scheme (tt_transformers attention.py / mlp.py) on the TP (column) axis, DP ax
 mRoPE: the (t, h, w) cos/sin sections are combined on host (metadata, per HF
 apply_multimodal_rotary_pos_emb) and applied on device with rotate_half == x @ R.
 """
+
 from __future__ import annotations
 
 import math

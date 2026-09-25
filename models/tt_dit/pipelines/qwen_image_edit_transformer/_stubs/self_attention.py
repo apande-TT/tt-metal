@@ -5,6 +5,7 @@ QwenImage's only self-attention is the joint (dual-stream) attention over cat[tx
 uses the joint-attention port: heads split across chips (q/k/v COLUMN-parallel), to_out/to_add_out
 ROW-parallel + all_reduce, norms and rotary tables replicated.
 """
+
 from __future__ import annotations
 
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs.attention import TtQwenJointAttention

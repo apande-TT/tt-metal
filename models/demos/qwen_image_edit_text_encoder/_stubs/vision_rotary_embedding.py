@@ -7,6 +7,7 @@
 i.e. out[:, :F] = row * inv_freq and out[:, F:] = col * inv_freq, computed on device in fp32.
 A table op -- replicated on every chip of a mesh.
 """
+
 from __future__ import annotations
 
 import ttnn

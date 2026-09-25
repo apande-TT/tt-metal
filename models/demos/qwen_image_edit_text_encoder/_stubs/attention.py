@@ -19,6 +19,7 @@ Any extra (DP) mesh axis replicates everything.
 The sequence is padded to a tile multiple; the additive mask hides padded keys, and the
 cu_seqlens block structure (per-image / per-window attention) is expressed in the same mask.
 """
+
 from __future__ import annotations
 
 import math

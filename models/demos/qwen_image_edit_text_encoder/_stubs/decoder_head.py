@@ -6,6 +6,7 @@ TP scheme (as models/tt_transformers/tt/lm_head.py): column-parallel over the vo
 TP axis owns vocab/TP output columns, computes its logits slice locally, and an all_gather on the
 last dim over the TP axis reassembles the full logits on every chip. Any DP mesh axis replicates.
 """
+
 from __future__ import annotations
 
 import ttnn

@@ -13,6 +13,7 @@ with scale_rope centring the height/width positions: pos(y) = y - (height - heig
 use pos = max_vid_index + arange(L) on every column. The per-token integer positions are metadata
 (built as a plain list); the angle products and cos/sin run on device in float32.
 """
+
 from __future__ import annotations
 
 import torch

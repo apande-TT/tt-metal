@@ -6,6 +6,7 @@ Covers the text `Qwen2MLP` (no biases, 3584 -> 18944) and the vision `Qwen2_5_VL
 1280 -> 3420, intermediate zero-padded to a multiple of TP*32). gate/up are column-parallel, down is
 row-parallel followed by an all_reduce over the TP axis; any DP axis replicates.
 """
+
 from __future__ import annotations
 
 from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtVisionMLP

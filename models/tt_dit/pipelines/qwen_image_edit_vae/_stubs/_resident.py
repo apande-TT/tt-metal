@@ -13,6 +13,7 @@ the weights) and routes the body's forward through the port. The encoder3d / dec
 `attach_block_ports()` once at build time, so every child of their Wan stack runs as the matching
 graduated port.
 """
+
 from __future__ import annotations
 
 

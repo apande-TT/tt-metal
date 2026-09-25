@@ -8,6 +8,7 @@ all_reduce), FeedForward COLUMN/ROW-parallel + all_reduce, float32 LayerNorm/mod
 This wraps that block for a single-block call and returns (encoder_hidden_states, hidden_states),
 the same order diffusers returns.
 """
+
 from __future__ import annotations
 
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs.encoder_stack import TtQwenBlockStack

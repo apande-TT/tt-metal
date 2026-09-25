@@ -4,9 +4,9 @@
 
 """Native TTNN port of diffusers `AdaLayerNormContinuous` (QwenImage `norm_out`).
 
-    emb          = linear(silu(conditioning_embedding))
-    scale, shift = chunk(emb, 2, dim=-1)
-    out          = norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+emb          = linear(silu(conditioning_embedding))
+scale, shift = chunk(emb, 2, dim=-1)
+out          = norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
 """
 
 from __future__ import annotations

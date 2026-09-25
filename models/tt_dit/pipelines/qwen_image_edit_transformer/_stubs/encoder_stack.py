@@ -21,6 +21,7 @@ Tensor parallel (TP = mesh size):
 Numerics: the residual streams, LayerNorm and modulation stay in float32; matmul inputs are bf16
 with float32 accumulation.
 """
+
 from __future__ import annotations
 
 import torch

@@ -8,6 +8,7 @@ siblings img_norm2 / txt_norm1 / txt_norm2: nn.LayerNorm(3072, elementwise_affin
 Tensor parallel: a norm reduces over the full hidden dim, so any weight/bias is REPLICATED and every
 chip computes the full (replicated) output; no collective. Computed in float32.
 """
+
 from __future__ import annotations
 
 import torch

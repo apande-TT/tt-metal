@@ -13,6 +13,7 @@ chip), MLP intermediate split; all_reduce after each row-parallel projection. Em
 and rotary tables replicated. The rotary tables depend only on integer positions and are precomputed
 on host (as tt_transformers does); the residual stream stays in fp32 on device across all layers.
 """
+
 from __future__ import annotations
 
 import numpy as np

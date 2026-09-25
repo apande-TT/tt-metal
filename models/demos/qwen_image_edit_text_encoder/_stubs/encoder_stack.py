@@ -19,6 +19,7 @@ TP scheme on the TP (column) axis of the mesh, DP axis replicated:
 Token order permutations and masks depend only on grid_thw (integer metadata): they are built on
 host in numpy and applied on device as one-hot matmuls / additive masks.
 """
+
 from __future__ import annotations
 
 import numpy as np

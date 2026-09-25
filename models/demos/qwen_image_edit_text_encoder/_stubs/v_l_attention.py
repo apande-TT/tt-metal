@@ -6,6 +6,7 @@
 Scheme (see layer.py): q/k/v column-parallel by KV group (TP=4 -> 1 kv head + its 7 q heads per chip),
 o_proj row-parallel + all_reduce; mRoPE sections combined on host, rotation applied on device.
 """
+
 from __future__ import annotations
 
 import ttnn

@@ -9,6 +9,7 @@ Tensor parallel (TP = mesh size): COLUMN-parallel on the output features, follow
 zero-padded up to a multiple of TP*32 (each chip owns one whole tile of columns). After the gather
 the padding columns are sliced off and the bias (replicated) is added once.
 """
+
 from __future__ import annotations
 
 import torch

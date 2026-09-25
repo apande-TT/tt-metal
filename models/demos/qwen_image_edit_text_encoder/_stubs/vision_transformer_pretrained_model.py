@@ -18,6 +18,7 @@ per grid on host (numpy) and applied on device as one-hot matmuls / additive mas
 TP scheme: see encoder_stack.py (heads + MLP column/row-parallel, all_reduce on the TP axis; any DP
 axis replicates).
 """
+
 from __future__ import annotations
 
 import numpy as np

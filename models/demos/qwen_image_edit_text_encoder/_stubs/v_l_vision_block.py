@@ -4,6 +4,7 @@
 x + attn(norm1(x)); x + mlp(norm2(x)). Attention heads and MLP intermediate split across TP with an
 all_reduce after each row-parallel projection; norms replicated; fp32 residual stream.
 """
+
 from __future__ import annotations
 
 import ttnn

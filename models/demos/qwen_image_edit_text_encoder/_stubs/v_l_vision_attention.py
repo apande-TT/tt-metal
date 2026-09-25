@@ -5,6 +5,7 @@
 Same module as `attention`: heads split across TP (column-parallel qkv, row-parallel proj +
 all_reduce), cu_seqlens expressed as an additive block mask. See attention.py.
 """
+
 from __future__ import annotations
 
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import TtVisionAttention

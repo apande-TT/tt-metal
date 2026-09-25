@@ -14,6 +14,7 @@ streams in float32 for a reason, so the reduce here gathers the partials (all_ga
 exactly) and adds them in float32. Measured error of that path: 0.0 on the same tensors. The gather
 is chunked along the token dim so the N-fold temporary stays bounded.
 """
+
 from __future__ import annotations
 
 import ttnn

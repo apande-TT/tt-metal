@@ -10,6 +10,7 @@ get_timestep_embedding; QwenImage: num_channels=256, flip_sin_to_cos=True, shift
 `freq` is a constant computed once at build time with the reference's float32 expression; the
 per-call products and sin/cos run on device in float32.
 """
+
 from __future__ import annotations
 
 import math

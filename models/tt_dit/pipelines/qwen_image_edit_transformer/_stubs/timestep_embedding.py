@@ -6,6 +6,7 @@ TimestepEmbedding: linear_1 (256 -> 3072) -> SiLU -> linear_2 (3072 -> 3072)).
 Weights replicated (this runs once per denoising step on a [B, 256] input). Matmul inputs are bf16
 with float32 accumulation; SiLU in float32.
 """
+
 from __future__ import annotations
 
 import torch

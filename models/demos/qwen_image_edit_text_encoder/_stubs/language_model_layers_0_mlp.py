@@ -6,6 +6,7 @@ SwiGLU down(silu(gate(x)) * up(x)), 3584 -> 18944 -> 3584, no biases. gate/up ar
 (intermediate split across the TP axis), down is row-parallel followed by an all_reduce over the TP
 axis; any DP axis replicates. Same scheme as m_l_p.py.
 """
+
 from __future__ import annotations
 
 from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtVisionMLP

@@ -5,6 +5,7 @@
 Same module as `layer`: GQA attention split by KV group + SwiGLU MLP, column/row-parallel with
 all_reduce after each row-parallel projection; fp32 residual stream. See layer.py.
 """
+
 from __future__ import annotations
 
 from models.demos.qwen_image_edit_text_encoder._stubs.layer import TtTextDecoderLayer

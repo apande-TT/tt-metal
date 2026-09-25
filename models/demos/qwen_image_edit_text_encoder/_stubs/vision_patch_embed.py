@@ -6,6 +6,7 @@ Conv3d(3 -> 1280, kernel = stride = (2, 14, 14), no bias) over pre-flattened pat
 Linear(1176 -> 1280) with the conv weight flattened in (c, t, h, w) order. Column-parallel on a mesh
 (output channels split across TP) followed by an all_gather on the last dim.
 """
+
 from __future__ import annotations
 
 import ttnn

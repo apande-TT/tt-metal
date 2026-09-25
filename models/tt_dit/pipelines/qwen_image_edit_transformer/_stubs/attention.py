@@ -30,6 +30,7 @@ unchanged.
 Rotary input convention (the harness stages complex tensors this way): each freqs tensor is a
 float32 ttnn tensor [S, 2*(D/2)] = [cos | sin].
 """
+
 from __future__ import annotations
 
 import torch

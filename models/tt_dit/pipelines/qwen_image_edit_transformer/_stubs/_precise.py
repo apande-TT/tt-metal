@@ -14,6 +14,7 @@ Precise mode carries matmul inputs as bf16 hi + lo (exact products against bf16 
 also splits K into 8 lanes (<= 4 nonzeros per 32-group, 8 apart: exact accumulation, measured 1.2e-6)
 and takes the median of 3 rotated lane partitions (a rare power-of-two tile glitch is outvoted).
 """
+
 from __future__ import annotations
 
 import ttnn

@@ -7,6 +7,7 @@
 
 On a mesh the weights are replicated (64 input features is a single 2-tile K; not worth splitting).
 """
+
 from __future__ import annotations
 
 import torch

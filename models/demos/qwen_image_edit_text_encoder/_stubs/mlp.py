@@ -6,6 +6,7 @@ Same SwiGLU scheme as m_l_p.py: gate/up column-parallel (intermediate 3420 zero-
 of TP*32), down row-parallel + all_reduce over the TP axis, biases sharded with their columns and the
 down bias added after the reduction.
 """
+
 from __future__ import annotations
 
 from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtVisionMLP

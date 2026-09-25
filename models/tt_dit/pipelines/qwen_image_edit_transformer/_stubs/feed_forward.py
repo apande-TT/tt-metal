@@ -9,6 +9,7 @@ Tensor parallel (TP = mesh size): net[0].proj is COLUMN-parallel (hidden feature
 with it), GELU is local, net[2] is ROW-parallel followed by all_reduce; its bias is replicated and
 added once after the reduce. Matmul inputs are bf16 with float32 accumulation.
 """
+
 from __future__ import annotations
 
 import torch
