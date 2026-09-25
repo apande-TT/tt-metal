@@ -35,6 +35,8 @@ _SHARD_HEIGHT = 32
 # SDPA takes bfloat16 and nothing wider (`sdpa_device_operation.cpp:43`), and the KV cache is read
 # by the same op family, so q/k/v and the cache are bf16 while the residual stream stays float32.
 _SDPA_DTYPE = ttnn.bfloat16
+# The resident KV cache: every decode step streams all of it through both attention bmms.
+_CACHE_DTYPE = ttnn.bfloat8_b
 
 
 # Tall (prefill) linears are compute-bound, so they run at LoFi rather than the HiFi4 the
@@ -280,7 +282,7 @@ def _zero_tail(device, b, h, rows, width):
     key = (id(device), b, h, rows, width)
     buf = _ZERO_TAIL.get(key)
     if buf is None:
-        buf = ttnn.zeros([b, h, rows, width], dtype=_SDPA_DTYPE, layout=ttnn.TILE_LAYOUT, device=device)
+        buf = ttnn.zeros([b, h, rows, width], dtype=_CACHE_DTYPE, layout=ttnn.TILE_LAYOUT, device=device)
         _ZERO_TAIL[key] = buf
     return buf
 
@@ -295,8 +297,8 @@ def _seed_cache(kv, k, v):
     """
     capacity = int(kv.get("capacity") or 0)
     for key, tensor in (("k", k), ("v", v)):
-        if tensor.dtype != _SDPA_DTYPE:
-            tensor = ttnn.typecast(tensor, _SDPA_DTYPE)
+        if tensor.dtype != _CACHE_DTYPE:
+            tensor = ttnn.typecast(tensor, _CACHE_DTYPE)
         shape = [int(s) for s in tensor.shape]
         if capacity > shape[-2]:
             pad = _zero_tail(tensor.device(), shape[0], shape[1], capacity - shape[-2], shape[-1])
