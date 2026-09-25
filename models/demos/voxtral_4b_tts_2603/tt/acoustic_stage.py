@@ -196,7 +196,7 @@ def _rms_norm(x, gamma, eps, dtype=None):
     stubs beside this file (`flow_matching_audio_transformer`, `acoustic_transformer_block`)
     already spell it out; this is the same four ops so the two bodies agree.
     """
-    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
+    scale = ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps, activations=[ttnn.UnaryOpType.RSQRT])
     return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
 
 
@@ -459,9 +459,7 @@ class AcousticStage:
         if h_in.dtype != ttnn.float32:
             h_in = ttnn.typecast(h_in, ttnn.float32)
 
-        semantic = ttnn.reshape(
-            _lin(h_in, p["w_semantic"], compute_kernel_config=_COMPUTE), [rows, self.semantic_out]
-        )
+        semantic = ttnn.reshape(_lin(h_in, p["w_semantic"], compute_kernel_config=_COMPUTE), [rows, self.semantic_out])
         if p["b_semantic"] is not None:
             semantic = ttnn.add(semantic, p["b_semantic"])
 
@@ -481,9 +479,7 @@ class AcousticStage:
         h = _rms_norm(h, p["g_final"], p["eps"])
 
         first = ttnn.slice(h, [0, 0, 0, 0], [rows, 1, 1, self.dim])
-        velocity = ttnn.reshape(
-            _lin(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic]
-        )
+        velocity = ttnn.reshape(_lin(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic])
         return velocity, semantic
 
     def _part_body_compact(self, llm, x, t, rows, cache=None, t_proj=None):
@@ -525,9 +521,7 @@ class AcousticStage:
             h = block(h, None, tokens=_N_REAL_TOKENS)
         # The norm is per row and only token 0 is read out, so normalise just those rows.
         first = _rms_norm(ttnn.slice(h, [0, 0, 0, 0], [1, 1, rows, self.dim]), p["g_final"], p["eps"])
-        velocity = ttnn.reshape(
-            _lin(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic]
-        )
+        velocity = ttnn.reshape(_lin(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic])
         return velocity, semantic
 
     def _plan(self, batch):

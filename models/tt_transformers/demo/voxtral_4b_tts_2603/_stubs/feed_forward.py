@@ -189,14 +189,16 @@ def build(device, torch_module):
         rank = len(list(x.shape))
 
         h = ttnn.reshape(x, [batch, 1, seq, dim])
+        # HiFi2 on the bf8_b weights (two phases cover a bf8_b mantissa); the hidden activation is
+        # handed over in L1 and in bf16, since the down projection multicasts it whole.
         gated = ttnn.multiply(
-            _lin(h, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
-            _lin(h, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            _lin(h, w1, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            _lin(h, w3, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
-            # Consumed once, by the down projection: hand it over in L1, not through DRAM.
+            dtype=ttnn.bfloat16,
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
-        out = _lin(gated, w2, compute_kernel_config=_COMPUTE)
+        out = _lin(gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
         if bias is not None:
             out = ttnn.add(out, bias)
         if rank >= 4:

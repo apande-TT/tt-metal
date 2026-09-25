@@ -187,11 +187,13 @@ def _rms_norm(x, gamma, eps, dtype=None):
     sampler downstream rounds onto 21 levels 0.1 apart in x, so 2.7e-3 through seven norms is
     worth ~1% of the output codes and 1.2e-7 is worth none of them.
     """
-    inv = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
+    inv = ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps, activations=[ttnn.UnaryOpType.RSQRT])
+    if gamma is None:  # folded into the consuming weights
+        return ttnn.multiply(x, inv, dtype=dtype or ttnn.float32)
     return ttnn.multiply(ttnn.multiply(x, inv), gamma, dtype=dtype or ttnn.float32)
 
 
-def _bmm(a, b, per_core_m=None, transpose_b=False):
+def _bmm(a, b, per_core_m=None, transpose_b=False, dtype=None):
     """Head-batched `a @ b` spread over the full grid.
 
     Without a program config the `[B, H, 32, 128] x [B, H, 128, 32]` score product lands on ONE
@@ -208,7 +210,7 @@ def _bmm(a, b, per_core_m=None, transpose_b=False):
         per_core_M=per_core_m or m,
         per_core_N=n,
     )
-    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE)
+    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE, dtype=dtype)
 
 
 def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
@@ -239,7 +241,7 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     q = ttnn.reshape(q, [batch, n_kv_heads, repeats * seq, head_dim])
 
     # The reference scales the QUERY before the product, not the scores after it.
-    scores = _bmm(ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1))
+    scores = _bmm(q if scale is None else ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1))
     if attn_mask is not None:
         if int(attn_mask.shape[-2]) != 1:
             attn_mask = ttnn.slice(attn_mask, [0, 0, 0, 0], [1, 1, 1, int(attn_mask.shape[-1])])
@@ -288,20 +290,23 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
     """
     rows = int(h.shape[-2])
     repeats = n_heads // n_kv_heads
-    qkv = _lin(h, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+    # bf16 q/k/v for the head split; the scores come back float32 for the softmax.
+    qkv = _lin(h, wqkv, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE)
     q, k, v = ttnn.experimental.nlp_create_qkv_heads(
         qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
     )
     head_dim = int(q.shape[-1])
     q = ttnn.reshape(q, [1, n_kv_heads, repeats * rows, head_dim])
 
-    scores = _bmm(ttnn.multiply(q, scale), k, per_core_m=1, transpose_b=True)
+    q = q if scale is None else ttnn.multiply(q, scale)
+    scores = _bmm(q, k, per_core_m=1, transpose_b=True, dtype=ttnn.float32)
     scores = ttnn.add(scores, _compact_mask(h.device(), rows, tokens, repeats))
     weights = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
-    out = ttnn.reshape(_bmm(weights, v, per_core_m=1), [1, n_heads, rows, head_dim])
-    return _lin(ttnn.experimental.nlp_concat_heads(out), wo, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+    # bf16 context: the head merge moves it and o_proj multicasts it whole.
+    out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.bfloat16), [1, n_heads, rows, head_dim])
+    return _lin(ttnn.experimental.nlp_concat_heads(out), wo, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
 
 
 def _leading(shape) -> int:
@@ -325,25 +330,34 @@ def build(device, torch_module):
     scale = 1.0 / math.sqrt(head_dim)
     eps = float(blk.attention_norm.eps)
 
+    # Each norm's gamma is folded into the weights that consume it, `(x * s * g) @ W` being
+    # `(x * s) @ (g[:, None] * W)`, and the query scale into Wq.
+    g_attn_t = blk.attention_norm.weight.detach().float().reshape(-1, 1)
+    g_ffn_t = blk.ffn_norm.weight.detach().float().reshape(-1, 1)
     wqkv = _from_torch(
         torch.cat(
             [
-                attn.wq.weight.detach().transpose(0, 1),
-                attn.wk.weight.detach().transpose(0, 1),
-                attn.wv.weight.detach().transpose(0, 1),
+                attn.wq.weight.detach().float().transpose(0, 1) * scale,
+                attn.wk.weight.detach().float().transpose(0, 1),
+                attn.wv.weight.detach().float().transpose(0, 1),
             ],
             dim=-1,
-        ).contiguous(),
+        )
+        .mul(g_attn_t)
+        .contiguous(),
         device,
         dtype=ttnn.bfloat8_b,
     )
     wo = _from_torch(attn.wo.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
-    w1 = _from_torch(ff.w1.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
+    w1 = _from_torch(
+        (ff.w1.weight.detach().float().transpose(0, 1) * g_ffn_t).contiguous(), device, dtype=ttnn.bfloat8_b
+    )
     # The down projection is DRAM-bound at 1024 rows; bf8_b halves the weight it streams.
     w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
-    w3 = _from_torch(ff.w3.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
-    g_attn = _gamma(blk.attention_norm, device)
-    g_ffn = _gamma(blk.ffn_norm, device)
+    w3 = _from_torch(
+        (ff.w3.weight.detach().float().transpose(0, 1) * g_ffn_t).contiguous(), device, dtype=ttnn.bfloat8_b
+    )
+    g_attn = g_ffn = None
     for rows in _COMPACT_ROWS:
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
 
@@ -358,14 +372,16 @@ def build(device, torch_module):
 
         xn = _rms_norm(h4, g_attn, eps, dtype=ttnn.bfloat16)
         if tokens:
-            attn_out = _compact_attention(xn, wqkv, wo, n_heads, n_kv_heads, scale, tokens)
+            attn_out = _compact_attention(xn, wqkv, wo, n_heads, n_kv_heads, None, tokens)
         else:
-            attn_out = _attention(xn, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask)
+            attn_out = _attention(xn, wqkv, wo, n_heads, n_kv_heads, None, attn_mask)
         h4 = ttnn.add(h4, attn_out)
 
         hn = _rms_norm(h4, g_ffn, eps, dtype=ttnn.bfloat16)
-        gate = _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
-        up = _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
+        gate = _lin(
+            hn, w1, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
+        )
+        up = _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
         h4 = ttnn.add(
             h4,
             _lin(
@@ -373,10 +389,13 @@ def build(device, torch_module):
                     gate,
                     up,
                     input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+                    # bf16: the down projection multicasts it whole to every core.
+                    dtype=ttnn.bfloat16,
                     memory_config=ttnn.L1_MEMORY_CONFIG,
                 ),
                 w2,
-                compute_kernel_config=_COMPUTE,
+                dtype=ttnn.float32,
+                compute_kernel_config=_TALL_COMPUTE,
             ),
         )
 

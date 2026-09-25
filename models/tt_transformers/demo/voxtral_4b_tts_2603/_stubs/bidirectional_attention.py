@@ -159,7 +159,7 @@ def _lin(x, w, **kwargs):
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
-def _bmm(a, b, per_core_m=None, transpose_b=False):
+def _bmm(a, b, per_core_m=None, transpose_b=False, dtype=None):
     """Head-batched `a @ b` spread over the full grid.
 
     Without a program config the `[B, H, 32, 128] x [B, H, 128, 32]` score product lands on ONE
@@ -176,7 +176,7 @@ def _bmm(a, b, per_core_m=None, transpose_b=False):
         per_core_M=per_core_m or m,
         per_core_N=n,
     )
-    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE)
+    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE, dtype=dtype)
 
 
 def _leading(shape) -> int:
@@ -228,7 +228,7 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     q = ttnn.reshape(q, [batch, n_kv_heads, repeats * seq, head_dim])
 
     # The reference scales the QUERY before the product, not the scores after it.
-    scores = _bmm(ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1))
+    scores = _bmm(q if scale is None else ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1))
     if attn_mask is not None:
         if int(attn_mask.shape[-2]) != 1:
             attn_mask = ttnn.slice(attn_mask, [0, 0, 0, 0], [1, 1, 1, int(attn_mask.shape[-1])])
@@ -277,20 +277,23 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
     """
     rows = int(h.shape[-2])
     repeats = n_heads // n_kv_heads
-    qkv = _lin(h, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+    # bf16 q/k/v for the head split; the scores come back float32 for the softmax.
+    qkv = _lin(h, wqkv, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE)
     q, k, v = ttnn.experimental.nlp_create_qkv_heads(
         qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
     )
     head_dim = int(q.shape[-1])
     q = ttnn.reshape(q, [1, n_kv_heads, repeats * rows, head_dim])
 
-    scores = _bmm(ttnn.multiply(q, scale), k, per_core_m=1, transpose_b=True)
+    q = q if scale is None else ttnn.multiply(q, scale)
+    scores = _bmm(q, k, per_core_m=1, transpose_b=True, dtype=ttnn.float32)
     scores = ttnn.add(scores, _compact_mask(h.device(), rows, tokens, repeats))
     weights = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
-    out = ttnn.reshape(_bmm(weights, v, per_core_m=1), [1, n_heads, rows, head_dim])
-    return _lin(ttnn.experimental.nlp_concat_heads(out), wo, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+    # bf16 context: the head merge moves it and o_proj multicasts it whole.
+    out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.bfloat16), [1, n_heads, rows, head_dim])
+    return _lin(ttnn.experimental.nlp_concat_heads(out), wo, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
 
 
 def build(device, torch_module):
@@ -305,9 +308,10 @@ def build(device, torch_module):
     wqkv = _from_torch(
         torch.cat(
             [
-                attn.wq.weight.detach().transpose(0, 1),
-                attn.wk.weight.detach().transpose(0, 1),
-                attn.wv.weight.detach().transpose(0, 1),
+                # The query scale folded into Wq: the reference scales the query before the product.
+                attn.wq.weight.detach().float().transpose(0, 1) * scale,
+                attn.wk.weight.detach().float().transpose(0, 1),
+                attn.wv.weight.detach().float().transpose(0, 1),
             ],
             dim=-1,
         ).contiguous(),
@@ -320,7 +324,7 @@ def build(device, torch_module):
 
     def bidirectional_attention(x, attn_mask=None, tokens=None, **kwargs):
         if tokens:
-            return _compact_attention(x, wqkv, wo, n_heads, n_kv_heads, scale, tokens)
+            return _compact_attention(x, wqkv, wo, n_heads, n_kv_heads, None, tokens)
         seq = int(x.shape[-2])
         batch = _leading(x.shape)
         rank = len(list(x.shape))
@@ -328,7 +332,7 @@ def build(device, torch_module):
         # A bf16 input (a norm that already narrowed its output) feeds the qkv matmul as-is; the
         # projection writes float32, so the attention itself stays float32 either way.
         h = ttnn.reshape(x, [batch, 1, seq, dim])
-        out = _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask)
+        out = _attention(h, wqkv, wo, n_heads, n_kv_heads, None, attn_mask)
         if rank >= 4:
             return ttnn.reshape(out, [batch, 1, seq, out_dim])
         return ttnn.reshape(out, [batch, seq, out_dim])
