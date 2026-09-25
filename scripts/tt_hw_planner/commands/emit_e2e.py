@@ -202,43 +202,61 @@ def _scope_grounding_gate(demo_dir: Path, reference_config=_SCOPE_SENTINEL):
     )
 
 
-def _reset_device() -> str:
-    """Reset the device, widening the requested chips to WHOLE BOARDS.
-
-    TT_HW_PLANNER_RESET_CHIPS lets an operator name chips directly, and naming one chip of a p300c
-    (`-r 3`) half-resets the board: the untouched ASIC's clock arbiter is left inconsistent and the
-    next device-open wedges. Widen through the shared recovery primitive, falling back to every chip
-    rather than narrowing when the topology is unknown."""
-    chips = os.environ.get("TT_HW_PLANNER_RESET_CHIPS", "0,1,2,3")
+def _recovery():
+    """(probes, device_recovery) from the shared recovery package, or None when it cannot be imported."""
     try:
-        import importlib.util as _ilu
+        from models.experimental.perf_automation.agent import device_recovery as _dr
+        from models.experimental.perf_automation.agent import probes as _pr
 
-        _p = (
-            Path(__file__).resolve().parents[3]
-            / "models"
-            / "experimental"
-            / "perf_automation"
-            / "agent"
-            / "device_recovery.py"
-        )
-        _spec = _ilu.spec_from_file_location("tt_device_recovery", str(_p))
-        _dr = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_dr)
-        widened = _dr.expand_spec(chips)
-        if widened and widened != "all":
-            chips = widened
+        return _pr, _dr
     except Exception:  # noqa: BLE001
-        pass
-    from models.experimental.perf_automation.agent.probes import tt_smi_bin
+        return None
 
-    tt_smi = tt_smi_bin()
-    if not Path(tt_smi).exists():
+
+def _reset_device(error_text: str = "") -> str:
+    """Recover a wedged device through the SHARED recovery (agent.probes._device_reset) and say
+    whether it came back.
+
+    This used to issue its own `tt-smi -r 0,1,2,3`: a plain `-r` does not reset a Galaxy, the chip
+    list ignored the chip the failure named, and the by-path load meant to widen it to whole boards
+    raised on the module's relative import, so the widening never ran. The shared path picks the
+    target from `error_text`, widens to whole boards, uses the host's reset (galaxy-tray on a
+    Galaxy), verifies the device answers, and counts failures against one run-wide limit.
+    TT_HW_PLANNER_RESET_CHIPS still names an operator's preferred target."""
+    rec = _recovery()
+    if rec is None:
+        return "device reset SKIPPED (shared device recovery could not be imported)"
+    _pr, _dr = rec
+    if not Path(_pr.tt_smi_bin()).exists():
         return "device reset SKIPPED (tt-smi not found)"
     try:
-        r = subprocess.run([tt_smi, "-r", chips], capture_output=True, text=True, timeout=420)
-        return "device reset (tt-smi -r %s) rc=%d" % (chips, r.returncode)
+        ok = _pr._device_reset(error_text=error_text, config_target=os.environ.get("TT_HW_PLANNER_RESET_CHIPS", ""))
     except Exception as e:  # noqa: BLE001
         return "device reset FAILED (%s) — a hard boot may be required" % e
+    if ok:
+        return "device recovery: board answering after recovery (verified)"
+    if _dr.recovery_exhausted():
+        return "device recovery EXHAUSTED (resets keep failing) — reset the board by hand or reboot the host"
+    return "device reset did NOT bring the board back — a hard boot may be required"
+
+
+def _recover_if_wedged(text: str) -> Optional[str]:
+    """Reset when a failure's OWN output carries a dead-board signature; None when it does not.
+
+    A hang is not the only way a board wedges: once a run dies mid-collective, every later run fails
+    at device-open within seconds ("NOC0 is hung on PCIe device ID 9"), which never reaches a
+    timeout. Without this, each round failed identically on the same chip and nothing reset it."""
+    rec = _recovery()
+    if rec is None or not rec[1].is_dead_board(text or ""):
+        return None
+    return _reset_device(error_text=text)
+
+
+def _as_text(out) -> str:
+    """A subprocess stream as text (TimeoutExpired carries bytes, or None)."""
+    if isinstance(out, bytes):
+        return out.decode(errors="ignore")
+    return out or ""
 
 
 def _verbose() -> bool:
@@ -1267,8 +1285,36 @@ def _signal_quality_gate(demo_dir: Path):
     )
 
 
-def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
-    """Model-agnostic gate runner: G1 native, G2/G3 (run tests/e2e), G4 demo/ structure. Returns (ok, reasons)."""
+# How the `--batch` request reaches the gate's own process (e2e_mcp reads it back by this name).
+E2E_MCP_BATCH_ENV = "E2E_MCP_BATCH"
+
+
+def _batch_gate_reason(requested: int, test_output: str) -> Optional[str]:
+    """None when the e2e tests reported driving exactly the `requested` batch, else why not.
+
+    `--batch` used to reach only the builder's prompt; the gate ran whatever batch the tests typed.
+    A T3K Qwen-Image-Edit gate asked for 32 hard-coded 4, passed on 4 samples, and was reported as a
+    batch-32 PASS -- the 32-sample result, 20/32 at the PCC bar, lived only in a README. So the gate
+    now hands the tests the batch (perf_adapter.BATCH_ENV) and reads back what they say they drove."""
+    from models.experimental.perf_automation.agent.perf_adapter import BATCH_ENV, batch_report_line, parse_batch_report
+
+    served = parse_batch_report(test_output)
+    if served == requested:
+        return None
+    how = (
+        f"read the batch from ${BATCH_ENV} (the gate sets it to {requested}) and print "
+        f"`{batch_report_line(requested)}` with the batch actually driven"
+    )
+    if served is None:
+        return f"G3 batch: --batch {requested} was requested but tests/e2e never reported the batch it drove; {how}"
+    return f"G3 batch: --batch {requested} was requested but tests/e2e drove {served} samples; {how}"
+
+
+def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: int = 1):
+    """Model-agnostic gate runner: G1 native, G2/G3 (run tests/e2e), G4 demo/ structure. Returns (ok, reasons).
+
+    batch > 1 is the emit-e2e `--batch` request: the tests are run with it and must report driving it
+    (see _batch_gate_reason). The default 1 leaves the tests' own batch unchecked, as before."""
     reasons = []
     e2e_dir = demo_dir / "tests" / "e2e"
     test_files = sorted(e2e_dir.glob("test_*.py")) if e2e_dir.is_dir() else []
@@ -1379,6 +1425,11 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
     gate_env = dict(os.environ)
     gate_env["PYTHONPATH"] = str(demo_repo_root) + os.pathsep + gate_env.get("PYTHONPATH", "")
     gate_env["TT_METAL_HOME"] = str(demo_repo_root)
+    batch = int(batch or 1)
+    if batch > 1:
+        from models.experimental.perf_automation.agent.perf_adapter import BATCH_ENV
+
+        gate_env[BATCH_ENV] = str(batch)
     pytest_out = ""
     hang_timeout = min(int(timeout_s), int(os.environ.get("E2E_GATE_HANG_TIMEOUT", "2700")))
     gate_tests = [f for f in test_files if "perf" not in f.name] or test_files
@@ -1395,8 +1446,15 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
         if proc.returncode != 0:
             tail = "\n".join(pytest_out.splitlines()[-15:])
             reasons.append(f"G2/G3: tests/e2e did not pass (pytest rc={proc.returncode}); tail:\n{tail}")
-    except subprocess.TimeoutExpired:
-        _rst = _reset_device()
+            _rst = _recover_if_wedged(pytest_out + "\n" + (proc.stderr or ""))
+            if _rst:
+                reasons.append(f"G2/G3: the device reported a wedge during tests/e2e — {_rst}")
+        if batch > 1:
+            _batch_reason = _batch_gate_reason(batch, pytest_out)
+            if _batch_reason:
+                reasons.append(_batch_reason)
+    except subprocess.TimeoutExpired as _te:
+        _rst = _reset_device(error_text=_as_text(_te.stdout) + "\n" + _as_text(_te.stderr))
         reasons.append(
             f"G2/G3: tests/e2e exceeded {hang_timeout}s with no verdict (likely device/fabric hang) — {_rst}"
         )
@@ -1534,7 +1592,7 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
                 pass
 
             if timed_out:
-                _rst = _reset_device()
+                _rst = _reset_device(error_text=_as_text(stdout) + "\n" + _as_text(stderr))
                 reasons.append(
                     f"G6 trace: trace-capture probe hung >{g6_hang}s "
                     f"(subprocess group killed, {_rst}); fix-loop should treat as failure and iterate"
@@ -1557,6 +1615,10 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
                         + (_b or _cap or "capture failed")
                         + " (set E2E_ALLOW_NO_TRACE=1 to waive for a genuinely non-traceable model)"
                     )
+                if tr is None or not tr.get("trace_ready"):
+                    _rst = _recover_if_wedged(_as_text(stdout) + "\n" + _as_text(stderr))
+                    if _rst:
+                        reasons.append(f"G6 trace: the device reported a wedge during the trace-capture probe — {_rst}")
 
     try:
         from ..trace_gate import build_fix_directive, evaluate_trace_gate, overflow_fix_loop, record_trace_verdict
@@ -1809,13 +1871,21 @@ def cmd_emit_e2e(args) -> int:
     if _tf:
         print("error: " + _tf)
         return 1
+    _rec = _recovery()
+    if _rec is not None:
+        _rec[1].stamp_run()  # scope the device-reset budget to THIS run (see device_recovery.stamp_run)
+        try:  # while the board is healthy: know the host kind and make sure its reset can run
+            _rec[0].prepare_device_reset(box=str(getattr(args, "box", "") or ""))
+        except Exception:  # noqa: BLE001 -- reset preparation must never stop the run
+            pass
     return _emit_e2e_phase_a(args)
 
 
-def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_rounds) -> int:
+def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_rounds, batch=1) -> int:
     """emit-e2e cc engine: after the builder runs, drive the fix loop through the shared cc harness
     against the e2e_mcp deterministic gate (which REUSES the same G1–G4 `_run_deterministic_gates` the
-    legacy loop uses). The gate is the sole stop authority. Returns 0 iff the gate reports can_stop."""
+    legacy loop uses). The gate is the sole stop authority. Returns 0 iff the gate reports can_stop.
+    `batch` is the `--batch` request, which the gate enforces (see _batch_gate_reason)."""
     import json as _json
     import os as _os
 
@@ -1831,6 +1901,7 @@ def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_round
         "E2E_MCP_DEMO_DIR": str(demo_dir),
         "E2E_MCP_PCC": str(pcc),
         "E2E_MCP_TIMEOUT": str(timeout_s),
+        E2E_MCP_BATCH_ENV: str(int(batch or 1)),
         "E2E_MODEL_ID": model_id,
         "E2E_ALL_TASKS": _os.environ.get("E2E_ALL_TASKS", "0"),
         "E2E_REQUIRE_TRACE": _os.environ.get("E2E_REQUIRE_TRACE", "1"),
@@ -1839,6 +1910,10 @@ def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_round
         "PYTHONPATH": str(repo_root),
         "PATH": f"{repo_root / 'python_env' / 'bin'}{_os.pathsep}/usr/bin:/bin",
     }
+    # The gate resets the device from the MCP server's own process; without the run stamp it would
+    # count its failures under a different run than this one (see device_recovery.stamp_run).
+    if _os.environ.get("PERF_MCP_RUN_ID"):
+        mcp_env["PERF_MCP_RUN_ID"] = _os.environ["PERF_MCP_RUN_ID"]
     cfg = cc_harness.build_mcp_config(pybin, server_path, mcp_env, "e2e-mcp")
     cfg_path = thp_dir / f".e2e_mcp_config_{re.sub(r'[^A-Za-z0-9._-]', '_', model_id)}.json"
     cfg_path.write_text(_json.dumps(cfg, indent=2))
@@ -2056,6 +2131,7 @@ def _emit_e2e_phase_a(args) -> int:
         timeout_s=timeout_s,
         agent_bin=agent_bin,
         max_rounds=max_grade_rounds,
+        batch=_batch_size,
     )
 
 
@@ -2086,10 +2162,14 @@ def _run_agent(*, prompt: str, agent_bin: str, agent_model: str, timeout_s: int,
         except Exception:
             log_fh = None
     _cap = _agent_mem_cap_bytes()
+    from ..cc_harness import tag_agent_env, wait_for_agent_device_work
+
+    agent_env, agent_tag = tag_agent_env()  # so its device runs can be told apart once it exits
     try:
         proc = subprocess.Popen(
             cmd,
             cwd=str(Path.cwd()),
+            env=agent_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -2147,6 +2227,7 @@ def _run_agent(*, prompt: str, agent_bin: str, agent_model: str, timeout_s: int,
                 log_fh.close()
             except Exception:
                 pass
+    wait_for_agent_device_work(agent_tag)  # the next phase's gate would otherwise reap it mid-run
     return (0 if rc == 0 else 1), final_text
 
 
@@ -2702,12 +2783,26 @@ def _batch_prompt_block(batch: int, *, heads: Optional[list] = None) -> str:
         if autoregressive is not False
         else _BATCH_INDEPENDENT_AXIS.format(batch=batch)
     )
+    from models.experimental.perf_automation.agent.perf_adapter import BATCH_ENV, BATCH_REPORT, batch_report_line
+
+    gate_contract = _BATCH_GATE_CONTRACT.format(
+        batch=batch, batch_env=BATCH_ENV, report=batch_report_line(batch), report_n="%s=<B>" % BATCH_REPORT
+    )
     return f"""
 BATCH = {batch}. Emit the pipeline to process {batch} INDEPENDENT samples per call, not one. A single
 sample wastes 31/32 of a 32-row matmul tile, so filling it with {batch} real samples raises AGGREGATE
 throughput ~{batch}x; per-sample latency is unchanged. Thread a leading batch dimension B={batch}
 through the WHOLE path and verify it end to end:
-{axis_note}{_BATCH_COMMON_RULES.format(batch=batch)}"""
+{axis_note}{_BATCH_COMMON_RULES.format(batch=batch)}{gate_contract}"""
+
+
+# What the gate ENFORCES about the batch (see _batch_gate_reason), stated to the builder up front so it
+# does not learn it from a failed round. Kept apart from _BATCH_COMMON_RULES so that block's placeholders
+# are unchanged for its existing callers.
+_BATCH_GATE_CONTRACT = """THE GATE ENFORCES THE BATCH. It runs tests/e2e with ${batch_env}={batch} and fails unless the tests
+print `{report_n}` with the batch they actually drove, equal to {batch}. So the e2e tests take B from
+${batch_env} -- never a number typed into the test -- and print `{report}` once B is known.
+"""
 
 
 def _build_agent_prompt(

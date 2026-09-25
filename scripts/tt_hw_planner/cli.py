@@ -7709,36 +7709,51 @@ def _run_tt_smi_reset(
     _dead = _dr.dead_chip_from_error(error_text)
     if _dead is not None:
         devices = _dr.expand_to_boards([_dead]) or devices
+    # The shared, host-aware command list: a Galaxy gets its galaxy-tray resets first, because a plain
+    # `-r` does not reset one. Falls back to the plain per-board reset only if that primitive can't load.
+    try:
+        from models.experimental.perf_automation.agent import probes as _pr
+
+        arg_sets = _pr.reset_commands(devices)
+        _run_reset = _pr.run_reset_command  # also installs a host tool the reset reports missing
+    except Exception:  # noqa: BLE001
+        arg_sets = [["-r", devices]]
+
+        def _run_reset(smi, args, timeout):
+            return _sp.run([smi, *args], timeout=timeout, capture_output=True, text=True)
+
     label = f" [{context}]" if context else ""
     print()
     print("=" * 78)
-    print(f"  Auto device-reset{label}: tt-smi -r {devices} (timeout={timeout_s}s)")
+    print(f"  Auto device-reset{label}: tt-smi {' | '.join(' '.join(a) for a in arg_sets)} (timeout={timeout_s}s)")
     print("=" * 78)
-    try:
-        proc = _sp.run(
-            ["tt-smi", "-r", devices],
-            timeout=timeout_s,
-            capture_output=True,
-            text=True,
-        )
-    except _sp.TimeoutExpired:
-        print(f"  tt-smi -r timed out after {timeout_s}s", file=sys.stderr)
-        return False
-    except OSError as exc:
-        print(f"  failed to launch tt-smi: {exc}", file=sys.stderr)
+    proc, shown = None, ""
+    for args in arg_sets:
+        shown = " ".join(args)
+        try:
+            proc = _run_reset("tt-smi", args, timeout_s)
+        except _sp.TimeoutExpired:
+            print(f"  tt-smi {shown} timed out after {timeout_s}s", file=sys.stderr)
+            proc = None
+            continue
+        except OSError as exc:
+            print(f"  failed to launch tt-smi: {exc}", file=sys.stderr)
+            return False
+        tail = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if tail:
+            print(tail[-1200:])
+        if proc.returncode == 0:
+            break
+        print(f"  tt-smi {shown} exited rc={proc.returncode}", file=sys.stderr)
+    if proc is None:
         return False
     _DEVICE_RESET_COUNT += 1
-    tail = (proc.stdout or "") + (proc.stderr or "")
-    tail = tail.strip()
-    if tail:
-        print(tail[-1200:])
     if proc.returncode != 0:
-        print(f"  tt-smi -r exited rc={proc.returncode}", file=sys.stderr)
         return False
     if not _device_recovery().device_is_healthy():
-        print("  tt-smi -r exited 0 but the device is NOT answering; treating as a failed reset", file=sys.stderr)
+        print(f"  tt-smi {shown} exited 0 but the device is NOT answering; treating as a failed reset", file=sys.stderr)
         return False
-    print(f"  tt-smi -r completed cleanly (reset #{_DEVICE_RESET_COUNT}/{_DEVICE_RESET_MAX_PER_PROCESS})")
+    print(f"  tt-smi {shown} completed cleanly (reset #{_DEVICE_RESET_COUNT}/{_DEVICE_RESET_MAX_PER_PROCESS})")
     return True
 
 
@@ -10218,6 +10233,7 @@ from .commands.op_synth import cmd_op_synth  # noqa: F401
 from .commands.emit_e2e import cmd_emit_e2e  # noqa: F401
 from .commands.optimize import cmd_optimize  # noqa: F401
 from .commands.optimize_dashboard import cmd_optimize_dashboard  # noqa: F401
+from .commands.publish_hf import cmd_publish_hf  # noqa: F401
 from .commands.auto_onboard import cmd_auto_onboard  # noqa: F401
 
 
@@ -11379,11 +11395,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         type=int,
         default=1,
         help=(
-            "Emit the pipeline for this DECODE BATCH size B (independent concurrent streams that fill the "
-            "matmul tile rows). Default 1. B>1 instructs the builder to thread a batch dimension through the "
-            "decode step, the KV-cache ([B,h,C,d]), the collectives and the vocoder, and the PCC gate "
-            "validates across B streams. Batching raises AGGREGATE throughput (fills the 32-row tile), not "
-            "per-token latency; the model must be an autoregressive decode that can carry a batch axis."
+            "Emit the pipeline for this batch size B (independent samples per call, filling the matmul "
+            "tile rows). Default 1. B>1 instructs the builder to thread a leading batch axis through the "
+            "whole path, and the e2e gate ENFORCES it: the tests run with the batch set to B and must report "
+            "driving B samples, each checked against its own golden. Batching raises AGGREGATE throughput "
+            "(fills the 32-row tile), not per-sample latency."
         ),
     )
     pe2e.add_argument(
@@ -11629,6 +11645,70 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--port", type=int, default=8798, help="port to serve on (default 8798; free port chosen if taken)"
     )
     pdash.set_defaults(func=cmd_optimize_dashboard)
+
+    pph = sub.add_parser(
+        "publish-hf",
+        help="Publish a tool-optimized model to Hugging Face (optimized code + a model card built from the run's metrics). Run commit-wins first.",
+    )
+    pph.add_argument(
+        "target",
+        nargs="?",
+        help="HF model_id of a planner demo, or a demo dir (default: newest run).",
+    )
+    pph.add_argument("--run", dest="run", help="explicit run id or run directory path")
+    pph.add_argument(
+        "--from-dashboard",
+        dest="from_dashboard",
+        help="read metrics from a live dashboard URL (e.g. http://127.0.0.1:8798) "
+        "instead of run state files — best for an in-flight run",
+    )
+    pph.add_argument("--repo", required=True, help="target HF repo id, e.g. ashwaaaaa/<model>-tt")
+    pph.add_argument("--weights", help="base weights HF repo id to reference (pointer; not uploaded)")
+    pph.add_argument("--private", action="store_true", help="create the HF repo as private")
+    pph.add_argument(
+        "--card-only",
+        dest="card_only",
+        action="store_true",
+        help="publish only the model card + manifest (no model code upload)",
+    )
+    pph.add_argument(
+        "--dry-run", dest="dry_run", action="store_true", help="stage + preview the model card without pushing"
+    )
+    pph.add_argument("--token", help="HF token (default: env HF_TOKEN or the CLI login file)")
+    pph.add_argument(
+        "--container",
+        action="store_true",
+        help="build a REAL v5.1 tt-model container bundle (tt-model package --container "
+        "+ push): servable via tt-model pull/serve, like the published TT repos. "
+        "2.5-4h OCI build; needs Docker + a vLLM adapter (vllm_metadata.json).",
+    )
+    pph.add_argument("--box", help="planner box (QB2/T3K/GalaxyBH/...) to derive arch/hardware/mesh")
+    pph.add_argument("--arch", help="override arch: blackhole | wormhole_b0")
+    pph.add_argument("--hardware", help="override serve.hardware (e.g. p300x2)")
+    pph.add_argument("--mesh", help="override serve.mesh_device (e.g. P300x2)")
+    pph.add_argument("--kind", help="tt-model kind: vllm-plugin (default) | vllm-fork | tt-dit-server")
+    pph.add_argument("--plugin-ref", dest="plugin_ref", help="vllm-tt-plugin git ref (default: main)")
+    pph.add_argument("--vllm-version", dest="vllm_version", help="vLLM version (default: 0.24.0)")
+    pph.add_argument(
+        "--extra-models-dir",
+        dest="extra_models_dir",
+        help="dir the plugin scans for vllm_metadata.json (under source.code)",
+    )
+    pph.add_argument(
+        "--no-scaffold",
+        dest="no_scaffold",
+        action="store_true",
+        help="do not auto-create the vLLM adapter bundle for --container",
+    )
+    pph.add_argument(
+        "--hf-arch", dest="hf_arch", help="HF architecture (e.g. LlamaForCausalLM) if config.json is not in the demo"
+    )
+    pph.add_argument("--lock", help="path to a requirements.lock to pin the container build deps")
+    pph.add_argument("--out", help="tt-model build staging dir (default ~/tt-model-builds)")
+    pph.add_argument("--tt-model-bin", dest="tt_model_bin", help="path to the tt-model executable")
+    pph.add_argument("--public", action="store_true", help="push the bundle public (shared by link)")
+    pph.add_argument("--publish", action="store_true", help="push public AND list in the catalog")
+    pph.set_defaults(func=cmd_publish_hf)
 
     pao = sub.add_parser(
         "auto-onboard",
