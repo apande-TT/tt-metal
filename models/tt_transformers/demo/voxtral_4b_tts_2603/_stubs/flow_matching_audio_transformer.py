@@ -257,7 +257,7 @@ def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
     q = ttnn.reshape(q, [batch, n_kv_heads, repeats * seq, head_dim])
 
     # The reference scales the QUERY before the product, not the scores after it.
-    scores = _bmm(ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1))
+    scores = _bmm(q if scale is None else ttnn.multiply(q, scale), ttnn.transpose(k, -2, -1))
     if attn_mask is not None:
         if int(attn_mask.shape[-2]) != 1:
             attn_mask = ttnn.slice(attn_mask, [0, 0, 0, 0], [1, 1, 1, int(attn_mask.shape[-1])])
@@ -306,14 +306,16 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
     """
     rows = int(h.shape[-2])
     repeats = n_heads // n_kv_heads
-    qkv = _lin(h, wqkv, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
+    # bf16 q/k/v for the head split; the scores come back float32 for the softmax.
+    qkv = _lin(h, wqkv, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE)
     q, k, v = ttnn.experimental.nlp_create_qkv_heads(
         qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
     )
     head_dim = int(q.shape[-1])
     q = ttnn.reshape(q, [1, n_kv_heads, repeats * rows, head_dim])
 
-    scores = _bmm(ttnn.multiply(q, scale), k, per_core_m=1, transpose_b=True)
+    q = q if scale is None else ttnn.multiply(q, scale)
+    scores = _bmm(q, k, per_core_m=1, transpose_b=True, dtype=ttnn.float32)
     scores = ttnn.add(scores, _compact_mask(h.device(), rows, tokens, repeats))
     weights = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
@@ -340,7 +342,8 @@ def _compile_block(device, blk, mask):
     wqkv = _from_torch(
         torch.cat(
             [
-                attn.wq.weight.detach().float().transpose(0, 1),
+                # The query scale folded into Wq: the reference scales the query before the product.
+                attn.wq.weight.detach().float().transpose(0, 1) * scale,
                 attn.wk.weight.detach().float().transpose(0, 1),
                 attn.wv.weight.detach().float().transpose(0, 1),
             ],
@@ -368,9 +371,9 @@ def _compile_block(device, blk, mask):
     def run(h, tokens=None):
         xn = _rms_norm(h, g_attn, eps, dtype=ttnn.bfloat16)
         if tokens:
-            attn_out = _compact_attention(xn, wqkv, wo, n_heads, n_kv_heads, scale, tokens)
+            attn_out = _compact_attention(xn, wqkv, wo, n_heads, n_kv_heads, None, tokens)
         else:
-            attn_out = _attention(xn, wqkv, wo, n_heads, n_kv_heads, scale, mask)
+            attn_out = _attention(xn, wqkv, wo, n_heads, n_kv_heads, None, mask)
         h = ttnn.add(h, attn_out)
 
         hn = _rms_norm(h, g_ffn, eps, dtype=ttnn.bfloat16)
