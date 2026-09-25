@@ -207,7 +207,7 @@ def _lin(x, w, **kwargs):
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
-def _bmm(a, b, per_core_m=None, transpose_b=False):
+def _bmm(a, b, per_core_m=None, transpose_b=False, dtype=None):
     """Head-batched `a @ b` spread over the full grid.
 
     Without a program config the `[B, H, 32, 128] x [B, H, 128, 32]` score product lands on ONE
@@ -224,7 +224,7 @@ def _bmm(a, b, per_core_m=None, transpose_b=False):
         per_core_M=per_core_m or m,
         per_core_N=n,
     )
-    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE)
+    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE, dtype=dtype)
 
 
 def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
@@ -316,7 +316,9 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
     weights = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
-    out = ttnn.reshape(_bmm(weights, v, per_core_m=1), [1, n_heads, rows, head_dim])
+    # bf16 context: the head merge moves it and o_proj multicasts it whole; the scores and the
+    # softmax that produced it stay float32.
+    out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.bfloat16), [1, n_heads, rows, head_dim])
     return _lin(ttnn.experimental.nlp_concat_heads(out), wo, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
 
 
