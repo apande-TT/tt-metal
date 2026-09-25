@@ -10233,6 +10233,7 @@ from .commands.op_synth import cmd_op_synth  # noqa: F401
 from .commands.emit_e2e import cmd_emit_e2e  # noqa: F401
 from .commands.optimize import cmd_optimize  # noqa: F401
 from .commands.optimize_dashboard import cmd_optimize_dashboard  # noqa: F401
+from .commands.publish_hf import cmd_publish_hf  # noqa: F401
 from .commands.auto_onboard import cmd_auto_onboard  # noqa: F401
 
 
@@ -11644,6 +11645,70 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--port", type=int, default=8798, help="port to serve on (default 8798; free port chosen if taken)"
     )
     pdash.set_defaults(func=cmd_optimize_dashboard)
+
+    pph = sub.add_parser(
+        "publish-hf",
+        help="Publish a tool-optimized model to Hugging Face (optimized code + a model card built from the run's metrics). Run commit-wins first.",
+    )
+    pph.add_argument(
+        "target",
+        nargs="?",
+        help="HF model_id of a planner demo, or a demo dir (default: newest run).",
+    )
+    pph.add_argument("--run", dest="run", help="explicit run id or run directory path")
+    pph.add_argument(
+        "--from-dashboard",
+        dest="from_dashboard",
+        help="read metrics from a live dashboard URL (e.g. http://127.0.0.1:8798) "
+        "instead of run state files — best for an in-flight run",
+    )
+    pph.add_argument("--repo", required=True, help="target HF repo id, e.g. ashwaaaaa/<model>-tt")
+    pph.add_argument("--weights", help="base weights HF repo id to reference (pointer; not uploaded)")
+    pph.add_argument("--private", action="store_true", help="create the HF repo as private")
+    pph.add_argument(
+        "--card-only",
+        dest="card_only",
+        action="store_true",
+        help="publish only the model card + manifest (no model code upload)",
+    )
+    pph.add_argument(
+        "--dry-run", dest="dry_run", action="store_true", help="stage + preview the model card without pushing"
+    )
+    pph.add_argument("--token", help="HF token (default: env HF_TOKEN or the CLI login file)")
+    pph.add_argument(
+        "--container",
+        action="store_true",
+        help="build a REAL v5.1 tt-model container bundle (tt-model package --container "
+        "+ push): servable via tt-model pull/serve, like the published TT repos. "
+        "2.5-4h OCI build; needs Docker + a vLLM adapter (vllm_metadata.json).",
+    )
+    pph.add_argument("--box", help="planner box (QB2/T3K/GalaxyBH/...) to derive arch/hardware/mesh")
+    pph.add_argument("--arch", help="override arch: blackhole | wormhole_b0")
+    pph.add_argument("--hardware", help="override serve.hardware (e.g. p300x2)")
+    pph.add_argument("--mesh", help="override serve.mesh_device (e.g. P300x2)")
+    pph.add_argument("--kind", help="tt-model kind: vllm-plugin (default) | vllm-fork | tt-dit-server")
+    pph.add_argument("--plugin-ref", dest="plugin_ref", help="vllm-tt-plugin git ref (default: main)")
+    pph.add_argument("--vllm-version", dest="vllm_version", help="vLLM version (default: 0.24.0)")
+    pph.add_argument(
+        "--extra-models-dir",
+        dest="extra_models_dir",
+        help="dir the plugin scans for vllm_metadata.json (under source.code)",
+    )
+    pph.add_argument(
+        "--no-scaffold",
+        dest="no_scaffold",
+        action="store_true",
+        help="do not auto-create the vLLM adapter bundle for --container",
+    )
+    pph.add_argument(
+        "--hf-arch", dest="hf_arch", help="HF architecture (e.g. LlamaForCausalLM) if config.json is not in the demo"
+    )
+    pph.add_argument("--lock", help="path to a requirements.lock to pin the container build deps")
+    pph.add_argument("--out", help="tt-model build staging dir (default ~/tt-model-builds)")
+    pph.add_argument("--tt-model-bin", dest="tt_model_bin", help="path to the tt-model executable")
+    pph.add_argument("--public", action="store_true", help="push the bundle public (shared by link)")
+    pph.add_argument("--publish", action="store_true", help="push public AND list in the catalog")
+    pph.set_defaults(func=cmd_publish_hf)
 
     pao = sub.add_parser(
         "auto-onboard",
