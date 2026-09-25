@@ -296,6 +296,22 @@ def _compact_mask(device, rows, tokens, repeats):
     return mask
 
 
+def _split_heads(qkv, n_heads, n_kv_heads):
+    """`nlp_create_qkv_heads` on the fused `[1, 1, rows, (H + 2 H_kv) * D]` projection, split over HEADS.
+
+    The fused q/k/v mode deals out one work unit per 32-row tile, so a 96-row compact projection
+    runs on 3 cores. Its Q-only mode (`num_kv_heads=0`) deals out (row tile, head) pairs instead;
+    q, k and v are the fused layout's consecutive head ranges, so the three are slices of one split.
+    """
+    total = n_heads + 2 * n_kv_heads
+    heads, _, _ = ttnn.experimental.nlp_create_qkv_heads(qkv, num_heads=total, num_kv_heads=0, transpose_k_heads=False)
+    b, _, s, d = (int(v) for v in heads.shape)
+    q = ttnn.slice(heads, [0, 0, 0, 0], [b, n_heads, s, d])
+    k = ttnn.slice(heads, [0, n_heads, 0, 0], [b, n_heads + n_kv_heads, s, d])
+    v = ttnn.slice(heads, [0, n_heads + n_kv_heads, 0, 0], [b, total, s, d])
+    return q, k, v
+
+
 def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
     """The same attention on the COMPACT layout: `[1, 1, tokens * R, dim]`, token t in rows t*R..
 
@@ -308,9 +324,7 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
     repeats = n_heads // n_kv_heads
     # bf16 q/k/v for the head split; the scores come back float32 for the softmax.
     qkv = _lin(h, wqkv, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE)
-    q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-        qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
-    )
+    q, k, v = _split_heads(qkv, n_heads, n_kv_heads)
     head_dim = int(q.shape[-1])
     q = ttnn.reshape(q, [1, n_kv_heads, repeats * rows, head_dim])
 
