@@ -431,6 +431,9 @@ def _decode_mask(kv_cache, position, cap):
             "the text stack stages at build time; without it the zero tail of the cache is "
             "attended as if it were real keys"
         )
+    shared = kv_cache.get("mask_row")
+    if shared is not None and shared[0] == int(position) and int(shared[1].shape[-1]) == cap:
+        return shared[1]
     row = ttnn.slice(table, [int(position), 0], [int(position) + 1, cap])
     return ttnn.to_layout(ttnn.reshape(row, [1, 1, 1, cap]), ttnn.TILE_LAYOUT)
 

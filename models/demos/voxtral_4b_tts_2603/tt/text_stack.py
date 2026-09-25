@@ -443,6 +443,15 @@ class TextStack:
         # last dim, so neither cares which leading axis holds the batch.
         folded = ttnn.reshape(embeds, [1, 1, batch, self.hidden_size])
         rope = self._decode_rope(batch, position)
+        # The additive mask row for `position` is the same for every layer: cut it off the staged
+        # table ONCE per step and hand it to each block, instead of 26 slice + tilize pairs.
+        cap = int(self.kv_capacity)
+        mask_row = ttnn.to_layout(
+            ttnn.reshape(ttnn.slice(self._decode_mask, [position, 0], [position + 1, cap]), [1, 1, 1, cap]),
+            ttnn.TILE_LAYOUT,
+        )
+        for block in self.blocks:
+            block.kv["mask_row"] = (position, mask_row)
         hidden = folded
         try:
             for block in self.blocks:
