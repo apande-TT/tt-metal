@@ -210,6 +210,26 @@ def _softmax(x, dim=-1):
     return ttnn.divide(e, ttnn.sum(e, dim=dim, keepdim=True))
 
 
+def _largest_divisor(n, cap):
+    return max(d for d in range(1, min(n, cap) + 1) if n % d == 0)
+
+
+def _bmm(a, b, transpose_b=False):
+    """Head-batched attention `a @ b` over the full grid, every (batch, head, 4-tile M block) its own
+    work unit. With no program config these `[B, H, S, S]` products ran on 16-64 cores."""
+    m, k, n = (-(-int(d) // 32) for d in (a.shape[-2], a.shape[-1], b.shape[-2 if transpose_b else -1]))
+    grid = a.device().compute_with_storage_grid_size()
+    cfg = ttnn.MatmulMultiCoreReuseProgramConfig(
+        compute_with_storage_grid_size=(grid.x, grid.y),
+        in0_block_w=k,
+        out_subblock_h=1,
+        out_subblock_w=_largest_divisor(n, 4),
+        per_core_M=_largest_divisor(m, 4),
+        per_core_N=n,
+    )
+    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE)
+
+
 def build(device, torch_module):
     attn = torch_module
     args = attn.args
@@ -268,16 +288,12 @@ def build(device, torch_module):
             num_kv_heads=n_kv_heads,
             transpose_k_heads=False,
         )
-        scores = ttnn.matmul(qh, kh, transpose_b=True, compute_kernel_config=_COMPUTE)
+        scores = _bmm(qh, kh, transpose_b=True)
         scores = ttnn.add(
             ttnn.multiply(scores, scale),
             ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq]),
         )
-        a = ttnn.matmul(
-            _softmax(scores),
-            vh,
-            compute_kernel_config=_COMPUTE,
-        )
+        a = _bmm(_softmax(scores), vh)
         ttnn.deallocate(scores)
         a = ttnn.experimental.nlp_concat_heads(a)
         return ttnn.reshape(
