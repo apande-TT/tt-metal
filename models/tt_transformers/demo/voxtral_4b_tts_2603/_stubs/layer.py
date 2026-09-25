@@ -460,7 +460,7 @@ def build(device, torch_module):
         _from_torch((p.weight.detach().float().transpose(0, 1) * g_post_t).contiguous(), device, dtype=ttnn.bfloat8_b)
         for p in (mlp.gate_proj, mlp.up_proj)
     )
-    # Prefill's fused SwiGLU weight, bf8_b against the bf16 norm output (minimal_matmul takes mixed
+    # Prefill's fused SwiGLU weight, bf4_b against the bf16 norm output (minimal_matmul takes mixed
     # dtypes); decode keeps the separate gate/up above for its float32 activation.
     w_gu = _from_torch(
         _swiglu_pairs(
@@ -468,7 +468,7 @@ def build(device, torch_module):
             mlp.up_proj.weight.detach().float().transpose(0, 1) * g_post_t,
         ),
         device,
-        dtype=ttnn.bfloat8_b,
+        dtype=ttnn.bfloat4_b,
     )
     w_down = _weight(mlp.down_proj, device)
     g_in = None

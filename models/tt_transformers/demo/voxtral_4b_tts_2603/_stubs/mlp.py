@@ -316,14 +316,14 @@ def build(device, torch_module):
         for p in (mlp.gate_proj, mlp.up_proj)
     )
     w_down = _weight(mlp.down_proj, device)
-    # Prefill's fused SwiGLU weight, bf8_b against the bf16 norm output; the float32 decode
+    # Prefill's fused SwiGLU weight, bf4_b against the bf16 norm output; the float32 decode
     # activation keeps the separate pair above.
     w_gu = _from_torch(
         _swiglu_pairs(
             mlp.gate_proj.weight.detach().float().transpose(0, 1), mlp.up_proj.weight.detach().float().transpose(0, 1)
         ),
         device,
-        dtype=ttnn.bfloat8_b,
+        dtype=ttnn.bfloat4_b,
     )
 
     def mlp_forward(x, **kwargs):
