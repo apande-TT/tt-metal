@@ -635,10 +635,12 @@ def build(device, torch_module):
         # The cache tail beyond `position` is zeros, and a zero key scores ZERO -- which is a
         # perfectly ordinary logit, not a small one. It has to be masked explicitly.
         scores = ttnn.add(scores, _decode_mask(kv_cache, position, cap))
-        weights = _softmax(scores)
+        # Normalise AFTER P@V: dividing the [B, n_kv, 32, head_dim] context by the row sums is the
+        # same arithmetic as dividing the C/head_dim-times larger [B, n_kv, 32, C] weights first.
+        e = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
         ttnn.deallocate(scores)
-        ctx = _bmm(weights, kv_cache["v"])
-        ttnn.deallocate(weights)
+        ctx = ttnn.divide(_bmm(e, kv_cache["v"]), ttnn.sum(e, dim=-1, keepdim=True))
+        ttnn.deallocate(e)
         merged = ttnn.to_layout(
             ttnn.reshape(
                 ttnn.slice(
