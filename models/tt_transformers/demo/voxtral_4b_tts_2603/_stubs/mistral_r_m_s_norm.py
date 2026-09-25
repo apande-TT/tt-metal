@@ -54,28 +54,24 @@ def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
 
 
-_SQUARES = {}
+_STATS_COMPUTE = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=False
+)
 
 
 def _sq_mean(x):
-    """`mean(x^2, -1)` of a float32 `x`. A tall (prefill) `x` writes its square into a PERSISTENT
-    bfloat16 buffer instead of a fresh float32 one: the square is only ever averaged, over 3072
-    elements, so its bf16 rounding averages down to ~3e-5 relative on the mean while the write and
-    the mean's read both halve. Created on the first (eager) call, so a trace allocates nothing."""
+    """`mean(x^2, -1)` of a float32 `x`. A tall (prefill) `x` gets its row sums of squares from
+    `rms_norm_pre_all_gather` -- ONE read of `x`, float32 accumulation and a float32 `[rows, 32]`
+    result whose column 0 is the sum -- instead of writing `x^2` out and reading it back to reduce."""
     shape = [int(d) for d in x.shape]
     rows = 1
     for d in shape[:-1]:
         rows *= d
     if rows < 256:
         return ttnn.mean(ttnn.square(x), dim=-1, keepdim=True)
-    key = (id(x.device()), tuple(shape))
-    buf = _SQUARES.get(key)
-    if buf is None:
-        buf = ttnn.allocate_tensor_on_device(
-            ttnn.Shape(shape), ttnn.bfloat16, ttnn.TILE_LAYOUT, x.device(), ttnn.DRAM_MEMORY_CONFIG
-        )
-        _SQUARES[key] = buf
-    return ttnn.mean(ttnn.square(x, output_tensor=buf), dim=-1, keepdim=True)
+    stats = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=_STATS_COMPUTE, dtype=ttnn.float32)
+    total = ttnn.slice(stats, [0] * len(shape), shape[:-1] + [1])
+    return ttnn.multiply(total, 1.0 / shape[-1])
 
 
 def build(device, torch_module):
