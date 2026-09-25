@@ -511,7 +511,8 @@ def build(device, torch_module):
     wqkv = _from_torch(
         torch.cat(
             [
-                attn.q_proj.weight.detach().float().transpose(0, 1),
+                # The attention scale folded into Wq (RoPE is linear, so it commutes).
+                attn.q_proj.weight.detach().float().transpose(0, 1) * float(attn.scaling),
                 attn.k_proj.weight.detach().float().transpose(0, 1),
                 attn.v_proj.weight.detach().float().transpose(0, 1),
             ],
@@ -630,7 +631,7 @@ def build(device, torch_module):
         # [B, n_kv, C, head_dim] K cache every step.
         # Scale the [B, n_kv, 32, head_dim] query, not the [B, n_kv, 32, C] scores: one pass over
         # a tensor C/head_dim times smaller.
-        scores = _bmm(ttnn.multiply(q, scale), kv_cache["k"], transpose_b=True)
+        scores = _bmm(q, kv_cache["k"], transpose_b=True)
         ttnn.deallocate(q)
         # The cache tail beyond `position` is zeros, and a zero key scores ZERO -- which is a
         # perfectly ordinary logit, not a small one. It has to be masked explicitly.
@@ -674,7 +675,7 @@ def build(device, torch_module):
             sin = _broadcast4(sin, seq, head_dim)
             q, k = _rope_prefill(q, k, cos, sin, half)
         a = ttnn.transformer.scaled_dot_product_attention(
-            q, k, v, is_causal=True, scale=scale, program_config=_sdpa_cfg(q)
+            q, k, v, is_causal=True, scale=1.0, program_config=_sdpa_cfg(q)
         )
         if kv_cache is not None:
             _seed_cache(kv_cache, k, v)
