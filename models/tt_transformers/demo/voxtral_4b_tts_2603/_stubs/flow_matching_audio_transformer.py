@@ -342,7 +342,8 @@ def _compile_block(device, blk, mask):
         dtype=ttnn.bfloat8_b,
     )
     wo = _from_torch(attn.wo.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
-    # Weight-stream bound at 96 rows; bf8_b halves the bytes each FFN projection reads.
+    # Weight-stream bound at 96 rows; bf8_b halves the bytes each FFN projection reads, and HiFi2
+    # (two phases, enough for a bf8_b mantissa) halves the math that sits behind the stream.
     w1, w3 = (
         _from_torch(m.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
         for m in (ff.w1, ff.w3)
@@ -365,8 +366,8 @@ def _compile_block(device, blk, mask):
 
         hn = _rms_norm(h, g_ffn, eps, dtype=ttnn.bfloat16)
         gated = ttnn.multiply(
-            _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
-            _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             # Consumed once, by the down projection: hand it over in L1, not through DRAM.
             memory_config=ttnn.L1_MEMORY_CONFIG,
