@@ -23,7 +23,8 @@ MESH_PARAMS = pytest.mark.parametrize(
     indirect=True,
 )
 MESH = pytest.mark.parametrize("mesh_device", [P.MESH_SHAPE], indirect=True)
-BATCH = 4  # the e2e gate's batch
+BATCH = 32  # the e2e gate's batch
+SMALL_BATCH = 8  # smallest batch of the 8x4 layout (1 image per VAE row, 2 per DP column)
 
 
 @pytest.fixture(scope="module")
@@ -53,10 +54,10 @@ def test_depth_knob(mesh_device, hf_pipe):
     assert len(pipe.stacks["vision_encode"]) == 2 < len(te.model.visual.blocks)
     assert pipe.text_encoder.text_model.num_layers == 2 < len(te.model.language_model.layers)
     assert len(pipe.stacks["denoise"]) == 3 < len(hf_pipe.transformer.transformer_blocks)
-    cfg = EditConfig(batch=BATCH, num_inference_steps=2)
+    cfg = EditConfig(batch=SMALL_BATCH, num_inference_steps=2)
     p = pipe.prepare(pipe.encode(cfg))
     out = pipe.run_image_edit(p)
-    assert tuple(out.shape) == (BATCH, 3, 256, 256)
+    assert tuple(out.shape) == (SMALL_BATCH, 3, 256, 256)
     counts = pipe.tracker.snapshot()
     assert counts["qwen_image_transformer_block"] == 3 * 2 * 2  # blocks x (cond + uncond) x steps
     assert counts["v_l_vision_block"] == 2

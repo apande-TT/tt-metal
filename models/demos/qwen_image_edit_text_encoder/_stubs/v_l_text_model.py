@@ -27,12 +27,14 @@ from models.demos.qwen_image_edit_text_encoder._stubs.token_embed import TtToken
 class TtTextModel:
     """Composed of the graduated ports: 28 x v_l_decoder_layer, each with its language_model_layers_0_mlp.
 
-    Row-staged on a 2-row mesh (row_stages=True, the default there): every layer keeps its TP split over
-    the 4 columns, but layers [0, n/2) live on row 0 and [n/2, n) on row 1, so each chip holds 1/8 of
-    the stack instead of 1/4. One slot i of `self.layers` is the pair (layer i on row 0, layer n/2 + i
-    on row 1). The forward runs the slots twice: pass 1 is valid on row 0, then row 0's activation is
-    handed to row 1 (all_gather over the row axis, exact), and pass 2 is valid on row 1. On a 1-row mesh
-    (or row_stages=False) it is the plain TP stack.
+    Row-staged on a mesh with an even number R >= 2 of rows (row_stages=True, the default there): every
+    layer keeps its TP split over the columns, but the rows form two pipeline stages of R/2 rows each:
+    layers [0, n/2) live on rows [0, R/2) and [n/2, n) on rows [R/2, R), so each chip holds half of its
+    TP share of the stack. One slot i of `self.layers` is the pair (layer i on stage 0, layer n/2 + i on
+    stage 1). The forward runs the slots twice: pass 1 is valid on the stage-0 rows, then row 0's
+    activation is handed to every row (all_gather over the row axis, exact), and pass 2 is valid on the
+    stage-1 rows, whose row R/2 copy is handed out the same way. On a 2xN mesh the stages are single
+    rows. On a 1-row mesh (or row_stages=False) it is the plain TP stack.
     """
 
     def __init__(self, device, torch_module, embed_tokens=True, row_stages=None):
@@ -41,8 +43,9 @@ class TtTextModel:
         rows, _ = mesh_shape(device)
         layers = list(torch_module.layers)
         if row_stages is None:
-            row_stages = rows == 2 and len(layers) >= 2
-        self.row_stages = bool(row_stages) and rows == 2
+            row_stages = rows >= 2 and rows % 2 == 0 and len(layers) >= 2
+        self.row_stages = bool(row_stages) and rows >= 2 and rows % 2 == 0
+        self.stage_rows = rows // 2 if self.row_stages else rows  # rows per pipeline stage
         self.num_layers = len(layers)
         self.layers = []
         if self.row_stages:
@@ -91,10 +94,10 @@ class TtTextModel:
         for lyr in self.layers:
             x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask)
         if self.row_stages:
-            x = self._take_row(x, 0)  # layers [0, n/2) done on row 0 -> hand to row 1
+            x = self._take_row(x, 0)  # layers [0, n/2) done on the stage-0 rows -> hand to every row
             for lyr in self.layers:
                 x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask)
-            x = self._take_row(x, 1)  # layers [n/2, n) done on row 1 -> everyone
+            x = self._take_row(x, self.stage_rows)  # layers [n/2, n) done on the stage-1 rows -> everyone
         return self.norm(x)
 
     def __call__(self, inputs_embeds=None, input_ids=None, attention_mask=None, position_ids=None, **kwargs):

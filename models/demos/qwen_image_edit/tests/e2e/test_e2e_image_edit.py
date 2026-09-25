@@ -2,16 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """End-to-end Qwen-Image-Edit on TT (Call 1: image_edit), against the HF QwenImageEditPipeline golden.
 
-Real input: E2E_BATCH (4) condition images (crops of the photos in models/sample_data), distinct edit
-instructions and seeds: samples 0..3 of the bundled set. They are encoded with the HF Qwen2VLProcessor, VaeImageProcessor and
-FlowMatch scheduler (tt/inputs.py). One chained TT forward (tt/pipeline.py:run_image_edit, the same
-function the demo calls) takes them to 4 edited images. The golden is the HF pipeline in float32 on
-CPU with the same inputs and the same initial noise (reference/golden.py, cached).
+Real input: E2E_BATCH (32) condition images (crops of the photos in models/sample_data), 32 distinct
+edit instructions and seeds 1000..1031 (the bundled set). They are encoded with the HF Qwen2VLProcessor,
+VaeImageProcessor and FlowMatch scheduler (tt/inputs.py). One chained TT forward (tt/pipeline.py:
+run_image_edit, the same function the demo calls) takes them to 32 edited images in one program per
+step. The golden is the HF pipeline in float32 on CPU with the same inputs and the same initial noise
+(reference/golden.py). It takes hours on CPU, so it is precomputed and cached; this test fails fast if
+it is missing and never builds it.
 
-Batch: 4. The precise transformer costs ~4 s per sample per scheduler step on this T3K (device-compute
-bound, measured: 16.06 s per step at B=4 both eager and trace-replayed; 120 s at B=32), so the full
-50-step schedule at B=32 is ~100 min, past the 45 min the gate harness allows the whole run. B=4 runs
-the same full schedule in ~15 min. Every sample is still scored against its own golden.
+Mesh: Galaxy 8x4. The denoise batch is split over the 4 mesh columns (DP=4, 8 samples per column)
+with the transformer TP=8 down each column, which is what makes B=32 x 50 steps fit the 45 min the
+harness allows the whole run. Every sample is scored against its own golden.
 
 Gates:
   1  every routed graduated stub is ttnn: no torch compute in its forward code (static scan), and the
@@ -37,7 +38,9 @@ from models.demos.qwen_image_edit.tt import pipeline as P
 from models.demos.qwen_image_edit.tt.inputs import EditConfig
 
 PCC_TARGET = 0.99
-E2E_BATCH = 4
+E2E_BATCH = 32
+# the correctness gate: per-sample image PCC vs the independently computed HF golden (not teacher-forced)
+E2E_CORRECTNESS_GATE = "test_e2e_image_edit"
 STUB_PKGS = {
     "text_encoder": "models.demos.qwen_image_edit_text_encoder._stubs.",
     "vae": "models.tt_dit.pipelines.qwen_image_edit_vae._stubs.",
@@ -71,18 +74,28 @@ def _config():
 
 
 @pytest.fixture(scope="module")
+def golden():
+    """The cached HF golden. Requested first so a missing golden fails before the device or the HF
+    model is touched; it is never built here (hours on CPU: python -m models.demos.qwen_image_edit.
+    reference.golden --batch 32 --steps 50)."""
+    cfg = _config()
+    g = load_or_build_golden(cfg, build_if_missing=False)
+    if g is None:
+        pytest.fail(f"cached golden missing: {golden_path(cfg)} (build it with reference/golden.py first)")
+    return g
+
+
+@pytest.fixture(scope="module")
 def hf_pipe():
     return P.load_hf_reference(torch.float32)
 
 
-# the forward is ~15 min at B=4 x 50 steps; building a missing golden on CPU adds ~1.5 h
-@pytest.mark.timeout(4 * 3600)
+# the harness's hang budget for the whole run (build + 32-sample x 50-step forward + checks)
+@pytest.mark.timeout(2700)
 @MESH_PARAMS
 @MESH
-def test_e2e_image_edit(mesh_device, hf_pipe):
+def test_e2e_image_edit(golden, mesh_device, hf_pipe):
     cfg = _config()
-    golden = load_or_build_golden(cfg, build_if_missing=True)  # ~1.5 h on CPU the first time, then cached
-    assert golden is not None, f"golden missing: {golden_path(cfg)}"
 
     pipe = P.build_pipeline(mesh_device, model=hf_pipe, cfg=cfg)
     enc = pipe.encode(cfg)

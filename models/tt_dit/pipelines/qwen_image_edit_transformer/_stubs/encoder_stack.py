@@ -10,7 +10,7 @@
 
 Returns cat([txt, img], dim=1), matching the test's stack reference.
 
-Tensor parallel (TP = mesh size):
+Tensor parallel (TP = mesh size, or one mesh axis via _ccl.tp_axis):
   * img_mod / txt_mod: COLUMN-parallel (output features split) + all_gather, so every chip holds the
     full modulation vector.
   * attention: the graduated TP attention stub (heads split, row-parallel out + all_reduce).
@@ -47,7 +47,7 @@ def _sharded(t, device, dim, dtype=ttnn.bfloat16):
             dtype=dtype,
             layout=ttnn.TILE_LAYOUT,
             device=device,
-            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=dim),
+            mesh_mapper=_ccl.shard_mapper(device, dim),  # TP axis: see _ccl.tp_axis
         )
     return _replicated(t, device, dtype=dtype)
 
@@ -63,6 +63,7 @@ def _as_tt(t, device, dtype=ttnn.float32):
 class _TtBlock:
     def __init__(self, device, block, hifi, tp):
         self.device = device
+        self.tp_axis = _ccl.get_tp_axis()
         self.hifi = hifi
         self.tp = tp
         self.dim = block.dim
@@ -82,7 +83,7 @@ class _TtBlock:
 
     def _gather(self, y):
         if self.tp > 1:
-            y = _ccl.all_gather(y, self.device, dim=-1)
+            y = _ccl.all_gather(y, self.device, dim=-1, axis=self.tp_axis)
         return y
 
     def _mod_params(self, silu_temb, wb):
@@ -127,7 +128,8 @@ class TtQwenBlockStack:
     def __init__(self, device, torch_module):
         self.device = device
         blocks = torch_module.blocks if hasattr(torch_module, "blocks") else torch_module
-        self.tp = device.get_num_devices() if _is_mesh(device) else 1
+        self.tp_axis = _ccl.get_tp_axis()  # mesh axis of the TP split (None = every device)
+        self.tp = _ccl.tp_size(device, self.tp_axis)
         self.hifi = ttnn.init_device_compute_kernel_config(
             device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi4,

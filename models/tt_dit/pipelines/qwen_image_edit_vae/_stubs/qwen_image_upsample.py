@@ -12,23 +12,21 @@ Tensor-parallel scheme (TP over the 1xN mesh): the op has no weights and is pixe
 parallel axis is SPATIAL, as in decoder_head. The frame is partitioned along W across the mesh;
 nearest-upsampling a W shard yields exactly the matching shard of the upsampled frame (no halo
 needed), and the output is all-gathered along W. The gathered output equals the single-device result.
+
+On a Galaxy the 1x32 line is run as an 8x4 grid (see _mesh.py: CCLs along the 32-chip line
+deadlock): the activation is zero-padded up to the grid, partitioned H over the 8-axis and W over
+the 4-axis, and the gathered output is cropped back to the logical size.
 """
 
 from __future__ import annotations
 
 import ttnn
 from models.tt_dit.parallel.manager import CCLManager
+from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._mesh import mesh_shape, pad_to_multiple, physical_grid
 
-# NHWC layout: W is dim 2.
+# NHWC layout: H is dim 1, W is dim 2; H is split over mesh axis 0, W over mesh axis 1.
+_H_DIM = 1
 _W_DIM = 2
-
-
-def _mesh_shape(device):
-    try:
-        shape = tuple(device.shape)
-    except (AttributeError, TypeError):
-        return (1, 1)
-    return shape if len(shape) == 2 else (1, 1)
 
 
 class TtQwenImageUpsample:
@@ -42,11 +40,10 @@ class TtQwenImageUpsample:
         ), f"nearest-exact == nearest only for integer scales, got {scale}"
         self.scale = tuple(int(s) for s in scale)
 
-        self.device = device
-        mesh_shape = _mesh_shape(device)
-        # W is split across the larger mesh axis (the N of a 1xN mesh).
-        self.tp_axis = 1 if mesh_shape[1] >= mesh_shape[0] else 0
-        self.tp = mesh_shape[self.tp_axis]
+        self.device = device = physical_grid(device)
+        shape = mesh_shape(device)
+        self.shape = shape
+        self.tp = shape[0] * shape[1]
         self.ccl_manager = CCLManager(device, topology=ttnn.Topology.Linear, num_links=1) if self.tp > 1 else None
 
     @classmethod
@@ -69,17 +66,23 @@ class TtQwenImageUpsample:
     def __call__(self, x, **_ignored):
         # x: replicated TILE [N, C, H, W] (NCHW, like the torch reference).
         N, C, H, W = x.shape
-        assert W % self.tp == 0, f"width {W} must divide the TP={self.tp} mesh"
+        splits = [(dim, ax) for dim, ax in ((_H_DIM, 0), (_W_DIM, 1)) if self.shape[ax] > 1]
 
         x = ttnn.permute(x, (0, 2, 3, 1))  # NHWC
         x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
-        if self.tp > 1:
-            x = ttnn.mesh_partition(x, dim=_W_DIM, cluster_axis=self.tp_axis)
+        # zero-pad H/W up to the grid; nearest upsampling maps each padded row/col to its own rows/cols,
+        # so the padding lands wholly past the logical edge and is cropped after the gather.
+        for dim, ax in splits:
+            x, _ = pad_to_multiple(x, dim, self.shape[ax])
+            x = ttnn.mesh_partition(x, dim=dim, cluster_axis=ax)
 
         out = ttnn.upsample(x, scale_factor=self.scale)
 
-        if self.tp > 1:
-            out = self.ccl_manager.all_gather(out, dim=_W_DIM, mesh_axis=self.tp_axis, use_hyperparams=False)
+        for dim, ax in reversed(splits):
+            out = self.ccl_manager.all_gather(out, dim=dim, mesh_axis=ax, use_hyperparams=False)
+        oh, ow = H * self.scale[0], W * self.scale[1]
+        if (out.shape[_H_DIM], out.shape[_W_DIM]) != (oh, ow):
+            out = ttnn.slice(out, (0, 0, 0, 0), (N, oh, ow, C))
         out = ttnn.to_layout(out, ttnn.TILE_LAYOUT)
         return ttnn.permute(out, (0, 3, 1, 2))  # NCHW
 

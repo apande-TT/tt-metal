@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen-Image-Edit image editing on a T3K (Call 1: image_edit).
+"""Qwen-Image-Edit image editing on a Galaxy, 32 Wormhole chips as an 8x4 mesh (Call 1: image_edit).
 
 Loads real images + edit instructions, encodes them with the HF processors, runs the chained TT
 pipeline (tt/pipeline.py: build_pipeline -> run_image_edit, the same code the e2e test runs) and
@@ -59,10 +59,11 @@ def _inputs(a):
     seeds = [(a.seed if a.seed is not None else 1000) + i for i in range(n)]
     if not a.image and a.seed is None:
         seeds = sample_seeds(n)
-    # the VAE runs batch-parallel over the 2 mesh rows: pad an odd batch with a copy (dropped on output)
-    pad = n % 2
+    # the VAE runs batch-parallel over the 8 mesh rows and the denoise splits the batch over the 4
+    # columns: pad the batch up to a multiple of 8 with copies of the last sample (dropped on output)
+    pad = (-n) % 8
     if pad:
-        images, prompts, seeds = images + images[-1:], prompts + prompts[-1:], seeds + seeds[-1:]
+        images, prompts, seeds = images + images[-1:] * pad, prompts + prompts[-1:] * pad, seeds + seeds[-1:] * pad
     return images, prompts, seeds, n
 
 

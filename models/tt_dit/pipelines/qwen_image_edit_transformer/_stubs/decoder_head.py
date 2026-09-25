@@ -4,7 +4,7 @@
 
     out = hidden_states @ W^T + b        W: [patch*patch*out_channels, inner_dim] = [64, 3072]
 
-Tensor parallel (TP = mesh size): COLUMN-parallel on the output features, followed by all_gather.
+Tensor parallel (TP = mesh size, or one mesh axis via _ccl.tp_axis): COLUMN-parallel on the output features, followed by all_gather.
 64 outputs / 8 chips is 8 columns per chip, which is not tile-aligned, so the output features are
 zero-padded up to a multiple of TP*32 (each chip owns one whole tile of columns). After the gather
 the padding columns are sliced off and the bias (replicated) is added once.
@@ -34,7 +34,8 @@ class TtQwenDecoderHead:
         w = torch_module.weight.detach().to(torch.float32)  # [N, K]
         b = torch_module.bias.detach().to(torch.float32) if torch_module.bias is not None else None
         self.out_features, self.in_features = w.shape
-        self.tp = device.get_num_devices() if _is_mesh(device) else 1
+        self.tp_axis = _ccl.get_tp_axis()  # mesh axis of the TP split (None = every device)
+        self.tp = _ccl.tp_size(device, self.tp_axis)
 
         wt = w.t()  # [K, N]
         if self.tp > 1:
@@ -47,7 +48,7 @@ class TtQwenDecoderHead:
                 dtype=ttnn.bfloat16,
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
-                mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1),
+                mesh_mapper=_ccl.shard_mapper(device, -1),
             )
         else:
             self.w = _replicated(wt, device, ttnn.bfloat16)
@@ -70,7 +71,7 @@ class TtQwenDecoderHead:
                 x = ttnn.typecast(x, ttnn.bfloat16)
             y = ttnn.linear(x, self.w, dtype=ttnn.float32, compute_kernel_config=self.hifi)
         if self.tp > 1:
-            y = _ccl.all_gather(y, self.device, dim=-1)
+            y = _ccl.all_gather(y, self.device, dim=-1, axis=self.tp_axis)
             if y.shape[-1] != self.out_features:
                 start = [0] * len(y.shape)
                 end = list(y.shape)

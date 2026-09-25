@@ -1,6 +1,6 @@
 {
   "model": "Qwen/Qwen-Image-Edit",
-  "plan_version": 3,
+  "plan_version": 4,
   "sources": {
     "A_hf": {
       "pipeline_class": "diffusers.QwenImageEditPipeline (model_index.json)",
@@ -18,13 +18,14 @@
       "golden": "QwenImageEditPipeline.__call__(image, prompt, negative_prompt=' ', true_cfg_scale=4.0, num_inference_steps=50, latents=<shared initial noise>, output_type='pt') in float32 on CPU"
     },
     "B_bringup": {
-      "note": "models/demos/qwen_image_edit does not exist. This model was brought up as three components, and their bring-up folders ARE Source B: models/demos/qwen_image_edit_text_encoder (mesh 2x4 TP=4xDP=2), models/tt_dit/pipelines/qwen_image_edit_vae (1x8 TP=8), models/tt_dit/pipelines/qwen_image_edit_transformer (1x8 TP=8).",
-      "graduation_rule": "status NEW with a _stubs/<name>.py.last_good_native or .last_good_sharded snapshot; the live _stubs/<name>.py equals that snapshot (verified by byte compare for all 25)."
+      "note": "models/demos/qwen_image_edit holds no bringup_status.json: the model was brought up as three components and their folders ARE Source B. VAE: models/tt_dit/pipelines/qwen_image_edit_vae (re-graduated on this Galaxy: parallelism_manifest 32 chips, run as an 8x4 grid by _stubs/_mesh.py). Text encoder: models/demos/qwen_image_edit_text_encoder (graduated TP=4 x DP=2 on 2x4). Transformer: models/tt_dit/pipelines/qwen_image_edit_transformer (graduated TP=8 on 1x8).",
+      "graduation_rule": "status NEW with a _stubs/<name>.py.last_good_native or .last_good_sharded snapshot. REUSE/ADAPT entries are not graduated work products even where they have a snapshot.",
+      "live_vs_snapshot_2026_09_25": "VAE 11/11 live == snapshot, byte compare. Transformer: qwen_embed_rope and timesteps equal their snapshots. The other 5 transformer stubs and all 7 text-encoder stubs differ, from the committed T3K e2e work (precise mode, batch generalisation, 2x4 collectives). Those were re-verified then with their own tests/pcc (40/40). The live stub is the graduated body that gets composed."
     }
   },
   "graduated_modules": {
     "count": 25,
-    "verified_by": "bringup_status.json status==NEW and a last_good snapshot exists; the live stub equalled that snapshot when this run started (byte compare). Stubs this run changed were re-verified with their own tests/pcc tests on their graduated topologies: 40/40 pass, lowest qwen_image_decoder3d 0.9973.",
+    "verified_by": "bringup_status.json status==NEW + last_good snapshot, re-enumerated 2026-09-25 from all three bring-up folders: text encoder 7, VAE 11, transformer 7 = 25. No NEW entry lacks a snapshot. None is left out of the chain below.",
     "text_encoder": {
       "dir": "models/demos/qwen_image_edit_text_encoder/_stubs",
       "modules": {
@@ -123,7 +124,8 @@
       },
       "non_graduated_used_as_glue": {
         "mlp": "ADAPT (last_good_sharded): quant_conv 1x1x1 (and the same port for post_quant_conv)"
-      }
+      },
+      "dir_note": "VAE stubs re-graduated for Galaxy: physical_grid() reshapes a 1x32 mesh to 8x4 in place; H (or batch, batch_parallel=True) over the 8-axis, W over the 4-axis, zero-pad to the grid + crop."
     },
     "transformer": {
       "dir": "models/tt_dit/pipelines/qwen_image_edit_transformer/_stubs",
@@ -182,21 +184,22 @@
       "output": "edited image tensor [B, 3, H, W] in [0,1] (HF postprocess output_type='pt'); the demo also saves PNGs",
       "chain": [
         "vision_encode: vision_transformer_pretrained_model(vision_patch_embed -> 32 x v_l_vision_block -> v_l_patch_merger) on the resized condition image",
-        "text_encode: token_embed(ids) with the image embeddings spliced at the <|image_pad|> run -> v_l_text_model (28 x v_l_decoder_layer, each with language_model_layers_0_mlp; row-staged 14 + 14) -> drop the 64 template tokens -> prompt_embeds (+mask). The prompts and negatives run as one 64-sequence batch.",
+        "text_encode: token_embed(ids) with the image embeddings spliced at the <|image_pad|> run -> v_l_text_model (28 x v_l_decoder_layer, each with language_model_layers_0_mlp; TP=4 on mesh axis 1, stage-split over the 8-row axis: rows 0-3 hold layers 0-13 and rows 4-7 hold layers 14-27) -> drop the 64 template tokens -> prompt_embeds (+mask), cond and uncond",
         "vae_encode: qwen_image_encoder3d -> quant_conv -> mode (first z_dim channels) -> (x - mean)/std -> 2x2 pack -> image_latents",
-        "denoise x num_inference_steps: cat[latents, image_latents] -> img_in; txt_norm -> txt_in; qwen_timestep_proj_embeddings(t/1000); rope = qwen_embed_rope([(1,h,w),(1,h,w)], txt_len) -> 60 x qwen_image_transformer_block -> ada_layer_norm_continuous -> proj_out -> noise_pred[:, :S_latent]; same for uncond; true-CFG combine + norm rescale; flow-match Euler step",
-        "vae_decode: unpack -> x*std + mean -> post_quant_conv -> qwen_image_decoder3d -> clamp(-1,1) -> (x+1)/2"
+        "denoise x num_inference_steps: batch split over mesh axis 1 (DP=4, 8 samples per column), transformer TP=8 over mesh axis 0. cat[latents, image_latents] -> img_in; txt_norm -> txt_in; qwen_timestep_proj_embeddings(t/1000); rope = qwen_embed_rope([(1,h,w),(1,h,w)], txt_len) -> 60 x qwen_image_transformer_block -> ada_layer_norm_continuous -> proj_out -> noise_pred[:, :S_latent]; same for uncond; true-CFG combine + norm rescale; flow-match Euler step",
+        "vae_decode: all_gather the latents over axis 1 -> unpack -> x*std + mean -> post_quant_conv -> qwen_image_decoder3d (batch over the 8-axis, W over the 4-axis) -> clamp(-1,1) -> (x+1)/2"
       ],
       "shared_modules_with_other_calls": [],
-      "agent": "one agent (a single call; no other call shares modules)"
+      "agent": "one agent: there is a single call, and it uses all 25 graduated modules"
     }
   ],
   "pass_definition": {
-    "gate1_native": "every routed graduated stub is ttnn (no torch compute in its forward). The sharded bodies stay sharded: ShardTensorToMesh plus all_reduce/all_gather, with the collectives extended from the 1x8 row to both axes of the 2x4 mesh; never replicated.",
+    "gate1_native": "every routed graduated stub is ttnn: no torch compute in its forward (static AST scan of stubs + glue + chain) and zero host aten ops in the observed forward (host_op_observer). Sharded bodies stay sharded (ShardTensorToMesh / ShardTensor2dMesh + CCL on the TP axis); the TP axis is re-pointed to the 8x4 mesh, never replicated away.",
     "gate2_invoked": "each of the 25 graduated modules records >=1 call during the real image_edit forward. Counters sit on the stub instances inside the chain; there is no coverage sweep.",
-    "gate3_pcc": "final image PCC >= 0.99 vs the HF golden, per sample, for all 32 samples. Also asserted: PCC of the last-step latent. Printed on every run: 'e2e PCC=<min over samples>'.",
+    "gate3_pcc": "final image PCC >= 0.99 vs the HF golden, per sample, for ALL 32 samples at B=32 (the batch the test drives is read from the pipeline). Printed on every run as its own line, 'e2e PCC=<min over samples>', immediately before the asserts. It is the only line with 'PCC...=' in the output; per-sample lines use 'PCC ' without '='.",
     "host_free": "host_op_selftest(): zero non-benign aten ops inside the observed forward (encoded inputs -> image)",
-    "trace": "trace_capture_selftest(): per stage, capture / execute / release; output PCC vs eager"
+    "trace": "trace_capture_selftest(): per stage, capture / execute / release; output PCC vs eager",
+    "time_budget": "The harness runs tests/e2e/test_e2e_image_edit.py under a 2700 s hang timeout, so build + 32-sample forward + checks must fit in 45 min. The golden is precomputed and cached (reference/golden.py); the test fails fast if it is missing rather than building it (~hours on CPU)."
   },
   "validation_metric": {
     "primary": "PCC(tt_image[b], hf_image[b]) >= 0.99 for every b in 0..31, over the full image tensor (no crop)",
@@ -207,7 +210,7 @@
     "not_applicable": "rendered-signal scores (WER/MOS) apply to audio output with a rate; this output is an image tensor, so PCC is the gate"
   },
   "behavioral_proof": {
-    "real_input": "4 real photos from models/sample_data, each cut into 8 distinct square crops -> 32 distinct condition images, 32 distinct instructions, 32 distinct seeds",
+    "real_input": "the 32 bundled samples: 4 photos from models/sample_data x 8 distinct square crops, 32 distinct instructions, seeds 1000..1031, encoded by the HF processors (tt/inputs.py). Same set as the T3K run, so its per-sample findings carry over.",
     "independence_check": "assert the 32 TT outputs are pairwise distinct, and each matches its own golden better than any other sample's golden",
     "no_injection": "each stage consumes the previous TT stage's device tensor; the golden is used only for the final comparison"
   },
@@ -222,50 +225,45 @@
   },
   "batch": {
     "B": 32,
-    "axis": "leading axis of every tensor; the denoise loop runs one program per step for all 32 (cond and uncond as two B=32 transformer calls)",
-    "dp": "the text encoder rows split cond/uncond (64 sequences = 2 rows x 32)"
+    "axis": "leading axis of every tensor, one program per step for all 32",
+    "per_stage": "vision_encode: 32 images replicated over rows, TP=4 over the 4 columns. text_encode: 64 sequences (32 prompts + 32 negatives). vae_encode: batch over the 8-axis (4 per row). denoise: batch over the 4-axis (8 per column), TP=8 on the 8-axis. Cond and uncond are two B_local=8 transformer calls. vae_decode: batch over the 8-axis (4 per row, one program if memory allows).",
+    "ceilings": "No ceiling assumed. The T3K STAGE_MAX_BATCH (vae_decode 16, text 2x32) was measured on 2x4 and must be re-measured here. Keep one only if it reproduces on the 8x4 mesh, with the measurement recorded."
   },
   "hardware": {
-    "box": "T3K, 8 x Wormhole, opened as a 2x4 mesh",
+    "box": "GalaxyWH, 32 x Wormhole, opened as an 8x4 mesh (the physical grid; same 32 chips as the harness's --mesh 4,8 = DP4 x TP8)",
     "dram_per_chip_GB": 12,
-    "usable_per_chip_GB_with_ccl": 10.5,
-    "aggregate_GB": 96,
-    "weights_estimate_per_chip_GB": {
-      "transformer_TP8": 5.1,
-      "text_encoder_TP4_replicated_over_2_rows": "3.6 (+1.09 if embed_tokens stays replicated)",
-      "vae": 0.4,
-      "note": "estimate from parameter counts (20.4B/8, 7.1B/4 excluding lm_head, bf16), NOT measured; checked against the 10.5 GB usable figure (the CCL axis is in play)"
+    "chips": 32,
+    "aggregate_GB": 384,
+    "usable_per_chip_GB": {
+      "tp1": 10.9,
+      "with_ccl_axis": 10.5
     },
-    "weights_measured_per_chip_GB": {
-      "note": "measured this run from ttnn buffer reports (max over chips, DRAM buffers), 2x4 mesh",
-      "vae": 0.409,
-      "text_encoder_graduated_layout_TP4_DP2": 4.717,
-      "text_encoder_row_staged_TP4_x_2_stages": 2.264,
-      "transformer_TP8": 5.363,
-      "total_resident_after_build": 8.036,
-      "after_prepare_B32": 8.209,
-      "ceiling_used": "10.5 GB usable per chip with a CCL axis in play (registered figure)"
+    "ceiling_used": "10.5 GB usable per chip, the registered figure with a CCL axis in play",
+    "per_chip_budget_estimate_GB": {
+      "transformer_TP8": 5.36,
+      "text_encoder_TP4_two_stages_over_rows": 2.26,
+      "vae": 0.41,
+      "total": 8.03,
+      "note": "carried from the T3K measurements of the same per-chip splits (TP=8 transformer, TP=4 x half the LM layers per chip, replicated VAE weights). Not re-measured on this Galaxy yet; the build must re-measure and record it. Rejected: the whole LM replicated on every row, 4.72 + 5.36 + 0.41 = 10.49 GB, which leaves no activation headroom under 10.5."
     }
   },
   "self_validation_plan": [
-    "1. Build the HF golden once (fp32 CPU, B=32, 50 steps) and cache it with its inputs and per-step latents under models/demos/qwen_image_edit/_golden/",
-    "2. Stage bring-up on device in order vision -> text -> vae_encode -> one transformer step -> vae_decode; compare each against the golden intermediates at B=2, then at B=32",
-    "3. Re-run the modified stubs' own tests/pcc tests (captured B=1 inputs) to prove the batch generalisation and the 2x4 collectives did not regress them",
-    "4. Full e2e test at B=32: Gate 1 (static and runtime scan for torch compute in the stubs), Gate 2 (invocation counters), Gate 3 (PCC per sample); print e2e PCC before the assert",
-    "5. host_op_selftest and trace_capture_selftest per stage; build_pipeline(layers=2) proves the depth knob changes the op count"
+    "1. HF golden: fp32 CPU, B=32, 50 steps, cached with its intermediates under _golden/ (started 2026-09-25, reference/golden.py).",
+    "2. Port to 8x4: re-point the transformer TP axis (axis 0) + DP over axis 1; stage-split the text LM over rows; VAE as graduated. Re-run each modified stub's own tests/pcc on its graduated topology plus the 8x4 mesh.",
+    "3. Stage parity on device vs golden intermediates at B=32: prompt/neg embeds, image latents, step-0 latents, decode of the golden final latents.",
+    "4. Full e2e test at B=32, 50 steps, within 2700 s: Gate 1 (static scan + host_op_observer), Gate 2 (tracker counts for all 25), Gate 3 (per-sample PCC); 'e2e PCC=' printed before the asserts.",
+    "5. trace_capture_selftest (per stage, capture / replay / release; trace_region sized from the largest stage, measured) and host_op_selftest, zero-arg, each within the probes' 600 s budget; build_pipeline(layers=2) proves the depth knob.",
+    "6. Re-measure memory per chip and every batch ceiling on this Galaxy before finishing; run pre-commit on the emitted files."
   ],
   "decisions": {
-    "mesh": "one 2x4 mesh (T3K). The text encoder needs TP=4 (4 kv heads) on the 4 columns. The transformer keeps TP=8 over all 8 chips, with its collectives run on axis 1 then axis 0. The VAE is W-parallel over the 4 columns.",
-    "text_encoder_rows": "The graduated TP=4 x DP=2 layout replicates the 28-layer LM on both rows: 4.72 GB/chip, which with the 5.36 GB transformer is past the 10.5 GB ceiling. So the LM is row-staged: layers 0-13 on row 0, 14-27 on row 1, same TP=4 split per layer, exact all_gather hand-off between rows. The 32 prompts and 32 negatives run as one 64-sequence batch. embed_tokens is sharded over the columns (hidden dim) instead of replicated.",
-    "vae_batch": "The Wan causal conv fuses its temporal front pad into the H-halo neighbor_pad, which asserts B==1 (measured TT_FATAL at B=2 on the H2xW4 split). The VAE therefore runs W-parallel over the 4 columns and batch-parallel over the 2 rows.",
-    "vae_decode_ceiling": "32 images per decode program fail in the allocator; 16 per program fit (9.27 GB live + 896 MB trace region). Re-tested after the last memory change.",
-    "exact_collectives": "ttnn.all_reduce / reduce_scatter round float32 partials at bf16 level (7e-3..1.1e-2 abs measured). The transformer's row-parallel outputs and the precise text-encoder path use gather + fp32 add, which is exact.",
-    "text_encoder_precision": "The Qwen2.5-VL towers grow massive activations (|x| up to 2.6e4) that amplify per-block error ~1000x on a few tokens (HF fp32 vs fp64 differs <0.4% there). The text-encoder ports run in a precise mode: fp32 biases (ttnn.add(fp32, bf16) rounds the sum to bf16), packer_l1_acc off (auto configs lost 3-5x with it on), explicit fp32 softmax, fp32 manual RMSNorm, fp32 RoPE, exact TP reduce. The vision matmuls are exact-lane (3 bf16 limbs x 8 lanes spaced 8 apart, median of 3 rotated partitions against rare tile glitches). The LM uses 2-limb dense products. Measured at B=32: min prompt-embed PCC 0.999978 (before: 0.973); text-encode stage 80 s.",
-    "vae_gate2": "encoder3d / decoder3d route every child of the Wan stack through its graduated port (forward_sharded on the partitioned activation). zero_pad2d pads the bottom row explicitly before a valid-H conv; qwen_image_upsample is the x2 inside each decoder resample.",
-    "transformer_precision": "Precise transformer mode (_stubs/_precise.py, on in the pipeline): 2-limb bf16 activations for every projection, float32 AdaNorm modulation and biases, exact-lane QK^T (median of 3 rotated partitions). Measured per forward at B=2, full depth: CFG noise PCC 0.99993 -> 0.9999956. Cost at B=32: 55 -> 120 s per denoise step.",
-    "text_encode_chunks": "The 64 text sequences run as 2 programs of 32 (prompts, negatives). With the 896 MB trace region reserved, one 64-sequence program ran out of DRAM (a 704 MB allocation), measured."
+    "mesh": "MeshShape(8, 4) with FABRIC_1D. The VAE stubs were graduated on exactly this grid, and the text encoder's TP=4 axis stays mesh axis 1 as graduated. build_pipeline normalises a handed 1x32 or 4x8 mesh to 8x4 in place (device.reshape, the same call the VAE's physical_grid uses) before anything is allocated.",
+    "transformer": "TP=8 over mesh axis 0 (graduated TP=8; 24 heads / 8 = 3), replicated over axis 1. Weights: ShardTensor2dMesh dims=(shard_dim, None). _ccl collectives run on axis 0 only (exact fp32 gather-sum kept). Activations batch-sharded over axis 1 (DP=4) with ttnn.mesh_partition from the replicated text/VAE outputs. After the last step, all_gather over axis 1 for the decode.",
+    "text_encoder": "TP=4 on axis 1 as graduated. The LM is stage-split over the 8-row axis: rows 0-3 hold layers 0-13, rows 4-7 hold 14-27. This generalises the T3K row_stages (rows==2) to 2 stages of rows//2 rows each, with an exact all_gather hand-off over axis 0. Vision tower replicated over rows. Optional: split the batch over rows inside a stage.",
+    "vae": "the re-graduated 8x4 stubs as-is: batch_parallel over the 8-axis, W over the 4-axis; quant/post_quant_conv via the mlp port.",
+    "precision": "keep the T3K precise modes (text encoder precise + exact reduces; transformer _precise 2-limb / exact-lane QK^T). On T3K they gave per-stage PCC prompt 0.99994, VAE 0.99998, CFG noise per forward 0.9999956, and 20/32 images >= 0.99 over 50 steps. The Galaxy DP=4 cuts denoise time ~4x; spend any headroom under the 45 min budget on precision where the diagnosis points.",
+    "known_risk_gate3": "On T3K the 50-step true-CFG trajectory was chaotic for some samples. The HF fp32 reference re-run at B=2 instead of B=32 gave only 0.953 (sample 30) and 0.966 (sample 26), so no non-bit-identical implementation can reach 0.99 on those. Plan: (1) measure per-sample PCC on the Galaxy; (2) on samples that fail with a stable reference, find the dominant stage (swap in one golden intermediate at a time, diagnosis only, never in the pipeline or the gate) and improve that stage's precision; (3) quantify reference self-consistency per sample. If Gate 3 still cannot be met, report it as NOT MET with the evidence. Do not drop or cherry-pick samples to pass it."
   },
-  "results": {
+  "previous_results_t3k": {
     "measured_on": "T3K 2x4, B=32 distinct samples, 256x256, 50 steps, true-CFG 4.0, fp32 CPU golden",
     "gate1": "PASS: static scan clean; host_op_observer 0 host aten ops over the full forward",
     "gate2": "PASS: all 25 graduated modules invoked in the real forward",

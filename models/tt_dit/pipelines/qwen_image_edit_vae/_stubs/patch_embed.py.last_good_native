@@ -71,9 +71,9 @@ class TtQwenImageConvIn:
         assert cache_x is None, "only the first (cache-free) chunk is ported; cache_x is not supported"
         B, C, T, H, W = x.shape
         pc = self.parallel_config
-        assert H % pc.height_parallel.factor == 0 and W % pc.width_parallel.factor == 0, (
-            f"image {H}x{W} must divide the {pc.height_parallel.factor}x{pc.width_parallel.factor} spatial mesh"
-        )
+        assert (
+            H % pc.height_parallel.factor == 0 and W % pc.width_parallel.factor == 0
+        ), f"image {H}x{W} must divide the {pc.height_parallel.factor}x{pc.width_parallel.factor} spatial mesh"
 
         x = ttnn.permute(x, (0, 2, 3, 4, 1))  # BTHWC
         c_pad = aligned_channels(C) - C

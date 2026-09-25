@@ -88,7 +88,7 @@ def text_attention_mask(attention_mask, b, s, s_pad, rep):
 
 class TtTextAttention:
     def __init__(self, device, torch_module, pair=None):
-        """pair: a second attention module placed on mesh row 1 (row-staged layers); same TP split."""
+        """pair: a second attention module placed on the second row stage (row-staged layers); same TP split."""
         self.device = device
         _, self.tp = mesh_shape(device)
         cfg = torch_module.config
@@ -219,7 +219,7 @@ class TtTextMLP:
     """down(silu(gate(x)) * up(x)), no biases -- gate/up column-parallel, down row-parallel."""
 
     def __init__(self, device, torch_module, pair=None):
-        """pair: a second MLP placed on mesh row 1 (row-staged layers); same TP split."""
+        """pair: a second MLP placed on the second row stage (row-staged layers); same TP split."""
         _, self.tp = mesh_shape(device)
         self.device = device
         if pair is not None:
@@ -253,7 +253,7 @@ class TtTextMLP:
 
 class TtTextDecoderLayer:
     def __init__(self, device, torch_module, mlp=None, pair=None):
-        """pair: a second decoder layer whose weights live on mesh row 1 (row-staged layers)."""
+        """pair: a second decoder layer whose weights live on the second row stage (row-staged layers)."""
         self.device = device
         pn = (lambda name: getattr(pair, name)) if pair is not None else (lambda name: None)
         self.input_layernorm = TtRMSNorm(device, torch_module.input_layernorm, pair=pn("input_layernorm"))

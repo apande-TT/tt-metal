@@ -6,6 +6,32 @@ verdict: **PASS**
 trace engaged
 
 graduated on-device: 0, ungraduated: 0
+
+fresh capture: invalid E       23. _PyFunction_Vectorcall
+E       25. /home/ubuntu/apande/tt-metal/python_env/bin/python(+0x2779e8) [0x5579aa7a69e8]
+E       26. /home/ubuntu/apande/tt-metal/python_env/bin/python(+0x2c40c9) [0x5579aa7f30c9]
+E       27. /home/ubuntu/apande/tt-metal/python_env/bin/python(+0x29259f) [0x5579aa7c159f]
+E       28. /home/ubuntu/apande/tt-metal/python_env/bin/python(+0x2fd0b9) [0x5579aa82c0b9]
+E       30. _PyFunction_Vectorcall
+E       31. /home/ubuntu/apande/tt-metal/python_env/bin/python(+0x2fd0b9) [0x5579aa82c0b9]
+E       33. _PyFunction_Vectorcall
+E       35. _PyFunction_Vectorcall
+E       37. _PyFunction_Vectorcall
+E       38. /home/ubuntu/apande/tt-metal/python_env/bin/python(+0x273350) [0x5579aa7a2350]
+E       40. _PyFunction_Vectorcall
+E       41. _PyObject_Call_Prepend
+E       42. /home/ubuntu/apande/tt-metal/python_env/bin/python(+0x3a2b46) [0x5579aa8d1b46]
+E       43. /home/ubuntu/apande/tt-metal/python_env/bin/python(+0x2fd2a2) [0x5579aa82c2a2]
+E       45. _PyFunction_Vectorcall
+E       46. /home/ubuntu/apande/tt-metal/python_env/bin/python(+0x273350) [0x5579aa7a2350]
+E       47. /home/ubuntu/apande/tt-metal/python_env/bin/python(+0x2fd0b9) [0x5579aa82c0b9]
+E       49. _PyFunction_Vectorcall
+E       51. _PyFunction_Vectorcall
+E       53. _PyFunction_Vectorcall
+E       55. _PyFunction_Vectorcall
+E       57. _PyFunction_Vectorcall
+E       59. _PyFunction_Vectorcall
+E       61. _PyFunction_Vectorcall
 <!-- END trace-gate -->
 
 <!-- BEGIN bringup -->

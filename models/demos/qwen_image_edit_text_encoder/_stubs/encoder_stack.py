@@ -58,7 +58,7 @@ def _fp32(t):
 
 class TtRMSNorm:
     def __init__(self, device, torch_module, pair=None):
-        """pair: a second norm module whose weight goes on mesh row 1 (row-staged layers)."""
+        """pair: a second norm module whose weight goes on the second row stage (row-staged layers)."""
         w = torch_module.weight.detach().float()
         self.eps = float(torch_module.variance_epsilon)
         if pair is not None:

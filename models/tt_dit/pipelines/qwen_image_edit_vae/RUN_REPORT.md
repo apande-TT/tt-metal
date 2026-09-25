@@ -1,13 +1,13 @@
 <!-- BEGIN bringup -->
 # Bring-up run report — `/tmp/tt_hw_planner_components/qwen_image_edit_vae`
 
-_Generated: 2026-09-23 10:48:18 UTC_
+_Generated: 2026-09-25 03:55:11 UTC_
 
-_Topology: TP=8 x DP=1 (mesh 1x8, 8 chips) — run emit-e2e / optimize with `--mesh 1x8`._
+_Topology: TP=32 x DP=1 (mesh 1x32, 32 chips) — run emit-e2e / optimize with `--mesh 1x32`._
 
 ## Outcome
 
-**Converged** after bring-up.
+**Converged** after 3 iteration(s).
 - Run ended: bring-up complete — gate can_stop (all components graduated or fell back)
 
 ## Backend & template match
@@ -21,9 +21,9 @@ Top backends by match score — the demo can compose per-component reuse across 
 
 | Rank | Backend | Score | Match reason |
 |---|---|---|---|
-| 1 | `tt_dit/qwenimage (auto-upstream)` (selected) | 95 | LLM: Same model family (Qwen-Image). The Qwen-Image-Edit VAE is the QwenImage causal 3D-conv autoencoder (a Wan-style VAE), which the qwenimage pipeline already builds in tt_dit. |
-| 2 | `tt_dit/wan (auto-upstream)` | 89 | LLM: The Qwen-Image VAE comes from the Wan 2.1 causal 3D-conv VAE (CausalConv3d, RMS-norm residual blocks, mid-block attention). tt_dit/wan has the matching VAE encoder and decoder kernels. |
-| 3 | `tt_dit/flux1 (auto-upstream)` | 55 | LLM: tt_dit image pipeline with a 2D conv AutoencoderKL VAE decoder (GroupNorm, ResNet blocks, up-sampling). Close conv-VAE structure. |
+| 1 | `tt_dit/qwenimage (auto-upstream)` (selected) | 95 | LLM: Same model family. The Qwen-Image-Edit VAE is AutoencoderKLQwenImage, the VAE that the tt_dit/qwenimage pipeline already uses. The encoder and decoder can be reused directly. |
+| 2 | `tt_dit/wan (auto-upstream)` | 89 | LLM: The Qwen-Image VAE is derived from the Wan 2.1 VAE: a causal 3D-conv autoencoder with RMS norm, residual blocks and mid-block attention. The tt_dit Wan VAE kernels map to it block for block. |
+| 3 | `tt_dit/mochi (auto-upstream)` | 54 | LLM: Its video VAE decoder uses causal 3D convolutions and conv-parallel tiling patterns that apply to a temporal-causal VAE. |
 
 ## Placement summary
 

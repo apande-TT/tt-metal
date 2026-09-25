@@ -16,7 +16,16 @@
         image          = vae decoder(post_quant_conv(denormalize(unpack(latents))))  [vae_decode]
 
 Every stage consumes the previous stage's device tensor; nothing is read back to the host until the
-final image. Mesh: 2x4 (T3K).
+final image.
+
+Mesh: Galaxy, 32 Wormhole chips as an 8x4 mesh (build_pipeline reshapes a 1x32 / 4x8 handle in place).
+  vision_encode  replicated over the 8 rows, TP=4 over the 4 columns (graduated)
+  text_encode    TP=4 over the columns; the 28 LM layers are stage-split over the rows
+                 (rows 0-3: layers 0-13, rows 4-7: layers 14-27), exact all_gather hand-off on axis 0
+  vae_encode     batch over the 8-axis, W over the 4-axis (the re-graduated VAE ports)
+  denoise        transformer TP=8 over mesh axis 0; the batch is split over mesh axis 1 (DP=4, B/4
+                 samples per column: mesh_partition of the replicated text / VAE outputs)
+  vae_decode     latents all_gathered over axis 1 -> batch over the 8-axis, W over the 4-axis
 """
 from __future__ import annotations
 
@@ -33,6 +42,7 @@ from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.tracker import InvocationTracker
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
 from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
+from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl as _tr_ccl
 
 PIPELINE_STAGES = ["vision_encode", "text_encode", "vae_encode", "denoise", "vae_decode"]
 
@@ -72,20 +82,39 @@ GRADUATED = {
 }
 GRADUATED_ALL = [n for v in GRADUATED.values() for n in v]
 
-# Per-stage batch ceilings (images per program). Measured on this T3K, 2x4 mesh, with every stage's
-# weights resident (8.21 GB per chip after prepare, B=32, 256x256):
-#   vae_decode: 32 per program fails (TT_FATAL out of memory in the allocator, even after the halo
-#   buffers are released); 16 per program fits (9.24 GB per chip with its halo buffers held), so the
-#   32-image batch decodes as two 16-image programs. All other stages run the full 32 in one program.
-#   Re-tested after the last memory-relevant change (896 MB trace region, chunked text encode):
-#   32 still fails in the allocator, 16 still fits at 9.27 GB live -> the ceiling stays.
-STAGE_MAX_BATCH = {"vae_decode": 16}
+# Galaxy layout (e2e_plan.json "decisions"): the mesh is 8x4; the transformer's TP axis is mesh axis 0
+# (TP=8, 24 heads / 8 = 3 per chip) and the denoise batch is split over mesh axis 1 (DP=4).
+GALAXY_SHAPE = (8, 4)
+TP_AXIS = 0
+DP_AXIS = 1
+
+
+def normalize_mesh(device):
+    """Reshape a 32-chip mesh handed as 1x32 or 4x8 to the 8x4 grid, in place, before anything is
+    allocated on it (the same device.reshape the VAE ports' physical_grid uses). Returns the device."""
+    shape = tuple(device.shape)
+    if device.get_num_devices() == GALAXY_SHAPE[0] * GALAXY_SHAPE[1] and shape != GALAXY_SHAPE:
+        device.reshape(ttnn.MeshShape(*GALAXY_SHAPE))
+    return device
+
+
+# Per-stage batch ceilings (images per program). None -> the whole batch in one program.
+# MEASURED_CEILINGS_PLACEHOLDER
+STAGE_MAX_BATCH = {}
 
 
 def _replicated(device, t, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
     return ttnn.from_torch(
         t.contiguous(), dtype=dtype, layout=layout, device=device, mesh_mapper=ttnn.ReplicateTensorToMesh(device)
     )
+
+
+def _dp_sharded(device, t, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
+    """Host input -> device, dim 0 (the batch) split over the DP mesh axis, replicated over the TP axis."""
+    dims = [None, None]
+    dims[DP_AXIS] = 0
+    mapper = ttnn.ShardTensor2dMesh(device, mesh_shape=tuple(device.shape), dims=tuple(dims))
+    return ttnn.from_torch(t.contiguous(), dtype=dtype, layout=layout, device=device, mesh_mapper=mapper)
 
 
 def to_host(t):
@@ -111,10 +140,12 @@ class QwenImageEditTT:
         cfg: EditConfig | None = None,
         precise_transformer: bool = True,
     ):
-        self.device = device
+        self.device = normalize_mesh(device)
         self.hf = hf_pipe  # HF reference kept reachable: ground truth for section structure / depth
         self.cfg = cfg or EditConfig()
         self.batch_size = int(self.cfg.batch)  # images per image_edit call (what the trace hooks run)
+        self.dp = tuple(device.shape)[DP_AXIS]  # denoise batch split (samples per column = B / dp)
+        self.tp = tuple(device.shape)[TP_AXIS]  # transformer tensor parallelism
         self.tracker = InvocationTracker()
         pick = lambda v: layers if v is None else v  # noqa: E731
         t0 = time.time()
@@ -126,9 +157,10 @@ class QwenImageEditTT:
             tracker=self.tracker,
         )
         self.vae = TtQwenVAE(device, hf_pipe.vae, tracker=self.tracker)
-        self.transformer = TtQwenImageTransformer(
-            device, hf_pipe.transformer, layers=pick(denoise_layers), tracker=self.tracker
-        )
+        with _tr_ccl.tp_axis(TP_AXIS):  # TP=8 over mesh axis 0, replicated over axis 1 (see _ccl)
+            self.transformer = TtQwenImageTransformer(
+                device, hf_pipe.transformer, layers=pick(denoise_layers), tracker=self.tracker
+            )
         # Precise transformer (see _stubs/_precise.py): 2-limb activations + exact-lane QK^T. Measured at
         # B=2, full depth: CFG noise PCC 0.99993 -> 0.9999956 per forward. Over the 50-step trajectory
         # that moved the worst samples' image PCC from 0.52-0.64 to 0.76 (sample 30) and from ~0.85 to
@@ -157,9 +189,12 @@ class QwenImageEditTT:
         p = PreparedInputs()
         p.enc = enc
         p.B = enc.latents.shape[0]
+        assert p.B % self.dp == 0, f"batch {p.B} must split evenly over the {self.dp} DP columns"
+        p.B_local = p.B // self.dp
         p.te = self.text_encoder.prepare(enc)
         p.vae_image = _replicated(d, enc.vae_image, ttnn.float32)
-        p.latents = _replicated(d, enc.latents.to(torch.float32), ttnn.float32)
+        p.latents = _replicated(d, enc.latents.to(torch.float32), ttnn.float32)  # (vae_decode trace input)
+        p.latents_dp = _dp_sharded(d, enc.latents.to(torch.float32))  # the denoise loop's initial noise
         p.S_lat = enc.latents.shape[1]
         p.lat_h = 2 * (enc.height // 16)
         p.lat_w = 2 * (enc.width // 16)
@@ -169,15 +204,15 @@ class QwenImageEditTT:
         ts = enc.timesteps.to(torch.float32)
         sig = enc.sigmas.to(torch.float32)
         p.num_steps = int(ts.numel())
-        # per step: t / 1000 for every sample, and the Euler step size sigma_{i+1} - sigma_i
-        p.timesteps = [_replicated(d, torch.full((p.B,), float(t) / 1000.0)) for t in ts.tolist()]
+        # per step: t / 1000 for every sample (DP-split like the latents), and the Euler step size
+        p.timesteps = [_dp_sharded(d, torch.full((p.B,), float(t) / 1000.0)) for t in ts.tolist()]
         p.dts = [_replicated(d, torch.full((1, 1, 1), float(sig[i + 1] - sig[i]))) for i in range(p.num_steps)]
 
         def joint_mask(m):
             if m is None:
                 return None
             full = torch.cat([m.to(torch.float32), torch.ones(p.B, 2 * p.S_lat)], dim=1)
-            return _replicated(d, full.reshape(p.B, 1, 1, -1))
+            return _dp_sharded(d, full.reshape(p.B, 1, 1, -1))
 
         p.joint_mask_cond = joint_mask(p.te.mask_cond)
         p.joint_mask_uncond = joint_mask(p.te.mask_uncond)
@@ -196,12 +231,23 @@ class QwenImageEditTT:
     def rope(self, p, txt_len):
         return self.transformer.rope(p.img_shapes, txt_len)
 
+    def dp_split(self, x):
+        """Replicated device tensor -> this column's B/dp samples (dim 0 split over the DP axis)."""
+        return ttnn.mesh_partition(x, dim=0, cluster_axis=DP_AXIS) if self.dp > 1 else x
+
+    def dp_gather(self, x):
+        """DP-split device tensor -> the whole batch on every chip (exact all_gather over the DP axis)."""
+        if self.dp == 1:
+            return x
+        return ttnn.all_gather(x, dim=0, cluster_axis=DP_AXIS, num_links=1, topology=ttnn.Topology.Linear)
+
     def denoise_step(self, p, i, latents, image_latents, pe, neg_pe, rope_c, rope_u, t=None, dt=None):
-        """One FlowMatch-Euler step with true CFG. t / dt default to step i's persistent buffers."""
+        """One FlowMatch-Euler step with true CFG on this column's B/dp samples (every tensor here is
+        DP-split over mesh axis 1). t / dt default to step i's persistent buffers."""
         t = p.timesteps[i] if t is None else t
         dt = p.dts[i] if dt is None else dt
         x = ttnn.concat([latents, image_latents], dim=1)
-        B, S = p.B, p.S_lat
+        B, S = latents.shape[0], p.S_lat
         eps = self.transformer(x, pe, t, rope_c, p.joint_mask_cond)
         eps = ttnn.slice(eps, [0, 0, 0], [B, S, eps.shape[-1]])
         if p.do_cfg:
@@ -265,7 +311,10 @@ class QwenImageEditTT:
         rope_c = self.rope(p, pe.shape[1])
         rope_u = self.rope(p, neg_pe.shape[1])
         n = p.num_steps if num_steps is None else num_steps
-        latents = self._denoise_loop(p, n, p.latents, image_latents, pe, neg_pe, rope_c, rope_u, on_step)
+        # denoise: the batch is split over mesh axis 1 (DP), the transformer is TP over axis 0
+        pe_l, neg_l, img_lat_l = self.dp_split(pe), self.dp_split(neg_pe), self.dp_split(image_latents)
+        latents = self._denoise_loop(p, n, p.latents_dp, img_lat_l, pe_l, neg_l, rope_c, rope_u, on_step)
+        latents = self.dp_gather(latents)  # the whole batch on every chip for the decode
         self.last_latents = latents
         self.steps_run = n
         return self.vae_decode(p, latents)
@@ -351,17 +400,16 @@ class QwenImageEditTT:
         img = self.vision_encode(p)
         pe, neg = self.text_encode(p, img)
         lat_img = self.vae_encode(p)
-        d = self.device
         self._ts["denoise"] = {
             "p": p,
-            "pe": pe,
-            "neg": neg,
-            "img_lat": lat_img,
+            "pe": self.dp_split(pe),  # the step runs on DP-split inputs, as in run_image_edit
+            "neg": self.dp_split(neg),
+            "img_lat": self.dp_split(lat_img),
             "rope_c": self.rope(p, pe.shape[1]),  # RoPE tables: shape-dependent constants, pre-uploaded
             "rope_u": self.rope(p, neg.shape[1]),
-            "latents": p.latents,
-            "t": _replicated(d, to_host(p.timesteps[0]).reshape(-1)),  # persistent step inputs
-            "dt": _replicated(d, to_host(p.dts[0]).reshape(1, 1, 1)),
+            "latents": p.latents_dp,
+            "t": ttnn.clone(p.timesteps[0]),  # persistent step inputs
+            "dt": ttnn.clone(p.dts[0]),
         }
 
     def denoise_trace_step(self):
@@ -423,6 +471,17 @@ class QwenImageEditTT:
         self._vae_items_cache = cache
         return cache[which]
 
+    def _trace_readback(self, t):
+        """Whole stage output on host: device 0's copy, plus the other DP columns for a DP-split tensor
+        (the denoise step's output), concatenated along the batch."""
+        t = t[0] if isinstance(t, tuple) else t
+        shape = tuple(self.device.shape)
+        devs = ttnn.get_device_tensors(t)
+        cols = [ttnn.to_torch(devs[c]).to(torch.float32) for c in range(shape[1])]
+        if all(torch.equal(cols[0], c) for c in cols[1:]):
+            return cols[0]
+        return torch.cat(cols, dim=0)
+
     def trace_capture_selftest(self, device=None, pcc_threshold=0.999):
         """Per stage: eager reference, then capture ONE step, execute it, compare, release the trace
         before the next stage (stage traces never co-reside). True only if every stage captured and
@@ -436,7 +495,7 @@ class QwenImageEditTT:
             inputs = getattr(self, f"{stage}_trace_inputs")()
             getattr(self, f"{stage}_trace_setup")(inputs)
             step = getattr(self, f"{stage}_trace_step")
-            ref = to_host(step()).to(torch.float32)  # eager warm-up: compiles, allocates halo buffers
+            ref = self._trace_readback(step())  # eager warm-up: compiles, allocates halo buffers
             tid = None
             try:
                 tid = ttnn.begin_trace_capture(d, cq_id=0)
@@ -462,7 +521,7 @@ class QwenImageEditTT:
                 gc.collect()
                 continue
             ttnn.execute_trace(d, tid, cq_id=0, blocking=True)
-            got = to_host(out).to(torch.float32)
+            got = self._trace_readback(out)
             _, pcc = comp_pcc(ref, got, pcc_threshold)
             ttnn.release_trace(d, tid)
             passed = float(pcc) >= pcc_threshold
@@ -510,7 +569,9 @@ def build_pipeline(
     layers: default depth cap for EVERY repeated stack (None = all layers); per-stack overrides
         vision_encode_layers / text_encode_layers / denoise_layers fall back to `layers`.
     Other kwargs (prompt, image, ...) are accepted and ignored: shapes come from the config.
+    A 32-chip mesh handed as 1x32 or 4x8 is reshaped to 8x4 in place before anything is allocated.
     """
+    normalize_mesh(device)
     if layers is None and os.environ.get("TT_PERF_LAYERS"):
         layers = int(os.environ["TT_PERF_LAYERS"])
     hf = model if model is not None else load_hf_reference()
@@ -532,10 +593,11 @@ def build_pipeline(
 # standalone self-tests, so they open (and close) the mesh themselves via models/demos/qwen_image_edit/mesh.py;
 # the pipeline proper only ever runs on the device handed to build_pipeline. They check properties of
 # the CODE PATH (no host aten op in the forward; every stage captures and replays), which do not depend
-# on depth or batch, so they build shallow (2 of each repeated stack) at B=2 (one sample per mesh row) for 2
-# scheduler steps (step 0 eager + one traced replay) to stay inside the probes' time budget.
+# on depth or batch, so they build shallow (2 of each repeated stack) at B=8 -- the smallest batch the
+# 8x4 layout takes: one image per mesh row in the batch-parallel VAE, 2 samples per DP column in the
+# denoise -- for 2 scheduler steps (step 0 eager + one traced replay) to stay inside the probes' budget.
 SELFTEST_LAYERS = 2
-SELFTEST_CFG = dict(batch=2, num_inference_steps=2)
+SELFTEST_CFG = dict(batch=8, num_inference_steps=2)
 
 
 def _selftest_pipeline(mesh):

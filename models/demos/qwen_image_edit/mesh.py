@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import ttnn
 
-MESH_SHAPE = (2, 4)
+# Galaxy: 32 Wormhole chips as the physical 8x4 grid (the harness's --mesh 4,8 is the same 32 chips;
+# build_pipeline reshapes a 1x32 / 4x8 handle to 8x4 in place).
+MESH_SHAPE = (8, 4)
 
 # trace_region_size is sized from the LARGEST stage trace, measured: denoise 760.3 MB (precise transformer:
 # 60 blocks x cond + uncond, 2-limb projections, exact-lane QK^T), vision_encode 548.2 MB (exact-lane
@@ -18,7 +20,7 @@ DEVICE_PARAMS = {"l1_small_size": 24576, "trace_region_size": 896 * 1024 * 1024,
 
 
 def open_mesh(device_params=None, mesh_shape=MESH_SHAPE):
-    """Open the T3K as a 2x4 mesh with 1D fabric (what the e2e test's mesh_device fixture opens)."""
+    """Open the Galaxy as an 8x4 mesh with 1D fabric (what the e2e test's mesh_device fixture opens)."""
     params = dict(DEVICE_PARAMS)
     params.update(device_params or {})
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)

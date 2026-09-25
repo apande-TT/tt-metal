@@ -7,36 +7,31 @@ causal conv (no temporal/spatial padding) that maps the encoder latent 2*z_dim -
 per voxel. A 1x1x1 conv is exactly a per-voxel linear over channels, so this is one `ttnn.linear`
 on the channels-last token matrix. This replaces the tt_transformers SwiGLU MLP scaffold.
 
-Tensor-parallel scheme (TP over the 1xN mesh): the weight is only 32x32 -- splitting its output
-features gives 4 per chip, below one tile -- so, like encoder_stack / layer, the parallel axis is
-SPATIAL. The flattened voxel (token) axis is partitioned across the mesh, the weight/bias stay
-replicated, each chip projects its own voxels, and the tokens are all-gathered back in order. The
-gathered output equals the single-device result.
+Tensor-parallel scheme: the weight is only 32x32 -- splitting its output features gives 1 per chip
+at TP=32, far below one tile -- so, like encoder_stack / layer, the parallel axis is SPATIAL. The
+1x32 line is run as an 8x4 grid (see _mesh.py: CCLs along the 32-chip line deadlock). The flattened
+voxel (token) axis is zero-padded up to the chip count and partitioned over the 8-axis, then each
+slice again over the 4-axis; the weight/bias stay replicated, each chip projects its own voxels, and
+the tokens are all-gathered back in reverse order (4-axis, then 8-axis) and cropped. The gathered
+output equals the single-device result.
 """
 
 from __future__ import annotations
 
 import ttnn
 from models.tt_dit.parallel.manager import CCLManager
+from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._mesh import mesh_shape, pad_to_multiple, physical_grid
 
 _TOKEN_DIM = 2
 
 
-def _mesh_shape(device):
-    try:
-        shape = tuple(device.shape)
-    except (AttributeError, TypeError):
-        return (1, 1)
-    return shape if len(shape) == 2 else (1, 1)
-
-
 class TtQwenImagePointwiseProj:
     def __init__(self, device, torch_module):
-        self.device = device
-        mesh_shape = _mesh_shape(device)
-        # Tokens are split across the larger mesh axis (the N of a 1xN mesh).
-        self.tp_axis = 1 if mesh_shape[1] >= mesh_shape[0] else 0
-        self.tp = mesh_shape[self.tp_axis]
+        self.device = device = physical_grid(device)
+        self.shape = mesh_shape(device)
+        # Tokens are split over every mesh axis with more than one chip, outermost first.
+        self.tp_axes = [ax for ax in (0, 1) if self.shape[ax] > 1]
+        self.tp = self.shape[0] * self.shape[1]
         self.ccl_manager = CCLManager(device, topology=ttnn.Topology.Linear, num_links=1) if self.tp > 1 else None
 
         weight = torch_module.weight.detach().float()
@@ -74,21 +69,22 @@ class TtQwenImagePointwiseProj:
         # temporal padding, so the causal cache never enters the math.
         B, C, T, H, W = x.shape
         n_tokens = B * T * H * W
-        assert n_tokens % self.tp == 0, f"{n_tokens} voxels must divide the TP={self.tp} mesh"
 
         x = ttnn.permute(x, (0, 2, 3, 4, 1))  # BTHWC
         x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
         x = ttnn.reshape(x, (1, 1, n_tokens, C))
-        if self.tp > 1:
-            x = ttnn.mesh_partition(x, dim=_TOKEN_DIM, cluster_axis=self.tp_axis)
+        x, _ = pad_to_multiple(x, _TOKEN_DIM, self.tp)
+        for ax in self.tp_axes:
+            x = ttnn.mesh_partition(x, dim=_TOKEN_DIM, cluster_axis=ax)
         x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
 
         out = ttnn.linear(x, self.weight, bias=self.bias, compute_kernel_config=self.compute_kernel_config)
 
-        if self.tp > 1:
-            out = ttnn.to_layout(out, ttnn.ROW_MAJOR_LAYOUT)
-            out = self.ccl_manager.all_gather(out, dim=_TOKEN_DIM, mesh_axis=self.tp_axis, use_hyperparams=False)
         out = ttnn.to_layout(out, ttnn.ROW_MAJOR_LAYOUT)
+        for ax in reversed(self.tp_axes):
+            out = self.ccl_manager.all_gather(out, dim=_TOKEN_DIM, mesh_axis=ax, use_hyperparams=False)
+        if out.shape[_TOKEN_DIM] != n_tokens:
+            out = ttnn.slice(out, (0, 0, 0, 0), (1, 1, n_tokens, self.out_channels))
         out = ttnn.reshape(out, (B, T, H, W, self.out_channels))
         out = ttnn.to_layout(out, ttnn.TILE_LAYOUT)
         return ttnn.permute(out, (0, 4, 1, 2, 3))  # BCTHW

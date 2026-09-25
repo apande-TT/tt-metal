@@ -89,12 +89,17 @@ def block_mask(cu_seqlens, s, s_pad):
 
 
 def upload_rows(device, arrays, dtype=ttnn.bfloat16, col_dim=None, layout=ttnn.TILE_LAYOUT):
-    """Row-staged upload: device (r, c) receives arrays[r], sharded over the TP columns along `col_dim`
-    (None = replicated over the columns). One array per mesh row -- used to place DIFFERENT layers on
-    the two rows of a 2xN mesh (pipeline stages) while every layer keeps its TP split over the columns."""
+    """Row-staged upload: one array per pipeline stage; the mesh rows are split into len(arrays) equal
+    contiguous groups and every device of group s receives arrays[s], sharded over the TP columns
+    along `col_dim` (None = replicated over the columns). Used to place DIFFERENT layers on the row
+    groups of an RxN mesh (pipeline stages: rows [0, R/2) and [R/2, R) for two stages) while every
+    layer keeps its TP split over the columns. On a 2xN mesh this is one array per row."""
     rows, cols = mesh_shape(device)
-    assert len(arrays) == rows, f"need one array per mesh row ({rows}), got {len(arrays)}"
+    n = len(arrays)
+    assert n >= 1 and rows % n == 0, f"{n} stages do not split the {rows} mesh rows evenly"
+    per = rows // n
     ts = [torch.from_numpy(np.ascontiguousarray(a)) if isinstance(a, np.ndarray) else a.contiguous() for a in arrays]
+    ts = [t for t in ts for _ in range(per)]  # stage s on rows [s*per, (s+1)*per)
     t = torch.stack(ts, 0)
     cd = None if col_dim is None else (col_dim + 1 if col_dim >= 0 else col_dim)
     mapper = ttnn.ShardTensor2dMesh(device, mesh_shape=(rows, cols), dims=(0, cd))

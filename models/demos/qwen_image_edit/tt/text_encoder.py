@@ -7,12 +7,14 @@
     h        = v_l_text_model(x)                                   28 decoder layers + final norm
     prompt   = h[:, 64:L] * mask                                   drop the template prefix, zero the padding
 
-Mesh: 2x4. Every layer keeps its graduated TP=4 split over the columns. The LM is row-staged: layers
-0-13 live on row 0 and 14-27 on row 1 (1/8 of the stack per chip). The graduated layout replicated
-the whole stack over both rows (DP=2), which is 4.72 GB per chip, measured this run; next to the
-~5.8 GB transformer that is past the 10.5 GB usable per chip with a CCL axis. The 32 prompts and the
-32 negative prompts run as ONE batch of 64 sequences through both stages. The vision tower (0.34 GB)
-stays replicated over the rows.
+Mesh: 8x4 (Galaxy). Every layer keeps its graduated TP=4 split over the 4 columns (mesh axis 1). The
+LM is stage-split over the 8 rows: rows 0-3 hold layers 0-13 and rows 4-7 hold layers 14-27 (half of
+the TP=4 share of the stack per chip), with an exact all_gather hand-off over axis 0 between the two
+stages (v_l_text_model row_stages, generalised from the T3K's 2 single-row stages to 2 stages of
+rows/2 rows). Replicating the whole LM on every row instead is 4.72 GB per chip (measured on T3K);
+next to the 5.36 GB TP=8 transformer and the 0.41 GB VAE that is 10.49 GB, over the registered 10.5
+GB usable per chip with a CCL axis once activations are counted. The vision tower stays replicated
+over the rows.
 """
 from __future__ import annotations
 
@@ -57,8 +59,9 @@ class TtQwenTextEncoder:
         visual, lm = te.model.visual, te.model.language_model
         n_lm = len(lm.layers)
         self.num_text_layers = n_lm if text_layers is None else max(1, min(int(text_layers), n_lm))
-        if tuple(device.shape)[0] == 2 and self.num_text_layers % 2:
-            # the row-staged stack needs one layer per row per slot: round a cap up to even (min 2)
+        rows = tuple(device.shape)[0]
+        if rows >= 2 and rows % 2 == 0 and self.num_text_layers % 2:
+            # the two-stage row-staged stack needs one layer per stage per slot: round a cap up to even
             self.num_text_layers = min(n_lm, self.num_text_layers + 1)
         self.num_vision_layers = (
             len(visual.blocks) if vision_layers is None else max(1, min(int(vision_layers), len(visual.blocks)))

@@ -5,7 +5,7 @@
 
     out = net[2](GELU_tanh(net[0].proj(x)))        3072 -> 12288 -> 3072
 
-Tensor parallel (TP = mesh size): net[0].proj is COLUMN-parallel (hidden features split, bias split
+Tensor parallel (TP = mesh size, or one mesh axis via _ccl.tp_axis): net[0].proj is COLUMN-parallel (hidden features split, bias split
 with it), GELU is local, net[2] is ROW-parallel followed by all_reduce; its bias is replicated and
 added once after the reduce. Matmul inputs are bf16 with float32 accumulation.
 """
@@ -33,7 +33,7 @@ def _sharded(t, device, dim, dtype=ttnn.bfloat16):
             dtype=dtype,
             layout=ttnn.TILE_LAYOUT,
             device=device,
-            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=dim),
+            mesh_mapper=_ccl.shard_mapper(device, dim),  # TP axis: see _ccl.tp_axis
         )
     return _replicated(t, device, dtype=dtype)
 
@@ -41,7 +41,8 @@ def _sharded(t, device, dim, dtype=ttnn.bfloat16):
 class TtQwenFeedForward:
     def __init__(self, device, torch_module):
         self.device = device
-        self.tp = device.get_num_devices() if _is_mesh(device) else 1
+        self.tp_axis = _ccl.get_tp_axis()  # mesh axis of the TP split (None = every device)
+        self.tp = _ccl.tp_size(device, self.tp_axis)
         proj, out = torch_module.net[0].proj, torch_module.net[2]
         approx = getattr(torch_module.net[0], "approximate", "tanh")
         self.variant = ttnn.GeluVariant.Tanh if approx == "tanh" else ttnn.GeluVariant.Accurate
@@ -71,7 +72,7 @@ class TtQwenFeedForward:
             h = ttnn.gelu(_precise.linear(x, self.w1, bias=self.b1), variant=self.variant)
             y = _precise.linear(h, self.w2)
             if self.tp > 1:
-                y = _ccl.all_reduce(y, self.device)
+                y = _ccl.all_reduce(y, self.device, axis=self.tp_axis)
             return ttnn.add(y, self.b2)
         if x.dtype != ttnn.bfloat16:
             x = ttnn.typecast(x, ttnn.bfloat16)
@@ -79,7 +80,7 @@ class TtQwenFeedForward:
         h = ttnn.gelu(h, variant=self.variant)
         y = ttnn.linear(ttnn.typecast(h, ttnn.bfloat16), self.w2, dtype=ttnn.float32, compute_kernel_config=self.hifi)
         if self.tp > 1:
-            y = _ccl.all_reduce(y, self.device)
+            y = _ccl.all_reduce(y, self.device, axis=self.tp_axis)
         return ttnn.add(y, self.b2)
 
 

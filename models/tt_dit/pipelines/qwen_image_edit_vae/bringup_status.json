@@ -40,8 +40,8 @@
       "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_conv2d_patch.py",
       "hf_reference": null,
       "notes": "reuse_registry: llama_conv2d_patch -> models/tt_transformers/tt/multimodal/llama_conv2d_patch.py::TtLlamaConv2dPatch (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
-      "submodule_path": null,
-      "class_name": null
+      "submodule_path": "encoder.conv_in",
+      "class_name": "QwenImageCausalConv3d"
     },
     {
       "name": "self_attention",
@@ -52,8 +52,8 @@
       "tt_reuse_target": "models/tt_transformers/tt/attention.py",
       "hf_reference": null,
       "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0.",
-      "submodule_path": null,
-      "class_name": null
+      "submodule_path": "encoder.mid_block.attentions.0",
+      "class_name": "QwenImageAttentionBlock"
     },
     {
       "name": "mlp",
@@ -64,8 +64,8 @@
       "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
       "hf_reference": null,
       "notes": "reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh.",
-      "submodule_path": null,
-      "class_name": null
+      "submodule_path": "quant_conv",
+      "class_name": "QwenImageCausalConv3d"
     },
     {
       "name": "layer",
@@ -76,8 +76,8 @@
       "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_layernorm.py",
       "hf_reference": null,
       "notes": "reuse_registry: llama_layernorm -> models/tt_transformers/tt/multimodal/llama_layernorm.py::TtLayerNorm (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
-      "submodule_path": null,
-      "class_name": null
+      "submodule_path": "encoder.down_blocks.0",
+      "class_name": "QwenImageResidualBlock"
     },
     {
       "name": "encoder_stack",
@@ -88,8 +88,8 @@
       "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_vision_encoder.py",
       "hf_reference": null,
       "notes": "reuse_registry: llama_vision_encoder -> models/tt_transformers/tt/multimodal/llama_vision_encoder.py::TtLlamaVisionEncoder (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
-      "submodule_path": null,
-      "class_name": null
+      "submodule_path": "encoder",
+      "class_name": "QwenImageEncoder3d"
     },
     {
       "name": "decoder_head",
@@ -100,8 +100,8 @@
       "tt_reuse_target": "models/tt_transformers/tt/lm_head.py",
       "hf_reference": null,
       "notes": "reuse_registry: lm_head -> models/tt_transformers/tt/lm_head.py::LMHead (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
-      "submodule_path": null,
-      "class_name": null
+      "submodule_path": "decoder",
+      "class_name": "QwenImageDecoder3d"
     },
     {
       "name": "qwen_image_residual_block",

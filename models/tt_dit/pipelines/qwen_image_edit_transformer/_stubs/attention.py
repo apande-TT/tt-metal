@@ -8,7 +8,8 @@
     joint      = SDPA(cat[txt, img] q/k/v)           (non-causal, optional key mask)
     img_out    = to_out[0](joint[img])               txt_out = to_add_out(joint[txt])
 
-Tensor parallel (TP = mesh size): heads are split across chips.
+Tensor parallel (TP = mesh size, or the size of the mesh axis chosen with _ccl.tp_axis): heads are
+split across chips.
   * q/k/v and add_q/k/v projections are COLUMN-parallel (output features = whole heads per chip).
   * to_out / to_add_out are ROW-parallel (input features = this chip's heads) followed by all_reduce;
     their biases are added once, after the reduce.
@@ -54,7 +55,7 @@ def _sharded(t, device, dim, dtype=ttnn.bfloat16):
             dtype=dtype,
             layout=ttnn.TILE_LAYOUT,
             device=device,
-            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=dim),
+            mesh_mapper=_ccl.shard_mapper(device, dim),  # TP axis: see _ccl.tp_axis
         )
     return _replicated(t, device, dtype=dtype)
 
@@ -75,7 +76,8 @@ class TtQwenJointAttention:
         self.n_heads = int(m.heads)
         inner = m.to_q.weight.shape[0]
         self.head_dim = inner // self.n_heads
-        self.tp = device.get_num_devices() if _is_mesh(device) else 1
+        self.tp_axis = _ccl.get_tp_axis()  # mesh axis of the TP split (None = every device)
+        self.tp = _ccl.tp_size(device, self.tp_axis)
         assert self.n_heads % self.tp == 0, f"{self.n_heads} heads not divisible by TP={self.tp}"
         self.local_heads = self.n_heads // self.tp
         self.half = self.head_dim // 2
@@ -201,7 +203,7 @@ class TtQwenJointAttention:
         else:
             y = ttnn.linear(x, w, dtype=ttnn.float32, compute_kernel_config=self.hifi)
         if self.tp > 1:
-            y = _ccl.all_reduce(y, self.device)
+            y = _ccl.all_reduce(y, self.device, axis=self.tp_axis)
         return ttnn.add(y, b)
 
     # ---- forward -------------------------------------------------------------------------------

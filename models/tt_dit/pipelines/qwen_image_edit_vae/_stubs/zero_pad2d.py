@@ -10,23 +10,20 @@ Tensor-parallel scheme (TP over the 1xN mesh): the op has no weights and pads ev
 identically, so the parallel axis is the CHANNEL axis -- a W split would put the right-hand pad on
 the last chip only. Channels are partitioned across the mesh, each chip pads its own channels, and
 the output is all-gathered along C. The gathered output equals the single-device result.
+
+On a Galaxy the 1x32 line is run as an 8x4 grid (see _mesh.py: CCLs along the 32-chip line
+deadlock): the activation is zero-padded up to the grid, partitioned H over the 8-axis and W over
+the 4-axis, and the gathered output is cropped back to the logical size.
 """
 
 from __future__ import annotations
 
 import ttnn
 from models.tt_dit.parallel.manager import CCLManager
+from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._mesh import mesh_shape, pad_to_multiple, physical_grid
 
 # NCHW layout: C is dim 1.
 _C_DIM = 1
-
-
-def _mesh_shape(device):
-    try:
-        shape = tuple(device.shape)
-    except (AttributeError, TypeError):
-        return (1, 1)
-    return shape if len(shape) == 2 else (1, 1)
 
 
 class TtZeroPad2d:
@@ -36,11 +33,11 @@ class TtZeroPad2d:
         self.pad_h = (top, bottom)
         self.pad_w = (left, right)
 
-        self.device = device
-        mesh_shape = _mesh_shape(device)
-        # Channels are split across the larger mesh axis (the N of a 1xN mesh).
-        self.tp_axis = 1 if mesh_shape[1] >= mesh_shape[0] else 0
-        self.tp = mesh_shape[self.tp_axis]
+        self.device = device = physical_grid(device)
+        shape = mesh_shape(device)
+        # Channels are split over every mesh axis with more than one chip, outermost first.
+        self.tp_axes = [ax for ax in (0, 1) if shape[ax] > 1]
+        self.tp = shape[0] * shape[1]
         self.ccl_manager = CCLManager(device, topology=ttnn.Topology.Linear, num_links=1) if self.tp > 1 else None
 
     @classmethod
@@ -68,16 +65,19 @@ class TtZeroPad2d:
     def __call__(self, x, **_ignored):
         # x: replicated TILE [N, C, H, W] (NCHW, like the torch reference).
         N, C, H, W = x.shape
-        assert C % self.tp == 0, f"{C} channels must divide the TP={self.tp} mesh"
 
         x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
-        if self.tp > 1:
-            x = ttnn.mesh_partition(x, dim=_C_DIM, cluster_axis=self.tp_axis)
+        x, _ = pad_to_multiple(x, _C_DIM, self.tp)
+        for ax in self.tp_axes:
+            x = ttnn.mesh_partition(x, dim=_C_DIM, cluster_axis=ax)
 
         out = ttnn.pad(x, [(0, 0), (0, 0), self.pad_h, self.pad_w], value=0.0)
 
-        if self.tp > 1:
-            out = self.ccl_manager.all_gather(out, dim=_C_DIM, mesh_axis=self.tp_axis, use_hyperparams=False)
+        for ax in reversed(self.tp_axes):
+            out = self.ccl_manager.all_gather(out, dim=_C_DIM, mesh_axis=ax, use_hyperparams=False)
+        if out.shape[_C_DIM] != C:
+            _, _, oh, ow = out.shape
+            out = ttnn.slice(out, (0, 0, 0, 0), (N, C, oh, ow))
         return out
 
 
