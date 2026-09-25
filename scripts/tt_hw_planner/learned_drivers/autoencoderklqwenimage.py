@@ -11,113 +11,78 @@ def driver(model, sample_input=None):
         import torch
 
         try:
-            model.eval()
-        except Exception:
-            pass
-
-        try:
-            p = next(model.parameters())
-            device = p.device
-            dtype = p.dtype
+            device = next(model.parameters()).device
+            dtype = next(model.parameters()).dtype
         except Exception:
             device = torch.device("cpu")
             dtype = torch.float32
 
         in_channels = 3
-        z_dim = 16
         try:
             cfg = getattr(model, "config", None)
             if cfg is not None:
-                z_dim = int(getattr(cfg, "z_dim", z_dim))
-                in_channels = int(getattr(cfg, "in_channels", in_channels))
+                val = None
+                try:
+                    val = cfg.get("in_channels", None)
+                except Exception:
+                    val = getattr(cfg, "in_channels", None)
+                if val:
+                    in_channels = int(val)
         except Exception:
             pass
 
-        def make_sample(t, hw):
-            return torch.randn(1, in_channels, t, hw, hw, device=device, dtype=dtype)
+        was_training = getattr(model, "training", False)
+        try:
+            model.eval()
+        except Exception:
+            pass
 
         candidates = []
-        if sample_input is not None:
+        if isinstance(sample_input, torch.Tensor) and sample_input.dim() == 5:
+            candidates.append(
+                tuple(sample_input.shape[2:]) and (sample_input.shape[2], sample_input.shape[3], sample_input.shape[4])
+            )
+
+        for num_frames in (1, 5, 9):
+            for size in (64, 32):
+                candidates.append((num_frames, size, size))
+
+        working_sample = None
+
+        with torch.no_grad():
+            for t, h, w in candidates:
+                try:
+                    sample = torch.randn(1, in_channels, t, h, w, device=device, dtype=dtype)
+                    model(sample, sample_posterior=True, return_dict=True)
+                    working_sample = sample
+                    break
+                except Exception:
+                    continue
+
             try:
-                if torch.is_tensor(sample_input):
-                    candidates.append(sample_input.to(device=device, dtype=dtype))
+                if working_sample is None:
+                    working_sample = torch.randn(1, in_channels, 1, 64, 64, device=device, dtype=dtype)
+                enc_out = model.encode(working_sample)
+                latent_dist = getattr(enc_out, "latent_dist", None)
+                z = None
+                if latent_dist is not None:
+                    try:
+                        z = latent_dist.mode()
+                    except Exception:
+                        try:
+                            z = latent_dist.sample()
+                        except Exception:
+                            z = None
+                if z is None:
+                    z = getattr(enc_out, "latents", None)
+                if z is not None:
+                    model.decode(z)
             except Exception:
                 pass
-        for hw in (64, 32, 96, 128):
-            for t in (1, 5, 9):
-                candidates.append(None)  # placeholder, built lazily below
-
-        succeeded = False
-        with torch.no_grad():
-            idx = 0
-            for hw in (64, 32, 96, 128):
-                if succeeded:
-                    break
-                for t in (1, 5, 9):
-                    if succeeded:
-                        break
-                    trial_tensors = []
-                    if idx == 0 and sample_input is not None:
-                        try:
-                            if torch.is_tensor(sample_input):
-                                trial_tensors.append(sample_input.to(device=device, dtype=dtype))
-                        except Exception:
-                            pass
-                    idx += 1
-                    try:
-                        trial_tensors.append(make_sample(t, hw))
-                    except Exception:
-                        pass
-                    for sample in trial_tensors:
-                        try:
-                            model(sample, sample_posterior=True, return_dict=True)
-                            succeeded = True
-                            break
-                        except Exception:
-                            continue
 
         try:
-            with torch.no_grad():
-                sample = make_sample(1, 64)
-                latent = None
-                if hasattr(model, "encode"):
-                    try:
-                        enc_out = model.encode(sample)
-                    except Exception:
-                        enc_out = None
-                    if enc_out is not None:
-                        try:
-                            if hasattr(enc_out, "latent_dist"):
-                                try:
-                                    latent = enc_out.latent_dist.mode()
-                                except Exception:
-                                    latent = enc_out.latent_dist.sample()
-                            elif torch.is_tensor(enc_out):
-                                latent = enc_out
-                        except Exception:
-                            latent = None
-                if latent is None:
-                    try:
-                        latent = torch.randn(1, z_dim, 1, 8, 8, device=device, dtype=dtype)
-                    except Exception:
-                        latent = None
-                if latent is not None and hasattr(model, "decode"):
-                    try:
-                        model.decode(latent)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        try:
-            with torch.no_grad():
-                for hw in (32, 64):
-                    try:
-                        latent2 = torch.randn(1, z_dim, 1, hw // 8, hw // 8, device=device, dtype=dtype)
-                        if hasattr(model, "decode"):
-                            model.decode(latent2)
-                    except Exception:
-                        continue
+            if was_training:
+                model.train()
         except Exception:
             pass
     except Exception:

@@ -10,151 +10,123 @@ def driver(model, sample_input=None):
     try:
         import torch
 
-        was_training = model.training
-        model.eval()
+        try:
+            model.eval()
+        except Exception:
+            pass
 
-        params = list(model.parameters())
-        device = params[0].device if params else torch.device("cpu")
-        dtype = params[0].dtype if params else torch.float32
-
-        config = getattr(model, "config", None)
-
-        def cfg(name, default):
-            if config is None:
-                return default
+        try:
+            dtype = model.dtype
+        except Exception:
+            dtype = None
+        if not isinstance(dtype, torch.dtype):
+            dtype = torch.float32
             try:
-                if isinstance(config, dict):
-                    return config.get(name, default)
-                return getattr(config, name, default)
+                for p in model.parameters():
+                    if p.is_floating_point():
+                        dtype = p.dtype
+                        break
+            except Exception:
+                pass
+
+        try:
+            device = model.device
+        except Exception:
+            device = None
+        if device is None:
+            device = torch.device("cpu")
+            try:
+                for p in model.parameters():
+                    device = p.device
+                    break
+            except Exception:
+                pass
+
+        cfg = getattr(model, "config", None)
+
+        def _cfg(name, default):
+            try:
+                val = getattr(cfg, name, default)
+                return default if val is None else val
             except Exception:
                 return default
 
-        in_channels = cfg("in_channels", 64)
-        joint_attention_dim = cfg("joint_attention_dim", 3584)
-        guidance_embeds = bool(cfg("guidance_embeds", False))
+        in_channels = _cfg("in_channels", 64)
+        joint_attention_dim = _cfg("joint_attention_dim", 3584)
+        guidance_embeds = bool(_cfg("guidance_embeds", False))
 
-        batch_size = 1
-        frames = 1
-        h_patches = 4
-        w_patches = 4
-        img_seq_len = frames * h_patches * w_patches
+        try:
+            in_channels = int(in_channels)
+            if in_channels <= 0:
+                in_channels = 64
+        except Exception:
+            in_channels = 64
+        try:
+            joint_attention_dim = int(joint_attention_dim)
+            if joint_attention_dim <= 0:
+                joint_attention_dim = 3584
+        except Exception:
+            joint_attention_dim = 3584
+
+        batch = 1
+        patch_h, patch_w = 4, 4
+        seq_len = patch_h * patch_w
         txt_len = 8
 
-        def build_inputs(hs_dtype, ts_kind):
-            hidden_states = torch.randn(batch_size, img_seq_len, in_channels, device=device, dtype=hs_dtype)
-            encoder_hidden_states = torch.randn(batch_size, txt_len, joint_attention_dim, device=device, dtype=hs_dtype)
-            encoder_hidden_states_mask = torch.ones(batch_size, txt_len, device=device, dtype=torch.long)
-            if ts_kind == "long":
-                timestep = torch.full((batch_size,), 500, device=device, dtype=torch.long)
-            else:
-                timestep = torch.full((batch_size,), 500.0, device=device, dtype=torch.float32)
+        def _make_inputs():
+            hidden_states = torch.randn(batch, seq_len, in_channels, dtype=dtype, device=device)
+            encoder_hidden_states = torch.randn(batch, txt_len, joint_attention_dim, dtype=dtype, device=device)
+            encoder_hidden_states_mask = torch.ones(batch, txt_len, dtype=torch.long, device=device)
+            timestep = torch.full((batch,), 0.5, dtype=dtype, device=device)
+            return hidden_states, encoder_hidden_states, encoder_hidden_states_mask, timestep
 
-            img_shapes = [(frames, h_patches, w_patches)] * batch_size
-            txt_seq_lens = [txt_len] * batch_size
+        hidden_states, encoder_hidden_states, encoder_hidden_states_mask, timestep = _make_inputs()
+        txt_seq_lens = [txt_len] * batch
 
-            guidance = None
-            if guidance_embeds:
-                guidance = torch.full((batch_size,), 3.5, device=device, dtype=torch.float32)
+        img_shapes_variants = [
+            [[(1, patch_h, patch_w)]] * batch,
+            [(1, patch_h, patch_w)] * batch,
+        ]
 
-            return (
-                hidden_states,
-                encoder_hidden_states,
-                encoder_hidden_states_mask,
-                timestep,
-                img_shapes,
-                txt_seq_lens,
-                guidance,
-            )
+        guidance_candidates = []
+        if guidance_embeds:
+            guidance_candidates.append(torch.full((batch,), 1000.0, dtype=dtype, device=device))
+        guidance_candidates.append(None)
+        if not guidance_embeds:
+            guidance_candidates.append(torch.full((batch,), 1000.0, dtype=dtype, device=device))
 
-        attempts = []
-        for hs_dtype in (dtype, torch.float32):
-            for ts_kind in ("float", "long"):
-                attempts.append((hs_dtype, ts_kind))
-
-        succeeded = False
         with torch.no_grad():
-            for hs_dtype, ts_kind in attempts:
+            for img_shapes in img_shapes_variants:
+                for guidance in guidance_candidates:
+                    try:
+                        model(
+                            hidden_states=hidden_states,
+                            encoder_hidden_states=encoder_hidden_states,
+                            encoder_hidden_states_mask=encoder_hidden_states_mask,
+                            timestep=timestep,
+                            img_shapes=img_shapes,
+                            txt_seq_lens=txt_seq_lens,
+                            guidance=guidance,
+                            return_dict=False,
+                        )
+                        return None
+                    except Exception:
+                        continue
+
+        with torch.no_grad():
+            for img_shapes in img_shapes_variants:
                 try:
-                    (
+                    model(
                         hidden_states,
                         encoder_hidden_states,
                         encoder_hidden_states_mask,
                         timestep,
                         img_shapes,
                         txt_seq_lens,
-                        guidance,
-                    ) = build_inputs(hs_dtype, ts_kind)
-
-                    kwargs = dict(
-                        hidden_states=hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        encoder_hidden_states_mask=encoder_hidden_states_mask,
-                        timestep=timestep,
-                        img_shapes=img_shapes,
-                        txt_seq_lens=txt_seq_lens,
-                        return_dict=False,
                     )
-                    if guidance is not None:
-                        kwargs["guidance"] = guidance
-
-                    model(**kwargs)
-                    succeeded = True
-                    break
+                    return None
                 except Exception:
                     continue
-
-        if not succeeded:
-            try:
-                pos_embed = getattr(model, "pos_embed", None)
-                if pos_embed is not None:
-                    try:
-                        pos_embed(
-                            [(frames, h_patches, w_patches)] * batch_size,
-                            [txt_len] * batch_size,
-                            device,
-                        )
-                    except Exception:
-                        pass
-
-                img_in = getattr(model, "img_in", None)
-                if img_in is not None:
-                    try:
-                        img_in(torch.randn(batch_size, img_seq_len, in_channels, device=device, dtype=dtype))
-                    except Exception:
-                        pass
-
-                txt_in = getattr(model, "txt_in", None)
-                txt_norm = getattr(model, "txt_norm", None)
-                if txt_norm is not None and txt_in is not None:
-                    try:
-                        t = torch.randn(batch_size, txt_len, joint_attention_dim, device=device, dtype=dtype)
-                        txt_in(txt_norm(t))
-                    except Exception:
-                        pass
-
-                time_text_embed = getattr(model, "time_text_embed", None)
-                if time_text_embed is not None:
-                    try:
-                        hs = torch.randn(batch_size, img_seq_len, in_channels, device=device, dtype=dtype)
-                        ts = torch.full((batch_size,), 500.0, device=device, dtype=torch.float32)
-                        if guidance_embeds:
-                            time_text_embed(
-                                ts,
-                                torch.full((batch_size,), 3.5, device=device, dtype=torch.float32),
-                                hs,
-                            )
-                        else:
-                            time_text_embed(ts, hs)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        if was_training:
-            try:
-                model.train()
-            except Exception:
-                pass
     except Exception:
         pass
     return None

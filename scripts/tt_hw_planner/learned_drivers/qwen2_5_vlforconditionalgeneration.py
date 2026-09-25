@@ -11,130 +11,125 @@ def driver(model, sample_input=None):
         import torch
 
         try:
-            device = next(model.parameters()).device
+            model.eval()
+        except Exception:
+            pass
+
+        try:
+            param = next(model.parameters())
+            device = param.device
+            model_dtype = param.dtype
         except Exception:
             device = torch.device("cpu")
-        try:
-            dtype = next(model.parameters()).dtype
-        except Exception:
-            dtype = torch.float32
+            model_dtype = torch.float32
 
-        config = getattr(model, "config", None)
-        text_config = getattr(config, "text_config", config) if config is not None else None
-        vision_config = getattr(config, "vision_config", None) if config is not None else None
+        cfg = getattr(model, "config", None)
 
-        def cfg_get(cfg, name, default):
-            try:
-                v = getattr(cfg, name, None)
-                return v if v is not None else default
-            except Exception:
-                return default
+        text_cfg = getattr(cfg, "text_config", cfg)
+        vision_cfg = getattr(cfg, "vision_config", cfg)
 
-        image_token_id = cfg_get(config, "image_token_id", cfg_get(config, "image_token_index", 151655))
-        vision_start_token_id = cfg_get(config, "vision_start_token_id", 151652)
-        vision_end_token_id = cfg_get(config, "vision_end_token_id", 151653)
-        vocab_size = cfg_get(text_config, "vocab_size", cfg_get(config, "vocab_size", 152064))
-        try:
-            vocab_size = int(vocab_size)
-        except Exception:
-            vocab_size = 152064
-        high = max(200, min(vocab_size - 1, 50000))
+        vocab_size = getattr(text_cfg, "vocab_size", None) or getattr(cfg, "vocab_size", 151936)
 
-        patch_size = cfg_get(vision_config, "patch_size", 14)
-        temporal_patch_size = cfg_get(vision_config, "temporal_patch_size", 2)
-        in_channels = cfg_get(vision_config, "in_channels", 3)
-        merge_size = cfg_get(vision_config, "spatial_merge_size", 2)
+        image_token_id = getattr(cfg, "image_token_id", None)
+        if image_token_id is None:
+            image_token_id = getattr(text_cfg, "image_token_id", 151655)
+        video_token_id = getattr(cfg, "video_token_id", None)
+        if video_token_id is None:
+            video_token_id = getattr(text_cfg, "video_token_id", 151656)
+        vision_start_token_id = getattr(cfg, "vision_start_token_id", None)
+        if vision_start_token_id is None:
+            vision_start_token_id = getattr(text_cfg, "vision_start_token_id", 151652)
+        vision_end_token_id = getattr(cfg, "vision_end_token_id", None)
+        if vision_end_token_id is None:
+            vision_end_token_id = getattr(text_cfg, "vision_end_token_id", 151653)
+
+        patch_size = getattr(vision_cfg, "patch_size", 14)
+        temporal_patch_size = getattr(vision_cfg, "temporal_patch_size", 2)
+        in_channels = getattr(vision_cfg, "in_channels", None)
+        if in_channels is None:
+            in_channels = getattr(vision_cfg, "in_chans", 3)
+        spatial_merge_size = getattr(vision_cfg, "spatial_merge_size", None)
+        if spatial_merge_size is None:
+            spatial_merge_size = getattr(cfg, "spatial_merge_size", 2)
 
         grid_t, grid_h, grid_w = 1, 4, 4
         num_patches = grid_t * grid_h * grid_w
-        patch_dim = int(in_channels) * int(temporal_patch_size) * int(patch_size) * int(patch_size)
+        feature_dim = in_channels * temporal_patch_size * patch_size * patch_size
 
-        pixel_values = torch.randn(num_patches, patch_dim, dtype=dtype, device=device)
-        image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device=device)
-
-        num_image_tokens = (grid_h // int(merge_size)) * (grid_w // int(merge_size)) * grid_t
-        if num_image_tokens <= 0:
-            num_image_tokens = 1
-
-        text_ids_before = torch.randint(low=1, high=high, size=(3,), dtype=torch.long)
-        text_ids_after = torch.randint(low=1, high=high, size=(3,), dtype=torch.long)
-
-        input_ids = (
-            torch.cat(
-                [
-                    text_ids_before,
-                    torch.tensor([vision_start_token_id], dtype=torch.long),
-                    torch.full((num_image_tokens,), image_token_id, dtype=torch.long),
-                    torch.tensor([vision_end_token_id], dtype=torch.long),
-                    text_ids_after,
-                ]
-            )
-            .unsqueeze(0)
-            .to(device)
+        pixel_dtype = (
+            model_dtype
+            if model_dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+            else torch.float32
         )
-        attention_mask = torch.ones_like(input_ids)
 
-        with torch.no_grad():
+        try:
+            pixel_values = torch.rand(num_patches, feature_dim, dtype=pixel_dtype, device=device)
+            image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device=device)
+        except Exception:
+            pixel_values = None
+            image_grid_thw = None
+
+        num_merged_image_tokens = max(1, (grid_t * grid_h * grid_w) // (spatial_merge_size * spatial_merge_size))
+
+        def _rand_text_ids(n):
+            safe_high = max(64, min(int(vocab_size) - 1, 100000))
+            return torch.randint(low=10, high=safe_high, size=(1, n), dtype=torch.long, device=device)
+
+        # Try full multimodal forward (text + image) so both text-side and
+        # vision-side submodules get exercised in a single, valid pass.
+        did_full_pass = False
+        if pixel_values is not None and image_grid_thw is not None:
             try:
-                model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
-                    use_cache=False,
-                )
+                prefix = _rand_text_ids(6)
+                suffix = _rand_text_ids(6)
+                vision_start = torch.tensor([[vision_start_token_id]], dtype=torch.long, device=device)
+                vision_end = torch.tensor([[vision_end_token_id]], dtype=torch.long, device=device)
+                image_tokens = torch.full((1, num_merged_image_tokens), image_token_id, dtype=torch.long, device=device)
+
+                input_ids = torch.cat([prefix, vision_start, image_tokens, vision_end, suffix], dim=1)
+                attention_mask = torch.ones_like(input_ids)
+
+                with torch.no_grad():
+                    model.forward(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                        use_cache=False,
+                    )
+                did_full_pass = True
+            except Exception:
+                did_full_pass = False
+
+        # Directly exercise the vision tower via its own public API too, in
+        # case the main forward routes vision processing differently from
+        # what hook installation expected.
+        if pixel_values is not None and image_grid_thw is not None:
+            try:
+                with torch.no_grad():
+                    if hasattr(model, "get_image_features"):
+                        model.get_image_features(pixel_values, image_grid_thw)
             except Exception:
                 pass
 
+        # Fallback / additional pass: pure text-only forward so decoder-side
+        # components still fire even if the vision path above failed.
+        if not did_full_pass:
             try:
-                model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw)
+                input_ids = _rand_text_ids(16)
+                attention_mask = torch.ones_like(input_ids)
+                with torch.no_grad():
+                    model.forward(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                    )
             except Exception:
                 pass
 
-            visual = None
-            try:
-                visual = getattr(model, "visual", None)
-                if visual is None:
-                    inner = getattr(model, "model", None)
-                    if inner is not None:
-                        visual = getattr(inner, "visual", None)
-            except Exception:
-                visual = None
-
-            if visual is not None:
-                try:
-                    visual(pixel_values, grid_thw=image_grid_thw)
-                except Exception:
-                    try:
-                        visual(hidden_states=pixel_values, grid_thw=image_grid_thw)
-                    except Exception:
-                        try:
-                            visual(pixel_values, image_grid_thw)
-                        except Exception:
-                            pass
-
-            try:
-                text_only_ids = torch.randint(low=1, high=high, size=(1, 8), dtype=torch.long).to(device)
-                text_attn = torch.ones_like(text_only_ids)
-                model(input_ids=text_only_ids, attention_mask=text_attn, use_cache=False)
-            except Exception:
-                pass
-
-            try:
-                get_decoder = getattr(model, "get_decoder", None)
-                if callable(get_decoder):
-                    decoder = get_decoder()
-                    if decoder is not None:
-                        dec_ids = torch.randint(low=1, high=high, size=(1, 6), dtype=torch.long).to(device)
-                        try:
-                            decoder(input_ids=dec_ids, attention_mask=torch.ones_like(dec_ids))
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+        return None
     except Exception:
-        pass
-    return None
+        return None
 
 
 @register_capture_driver(matcher=lambda m: type(m).__name__ == "Qwen2_5_VLForConditionalGeneration")
