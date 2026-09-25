@@ -26,6 +26,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import ttl_swiglu
 
 # SDPA takes bfloat16 and nothing wider (`sdpa_device_operation.cpp:43`), and the KV cache is read
 # by the same op family, so q/k/v and the cache are bf16 while the residual stream stays float32.
@@ -475,9 +476,17 @@ def _swiglu_pairs(gate, up, tile=32):
     return pairs.reshape(rows, 2 * n).contiguous()
 
 
-def _fused_swiglu(h, w_gu):
+def _ttl_swiglu_weights(gate, up, device):
+    if not ttl_swiglu.enabled():
+        return None
+    return tuple(_from_torch(w.contiguous(), device, dtype=ttnn.bfloat16) for w in (gate, up))
+
+
+def _fused_swiglu(h, w_gu, w_ttl=None):
     """Prefill `silu(h @ Wg) * (h @ Wu)` as ONE matmul: no gate/up tensors are written and there
     is no separate multiply pass over them."""
+    if w_ttl is not None and ttl_swiglu.supports(h, w_ttl[0]):
+        return ttl_swiglu.apply(h, *w_ttl)
     grid = h.device().compute_with_storage_grid_size()
     rows = 1
     for d in list(h.shape)[:-1]:
@@ -551,6 +560,11 @@ def build(device, torch_module):
         ),
         device,
         dtype=ttnn.bfloat4_b,
+    )
+    w_ttl = _ttl_swiglu_weights(
+        mlp.gate_proj.weight.detach().float().transpose(0, 1) * g_post_t,
+        mlp.up_proj.weight.detach().float().transpose(0, 1) * g_post_t,
+        device,
     )
     # bf8_b halves the weight both the prefill (LoFi) and decode down projections unpack.
     w_down = _from_torch(mlp.down_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
@@ -748,7 +762,7 @@ def build(device, torch_module):
                 input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             )
         else:
-            gated = _fused_swiglu(hn, w_gu)
+            gated = _fused_swiglu(hn, w_gu, w_ttl)
         ttnn.deallocate(hn)
         # Prefill hands the down projection over in bf16, as the composed kinds' mlp and every wo
         # already do; the residual it is added into stays float32.

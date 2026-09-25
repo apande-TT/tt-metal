@@ -20,6 +20,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import ttl_swiglu
 
 # `ttnn.linear`/`ttnn.matmul` on their DEFAULTS leave `fp32_dest_acc_en` off, so the accumulator
 # rounds to bfloat16 at every step even when the activations are float32. The consumer of this
@@ -324,9 +325,17 @@ def _swiglu_pairs(gate, up, tile=32):
     return pairs.reshape(rows, 2 * n).contiguous()
 
 
-def _fused_swiglu(h, w_gu):
+def _ttl_swiglu_weights(gate, up, device):
+    if not ttl_swiglu.enabled():
+        return None
+    return tuple(_from_torch(w.contiguous(), device, dtype=ttnn.bfloat16) for w in (gate, up))
+
+
+def _fused_swiglu(h, w_gu, w_ttl=None):
     """Prefill `silu(h @ Wg) * (h @ Wu)` as ONE matmul: no gate/up tensors are written and there
     is no separate multiply pass over them."""
+    if w_ttl is not None and ttl_swiglu.supports(h, w_ttl[0]):
+        return ttl_swiglu.apply(h, *w_ttl)
     grid = h.device().compute_with_storage_grid_size()
     rows = 1
     for d in list(h.shape)[:-1]:
@@ -365,16 +374,22 @@ def build(device, torch_module):
     # activation keeps the separate pair above.
     w_gu = _from_torch(
         _swiglu_pairs(
-            mlp.gate_proj.weight.detach().float().transpose(0, 1), mlp.up_proj.weight.detach().float().transpose(0, 1)
+            mlp.gate_proj.weight.detach().float().transpose(0, 1),
+            mlp.up_proj.weight.detach().float().transpose(0, 1),
         ),
         device,
         dtype=ttnn.bfloat4_b,
+    )
+    w_ttl = _ttl_swiglu_weights(
+        mlp.gate_proj.weight.detach().float().transpose(0, 1),
+        mlp.up_proj.weight.detach().float().transpose(0, 1),
+        device,
     )
 
     def mlp_forward(x, **kwargs):
         h, lead, seq, rank = _view4(x, dim)
         if h.dtype == ttnn.bfloat16 and lead * seq >= 256:
-            gated = _fused_swiglu(h, w_gu)
+            gated = _fused_swiglu(h, w_gu, w_ttl)
         else:
             gated = ttnn.multiply(
                 _lin(h, w_gate, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
