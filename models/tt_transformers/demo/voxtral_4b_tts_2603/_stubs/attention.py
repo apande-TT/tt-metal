@@ -493,8 +493,16 @@ def build(device, torch_module):
         q = _head_split(0, q_width, groups)
         if q_rows != groups:
             q = ttnn.pad(q, [(0, 0), (0, 0), (0, q_rows - groups), (0, 0)], 0.0)
-        k = _head_split(q_width, kv_width, 1)
-        v = _head_split(q_width + kv_width, kv_width, 1)
+
+        # k and v go straight into the cache's own `[1, B, n_kv, head_dim]` layout: the n_kv heads
+        # share ONE tile per user there, where `[B, n_kv, 1, head_dim]` pads every head to its own
+        # 32-row tile and k's RoPE would run on 32x the data.
+        def _cache_split(start):
+            part = ttnn.slice(rows, [0, 0, 0, start], [1, 1, batch, start + kv_width])
+            return ttnn.to_layout(ttnn.reshape(part, [1, batch, n_kv_heads, head_dim]), ttnn.TILE_LAYOUT)
+
+        k = _cache_split(q_width)
+        v = _cache_split(q_width + kv_width)
         ttnn.deallocate(rows)
         if position_embeddings is not None:
             cos, sin = position_embeddings
@@ -509,12 +517,12 @@ def build(device, torch_module):
         # `paged_update_cache` wants the decode layout `[1, B, n_kv, head_dim]` AND it wants that
         # tensor HEIGHT-SHARDED, one user per core -- it is part of the decode op set even though
         # the rest of that set is gone from this path ("Expect input_tensor to be sharded"). The
-        # head split above is `[B, n_kv, 1, head_dim]`, the same elements in the same order.
+        # k/v split above already produced that layout.
         for slot, tensor in (("k", k), ("v", v)):
             ttnn.experimental.paged_update_cache(
                 kv_cache[slot],
                 ttnn.to_memory_config(
-                    ttnn.reshape(tensor, [1, batch, n_kv_heads, head_dim]),
+                    tensor,
                     _decode_shard(tensor.device(), batch, head_dim),
                 ),
                 update_idxs=idxs,
