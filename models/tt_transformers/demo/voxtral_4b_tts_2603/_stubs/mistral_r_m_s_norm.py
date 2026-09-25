@@ -97,7 +97,7 @@ def build(device, torch_module):
         x = ttnn.reshape(hidden_states, [lead, 1, seq, dim])
         if x.dtype != ttnn.float32:
             x = ttnn.typecast(x, ttnn.float32)
-        scale = ttnn.rsqrt(ttnn.add(_sq_mean(x), eps))
+        scale = ttnn.add(_sq_mean(x), eps, activations=[ttnn.UnaryOpType.RSQRT])
         if unit:
             out = ttnn.multiply(x, scale, dtype=dtype or ttnn.float32)
         else:

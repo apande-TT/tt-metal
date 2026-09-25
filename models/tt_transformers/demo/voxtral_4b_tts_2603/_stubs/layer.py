@@ -243,7 +243,7 @@ def _rms_norm(x, gamma, eps, dtype=None):
     A zero pad row stays zero: `mean(x^2)` is 0 and `0 * rsqrt(eps)` is 0, so an off-tile
     sequence padded up to a tile multiple neither NaNs nor leaks into a real row.
     """
-    scale = ttnn.rsqrt(ttnn.add(_sq_mean(x), eps))
+    scale = ttnn.add(_sq_mean(x), eps, activations=[ttnn.UnaryOpType.RSQRT])
     if gamma is None:  # folded into the consuming weights
         return ttnn.multiply(x, scale, dtype=dtype or ttnn.float32)
     return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
