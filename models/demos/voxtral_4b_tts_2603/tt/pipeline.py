@@ -455,11 +455,13 @@ class VoxtralTTSPipeline:
         return {"input_ids": input_ids, "audio_mask": audio_mask, "voice_embedding": voice_embedding}
 
     def prefill_trace_setup(self, inputs):
-        capacity = self.trace_capacity
         input_ids = inputs["input_ids"]
         batch, real_len = int(input_ids.shape[0]), int(input_ids.shape[1])
-        if real_len > capacity:
-            raise ValueError(f"prompt is {real_len} tokens, past the pinned capacity {capacity}")
+        if real_len > self.trace_capacity:
+            raise ValueError(f"prompt is {real_len} tokens, past the pinned capacity {self.trace_capacity}")
+        # Captured at the request's own tile-rounded length (the bucket `prefill_voiced` pads to on
+        # the untraced path); the pinned capacity is only the ceiling a bucket may reach.
+        capacity = _tile_ceil(real_len)
 
         padded = torch.zeros(batch, capacity, dtype=input_ids.dtype)
         padded[:, :real_len] = input_ids
