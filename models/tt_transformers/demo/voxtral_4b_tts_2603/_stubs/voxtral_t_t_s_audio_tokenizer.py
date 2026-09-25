@@ -157,18 +157,18 @@ def _fold_linear(x, w, **kwargs):
     """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
 
     A `[B, 1, T, K]` activation against a 2-D weight runs as B separate matmuls that each re-read
-    the whole weight; `[1, 1, B*T, K]` is one matmul. Only when T is tile-aligned, where the fold
-    is a free view. Tall results get the same hand-sized full-grid config the part-chain
-    stubs' `_lin` uses.
+    the whole weight; `[1, 1, B*T, K]` is one matmul. A T that is not tile-aligned makes the fold a
+    real relayout each way, still far cheaper than re-reading the weight B times. Tall results get
+    the same hand-sized full-grid config the part-chain stubs' `_lin` uses.
     """
     shape = [int(d) for d in x.shape]
     lead = 1
     for d in shape[:-2]:
         lead *= d
-    if lead == 1 or shape[-2] % 32 != 0:
+    if lead == 1:
         return ttnn.linear(x, w, **kwargs)
     rows = lead * shape[-2]
-    if rows >= 256 and "program_config" not in kwargs:
+    if rows >= 256 and rows % 32 == 0 and "program_config" not in kwargs:
         cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
             kwargs["program_config"] = cfg

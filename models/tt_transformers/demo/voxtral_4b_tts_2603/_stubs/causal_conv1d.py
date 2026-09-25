@@ -86,14 +86,14 @@ def _tap_linear(x, w, **kwargs):
     """`ttnn.linear` for one tap with the leading batch folded into M, so the tap streams ONCE.
 
     A `[B, 1, L, C]` slice against a 2-D tap runs as B separate `L x C x C_out` matmuls that each
-    re-read the whole tap; `[1, 1, B*L, C]` is one matmul. Only when L is tile-aligned, where the
-    fold is a free view.
+    re-read the whole tap; `[1, 1, B*L, C]` is one matmul. An L that is not tile-aligned makes the
+    fold a real relayout each way, still far cheaper than re-reading the tap B times.
     """
     shape = [int(d) for d in x.shape]
     lead = 1
     for d in shape[:-2]:
         lead *= d
-    if lead == 1 or shape[-2] % 32 != 0:
+    if lead == 1:
         return ttnn.linear(x, w, **kwargs)
     y = ttnn.linear(ttnn.reshape(x, [1, 1, lead * shape[-2], shape[-1]]), w, **kwargs)
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
