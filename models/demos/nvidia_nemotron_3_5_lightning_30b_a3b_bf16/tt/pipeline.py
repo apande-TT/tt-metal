@@ -55,6 +55,7 @@ from pathlib import Path
 import torch
 
 import ttnn
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm, _ssm_cache
 from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import nemotron_h_attention as _attn_stub
 from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import nemotron_h_block as _block_stub
 from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import nemotron_h_experts as _experts_stub
@@ -159,12 +160,20 @@ def _reshape_rm(t, shape):
     graduated stubs use this same pattern for their head reshapes.
     """
     was_tile = t.layout == ttnn.TILE_LAYOUT
+    old = [int(v) for v in t.shape]
+    if was_tile and shape[-1] == old[-1] and (shape[-2] == old[-2] or (shape[-2] % 32 == 0 and old[-2] % 32 == 0)):
+        return ttnn.reshape(t, list(shape))  # rows stay tile-aligned: a view, no round trip
     if was_tile:
         t = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
     t = ttnn.reshape(t, list(shape))
     if was_tile:
         t = ttnn.to_layout(t, ttnn.TILE_LAYOUT)
     return t
+
+
+def _f32(t):
+    """t as fp32 -- without launching a copy when it already is."""
+    return t if t.dtype == ttnn.float32 else ttnn.typecast(t, ttnn.float32)
 
 
 def _dup(t):
@@ -246,6 +255,7 @@ class TtNemotronHLayer:
         elif variant in ("MOE_B", "MOE_C"):
             self.router = _router_stub.build(device, mixer.gate)
             self.experts = _experts_stub.build(device, mixer.experts)
+            self.experts.top_k = int(mixer.top_k)  # enables its sparse prefill path
             self.stub_names += ["nemotron_h_topk_router", "nemotron_h_experts"]
             self.top_k = int(mixer.top_k)
             self.n_experts = int(mixer.n_routed_experts)
@@ -266,11 +276,11 @@ class TtNemotronHLayer:
                 tp = _mesh_shape(device)[-1] if pipeline.sharded else 1
                 self._sh_tp = pipeline.sharded and tp > 1 and up.shape[1] % tp == 0
                 if self._sh_tp:
-                    self._sh_up = _shard(device, up, 1)  # column-parallel
-                    self._sh_dn = _shard(device, dn, 0)  # row-parallel
+                    self._sh_up = _shard(device, up, 1, dtype=ttnn.bfloat8_b)  # column-parallel
+                    self._sh_dn = _shard(device, dn, 0, dtype=ttnn.bfloat8_b)  # row-parallel
                 else:
-                    self._sh_up = _replicate(device, up)
-                    self._sh_dn = _replicate(device, dn)
+                    self._sh_up = _replicate(device, up, dtype=ttnn.bfloat8_b)
+                    self._sh_dn = _replicate(device, dn, dtype=ttnn.bfloat8_b)
         else:
             raise ValueError(f"unknown variant {variant}")
 
@@ -306,17 +316,13 @@ class TtNemotronHLayer:
         ttnn.deallocate(logits)
         choice = ttnn.add(scores, self._bias)
 
-        bb = ttnn.reshape(choice, [1, T, 1, E])
-        b_full = ttnn.repeat(bb, [1, 1, E, 1])  # [.,.,i,j] = choice_j
+        bb = ttnn.reshape(choice, [1, T, 1, E])  # [.,.,0,j] = choice_j
+        a_col = ttnn.transpose(bb, 2, 3)  # [.,.,i,0] = choice_i
+        gt = ttnn.gt(bb, a_col, dtype=ttnn.bfloat8_b)  # broadcast to [.,.,i,j] = choice_j > choice_i, no E x E repeat
         ttnn.deallocate(bb)
-        a_full = ttnn.transpose(b_full, 2, 3)  # [.,.,i,j] = choice_i
-        gt = ttnn.gt(b_full, a_full)
-        ttnn.deallocate(b_full)
-        ttnn.deallocate(a_full)
-        gt_f = ttnn.typecast(gt, ttnn.float32)
+        ttnn.deallocate(a_col)
+        rank = ttnn.sum(gt, dim=3)
         ttnn.deallocate(gt)
-        rank = ttnn.sum(gt_f, dim=3)
-        ttnn.deallocate(gt_f)
         if list(rank.shape)[-1] != E:
             rank = ttnn.reshape(rank, [1, T, E])
         mask = ttnn.lt(rank, float(top_k))
@@ -344,60 +350,75 @@ class TtNemotronHLayer:
 
         if self.variant == "MAMBA_A":
             _invocation.record("nemotron_h_block")
-            return self.block(x)  # stub owns norm + mixer + residual
+            return self.block(x, dtype=ttnn.float32)  # stub owns norm + mixer + residual; fp32 residual stream
 
         # The norm stub deallocates its own working tensor, which IS the caller's
         # tensor when the input already arrives as fp32 (its `_fp32` is a no-op
         # then). The residual stream is fp32, so hand it a copy -- otherwise the
         # residual `x` is freed under us before the add below.
         _invocation.record("nemotron_h_r_m_s_norm")
-        h = self.norm(_dup(x))
+        h = self.norm(_dup(x), dtype=ttnn.float32)  # every mixer below upcasts its input to fp32 anyway
 
         if self.variant in ("MAMBA_B", "MAMBA_C"):
             _invocation.record("nemotron_h_mamba2_mixer")
-            y = self.mixer(h)
+            y = self.mixer(h, dtype=ttnn.float32)  # feeds the fp32 residual add
         elif self.variant == "ATTN":
             _invocation.record("nemotron_h_attention")
-            y = self.mixer(h)
+            y = self.mixer(h, dtype=ttnn.float32)
         elif self.variant == "MOE_A":
             _invocation.record("nemotron_h_mo_e")
+            # tokens are independent here: run them as one (1, B*T) row block so a
+            # short prompt does not pad every sample's T rows up to a 32-row tile
+            B, T, hid = int(h.shape[0]), int(h.shape[1]), int(h.shape[2])
+            if B > 1:
+                h = _reshape_rm(h, [1, B * T, hid])
             y = self.mixer(h)
+            if B > 1:
+                y = _reshape_rm(y, [B, T, hid])
         else:  # MOE_B / MOE_C
             B, T = int(h.shape[0]), int(h.shape[1])
             hid = int(h.shape[2])
             h_flat = _reshape_rm(h, [B * T, hid])  # tokens are independent here
             W, ntok = self._route(h_flat)
 
+            # routed and shared expert both TP-partial: sum them, all_reduce once
+            shared_tp = self.shared._shard if self.variant == "MOE_B" else self._sh_tp
+            merge = self.experts._shard and shared_tp
+
             _invocation.record("nemotron_h_experts")
-            routed = self.experts(h_flat, routing_dense=W)  # (tokens, hidden)
+            routed = self.experts(h_flat, routing_dense=W, reduce=not merge)  # (tokens, hidden)
             routed = _reshape_rm(routed, [B, T, hid])
 
             if self.variant == "MOE_B":
                 _invocation.record("nemotron_h_m_l_p")
-                shared = self.shared(h)
+                shared = _dram_mm.from_rows(self.shared(_dram_mm.as_rows(h), reduce=not merge), B, T)
             else:
                 # upcast first: the norm stub hands back bf16, and feeding a
                 # bf16 activation into these fp32 weights is what made this
                 # variant the worst layer in the chain (0.971 vs 0.990 for the
                 # MLP-stub variant, which upcasts internally).
-                hh = ttnn.typecast(h, ttnn.float32) if h.dtype != ttnn.float32 else h
+                hh = _f32(h)
+                hh = _dram_mm.as_rows(hh)  # tokens are independent: one 2-D matmul
                 up = ttnn.matmul(hh, self._sh_up, compute_kernel_config=ckc)
                 _invocation.record("re_l_u_squared_activation")
                 act = self.relu2(up)
                 ttnn.deallocate(up)
                 shared = ttnn.matmul(act, self._sh_dn, compute_kernel_config=ckc)
                 ttnn.deallocate(act)
-                if self._sh_tp:
+                if self._sh_tp and not merge:
                     shared = ttnn.all_reduce(shared, cluster_axis=1, topology=ttnn.Topology.Linear)
+                shared = _dram_mm.from_rows(shared, B, T)
 
-            y = ttnn.add(ttnn.typecast(routed, ttnn.float32), ttnn.typecast(shared, ttnn.float32))
+            y = ttnn.add(_f32(routed), shared, dtype=ttnn.float32)  # mixed-dtype add: no typecast pass
+            if merge:
+                y = ttnn.all_reduce(y, cluster_axis=1, topology=ttnn.Topology.Linear)
 
         # Keep the residual stream in fp32. The graduated stubs each return
         # bf16, but truncating the RESIDUAL too costs ~3 decimal digits per
         # layer and compounds: measured 2026-09-06, a bf16 residual gave e2e
         # PCC 0.947 at depth 7 where the fp32 residual clears the gate. The HF
         # reference runs the whole block in fp32, so this matches it.
-        return ttnn.add(ttnn.typecast(x, ttnn.float32), ttnn.typecast(y, ttnn.float32))
+        return ttnn.add(_f32(x), y, dtype=ttnn.float32)  # bf16 y read as-is: no typecast pass
 
 
 # --------------------------------------------------------------------------- #
@@ -474,7 +495,14 @@ class NemotronHPipeline:
         # lm_head in fp32: HF computes `self.lm_head(...).float()`, and a bf16
         # head visibly costs final-logit PCC.
         lm = model.lm_head.weight.detach().float().t().contiguous()  # (hidden, vocab)
-        self.lm_head_w = _replicate(device, lm, dtype=ttnn.bfloat8_b)
+        # vocab-parallel on the TP axis: each chip streams half the ~350 MB head
+        # and the logits are all-gathered back before sampling
+        self._lm_tp = self.sharded and lm.shape[1] % (_mesh_shape(device)[-1] * ttnn.TILE_SIZE) == 0
+        # bf4_b: the head is pure weight streaming at decode (M = one tile row)
+        if self._lm_tp:
+            self.lm_head_w = _shard(device, lm, 1, dtype=ttnn.bfloat4_b)
+        else:
+            self.lm_head_w = _replicate(device, lm, dtype=ttnn.bfloat4_b)
         self.vocab_size = int(lm.shape[1])
         self.hidden_size = int(lm.shape[0])
 
@@ -528,27 +556,37 @@ class NemotronHPipeline:
         h = ttnn.embedding(ids_tt, self.embed_w)
         return ttnn.to_layout(h, ttnn.TILE_LAYOUT)
 
-    def forward_hidden(self, ids_tt):
-        """ids (B, T) -> final-normed hidden states (B, T, H). Pure ttnn."""
+    def forward_hidden(self, ids_tt, token_rows=False):
+        """ids (B, T) -> final-normed hidden states (B, T, H). Pure ttnn.
+
+        token_rows (decode, T == 1): carry the B tokens as ONE (1, B, H) row
+        block. As (B, 1, H) every sample pads its single row to a 32-row tile,
+        so each op does ~32x the work; the stateful stubs split back to
+        per-sample heads themselves."""
         h = self.embed(ids_tt)
+        if token_rows:
+            h = _reshape_rm(h, [1, int(h.shape[0]) * int(h.shape[1]), int(h.shape[2])])
         for layer in self.layers:
             h = layer(h)
         _invocation.record("nemotron_h_r_m_s_norm")
-        return self.final_norm(h)
+        return self.final_norm(h, dtype=ttnn.float32)  # the fp32 lm_head input
 
-    def forward_logits(self, ids_tt, last_only=True):
-        """ids (B, T) -> lm_head logits. (B, 1, vocab) when last_only."""
-        h = self.forward_hidden(ids_tt)
-        if last_only:
+    def forward_logits(self, ids_tt, last_only=True, token_rows=False):
+        """ids (B, T) -> lm_head logits: (1, B, vocab) for the last positions
+        (last_only, or token_rows decode -- see forward_hidden), else (B, T, vocab)."""
+        h = self.forward_hidden(ids_tt, token_rows=token_rows)
+        if last_only and not token_rows:
             B, T = int(h.shape[0]), int(h.shape[1])
             h = ttnn.slice(h, [0, T - 1, 0], [B, T, self.hidden_size])
+            # the B last positions as one (1, B, H) row block, not B padded tiles
+            h = _reshape_rm(h, [1, B, self.hidden_size])
         if h.dtype != ttnn.float32:
             h = ttnn.typecast(h, ttnn.float32)
         cg = self.device.compute_with_storage_grid_size()
         core_grid = ttnn.CoreGrid(y=cg.y, x=cg.x)
         num_cores = cg.x * cg.y
         k_tiles = self.hidden_size // 32
-        n_tiles = self.vocab_size // 32
+        n_tiles = int(self.lm_head_w.shape[-1]) // 32  # local (per-chip) vocab
         if n_tiles % num_cores == 0:
             per_core_n = n_tiles // num_cores
             out_sub_w = max(d for d in range(1, min(4, per_core_n) + 1) if per_core_n % d == 0)
@@ -563,13 +601,71 @@ class NemotronHPipeline:
                 fused_activation=None,
                 mcast_in0=True,
             )
-            return ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, program_config=pc)
-        return ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, core_grid=core_grid)
+            out = ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, program_config=pc)
+        elif int(h.shape[-2]) <= _dram_mm.TILE:  # one tile row: spread the vocab over the full grid
+            pc = _dram_mm.mcast1d_config(self.device, self.hidden_size, int(self.lm_head_w.shape[-1]))
+            out = ttnn.matmul(
+                h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, program_config=pc, dtype=ttnn.bfloat16
+            )  # bf16 logits: half the all_gather + untilize + argmax traffic per token
+        else:
+            out = ttnn.matmul(h, self.lm_head_w, compute_kernel_config=self.lm_head_ckc, core_grid=core_grid)
+        if self._lm_tp:
+            out = ttnn.all_gather(out, dim=-1, cluster_axis=1)
+        return out
 
     def _ids_to_device(self, ids):
         t = ids.to(torch.int32)
         kw = {"mesh_mapper": ttnn.ReplicateTensorToMesh(self.device)} if _is_mesh(self.device) else {}
         return ttnn.from_torch(t, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device, **kw)
+
+    # ----------------------------------------------------------------- #
+    #  cached decode: prefill seeds per-layer state, then 1 token per step
+    # ----------------------------------------------------------------- #
+    def _set_cache_mode(self, mode):
+        """Route every stateful stub (Mamba2 mixers / block, attention) into
+        "fill", "decode" or the plain stateless forward (None)."""
+        for layer in self.layers:
+            for attr in ("block", "mixer"):
+                m = getattr(layer, attr, None)
+                if m is not None and layer.variant in ("MAMBA_A", "MAMBA_B", "MAMBA_C", "ATTN"):
+                    m._cache_mode = mode
+
+    def _greedy_ids(self, logits):
+        """(B,1,vocab) or (1,B,vocab) logits -> (B,1) uint32 ROW_MAJOR next ids, on device."""
+        B = int(logits.shape[0]) * int(logits.shape[1])
+        nxt = ttnn.argmax(ttnn.untilize(logits, use_multicore=True), dim=-1)
+        nxt = ttnn.reshape(ttnn.to_layout(nxt, ttnn.ROW_MAJOR_LAYOUT), [B, 1])
+        return ttnn.typecast(nxt, ttnn.uint32)
+
+    def prefill_fill(self, input_ids):
+        """Full-prompt forward that seeds every layer's decode state and the
+        next-token buffer. Re-running it resets the state IN PLACE, so a
+        captured decode trace stays valid. Returns the last-position logits."""
+        self._set_cache_mode("fill")
+        try:
+            logits = self.forward_logits(self._ids_to_device(input_ids), last_only=True)
+        finally:
+            self._set_cache_mode(None)
+        nxt = self._greedy_ids(logits)
+        if "dec_ids" in self._persistent:
+            ttnn.copy(nxt, self._persistent["dec_ids"])
+            ttnn.deallocate(nxt)
+        else:
+            self._persistent["dec_ids"] = nxt
+        return logits
+
+    def _decode_token(self):
+        """One cached decode step: consume dec_ids, advance every layer's state,
+        write the greedy next id back into dec_ids. Returns (1,B,vocab) logits."""
+        self._set_cache_mode("decode")
+        try:
+            logits = self.forward_logits(self._persistent["dec_ids"], token_rows=True)
+        finally:
+            self._set_cache_mode(None)
+        nxt = self._greedy_ids(logits)
+        ttnn.copy(nxt, self._persistent["dec_ids"])
+        ttnn.deallocate(nxt)
+        return logits
 
     # ----------------------------------------------------------------- #
     #  Call 1 -- text generation.  THE task entrypoint.
@@ -590,25 +686,18 @@ class NemotronHPipeline:
         N = max_new_tokens if max_new_tokens is not None else self.decode_cap(input_ids.shape[1])
 
         B = int(input_ids.shape[0])
-        ids_tt = self._ids_to_device(input_ids)
         seq = input_ids.clone()
         finished = torch.zeros(B, dtype=torch.bool)
         step_logits = []
 
+        logits = self.prefill_fill(input_ids)
         for step in range(N):
-            logits = self.forward_logits(ids_tt, last_only=True)  # (B,1,vocab) on device
-            logits_rm = ttnn.untilize(logits, use_multicore=True)
-            nxt = ttnn.argmax(logits_rm, dim=-1)  # on-device greedy pick, multicore (ROW_MAJOR last-dim)
-            ttnn.deallocate(logits_rm)
+            if step > 0:
+                logits = self._decode_token()
             step_logits.append(_first_shard(logits).reshape(B, -1)[:, : self.vocab_size].float())
             ttnn.deallocate(logits)
 
-            nxt_rm = ttnn.to_layout(nxt, ttnn.ROW_MAJOR_LAYOUT)
-            nxt_rm = ttnn.reshape(nxt_rm, [B, 1])
-            nxt_rm = ttnn.typecast(nxt_rm, ttnn.uint32)
-            ids_tt = ttnn.concat([ids_tt, nxt_rm], dim=1)
-
-            tok = _first_shard(nxt_rm).reshape(B).to(torch.int64)
+            tok = _first_shard(self._persistent["dec_ids"]).reshape(B).to(torch.int64)
             seq = torch.cat([seq, tok.reshape(B, 1)], dim=1)
             finished |= torch.tensor([int(t) in stop_ids for t in tok.tolist()])
             if progress:
@@ -636,13 +725,11 @@ class NemotronHPipeline:
     def decode_cap(self, prompt_len):
         """Safety cap for the stop-token rule.
 
-        The graduated stubs are STATELESS full-sequence bodies (no KV / SSM
-        cache), so step k recomputes the whole prefix and decode is O(N^2) in
-        tokens. TT_E2E_MAX_NEW_TOKENS (default 16) is that hardware-forced
-        bound, clamped by the config's own context limit.
+        TT_E2E_MAX_NEW_TOKENS (default 16), clamped by the config's context
+        limit and by the attention KV cache's capacity.
         """
         env = int(os.environ.get("TT_E2E_MAX_NEW_TOKENS", "16"))
-        ctx = int(self.config.max_position_embeddings) - int(prompt_len)
+        ctx = min(int(self.config.max_position_embeddings), _ssm_cache.KV_CAPACITY) - int(prompt_len)
         return max(1, min(env, ctx))
 
     # ----------------------------------------------------------------- #
@@ -753,32 +840,27 @@ class NemotronHPipeline:
         return int(self.batch)
 
     def decode_prefill(self, inputs):
-        """AR contract: seed the resident decode state.
-
-        NOTE, honestly: the graduated stubs are stateless full-sequence bodies
-        with no KV / SSM cache to seed, so "resident state" here is the pinned
-        capacity-C id buffer that a decode step reads and never rebuilds. There
-        is no cache to recompute, so the decode contract's "reads them, never
-        recomputes" holds trivially.
-        """
+        """AR contract: seed the resident decode state (Mamba conv/SSM state,
+        attention K/V cache, next-token ids) from the prompt."""
         return self.decode_trace_setup(inputs)
 
     def decode_trace_setup(self, inputs):
-        C = self.trace_capacity
-        ids, real = self._pin(inputs["input_ids"], C)
-        buf = self._ids_to_device(ids)
-        self._persistent["decode_ids"] = buf
-        self._persistent["decode_real_len"] = real
-        out = self.forward_logits(buf, last_only=True)
+        ids = inputs["input_ids"]
+        # one eager step both compiles every T=1 program and is the reference;
+        # the second fill resets the state in place so the captured step
+        # replays from exactly the reference's starting state.
+        ttnn.deallocate(self.prefill_fill(ids))
+        out = self._decode_token()
         self._persistent["decode_ref"] = _first_shard(out)
         ttnn.deallocate(out)
-        return buf
+        ttnn.deallocate(self.prefill_fill(ids))
+        return self._persistent["dec_ids"]
 
     def decode_step(self):
-        return self.decode_trace_step()
+        return self._decode_token()
 
     def decode_trace_step(self):
-        return self.forward_logits(self._persistent["decode_ids"], last_only=True)
+        return self._decode_token()
 
     # ---- selftests -------------------------------------------------------- #
     def trace_capture_selftest(self, device=None):

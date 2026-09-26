@@ -71,13 +71,59 @@ class TtNemotronHRMSNorm:
             return t
         return self._dev(t.float())
 
-    def __call__(self, hidden_states, **kwargs):
+    def _row_shard(self, W):
+        """(memory config, program config) for a width-sharded norm of ONE tile
+        row: interleaved, a (32, W) input runs on a single core; sharded, the row
+        is split over the largest core rectangle whose count divides W's tiles."""
+        cfg = getattr(self, "_row_cfg", {}).get(W)
+        if cfg is not None:
+            return cfg
+        g = self.device.compute_with_storage_grid_size()
+        wt = W // 32
+        best = max(
+            ((x, y) for x in range(1, g.x + 1) for y in range(1, g.y + 1) if wt % (x * y) == 0),
+            key=lambda c: (c[0] * c[1], c[0]),
+        )
+        bw = wt // (best[0] * best[1])
+        mem = ttnn.create_sharded_memory_config(
+            shape=(1, 1, 32, W), core_grid=ttnn.CoreGrid(y=best[1], x=best[0]), strategy=ttnn.ShardStrategy.WIDTH
+        )
+        pc = ttnn.LayerNormShardedMultiCoreProgramConfig(
+            compute_with_storage_grid_size=best,
+            subblock_w=max(d for d in range(1, min(4, bw) + 1) if bw % d == 0),
+            block_h=1,
+            block_w=bw,
+            inplace=False,
+        )
+        self._row_cfg = {**getattr(self, "_row_cfg", {}), W: (mem, pc)}
+        return mem, pc
+
+    def __call__(self, hidden_states, dtype=ttnn.bfloat16, **kwargs):
+        """dtype: output dtype. A caller that upcasts to fp32 anyway asks for
+        fp32 and skips a bf16 round trip (two passes, and the rounding)."""
         hs = self._fp32(hidden_states)
         if hs.layout != ttnn.TILE_LAYOUT:
             hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
-        out = ttnn.rms_norm(hs, weight=self._w, epsilon=self.eps, compute_kernel_config=self.ckc)
-        ttnn.deallocate(hs)
-        return ttnn.typecast(out, ttnn.bfloat16)
+        shape = [int(v) for v in hs.padded_shape]
+        W = shape[-1]
+        if shape[-2] == 32 and all(v == 1 for v in shape[:-2]) and W % 32 == 0:  # decode: one tile row
+            mem, pc = self._row_shard(W)
+            xs = ttnn.to_memory_config(hs, mem)
+            ttnn.deallocate(hs)
+            out = ttnn.rms_norm(
+                xs,
+                weight=self._w,
+                epsilon=self.eps,
+                program_config=pc,
+                memory_config=mem,
+                compute_kernel_config=self.ckc,
+            )
+            ttnn.deallocate(xs)
+            out = ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            out = ttnn.rms_norm(hs, weight=self._w, epsilon=self.eps, compute_kernel_config=self.ckc)
+            ttnn.deallocate(hs)
+        return out if dtype == ttnn.float32 else ttnn.typecast(out, dtype)
 
 
 # Module-level `build` — primary test entry point.

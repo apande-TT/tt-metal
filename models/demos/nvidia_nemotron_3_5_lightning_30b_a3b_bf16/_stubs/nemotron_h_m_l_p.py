@@ -50,11 +50,11 @@ class TtNemotronHMLP:
         self._mesh_shape = _mesh_shape
 
         if shard:
-            self._w_up = self._shd(Wup, 1)
-            self._w_down = self._shd(Wdown, 0)
+            self._w_up = self._shd(Wup, 1, dtype=ttnn.bfloat8_b)
+            self._w_down = self._shd(Wdown, 0, dtype=ttnn.bfloat8_b)
         else:
-            self._w_up = self._dev(Wup)
-            self._w_down = self._dev(Wdown)
+            self._w_up = self._dev(Wup, dtype=ttnn.bfloat8_b)
+            self._w_down = self._dev(Wdown, dtype=ttnn.bfloat8_b)
 
         self.ckc = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -77,24 +77,24 @@ class TtNemotronHMLP:
             pass
         return hasattr(self.device, "get_device_ids") or hasattr(self.device, "get_devices")
 
-    def _dev(self, torch_tensor, layout=ttnn.TILE_LAYOUT):
+    def _dev(self, torch_tensor, layout=ttnn.TILE_LAYOUT, dtype=ttnn.float32):
         if self._is_mesh():
             try:
                 return ttnn.from_torch(
                     torch_tensor,
-                    dtype=ttnn.float32,
+                    dtype=dtype,
                     layout=layout,
                     device=self.device,
                     mesh_mapper=ttnn.ReplicateTensorToMesh(self.device),
                 )
             except Exception:
                 pass
-        return ttnn.from_torch(torch_tensor, dtype=ttnn.float32, layout=layout, device=self.device)
+        return ttnn.from_torch(torch_tensor, dtype=dtype, layout=layout, device=self.device)
 
-    def _shd(self, torch_tensor, dim, layout=ttnn.TILE_LAYOUT):
+    def _shd(self, torch_tensor, dim, layout=ttnn.TILE_LAYOUT, dtype=ttnn.float32):
         return ttnn.from_torch(
             torch_tensor,
-            dtype=ttnn.float32,
+            dtype=dtype,
             layout=layout,
             device=self.device,
             mesh_mapper=ttnn.ShardTensor2dMesh(self.device, mesh_shape=self._mesh_shape, dims=(None, dim)),
@@ -108,7 +108,9 @@ class TtNemotronHMLP:
         return self._dev(t.float())
 
     # ----------------------------- forward ---------------------------- #
-    def __call__(self, hidden_states, **kwargs):
+    def __call__(self, hidden_states, reduce=True, **kwargs):
+        """reduce=False returns this chip's fp32 partial (no all_reduce), so a
+        caller can sum it with other TP partials and reduce once."""
         hs = self._fp32(hidden_states)
         if hs.layout != ttnn.TILE_LAYOUT:
             hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
@@ -119,6 +121,8 @@ class TtNemotronHMLP:
 
         out = ttnn.matmul(act, self._w_down, compute_kernel_config=self.ckc)  # (.,.,hidden) partial if sharded
         ttnn.deallocate(act)
+        if not reduce:
+            return out
         if self._shard:
             out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
         return ttnn.typecast(out, ttnn.bfloat16)

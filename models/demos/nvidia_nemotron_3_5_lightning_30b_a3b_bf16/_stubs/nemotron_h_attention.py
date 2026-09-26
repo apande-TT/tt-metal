@@ -51,6 +51,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm, _ssm_cache
 from models.tt_transformers.tt.attention import Attention  # kept per ADAPT requirement
 
 
@@ -168,7 +169,10 @@ class TtNemotronHAttention:
         if self._is_mesh():
             try:
                 return ttnn.from_torch(
-                    t16, dtype=ttnn.bfloat16, layout=layout, device=self.device,
+                    t16,
+                    dtype=ttnn.bfloat16,
+                    layout=layout,
+                    device=self.device,
                     mesh_mapper=ttnn.ReplicateTensorToMesh(self.device),
                 )
             except Exception:
@@ -194,17 +198,11 @@ class TtNemotronHAttention:
 
     def _to_heads(self, t, B, T, n, d):
         """(B, T, n*d) tile -> (B, n, T, d) tile."""
-        rm = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
-        rm = ttnn.reshape(rm, [B, T, n, d])
-        rm = ttnn.permute(rm, (0, 2, 1, 3))
-        return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
+        return _ssm_cache.to_heads(t, B, T, n, d)
 
     def _from_heads(self, t, B, T, n, d):
         """(B, n, T, d) tile -> (B, T, n*d) tile."""
-        rm = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
-        rm = ttnn.permute(rm, (0, 2, 1, 3))
-        rm = ttnn.reshape(rm, [B, T, n * d])
-        return ttnn.to_layout(rm, ttnn.TILE_LAYOUT)
+        return _ssm_cache.from_heads(t, B, T, n, d)
 
     def _get_causal_mask(self, T):
         m = self._causal_masks.get(T)
@@ -215,8 +213,33 @@ class TtNemotronHAttention:
         self._causal_masks[T] = m
         return m
 
+    def _out_proj(self, attn, B, T):
+        """(B,H,T,D) attention output -> o_proj (B,T,hidden) bf16."""
+        H, D = self.num_heads, self.head_dim
+        attn_flat = self._from_heads(attn, B, T, H, D)  # (B,T,H*D) local
+        ttnn.deallocate(attn)
+
+        cg = self.device.compute_with_storage_grid_size()
+        out = _dram_mm.from_rows(
+            ttnn.matmul(
+                _dram_mm.as_rows(attn_flat),
+                self._w_o,
+                compute_kernel_config=self.ckc,
+                core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x),
+            ),
+            B,
+            T,
+        )  # (B,T,hidden) partial if sharded
+        ttnn.deallocate(attn_flat)
+        if self._shard:
+            out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
+        dtype = getattr(self, "_out_dtype", ttnn.bfloat16)
+        return out if out.dtype == dtype else ttnn.typecast(out, dtype)
+
     # ----------------------------- forward ---------------------------- #
-    def __call__(self, hidden_states, attention_mask=None, **kwargs):
+    def __call__(self, hidden_states, attention_mask=None, dtype=ttnn.bfloat16, **kwargs):
+        """dtype: output dtype (a caller that upcasts anyway asks for fp32)."""
+        self._out_dtype = dtype
         hs = self._fp32(hidden_states)
         if hs.layout != ttnn.TILE_LAYOUT:
             hs = ttnn.to_layout(hs, ttnn.TILE_LAYOUT)
@@ -226,21 +249,35 @@ class TtNemotronHAttention:
 
         cg_qkv = self.device.compute_with_storage_grid_size()
         qkv_cg = ttnn.CoreGrid(y=cg_qkv.y, x=cg_qkv.x)
-        q = ttnn.matmul(hs, self._w_q, compute_kernel_config=self.ckc, core_grid=qkv_cg)  # (B,T,H*D) local
-        k = ttnn.matmul(hs, self._w_k, compute_kernel_config=self.ckc, core_grid=qkv_cg)
-        v = ttnn.matmul(hs, self._w_v, compute_kernel_config=self.ckc, core_grid=qkv_cg)
+        rows = _dram_mm.as_rows(hs)  # projections over (1, B*T) token rows
+        q = _dram_mm.from_rows(ttnn.matmul(rows, self._w_q, compute_kernel_config=self.ckc, core_grid=qkv_cg), B, T)
+        k = _dram_mm.from_rows(ttnn.matmul(rows, self._w_k, compute_kernel_config=self.ckc, core_grid=qkv_cg), B, T)
+        v = _dram_mm.from_rows(ttnn.matmul(rows, self._w_v, compute_kernel_config=self.ckc, core_grid=qkv_cg), B, T)
         ttnn.deallocate(hs)
 
-        Qh = self._to_heads(q, B, T, H, D)  # (B,H,T,D)
-        Kh = self._to_heads(k, B, T, H, D)
-        Vh = self._to_heads(v, B, T, H, D)
+        # decode arrives as (1, B, .) token rows; its heads are per sample (B,H,1,D)
+        hb, ht = (B * T, 1) if getattr(self, "_cache_mode", None) == "decode" else (B, T)
+        Qh = self._to_heads(q, hb, ht, H, D)  # (B,H,T,D)
+        Kh = self._to_heads(k, hb, ht, H, D)
+        Vh = self._to_heads(v, hb, ht, H, D)
         ttnn.deallocate(q)
         ttnn.deallocate(k)
         ttnn.deallocate(v)
 
+        mode = getattr(self, "_cache_mode", None)
+        if mode == "decode":
+            attn = _ssm_cache.attn_step(self._state, self.device, Qh, Kh, Vh, self.scaling, self.ckc)  # (B,H,1,D)
+            ttnn.deallocate(Qh)
+            ttnn.deallocate(Kh)
+            ttnn.deallocate(Vh)
+            return self._out_proj(attn, B, T)
+        if mode == "fill":
+            self._state = getattr(self, "_state", {})
+            _ssm_cache.attn_fill(self._state, self.device, Kh, Vh)
+
         Kt = ttnn.transpose(Kh, -2, -1)  # (B,H,D,T)
         ttnn.deallocate(Kh)
-        scores = ttnn.matmul(Qh, Kt, compute_kernel_config=self.ckc)  # (B,H,T,T)
+        scores = _ssm_cache.heads_matmul(Qh, Kt, self.ckc)  # (B,H,T,T), heads spread over the grid
         ttnn.deallocate(Qh)
         ttnn.deallocate(Kt)
         scores = ttnn.multiply(scores, self.scaling)
@@ -253,21 +290,11 @@ class TtNemotronHAttention:
         probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.ckc, numeric_stable=True)
         ttnn.deallocate(scores)
 
-        attn = ttnn.matmul(probs, Vh, compute_kernel_config=self.ckc)  # (B,H,T,D)
+        attn = _ssm_cache.heads_matmul(probs, Vh, self.ckc)  # (B,H,T,D)
         ttnn.deallocate(probs)
         ttnn.deallocate(Vh)
 
-        attn_flat = self._from_heads(attn, B, T, H, D)  # (B,T,H*D) local
-        ttnn.deallocate(attn)
-
-        cg = self.device.compute_with_storage_grid_size()
-        out = ttnn.matmul(
-            attn_flat, self._w_o, compute_kernel_config=self.ckc, core_grid=ttnn.CoreGrid(y=cg.y, x=cg.x)
-        )  # (B,T,hidden) partial if sharded
-        ttnn.deallocate(attn_flat)
-        if self._shard:
-            out = ttnn.all_reduce(out, cluster_axis=self._tp_axis, topology=ttnn.Topology.Linear)
-        return ttnn.typecast(out, ttnn.bfloat16)
+        return self._out_proj(attn, B, T)
 
 
 # Module-level `build` — primary test entry point.
