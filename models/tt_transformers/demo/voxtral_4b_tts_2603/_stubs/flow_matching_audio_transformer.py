@@ -505,8 +505,8 @@ def _compile_block(device, blk, mask):
 
         hn = _block_norm(h, eps, norm_scale, ttnn.bfloat16)
         gated = ttnn.multiply(
-            _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
-            _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            _lin(hn, w1, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            _lin(hn, w3, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             # Consumed once, by the down projection: hand it over in L1, not through DRAM, and in
             # bf16 -- the down projection multicasts all of it to every core, and its bf8_b weight

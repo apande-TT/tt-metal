@@ -507,9 +507,9 @@ def build(device, torch_module):
 
         hn = _block_norm(h4, eps, norm_scale, ttnn.bfloat16)
         gate = _lin(
-            hn, w1, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
+            hn, w1, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
         )
-        up = _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
+        up = _lin(hn, w3, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
         h4 = ttnn.add(
             h4,
             _lin(
