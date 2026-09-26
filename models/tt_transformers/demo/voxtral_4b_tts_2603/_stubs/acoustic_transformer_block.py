@@ -223,7 +223,7 @@ def _norm_layout(device, rows, dim):
     return mem, cfg
 
 
-def _sharded_rms_norm(x, eps, dtype, gamma=None):
+def _sharded_rms_norm(x, eps, dtype, gamma=None, memory_config=None):
     """`x * rsqrt(mean(x^2) + eps)` on the block-sharded layout, or None when the shape has none.
 
     The interleaved reduction deals one work unit per row tile, so a 96-row norm ran on 3 cores
@@ -248,8 +248,12 @@ def _sharded_rms_norm(x, eps, dtype, gamma=None):
         program_config=cfg,
         compute_kernel_config=_NORM_COMPUTE,
     )
-    return ttnn.reshape(ttnn.sharded_to_interleaved(y, ttnn.DRAM_MEMORY_CONFIG, output_dtype=dtype), shape)
+    out_mem = ttnn.DRAM_MEMORY_CONFIG if memory_config is None else memory_config
+    return ttnn.reshape(ttnn.sharded_to_interleaved(y, out_mem, output_dtype=dtype), shape)
 
+
+# The SwiGLU kernel reads its activation from L1 on every core: land the norm output there.
+_FFN_IN_MEM = ttnn.L1_MEMORY_CONFIG
 
 _NORM_SCALE = {}
 
@@ -272,10 +276,10 @@ def _norm_scale(device, dim, eps):
     return _NORM_SCALE[key]
 
 
-def _block_norm(h, eps, scale, dtype):
+def _block_norm(h, eps, scale, dtype, memory_config=None):
     """The in-block RMSNorm whose output feeds weights pre-multiplied by `scale` (see `_norm_scale`)."""
     if scale is not None:
-        y = _sharded_rms_norm(h, eps, dtype)
+        y = _sharded_rms_norm(h, eps, dtype, memory_config=memory_config)
         if y is not None:
             return y
         sq = ttnn.multiply(ttnn.mean(ttnn.square(h), dim=-1, keepdim=True), scale * scale)
@@ -511,7 +515,7 @@ def build(device, torch_module):
             attn_out = _attention(xn, wqkv, wo, n_heads, n_kv_heads, None, attn_mask)
         h4 = ttnn.add(h4, attn_out)
 
-        hn = _block_norm(h4, eps, norm_scale, ttnn.bfloat16)
+        hn = _block_norm(h4, eps, norm_scale, ttnn.bfloat16, memory_config=_FFN_IN_MEM if w13 is not None else None)
         if cpp_swiglu.serves(hn, w13):
             gated = cpp_swiglu.apply(hn, w13)
         else:
