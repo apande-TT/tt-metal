@@ -961,6 +961,16 @@ class WanResample(Module):
     def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
         rename_substate(state, "resample.1", "conv")
 
+    def spatial_upsample(self, x_NHWC: ttnn.Tensor) -> ttnn.Tensor:
+        """Nearest x2 on (H, W) of an NHWC frame stack (a W/H shard upsamples to the matching shard)."""
+        return ttnn.upsample(x_NHWC, scale_factor=2)
+
+    def spatial_downsample(self, x_BTHWC: ttnn.Tensor, logical_h: int, logical_w: int = 0) -> ttnn.Tensor:
+        """ZeroPad2d(0, 1, 0, 1) + stride-2 3x3 conv, realised as the stride-1 conv sampled at [1::2, 1::2]
+        (patched-conv friendly: only right and bottom padding matter)."""
+        x_conv_BTHWC = self.conv(x_BTHWC, logical_h, logical_w=logical_w)
+        return x_conv_BTHWC[:, :, 1::2, 1::2, :]
+
     def forward(
         self,
         x_BTHWC,
@@ -1064,7 +1074,7 @@ class WanResample(Module):
         if self.is_upsample:
             T2 = x_BTHWC.shape[1]
             x_NHWC = ttnn.reshape(x_BTHWC, (B * T2, H, W, C))
-            x_upsamped_NHWC = ttnn.upsample(x_NHWC, scale_factor=2)
+            x_upsamped_NHWC = self.spatial_upsample(x_NHWC)
             logical_h *= 2
             if logical_w > 0:
                 logical_w *= 2
@@ -1072,10 +1082,7 @@ class WanResample(Module):
             x_BTHWC = ttnn.reshape(x_upsamped_NHWC, (B, T2, H2, W2, C))
             x_conv_BTHWC = self.conv(x_BTHWC, logical_h, logical_w=logical_w)
         else:
-            x_conv_BTHWC = self.conv(x_BTHWC, logical_h, logical_w=logical_w)
-            x_conv_BTHWC = x_conv_BTHWC[
-                :, :, 1::2, 1::2, :
-            ]  # 2x2 strided convolution output to support patched conv, with only right and bottom padding
+            x_conv_BTHWC = self.spatial_downsample(x_BTHWC, logical_h, logical_w)
             logical_h //= 2
             if logical_w > 0:
                 logical_w //= 2
