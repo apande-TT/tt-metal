@@ -181,8 +181,12 @@ def _weight(linear, device):
 
 
 def _norm_weight(norm, device):
-    """A norm's gamma as `[1, 1, 1, dim]` float32 TILE -- the form `_rms_norm` multiplies by."""
-    return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
+    """A norm's gamma as `[1, 1, 1, dim]` float32 TILE -- the form `_rms_norm` multiplies by -- paired,
+    when the whole-section stub's block-sharded norm applies, with gamma times its `_norm_scale`."""
+    gamma = norm.weight.detach().float().reshape(1, 1, 1, -1)
+    exact = _from_torch(gamma, device, dtype=ttnn.float32)
+    scale = common.import_stub(_WHOLE_STUB)._norm_scale(device, int(gamma.shape[-1]), float(norm.eps))
+    return exact if scale is None else (exact, _from_torch(gamma * scale, device, dtype=ttnn.float32))
 
 
 def _rms_norm(x, gamma, eps, dtype=None):
@@ -196,6 +200,11 @@ def _rms_norm(x, gamma, eps, dtype=None):
     stubs beside this file (`flow_matching_audio_transformer`, `acoustic_transformer_block`)
     already spell it out; this is the same four ops so the two bodies agree.
     """
+    if isinstance(gamma, tuple):
+        gamma, scaled = gamma
+        y = common.import_stub(_WHOLE_STUB)._sharded_rms_norm(x, eps, ttnn.float32)
+        if y is not None:
+            return ttnn.multiply(y, scaled, dtype=dtype or ttnn.float32)
     scale = ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps, activations=[ttnn.UnaryOpType.RSQRT])
     return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
 
