@@ -112,7 +112,7 @@ def main(argv=None):
             if g is None:
                 print("no cached golden for this config", flush=True)
             else:
-                pccs = [float(comp_pcc(g["image"][b], image[b], 0.99)[1]) for b in range(n_real)]
+                pccs = [float(comp_pcc(g["image"][b], image[b], 0.95)[1]) for b in range(n_real)]
                 print(f"PCC vs HF golden: min {min(pccs):.6f} mean {sum(pccs) / len(pccs):.6f}", flush=True)
                 print(f"e2e PCC={min(pccs)}", flush=True)
     finally:

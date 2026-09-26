@@ -28,8 +28,9 @@ _EAGER_OSL_TOKENS = min(PERF_OSL_TOKENS, int(os.environ.get("TT_PERF_EAGER_OSL_T
 PERF_BATCH = int(os.environ.get("TT_PERF_BATCH", "0"))
 # diffusion's heavy axis: scheduler timesteps. SMALL default; the source's full schedule is 50.
 PERF_STEPS = int(os.environ.get("TT_PERF_STEPS", "2"))
-# the batch the source test drives (E2E_BATCH); TT_PERF_BATCH>0 overrides
-_SOURCE_BATCH = 4
+# the batch the source test drives (test_e2e_image_edit.E2E_BATCH, 32 when TT_PERF_BATCH is unset);
+# TT_PERF_BATCH>0 overrides
+_SOURCE_BATCH = 32
 
 _pl = (os.environ.get("TT_PERF_LAYERS") or "").strip()
 PERF_LAYERS = int(_pl) if (_pl.isdigit() and int(_pl) > 0) else None

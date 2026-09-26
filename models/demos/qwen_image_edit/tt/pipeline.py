@@ -99,7 +99,8 @@ def normalize_mesh(device):
 
 
 # Per-stage batch ceilings (images per program). None -> the whole batch in one program.
-# MEASURED_CEILINGS_PLACEHOLDER
+# Empty on the 8x4 Galaxy: every stage ran all 32 samples in one program (2026-09-25, B=32 demo +
+# full-depth trace test); the T3K ceilings (vae_decode 16, text 2 x 32) did not reproduce here.
 STAGE_MAX_BATCH = {}
 
 

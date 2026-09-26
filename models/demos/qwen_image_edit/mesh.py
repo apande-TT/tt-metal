@@ -13,9 +13,11 @@ import ttnn
 # build_pipeline reshapes a 1x32 / 4x8 handle to 8x4 in place).
 MESH_SHAPE = (8, 4)
 
-# trace_region_size is sized from the LARGEST stage trace, measured: denoise 760.3 MB (precise transformer:
-# 60 blocks x cond + uncond, 2-limb projections, exact-lane QK^T), vision_encode 548.2 MB (exact-lane
-# precise vision tower), vae_decode 266.5 MB, all at B=32. 896 MB is ~1.18x the largest.
+# trace_region_size is sized from the LARGEST stage trace. Measured on T3K at B=32: denoise 760.3 MB (precise
+# transformer: 60 blocks x cond + uncond, 2-limb projections, exact-lane QK^T), vision_encode 548.2 MB,
+# vae_decode 266.5 MB; 896 MB is ~1.18x the largest. On this 8x4 Galaxy the per-chip denoise trace is
+# smaller (DP=4 splits its batch); every stage captured at full depth and B=32 inside 896 MB
+# (tests/test_pipeline_contract.py::test_trace_capture, 2026-09-25).
 DEVICE_PARAMS = {"l1_small_size": 24576, "trace_region_size": 896 * 1024 * 1024, "num_command_queues": 1}
 
 

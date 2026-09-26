@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """End-to-end Qwen-Image-Edit on TT (Call 1: image_edit), against the HF QwenImageEditPipeline golden.
 
-Real input: E2E_BATCH (32) condition images (crops of the photos in models/sample_data), 32 distinct
-edit instructions and seeds 1000..1031 (the bundled set). They are encoded with the HF Qwen2VLProcessor,
-VaeImageProcessor and FlowMatch scheduler (tt/inputs.py). One chained TT forward (tt/pipeline.py:
-run_image_edit, the same function the demo calls) takes them to 32 edited images in one program per
+Real input: B condition images (B = $TT_PERF_BATCH, 32 when unset; crops of the photos in
+models/sample_data), B distinct edit instructions and B seeds from 1000 (the bundled set). They are
+encoded with the HF Qwen2VLProcessor, VaeImageProcessor and FlowMatch scheduler (tt/inputs.py). One chained TT forward (tt/pipeline.py:
+run_image_edit, the same function the demo calls) takes them to B edited images in one program per
 step. The golden is the HF pipeline in float32 on CPU with the same inputs and the same initial noise
 (reference/golden.py). It takes hours on CPU, so it is precomputed and cached; this test fails fast if
 it is missing and never builds it.
@@ -18,7 +18,7 @@ Gates:
   1  every routed graduated stub is ttnn: no torch compute in its forward code (static scan), and the
      forward fires zero host aten ops (host_op_observer, the authoritative runtime check)
   2  all 25 graduated modules were invoked by that forward
-  3  every sample's final image PCC vs its own golden >= 0.99
+  3  every sample's final image PCC vs its own golden >= PCC_TARGET (0.95)
 Also asserted: the full scheduler schedule ran (no step cap); the outputs are distinct; each output
 matches its own golden better than any other sample's golden.
 """
@@ -36,9 +36,12 @@ from models.demos.qwen_image_edit.reference.golden import golden_path, load_or_b
 from models.demos.qwen_image_edit.tt import gates
 from models.demos.qwen_image_edit.tt import pipeline as P
 from models.demos.qwen_image_edit.tt.inputs import EditConfig
+from models.experimental.perf_automation.agent.perf_adapter import BATCH_ENV, batch_report_line
 
-PCC_TARGET = 0.99
-E2E_BATCH = 32
+# the gate's bar for this run (emit-e2e --pcc-target 0.95), applied to EVERY sample
+PCC_TARGET = 0.95
+# the batch the harness asks for (perf_adapter.BATCH_ENV); the gate's batch, 32, when it asks for none
+E2E_BATCH = int(os.environ.get(BATCH_ENV) or 32)
 # the correctness gate: per-sample image PCC vs the independently computed HF golden (not teacher-forced)
 E2E_CORRECTNESS_GATE = "test_e2e_image_edit"
 STUB_PKGS = {
@@ -102,6 +105,7 @@ def test_e2e_image_edit(golden, mesh_device, hf_pipe):
     p = pipe.prepare(enc)
     B = p.B  # the batch this test actually drives, read from the pipeline
     assert B == cfg.batch == golden["image"].shape[0]
+    print(batch_report_line(B), flush=True)
     print(f"[e2e] batch={B} steps={p.num_steps} size={enc.width}x{enc.height} cfg_scale={p.cfg_scale}", flush=True)
 
     # ---- the real forward, under the host-op observer (inputs already encoded + uploaded) ----------
