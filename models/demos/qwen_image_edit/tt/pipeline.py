@@ -540,15 +540,16 @@ class QwenImageEditTT:
         self._ts = {}
         return ok_all
 
-    def host_op_selftest(self, p=None, num_steps=None):
+    def host_op_selftest(self, p=None, num_steps=None, on_step=None):
         """Run the image_edit forward (encoded + uploaded inputs -> image, every stage) under
         host_op_observer. Input encoding and the weight build happen outside the observed region.
+        on_step is run_image_edit's per-scheduler-step callback, passed through unchanged.
         Returns (verdict, output device tensor)."""
         from scripts.tt_hw_planner import host_op_observer
 
         p = p if p is not None else self.prepare(self._trace_inputs_common())
         with host_op_observer.observe_host_ops() as ops:
-            out = self.run_image_edit(p, num_steps=num_steps)
+            out = self.run_image_edit(p, num_steps=num_steps, on_step=on_step)
             ttnn.synchronize_device(self.device)
         return host_op_observer.verdict(list(ops)), out
 

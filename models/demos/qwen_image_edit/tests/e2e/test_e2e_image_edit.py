@@ -109,7 +109,16 @@ def test_e2e_image_edit(golden, mesh_device, hf_pipe):
     print(f"[e2e] batch={B} steps={p.num_steps} size={enc.width}x{enc.height} cfg_scale={p.cfg_scale}", flush=True)
 
     # ---- the real forward, under the host-op observer (inputs already encoded + uploaded) ----------
-    verdict, out = pipe.host_op_selftest(p)
+    # The traced scheduler steps are enqueued non-blocking, so without this the host waits on the
+    # chips in silence for the whole schedule (measured: 1216 s with no output at B=32), and the
+    # gate's progress watchdog (600 s of no log growth) kills a healthy run as a hang. Waiting on
+    # each step and reporting it keeps the run visibly progressing; the ops and their order are
+    # unchanged, so the result is too.
+    def _report_step(i, _latents):
+        ttnn.synchronize_device(mesh_device)
+        print(f"[e2e] scheduler step {i + 1}/{p.num_steps} done", flush=True)
+
+    verdict, out = pipe.host_op_selftest(p, on_step=_report_step)
     image = P.to_host(out).to(torch.float32)
     latents = P.to_host(pipe.last_latents).to(torch.float32)
     ref = golden["image"].to(torch.float32)
