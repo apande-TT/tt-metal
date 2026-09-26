@@ -46,6 +46,7 @@ import math
 import torch
 
 import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import cpp_swiglu
 
 _TILE = 32
 _MASK_NEG = -1.0e9
@@ -486,10 +487,9 @@ def _compile_block(device, blk, mask):
     wo = _from_torch(attn.wo.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     # Weight-stream bound at 96 rows; bf8_b halves the bytes each FFN projection reads, and HiFi2
     # (two phases, enough for a bf8_b mantissa) halves the math that sits behind the stream.
-    w1, w3 = (
-        _from_torch((m.weight.detach().float().transpose(0, 1) * g_ffn_t).contiguous(), device, dtype=ttnn.bfloat8_b)
-        for m in (ff.w1, ff.w3)
-    )
+    w1_t, w3_t = ((m.weight.detach().float().transpose(0, 1) * g_ffn_t).contiguous() for m in (ff.w1, ff.w3))
+    w1, w3 = (_from_torch(t, device, dtype=ttnn.bfloat8_b) for t in (w1_t, w3_t))
+    w13 = cpp_swiglu.fuse(w1_t, w3_t, device)
     # The down projection is DRAM-bound at 1024 rows; bf8_b halves the weight it streams.
     w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     for rows in _COMPACT_ROWS:
@@ -504,6 +504,10 @@ def _compile_block(device, blk, mask):
         h = ttnn.add(h, attn_out)
 
         hn = _block_norm(h, eps, norm_scale, ttnn.bfloat16)
+        if cpp_swiglu.serves(hn, w13):
+            return ttnn.add(
+                h, _lin(cpp_swiglu.apply(hn, w13), w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
+            )
         gated = ttnn.multiply(
             _lin(hn, w1, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
             _lin(hn, w3, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),

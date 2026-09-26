@@ -33,6 +33,7 @@ import math
 import torch
 
 import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import cpp_swiglu
 
 _TILE = 32
 _COMPUTE = ttnn.WormholeComputeKernelConfig(
@@ -486,6 +487,11 @@ def build(device, torch_module):
     w3 = _from_torch(
         (ff.w3.weight.detach().float().transpose(0, 1) * g_ffn_t).contiguous(), device, dtype=ttnn.bfloat8_b
     )
+    w13 = cpp_swiglu.fuse(
+        (ff.w1.weight.detach().float().transpose(0, 1) * g_ffn_t).contiguous(),
+        (ff.w3.weight.detach().float().transpose(0, 1) * g_ffn_t).contiguous(),
+        device,
+    )
     for rows in _COMPACT_ROWS:
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
 
@@ -506,26 +512,24 @@ def build(device, torch_module):
         h4 = ttnn.add(h4, attn_out)
 
         hn = _block_norm(h4, eps, norm_scale, ttnn.bfloat16)
-        gate = _lin(
-            hn, w1, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
-        )
-        up = _lin(hn, w3, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
-        h4 = ttnn.add(
-            h4,
-            _lin(
-                ttnn.multiply(
-                    gate,
-                    up,
-                    input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
-                    # bf16: the down projection multicasts it whole to every core.
-                    dtype=ttnn.bfloat16,
-                    memory_config=ttnn.L1_MEMORY_CONFIG,
-                ),
-                w2,
-                dtype=ttnn.float32,
-                compute_kernel_config=_TALL_COMPUTE,
-            ),
-        )
+        if cpp_swiglu.serves(hn, w13):
+            gated = cpp_swiglu.apply(hn, w13)
+        else:
+            gate = _lin(
+                hn, w1, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
+            )
+            up = _lin(
+                hn, w3, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
+            )
+            gated = ttnn.multiply(
+                gate,
+                up,
+                input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+                # bf16: the down projection multicasts it whole to every core.
+                dtype=ttnn.bfloat16,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
+        h4 = ttnn.add(h4, _lin(gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE))
 
         if rank >= 4:
             return h4

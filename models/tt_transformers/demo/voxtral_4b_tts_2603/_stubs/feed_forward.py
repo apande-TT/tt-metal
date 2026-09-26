@@ -22,6 +22,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import cpp_swiglu
 
 _COMPUTE = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True
@@ -179,6 +180,7 @@ def build(device, torch_module):
     # The down projection is DRAM-bound at 1024 rows; bf8_b halves the weight it streams.
     w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     w3 = _from_torch(ff.w3.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
+    w13 = cpp_swiglu.fuse(ff.w1.weight.detach().transpose(0, 1), ff.w3.weight.detach().transpose(0, 1), device)
     bias = None
     if ff.w2.bias is not None:
         bias = _from_torch(ff.w2.bias.detach().reshape(1, 1, 1, out_dim), device)
@@ -191,12 +193,20 @@ def build(device, torch_module):
         h = ttnn.reshape(x, [batch, 1, seq, dim])
         # HiFi2 on the bf8_b weights (two phases cover a bf8_b mantissa); the hidden activation is
         # handed over in L1 and in bf16, since the down projection multicasts it whole.
-        gated = ttnn.multiply(
-            _lin(h, w1, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
-            _lin(h, w3, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
-            input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
+        gated = (
+            cpp_swiglu.apply(h, w13)
+            if cpp_swiglu.serves(h, w13)
+            else ttnn.multiply(
+                _lin(
+                    h, w1, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
+                ),
+                _lin(
+                    h, w3, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
+                ),
+                input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+                dtype=ttnn.bfloat16,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
         )
         out = _lin(gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
         if bias is not None:
