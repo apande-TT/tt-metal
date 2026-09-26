@@ -22,14 +22,22 @@ import time
 
 import torch
 
-from models.demos.qwen_image_edit.tt.inputs import MODEL_ID, EditConfig, encode_inputs
+from models.demos.qwen_image_edit.tt.inputs import MODEL_ID, EditConfig, encode_inputs, sample_prompts, sample_seeds
 
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_golden")
 
 
 def golden_key(cfg: EditConfig) -> str:
+    # the sample inputs are part of the key: a golden built for another prompt set is another golden
     d = dict(
-        b=cfg.batch, area=cfg.area, n=cfg.num_inference_steps, cfg=cfg.true_cfg_scale, neg=cfg.negative_prompt, v=2
+        b=cfg.batch,
+        area=cfg.area,
+        n=cfg.num_inference_steps,
+        cfg=cfg.true_cfg_scale,
+        neg=cfg.negative_prompt,
+        prompts=sample_prompts(cfg.batch),
+        seeds=sample_seeds(cfg.batch),
+        v=3,
     )
     h = hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:10]
     return f"golden_b{cfg.batch}_a{int(cfg.area ** 0.5)}_n{cfg.num_inference_steps}_{h}"
@@ -122,7 +130,9 @@ def _hf_reference_image_edit(cfg: EditConfig, pipe=None, enc=None, threads: int 
 def load_or_build_golden(cfg: EditConfig, build_if_missing: bool = False):
     path = golden_path(cfg)
     if os.path.exists(path):
-        return torch.load(path, weights_only=False)
+        g = torch.load(path, weights_only=False)
+        assert list(g["prompts"]) == sample_prompts(cfg.batch), f"{path} was built for other prompts"
+        return g
     if not build_if_missing:
         return None
     g = _hf_reference_image_edit(cfg)
