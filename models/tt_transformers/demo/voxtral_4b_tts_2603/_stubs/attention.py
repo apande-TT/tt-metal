@@ -551,7 +551,8 @@ def build(device, torch_module):
         )
         if q_rows != groups:
             q = ttnn.pad(q, [(0, 0), (0, 0), (0, q_rows - groups), (0, 0)], 0.0)
-        idxs = [int(position)] * batch
+        # A split prefill leaves dead slots before the tail: position p lives at slot p + offset.
+        idxs = [int(position) + int(kv_cache.get("slot_offset", 0))] * batch
         # `paged_update_cache` wants the decode layout `[1, B, n_kv, head_dim]` AND it wants that
         # tensor HEIGHT-SHARDED, one user per core -- it is part of the decode op set even though
         # the rest of that set is gone from this path ("Expect input_tensor to be sharded"). The
