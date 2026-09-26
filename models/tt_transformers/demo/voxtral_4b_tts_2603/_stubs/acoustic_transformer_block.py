@@ -34,6 +34,7 @@ import torch
 
 import ttnn
 
+_TILE = 32
 _COMPUTE = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True
 )
@@ -191,6 +192,94 @@ def _rms_norm(x, gamma, eps, dtype=None):
     if gamma is None:  # folded into the consuming weights
         return ttnn.multiply(x, inv, dtype=dtype or ttnn.float32)
     return ttnn.multiply(ttnn.multiply(x, inv), gamma, dtype=dtype or ttnn.float32)
+
+
+_NORM_COMPUTE = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=False
+)
+_NORM_COLS = 8
+
+
+def _norm_layout(device, rows, dim):
+    """Block-sharded layout for a `[rows, dim]` RMSNorm: one row tile per grid row, 8 cores across."""
+    grid = device.compute_with_storage_grid_size()
+    ht, wt = rows // _TILE, dim // _TILE
+    if rows % _TILE or dim % (_TILE * _NORM_COLS) or ht > int(grid.y) or _NORM_COLS > int(grid.x):
+        return None
+    cores = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(_NORM_COLS - 1, ht - 1))})
+    mem = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.BLOCK_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(cores, [_TILE, dim // _NORM_COLS], ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    cfg = ttnn.LayerNormShardedMultiCoreProgramConfig(
+        compute_with_storage_grid_size=(_NORM_COLS, ht),
+        subblock_w=1,
+        block_h=1,
+        block_w=wt // _NORM_COLS,
+        inplace=False,
+    )
+    return mem, cfg
+
+
+def _sharded_rms_norm(x, eps, dtype, gamma=None):
+    """`x * rsqrt(mean(x^2) + eps)` on the block-sharded layout, or None when the shape has none.
+
+    The interleaved reduction deals one work unit per row tile, so a 96-row norm ran on 3 cores
+    (23 us for the reduce alone). Sharded 8 cores across, each core reduces its own column block
+    and the partial sums are combined over the row. The op's reduction scaler is a bfloat16
+    rounding of `8 / dim`, a constant relative error that `_norm_scale` measures once and the
+    consuming weights absorb.
+    """
+    shape = [int(d) for d in x.shape]
+    rows = 1
+    for d in shape[:-1]:
+        rows *= d
+    layout = _norm_layout(x.device(), rows, shape[-1])
+    if layout is None:
+        return None
+    mem, cfg = layout
+    y = ttnn.rms_norm(
+        ttnn.to_memory_config(ttnn.reshape(x, [1, 1, rows, shape[-1]]), mem),
+        epsilon=eps,
+        weight=gamma,
+        memory_config=mem,
+        program_config=cfg,
+        compute_kernel_config=_NORM_COMPUTE,
+    )
+    return ttnn.reshape(ttnn.sharded_to_interleaved(y, ttnn.DRAM_MEMORY_CONFIG, output_dtype=dtype), shape)
+
+
+_NORM_SCALE = {}
+
+
+def _norm_scale(device, dim, eps):
+    """The factor that makes `_sharded_rms_norm` exact: `exact / measured` on a row of ones."""
+    key = (id(device), dim, eps)
+    if key not in _NORM_SCALE:
+        ones = _from_torch(torch.ones(1, 1, _TILE, dim), device, dtype=ttnn.float32)
+        got = _sharded_rms_norm(ones, eps, ttnn.float32)
+        if got is None:
+            _NORM_SCALE[key] = None
+        else:
+            if device.__class__.__name__ == "MeshDevice":
+                host = ttnn.to_torch(got, mesh_composer=ttnn.ConcatMeshToTensor(device, dim=0))
+            else:
+                host = ttnn.to_torch(got)
+            measured = host.double().mean().item()
+            _NORM_SCALE[key] = (1.0 / math.sqrt(1.0 + eps)) / measured
+    return _NORM_SCALE[key]
+
+
+def _block_norm(h, eps, scale, dtype):
+    """The in-block RMSNorm whose output feeds weights pre-multiplied by `scale` (see `_norm_scale`)."""
+    if scale is not None:
+        y = _sharded_rms_norm(h, eps, dtype)
+        if y is not None:
+            return y
+        sq = ttnn.multiply(ttnn.mean(ttnn.square(h), dim=-1, keepdim=True), scale * scale)
+        return ttnn.multiply(h, ttnn.add(sq, eps * scale * scale, activations=[ttnn.UnaryOpType.RSQRT]), dtype=dtype)
+    return _rms_norm(h, None, eps, dtype=dtype)
 
 
 def _bmm(a, b, per_core_m=None, transpose_b=False, dtype=None):
@@ -367,11 +456,13 @@ def build(device, torch_module):
     dim = int(blk.dim)
     scale = 1.0 / math.sqrt(head_dim)
     eps = float(blk.attention_norm.eps)
+    norm_scale = _norm_scale(device, dim, eps)
+    fold = 1.0 if norm_scale is None else norm_scale
 
     # Each norm's gamma is folded into the weights that consume it, `(x * s * g) @ W` being
     # `(x * s) @ (g[:, None] * W)`, and the query scale into Wq.
-    g_attn_t = blk.attention_norm.weight.detach().float().reshape(-1, 1)
-    g_ffn_t = blk.ffn_norm.weight.detach().float().reshape(-1, 1)
+    g_attn_t = blk.attention_norm.weight.detach().float().reshape(-1, 1) * fold
+    g_ffn_t = blk.ffn_norm.weight.detach().float().reshape(-1, 1) * fold
     wqkv = _from_torch(
         torch.cat(
             [
@@ -395,7 +486,6 @@ def build(device, torch_module):
     w3 = _from_torch(
         (ff.w3.weight.detach().float().transpose(0, 1) * g_ffn_t).contiguous(), device, dtype=ttnn.bfloat8_b
     )
-    g_attn = g_ffn = None
     for rows in _COMPACT_ROWS:
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
 
@@ -408,14 +498,14 @@ def build(device, torch_module):
         if h4.dtype != ttnn.float32:
             h4 = ttnn.typecast(h4, ttnn.float32)
 
-        xn = _rms_norm(h4, g_attn, eps, dtype=ttnn.bfloat16)
+        xn = _block_norm(h4, eps, norm_scale, ttnn.bfloat16)
         if tokens:
             attn_out = _compact_attention(xn, wqkv, wo, n_heads, n_kv_heads, None, tokens)
         else:
             attn_out = _attention(xn, wqkv, wo, n_heads, n_kv_heads, None, attn_mask)
         h4 = ttnn.add(h4, attn_out)
 
-        hn = _rms_norm(h4, g_ffn, eps, dtype=ttnn.bfloat16)
+        hn = _block_norm(h4, eps, norm_scale, ttnn.bfloat16)
         gate = _lin(
             hn, w1, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
         )
