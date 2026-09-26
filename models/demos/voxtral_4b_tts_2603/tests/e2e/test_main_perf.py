@@ -126,7 +126,7 @@ def test_main_perf():
                 print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals(), device), flush=True)
             except Exception as _tt_e2:  # noqa: BLE001
                 print("STAGE_MARKS_SKIPPED=%r" % (_tt_e2,), flush=True)
-            voice = pipe.stage_voice(audio_mask, voice_embedding)
+            voice = pipe.stage_voice(audio_mask, voice_embedding, input_ids=input_ids)
             print("PERF_BATCH_ROWS=%d" % resolve_batch(pipe, PERF_BATCH), flush=True)
 
             _mods = [ttnn] + [getattr(ttnn, _m, None) for _m in ("transformer", "experimental")]

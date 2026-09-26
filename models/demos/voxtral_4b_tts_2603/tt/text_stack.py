@@ -249,7 +249,7 @@ class TextStack:
 
     # ---- prefill -----------------------------------------------------------------------
 
-    def stage_voice(self, audio_mask, voice_embedding):
+    def stage_voice(self, audio_mask, voice_embedding, input_ids=None):
         """The speaker's voice as two PERSISTENT device constants, built ONCE, outside the forward.
 
         Voxtral TTS conditions on a speaker embedding carried in the prompt: a contiguous block of
@@ -291,11 +291,42 @@ class TextStack:
         keep[0, 0, where] = 0.0
         placed[0, 0, where] = voice_embedding.to(torch.float32)
         upload = dict(dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
-        return {
+        staged = {
             "keep": ttnn.from_torch(keep, **upload),
             "placed": ttnn.from_torch(placed, **upload),
             "seq": seq,
             "slots": slots,
+        }
+        staged.update(self._stage_prefix(input_ids, padded))
+        return staged
+
+    def _stage_prefix(self, input_ids, padded):
+        """The SHARED PROMPT PREFIX, measured on the host ids: the whole tiles every row agrees on.
+
+        Every row carries the same voice, so `[BOS] [BEGIN_AUDIO] [AUDIO]*N [NEXT_AUDIO_TEXT]` is the
+        same ~150 tokens on all of them, and a causal stack computes the same hidden state at those
+        positions for every row. `prefill_voiced` runs those rows ONCE, at batch 1, and only the
+        per-row tail at the full batch, attending to the prefix's k/v through `mask` (prefix columns
+        open, the tail's own columns causal). Nothing is staged when there is no whole shared tile
+        in front of the last real token, and the prefill then runs the plain full-batch chain.
+        """
+        if input_ids is None or int(input_ids.shape[0]) < 2:
+            return {}
+        ids = input_ids
+        same = (ids == ids[:1]).all(dim=0)
+        shared = int(same.long().cumprod(0).sum())
+        rows = min(shared, int(ids.shape[-1]) - 1) // ttnn.TILE_SIZE * ttnn.TILE_SIZE
+        if rows <= 0 or rows >= padded:
+            return {}
+        tail = padded - rows
+        q_pos = torch.arange(rows, padded).reshape(-1, 1)
+        k_pos = torch.arange(padded).reshape(1, -1)
+        mask = torch.where(k_pos <= q_pos, 0.0, float("-inf")).reshape(1, 1, tail, padded)
+        return {
+            "prefix_rows": rows,
+            "prefix_mask": ttnn.from_torch(
+                mask.to(torch.bfloat16).contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
+            ),
         }
 
     def prefill_voiced(self, input_ids_tt, voice, position_ids_tt=None, real_len=None):
@@ -321,8 +352,11 @@ class TextStack:
         ttnn.deallocate(embeds)
         voiced = ttnn.add(kept, voice["placed"])
         ttnn.deallocate(kept)
+        prefix = None
+        if position_ids_tt is None and voice.get("prefix_rows"):
+            prefix = (int(voice["prefix_rows"]), voice["prefix_mask"])
         try:
-            return self.prefill_embeds(voiced, position_ids_tt=position_ids_tt, real_len=real_len)
+            return self.prefill_embeds(voiced, position_ids_tt=position_ids_tt, real_len=real_len, prefix=prefix)
         finally:
             ttnn.deallocate(voiced)
 
@@ -355,7 +389,7 @@ class TextStack:
         finally:
             ttnn.deallocate(embeds)
 
-    def prefill_embeds(self, embeds, position_ids_tt=None, real_len=None):
+    def prefill_embeds(self, embeds, position_ids_tt=None, real_len=None, prefix=None):
         """`[B, 1, S, 3072]` -> `(hidden [B, 1, real, 3072], last_hidden [B, 3072])`.
 
         The TTS decode feeds audio-token EMBEDDINGS rather than ids, so the embedding table is not
@@ -377,24 +411,19 @@ class TextStack:
         # `ttnn.slice` of its own build-time table, and freeing a view of that would take the
         # table with it.
         rope = self._prefill_rope(embeds, position_ids_tt)
-        hidden = embeds
-        try:
-            for block in self.blocks:
-                nxt = block(hidden, position_embeddings=rope, decode=False)
-                if hidden is not embeds:
-                    ttnn.deallocate(hidden)
-                hidden = nxt
-            out = self.final_norm(hidden)
-        finally:
-            if hidden is not embeds:
-                ttnn.deallocate(hidden)
+        top = (real - 1) // ttnn.TILE_SIZE * ttnn.TILE_SIZE
+        if prefix is not None and position_ids_tt is None and batch > 1 and 0 < prefix[0] <= top:
+            out, tail_out = self._prefill_shared_prefix(embeds, rope, prefix)
+            tail_top = top - prefix[0]
+        else:
+            out = self._run_chain(embeds, rope)
+            tail_out, tail_top = out, top
         # The REAL length, so the first decode step writes slot `real` and flash-decode's
         # `[0, real]` window covers the prompt and nothing the pad wrote.
         self.filled = real
         # The tile-aligned 32-row block holding row `real - 1` first: slicing one row straight out
         # of the whole tiled `[B, 1, S, H]` untilizes all of it.
-        top = (real - 1) // ttnn.TILE_SIZE * ttnn.TILE_SIZE
-        block = ttnn.slice(out, [0, 0, top, 0], [batch, 1, top + ttnn.TILE_SIZE, self.hidden_size])
+        block = ttnn.slice(tail_out, [0, 0, tail_top, 0], [batch, 1, tail_top + ttnn.TILE_SIZE, self.hidden_size])
         last = ttnn.reshape(
             ttnn.slice(block, [0, 0, real - 1 - top, 0], [batch, 1, real - top, self.hidden_size]),
             [batch, self.hidden_size],
@@ -405,6 +434,53 @@ class TextStack:
             # `last` with it.
             out = ttnn.slice(out, [0, 0, 0, 0], [batch, 1, real, self.hidden_size])
         return out, last
+
+    def _run_chain(self, embeds, rope):
+        """Every block over `embeds`, then the final norm. `embeds` itself is never freed."""
+        hidden = embeds
+        try:
+            for block in self.blocks:
+                nxt = block(hidden, position_embeddings=rope, decode=False)
+                if hidden is not embeds:
+                    ttnn.deallocate(hidden)
+                hidden = nxt
+            return self.final_norm(hidden)
+        finally:
+            if hidden is not embeds:
+                ttnn.deallocate(hidden)
+
+    def _prefill_shared_prefix(self, embeds, rope, prefix):
+        """`(out [B, 1, S, H], tail_out [B, 1, S - P, H])` with the shared first P rows run ONCE.
+
+        Row 0's first P positions go through the whole chain at batch 1 and every attention layer
+        stashes their post-RoPE k/v; the remaining S - P positions of every row then go through at
+        the full batch, and each attention layer puts the stashed prefix k/v in front of its own and
+        seeds the cache with the whole `[B, n_kv, S, head_dim]`. The batch-B work drops from B * S
+        rows to B * (S - P) + P.
+        """
+        rows, mask = prefix
+        batch, seq = int(embeds.shape[0]), int(embeds.shape[-2])
+        width = int(rope[0].shape[-1])
+        head = [ttnn.slice(t, [0, 0, 0, 0], [1, 1, rows, width]) for t in rope]
+        tail = [ttnn.slice(t, [0, 0, rows, 0], [1, 1, seq, width]) for t in rope]
+        pre_in = ttnn.slice(embeds, [0, 0, 0, 0], [1, 1, rows, self.hidden_size])
+        tail_in = ttnn.slice(embeds, [0, 0, rows, 0], [batch, 1, seq, self.hidden_size])
+        for block in self.blocks:
+            block.kv["prefix_phase"] = "stash"
+        try:
+            pre_out = self._run_chain(pre_in, tuple(head))
+            for block in self.blocks:
+                block.kv["prefix_phase"] = "extend"
+                block.kv["prefix_mask"] = mask
+            tail_out = self._run_chain(tail_in, tuple(tail))
+        finally:
+            for block in self.blocks:
+                block.kv.pop("prefix_phase", None)
+                block.kv.pop("prefix_mask", None)
+                block.kv.pop("prefix_kv", None)
+        out = ttnn.concat([ttnn.repeat(pre_out, ttnn.Shape([batch, 1, 1, 1])), tail_out], dim=2)
+        ttnn.deallocate(pre_out)
+        return out, tail_out
 
     def _prefill_rope(self, embeds, position_ids_tt):
         if position_ids_tt is not None:

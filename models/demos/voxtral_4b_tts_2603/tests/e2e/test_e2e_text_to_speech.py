@@ -123,7 +123,7 @@ def evidence(device, hf_model):
     )
     batch = pipe.batch
     assert input_ids.shape[0] == batch
-    voice = pipe.stage_voice(audio_mask, voice_embedding)
+    voice = pipe.stage_voice(audio_mask, voice_embedding, input_ids=input_ids)
     x0 = pipe.noise(max_frames, batch=batch)
     cfg_alpha = torch.full((batch,), pipeline.DEFAULT_CFG_ALPHA)
 

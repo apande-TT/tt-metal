@@ -205,9 +205,10 @@ class VoxtralTTSPipeline:
         """The real TTS input for this pipeline's batch -- see module-level `speech_inputs`."""
         return speech_inputs(texts=texts, voice=voice, batch=self.batch if batch is None else batch)
 
-    def stage_voice(self, audio_mask, voice_embedding):
-        """Upload the voice once, as persistent device constants, OUTSIDE the forward."""
-        return self.text.stage_voice(audio_mask, voice_embedding)
+    def stage_voice(self, audio_mask, voice_embedding, input_ids=None):
+        """Upload the voice once, as persistent device constants, OUTSIDE the forward. `input_ids`
+        (host) lets the prefill run the prompt prefix every row shares once instead of per row."""
+        return self.text.stage_voice(audio_mask, voice_embedding, input_ids=input_ids)
 
     def noise(self, max_frames: int, batch=None, seed: int = 0):
         """The flow-matching sampler's noise input, drawn ONCE on the host.
@@ -471,7 +472,7 @@ class VoxtralTTSPipeline:
 
         self._stage_buffers["prefill"] = {
             "ids": self.prepare_prompt(padded),
-            "voice": self.stage_voice(mask, inputs["voice_embedding"]),
+            "voice": self.stage_voice(mask, inputs["voice_embedding"], input_ids=padded),
             "positions": self._positions(0, capacity, batch),
             "cos": ttnn.from_torch(
                 cos.reshape(1, 1, capacity, -1).contiguous(),
@@ -527,7 +528,7 @@ class VoxtralTTSPipeline:
         batch, real_len = int(input_ids.shape[0]), int(input_ids.shape[1])
         self.text.reset_cache()
         ids_tt = self.prepare_prompt(input_ids)
-        voice = self.stage_voice(inputs["audio_mask"], inputs["voice_embedding"])
+        voice = self.stage_voice(inputs["audio_mask"], inputs["voice_embedding"], input_ids=input_ids)
         # Contiguous 0..S-1 -- the rotary stub's float32 default branch; see run_text_to_speech.
         _, last = self.text.prefill_voiced(ids_tt, voice)
         self._stage_buffers["decode"] = {
@@ -989,7 +990,7 @@ def host_op_selftest(device=None, pipe=None):
         max_frames = 2
         if head == "text_to_speech":
             input_ids, audio_mask, voice_embedding, _ = shared.speech_inputs()
-            voice = shared.stage_voice(audio_mask, voice_embedding)
+            voice = shared.stage_voice(audio_mask, voice_embedding, input_ids=input_ids)
             x0 = shared.noise(max_frames)
         else:
             input_ids, _ = common.build_batch_inputs(batch=shared.batch)
