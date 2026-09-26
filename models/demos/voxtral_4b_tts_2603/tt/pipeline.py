@@ -472,7 +472,7 @@ class VoxtralTTSPipeline:
 
         self._stage_buffers["prefill"] = {
             "ids": self.prepare_prompt(padded),
-            "voice": self.stage_voice(mask, inputs["voice_embedding"], input_ids=padded),
+            "voice": self.stage_voice(mask, inputs["voice_embedding"], input_ids=input_ids),
             "positions": self._positions(0, capacity, batch),
             "cos": ttnn.from_torch(
                 cos.reshape(1, 1, capacity, -1).contiguous(),
@@ -500,7 +500,7 @@ class VoxtralTTSPipeline:
 
     def prefill_trace_step(self):
         buf = self._stage_buffers["prefill"]
-        _, last = self.text.prefill_voiced(buf["ids"], buf["voice"], real_len=buf["real_len"])
+        _, last = self.text.prefill_voiced(buf["ids"], buf["voice"], real_len=buf["real_len"], need_hidden=False)
         return last
 
     def prefill_trace_items(self):
@@ -530,7 +530,7 @@ class VoxtralTTSPipeline:
         ids_tt = self.prepare_prompt(input_ids)
         voice = self.stage_voice(inputs["audio_mask"], inputs["voice_embedding"], input_ids=input_ids)
         # Contiguous 0..S-1 -- the rotary stub's float32 default branch; see run_text_to_speech.
-        _, last = self.text.prefill_voiced(ids_tt, voice)
+        _, last = self.text.prefill_voiced(ids_tt, voice, need_hidden=False)
         self._stage_buffers["decode"] = {
             "llm_hidden": last,
             "position": real_len,
