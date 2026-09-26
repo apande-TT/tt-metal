@@ -355,6 +355,34 @@ def _sdpa_cfg(q):
     )
 
 
+def _prefill_sdpa(q, k, v, kv_cache):
+    """Prefill SDPA, `(attn, k, v)` -- the k/v to seed the cache with, or None to seed nothing.
+
+    With no `kv_cache["prefix_phase"]` this is the plain causal SDPA. A text stack running a SHARED
+    prompt prefix once calls every layer twice: "stash" (the batch-1 prefix) keeps its k/v in the
+    cache dict and seeds nothing, and "extend" (the per-row tail at the full batch) puts that k/v in
+    front of its own for every row and attends through `kv_cache["prefix_mask"]` -- prefix columns
+    open, the tail's own columns causal -- so the cache is seeded with the whole prompt.
+    """
+    phase = kv_cache.get("prefix_phase") if kv_cache is not None else None
+    if phase == "extend":
+        pk, pv = kv_cache.pop("prefix_kv")
+        rep = ttnn.Shape([int(q.shape[0]), 1, 1, 1])
+        k = ttnn.concat([ttnn.repeat(pk, rep), k], dim=2)
+        v = ttnn.concat([ttnn.repeat(pv, rep), v], dim=2)
+        ttnn.deallocate(pk)
+        ttnn.deallocate(pv)
+        a = ttnn.transformer.scaled_dot_product_attention(
+            q, k, v, is_causal=False, attn_mask=kv_cache["prefix_mask"], scale=1.0, program_config=_sdpa_cfg(q)
+        )
+        return a, k, v
+    a = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0, program_config=_sdpa_cfg(q))
+    if phase == "stash":
+        kv_cache["prefix_kv"] = (k, v)
+        return a, None, None
+    return a, k, v
+
+
 def _decode_shard(device, rows, width):
     """HEIGHT-sharded over the batch, one user per core -- the decode op set's layout.
 
@@ -719,10 +747,8 @@ def build(device, torch_module):
             cos = _broadcast4(cos, seq, head_dim)
             sin = _broadcast4(sin, seq, head_dim)
             q, k = _rope_prefill(q, k, cos, sin, half)
-        a = ttnn.transformer.scaled_dot_product_attention(
-            q, k, v, is_causal=True, scale=1.0, program_config=_sdpa_cfg(q)
-        )
-        if kv_cache is not None:
+        a, k, v = _prefill_sdpa(q, k, v, kv_cache)
+        if kv_cache is not None and k is not None:
             _seed_cache(kv_cache, k, v)
         return _lin(
             ttnn.experimental.nlp_concat_heads(a),
