@@ -320,7 +320,31 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
 
     # bf16 context: the head merge moves it and o_proj multicasts it whole.
     out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.bfloat16), [1, n_heads, rows, head_dim])
-    return _lin(ttnn.experimental.nlp_concat_heads(out), wo, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
+    return _lin(_concat_heads(out), wo, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
+
+
+def _concat_heads(out):
+    """`nlp_concat_heads` with one HEAD per core instead of one 32-row tile per core.
+
+    Interleaved, the op deals out a work unit per row tile, so 96 rows run on 3 cores (54 us).
+    Height-sharded one head per core, every core copies its own head into its own column block
+    of a width-sharded result; the result goes back to interleaved L1 for o_proj.
+    """
+    _, n_heads, rows, head_dim = (int(d) for d in out.shape)
+    grid = out.device().compute_with_storage_grid_size()
+    cores = ttnn.num_cores_to_corerangeset(n_heads, grid, row_wise=True)
+    in_cfg = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(cores, [rows, head_dim], ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    out_cfg = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(cores, [rows, head_dim], ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    merged = ttnn.experimental.nlp_concat_heads(ttnn.to_memory_config(out, in_cfg), memory_config=out_cfg)
+    return ttnn.to_memory_config(merged, ttnn.L1_MEMORY_CONFIG)
 
 
 def _leading(shape) -> int:
