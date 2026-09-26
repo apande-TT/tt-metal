@@ -620,15 +620,19 @@ def host_op_selftest():
         close_mesh(mesh)
 
 
-def trace_capture_selftest():
-    """Every PIPELINE_STAGES step captured, replayed and compared against eager -> True iff all match."""
+def trace_capture_selftest(device=None):
+    """Every PIPELINE_STAGES step captured, replayed and compared against eager -> True iff all match.
+
+    device: an open mesh to run on (it must carry a trace region, DEVICE_PARAMS); None opens and closes one.
+    """
     from models.demos.qwen_image_edit.mesh import close_mesh, open_mesh
 
-    mesh = open_mesh()
+    mesh = device if device is not None else open_mesh()
     try:
         pipe, _ = _selftest_pipeline(mesh)
         ok = pipe.trace_capture_selftest()
         print(f"[trace] report {pipe.trace_report}", flush=True)
         return ok
     finally:
-        close_mesh(mesh)
+        if device is None:
+            close_mesh(mesh)

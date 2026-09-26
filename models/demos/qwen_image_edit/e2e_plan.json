@@ -310,5 +310,16 @@
     "gate3": "PASS: e2e PCC=0.9610505831262349 (min over 32 samples, target 0.95); 29/32 >= 0.99; mean 0.9955",
     "batch": "PERF_BATCH_STREAMS=32",
     "test_seconds": 1624
+  },
+  "results_galaxy_2026_09_26_rerun": {
+    "call_1_image_edit": "READY",
+    "graduated_recheck": "re-enumerated the three bringup_status.json files: 25 NEW + last_good snapshot (text encoder 7, VAE 11, transformer 7); equals graduated_modules and tt/pipeline.py GRADUATED",
+    "gate1": "PASS (static scan clean; host_op_observer 0 host aten ops)",
+    "gate2": "PASS (all 25 graduated modules invoked, e.g. v_l_vision_block 32, v_l_decoder_layer 56, qwen_image_causal_conv3d 52)",
+    "gate3": "PASS: e2e PCC=0.9610505831262349 (min over 32 samples, target 0.95); next lowest 0.983, 0.989; distinct + own-golden-best",
+    "batch": "PERF_BATCH_STREAMS=32 (TT_PERF_BATCH=32)",
+    "test_seconds": 1626,
+    "ceilings": "none recorded, so none to re-test (STAGE_MAX_BATCH = {})",
+    "rerun_14_39": "PASS again: e2e PCC=0.9610505831262349 (sample 15, 'Add thick mist'), all others >= 0.988; gate1 clean + 0 host ops; gate2 25/25 invoked; distinct+own-golden-best; PERF_BATCH_STREAMS=32; 1629 s; pre-commit hooks pass on the package"
   }
 }
