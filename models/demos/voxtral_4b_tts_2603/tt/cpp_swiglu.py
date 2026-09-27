@@ -45,7 +45,10 @@ _DEST_TILES = 8
 # Small K blocks, deep weight buffering: compute starts after one block lands and trails the stream
 # by one block, and at RT x 2 subblocks a spill/reload round is cheap next to a block's math.
 _KB_DEPTH = ((8, 4), (8, 3), (8, 2), (6, 3), (4, 3), (4, 2), (2, 2), (1, 2))
-_BF16, _BF8 = 2048, 1088
+_BF16 = 2048
+# The fused gate/up weight's format: bf4_b halves the bytes the weight-stream-bound kernel reads
+# (576 B a tile: 512 B of mantissas + 64 B of shared exponents), as it did for the down projection.
+_W_DTYPE, _BF8 = ttnn.bfloat4_b, 576
 
 
 def _log(msg):
@@ -109,7 +112,7 @@ def fuse(w1, w3, device):
     mapper = ttnn.ReplicateTensorToMesh(device) if device.__class__.__name__ == "MeshDevice" else None
     t = ttnn.from_torch(
         inter.contiguous(),
-        dtype=ttnn.bfloat8_b,
+        dtype=_W_DTYPE,
         layout=ttnn.TILE_LAYOUT,
         device=device,
         memory_config=mem,
@@ -198,7 +201,7 @@ class _Plan:
         cfg.dst_full_sync_en = True
         cbs = [
             self._cb(0, ttnn.bfloat16, _BF16, 2 * mt * kb),
-            self._cb(1, ttnn.bfloat8_b, _BF8, self.depth * kb * 2 * pn),
+            self._cb(1, _W_DTYPE, _BF8, self.depth * kb * 2 * pn),
             self._cb(16, ttnn.bfloat16, _BF16, 2 * rt),
             self._cb(24, ttnn.float32, 4096, mt * 2 * pn),
         ]
