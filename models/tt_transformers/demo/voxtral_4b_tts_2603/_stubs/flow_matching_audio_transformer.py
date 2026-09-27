@@ -510,7 +510,14 @@ def _compile_block(device, blk, mask):
         hn = _block_norm(h, eps, norm_scale, ttnn.bfloat16, memory_config=_FFN_IN_MEM if w13 is not None else None)
         if cpp_swiglu.serves(hn, w13):
             return ttnn.add(
-                h, _lin(cpp_swiglu.apply(hn, w13), w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
+                h,
+                _lin(
+                    cpp_swiglu.apply(hn, w13),
+                    w2,
+                    dtype=ttnn.float32,
+                    compute_kernel_config=_TALL_COMPUTE,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                ),
             )
         gated = ttnn.multiply(
             _lin(hn, w1, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
@@ -522,7 +529,12 @@ def _compile_block(device, blk, mask):
             dtype=ttnn.bfloat16,
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
-        return ttnn.add(h, _lin(gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE))
+        return ttnn.add(
+            h,
+            _lin(
+                gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
+            ),
+        )
 
     return run
 

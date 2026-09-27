@@ -533,7 +533,12 @@ def build(device, torch_module):
                 dtype=ttnn.bfloat16,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
             )
-        h4 = ttnn.add(h4, _lin(gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE))
+        h4 = ttnn.add(
+            h4,
+            _lin(
+                gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
+            ),
+        )
 
         if rank >= 4:
             return h4
