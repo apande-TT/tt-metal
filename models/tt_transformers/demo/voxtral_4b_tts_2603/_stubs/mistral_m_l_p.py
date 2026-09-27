@@ -344,6 +344,9 @@ def _fused_swiglu(h, w_gu, w_ttl=None):
     # 18-tile N blocks split each core's 54 fused columns (27 output tiles x 2) into exactly 3 blocks
     # (12 left a half-empty 5th block); 4-tile K blocks keep the L1 footprint near 1 MB.
     share = -(-(rows // 32) // int(grid.y))
+    # The fewest grid rows that keep that share: rows past ceil(M / share) would only compute padding
+    # (32 M tiles over 10 rows is 4 each, and rows 8-9 held the pad).
+    grid = ttnn.CoreCoord(int(grid.x), -(-(rows // 32) // share))
     # A share of <= 8 tiles fits one M block, so each core streams its weight columns ONCE.
     m_blk = share if share <= 8 else -(-share // 2)
     cfg = ttnn.MinimalMatmulConfig(
