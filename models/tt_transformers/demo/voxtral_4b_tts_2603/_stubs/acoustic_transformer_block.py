@@ -33,7 +33,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import cpp_swiglu, ttl_down
+from models.demos.voxtral_4b_tts_2603.tt import cpp_down, cpp_swiglu, ttl_down
 
 _TILE = 32
 _COMPUTE = ttnn.WormholeComputeKernelConfig(
@@ -489,6 +489,7 @@ def build(device, torch_module):
     # The down projection is DRAM-bound at 1024 rows; bf8_b halves the weight it streams.
     w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat4_b)
     w2_ttl = ttl_down.weight(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, _from_torch)
+    w2_cpp = cpp_down.shard(ff.w2.weight.detach().transpose(0, 1).contiguous(), device)
     w3 = _from_torch(
         (ff.w3.weight.detach().float().transpose(0, 1) * g_ffn_t).contiguous(), device, dtype=ttnn.bfloat8_b
     )
@@ -534,7 +535,9 @@ def build(device, torch_module):
                 dtype=ttnn.bfloat16,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
             )
-        if ttl_down.supports(gated, w2_ttl):
+        if cpp_down.serves(gated, w2_cpp):
+            down = cpp_down.apply(gated, w2_cpp)
+        elif ttl_down.supports(gated, w2_ttl):
             down = ttl_down.apply(gated, w2_ttl)
         else:
             down = _lin(
