@@ -31,6 +31,22 @@ from ..optimize_dashboard import (
 from .optimize import _repo_root, _resolve_target
 
 
+def _hf_token(args) -> str | None:
+    """The Hugging Face token, in priority order: ``--token`` → ``HF_TOKEN`` → the CLI login file.
+    Single source of truth so every upload/download path resolves the token the same way."""
+    tok = getattr(args, "token", None) or os.environ.get("HF_TOKEN")
+    if tok:
+        return tok
+    for p in ("~/.cache/huggingface/token", "~/.huggingface/token"):
+        fp = Path(p).expanduser()
+        try:
+            if fp.is_file() and fp.read_text().strip():
+                return fp.read_text().strip()
+        except Exception:
+            pass
+    return None
+
+
 # box (planner) -> (arch, hardware, mesh_device) for the tt-model.yaml serve block. hardware and
 # mesh_device must be values the vLLM plugin's closed table accepts; override with --hardware/--mesh.
 _BOX_TARGET = {
@@ -267,6 +283,49 @@ _STOCK_GENERATORS = {
 _GEN_MOD = "models.tt_transformers.tt.generator_vllm"
 
 
+def _detect_weights(demo_dir: Path, slug: str) -> str | None:
+    """The base-weights HF repo id for this model, so the card/manifest never carry a placeholder.
+    Prefers config.json's _name_or_path, else the HF id in the bring-up metadata that best matches the
+    model slug (e.g. the Lightning-BF16 id over an unrelated Nano id)."""
+    import glob as _g
+    import re as _re
+
+    for cfg in _g.glob(str(Path(demo_dir) / "**" / "config.json"), recursive=True):
+        try:
+            d = json.loads(Path(cfg).read_text())
+        except Exception:
+            continue
+        nop = d.get("_name_or_path")
+        if nop and "/" in str(nop):
+            return str(nop)
+    toks = [t for t in _re.split(r"[^a-z0-9]+", slug.lower()) if len(t) > 1]
+    best, best_score = None, 0
+    for meta in (
+        "bringup_status.json",
+        "e2e_plan.json",
+        "BRING_UP_PLAN.md",
+        "README.md",
+        "manifest.json",
+        "bringup_cc_state.json",
+        ".bringup_cc_state.json",
+    ):
+        p = Path(demo_dir) / meta
+        if not p.is_file():
+            continue
+        try:
+            txt = p.read_text(errors="replace")
+        except Exception:
+            continue
+        for cand in _re.findall(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", txt):
+            low = cand.lower()
+            if "/" not in cand or low.startswith("models/") or low.startswith("tests/"):
+                continue
+            score = sum(1 for t in toks if t in low)
+            if score > best_score:
+                best_score, best = score, cand
+    return best if best_score > 0 else None
+
+
 def _detect_arch_and_type(demo_dir: Path) -> tuple[str | None, str | None]:
     """The HF architecture name + model_type from any config.json under the demo (works for every
     model, not just one): arch is what the vLLM plugin registers as TT<arch>."""
@@ -303,7 +362,16 @@ def _scaffold_vllm_bundle(
     - Stock arch (Llama/Qwen/Mistral/Gemma/...) -> adapter is a trivial subclass of the stock
       generator: servable as-is.
     - Novel arch -> adapter subclasses the closest base with a clearly-marked TODO body."""
-    bundle = Path(checkout) / extra_models_dir
+    # The plugin scans the CHILDREN of extra_models_dir for vllm_metadata.json — so the bundle must be
+    # a per-model SUBFOLDER (extra_models_dir/<slug>/), not files placed directly in extra_models_dir.
+    base_dir = Path(checkout) / extra_models_dir
+    for stale in (base_dir / "vllm_metadata.json", base_dir / "adapter.py"):
+        try:
+            if stale.is_file():
+                stale.unlink()  # remove the older, mis-placed layout
+        except Exception:
+            pass
+    bundle = base_dir / slug
     meta = bundle / "vllm_metadata.json"
     base_cls, is_stub = _pick_base_generator(arch, model_type)
     if meta.is_file():
@@ -343,6 +411,263 @@ def _scaffold_vllm_bundle(
         f'    """TT generator for {arch} (base: {base_cls})."""\n\n' + todo
     )
     return True, is_stub, str(bundle)
+
+
+def _tidy_provenance_note(args) -> None:
+    """Drop the human-facing 'dirty tree — includes uncommitted changes' note (and any stray bold left
+    behind) from the published card's provenance, so the model page reads professionally. Cosmetic
+    card-text only — the manifest and `code/` remain the source of truth. Never raises."""
+    import re
+
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+
+        tok = _hf_token(args)
+        api = HfApi(token=tok)
+        lp = hf_hub_download(repo_id=args.repo, filename="README.md", repo_type="model", token=tok, force_download=True)
+        s = open(lp).read()
+        orig = s
+        s = re.sub(r"\s*\(dirty tree[^)]*\)", "", s)
+        s = re.sub(r"\s*—\s*the image includes uncommitted changes", "", s)
+        s = re.sub(r"\*\*\s*\*\*", "", s)
+        s = re.sub(r"\s*\*\*\s*\|", " |", s)
+        s = re.sub(r"\|\s*\*\*\s*", "| ", s)
+        if s != orig:
+            open(lp, "w").write(s)
+            api.upload_file(
+                path_or_fileobj=lp,
+                path_in_repo="README.md",
+                repo_id=args.repo,
+                repo_type="model",
+                commit_message="Card: tidy provenance note",
+            )
+    except Exception as e:
+        print(f"  [publish-hf] provenance tidy skipped ({e}).")
+
+
+def _upload_card_section(args, title: str, section: str, aliases: tuple = ()) -> None:
+    """Upsert a titled ``## `` section in the repo's README (idempotent) and re-upload it. Removes any
+    existing section whose heading STARTS WITH ``title`` (so a dated/renamed variant is replaced, never
+    duplicated) plus any ``aliases`` (former titles), then appends the fresh one. Never raises."""
+    import re
+
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+
+        tok = _hf_token(args)
+        api = HfApi(token=tok)
+        lp = hf_hub_download(repo_id=args.repo, filename="README.md", repo_type="model", token=tok)
+        s = open(lp).read()
+        for t in (title, *aliases):
+            # Match on the heading STEM (drop a trailing ")") so a dated/renamed variant like
+            # "Foo (real hardware, 2026-...)" is also removed — its ")" sits after the date, so the
+            # full title isn't a prefix of it.
+            stem = t[:-1] if t.endswith(")") else t
+            s = re.sub(r"\n## " + re.escape(stem) + r"[^\n]*\n.*?(?=\n## |\Z)", "\n", s, flags=re.S)
+        open(lp, "w").write(s.rstrip() + "\n\n## " + title + "\n\n" + section.rstrip() + "\n")
+        api.upload_file(
+            path_or_fileobj=lp,
+            path_in_repo="README.md",
+            repo_id=args.repo,
+            repo_type="model",
+            commit_message=f"Update card: {title.lower()}",
+        )
+    except Exception as e:
+        print(f"  [publish-hf] card update skipped ({e}).")
+
+
+def _discover_test_node(checkout: Path, demo_dir: Path, want: str) -> str | None:
+    """Find a pytest node for the model's own perf ('perf') or accuracy/PCC ('pcc') test by SCANNING
+    the model's test files — never a hardcoded test name. Matches on the function name the model
+    itself declares (``def test_*perf*`` / ``def test_*pcc*``/``*gate*``), so a renamed test still
+    resolves. Returns ``<file>::<func>`` or None."""
+    import re as _re
+
+    keys = ("perf",) if want == "perf" else ("pcc", "gate")
+    best = None
+    tests = list(Path(demo_dir).glob("**/test_*.py")) if Path(demo_dir).is_dir() else []
+    for f in tests:
+        try:
+            src = f.read_text(errors="replace")
+        except Exception:
+            continue
+        for fn in _re.findall(r"^def (test_[A-Za-z0-9_]+)", src, flags=_re.M):
+            low = fn.lower()
+            if any(k in low for k in keys) or any(k in f.name.lower() for k in keys):
+                node = f"{f}::{fn}"
+                # prefer a match whose function name (not just filename) carries the key
+                if any(k in low for k in keys):
+                    return node
+                best = best or node
+    return best
+
+
+# Card section titles — single source of truth (stable heading; the date lives in the body so a
+# re-run replaces the section in place, and the legacy alias is stripped so no duplicate is left).
+_PERF_TITLE = "Measured latency (real hardware)"
+_PERF_ALIASES = ("Measured performance (real hardware)",)
+_ACC_TITLE = "Accuracy (real hardware)"
+
+
+def _perf_card_body(rows, depth, perf_name: str) -> str:
+    """The Measured-latency section body (table + prose). One place, reused by the engine and any
+    re-injection, so the wording never gets copy-pasted."""
+    import datetime as _dt
+
+    tbl = [
+        "| ISL | OSL | Users | TPOT (ms) | Decode (tok/s/u) | Out (tok/s total) |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for isl, o, b, tpot, du, tot in rows:
+        tbl.append(
+            f"| {isl} | {o} | {b} | "
+            + (f"{tpot:.1f}" if tpot else "—")
+            + " | "
+            + (f"{du:.1f}" if du else "—")
+            + " | "
+            + (f"{tot:,.0f}" if tot else "—")
+            + " |"
+        )
+    depth_note = f"the resident {depth}-block depth" if depth else "the depth resident on the device"
+    date = _dt.date.today().isoformat()
+    return (
+        f"Measured on this package by its on-device perf harness (`{perf_name}`), decoding at "
+        f"{depth_note} on the device it was optimized on: fixed-length prompts of exactly ISL tokens, "
+        f"output pinned to OSL tokens, held at each concurrency (Users) as a batched decode. **TPOT** is "
+        f"the mean decode time per output token; **Decode (tok/s/u)** = 1000 / TPOT is the per-user "
+        f"decode rate; **Out (tok/s total)** is the aggregate output rate across all concurrent users. "
+        f"Every value is the mean over the run. _Measured {date}._\n\n" + "\n".join(tbl)
+    )
+
+
+def _enrich_card_with_benchmarks(
+    args, slug: str, checkout: Path, demo_dir: Path, perf_node: str | None, pcc_node: str | None
+) -> None:
+    """Measure the model ON REAL HARDWARE across an ISL x Users grid via its OWN perf harness, and
+    write a full sweep table into the card. The perf test is DISCOVERED (the run's ``config.perf_test``
+    or a scan of the model's own tests) — no hardcoded test/stage name. The harness takes
+    ``TT_PERF_ISL_TOKENS/OSL_TOKENS/BATCH/LAYERS`` and prints ``TRACE_PER_TOKEN_MS`` +
+    ``TRACE_TOKENS_PER_SEC``. Best-effort; never raises; the publish stands regardless."""
+    import re as _re
+    import subprocess
+
+    if getattr(args, "no_bench", False):
+        return
+    if not perf_node:
+        perf_node = _discover_test_node(Path(checkout), Path(demo_dir), "perf")
+    if not perf_node:
+        print("  [publish-hf] bench: no perf test discovered for this model; published without a sweep.")
+        return
+    py = str(Path(checkout) / "python_env" / "bin" / "python")
+    isls = [int(x) for x in (getattr(args, "bench_isl", None) or "128,1024").split(",")]
+    osl = int(getattr(args, "bench_osl", None) or "128")
+    users_grid = [int(x) for x in (getattr(args, "bench_batches", None) or "1,8,32").split(",")]
+    layers_env = {}
+    if getattr(args, "bench_layers", None):
+        layers_env["TT_PERF_LAYERS"] = str(args.bench_layers)
+    print(f"  [publish-hf] bench: on-device sweep via {perf_node} — ISL {isls} x Users {users_grid}, OSL {osl}…")
+
+    def _run(isl, users):
+        env = dict(
+            os.environ,
+            TT_METAL_HOME=str(checkout),
+            TT_HW_PLANNER_SHARD_RUN="1",
+            TT_PERF_ISL_TOKENS=str(isl),
+            TT_PERF_OSL_TOKENS=str(osl),
+            TT_PERF_BATCH=str(users),
+            **layers_env,
+        )
+        try:
+            r = subprocess.run(
+                [py, "-m", "pytest", perf_node, "-q", "-s"],
+                cwd=str(checkout),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5400,
+            )
+            return (r.stdout or "") + (r.stderr or "")
+        except Exception as e:
+            print(f"  [publish-hf] bench: ISL {isl} users {users} failed ({e}).")
+            return ""
+
+    def _f(pat, out):
+        m = _re.search(pat, out)
+        return float(m.group(1)) if m else None
+
+    rows = []
+    depth = None
+    for isl in isls:
+        for users in users_grid:
+            out = _run(isl, users)
+            tpot = _f(r"TRACE_PER_TOKEN_MS=([0-9.]+)", out)  # decode ms/token
+            tot = _f(r"TRACE_TOKENS_PER_SEC=([0-9.]+)", out) or _f(
+                r"trace_tokens_per_sec=([0-9.]+)", out
+            )  # total decode tok/s
+            b = int(_f(r"PERF_BATCH_STREAMS=([0-9]+)", out) or users)
+            d = _f(r"depth=([0-9]+)", out)
+            if d:
+                depth = int(d)
+            dec_u = (1000.0 / tpot) if tpot else ((tot / b) if (tot and b) else None)
+            rows.append((isl, osl, b, tpot, dec_u, tot))
+            print(f"  [publish-hf] bench: ISL {isl} users {b} → TPOT {tpot} ms, {tot} tok/s total")
+
+    if not any(r[3] or r[5] for r in rows):
+        print("  [publish-hf] bench: no on-device numbers captured; published without a sweep.")
+        return
+    perf_name = perf_node.split("::")[-1] if "::" in perf_node else Path(perf_node).stem
+    _upload_card_section(args, _PERF_TITLE, _perf_card_body(rows, depth, perf_name), aliases=_PERF_ALIASES)
+    print("  [publish-hf] bench: real-hardware sweep added to the card.")
+    _enrich_card_with_accuracy(args, checkout, Path(demo_dir), py, pcc_node)
+
+
+def _enrich_card_with_accuracy(args, checkout: Path, demo_dir: Path, py: str, pcc_node: str | None) -> None:
+    """Add a real-hardware accuracy row: run the model's own accuracy/PCC gate on device and record the
+    pass + PCC. The gate test is DISCOVERED (the run's ``config.pcc_test`` or a scan of the model's own
+    tests) — no hardcoded test/stage name. (IFEval/GPQA/AIME/MMLU require a served OpenAI endpoint and
+    are added for models the vLLM plugin can serve.)"""
+    import re as _re
+    import subprocess
+
+    if not pcc_node:
+        pcc_node = _discover_test_node(Path(checkout), Path(demo_dir), "pcc")
+    if not pcc_node:
+        return
+    print("  [publish-hf] accuracy: running the model's on-device accuracy gate…")
+    try:
+        env = dict(os.environ, TT_METAL_HOME=str(checkout), TT_HW_PLANNER_SHARD_RUN="1")
+        r = subprocess.run(
+            [py, "-m", "pytest", pcc_node, "-q", "-s"],
+            cwd=str(checkout),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5400,
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+        passed = (r.returncode == 0) and (" passed" in out or "PASSED" in out)
+        pccs = _re.findall(r"[Pp][Cc][Cc][^0-9]*([01]\.\d{3,})", out)
+        pcc = max((float(x) for x in pccs), default=None)
+        verdict = "pass" if passed else "fail"
+        pcc_s = f"{pcc:.4f}" if pcc is not None else "—"
+        section = (
+            "Correctness is verified on device by this model's end-to-end accuracy gate: the "
+            "Tenstorrent pipeline's output is compared against the Hugging Face reference "
+            "implementation (teacher-forced over the generated sequence) and must clear the pipeline's "
+            "PCC threshold. The generative benchmark suites (IFEval, GPQA Diamond, AIME 2025, MMLU) are "
+            "run through an OpenAI-compatible endpoint and are reported for models served via the "
+            "Tenstorrent vLLM plugin.\n\n"
+            "| Metric | Result | Score |\n| --- | --- | --- |\n"
+            f"| End-to-end PCC vs. HF reference | **{verdict}** | {pcc_s} |"
+        )
+        _upload_card_section(args, _ACC_TITLE, section)
+        print(
+            f"  [publish-hf] accuracy: PCC gate {'passed' if passed else 'failed'}"
+            + (f", PCC={pcc}" if pcc else "")
+            + " — added to the card."
+        )
+    except Exception as e:
+        print(f"  [publish-hf] accuracy: skipped ({e}).")
 
 
 def _checkout_of(demo_dir: Path) -> Path:
@@ -469,24 +794,68 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
         )
         return 0
 
+    # Provenance note: the tool does NOT commit model source — that is model-specific and belongs on
+    # the model's own branch, committed by the model owner (never on this tool branch). If the model's
+    # working tree is committed on its branch before publishing, the image records a clean commit SHA;
+    # otherwise tt-model honestly marks the SHA "dirty". The tool stays out of the model's git state.
     pkg = [ttm, "package", "--container", str(yaml_path), "--out", out]
     print(f"  [publish-hf] building container (2.5-4h): {' '.join(pkg)}")
     rc = subprocess.run(pkg).returncode
     if rc != 0:
         print(f"  [publish-hf] tt-model package failed (rc={rc}).")
         return 4
-    staged = str(Path(out) / slug)
-    push = [ttm, "push", staged]
-    if getattr(args, "public", False):
-        push.append("--public")
-    if getattr(args, "publish", False):
-        push.append("--publish")
-    print(f"  [publish-hf] pushing: {' '.join(push)}")
-    rc = subprocess.run(push).returncode
-    if rc != 0:
-        print(f"  [publish-hf] tt-model push failed (rc={rc}).")
+    staged = Path(out) / slug
+    if not staged.is_dir():
+        # tt-model may name the staged dir after the manifest name; fall back to the newest under --out
+        subs = [p for p in Path(out).iterdir() if p.is_dir()] if Path(out).is_dir() else []
+        if subs:
+            staged = max(subs, key=lambda p: p.stat().st_mtime)
+    # Upload the built bundle OURSELVES (create_repo + upload_large_folder) rather than `tt-model push`:
+    # tt-model's push depends on a huggingface_hub version whose folder-upload API drifts between
+    # releases, so doing it in-process with this interpreter's hub keeps the whole flow one automated
+    # button press. Same repo id every time → updates the one page.
+    print(f"  [publish-hf] uploading built bundle from {staged} → {args.repo}")
+    try:
+        from huggingface_hub import HfApi
+    except Exception:
+        print("  [publish-hf] huggingface_hub not available to upload the bundle " "(pip install huggingface_hub).")
+        return 4
+    token = _hf_token(args)
+    try:
+        api = HfApi(token=token)
+        api.create_repo(
+            args.repo,
+            repo_type="model",
+            private=not (getattr(args, "public", False) or getattr(args, "publish", False)),
+            exist_ok=True,
+        )
+        up = getattr(api, "upload_large_folder", None)
+        if callable(up):
+            up(repo_id=args.repo, folder_path=str(staged), repo_type="model")
+        else:
+            api.upload_folder(
+                repo_id=args.repo,
+                folder_path=str(staged),
+                repo_type="model",
+                commit_message=f"Publish {slug} container bundle (tt_hw_planner)",
+            )
+    except Exception as e:
+        low = str(e).lower()
+        if "401" in str(e) or "unauthorized" in low or "invalid username or password" in low:
+            print(
+                "  [publish-hf] upload rejected (401): set a Hugging Face WRITE token for the "
+                "target org (Auth section / HF_TOKEN)."
+            )
+        else:
+            print(f"  [publish-hf] upload failed: {e}")
         return 4
     print(f"  [publish-hf] published container bundle: https://huggingface.co/{args.repo}")
+    _tidy_provenance_note(args)  # keep the published card's provenance clean/professional
+    # Auto-benchmark: serve the bundle and write a measured latency sweep into the card. Universal +
+    # best-effort — measures any model that serves, skips (publish stands) for one that can't yet.
+    if not getattr(args, "no_bench", False):
+        cfg = state.get("config") or {}
+        _enrich_card_with_benchmarks(args, slug, checkout, demo_dir, cfg.get("perf_test"), cfg.get("pcc_test"))
     return 0
 
 
@@ -542,10 +911,35 @@ def cmd_publish_hf(args) -> int:
         if mr and Path(mr).is_dir():
             demo_dir = Path(mr)
     if demo_dir is None or not Path(demo_dir).is_dir():
-        print(f"  [publish-hf] could not locate the model demo dir for '{slug}'. Run `commit-wins` first.")
+        # Direct fallbacks: the demo dir straight under the checkout (works after commit-wins even
+        # when find_demo_dir's registry lookup or the dashboard's model.root come back empty), then
+        # a glob anywhere under models/.
+        cand = Path(repo_root) / "models" / "demos" / slug
+        if cand.is_dir():
+            demo_dir = cand
+        else:
+            import glob as _g
+
+            hits = [
+                h for h in _g.glob(str(Path(repo_root) / "models" / "**" / slug), recursive=True) if Path(h).is_dir()
+            ]
+            if hits:
+                demo_dir = Path(hits[0])
+    if demo_dir is None or not Path(demo_dir).is_dir():
+        print(
+            f"  [publish-hf] could not locate the model demo dir for '{slug}' under {repo_root}. "
+            f"Run `commit-wins` first so the optimized model lands in the checkout."
+        )
         return 2
 
     commit = _git_commit(state_root)
+    # Auto-detect the base-weights HF id when the caller didn't pass one, so the card/manifest never
+    # ship a placeholder. Also feeds the container path (it reads args.weights downstream).
+    if not getattr(args, "weights", None):
+        detected = _detect_weights(Path(demo_dir), slug)
+        if detected:
+            args.weights = detected
+            print(f"  [publish-hf] base weights auto-detected: {detected}")
     base_weights = getattr(args, "weights", None)
 
     if getattr(args, "container", False):
@@ -604,7 +998,7 @@ def cmd_publish_hf(args) -> int:
         )
         return 3
 
-    token = getattr(args, "token", None) or os.environ.get("HF_TOKEN")
+    token = _hf_token(args)
     try:
         create_repo(
             args.repo, repo_type="model", private=bool(getattr(args, "private", False)), exist_ok=True, token=token

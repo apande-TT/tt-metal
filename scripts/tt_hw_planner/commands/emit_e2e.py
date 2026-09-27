@@ -1372,6 +1372,10 @@ def _signal_quality_gate(demo_dir: Path):
 
 # How the `--batch` request reaches the gate's own process (e2e_mcp reads it back by this name).
 E2E_MCP_BATCH_ENV = "E2E_MCP_BATCH"
+# Where the gate streams its tests' output. The out-of-band gate check supervises THIS FILE for
+# forward progress instead of guessing a duration, so both sides must agree on the path: the caller
+# names it, the gate writes there. Unset (any other caller) -> the gate picks its own, as before.
+E2E_GATE_LOG_ENV = "E2E_GATE_LOG"
 
 
 def _batch_gate_reason(requested: int, test_output: str) -> Optional[str]:
@@ -1543,7 +1547,11 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
     # and no wall is typed here at all -- the caller's budget is the only number, as a fuse.
     from models.experimental.perf_automation.agent import probes as _pr
 
-    _gate_log = Path(tempfile.mkdtemp(prefix="e2e_gate_")) / "gate.log"
+    # The caller may name the log so it can watch the run progress; otherwise keep our own temp dir.
+    # Either way this function owns the file and its directory, including the keep-on-failure below.
+    _caller_log = os.environ.get(E2E_GATE_LOG_ENV)
+    _gate_log = Path(_caller_log) if _caller_log else Path(tempfile.mkdtemp(prefix="e2e_gate_")) / "gate.log"
+    _gate_log.parent.mkdir(parents=True, exist_ok=True)
 
     def _e2e_once():
         _gate_log.unlink(missing_ok=True)  # each attempt is judged on its own output
@@ -2043,10 +2051,14 @@ def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_round
     pybin = str(repo_root / "python_env" / "bin" / "python")
     if not Path(pybin).is_file():
         pybin = sys.executable
+    # One agreed path for the gate's live output: the gate writes it, this caller watches it grow.
+    # Made here (not in the gate) because the watcher has to know it before the gate starts.
+    _gate_progress_log = Path(tempfile.mkdtemp(prefix="e2e_gate_")) / "gate.log"
     mcp_env = {
         "E2E_MCP_DEMO_DIR": str(demo_dir),
         "E2E_MCP_PCC": str(pcc),
         "E2E_MCP_TIMEOUT": str(timeout_s),
+        E2E_GATE_LOG_ENV: str(_gate_progress_log),
         E2E_MCP_BATCH_ENV: str(int(batch or 1)),
         "E2E_MODEL_ID": model_id,
         "E2E_ALL_TASKS": _os.environ.get("E2E_ALL_TASKS", "0"),
@@ -2068,7 +2080,15 @@ def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_round
     env["PYTHONPATH"] = str(repo_root)
 
     def gate_fn():
-        return cc_harness.gate_status(pybin, thp_dir, "e2e_mcp", mcp_env, repo_root)
+        # The gate's OWN budget is the floor: this call wraps the gate, so a tighter limit here
+        # kills honest work and reports nothing. `timeout_s` is the same value handed to the server
+        # as its per-pytest timeout above, so the two layers cannot disagree. It is only a BACKSTOP
+        # now -- the check is supervised on the gate's own log, so a long-but-working gate (a first
+        # run that must build its reference, say) is judged on progress rather than on a duration
+        # nobody can know in advance.
+        return cc_harness.gate_status(
+            pybin, thp_dir, "e2e_mcp", mcp_env, repo_root, timeout_s=timeout_s, progress_log=_gate_progress_log
+        )
 
     prompt = _build_cc_fix_prompt(model_id=model_id, demo_dir=demo_dir, pcc=pcc)
     allowed = ["mcp__e2e-mcp__termination_check", "Read", "Edit", "Write", "Bash", "Grep", "Glob"]
@@ -2231,7 +2251,18 @@ def _emit_e2e_phase_a(args) -> int:
     # generation, so the independent-sample axis applies. Passing None here instead would send exactly
     # the models this fix is for back down the autoregressive path.
     _batch_heads = _enumerate_task_heads(model_id) if _batch_size > 1 else None
-    _batch_note = _batch_prompt_block(_batch_size, heads=_batch_heads)
+    # The batch's inputs come from the model's own published example where it has one. Looked up
+    # only for a real batch, like the heads above: at B=1 the block is empty and nothing reads it.
+    _batch_reference = _discover_reference_inputs(model_id) if _batch_size > 1 else None
+    if _batch_size > 1:
+        if _batch_reference is None:
+            print(f"  [inputs] no published example discovered for {model_id} — the builder will")
+            print("           author ONE input and reuse it for every sample (recorded as tool-authored)")
+        else:
+            print("  [inputs] batch inputs sourced from the model's own published example:")
+            for _line in _batch_reference.describe().splitlines():
+                print(f"    {_line}")
+    _batch_note = _batch_prompt_block(_batch_size, heads=_batch_heads, reference=_batch_reference)
     build_prompt = _build_agent_prompt(
         model_id=model_id,
         demo_dir=demo_dir,
@@ -2880,9 +2911,9 @@ _BATCH_COMMON_RULES = """  - ONE program per step feeds all {batch} samples -- d
   - graduated stubs were PCC'd at B=1 and may hardcode a leading 1 in slice/reshape bounds. Where they
     do, take that bound from the tensor itself (e.g. x.shape[0]) and re-verify the stub -- a hardcoded
     1 SILENTLY DROPS samples 2..{batch} rather than failing.
-The PCC gate must pass for ALL {batch} samples: feed {batch} DISTINCT reference inputs and compare each
-sample to its OWN golden from the reference model. A pipeline that shape-supports B but emits {batch}
-identical outputs is WRONG. If the model genuinely has no axis over which {batch} independent samples
+The PCC gate must pass for ALL {batch} samples, each compared to its OWN golden from the reference
+model (how the {batch} inputs are SOURCED is below -- they are not yours to invent). A pipeline that
+shape-supports B but emits {batch} identical outputs is WRONG. If the model genuinely has no axis over which {batch} independent samples
 can be batched, STOP and report it as a hole -- do NOT fake a batch axis.
 
 If a stage cannot hold {batch} at once, EXHAUST THE MECHANISMS THIS PIPELINE ALREADY HAS before you
@@ -2902,7 +2933,90 @@ still reproduces.
 """
 
 
-def _batch_prompt_block(batch: int, *, heads: Optional[list] = None) -> str:
+# WHERE THE {batch} INPUTS COME FROM. Split out from the axis rules because the policy is the same
+# for either axis, and because this is the one the last bring-up got wrong: the rules said only that
+# the inputs must be DISTINCT, so the builder authored {batch} of its own. Every sample then varied
+# its content AND its seed at once, so a PCC miss named no cause -- and because no input could be
+# sourced, a miss read exactly like a hardware fault and no re-run ever settled it. One axis moves,
+# and it is the one the model already samples over.
+_BATCH_INPUT_RULES = """
+HOW TO SOURCE THE {batch} INPUTS -- a correctness requirement, not a style note.
+  - Hold the CONTENT inputs IDENTICAL across all {batch} samples. Vary ONLY the sampling axis the
+    model itself exposes -- the seed/generator its own example seeds -- one value per sample.
+  - Do NOT author {batch} different content inputs. An input you wrote is one nobody can source, and
+    it moves a second variable between samples, so a failure cannot be attributed.
+  - A seed is not authored content: it indexes into the distribution the model already defines, so
+    every value is equally in-distribution. Content is authored; a seed is not.
+  - DISTINCT OUTPUTS ARE STILL REQUIRED. If the model exposes no sampling axis (it is deterministic),
+    vary instead the one input its example supplies as LOADED DATA -- a file or URL the example opens
+    -- and say so. If it has neither a sampling axis nor a loaded-data input, report that as a hole;
+    do NOT invent {batch} inputs to fill it.
+  - Record the inputs' provenance beside the test in one line: what they are and where they came
+    from. A PCC number whose inputs have no provenance cannot be cited.
+"""
+
+_BATCH_INPUT_PUBLISHED = """  - THE MODEL PUBLISHES ITS OWN EXAMPLE. Use it VERBATIM as the content input for every one of the
+    {batch} samples:
+"""
+
+_BATCH_INPUT_SEEDED = """    The example declares seed {seed}. Sample 0 uses {seed} EXACTLY -- so sample 0 reproduces the
+    published example and can be diffed against it -- and sample i uses {seed}+i.
+    Keep these values in ONE named block in the inputs module, each line carrying the source above,
+    so a reader can check them against the model's own documents. Do not scatter them as literals.
+"""
+
+_BATCH_INPUT_UNSEEDED = """    The example declares no seed. Pick one base value, record it beside the inputs, and let sample i
+    use base+i.
+    Keep these values in ONE named block in the inputs module, each line carrying the source above,
+    so a reader can check them against the model's own documents. Do not scatter them as literals.
+"""
+
+_BATCH_INPUT_UNPUBLISHED = """  - NO PUBLISHED EXAMPLE WAS DISCOVERED FOR THIS MODEL. Author exactly ONE content input -- the
+    smallest, most ordinary instance of what this model is for -- and reuse that SAME one for all
+    {batch} samples, still varying only the sampling axis. One authored input shared by every sample
+    is a single declared assumption; {batch} authored inputs are {batch} of them.
+  - Record it as TOOL-AUTHORED, not as sourced from the model, so the report does not imply a
+    provenance it does not have.
+"""
+
+
+def _discover_reference_inputs(model_id: str):
+    """The model's own published example inputs, or None. Never raises.
+
+    Discovery reads the hub, so it can fail for reasons that have nothing to do with the bring-up
+    (offline, gated repo, a card with no example). None is a valid answer -- the builder is then told
+    to author ONE input -- so a failure here must never take the run down with it."""
+    try:
+        from ..reference_inputs import discover
+
+        return discover(model_id)
+    except Exception as exc:  # noqa: BLE001 - provenance is best-effort, the bring-up is not
+        print(f"  [inputs] could not read the model's published example ({type(exc).__name__}: {exc})")
+        return None
+
+
+def _batch_input_block(batch: int, reference=None) -> str:
+    """The sourcing policy, plus whichever origin applies.
+
+    `reference` is a `reference_inputs.ExampleInputs` or None. None covers both "the model publishes
+    nothing parseable" and "this caller did not look", which is why the text claims only that none
+    was discovered -- it never asserts the model has none."""
+    parts = [_BATCH_INPUT_RULES.format(batch=batch)]
+    if reference is None:
+        parts.append(_BATCH_INPUT_UNPUBLISHED.format(batch=batch))
+    else:
+        parts.append(_BATCH_INPUT_PUBLISHED.format(batch=batch))
+        # The example is inserted, never formatted: its values legitimately contain braces (a chat
+        # template's message dicts), which str.format would read as fields and fail on.
+        parts.append(reference.describe() + "\n")
+        seed = reference.seed
+        parts.append(
+            _BATCH_INPUT_SEEDED.format(seed=seed) if seed is not None else _BATCH_INPUT_UNSEEDED.format(batch=batch)
+        )
+    return "".join(parts)
+
+
+def _batch_prompt_block(batch: int, *, heads: Optional[list] = None, reference=None) -> str:
     """Builder instruction for a batch of B>1 independent samples. Empty for B<=1 (default, unchanged
     single-sample behaviour).
 
@@ -2918,6 +3032,8 @@ def _batch_prompt_block(batch: int, *, heads: Optional[list] = None) -> str:
     invariants; only the axis-specific guidance differs.
 
     `heads` is optional and defaults to the previous behaviour, so existing call sites are unchanged.
+    `reference` -- the model's own published example inputs, if any -- is optional for the same
+    reason; omitted, the builder is told none was discovered and authors ONE input for all samples.
     """
     if not batch or batch <= 1:
         return ""
@@ -2939,7 +3055,7 @@ BATCH = {batch}. Emit the pipeline to process {batch} INDEPENDENT samples per ca
 sample wastes 31/32 of a 32-row matmul tile, so filling it with {batch} real samples raises AGGREGATE
 throughput ~{batch}x; per-sample latency is unchanged. Thread a leading batch dimension B={batch}
 through the WHOLE path and verify it end to end:
-{axis_note}{_BATCH_COMMON_RULES.format(batch=batch)}{gate_contract}"""
+{axis_note}{_BATCH_COMMON_RULES.format(batch=batch)}{_batch_input_block(batch, reference)}{gate_contract}"""
 
 
 # What the gate ENFORCES about the batch (see _batch_gate_reason), stated to the builder up front so it
@@ -2949,6 +3065,51 @@ _BATCH_GATE_CONTRACT = """THE GATE ENFORCES THE BATCH. It runs tests/e2e with ${
 print `{report_n}` with the batch they actually drove, equal to {batch}. So the e2e tests take B from
 ${batch_env} -- never a number typed into the test -- and print `{report}` once B is known.
 """
+
+
+# WHAT THE SUPERVISOR WATCHES, told to the builder up front.
+#
+# The gate's tests run under `probes._execute`, which kills a step only when its log has stopped
+# growing (and its syscall/IO counters and stack have stopped moving) -- never for being slow. That
+# is the right rule, and it has one consequence the builder has to know: a test that does device
+# work WITHOUT printing looks exactly like a hang.
+#
+# This is not hypothetical. A pipeline that replayed a captured device trace enqueued the whole
+# schedule non-blocking, so the host sat inside one call with a frozen log while the hardware was
+# busy, and the supervisor killed a healthy run. The repair was a per-iteration print in the MODEL's
+# test -- which meant the lesson lived in one model's code and was lost the moment that demo was
+# regenerated. It belongs here, where every model gets it.
+_PROGRESS_PROMPT_BLOCK = """
+THE SUPERVISOR WATCHES FORWARD PROGRESS, NOT ELAPSED TIME. Your tests run under a watchdog that
+kills a step only when its LOG HAS STOPPED GROWING for {stall_s}s with nothing else moving. A long
+run is never killed for being slow -- but a SILENT one is killed for looking dead.
+  - Work enqueued on the device without blocking gives the host nothing to print: the process waits
+    inside a single call for the entire schedule while the hardware is busy, and the log is frozen
+    the whole time. That is indistinguishable from a hang, and it WILL be killed.
+  - So whatever your pipeline ITERATES over -- read that from the model, do not assume what it is
+    called -- print one line per iteration as it completes, and SYNCHRONISE THE DEVICE before the
+    print so the line means the work finished rather than that it was queued.
+  - A test that prints only when it is done will be killed before it gets there.
+  - This is a property of the harness, not of one model: it applies to any test long enough to
+    outlast the window above.
+"""
+
+
+def _progress_prompt_block() -> str:
+    """The progress requirement, carrying the watchdog's OWN stall window.
+
+    The number is read off `probes._execute`'s signature rather than retyped, so the builder is
+    never told a threshold the supervisor does not actually use."""
+    stall = None
+    try:
+        import inspect
+
+        from models.experimental.perf_automation.agent import probes as _pr
+
+        stall = inspect.signature(_pr._execute).parameters["stall_timeout_s"].default
+    except Exception:  # noqa: BLE001 - the guidance is still correct without the exact number
+        stall = None
+    return _PROGRESS_PROMPT_BLOCK.format(stall_s=int(stall) if isinstance(stall, int) else "the watchdog's stall")
 
 
 def _build_agent_prompt(
@@ -3066,7 +3227,7 @@ inventing a new layout. Keep iterating (fix the stub/wiring, re-run on the TT de
 gates pass. Use `./python_env/bin/python -m pytest <file> -s` to run on device.
 Report a final summary: which calls are READY, the FINAL_PCC per call, and
 confirm all graduated modules were invoked.
-{hardware_note}{parallel_note}{trace_note}{batch_note}
+{hardware_note}{parallel_note}{trace_note}{batch_note}{_progress_prompt_block()}
 {_TT_ONLY_CONTRACT}
 """
 

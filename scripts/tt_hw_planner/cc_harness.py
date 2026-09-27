@@ -92,6 +92,127 @@ def build_mcp_config(python_bin: str, server_path: str | Path, env: dict, server
     }
 
 
+# The out-of-band gate check's wall clock.
+#
+# A WRAPPER MUST NEVER BE TIGHTER THAN WHAT IT WRAPS. This call runs the gate in a subprocess, and
+# the gate has its own budget (the server's per-pytest timeout). While the default here was a flat
+# hour and the gate's own budget was four, an honest gate that simply took longer than an hour was
+# SIGKILLed mid-run and -- because the timeout was swallowed -- came back as an ordinary "not done"
+# with no reason. On a T3K at batch 32 the e2e gate needs ~110 min, so it could never complete: four
+# consecutive rounds died at 59m41s having done real work, and the kill was indistinguishable from a
+# PCC failure. It had never surfaced before because at batch 4 the same gate takes ~15 min.
+#
+# So the budget is, in order:
+#   1. ``_GATE_STATUS_TIMEOUT_ENV`` -- an operator's explicit value wins and is used unscaled.
+#   2. ADAPTIVE: a multiple of the longest gate this process has actually observed. Sized from
+#      measured cost rather than a typed number, so it follows the box, the batch and the precision
+#      mode by itself instead of needing one constant per combination.
+#   3. The caller's own budget as the FLOOR -- what it wraps, so it can never be tighter.
+# The result only ever grows. A gate that ran long once is not evidence that the next one is hung.
+_GATE_STATUS_TIMEOUT_ENV = "E2E_GATE_STATUS_TIMEOUT"
+_GATE_STATUS_GROWTH = 4  # headroom over the longest observed gate, matching probes' ceiling multiple
+_gate_status_observed: dict = {}
+
+
+def _gate_status_budget(key: str, floor: int) -> int:
+    """Seconds this gate check may take: operator's value, else measured cost, else the floor."""
+    override = os.environ.get(_GATE_STATUS_TIMEOUT_ENV)
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    observed = float(_gate_status_observed.get(key) or 0.0)
+    return max(int(floor), int(_GATE_STATUS_GROWTH * observed))
+
+
+def _record_gate_status_cost(key: str, seconds: float) -> None:
+    """Remember the longest this gate has taken, so later checks are sized from it."""
+    if seconds > 0 and seconds > float(_gate_status_observed.get(key) or 0.0):
+        _gate_status_observed[key] = float(seconds)
+
+
+def _supervised_gate_run(cmd: list, cwd, env: dict, progress_log, budget: int):
+    """Run the gate check under FORWARD-PROGRESS supervision instead of a stopwatch.
+
+    ANY budget is a guess, and the guess is what keeps going wrong: a gate that legitimately runs
+    longer than the number someone picked is killed having done real work. The gate already writes
+    its tests' output live to `progress_log`, so there is a true signal available -- kill only when
+    that file (and the group's counters and stack) have stopped moving for the watchdog's own stall
+    window. `budget` stays as an absolute backstop against a process that produces output forever
+    without finishing.
+
+    Supervision is `probes.ProgressWatch`, which exists precisely so this rule is not re-spelled per
+    caller, and the stall window is read off `probes._execute`'s signature rather than retyped.
+
+    Returns (rc, stalled). Raises nothing; the caller owns the verdict."""
+    import inspect
+    import subprocess as _sp
+    import tempfile as _tf
+
+    from models.experimental.perf_automation.agent import probes as _pr
+
+    stall_s = inspect.signature(_pr._execute).parameters["stall_timeout_s"].default
+    out_path = Path(_tf.mkdtemp(prefix="gate_status_")) / "stdout.log"
+    started = time.monotonic()
+    last_progress = started
+    over_budget = [False]
+    with open(out_path, "w") as out_fh:
+        # OWN PROCESS GROUP, or the watcher counts OUR syscalls as the child's progress and nothing
+        # ever looks stalled. The gate's own pytest is in a further group again -- which is exactly
+        # why the log file, not the group, is what carries its progress here.
+        proc = _sp.Popen(cmd, cwd=str(cwd), env=env, stdout=out_fh, stderr=_sp.STDOUT, start_new_session=True)
+        watch = _pr.ProgressWatch(os.getpgid(proc.pid), Path(progress_log), stall_s)
+        while True:
+            try:
+                rc = proc.wait(timeout=5.0)
+                return rc, False, out_path
+            except _sp.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            if watch.moved(now, last_progress, proc.pid):
+                last_progress = now
+            if stall_s and now - last_progress >= stall_s:
+                _pr._kill_tree(proc.pid)
+                proc.wait()
+                return None, True, out_path
+            # OVER BUDGET IS NOT A VERDICT while the gate is visibly working. `_execute` already
+            # settles this the same way -- say so once, keep going, and kill only at the hard
+            # ceiling -- so the multiple is taken from there rather than chosen again here.
+            if budget and now - started >= budget and not over_budget[0]:
+                over_budget[0] = True
+                print(
+                    f"  [gate] over its {int(budget)}s budget and STILL WORKING (its log is growing); "
+                    f"not killing it -- the stall check decides, and a hard ceiling at "
+                    f"{int(budget * _pr._HARD_CEILING_MULT)}s is behind that",
+                    flush=True,
+                )
+            if budget and now - started >= budget * _pr._HARD_CEILING_MULT:
+                _pr._kill_tree(proc.pid)
+                proc.wait()
+                return None, False, out_path
+
+
+def _parse_gate_output(out: str) -> dict:
+    """The server's printed verdict, as a dict. One reader, shared by both run paths."""
+
+    def pick(pfx: str) -> str:
+        for line in out.splitlines():
+            if line.startswith(pfx):
+                return line[len(pfx) :]
+        return ""
+
+    return {
+        "can_stop": "CANSTOP=True" in out,
+        "halt": "HALT=True" in out,
+        "reason": pick("HALTREASON="),
+        "next_op": pick("NEXTOP="),
+        "next_rung": pick("NEXTRUNG="),
+        "graduated": [c for c in pick("GRAD=").split(",") if c],
+        "shard_graduated": [c for c in pick("SHARDGRAD=").split(",") if c],
+    }
+
+
 def gate_status(
     python_bin: str,
     server_dir: str | Path,
@@ -99,6 +220,7 @@ def gate_status(
     mcp_env: dict,
     cwd: str | Path,
     timeout_s: int = 3600,
+    progress_log: str | Path | None = None,
 ) -> dict:
     """Call the server's ``termination_check()`` out-of-band (driver-side, NOT the agent) and return
     ``{can_stop, halt, reason, next_op, next_rung}``. The gate logic lives in ``server_module`` — this
@@ -122,34 +244,55 @@ def gate_status(
     )
     env = dict(os.environ)
     env.update(mcp_env)
+    budget = _gate_status_budget(str(server_module), timeout_s)
+    started = time.monotonic()
+    cmd = [str(python_bin), "-c", code, str(server_dir)]
+    if progress_log:
+        # The gate streams its tests' output here, so a real signal exists: supervise progress
+        # rather than guess a duration. The stopwatch below stays for callers that offer no log.
+        rc, stalled, out_path = _supervised_gate_run(cmd, cwd, env, progress_log, budget)
+        out = ""
+        try:
+            out = Path(out_path).read_text()
+        except OSError:
+            pass
+        if rc is None:
+            waited = int(time.monotonic() - started)
+            reason = (
+                f"the gate check made no progress for the watchdog's stall window and was killed after "
+                f"{waited}s -- its log stopped growing while it was still running"
+                if stalled
+                else f"the gate check was killed after {waited}s (backstop {int(budget)}s) -- it did not "
+                f"report a verdict. Raise ${_GATE_STATUS_TIMEOUT_ENV} if the gate legitimately takes longer."
+            )
+            print(f"  [gate] {reason}", flush=True)
+            return {"can_stop": False, "halt": False, "reason": reason, "next_op": "", "next_rung": ""}
+        _record_gate_status_cost(str(server_module), time.monotonic() - started)
+        return _parse_gate_output(out)
     try:
         r = subprocess.run(
-            [str(python_bin), "-c", code, str(server_dir)],
+            cmd,
             cwd=str(cwd),
             env=env,
             capture_output=True,
             text=True,
-            timeout=timeout_s,
+            timeout=budget,
         )
+    except subprocess.TimeoutExpired:
+        # NAME IT. Swallowed, this is a verdict-shaped lie: the caller cannot tell a gate that was
+        # killed from one that ran and failed, so it retries the same work until the run is abandoned.
+        reason = (
+            f"the gate check was killed after {int(time.monotonic() - started)}s (limit {int(budget)}s) "
+            f"-- it did not report a verdict. Raise ${_GATE_STATUS_TIMEOUT_ENV} if the gate legitimately "
+            f"takes longer."
+        )
+        print(f"  [gate] {reason}", flush=True)
+        return {"can_stop": False, "halt": False, "reason": reason, "next_op": "", "next_rung": ""}
     except Exception:  # noqa: BLE001
         return {"can_stop": False, "halt": False, "reason": "", "next_op": "", "next_rung": ""}
-    out = r.stdout or ""
-
-    def pick(pfx: str) -> str:
-        for line in out.splitlines():
-            if line.startswith(pfx):
-                return line[len(pfx) :]
-        return ""
-
-    return {
-        "can_stop": "CANSTOP=True" in out,
-        "halt": "HALT=True" in out,
-        "reason": pick("HALTREASON="),
-        "next_op": pick("NEXTOP="),
-        "next_rung": pick("NEXTRUNG="),
-        "graduated": [c for c in pick("GRAD=").split(",") if c],
-        "shard_graduated": [c for c in pick("SHARDGRAD=").split(",") if c],
-    }
+    _record_gate_status_cost(str(server_module), time.monotonic() - started)
+    _record_gate_status_cost(str(server_module), time.monotonic() - started)
+    return _parse_gate_output(r.stdout or "")
 
 
 # Per-round wall-clock budget for one `claude -p` invocation, when the caller names none.
