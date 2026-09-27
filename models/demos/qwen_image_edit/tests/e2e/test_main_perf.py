@@ -129,6 +129,9 @@ except Exception as _ie:  # noqa: BLE001 -- the real import error surfaces insid
 _DEMO_MESH = _SRC_MESH
 _MESH_SHAPE = tuple(resolve_mesh_shape(default_rows=_DEMO_MESH[0], default_cols=_DEMO_MESH[1]))
 
+_TRACE_REPLAY_ITERS = max(1, int(os.environ.get("TT_TRACE_REPLAY_ITERS", "4")))
+_TRACE_WARMUP_ITERS = max(1, int(os.environ.get("TT_TRACE_WARMUP_ITERS", "1")))
+
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
 _DEV_PARAMS = {"l1_small_size": 24576, "trace_region_size": _SRC_TRACE_REGION}
 if _MESH_SHAPE[0] * _MESH_SHAPE[1] > 1:
@@ -236,8 +239,38 @@ def test_main_perf(mesh_device, hf_pipe):
         print(f"[perf] steps_run={pipe.steps_run}", flush=True)
 
     def _traced_forward():
+        # B=32 full-depth stages run ~20 s per replay. The stock replay loop enqueues every replay and syncs
+        # once, so the log goes silent for minutes and the stall watchdog reads a healthy run as a hang.
+        # Sync + report each replay (the per-replay sync costs nothing next to a 20 s stage).
+        import models.experimental.perf_automation.agent.trace_replay as _tr
         from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter
         from models.experimental.perf_automation.agent.trace_replay import measure_adapter
+
+        _tr._REPLAY_ITERS = _TRACE_REPLAY_ITERS
+        _tr._WARMUP_ITERS = _TRACE_WARMUP_ITERS
+
+        def _replay_1cq_progress(dev, tid, iters):
+            total = 0.0
+            for _i in range(iters):
+                t0 = time.perf_counter()
+                ttnn.execute_trace(dev, tid, cq_id=0, blocking=False)
+                ttnn.synchronize_device(dev)
+                dt = time.perf_counter() - t0
+                total += dt
+                print("[perf] trace replay %d/%d %.1f ms" % (_i + 1, iters, dt * 1000.0), flush=True)
+            return total / iters
+
+        _tr._replay_1cq = _replay_1cq_progress
+
+        def _warm_progress(step, iters):
+            out = []
+            for _i in range(max(0, iters)):
+                out.append(step())
+                ttnn.synchronize_device(mesh_device)
+                print("[perf] warmup %d/%d done" % (_i + 1, iters), flush=True)
+            return out
+
+        _tr._warm = _warm_progress
 
         def _build_for_perf(dev):
             build_pipeline = _import_pipeline().build_pipeline
@@ -247,15 +280,48 @@ def test_main_perf(mesh_device, hf_pipe):
         _prompt_ids = prompt_ids_for_isl(getattr(hf_pipe, "tokenizer", None), PERF_ISL_TOKENS)
         print("PERF_ISL_TOKENS=%d" % _prompt_ids.shape[-1], flush=True)
         print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
-        measure_adapter(PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=PERF_BATCH), mesh_device)
+        # Every stage is replayed as trace+1cq (TRACE_STAGE_MS[...] path=trace+1cq); the adapter labels
+        # the multi-stage summary "trace+pipeline", which names no queue. Spell the queue out in that one
+        # line so the summary states the path each stage actually took.
+        import contextlib
+
+        class _PathTee:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def write(self, x):
+                return self._inner.write(
+                    x.replace("TRACE_REPLAY_PATH=trace+pipeline", "TRACE_REPLAY_PATH=trace+1cq+pipeline")
+                )
+
+            def flush(self):
+                return self._inner.flush()
+
+            def __getattr__(self, n):
+                return getattr(self._inner, n)
+
+        with contextlib.redirect_stdout(_PathTee(sys.stdout)):
+            measure_adapter(PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=PERF_BATCH), mesh_device)
+
+    def _heartbeat(stop):
+        t0 = time.monotonic()
+        while not stop.wait(60.0):
+            print("[perf] heartbeat %.0f s" % (time.monotonic() - t0), flush=True)
 
     def _try_traced():
+        import threading
+
+        _stop = threading.Event()
+        _hb = threading.Thread(target=_heartbeat, args=(_stop,), daemon=True)
+        _hb.start()
         try:
             _traced_forward()
             return True
         except Exception as _te:  # noqa: BLE001
             print("TRACE_REPLAY_SKIPPED=%r" % (_te,), flush=True)
             return False
+        finally:
+            _stop.set()
 
     print("PERF_ISL_TOKENS=%d" % PERF_ISL_TOKENS, flush=True)
     print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
