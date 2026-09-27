@@ -22,7 +22,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import cpp_swiglu
+from models.demos.voxtral_4b_tts_2603.tt import cpp_swiglu, ttl_down
 
 _COMPUTE = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True
@@ -179,6 +179,7 @@ def build(device, torch_module):
     w1 = _from_torch(ff.w1.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     # The down projection is DRAM-bound at 1024 rows; bf8_b halves the weight it streams.
     w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat4_b)
+    w2_ttl = ttl_down.weight(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, _from_torch)
     w3 = _from_torch(ff.w3.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     w13 = cpp_swiglu.fuse(ff.w1.weight.detach().transpose(0, 1), ff.w3.weight.detach().transpose(0, 1), device)
     bias = None
@@ -208,7 +209,10 @@ def build(device, torch_module):
                 memory_config=ttnn.L1_MEMORY_CONFIG,
             )
         )
-        out = _lin(gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
+        if ttl_down.supports(gated, w2_ttl):
+            out = ttl_down.apply(gated, w2_ttl)
+        else:
+            out = _lin(gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
         if bias is not None:
             out = ttnn.add(out, bias)
         if rank >= 4:

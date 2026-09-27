@@ -46,7 +46,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import cpp_swiglu
+from models.demos.voxtral_4b_tts_2603.tt import cpp_swiglu, ttl_down
 
 _TILE = 32
 _MASK_NEG = -1.0e9
@@ -496,6 +496,7 @@ def _compile_block(device, blk, mask):
     w13 = cpp_swiglu.fuse(w1_t, w3_t, device)
     # The down projection is DRAM-bound at 1024 rows; bf8_b halves the weight it streams.
     w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat4_b)
+    w2_ttl = ttl_down.weight(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, _from_torch)
     for rows in _COMPACT_ROWS:
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
 
@@ -509,10 +510,13 @@ def _compile_block(device, blk, mask):
 
         hn = _block_norm(h, eps, norm_scale, ttnn.bfloat16, memory_config=_FFN_IN_MEM if w13 is not None else None)
         if cpp_swiglu.serves(hn, w13):
+            gated = cpp_swiglu.apply(hn, w13)
+            if ttl_down.supports(gated, w2_ttl):
+                return ttnn.add(h, ttl_down.apply(gated, w2_ttl))
             return ttnn.add(
                 h,
                 _lin(
-                    cpp_swiglu.apply(hn, w13),
+                    gated,
                     w2,
                     dtype=ttnn.float32,
                     compute_kernel_config=_TALL_COMPUTE,
