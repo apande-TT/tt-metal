@@ -195,7 +195,8 @@ class _Plan:
             ),
         ]
         cfg = kernels[2].config
-        cfg.math_fidelity = ttnn.MathFidelity.HiFi2
+        # LoFi: the weight (srcA) is bf4_b, whose 3-bit mantissa already fits the phase LoFi multiplies.
+        cfg.math_fidelity = ttnn.MathFidelity.LoFi
         cfg.fp32_dest_acc_en = True
         cfg.math_approx_mode = False
         cfg.dst_full_sync_en = True
