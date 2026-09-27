@@ -488,7 +488,8 @@ def _compile_block(device, blk, mask):
         device,
         dtype=ttnn.bfloat8_b,
     )
-    wo = _from_torch(attn.wo.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
+    # o_proj is weight-stream bound at 96 rows; bf4_b is 576 B a tile against bf8_b's 1088.
+    wo = _from_torch(attn.wo.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat4_b)
     # Weight-stream bound at 96 rows; bf8_b halves the bytes each FFN projection reads, and HiFi2
     # (two phases, enough for a bf8_b mantissa) halves the math that sits behind the stream.
     w1_t, w3_t = ((m.weight.detach().float().transpose(0, 1) * g_ffn_t).contiguous() for m in (ff.w1, ff.w3))

@@ -356,7 +356,8 @@ def build(device, torch_module):
         device,
         dtype=ttnn.bfloat8_b,
     )
-    wo = _from_torch(attn.wo.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
+    # o_proj is weight-stream bound at 96 rows; bf4_b is 576 B a tile against bf8_b's 1088.
+    wo = _from_torch(attn.wo.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat4_b)
     for rows in _COMPACT_ROWS:
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
 
