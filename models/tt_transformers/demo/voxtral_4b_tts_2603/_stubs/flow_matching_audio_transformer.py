@@ -495,7 +495,7 @@ def _compile_block(device, blk, mask):
     w1, w3 = (_from_torch(t, device, dtype=ttnn.bfloat8_b) for t in (w1_t, w3_t))
     w13 = cpp_swiglu.fuse(w1_t, w3_t, device)
     # The down projection is DRAM-bound at 1024 rows; bf8_b halves the weight it streams.
-    w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
+    w2 = _from_torch(ff.w2.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat4_b)
     for rows in _COMPACT_ROWS:
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
 
