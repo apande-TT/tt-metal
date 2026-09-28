@@ -349,9 +349,12 @@ def _fused_swiglu(h, w_gu, w_ttl=None):
     grid = ttnn.CoreCoord(int(grid.x), -(-(rows // 32) // share))
     # A share of <= 8 tiles fits one M block, so each core streams its weight columns ONCE.
     m_blk = share if share <= 8 else -(-share // 2)
+    # At <= 2 M tiles a core the bf4_b weight's blocks are small enough for 8-tile K blocks
+    # (half the K steps of 4) within the ~1 MB of L1 that still traces.
+    wide = m_blk <= 2
     cfg = ttnn.MinimalMatmulConfig(
         M_block_size=m_blk,
-        K_block_size=4,
+        K_block_size=8 if wide else 4,
         N_block_size=18,
         subblock_h=1,
         subblock_w=6,
