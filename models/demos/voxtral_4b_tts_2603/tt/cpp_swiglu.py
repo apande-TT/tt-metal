@@ -228,7 +228,7 @@ def serves(x, fused) -> bool:
         if x.layout != ttnn.TILE_LAYOUT or x.is_sharded() or x.dtype != ttnn.bfloat16:
             return False
         rows, k = _rows(x), int(tuple(x.padded_shape)[-1])
-        return k == fused.k and rows % _TILE == 0 and 2 <= rows // _TILE <= 8
+        return k == fused.k and rows % _TILE == 0 and 1 <= rows // _TILE <= 8
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return False
 

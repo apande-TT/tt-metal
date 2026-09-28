@@ -90,7 +90,7 @@ def _mcast_cfg(x, w, rows, out_dtype):
 
 
 def _short_cfg(x, w, rows, out_dtype):
-    """A 1D in0-multicast config for a SHORT (2..7 tile rows) linear, or None.
+    """A 1D in0-multicast config for a SHORT (1..7 tile rows) linear, or None.
 
     Such a linear is bound by streaming its weight, so every core should own a slice of N and
     read only its own weight columns while the small activation is multicast to all of them.
@@ -147,7 +147,7 @@ def _lin(x, w, **kwargs):
         if cfg is not None:
             kwargs["program_config"] = cfg
         kwargs["compute_kernel_config"] = _TALL_COMPUTE
-    elif 64 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs:
+    elif 32 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs:
         cfg = _short_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
             kwargs["program_config"] = cfg
@@ -390,7 +390,7 @@ def _split_heads(qkv, n_heads, n_kv_heads):
     return q, k, v
 
 
-def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
+def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens, readout=False):
     """The same attention on the COMPACT layout: `[1, 1, tokens * R, dim]`, token t in rows t*R..
 
     No 32-row pad per sample, so nothing downstream computes on 29 padding rows. All
@@ -414,6 +414,11 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
 
     # bf16 context: the head merge moves it and o_proj multicasts it whole.
     out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.bfloat16), [1, n_heads, rows, head_dim])
+    if readout:
+        # Only token 0 is read out after the last block, so o_proj and everything after it need
+        # only the first rows // tokens rows (token t lives in rows t*R..).
+        rows = rows // tokens
+        out = ttnn.slice(out, [0, 0, 0, 0], [1, n_heads, rows, head_dim])
     # bf16 into L1: the residual add is its only reader, and fp32 in DRAM doubles the bytes it writes.
     return _lin(
         _concat_heads(out),
@@ -509,7 +514,7 @@ def build(device, torch_module):
     for rows in _COMPACT_ROWS:
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
 
-    def acoustic_transformer_block(x, attn_mask=None, tokens=None, **kwargs):
+    def acoustic_transformer_block(x, attn_mask=None, tokens=None, readout=False, **kwargs):
         seq = int(x.shape[-2])
         batch = _leading(x.shape)
         rank = len(list(x.shape))
@@ -520,9 +525,12 @@ def build(device, torch_module):
 
         xn = _block_norm(h4, eps, norm_scale, ttnn.bfloat16)
         if tokens:
-            attn_out = _compact_attention(xn, wqkv, wo, n_heads, n_kv_heads, None, tokens)
+            attn_out = _compact_attention(xn, wqkv, wo, n_heads, n_kv_heads, None, tokens, readout)
         else:
             attn_out = _attention(xn, wqkv, wo, n_heads, n_kv_heads, None, attn_mask)
+        if tokens and readout:
+            seq = seq // tokens
+            h4 = ttnn.slice(h4, [0, 0, 0, 0], [batch, 1, seq, dim])
         h4 = ttnn.add(h4, attn_out)
 
         hn = _block_norm(h4, eps, norm_scale, ttnn.bfloat16, memory_config=_FFN_IN_MEM if w13 is not None else None)

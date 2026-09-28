@@ -78,7 +78,7 @@ def _mcast_cfg(x, w, rows, out_dtype):
 
 
 def _short_cfg(x, w, rows, out_dtype):
-    """A 1D in0-multicast config for a SHORT (2..7 tile rows) linear, or None.
+    """A 1D in0-multicast config for a SHORT (1..7 tile rows) linear, or None.
 
     Such a linear is bound by streaming its weight, so every core should own a slice of N and
     read only its own weight columns while the small activation is multicast to all of them.
@@ -135,7 +135,7 @@ def _lin(x, w, **kwargs):
         if cfg is not None:
             kwargs["program_config"] = cfg
         kwargs["compute_kernel_config"] = _TALL_COMPUTE
-    elif 64 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs:
+    elif 32 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs:
         cfg = _short_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
             kwargs["program_config"] = cfg

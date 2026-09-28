@@ -92,7 +92,7 @@ def _mcast_cfg(x, w, rows, out_dtype):
 
 
 def _short_cfg(x, w, rows, out_dtype):
-    """A 1D in0-multicast config for a SHORT (2..7 tile rows) linear, or None.
+    """A 1D in0-multicast config for a SHORT (1..7 tile rows) linear, or None.
 
     Such a linear is bound by streaming its weight, so every core should own a slice of N and
     read only its own weight columns while the small activation is multicast to all of them.
@@ -149,7 +149,7 @@ def _lin(x, w, **kwargs):
         if cfg is not None:
             kwargs["program_config"] = cfg
         kwargs["compute_kernel_config"] = _TALL_COMPUTE
-    elif 64 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs:
+    elif 32 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs:
         cfg = _short_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
             kwargs["program_config"] = cfg
@@ -283,7 +283,7 @@ def _split_heads(qkv, n_heads, n_kv_heads):
     return q, k, v
 
 
-def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
+def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens, readout=False):
     """The same attention on the COMPACT layout: `[1, 1, tokens * R, dim]`, token t in rows t*R..
 
     No 32-row pad per sample, so nothing downstream computes on 29 padding rows. All
@@ -307,6 +307,11 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
 
     # bf16 context: the head merge moves it and o_proj multicasts it whole.
     out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.bfloat16), [1, n_heads, rows, head_dim])
+    if readout:
+        # Only token 0 is read out after the last block, so o_proj and everything after it need
+        # only the first rows // tokens rows (token t lives in rows t*R..).
+        rows = rows // tokens
+        out = ttnn.slice(out, [0, 0, 0, 0], [1, n_heads, rows, head_dim])
     # bf16 into L1: the residual add is its only reader, and fp32 in DRAM doubles the bytes it writes.
     return _lin(
         _concat_heads(out),
@@ -368,9 +373,9 @@ def build(device, torch_module):
     for rows in _COMPACT_ROWS:
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
 
-    def bidirectional_attention(x, attn_mask=None, tokens=None, **kwargs):
+    def bidirectional_attention(x, attn_mask=None, tokens=None, readout=False, **kwargs):
         if tokens:
-            return _compact_attention(x, wqkv, wo, n_heads, n_kv_heads, None, tokens)
+            return _compact_attention(x, wqkv, wo, n_heads, n_kv_heads, None, tokens, readout)
         seq = int(x.shape[-2])
         batch = _leading(x.shape)
         rank = len(list(x.shape))

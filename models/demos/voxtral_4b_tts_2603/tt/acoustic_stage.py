@@ -245,8 +245,8 @@ class AcousticBlock:
         self.stubs = tuple(stubs)
         self._run = run
 
-    def __call__(self, h, attn_mask=None, tokens=None):
-        return self._run(h, attn_mask, tokens)
+    def __call__(self, h, attn_mask=None, tokens=None, readout=False):
+        return self._run(h, attn_mask, tokens, readout)
 
     def __repr__(self):
         return f"AcousticBlock(layer_id={self.layer_id}, kind={self.kind!r}, stubs={list(self.stubs)})"
@@ -255,8 +255,8 @@ class AcousticBlock:
 def _fused_block(device, torch_block, layer_id, counter):
     stub = _build_stub(_BLOCK_STUB, device, torch_block, counter)
 
-    def run(h, attn_mask, tokens=None):
-        return stub(h, attn_mask=attn_mask, tokens=tokens)
+    def run(h, attn_mask, tokens=None, readout=False):
+        return stub(h, attn_mask=attn_mask, tokens=tokens, readout=readout)
 
     return AcousticBlock(layer_id, "fused", run, [_BLOCK_STUB])
 
@@ -269,9 +269,12 @@ def _composed_block(device, torch_block, layer_id, counter):
     g_ffn = _norm_weight(torch_block.ffn_norm, device)
     eps = float(torch_block.attention_norm.eps)
 
-    def run(h, attn_mask, tokens=None):
+    def run(h, attn_mask, tokens=None, readout=False):
         xn = _rms_norm(h, g_attn, eps, dtype=ttnn.bfloat16)
-        h = ttnn.add(h, attn(xn, attn_mask=attn_mask, tokens=tokens))
+        a = attn(xn, attn_mask=attn_mask, tokens=tokens, readout=readout)
+        if tokens and readout:
+            h = ttnn.slice(h, [0, 0, 0, 0], [1, 1, int(h.shape[-2]) // tokens, int(h.shape[-1])])
+        h = ttnn.add(h, a)
         hn = _rms_norm(h, g_ffn, eps, dtype=ttnn.bfloat16)
         return ttnn.add(h, ff(hn))
 
@@ -526,8 +529,9 @@ class AcousticStage:
             ],
             dim=2,
         )
-        for block in self.blocks[: self.n_layers]:
-            h = block(h, None, tokens=_N_REAL_TOKENS)
+        for i, block in enumerate(self.blocks[: self.n_layers]):
+            # The last block computes only token 0's rows, the only ones read out below.
+            h = block(h, None, tokens=_N_REAL_TOKENS, readout=i == self.n_layers - 1)
         # The norm is per row and only token 0 is read out, so normalise just those rows.
         first = _rms_norm(ttnn.slice(h, [0, 0, 0, 0], [1, 1, rows, self.dim]), p["g_final"], p["eps"])
         velocity = ttnn.reshape(_lin(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic])
