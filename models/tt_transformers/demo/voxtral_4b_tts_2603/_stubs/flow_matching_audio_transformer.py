@@ -371,7 +371,7 @@ _COMPACT_MASKS = {}
 _COMPACT_ROWS = (96, 192)
 
 
-def _compact_mask(device, rows, tokens, repeats):
+def _compact_mask(device, rows, tokens, repeats, q_rows=None):
     """Additive `[1, 1, repeats * rows, rows]` mask letting a row attend only to its own sample.
 
     Row/column `t * R + r` is token t of sample r, so the allowed pairs are those with equal
@@ -379,12 +379,13 @@ def _compact_mask(device, rows, tokens, repeats):
     (device, rows) shape, shared by every block, created at build time for the usual row counts
     so nothing is allocated inside a trace.
     """
-    key = (id(device), rows, tokens, repeats)
+    q_rows = rows if q_rows is None else q_rows
+    key = (id(device), rows, tokens, repeats, q_rows)
     mask = _COMPACT_MASKS.get(key)
     if mask is None:
         sample = torch.arange(rows) % (rows // tokens)
-        blk = torch.where(sample[:, None] == sample[None, :], 0.0, -1.0e9)
-        mask = _from_torch(blk.repeat(repeats, 1).reshape(1, 1, repeats * rows, rows), device, dtype=ttnn.float32)
+        blk = torch.where(sample[:q_rows, None] == sample[None, :], 0.0, -1.0e9)
+        mask = _from_torch(blk.repeat(repeats, 1).reshape(1, 1, repeats * q_rows, rows), device, dtype=ttnn.float32)
         _COMPACT_MASKS[key] = mask
     return mask
 
@@ -427,22 +428,23 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens, readout=
     )
     q, k, v = _split_heads(qkv, n_heads, n_kv_heads)
     head_dim = int(q.shape[-1])
-    q = ttnn.reshape(q, [1, n_kv_heads, repeats * rows, head_dim])
+    # After the last block only token 0 is read out, so only its queries (the first R = rows /
+    # tokens rows; token t lives in rows t*R..) go through the scores, softmax, context and o_proj.
+    # Every token's k/v is still needed.
+    q_rows = rows // tokens if readout else rows
+    if readout:
+        q = ttnn.slice(q, [0, 0, 0, 0], [1, n_heads, q_rows, head_dim])
+    q = ttnn.reshape(q, [1, n_kv_heads, repeats * q_rows, head_dim])
 
     q = q if scale is None else ttnn.multiply(q, scale)
     scores = _bmm(q, k, per_core_m=1, transpose_b=True, dtype=ttnn.float32)
-    scores = ttnn.add(scores, _compact_mask(h.device(), rows, tokens, repeats))
+    scores = ttnn.add(scores, _compact_mask(h.device(), rows, tokens, repeats, q_rows))
     weights = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
     # bf16 context: the head merge moves it and o_proj multicasts it whole; the scores and the
     # softmax that produced it stay float32.
-    out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.bfloat16), [1, n_heads, rows, head_dim])
-    if readout:
-        # Only token 0 is read out after the last block, so o_proj and everything after it need
-        # only the first rows // tokens rows (token t lives in rows t*R..).
-        rows = rows // tokens
-        out = ttnn.slice(out, [0, 0, 0, 0], [1, n_heads, rows, head_dim])
+    out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.bfloat16), [1, n_heads, q_rows, head_dim])
     # bf16 into L1: the residual add is its only reader, and fp32 in DRAM doubles the bytes it writes.
     return _lin(
         _concat_heads(out),
@@ -526,6 +528,7 @@ def _compile_block(device, blk, mask):
     w2_cpp = cpp_down.shard(ff.w2.weight.detach().transpose(0, 1).contiguous(), device)
     for rows in _COMPACT_ROWS:
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
+        _compact_mask(device, rows, 3, n_heads // n_kv_heads, rows // 3)
 
     def run(h, tokens=None, readout=False):
         # qkv's input lands in L1, not DRAM: it is read once, by the next op.
