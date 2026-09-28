@@ -228,7 +228,7 @@ def _sq_mean(x):
     return ttnn.multiply(total, 1.0 / shape[-1])
 
 
-def _rms_norm(x, gamma, eps, dtype=None):
+def _rms_norm(x, gamma, eps, dtype=None, memory_config=None):
     """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
 
     NOT `ttnn.rms_norm`. On the real layer-0 input the stock op lands at 9.65e-4 relative error
@@ -242,8 +242,8 @@ def _rms_norm(x, gamma, eps, dtype=None):
     """
     scale = ttnn.add(_sq_mean(x), eps, activations=[ttnn.UnaryOpType.RSQRT])
     if gamma is None:  # folded into the consuming weights
-        return ttnn.multiply(x, scale, dtype=dtype or ttnn.float32)
-    return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
+        return ttnn.multiply(x, scale, dtype=dtype or ttnn.float32, memory_config=memory_config)
+    return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32, memory_config=memory_config)
 
 
 def _view4(x, dim):
@@ -827,7 +827,14 @@ def build(device, torch_module):
         h = ttnn.add(h, attn_out)
         ttnn.deallocate(attn_out)
 
-        hn = _rms_norm(h, g_post, eps_post, dtype=None if decode else ttnn.bfloat16)
+        # Prefill's norm output is read only by the fused SwiGLU, once per N block: it lands in L1.
+        hn = _rms_norm(
+            h,
+            g_post,
+            eps_post,
+            dtype=None if decode else ttnn.bfloat16,
+            memory_config=None if decode else ttnn.L1_MEMORY_CONFIG,
+        )
         if decode:
             gated = ttnn.multiply(
                 _lin(hn, w_gate, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
