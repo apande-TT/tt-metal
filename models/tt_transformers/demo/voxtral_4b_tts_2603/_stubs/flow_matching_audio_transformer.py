@@ -430,7 +430,14 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens):
     # bf16 context: the head merge moves it and o_proj multicasts it whole; the scores and the
     # softmax that produced it stay float32.
     out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.bfloat16), [1, n_heads, rows, head_dim])
-    return _lin(_concat_heads(out), wo, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE)
+    # bf16 into L1: the residual add is its only reader, and fp32 in DRAM doubles the bytes it writes.
+    return _lin(
+        _concat_heads(out),
+        wo,
+        dtype=ttnn.bfloat16,
+        compute_kernel_config=_TALL_COMPUTE,
+        memory_config=ttnn.L1_MEMORY_CONFIG,
+    )
 
 
 def _concat_heads(out):
