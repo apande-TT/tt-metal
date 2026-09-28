@@ -89,7 +89,7 @@ def _mcast_cfg(x, w, rows, out_dtype):
     )
 
 
-def _short_cfg(x, w, rows, out_dtype):
+def _short_cfg(x, w, rows, out_dtype, k_block=None):
     """A 1D in0-multicast config for a SHORT (1..7 tile rows) linear, or None.
 
     Such a linear is bound by streaming its weight, so every core should own a slice of N and
@@ -106,7 +106,7 @@ def _short_cfg(x, w, rows, out_dtype):
     kb = next(
         (
             c
-            for c in (32, 24, 16, 12, 8, 6, 4, 3, 2, 1)
+            for c in ((k_block,) if k_block else (32, 24, 16, 12, 8, 6, 4, 3, 2, 1))
             if kt % c == 0 and fixed + 2 * c * (mt * size(x.dtype) + per_n * size(w.dtype)) <= _L1_BUDGET
         ),
         None,
@@ -401,7 +401,14 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens, readout=
     rows = int(h.shape[-2])
     repeats = n_heads // n_kv_heads
     # bf16 q/k/v for the head split; the scores come back float32 for the softmax.
-    qkv = _lin(h, wqkv, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE)
+    # 8-tile K blocks: 12 multicast rounds pipeline the weight stream better than 3 wide ones.
+    qkv = _lin(
+        h,
+        wqkv,
+        dtype=ttnn.bfloat16,
+        compute_kernel_config=_TALL_COMPUTE,
+        program_config=_short_cfg(h, wqkv, rows, ttnn.bfloat16, k_block=8),
+    )
     q, k, v = _split_heads(qkv, n_heads, n_kv_heads)
     head_dim = int(q.shape[-1])
     q = ttnn.reshape(q, [1, n_kv_heads, repeats * rows, head_dim])
