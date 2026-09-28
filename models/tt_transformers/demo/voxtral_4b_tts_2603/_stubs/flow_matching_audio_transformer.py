@@ -477,6 +477,11 @@ def _concat_heads(out):
     return ttnn.to_memory_config(merged, ttnn.L1_MEMORY_CONFIG)
 
 
+def _residual_add(h, x):
+    """The residual stream stays in L1: each block's norm and next add read it right back."""
+    return ttnn.add(h, x, memory_config=ttnn.L1_MEMORY_CONFIG)
+
+
 def _compile_block(device, blk, mask):
     """One `AcousticTransformerBlock` as a callable on `[B, 1, TILE, dim]`."""
     attn = blk.attention
@@ -531,16 +536,16 @@ def _compile_block(device, blk, mask):
             attn_out = _attention(xn, wqkv, wo, n_heads, n_kv_heads, None, mask)
         if tokens and readout:
             h = ttnn.slice(h, [0, 0, 0, 0], [1, 1, int(h.shape[-2]) // tokens, int(h.shape[-1])])
-        h = ttnn.add(h, attn_out)
+        h = _residual_add(h, attn_out)
 
         hn = _block_norm(h, eps, norm_scale, ttnn.bfloat16, memory_config=_FFN_IN_MEM if w13 is not None else None)
         if cpp_swiglu.serves(hn, w13):
             gated = cpp_swiglu.apply(hn, w13)
             if cpp_down.serves(gated, w2_cpp):
-                return ttnn.add(h, cpp_down.apply(gated, w2_cpp))
+                return _residual_add(h, cpp_down.apply(gated, w2_cpp))
             if ttl_down.supports(gated, w2_ttl):
-                return ttnn.add(h, ttl_down.apply(gated, w2_ttl))
-            return ttnn.add(
+                return _residual_add(h, ttl_down.apply(gated, w2_ttl))
+            return _residual_add(
                 h,
                 _lin(
                     gated,
@@ -560,7 +565,7 @@ def _compile_block(device, blk, mask):
             dtype=ttnn.bfloat16,
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
-        return ttnn.add(
+        return _residual_add(
             h,
             _lin(
                 gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG

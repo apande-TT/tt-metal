@@ -540,7 +540,7 @@ def build(device, torch_module):
         if tokens and readout:
             seq = seq // tokens
             h4 = ttnn.slice(h4, [0, 0, 0, 0], [batch, 1, seq, dim])
-        h4 = ttnn.add(h4, attn_out)
+        h4 = ttnn.add(h4, attn_out, memory_config=ttnn.L1_MEMORY_CONFIG)
 
         hn = _block_norm(h4, eps, norm_scale, ttnn.bfloat16, memory_config=_FFN_IN_MEM if w13 is not None else None)
         if cpp_swiglu.serves(hn, w13):
@@ -568,7 +568,7 @@ def build(device, torch_module):
             down = _lin(
                 gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
             )
-        h4 = ttnn.add(h4, down)
+        h4 = ttnn.add(h4, down, memory_config=ttnn.L1_MEMORY_CONFIG)
 
         if rank >= 4:
             return h4

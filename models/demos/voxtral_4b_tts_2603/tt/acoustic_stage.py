@@ -275,9 +275,9 @@ def _composed_block(device, torch_block, layer_id, counter):
         a = attn(xn, attn_mask=attn_mask, tokens=tokens, readout=readout)
         if tokens and readout:
             h = ttnn.slice(h, [0, 0, 0, 0], [1, 1, int(h.shape[-2]) // tokens, int(h.shape[-1])])
-        h = ttnn.add(h, a)
+        h = ttnn.add(h, a, memory_config=ttnn.L1_MEMORY_CONFIG)
         hn = _rms_norm(h, g_ffn, eps, dtype=ttnn.bfloat16)
-        return ttnn.add(h, ff(hn))
+        return ttnn.add(h, ff(hn), memory_config=ttnn.L1_MEMORY_CONFIG)
 
     return AcousticBlock(layer_id, "composed", run, [_ATTN_STUB, _FF_STUB])
 
