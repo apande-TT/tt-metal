@@ -3,5 +3,6 @@
   "main_class": "adapter:TTNemotronHForCausalLM",
   "weights": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
   "note": "Single-sequence generator over the demo pipeline; serve with --max-num-seqs 1 --max-model-len 128 and MESH_DEVICE=\"(2, 2)\".",
-  "max_num_seqs": 1
+  "max_num_seqs": 1,
+  "max_model_len": 128
 }
