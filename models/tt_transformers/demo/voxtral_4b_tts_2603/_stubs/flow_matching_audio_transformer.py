@@ -423,6 +423,7 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens, readout=
         dtype=ttnn.bfloat16,
         compute_kernel_config=_TALL_COMPUTE,
         program_config=_short_cfg(h, wqkv, rows, ttnn.bfloat16, k_block=8),
+        memory_config=ttnn.L1_MEMORY_CONFIG,
     )
     q, k, v = _split_heads(qkv, n_heads, n_kv_heads)
     head_dim = int(q.shape[-1])
@@ -522,7 +523,8 @@ def _compile_block(device, blk, mask):
         _compact_mask(device, rows, 3, n_heads // n_kv_heads)
 
     def run(h, tokens=None, readout=False):
-        xn = _block_norm(h, eps, norm_scale, ttnn.bfloat16)
+        # qkv's input lands in L1, not DRAM: it is read once, by the next op.
+        xn = _block_norm(h, eps, norm_scale, ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
         if tokens:
             attn_out = _compact_attention(xn, wqkv, wo, n_heads, n_kv_heads, None, tokens, readout)
         else:

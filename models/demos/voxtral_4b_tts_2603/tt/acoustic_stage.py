@@ -189,7 +189,7 @@ def _norm_weight(norm, device):
     return exact if scale is None else (exact, _from_torch(gamma * scale, device, dtype=ttnn.float32))
 
 
-def _rms_norm(x, gamma, eps, dtype=None):
+def _rms_norm(x, gamma, eps, dtype=None, memory_config=None):
     """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
 
     NOT `ttnn.rms_norm`: on this model's real inputs the stock op sits at 9.65e-4 relative error
@@ -202,11 +202,11 @@ def _rms_norm(x, gamma, eps, dtype=None):
     """
     if isinstance(gamma, tuple):
         gamma, scaled = gamma
-        y = common.import_stub(_WHOLE_STUB)._sharded_rms_norm(x, eps, ttnn.float32)
+        y = common.import_stub(_WHOLE_STUB)._sharded_rms_norm(x, eps, ttnn.float32, memory_config=memory_config)
         if y is not None:
-            return ttnn.multiply(y, scaled, dtype=dtype or ttnn.float32)
+            return ttnn.multiply(y, scaled, dtype=dtype or ttnn.float32, memory_config=memory_config)
     scale = ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps, activations=[ttnn.UnaryOpType.RSQRT])
-    return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
+    return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32, memory_config=memory_config)
 
 
 def _build_stub(name, device, torch_module, counter=None, **kwargs):
@@ -270,7 +270,8 @@ def _composed_block(device, torch_block, layer_id, counter):
     eps = float(torch_block.attention_norm.eps)
 
     def run(h, attn_mask, tokens=None, readout=False):
-        xn = _rms_norm(h, g_attn, eps, dtype=ttnn.bfloat16)
+        # qkv's input lands in L1, not DRAM: it is read once, by the next op.
+        xn = _rms_norm(h, g_attn, eps, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
         a = attn(xn, attn_mask=attn_mask, tokens=tokens, readout=readout)
         if tokens and readout:
             h = ttnn.slice(h, [0, 0, 0, 0], [1, 1, int(h.shape[-2]) // tokens, int(h.shape[-1])])
