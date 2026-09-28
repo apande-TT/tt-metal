@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -1399,6 +1400,119 @@ def _batch_gate_reason(requested: int, test_output: str) -> Optional[str]:
     return f"G3 batch: --batch {requested} was requested but tests/e2e drove {served} samples; {how}"
 
 
+# SKIPPING A CORRECTNESS RE-RUN THAT CANNOT HAVE CHANGED ITS ANSWER.
+#
+# termination_check runs the FULL correctness suite on every call, then the host-free/trace check
+# only once correctness passes. That order is right -- the agent may not self-declare, and an edit
+# aimed at the trace can break correctness. But it re-runs UNCONDITIONALLY, with no way to tell "the
+# pipeline was rewritten" from "nothing that matters was touched", so it assumes the worst every
+# time. On a Qwen-Image-Edit bring-up that meant ~3.5 h of 50-step device work per round to re-prove
+# a byte-identical pipeline, before reaching the ~10-minute trace check that was the actual failure:
+# six rounds, ~33 h, one real attempt at the blocker per four hours.
+#
+# So the verdict is keyed by CONTENT, the way reference/golden.py already keys its goldens. The key
+# covers every file that can change the answer -- found by walking the demo's own import closure, so
+# a graduated stub in another package counts too and nothing is assumed about where code lives --
+# plus the pcc bar and the batch. Two deliberate limits:
+#   * ONLY A PASS IS CACHED. A failing gate is what the agent is working on; it must re-run.
+#   * THE RUN STAMP IS PART OF THE KEY, so a new run always re-verifies once. A pass is a statement
+#     about this code on THIS board, and device_recovery._run_stamp() already exists to say which
+#     run a piece of state belongs to -- see its docstring on state outliving the run that earned it.
+# Set $E2E_GATE_NO_CACHE=1 to re-run regardless.
+_GATE_CACHE_FILE = ".e2e_correctness_pass.json"
+_GATE_CACHE_OFF_ENV = "E2E_GATE_NO_CACHE"
+_GATE_KEY_VERSION = 1
+
+
+def _repo_root_of(demo_dir: Path) -> Optional[Path]:
+    """The checkout `demo_dir` lives in, found by walking up to the directory holding `models/`."""
+    for parent in [demo_dir] + list(demo_dir.parents):
+        if (parent / "models").is_dir() and (parent / "scripts").is_dir():
+            return parent
+    return None
+
+
+def _import_closure(demo_dir: Path) -> list:
+    """Every .py file the demo's own sources reach, transitively, inside this checkout.
+
+    Walks the imports rather than assuming a layout: a graduated stub the pipeline composes may live
+    in another package entirely (models/tt_dit/..., a sibling demo), and hashing only `demo_dir`
+    would call such an edit "no change". Module names come from the AST, never from a path typed
+    here."""
+    root = _repo_root_of(demo_dir)
+    seen, out = set(), []
+    work = sorted(demo_dir.rglob("*.py")) if demo_dir.is_dir() else []
+    while work:
+        f = work.pop()
+        rf = f.resolve()
+        if rf in seen or not rf.is_file():
+            continue
+        seen.add(rf)
+        out.append(rf)
+        if root is None:
+            continue
+        try:
+            tree = ast.parse(rf.read_text(errors="ignore"))
+        except (SyntaxError, OSError):
+            continue
+        mods = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                mods += [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                mods.append(node.module)
+        for m in mods:
+            rel = Path(*m.split("."))
+            for cand in (root / rel.with_suffix(".py"), root / rel / "__init__.py"):
+                if cand.is_file() and cand.resolve() not in seen:
+                    work.append(cand)
+    return out
+
+
+def _correctness_key(demo_dir: Path, pcc: float, batch: int) -> Optional[str]:
+    """Fingerprint of everything that decides the correctness verdict, or None if it cannot be taken.
+
+    Content, not mtimes: a checkout or a no-op rewrite must not invalidate a good answer, and a real
+    edit must."""
+    try:
+        from models.experimental.perf_automation.agent.device_recovery import _run_stamp
+
+        stamp = _run_stamp()
+    except Exception:  # noqa: BLE001
+        stamp = ""
+    if not stamp:
+        return None  # no run identity -> cannot scope a pass to this run -> never cache
+    try:
+        h = hashlib.sha256()
+        h.update(repr((_GATE_KEY_VERSION, stamp, float(pcc), int(batch))).encode())
+        for f in sorted(_import_closure(demo_dir)):
+            h.update(str(f).encode())
+            h.update(f.read_bytes())
+        return h.hexdigest()[:16]
+    except Exception:  # noqa: BLE001 - a key that cannot be taken must not block the gate
+        return None
+
+
+def _cached_correctness_pass(demo_dir: Path, key: Optional[str]) -> bool:
+    if not key or os.environ.get(_GATE_CACHE_OFF_ENV) == "1":
+        return False
+    try:
+        doc = json.loads((demo_dir / _GATE_CACHE_FILE).read_text())
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(doc, dict) and doc.get("key") == key
+
+
+def _record_correctness_pass(demo_dir: Path, key: Optional[str]) -> None:
+    """Remember a PASS only. A failure is what the loop is working on and must be re-run."""
+    if not key or os.environ.get(_GATE_CACHE_OFF_ENV) == "1":
+        return
+    try:
+        (demo_dir / _GATE_CACHE_FILE).write_text(json.dumps({"key": key, "version": _GATE_KEY_VERSION}))
+    except OSError:
+        pass
+
+
 def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: int = 1):
     """Model-agnostic gate runner: G1 native, G2/G3 (run tests/e2e), G4 demo/ structure. Returns (ok, reasons).
 
@@ -1409,6 +1523,14 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
     test_files = sorted(e2e_dir.glob("test_*.py")) if e2e_dir.is_dir() else []
     if not test_files:
         return False, ["G2/G3: no tests/e2e/test_*.py to run"]
+
+    # A pass this run already earned, on code that has not changed since, is still a pass. Re-running
+    # it costs the whole round (see _correctness_key). Only a PASS is reused, and only within the run
+    # that earned it.
+    _key = _correctness_key(demo_dir, pcc, batch)
+    if _cached_correctness_pass(demo_dir, _key):
+        print("  [gate] correctness unchanged since it passed this run -- reusing that verdict", flush=True)
+        return True, []
 
     demo_subdir = demo_dir / "demo"
     demo_entrypoints = sorted(demo_subdir.glob("demo_*.py")) if demo_subdir.is_dir() else []
@@ -1553,11 +1675,14 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
     _gate_log = Path(_caller_log) if _caller_log else Path(tempfile.mkdtemp(prefix="e2e_gate_")) / "gate.log"
     _gate_log.parent.mkdir(parents=True, exist_ok=True)
 
+    _gate_argv = [py, "-m", "pytest", *[str(f) for f in gate_tests], "-p", "no:cacheprovider"]
+    _gate_argv += [*_pr.PYTEST_NO_TIMEOUT, "-rA", "-s"]
+
     def _e2e_once():
         _gate_log.unlink(missing_ok=True)  # each attempt is judged on its own output
         try:
             rc = _pr._execute(
-                [py, "-m", "pytest", *[str(f) for f in gate_tests], "-p", "no:cacheprovider", "-rA", "-s"],
+                _gate_argv,
                 Path(demo_repo_root),
                 gate_env,
                 int(timeout_s),
@@ -1830,6 +1955,8 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
     if _stack_reason:
         reasons.append(_stack_reason)
 
+    if not reasons:
+        _record_correctness_pass(demo_dir, _key)
     return (len(reasons) == 0), reasons
 
 
@@ -3079,6 +3206,72 @@ ${batch_env} -- never a number typed into the test -- and print `{report}` once 
 # busy, and the supervisor killed a healthy run. The repair was a per-iteration print in the MODEL's
 # test -- which meant the lesson lived in one model's code and was lost the moment that demo was
 # regenerated. It belongs here, where every model gets it.
+# THE DEMO README'S LAYOUT, which this repo has a convention for and the builder was never told.
+#
+# The brief was one line -- "what each Call does, how to run it, the PCC numbers" -- which is not
+# what the repo does, so every generated README invented its own shape. Measured over the 39 demos
+# under models/demos: 12 have no README at all, and of the 27 that do only 6 use the sequence below.
+# It is nonetheless the ONLY heading sequence that recurs; the other 21 are each unique ("quick
+# start > configuration > testing", "runtime > run > verification and weekly ci", ...). So the
+# convention existed and simply was not written anywhere the builder could read it.
+#
+# WHICH NUMBERS BELONG THERE. The trace-replay result does: it is what `trace_replay.py` prints and
+# what the trace gate reads, so it is measured by the tool rather than typed by the agent, and
+# whether each stage replayed under trace is the single most useful fact about a bring-up. Tracy
+# profiler output does not -- zone levels and capture env vars are harness knobs (`minimax_m3`
+# documents four of them), and a profile is a debugging artefact, not documentation of the demo.
+# Nor do headline throughput tables: `gemma4/README.md` carries "Tokens/s | TTFT (ms)", and on one
+# bring-up a batch-32 result lived ONLY in a README while the gate had passed on 4 samples (see
+# _batch_gate_reason). RUN_REPORT.md is the tool-written file (`run_report.py` upserts
+# marker-delimited sections into it), so the README ends by pointing at it.
+_README_LAYOUT_BLOCK = """
+README.md -- USE THIS REPO'S LAYOUT, not one of your own. This is the only shape that recurs across
+the existing demos under models/demos, so match it instead of inventing headings:
+
+  # <Model name>
+
+  ## Platforms
+  the hardware this was brought up and validated on.
+
+  ## Introduction
+  a short paragraph: what the model is and what it does.
+
+  ## Prerequisites
+  cloned tt-metal for source, and TT-Metalium / TT-NN installed (link INSTALLING.md).
+
+  ## How to Run
+  copy-pasteable commands, one block per way to run it -- the demo entrypoint(s), the e2e test, and
+  any variant (a different input, a different batch). Commands, not prose about commands.
+
+  ## Details
+  the entry-point function and the file it lives in, where it loads weights/config from, and which
+  reference the goldens are built against.
+
+  ### Inputs
+  where the inputs come from and how to change them.
+
+  ### Trace replay
+  the TRACE-REPLAY RESULT, copied from the trace-replay output -- one row per stage IT reports
+  (never a stage list you type): its `TRACE_STAGE_MS[...]` and the `path=` that row carries, plus
+  the `TRACE_PER_TOKEN_MS` headline and its `TRACE_HEADLINE_UNIT`. If a stage reports
+  `TRACE_NOT_TRACE_CAPABLE` or replays on a non-trace path, say so for that stage. Copy what the
+  replay printed; do not restate it in your own numbers and do not fill in a stage it did not report.
+
+DO NOT PUT IN THE README:
+  * TRACY PROFILER OUTPUT OR SETTINGS -- zone levels, profiling env vars, capture knobs and profile
+    dumps are harness configuration and debugging artefacts, not documentation of this demo.
+  * HEADLINE THROUGHPUT TABLES -- tokens/s, TTFT, latency league tables. Nothing verifies a README,
+    so a number written there reads as certified when nobody checked it.
+  * PCC VALUES -- give the command that measures PCC, never the value it produced.
+
+END THE README with exactly this section, so a reader after the full results is sent to the file that
+holds them:
+
+  ## Results
+  See [RUN_REPORT.md](RUN_REPORT.md) for the measured gate results for this demo.
+"""
+
+
 _PROGRESS_PROMPT_BLOCK = """
 THE SUPERVISOR WATCHES FORWARD PROGRESS, NOT ELAPSED TIME. Your tests run under a watchdog that
 kills a step only when its LOG HAS STOPPED GROWING for {stall_s}s with nothing else moving. A long
@@ -3110,6 +3303,14 @@ def _progress_prompt_block() -> str:
     except Exception:  # noqa: BLE001 - the guidance is still correct without the exact number
         stall = None
     return _PROGRESS_PROMPT_BLOCK.format(stall_s=int(stall) if isinstance(stall, int) else "the watchdog's stall")
+
+
+def _pytest_no_timeout() -> str:
+    """The flags every tool-launched pytest carries to switch pytest's own timeout off, as the agent
+    should type them -- from probes, which owns them (see probes.PYTEST_NO_TIMEOUT)."""
+    from models.experimental.perf_automation.agent import probes as _pr
+
+    return " ".join(_pr.PYTEST_NO_TIMEOUT)
 
 
 def _build_agent_prompt(
@@ -3213,7 +3414,7 @@ For ANY model, emit a complete, runnable package — not a lone test file:
     tests/e2e/    the e2e pipeline test(s): real input -> chained stubs ->
                   real output, asserting Gate 1/2/3 (all stubs INVOKED + final
                   PCC >= {pcc} vs HF golden).
-    README.md     what each Call does, how to run it, the PCC numbers.
+    README.md     the demo's documentation, in THIS REPO'S layout (spelled out below).
 
   CRITICAL — DEMO AND TEST MUST SHARE ONE PIPELINE: the chained forward pass (the
   exact wiring of the graduated stubs) lives in `tt/` as a single function, and
@@ -3224,10 +3425,13 @@ For ANY model, emit a complete, runnable package — not a lone test file:
   deliverable is a runnable demo; a green test with no/working demo is NOT done.
 Match the conventions of existing demos under models/demos/ rather than
 inventing a new layout. Keep iterating (fix the stub/wiring, re-run on the TT device) until the
-gates pass. Use `./python_env/bin/python -m pytest <file> -s` to run on device.
+gates pass. Use `./python_env/bin/python -m pytest {_pytest_no_timeout()} <file> -s` to run on device.
+Do NOT add `@pytest.mark.timeout` (or any other timeout) to a test you write: the tool bounds every
+run it launches by watching progress, and a limit typed into a test later kills slower runs of the
+same test -- a profiled run of it takes several times longer than this one.
 Report a final summary: which calls are READY, the FINAL_PCC per call, and
 confirm all graduated modules were invoked.
-{hardware_note}{parallel_note}{trace_note}{batch_note}{_progress_prompt_block()}
+{hardware_note}{parallel_note}{trace_note}{batch_note}{_progress_prompt_block()}{_README_LAYOUT_BLOCK}
 {_TT_ONLY_CONTRACT}
 """
 

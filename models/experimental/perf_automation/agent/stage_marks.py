@@ -35,8 +35,10 @@ from __future__ import annotations
 # The seam names live in ONE module -- see stage_seams. A RELATIVE import resolves under both
 # names this package is imported by, so neither spelling has to be guarded.
 from . import stage_seams as _seams
+from .profiler_drain import ProfilerDrain, capacity_cadence, is_device
 
 import ast
+import re
 import sys
 
 _UNKNOWN = object()
@@ -115,26 +117,31 @@ def mark_stages(adapter, device) -> int:
         no_marks("the pipeline declares no stages after setup")
         return 0
     n = 0
-    for st in stages:
-        name = str(getattr(st, "name", "") or "").strip()
-        step = getattr(st, "step", None)
-        if not name or not callable(step):
-            continue
-        signpost("stage:%s" % name)
-        try:
-            step()
-            ttnn.synchronize_device(device)
-            n += 1
-        except Exception as exc:  # noqa: BLE001
-            # One stage that will not run alone must not cost the others their boundary, nor the run.
-            print(
-                "  [stage-marks] stage %r could not be run on its own (%s: %s); no boundary for it"
-                % (name, type(exc).__name__, str(exc)[:140]),
-                file=sys.stderr,
-                flush=True,
-            )
-        finally:
-            signpost("stage:%s:end" % name)
+    # At the buffer's capacity, like the session drain (profiler_drain) it runs inside, plus a read
+    # after each stage. A read of every chip is not free: at the fine TT_PERF_FLUSH_EVERY cadence one
+    # 2-layer vision_encode stage ran 16+ minutes on a WH Galaxy (2026-09-28) without ending.
+    with ProfilerDrain(ttnn, device, every=capacity_cadence()) as drain:
+        for st in stages:
+            name = str(getattr(st, "name", "") or "").strip()
+            step = getattr(st, "step", None)
+            if not name or not callable(step):
+                continue
+            signpost("stage:%s" % name)
+            try:
+                step()
+                ttnn.synchronize_device(device)
+                n += 1
+            except Exception as exc:  # noqa: BLE001
+                # One stage that will not run alone must not cost the others their boundary, nor the run.
+                print(
+                    "  [stage-marks] stage %r could not be run on its own (%s: %s); no boundary for it"
+                    % (name, type(exc).__name__, str(exc)[:140]),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finally:
+                signpost("stage:%s:end" % name)
+                drain.read()
     if not n:
         no_marks("%d declared stage(s), none could be run one at a time" % len(stages))
     return n
@@ -352,7 +359,22 @@ def mark_stages_for(pipe, device) -> int:
             _restore()
 
 
-def mark_stages_in_scope(scope: dict, device, bind=None) -> int:
+def find_device_in_scope(scope: dict, pipe=None):
+    """The device the scope's pipeline runs on, found BY SHAPE like the pipeline itself, or None.
+
+    The injected pass used to hand over a variable literally named `device`, and a test whose fixture
+    is spelled otherwise raised NameError before a single stage was marked -- measured 2026-09-27 on a
+    generated perf test whose device is its `mesh_device` fixture: every profiled run printed
+    STAGE_MARKS_SKIPPED=NameError("name 'device' is not defined"). A ttnn device is recognisable
+    without its name: a mesh answers get_num_devices(). The pipeline's own `device` attribute, when it
+    keeps one, is the fallback."""
+    for k, v in (scope or {}).items():
+        if not k.startswith("__") and is_device(v):
+            return v
+    return getattr(pipe, "device", None) if pipe is not None else None
+
+
+def mark_stages_in_scope(scope: dict, device=None, bind=None) -> int:
     """Mark each stage of whatever pipeline is live in `scope`. Returns how many were marked.
 
     The scope is the locals() of the function that built the model, so the pipeline is already
@@ -381,6 +403,8 @@ def mark_stages_in_scope(scope: dict, device, bind=None) -> int:
                 file=sys.stderr,
                 flush=True,
             )
+    if device is None:
+        device = find_device_in_scope(scope, pipe)
     return mark_stages_for(pipe, device)
 
 
@@ -432,7 +456,7 @@ _MARK_PASS_TEMPLATE = """{i}# --- per-stage marks (injected) -------------------
 {i}try:
 {i}    from models.experimental.perf_automation.agent import stage_marks as _tt_sm2
 
-{i}    print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals(), device{bind}), flush=True)
+{i}    print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals(){bind}), flush=True)
 {i}except Exception as _tt_e2:  # noqa: BLE001
 {i}    print("STAGE_MARKS_SKIPPED=%r" % (_tt_e2,), flush=True)
 """
@@ -443,10 +467,8 @@ _MARK_PASS_START_LINE = _MARK_PASS_TEMPLATE.splitlines()[0].replace("{i}", "").s
 _MARK_PASS_END_LINE = [ln for ln in _MARK_PASS_TEMPLATE.splitlines() if ln.strip()][-1].replace("{i}", "").strip()
 
 
-def _strip_mark_pass(text: str):
-    """(text with an existing per-stage pass block removed, the 1-indexed line STAGE_MARKS_ENTER
-    was on) -- or (text, None) when no such block is present."""
-    lines = text.splitlines(keepends=True)
+def _mark_pass_span(lines: list):
+    """(first, last) 0-indexed line of an existing per-stage pass block, or (None, None)."""
     start = end = None
     for i, ln in enumerate(lines):
         if start is None and _MARK_PASS_START_LINE in ln:
@@ -455,9 +477,52 @@ def _strip_mark_pass(text: str):
             end = i
             break
     if start is None or end is None:
+        return None, None
+    return start, end
+
+
+def _strip_mark_pass(text: str):
+    """(text with an existing per-stage pass block removed, the 1-indexed line STAGE_MARKS_ENTER
+    was on) -- or (text, None) when no such block is present."""
+    lines = text.splitlines(keepends=True)
+    start, end = _mark_pass_span(lines)
+    if start is None:
         return text, None
     marker = next((j + 1 for j in range(start, end + 1) if "STAGE_MARKS_ENTER" in lines[j]), None)
     return "".join(lines[:start] + lines[end + 1 :]), marker
+
+
+# The one line of the pass that calls into this module -- the line whose ARGUMENTS changed when the
+# device stopped being passed by name. Named from the function itself, so a rename cannot drift.
+_MARK_PASS_CALL_KEY = mark_stages_in_scope.__name__ + "("
+_MARK_PASS_BIND_RE = re.compile(r"bind=([A-Za-z_][A-Za-z0-9_]*)")
+_REFRESHED = "refreshed the per-stage pass call (template changed)"
+
+
+def _refresh_mark_pass(text: str) -> tuple:
+    """(text, refreshed?) -- an existing pass block re-rendered IN PLACE when its call no longer
+    matches the template's.
+
+    NARROW ON PURPOSE, like _relocate_mark_pass: only the call line is compared, so a block a
+    formatter touched is left alone. It exists for one confirmed failure: blocks injected while the
+    template still handed over a variable literally named `device` raised NameError on every profiled
+    run of a test whose fixture is spelled differently, and "already injected" kept them that way.
+    The position, the indent and the test's own preparer (`bind=`) are kept."""
+    lines = text.splitlines(keepends=True)
+    start, end = _mark_pass_span(lines)
+    if start is None:
+        return text, False
+    old = "".join(lines[start : end + 1])
+    indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+    m = _MARK_PASS_BIND_RE.search(old)
+    fresh = _MARK_PASS_TEMPLATE.format(i=indent, bind=(", bind=%s" % m.group(1)) if m else "")
+
+    def _call(block):
+        return next((ln.strip() for ln in block.splitlines() if _MARK_PASS_CALL_KEY in ln), "")
+
+    if _call(old) == _call(fresh):
+        return text, False
+    return "".join(lines[:start]) + fresh + "".join(lines[end + 1 :]), True
 
 
 def _enclosing_function_at(tree, lineno: int):
@@ -486,31 +551,36 @@ def _relocate_mark_pass(text: str) -> tuple:
     to match today's preferred spot would be a silent, unasked-for behavior change to files that
     already work. Only a marker that ran BEFORE the pipeline call it needed is unconditionally
     wrong, so only that case is fixed.
+
+    A block whose CALL predates the template's current one is refreshed in place first
+    (_refresh_mark_pass); that, too, is a block that fails every run, not a style preference.
     """
+    text, _refreshed = _refresh_mark_pass(text)
+    _unchanged = _REFRESHED if _refreshed else "already injected"
     stripped, marker_line = _strip_mark_pass(text)
     if marker_line is None:
-        return text, "already injected"  # only the outer start/stop bracket exists here
+        return text, _unchanged  # only the outer start/stop bracket exists here
     try:
         tree = ast.parse(stripped)
     except SyntaxError:
-        return text, "already injected"
+        return text, _unchanged
     fn = _enclosing_function_at(tree, marker_line)
     if fn is None:
-        return text, "already injected"
+        return text, _unchanged
     build_site = _build_pipeline_call_site(fn)
     if build_site is None or marker_line >= build_site[0]:
         # No direct build_pipeline call to check against (e.g. reached through a helper, as
         # voxtral's does), or the pipeline already existed when the marks ran -- leave it alone.
-        return text, "already injected"
+        return text, _unchanged
     end, find = _mark_pass_site(stripped, fn.name)
     if end is None:
-        return text, "already injected"
+        return text, _unchanged
     lines = stripped.splitlines(keepends=True)
     _prep = find_input_preparer(stripped, end)
     lines.insert(end, _MARK_PASS_TEMPLATE.format(i=find, bind=(", bind=%s" % _prep) if _prep else ""))
     relocated = "".join(lines)
     if relocated == text:
-        return text, "already injected"
+        return text, _unchanged
     return relocated, "relocated the per-stage pass in %s()" % fn.name
 
 
@@ -732,7 +802,7 @@ def marks_ok(why: str) -> bool:
     function does not recognise as failure, not success: an unrecognised reason from a future change
     here is a gap to report, never one to assume is fine.
     """
-    return why == "already injected" or "per-stage pass in" in why
+    return why in ("already injected", _REFRESHED) or "per-stage pass in" in why
 
 
 def _build_pipeline_call_site(node):
