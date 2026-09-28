@@ -12,18 +12,23 @@ Two jobs, and ONLY these two:
 
 Nothing here is ever called from the TT hot path.
 
-DEPTH CAP
----------
+BUILD DEPTH
+-----------
 The checkpoint is 31.58e9 parameters. Its 23 MoE blocks alone hold
-128 x 2 x 2688 x 1856 x 23 = 29.4e9 parameters (58.8 GB bf16); expert-parallel
-at TP=2 halves that to ~29 GB *per chip* against ~12 GB of Wormhole DRAM. No
-TP degree this model permits (TP>2 is blocked by num_key_value_heads=2, see
-kernel_findings.json) makes a resident 52-layer build fit on 4 chips.
+128 x 2 x 2688 x 1856 x 23 = 29.4e9 parameters (58.8 GB bf16). This runs on
+Blackhole p300c -- ~34 GB DRAM per chip (8 banks x 4.27 GB), NOT Wormhole -- so
+the FULL 52-layer stack is resident-buildable on 4 chips. Measured resident
+footprint (a fresh build_pipeline at layers=None):
+  * DP=1  (one copy sharded 4 ways, mesh 1x4)  : ~12.8 GB/chip
+  * DP=2/TP=2 (two copies, each sharded 2 ways) : ~25.6 GB/chip
+Both are well under the ~34 GB available. num_key_value_heads=2 caps attention
+TP at 2, but the MoE experts shard across all 4 chips, so DP=1/TP=4 loads the
+whole model.
 
-So the on-device gate runs a DEPTH-CAPPED model, and the golden is the SAME
-checkpoint capped to the SAME depth -- TT and HF compute the same function, so
-the PCC comparison is exact-in-scope rather than approximate. `layers=None`
-still means every layer; the caller chooses.
+DEFAULT_GATE_LAYERS=7 is therefore only a FAST default for quick PCC iteration
+(the shortest prefix carrying all three block types), NOT a hardware ceiling.
+The golden is capped to the SAME depth, so a capped gate's PCC comparison stays
+exact-in-scope. `layers=None` builds every layer; the caller chooses.
 
 The first 7 blocks are `[mamba, moe, mamba, moe, mamba, attention, moe]` --
 the shortest prefix carrying all three block types with enough of each to host

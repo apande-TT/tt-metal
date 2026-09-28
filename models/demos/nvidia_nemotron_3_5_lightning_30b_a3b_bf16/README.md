@@ -115,32 +115,33 @@ minimum, and separately asserts the 32 outputs are not all identical.
 
 ---
 
-## The depth cap — a real hardware ceiling
+## Build depth — the full model fits
 
-**The gate builds 7 of the 52 decoder blocks.** This is a measured DRAM limit,
-not a convenience:
+This runs on **Blackhole p300c (~34 GB DRAM per chip**, 8 banks × 4.27 GB), so the
+**full 52-layer model is resident-buildable on the 4 chips.** Measured resident
+footprint of a fresh `build_pipeline(device, layers=None)`:
 
-* the 23 MoE blocks hold `128 × 2 × 2688 × 1856 × 23 = 29.4e9` parameters
-  = **58.8 GB** in bf16;
-* expert-parallel at TP=2 halves that to **~29 GB per chip**, against ~12 GB of
-  DRAM per chip;
-* TP > 2 (which would split them further) is blocked by `num_key_value_heads=2`.
+| parallelism | per-chip DRAM | fits in ~34 GB |
+|---|---|---|
+| DP=1 / TP=4 (one copy, mesh `1x4`)   | **~12.8 GB/chip** | yes, easily |
+| DP=2 / TP=2 (two copies, mesh `2x2`) | **~25.6 GB/chip** | yes |
 
-No TP degree this model permits makes a resident 52-block build fit on 4 chips.
+The 23 MoE blocks hold `128 × 2 × 2688 × 1856 × 23 = 29.4e9` params (**58.8 GB**
+bf16); sharded across the chips this lands well under DRAM. `num_key_value_heads=2`
+caps *attention* TP at 2, but the MoE experts shard across all 4 chips, so a
+`1x4` (DP=1) mesh loads the whole model.
 
-`layers_block_type[:7] == [mamba, moe, mamba, moe, mamba, attention, moe]` — the
-shortest prefix that carries all three block types with enough of each to host
-every graduated stub, so a capped build still exercises **every distinct op** the
-full model runs, just fewer times. Embeddings, final norm and lm_head are intact.
+> Earlier notes here claimed a 12 GB/chip **Wormhole** ceiling and that no TP
+> degree fits 52 blocks. That was wrong hardware: on Blackhole the full stack is
+> resident (measured above).
 
-**The golden is capped identically** (`tt/_hf_ref.py` truncates
-`model.model.layers` to the same 7 blocks), so TT and HF compute the same
-function and the PCC comparison is exact-in-scope. The generated *text* from a
-7-block truncation is not meaningful English — that is a property of the
-truncation, not of the port.
-
-`build_pipeline(device, layers=None)` still means every layer; the gate and demo
-pass `layers=7`. `TT_E2E_LAYERS` / `TT_PERF_LAYERS` override it.
+**`DEFAULT_GATE_LAYERS = 7` is a FAST default, not a ceiling.**
+`layers_block_type[:7] == [mamba, moe, mamba, moe, mamba, attention, moe]` is the
+shortest prefix that still exercises **every distinct op** the full model runs, so
+the PCC gate can iterate quickly. The golden is capped to the SAME depth, so a
+capped gate's PCC comparison is exact-in-scope. For a real (meaningful-text) run
+or serving, build every layer: `build_pipeline(device, layers=None)`
+(or `TT_E2E_LAYERS` / `TT_PERF_LAYERS` to pick a depth).
 
 ---
 
