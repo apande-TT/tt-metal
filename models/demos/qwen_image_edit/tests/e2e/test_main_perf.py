@@ -182,6 +182,12 @@ def test_main_perf(mesh_device, hf_pipe):
     def _eager_forward():
         cfg = _config()
         pipe = P.build_pipeline(mesh_device, model=hf_pipe, cfg=cfg, **_build_kwargs())
+        if os.environ.get("TT_METAL_DEVICE_PROFILER") == "1":
+            # the op wrapper below flushes the profiler every PERF_FLUSH_EVERY ops, and a flush inside
+            # _denoise_loop's trace capture is a TT_FATAL (event sync during capture) that leaves the
+            # captured ops undrained until one read overflows every core: profile every step eagerly
+            # (same ops, same order as the replay)
+            pipe.trace_denoise = False
         # --- per-stage marks (injected) ---------------------------------------------------
         # Runs HERE, at the end of the function that built the pipeline, because that object is a LOCAL of
         # this scope: an earlier version copied the test's own PipelineStageAdapter(...) arguments into the
@@ -191,7 +197,7 @@ def test_main_perf(mesh_device, hf_pipe):
         try:
             from models.experimental.perf_automation.agent import stage_marks as _tt_sm2
 
-            print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals(), device), flush=True)
+            print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals()), flush=True)
         except Exception as _tt_e2:  # noqa: BLE001
             print("STAGE_MARKS_SKIPPED=%r" % (_tt_e2,), flush=True)
         enc = pipe.encode(cfg)
