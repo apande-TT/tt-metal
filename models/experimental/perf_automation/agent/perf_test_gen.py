@@ -564,7 +564,13 @@ def _run_perf_node(node_abs: str, extra_env: dict, timeout_s: int = 2400):
             return rc, (log.read_text(errors="ignore") if log.exists() else "")
         except _pr.TracyHangError as exc:
             out = log.read_text(errors="ignore") if log.exists() else ""
-            ok = _pr._device_reset(error_text=out)
+            from . import device_recovery as _dr
+
+            # _execute killed the run's process group: on a multi-chip fabric that kill is the
+            # evidence the reset needs, whatever the telemetry says (device_recovery's own rule).
+            # Passed only when set, so every other call reaches the reset exactly as before.
+            _kill = {"fault_is_certain": True} if _dr.reset_is_mandatory_after_kill(env=env) else {}
+            ok = _pr._device_reset(error_text=out, **_kill)
             return 124, out + "\n[perf_test_gen] WEDGE: %s; killed process group + tt-smi -r (reset_ok=%s)\n" % (
                 exc,
                 ok,
@@ -675,6 +681,12 @@ _ERR_NOISE = re.compile(
 )
 
 
+# The marker prefix `measure_adapter` prints per stage (TRACE_STAGE_MS[...], _BYTES[...], _ITEMS[...]).
+# Matched on the PREFIX only: the stage names inside the brackets come from the model at runtime and
+# are never enumerated here.
+_STAGE_MARKER = "TRACE_STAGE"
+
+
 def _extract_error(out: str) -> str:
     """Surface the REAL failure from a pytest run so the correction feedback is actionable. Anchor on
     pytest's own error lines ('E   ...', 'ERROR collecting', assertion/exception summaries) and DROP the
@@ -702,6 +714,16 @@ def _extract_error(out: str) -> str:
             or "TRACE_NOT_TRACE_CAPABLE" in ln
             or "TRACE_REPLAY_PATH" in ln
             or "HANDROLLED_TRACE_CAPTURE" in ln
+            # HOW FAR IT GOT IS PART OF THE ERROR. A hang has no exception to anchor on, so the only
+            # evidence of WHERE it died is which stages reported. Those markers used to be dropped
+            # here, and by a cruel accident it was this function's own WEDGE line that dropped them:
+            # a log with no anchor falls through to the "last few lines" tail, which happened to
+            # include them, but appending "[perf_test_gen] WEDGE: ..." anchors the whitelist and the
+            # tail is never reached. So the richer a failure's description became, the less of the
+            # failure survived. Measured on a real capture: 3 stage lines kept without the WEDGE
+            # line, 0 with it -- and the agent was told only "trace did not engage" for five rounds
+            # while the log said it traced two stages and froze in the third.
+            or _STAGE_MARKER in ln
         ):
             picked.append(s)
     tail = "\n".join(picked[-25:]) if picked else ""
