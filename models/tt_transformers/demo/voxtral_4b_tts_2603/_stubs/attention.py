@@ -320,6 +320,20 @@ def _sdpa_cfg(q):
     )
 
 
+def _per_sample(t, batch, real, padded):
+    """A compact `[1, H, batch * real, D]` k/v as the cache's per-sample `[batch, H, padded, D]`.
+
+    Row `b * real + i` is sample b's i-th tail position; the rows past `real` are zeros, which
+    the decode slot mask keeps closed until a step writes them.
+    """
+    heads, width = int(t.shape[1]), int(t.shape[-1])
+    rows = ttnn.reshape(ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT), [heads, batch, real, width])
+    rows = ttnn.permute(rows, (1, 0, 2, 3))
+    if padded != real:
+        rows = ttnn.pad(rows, [(0, 0), (0, 0), (0, padded - real), (0, 0)], 0.0)
+    return ttnn.to_layout(rows, ttnn.TILE_LAYOUT)
+
+
 def _prefill_sdpa(q, k, v, kv_cache):
     """Prefill SDPA, `(attn, k, v)` -- the k/v to seed the cache with, or None to seed nothing.
 
@@ -330,6 +344,34 @@ def _prefill_sdpa(q, k, v, kv_cache):
     open, the tail's own columns causal -- so the cache is seeded with the whole prompt.
     """
     phase = kv_cache.get("prefix_phase") if kv_cache is not None else None
+    compact = kv_cache.get("prefix_compact") if kv_cache is not None else None
+    if phase == "extend" and compact is not None:
+        # COMPACT tail: `[1, H, batch * real, D]`, only the positions the rows disagree on. All
+        # of it is one sequence behind the batch-1 prefix k/v, and the staged mask keeps each row
+        # to the shared prefix plus its own sample's earlier tail positions.
+        batch, real, padded = compact
+        pk, pv = kv_cache.pop("prefix_kv")
+        grid = q.device().compute_with_storage_grid_size()
+        a = ttnn.transformer.scaled_dot_product_attention(
+            q,
+            ttnn.concat([pk, k], dim=2),
+            ttnn.concat([pv, v], dim=2),
+            is_causal=False,
+            attn_mask=kv_cache["prefix_mask"],
+            scale=1.0,
+            program_config=ttnn.SDPAProgramConfig(
+                compute_with_storage_grid_size=(grid.x, grid.y),
+                exp_approx_mode=False,
+                q_chunk_size=next(c for c in (128, 64, 32) if int(q.shape[-2]) % c == 0),
+                k_chunk_size=32,
+            ),
+        )
+        rep = ttnn.Shape([batch, 1, 1, 1])
+        k = ttnn.concat([ttnn.repeat(pk, rep), _per_sample(k, batch, real, padded)], dim=2)
+        v = ttnn.concat([ttnn.repeat(pv, rep), _per_sample(v, batch, real, padded)], dim=2)
+        ttnn.deallocate(pk)
+        ttnn.deallocate(pv)
+        return a, k, v
     if phase == "extend":
         pk, pv = kv_cache.pop("prefix_kv")
         rep = ttnn.Shape([int(q.shape[0]), 1, 1, 1])

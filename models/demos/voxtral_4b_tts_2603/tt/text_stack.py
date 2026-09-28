@@ -310,9 +310,9 @@ class TextStack:
         Every row carries the same voice, so `[BOS] [BEGIN_AUDIO] [AUDIO]*N [NEXT_AUDIO_TEXT]` is the
         same ~150 tokens on all of them, and a causal stack computes the same hidden state at those
         positions for every row. `prefill_voiced` then runs row 0's first P = tile_ceil(t0) positions
-        ONCE, at batch 1, and only a T-row TAIL -- positions [t0, R), the fewest whole tiles that
-        still hold every position the rows disagree on -- at the full batch. For the package's
-        170-token prompt that is 32 rows per user instead of 192.
+        ONCE, at batch 1, and only the T-row TAIL -- positions [t0, R), exactly the positions the
+        rows disagree on -- for every row, packed compact as one `[1, 1, B * T, dim]` sequence. For
+        the package's 170-token prompt that is 20 rows per user instead of 192.
 
         The tail attends to the prefix's k/v through `mask`: prefix columns before t0 open, the
         prefix's own rows past t0 (row 0's tokens, not this row's) closed, the tail's columns causal.
@@ -324,18 +324,25 @@ class TextStack:
             return {}
         ids = input_ids
         tile = ttnn.TILE_SIZE
+        batch = int(ids.shape[0])
         real = int(ids.shape[-1])
-        shared = int((ids == ids[:1]).all(dim=0).long().cumprod(0).sum())
-        tail = _tile_ceil(max(real - shared, 1))
-        start = real - tail
+        start = int((ids == ids[:1]).all(dim=0).long().cumprod(0).sum())
+        tail = real - start
+        tail_slots = _tile_ceil(tail)
         rows = _tile_ceil(start)
-        if start < tile or rows + tail > self.kv_capacity - 1:
+        if start < tile or tail < 1 or (batch * tail) % tile or rows + tail_slots > self.kv_capacity - 1:
             return {}
         gap = rows - start
-        q_pos = torch.arange(tail).reshape(-1, 1)
-        cols = torch.arange(rows + tail).reshape(1, -1)
-        open_ = (cols < start) | ((cols >= rows) & (cols - rows <= q_pos))
-        mask = torch.where(open_, 0.0, float("-inf")).reshape(1, 1, tail, rows + tail)
+        # The tail runs COMPACT: `[1, 1, batch * tail, dim]`, sample b's positions [t0, R) in rows
+        # b * tail.., so no row pads its tail out to a tile and nothing recomputes shared positions.
+        # Row (b, i) sees prefix columns before t0 and its own sample's tail columns up to i.
+        sample = torch.arange(batch * tail) // tail
+        step = torch.arange(batch * tail) % tail
+        cols = torch.arange(rows + batch * tail).reshape(1, -1)
+        own = (cols >= rows) & (((cols - rows) // tail) == sample.reshape(-1, 1))
+        own = own & (((cols - rows) % tail) <= step.reshape(-1, 1))
+        open_ = (cols < start) | own
+        mask = torch.where(open_, 0.0, float("-inf")).reshape(1, 1, batch * tail, rows + batch * tail)
         cap = self.kv_capacity
         pos = torch.arange(cap).reshape(-1, 1)
         slot = torch.arange(cap).reshape(1, -1)
@@ -347,19 +354,28 @@ class TextStack:
         cos, sin = (ttnn.to_torch(t).float().reshape(-1, int(t.shape[-1])) for t in self.rotary(_Rows()))
         bf16 = dict(dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
         fp32 = dict(dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+
+        def _compact(t):
+            return t[:, :, start:real].repeat(1, 1, batch, 1).contiguous()
+
         return {
             "prefix": {
                 "real": real,
                 "rows": rows,
                 "start": start,
                 "tail": tail,
+                "tail_slots": tail_slots,
+                "batch": batch,
                 "gap": gap,
                 "keep_head": ttnn.from_torch(keep[:, :, :rows].contiguous(), **fp32),
                 "placed_head": ttnn.from_torch(placed[:, :, :rows].contiguous(), **fp32),
-                "keep_tail": ttnn.from_torch(keep[:, :, start:real].contiguous(), **fp32),
-                "placed_tail": ttnn.from_torch(placed[:, :, start:real].contiguous(), **fp32),
+                "keep_tail": ttnn.from_torch(_compact(keep), **fp32),
+                "placed_tail": ttnn.from_torch(_compact(placed), **fp32),
                 "rope_tail": tuple(
-                    ttnn.from_torch(t[start:real].reshape(1, 1, tail, -1).to(torch.bfloat16).contiguous(), **bf16)
+                    ttnn.from_torch(
+                        t[start:real].repeat(batch, 1).reshape(1, 1, batch * tail, -1).to(torch.bfloat16).contiguous(),
+                        **bf16,
+                    )
                     for t in (cos, sin)
                 ),
                 "mask": ttnn.from_torch(mask.to(torch.bfloat16).contiguous(), **bf16),
@@ -512,11 +528,12 @@ class TextStack:
         rows, start, tail, real = split["rows"], split["start"], split["tail"], split["real"]
         if batch > self.max_batch:
             raise ValueError(f"batch {batch} exceeds the staged decode-position width {self.max_batch}")
-        self._arm_cache(batch, rows + tail)
+        if batch != split["batch"]:
+            raise ValueError(f"batch {batch} != the staged compact tail's {split['batch']}")
+        self._arm_cache(batch, rows + split["tail_slots"])
         pre_in = self._voiced(ttnn.slice(input_ids_tt, [0, 0], [1, rows]), split["keep_head"], split["placed_head"])
-        tail_in = self._voiced(
-            ttnn.slice(input_ids_tt, [0, start], [batch, real]), split["keep_tail"], split["placed_tail"]
-        )
+        tail_ids = ttnn.reshape(ttnn.slice(input_ids_tt, [0, start], [batch, real]), [1, batch * tail])
+        tail_in = self._voiced(tail_ids, split["keep_tail"], split["placed_tail"])
         for block in self.blocks:
             block.kv["prefix_phase"] = "stash"
         try:
@@ -524,19 +541,30 @@ class TextStack:
             for block in self.blocks:
                 block.kv["prefix_phase"] = "extend"
                 block.kv["prefix_mask"] = split["mask"]
+                block.kv["prefix_compact"] = (batch, tail, split["tail_slots"])
             tail_out = self._run_chain(tail_in, split["rope_tail"])
         finally:
             for block in self.blocks:
                 block.kv.pop("prefix_phase", None)
                 block.kv.pop("prefix_mask", None)
                 block.kv.pop("prefix_kv", None)
+                block.kv.pop("prefix_compact", None)
                 block.kv["slot_offset"] = split["gap"]
             ttnn.deallocate(pre_in)
             ttnn.deallocate(tail_in)
         self.filled = real
         self._slot_gap = split["gap"]
         self._slot_mask = split["slot_mask"]
-        last = self._last_row(tail_out, tail)
+        # Compact rows back to `[B, 1, tail, H]`, sample-major, for `last` and the hidden state.
+        per_sample = ttnn.reshape(ttnn.to_layout(tail_out, ttnn.ROW_MAJOR_LAYOUT), [batch, 1, tail, self.hidden_size])
+        ttnn.deallocate(tail_out)
+        last = ttnn.to_layout(
+            ttnn.reshape(
+                ttnn.slice(per_sample, [0, 0, tail - 1, 0], [batch, 1, tail, self.hidden_size]),
+                [batch, self.hidden_size],
+            ),
+            ttnn.TILE_LAYOUT,
+        )
         if not need_hidden:
             ttnn.deallocate(pre_out)
             return None, last
@@ -544,9 +572,7 @@ class TextStack:
         # sample, then each sample's own tail. The seam is off-tile, so it is joined ROW_MAJOR.
         head = ttnn.slice(ttnn.to_layout(pre_out, ttnn.ROW_MAJOR_LAYOUT), [0, 0, 0, 0], [1, 1, start, self.hidden_size])
         ttnn.deallocate(pre_out)
-        out = ttnn.concat(
-            [ttnn.repeat(head, ttnn.Shape([batch, 1, 1, 1])), ttnn.to_layout(tail_out, ttnn.ROW_MAJOR_LAYOUT)], dim=2
-        )
+        out = ttnn.concat([ttnn.repeat(head, ttnn.Shape([batch, 1, 1, 1])), per_sample], dim=2)
         return ttnn.to_layout(out, ttnn.TILE_LAYOUT), last
 
     def _prefill_rope(self, embeds, position_ids_tt):
