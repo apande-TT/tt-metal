@@ -32,10 +32,12 @@ _W_AXIS = 1
 
 
 class TtQwenImageDecoder3d:
-    def __init__(self, device, torch_module, batch_parallel=False):
+    def __init__(self, device, torch_module, batch_parallel=False, single_frame=False):
         """batch_parallel: split the batch over mesh axis 0 (DP) instead of partitioning H there. The
         Wan causal conv fuses its temporal front pad into the H halo exchange, and that fused
-        neighbor_pad only takes B=1; with H unsplit the pad is a plain ttnn.pad and B > 1 runs."""
+        neighbor_pad only takes B=1; with H unsplit the pad is a plain ttnn.pad and B > 1 runs.
+        single_frame: the decoder only ever sees T = 1 latents (images), so every causal conv keeps just
+        its last temporal tap (see _resident.fold_single_frame_convs)."""
         self.device = device = physical_grid(device)
         shape = mesh_shape(device)
         self.batch_axis = _H_AXIS if (batch_parallel and shape[_H_AXIS] > 1) else None
@@ -63,6 +65,11 @@ class TtQwenImageDecoder3d:
             # fp32 end-to-end: the bf16 decode drifts to PCC ~0.982 through the deep conv stack.
             dtype=ttnn.float32,
         )
+        self.single_frame = single_frame
+        if single_frame:
+            from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._resident import fold_single_frame_convs
+
+            fold_single_frame_convs(self.decoder)
         self.decoder.load_torch_state_dict(torch_module.state_dict())
         self.num_convs = count_convs(self.decoder)
         # Every child of the Wan stack runs as its graduated port (causal conv, RMS norm, residual /
@@ -81,6 +88,7 @@ class TtQwenImageDecoder3d:
     def __call__(self, x, feat_cache=None, feat_idx=None, **_ignored):
         # x: replicated TILE [B, C=z_dim, T, H, W] (BCTHW, like the torch reference).
         B, C, T, H, W = x.shape
+        assert T == 1 or not self.single_frame, f"single_frame decoder got T={T}"
         pc = self.parallel_config
 
         if x.dtype != ttnn.float32:

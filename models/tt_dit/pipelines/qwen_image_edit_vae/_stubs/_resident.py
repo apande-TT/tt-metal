@@ -113,3 +113,42 @@ def attach_block_ports(stack, device, parallel_config, ccl_manager, torch_stack=
                 ports.append(port_cls.around(mod, device, parallel_config, ccl_manager))
                 break
     return ports
+
+
+def fold_single_frame_convs(stack):
+    """Rebuild every causal conv of a Wan `stack` for single-frame (T = 1) input, BEFORE its weights load.
+
+    A causal conv with kernel_t > 1 and stride_t = 1 front-pads T with kernel_t - 1 zero frames, so on
+    one frame (the image VAE, cache-free first chunk) every temporal tap but the last multiplies zeros.
+    The conv is re-made with kernel (1, kh, kw), no T padding, and the last temporal tap of the weights:
+    the same output at 1/kernel_t of the MACs and weight reads. Returns the number of convs folded."""
+    from models.tt_dit.models.vae.vae_wan2_1 import WanCausalConv3d
+
+    n = 0
+    for mod in list(walk(stack))[1:]:
+        if type(mod) is not WanCausalConv3d:
+            continue
+        kt, kh, kw = mod.kernel_size
+        if kt == 1 or mod.stride[0] != 1 or mod.external_padding[0] != kt - 1:
+            continue
+        WanCausalConv3d.__init__(
+            mod,
+            mod.unpadded_in_channels,
+            mod.out_channels,
+            kernel_size=(1, kh, kw),
+            stride=mod.stride,
+            padding=(0, mod.external_padding[1], mod.external_padding[2]),
+            mesh_device=mod.mesh_device,
+            parallel_config=mod.parallel_config,
+            ccl_manager=mod.ccl_manager,
+            dtype=mod.dtype,
+        )
+
+        def _prepare(state, _mod=mod):
+            if "weight" in state:
+                state["weight"] = state["weight"][:, :, -1:].contiguous()
+            WanCausalConv3d._prepare_torch_state(_mod, state)
+
+        mod._prepare_torch_state = _prepare
+        n += 1
+    return n
