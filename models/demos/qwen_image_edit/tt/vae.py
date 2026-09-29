@@ -50,7 +50,8 @@ class TtQwenVAE:
         self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel=True)
         self.quant_conv = vae_pointwise.build(device, hf_vae.quant_conv)
         self.post_quant_conv = vae_pointwise.build(device, hf_vae.post_quant_conv)
-        self.decoder = qwen_image_decoder3d.build(device, hf_vae.decoder, batch_parallel=True)
+        # image latents are single-frame: the decoder's causal convs keep only their live temporal tap
+        self.decoder = qwen_image_decoder3d.build(device, hf_vae.decoder, batch_parallel=True, single_frame=True)
         mean = torch.tensor(cfg.latents_mean, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
         std = torch.tensor(cfg.latents_std, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
         self.mean = _replicated(device, mean)
