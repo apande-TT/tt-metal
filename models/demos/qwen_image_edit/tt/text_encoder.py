@@ -44,6 +44,10 @@ def _replicated(device, t, dtype, layout=ttnn.TILE_LAYOUT):
 
 
 LM_EXACT = False
+# the vision tower needs the exact 8-lane K reduction (without it the image PCC measured 0.55), but it
+# forms it with one lane pattern instead of the median of three: the median only outvotes a rare
+# power-of-two glitch, and it triples the ~24 matmuls + masks + adds of every vision linear
+VISION_EXACT = ("strided",)
 
 
 class TextEncoderInputs:
@@ -109,14 +113,17 @@ class TtQwenTextEncoder:
         vl = 3 if on else 2
         self.visual.precise = on
         self.visual.limbs = self.visual.patch_embed.limbs = vl
+        self.visual.exact = self.visual.patch_embed.exact = VISION_EXACT
         for blk in self.visual.blocks:
             b = blk.block
             b.attn.precise = b.mlp.precise = b.norm1.precise = b.norm2.precise = on
             b.precise_inputs = on
             b.attn.limbs = b.mlp.limbs = vl
+            b.attn.exact = b.mlp.exact = VISION_EXACT
         self.visual.merger.merger.precise = on
         self.visual.merger.merger.ln_q.precise = on
         self.visual.merger.merger.limbs = vl
+        self.visual.merger.merger.exact = VISION_EXACT
         for lyr in self.text_model.layers:
             lyr.self_attn.precise = lyr.mlp.precise = on
             # the LM is well conditioned: 2-limb dense products hold it at PCC ~1 - 2e-6 on HF inputs,
