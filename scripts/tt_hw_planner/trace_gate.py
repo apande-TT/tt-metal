@@ -5,14 +5,47 @@ import re
 from pathlib import Path
 
 
-def read_graduation(demo_dir):
-    demo_dir = Path(demo_dir)
-    status_path = demo_dir / "bringup_status.json"
-    result = {}
-    if not status_path.is_file():
-        return result
+_STATUS_FILE = "bringup_status.json"
+
+
+def _component_status_dirs(demo_dir):
+    """The bring-up dirs of a COMPOSITE model, discovered from what its own pipeline imports.
+
+    A composite e2e package holds no status file of its own: its parts were brought up separately and
+    each keeps its status beside its own stubs, anywhere in the checkout. Which dirs those are cannot
+    be guessed from the demo path and must not be typed -- so the PIPELINE is asked, by walking the
+    imports it actually makes (the same closure the correctness cache keys on) and keeping every
+    directory along the way that carries a status file. A model that renames or relocates its
+    components still resolves, because nothing here assumed where they were.
+
+    This is the case the gate was failing on: with no status file in the demo dir, `trace_policy`
+    reported `known: False` and `classify_trace_verdict` returned a hard FAIL -- correctly, on its
+    own terms, since nothing licenses skipping a trace on no evidence. But the evidence existed; it
+    was one directory away, and the agent was told to make the status readable from a dir it was
+    never written to. 25 graduated modules read as 0, every round.
+    """
     try:
-        data = json.loads(status_path.read_text())
+        from .commands.emit_e2e import _import_closure
+    except Exception:  # noqa: BLE001 - no walker available: no components to report
+        return []
+    out = []
+    seen = set()
+    for f in _import_closure(Path(demo_dir)):
+        for d in f.parents:
+            if d in seen:
+                continue
+            seen.add(d)
+            if (d / _STATUS_FILE).is_file():
+                out.append(d)
+    return sorted(out)
+
+
+def _graduation_in(status_dir, qualify=False):
+    """The graduation state recorded in ONE bring-up dir: {module: "sharded"|"native"|None}."""
+    status_dir = Path(status_dir)
+    result = {}
+    try:
+        data = json.loads((status_dir / _STATUS_FILE).read_text())
     except Exception:
         return result
     try:
@@ -23,19 +56,34 @@ def read_graduation(demo_dir):
         name = comp.get("name")
         if not name:
             continue
-        stub = demo_dir / "_stubs" / f"{_safe_id(name)}.py"
+        stub = status_dir / "_stubs" / f"{_safe_id(name)}.py"
         native = stub.with_suffix(".py.last_good_native").is_file()
         sharded = stub.with_suffix(".py.last_good_sharded").is_file()
         try:
             graduated = bool(_stub_has_graduated_any(stub))
         except Exception:
             graduated = False
+        # Qualified only when several dirs are being merged, where the same module name can occur in
+        # more than one component and an unqualified key would silently drop one. A single-dir model
+        # keeps the bare names it has always reported.
+        key = "%s/%s" % (status_dir.name, name) if qualify else name
         if graduated and sharded:
-            result[name] = "sharded"
+            result[key] = "sharded"
         elif graduated and native:
-            result[name] = "native"
+            result[key] = "native"
         else:
-            result[name] = None
+            result[key] = None
+    return result
+
+
+def read_graduation(demo_dir):
+    demo_dir = Path(demo_dir)
+    if (demo_dir / _STATUS_FILE).is_file():
+        return _graduation_in(demo_dir)
+    dirs = _component_status_dirs(demo_dir)
+    result = {}
+    for d in dirs:
+        result.update(_graduation_in(d, qualify=len(dirs) > 1))
     return result
 
 
@@ -231,6 +279,57 @@ def caps_stale(demo_dir):
     return False
 
 
+# RETRY A WEDGE ON THE BOARD THE WEDGE JUST RESET.
+#
+# A trace hang already triggers a reset (perf_test_gen._run_perf_node catches TracyHangError, runs
+# tt-smi -r, and returns the WEDGE). What it does NOT do on this path is try again: the retry loop
+# lives in `generate_perf_test`, which bounds itself at _TRACE_WEDGE_LIMIT, and the gate reaches the
+# capture through `validate_generated_perf_test` instead -- which has none. So the board is reset and
+# the result is then discarded.
+#
+# That costs the whole round. Reaching the capture at all means the correctness gate has just run:
+# ~3.5 h of device work on one Qwen-Image-Edit bring-up. Against that, one more ~10-minute capture on
+# a board that was JUST reset is nearly free, and it is the only way to find out whether the reset
+# actually restored anything. Six rounds over two days each paid the 3.5 h, wedged once, and stopped.
+#
+# `_is_device_disruption` states the case against retrying -- "that already got one reset and must
+# return to the caller as a WEDGE, NOT loop reset+retry (which just re-hangs)". That is why this is
+# BOUNDED AND SMALL (one extra attempt by default) rather than a loop: if it just re-hangs, the cost
+# is one capture and the report now says so with BOTH attempts' evidence; if it does not, the round
+# is saved. Every attempt's detail is kept, so the progression is visible instead of only the last.
+# HOW MANY, from what an attempt costs against what it tells you. A capture runs ~5-15 min (the
+# longest observed was 13); the round it is trying to save is ~3.5 h. The value decays fast, though:
+# attempt 1 establishes the failure, attempt 2 answers the open question (did the reset restore the
+# board?), attempt 3 separates flaky from deterministic -- and past that each 15 minutes buys
+# information already in hand. generate_perf_test's _TRACE_WEDGE_LIMIT of 10 would be up to 2.5 h,
+# as expensive as the round, so it is not reused as a count here.
+_WEDGE_RETRY_ENV = "E2E_TRACE_WEDGE_RETRIES"
+_WEDGE_RETRIES = 2
+
+# WHAT THE CAPTURE SAW, IN THE FIELD THE AGENT ACTUALLY READS.
+#
+# `capture_detail` is the only model-specific evidence this gate produces: the stage markers the
+# capture printed before it stopped, one line per attempt. It was returned in the result and written
+# to the report -- and left OUT of `reasons`, which is the list the gate server turns into
+# next_target.reason and blocking[]. So the agent was handed the verdict PROSE only ("trace did not
+# engage ..."), identical every round, while the line naming where it stopped sat in a file nothing
+# told it to read: five rounds of guessing, no edits. The report keeps its own copy; this puts the
+# same fact into the pipe that reaches the agent.
+_CAPTURE_DETAIL_CHARS = 900  # next_target.reason is capped at 2000 -- leave room for the other blockers
+
+
+def _wedge_retries() -> int:
+    try:
+        return max(0, int(os.environ.get(_WEDGE_RETRY_ENV, str(_WEDGE_RETRIES))))
+    except ValueError:
+        return _WEDGE_RETRIES
+
+
+def _is_wedge(status, detail) -> bool:
+    """A hang, as opposed to an ordinary invalid/skip verdict the agent should fix in code."""
+    return status == "invalid" and "WEDGE" in (detail or "")
+
+
 def run_fresh_trace_capture(demo_dir, timeout_s=900):
     demo_dir = Path(demo_dir)
     perf = _perf_test(demo_dir)
@@ -243,11 +342,29 @@ def run_fresh_trace_capture(demo_dir, timeout_s=900):
         return read_trace_caps(demo_dir), "perf_test_gen unavailable: %s" % e
     os.environ["TT_PERF_TRACE"] = "1"
     os.environ.setdefault("PERF_MCP_VALIDATE_TIMEOUT", str(timeout_s))
-    try:
-        status, detail = validate_generated_perf_test(perf, task)
-    except Exception as e:  # noqa: BLE001
-        return read_trace_caps(demo_dir), "capture raised: %s" % e
-    return read_trace_caps(demo_dir), "%s %s" % (status, detail or "")
+    attempts = []
+    for attempt in range(1 + _wedge_retries()):
+        try:
+            status, detail = validate_generated_perf_test(perf, task)
+        except Exception as e:  # noqa: BLE001
+            attempts.append("capture raised: %s" % e)
+            break
+        attempts.append("%s %s" % (status, detail or ""))
+        if not _is_wedge(status, detail):
+            break
+        if attempt < _wedge_retries():  # another attempt follows
+            print(
+                "  [trace] capture wedged and the board was reset; retrying the capture on it "
+                "(%d/%d)" % (attempt + 1, _wedge_retries()),
+                flush=True,
+            )
+    # Every attempt is reported, not just the last: "wedged in the same place twice" and "got further
+    # the second time" need opposite fixes, and only the sequence tells them apart.
+    if len(attempts) > 1:
+        joined = "\n".join("attempt %d: %s" % (i + 1, a) for i, a in enumerate(attempts))
+    else:
+        joined = attempts[0] if attempts else "no capture attempted"
+    return read_trace_caps(demo_dir), joined
 
 
 def evaluate_trace_gate(demo_dir, trace_caps=None, allow_no_trace=False, overflow_proof=None, fresh=False):
@@ -277,6 +394,8 @@ def evaluate_trace_gate(demo_dir, trace_caps=None, allow_no_trace=False, overflo
         reclaim_mesh()
     if verdict == "FAIL":
         reasons.append("G6 trace-gate: " + reason)
+        if capture_detail:
+            reasons.append("G6 trace-gate: what the capture itself reported: " + capture_detail[:_CAPTURE_DETAIL_CHARS])
         for g in glue:
             reasons.append("G6 trace-gate: " + g)
         if repin:
@@ -449,7 +568,12 @@ def build_fix_directive(result):
     for g in result.get("glue_violations") or []:
         parts.append("Port to on-device ttnn (remove from traced step): " + g)
     if not parts:
+        # Nothing static to point at, so the only lead is what the capture reported. Without it this
+        # fell back to the verdict prose, which is the same sentence every round and names nothing.
         parts.append(result.get("reason", "trace did not engage"))
+        detail = result.get("capture_detail")
+        if detail:
+            parts.append("The capture's own last output was: " + detail[:_CAPTURE_DETAIL_CHARS])
     return " ".join(parts)
 
 

@@ -453,12 +453,38 @@ def _is_device_disruption(rc, out: str) -> bool:
     a wall-time marker, or the tracy hang marker), the trace capture wedged mid-test — that already got
     one reset and must return to the caller as a WEDGE (-> eager fallback), NOT loop reset+retry (which
     just re-hangs). The post-hang reset re-init prints 'AICLK failed to settle', which would otherwise
-    look like a fresh board disruption — this guard prevents that misclassification."""
+    look like a fresh board disruption — this guard prevents that misclassification.
+
+    The board-level evidence is device_recovery.is_dead_board's, not a second list kept here."""
     if not out:
         return False
     if any(m in out for m in _TRACE_RAN_MARKERS):
         return False
     if _DEVICE_DISRUPTION_RE.search(out):
+        return True
+    # ONE VOCABULARY FOR "THE BOARD IS DEAD", NOT TWO.
+    #
+    # The reset below this predicate already existed and worked; it was simply never reached,
+    # because this path matched the failure against a PRIVATE list while device_recovery kept the
+    # authoritative one. Two lists drift, and one of them had not been told about the ETH fabric.
+    #
+    # Measured 2026-09-25: the perf-test builder failed at device open three times in a row with
+    # "Timed out waiting for ETH heartbeat on device ASIC ID ..., ETH core e7-0 (NOC0) to advance.
+    # Stuck at 0x..." (umd/device/pcie/pci_device.cpp), retried into the identical wedge each time
+    # and gave up after 51 minutes. is_dead_board() returned True for that text throughout; this
+    # returned False, so no reset was issued. The builder's own agent wrote the diagnosis down:
+    # "The harness only resets the board after a hang, not on this failure, and no other process is
+    # holding the chips."
+    #
+    # So ASK the shared predicate rather than copying its signatures here -- a signature added for
+    # any other caller then reaches this one too, which is the whole point of there being one list.
+    from .device_recovery import is_dead_board
+
+    # DELIBERATELY BELOW THE _TRACE_RAN_MARKERS GUARD. That guard is what keeps a TRACE HANG out of
+    # this branch: a test that already ran has had its one reset and must return to the caller as a
+    # WEDGE, not loop reset+retry (which "just re-hangs"). A hang's output can mention a dead board,
+    # so asking first would defeat the guard. Everything reaching here failed BEFORE the test body.
+    if is_dead_board(out):
         return True
     if "unordered_map::at" in out and re.search(
         r"GetPCIeDeviceID|open_device|CreateDevice|MeshDevice|conftest\.py|device_params", out
@@ -519,8 +545,9 @@ def _run_perf_node(node_abs: str, extra_env: dict, timeout_s: int = 2400):
         env.setdefault("TT_PERF_OSL_TOKENS", "4")
         env.pop("TT_METAL_DEVICE_PROFILER", None)
         env.update(ev)
-        cmd = [sys.executable, "-m", "pytest", "-o", "timeout=0", "-s", node_abs]
         from . import probes as _pr
+
+        cmd = [sys.executable, "-m", "pytest", *_pr.PYTEST_NO_TIMEOUT, "-s", node_abs]
 
         # A PERF-ONLY NODE NEVER CHECKS THE REFERENCE'S VALUES, ONLY ITS SHAPES -- see the
         # authoring contract (_contract/_SKELETON_REF): "NO PCC / correctness assertions ... just
@@ -538,7 +565,13 @@ def _run_perf_node(node_abs: str, extra_env: dict, timeout_s: int = 2400):
             return rc, (log.read_text(errors="ignore") if log.exists() else "")
         except _pr.TracyHangError as exc:
             out = log.read_text(errors="ignore") if log.exists() else ""
-            ok = _pr._device_reset(error_text=out)
+            from . import device_recovery as _dr
+
+            # _execute killed the run's process group: on a multi-chip fabric that kill is the
+            # evidence the reset needs, whatever the telemetry says (device_recovery's own rule).
+            # Passed only when set, so every other call reaches the reset exactly as before.
+            _kill = {"fault_is_certain": True} if _dr.reset_is_mandatory_after_kill(env=env) else {}
+            ok = _pr._device_reset(error_text=out, **_kill)
             return 124, out + "\n[perf_test_gen] WEDGE: %s; killed process group + tt-smi -r (reset_ok=%s)\n" % (
                 exc,
                 ok,
@@ -649,6 +682,50 @@ _ERR_NOISE = re.compile(
 )
 
 
+# The marker prefix `measure_adapter` prints per stage (TRACE_STAGE_MS[...], _BYTES[...], _ITEMS[...]).
+# Matched on the PREFIX only: the stage names inside the brackets come from the model at runtime and
+# are never enumerated here.
+_STAGE_MARKER = "TRACE_STAGE"
+
+
+def signal_note(rc) -> str:
+    """ "terminated by SIGKILL (rc=-9)" for a killed step, "" for any ordinary exit.
+
+    THE SECOND CHANNEL. A step reports through two: its OUTPUT and its EXIT STATUS. A signal death
+    says nothing in the first -- SIGKILL has no handler, so there is no traceback and the output
+    simply stops mid-line -- and everything downstream reads the output. So `rc = -9` was routed to
+    the same branch as `rc = 1`, and "the tool killed this step" arrived as "some unspecified invalid
+    result", pointing the agent at code that was never the problem.
+
+    Python already hands the caller the whole fact: a negative returncode IS the signal. It was only
+    ever compared against 0, 124 and None, so anything else fell through."""
+    try:
+        n = int(rc)
+    except (TypeError, ValueError):
+        return ""
+    if n >= 0:
+        return ""
+    try:
+        import signal as _sig
+
+        name = _sig.Signals(-n).name
+    except (ValueError, AttributeError):
+        name = "signal %d" % -n
+    return "terminated by %s (rc=%d)" % (name, n)
+
+
+def killed_verdict(rc, out):
+    """("invalid", "terminated by SIGKILL ...") for a signal death, else None.
+
+    Lead with the signal: the output cannot mention it, and "you were killed" and "your code is
+    wrong" call for opposite responses from whoever reads this. One helper, so both the traced and
+    the eager path report a kill the same way."""
+    note = signal_note(rc)
+    if not note:
+        return None
+    return "invalid", "%s -- the step was killed, not failed. %s" % (note, _extract_error(out) or "")
+
+
 def _extract_error(out: str) -> str:
     """Surface the REAL failure from a pytest run so the correction feedback is actionable. Anchor on
     pytest's own error lines ('E   ...', 'ERROR collecting', assertion/exception summaries) and DROP the
@@ -676,6 +753,16 @@ def _extract_error(out: str) -> str:
             or "TRACE_NOT_TRACE_CAPABLE" in ln
             or "TRACE_REPLAY_PATH" in ln
             or "HANDROLLED_TRACE_CAPTURE" in ln
+            # HOW FAR IT GOT IS PART OF THE ERROR. A hang has no exception to anchor on, so the only
+            # evidence of WHERE it died is which stages reported. Those markers used to be dropped
+            # here, and by a cruel accident it was this function's own WEDGE line that dropped them:
+            # a log with no anchor falls through to the "last few lines" tail, which happened to
+            # include them, but appending "[perf_test_gen] WEDGE: ..." anchors the whitelist and the
+            # tail is never reached. So the richer a failure's description became, the less of the
+            # failure survived. Measured on a real capture: 3 stage lines kept without the WEDGE
+            # line, 0 with it -- and the agent was told only "trace did not engage" for five rounds
+            # while the log said it traced two stages and froze in the third.
+            or _STAGE_MARKER in ln
         ):
             picked.append(s)
     tail = "\n".join(picked[-25:]) if picked else ""
@@ -900,6 +987,9 @@ def validate_generated_perf_test(out_path: Path, task: str, component: bool = Fa
             return "ok_marker", ""
         if rc1 == 124 or "WEDGE" in out1:
             return "invalid", "WEDGE: " + (_extract_error(out1) or "device hung capturing the module's forward")
+        _killed = killed_verdict(rc1, out1)
+        if _killed:
+            return _killed
         return "invalid", (
             _extract_error(out1)
             or "module perf test produced no TRACE_PER_TOKEN_MS (trace required; eager only via TT_PERF_TRACE=0)"
@@ -907,6 +997,9 @@ def validate_generated_perf_test(out_path: Path, task: str, component: bool = Fa
     rc1, out1 = _run_perf_node(node_abs, {}, timeout_s=vt)
     if rc1 is None:
         return "skip", out1
+    _killed = killed_verdict(rc1, out1)
+    if _killed:
+        return _killed
     low = out1.lower()
     if any(s in low for s in _DEVICE_UNAVAILABLE):
         return "skip", "device/ttnn unavailable during generation-time validation"

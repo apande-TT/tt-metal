@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -202,43 +204,116 @@ def _scope_grounding_gate(demo_dir: Path, reference_config=_SCOPE_SENTINEL):
     )
 
 
-def _reset_device() -> str:
-    """Reset the device, widening the requested chips to WHOLE BOARDS.
-
-    TT_HW_PLANNER_RESET_CHIPS lets an operator name chips directly, and naming one chip of a p300c
-    (`-r 3`) half-resets the board: the untouched ASIC's clock arbiter is left inconsistent and the
-    next device-open wedges. Widen through the shared recovery primitive, falling back to every chip
-    rather than narrowing when the topology is unknown."""
-    chips = os.environ.get("TT_HW_PLANNER_RESET_CHIPS", "0,1,2,3")
+def _recovery():
+    """(probes, device_recovery) from the shared recovery package, or None when it cannot be imported."""
     try:
-        import importlib.util as _ilu
+        from models.experimental.perf_automation.agent import device_recovery as _dr
+        from models.experimental.perf_automation.agent import probes as _pr
 
-        _p = (
-            Path(__file__).resolve().parents[3]
-            / "models"
-            / "experimental"
-            / "perf_automation"
-            / "agent"
-            / "device_recovery.py"
-        )
-        _spec = _ilu.spec_from_file_location("tt_device_recovery", str(_p))
-        _dr = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_dr)
-        widened = _dr.expand_spec(chips)
-        if widened and widened != "all":
-            chips = widened
+        return _pr, _dr
     except Exception:  # noqa: BLE001
-        pass
-    from models.experimental.perf_automation.agent.probes import tt_smi_bin
+        return None
 
-    tt_smi = tt_smi_bin()
-    if not Path(tt_smi).exists():
-        return "device reset SKIPPED (tt-smi not found)"
+
+def _reset_device(error_text: str = "") -> str:
+    """Recover a wedged device through the SHARED recovery (agent.probes._device_reset) and say
+    whether it came back.
+
+    This used to issue its own `tt-smi -r 0,1,2,3`: a plain `-r` does not reset a Galaxy, the chip
+    list ignored the chip the failure named, and the by-path load meant to widen it to whole boards
+    raised on the module's relative import, so the widening never ran. The shared path picks the
+    target from `error_text`, widens to whole boards, uses the host's reset (galaxy-tray on a
+    Galaxy), verifies the device answers, and counts failures against one run-wide limit.
+    TT_HW_PLANNER_RESET_CHIPS still names an operator's preferred target."""
+    return _recover_board(error_text)[1]
+
+
+def _recover_board(error_text: str = "", fault_is_certain: bool = False) -> tuple:
+    """(came back, what happened): _reset_device's work, with the verdict as a bool for callers that
+    act on it (_retry_after_wedge) rather than only report it. fault_is_certain is passed on only
+    when set, so every existing call reaches the shared reset exactly as before."""
+    rec = _recovery()
+    if rec is None:
+        return False, "device reset SKIPPED (shared device recovery could not be imported)"
+    _pr, _dr = rec
+    if not Path(_pr.tt_smi_bin()).exists():
+        return False, "device reset SKIPPED (tt-smi not found)"
+    kw = {"fault_is_certain": True} if fault_is_certain else {}
     try:
-        r = subprocess.run([tt_smi, "-r", chips], capture_output=True, text=True, timeout=420)
-        return "device reset (tt-smi -r %s) rc=%d" % (chips, r.returncode)
+        ok = _pr._device_reset(
+            error_text=error_text, config_target=os.environ.get("TT_HW_PLANNER_RESET_CHIPS", ""), **kw
+        )
     except Exception as e:  # noqa: BLE001
-        return "device reset FAILED (%s) — a hard boot may be required" % e
+        return False, "device reset FAILED (%s) — a hard boot may be required" % e
+    if ok:
+        return True, "device recovery: board answering after recovery (verified)"
+    if _dr.recovery_exhausted():
+        return False, "device recovery EXHAUSTED (resets keep failing) — reset the board by hand or reboot the host"
+    return False, "device reset did NOT bring the board back — a hard boot may be required"
+
+
+class _StepResult:
+    """One attempt of a device-running gate step: passed?, its output, and whether it had to be
+    stopped for making no progress (a hang, as opposed to a run that finished and failed)."""
+
+    __slots__ = ("ok", "output", "stalled", "detail")
+
+    def __init__(self, ok: bool, output: str = "", stalled: bool = False, detail=None):
+        self.ok, self.output, self.stalled, self.detail = bool(ok), output or "", bool(stalled), detail
+
+
+def _retry_after_wedge(label: str, run_once) -> tuple:
+    """Run a device-running gate step; if it failed BECAUSE THE BOARD WAS WEDGED, recover and run it
+    once more. Returns (final _StepResult, notes for the gate's reasons).
+
+    The gate used to recover the board and then report the step it had just rescued as failed, so a
+    board left wedged by the PREVIOUS process cost a whole fix-loop round (1-2 h at B=32) although the
+    reset took a minute. Measured on a WH Galaxy, 2026-09-26: after a fabric run exits, the next open
+    can fail with a frozen ETH heartbeat; the same step passes on the reset board.
+
+    A retry happens only when the failure is the board's, never the model's: the step stalled (it was
+    killed, so the fault is certain), or its own output carries a dead-board signature. It happens at
+    most once, and only after the reset is VERIFIED. A step that fails again fails the gate, now on a
+    board known to be fresh -- which is when a failure says something about the model."""
+    first = run_once()
+    if first.ok:
+        return first, []
+    wedged = first.stalled or _output_is_wedge(first.output)
+    if not wedged:
+        return first, []
+    came_back, how = _recover_board(error_text=first.output, fault_is_certain=first.stalled)
+    notes = ["%s: the device was wedged — %s" % (label, how)]
+    if not came_back:
+        return first, notes
+    print("[emit-e2e] %s: the board was wedged and has been recovered; running the step once more" % label)
+    second = run_once()
+    if not second.ok:
+        notes.append("%s: re-ran once on the recovered board and it failed again" % label)
+    return second, notes
+
+
+def _recover_if_wedged(text: str) -> Optional[str]:
+    """Reset when a failure's OWN output carries a dead-board signature; None when it does not.
+
+    A hang is not the only way a board wedges: once a run dies mid-collective, every later run fails
+    at device-open within seconds ("NOC0 is hung on PCIe device ID 9"), which never reaches a
+    timeout. Without this, each round failed identically on the same chip and nothing reset it."""
+    if not _output_is_wedge(text):
+        return None
+    return _reset_device(error_text=text)
+
+
+def _output_is_wedge(text: str) -> bool:
+    """Does a failed step's OWN output carry a dead-board signature (device_recovery.is_dead_board)?"""
+    rec = _recovery()
+    return rec is not None and rec[1].is_dead_board(text or "")
+
+
+def _as_text(out) -> str:
+    """A subprocess stream as text (TimeoutExpired carries bytes, or None)."""
+    if isinstance(out, bytes):
+        return out.decode(errors="ignore")
+    return out or ""
 
 
 def _verbose() -> bool:
@@ -852,22 +927,36 @@ def _check_hf_fallback(src: str) -> list:
     return hits
 
 
+# Layer cap for the G6 probe build. The SAME value sizes the build and the
+# stack-member floor (via stack_member_floor): a cap below the floor makes every
+# capped stack invisible, which reads as "structure is hidden" when it is not.
+_STACK_PROBE_LAYERS = 2
+
+
+def _g6_probe_timeout_s(timeout_s) -> int:
+    """How long a G6 device probe may run: E2E_G6_HANG_TIMEOUT (default 600 s), never beyond the
+    caller's budget. G6 probes are cheap, batch-independent surveys, so a short bound is right for
+    both of them (the trace-capture probe and the block-stack probe share this one knob)."""
+    probe_limit = int(os.environ.get("E2E_G6_HANG_TIMEOUT", "600"))
+    return min(probe_limit, int(timeout_s)) if timeout_s else probe_limit
+
+
 _STACK_PROBE = """
 import json, sys
 import ttnn
-from models.experimental.perf_automation.cc_optimize._op_sig_probe import find_all_stacks
+from models.experimental.perf_automation.cc_optimize._op_sig_probe import find_all_stacks, stack_member_floor
 sys.path.insert(0, {demo!r})
 from tt.pipeline import build_pipeline
 dev = ttnn.open_device(device_id=0, l1_small_size=24576)
 try:
-    pipe = build_pipeline(dev, layers=2)
+    pipe = build_pipeline(dev, layers={cap})
     try:
         import torch as _t
         _m = _t.nn.Module
     except Exception:
         _m = ()
     n = 0
-    for st in find_all_stacks(pipe) or []:
+    for st in find_all_stacks(pipe, min_members=stack_member_floor({cap})) or []:
         blocks = getattr(st, "stack", None) or []
         if not blocks:
             continue
@@ -950,30 +1039,50 @@ def _block_stack_gate(demo_dir: Path, model_id: str, timeout_s: int):
         return None
     if len(sections) < 2:
         return None  # single-section model: one stack is the whole story
-    code = _STACK_PROBE.format(demo=str(demo_dir))
+    code = _STACK_PROBE.format(demo=str(demo_dir), cap=_STACK_PROBE_LAYERS)
+    probe_timeout = _g6_probe_timeout_s(timeout_s)
+
+    def _stack_probe_once():
+        # A HANG IS NOT A PASS. This used to return None ("could not run") on a timeout, so a probe
+        # frozen on a wedged board sat out the whole caller budget (4 h, observed 2026-09-26 on a WH
+        # Galaxy, stuck in a weight upload) and then let G6 through unchecked. It is now bounded like
+        # the other G6 probe and reported as a stall, which _retry_after_wedge resets and re-runs.
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", code],
+                capture_output=True,
+                text=True,
+                timeout=probe_timeout,
+                cwd=str(demo_dir),
+            )
+        except subprocess.TimeoutExpired as exc:
+            return _StepResult(False, _as_text(exc.stderr) + "\n" + _as_text(exc.stdout), stalled=True)
+        found = None
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("STACKS="):
+                try:
+                    found = int(line.split("=", 1)[1])
+                except ValueError:
+                    pass
+        return _StepResult(found is not None, (proc.stderr or "") + "\n" + (proc.stdout or ""), detail=found)
+
     try:
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=max(300, int(timeout_s or 0)),
-            cwd=str(demo_dir),
-        )
-    except Exception as exc:  # noqa: BLE001 -- an unrunnable probe is not a model defect
+        probe, notes = _retry_after_wedge("G6 block stacks", _stack_probe_once)
+    except Exception:  # noqa: BLE001 -- an unrunnable probe is not a model defect
         return None
-    found = None
-    for line in (proc.stdout or "").splitlines():
-        if line.startswith("STACKS="):
-            try:
-                found = int(line.split("=", 1)[1])
-            except ValueError:
-                pass
-    if found is None:
-        tail = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()[-3:]
+    found = probe.detail
+    if not probe.ok:
+        from models.experimental.perf_automation.agent.probes import _salient_tail
+
+        what = (
+            "the shallow build made no progress for %ds and was killed" % probe_timeout
+            if probe.stalled
+            else "the model could not be BUILT at layers=%d" % _STACK_PROBE_LAYERS
+        )
         return (
-            "G6 block stacks: the model could not be BUILT at layers=2 (a shallow build is what "
-            "every profile uses), so its stacks cannot be checked. Capping must leave a runnable "
-            "model, not a fragment. tail: %s" % " | ".join(t[:120] for t in tail)
+            "G6 block stacks: %s (a shallow build is what every profile uses), so its stacks cannot "
+            "be checked. Capping must leave a runnable model, not a fragment.%s error: %s"
+            % (what, "".join(" " + n + "." for n in notes), " | ".join(_salient_tail(probe.output, 3).splitlines()))
         )
     # ONE KNOB PER STACK. A multi-stack model that accepts only `layers` forces every section to the
     # same depth: optimize sizes a coverage window PER stack and has nowhere to put the second
@@ -1262,13 +1371,241 @@ def _signal_quality_gate(demo_dir: Path):
     )
 
 
-def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
-    """Model-agnostic gate runner: G1 native, G2/G3 (run tests/e2e), G4 demo/ structure. Returns (ok, reasons)."""
+# How the `--batch` request reaches the gate's own process (e2e_mcp reads it back by this name).
+E2E_MCP_BATCH_ENV = "E2E_MCP_BATCH"
+# Where the gate streams its tests' output. The out-of-band gate check supervises THIS FILE for
+# forward progress instead of guessing a duration, so both sides must agree on the path: the caller
+# names it, the gate writes there. Unset (any other caller) -> the gate picks its own, as before.
+E2E_GATE_LOG_ENV = "E2E_GATE_LOG"
+
+
+def _batch_gate_reason(requested: int, test_output: str) -> Optional[str]:
+    """None when the e2e tests reported driving exactly the `requested` batch, else why not.
+
+    `--batch` used to reach only the builder's prompt; the gate ran whatever batch the tests typed.
+    A T3K Qwen-Image-Edit gate asked for 32 hard-coded 4, passed on 4 samples, and was reported as a
+    batch-32 PASS -- the 32-sample result, 20/32 at the PCC bar, lived only in a README. So the gate
+    now hands the tests the batch (perf_adapter.BATCH_ENV) and reads back what they say they drove."""
+    from models.experimental.perf_automation.agent.perf_adapter import BATCH_ENV, batch_report_line, parse_batch_report
+
+    served = parse_batch_report(test_output)
+    if served == requested:
+        return None
+    how = (
+        f"read the batch from ${BATCH_ENV} (the gate sets it to {requested}) and print "
+        f"`{batch_report_line(requested)}` with the batch actually driven"
+    )
+    if served is None:
+        return f"G3 batch: --batch {requested} was requested but tests/e2e never reported the batch it drove; {how}"
+    return f"G3 batch: --batch {requested} was requested but tests/e2e drove {served} samples; {how}"
+
+
+# SKIPPING A CORRECTNESS RE-RUN THAT CANNOT HAVE CHANGED ITS ANSWER.
+#
+# termination_check runs the FULL correctness suite on every call, then the host-free/trace check
+# only once correctness passes. That order is right -- the agent may not self-declare, and an edit
+# aimed at the trace can break correctness. But it re-runs UNCONDITIONALLY, with no way to tell "the
+# pipeline was rewritten" from "nothing that matters was touched", so it assumes the worst every
+# time. On a Qwen-Image-Edit bring-up that meant ~3.5 h of 50-step device work per round to re-prove
+# a byte-identical pipeline, before reaching the ~10-minute trace check that was the actual failure:
+# six rounds, ~33 h, one real attempt at the blocker per four hours.
+#
+# So the verdict is keyed by CONTENT, the way reference/golden.py already keys its goldens. The key
+# covers every file that can change the answer -- found by walking the demo's own import closure, so
+# a graduated stub in another package counts too and nothing is assumed about where code lives --
+# plus the pcc bar and the batch. Two deliberate limits:
+#   * ONLY A PASS IS CACHED. A failing gate is what the agent is working on; it must re-run.
+#   * THE RUN STAMP IS PART OF THE KEY, so a new run always re-verifies once. A pass is a statement
+#     about this code on THIS board, and device_recovery._run_stamp() already exists to say which
+#     run a piece of state belongs to -- see its docstring on state outliving the run that earned it.
+# Set $E2E_GATE_NO_CACHE=1 to re-run regardless.
+#
+# TWO CORRECTIONS, BOTH FROM WATCHING IT NEVER FIRE ON THE RUN IT WAS BUILT FOR.
+#
+# (1) IT RECORDED NOTHING. The record sat under `if not reasons` at the very END of this function,
+#     by which point `reasons` also carries the TRACE and STACK gates. Those run after correctness
+#     and, on the bring-up this was written for, were the only thing failing -- so a clean 3.5 h
+#     correctness pass was thrown away every round because a ten-minute gate after it had failed.
+#     The record now happens where correctness ENDS, on the correctness verdict alone.
+# (2) A HIT SKIPPED THE TRACE GATE TOO. The hit returned `(True, [])` from the top of the function,
+#     ahead of the trace and stack gates -- so the one time it did fire it would have waived exactly
+#     the gate that was failing. The hit now skips only the expensive thing, the tests/e2e RUN, and
+#     everything after it still runs.
+#
+# Skipping the run means the checks that read its OUTPUT (the batch report, the xfail/skip scan, the
+# measured PCC) would have nothing to read, and a check with no input must never read as a pass. So
+# the record keeps the lines that carry those facts and a hit replays them: the same verdict from the
+# same evidence, without the device work that produced it.
+_GATE_CACHE_FILE = ".e2e_correctness_pass.json"
+_GATE_CACHE_OFF_ENV = "E2E_GATE_NO_CACHE"
+_GATE_KEY_VERSION = 1
+
+
+def _repo_root_of(demo_dir: Path) -> Optional[Path]:
+    """The checkout `demo_dir` lives in, found by walking up to the directory holding `models/`."""
+    for parent in [demo_dir] + list(demo_dir.parents):
+        if (parent / "models").is_dir() and (parent / "scripts").is_dir():
+            return parent
+    return None
+
+
+def _import_closure(demo_dir: Path) -> list:
+    """Every .py file the demo's own sources reach, transitively, inside this checkout.
+
+    Walks the imports rather than assuming a layout: a graduated stub the pipeline composes may live
+    in another package entirely (models/tt_dit/..., a sibling demo), and hashing only `demo_dir`
+    would call such an edit "no change". Module names come from the AST, never from a path typed
+    here."""
+    root = _repo_root_of(demo_dir)
+    seen, out = set(), []
+    work = sorted(demo_dir.rglob("*.py")) if demo_dir.is_dir() else []
+    while work:
+        f = work.pop()
+        rf = f.resolve()
+        if rf in seen or not rf.is_file():
+            continue
+        seen.add(rf)
+        out.append(rf)
+        if root is None:
+            continue
+        try:
+            tree = ast.parse(rf.read_text(errors="ignore"))
+        except (SyntaxError, OSError):
+            continue
+        mods = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                mods += [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                mods.append(node.module)
+                # `from pkg import a, b` may be importing SUBMODULES rather than attributes, and for
+                # some packages that is the ONLY form they are reached by. A namespace package (no
+                # __init__.py, which is how the bring-up tool leaves its stub packages) resolves
+                # through neither `pkg.py` nor `pkg/__init__.py`, so the module name alone finds
+                # nothing and that whole subtree went unwalked: its sources stayed out of the
+                # fingerprint, so editing one of them did not invalidate a cached pass, and its
+                # bring-up state stayed invisible to anything that discovers components this way.
+                # A name that is an attribute rather than a submodule simply resolves to no file.
+                mods += ["%s.%s" % (node.module, a.name) for a in node.names]
+        for m in mods:
+            rel = Path(*m.split("."))
+            for cand in (root / rel.with_suffix(".py"), root / rel / "__init__.py"):
+                if cand.is_file() and cand.resolve() not in seen:
+                    work.append(cand)
+    return out
+
+
+def _source_fingerprint(demo_dir: Path) -> Optional[str]:
+    """Content hash of every file that can change this demo's verdict, or None if it cannot be taken.
+
+    Content, not mtimes: a checkout or a no-op rewrite must not invalidate a good answer, and a real
+    edit must. Two callers need exactly this fact and must agree on it -- the correctness cache (is
+    this the code that already passed?) and the loop's no-edit check (did the last round change
+    anything at all?) -- so it is taken once, here."""
+    try:
+        files = sorted(_import_closure(demo_dir))
+        if not files:
+            return None  # nothing found to hash: no evidence, NOT "the same as last time"
+        h = hashlib.sha256()
+        for f in files:
+            h.update(str(f).encode())
+            h.update(f.read_bytes())
+        return h.hexdigest()[:16]
+    except Exception:  # noqa: BLE001 - a fingerprint that cannot be taken must not block the gate
+        return None
+
+
+def run_stamp() -> str:
+    """Which run this state belongs to, or "" when nothing said.
+
+    State that outlives the run that earned it is a latch -- device_recovery._run_stamp's own
+    docstring is the case history -- and more than one piece of gate state now has to be scoped the
+    same way, so they ask one function rather than each spelling the lookup."""
+    try:
+        from models.experimental.perf_automation.agent.device_recovery import _run_stamp
+
+        return _run_stamp() or ""
+    except Exception:  # noqa: BLE001 - no run identity is a valid answer, not an error
+        return ""
+
+
+def _correctness_key(demo_dir: Path, pcc: float, batch: int) -> Optional[str]:
+    """The correctness verdict's cache key: this demo's sources, plus the bar they were judged against.
+
+    None if it cannot be taken (no run identity, or the sources cannot be read) -> never cache."""
+    stamp = run_stamp()
+    if not stamp:
+        return None  # no run identity -> cannot scope a pass to this run -> never cache
+    src = _source_fingerprint(demo_dir)
+    if src is None:
+        return None
+    h = hashlib.sha256()
+    h.update(repr((_GATE_KEY_VERSION, stamp, float(pcc), int(batch), src)).encode())
+    return h.hexdigest()[:16]
+
+
+def _gate_pass_evidence(test_output: str) -> list:
+    """The lines of a PASSING gate run that the checks after it read: the batch report, and PCC.
+
+    Kept as the run's own lines rather than as parsed values, so the checks downstream stay the
+    single authority on what those lines mean and a cached verdict is reached the same way a live
+    one is."""
+    from models.experimental.perf_automation.agent.perf_adapter import parse_batch_report
+
+    keep = []
+    for line in (test_output or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.search(r"PCC[^=\n]*=\s*-?\d+(?:\.\d+)?", line) or parse_batch_report(line) is not None:
+            keep.append(line)
+    return keep
+
+
+def _cached_correctness_pass(demo_dir: Path, key: Optional[str]) -> Optional[list]:
+    """The evidence of a pass already earned for this exact code, or None. Falsy when absent."""
+    if not key or os.environ.get(_GATE_CACHE_OFF_ENV) == "1":
+        return None
+    try:
+        doc = json.loads((demo_dir / _GATE_CACHE_FILE).read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(doc, dict) or doc.get("key") != key:
+        return None
+    ev = doc.get("evidence")
+    return list(ev) if isinstance(ev, list) else None
+
+
+def _record_correctness_pass(demo_dir: Path, key: Optional[str], evidence: Optional[list] = None) -> None:
+    """Remember a PASS only. A failure is what the loop is working on and must be re-run."""
+    if not key or os.environ.get(_GATE_CACHE_OFF_ENV) == "1":
+        return
+    try:
+        (demo_dir / _GATE_CACHE_FILE).write_text(
+            json.dumps({"key": key, "version": _GATE_KEY_VERSION, "evidence": list(evidence or [])})
+        )
+    except OSError:
+        pass
+
+
+def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: int = 1):
+    """Model-agnostic gate runner: G1 native, G2/G3 (run tests/e2e), G4 demo/ structure. Returns (ok, reasons).
+
+    batch > 1 is the emit-e2e `--batch` request: the tests are run with it and must report driving it
+    (see _batch_gate_reason). The default 1 leaves the tests' own batch unchecked, as before."""
     reasons = []
     e2e_dir = demo_dir / "tests" / "e2e"
     test_files = sorted(e2e_dir.glob("test_*.py")) if e2e_dir.is_dir() else []
     if not test_files:
         return False, ["G2/G3: no tests/e2e/test_*.py to run"]
+
+    # A pass this run already earned, on code that has not changed since, is still a pass. Re-running
+    # it costs the whole round (see _correctness_key). Only a PASS is reused, and only within the run
+    # that earned it.
+    _key = _correctness_key(demo_dir, pcc, batch)
+    _cached_pass = _cached_correctness_pass(demo_dir, _key)
+    if _cached_pass is not None:
+        print("  [gate] correctness unchanged since it passed this run -- reusing that verdict", flush=True)
 
     demo_subdir = demo_dir / "demo"
     demo_entrypoints = sorted(demo_subdir.glob("demo_*.py")) if demo_subdir.is_dir() else []
@@ -1374,27 +1711,127 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
     gate_env = dict(os.environ)
     gate_env["PYTHONPATH"] = str(demo_repo_root) + os.pathsep + gate_env.get("PYTHONPATH", "")
     gate_env["TT_METAL_HOME"] = str(demo_repo_root)
+    batch = int(batch or 1)
+    if batch > 1:
+        from models.experimental.perf_automation.agent.perf_adapter import BATCH_ENV
+
+        gate_env[BATCH_ENV] = str(batch)
     pytest_out = ""
-    hang_timeout = min(int(timeout_s), int(os.environ.get("E2E_GATE_HANG_TIMEOUT", "2700")))
     gate_tests = [f for f in test_files if "perf" not in f.name] or test_files
+    # A STOPWATCH CANNOT TELL "HUNG" FROM "SLOW", SO IT MUST NOT BE THE JUDGE.
+    #
+    # This ran pytest under subprocess.run(timeout=N) with N a typed constant, and a gate that
+    # outlived N was reported as "likely device/fabric hang". The gate's runtime is not knowable in
+    # advance: it includes building the reference the PCC is scored against, whose cost belongs to
+    # the MODEL. A text model's reference is a generate() of a few dozen tokens; Qwen-Image-Edit's
+    # is 32 samples x 50 diffusion steps x 2 CFG in fp32 on CPU.
+    #
+    # Measured 2026-09-25 on a healthy T3K: that reference had run 3 h 55 m on ~11 cores when the
+    # 4 h budget killed it, and the verdict read
+    #
+    #   "exceeded 14400s with no verdict (likely device/fabric hang)
+    #    -- device recovery: board answering after recovery (verified)"
+    #
+    # accusing the fabric and confirming the fabric was fine in one sentence. It also reset a
+    # healthy board, and because the reference is saved only when complete, every round discarded
+    # ~4 h and began again: a loop that cannot converge however long it is given.
+    #
+    # probes._execute already decides this correctly and its docstring names this exact failure ("a
+    # fixed wall-clock kill cannot tell 'hung' from 'slow' ... a flat 30-min cap killed it mid-compile
+    # before a single op ran"): it kills only when the log has stopped growing AND the process group
+    # has burned no CPU, treats timeout_s as a budget to REPORT rather than enforce, and keeps a hard
+    # ceiling far behind that for a runaway. So the gate uses it instead of a stopwatch of its own,
+    # and no wall is typed here at all -- the caller's budget is the only number, as a fuse.
+    from models.experimental.perf_automation.agent import probes as _pr
+
+    # The caller may name the log so it can watch the run progress; otherwise keep our own temp dir.
+    # Either way this function owns the file and its directory, including the keep-on-failure below.
+    _caller_log = os.environ.get(E2E_GATE_LOG_ENV)
+    _gate_log = Path(_caller_log) if _caller_log else Path(tempfile.mkdtemp(prefix="e2e_gate_")) / "gate.log"
+    _gate_log.parent.mkdir(parents=True, exist_ok=True)
+
+    _gate_argv = [py, "-m", "pytest", *[str(f) for f in gate_tests], "-p", "no:cacheprovider"]
+    _gate_argv += [*_pr.PYTEST_NO_TIMEOUT, "-rA", "-s"]
+
+    def _e2e_once():
+        # The run that already passed, on code that has not changed since, is still a pass; what the
+        # checks below it read is replayed from the record rather than re-earned on the device.
+        if _cached_pass is not None:
+            return _StepResult(True, "\n".join(_cached_pass + ["1 passed"]), detail=0)
+        _gate_log.unlink(missing_ok=True)  # each attempt is judged on its own output
+        try:
+            rc = _pr._execute(
+                _gate_argv,
+                Path(demo_repo_root),
+                gate_env,
+                int(timeout_s),
+                _gate_log,
+            )
+            out = _gate_log.read_text(errors="ignore") if _gate_log.exists() else ""
+            return _StepResult(rc == 0, out, detail=rc)
+        except _pr.TracyHangError as _he:
+            # NOW this really is a stall: no log growth and no CPU. The run was killed mid-flight, so
+            # the board is suspect whatever its telemetry says (_retry_after_wedge resets it for sure).
+            out = _gate_log.read_text(errors="ignore") if _gate_log.exists() else ""
+            return _StepResult(False, out + "\n" + str(_he), stalled=True, detail=_he)
+
+    # KEEP THE LOG OF A STEP THAT FAILED. This deleted the gate's own output unconditionally, so the
+    # only trace of a failure was the 15-line tail quoted into `reasons` -- and for a step killed
+    # mid-flight there is no tail worth quoting at all. Measured 2026-09-25: a gate killed at its
+    # budget reported "exceeded 14400s with no verdict (likely device/fabric hang)" and the pytest
+    # output that would have shown WHERE it was when it died had already been removed by this line;
+    # neither operator on either box could produce it afterwards. A failure whose evidence the tool
+    # destroys cannot be diagnosed, only guessed at -- which is what the whole of that day became.
+    #
+    # So the cleanup is conditional on the step having PASSED, and a failure names the file it left
+    # behind. Nothing else changes: the same verdict, the same reasons, one more sentence saying
+    # where to look.
+    _e2e, _e2e_notes = None, []
     try:
-        proc = subprocess.run(
-            [py, "-m", "pytest", *[str(f) for f in gate_tests], "-p", "no:cacheprovider", "-rA", "-s"],
-            capture_output=True,
-            text=True,
-            timeout=hang_timeout,
-            cwd=str(demo_repo_root),
-            env=gate_env,
-        )
-        pytest_out = proc.stdout or ""
-        if proc.returncode != 0:
-            tail = "\n".join(pytest_out.splitlines()[-15:])
-            reasons.append(f"G2/G3: tests/e2e did not pass (pytest rc={proc.returncode}); tail:\n{tail}")
-    except subprocess.TimeoutExpired:
-        _rst = _reset_device()
-        reasons.append(
-            f"G2/G3: tests/e2e exceeded {hang_timeout}s with no verdict (likely device/fabric hang) — {_rst}"
-        )
+        _e2e, _e2e_notes = _retry_after_wedge("G2/G3 tests/e2e", _e2e_once)
+    finally:
+        # Also cleaned when the step RAISED: there is no verdict to diagnose, and leaving temp dirs
+        # behind on every exception is its own leak.
+        if _e2e is None or _e2e.ok:
+            shutil.rmtree(_gate_log.parent, ignore_errors=True)
+    if not _e2e.ok and _gate_log.exists():
+        reasons.append(f"G2/G3: the failing run's full output is kept at {_gate_log}")
+    pytest_out = _e2e.output
+    if _e2e.stalled:
+        reasons.append(f"G2/G3: tests/e2e made no forward progress ({_e2e.detail})")
+    else:
+        if not _e2e.ok:
+            # A KILLED RUN AND A FAILING RUN CALL FOR OPPOSITE RESPONSES, AND THIS TOLD THEM APART
+            # NOWHERE. A step reports through two channels -- its output and its exit status -- and a
+            # signal death says nothing in the first: SIGKILL has no handler, so there is no
+            # traceback and the output simply stops mid-line. This branch quoted the raw returncode
+            # and the literal last 15 lines, which for a killed run are whatever routine chatter
+            # happened to be printing. So a run terminated from outside arrived as "rc=-9" plus
+            # fifteen deprecation warnings, and the agent spent a round inferring the kill from `ps`
+            # before concluding, correctly, that nothing in the model was wrong.
+            #
+            # Both halves are already solved elsewhere and are reused rather than re-spelled:
+            # `signal_note` turns a negative returncode into the signal that caused it, and
+            # `_extract_error` picks a log's actual failure lines (its whitelist keeps the stage
+            # markers, so "how far it got" survives a hang that has no exception to anchor on).
+            from models.experimental.perf_automation.agent.perf_test_gen import _extract_error, signal_note
+
+            _sig = signal_note(_e2e.detail)
+            _why = _extract_error(pytest_out) or "\n".join(pytest_out.splitlines()[-15:])
+            if _sig:
+                reasons.append(
+                    f"G2/G3: tests/e2e was KILLED, not failed: {_sig}. The output stops mid-run with "
+                    f"no traceback because a signal leaves none. Nothing here says the pipeline is "
+                    f"wrong -- do not rewrite working code on this evidence. Last output:\n{_why}"
+                )
+            else:
+                reasons.append(f"G2/G3: tests/e2e did not pass (pytest rc={_e2e.detail}); tail:\n{_why}")
+        if batch > 1:
+            _batch_reason = _batch_gate_reason(batch, pytest_out)
+            if _batch_reason:
+                reasons.append(_batch_reason)
+    if not _e2e.ok:
+        reasons.extend(_e2e_notes)
 
     for cnt, kind in re.findall(r"(\d+)\s+(xfailed|xpassed|skipped|errors?)\b", pytest_out):
         if int(cnt) > 0:
@@ -1488,63 +1925,77 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
         print("[emit-e2e] WARNING: G6 trace gate DISABLED via E2E_I_KNOW_TRACE_IS_BROKEN=1")
         print("[emit-e2e]          emitted pipeline may not run trace in optimize.")
 
+    # ---- CORRECTNESS ENDS HERE. Everything below is the trace/stack gates, which are cheap and
+    # must be re-run every round; the expensive verdict above is the one worth keeping.
+    if not reasons:
+        _record_correctness_pass(demo_dir, _key, _gate_pass_evidence(pytest_out))
+
     if not _rt_off and not _anno and not reasons:
         probe_py = Path(__file__).resolve().parent.parent / "_trace_capture_probe.py"
         if probe_py.is_file():
             tenv = dict(os.environ)
             tenv["TT_METAL_HOME"] = str(demo_repo_root)
             tenv["PYTHONPATH"] = str(demo_repo_root) + os.pathsep + tenv.get("PYTHONPATH", "")
-            g6_hang = min(int(hang_timeout), int(os.environ.get("E2E_G6_HANG_TIMEOUT", "600")))
-            proc = subprocess.Popen(
-                [py, str(probe_py), str(demo_dir)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=str(demo_repo_root),
-                env=tenv,
-                start_new_session=True,
-            )
-            stdout, stderr = "", ""
-            timed_out = False
-            try:
-                stdout, stderr = proc.communicate(timeout=g6_hang)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                try:
-                    pgid = os.getpgid(proc.pid)
-                    os.killpg(pgid, signal.SIGTERM)
-                    for _ in range(10):
-                        if proc.poll() is not None:
-                            break
-                        time.sleep(0.5)
-                    if proc.poll() is None:
-                        os.killpg(pgid, signal.SIGKILL)
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    proc.wait(timeout=10)
-                except Exception:  # noqa: BLE001
-                    pass
-            except Exception:  # noqa: BLE001
-                pass
+            # G6 is a cheap, batch-independent stack survey -- a short stopwatch is right for it,
+            # and it is bounded by the caller's budget rather than by the e2e gate's (now gone) wall.
+            g6_hang = _g6_probe_timeout_s(timeout_s)
 
-            if timed_out:
-                _rst = _reset_device()
-                reasons.append(
-                    f"G6 trace: trace-capture probe hung >{g6_hang}s "
-                    f"(subprocess group killed, {_rst}); fix-loop should treat as failure and iterate"
+            def _trace_probe_once():
+                proc = subprocess.Popen(
+                    [py, str(probe_py), str(demo_dir)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=str(demo_repo_root),
+                    env=tenv,
+                    start_new_session=True,
                 )
-            else:
+                stdout, stderr = "", ""
+                timed_out = False
+                try:
+                    stdout, stderr = proc.communicate(timeout=g6_hang)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    try:
+                        pgid = os.getpgid(proc.pid)
+                        os.killpg(pgid, signal.SIGTERM)
+                        for _ in range(10):
+                            if proc.poll() is not None:
+                                break
+                            time.sleep(0.5)
+                        if proc.poll() is None:
+                            os.killpg(pgid, signal.SIGKILL)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        proc.wait(timeout=10)
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception:  # noqa: BLE001
+                    pass
+                out = _as_text(stdout) + "\n" + _as_text(stderr)
+                if timed_out:
+                    return _StepResult(False, out, stalled=True)
                 tr = None
-                for line in ((stdout or "") + "\n" + (stderr or "")).splitlines():
+                for line in out.splitlines():
                     if line.startswith("TRACE_PROBE="):
                         try:
                             tr = json.loads(line.split("=", 1)[1])
                         except Exception:  # noqa: BLE001
                             tr = None
+                return _StepResult(bool(tr and tr.get("trace_ready")), out, detail=tr)
+
+            _trace, _trace_notes = _retry_after_wedge("G6 trace", _trace_probe_once)
+            if _trace.stalled:
+                reasons.append(
+                    f"G6 trace: trace-capture probe hung >{g6_hang}s "
+                    f"(subprocess group killed); fix-loop should treat as failure and iterate"
+                )
+            elif not _trace.ok:
+                tr = _trace.detail
                 if tr is None:
                     reasons.append("G6 trace: trace-capture probe produced no verdict (could not run)")
-                elif not tr.get("trace_ready"):
+                else:
                     _b = "; ".join(x.get("guidance", x.get("rung", "")) for x in (tr.get("static_blockers") or []))
                     _cap = (tr.get("device_capture") or {}).get("reason", "")
                     reasons.append(
@@ -1552,6 +2003,8 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int):
                         + (_b or _cap or "capture failed")
                         + " (set E2E_ALLOW_NO_TRACE=1 to waive for a genuinely non-traceable model)"
                     )
+            if not _trace.ok:
+                reasons.extend(_trace_notes)
 
     try:
         from ..trace_gate import build_fix_directive, evaluate_trace_gate, overflow_fix_loop, record_trace_verdict
@@ -1804,13 +2257,21 @@ def cmd_emit_e2e(args) -> int:
     if _tf:
         print("error: " + _tf)
         return 1
+    _rec = _recovery()
+    if _rec is not None:
+        _rec[1].stamp_run()  # scope the device-reset budget to THIS run (see device_recovery.stamp_run)
+        try:  # while the board is healthy: know the host kind and make sure its reset can run
+            _rec[0].prepare_device_reset(box=str(getattr(args, "box", "") or ""))
+        except Exception:  # noqa: BLE001 -- reset preparation must never stop the run
+            pass
     return _emit_e2e_phase_a(args)
 
 
-def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_rounds) -> int:
+def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_rounds, batch=1) -> int:
     """emit-e2e cc engine: after the builder runs, drive the fix loop through the shared cc harness
     against the e2e_mcp deterministic gate (which REUSES the same G1–G4 `_run_deterministic_gates` the
-    legacy loop uses). The gate is the sole stop authority. Returns 0 iff the gate reports can_stop."""
+    legacy loop uses). The gate is the sole stop authority. Returns 0 iff the gate reports can_stop.
+    `batch` is the `--batch` request, which the gate enforces (see _batch_gate_reason)."""
     import json as _json
     import os as _os
 
@@ -1822,10 +2283,15 @@ def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_round
     pybin = str(repo_root / "python_env" / "bin" / "python")
     if not Path(pybin).is_file():
         pybin = sys.executable
+    # One agreed path for the gate's live output: the gate writes it, this caller watches it grow.
+    # Made here (not in the gate) because the watcher has to know it before the gate starts.
+    _gate_progress_log = Path(tempfile.mkdtemp(prefix="e2e_gate_")) / "gate.log"
     mcp_env = {
         "E2E_MCP_DEMO_DIR": str(demo_dir),
         "E2E_MCP_PCC": str(pcc),
         "E2E_MCP_TIMEOUT": str(timeout_s),
+        E2E_GATE_LOG_ENV: str(_gate_progress_log),
+        E2E_MCP_BATCH_ENV: str(int(batch or 1)),
         "E2E_MODEL_ID": model_id,
         "E2E_ALL_TASKS": _os.environ.get("E2E_ALL_TASKS", "0"),
         "E2E_REQUIRE_TRACE": _os.environ.get("E2E_REQUIRE_TRACE", "1"),
@@ -1834,6 +2300,10 @@ def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_round
         "PYTHONPATH": str(repo_root),
         "PATH": f"{repo_root / 'python_env' / 'bin'}{_os.pathsep}/usr/bin:/bin",
     }
+    # The gate resets the device from the MCP server's own process; without the run stamp it would
+    # count its failures under a different run than this one (see device_recovery.stamp_run).
+    if _os.environ.get("PERF_MCP_RUN_ID"):
+        mcp_env["PERF_MCP_RUN_ID"] = _os.environ["PERF_MCP_RUN_ID"]
     cfg = cc_harness.build_mcp_config(pybin, server_path, mcp_env, "e2e-mcp")
     cfg_path = thp_dir / f".e2e_mcp_config_{re.sub(r'[^A-Za-z0-9._-]', '_', model_id)}.json"
     cfg_path.write_text(_json.dumps(cfg, indent=2))
@@ -1842,7 +2312,15 @@ def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_round
     env["PYTHONPATH"] = str(repo_root)
 
     def gate_fn():
-        return cc_harness.gate_status(pybin, thp_dir, "e2e_mcp", mcp_env, repo_root)
+        # The gate's OWN budget is the floor: this call wraps the gate, so a tighter limit here
+        # kills honest work and reports nothing. `timeout_s` is the same value handed to the server
+        # as its per-pytest timeout above, so the two layers cannot disagree. It is only a BACKSTOP
+        # now -- the check is supervised on the gate's own log, so a long-but-working gate (a first
+        # run that must build its reference, say) is judged on progress rather than on a duration
+        # nobody can know in advance.
+        return cc_harness.gate_status(
+            pybin, thp_dir, "e2e_mcp", mcp_env, repo_root, timeout_s=timeout_s, progress_log=_gate_progress_log
+        )
 
     prompt = _build_cc_fix_prompt(model_id=model_id, demo_dir=demo_dir, pcc=pcc)
     allowed = ["mcp__e2e-mcp__termination_check", "Read", "Edit", "Write", "Bash", "Grep", "Glob"]
@@ -1857,10 +2335,14 @@ def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_round
         max_rounds=max_rounds,
         claude_bin=agent_bin,
     )
-    final = gate_fn()
+    # A HALT ALREADY CARRIES THE VERDICT that caused it, and re-running the gate here would spend the
+    # whole thing again to reach the same answer -- the exact cost the halt exists to avoid.
+    final = res.get("state") if res.get("halted") else gate_fn()
     sep = "=" * 78
     print("\n" + sep)
     print(f"  cc engine: rounds={res['rounds']} can_stop={final.get('can_stop')} halted={res['halted']}")
+    if res.get("halted") and final.get("reason"):
+        print(f"  halted because: {final.get('reason')}")
     print(sep)
     if final.get("can_stop"):
         emit_e2e_report(model_id, demo_dir, verdict="PASS")
@@ -2005,7 +2487,18 @@ def _emit_e2e_phase_a(args) -> int:
     # generation, so the independent-sample axis applies. Passing None here instead would send exactly
     # the models this fix is for back down the autoregressive path.
     _batch_heads = _enumerate_task_heads(model_id) if _batch_size > 1 else None
-    _batch_note = _batch_prompt_block(_batch_size, heads=_batch_heads)
+    # The batch's inputs come from the model's own published example where it has one. Looked up
+    # only for a real batch, like the heads above: at B=1 the block is empty and nothing reads it.
+    _batch_reference = _discover_reference_inputs(model_id) if _batch_size > 1 else None
+    if _batch_size > 1:
+        if _batch_reference is None:
+            print(f"  [inputs] no published example discovered for {model_id} — the builder will")
+            print("           author ONE input and reuse it for every sample (recorded as tool-authored)")
+        else:
+            print("  [inputs] batch inputs sourced from the model's own published example:")
+            for _line in _batch_reference.describe().splitlines():
+                print(f"    {_line}")
+    _batch_note = _batch_prompt_block(_batch_size, heads=_batch_heads, reference=_batch_reference)
     build_prompt = _build_agent_prompt(
         model_id=model_id,
         demo_dir=demo_dir,
@@ -2051,6 +2544,7 @@ def _emit_e2e_phase_a(args) -> int:
         timeout_s=timeout_s,
         agent_bin=agent_bin,
         max_rounds=max_grade_rounds,
+        batch=_batch_size,
     )
 
 
@@ -2081,10 +2575,14 @@ def _run_agent(*, prompt: str, agent_bin: str, agent_model: str, timeout_s: int,
         except Exception:
             log_fh = None
     _cap = _agent_mem_cap_bytes()
+    from ..cc_harness import tag_agent_env, wait_for_agent_device_work
+
+    agent_env, agent_tag = tag_agent_env()  # so its device runs can be told apart once it exits
     try:
         proc = subprocess.Popen(
             cmd,
             cwd=str(Path.cwd()),
+            env=agent_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -2142,6 +2640,7 @@ def _run_agent(*, prompt: str, agent_bin: str, agent_model: str, timeout_s: int,
                 log_fh.close()
             except Exception:
                 pass
+    wait_for_agent_device_work(agent_tag)  # the next phase's gate would otherwise reap it mid-run
     return (0 if rc == 0 else 1), final_text
 
 
@@ -2648,9 +3147,9 @@ _BATCH_COMMON_RULES = """  - ONE program per step feeds all {batch} samples -- d
   - graduated stubs were PCC'd at B=1 and may hardcode a leading 1 in slice/reshape bounds. Where they
     do, take that bound from the tensor itself (e.g. x.shape[0]) and re-verify the stub -- a hardcoded
     1 SILENTLY DROPS samples 2..{batch} rather than failing.
-The PCC gate must pass for ALL {batch} samples: feed {batch} DISTINCT reference inputs and compare each
-sample to its OWN golden from the reference model. A pipeline that shape-supports B but emits {batch}
-identical outputs is WRONG. If the model genuinely has no axis over which {batch} independent samples
+The PCC gate must pass for ALL {batch} samples, each compared to its OWN golden from the reference
+model (how the {batch} inputs are SOURCED is below -- they are not yours to invent). A pipeline that
+shape-supports B but emits {batch} identical outputs is WRONG. If the model genuinely has no axis over which {batch} independent samples
 can be batched, STOP and report it as a hole -- do NOT fake a batch axis.
 
 If a stage cannot hold {batch} at once, EXHAUST THE MECHANISMS THIS PIPELINE ALREADY HAS before you
@@ -2670,7 +3169,90 @@ still reproduces.
 """
 
 
-def _batch_prompt_block(batch: int, *, heads: Optional[list] = None) -> str:
+# WHERE THE {batch} INPUTS COME FROM. Split out from the axis rules because the policy is the same
+# for either axis, and because this is the one the last bring-up got wrong: the rules said only that
+# the inputs must be DISTINCT, so the builder authored {batch} of its own. Every sample then varied
+# its content AND its seed at once, so a PCC miss named no cause -- and because no input could be
+# sourced, a miss read exactly like a hardware fault and no re-run ever settled it. One axis moves,
+# and it is the one the model already samples over.
+_BATCH_INPUT_RULES = """
+HOW TO SOURCE THE {batch} INPUTS -- a correctness requirement, not a style note.
+  - Hold the CONTENT inputs IDENTICAL across all {batch} samples. Vary ONLY the sampling axis the
+    model itself exposes -- the seed/generator its own example seeds -- one value per sample.
+  - Do NOT author {batch} different content inputs. An input you wrote is one nobody can source, and
+    it moves a second variable between samples, so a failure cannot be attributed.
+  - A seed is not authored content: it indexes into the distribution the model already defines, so
+    every value is equally in-distribution. Content is authored; a seed is not.
+  - DISTINCT OUTPUTS ARE STILL REQUIRED. If the model exposes no sampling axis (it is deterministic),
+    vary instead the one input its example supplies as LOADED DATA -- a file or URL the example opens
+    -- and say so. If it has neither a sampling axis nor a loaded-data input, report that as a hole;
+    do NOT invent {batch} inputs to fill it.
+  - Record the inputs' provenance beside the test in one line: what they are and where they came
+    from. A PCC number whose inputs have no provenance cannot be cited.
+"""
+
+_BATCH_INPUT_PUBLISHED = """  - THE MODEL PUBLISHES ITS OWN EXAMPLE. Use it VERBATIM as the content input for every one of the
+    {batch} samples:
+"""
+
+_BATCH_INPUT_SEEDED = """    The example declares seed {seed}. Sample 0 uses {seed} EXACTLY -- so sample 0 reproduces the
+    published example and can be diffed against it -- and sample i uses {seed}+i.
+    Keep these values in ONE named block in the inputs module, each line carrying the source above,
+    so a reader can check them against the model's own documents. Do not scatter them as literals.
+"""
+
+_BATCH_INPUT_UNSEEDED = """    The example declares no seed. Pick one base value, record it beside the inputs, and let sample i
+    use base+i.
+    Keep these values in ONE named block in the inputs module, each line carrying the source above,
+    so a reader can check them against the model's own documents. Do not scatter them as literals.
+"""
+
+_BATCH_INPUT_UNPUBLISHED = """  - NO PUBLISHED EXAMPLE WAS DISCOVERED FOR THIS MODEL. Author exactly ONE content input -- the
+    smallest, most ordinary instance of what this model is for -- and reuse that SAME one for all
+    {batch} samples, still varying only the sampling axis. One authored input shared by every sample
+    is a single declared assumption; {batch} authored inputs are {batch} of them.
+  - Record it as TOOL-AUTHORED, not as sourced from the model, so the report does not imply a
+    provenance it does not have.
+"""
+
+
+def _discover_reference_inputs(model_id: str):
+    """The model's own published example inputs, or None. Never raises.
+
+    Discovery reads the hub, so it can fail for reasons that have nothing to do with the bring-up
+    (offline, gated repo, a card with no example). None is a valid answer -- the builder is then told
+    to author ONE input -- so a failure here must never take the run down with it."""
+    try:
+        from ..reference_inputs import discover
+
+        return discover(model_id)
+    except Exception as exc:  # noqa: BLE001 - provenance is best-effort, the bring-up is not
+        print(f"  [inputs] could not read the model's published example ({type(exc).__name__}: {exc})")
+        return None
+
+
+def _batch_input_block(batch: int, reference=None) -> str:
+    """The sourcing policy, plus whichever origin applies.
+
+    `reference` is a `reference_inputs.ExampleInputs` or None. None covers both "the model publishes
+    nothing parseable" and "this caller did not look", which is why the text claims only that none
+    was discovered -- it never asserts the model has none."""
+    parts = [_BATCH_INPUT_RULES.format(batch=batch)]
+    if reference is None:
+        parts.append(_BATCH_INPUT_UNPUBLISHED.format(batch=batch))
+    else:
+        parts.append(_BATCH_INPUT_PUBLISHED.format(batch=batch))
+        # The example is inserted, never formatted: its values legitimately contain braces (a chat
+        # template's message dicts), which str.format would read as fields and fail on.
+        parts.append(reference.describe() + "\n")
+        seed = reference.seed
+        parts.append(
+            _BATCH_INPUT_SEEDED.format(seed=seed) if seed is not None else _BATCH_INPUT_UNSEEDED.format(batch=batch)
+        )
+    return "".join(parts)
+
+
+def _batch_prompt_block(batch: int, *, heads: Optional[list] = None, reference=None) -> str:
     """Builder instruction for a batch of B>1 independent samples. Empty for B<=1 (default, unchanged
     single-sample behaviour).
 
@@ -2686,6 +3268,8 @@ def _batch_prompt_block(batch: int, *, heads: Optional[list] = None) -> str:
     invariants; only the axis-specific guidance differs.
 
     `heads` is optional and defaults to the previous behaviour, so existing call sites are unchanged.
+    `reference` -- the model's own published example inputs, if any -- is optional for the same
+    reason; omitted, the builder is told none was discovered and authors ONE input for all samples.
     """
     if not batch or batch <= 1:
         return ""
@@ -2697,12 +3281,145 @@ def _batch_prompt_block(batch: int, *, heads: Optional[list] = None) -> str:
         if autoregressive is not False
         else _BATCH_INDEPENDENT_AXIS.format(batch=batch)
     )
+    from models.experimental.perf_automation.agent.perf_adapter import BATCH_ENV, BATCH_REPORT, batch_report_line
+
+    gate_contract = _BATCH_GATE_CONTRACT.format(
+        batch=batch, batch_env=BATCH_ENV, report=batch_report_line(batch), report_n="%s=<B>" % BATCH_REPORT
+    )
     return f"""
 BATCH = {batch}. Emit the pipeline to process {batch} INDEPENDENT samples per call, not one. A single
 sample wastes 31/32 of a 32-row matmul tile, so filling it with {batch} real samples raises AGGREGATE
 throughput ~{batch}x; per-sample latency is unchanged. Thread a leading batch dimension B={batch}
 through the WHOLE path and verify it end to end:
-{axis_note}{_BATCH_COMMON_RULES.format(batch=batch)}"""
+{axis_note}{_BATCH_COMMON_RULES.format(batch=batch)}{_batch_input_block(batch, reference)}{gate_contract}"""
+
+
+# What the gate ENFORCES about the batch (see _batch_gate_reason), stated to the builder up front so it
+# does not learn it from a failed round. Kept apart from _BATCH_COMMON_RULES so that block's placeholders
+# are unchanged for its existing callers.
+_BATCH_GATE_CONTRACT = """THE GATE ENFORCES THE BATCH. It runs tests/e2e with ${batch_env}={batch} and fails unless the tests
+print `{report_n}` with the batch they actually drove, equal to {batch}. So the e2e tests take B from
+${batch_env} -- never a number typed into the test -- and print `{report}` once B is known.
+"""
+
+
+# WHAT THE SUPERVISOR WATCHES, told to the builder up front.
+#
+# The gate's tests run under `probes._execute`, which kills a step only when its log has stopped
+# growing (and its syscall/IO counters and stack have stopped moving) -- never for being slow. That
+# is the right rule, and it has one consequence the builder has to know: a test that does device
+# work WITHOUT printing looks exactly like a hang.
+#
+# This is not hypothetical. A pipeline that replayed a captured device trace enqueued the whole
+# schedule non-blocking, so the host sat inside one call with a frozen log while the hardware was
+# busy, and the supervisor killed a healthy run. The repair was a per-iteration print in the MODEL's
+# test -- which meant the lesson lived in one model's code and was lost the moment that demo was
+# regenerated. It belongs here, where every model gets it.
+# THE DEMO README'S LAYOUT, which this repo has a convention for and the builder was never told.
+#
+# The brief was one line -- "what each Call does, how to run it, the PCC numbers" -- which is not
+# what the repo does, so every generated README invented its own shape. Measured over the 39 demos
+# under models/demos: 12 have no README at all, and of the 27 that do only 6 use the sequence below.
+# It is nonetheless the ONLY heading sequence that recurs; the other 21 are each unique ("quick
+# start > configuration > testing", "runtime > run > verification and weekly ci", ...). So the
+# convention existed and simply was not written anywhere the builder could read it.
+#
+# WHICH NUMBERS BELONG THERE. The trace-replay result does: it is what `trace_replay.py` prints and
+# what the trace gate reads, so it is measured by the tool rather than typed by the agent, and
+# whether each stage replayed under trace is the single most useful fact about a bring-up. Tracy
+# profiler output does not -- zone levels and capture env vars are harness knobs (`minimax_m3`
+# documents four of them), and a profile is a debugging artefact, not documentation of the demo.
+# Nor do headline throughput tables: `gemma4/README.md` carries "Tokens/s | TTFT (ms)", and on one
+# bring-up a batch-32 result lived ONLY in a README while the gate had passed on 4 samples (see
+# _batch_gate_reason). RUN_REPORT.md is the tool-written file (`run_report.py` upserts
+# marker-delimited sections into it), so the README ends by pointing at it.
+_README_LAYOUT_BLOCK = """
+README.md -- USE THIS REPO'S LAYOUT, not one of your own. This is the only shape that recurs across
+the existing demos under models/demos, so match it instead of inventing headings:
+
+  # <Model name>
+
+  ## Platforms
+  the hardware this was brought up and validated on.
+
+  ## Introduction
+  a short paragraph: what the model is and what it does.
+
+  ## Prerequisites
+  cloned tt-metal for source, and TT-Metalium / TT-NN installed (link INSTALLING.md).
+
+  ## How to Run
+  copy-pasteable commands, one block per way to run it -- the demo entrypoint(s), the e2e test, and
+  any variant (a different input, a different batch). Commands, not prose about commands.
+
+  ## Details
+  the entry-point function and the file it lives in, where it loads weights/config from, and which
+  reference the goldens are built against.
+
+  ### Inputs
+  where the inputs come from and how to change them.
+
+  ### Trace replay
+  the TRACE-REPLAY RESULT, copied from the trace-replay output -- one row per stage IT reports
+  (never a stage list you type): its `TRACE_STAGE_MS[...]` and the `path=` that row carries, plus
+  the `TRACE_PER_TOKEN_MS` headline and its `TRACE_HEADLINE_UNIT`. If a stage reports
+  `TRACE_NOT_TRACE_CAPABLE` or replays on a non-trace path, say so for that stage. Copy what the
+  replay printed; do not restate it in your own numbers and do not fill in a stage it did not report.
+
+DO NOT PUT IN THE README:
+  * TRACY PROFILER OUTPUT OR SETTINGS -- zone levels, profiling env vars, capture knobs and profile
+    dumps are harness configuration and debugging artefacts, not documentation of this demo.
+  * HEADLINE THROUGHPUT TABLES -- tokens/s, TTFT, latency league tables. Nothing verifies a README,
+    so a number written there reads as certified when nobody checked it.
+  * PCC VALUES -- give the command that measures PCC, never the value it produced.
+
+END THE README with exactly this section, so a reader after the full results is sent to the file that
+holds them:
+
+  ## Results
+  See [RUN_REPORT.md](RUN_REPORT.md) for the measured gate results for this demo.
+"""
+
+
+_PROGRESS_PROMPT_BLOCK = """
+THE SUPERVISOR WATCHES FORWARD PROGRESS, NOT ELAPSED TIME. Your tests run under a watchdog that
+kills a step only when its LOG HAS STOPPED GROWING for {stall_s}s with nothing else moving. A long
+run is never killed for being slow -- but a SILENT one is killed for looking dead.
+  - Work enqueued on the device without blocking gives the host nothing to print: the process waits
+    inside a single call for the entire schedule while the hardware is busy, and the log is frozen
+    the whole time. That is indistinguishable from a hang, and it WILL be killed.
+  - So whatever your pipeline ITERATES over -- read that from the model, do not assume what it is
+    called -- print one line per iteration as it completes, and SYNCHRONISE THE DEVICE before the
+    print so the line means the work finished rather than that it was queued.
+  - A test that prints only when it is done will be killed before it gets there.
+  - This is a property of the harness, not of one model: it applies to any test long enough to
+    outlast the window above.
+"""
+
+
+def _progress_prompt_block() -> str:
+    """The progress requirement, carrying the watchdog's OWN stall window.
+
+    The number is read off `probes._execute`'s signature rather than retyped, so the builder is
+    never told a threshold the supervisor does not actually use."""
+    stall = None
+    try:
+        import inspect
+
+        from models.experimental.perf_automation.agent import probes as _pr
+
+        stall = inspect.signature(_pr._execute).parameters["stall_timeout_s"].default
+    except Exception:  # noqa: BLE001 - the guidance is still correct without the exact number
+        stall = None
+    return _PROGRESS_PROMPT_BLOCK.format(stall_s=int(stall) if isinstance(stall, int) else "the watchdog's stall")
+
+
+def _pytest_no_timeout() -> str:
+    """The flags every tool-launched pytest carries to switch pytest's own timeout off, as the agent
+    should type them -- from probes, which owns them (see probes.PYTEST_NO_TIMEOUT)."""
+    from models.experimental.perf_automation.agent import probes as _pr
+
+    return " ".join(_pr.PYTEST_NO_TIMEOUT)
 
 
 def _build_agent_prompt(
@@ -2806,7 +3523,7 @@ For ANY model, emit a complete, runnable package — not a lone test file:
     tests/e2e/    the e2e pipeline test(s): real input -> chained stubs ->
                   real output, asserting Gate 1/2/3 (all stubs INVOKED + final
                   PCC >= {pcc} vs HF golden).
-    README.md     what each Call does, how to run it, the PCC numbers.
+    README.md     the demo's documentation, in THIS REPO'S layout (spelled out below).
 
   CRITICAL — DEMO AND TEST MUST SHARE ONE PIPELINE: the chained forward pass (the
   exact wiring of the graduated stubs) lives in `tt/` as a single function, and
@@ -2817,10 +3534,13 @@ For ANY model, emit a complete, runnable package — not a lone test file:
   deliverable is a runnable demo; a green test with no/working demo is NOT done.
 Match the conventions of existing demos under models/demos/ rather than
 inventing a new layout. Keep iterating (fix the stub/wiring, re-run on the TT device) until the
-gates pass. Use `./python_env/bin/python -m pytest <file> -s` to run on device.
+gates pass. Use `./python_env/bin/python -m pytest {_pytest_no_timeout()} <file> -s` to run on device.
+Do NOT add `@pytest.mark.timeout` (or any other timeout) to a test you write: the tool bounds every
+run it launches by watching progress, and a limit typed into a test later kills slower runs of the
+same test -- a profiled run of it takes several times longer than this one.
 Report a final summary: which calls are READY, the FINAL_PCC per call, and
 confirm all graduated modules were invoked.
-{hardware_note}{parallel_note}{trace_note}{batch_note}
+{hardware_note}{parallel_note}{trace_note}{batch_note}{_progress_prompt_block()}{_README_LAYOUT_BLOCK}
 {_TT_ONLY_CONTRACT}
 """
 

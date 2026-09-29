@@ -24,6 +24,9 @@ import pytest as _pytest
 @_pytest.fixture(autouse=True)
 def _no_live_agent_calls(monkeypatch):
     monkeypatch.setenv("PERF_MCP_NO_AGENT_CLASSIFY", "1")
+    # Nor may a test install system packages (pkgtools.ensure_system_tool): the Galaxy reset path
+    # installs its host tool when it is missing, and a test must never run apt-get on the machine.
+    monkeypatch.setenv("TT_HW_PLANNER_NO_SYSTEM_INSTALL", "1")
     yield
 
 
@@ -118,3 +121,21 @@ def _private_measurement_ledger(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("PERF_MCP_LEDGER_DIR", str(box))
     monkeypatch.setenv("PERF_MCP_LEDGER", str(box / "measurements.jsonl"))
     yield
+
+
+# --- the machine a pricing test prices ------------------------------------------------------------
+# The report has no default machine: it prices the hardware the run DETECTED (summary._run_env reads
+# the run's manifest, perf_mcp prices with its manifest's env). A test whose numbers were written for
+# one part says so here, through the same manifest path a real run uses, instead of relying on a
+# fallback that silently chose a machine for every run.
+@_pytest.fixture
+def priced_on_blackhole(tmp_path, monkeypatch):
+    import json as _json
+
+    from agent.environment import ARCH_FACTS
+
+    facts = dict(ARCH_FACTS["blackhole"])
+    manifest = tmp_path / "_machine_manifest.json"
+    manifest.write_text(_json.dumps({"env": facts}))
+    monkeypatch.setenv("PERF_MCP_MANIFEST", str(manifest))
+    return facts

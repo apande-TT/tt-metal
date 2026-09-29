@@ -860,12 +860,47 @@ def _host_transfer_ops(sigs) -> set:
     return known
 
 
+# ONE more attempt for a probe that came back empty on a board that reported a fault. Bounded and
+# env-tunable like every other retry budget in this file; 0 restores the single-shot behaviour.
+_OP_SIG_WEDGE_RETRIES = max(0, int(os.environ.get("PERF_MCP_OP_SIG_WEDGE_RETRIES", "1") or "1"))
+
+
+def _parse_op_sigs(raw: str):
+    """The probe's two output lines, read once. Returns (sigs_set_or_None, sequence_list)."""
+    sigs = None
+    seq = []
+    for line in (raw or "").splitlines():
+        if line.startswith("PERF_OP_SIGS="):
+            try:
+                sigs = set(json.loads(line.split("=", 1)[1]))
+            except (ValueError, TypeError):
+                sigs = None
+        elif line.startswith("PERF_OP_SIG_SEQUENCE="):
+            try:
+                seq = json.loads(line.split("=", 1)[1])
+            except (ValueError, TypeError):
+                seq = []
+    return sigs, seq
+
+
 def _run_op_sigs(repo_root: Path, mcp_env: dict, devices: str, node: str, case, k: int):
     """Run the perf test forward at TT_PERF_LAYERS=k (no tracy, 1 decode token) through the generic
     _op_sig_probe. Returns (sigs_set_or_None, raw_stdout_stderr, sequence_list) -- ALWAYS a 3-tuple.
     The device-timeout path used to return a 2-tuple while all four callers unpack three, so a
     timeout raised ValueError and _print_optimize_stop then blamed "a build/env/version mismatch"
-    while the pipeline was simply never optimized."""
+    while the pipeline was simply never optimized.
+
+    A DEAD BOARD IS NOT AN EMPTY MODEL. The probe exits 0 after printing `PERF_OP_SIGS=[]` whenever
+    the test dispatched no op -- including when it dispatched none because the mesh fixture could
+    not bring the board up. So "this model has nothing to count" and "the hardware was dead" reach
+    the caller as the same empty set, and a profiling window is sized from it.
+
+    Measured 2026-09-25: the probe errored at fixture setup with a stuck ETH heartbeat, reported no
+    window, and the run then spent twenty rounds with no per-op levers and no stated reason. The
+    evidence sat in the probe's own output the whole time and nothing read it -- recovery had only
+    ever been wired into the paths that run AFTER this one (the baseline and the per-op loop), and
+    a wedge had never been seen this early. So hand the output to the SAME shared predicate those
+    paths use, reclaim through the SAME primitive, and give the probe one more attempt."""
     env = cc_env(repo_root, devices)
     env.update(mcp_env)
     # k<=0 means ALL LAYERS and is expressed by REMOVING the cap, never by sending "0": that value
@@ -880,36 +915,37 @@ def _run_op_sigs(repo_root: Path, mcp_env: dict, devices: str, node: str, case, 
     cmd = [_python_bin(repo_root), str(repo_root / CC_DIR / "_op_sig_probe.py"), node]
     if case:
         cmd.append(case)
-    rc, raw = _run_device_step(
-        cmd,
-        repo_root,
-        env,
-        devices,
-        _measure_backstop(repo_root),
-        "coverage probe",
-        stall_s=adaptive_timer(repo_root, "profile", env_key="PERF_MCP_MEASURE_STALL_SEC"),
-        observe_op="profile",
-        observe_root=repo_root,
-    )
-    if rc is None:
-        return None, "", []
-    raw = raw or ""
-    sigs = None
-    seq = []
-    for line in raw.splitlines():
-        if line.startswith("PERF_OP_SIGS="):
-            try:
-                sigs = set(json.loads(line.split("=", 1)[1]))
-            except (ValueError, TypeError):
-                sigs = None
-        elif line.startswith("PERF_OP_SIG_SEQUENCE="):
-            try:
-                seq = json.loads(line.split("=", 1)[1])
-            except (ValueError, TypeError):
-                seq = []
-    if not sigs:
-        return None, raw, []
-    return sigs, raw, seq
+    raw = ""
+    for attempt in range(1 + _OP_SIG_WEDGE_RETRIES):
+        rc, out = _run_device_step(
+            cmd,
+            repo_root,
+            env,
+            devices,
+            _measure_backstop(repo_root),
+            "coverage probe",
+            stall_s=adaptive_timer(repo_root, "profile", env_key="PERF_MCP_MEASURE_STALL_SEC"),
+            observe_op="profile",
+            observe_root=repo_root,
+        )
+        if rc is None:
+            # UNCHANGED. The timeout path inside _run_device_proc has already reclaimed the device
+            # on its way out and captured no output to reason about, so every caller sees exactly
+            # what it saw before: no signatures, no evidence.
+            return None, "", []
+        raw = out or ""
+        sigs, seq = _parse_op_sigs(raw)
+        if sigs:
+            return sigs, raw, seq
+        if attempt >= _OP_SIG_WEDGE_RETRIES or not _dr().is_dead_board(raw):
+            break
+        print(
+            "  [optimize/cc] coverage probe dispatched no ops and its output names a dead board -- "
+            "reclaiming and retrying (attempt %d of %d): %s"
+            % (attempt + 2, _OP_SIG_WEDGE_RETRIES + 1, _reclaim_device(devices, error_text=raw)),
+            flush=True,
+        )
+    return None, raw, []
 
 
 _LAYER_PATTERN_ATTRS = ("hybrid_override_pattern", "layer_types", "layers_block_type", "block_types")
@@ -998,7 +1034,7 @@ def _coverage_cache_get(repo_root: Path, node, case):
     return None
 
 
-def coverage_cache_get_ops_per_step(repo_root: Path, node, case):
+def coverage_cache_get_ops_per_step(repo_root: Path, node, case, allow_stale: bool = False):
     """Total op INVOCATIONS the k=0 coverage probe's own capture already saw in one decode step
     (len(seq) at cache-write time), or None if never recorded (older cache entry, or the probe that
     wrote it had none). Same fingerprint/invalidation rule as _coverage_cache_get -- this reads the
@@ -1007,13 +1043,21 @@ def coverage_cache_get_ops_per_step(repo_root: Path, node, case):
     nvidia_nemotron_3_5_lightning_30b_a3b_bf16 (2026-09-12): 27,577 op invocations in ONE decode step
     at its coverage depth (TT_PERF_LAYERS=6, dense 128-expert MoE dominating) -- the number
     agent.measure's profiling capture needs to know a declared OSL=128 means ~3.5M profiled op
-    invocations, which is what produced a 27+ GB tracy_ops_times.csv and OOM'd mid-round."""
+    invocations, which is what produced a 27+ GB tracy_ops_times.csv and OOM'd mid-round.
+
+    allow_stale=True also answers from an entry whose fingerprint no longer matches. For the
+    capacity bound that is the right trade: the fingerprint is the newest .py mtime beside the node,
+    so ANY edit there -- including the agent's own edit to the perf test -- invalidated the count,
+    the bound fell back to the declared OSL, and the next profile ran 64x larger. Measured 2026-09-28
+    on a WH Galaxy: an agent edit at 06:39 turned OSL=2 into OSL=128, and that profile recorded 562M
+    zones in 16 minutes and aborted. A count from before a small edit is a far better size bound than
+    none. Every other caller keeps the strict default."""
     try:
         _fp = _coverage_fingerprint(node, repo_root)
-        if not _fp:
+        if not _fp and not allow_stale:
             return None
         entry = json.loads(_coverage_cache_path(repo_root).read_text()).get(f"{_cache_node(node, repo_root)}|{case}")
-        if entry and entry.get("fp") == _fp and entry.get("ops"):
+        if entry and entry.get("ops") and (entry.get("fp") == _fp or allow_stale):
             return int(entry["ops"])
     except Exception:  # noqa: BLE001
         pass
@@ -3078,6 +3122,15 @@ def _coverage_layers(
         )
         _coverage_cache_put(repo_root, node, case, _cov)
         return {"stack0": _cov}, facts
+    # WHICH KIND OF NOTHING. An empty probe on a live board means there were no ops to count; an
+    # empty probe on a DEAD one means the model never ran at all. Both used to be reported as
+    # "probe_failed", which reads as a defect in the model and sends the reader looking at the
+    # walk, the stacks and the builder -- none of which were involved. _run_op_sigs has already
+    # reclaimed and retried by the time this is reached, so the signature still being present in
+    # the evidence means the board did not come back.
+    if _dr().is_dead_board(raw):
+        facts["no_window"] = "board_wedged"
+        return None, facts
     facts["no_window"] = "probe_failed"
     return None, facts
 
@@ -3281,23 +3334,21 @@ def _reset_devices(devices: str) -> str:
     tt_smi = tt_smi_bin()
     if not Path(tt_smi).is_file():
         return "device reset SKIPPED (tt-smi not found)"
+    chips = _reset_chip_list(devices) if d not in ("all", "") else ""
     try:
         import agent.probes as _pr  # galaxy-aware reset invocations (single source of truth)
 
-        if _pr._GALAXY_HOST is None and not os.environ.get("TT_HW_PLANNER_GALAXY"):
-            try:
-                _pr.note_board(tt_smi=tt_smi)  # one-time galaxy capability probe (cheap on plain boards)
-            except Exception:  # noqa: BLE001
-                pass
-        arg_sets = _pr._reset_arg_sets()
+        _pr.ensure_board_noted(tt_smi=tt_smi)  # one-time galaxy capability probe (cheap on plain boards)
+        arg_sets = _pr.reset_commands(chips)
     except Exception:  # noqa: BLE001
-        arg_sets = [["-r"]]
-    chips = _reset_chip_list(devices) if d not in ("all", "") else ""
+        arg_sets = [["-r", chips]] if chips else [["-r"]]
+    from agent.probes import run_reset_command  # also installs a host tool the reset reports missing
+
     last = "no reset ran"
     for args in arg_sets:
-        cmd = [tt_smi, "-r", chips] if (chips and args and args[0] == "-r") else [tt_smi, *args]
+        cmd = [tt_smi, *args]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=420)
+            r = run_reset_command(tt_smi, args, 420)
             last = "tt-smi %s rc=%d" % (" ".join(cmd[1:]), r.returncode)
             if r.returncode == 0:
                 return last
@@ -3391,6 +3442,10 @@ def _reclaim_device(devices: str, error_text: str = "", after_kill: bool = False
         "reclaim",
         _issue,
         error_text=error_text,
+        # AFTER A KILL THE EVIDENCE IS THE KILL. A killed process usually left no output to match,
+        # and the telemetry veto reads the ARC, which a wedged fabric leaves warm -- so without this
+        # the reset this path exists to issue was cancelled. See _reset_is_mandatory_after_kill.
+        fault_is_certain=after_kill,
         # NOT named `killed`: that local already holds reap_device_holders()'s list, and a
         # parameter by the same name is overwritten before it is read -- silently, because the
         # list is empty after a SIGKILL and an empty string is falsy.
@@ -3443,6 +3498,12 @@ def _progress_watch(pgid, log_path=None, stall_s=0.0):
         class _Blind:
             def moved(self, *_a, **_k):
                 return True
+
+            def note_progress(self, *_a, **_k):
+                return None
+
+            def limit(self):
+                return float(stall_s or 0.0)
 
         return _Blind()
 
@@ -3714,6 +3775,56 @@ def _run_device_step(*args, **kwargs):
     return result
 
 
+def _reset_is_mandatory_after_kill(devices, env=None) -> bool:
+    """After SIGKILLing a device process, is a reset required REGARDLESS of the liveness probe?
+
+    THE PROBE ANSWERS THE WRONG QUESTION. `_device_answers()` asks tt-smi, which reports the ARC.
+    A multi-chip ETH fabric can be wedged solid while every ARC is still answering, so "the board
+    replied" is not evidence that the next run can open the mesh -- it is evidence about a different
+    component.
+
+    REPRODUCED 2026-09-25 on a T3K, deliberately, with nothing else on the box:
+
+        a workload ran 5180 all_gathers across the 2x4 mesh, healthy throughout;
+        SIGKILL mid-collective -- exactly what this function does on a timeout;
+        the very next mesh open:
+            RuntimeError: Firmware startup error on device 0 at core 0-10 over NOC0:
+                          scratch_status=0xffffffff, postcode=0xffffffff
+
+    Open/close cycling is NOT the cause and was ruled out in the same session: 10 in-process cycles
+    and 8 consecutive fresh processes, fabric on, all clean. It is the KILL, mid-collective, that
+    leaves the fabric stuck -- and the run that inherits it fails at device open, over and over. The
+    perf-test builder recorded exactly that shape: "First run: VERDICT=WEDGE (rc=124, a timeout) ...
+    Next three runs: all FAIL at device open", 51 minutes for nothing.
+
+    So the kill itself is the evidence, and the reset stops being optional.
+
+    NARROW, because the probe was added for a real injury: "On 2026-08-15 that reset four HEALTHY
+    chips because an op ran long", and the reset is what produced a fault no PCIe reset could clear.
+    That incident was a SINGLE-CHIP run, where there is no fabric to wedge and the probe's answer is
+    the whole truth -- so single-chip keeps the gate exactly as it was. Only a run that held more
+    than one chip, which is the only way the fabric can be involved at all, skips it.
+
+    The chip count comes from the child's own environment first (the same `device_count`/`mesh_chips`
+    keys every other caller in this file reads), because nothing may open a device to answer a
+    question asked at the moment a device just died.
+
+    AND IT MUST NOT ASK ttnn. The first version of this fell back to _chip_count(devices), whose
+    "all" branch calls ttnn.GetNumAvailableDevices() and returns 1 when that raises -- which is
+    exactly what it does on a wedged board. Measured while writing this: with the fabric wedged and
+    devices="all" it answered False, so the one case the change exists for would have skipped its
+    reset. A count that cannot be taken is UNKNOWN, not one, and the rule this file already states
+    for an unverifiable target applies ("must widen, never narrow"): "all" means every chip on the
+    box, so it is treated as a fabric. Only a spec that NAMES a single chip keeps the gate, and that
+    parse is pure string work with no device in it.
+
+    The decision itself lives in agent.device_recovery.reset_is_mandatory_after_kill, so the
+    profiler and perf-test layers (which cannot import this module) apply the same rule. This file
+    counts an explicit spec with its own _chip_count, exactly as before.
+    """
+    return _dr().reset_is_mandatory_after_kill(devices or "", env, chip_count=lambda d: _chip_count(d))
+
+
 def _run_device_proc(
     cmd,
     cwd,
@@ -3822,7 +3933,6 @@ def _run_device_proc(
             # (_llm_child_alive), which no hung run can fail. Cooling stays: it is a deliberate
             # pause this tool asked for.
             _watch = _progress_watch(pgid, None, stall_s)
-            max_gap = 0.0
             _over_budget = [False]
             _ceiling_mult = _hard_ceiling_mult()
             while proc.poll() is None:
@@ -3852,9 +3962,9 @@ def _run_device_proc(
                 # liveness signals read that as a wedge, which is exactly wrong.
                 moved = _watch.moved(now, last_progress, proc.pid) or _act[0] > last_progress or _cooling_now()
                 if moved:
-                    max_gap = max(max_gap, now - last_progress)
+                    _watch.note_progress(now, last_progress)  # the rule lives in ProgressWatch now
                     last_progress = now
-                limit = max(stall_s, int(3 * max_gap))
+                limit = int(_watch.limit())
                 idle = now - last_progress
                 if idle >= limit:
                     print(
@@ -3937,7 +4047,7 @@ def _run_device_proc(
         # A timeout means SLOW. It does not mean wedged, and the difference is cheap to establish:
         # measured on this host, a live board answers tt_smi_probe() in 0.24 s and a wedged one does
         # not answer at all. Resetting a working board is not a neutral act, so it needs evidence.
-        if reset_on_timeout and _device_answers():
+        if reset_on_timeout and not _reset_is_mandatory_after_kill(devices, env) and _device_answers():
             tail = "process group killed; device answered a liveness probe, so it was NOT reset"
         else:
             tail = (
@@ -4176,13 +4286,28 @@ def record_observed(repo_root: Path, op: str, seconds: float) -> None:
         pass
 
 
+def _p95(vals: list) -> float:
+    s = sorted(vals)
+    return s[min(len(s) - 1, int(0.95 * len(s)))]
+
+
+def _timer_override(key: str):
+    """An operator's pinned timer value, or None when unset or not an integer (adaptivity resumes)."""
+    ov = os.environ.get(key)
+    if ov:
+        try:
+            return int(ov)
+        except ValueError:
+            pass
+    return None
+
+
 def _op_cost(repo_root: Path, op: str) -> float:
     """Best estimate of what ONE `op` costs on this model: p95 of its own observations,
     else the baseline-profile duration scaled into that operation's units."""
     obs = _observed(repo_root, op)
     if obs:
-        s = sorted(obs)
-        return s[min(len(s) - 1, int(0.95 * len(s)))]
+        return _p95(obs)
     # COLD START: ask the agent to size this op from the model's own evidence instead of applying a
     # frozen per-op multiplier table (the table is what capped llama's 872 s build at 240 s).
     base, ceil = _baseline_ceiling(repo_root)
@@ -4206,12 +4331,9 @@ def adaptive_timer(repo_root: Path, op: str, *, env_key: str = "", mult: float =
     gets tens of seconds and an 8B pipeline gets what its own cycle costs.
     """
     if env_key:
-        ov = os.environ.get(env_key)
-        if ov:
-            try:
-                return int(ov)
-            except ValueError:
-                pass
+        ov = _timer_override(env_key)
+        if ov is not None:
+            return ov
     _, ceil = _baseline_ceiling(repo_root)
     cost = _op_cost(repo_root, op)
     m = mult or _OP_MULT.get(op, 4.0)
@@ -4236,9 +4358,33 @@ def _adaptive_cap(repo_root: Path, floor: int, mult: int = 3) -> int:
 _MAX_WATCHDOG_REPRIEVES = 3
 
 
+_ROUND_CAP_ENV = "PERF_MCP_ROUND_MAX_SEC"
+
+
 def _round_hard_cap(repo_root: Path, stall_sec: int) -> int:
-    """UNPRODUCTIVE bound for one agent round, derived from the observed ROUND cycle."""
-    return adaptive_timer(repo_root, "round", env_key="PERF_MCP_ROUND_MAX_SEC")
+    """UNPRODUCTIVE bound for one agent round, derived from the observed ROUND cycle -- and never
+    shorter than one profiled measurement can legitimately take on this model.
+
+    A round cannot show progress before its first measurement returns, and one measurement is the
+    profile plus every re-profile make_run_profiled may run to heal it. WH Galaxy, 2026-09-28: the
+    profiles this model had taken ran up to 5,158 s, the cap came out at 7,200 s (the ceiling is one
+    OPERATION's timeout, not a round's), and the round was killed inside its first measurement with
+    nothing recorded. So the measured profile p95 times (1 + the heal budget) is a floor, and it is
+    allowed above the ceiling. Only real profile observations count -- no proxy -- and an operator
+    override still wins outright."""
+    ov = _timer_override(_ROUND_CAP_ENV)
+    if ov is not None:
+        return ov
+    cap = adaptive_timer(repo_root, "round")
+    prof = _observed(repo_root, "profile")
+    if prof:
+        try:
+            from agent.probes import _MAX_HEAL_ATTEMPTS
+
+            cap = max(cap, int(_p95(prof) * (1 + _MAX_HEAL_ATTEMPTS)))
+        except Exception:  # noqa: BLE001 -- no floor is the old behaviour, never a failure
+            pass
+    return cap
 
 
 def _measure_backstop(repo_root: Path) -> int:
@@ -4772,7 +4918,12 @@ def _run_round_with_watchdog(
         proc.wait(timeout=30)
     except Exception:  # noqa: BLE001
         pass
-    rst = _reclaim_device(devices, error_text=_tail_lines(agent_log, 40))
+    # The round was SIGKILLed with its MCP server and whatever device run it had in flight, so the
+    # kill is the evidence (the same rule the timeout path applies): without it the temperature veto
+    # cancels the reset on a multi-chip fabric and the next round opens the mesh still wedged.
+    rst = _reclaim_device(
+        devices, error_text=_tail_lines(agent_log, 40), after_kill=_reset_is_mandatory_after_kill(devices)
+    )
     print(
         "  [optimize/cc] WATCHDOG: round %s — killed the round + %s; next round starts a FRESH mcp "
         "server on the reset mesh." % (wedge_reason, rst)
@@ -4897,10 +5048,19 @@ def _emit_summary(
 ) -> None:
     import importlib.util
 
+    # THE HARDWARE THIS RUN DETECTED, from its own manifest. This function has no `manifest` in scope
+    # (it is a local of run_cc_optimize), and the residual line below read one anyway -- a NameError
+    # its except swallowed, so the final summary never carried a residual.
+    try:
+        _mani = _latest_manifest(repo_root / PERF_DIR)
+        _run_env = (json.loads(_mani.read_text()).get("env") or {}) if _mani else {}
+    except (OSError, ValueError, AttributeError):
+        _run_env = {}
     try:
         spec = importlib.util.spec_from_file_location("cc_summary", str(Path(__file__).parent / "summary.py"))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        mod.set_run_env(_run_env)  # the report prices the machine the run detected -- no default
     except Exception as exc:  # noqa: BLE001
         print(f"  [optimize/cc] summary unavailable: {exc}")
         return
@@ -4925,7 +5085,7 @@ def _emit_summary(
 
             _prof = _read_baseline_profile_for_report(repo_root)
             if _prof:
-                residual = _rl.residual_report(_prof, (manifest or {}).get("env", {}) or {})
+                residual = _rl.residual_report(_prof, _run_env)
         except Exception:  # noqa: BLE001
             residual = None
     except Exception:  # noqa: BLE001
@@ -5721,7 +5881,11 @@ def optimize_pipeline(
                 )
                 print(
                     "  [optimize/cc] "
-                    + _reclaim_device(devices, error_text=_tail_lines(str(kernel_log) + ".agent.log", 40)),
+                    + _reclaim_device(
+                        devices,
+                        error_text=_tail_lines(str(kernel_log) + ".agent.log", 40),
+                        after_kill=_reset_is_mandatory_after_kill(devices),  # every one of those rounds was killed
+                    ),
                     flush=True,
                 )
                 wedge_strikes = 0
@@ -6049,15 +6213,19 @@ def _hf_snapshots(model_id: str) -> list:
 
 
 def _hf_cache_weight_bytes(model_id: str) -> int:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from agent import model_bytes as _mb
+
     best = 0
     for snap in _hf_snapshots(model_id):
         total = 0
-        for p in snap.iterdir():
-            if p.suffix.lower() in (".safetensors", ".bin", ".pt", ".pth"):
-                try:
-                    total += os.path.getsize(os.path.realpath(p))
-                except OSError:
-                    pass
+        # Where the checkpoint says its weights are -- the top level and every declared component's
+        # subfolder (model_bytes.weight_files) -- not the top level alone.
+        for _prefix, p in _mb.weight_files(snap, _mb._WEIGHT_SUFFIXES):
+            try:
+                total += os.path.getsize(os.path.realpath(p))
+            except OSError:
+                pass
         best = max(best, total)
     return best
 
@@ -6202,6 +6370,7 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
     experts = cfg.get("num_local_experts") or cfg.get("num_experts") or cfg.get("n_routed_experts")
     src = "checkpoint bytes + HF config"
     analytic_params = 0
+    _unread_w: list = []  # weight files the checkpoint holds that no lookup read (the gate below)
     _unit = ""  # bound before the try below, which can raise before assigning it (params_basis reads it)
     # ANALYTIC FIRST: every tensor's shape and dtype from the safetensors header, with the on-device
     # widths applied per name pattern. The checkpoint's FILE SIZE counts the stored dtype -- 15.0 GB of
@@ -6227,6 +6396,7 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
         # SIZE as the divisor: 1.34 GB of float32 instead of its param count, i.e. ~4 B/param, so the
         # xB -> xGB rule was bypassed for exactly the models least able to report the error themselves.
         if _snap:
+            _unread_w = _mb.unread_weight_files(_snap)
             _an = _mb.weight_bytes(
                 _snap,
                 # Unknown unit -> count as "token", which EXCLUDES lookup-only tensors. One row of an
@@ -6320,6 +6490,20 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
         "dominant_dtype": str(cfg.get("torch_dtype") or "bfloat16"),
         "source": src,
     }
+    # EVERY WEIGHT FILE IS READ, OR THE RUN SAYS WHICH WERE NOT. A layout the reader does not know used
+    # to cost the whole roofline without a word -- it simply rendered "n/a -- not measured". Recorded in
+    # the facts (so the report and the dashboard carry it) and printed as an ERROR; not raised, because
+    # a ceiling must never cost a run.
+    if _unread_w:
+        facts["weights_unread"] = list(_unread_w)
+        print(
+            "  [optimize/cc] ERROR: %d weight file(s) in the checkpoint were NOT read (%s%s) -- every "
+            "number derived from the weights (params, roofline, fidelity ladder) is missing or short. "
+            "The checkpoint's layout is not one model_bytes.weight_files knows."
+            % (len(_unread_w), ", ".join(_unread_w[:4]), ", ..." if len(_unread_w) > 4 else ""),
+            file=sys.stderr,
+            flush=True,
+        )
     # PARAMS drive the ceiling (xB -> xGB). Exact count from the headers when readable, else the count
     # the model NAME publishes; for MoE the A-suffix ("30B-A3B") is the ACTIVE count, which is the read
     # set a routed token streams.
@@ -6807,19 +6991,10 @@ def _print_optimize_stop(pipe, exc) -> None:
 
 
 def _stamp_run_id() -> str:
-    """One id for this optimize run, set once and inherited by every child.
-
-    The recovery counters are scoped to it: "resets have stopped working" is a fact about THIS run
-    against THIS board, and carrying it into the next run is what turned a limit into a latch (run 39
-    left reset_fails=34 in a (model, task)-keyed file that survived the board being fixed and a host
-    reboot). Set here rather than in the CLI so every entry point -- supervisor restarts included --
-    lands in the same run, and never overwritten, so a restart does not silently get a fresh budget.
-    """
-    cur = str(os.environ.get("PERF_MCP_RUN_ID") or "").strip()
-    if not cur:
-        cur = "%d_%d" % (int(time.time()), os.getpid())
-        os.environ["PERF_MCP_RUN_ID"] = cur
-    return cur
+    """One id for this optimize run, set once and inherited by every child -- device_recovery.stamp_run,
+    the one implementation every stage shares. Called here rather than in the CLI so every entry point
+    -- supervisor restarts included -- lands in the same run."""
+    return _dr().stamp_run()
 
 
 def _stamp_model_root(demo_dir) -> str:

@@ -502,6 +502,68 @@ def detect_marker_drop(log_text: str) -> str | None:
     return m.group(0) if m else None
 
 
+# PYTEST'S OWN TIMEOUT IS OFF IN EVERY TOOL-LAUNCHED RUN. The repo's pytest.ini gives every test
+# 300 s, and a @pytest.mark.timeout on a test beats any command-line value -- so "-o timeout=0" did
+# not stop Qwen-Image-Edit's own @pytest.mark.timeout(2 * 3600) from killing a healthy WH Galaxy
+# profile at 7,204 s (2026-09-28), and a bring-up agent that saw its test die at 300 s wrote that
+# marker in to survive emit-e2e's gate. Disabling the plugin ends both. pytest.ini registers the
+# `timeout` mark, so a test carrying one still collects. Hangs stay bounded by _execute's watch.
+PYTEST_NO_TIMEOUT = ("-p", "no:timeout")
+
+# The generated perf test drains the device profiler every <this many> wrapped ttnn calls; the
+# profiling env carries it (measure._capacity_scaled_osl sets it), so a retry can change it.
+PERF_FLUSH_EVERY_ENV = "TT_PERF_FLUSH_EVERY"
+_SUPPORT_COUNT_ENV = "TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT"
+_DEFAULT_SUPPORT_COUNT = 1000  # tt-metal's DEFAULT_PROFILER_PROGRAM_SUPPORT_COUNT
+
+# One line per (chip, core, RISC) whose buffer was full when the host read it:
+# "... markers were dropped! device 20, worker core 18, 18, Risc BRISC,  bufferEndIndex = 12000 ..."
+_DROP_SITE_RE = re.compile(r"markers were dropped!\s*device (\d+),\s*(\w+ core \d+,\s*\d+),\s*Risc (\w+)")
+
+
+def marker_drop_evidence(log_text: str) -> dict | None:
+    """What the drop warnings say about WHY markers were lost, or None when none were.
+
+    A site (chip, core, RISC) reported ONCE overflowed during one stretch between two reads: every
+    site of a WH Galaxy run (32 chips x 72 cores x 5 RISCs = 11,520 lines, 2026-09-28) dropped in the
+    single read that followed a trace capture, where the drain cannot run at all -- reading more
+    often cannot help, only a bigger buffer can. A site reported on SEVERAL reads overflows at the
+    current drain cadence, which reading more often does fix."""
+    reason = detect_marker_drop(log_text)
+    if not reason:
+        return None
+    sites: dict[tuple, int] = {}
+    for m in _DROP_SITE_RE.finditer(log_text):
+        sites[m.groups()] = sites.get(m.groups(), 0) + 1
+    return {
+        "reason": reason,
+        "drops": sum(sites.values()) or 1,  # a drop seen only as an imbalance still counts
+        "sites": len(sites),
+        "repeated": any(n > 1 for n in sites.values()),
+    }
+
+
+def choose_marker_drop_remedy(evidence: dict, support_count: int, flush_every: str | None) -> dict | None:
+    """The env change the next attempt runs with, chosen from the drop evidence, or None when no
+    knob is left. Repeated drops shorten the drain interval, a single overflow grows the buffer --
+    each by _HEAL_GROWTH, so a buffer-sized interval (profiler_drain.capacity_cadence) reaches a
+    per-few-ops one within the heal budget for a model whose ops dispatch many programs each."""
+    try:
+        flush = int(flush_every) if flush_every else 0
+    except (TypeError, ValueError):
+        flush = 0
+    can_drain_more = flush > 1
+    can_grow = support_count < _MAX_PROFILER_SUPPORT_COUNT
+    if evidence.get("repeated") and can_drain_more:
+        return {PERF_FLUSH_EVERY_ENV: str(max(1, flush // _HEAL_GROWTH))}
+    if can_grow:
+        grown = min(max(support_count, _DEFAULT_SUPPORT_COUNT) * _HEAL_GROWTH, _MAX_PROFILER_SUPPORT_COUNT)
+        return {_SUPPORT_COUNT_ENV: str(grown)}
+    if can_drain_more:
+        return {PERF_FLUSH_EVERY_ENV: str(max(1, flush // _HEAL_GROWTH))}
+    return None
+
+
 class PreflightError(Exception):
     """The discovered perf test selects zero tests (the S512 trap)."""
 
@@ -522,11 +584,23 @@ PROFILING_ENV = {
 }
 
 
-def build_tracy_command(perf_test: str, case: str | None, out_dir: str | Path) -> list[str]:
+def build_tracy_command(
+    perf_test: str,
+    case: str | None,
+    out_dir: str | Path,
+    plugins=(),
+    mid_run_dump: bool = False,
+    push_device_to_tracy: bool = True,
+) -> list[str]:
     """The raw profile_this command (C++ post-processing default) + -o.
 
     TT_METAL_DEVICE_PROFILER=1 python -m tracy -v -r -p -o <out> -m pytest ... -sv
-    Run directly (never via profile_this.py: it swallows the exit code).
+    Run directly (never via profile_this.py: it swallows the exit code). `plugins` are pytest
+    plugin modules loaded into the profiled run (`-p <module>`). `mid_run_dump` is tracy's own
+    --dump-device-data-mid-run: each profiler read is written out and released instead of held in
+    host memory until exit. `push_device_to_tracy=False` is its --disable-device-data-push-to-tracy:
+    device markers still go to the device log the ops report is built from, but not into the tracy
+    stream, whose capture tool only needs the host side.
     """
     cmd = [
         sys.executable,
@@ -535,14 +609,17 @@ def build_tracy_command(perf_test: str, case: str | None, out_dir: str | Path) -
         "-v",
         "-r",
         "-p",
+        *(["--dump-device-data-mid-run"] if mid_run_dump else []),
+        *([] if push_device_to_tracy else ["--disable-device-data-push-to-tracy"]),
         "-o",
         str(out_dir),
         "-m",
         "pytest",
-        "-o",
-        "timeout=0",
-        perf_test,
+        *PYTEST_NO_TIMEOUT,
     ]
+    for plugin in plugins:
+        cmd += ["-p", plugin]
+    cmd += [perf_test]
     if case:
         cmd += ["-k", case]
     cmd += ["-sv"]
@@ -582,6 +659,10 @@ def _proc_stat_fields():
 
 
 _STACK_EVERY_S = 30.0
+# Headroom over the longest quiet stretch a run has already come back from. Dimensionless, so it
+# assumes nothing about the model, the stage or the box -- and the same multiple run._run_device_proc
+# arrived at independently, which is why it is now shared rather than spelled twice.
+_GAP_MULT = 3
 
 # How far past its budget a still-moving step may run before the attempt is failed. A multiple, so
 # it scales with what the caller already said the work is worth.
@@ -599,12 +680,26 @@ def _pgroup_io_counters(pgid) -> tuple:
     ttnn.from_torch call, with syscr and syscw unchanged across a twenty-second window and
     read_bytes/write_bytes flat. Its stall clock never fired because CPU movement reset it on every
     poll.
+
+    THE RUN IS THE GROUP AND EVERYTHING ITS LEADER STARTED. Every caller starts its run with
+    start_new_session=True and passes that group, so pgid is also the leader's pid -- and a
+    descendant that moved itself into a session of its own is still the run's work. tracy does
+    exactly that (tools/tracy/__main__.py: the workload is Popen'd with preexec_fn=os.setsid), so a
+    group-only sum saw the launcher and the capture tool, both idle during a device-profiler
+    read-back, and never the test doing the reading. Measured 2026-09-27 on a WH Galaxy: over 30 s
+    of a read-back the watched group moved 0 syscalls while the profiled test moved 13,240 and read
+    90 MB; the stall check then killed it as "no forward progress" three times running. The kill
+    (_kill_tree) already walks this same tree; the progress count now sees what the kill reaches.
+    A leader that has exited has no descendants left to find, so that case counts the group alone.
     """
     calls = 0
     total = 0
-    for pid, fields in _proc_stat_fields():
-        if len(fields) <= 2 or fields[2] != str(pgid):
-            continue
+    members = {pid for pid, fields in _proc_stat_fields() if len(fields) > 2 and fields[2] == str(pgid)}
+    try:
+        members.update(_descendant_pids(int(pgid)))
+    except (TypeError, ValueError):
+        pass
+    for pid in members:
         try:
             with open("/proc/%d/io" % pid) as fh:
                 for line in fh:
@@ -686,6 +781,24 @@ class ProgressWatch:
         self._stall_s = float(stall_s or 0.0)
         self._sig = progress_signature(pgid, log_path)
         self._last_stack_at = 0.0
+        self._max_gap = 0.0
+
+    # A WINDOW MAY NEVER BE TIGHTER THAN A GAP THIS RUN HAS ALREADY SURVIVED.
+    #
+    # Every stall window in this tree is a number somebody typed, and the number is a guess about
+    # work nobody has measured yet -- which is how a 2400s window became 600s and then killed a
+    # perfectly healthy trace stage three times over. The run itself carries the answer: if it has
+    # already gone quiet for 200s and come back with real progress, 200s is not evidence of a wedge.
+    # `run._run_device_proc` worked this out and kept the rule to itself, so the other two supervised
+    # loops -- _execute here and cc_harness's gate check -- still killed on the raw typed number.
+    # Same rule, one owner, exactly as this class's own docstring demands.
+    def note_progress(self, now, last_progress) -> None:
+        """Record that progress just happened, widening the window to what this run really does."""
+        self._max_gap = max(self._max_gap, float(now) - float(last_progress))
+
+    def limit(self) -> float:
+        """The stall window in force: the typed one, or a multiple of the longest gap survived."""
+        return max(self._stall_s, _GAP_MULT * self._max_gap)
 
     def moved(self, now, last_progress, pid=None) -> bool:
         want = (
@@ -775,6 +888,19 @@ def _reap_process_group(pgid) -> list:
     return victims
 
 
+def _kill_signature(root_pid: int) -> str:
+    """Who is killing what, for the record. Reads /proc, so it is best-effort and never raises."""
+
+    def _cmd(pid):
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as fh:
+                return (fh.read().replace(b"\0", b" ").decode(errors="ignore").strip() or "?")[:70]
+        except OSError:
+            return "?"
+
+    return "pid %d (%s) killing pid %d (%s)" % (os.getpid(), _cmd(os.getpid()), root_pid, _cmd(root_pid))
+
+
 def _kill_tree(root_pid: int, extra=()) -> None:
     """SIGKILL root_pid, every descendant still traceable from it, and every process group involved.
 
@@ -789,6 +915,14 @@ def _kill_tree(root_pid: int, extra=()) -> None:
     the process-group kill and the device-holder reclaim. A second optimize attempt then started
     alongside the first, and two runs driving one board took its ARC cores down.
     """
+    # A SIGKILL CANNOT BE REPORTED BY ITS VICTIM. It has no handler, leaves no traceback, and the
+    # dying process's output simply stops mid-line -- so a killed step is indistinguishable from a
+    # broken one downstream, and the agent is told to fix code that was never the problem. Two days
+    # of a Qwen-Image-Edit bring-up went that way: five captures died with rc=-9, no traceback and no
+    # watchdog line, and nothing anywhere recorded that the tool itself had done it. The killer is
+    # the only party that CAN say so, so it says so here -- once, at the single point every
+    # tool-initiated kill passes through, rather than at each call site.
+    print("  [kill] SIGKILL: %s" % _kill_signature(root_pid), file=sys.stderr, flush=True)
     import signal
 
     # NEVER OURSELVES. The walk could only ever reach our descendants, so this was safe by
@@ -839,12 +973,15 @@ def _galaxy_capability_probe(tt_smi: str) -> bool | None:
     return None
 
 
-def note_board(card: str = "", device_count: int = 0, box: str = "", tt_smi: str | None = None) -> None:
+def note_board(
+    card: str = "", device_count: int = 0, box: str = "", tt_smi: str | None = None, probe: bool = True
+) -> None:
     """Record, at healthy STARTUP, whether this host is a Galaxy — a Galaxy needs `-glx_reset`, a plain
     board needs `-r`, and a WEDGED board can't be re-probed at reset time so the decision must be made
     now. Order of trust: explicit env override -> tt-smi galaxy-tray capability probe (authoritative,
     survives the mesh rewiring) -> cheap hints (box/board name says 'galaxy', or >=32 chips) as a
-    last-ditch fallback when the probe couldn't run."""
+    last-ditch fallback when the probe couldn't run. `probe=False` skips the tt-smi probe, for a caller
+    that may be looking at a wedged board (see ensure_board_noted)."""
     global _GALAXY_HOST
     v = os.environ.get("TT_HW_PLANNER_GALAXY")
     if v is not None:
@@ -854,8 +991,7 @@ def note_board(card: str = "", device_count: int = 0, box: str = "", tt_smi: str
     if "galaxy" not in text and 0 < device_count < 32:
         _GALAXY_HOST = False
         return
-    smi = tt_smi or tt_smi_bin()
-    probed = _galaxy_capability_probe(smi)
+    probed = _galaxy_capability_probe(tt_smi or tt_smi_bin()) if probe else None
     if probed is not None:
         _GALAXY_HOST = probed
         return
@@ -895,29 +1031,120 @@ def _reset_arg_sets() -> list[list[str]]:
     return [["-r"]]
 
 
-def _device_reset(error_text: str = "", config_target: str = "") -> bool:
+_SYSFS_TT_CLASS = "/sys/class/tenstorrent"
+
+
+def _sysfs_card_types() -> str:
+    """The card types the tenstorrent driver publishes per chip (e.g. "galaxy-wormhole"), space-joined.
+
+    A file read, so it answers while the board is wedged -- which the tt-smi galaxy probe does not:
+    on a wedged WH Galaxy (2026-09-25) `-glx_list_tray_to_device` failed with "Error in detecting
+    devices!", and a failed probe reads as "not a Galaxy"."""
+    try:
+        return " ".join(sorted({p.read_text().strip() for p in Path(_SYSFS_TT_CLASS).glob("*/tt_card_type")}))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def ensure_board_noted(box: str = "", tt_smi: str | None = None) -> None:
+    """Make the Galaxy decision before a reset needs it, for callers that never ran note_board.
+
+    _reset_arg_sets() trusts _GALAXY_HOST, and only optimize's startup recorded it -- so a reset
+    issued from any other stage read None, treated a Galaxy as a plain board and sent `-r`, which
+    does not reset a Galaxy. This runs when a reset is ABOUT to happen, i.e. possibly on a wedged
+    board, so it decides from wedge-safe signals only -- the driver's card type and the
+    /dev/tenstorrent count -- and never the tt-smi probe, which fails on a wedged board."""
+    if _GALAXY_HOST is not None or os.environ.get("TT_HW_PLANNER_GALAXY") is not None:
+        return
+    try:
+        note_board(
+            card=_sysfs_card_types(), device_count=_enumerated_device_count(), box=box, tt_smi=tt_smi, probe=False
+        )
+    except Exception:  # noqa: BLE001 -- a detection that cannot run must never block the reset itself
+        pass
+
+
+def reset_commands(target: str = "") -> list[list[str]]:
+    """The tt-smi argument lists that reset `target` (a whole-board chip list, or ''/'all') on THIS host.
+
+    The ONE place a target becomes a command. A per-board `-r <chips>` only replaces the plain `-r`
+    entries of _reset_arg_sets(), so a Galaxy host still tries its galaxy-tray resets first -- a
+    chip-targeted `-r` on a Galaxy is exactly the reset that leaves it wedged."""
+    ensure_board_noted()
+    chips = "" if (target or "").strip().lower() in ("", "all") else target
+    return [["-r", chips] if (chips and args and args[0] == "-r") else list(args) for args in _reset_arg_sets()]
+
+
+# A tt-smi reset shells out to host tools -- the galaxy-tray reset drives the chassis BMC through one --
+# and when one is missing the reset fails NAMING it: "sudo: <tool>: command not found" (a WH Galaxy,
+# 2026-09-25, where every -glx_reset failed that way and the board could not be reset at all). The name
+# is read from that failure rather than typed here, so whatever tool tt-smi needs is the one installed.
+_MISSING_TOOL_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9._+-]*): command not found")
+
+
+def missing_host_tool(output: str) -> str | None:
+    """The host command a failed tt-smi run reported as missing, or None."""
+    m = _MISSING_TOOL_RE.search(output or "")
+    return m.group(1) if m else None
+
+
+def run_reset_command(tt_smi: str, args: list, timeout_s: float) -> subprocess.CompletedProcess:
+    """Run one tt-smi reset. If it fails because a host tool it needs is missing, install that tool
+    (pkgtools.ensure_system_tool -- like the tt-lang auto-install) and run the same reset once more.
+    Raises what subprocess.run raises (TimeoutExpired, OSError), exactly as the callers already expect."""
+    cmd = [tt_smi, *args]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    if proc.returncode == 0:
+        return proc
+    tool = missing_host_tool((proc.stdout or "") + (proc.stderr or ""))
+    if not tool or shutil.which(tool):
+        return proc
+    from .pkgtools import ensure_system_tool
+
+    ok = ensure_system_tool(tool)
+    print(
+        "  [device-reset] `tt-smi %s` needs %s, which is missing: %s"
+        % (" ".join(args), tool, "installed it, retrying" if ok else "could NOT install it -- install it by hand"),
+        file=sys.stderr,
+        flush=True,
+    )
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s) if ok else proc
+
+
+def prepare_device_reset(box: str = "") -> None:
+    """At a stage's startup, while the board is healthy: decide the host kind, so the reset path is
+    not first asked on a wedged board (see ensure_board_noted). A host tool the reset needs is
+    installed when a reset reports it missing (run_reset_command)."""
+    ensure_board_noted(box=box)
+
+
+def _device_reset(error_text: str = "", config_target: str = "", fault_is_certain: bool = False) -> bool:
     """Reset the device and report whether it CAME BACK -- not merely whether tt-smi exited 0.
 
     Routed through the shared recovery primitive so the profiler layer picks its target from the
     same evidence, verifies the same way, and spends the same escalation budget as the orchestrator
     and the MCP server. This used to return the exit code of a reset aimed at whatever
     _reset_arg_sets() decided, with nothing checking the device afterwards.
+
+    fault_is_certain: the caller KNOWS the board is suspect (it killed a device run mid-flight), so
+    the telemetry veto must not cancel the reset -- device_recovery.recover's own parameter.
     """
     from . import device_recovery as _dr
 
     def _issue(target):
         tt_smi = tt_smi_bin()
-        arg_sets = [["-r", target]] if target and target != "all" else _reset_arg_sets()
-        for args in arg_sets:
+        for args in reset_commands(target):
             try:
-                proc = subprocess.run([tt_smi, *args], capture_output=True, text=True, timeout=300)
+                proc = run_reset_command(tt_smi, args, 300)
                 if proc.returncode == 0:
                     return True
             except Exception:  # noqa: BLE001
                 continue
         return False
 
-    return _dr.recover("probes", _issue, error_text=error_text, config_target=config_target)
+    return _dr.recover(
+        "probes", _issue, error_text=error_text, config_target=config_target, fault_is_certain=fault_is_certain
+    )
 
 
 # "AICLK failed to settle" is what UMD emits TODAY (tt_device.cpp:342) and is arch-independent: it
@@ -1322,9 +1549,12 @@ def _execute(
     cold profiler-instrumented kernel compilation for a multi-chip mesh is slow
     but alive (CPU-busy, log still streaming), and a flat 30-min cap killed it
     mid-compile before a single op ran. So the watchdog gates on FORWARD PROGRESS,
-    not elapsed time: kill only when the log has not grown AND the process group
-    has burned ~no CPU for `stall_timeout_s` (a real stall/deadlock). `timeout_s`
-    remains as a generous ABSOLUTE backstop against a pathological busy-spin."""
+    not elapsed time: kill only when NOTHING IN `progress_signature` HAS MOVED for
+    `stall_timeout_s` — the log has not grown, the process group's syscall and IO
+    counters are flat, and the stack is unchanged. CPU is deliberately NOT among
+    them: a livelock burns a full core while getting nowhere, so treating CPU as
+    progress is what let one hide for ten hours. `timeout_s` remains as a generous
+    ABSOLUTE backstop (hard ceiling `timeout_s * _HARD_CEILING_MULT`)."""
     _therm_label = "generated-test run"
     try:
         _run = _cc_optimize("run")
@@ -1391,10 +1621,12 @@ def _execute(
             except OSError:
                 size = last_size
             if _watch.moved(now, last_progress, proc.pid):
+                _watch.note_progress(now, last_progress)
                 last_progress = now
-            if stall_timeout_s and now - last_progress >= stall_timeout_s:
+            _stall_limit = _watch.limit()
+            if stall_timeout_s and now - last_progress >= _stall_limit:
                 _kill_and_raise(
-                    f"made no forward progress for {stall_timeout_s}s -- no log growth, no syscalls, "
+                    f"made no forward progress for {int(_stall_limit)}s -- no log growth, no syscalls, "
                     f"no bytes and an unchanged stack. CPU alone is not progress; a livelock has "
                     f"plenty of it. Process group killed"
                 )
@@ -1579,6 +1811,18 @@ def preflight_collect(
     return n
 
 
+def profiler_drain_plugin(tt_metal_root) -> str | None:
+    """The dotted name the profiled pytest imports agent/profiler_drain by, from where this tool sits
+    in the tree it profiles; None when the tool lives outside it (the run then goes without)."""
+    from . import profiler_drain
+
+    try:
+        rel = Path(profiler_drain.__file__).resolve().relative_to(Path(tt_metal_root).resolve())
+    except ValueError:
+        return None
+    return ".".join(rel.with_suffix("").parts)
+
+
 def make_run_profiled(
     tt_metal_root: str | os.PathLike[str],
     perf_test: str,
@@ -1588,7 +1832,7 @@ def make_run_profiled(
     extra_env: dict[str, str] | None = None,  # e.g. TT_METAL_VISIBLE_DEVICES
     collect_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     retries: int = 2,
-    device_reset: Callable[[], bool] = _device_reset,
+    device_reset: Callable[..., bool] = _device_reset,  # called as device_reset(error_text=[, fault_is_certain=True])
 ) -> Callable[..., tuple[Path, float]]:
     """Factory for tracy_tool's stage-1 `run_profiled` (real hardware).
 
@@ -1658,15 +1902,91 @@ def make_run_profiled(
         except Exception as exc:  # noqa: BLE001 -- never let the gate stop the run
             _warn_thermal_inert("make_run_profiled", exc)
         node_id = resolve_node_id(root, perf_test, case, env=env, runner=collect_runner)
-        cmd = build_tracy_command(node_id, None, out_dir)
-        support_count = int(env.get("TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT") or 0)
+        # Drain from the first op (profiler_drain), release each read (mid-run dump), and keep the
+        # device markers out of the tracy stream: every marker held until exit was 320 GB and
+        # climbing, and pushed into tracy it segfaulted tracy-capture (WH Galaxy, 2026-09-28).
+        _drain = profiler_drain_plugin(root)
+        cmd = build_tracy_command(
+            node_id,
+            None,
+            out_dir,
+            plugins=(_drain,) if _drain else (),
+            mid_run_dump=bool(_drain),
+            push_device_to_tracy=not _drain,
+        )
+        support_count = int(env.get(_SUPPORT_COUNT_ENV) or 0)
         t_start = time.monotonic()
         partial_reason = None
         heal_attempt = 0
         throttle_retry = 0
+        attempts_set_aside = 0
+        # The cleanest finished attempt so far that left a CSV, kept in case every retry still drops
+        # markers or a later one crashes: {"drops", "csv", "log", "reason"}.
+        best = None
+        kept = None  # the attempt the result comes from when it is not the last one run
+
+        def _set_aside_log() -> Path | None:
+            # Each launch reopens log_path for writing; keep the finished attempt's log as
+            # <name>.attemptN (no *_tracy.log reader matches it).
+            nonlocal attempts_set_aside
+            if not log_path.is_file():
+                return None
+            attempts_set_aside += 1
+            aside = log_path.with_name("%s.attempt%d" % (log_path.name, attempts_set_aside))
+            try:
+                log_path.replace(aside)
+            except OSError:
+                return None
+            return aside
+
+        def _reset_before_retry(error_text: str) -> None:
+            # A multi-chip run that ended badly leaves the fabric wedged while every ARC still
+            # answers, so the temperature veto would cancel the reset the retry needs; the kill rule
+            # already knows which runs held a fabric. fault_is_certain passed only when set, so a
+            # single-chip run resets as before.
+            from . import device_recovery as _dr
+
+            _kill = {"fault_is_certain": True} if _dr.reset_is_mandatory_after_kill(env=env) else {}
+            device_reset(error_text=error_text, **_kill)
+
+        def _find_csv(watermark: float) -> Path | None:
+            # layer 1: directed output (-o). out_dir PERSISTS across iterations, so a PRIOR
+            # run's CSV is still sitting here -- filter to THIS run (mtime > watermark) or the
+            # glob can return the stale baseline. That stale-CSV reuse made every REMEASURE
+            # re-read the baseline, so real edits measured identical to baseline and were
+            # wrongly flagged inert/no-gain and reverted (the "zero gains" root cause).
+            found = sorted(
+                (p for p in out_dir.glob("**/ops_perf_results_*.csv") if p.stat().st_mtime > watermark),
+                key=lambda p: p.stat().st_mtime,
+            )
+            # layer 2: the stdout path is AUTHORITATIVE -- tracy logs the exact CSV it wrote for
+            # THIS run ("OPs csv generated at: <path>"). Trust it over the glob, which can tie or
+            # pick a touched older dir. Previously this only WARNED on a mismatch and kept the
+            # (stale) glob result; now the reported path wins whenever it exists.
+            log_text = log_path.read_text() if log_path.is_file() else ""
+            m = _CSV_STDOUT_RE.search(log_text)
+            if m:
+                reported = Path(m.group(1))
+                if reported.is_file():
+                    if found and reported.resolve() != found[-1].resolve():
+                        with open(log_path, "a") as fh:
+                            fh.write(f"\n[harness] using authoritative stdout CSV {reported} over glob {found[-1]}\n")
+                    found = [reported]
+            # layer 3: watermark fallback in the shared area
+            if not found:
+                found = sorted(
+                    (
+                        p
+                        for p in root.glob("generated/profiler/**/ops_perf_results_*.csv")
+                        if p.stat().st_mtime > watermark
+                    ),
+                    key=lambda p: p.stat().st_mtime,
+                )
+            return found[-1] if found else None
+
         while True:
             if support_count > 0:
-                env["TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT"] = str(support_count)
+                env[_SUPPORT_COUNT_ENV] = str(support_count)
             for _attempt in range(retries + 1):
                 watermark = time.time() - 0.05
                 try:
@@ -1674,10 +1994,42 @@ def make_run_profiled(
                     break
                 except TracyHangError:
                     if _attempt >= retries:
-                        raise
-                    device_reset()
+                        if best is None:
+                            raise
+                        code = None  # out of hang retries, but an earlier attempt finished
+                        break
+                    # The hung run's process group was just SIGKILLed. Keep its log -- the retry
+                    # reopens log_path for writing, which is how the first failure of a night went
+                    # unrecorded -- and hand both it and the kill to the reset: with neither, the
+                    # temperature veto cancels the reset on a multi-chip fabric and the retry opens
+                    # the mesh still wedged.
+                    hung = log_path.read_text(errors="ignore") if log_path.is_file() else ""
+                    _set_aside_log()
+                    _reset_before_retry(hung)
+            if code is None:
+                kept, partial_reason = best, best["reason"]
+                break
             if code != 0:
-                tail = _salient_tail(log_path.read_text()) if log_path.is_file() else ""
+                log_text = log_path.read_text(errors="ignore") if log_path.is_file() else ""
+                # A device or capture-tool crash (the tracy capture tool segfaulting at shutdown
+                # after "1 passed", WH Galaxy 2026-09-28) leaves no CSV and a dirty board: reset
+                # and run again. Any other non-zero exit is tracy's own verdict, raised as before.
+                if _DEVICE_CRASH_RE.search(log_text) and heal_attempt < _MAX_HEAL_ATTEMPTS:
+                    heal_attempt += 1
+                    with open(log_path, "a") as fh:
+                        fh.write(
+                            f"\n[harness] tracy exit {code} after a crash; reset + re-profile "
+                            f"(heal {heal_attempt}/{_MAX_HEAL_ATTEMPTS})\n"
+                        )
+                    _set_aside_log()
+                    _await_cool()
+                    _reset_before_retry(log_text)
+                    continue
+                if best is not None:
+                    kept = best
+                    partial_reason = best["reason"]
+                    break
+                tail = _salient_tail(log_text)
                 raise TracyRunError(f"tracy run exit {code} (log: {log_path})\n{tail}")
             log_text = log_path.read_text() if log_path.is_file() else ""
             if detect_overheat(log_text):
@@ -1715,65 +2067,76 @@ def make_run_profiled(
                 if _DEVICE_CRASH_RE.search(log_text) and heal_attempt < _MAX_HEAL_ATTEMPTS:
                     heal_attempt += 1
                     _await_cool()
-                    device_reset()
+                    _reset_before_retry(log_text)
                     with open(log_path, "a") as fh:
                         fh.write(
                             f"\n[harness] device crash ({crash}); reset + re-profile "
                             f"(heal {heal_attempt}/{_MAX_HEAL_ATTEMPTS})\n"
                         )
+                    _set_aside_log()
                     continue
                 raise PerfRunFailed(crash, log_path)
-            drop = detect_marker_drop(log_text)
-            if drop and support_count < _MAX_PROFILER_SUPPORT_COUNT and heal_attempt < _MAX_HEAL_ATTEMPTS:
-                heal_attempt += 1
-                support_count = min(max(support_count, 1000) * _HEAL_GROWTH, _MAX_PROFILER_SUPPORT_COUNT)
-                with open(log_path, "a") as fh:
-                    fh.write(
-                        f"\n[harness] profiler buffer grew to TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT="
-                        f"{support_count}; re-profiling (heal {heal_attempt}/{_MAX_HEAL_ATTEMPTS})\n"
-                    )
-                continue
-            partial_reason = drop
-            break
+            evidence = marker_drop_evidence(log_text)
+            if not evidence:
+                break
+            # EVERY MARKER OR ANOTHER ATTEMPT. A dropped marker is a missing op, and a profile
+            # missing ops ranks the wrong ones; retry while attempts remain, with the knob the drop
+            # evidence points at, and keep the cleanest finished attempt in case none is complete.
+            _csv = _find_csv(watermark)
+            _new_best = _csv is not None and (best is None or evidence["drops"] < best["drops"])
+            if _new_best:
+                _copy = profiles_dir / ("run%d_raw.csv.best" % i)
+                shutil.copyfile(_csv, _copy)
+                best = {"drops": evidence["drops"], "csv": _copy, "log": None, "reason": evidence["reason"]}
+            remedy = (
+                choose_marker_drop_remedy(evidence, support_count, env.get(PERF_FLUSH_EVERY_ENV))
+                if heal_attempt < _MAX_HEAL_ATTEMPTS
+                else None
+            )
+            if remedy is None:
+                partial_reason = evidence["reason"]
+                if best is not None and best["drops"] < evidence["drops"]:
+                    kept = best
+                    partial_reason = best["reason"]
+                break
+            heal_attempt += 1
+            with open(log_path, "a") as fh:
+                fh.write(
+                    f"\n[harness] {evidence['drops']} marker drop(s) at {evidence['sites']} site(s)"
+                    f"{' on repeated reads' if evidence['repeated'] else ' in one read'}; "
+                    + ", ".join(f"{k}={v}" for k, v in remedy.items())
+                    + f"; reset + re-profile (heal {heal_attempt}/{_MAX_HEAL_ATTEMPTS})\n"
+                )
+            env.update(remedy)
+            support_count = int(env.get(_SUPPORT_COUNT_ENV) or 0)
+            _aside = _set_aside_log()
+            if _new_best:
+                best["log"] = _aside
+            _await_cool()
+            _reset_before_retry(log_text)
         wall_ms = (time.monotonic() - t_start) * 1000.0
 
-        # layer 1: directed output (-o). out_dir PERSISTS across iterations, so a PRIOR
-        # run's CSV is still sitting here -- filter to THIS run (mtime > watermark) or the
-        # glob can return the stale baseline. That stale-CSV reuse made every REMEASURE
-        # re-read the baseline, so real edits measured identical to baseline and were
-        # wrongly flagged inert/no-gain and reverted (the "zero gains" root cause).
-        found = sorted(
-            (p for p in out_dir.glob("**/ops_perf_results_*.csv") if p.stat().st_mtime > watermark),
-            key=lambda p: p.stat().st_mtime,
-        )
-        # layer 2: the stdout path is AUTHORITATIVE -- tracy logs the exact CSV it wrote for
-        # THIS run ("OPs csv generated at: <path>"). Trust it over the glob, which can tie or
-        # pick a touched older dir. Previously this only WARNED on a mismatch and kept the
-        # (stale) glob result; now the reported path wins whenever it exists.
-        log_text = log_path.read_text() if log_path.is_file() else ""
-        m = _CSV_STDOUT_RE.search(log_text)
-        if m:
-            reported = Path(m.group(1))
-            if reported.is_file():
-                if found and reported.resolve() != found[-1].resolve():
-                    with open(log_path, "a") as fh:
-                        fh.write(f"\n[harness] using authoritative stdout CSV {reported} over glob {found[-1]}\n")
-                found = [reported]
-        # layer 3: watermark fallback in the shared area
-        if not found:
-            found = sorted(
-                (p for p in root.glob("generated/profiler/**/ops_perf_results_*.csv") if p.stat().st_mtime > watermark),
-                key=lambda p: p.stat().st_mtime,
-            )
-        if not found:
+        newest = None if kept is not None else _find_csv(watermark)
+        if newest is None and kept is None and best is not None:
+            kept, partial_reason = best, best["reason"]  # the last attempt left no CSV
+        if kept is not None:
+            # The result is an earlier attempt: its log is the one every reader of log_path must see.
+            _set_aside_log()
+            if kept["log"] is not None and Path(kept["log"]).is_file():
+                shutil.copyfile(kept["log"], log_path)
+            with open(log_path, "a") as fh:
+                fh.write(f"\n[harness] kept the cleanest finished attempt ({kept['drops']} marker drop(s))\n")
+            newest = kept["csv"]
+        elif newest is None:
             raise TracyRunError(
                 f"no ops_perf_results_*.csv produced (checked {out_dir}, stdout, "
                 f"generated/profiler); log: {log_path}"
             )
-        newest = found[-1]
         _validate_csv(newest, log_path)
         dest = profiles_dir / f"run{i}_raw.csv"
         shutil.copyfile(newest, dest)
+        if best is not None:
+            Path(best["csv"]).unlink(missing_ok=True)
         if partial_reason:
             try:
                 (profiles_dir / f"run{i}.partial").write_text(str(partial_reason))

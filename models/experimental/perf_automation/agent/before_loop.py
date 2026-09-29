@@ -276,21 +276,9 @@ def make_mock_model_runner(model_root: str | Path) -> Callable[[str], str]:
     return runner
 
 
-def _requested_chip_count(devices: str):
-    """How many chips --devices asks for, or None when it does not narrow the host.
-
-    "all" (and anything unparseable) means the whole host and must NOT pin visibility. "single" is
-    one chip. An explicit list is its own length, so "0,1" is two.
-    """
-    text = str(devices or "").strip().lower()
-    if not text or text == "all":
-        return None
-    if text == "single":
-        return 1
-    ids = [part for part in re.split(r"[,\s]+", text) if part]
-    if ids and all(part.isdigit() for part in ids):
-        return len(ids)
-    return None
+# ONE parser for "how many chips does --devices ask for": device_recovery owns it, because the reset
+# layer needs the same answer at the moment a device dies (and must not open one to get it).
+from .device_recovery import requested_chip_count as _requested_chip_count  # noqa: E402
 
 
 def mock_run_profiled(pcc_path, batch_size, seq_len, profiles_dir, i):
@@ -504,10 +492,11 @@ def before_loop(
         except Exception as exc:
             print(f"      WARN --box {box}: {exc}; using auto-detected single-chip env", file=sys.stderr, flush=True)
     stages.done(f"{env['card']} ({env['arch']}), {env['worker_cores']} cores")
-    from .probes import note_board
+    from .probes import note_board, prepare_device_reset
 
     chips = max(physical_chips, int(env.get("mesh_chips") or env.get("device_count") or 0))
     note_board(str(env.get("card") or ""), chips, box=str(box or ""))
+    prepare_device_reset(box=str(box or ""))  # a Galaxy's reset needs a host tool; install it now if absent
 
     devices = str(config.get("devices") or "single")
     # VISIBILITY IS RESTRICTED ONLY WITH THE DESCRIPTOR THAT MAKES IT LEGAL, AND OTHERWISE NOT AT ALL.
@@ -575,9 +564,26 @@ def before_loop(
             dirty = gitio.changed_files(repo, head, pathspec=str(model_root))
             _generated = {"RUN_REPORT.md", ".module_optimize_state.json"}
             code_dirty = [d for d in dirty if os.path.basename(d) not in _generated]
-            if code_dirty:
-                gitio.checkout(repo, head, pathspec=code_dirty)
-                stages.done(f"restored {len(code_dirty)} leftover-dirty file(s) to {head[:9]} (prior interrupted run?)")
+            # Restore only what this commit HAS. `git checkout <sha> -- <paths>` fails the whole
+            # invocation if any one path is unknown to the commit, printing a line per path -- so a
+            # model that is untracked on the checked-out branch (it lives on its own branch, or is
+            # staged but not committed) produced ~100 "did not match any file(s) known to git"
+            # errors, restored nothing, and reported itself as a tidy "skipped".
+            restorable = gitio.present_at(repo, head, code_dirty) if code_dirty else []
+            absent = [d for d in code_dirty if d not in set(restorable)]
+            if restorable:
+                gitio.checkout(repo, head, pathspec=restorable)
+            if restorable and absent:
+                stages.done(
+                    f"restored {len(restorable)} leftover-dirty file(s) to {head[:9]}; "
+                    f"{len(absent)} not in that commit, left as they are"
+                )
+            elif restorable:
+                stages.done(f"restored {len(restorable)} leftover-dirty file(s) to {head[:9]} (prior interrupted run?)")
+            elif absent:
+                # Not an error and not a clean tree: there is simply no committed state to go back
+                # to. Say so in ONE line, and do not let the caller believe a reset happened.
+                stages.done(f"no reset: {len(absent)} model file(s) are not in {head[:9]} (untracked on this branch)")
             else:
                 stages.done(f"clean ({head[:9]})")
         except Exception as exc:  # never block the run on the restore
@@ -1066,6 +1072,9 @@ def before_loop(
                 "no_node": "no perf-test node to probe",
                 "probe_failed": "the op-signature probe found nothing and no config declares a layer "
                 "pattern -- this one is NOT a decision, it is unknown",
+                "board_wedged": "the board reported a fault while the op-signature probe ran, so the "
+                "probe never got as far as running the model; the reclaim+retry did not bring it "
+                "back -- the measurement was LOST, and the model has not been shown to be at fault",
             }.get(_why, "reason not reported by the coverage probe (%r)" % (_why or None))
             print(
                 "      depth-bridge: no profiling window -- %s. The baseline profiles FULL depth "

@@ -35,11 +35,35 @@ from __future__ import annotations
 # The seam names live in ONE module -- see stage_seams. A RELATIVE import resolves under both
 # names this package is imported by, so neither spelling has to be guarded.
 from . import stage_seams as _seams
+from .profiler_drain import ProfilerDrain, capacity_cadence, is_device
 
 import ast
+import functools
+import inspect
+import os
+import re
 import sys
+import textwrap
 
 _UNKNOWN = object()
+
+# The marks one stage's window is bounded by. tracy_tool.stage_windows reads exactly these back.
+_STAGE_MARK = "stage:%s"
+_STAGE_END_MARK = "stage:%s:end"
+
+# THE SEPARATE PER-STAGE PASS IS A SWITCH, OFF BY DEFAULT. On ("1") it runs every declared stage once
+# more, between marks, as it always used to. Off (unset, or anything else) the same marks go on the
+# MEASURED forward instead:
+# each stage's own method, found from the model's <stage>_trace_step hook, is wrapped on the pipeline
+# instance to emit its marks as the forward calls it. On a WH Galaxy (2026-09-28) the separate pass
+# cost 10,458 of the 32,769 ops tracy can record per chip, and the forward it was measuring for was
+# cut off at 65%; marked in place, nothing runs twice. A pipeline whose stages cannot be matched to a
+# method falls back to the pass, so switching it off never leaves a model unmarked.
+STAGE_PASS_ENV = "PERF_MCP_STAGE_PASS"
+
+
+def stage_pass_enabled() -> bool:
+    return os.environ.get(STAGE_PASS_ENV, "0") == "1"
 
 
 def signpost(name: str) -> None:
@@ -115,29 +139,48 @@ def mark_stages(adapter, device) -> int:
         no_marks("the pipeline declares no stages after setup")
         return 0
     n = 0
-    for st in stages:
-        name = str(getattr(st, "name", "") or "").strip()
-        step = getattr(st, "step", None)
-        if not name or not callable(step):
-            continue
-        signpost("stage:%s" % name)
-        try:
-            step()
-            ttnn.synchronize_device(device)
-            n += 1
-        except Exception as exc:  # noqa: BLE001
-            # One stage that will not run alone must not cost the others their boundary, nor the run.
-            print(
-                "  [stage-marks] stage %r could not be run on its own (%s: %s); no boundary for it"
-                % (name, type(exc).__name__, str(exc)[:140]),
-                file=sys.stderr,
-                flush=True,
-            )
-        finally:
-            signpost("stage:%s:end" % name)
+    # At the buffer's capacity, like the session drain (profiler_drain) it runs inside, plus a read
+    # after each stage. A read of every chip is not free: at the fine TT_PERF_FLUSH_EVERY cadence one
+    # 2-layer vision_encode stage ran 16+ minutes on a WH Galaxy (2026-09-28) without ending.
+    with ProfilerDrain(ttnn, device, every=capacity_cadence()) as drain:
+        for st in stages:
+            name = str(getattr(st, "name", "") or "").strip()
+            step = getattr(st, "step", None)
+            if not name or not callable(step):
+                continue
+            signpost(_STAGE_MARK % name)
+            try:
+                step()
+                ttnn.synchronize_device(device)
+                n += 1
+            except Exception as exc:  # noqa: BLE001
+                # One stage that will not run alone must not cost the others their boundary, nor the run.
+                print(
+                    "  [stage-marks] stage %r could not be run on its own (%s: %s); no boundary for it"
+                    % (name, type(exc).__name__, str(exc)[:140]),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finally:
+                signpost(_STAGE_END_MARK % name)
+                drain.read()
     if not n:
         no_marks("%d declared stage(s), none could be run one at a time" % len(stages))
     return n
+
+
+_STAGES_ATTR = "PIPELINE_STAGES"  # the stage list a pipeline declares -- the contract's name for it
+
+
+def _declared_stages(obj) -> tuple:
+    """(the stage names the pipeline declares, whether it declares them on itself rather than on its
+    module) -- ([], False) when it declares none."""
+    names = getattr(obj, _STAGES_ATTR, None)
+    if isinstance(names, (list, tuple)) and names:
+        return list(names), True
+    mod = sys.modules.get(type(obj).__module__)
+    names = getattr(mod, _STAGES_ATTR, None) if mod else None
+    return (list(names), False) if isinstance(names, (list, tuple)) and names else ([], False)
 
 
 def looks_like_a_pipeline(obj) -> bool:
@@ -145,14 +188,144 @@ def looks_like_a_pipeline(obj) -> bool:
 
     The same two things perf_adapter looks for: a PIPELINE_STAGES list, or the per-stage trace hooks
     named after its entries. Shape, not type -- the tool never imports a model's classes."""
-    names = getattr(obj, "PIPELINE_STAGES", None)
-    if isinstance(names, (list, tuple)) and names:
+    names, own = _declared_stages(obj)
+    if own:
         return True
-    mod = sys.modules.get(type(obj).__module__)
-    names = getattr(mod, "PIPELINE_STAGES", None) if mod else None
-    if not isinstance(names, (list, tuple)) or not names:
-        return False
-    return any(callable(getattr(obj, _seams.hook(n, _seams.STEP), None)) for n in names)
+    return bool(names) and any(callable(getattr(obj, _seams.hook(n, _seams.STEP), None)) for n in names)
+
+
+def _methods_a_hook_calls(hook) -> set:
+    """Names of the methods `hook` calls on its own instance, read from its source."""
+    try:
+        fn = ast.parse(textwrap.dedent(inspect.getsource(hook))).body[0]
+        me = fn.args.args[0].arg
+    except Exception:  # noqa: BLE001 -- no source, or not a method: nothing to read
+        return set()
+    return {
+        n.func.attr
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == me
+    }
+
+
+def stage_methods(pipe) -> dict:
+    """{stage: the method the measured forward runs that stage through}, or {} when not every declared
+    stage resolves to exactly one.
+
+    Read from the model's own hooks, never from a name typed here: <stage>_trace_step exists to run
+    ONE stage, so the method it calls that no other stage's step also calls is that stage's own.
+    Helpers every hook shares (input prep, readback) drop out by that rule, and so do the seams."""
+    stages, _ = _declared_stages(pipe)
+    seams = {_seams.hook(st, sm) for st in stages for sm in _seams.ALL}
+    calls = {}
+    for st in stages:
+        hook = getattr(type(pipe), _seams.hook(st, _seams.STEP), None)
+        if hook is None:
+            return {}
+        calls[st] = _methods_a_hook_calls(hook)
+    out = {}
+    for st, names in calls.items():
+        shared = set().union(*[v for k, v in calls.items() if k != st])
+        own = [n for n in sorted(names - shared - seams) if callable(getattr(pipe, n, None))]
+        if len(own) != 1:
+            return {}
+        out[st] = own[0]
+    return out if len(set(out.values())) == len(out) else {}
+
+
+def _self_calls(fn) -> list:
+    """[(attr, sub)] for every call rooted at the function's own instance: `self.a(...)` gives
+    (a, None), `self.a.b(...)` and deeper give (a, b)."""
+    try:
+        f = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+        me = f.args.args[0].arg
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for n in ast.walk(f):
+        if not isinstance(n, ast.Call):
+            continue
+        chain, cur = [], n.func
+        while isinstance(cur, ast.Attribute):
+            chain.append(cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name) and cur.id == me and chain:
+            chain.reverse()
+            out.append((chain[0], chain[1] if len(chain) > 1 else None))
+    return out
+
+
+def _is_own_method(obj, name) -> bool:
+    return inspect.isfunction(getattr(type(obj), name, None))
+
+
+def _modules_run_by(obj, fn, prefix: str, depth: int, seen: set) -> set:
+    """Attribute paths (under `prefix`) of the sub-objects `fn` of `obj` calls into, following the
+    object's own helper methods and, one level down, a component's own method."""
+    if depth <= 0 or (id(obj), fn) in seen:
+        return set()
+    seen.add((id(obj), fn))
+    paths = set()
+    for a, b in _self_calls(getattr(type(obj), fn)):
+        if _is_own_method(obj, a):
+            paths |= _modules_run_by(obj, a, prefix, depth - 1, seen)
+            continue
+        sub = getattr(obj, a, None)
+        if sub is None:
+            continue
+        path = "%s%s" % (prefix, a)
+        if b is not None and _is_own_method(sub, b):
+            inner = _modules_run_by(sub, b, path + ".", depth - 1, seen)
+            paths |= inner or {path}
+        else:
+            paths.add(path)
+    return paths
+
+
+def stage_module_paths(pipe) -> dict:
+    """{stage: sorted attribute paths of the modules it runs}, read from the model's own code: each
+    stage's method (stage_methods), the components it calls, and the sub-modules those components'
+    methods call. {} when the stages cannot be matched to methods. The paths are the pipeline's own
+    attribute names; which weights they hold is the checkpoint's business (model_bytes.stage_params)."""
+    out = {}
+    for stage, name in stage_methods(pipe).items():
+        paths = _modules_run_by(pipe, name, "", 4, set())
+        if paths:
+            out[stage] = sorted(paths)
+    return out
+
+
+def pipeline_tp(pipe) -> int:
+    """The tensor-parallel degree the pipeline says it runs at (stage_seams.TP_ATTR), or 0."""
+    try:
+        v = int(getattr(pipe, _seams.TP_ATTR, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return v if v > 0 else 0
+
+
+def mark_stages_on_forward(pipe) -> int:
+    """Wrap each stage's own method on THIS pipeline so the forward emits its marks. Returns how many
+    stages were marked, 0 when they cannot be matched (the caller then runs the separate pass).
+
+    On the instance, not the class: the wrap lives exactly as long as the pipeline the profiled
+    forward runs, and no other pipeline -- a trace-replay build, a second test -- ever sees it."""
+    mapping = stage_methods(pipe)
+    for stage, name in mapping.items():
+        fn = getattr(pipe, name)
+
+        def _marked(*a, _fn=fn, _stage=stage, **k):
+            signpost(_STAGE_MARK % _stage)
+            try:
+                return _fn(*a, **k)
+            finally:
+                signpost(_STAGE_END_MARK % _stage)
+
+        setattr(pipe, name, functools.wraps(fn)(_marked))
+    return len(mapping)
 
 
 def find_pipeline_in_scope(scope: dict):
@@ -352,7 +525,22 @@ def mark_stages_for(pipe, device) -> int:
             _restore()
 
 
-def mark_stages_in_scope(scope: dict, device, bind=None) -> int:
+def find_device_in_scope(scope: dict, pipe=None):
+    """The device the scope's pipeline runs on, found BY SHAPE like the pipeline itself, or None.
+
+    The injected pass used to hand over a variable literally named `device`, and a test whose fixture
+    is spelled otherwise raised NameError before a single stage was marked -- measured 2026-09-27 on a
+    generated perf test whose device is its `mesh_device` fixture: every profiled run printed
+    STAGE_MARKS_SKIPPED=NameError("name 'device' is not defined"). A ttnn device is recognisable
+    without its name: a mesh answers get_num_devices(). The pipeline's own `device` attribute, when it
+    keeps one, is the fallback."""
+    for k, v in (scope or {}).items():
+        if not k.startswith("__") and is_device(v):
+            return v
+    return getattr(pipe, "device", None) if pipe is not None else None
+
+
+def mark_stages_in_scope(scope: dict, device=None, bind=None) -> int:
     """Mark each stage of whatever pipeline is live in `scope`. Returns how many were marked.
 
     The scope is the locals() of the function that built the model, so the pipeline is already
@@ -369,6 +557,22 @@ def mark_stages_in_scope(scope: dict, device, bind=None) -> int:
     if pipe is None:
         no_marks("no object in scope exposes PIPELINE_STAGES or <stage>_trace_step hooks")
         return 0
+    if not stage_pass_enabled():
+        n = mark_stages_on_forward(pipe)
+        if n:
+            print(
+                "  [stage-marks] %s off: %d stage(s) marked on the measured forward, no separate pass"
+                % (STAGE_PASS_ENV, n),
+                file=sys.stderr,
+                flush=True,
+            )
+            return n
+        print(
+            "  [stage-marks] %s off, but the stages could not be matched to the forward's own methods; "
+            "running the separate pass" % STAGE_PASS_ENV,
+            file=sys.stderr,
+            flush=True,
+        )
     if callable(bind):
         try:
             _call_preparer(bind, pipe, scope)
@@ -381,6 +585,8 @@ def mark_stages_in_scope(scope: dict, device, bind=None) -> int:
                 file=sys.stderr,
                 flush=True,
             )
+    if device is None:
+        device = find_device_in_scope(scope, pipe)
     return mark_stages_for(pipe, device)
 
 
@@ -432,7 +638,7 @@ _MARK_PASS_TEMPLATE = """{i}# --- per-stage marks (injected) -------------------
 {i}try:
 {i}    from models.experimental.perf_automation.agent import stage_marks as _tt_sm2
 
-{i}    print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals(), device{bind}), flush=True)
+{i}    print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals(){bind}), flush=True)
 {i}except Exception as _tt_e2:  # noqa: BLE001
 {i}    print("STAGE_MARKS_SKIPPED=%r" % (_tt_e2,), flush=True)
 """
@@ -443,10 +649,8 @@ _MARK_PASS_START_LINE = _MARK_PASS_TEMPLATE.splitlines()[0].replace("{i}", "").s
 _MARK_PASS_END_LINE = [ln for ln in _MARK_PASS_TEMPLATE.splitlines() if ln.strip()][-1].replace("{i}", "").strip()
 
 
-def _strip_mark_pass(text: str):
-    """(text with an existing per-stage pass block removed, the 1-indexed line STAGE_MARKS_ENTER
-    was on) -- or (text, None) when no such block is present."""
-    lines = text.splitlines(keepends=True)
+def _mark_pass_span(lines: list):
+    """(first, last) 0-indexed line of an existing per-stage pass block, or (None, None)."""
     start = end = None
     for i, ln in enumerate(lines):
         if start is None and _MARK_PASS_START_LINE in ln:
@@ -455,9 +659,52 @@ def _strip_mark_pass(text: str):
             end = i
             break
     if start is None or end is None:
+        return None, None
+    return start, end
+
+
+def _strip_mark_pass(text: str):
+    """(text with an existing per-stage pass block removed, the 1-indexed line STAGE_MARKS_ENTER
+    was on) -- or (text, None) when no such block is present."""
+    lines = text.splitlines(keepends=True)
+    start, end = _mark_pass_span(lines)
+    if start is None:
         return text, None
     marker = next((j + 1 for j in range(start, end + 1) if "STAGE_MARKS_ENTER" in lines[j]), None)
     return "".join(lines[:start] + lines[end + 1 :]), marker
+
+
+# The one line of the pass that calls into this module -- the line whose ARGUMENTS changed when the
+# device stopped being passed by name. Named from the function itself, so a rename cannot drift.
+_MARK_PASS_CALL_KEY = mark_stages_in_scope.__name__ + "("
+_MARK_PASS_BIND_RE = re.compile(r"bind=([A-Za-z_][A-Za-z0-9_]*)")
+_REFRESHED = "refreshed the per-stage pass call (template changed)"
+
+
+def _refresh_mark_pass(text: str) -> tuple:
+    """(text, refreshed?) -- an existing pass block re-rendered IN PLACE when its call no longer
+    matches the template's.
+
+    NARROW ON PURPOSE, like _relocate_mark_pass: only the call line is compared, so a block a
+    formatter touched is left alone. It exists for one confirmed failure: blocks injected while the
+    template still handed over a variable literally named `device` raised NameError on every profiled
+    run of a test whose fixture is spelled differently, and "already injected" kept them that way.
+    The position, the indent and the test's own preparer (`bind=`) are kept."""
+    lines = text.splitlines(keepends=True)
+    start, end = _mark_pass_span(lines)
+    if start is None:
+        return text, False
+    old = "".join(lines[start : end + 1])
+    indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+    m = _MARK_PASS_BIND_RE.search(old)
+    fresh = _MARK_PASS_TEMPLATE.format(i=indent, bind=(", bind=%s" % m.group(1)) if m else "")
+
+    def _call(block):
+        return next((ln.strip() for ln in block.splitlines() if _MARK_PASS_CALL_KEY in ln), "")
+
+    if _call(old) == _call(fresh):
+        return text, False
+    return "".join(lines[:start]) + fresh + "".join(lines[end + 1 :]), True
 
 
 def _enclosing_function_at(tree, lineno: int):
@@ -486,31 +733,36 @@ def _relocate_mark_pass(text: str) -> tuple:
     to match today's preferred spot would be a silent, unasked-for behavior change to files that
     already work. Only a marker that ran BEFORE the pipeline call it needed is unconditionally
     wrong, so only that case is fixed.
+
+    A block whose CALL predates the template's current one is refreshed in place first
+    (_refresh_mark_pass); that, too, is a block that fails every run, not a style preference.
     """
+    text, _refreshed = _refresh_mark_pass(text)
+    _unchanged = _REFRESHED if _refreshed else "already injected"
     stripped, marker_line = _strip_mark_pass(text)
     if marker_line is None:
-        return text, "already injected"  # only the outer start/stop bracket exists here
+        return text, _unchanged  # only the outer start/stop bracket exists here
     try:
         tree = ast.parse(stripped)
     except SyntaxError:
-        return text, "already injected"
+        return text, _unchanged
     fn = _enclosing_function_at(tree, marker_line)
     if fn is None:
-        return text, "already injected"
+        return text, _unchanged
     build_site = _build_pipeline_call_site(fn)
     if build_site is None or marker_line >= build_site[0]:
         # No direct build_pipeline call to check against (e.g. reached through a helper, as
         # voxtral's does), or the pipeline already existed when the marks ran -- leave it alone.
-        return text, "already injected"
+        return text, _unchanged
     end, find = _mark_pass_site(stripped, fn.name)
     if end is None:
-        return text, "already injected"
+        return text, _unchanged
     lines = stripped.splitlines(keepends=True)
     _prep = find_input_preparer(stripped, end)
     lines.insert(end, _MARK_PASS_TEMPLATE.format(i=find, bind=(", bind=%s" % _prep) if _prep else ""))
     relocated = "".join(lines)
     if relocated == text:
-        return text, "already injected"
+        return text, _unchanged
     return relocated, "relocated the per-stage pass in %s()" % fn.name
 
 
@@ -732,7 +984,7 @@ def marks_ok(why: str) -> bool:
     function does not recognise as failure, not success: an unrecognised reason from a future change
     here is a gap to report, never one to assume is fine.
     """
-    return why == "already injected" or "per-stage pass in" in why
+    return why in ("already injected", _REFRESHED) or "per-stage pass in" in why
 
 
 def _build_pipeline_call_site(node):

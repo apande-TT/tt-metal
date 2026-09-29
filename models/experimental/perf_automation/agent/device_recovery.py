@@ -33,6 +33,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 # ONE state directory for every durable temp artifact -- see cc_optimize/tmpstate.py.
@@ -46,7 +47,38 @@ from .probes import tt_smi_bin as _tt_smi_bin
 # agent.probes.tt_smi_bin for why a bare "tt-smi" is not safe from a non-interactive launch.
 TT_SMI = _tt_smi_bin()
 
-DEAD_BOARD_SIGS = ("0xffffffff", "board should be reset", "pcie link", "device hang", "hang detected")
+DEAD_BOARD_SIGS = (
+    "0xffffffff",
+    "board should be reset",
+    "pcie link",
+    "device hang",
+    "hang detected",
+    # UMD's generic device-init failure (tt_device_error.cpp): "Firmware startup error on device N
+    # at core X over NOC0: scratch_status=..., postcode=...". The card did not come up at all, which
+    # is as definitive as an all-ones read -- and it is what a wedged Wormhole board on this host
+    # actually printed, while matching none of the signatures above. Arch-independent: the same UMD
+    # template serves every device.
+    "firmware startup error",
+    # A multi-chip ETH fabric that stopped advancing: "Timed out waiting for ETH heartbeat on
+    # device ASIC ID: N, ETH core eX-Y (NOC0) to advance. Stuck at 0x...". run.py already calls
+    # this a "heartbeat-stuck wedge" when it warns that resetting chip 0 alone can CAUSE one, so
+    # the condition is known to the tool -- it just was not on this list, and a board in it fails
+    # every retry identically until someone resets it by hand.
+    "eth heartbeat",
+    # UMD's NOC hang check (tt_device_error.cpp, NocHangError): "NOC0 is hung on PCIe device ID 9."
+    # Raised at device-open while the NOC is unreachable, so every retry fails the same way within
+    # seconds. Seen 2026-09-25 on a WH Galaxy after an e2e run hung mid-collective: no signature
+    # matched, the temperature veto cancelled every reset (the ARC was still publishing), and each
+    # emit-e2e round failed on the same chip until it was stopped by hand.
+    "is hung on pcie device",
+    # A fabric the PREVIOUS run left running, seen at the next device-open (tt_metal/llrt/llrt.cpp):
+    # "Read unexpected run_mailbox value: 0x40 (expected 0x80 or 0x0)" then TT_FATAL "Read unexpected
+    # run_mailbox value from core X-Y", beside "active ethernet dispatch core ... detected as still
+    # running". Seen 2026-09-27 on a WH Galaxy after optimize killed a 32-chip tracy run: every later
+    # profile opened with it (40 per run), the device profiler then hung or returned no device data,
+    # and the temperature veto cancelled each reset because every ARC was still publishing.
+    "unexpected run_mailbox value",
+)
 
 # THE KERNEL'S VERDICT that a reset cannot help. `tt-smi -r` talks to the card OVER PCIe and asks its
 # board-management firmware to cycle power; when that firmware is the thing refusing, the request has
@@ -149,24 +181,70 @@ RESET_FAIL_LIMIT = int(
 )
 
 
+# WHERE THE FAILURE HAPPENED, FOR WHEN NOTHING IT SAYS IS RECOGNISED.
+#
+# DEAD_BOARD_SIGS is an allowlist of PROSE, and the runtime keeps inventing new prose. Four entries
+# above were each added by hand after a run had already been lost to the wording they match, and the
+# list was still one short every time:
+#
+#   "Timed out waiting for ETH heartbeat ... Stuck at 0xaabb0024"   -> added by hand
+#   "Firmware startup error on device N at core X over NOC0"        -> added by hand
+#   "NOC0 is hung on PCIe device ID 9."                             -> added by hand
+#   "Timeout waiting for Ethernet core service remote IO request."  -> NOT matched; 2026-09-25 the
+#       profiler died on it 18 times in a row, each attempt reporting "no ops_perf_results_*.csv",
+#       no reset was ever issued because this returned False, and the run spent its whole budget
+#       recording nothing.
+#
+# An allowlist cannot be completed by adding to it, so this asks a question that does not depend on
+# the wording: WHERE did the failure happen. A test whose SETUP raised a hard runtime fault never
+# reached its body -- and setup, for every test this tool runs, is bringing the device up. A board
+# that cannot be opened is dead whatever the runtime chose to call it.
+#
+# Deliberately conservative in three ways: it needs pytest's own setup-error report (so an ordinary
+# failure inside a test body can never reach it), it needs a HARD fault class (an ImportError or a
+# missing-file error at setup is a host problem and stays unmatched), and it only ever ADDS to the
+# allowlist -- every signature that matched before still matches first, unchanged.
+_SETUP_FAILURE_REPORT = "error at setup of"  # pytest's own report line; not our vocabulary
+_HARD_FAULT_RE = re.compile(r"\b(RuntimeError|TT_FATAL|TT_THROW|TT_ASSERT)\b", re.IGNORECASE)
+
+
+def is_device_bringup_failure(text) -> bool:
+    """Did this failure happen while the DEVICE was being brought up, whatever it was called?
+
+    Structural, not lexical: pytest reports a fixture failure as "ERROR at setup of <node>", and
+    the only thing a perf/PCC test does in setup is open the mesh. A hard runtime fault there means
+    the device did not come up, so the board needs recovery before any retry can differ.
+    """
+    s = str(text) or ""
+    if _SETUP_FAILURE_REPORT not in s.lower():
+        return False
+    return bool(_HARD_FAULT_RE.search(s))
+
+
 def is_dead_board(text) -> bool:
     """Is this the UNAMBIGUOUS 'the card stopped answering' signature?
 
     A PCIe read of 0xffffffff is all-ones: the bus reporting that nobody replied. There is nothing
     to disambiguate, so waiting for a second occurrence before acting only guarantees being down
     twice. Counters belong on flaky symptoms, not definitive ones.
+
+    A recognised signature answers first; a failure at device BRING-UP answers when none does --
+    see is_device_bringup_failure for why an allowlist of prose cannot be completed by extending it.
     """
     s = (str(text) or "").lower()
-    return any(sig in s for sig in DEAD_BOARD_SIGS)
+    if any(sig in s for sig in DEAD_BOARD_SIGS):
+        return True
+    return is_device_bringup_failure(text)
 
 
 def dead_chip_from_error(text):
     """THE EVIDENCE: the chip id the runtime named in the failure, or None.
 
     tt-metal reports "Read 0xffffffff over PCIe ID 3" -- it says which chip died. Read the id
-    rather than infer it from a flag that describes intent.
+    rather than infer it from a flag that describes intent. UMD's NOC hang says "on PCIe device
+    ID 9", so "device" and "id" may both appear.
     """
-    m = re.search(r"pcie\s*(?:id|device)?\s*[:#]?\s*(\d+)", str(text or ""), re.I)
+    m = re.search(r"pcie\s*(?:device\s*)?(?:id)?\s*[:#]?\s*(\d+)", str(text or ""), re.I)
     if m:
         try:
             return int(m.group(1))
@@ -214,6 +292,25 @@ def _run_stamp() -> str:
     reads is transient and would condemn a working board.
     """
     return str(os.environ.get("PERF_MCP_RUN_ID") or "").strip()
+
+
+def stamp_run() -> str:
+    """One id for this run, set once and inherited by every child. Every entry point that can reset
+    a device calls this before its first device work.
+
+    The recovery counters are scoped to it: "resets have stopped working" is a fact about THIS run
+    against THIS board, and carrying it into the next run is what turned a limit into a latch (run 39
+    left reset_fails=34 in a (model, task)-keyed file that survived the board being fixed and a host
+    reboot). Only optimize used to stamp its run, so every other stage counted under the empty stamp:
+    on 2026-09-25 an emit-e2e run's three failed resets left reset_fails=3 there, and every later
+    emit-e2e refused to reset at all. Never overwritten, so a supervisor restart does not silently get
+    a fresh budget.
+    """
+    cur = _run_stamp()
+    if not cur:
+        cur = "%d_%d" % (int(time.time()), os.getpid())
+        os.environ["PERF_MCP_RUN_ID"] = cur
+    return cur
 
 
 class Counter:
@@ -452,6 +549,23 @@ def board_needs_reset() -> bool:
     return _board_needs_reset()
 
 
+def device_holders() -> set:
+    """Pids holding /dev/tenstorrent open, except this process and its ancestors. Best-effort: no
+    `fuser` or an unreadable node yields fewer holders, never an exception. The one scan both the
+    reaper below and the agent runners' leftover wait (cc_harness) use."""
+    import glob as _glob
+    import subprocess as _sp
+
+    holders = set()
+    for node in _glob.glob("/dev/tenstorrent/*"):
+        try:
+            r = _sp.run(["fuser", node], capture_output=True, text=True, timeout=30)
+            holders.update(int(t) for t in (r.stdout + " " + r.stderr).split() if t.strip().isdigit())
+        except Exception:  # noqa: BLE001
+            pass
+    return holders - _protected_pids()
+
+
 def reap_device_holders() -> list:
     """SIGKILL every process holding /dev/tenstorrent except this one and its ancestors.
 
@@ -462,20 +576,10 @@ def reap_device_holders() -> list:
     runs on the recovery path, where the board is already in trouble; a reclaim that can raise would
     turn a recoverable wedge into a dead run.
     """
-    import glob as _glob
     import signal as _signal
-    import subprocess as _sp
 
-    protected = _protected_pids()
-    holders = set()
-    for node in _glob.glob("/dev/tenstorrent/*"):
-        try:
-            r = _sp.run(["fuser", node], capture_output=True, text=True, timeout=30)
-            holders.update(int(t) for t in (r.stdout + " " + r.stderr).split() if t.strip().isdigit())
-        except Exception:  # noqa: BLE001
-            pass
     killed = []
-    for pid in sorted(holders - protected):
+    for pid in sorted(device_holders()):
         try:
             os.kill(pid, _signal.SIGKILL)
             killed.append(pid)
@@ -484,7 +588,71 @@ def reap_device_holders() -> list:
     return killed
 
 
-def recover(where: str, reset, error_text: str = "", config_target: str = "", log=None, expand=None) -> bool:
+# The device spec the orchestrator runs with (--devices), exported for every layer below it.
+DEVICES_ENV = "PERF_MCP_DEVICES"
+
+
+def requested_chip_count(devices: str):
+    """How many chips --devices asks for, or None when it does not narrow the host.
+
+    "all" (and anything unparseable) means the whole host and must NOT pin visibility. "single" is
+    one chip. An explicit list is its own length, so "0,1" is two. Pure string work: nothing here
+    opens a device, so it is safe to ask at the moment a device just died.
+    """
+    text = str(devices or "").strip().lower()
+    if not text or text == "all":
+        return None
+    if text == "single":
+        return 1
+    ids = [part for part in re.split(r"[,\s]+", text) if part]
+    if ids and all(part.isdigit() for part in ids):
+        return len(ids)
+    return None
+
+
+def reset_is_mandatory_after_kill(devices=None, env=None, chip_count=None) -> bool:
+    """After a device process was SIGKILLed, is a reset required whatever the telemetry says?
+
+    The kill itself is the evidence when the run held MORE THAN ONE CHIP: a multi-chip ETH fabric
+    killed mid-run stays wedged while every ARC keeps answering, so the temperature veto in
+    recover() cancels the reset the next run needs (reproduced on a T3K 2026-09-25; the full
+    account is at cc_optimize/run.py:_reset_is_mandatory_after_kill). A single-chip run has no
+    fabric to wedge, so it keeps the veto -- that is the 2026-08-17 single-chip injury the veto
+    exists for.
+
+    The chip count comes from the child's environment first, then the device spec (DEVICES_ENV when
+    none is given). A count that cannot be taken is UNKNOWN, not one: "all" or an unparseable spec
+    means every chip on the box, so it is treated as a fabric. ``chip_count`` counts an explicit
+    spec; the default is requested_chip_count, which never opens a device.
+
+    No spec at all (devices=None and DEVICES_ENV unset -- a layer run outside the orchestrator)
+    answers False: nothing says the run held a fabric, so the veto keeps the last word, exactly as
+    it did before this rule reached that layer.
+    """
+    try:
+        chips = int((env or {}).get("device_count") or (env or {}).get("mesh_chips") or 0)
+    except (TypeError, ValueError, AttributeError):
+        chips = 0
+    if chips:
+        return chips > 1
+    spec = os.environ.get(DEVICES_ENV) if devices is None else devices
+    if spec is None:
+        return False
+    if (spec or "").strip().lower() in ("", "all"):
+        return True
+    n = (chip_count or requested_chip_count)(spec)
+    return n is None or n > 1
+
+
+def recover(
+    where: str,
+    reset,
+    error_text: str = "",
+    config_target: str = "",
+    log=None,
+    expand=None,
+    fault_is_certain: bool = False,
+) -> bool:
     """Reset the device and REPORT WHETHER IT CAME BACK. True only on a VERIFIED-healthy device.
 
     ``reset`` is a callable taking the target spec -- the only per-caller part. Everything else
@@ -560,7 +728,32 @@ def recover(where: str, reset, error_text: str = "", config_target: str = "", lo
     # reset it might have wanted, and gets one on the next attempt once its telemetry goes. A board
     # that is alive and healthy no longer gets reset at all, which is the failure that cost four
     # chips today.
-    if not _board_needs_reset():
+    # EVIDENCE OUTRANKS TELEMETRY, and only evidence does.
+    #
+    # The temperature veto reads the ARC: a chip that reports a plausible die temperature has a
+    # running ARC, "which is the thing a reset exists to restore". That holds for the fault it was
+    # written for -- 2026-08-17, a reset fired by a TIMEOUT, with no failure signature behind it.
+    #
+    # It does not hold for a stuck ETH fabric. The ARC keeps running and every chip keeps publishing
+    # its temperature while the fabric is dead, so the veto cancels the reset, recover() returns
+    # True, and the caller is told the board came back when nothing was done. Measured 2026-09-25 on
+    # this box: the coverage probe failed with "Timed out waiting for ETH heartbeat ... Stuck at
+    # 0xaabb0024", the reclaim reported "no reset issued", the retry hit the identical wedge, and
+    # `tt-smi -s` answered normally throughout. The veto's own escape hatch -- "gets one on the next
+    # attempt once its telemetry goes" -- never opens for this fault, because the telemetry never
+    # goes.
+    #
+    # So a failure whose OWN TEXT carries a dead-board signature is not vetoed. That is a narrow
+    # door: is_dead_board matches specific runtime faults, never a slow op or a plain timeout, so
+    # the 2026-08-17 path (no signature in its output) still cancels exactly as before. Absent
+    # evidence the telemetry veto is unchanged and still has the last word.
+    # ``fault_is_certain`` is the caller saying it already KNOWS -- see _reset_is_mandatory_after_kill
+    # in run.py. A SIGKILL of a multi-chip run is a fabric-corrupting event whether or not the dead
+    # process left any text behind, and after a kill there usually is none: the evidence is the kill,
+    # not the output. Without this the two halves disagreed -- measured 2026-09-25, the caller
+    # correctly decided "reset mandatory" and this still answered "no reset issued", because every
+    # ARC was warm and error_text was empty.
+    if not fault_is_certain and not is_dead_board(error_text) and not _board_needs_reset():
         if log:
             log(
                 "reset SKIPPED at %s: every chip reports a die temperature (%s), so nothing is "

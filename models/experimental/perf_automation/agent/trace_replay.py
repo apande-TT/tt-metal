@@ -42,6 +42,117 @@ _NOTE_MAX_DEPTH = 3
 _REPLAY_ITERS = max(1, int(os.environ.get("TT_TRACE_REPLAY_ITERS", "16")))
 
 
+# A LOOP THAT PRINTS NOTHING READS AS A HANG, AND IT IS NOT ONE.
+#
+# Warmup, capture and replay ran their iterations in silence, and the replay batch is enqueued
+# non-blocking and then waited on in ONE `synchronize_device` -- so a stage whose step costs tens of
+# seconds produces no log line, no syscall and no stack movement for the whole of 3 + 16 iterations.
+# Every supervising watchdog in this tree judges liveness on exactly those signals
+# (probes.progress_signature), so it reports "no forward progress" and kills work that is perfectly
+# healthy. On 2026-09-29 that killed one Qwen-Image-Edit stage three times over, each kill reported as
+# a device wedge, and the retry loop re-ran the same silence.
+#
+# THE CURE FOR SILENCE IS TO SPEAK, NOT TO PICK A LARGER TIMEOUT. Whatever number anyone chooses is a
+# guess about a stage nobody has measured yet; a line per iteration is a fact. Growing the log is
+# already one of the four progress signals, so no watchdog, window or caller needs to change.
+#
+# The cadence is the one thing that must not be typed: it has to stay INSIDE whatever window is
+# supervising us, and only that supervisor knows it. It tells us in the environment, so the beat is
+# read from there and divided; a dimensionless divisor carries no assumption about the model, the
+# stage or the box. With nothing said, fall back to the tightest cadence any caller supervises at.
+_HEARTBEAT_DIVISOR = 4  # beats per supervising window, so a missed beat is never the first evidence
+_STALL_WINDOW_ENVS = ("PERF_MCP_VALIDATE_STALL_SEC", "PERF_MCP_MEASURE_STALL_SEC", "PERF_MCP_ROUND_STALL_SEC")
+
+
+def _heartbeat_s() -> float:
+    """Seconds between liveness lines: a fraction of the tightest window supervising this process."""
+    windows = []
+    for key in _STALL_WINDOW_ENVS:
+        try:
+            v = float(os.environ.get(key) or 0)
+        except ValueError:
+            v = 0.0
+        if v > 0:
+            windows.append(v)
+    if not windows:
+        try:  # what probes._execute supervises at when no caller narrowed it
+            from .probes import _execute
+
+            import inspect
+
+            windows.append(float(inspect.signature(_execute).parameters["stall_timeout_s"].default))
+        except Exception:  # noqa: BLE001
+            return 0.0  # nothing to stay inside of -> the caller is unsupervised, stay quiet
+    return max(1.0, min(windows) / _HEARTBEAT_DIVISOR)
+
+
+class _Alive:
+    """Say so, on a beat, while a blocking device call holds this process silent.
+
+    The same shape as the thermal wait's heartbeat (cc_optimize/run's _COOL_HEARTBEAT_S): a child
+    that is busy ON PURPOSE re-asserts it, rather than every supervisor being taught to expect this
+    particular silence."""
+
+    def __init__(self, what: str):
+        self._what = what
+        self._stop = None
+        self._t = None
+
+    def __enter__(self):
+        beat = _heartbeat_s()
+        if beat <= 0:
+            return self
+        import threading
+
+        self._stop = threading.Event()
+        t0 = time.monotonic()
+
+        def _beat():
+            while not self._stop.wait(beat):
+                print(
+                    "TRACE_STAGE_WAITING[%s] %ds on device" % (self._what, int(time.monotonic() - t0)),
+                    flush=True,
+                )
+
+        self._t = threading.Thread(target=_beat, daemon=True)
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self._stop is not None:
+            self._stop.set()
+            self._t.join(timeout=1)
+        return False
+
+
+def _iterate(step, iters, what, keep=False):
+    """Run `iters` steps, reporting on the heartbeat cadence, keeping the results only if asked.
+
+    THROTTLED, NOT PER-ITERATION, and it does not retain what it does not need: this runs inside a
+    timed region, a fast stage does thousands of iterations, and the replay loop deliberately drops
+    each result so the device buffers it holds are freed. Beating at the same cadence as the waits
+    costs nothing measurable and breaks the silence just as well."""
+    out = []
+    n = max(0, iters)
+    beat = _heartbeat_s()
+    last = time.monotonic()
+    # THE LOOP CAN ONLY SPEAK BETWEEN ITERATIONS, AND ONE ITERATION CAN OUTLAST THE WINDOW. A stage
+    # whose single step costs more than the supervising window is silent for the whole of it, so
+    # reporting per iteration is not enough on its own -- the beat has to come from somewhere that is
+    # not waiting on the step. Hence the heartbeat across the whole loop: the ITER lines mark
+    # progress, the heartbeat proves liveness, and no step duration can outrun it.
+    with _Alive(what):
+        for i in range(n):
+            r = step()
+            if keep:
+                out.append(r)
+            now = time.monotonic()
+            if i + 1 == n or (beat > 0 and now - last >= beat):
+                last = now
+                print("TRACE_STAGE_ITER[%s]=%d/%d" % (what, i + 1, n), flush=True)
+    return out
+
+
 def _warm(step, iters):
     """Run the warmup steps, keeping what each one handed back.
 
@@ -49,7 +160,7 @@ def _warm(step, iters):
     is the one thing the capture path and the self-traced path have in common -- putting the check in
     either alone would have missed every pipeline that takes the other, and gemma3 takes the other.
     """
-    return [step() for _ in range(max(0, iters))]
+    return _iterate(step, iters, "warmup", keep=True)  # _check_advance reads the samples
 
 
 def _check_advance(samples):
@@ -73,19 +184,24 @@ def _check_advance(samples):
 def _capture_step_trace(device, step):
     """Warm up, then capture exactly one host-op-free, fixed-shape step as a trace on cq0."""
     _check_advance(_warm(step, _WARMUP_ITERS))
-    ttnn.synchronize_device(device)
-    tid = ttnn.begin_trace_capture(device, cq_id=0)
-    step()
-    ttnn.end_trace_capture(device, tid, cq_id=0)
-    ttnn.synchronize_device(device)
+    with _Alive("capture"):
+        ttnn.synchronize_device(device)
+        tid = ttnn.begin_trace_capture(device, cq_id=0)
+        step()
+        ttnn.end_trace_capture(device, tid, cq_id=0)
+        ttnn.synchronize_device(device)
     return tid
 
 
 def _replay_1cq(device, tid, iters):
+    # The replays are enqueued non-blocking ON PURPOSE -- that is what makes this a steady-state
+    # throughput measurement -- so the wait is one silent block that no per-iteration print can
+    # break. Hence the heartbeat: it grows the log without touching the timed region.
     t0 = time.perf_counter()
     for _ in range(iters):
         ttnn.execute_trace(device, tid, cq_id=0, blocking=False)
-    ttnn.synchronize_device(device)
+    with _Alive("replay x%d" % iters):
+        ttnn.synchronize_device(device)
     return (time.perf_counter() - t0) / iters
 
 
@@ -268,9 +384,9 @@ def _measure_native(device, stage):
     _report_read_set(stage.name, dispatched, _ws_bytes)
     ttnn.synchronize_device(device)
     t0 = time.perf_counter()
-    for _ in range(_REPLAY_ITERS):
-        stage.step()
-    ttnn.synchronize_device(device)
+    _iterate(stage.step, _REPLAY_ITERS, stage.name)
+    with _Alive(stage.name):
+        ttnn.synchronize_device(device)
     per_s = (time.perf_counter() - t0) / _REPLAY_ITERS
     tp = getattr(stage, "trace_path", None)
     if callable(tp):
@@ -481,6 +597,17 @@ def measure_adapter(adapter, device) -> float:
         except Exception:  # noqa: BLE001
             _dims = (1, 1)
     _dp, _tp = int(_dims[0]), int(_dims[1])
+    # THE PIPELINE'S OWN SPLIT, when it states one, over the mesh's axis order. rows x cols says how
+    # many chips, not which axis is tensor-parallel: Qwen-Image-Edit opens 8x4 and runs TP=8 over axis
+    # 0, which this printed as TP=4 (stage_marks.pipeline_tp; stage_seams.TP_ATTR).
+    try:
+        from .stage_marks import pipeline_tp as _pipeline_tp
+
+        _own_tp = _pipeline_tp(getattr(adapter, "_pipe", None) or adapter)
+        if _own_tp and (_dp * _tp) % _own_tp == 0:
+            _dp, _tp = (_dp * _tp) // _own_tp, _own_tp
+    except Exception:  # noqa: BLE001 -- an unstated split keeps the mesh's
+        pass
     print("DP=%d TP=%d shard_active=%s" % (_dp, _tp, bool(_dp * _tp > 1)), flush=True)
 
     stages = list(getattr(adapter, "stages", None) or [])
@@ -522,6 +649,17 @@ def measure_adapter(adapter, device) -> float:
         _n = int(getattr(st, "items", 0) or 0)
         if _n > 0:
             print("TRACE_STAGE_ITEMS[%s]=%d" % (st.name, _n), flush=True)
+
+    # WHICH MODULES EACH STAGE RUNS, read from the pipeline's own code (stage_marks.stage_module_paths)
+    # so perf_mcp can price each stage's compute from the weights it actually multiplies instead of
+    # charging every stage the whole model. Silent when the stages cannot be matched.
+    try:
+        from .stage_marks import stage_module_paths as _stage_module_paths
+
+        for _sn, _sp in _stage_module_paths(getattr(adapter, "_pipe", None) or adapter).items():
+            print("TRACE_STAGE_MODULES[%s]=%s" % (_sn, ",".join(_sp)), flush=True)
+    except Exception:  # noqa: BLE001
+        pass
 
     pipeline_ms = sum(ms for _, ms, _ in results)
     # THE UNIT IS A STRUCTURAL FACT, so read the STRUCTURE, not a name. This matched

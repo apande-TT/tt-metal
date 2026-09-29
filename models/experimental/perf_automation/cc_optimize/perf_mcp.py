@@ -37,6 +37,7 @@ sys.path.insert(0, str(_PKG))  # the perf_automation dir, so `agent` imports res
 
 from agent import gitio, perf_target, promote, roofline, router  # noqa: E402
 from agent import integrity as _integrity  # noqa: E402
+from agent.probes import PYTEST_NO_TIMEOUT  # noqa: E402
 from agent.probes import tt_smi_bin as _tt_smi_bin  # noqa: E402
 from agent.layer_depth import set_depth as _set_depth  # noqa: E402
 
@@ -456,6 +457,30 @@ _RESET_FAILS = _dr().RESET_FAILS
 
 def _is_dead_board(text) -> bool:
     return _dr().is_dead_board(text)
+
+
+# Label the recovery logs against, so all three baseline exits report one origin.
+_BASELINE_WHERE = "full-pipeline baseline"
+
+
+def _recover_if_board_is_dead(evidence, where: str) -> bool:
+    """Hand a failure's OWN TEXT to device recovery before giving up on it.
+
+    The per-op loop is wedge-aware: a wedge there is recorded and the board is reset between
+    attempts, which is why an optimize table can show `·wedge` on one knob and a win on the next.
+    The baseline measurement that runs BEFORE that loop was not: its failure exits returned the
+    error upward without ever asking whether the board had died, so a wedge surfaced as "the
+    workload printed no timing marker". Nothing called is_dead_board, nothing counted a crash, and
+    the reset that already exists was never issued -- a dead board then failed every retry
+    identically for as long as the run lasted.
+
+    Returns True only when the board was recognised as dead AND the reset reported success, so the
+    caller can tell "recovered, worth retrying" from "not a device problem".
+    """
+    text = str(evidence or "")
+    if not text or not _is_dead_board(text):
+        return False
+    return _recover_device(where, error_text=text)
 
 
 def _dead_chip_from_error(text):
@@ -1203,6 +1228,7 @@ def _summary_mod():
     spec = importlib.util.spec_from_file_location("cc_summary", str(Path(__file__).parent / "summary.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    mod.set_run_env(_ENV)  # the hardware this run's manifest detected -- the report never assumes one
     return mod
 
 
@@ -2592,18 +2618,33 @@ def _grow_trace_region_and_retry(cmd, repo, env, out, r):
 
     A run that produced a trace number, or that declared the pipeline genuinely un-traceable
     (TRACE_NOT_TRACE_CAPABLE), is left alone. Returns the last (output, result).
+
+    A TRACE NUMBER MEANS A POSITIVE ONE. The harness prints TRACE_PER_TOKEN_MS even when every stage
+    raised, as 0.0000, and this loop used to stop on the bare sentinel -- so a region too small for
+    every stage read as "a real trace ran" and was never grown. Measured on Qwen-Image-Edit (WH
+    Galaxy, 2026-09-27): the full-model run started at the DRAM-derived 192 MB against a pipeline
+    needing ~896 MB, all five stages failed, the headline was 0, and the gate reported a crash with
+    no retry; the same run at 896 MB times vision_encode normally. A zero headline is grown only on
+    the same overflow evidence the build phase grows on (the device's byte count, or the bare mesh
+    assertion), so a run that measured nothing for another reason (an L1 overflow, a bad shard) is
+    still reported as it was, not re-run into the ceiling.
     """
     try:
-        from agent.perf_test_gen import _needed_trace_region, _TRACE_REGION_GROW_ROUNDS
+        from agent.perf_test_gen import _MESH_TRACE_OVERFLOW_RE, _needed_trace_region, _TRACE_REGION_GROW_ROUNDS
+        from agent.tracy_tool import per_token_readings
     except Exception:  # noqa: BLE001
         return out, r
     for _ in range(int(_TRACE_REGION_GROW_ROUNDS or 0)):
         text = out or ""
-        if "TRACE_PER_TOKEN_MS=" in text or "TRACE_NOT_TRACE_CAPABLE" in text:
+        readings = per_token_readings(text)
+        if any(v > 0 for v in readings) or "TRACE_NOT_TRACE_CAPABLE" in text:
             break  # a real trace ran, or the pipeline genuinely cannot trace -- nothing to grow
         cur = int(env.get("TT_PERF_TRACE_REGION") or os.environ.get("TT_PERF_TRACE_REGION") or _TRACE_REGION_DEFAULT)
         need = _needed_trace_region(text)
-        silent = need is None
+        if readings and need is None and not _MESH_TRACE_OVERFLOW_RE.search(text):
+            break  # it finished and measured nothing, but not for want of trace space
+        # silent = the run printed no headline at all: a hung overflow, the only case that wedges the mesh
+        silent = need is None and not readings
         target = min(max(int(need), cur * 2) if need is not None else cur * 2, _TRACE_REGION_MAX)
         if target <= cur:
             break  # already at the DRAM ceiling -> the trace genuinely does not fit
@@ -2611,7 +2652,11 @@ def _grow_trace_region_and_retry(cmd, repo, env, out, r):
         sys.stderr.write(
             "[perf-mcp] trace region too small (%s); growing to %d B%s and re-running\n"
             % (
-                "silent overflow / mesh hang -- no size reported" if silent else "device reports %d B" % need,
+                (
+                    "silent overflow / mesh hang -- no size reported"
+                    if silent
+                    else ("device reports %d B" % need if need is not None else "mesh overflow -- no size reported")
+                ),
                 target,
                 " + resetting the wedged device" if silent else "",
             )
@@ -3182,7 +3227,7 @@ def _run_full_pipeline_ms():
         env[_tokens_env()] = _gate_tokens
     # -p depth_guard: this gate asks for ALL layers by removing the cap, and a perf test can fill
     # it back in at import via setdefault. The guard drops it again before the test body builds.
-    cmd = [sys.executable, "-m", "pytest", "-p", _DEPTH_GUARD, "-o", "timeout=0", "-s", node]
+    cmd = [sys.executable, "-m", "pytest", "-p", _DEPTH_GUARD, *PYTEST_NO_TIMEOUT, "-s", node]
     if case:
         cmd += ["-k", case]
     per_tokens = []
@@ -3207,6 +3252,7 @@ def _run_full_pipeline_ms():
     stage_bytes_samples: dict = {}
     stage_paths = {}
     stage_isl = {}
+    stage_modules: dict = {}  # {stage: module paths it runs}, from TRACE_STAGE_MODULES
     # {stage: items PER REQUEST}, the legacy marker's unit. Kept apart from stage_isl, which holds
     # the TOTAL a stage states for one call.
     stage_isl_per_request = {}
@@ -3384,6 +3430,14 @@ def _run_full_pipeline_ms():
             # THE COUNT THE STAGE ITSELF STATED, for whatever stage stated it. TRACE_STAGE_ITEMS is
             # printed beside TRACE_STAGE_MS by the same loop that measured the stage, so a third
             # tower can carry a real item count instead of inheriting the fallback of 1.
+            if "TRACE_STAGE_MODULES[" in line:
+                try:
+                    _mn = line.split("TRACE_STAGE_MODULES[", 1)[1].split("]", 1)[0].strip()
+                    _mv = [x.strip() for x in line.split("]=", 1)[1].split()[0].split(",") if x.strip()]
+                    if _mn and _mv:
+                        stage_modules[_mn] = _mv
+                except Exception:  # noqa: BLE001
+                    pass
             if "TRACE_STAGE_ITEMS[" in line:
                 try:
                     _nm = line.split("TRACE_STAGE_ITEMS[", 1)[1].split("]", 1)[0].strip()
@@ -3475,6 +3529,9 @@ def _run_full_pipeline_ms():
     # prices the same non-advancing step. Failing the measurement is the honest outcome -- the gate
     # then reports no reading rather than a fast one.
     if decode_stuck:
+        # A wedged board makes the step stop advancing, which is indistinguishable from a workload
+        # that genuinely stalls -- so ask the recovery, which knows the difference.
+        _recover_if_board_is_dead(decode_stuck, _BASELINE_WHERE)
         return None, None, "decode did not advance between iterations: %s" % decode_stuck, None
     dec = statistics.median(per_tokens) if per_tokens else None
     pf = statistics.median(prefills) if prefills else None
@@ -3557,6 +3614,7 @@ def _run_full_pipeline_ms():
                     )
         except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost a measurement
             pass
+        _pin_stage_params_and_tp(stage_modules, tp)
         # PIN THE BASELINE READ SET, where it is produced. Measuring the bytes made them right; it did
         # not stop them moving, and the dtype rung moves them by construction: bf16 -> bf8_b halves a
         # weight, the observed bytes halve, and a ceiling recomputed from them retreats ahead of the
@@ -3598,11 +3656,15 @@ def _run_full_pipeline_ms():
     if walls:
         return statistics.median(walls), "eager", None, None
     if last_err:
+        _recover_if_board_is_dead(last_err, _BASELINE_WHERE)
         return None, None, last_err, None
     # ATTACH THE EVIDENCE. `out` holds the workload's full stdout+stderr and was being discarded, so
     # this gate could only ever say "no markers" -- the actual reason (a TT_FATAL, an import error, a
     # crash before the first print) was written nowhere. Every full-pipeline failure was therefore
     # undiagnosable without patching the tool, which cost several wrong diagnoses on 2026-07-25/26.
+    # The same `out` that is attached as evidence below is the only place a dead board announces
+    # itself on this path, so give it to the recovery before reporting "no markers".
+    _recover_if_board_is_dead(locals().get("out") or "", _BASELINE_WHERE)
     return (
         None,
         None,
@@ -7033,6 +7095,68 @@ def _perf_target_status(rep: dict, dev: float) -> dict | None:
         return None
 
 
+def _pin_stage_params_and_tp(stage_modules: dict, tp) -> None:
+    """Pin, where they are observed, the two ceiling inputs a stage-by-stage roof needs.
+
+    - matmul_params per stage: the parameters the modules each stage runs multiply
+      (model_bytes.stage_params over the model's own checkpoint), so a stage is no longer charged the
+      whole model. Qwen-Image-Edit: denoise 20.43 B, text_encode 7.07 B, vision_encode 0.68 B, the
+      VAE halves 0.05 / 0.07 B -- where the flat fallback charged each of them 28.85 B.
+    - tp_degree: what the run's own DP=/TP= marker reported.
+    Write-once (measurements.anchor); best-effort, never costs a measurement."""
+    try:
+        led = _ledger()
+        model = _MODEL_ROOT.name if _MODEL_ROOT else ""
+        if tp:
+            led.anchor(
+                led.KIND_TP_DEGREE,
+                float(int(tp)),
+                depth="pipeline",
+                mode="count",
+                source="trace_replay DP=/TP= marker",
+                model=model,
+            )
+        if not stage_modules:
+            return
+        import importlib.util as _ilu
+
+        _spec = _ilu.spec_from_file_location("cc_run_stage_params", str(Path(__file__).parent / "run.py"))
+        _run = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_run)
+        from agent.checkpoint_sections import hf_cache_dir
+        from agent.model_bytes import stage_params
+
+        _snap = hf_cache_dir(_run._model_id_for_facts(_MODEL_ROOT) or "")
+        for _st, _n in (stage_params(_snap, stage_modules) if _snap else {}).items():
+            if _st and int(_n) > 0:
+                led.anchor(
+                    led.KIND_MATMUL_PARAMS,
+                    float(int(_n)),
+                    depth=str(_st).strip().lower(),
+                    mode="params",
+                    source="stage modules (pipeline code) x checkpoint headers",
+                    model=model,
+                )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _tp_degree() -> int:
+    """TP for the ceilings: the operator's topology when the tool exported one, else the degree the
+    run's own marker reported (pinned), else 1."""
+    env_tp = int(os.environ.get("TT_PERF_MESH_COLS", "0") or "0")
+    if env_tp > 0:
+        return env_tp
+    try:
+        led = _ledger()
+        v = led.anchor_value(led.KIND_TP_DEGREE, depth="pipeline", model=_MODEL_ROOT.name if _MODEL_ROOT else "")
+        if v and int(v) > 0:
+            return int(v)
+    except Exception:  # noqa: BLE001
+        pass
+    return 1
+
+
 def _select_perf_target(rep: dict):
     """Pick the roofline target for this pipeline, STATIC (no measurement mixed in). Returns
     ``(target, scope, has_unit_ceiling)``. Model-level config ceiling (compute_target, per-token tok/s)
@@ -7049,7 +7173,7 @@ def _select_perf_target(rep: dict):
             # purpose, and it was only wired into the report.
             mf = _anchored_ceiling_facts()
         if mf:
-            tp = int(os.environ.get("TT_PERF_MESH_COLS", "1") or "1")
+            tp = _tp_degree()
             # THE GATE AND THE REPORT MUST DIVIDE BY THE SAME BYTES. The report prices each stage by
             # the subtree it streams -- a decode token reads the language backbone and never the
             # audio encoder -- while this handed compute_target the WHOLE model. On a two-tower model
@@ -7208,11 +7332,11 @@ def _dominant_peak_flops(rep: dict) -> float:
         if not agg:
             return 0.0
         dom = max(agg.items(), key=lambda kv: kv[1])[0]
-        from agent.environment import ARCH_FACTS
         from agent.perf_target import chip_peak_flops as _cpf
 
-        _arch = str(os.environ.get("PERF_MCP_ARCH") or "blackhole").strip().lower()
-        return float(_cpf(ARCH_FACTS.get(_arch) or {}, dom) or 0.0)
+        # The run's detected hardware (its manifest env), the same _ENV every op is priced with --
+        # never a typed arch name.
+        return float(_cpf(roofline._facts(_ENV), dom) or 0.0) if _ENV else 0.0
     except Exception:  # noqa: BLE001 -- a peak that cannot be derived is simply not pinned
         return 0.0
 

@@ -92,6 +92,128 @@ def build_mcp_config(python_bin: str, server_path: str | Path, env: dict, server
     }
 
 
+# The out-of-band gate check's wall clock.
+#
+# A WRAPPER MUST NEVER BE TIGHTER THAN WHAT IT WRAPS. This call runs the gate in a subprocess, and
+# the gate has its own budget (the server's per-pytest timeout). While the default here was a flat
+# hour and the gate's own budget was four, an honest gate that simply took longer than an hour was
+# SIGKILLed mid-run and -- because the timeout was swallowed -- came back as an ordinary "not done"
+# with no reason. On a T3K at batch 32 the e2e gate needs ~110 min, so it could never complete: four
+# consecutive rounds died at 59m41s having done real work, and the kill was indistinguishable from a
+# PCC failure. It had never surfaced before because at batch 4 the same gate takes ~15 min.
+#
+# So the budget is, in order:
+#   1. ``_GATE_STATUS_TIMEOUT_ENV`` -- an operator's explicit value wins and is used unscaled.
+#   2. ADAPTIVE: a multiple of the longest gate this process has actually observed. Sized from
+#      measured cost rather than a typed number, so it follows the box, the batch and the precision
+#      mode by itself instead of needing one constant per combination.
+#   3. The caller's own budget as the FLOOR -- what it wraps, so it can never be tighter.
+# The result only ever grows. A gate that ran long once is not evidence that the next one is hung.
+_GATE_STATUS_TIMEOUT_ENV = "E2E_GATE_STATUS_TIMEOUT"
+_GATE_STATUS_GROWTH = 4  # headroom over the longest observed gate, matching probes' ceiling multiple
+_gate_status_observed: dict = {}
+
+
+def _gate_status_budget(key: str, floor: int) -> int:
+    """Seconds this gate check may take: operator's value, else measured cost, else the floor."""
+    override = os.environ.get(_GATE_STATUS_TIMEOUT_ENV)
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    observed = float(_gate_status_observed.get(key) or 0.0)
+    return max(int(floor), int(_GATE_STATUS_GROWTH * observed))
+
+
+def _record_gate_status_cost(key: str, seconds: float) -> None:
+    """Remember the longest this gate has taken, so later checks are sized from it."""
+    if seconds > 0 and seconds > float(_gate_status_observed.get(key) or 0.0):
+        _gate_status_observed[key] = float(seconds)
+
+
+def _supervised_gate_run(cmd: list, cwd, env: dict, progress_log, budget: int):
+    """Run the gate check under FORWARD-PROGRESS supervision instead of a stopwatch.
+
+    ANY budget is a guess, and the guess is what keeps going wrong: a gate that legitimately runs
+    longer than the number someone picked is killed having done real work. The gate already writes
+    its tests' output live to `progress_log`, so there is a true signal available -- kill only when
+    that file (and the group's counters and stack) have stopped moving for the watchdog's own stall
+    window. `budget` stays as an absolute backstop against a process that produces output forever
+    without finishing.
+
+    Supervision is `probes.ProgressWatch`, which exists precisely so this rule is not re-spelled per
+    caller, and the stall window is read off `probes._execute`'s signature rather than retyped.
+
+    Returns (rc, stalled). Raises nothing; the caller owns the verdict."""
+    import inspect
+    import subprocess as _sp
+    import tempfile as _tf
+
+    from models.experimental.perf_automation.agent import probes as _pr
+
+    stall_s = inspect.signature(_pr._execute).parameters["stall_timeout_s"].default
+    out_path = Path(_tf.mkdtemp(prefix="gate_status_")) / "stdout.log"
+    started = time.monotonic()
+    last_progress = started
+    over_budget = [False]
+    with open(out_path, "w") as out_fh:
+        # OWN PROCESS GROUP, or the watcher counts OUR syscalls as the child's progress and nothing
+        # ever looks stalled. The gate's own pytest is in a further group again -- which is exactly
+        # why the log file, not the group, is what carries its progress here.
+        proc = _sp.Popen(cmd, cwd=str(cwd), env=env, stdout=out_fh, stderr=_sp.STDOUT, start_new_session=True)
+        watch = _pr.ProgressWatch(os.getpgid(proc.pid), Path(progress_log), stall_s)
+        while True:
+            try:
+                rc = proc.wait(timeout=5.0)
+                return rc, False, out_path
+            except _sp.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            if watch.moved(now, last_progress, proc.pid):
+                watch.note_progress(now, last_progress)
+                last_progress = now
+            if stall_s and now - last_progress >= watch.limit():
+                _pr._kill_tree(proc.pid)
+                proc.wait()
+                return None, True, out_path
+            # OVER BUDGET IS NOT A VERDICT while the gate is visibly working. `_execute` already
+            # settles this the same way -- say so once, keep going, and kill only at the hard
+            # ceiling -- so the multiple is taken from there rather than chosen again here.
+            if budget and now - started >= budget and not over_budget[0]:
+                over_budget[0] = True
+                print(
+                    f"  [gate] over its {int(budget)}s budget and STILL WORKING (its log is growing); "
+                    f"not killing it -- the stall check decides, and a hard ceiling at "
+                    f"{int(budget * _pr._HARD_CEILING_MULT)}s is behind that",
+                    flush=True,
+                )
+            if budget and now - started >= budget * _pr._HARD_CEILING_MULT:
+                _pr._kill_tree(proc.pid)
+                proc.wait()
+                return None, False, out_path
+
+
+def _parse_gate_output(out: str) -> dict:
+    """The server's printed verdict, as a dict. One reader, shared by both run paths."""
+
+    def pick(pfx: str) -> str:
+        for line in out.splitlines():
+            if line.startswith(pfx):
+                return line[len(pfx) :]
+        return ""
+
+    return {
+        "can_stop": "CANSTOP=True" in out,
+        "halt": "HALT=True" in out,
+        "reason": pick("HALTREASON="),
+        "next_op": pick("NEXTOP="),
+        "next_rung": pick("NEXTRUNG="),
+        "graduated": [c for c in pick("GRAD=").split(",") if c],
+        "shard_graduated": [c for c in pick("SHARDGRAD=").split(",") if c],
+    }
+
+
 def gate_status(
     python_bin: str,
     server_dir: str | Path,
@@ -99,6 +221,7 @@ def gate_status(
     mcp_env: dict,
     cwd: str | Path,
     timeout_s: int = 3600,
+    progress_log: str | Path | None = None,
 ) -> dict:
     """Call the server's ``termination_check()`` out-of-band (driver-side, NOT the agent) and return
     ``{can_stop, halt, reason, next_op, next_rung}``. The gate logic lives in ``server_module`` — this
@@ -122,34 +245,55 @@ def gate_status(
     )
     env = dict(os.environ)
     env.update(mcp_env)
+    budget = _gate_status_budget(str(server_module), timeout_s)
+    started = time.monotonic()
+    cmd = [str(python_bin), "-c", code, str(server_dir)]
+    if progress_log:
+        # The gate streams its tests' output here, so a real signal exists: supervise progress
+        # rather than guess a duration. The stopwatch below stays for callers that offer no log.
+        rc, stalled, out_path = _supervised_gate_run(cmd, cwd, env, progress_log, budget)
+        out = ""
+        try:
+            out = Path(out_path).read_text()
+        except OSError:
+            pass
+        if rc is None:
+            waited = int(time.monotonic() - started)
+            reason = (
+                f"the gate check made no progress for the watchdog's stall window and was killed after "
+                f"{waited}s -- its log stopped growing while it was still running"
+                if stalled
+                else f"the gate check was killed after {waited}s (backstop {int(budget)}s) -- it did not "
+                f"report a verdict. Raise ${_GATE_STATUS_TIMEOUT_ENV} if the gate legitimately takes longer."
+            )
+            print(f"  [gate] {reason}", flush=True)
+            return {"can_stop": False, "halt": False, "reason": reason, "next_op": "", "next_rung": ""}
+        _record_gate_status_cost(str(server_module), time.monotonic() - started)
+        return _parse_gate_output(out)
     try:
         r = subprocess.run(
-            [str(python_bin), "-c", code, str(server_dir)],
+            cmd,
             cwd=str(cwd),
             env=env,
             capture_output=True,
             text=True,
-            timeout=timeout_s,
+            timeout=budget,
         )
+    except subprocess.TimeoutExpired:
+        # NAME IT. Swallowed, this is a verdict-shaped lie: the caller cannot tell a gate that was
+        # killed from one that ran and failed, so it retries the same work until the run is abandoned.
+        reason = (
+            f"the gate check was killed after {int(time.monotonic() - started)}s (limit {int(budget)}s) "
+            f"-- it did not report a verdict. Raise ${_GATE_STATUS_TIMEOUT_ENV} if the gate legitimately "
+            f"takes longer."
+        )
+        print(f"  [gate] {reason}", flush=True)
+        return {"can_stop": False, "halt": False, "reason": reason, "next_op": "", "next_rung": ""}
     except Exception:  # noqa: BLE001
         return {"can_stop": False, "halt": False, "reason": "", "next_op": "", "next_rung": ""}
-    out = r.stdout or ""
-
-    def pick(pfx: str) -> str:
-        for line in out.splitlines():
-            if line.startswith(pfx):
-                return line[len(pfx) :]
-        return ""
-
-    return {
-        "can_stop": "CANSTOP=True" in out,
-        "halt": "HALT=True" in out,
-        "reason": pick("HALTREASON="),
-        "next_op": pick("NEXTOP="),
-        "next_rung": pick("NEXTRUNG="),
-        "graduated": [c for c in pick("GRAD=").split(",") if c],
-        "shard_graduated": [c for c in pick("SHARDGRAD=").split(",") if c],
-    }
+    _record_gate_status_cost(str(server_module), time.monotonic() - started)
+    _record_gate_status_cost(str(server_module), time.monotonic() - started)
+    return _parse_gate_output(r.stdout or "")
 
 
 # Per-round wall-clock budget for one `claude -p` invocation, when the caller names none.
@@ -198,6 +342,79 @@ def _kill_agent_tree(proc: subprocess.Popen) -> None:
             return
         except subprocess.TimeoutExpired:
             continue
+
+
+# AN AGENT'S TURN ENDING IS NOT ITS DEVICE WORK ENDING. An agent regularly launches a long device run
+# detached (`nohup pytest ... &`), says "I'll check back", and ends its turn -- and `claude -p` exits at
+# the end of a turn. The run keeps going as an orphan, and the runner then moved straight on: the next
+# gate, or a device reclaim, killed it mid-run. On a WH Galaxy (2026-09-25) that threw away an
+# 18-minute e2e forward, and the night before a run killed mid-collective wedged the board.
+#
+# The Bash tool runs each command in its own session and a detached process is reparented to init, so
+# neither the session nor the parent says whose it is. The ENVIRONMENT does: every process the agent
+# starts inherits it. So each agent launch is tagged with a unique value of AGENT_RUN_ENV, and after the
+# agent exits the runner waits while any /dev/tenstorrent holder still carries that tag.
+AGENT_RUN_ENV = "TT_HW_PLANNER_AGENT_RUN"
+# Upper bound on that wait, per agent exit. A leftover still running past it is left to the existing
+# reclaim paths, exactly as before this wait existed. TT_HW_PLANNER_AGENT_LEFTOVER_WAIT_S overrides it.
+_DEFAULT_LEFTOVER_WAIT_S = 3600
+_LEFTOVER_POLL_S = 30
+
+
+def tag_agent_env(env: dict | None = None) -> tuple[dict, str]:
+    """(env with a fresh AGENT_RUN_ENV tag, the tag): pass the env to the agent, the tag to
+    wait_for_agent_device_work once it exits. `env` defaults to this process's environment."""
+    tag = "%d_%d" % (os.getpid(), time.time_ns())
+    return {**(os.environ if env is None else env), AGENT_RUN_ENV: tag}, tag
+
+
+def _carries_tag(pid: int, tag: str) -> bool:
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as fh:
+            return ("%s=%s" % (AGENT_RUN_ENV, tag)).encode() in fh.read().split(b"\0")
+    except OSError:
+        return False
+
+
+def _leftover_wait_s() -> int:
+    try:
+        return int(os.environ.get("TT_HW_PLANNER_AGENT_LEFTOVER_WAIT_S", str(_DEFAULT_LEFTOVER_WAIT_S)))
+    except ValueError:
+        return _DEFAULT_LEFTOVER_WAIT_S
+
+
+def wait_for_agent_device_work(tag: str, timeout_s: int | None = None, poll_s: float = _LEFTOVER_POLL_S) -> list:
+    """Block while a device holder started by the agent tagged `tag` is still running.
+
+    Returns the pids still running when the wait gave up ([] once they all finished). Best-effort and
+    never raises: if the holder scan is unavailable the wait is skipped, which is the old behaviour."""
+    try:
+        from models.experimental.perf_automation.agent.device_recovery import device_holders
+    except Exception:  # noqa: BLE001
+        return []
+    limit = _leftover_wait_s() if timeout_s is None else timeout_s
+    deadline = time.monotonic() + max(0, limit)
+    announced = False
+    while True:
+        try:
+            left = sorted(p for p in device_holders() if _carries_tag(p, tag))
+        except Exception:  # noqa: BLE001 -- a scan that cannot run must not stop the runner
+            return []
+        if not left:
+            if announced:
+                print("  · the agent's device run(s) finished; continuing", flush=True)
+            return []
+        if time.monotonic() >= deadline:
+            print(f"  · agent device run(s) {left} still running after {limit}s; continuing without them", flush=True)
+            return left
+        if not announced:
+            print(
+                f"  · the agent ended its turn with device run(s) {left} still going; waiting for them "
+                f"(up to {limit}s) so they are not killed mid-run",
+                flush=True,
+            )
+            announced = True
+        time.sleep(poll_s)
 
 
 def run_cc_loop(
@@ -253,10 +470,15 @@ def run_cc_loop(
     timeout_s = _resolve_agent_timeout_s(agent_timeout_s)
     consecutive_timeouts = 0
     verbose = _verbose()
+    st: dict = {}
     while rounds < max_rounds:
         st = gate_fn()
         if st.get("halt"):
             halted = True
+            # A HALT MUST SAY WHY. This branch used to break silently, so a loop that stopped on the
+            # gate's own authority looked identical to one that ran out of rounds, and the reason the
+            # gate had already computed was thrown away here.
+            print("  [cc-gate] HALT: %s" % (st.get("reason") or "no reason given"), flush=True)
             break
         if st.get("can_stop"):
             can_stop = True
@@ -286,10 +508,11 @@ def run_cc_loop(
                 "stream-json",
                 "--verbose",
             ], {}
+        _round_env, _round_tag = tag_agent_env({**env, **_agent_env} if _agent_env else env)
         proc = subprocess.Popen(
             _argv,
             cwd=str(cwd),
-            env=({**env, **_agent_env} if _agent_env else env),
+            env=_round_env,
             start_new_session=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -333,6 +556,7 @@ def run_cc_loop(
             proc.wait(timeout=timeout_s)
             pump.join(timeout=5)
             consecutive_timeouts = 0
+            wait_for_agent_device_work(_round_tag)  # before the next gate can reap or collide with it
         except subprocess.TimeoutExpired:
             _kill_agent_tree(proc)
             pump.join(timeout=5)
@@ -351,4 +575,6 @@ def run_cc_loop(
         rounds += 1
         if on_round is not None:
             on_round(rounds, st)
-    return {"rounds": rounds, "can_stop": can_stop, "halted": halted}
+    # `state` is the last gate verdict this loop saw. A caller that has to report a verdict after a
+    # halt can use it instead of paying for the whole gate again to be told the same thing.
+    return {"rounds": rounds, "can_stop": can_stop, "halted": halted, "state": st}
