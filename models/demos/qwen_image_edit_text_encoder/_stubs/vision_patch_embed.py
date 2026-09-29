@@ -28,7 +28,8 @@ class TtVisionPatchEmbed:
 
     def __call__(self, x, dtype=None, precise=False, **kwargs):
         if precise:  # float32 pixels carried as bf16 hi + lo -> exact products against the bf16 kernel
-            out = split_linear(x, self.weight, compute_kernel_config=self.compute_cfg, limbs=getattr(self, "limbs", 2))
+            ex, L = getattr(self, "exact", True), getattr(self, "limbs", 2)
+            out = split_linear(x, self.weight, compute_kernel_config=self.compute_cfg, exact=ex, limbs=L)
         else:
             out = ttnn.linear(x, self.weight, compute_kernel_config=self.compute_cfg, dtype=dtype)
         if self.tp > 1:

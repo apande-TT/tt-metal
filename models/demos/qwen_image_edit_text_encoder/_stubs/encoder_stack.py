@@ -131,10 +131,11 @@ class TtVisionMLP:
         if self.precise:
             cfg = self.compute_cfg
             L = getattr(self, "limbs", 2)
-            gate = split_linear(x, self.w_gate, bias=self.b_gate, compute_kernel_config=cfg, limbs=L)
-            up = split_linear(x, self.w_up, bias=self.b_up, compute_kernel_config=cfg, limbs=L)
+            ex = getattr(self, "exact", True)
+            gate = split_linear(x, self.w_gate, bias=self.b_gate, compute_kernel_config=cfg, exact=ex, limbs=L)
+            up = split_linear(x, self.w_up, bias=self.b_up, compute_kernel_config=cfg, exact=ex, limbs=L)
             h = ttnn.multiply(ttnn.silu(gate), up)
-            out = split_linear(h, self.w_down, compute_kernel_config=cfg, limbs=L)
+            out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex, limbs=L)
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)
             # float32 bias (a bf16 operand rounds the float32 sum to bf16)
@@ -187,11 +188,12 @@ class TtPatchMerger:
         if getattr(self, "precise", False):
             cfg = self.compute_cfg
             L = getattr(self, "limbs", 2)
+            ex = getattr(self, "exact", True)
             h = ttnn.gelu(
-                split_linear(x, self.w1, bias=self.b1, compute_kernel_config=cfg, limbs=L),
+                split_linear(x, self.w1, bias=self.b1, compute_kernel_config=cfg, exact=ex, limbs=L),
                 fast_and_approximate_mode=False,
             )
-            out = split_linear(h, self.w2, compute_kernel_config=cfg, limbs=L)
+            out = split_linear(h, self.w2, compute_kernel_config=cfg, exact=ex, limbs=L)
             if self.tp > 1:
                 out = exact_all_reduce(out, self._device)
             return ttnn.add(out, ttnn.typecast(self.b2, ttnn.float32))

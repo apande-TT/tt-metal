@@ -203,17 +203,26 @@ def _median3(a, b, c):
     return ttnn.maximum(ttnn.minimum(a, b), ttnn.minimum(ttnn.maximum(a, b), c))
 
 
-def _exact_sum(mm, parts):
-    """median over LANE_PATTERNS of sum_{part, lane} mm(lane(part))."""
+def _patterns(exact):
+    """exact=True -> all LANE_PATTERNS (median of three); a tuple of pattern names -> just those."""
+    return tuple(exact) if isinstance(exact, (tuple, list)) else LANE_PATTERNS
+
+
+def _vote(ests):
+    return ests[0] if len(ests) == 1 else _median3(*ests)
+
+
+def _exact_sum(mm, parts, patterns=LANE_PATTERNS):
+    """median over `patterns` of sum_{part, lane} mm(lane(part))."""
     ests = []
-    for pattern in LANE_PATTERNS:
+    for pattern in patterns:
         y = None
         for part in parts:
             for lane in _lanes(part, pattern):
                 t = mm(lane)
                 y = t if y is None else ttnn.add(y, t)
         ests.append(y)
-    return _median3(*ests)
+    return _vote(ests)
 
 
 def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2):
@@ -223,7 +232,7 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     parts = split_bf16(x, limbs)
     mm = lambda p: ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32)  # noqa: E731
     if exact:
-        y = _exact_sum(mm, parts)
+        y = _exact_sum(mm, parts, _patterns(exact))
     else:
         y = None
         for part in parts:
@@ -261,14 +270,14 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
             y = t if y is None else ttnn.add(y, t)
         return y
     ests = []
-    for pattern in LANE_PATTERNS:
+    for pattern in _patterns(exact):
         y = None
         for pa, pb in terms:
             for lane in _lanes(pa, pattern):
                 t = mm(lane, pb)
                 y = t if y is None else ttnn.add(y, t)
         ests.append(y)
-    return _median3(*ests)
+    return _vote(ests)
 
 
 def pad_rows(array, s_pad):
@@ -370,7 +379,8 @@ class TtVisionAttention:
         loc = hp * D
         cfg = self.compute_cfg
         L = getattr(self, "limbs", 2)
-        qkv = split_linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=cfg, limbs=L)
+        ex = getattr(self, "exact", True)
+        qkv = split_linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=cfg, exact=ex, limbs=L)
 
         def _heads(i):
             t = ttnn.slice(qkv, [0, 0, 0, i * loc], [n, 1, s_pad, (i + 1) * loc])
@@ -386,17 +396,17 @@ class TtVisionAttention:
 
         q, k = _rope(q), _rope(k)
         mask = tt_mask if tt_mask.dtype == ttnn.float32 else ttnn.typecast(tt_mask, ttnn.float32)
-        scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, limbs=L)
+        scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex, limbs=L)
         scores = ttnn.add(ttnn.multiply(scores, self.scale), mask)
         # explicit float32 softmax (the fused op mis-scales some masked window rows: one token of block
         # 12 measured 6.7% off with exact inputs)
         mx = ttnn.max(scores, dim=-1, keepdim=True)
         e = ttnn.exp(ttnn.subtract(scores, mx))
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
-        o = split_matmul(probs, v, compute_kernel_config=cfg, limbs=L)
+        o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex, limbs=L)
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.reshape(o, (n, 1, s_pad, loc))
-        out = split_linear(o, self.wproj, compute_kernel_config=cfg, limbs=L)
+        out = split_linear(o, self.wproj, compute_kernel_config=cfg, exact=ex, limbs=L)
         if self.tp > 1:
             out = exact_all_reduce(out, self.device)
         # float32 bias: adding a bf16 tensor to a float32 one rounds the SUM to bf16 (~4e-4 relative)

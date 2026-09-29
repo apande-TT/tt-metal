@@ -111,7 +111,13 @@ class TtVisionTransformer:
         cfg = self.compute_cfg
         if self.precise:
             x = self.patch_embed(pixels, dtype=ttnn.float32, precise=True)
-            x = split_matmul(c.perm, x, compute_kernel_config=cfg, limbs=getattr(self, "limbs", 2))
+            x = split_matmul(
+                c.perm,
+                x,
+                compute_kernel_config=cfg,
+                exact=getattr(self, "exact", True),
+                limbs=getattr(self, "limbs", 2),
+            )
         else:
             x = self.patch_embed(pixels, dtype=ttnn.float32)
             x = ttnn.matmul(c.perm, x, compute_kernel_config=cfg, dtype=ttnn.float32)
@@ -123,7 +129,13 @@ class TtVisionTransformer:
         if c.m_pad != m_rows:
             merged = ttnn.pad(merged, [(0, 0), (0, 0), (0, c.m_pad - m_rows), (0, 0)], 0.0)
         if self.precise:
-            merged = split_matmul(c.unperm, merged, compute_kernel_config=cfg, limbs=getattr(self, "limbs", 2))
+            merged = split_matmul(
+                c.unperm,
+                merged,
+                compute_kernel_config=cfg,
+                exact=getattr(self, "exact", True),
+                limbs=getattr(self, "limbs", 2),
+            )
         else:
             merged = ttnn.matmul(c.unperm, merged, compute_kernel_config=cfg)
         out = merged.shape[-1]
