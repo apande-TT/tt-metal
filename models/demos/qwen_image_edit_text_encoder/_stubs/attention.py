@@ -225,6 +225,10 @@ def _exact_sum(mm, parts, patterns=LANE_PATTERNS):
     return _vote(ests)
 
 
+# core grid for the non-exact split_linear products (None: ttnn.linear picks its own)
+LINEAR_CORE_GRID = None
+
+
 def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2):
     """float32 x @ bf16 w (+ bias) -> float32. x is carried as `limbs` bf16 parts (exact products). With
     exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part."""
@@ -236,7 +240,7 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     else:
         y = None
         for part in parts:
-            t = mm(part)
+            t = ttnn.linear(part, w, compute_kernel_config=cfg, dtype=ttnn.float32, core_grid=LINEAR_CORE_GRID)
             y = t if y is None else ttnn.add(y, t)
     # bias added separately in float32 (the fused bias add of ttnn.linear rounds: 3.1e-4 -> 5.1e-4)
     return ttnn.add(y, ttnn.typecast(bias, ttnn.float32)) if bias is not None else y
