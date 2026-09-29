@@ -33,6 +33,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs import (
     vision_patch_embed,
     vision_transformer_pretrained_model,
 )
+from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import pad_to_tile
 from models.demos.qwen_image_edit_text_encoder._stubs.layer import text_attention_mask
 
@@ -80,6 +81,9 @@ class TtQwenTextEncoder:
         finally:
             visual.blocks, lm.layers = vis_blocks, lm_layers
         self.rotary = v_l_rotary_embedding.build(device, lm.rotary_emb)
+        # the LM's 2-limb projections run on the full core grid (ttnn.linear's own pick left it partial)
+        grid = device.compute_with_storage_grid_size()
+        _te_attention.LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         self.set_precise(True)
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
