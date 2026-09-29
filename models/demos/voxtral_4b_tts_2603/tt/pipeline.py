@@ -205,9 +205,10 @@ class VoxtralTTSPipeline:
         """The real TTS input for this pipeline's batch -- see module-level `speech_inputs`."""
         return speech_inputs(texts=texts, voice=voice, batch=self.batch if batch is None else batch)
 
-    def stage_voice(self, audio_mask, voice_embedding):
-        """Upload the voice once, as persistent device constants, OUTSIDE the forward."""
-        return self.text.stage_voice(audio_mask, voice_embedding)
+    def stage_voice(self, audio_mask, voice_embedding, input_ids=None):
+        """Upload the voice once, as persistent device constants, OUTSIDE the forward. `input_ids`
+        (host) lets the prefill run the prompt prefix every row shares once instead of per row."""
+        return self.text.stage_voice(audio_mask, voice_embedding, input_ids=input_ids)
 
     def noise(self, max_frames: int, batch=None, seed: int = 0):
         """The flow-matching sampler's noise input, drawn ONCE on the host.
@@ -298,7 +299,11 @@ class VoxtralTTSPipeline:
             # the token ids stay, only the rows change, so positions and the causal mask are the
             # prompt's own. `voice` was staged on device by `stage_voice` before this call, so the
             # substitution here is two device ops and no host compute.
-            prefill_hidden, llm_hidden = self.text.prefill_voiced(ids_tt, voice)
+            # Everything below runs from the PRODUCTION prefill -- the one the traced stages run,
+            # whose last block computes only the rows read out. With `collect`, a whole-prompt
+            # prefill runs first for the per-stage check's hidden state; the second re-seeds the cache.
+            prefill_hidden = self.text.prefill_voiced(ids_tt, voice)[0] if collect else None
+            _, llm_hidden = self.text.prefill_voiced(ids_tt, voice, need_hidden=False)
 
         frames, diagnostics = [], []
         # The stop test is accumulated ON DEVICE. `finished |= semantic == stop_id` in torch would
@@ -372,7 +377,7 @@ class VoxtralTTSPipeline:
             "input_ids": input_ids,
             "codes": codes_host,
             "waveform": waveform,
-            "prefill_hidden": ttnn.to_torch(prefill_hidden).to(torch.float32),
+            "prefill_hidden": None if prefill_hidden is None else ttnn.to_torch(prefill_hidden).to(torch.float32),
             "frames_decoded": int(codes_host.shape[-1]),
             "stop_reason": stop_reason,
             # Per-row length, so a caller can cut each sample at its OWN end instead of the batch's.
@@ -455,11 +460,13 @@ class VoxtralTTSPipeline:
         return {"input_ids": input_ids, "audio_mask": audio_mask, "voice_embedding": voice_embedding}
 
     def prefill_trace_setup(self, inputs):
-        capacity = self.trace_capacity
         input_ids = inputs["input_ids"]
         batch, real_len = int(input_ids.shape[0]), int(input_ids.shape[1])
-        if real_len > capacity:
-            raise ValueError(f"prompt is {real_len} tokens, past the pinned capacity {capacity}")
+        if real_len > self.trace_capacity:
+            raise ValueError(f"prompt is {real_len} tokens, past the pinned capacity {self.trace_capacity}")
+        # Captured at the request's own tile-rounded length (the bucket `prefill_voiced` pads to on
+        # the untraced path); the pinned capacity is only the ceiling a bucket may reach.
+        capacity = _tile_ceil(real_len)
 
         padded = torch.zeros(batch, capacity, dtype=input_ids.dtype)
         padded[:, :real_len] = input_ids
@@ -469,7 +476,7 @@ class VoxtralTTSPipeline:
 
         self._stage_buffers["prefill"] = {
             "ids": self.prepare_prompt(padded),
-            "voice": self.stage_voice(mask, inputs["voice_embedding"]),
+            "voice": self.stage_voice(mask, inputs["voice_embedding"], input_ids=input_ids),
             "positions": self._positions(0, capacity, batch),
             "cos": ttnn.from_torch(
                 cos.reshape(1, 1, capacity, -1).contiguous(),
@@ -497,7 +504,7 @@ class VoxtralTTSPipeline:
 
     def prefill_trace_step(self):
         buf = self._stage_buffers["prefill"]
-        _, last = self.text.prefill_voiced(buf["ids"], buf["voice"], real_len=buf["real_len"])
+        _, last = self.text.prefill_voiced(buf["ids"], buf["voice"], real_len=buf["real_len"], need_hidden=False)
         return last
 
     def prefill_trace_items(self):
@@ -525,9 +532,9 @@ class VoxtralTTSPipeline:
         batch, real_len = int(input_ids.shape[0]), int(input_ids.shape[1])
         self.text.reset_cache()
         ids_tt = self.prepare_prompt(input_ids)
-        voice = self.stage_voice(inputs["audio_mask"], inputs["voice_embedding"])
+        voice = self.stage_voice(inputs["audio_mask"], inputs["voice_embedding"], input_ids=input_ids)
         # Contiguous 0..S-1 -- the rotary stub's float32 default branch; see run_text_to_speech.
-        _, last = self.text.prefill_voiced(ids_tt, voice)
+        _, last = self.text.prefill_voiced(ids_tt, voice, need_hidden=False)
         self._stage_buffers["decode"] = {
             "llm_hidden": last,
             "position": real_len,
@@ -987,7 +994,7 @@ def host_op_selftest(device=None, pipe=None):
         max_frames = 2
         if head == "text_to_speech":
             input_ids, audio_mask, voice_embedding, _ = shared.speech_inputs()
-            voice = shared.stage_voice(audio_mask, voice_embedding)
+            voice = shared.stage_voice(audio_mask, voice_embedding, input_ids=input_ids)
             x0 = shared.noise(max_frames)
         else:
             input_ids, _ = common.build_batch_inputs(batch=shared.batch)

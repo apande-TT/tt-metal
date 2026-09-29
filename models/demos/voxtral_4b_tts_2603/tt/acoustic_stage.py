@@ -90,6 +90,77 @@ _COMPUTE = ttnn.WormholeComputeKernelConfig(
 )
 
 
+# Tall (>= 8 tile rows) linears are compute-bound, so they run one fidelity rung below HiFi4.
+_TALL_COMPUTE = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+)
+_TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
+_L1_BUDGET = 1_100_000
+
+
+def _mcast_cfg(x, w, rows, out_dtype):
+    """A full-grid 2D-multicast program config for a tall `[rows, K] x [K, N]` linear, or None.
+
+    Left to itself ttnn picks a partial grid with small K-blocks for these shapes. This spreads M
+    over the grid rows and N over the grid columns, takes the widest K-block whose double-buffered
+    in0/in1 blocks plus the output block fit L1, and the largest subblock fp32 DEST allows (4 tiles).
+    None when even the output block alone does not fit, so the caller keeps ttnn's default.
+    """
+    grid = x.device().compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    mt, kt, nt = rows // 32, int(w.shape[-2]) // 32, int(w.shape[-1]) // 32
+    per_m, per_n = -(-mt // gy), -(-nt // gx)
+    size = lambda dt: _TILE_BYTES.get(dt, 2048)
+    fixed = per_m * per_n * (size(out_dtype) + (0 if out_dtype == ttnn.float32 else 4096))
+    kb = next(
+        (
+            c
+            for c in (16, 8, 4, 2, 1)
+            if kt % c == 0 and fixed + 2 * c * (per_m * size(x.dtype) + per_n * size(w.dtype)) <= _L1_BUDGET
+        ),
+        None,
+    )
+    if kb is None:
+        return None
+    sub = max(
+        ((h, s) for h in range(1, 5) for s in range(1, 5) if h * s <= 4 and per_m % h == 0 and per_n % s == 0),
+        key=lambda hs: (hs[0] * hs[1], hs[1]),
+    )
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=(gx, gy),
+        in0_block_w=kb,
+        out_subblock_h=sub[0],
+        out_subblock_w=sub[1],
+        per_core_M=per_m,
+        per_core_N=per_n,
+        transpose_mcast=False,
+        fused_activation=None,
+    )
+
+
+def _lin(x, w, **kwargs):
+    """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
+
+    A `[B, 1, S, K]` activation against a 2-D weight runs as B separate `S x K x N` matmuls that
+    each re-read the whole weight from DRAM; `[1, 1, B*S, K]` is one matmul that reads it once.
+    Tall results (>= 8 tile rows) also get a hand-sized full-grid program config.
+    """
+    shape = [int(d) for d in x.shape]
+    lead = 1
+    for d in shape[:-2]:
+        lead *= d
+    rows = lead * shape[-2]
+    if rows >= 256 and rows % 32 == 0 and "program_config" not in kwargs:
+        cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
+        if cfg is not None:
+            kwargs["program_config"] = cfg
+        kwargs["compute_kernel_config"] = _TALL_COMPUTE
+    if lead == 1:
+        return ttnn.linear(x, w, **kwargs)
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, rows, shape[-1]]), w, **kwargs)
+    return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
+
+
 # --------------------------------------------------------------------------------------
 # weight staging (BUILD time -- torch is allowed here, never in the forward)
 # --------------------------------------------------------------------------------------
@@ -110,11 +181,15 @@ def _weight(linear, device):
 
 
 def _norm_weight(norm, device):
-    """A norm's gamma as `[1, 1, 1, dim]` float32 TILE -- the form `_rms_norm` multiplies by."""
-    return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
+    """A norm's gamma as `[1, 1, 1, dim]` float32 TILE -- the form `_rms_norm` multiplies by -- paired,
+    when the whole-section stub's block-sharded norm applies, with gamma times its `_norm_scale`."""
+    gamma = norm.weight.detach().float().reshape(1, 1, 1, -1)
+    exact = _from_torch(gamma, device, dtype=ttnn.float32)
+    scale = common.import_stub(_WHOLE_STUB)._norm_scale(device, int(gamma.shape[-1]), float(norm.eps))
+    return exact if scale is None else (exact, _from_torch(gamma * scale, device, dtype=ttnn.float32))
 
 
-def _rms_norm(x, gamma, eps):
+def _rms_norm(x, gamma, eps, dtype=None, memory_config=None):
     """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
 
     NOT `ttnn.rms_norm`: on this model's real inputs the stock op sits at 9.65e-4 relative error
@@ -125,8 +200,13 @@ def _rms_norm(x, gamma, eps):
     stubs beside this file (`flow_matching_audio_transformer`, `acoustic_transformer_block`)
     already spell it out; this is the same four ops so the two bodies agree.
     """
-    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
-    return ttnn.multiply(ttnn.multiply(x, scale), gamma)
+    if isinstance(gamma, tuple):
+        gamma, scaled = gamma
+        y = common.import_stub(_WHOLE_STUB)._sharded_rms_norm(x, eps, ttnn.float32, memory_config=memory_config)
+        if y is not None:
+            return ttnn.multiply(y, scaled, dtype=dtype or ttnn.float32, memory_config=memory_config)
+    scale = ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps, activations=[ttnn.UnaryOpType.RSQRT])
+    return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32, memory_config=memory_config)
 
 
 def _build_stub(name, device, torch_module, counter=None, **kwargs):
@@ -165,8 +245,8 @@ class AcousticBlock:
         self.stubs = tuple(stubs)
         self._run = run
 
-    def __call__(self, h, attn_mask=None):
-        return self._run(h, attn_mask)
+    def __call__(self, h, attn_mask=None, tokens=None, readout=False):
+        return self._run(h, attn_mask, tokens, readout)
 
     def __repr__(self):
         return f"AcousticBlock(layer_id={self.layer_id}, kind={self.kind!r}, stubs={list(self.stubs)})"
@@ -175,8 +255,8 @@ class AcousticBlock:
 def _fused_block(device, torch_block, layer_id, counter):
     stub = _build_stub(_BLOCK_STUB, device, torch_block, counter)
 
-    def run(h, attn_mask):
-        return stub(h, attn_mask=attn_mask)
+    def run(h, attn_mask, tokens=None, readout=False):
+        return stub(h, attn_mask=attn_mask, tokens=tokens, readout=readout)
 
     return AcousticBlock(layer_id, "fused", run, [_BLOCK_STUB])
 
@@ -189,11 +269,15 @@ def _composed_block(device, torch_block, layer_id, counter):
     g_ffn = _norm_weight(torch_block.ffn_norm, device)
     eps = float(torch_block.attention_norm.eps)
 
-    def run(h, attn_mask):
-        xn = _rms_norm(h, g_attn, eps)
-        h = ttnn.add(h, attn(xn, attn_mask=attn_mask))
-        hn = _rms_norm(h, g_ffn, eps)
-        return ttnn.add(h, ff(hn))
+    def run(h, attn_mask, tokens=None, readout=False):
+        # qkv's input lands in L1, not DRAM: it is read once, by the next op.
+        xn = _rms_norm(h, g_attn, eps, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
+        a = attn(xn, attn_mask=attn_mask, tokens=tokens, readout=readout)
+        if tokens and readout:
+            h = ttnn.slice(h, [0, 0, 0, 0], [1, 1, int(h.shape[-2]) // tokens, int(h.shape[-1])])
+        h = ttnn.add(h, a, memory_config=ttnn.L1_MEMORY_CONFIG)
+        hn = _rms_norm(h, g_ffn, eps, dtype=ttnn.bfloat16)
+        return ttnn.add(h, ff(hn), memory_config=ttnn.L1_MEMORY_CONFIG)
 
     return AcousticBlock(layer_id, "composed", run, [_ATTN_STUB, _FF_STUB])
 
@@ -271,6 +355,23 @@ class AcousticStage:
             ),
         )
 
+    def _t_proj(self, body, rows, step):
+        """`time_projection(time_embedding(t_step))` for `rows` rows -- a CONSTANT, since the
+        timesteps are fixed; computed once per (body, rows, step) instead of every frame. Only the
+        compact (tile-aligned) layout consumes it."""
+        if rows % _TILE:
+            return None
+        whole = body == self._whole_body
+
+        def make():
+            t = self._t_rows(rows, step)
+            if whole:
+                return self.whole.time_projection(t)
+            t_emb = ttnn.reshape(self.parts["time_embedding"](t), [1, 1, rows, self.dim])
+            return _lin(t_emb, self.parts["w_time"], compute_kernel_config=_COMPUTE)
+
+        return self._const(("t_proj", whole, rows, step), make)
+
     def _pad(self, rows):
         """The 29 pad rows of the one-tile sequence (part-chain side)."""
         return self._const(
@@ -284,7 +385,7 @@ class AcousticStage:
         """Additive mask blocking columns 3..31 of the padded tile. float32: the scores are."""
 
         def make():
-            m = torch.zeros(1, 1, _TILE, _TILE)
+            m = torch.zeros(1, 1, 1, _TILE)
             m[:, :, :, _N_REAL_TOKENS:] = _MASK_NEG
             return _from_torch(m, self.device, dtype=ttnn.float32)
 
@@ -327,6 +428,9 @@ class AcousticStage:
             self._pad(2 * n)
             for i in range(self.n_steps):
                 self._t_rows(2 * n, i)
+        for body, a, b in self._plan(batch):
+            for i in range(self.n_steps):
+                self._t_proj(body, 2 * (b - a), i)
 
     # ---------------------------------------------------------------- routing
 
@@ -354,28 +458,28 @@ class AcousticStage:
 
     # ---------------------------------------------------------------- the two bodies
 
-    def _whole_body(self, llm, x, t):
+    def _whole_body(self, llm, x, t, cache=None, t_proj=None):
         """The graduated whole-section port: `velocity [R, 36]`, `semantic_logits [R, 8320]`."""
-        return self.whole(llm, x_t=x, t=t)
+        return self.whole(llm, x_t=x, t=t, step_cache=cache, t_proj=t_proj)
 
-    def _part_body(self, llm, x, t):
+    def _part_body(self, llm, x, t, cache=None, t_proj=None):
         """The same field, composed from the part stubs plus this file's norms and projections."""
         p = self.parts
         rows = int(llm.shape[0])
+        if rows % _TILE == 0:
+            return self._part_body_compact(llm, x, t, rows, cache, t_proj)
         h_in = ttnn.reshape(llm, [rows, 1, 1, self.dim])
         if h_in.dtype != ttnn.float32:
             h_in = ttnn.typecast(h_in, ttnn.float32)
 
-        semantic = ttnn.reshape(
-            ttnn.linear(h_in, p["w_semantic"], compute_kernel_config=_COMPUTE), [rows, self.semantic_out]
-        )
+        semantic = ttnn.reshape(_lin(h_in, p["w_semantic"], compute_kernel_config=_COMPUTE), [rows, self.semantic_out])
         if p["b_semantic"] is not None:
             semantic = ttnn.add(semantic, p["b_semantic"])
 
         t_emb = p["time_embedding"](t)  # graduated stub: [rows, dim]
-        t_proj = ttnn.linear(ttnn.reshape(t_emb, [rows, 1, 1, self.dim]), p["w_time"], compute_kernel_config=_COMPUTE)
-        llm_proj = ttnn.linear(h_in, p["w_llm"], compute_kernel_config=_COMPUTE)
-        x_proj = ttnn.linear(
+        t_proj = _lin(ttnn.reshape(t_emb, [rows, 1, 1, self.dim]), p["w_time"], compute_kernel_config=_COMPUTE)
+        llm_proj = _lin(h_in, p["w_llm"], compute_kernel_config=_COMPUTE)
+        x_proj = _lin(
             ttnn.typecast(ttnn.reshape(x, [rows, 1, 1, self.n_acoustic]), ttnn.float32),
             p["w_input"],
             compute_kernel_config=_COMPUTE,
@@ -388,9 +492,50 @@ class AcousticStage:
         h = _rms_norm(h, p["g_final"], p["eps"])
 
         first = ttnn.slice(h, [0, 0, 0, 0], [rows, 1, 1, self.dim])
-        velocity = ttnn.reshape(
-            ttnn.linear(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic]
+        velocity = ttnn.reshape(_lin(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic])
+        return velocity, semantic
+
+    def _part_body_compact(self, llm, x, t, rows, cache=None, t_proj=None):
+        """`_part_body` on the COMPACT layout: token k of every sample in rows k*rows.., no pad.
+
+        Every linear, norm and eltwise in the blocks then runs on 3*rows real rows instead of
+        32*rows, 29 of every 32 of which were padding. Needs `rows` to be tile-aligned.
+        """
+        p = self.parts
+        # `llm_proj` and the semantic head read only `llm`, identical at every Euler step of a frame.
+        if cache is not None and "llm_proj" in cache:
+            semantic, llm_proj = cache["semantic"], cache["llm_proj"]
+        else:
+            h_in = ttnn.reshape(llm, [1, 1, rows, self.dim])
+            if h_in.dtype != ttnn.float32:
+                h_in = ttnn.typecast(h_in, ttnn.float32)
+            semantic = ttnn.reshape(
+                _lin(h_in, p["w_semantic"], compute_kernel_config=_COMPUTE), [rows, self.semantic_out]
+            )
+            if p["b_semantic"] is not None:
+                semantic = ttnn.add(semantic, p["b_semantic"])
+            llm_proj = _lin(h_in, p["w_llm"], compute_kernel_config=_COMPUTE)
+            if cache is not None:
+                cache["semantic"], cache["llm_proj"] = semantic, llm_proj
+
+        if t_proj is None:
+            t_emb = ttnn.reshape(p["time_embedding"](t), [1, 1, rows, self.dim])
+            t_proj = _lin(t_emb, p["w_time"], compute_kernel_config=_COMPUTE)
+        x_in = ttnn.typecast(ttnn.reshape(x, [1, 1, rows, self.n_acoustic]), ttnn.float32)
+        h = ttnn.concat(
+            [
+                _lin(x_in, p["w_input"], compute_kernel_config=_COMPUTE),
+                t_proj,
+                llm_proj,
+            ],
+            dim=2,
         )
+        for i, block in enumerate(self.blocks[: self.n_layers]):
+            # The last block computes only token 0's rows, the only ones read out below.
+            h = block(h, None, tokens=_N_REAL_TOKENS, readout=i == self.n_layers - 1)
+        # The norm is per row and only token 0 is read out, so normalise just those rows.
+        first = _rms_norm(ttnn.slice(h, [0, 0, 0, 0], [1, 1, rows, self.dim]), p["g_final"], p["eps"])
+        velocity = ttnn.reshape(_lin(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic])
         return velocity, semantic
 
     def _plan(self, batch):
@@ -466,6 +611,8 @@ class AcousticStage:
                     "one_minus": ttnn.subtract(self._ones(n), alpha_h),
                     "x": self._rows(x0, a, b, batch),
                     "sem": None,
+                    # Per-frame: the llm projection + semantic head, computed at step 0 and reused.
+                    "cache": {},
                 }
             )
 
@@ -473,7 +620,13 @@ class AcousticStage:
             dt = self.dts[i]
             for st in states:
                 n = st["n"]
-                v_all, sem = st["body"](st["llm_cfg"], ttnn.concat([st["x"], st["x"]], dim=0), self._t_rows(2 * n, i))
+                v_all, sem = st["body"](
+                    st["llm_cfg"],
+                    ttnn.concat([st["x"], st["x"]], dim=0),
+                    self._t_rows(2 * n, i),
+                    cache=st["cache"],
+                    t_proj=self._t_proj(st["body"], 2 * n, i),
+                )
                 v_cond = ttnn.slice(v_all, [0, 0], [n, self.n_acoustic])
                 v_unc = ttnn.slice(v_all, [n, 0], [2 * n, self.n_acoustic])
                 v = ttnn.add(ttnn.multiply(v_cond, st["alpha"]), ttnn.multiply(v_unc, st["one_minus"]))

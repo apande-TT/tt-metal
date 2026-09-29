@@ -43,7 +43,6 @@ import torch
 
 import ttnn
 
-
 # A PERSISTENT ZERO BUFFER, NOT A PER-CALL `ttnn.zeros`.
 # `ttnn.zeros` builds its tensor on the host and enqueues a WRITE to land it on the device, and a
 # captured trace cannot replay a write -- capturing this stage died on `TT_FATAL: Writes are not
@@ -71,7 +70,10 @@ def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
         return ttnn.from_torch(
-            t, dtype=dtype, layout=layout, device=device,
+            t,
+            dtype=dtype,
+            layout=layout,
+            device=device,
             mesh_mapper=ttnn.ReplicateTensorToMesh(device),
         )
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
@@ -79,6 +81,99 @@ def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
 
 def _weight(linear, device):
     return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
+
+
+_TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
+_L1_BUDGET = 1_100_000
+
+
+def _divisors(n):
+    return [d for d in range(1, n + 1) if n % d == 0]
+
+
+def _mcast_cfg(x, w, rows, out_dtype):
+    """A full-grid 2D-multicast program config for a tall `[rows, K] x [K, N]` linear, or None.
+
+    M goes over the grid rows and N over the grid columns. Per-core M/N are searched a few tiles
+    above the minimum (a slightly larger block often divides into better subblocks), and when the
+    whole per-core output does not fit L1 it is split into out-blocks. Ranked by per-core work,
+    then subblock area (fp32 DEST caps it at 4 tiles), then out-block area, then K-block width.
+    """
+    grid = x.device().compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    mt, kt, nt = rows // 32, int(w.shape[-2]) // 32, int(w.shape[-1]) // 32
+    size = lambda dt: _TILE_BYTES.get(dt, 2048)
+    xs, ws = size(x.dtype), size(w.dtype)
+    os_ = size(out_dtype) + (0 if out_dtype == ttnn.float32 else 4096)
+    best = None
+    for pm in range(-(-mt // gy), -(-mt // gy) + 5):
+        if -(-mt // pm) > gy:
+            continue
+        for pn in range(-(-nt // gx), -(-nt // gx) + 5):
+            if -(-nt // pn) > gx:
+                continue
+            for bh in _divisors(pm):
+                for bw in _divisors(pn):
+                    kb = next(
+                        (
+                            c
+                            for c in (8, 4, 2, 1)
+                            if kt % c == 0 and bh * bw * os_ + 2 * c * (bh * xs + bw * ws) <= _L1_BUDGET
+                        ),
+                        None,
+                    )
+                    if kb is None:
+                        continue
+                    sub = max(
+                        (
+                            (h, s)
+                            for h in range(1, 5)
+                            for s in range(1, 5)
+                            if h * s <= 4 and bh % h == 0 and bw % s == 0
+                        ),
+                        key=lambda hs: (hs[0] * hs[1], hs[1]),
+                    )
+                    score = (pm * pn, -sub[0] * sub[1], -bh * bw, -kb)
+                    if best is None or score < best[0]:
+                        best = (score, pm, pn, bh, bw, kb, sub)
+    if best is None:
+        return None
+    _, pm, pn, bh, bw, kb, sub = best
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=(gx, gy),
+        in0_block_w=kb,
+        out_subblock_h=sub[0],
+        out_subblock_w=sub[1],
+        out_block_h=bh,
+        out_block_w=bw,
+        per_core_M=pm,
+        per_core_N=pn,
+        transpose_mcast=False,
+        fused_activation=None,
+    )
+
+
+def _fold_linear(x, w, **kwargs):
+    """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
+
+    A `[B, 1, T, K]` activation against a 2-D weight runs as B separate matmuls that each re-read
+    the whole weight; `[1, 1, B*T, K]` is one matmul. A T that is not tile-aligned makes the fold a
+    real relayout each way, still far cheaper than re-reading the weight B times. Tall results get
+    the same hand-sized full-grid config the part-chain stubs' `_lin` uses.
+    """
+    shape = [int(d) for d in x.shape]
+    lead = 1
+    for d in shape[:-2]:
+        lead *= d
+    if lead == 1:
+        return ttnn.linear(x, w, **kwargs)
+    rows = lead * shape[-2]
+    if rows >= 256 and rows % 32 == 0 and "program_config" not in kwargs:
+        cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
+        if cfg is not None:
+            kwargs["program_config"] = cfg
+    y = ttnn.linear(ttnn.reshape(x, [1, 1, rows, shape[-1]]), w, **kwargs)
+    return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
 _COMPUTE = ttnn.WormholeComputeKernelConfig(
@@ -130,21 +225,17 @@ def _compile_codec_block(device, blk, mask):
 
     attn_scale = ffn_scale = None
     if blk.layer_scale:
-        attn_scale = _from_torch(
-            blk.attention_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32
-        )
-        ffn_scale = _from_torch(
-            blk.ffn_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32
-        )
+        attn_scale = _from_torch(blk.attention_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32)
+        ffn_scale = _from_torch(blk.ffn_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32)
     if blk.post_attention_norm is not None or blk.post_ffn_norm is not None:
         raise NotImplementedError("post_attention_norm / post_ffn_norm are not ported")
 
     def block(h):
         seq = int(h.shape[-2])
         xn = _rms_norm(h, attn_gamma, attn_eps)
-        q = ttnn.linear(xn, wq, compute_kernel_config=_COMPUTE)
-        k = ttnn.linear(xn, wk, compute_kernel_config=_COMPUTE)
-        v = ttnn.linear(xn, wv, compute_kernel_config=_COMPUTE)
+        q = _fold_linear(xn, wq, compute_kernel_config=_COMPUTE)
+        k = _fold_linear(xn, wk, compute_kernel_config=_COMPUTE)
+        v = _fold_linear(xn, wv, compute_kernel_config=_COMPUTE)
         if qk_norm:
             q = _rms_norm(q, q_gamma, q_eps)
             k = _rms_norm(k, k_gamma, k_eps)
@@ -159,28 +250,29 @@ def _compile_codec_block(device, blk, mask):
             num_kv_heads=n_kv_heads,
             transpose_k_heads=False,
         )
-        scores = ttnn.matmul(
-            qh, ttnn.transpose(kh, -2, -1), compute_kernel_config=_COMPUTE
-        )
+        scores = _bmm(qh, kh, transpose_b=True)
         scores = ttnn.add(
             ttnn.multiply(scores, scale),
             ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq]),
         )
-        a = ttnn.matmul(_softmax(scores), vh, compute_kernel_config=_COMPUTE)
+        a = _bmm(_softmax(scores), vh)
         ttnn.deallocate(scores)
-        r = ttnn.linear(
-            ttnn.experimental.nlp_concat_heads(a), wo,
-            dtype=ttnn.float32, compute_kernel_config=_COMPUTE,
+        r = _fold_linear(
+            ttnn.experimental.nlp_concat_heads(a),
+            wo,
+            dtype=ttnn.float32,
+            compute_kernel_config=_COMPUTE,
         )
         if attn_scale is not None:
             r = ttnn.multiply(r, attn_scale)
         h = ttnn.add(h, r)
 
         hn = _rms_norm(h, ffn_gamma, ffn_eps)
-        r = ttnn.linear(
+        r = _fold_linear(
             ttnn.multiply(
-                ttnn.silu(ttnn.linear(hn, w1, compute_kernel_config=_COMPUTE)),
-                ttnn.linear(hn, w3, compute_kernel_config=_COMPUTE),
+                _fold_linear(hn, w1, compute_kernel_config=_COMPUTE),
+                _fold_linear(hn, w3, compute_kernel_config=_COMPUTE),
+                input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             ),
             w2,
             compute_kernel_config=_COMPUTE,
@@ -223,9 +315,7 @@ def _compile_causal_conv1d(device, mod):
                 pieces.extend(_row(x4, i) for i in range(padding_total, 0, -1))
             else:
                 first = _row(x4, 0)
-                pieces.append(
-                    first if padding_total == 1 else ttnn.repeat(first, [1, 1, padding_total, 1])
-                )
+                pieces.append(first if padding_total == 1 else ttnn.repeat(first, [1, 1, padding_total, 1]))
         pieces.append(x4)
         if extra > 0:
             if reflect:
@@ -243,10 +333,12 @@ def _compile_causal_conv1d(device, mod):
             begin = i * dilation
             end = begin + (out_len - 1) * stride + 1
             seg = ttnn.slice(
-                padded, [0, 0, begin, 0], [batch, 1, end, in_channels],
+                padded,
+                [0, 0, begin, 0],
+                [batch, 1, end, in_channels],
                 [1, 1, stride, 1] if stride > 1 else None,
             )
-            term = ttnn.linear(seg, tap, compute_kernel_config=_COMPUTE)
+            term = _fold_linear(seg, tap, compute_kernel_config=_COMPUTE)
             acc = term if acc is None else ttnn.add(acc, term)
         return acc if bias is None else ttnn.add(acc, bias)
 
@@ -277,19 +369,11 @@ def _compile_causal_conv_transpose1d(device, mod):
         def _delayed(tap):
             """`tap` applied to the PREVIOUS input step: a zero row, then steps 0..L-2."""
             head = ttnn.slice(x4, [0, 0, 0, 0], [batch, 1, length - 1, in_channels])
-            return ttnn.concat(
-                [zero_row, ttnn.linear(head, tap, compute_kernel_config=_COMPUTE)], dim=2
-            )
+            return ttnn.concat([zero_row, _fold_linear(head, tap, compute_kernel_config=_COMPUTE)], dim=2)
 
-        even = ttnn.add(
-            ttnn.linear(x4, taps[0], compute_kernel_config=_COMPUTE), _delayed(taps[2])
-        )
-        odd = ttnn.add(
-            ttnn.linear(x4, taps[1], compute_kernel_config=_COMPUTE), _delayed(taps[3])
-        )
-        out = ttnn.reshape(
-            ttnn.concat([even, odd], dim=-1), [batch, 1, length * stride, out_channels]
-        )
+        even = ttnn.add(_fold_linear(x4, taps[0], compute_kernel_config=_COMPUTE), _delayed(taps[2]))
+        odd = ttnn.add(_fold_linear(x4, taps[1], compute_kernel_config=_COMPUTE), _delayed(taps[3]))
+        out = ttnn.reshape(ttnn.concat([even, odd], dim=-1), [batch, 1, length * stride, out_channels])
         return out if bias is None else ttnn.add(out, bias)
 
     return run
@@ -297,9 +381,7 @@ def _compile_causal_conv_transpose1d(device, mod):
 
 def _norm_gamma(norm, device):
     """`[1, 1, 1, dim]` float32 TILE -- the form the spelled-out RMS norm's final multiply takes."""
-    return _from_torch(
-        norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32
-    )
+    return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
 
 
 def _rms_norm(x, gamma, eps):
@@ -313,7 +395,7 @@ def _rms_norm(x, gamma, eps):
     the chain looked broken. `tt/vocode_stage.py` spells out the same four ops for the same
     reason, so the two bodies agree.
     """
-    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True), eps))
+    scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
     return ttnn.multiply(ttnn.multiply(x, scale), gamma)
 
 
@@ -325,7 +407,7 @@ def _softmax(x, dim=-1):
     three ops sit at 5.5e-8. A softmax that does not sum to 1 ATTENUATES the attention output it
     weights, which reads as a norm ratio below 1 at a PCC of 0.9999.
     """
-    e = ttnn.exp(ttnn.subtract(x, ttnn.max(x, dim=dim, keepdim=True)))
+    e = ttnn.subtract(x, ttnn.max(x, dim=dim, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     return ttnn.divide(e, ttnn.sum(e, dim=dim, keepdim=True))
 
 
@@ -354,6 +436,31 @@ def _split_embedding(ids, tables, layout=None):
         ttnn.typecast(ttnn.embedding(ids, hi, layout=layout), ttnn.float32),
         ttnn.typecast(ttnn.embedding(ids, lo, layout=layout), ttnn.float32),
     )
+
+
+def _largest_divisor(n, cap):
+    return max(d for d in range(1, min(n, cap) + 1) if n % d == 0)
+
+
+def _bmm(a, b, transpose_b=False):
+    """Head-batched attention `a @ b` over the full grid, every (batch, head, 4-tile M block) its own
+    work unit. With no program config these `[B, H, S, S]` products ran on 16-64 cores."""
+    m, k, n = (-(-int(d) // 32) for d in (a.shape[-2], a.shape[-1], b.shape[-2 if transpose_b else -1]))
+    pm = _largest_divisor(m, 4)
+    # Whole-K, whole-N blocks: a long sequence (a longer utterance) outgrows L1, so fall back then.
+    tile = lambda t: 4096 if t.dtype == ttnn.float32 else 2048
+    if 2 * pm * k * tile(a) + 2 * k * n * tile(b) + 2 * pm * n * 4096 > 1_200_000:
+        return ttnn.matmul(a, b, transpose_b=transpose_b, compute_kernel_config=_COMPUTE)
+    grid = a.device().compute_with_storage_grid_size()
+    cfg = ttnn.MatmulMultiCoreReuseProgramConfig(
+        compute_with_storage_grid_size=(grid.x, grid.y),
+        in0_block_w=k,
+        out_subblock_h=1,
+        out_subblock_w=_largest_divisor(n, 4),
+        per_core_M=pm,
+        per_core_N=n,
+    )
+    return ttnn.matmul(a, b, transpose_b=transpose_b, compute_kernel_config=_COMPUTE)
 
 
 def build(device, torch_module):
@@ -389,9 +496,7 @@ def build(device, torch_module):
                 device,
                 dtype=ttnn.float32,
             )
-            blocks = [
-                _compile_codec_block(device, blk.layers[str(i)], mask) for i in blk.layers_ids
-            ]
+            blocks = [_compile_codec_block(device, blk.layers[str(i)], mask) for i in blk.layers_ids]
 
             def _stack(x4, _blocks=blocks):
                 for b in _blocks:
@@ -412,14 +517,10 @@ def build(device, torch_module):
                 f"forward"
             )
 
-        sem_codes = ttnn.reshape(
-            ttnn.slice(codes, [0, 0, 0], [batch, n_semantic, frames]), [batch, frames]
-        )
+        sem_codes = ttnn.reshape(ttnn.slice(codes, [0, 0, 0], [batch, n_semantic, frames]), [batch, frames])
         # `ttnn.embedding` requires a bfloat16 table (`embedding_device_operation.cpp:36`);
         # widen once here so every residual add downstream happens in float32.
-        sem = ttnn.typecast(
-            _split_embedding(sem_codes, table, layout=ttnn.TILE_LAYOUT), ttnn.float32
-        )
+        sem = ttnn.typecast(_split_embedding(sem_codes, table, layout=ttnn.TILE_LAYOUT), ttnn.float32)
         aco_codes = ttnn.typecast(
             ttnn.to_layout(
                 ttnn.slice(codes, [0, n_semantic, 0], [batch, n_semantic + n_acoustic, frames]),

@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""PERFORMANCE test for the `text_to_speech` pipeline of `mistralai/Voxtral-4B-TTS-2603`.
+"""PERFORMANCE test for the `text_continuation` pipeline of `mistralai/Voxtral-4B-TTS-2603`.
 
-Built as `demo/demo_text_to_speech.py` does -- `build_pipeline(device, heads=("text_to_speech",))` -- and measured through the per-stage trace contract
+Built as `demo/demo_text_continuation.py` does -- `build_pipeline(device, heads=("text_continuation",))` -- and measured through the per-stage trace contract
 (`PIPELINE_STAGES` = prefill / decode / acoustic / vocode, each `<stage>_trace_setup` +
-`<stage>_trace_step`), trace+1CQ. The eager fallback runs `run_text_to_speech` for a short,
-bounded horizon. Perf only: no PCC.
+`<stage>_trace_step`), trace+1CQ. The eager path runs ONE teacher-forced `run_text_continuation`
+forward over PERF_ISL_TOKENS tokens per row. Perf only: no PCC.
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ _MESH_SHAPE = resolve_mesh_shape(default_rows=1, default_cols=1)
 
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
 _DEVICE_ID = int(os.environ.get("TT_PERF_DEVICE_ID", os.environ.get("VOXTRAL_E2E_DEVICE_ID", "0")))
-# The demo's own trace region (demo_text_to_speech.py / device_session.TRACE_REGION_SIZE).
+# The demo's own trace region (demo_text_continuation.py / device_session.TRACE_REGION_SIZE).
 _TRACE_REGION = int(os.environ.get("TT_PERF_TRACE_REGION", str(200 * 1024 * 1024)))
 
 _OPEN_KWARGS = {"l1_small_size": 24576}
@@ -67,14 +67,10 @@ def _close_device(dev, is_mesh):
 
 
 def prompt_ids_for_isl(tokenizer, n_tokens: int):
-    """EXACTLY `n_tokens` real ids from the package's tekken tokenizer over its own speech texts."""
-    n = max(1, int(n_tokens))
-    ids = tokenizer.encode(common.SPEECH_TEXTS[0], bos=True)
-    i = 1
-    while len(ids) < n:
-        ids.extend(tokenizer.encode(common.SPEECH_TEXTS[i % len(common.SPEECH_TEXTS)], bos=False))
-        i += 1
-    return torch.tensor(ids[:n], dtype=torch.long).unsqueeze(0)
+    from models.experimental.perf_automation.agent.perf_test_gen import prompt_ids_for_isl as _p
+
+    ids = _p(tokenizer, n_tokens)
+    return ids.reshape(1, -1)
 
 
 def _build_args(hf_model):
@@ -83,7 +79,7 @@ def _build_args(hf_model):
     # stage needs room past it.
     return {
         "model": hf_model,
-        "heads": ("text_to_speech",),
+        "heads": ("text_continuation",),
         "layers": PERF_LAYERS,
         "prefill_layers": PERF_PREFILL_LAYERS,
         "decode_layers": PERF_DECODE_LAYERS,
@@ -93,7 +89,7 @@ def _build_args(hf_model):
     }
 
 
-def test_text_to_speech_perf():
+def test_text_continuation_perf():
     device, _is_mesh = _open_device()
     try:
         print("PERF_ISL_TOKENS=%d" % PERF_ISL_TOKENS, flush=True)
@@ -118,9 +114,6 @@ def test_text_to_speech_perf():
 
                 return inner
 
-            texts = list(common.SPEECH_TEXTS[: common.DEFAULT_BATCH])
-            texts = (texts * common.DEFAULT_BATCH)[: common.DEFAULT_BATCH]
-            input_ids, audio_mask, voice_embedding = common.build_voice_prompt(texts, common.DEFAULT_VOICE)
             pipe = build_pipeline(device, **_build_args(hf_model))
             print("STAGE_MARKS_ENTER", flush=True)
             try:
@@ -129,8 +122,10 @@ def test_text_to_speech_perf():
                 print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals(), device), flush=True)
             except Exception as _tt_e2:  # noqa: BLE001
                 print("STAGE_MARKS_SKIPPED=%r" % (_tt_e2,), flush=True)
-            voice = pipe.stage_voice(audio_mask, voice_embedding, input_ids=input_ids)
-            print("PERF_BATCH_ROWS=%d" % resolve_batch(pipe, PERF_BATCH), flush=True)
+            _rows = resolve_batch(pipe, PERF_BATCH)
+            _row = prompt_ids_for_isl(common.load_tokenizer(), PERF_ISL_TOKENS)
+            input_ids = _row.repeat(_rows, 1)
+            print("PERF_BATCH_ROWS=%d" % _rows, flush=True)
 
             _mods = [ttnn] + [getattr(ttnn, _m, None) for _m in ("transformer", "experimental")]
             for _mod in [_m for _m in _mods if _m is not None]:
@@ -141,7 +136,7 @@ def test_text_to_speech_perf():
                         setattr(_mod, _n, _draining(_op))
             _fw0 = time.monotonic()
             try:
-                out = pipe.run_text_to_speech(input_ids=input_ids, max_frames=_EAGER_OSL_TOKENS, voice=voice)
+                out = pipe.run_text_continuation(input_ids=input_ids)
                 try:
                     ttnn.ReadDeviceProfiler(device)
                 except Exception:
@@ -159,7 +154,36 @@ def test_text_to_speech_perf():
             _prompt_ids = prompt_ids_for_isl(common.load_tokenizer(), PERF_ISL_TOKENS)
 
             def _build_for_perf(dev):
-                return build_pipeline(dev, **_build_args(hf_model))
+                pipe = build_pipeline(dev, **_build_args(hf_model))
+                # The text_continuation head's ONE forward (run_text_continuation's device part) as
+                # the traced stage: ids are uploaded once in setup, the step reads only resident
+                # tensors, so the captured region is host-free.
+                _rows = resolve_batch(pipe, PERF_BATCH)
+                _buf = {}
+
+                def continuation_trace_inputs():
+                    return _prompt_ids.reshape(1, -1).repeat(_rows, 1)
+
+                def continuation_trace_setup(inputs):
+                    _buf["ids"] = pipe.prepare_prompt(inputs)
+                    _buf["rows"] = int(inputs.shape[0]) * int(inputs.shape[1])
+                    return _buf
+
+                def continuation_trace_step():
+                    picks, _logits = pipe.continuation.score(_buf["ids"])
+                    return picks
+
+                def continuation_trace_items():
+                    return _buf.get("rows", _rows * int(_prompt_ids.shape[-1]))
+
+                pipe.continuation_trace_inputs = continuation_trace_inputs
+                pipe.continuation_trace_setup = continuation_trace_setup
+                pipe.continuation_trace_step = continuation_trace_step
+                pipe.continuation_trace_items = continuation_trace_items
+                pipe.PIPELINE_STAGES = ["continuation"]
+                # One teacher-forced forward over the whole prompt is this pipeline's unit of work.
+                pipe.PIPELINE_UNIT = "step"
+                return pipe
 
             print("PERF_ISL_TOKENS=%d" % _prompt_ids.shape[-1], flush=True)
             print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)

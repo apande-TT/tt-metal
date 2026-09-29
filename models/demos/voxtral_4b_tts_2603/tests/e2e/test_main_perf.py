@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""PERFORMANCE test for the `text_to_speech` pipeline of `mistralai/Voxtral-4B-TTS-2603`.
+"""PERFORMANCE test for the `main` (text_to_speech) pipeline of `mistralai/Voxtral-4B-TTS-2603`.
 
 Built as `demo/demo_text_to_speech.py` does -- `build_pipeline(device, heads=("text_to_speech",))` -- and measured through the per-stage trace contract
 (`PIPELINE_STAGES` = prefill / decode / acoustic / vocode, each `<stage>_trace_setup` +
@@ -66,15 +66,12 @@ def _close_device(dev, is_mesh):
         ttnn.close_device(dev)
 
 
-def prompt_ids_for_isl(tokenizer, n_tokens: int):
-    """EXACTLY `n_tokens` real ids from the package's tekken tokenizer over its own speech texts."""
-    n = max(1, int(n_tokens))
-    ids = tokenizer.encode(common.SPEECH_TEXTS[0], bos=True)
-    i = 1
-    while len(ids) < n:
-        ids.extend(tokenizer.encode(common.SPEECH_TEXTS[i % len(common.SPEECH_TEXTS)], bos=False))
-        i += 1
-    return torch.tensor(ids[:n], dtype=torch.long).unsqueeze(0)
+def _prompt_ids_for_isl(tokenizer, n_tokens: int):
+    """EXACTLY `n_tokens` real ids via the tool's model-agnostic helper, shaped [1, n]."""
+    from models.experimental.perf_automation.agent.perf_test_gen import prompt_ids_for_isl
+
+    ids = prompt_ids_for_isl(tokenizer, n_tokens)
+    return ids.unsqueeze(0) if ids.dim() == 1 else ids
 
 
 def _build_args(hf_model):
@@ -93,7 +90,7 @@ def _build_args(hf_model):
     }
 
 
-def test_text_to_speech_perf():
+def test_main_perf():
     device, _is_mesh = _open_device()
     try:
         print("PERF_ISL_TOKENS=%d" % PERF_ISL_TOKENS, flush=True)
@@ -156,14 +153,55 @@ def test_text_to_speech_perf():
             from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter
             from models.experimental.perf_automation.agent.trace_replay import measure_adapter
 
-            _prompt_ids = prompt_ids_for_isl(common.load_tokenizer(), PERF_ISL_TOKENS)
+            _prompt_ids = _prompt_ids_for_isl(common.load_tokenizer(), PERF_ISL_TOKENS)
 
             def _build_for_perf(dev):
                 return build_pipeline(dev, **_build_args(hf_model))
 
             print("PERF_ISL_TOKENS=%d" % _prompt_ids.shape[-1], flush=True)
             print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
-            measure_adapter(PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=PERF_BATCH), device)
+            import re
+            import sys
+
+            class _PathTee:
+                """Passes the adapter's output through unchanged, except that the multi-stage
+                summary `TRACE_REPLAY_PATH=trace+pipeline` is qualified with the command-queue path
+                every stage ACTUALLY replayed on (each stage's own `path=trace+Ncq`)."""
+
+                def __init__(self, inner):
+                    self.inner, self.buf, self.paths = inner, "", set()
+
+                def write(self, data):
+                    self.buf += data
+                    while "\n" in self.buf:
+                        line, self.buf = self.buf.split("\n", 1)
+                        m = re.search(r"TRACE_STAGE_MS\[[^\]]+\]=\S+\s+path=(\S+)", line)
+                        if m:
+                            self.paths.add(m.group(1))
+                        if line.startswith("TRACE_REPLAY_PATH=trace+pipeline") and len(self.paths) == 1:
+                            (cq,) = self.paths
+                            if re.fullmatch(r"trace\+\d+cq", cq):
+                                line = line.replace("TRACE_REPLAY_PATH=trace+pipeline", "TRACE_REPLAY_PATH=%s+pipeline" % cq, 1)
+                        self.inner.write(line + "\n")
+                    return len(data)
+
+                def flush(self):
+                    if self.buf:
+                        self.inner.write(self.buf)
+                        self.buf = ""
+                    self.inner.flush()
+
+                def __getattr__(self, name):
+                    return getattr(self.inner, name)
+
+            _real_stdout = sys.stdout
+            _tee = _PathTee(_real_stdout)
+            sys.stdout = _tee
+            try:
+                measure_adapter(PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=PERF_BATCH), device)
+            finally:
+                _tee.flush()
+                sys.stdout = _real_stdout
 
         def _try_traced():
             try:

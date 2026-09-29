@@ -90,7 +90,7 @@ def main(argv=None):
             batch=len(texts),
             kv_capacity=pipeline.tts_kv_capacity(input_ids.shape[-1], max_frames),
         )
-        voice = pipe.stage_voice(audio_mask, voice_embedding)
+        voice = pipe.stage_voice(audio_mask, voice_embedding, input_ids=input_ids)
         print(
             f"voice={args.voice!r} ({voice_embedding.shape[0]} audio tokens)  batch={input_ids.shape[0]}  "
             f"prompt_tokens={input_ids.shape[1]}"
