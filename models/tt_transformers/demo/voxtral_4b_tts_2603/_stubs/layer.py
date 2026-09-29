@@ -814,6 +814,7 @@ def build(device, torch_module):
         kv_cache=None,
         position=None,
         decode=False,
+        trim=None,
         **kwargs,
     ):
         h, lead, seq, rank = _view4(hidden_states, dim)
@@ -826,6 +827,15 @@ def build(device, torch_module):
         ttnn.deallocate(xn)
         h = ttnn.add(h, attn_out)
         ttnn.deallocate(attn_out)
+        if trim is not None:
+            # The stack reads only some of this block's rows (its last block): `trim` keeps those as
+            # `[1, 1, rows, dim]` (or None when none are read), and the FFN runs on them as a decode
+            # step's would.
+            kept = trim(h)
+            ttnn.deallocate(h)
+            if kept is None:
+                return None
+            h, decode = kept, True
 
         # Prefill's norm output is read only by the fused SwiGLU, once per N block: it lands in L1.
         hn = _rms_norm(
@@ -850,6 +860,6 @@ def build(device, torch_module):
         h = ttnn.add(h, _lin(gated, w_down, dtype=down_dtype, compute_kernel_config=_COMPUTE))
         ttnn.deallocate(gated)
 
-        return _restore(h, lead, seq, rank, dim)
+        return h if trim is not None else _restore(h, lead, seq, rank, dim)
 
     return layer_forward

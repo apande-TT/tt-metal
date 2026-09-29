@@ -157,7 +157,9 @@ class TextBlock:
     def stub_names(self) -> tuple:
         return self.stubs
 
-    def __call__(self, hidden_states, position_embeddings=None, position=None, decode=False):
+    def __call__(self, hidden_states, position_embeddings=None, position=None, decode=False, trim=None):
+        """`trim`, when given, maps the post-attention residual `[1, 1, R, H]` to the rows the caller
+        reads (or None for none): the FFN then runs on those rows only, the way a decode step does."""
         if self.kind in ("layer", "mistral_decoder_layer"):
             return self.parts[self.kind](
                 hidden_states,
@@ -165,6 +167,7 @@ class TextBlock:
                 kv_cache=self.kv,
                 position=position,
                 decode=decode,
+                trim=trim,
             )
         # The composed kinds spell out what the fused stubs do internally, from the leaf stubs.
         # A prefill norm feeds only a matmul, so it hands over bf16; decode keeps float32.
@@ -179,6 +182,12 @@ class TextBlock:
         ttnn.deallocate(xn)
         h = ttnn.add(hidden_states, attn_out)
         ttnn.deallocate(attn_out)
+        if trim is not None:
+            kept = trim(h)
+            ttnn.deallocate(h)
+            if kept is None:
+                return None
+            h, decode = kept, True
         hn = self.parts["norm_post"](h, dtype=None if decode else ttnn.bfloat16)
         mlp_out = self.parts["mlp"](hn)
         ttnn.deallocate(hn)
@@ -484,18 +493,22 @@ class TextStack:
             out = ttnn.slice(out, [0, 0, 0, 0], [batch, 1, real, self.hidden_size])
         return out, last
 
-    def _run_chain(self, embeds, rope):
-        """Every block over `embeds`, then the final norm. `embeds` itself is never freed."""
+    def _run_chain(self, embeds, rope, trim=None):
+        """Every block over `embeds`, then the final norm. `embeds` itself is never freed.
+
+        `trim` goes to the LAST block only (see `TextBlock.__call__`): its FFN and the final norm run
+        on the rows `trim` keeps, and a `trim` that keeps none returns None without either."""
         hidden = embeds
+        last = len(self.blocks) - 1
         try:
-            for block in self.blocks:
-                nxt = block(hidden, position_embeddings=rope, decode=False)
+            for i, block in enumerate(self.blocks):
+                nxt = block(hidden, position_embeddings=rope, decode=False, trim=trim if i == last else None)
                 if hidden is not embeds:
                     ttnn.deallocate(hidden)
                 hidden = nxt
-            return self.final_norm(hidden)
+            return None if hidden is None else self.final_norm(hidden)
         finally:
-            if hidden is not embeds:
+            if hidden is not None and hidden is not embeds:
                 ttnn.deallocate(hidden)
 
     def _last_row(self, out, real):
@@ -508,6 +521,20 @@ class TextStack:
             ttnn.slice(block, [0, 0, real - 1 - top, 0], [batch, 1, real - top, self.hidden_size]),
             [batch, self.hidden_size],
         )
+
+    def _last_tail_rows(self, batch, tail):
+        """A `trim` for the compact tail `[1, 1, batch * tail, H]` (sample-major): each sample's last
+        row, as `[1, 1, batch, H]`. The rows are `tail` apart and off-tile, so they are picked ROW_MAJOR."""
+        hidden = self.hidden_size
+
+        def trim(h):
+            rm = ttnn.to_layout(h, ttnn.ROW_MAJOR_LAYOUT)
+            per_sample = ttnn.reshape(rm, [batch, 1, tail, hidden])
+            rows = ttnn.slice(per_sample, [0, 0, tail - 1, 0], [batch, 1, tail, hidden])
+            ttnn.deallocate(rm)
+            return ttnn.to_layout(ttnn.reshape(rows, [1, 1, batch, hidden]), ttnn.TILE_LAYOUT)
+
+        return trim
 
     def _voiced(self, ids, keep, placed):
         embeds = self.embed(ids)
@@ -536,13 +563,17 @@ class TextStack:
         tail_in = self._voiced(tail_ids, split["keep_tail"], split["placed_tail"])
         for block in self.blocks:
             block.kv["prefix_phase"] = "stash"
+        # With no hidden state asked for, the prefix's last block is read only for its k/v (its
+        # attention stashes them), and the tail's only for each sample's last row.
+        pre_trim = None if need_hidden else (lambda h: None)
+        tail_trim = None if need_hidden else self._last_tail_rows(batch, tail)
         try:
-            pre_out = self._run_chain(pre_in, self._prefill_rope(pre_in, None))
+            pre_out = self._run_chain(pre_in, self._prefill_rope(pre_in, None), trim=pre_trim)
             for block in self.blocks:
                 block.kv["prefix_phase"] = "extend"
                 block.kv["prefix_mask"] = split["mask"]
                 block.kv["prefix_compact"] = (batch, tail, split["tail_slots"])
-            tail_out = self._run_chain(tail_in, split["rope_tail"])
+            tail_out = self._run_chain(tail_in, split["rope_tail"], trim=tail_trim)
         finally:
             for block in self.blocks:
                 block.kv.pop("prefix_phase", None)
@@ -555,6 +586,8 @@ class TextStack:
         self.filled = real
         self._slot_gap = split["gap"]
         self._slot_mask = split["slot_mask"]
+        if not need_hidden:
+            return None, ttnn.reshape(tail_out, [batch, self.hidden_size])
         # Compact rows back to `[B, 1, tail, H]`, sample-major, for `last` and the hidden state.
         per_sample = ttnn.reshape(ttnn.to_layout(tail_out, ttnn.ROW_MAJOR_LAYOUT), [batch, 1, tail, self.hidden_size])
         ttnn.deallocate(tail_out)

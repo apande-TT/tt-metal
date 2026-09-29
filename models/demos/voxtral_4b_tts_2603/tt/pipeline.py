@@ -299,7 +299,11 @@ class VoxtralTTSPipeline:
             # the token ids stay, only the rows change, so positions and the causal mask are the
             # prompt's own. `voice` was staged on device by `stage_voice` before this call, so the
             # substitution here is two device ops and no host compute.
-            prefill_hidden, llm_hidden = self.text.prefill_voiced(ids_tt, voice)
+            # Everything below runs from the PRODUCTION prefill -- the one the traced stages run,
+            # whose last block computes only the rows read out. With `collect`, a whole-prompt
+            # prefill runs first for the per-stage check's hidden state; the second re-seeds the cache.
+            prefill_hidden = self.text.prefill_voiced(ids_tt, voice)[0] if collect else None
+            _, llm_hidden = self.text.prefill_voiced(ids_tt, voice, need_hidden=False)
 
         frames, diagnostics = [], []
         # The stop test is accumulated ON DEVICE. `finished |= semantic == stop_id` in torch would
@@ -373,7 +377,7 @@ class VoxtralTTSPipeline:
             "input_ids": input_ids,
             "codes": codes_host,
             "waveform": waveform,
-            "prefill_hidden": ttnn.to_torch(prefill_hidden).to(torch.float32),
+            "prefill_hidden": None if prefill_hidden is None else ttnn.to_torch(prefill_hidden).to(torch.float32),
             "frames_decoded": int(codes_host.shape[-1]),
             "stop_reason": stop_reason,
             # Per-row length, so a caller can cut each sample at its OWN end instead of the batch's.
