@@ -408,10 +408,12 @@ def _prefill_sdpa(q, k, v, kv_cache):
         # to the shared prefix plus its own sample's earlier tail positions.
         batch, real, padded = compact
         pk, pv = kv_cache.pop("prefix_kv")
+        # The joined k/v is SDPA's alone (the cache is built from pk/k below) and every q chunk
+        # streams it whole, so it sits in L1 (~1.6 MB each); the mask SDPA insists on reading from DRAM.
         a = ttnn.transformer.scaled_dot_product_attention(
             q,
-            ttnn.concat([pk, k], dim=2),
-            ttnn.concat([pv, v], dim=2),
+            ttnn.concat([pk, k], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG),
+            ttnn.concat([pv, v], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG),
             is_causal=False,
             attn_mask=kv_cache["prefix_mask"],
             scale=1.0,
