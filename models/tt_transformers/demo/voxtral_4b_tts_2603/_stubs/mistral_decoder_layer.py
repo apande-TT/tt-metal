@@ -311,8 +311,10 @@ def _rope_prefill(q, k, cos, sin, half):
         return _rope(q, cos, sin, half), _rope(k, cos, sin, half)
     if cos.dtype != ttnn.bfloat16:
         cos, sin = ttnn.typecast(cos, ttnn.bfloat16), ttnn.typecast(sin, ttnn.bfloat16)
+    # SDPA is q's only reader and streams it chunk by chunk, so q lands in L1; k stays in DRAM
+    # because the stash phase holds the prefix k across the whole stack.
     return (
-        ttnn.experimental.rotary_embedding(q, cos, sin),
+        ttnn.experimental.rotary_embedding(q, cos, sin, memory_config=ttnn.L1_MEMORY_CONFIG),
         ttnn.experimental.rotary_embedding(k, cos, sin),
     )
 
