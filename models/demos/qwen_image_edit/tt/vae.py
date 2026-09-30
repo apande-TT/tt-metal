@@ -60,7 +60,12 @@ class TtQwenVAE:
         self.post_quant_conv = vae_pointwise.build(device, hf_vae.post_quant_conv)
         # image latents are single-frame: the decoder's causal convs keep only their live temporal tap
         self.decoder = qwen_image_decoder3d.build(
-            device, hf_vae.decoder, batch_parallel=True, single_frame=True, blocking=_decoder_blocking
+            device,
+            hf_vae.decoder,
+            batch_parallel=True,
+            single_frame=True,
+            blocking=_decoder_blocking,
+            ccl_links=2,  # the decoder's gathers / halo exchanges over 2 fabric links instead of 1
         )
         mean = torch.tensor(cfg.latents_mean, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
         std = torch.tensor(cfg.latents_std, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
