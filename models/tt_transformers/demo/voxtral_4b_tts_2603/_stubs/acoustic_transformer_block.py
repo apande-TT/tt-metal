@@ -300,12 +300,25 @@ def _bmm(a, b, per_core_m=None, transpose_b=False, dtype=None):
     """
     m, k, n = int(a.shape[-2]) // 32, int(a.shape[-1]) // 32, int(b.shape[-2 if transpose_b else -1]) // 32
     grid = a.device().compute_with_storage_grid_size()
+    batch = 1
+    for d in list(a.shape)[:-2]:
+        batch *= int(d)
+    # A core that owns several output blocks steps a WHOLE batch (M x K tiles of `a`) between them,
+    # so while M is split into blocks there must be no more blocks than cores -- otherwise a core's
+    # second M block reads and writes the next head's rows (the 192-row compact acoustic attention,
+    # 8 x 24 blocks, and the codec attention regression 27033d4462).
+    per_m = next(
+        p
+        for p in range(min(per_core_m or m, m), m + 1)
+        if m % p == 0 and (p == m or batch * (m // p) <= grid.x * grid.y)
+    )
     cfg = ttnn.MatmulMultiCoreReuseProgramConfig(
         compute_with_storage_grid_size=(grid.x, grid.y),
         in0_block_w=k,
         out_subblock_h=1,
-        out_subblock_w=min(n, 4),
-        per_core_M=per_core_m or m,
+        # Must divide per_core_N; fp32 DEST holds 4 tiles.
+        out_subblock_w=max(w for w in range(1, 5) if n % w == 0),
+        per_core_M=per_m,
         per_core_N=n,
     )
     return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE, dtype=dtype)
