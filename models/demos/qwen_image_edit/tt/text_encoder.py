@@ -13,7 +13,7 @@ the TP=4 share of the stack per chip), with an exact all_gather hand-off over ax
 stages (v_l_text_model row_stages, generalised from the T3K's 2 single-row stages to 2 stages of
 rows/2 rows). Replicating the whole LM on every row instead is 4.72 GB per chip (measured on T3K);
 next to the 5.36 GB TP=8 transformer and the 0.41 GB VAE that is 10.49 GB, over the registered 10.5
-GB usable per chip with a CCL axis once activations are counted. The vision tower stays replicated
+GB usable per chip with a CCL axis once activations are counted. The vision tower splits its images
 over the rows.
 """
 from __future__ import annotations
@@ -49,6 +49,8 @@ LM_EXACT = False
 # forms it with one lane pattern instead of the median of three: the median only outvotes a rare
 # power-of-two glitch, and it triples the ~24 matmuls + masks + adds of every vision linear
 VISION_EXACT = ("strided",)
+# mesh axis the vision batch is split over (the tower's TP=4 runs on the other axis)
+VISION_DP_AXIS = 0
 
 
 class TextEncoderInputs:
@@ -156,12 +158,23 @@ class TtQwenTextEncoder:
 
         p = TextEncoderInputs()
         p.B = B
-        # vision: [N, 1, s_pad, 1176] (all images, replicated on every chip)
-        vc = self.visual.consts(grids[0], B)
+        # vision: [N, 1, s_pad, 1176], the images split over the mesh rows (each row's TP group runs
+        # its own B / rows images; the rows otherwise repeat the same tower on the same images)
+        rows = tuple(d.shape)[VISION_DP_AXIS]
+        p.vision_dp = rows if B % rows == 0 else 1
+        vc = self.visual.consts(grids[0], B // p.vision_dp)
         pix = cond["pixel_values"].to(torch.float32).reshape(B, 1, vc.s, -1)
         pix = torch.nn.functional.pad(pix, (0, 0, 0, vc.s_pad - vc.s))
         p.vision_consts = vc
-        p.pixels = _replicated(d, pix, ttnn.float32)
+        if p.vision_dp > 1:
+            dims = [None, None]
+            dims[VISION_DP_AXIS] = 0
+            mapper = ttnn.ShardTensor2dMesh(d, mesh_shape=tuple(d.shape), dims=tuple(dims))
+            p.pixels = ttnn.from_torch(
+                pix.contiguous(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=d, mesh_mapper=mapper
+            )
+        else:
+            p.pixels = _replicated(d, pix, ttnn.float32)
 
         # text: prompts (row 0) and negatives (row 1) right-padded to one length
         pad_id = 151643
@@ -224,6 +237,8 @@ class TtQwenTextEncoder:
     def encode_vision(self, p):
         """Vision tower over all B condition images -> image embeddings [B, m, 3584] (replicated)."""
         _, img = self.visual.forward_batched(p.pixels, p.vision_consts)
+        if p.vision_dp > 1:  # each row's images -> the whole batch on every chip (exact data movement)
+            img = ttnn.all_gather(img, dim=0, cluster_axis=VISION_DP_AXIS, num_links=1, topology=ttnn.Topology.Linear)
         return img
 
     def __call__(self, p):

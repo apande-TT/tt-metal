@@ -1,11 +1,16 @@
 {
-  "device_weight_bytes": 8119353016,
+  "weight_bytes": 57699249390,
+  "dominant_dtype": "bfloat16",
+  "source": "checkpoint bytes + HF config",
+  "total_params": 27627912755,
+  "params_basis": "read set for unit=unknown: lookup-only and tower-only tensors excluded",
+  "device_weight_bytes": 8058597048,
   "device_census_complete": false,
   "device_section_bytes": {
     "stacks": 7460737152,
     "denoise": 5124484132,
-    "blocks": 5101547520,
     "stack": 5101547520,
+    "blocks": 5101547520,
     "text_encode": 1670032896,
     "mlp": 1638330368,
     "attn": 1240023040,
@@ -21,10 +26,10 @@
     "ccl_manager": 254727168,
     "weight": 211028160,
     "self_attn": 206470656,
-    "te": 136292352,
     "conv1": 92587008,
     "transformer": 80907264,
     "vae_decode": 79685760,
+    "te": 75536384,
     "resnets": 71346432,
     "vae": 57941036,
     "mid_block_resnets": 53102592,
@@ -36,12 +41,12 @@
     "txt_in": 22032384,
     "time_text_embed": 20472320,
     "timestep_embedder": 20471808,
-    "vision_consts": 17170432,
     "upsamplers": 8339328,
     "conv": 7257868,
     "ports": 4835596,
     "conv_valid_h": 3484992,
     "time_conv": 3472512,
+    "vision_consts": 2777088,
     "to_qkv": 2661120,
     "proj": 887040,
     "patch_embed": 752640,
@@ -51,5 +56,5 @@
     "input_layernorm": 301056,
     "norm2": 267264
   },
-  "bytes_per_param": 2.042
+  "bytes_per_param": 2.0346
 }
