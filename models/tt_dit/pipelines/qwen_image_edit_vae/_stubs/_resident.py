@@ -15,6 +15,8 @@ graduated port.
 """
 from __future__ import annotations
 
+import ttnn
+
 
 class ResidentPort:
     """Mixin for a port whose body lives inside an encoder/decoder stack."""
@@ -115,13 +117,17 @@ def attach_block_ports(stack, device, parallel_config, ccl_manager, torch_stack=
     return ports
 
 
-def fold_single_frame_convs(stack):
+def fold_single_frame_convs(stack, blocking=None):
     """Rebuild every causal conv of a Wan `stack` for single-frame (T = 1) input, BEFORE its weights load.
 
     A causal conv with kernel_t > 1 and stride_t = 1 front-pads T with kernel_t - 1 zero frames, so on
     one frame (the image VAE, cache-free first chunk) every temporal tap but the last multiplies zeros.
     The conv is re-made with kernel (1, kh, kw), no T padding, and the last temporal tap of the weights:
-    the same output at 1/kernel_t of the MACs and weight reads. Returns the number of convs folded."""
+    the same output at 1/kernel_t of the MACs and weight reads. Returns the number of convs folded.
+
+    blocking: optional (in_channels, out_channels, kernel) -> (C_in_block, C_out_block, T_out_block,
+    H_out_block, W_out_block) or None, overriding the folded conv's conv3d blocking (set before the
+    weights are prepared, which are laid out by C_in_block)."""
     from models.tt_dit.models.vae.vae_wan2_1 import WanCausalConv3d
 
     n = 0
@@ -143,6 +149,20 @@ def fold_single_frame_convs(stack):
             ccl_manager=mod.ccl_manager,
             dtype=mod.dtype,
         )
+
+        blk = blocking(mod.in_channels, mod.out_channels, mod.kernel_size) if blocking else None
+        if blk is not None:
+            cib, cob, tb, hb, wb = blk
+            mod.conv_config = ttnn.Conv3dConfig(
+                weights_dtype=mod.dtype,
+                output_layout=ttnn.ROW_MAJOR_LAYOUT,
+                T_out_block=tb,
+                W_out_block=wb,
+                H_out_block=hb,
+                C_out_block=cob,
+                C_in_block=cib,
+                compute_with_storage_grid_size=mod.mesh_device.compute_with_storage_grid_size(),
+            )
 
         def _prepare(state, _mod=mod):
             if "weight" in state:
