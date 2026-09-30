@@ -326,7 +326,8 @@ class TextStack:
         The tail attends to the prefix's k/v through `mask`: prefix columns before t0 open, the
         prefix's own rows past t0 (row 0's tokens, not this row's) closed, the tail's columns causal.
         Every SDPA q chunk streams its head's whole k/v and mask rows, so the stubs' `_compact_sdpa_cfg`
-        takes the widest q chunk that still covers half the grid (320 of the 640 rows) and 4-tile k chunks.
+        takes the widest q chunk that still covers half the grid (320 of the 640 rows) and 4-tile k chunks,
+        and joins the prefix and tail k/v it streams in L1 (the mask must stay in DRAM).
         The KV cache is the prefix k/v followed by the tail's, so position p >= t0 lives at slot
         p + gap (gap = P - t0); `slot_mask` is the decode table for that layout, row p opening
         [0, t0) and [P, p + gap]. Nothing is staged when the rows share nothing a split can use.
