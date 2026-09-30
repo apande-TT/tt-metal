@@ -33,6 +33,51 @@ def _mesh_shape(device):
 class TtQwenImageRMSNorm(ResidentPort):
     BODY_ATTR = "norm"  # inside encoder3d/decoder3d the port is entered via forward_sharded
 
+    # precise: on a float32 activation, the norm is spelled out in float32 (sum_C x^2 -> rsqrt -> scale,
+    # then the body's fused activation) instead of the fused dit_rms_norm kernel. Measured on the decoder's
+    # last up block (96 ch, HF's own input): fused max abs error 3.9e-2, spelled out 4.8e-6. Off by default
+    # (the graduated path); the e2e pipeline switches it on for the float32 decoder.
+    precise = False
+
+    def forward_sharded(self, x, *args, **kwargs):
+        if not self.precise or x.dtype != ttnn.float32:
+            return super().forward_sharded(x, *args, **kwargs)
+        body = self.norm
+        if getattr(self, "_scale32", None) is None:
+            c = body.embedding_dim
+            w = body.weight.data if body.weight is not None else None
+            # F.normalize(x, dim=C) * sqrt(C) * gamma
+            self._scale32 = ttnn.multiply(ttnn.typecast(w, ttnn.float32), float(c) ** 0.5) if w is not None else None
+            self._bias32 = ttnn.typecast(body.bias.data, ttnn.float32) if body.bias is not None else None
+            self._cfg32 = ttnn.init_device_compute_kernel_config(
+                self.device.arch(),
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                packer_l1_acc=False,
+            )
+        shape = list(x.shape)
+        lead = 1
+        for d in shape[:-2]:
+            lead *= d
+        layout = x.layout  # the fused kernel returns its input's layout; so does this path
+        x3 = ttnn.reshape(x, (lead, shape[-2], shape[-1]))
+        if layout != ttnn.TILE_LAYOUT:
+            x3 = ttnn.to_layout(x3, ttnn.TILE_LAYOUT)
+        ss = ttnn.sum(ttnn.multiply(x3, x3), dim=-1, keepdim=True, compute_kernel_config=self._cfg32)
+        y = ttnn.multiply(x3, ttnn.rsqrt(ttnn.maximum(ss, 1e-24)))  # F.normalize eps = 1e-12 on the norm
+        if self._scale32 is not None:
+            y = ttnn.multiply(y, self._scale32)
+        if self._bias32 is not None:
+            y = ttnn.add(y, self._bias32)
+        act = body.fused_activation
+        if act is not None:
+            assert act == ttnn.UnaryOpType.SILU, f"fused activation {act} not handled in precise mode"
+            y = ttnn.silu(y)
+        if layout != ttnn.TILE_LAYOUT:
+            y = ttnn.to_layout(y, layout)
+        return ttnn.reshape(y, shape)
+
     def __init__(self, device, torch_module):
         assert torch_module.channel_first, "only the channel-first (BCTHW) variant is used by this VAE"
         self.device = device

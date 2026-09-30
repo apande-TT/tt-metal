@@ -16,6 +16,8 @@ graduated port.
 
 from __future__ import annotations
 
+import ttnn
+
 
 class ResidentPort:
     """Mixin for a port whose body lives inside an encoder/decoder stack."""
@@ -114,3 +116,133 @@ def attach_block_ports(stack, device, parallel_config, ccl_manager, torch_stack=
                 ports.append(port_cls.around(mod, device, parallel_config, ccl_manager))
                 break
     return ports
+
+
+# ---- precise evaluation of an affine op (the ports' float32 precise modes) ------------------------------
+# Two measured floors of the float32 conv / matmul kernels (encoder conv_in on HF's own input, vs float64):
+#   * dense accumulation: relative L2 error 4.2e-4 (hi + lo bf16 input limbs: 2.2e-4). A tile dot product
+#     is exact when each 32-term group holds <= 4 nonzeros spaced 8 apart, so the input channels are split
+#     into 8 lanes (c % 8) x 2 bf16 limbs: 16 runs summed in float32 -> 3.0e-6;
+#   * a rare output off by an exact power of two (decoder last up block: 3 of 6.3M outputs, |err| up to
+#     0.25 of a max 0.85; conv_in: one output off by 2.0), deterministic in the data, which the VAE's
+#     channel norms amplify. The same op on different contents does not glitch at the same place
+#     (conv_in: plain glitches, -x and hi + lo do not).
+# mode "median": elementwise median of op(x), 2 b - op(-x), op(x_hi) + op(x_lo) - b  (b = op(0), exact).
+# mode "exact":  the 16-run exact-lane sum, kept where it agrees with 2 b - op(-x) and replaced by the
+#                median of (exact, plain, negated) where it does not.
+
+
+def _flat(t):
+    n = 1
+    for d in t.shape:
+        n *= d
+    return ttnn.to_layout(ttnn.reshape(t, (n // 32, 32)), ttnn.TILE_LAYOUT) if n % 32 == 0 else None
+
+
+_LANE_MASKS = {}
+
+
+def _lane_masks(device, c):
+    key = (id(device), c)
+    if key not in _LANE_MASKS:
+        _LANE_MASKS[key] = [
+            ttnn.Tensor(
+                [1.0 if i % 8 == r else 0.0 for i in range(c)], [1, 1, c], ttnn.float32, ttnn.TILE_LAYOUT, device
+            )
+            for r in range(8)
+        ]
+    return _LANE_MASKS[key]
+
+
+def precise_affine(run, x, mode, device, extra=None, out=None):
+    """run(x, extra) -> output, affine in (x, extra) (a conv / linear with bias); channels on the last dim.
+    Returns the output in run's own layout and shape, evaluated per `mode` (see above). `out`: run(x, extra)
+    if the caller already has it."""
+    out = run(x, extra) if out is None else out
+    shape, layout = list(out.shape), out.layout
+    f0 = _flat(out)
+    if f0 is None or mode not in ("median", "exact"):
+        return out
+
+    def to3(t):
+        s = list(t.shape)
+        lead = 1
+        for d in s[:-2]:
+            lead *= d
+        return ttnn.to_layout(ttnn.reshape(t, (lead, s[-2], s[-1])), ttnn.TILE_LAYOUT)
+
+    def back(u, like):
+        return ttnn.reshape(ttnn.to_layout(u, like.layout), list(like.shape))
+
+    def variant(fn):
+        xv = back(fn(to3(x)), x)
+        ev = None if extra is None else back(fn(to3(extra)), extra)
+        return xv, ev
+
+    f32 = lambda t: ttnn.typecast(ttnn.typecast(t, ttnn.bfloat16), ttnn.float32)  # noqa: E731
+    b = _flat(run(*variant(lambda t: ttnn.multiply(t, 0.0))))
+    e_neg = ttnn.subtract(ttnn.multiply(b, 2.0), _flat(run(*variant(ttnn.neg))))
+    if mode == "exact":
+        acc, n = None, 0
+        for m in _lane_masks(device, x.shape[-1]):
+            for limb in (f32, lambda t: ttnn.subtract(t, f32(t))):
+                y = _flat(run(*variant(lambda t, m=m, limb=limb: ttnn.multiply(limb(t), m))))
+                acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
+        e_x = ttnn.subtract(acc, ttnn.multiply(b, float(n - 1)))  # each run added the bias once
+        med = ttnn.maximum(ttnn.minimum(e_x, f0), ttnn.minimum(ttnn.maximum(e_x, f0), e_neg))
+        tol = ttnn.add(ttnn.multiply(ttnn.abs(e_neg), 3e-3), 1e-3)
+        res = ttnn.where(ttnn.le(ttnn.abs(ttnn.subtract(e_x, e_neg)), tol), e_x, med)
+    else:
+        e_split = ttnn.subtract(
+            ttnn.add(_flat(run(*variant(f32))), _flat(run(*variant(lambda t: ttnn.subtract(t, f32(t)))))), b
+        )
+        res = ttnn.maximum(ttnn.minimum(f0, e_neg), ttnn.minimum(ttnn.maximum(f0, e_neg), e_split))
+    return ttnn.reshape(ttnn.to_layout(res, layout), shape)
+
+
+def precise_forward(module, mode, device):
+    """Route a float32 affine tt_dit module (conv / linear, channels last) through precise_affine."""
+    if getattr(module, "dtype", ttnn.float32) != ttnn.float32 or not mode:
+        return False
+    orig = type(module).forward
+    # the callers' matmul config for these linears runs without float32 dest accumulation (16-bit
+    # partials: the 1x1 conv_shortcut measured 4.7e-4 relative even on exact-lane inputs)
+    cfg = ttnn.init_device_compute_kernel_config(
+        device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=False,
+    )
+
+    from models.tt_dit.layers.linear import Linear
+
+    if isinstance(module, Linear):
+        # minimal_matmul keeps a 4.7e-4 relative error on this 1x1 shortcut even with exact-lane float32
+        # inputs, a float32 dest and a float32 output (measured); the exact-lane split linear of the
+        # text-encoder ports is exact to float32 there, so the linear runs as that.
+        from models.demos.qwen_image_edit_text_encoder._stubs.attention import split_linear
+
+        w = ttnn.typecast(module.weight.data, ttnn.bfloat16)  # the checkpoint is bf16: exact
+        bias = None if module.bias is None else ttnn.typecast(module.bias.data, ttnn.float32)
+
+        def forward(x, *args, **kwargs):
+            s = list(x.shape)
+            lead = 1
+            for d in s[:-2]:
+                lead *= d
+            x3 = ttnn.reshape(x, (lead, s[-2], s[-1]))
+            x3 = x3 if x3.dtype == ttnn.float32 else ttnn.typecast(x3, ttnn.float32)
+            y = split_linear(x3, w, bias=bias, compute_kernel_config=cfg, exact=True, limbs=2)
+            return ttnn.reshape(y, s[:-1] + [y.shape[-1]])
+
+        module.forward = forward
+        return True
+
+    def forward(x, *args, **kwargs):
+        if "compute_kernel_config" in kwargs:
+            kwargs["compute_kernel_config"] = cfg
+        return precise_affine(lambda t, _e: orig(module, t, *args, **kwargs), x, mode, device)
+
+    module.forward = forward
+    return True

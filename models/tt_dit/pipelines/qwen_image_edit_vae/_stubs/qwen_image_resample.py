@@ -81,6 +81,13 @@ class TtQwenImageResample(ResidentPort):
             body.spatial_downsample = lambda x, logical_h, logical_w=0: self.spatial_downsample(x, logical_h, logical_w)
         return self
 
+    def enable_precise(self, mode="median"):
+        """float32 spatial convs (the up/downsample conv) through _resident.precise_affine."""
+        from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._resident import precise_forward
+
+        mods = [getattr(self.block, "conv", None), getattr(self, "conv_valid_h", None)]
+        return sum(bool(precise_forward(m, mode, self.device)) for m in mods if m is not None)
+
     def spatial_downsample(self, x_BTHWC, logical_h, logical_w=0):
         x = self.zero_pad.forward_sharded(x_BTHWC)  # bottom zero row
         y = self.conv_valid_h(x, logical_h + 1, logical_w=logical_w)  # [B, T, H - 1, W, C']

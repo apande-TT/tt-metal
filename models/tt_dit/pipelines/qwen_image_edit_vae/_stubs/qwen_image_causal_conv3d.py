@@ -20,7 +20,7 @@ import ttnn
 from models.tt_dit.models.vae.vae_wan2_1 import WanCausalConv3d
 from models.tt_dit.parallel.config import ParallelFactor, VaeHWParallelConfig
 from models.tt_dit.parallel.manager import CCLManager
-from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._resident import ResidentPort
+from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._resident import ResidentPort, precise_affine
 from models.tt_dit.utils.conv3d import aligned_channels
 
 # Mesh axis that carries the W partition; the other axis carries H.
@@ -38,6 +38,22 @@ def _mesh_shape(device):
 
 class TtQwenImageCausalConv3d(ResidentPort):
     BODY_ATTR = "conv"  # inside encoder3d/decoder3d the port is entered via forward_sharded
+
+    # Precise mode (float32 bodies only; None = the graduated path): "median" or "exact", see
+    # _resident.precise_affine for the two measured conv3d floors each one removes.
+    precise = None
+
+    def enable_precise(self, torch_module=None, mode="median"):
+        if self.conv.dtype != ttnn.float32:
+            return False
+        self.precise = mode
+        return True
+
+    def forward_sharded(self, x, logical_h, cache_x_BTHWC=None, logical_w=0):
+        run = lambda t, c: self._body_forward(self.conv, t, logical_h, c, logical_w=logical_w)  # noqa: E731
+        if not self.precise:
+            return run(x, cache_x_BTHWC)
+        return precise_affine(run, x, self.precise, self.conv.mesh_device, extra=cache_x_BTHWC)
 
     def __init__(self, device, torch_module):
         self.device = device

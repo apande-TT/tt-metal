@@ -35,11 +35,13 @@ def _mesh_shape(device):
 
 
 class TtQwenImageEncoder3d:
-    def __init__(self, device, torch_module, batch_parallel=False):
+    def __init__(self, device, torch_module, batch_parallel=False, dtype=ttnn.bfloat16):
         """batch_parallel: split the batch over mesh axis 0 (DP) instead of partitioning H there. The
         Wan causal conv fuses its temporal front pad into the H halo exchange, and that fused
-        neighbor_pad only takes B=1; with H unsplit the pad is a plain ttnn.pad and B > 1 runs."""
+        neighbor_pad only takes B=1; with H unsplit the pad is a plain ttnn.pad and B > 1 runs.
+        dtype: the Wan stack's activation / weight dtype (graduated: bfloat16)."""
         self.device = device
+        self.dtype = dtype
         mesh_shape = _mesh_shape(device)
         self.batch_axis = _H_AXIS if (batch_parallel and mesh_shape[_H_AXIS] > 1) else None
         self.parallel_config = VaeHWParallelConfig(
@@ -63,7 +65,7 @@ class TtQwenImageEncoder3d:
             mesh_device=device,
             ccl_manager=self.ccl_manager,
             parallel_config=self.parallel_config,
-            dtype=ttnn.bfloat16,
+            dtype=dtype,
         )
         self.encoder.load_torch_state_dict(torch_module.state_dict())
         self.num_convs = count_convs(self.encoder)

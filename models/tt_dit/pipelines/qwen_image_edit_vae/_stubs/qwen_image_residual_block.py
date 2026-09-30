@@ -37,6 +37,13 @@ def _mesh_shape(device):
 class TtQwenImageResidualBlock(ResidentPort):
     BODY_ATTR = "block"  # inside encoder3d/decoder3d the port is entered via forward_sharded
 
+    def enable_precise(self, mode="median"):
+        """The float32 1x1 conv_shortcut (a linear) through _resident.precise_affine."""
+        from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._resident import precise_forward
+
+        sc = getattr(self.block, "conv_shortcut", None)
+        return bool(sc is not None and precise_forward(sc, mode, self.device))
+
     def __init__(self, device, torch_module):
         self.device = device
         mesh_shape = _mesh_shape(device)
