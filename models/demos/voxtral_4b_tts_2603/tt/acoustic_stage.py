@@ -30,14 +30,16 @@ tokens -- `[input_projection(x_t), time_projection(time_embedding(t)), llm_proje
 -- padded to one 32-row tile with an additive mask that blocks columns 3..31, and only row 0 is
 read out. The `rope_theta: 10000.0` in the acoustic sub-config is dead.
 
-TWO BODIES, SPLIT BY BATCH ROW. Source B graduated the whole section
+TWO BODIES, ALTERNATED BY EULER STEP. Source B graduated the whole section
 (`flow_matching_audio_transformer`) AND the parts that cover the same math
 (`acoustic_transformer_block`, `bidirectional_attention`, `feed_forward`, `time_embedding`).
-Running both at the same position would compute every sample twice, so the BATCH is split: rows
-`[0:split]` go through the whole-section body and rows `[split:B]` through the composed
-part-chain, and the halves are concatenated. Every sample is computed exactly once and both
-implementations are covered by the per-sample PCC gate. `split` defaults to `B // 2`; `B < 2`
-sends everything through the whole-section body (there is nothing to split).
+Running both on the same step would compute every sample twice. `decode_frame` sends EVERY row
+through ONE body per step -- the whole-section body on even steps, the composed part-chain on odd
+ones -- so each step streams the stack's weights once (splitting the batch between the bodies
+streamed them twice), every sample is computed once per step, and both implementations sit on
+every sample's path to the PCC gate. `velocity` (a single step) still splits the BATCH: rows
+`[0:split]` through the whole-section body and `[split:B]` through the part-chain; `split`
+defaults to `B // 2`, and `B < 2` sends everything through the whole-section body.
 
 Inside the part-chain the three blocks are themselves split BY LAYER INDEX for the same reason:
 `acoustic_transformer_block` is a fused block and `bidirectional_attention` + `feed_forward` are
@@ -431,6 +433,12 @@ class AcousticStage:
         for body, a, b in self._plan(batch):
             for i in range(self.n_steps):
                 self._t_proj(body, 2 * (b - a), i)
+        # `decode_frame`'s own constants: all rows, one body per step.
+        self._zeros(batch)
+        self._ones(batch)
+        for i in range(self.n_steps):
+            self._t_rows(2 * batch, i)
+            self._t_proj(self._step_body(i), 2 * batch, i)
 
     # ---------------------------------------------------------------- routing
 
@@ -538,6 +546,10 @@ class AcousticStage:
         velocity = ttnn.reshape(_lin(first, p["w_acoustic"], compute_kernel_config=_COMPUTE), [rows, self.n_acoustic])
         return velocity, semantic
 
+    def _step_body(self, step):
+        """The body `decode_frame` runs Euler step `step` through: whole-section on even steps."""
+        return self._whole_body if step % 2 == 0 else self._part_body
+
     def _plan(self, batch):
         """`[(body, start, end)]` -- which body owns which rows."""
         s = self.split_point(batch)
@@ -596,48 +608,35 @@ class AcousticStage:
         x0 = self._fp32(x0, batch, self.n_acoustic)
         alpha = self._fp32(cfg_alpha, batch, 1)
 
-        states = []
-        for body, a, b in self._plan(batch):
-            n = b - a
-            llm_h = self._rows(llm_hidden, a, b, batch)
-            alpha_h = self._rows(alpha, a, b, batch)
-            states.append(
-                {
-                    "body": body,
-                    "n": n,
-                    # CFG doubles the BATCH axis: [cond rows ; zero-conditioned rows].
-                    "llm_cfg": ttnn.concat([llm_h, self._zeros(n)], dim=0),
-                    "alpha": alpha_h,
-                    "one_minus": ttnn.subtract(self._ones(n), alpha_h),
-                    "x": self._rows(x0, a, b, batch),
-                    "sem": None,
-                    # Per-frame: the llm projection + semantic head, computed at step 0 and reused.
-                    "cache": {},
-                }
-            )
-
+        # CFG doubles the BATCH axis: [cond rows ; zero-conditioned rows].
+        llm_cfg = ttnn.concat([llm_hidden, self._zeros(batch)], dim=0)
+        one_minus = ttnn.subtract(self._ones(batch), alpha)
+        # Per-frame: the llm projection + semantic head, computed at step 0 and reused. Both bodies
+        # spell them the same way, so the cache is shared across steps whichever body runs.
+        cache = {}
+        x, sem = x0, None
         for i in range(self.n_steps):
-            dt = self.dts[i]
-            for st in states:
-                n = st["n"]
-                v_all, sem = st["body"](
-                    st["llm_cfg"],
-                    ttnn.concat([st["x"], st["x"]], dim=0),
-                    self._t_rows(2 * n, i),
-                    cache=st["cache"],
-                    t_proj=self._t_proj(st["body"], 2 * n, i),
-                )
-                v_cond = ttnn.slice(v_all, [0, 0], [n, self.n_acoustic])
-                v_unc = ttnn.slice(v_all, [n, 0], [2 * n, self.n_acoustic])
-                v = ttnn.add(ttnn.multiply(v_cond, st["alpha"]), ttnn.multiply(v_unc, st["one_minus"]))
-                st["x"] = ttnn.add(st["x"], ttnn.multiply(v, dt))
-                if st["sem"] is None:
-                    # The semantic head reads only `llm_hidden`, so it is the same at every step:
-                    # keep the conditional rows of the first step's output and never recompute it.
-                    st["sem"] = ttnn.slice(sem, [0, 0], [n, self.semantic_out])
-
-        x = states[0]["x"] if len(states) == 1 else ttnn.concat([st["x"] for st in states], dim=0)
-        sem = states[0]["sem"] if len(states) == 1 else ttnn.concat([st["sem"] for st in states], dim=0)
+            # EVERY row goes through ONE body per step, so each weight streams once per step
+            # rather than once per body; the bodies alternate by step so both stay in the path.
+            # The compact sequence is then 3 x 2B = 192 rows, whose head-batched attention products
+            # split into more M blocks than the grid has cores unless the stubs' `_bmm` widens
+            # per_core_M -- a core's second block would read the next head's rows.
+            body = self._step_body(i)
+            v_all, sem_all = body(
+                llm_cfg,
+                ttnn.concat([x, x], dim=0),
+                self._t_rows(2 * batch, i),
+                cache=cache,
+                t_proj=self._t_proj(body, 2 * batch, i),
+            )
+            v_cond = ttnn.slice(v_all, [0, 0], [batch, self.n_acoustic])
+            v_unc = ttnn.slice(v_all, [batch, 0], [2 * batch, self.n_acoustic])
+            v = ttnn.add(ttnn.multiply(v_cond, alpha), ttnn.multiply(v_unc, one_minus))
+            x = ttnn.add(x, ttnn.multiply(v, self.dts[i]))
+            if sem is None:
+                # The semantic head reads only `llm_hidden`, so it is the same at every step:
+                # keep the conditional rows of the first step's output and never recompute it.
+                sem = ttnn.slice(sem_all, [0, 0], [batch, self.semantic_out])
         if probe is not None:
             probe["x_final"] = x
             probe["semantic_logits"] = sem

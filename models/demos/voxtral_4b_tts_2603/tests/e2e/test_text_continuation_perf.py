@@ -52,6 +52,20 @@ if _PERF_TRACE:
     _OPEN_KWARGS["num_command_queues"] = 1
 
 
+# Timestamped progress breadcrumbs (stdout + a side file), so a timed-out run still says where it was.
+_PROGRESS_LOG = os.environ.get("TT_PERF_PROGRESS_LOG", "/tmp/perf_text_continuation_progress.log")
+
+
+def _mark(msg):
+    line = "[perf-tc %s] %s" % (time.strftime("%H:%M:%S"), msg)
+    print(line, flush=True)
+    try:
+        with open(_PROGRESS_LOG, "a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
 def _open_device():
     rows, cols = _MESH_SHAPE
     if rows * cols > 1:
@@ -90,12 +104,23 @@ def _build_args(hf_model):
 
 
 def test_text_continuation_perf():
+    import faulthandler
+
+    try:
+        os.remove(_PROGRESS_LOG)
+    except OSError:
+        pass
+    _fh = open(_PROGRESS_LOG + ".stacks", "w")
+    faulthandler.dump_traceback_later(240, repeat=True, file=_fh)
+    _mark("opening device mesh=%dx%d kwargs=%r" % (_MESH_SHAPE + (_OPEN_KWARGS,)))
     device, _is_mesh = _open_device()
+    _mark("device open")
     try:
         print("PERF_ISL_TOKENS=%d" % PERF_ISL_TOKENS, flush=True)
         print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
         print("PERF_MESH_SHAPE=%dx%d" % _MESH_SHAPE, flush=True)
         hf_model = common.load_reference_model()
+        _mark("reference model loaded")
 
         def _eager_forward():
             counter = [0]
@@ -154,7 +179,9 @@ def test_text_continuation_perf():
             _prompt_ids = prompt_ids_for_isl(common.load_tokenizer(), PERF_ISL_TOKENS)
 
             def _build_for_perf(dev):
+                _mark("trace: building pipeline")
                 pipe = build_pipeline(dev, **_build_args(hf_model))
+                _mark("trace: pipeline built")
                 # The text_continuation head's ONE forward (run_text_continuation's device part) as
                 # the traced stage: ids are uploaded once in setup, the step reads only resident
                 # tensors, so the captured region is host-free.
@@ -165,6 +192,7 @@ def test_text_continuation_perf():
                     return _prompt_ids.reshape(1, -1).repeat(_rows, 1)
 
                 def continuation_trace_setup(inputs):
+                    _mark("trace: setup inputs=%s" % (tuple(inputs.shape),))
                     _buf["ids"] = pipe.prepare_prompt(inputs)
                     _buf["rows"] = int(inputs.shape[0]) * int(inputs.shape[1])
                     return _buf
@@ -187,7 +215,9 @@ def test_text_continuation_perf():
 
             print("PERF_ISL_TOKENS=%d" % _prompt_ids.shape[-1], flush=True)
             print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
+            _mark("trace: measure_adapter start")
             measure_adapter(PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=PERF_BATCH), device)
+            _mark("trace: measure_adapter done")
 
         def _try_traced():
             try:
@@ -215,4 +245,7 @@ def test_text_continuation_perf():
             if _PERF_TRACE:
                 _try_traced()
     finally:
+        _mark("closing device")
         _close_device(device, _is_mesh)
+        faulthandler.cancel_dump_traceback_later()
+        _fh.close()
