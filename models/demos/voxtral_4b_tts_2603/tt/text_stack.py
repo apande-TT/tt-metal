@@ -203,8 +203,9 @@ class TextBlock:
 class TextStack:
     """embed -> rope -> N blocks -> final RMSNorm, with a resident per-layer KV cache."""
 
-    def __init__(self, device, token_embed, rotary, blocks, final_norm, hidden_size, kv_capacity):
+    def __init__(self, device, token_embed, rotary, blocks, final_norm, hidden_size, kv_capacity, n_kv_heads=None):
         self.device = device
+        self.n_kv_heads = None if n_kv_heads is None else int(n_kv_heads)
         self.token_embed = token_embed
         self.rotary = rotary
         self.blocks = blocks
@@ -383,6 +384,21 @@ class TextStack:
             shape = (1, real, 1)
 
         cos, sin = (ttnn.to_torch(t).float().reshape(-1, int(t.shape[-1])) for t in self.rotary(_Rows()))
+        # THE TAIL'S CACHE FILL, staged once. Viewed as `[B * n_kv * C/32, 1, 32, head_dim]` the
+        # cache is a paged cache of one-tile-row blocks -- block (b * n_kv + h) * C/32 + j holds
+        # sample b, head h, slots [32j, 32j + 32) -- so ONE `paged_fill_cache` sends every
+        # (head, sample) tile row of the compact tail straight to its slots after the prefix: page
+        # table row h * B + b = that block at j = P/32, batch indices 0..n_kv*B-1 (the stubs'
+        # `_seed_split`). Head-major rows, the order the compact tail already has, so no permute.
+        tail_fill = None
+        if self.n_kv_heads and batch == self.max_batch:
+            index = torch.arange(self.n_kv_heads * batch, dtype=torch.int32)
+            block = ((index % batch) * self.n_kv_heads + index // batch) * (cap // tile) + rows // tile
+            rm = dict(layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
+            tail_fill = (
+                ttnn.from_torch(block.reshape(-1, 1).repeat(1, 16).contiguous(), dtype=ttnn.int32, **rm),
+                ttnn.from_torch(index, dtype=ttnn.uint32, **rm),
+            )
         bf16 = dict(dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
         fp32 = dict(dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
 
@@ -398,6 +414,7 @@ class TextStack:
                 "tail_slots": tail_slots,
                 "batch": batch,
                 "gap": gap,
+                "tail_fill": tail_fill,
                 "keep_head": ttnn.from_torch(keep[:, :, :rows].contiguous(), **fp32),
                 "placed_head": ttnn.from_torch(placed[:, :, :rows].contiguous(), **fp32),
                 "keep_tail": ttnn.from_torch(_compact(keep), **fp32),
@@ -605,6 +622,7 @@ class TextStack:
                 block.kv["prefix_phase"] = "extend"
                 block.kv["prefix_mask"] = split["mask"]
                 block.kv["prefix_compact"] = (batch, tail, split["tail_slots"])
+                block.kv["tail_fill"] = split["tail_fill"]
             tail_out = self._run_chain(tail_in, split["rope_tail"], trim=tail_trim)
         finally:
             for block in self.blocks:
@@ -612,6 +630,7 @@ class TextStack:
                 block.kv.pop("prefix_mask", None)
                 block.kv.pop("prefix_kv", None)
                 block.kv.pop("prefix_compact", None)
+                block.kv.pop("tail_fill", None)
                 block.kv["slot_offset"] = split["gap"]
             ttnn.deallocate(pre_in)
             ttnn.deallocate(tail_in)
@@ -888,7 +907,9 @@ def build_text_stack(device, hf_model, layers=None, counter=None, kv_capacity=No
             )
         )
 
-    stack = TextStack(device, token_embed, rotary, blocks, final_norm, hidden_size, kv_capacity)
+    stack = TextStack(
+        device, token_embed, rotary, blocks, final_norm, hidden_size, kv_capacity, int(text.config.num_key_value_heads)
+    )
     if depth >= len(BLOCK_KINDS):
         missing = set(OWNED_STUBS) - set(stack.stub_names())
         if missing:
