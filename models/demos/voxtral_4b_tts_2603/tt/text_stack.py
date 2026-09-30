@@ -244,6 +244,25 @@ class TextStack:
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=device,
         )
+        # THE IN-PLACE CACHE FILL, staged once. A `[B, n_kv, C, head_dim]` cache is a paged cache of
+        # B blocks of C slots, so `paged_fill_cache` with page table row b = [b] and batch indices
+        # 0..B-1 writes every row's prefill slots into the resident buffer in ONE op -- instead of
+        # rebuilding all C slots around a zero tail each prefill. Built here: a host write inside a
+        # captured prefill is not allowed. 16 int32 columns make each table row one 64 B page.
+        self._fill_tables = (
+            ttnn.from_torch(
+                torch.arange(self.max_batch, dtype=torch.int32).reshape(-1, 1).repeat(1, 16).contiguous(),
+                dtype=ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=device,
+            ),
+            ttnn.from_torch(
+                torch.arange(self.max_batch, dtype=torch.int32),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=device,
+            ),
+        )
 
     # ---- pieces ------------------------------------------------------------------------
 
@@ -736,8 +755,22 @@ class TextStack:
                 f"prefill length {seq} and capacity {capacity} must both be tile multiples "
                 f"({ttnn.TILE_SIZE}): the zero tail is concatenated on the sequence axis"
             )
-        self.reset_cache()
+        # A block's previous cache is kept when it has this prefill's batch and capacity: the stubs
+        # fill its first `seq` slots in place and leave the rest, which decode overwrites before
+        # the slot mask ever opens them (a finite stale key under a -1e9 mask weighs nothing).
+        resident = []
         for block in self.blocks:
+            kv = block.kv or {}
+            home = (kv.pop("k", None), kv.pop("v", None))
+            if home[0] is None:
+                home = kv.pop("resident", None) or (None, None)
+            keep = home[0] is not None and kv.get("batch") == batch and kv.get("capacity") == capacity
+            keep = keep and batch == self.max_batch
+            if not keep:
+                kv["k"], kv["v"] = home  # reset_cache frees them
+            resident.append(home if keep else None)
+        self.reset_cache()
+        for block, home in zip(self.blocks, resident):
             block.kv = {
                 "k": None,
                 "v": None,
@@ -746,6 +779,8 @@ class TextStack:
                 "batch": batch,
                 # By REFERENCE: one staged table, every block, never rebuilt per step.
                 "mask": self._decode_mask,
+                "resident": home,
+                "fill_tables": self._fill_tables if batch == self.max_batch else None,
             }
 
     def reset_cache(self):
@@ -755,8 +790,7 @@ class TextStack:
             block.kv = None
             if not kv:
                 continue
-            for key in ("k", "v"):
-                tensor = kv.get(key)
+            for tensor in (kv.get("k"), kv.get("v"), *(kv.get("resident") or ())):
                 if tensor is None:
                     continue
                 try:
