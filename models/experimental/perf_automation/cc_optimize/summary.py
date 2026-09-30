@@ -78,6 +78,45 @@ def _structural_kinds() -> set:
 
 _REPORT_NAME = "RUN_REPORT.md"
 
+# THE HARDWARE THIS REPORT DESCRIBES: the run's own detected env -- its manifest's "env", which the
+# run filled from the flags (--box, --mesh, --devices) and the boards it found. Every peak and
+# capacity below is read from it through roofline._facts, the helper the optimize path already
+# prices ops with. There is NO default machine: a report with no run env prices no compute roof
+# rather than another machine's. (Six sites here and in perf_mcp used to fall back to one typed arch
+# name, so a Wormhole Galaxy run was reported against Blackhole's 175.5 TFLOPS instead of its own
+# 64 -- 2.7x optimistic -- while its own ops were ranked with the right numbers.)
+_RUN_ENV: dict = {}
+
+
+def set_run_env(env) -> None:
+    """Name the hardware for renderers that hold the run's env but not its manifest path."""
+    global _RUN_ENV
+    _RUN_ENV = dict(env or {})
+
+
+def _run_env() -> dict:
+    """The run's detected env: what set_run_env was given, else PERF_MCP_MANIFEST's, else {}."""
+    if _RUN_ENV:
+        return dict(_RUN_ENV)
+    p = os.environ.get("PERF_MCP_MANIFEST", "")
+    try:
+        return dict(json.loads(Path(p).read_text()).get("env") or {}) if p else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _hw_facts(profile=None) -> dict:
+    """Hardware facts for pricing: the run env through roofline._facts, with the profile's own arch
+    filling a gap. {} when neither says what the machine is."""
+    env = _run_env()
+    if not env.get("arch") and (profile or {}).get("arch"):
+        env["arch"] = (profile or {}).get("arch")
+    if not env:
+        return {}
+    from agent import roofline as _rf
+
+    return _rf._facts(env)
+
 
 def _runs_root() -> Path:
     return Path(__file__).resolve().parent.parent / "runs"
@@ -943,8 +982,7 @@ def _banks_the_same_state(win: dict, commit_row: dict) -> bool:
     of that one number is the evidence that this commit is the one that banked this win, and it
     needs no new field -- both rows already carry it.
     """
-    fp = win.get("fullpipe_ms")
-    return isinstance(fp, (int, float)) and commit_row.get("fullpipe_ms") == fp
+    return bool(_ledger().banks_the_same_state(win, commit_row))
 
 
 def _win_set(attempts, baseline_ms=None) -> set:
@@ -976,25 +1014,42 @@ def _win_set(attempts, baseline_ms=None) -> set:
     if not any(isinstance(a, dict) and a.get("commit_record") for a in rows):
         return wins  # this ledger predates commit rows entirely; unfiltered is the honest answer
     _m = _perf_mcp()
-    _match = getattr(_m, "_op_match", None) if _m else None
-    if not callable(_match):
+    if not callable(getattr(_m, "_op_match", None) if _m else None):
         return wins  # cannot verify banking here; do not silently blank the report
-    banked = set()
-    for i in wins:
-        a = rows[i] if 0 <= i < len(rows) else None
-        if not isinstance(a, dict):
-            continue
-        rung = str(a.get("kernel_kind") or "").strip().lower()
-        sig = a.get("op_signature")
-        for b in rows:
-            if not isinstance(b, dict) or not b.get("commit_record"):
-                continue
-            if _banks_the_same_state(a, b) or (
-                str(b.get("kernel_kind") or "").strip().lower() == rung and _match(sig, b)
-            ):
-                banked.add(i)
-                break
-    return banked
+    return {i for i in wins if 0 <= i < len(rows) and _banking_commit(rows[i], rows) is not None}
+
+
+def _banking_commit(a, rows):
+    """The commit row that banked attempt `a`, or None -- measurements.banking_commit, with perf_mcp's
+    own _op_match as the fallback matcher."""
+    _m = _perf_mcp()
+    return _ledger().banking_commit(a, rows, getattr(_m, "_op_match", None) if _m else None)
+
+
+def _attempt_result(a, won: bool, rows) -> str:
+    """The per-attempt result cell: what happened to this try, from what its own row recorded.
+
+    ✓ only for a banked win, with the commit that banked it; a candidate the PCC gate failed says so
+    with the number it had, since "faster" is not a result when the change was reverted for it."""
+    # FIRST: a candidate whose own PCC reading failed cannot have been banked (gates_allow_banking
+    # refuses it), so no fallback may tick it -- whatever its delta says.
+    _led = _ledger()
+    if _led is not None and _led.pcc_failed(a):
+        _st = str(a.get("pcc_status") or "")
+        _p, _t = a.get("pcc"), a.get("pcc_threshold")
+        if isinstance(_p, (int, float)) and isinstance(_t, (int, float)):
+            return "✗ PCC %.3f < %.2f" % (_p, _t)
+        return "✗ PCC %s" % _st
+    if won:
+        _c = _banking_commit(a, rows)
+        _sha = str((_c or {}).get("commit") or "")[:11]
+        return "✓ win (%s)" % _sha if _sha else "✓ win"
+    if a.get("wedged"):
+        return "· wedged"
+    _d = a.get("fullpipe_delta_ms")
+    if isinstance(_d, (int, float)) and _d < 0 and any(isinstance(b, dict) and b.get("commit_record") for b in rows):
+        return "· not kept"  # faster on the replay, but no commit banked it
+    return "· no gain"
 
 
 # THE MATH-FIDELITY RUNGS, ONE LIST. _fidelity_breakdown held it as a local so the ladder always
@@ -1011,12 +1066,11 @@ def _rung_of_peak(peak_flops) -> str:
     silicon resolves against that silicon and no rung name is written here.
     """
     try:
-        from agent.environment import ARCH_FACTS
         from agent.perf_target import chip_peak_flops as _cpf
 
         if not peak_flops or float(peak_flops) <= 0:
             return ""
-        _facts = ARCH_FACTS.get(str(os.environ.get("PERF_MCP_ARCH") or "blackhole").strip().lower()) or {}
+        _facts = _hw_facts()
         for _r in _RUNGS:
             _p = _cpf(_facts, _r)
             if _p and abs(float(_p) - float(peak_flops)) < 1e9:
@@ -1110,11 +1164,9 @@ def _peak_for_stage(stage, profile, model: str = "", task: str = ""):
         _whole = _pinned_peak_flops(_unit_key(""), model=model, task=task)
         if _whole and float(_whole) > 0:
             return float(_whole), _dom
-        from agent.environment import ARCH_FACTS
         from agent.perf_target import chip_peak_flops as _cpf
 
-        _arch = str(os.environ.get("PERF_MCP_ARCH") or "blackhole").strip().lower()
-        return float(_cpf(ARCH_FACTS.get(_arch) or {}, str(_top[0])) or 0.0), str(_top[0])
+        return float(_cpf(_hw_facts(profile), str(_top[0])) or 0.0), str(_top[0])
     except Exception:  # noqa: BLE001
         return 0.0, ""
 
@@ -1132,14 +1184,17 @@ def _unit_key(unit) -> str:
     capture -- the precise defect the anchor exists to prevent, and the comment at its call site
     describes.
 
-    "tok" is the only abbreviation the rate builder introduces; every other unit reaches the label
-    whole, so the leading segment IS the unit.
+    THE LABEL IS INVERTED BY THE TABLE THAT BUILT IT (model_bytes.unit_word via _unit_word), not by a
+    rule of its own. This took the leading segment and undid only "tok", so the plural the builder
+    also adds was kept: "inferences/s" looked up depth "inferences" while the anchor sits at
+    "inference", and the pinned peak was never found on any non-token run (Qwen-Image-Edit,
+    2026-09-29).
     """
     u = str(unit or "").strip().lower()
     if not u:
         return "token"
-    seg = u.split("/")[0].strip()
-    return "token" if seg == "tok" else (seg or "token")
+    # a unit the table does not know keeps its own leading noun, as before
+    return _unit_word(u, "known_unit_word") or u.split("/")[0].strip() or "token"
 
 
 def _pinned_peak_flops(unit, model: str = "", task: str = ""):
@@ -1269,14 +1324,9 @@ def _ops_per_unit(profile):
 
 
 def _capacity_bytes():
-    """Per-chip DRAM from the detected arch, or None. Never a hardcoded number."""
+    """Per-chip DRAM from the detected hardware, or None. Never a hardcoded number."""
     try:
-        from agent.environment import ARCH_FACTS
-
-        import os as _os
-
-        arch = (_os.environ.get("PERF_MCP_ARCH") or "blackhole").strip().lower()
-        return int((ARCH_FACTS.get(arch) or {}).get("dram_capacity_bytes") or 0) or None
+        return int(_hw_facts().get("dram_capacity_bytes") or 0) or None
     except Exception:  # noqa: BLE001
         return None
 
@@ -1685,8 +1735,9 @@ def _stage_units(stage, prompt_tokens, profile=None) -> int:
 _PROMPT_ROW_LABEL = "prefill"
 
 
-def _unit_word(unit) -> str:
-    """The vocabulary word behind a unit label, via the table in model_bytes that produced it.
+def _unit_word(unit, fn: str = "unit_word") -> str:
+    """The vocabulary word behind a unit label, via the table in model_bytes that produced it
+    (`fn="known_unit_word"`: "" for a unit the table does not know, instead of its fallback).
 
     GUARDED LIKE EVERY OTHER `agent.` IMPORT IN THIS FILE. They resolve because the tool puts the
     perf_automation dir on sys.path (perf_test_mcp.py:21), which an importer that reaches this module
@@ -1697,7 +1748,7 @@ def _unit_word(unit) -> str:
         try:
             import importlib
 
-            return importlib.import_module(_mod).unit_word(unit)
+            return getattr(importlib.import_module(_mod), fn)(unit)
         except Exception:  # noqa: BLE001
             continue
     return str(unit or "").strip().lower()
@@ -1811,6 +1862,7 @@ def _measured_bw_gbps(rf: dict, ms):
 # function rather than a ledger import repeated at each use.
 _LED_PARAMS = "matmul_params"
 _LED_TOKENS = "stage_tokens"
+_LED_SPLIT = "stage_split"
 
 
 def _pinned_ceiling_input(kind: str, stage, model: str = "", task: str = ""):
@@ -1862,6 +1914,17 @@ def _stage_roofs(active_bytes, peak_bw_gbps, tp_degree, unit, profile=None, stag
         _v, _b = _share_and_basis(mf, stage)
         _share_bases[str(stage)] = _b
         return _v
+
+    def _split_of(stage) -> int:
+        """How many data-parallel groups share this stage's items, as pinned; 1 when none was stated.
+
+        Divides the per-item terms only. Every group streams its own full weight shard once per call,
+        so the weights' share of the read set does not shrink with the split -- the items do."""
+        try:
+            _v = _pinned_ceiling_input(_LED_SPLIT, stage, model, task)
+            return max(1, int(_v or 1))
+        except Exception:  # noqa: BLE001
+            return 1
 
     def _stage_block(stage):
         """The geometry of the block this stage runs, or None when it cannot be established.
@@ -1966,7 +2029,7 @@ def _stage_roofs(active_bytes, peak_bw_gbps, tp_degree, unit, profile=None, stag
             ) - float(_ab(mf, regime=stage, seq_len=0, batch=1, items=0, block=_blk) or 0.0)
         except Exception:  # noqa: BLE001 -- regime unknown to the byte model, or no byte model at all
             return base
-        return base + max(0.0, _extra) / tp
+        return base + max(0.0, _extra) / (tp * _split_of(stage))
 
     params = 0
     try:
@@ -1989,11 +2052,9 @@ def _stage_roofs(active_bytes, peak_bw_gbps, tp_degree, unit, profile=None, stag
     except Exception:  # noqa: BLE001
         _dom = ""
     try:
-        from agent.environment import ARCH_FACTS
         from agent.perf_target import chip_peak_flops as _cpf
 
-        _arch = str(os.environ.get("PERF_MCP_ARCH") or "blackhole").strip().lower()
-        peak_flops = float(_cpf(ARCH_FACTS.get(_arch) or {}, _dom) or 0.0)
+        peak_flops = float(_cpf(_hw_facts(profile), _dom) or 0.0)
     except Exception:  # noqa: BLE001
         peak_flops = 0.0
     # THE PINNED PEAK OUTRANKS THE ONE JUST DERIVED, for the same reason the byte anchor outranks the
@@ -2109,7 +2170,8 @@ def _stage_roofs(active_bytes, peak_bw_gbps, tp_degree, unit, profile=None, stag
         except Exception:  # noqa: BLE001
             pass
         _attn = (4.0 * _L * float(toks) * float(toks) * _H) if (_L and _H) else 0.0
-        flops = ((2.0 * float(_params) * float(toks) + _attn) / tp) if _params else 0.0
+        # PER CHIP: TP splits each item's math, the stage's data-parallel groups split the items.
+        flops = ((2.0 * float(_params) * float(toks) + _attn) / (tp * _split_of(name))) if _params else 0.0
         # THIS STAGE'S OWN PEAK, when the capture marked its ops. The value resolved above is the
         # dominant fidelity across the WHOLE profile, applied to every stack -- one variable, used
         # three times. It is right only while every stack runs the same math mode: on voxtral encode,
@@ -2239,19 +2301,19 @@ def _fidelity_breakdown(profile):
     """
     try:
         from agent import roofline as _rf
-        from agent.environment import ARCH_FACTS
 
         # PASS THE ARCH. _facts() keys off env["arch"]; an empty env leaves peak_tflops_per_core
         # unset, ideal_ms_compute returns None, and no op ever carries a compute floor -- the
         # breakdown then silently renders "not modelled" on a profile that has everything it needs.
-        _arch = str((profile or {}).get("arch") or os.environ.get("PERF_MCP_ARCH") or "blackhole").lower()
-        rep = _rf.residual_report(profile or {}, {"arch": _arch})
+        _env = _hw_facts(profile)
+        if not _env:
+            return None, None  # no machine named: no compute floor rather than another machine's
+        rep = _rf.residual_report(profile or {}, _env)
         ops = [o for o in (rep.get("open_ops") or []) if o.get("compute_ms") and o.get("flops")]
         if not ops:
             return None, None
-        bh = ARCH_FACTS.get(_arch) or ARCH_FACTS.get("blackhole") or {}
-        cores = int(bh.get("grid_x") or 0) * int(bh.get("grid_y") or 0)
-        peaks = bh.get("peak_tflops_per_core") or {}
+        cores = int(_env.get("grid_x") or 0) * int(_env.get("grid_y") or 0)
+        peaks = _env.get("peak_tflops_per_core") or {}
         agg = {}
         for o in ops:
             f = str(o.get("fidelity") or "hifi4").lower()
@@ -2888,6 +2950,10 @@ def _roofline_tables(
     out.extend(_fidelity_section())
     disp = _dispatch_ms_per_unit(profile, per_unit_ms)
     cap = _capacity_bytes()
+    # PER CHIP, like the capacity it is held against: each chip keeps its 1/TP share of the weights
+    # (DP replicates, it does not add). Comparing the whole model to one chip's DRAM printed a 57.7 GB
+    # checkpoint as 448% of a 12 GB Wormhole on a 32-chip Galaxy.
+    _resident = (active_bytes / max(1, int(tp_degree or 1))) if active_bytes else 0
     out.append("")
 
     if disp is not None or cap:
@@ -2924,15 +2990,15 @@ def _roofline_tables(
             # targets 10784 ops -- counted over the whole profiling window (one prefill plus six
             # decode steps) on a row that reads per token, so it was out by roughly 7x as well.
             # Op counts live in the Op breakdown table below, per class, correctly attributed.
-        if cap and active_bytes:
-            _used = 100.0 * active_bytes / cap
+        if cap and _resident:
+            _used = 100.0 * _resident / cap
             out.append(
                 (
                     " %-30s\u2502 %-16s\u2502 %-28s\u2502 %.0f%% used%s"
                     % (
                         "DRAM capacity",
                         _ncell("%.1f" % (cap * 0.9 / 1024**3), "GiB 90%"),
-                        _ncell("%.2f" % (active_bytes / 1024**3), "GiB"),
+                        _ncell("%.2f" % (_resident / 1024**3), "GiB"),
                         _used,
                         "      \u2717 OVER" if _used >= 90 else "",
                     )
@@ -3006,10 +3072,10 @@ def _roofline_tables(
     if disp is not None and per_unit_ms:
         _d = disp / float(per_unit_ms)
         _rows.append(("dispatch  overhead", _d, "%.2f / %.2f ms" % (disp, per_unit_ms), "\u2193 better"))
-    if cap and active_bytes:
-        _c = active_bytes / cap
+    if cap and _resident:
+        _c = _resident / cap
         _rows.append(
-            ("DRAM      capacity", _c, "%.2f / %.0f GiB" % (active_bytes / 1024**3, cap / 1024**3), "\u2193 better")
+            ("DRAM      capacity", _c, "%.2f / %.0f GiB" % (_resident / 1024**3, cap / 1024**3), "\u2193 better")
         )
     for _name, _frac, _detail, _dir in _rows:
         # An estimated row draws a HATCHED bar, never the solid fill a measurement gets. A bar is
@@ -3670,15 +3736,18 @@ def render_summary(
         # Copy, the data movers, half of a typical run -- cannot be placed at all. Read from the
         # capture's marks; blank when the capture marked no stages, which is exactly how the column
         # renders for a model that emits none.
-        _ar = " %-44s\u2502 %-9s\u2502 %-18s\u2502 %-20s\u2502 %-22s\u2502 %s"
-        ah = _ar % ("op", "stack", "lever", "eager device_ms", "1CQ \u0394 vs current", "result")
+        # PCC: the accuracy this candidate had (its own check_pcc reading), "—" when it recorded none.
+        _ar = " %-44s\u2502 %-9s\u2502 %-18s\u2502 %-20s\u2502 %-22s\u2502 %-8s\u2502 %s"
+        ah = _ar % ("op", "stack", "lever", "eager device_ms", "1CQ \u0394 vs current", "PCC", "result")
         lines.append(ah)
         # THE RULE IS DERIVED FROM THE HEADER, not counted by hand. Hand-counted it drifted the
         # moment a field width changed -- crosses at 33/48/64/82 under dividers at 33/49/66/85.
         lines.append("".join("\u253c" if c == "\u2502" else "\u2500" for c in ah.ljust(140)))
         _unmeasured = 0
         for _i, a in enumerate(attempts):
-            if not isinstance(a, dict):
+            # A COMMIT ROW IS THE PROOF A WIN WAS BANKED, NOT AN ATTEMPT: it is read into the win's own
+            # result cell (its sha) and would otherwise print as a second, "no gain" copy of that try.
+            if not isinstance(a, dict) or a.get("commit_record"):
                 continue
             sig = _op_label(a.get("op_signature", "?"))
             lever = _disp_level(a.get("kernel_kind") or "?")
@@ -3716,9 +3785,13 @@ def render_summary(
             if gain_s == "n/m":
                 _unmeasured += 1
                 continue
-            res = "✓ win" if _i in _wins else ("· wedged" if a.get("wedged") else "· no gain")
+            res = _attempt_result(a, _i in _wins, attempts)
+            _pcc = a.get("pcc")
+            pcc_s = f"{_pcc:.4f}" if isinstance(_pcc, (int, float)) else "\u2014"
             lines.append(
-                (_ar % (sig, _stage_label(a.get("op_signature"), baseline_profile), lever, ms_s, gain_s, res)).rstrip()
+                (
+                    _ar % (sig, _stage_label(a.get("op_signature"), baseline_profile), lever, ms_s, gain_s, pcc_s, res)
+                ).rstrip()
             )
         if _unmeasured:
             lines.append("")
