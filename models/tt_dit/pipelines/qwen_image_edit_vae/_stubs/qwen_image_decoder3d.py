@@ -32,13 +32,13 @@ _W_AXIS = 1
 
 
 class TtQwenImageDecoder3d:
-    def __init__(self, device, torch_module, batch_parallel=False, single_frame=False, blocking=None):
+    def __init__(self, device, torch_module, batch_parallel=False, single_frame=False, blocking=None, ccl_links=1):
         """batch_parallel: split the batch over mesh axis 0 (DP) instead of partitioning H there. The
         Wan causal conv fuses its temporal front pad into the H halo exchange, and that fused
         neighbor_pad only takes B=1; with H unsplit the pad is a plain ttnn.pad and B > 1 runs.
         single_frame: the decoder only ever sees T = 1 latents (images), so every causal conv keeps just
         its last temporal tap (see _resident.fold_single_frame_convs); blocking optionally re-blocks those
-        folded convs."""
+        folded convs. ccl_links: fabric links per collective (halo exchanges and the output gathers)."""
         self.device = device = physical_grid(device)
         shape = mesh_shape(device)
         self.batch_axis = _H_AXIS if (batch_parallel and shape[_H_AXIS] > 1) else None
@@ -49,7 +49,7 @@ class TtQwenImageDecoder3d:
             width_parallel=ParallelFactor(factor=shape[_W_AXIS], mesh_axis=_W_AXIS),
         )
         self.batch_factor = shape[_H_AXIS] if self.batch_axis is not None else 1
-        self.ccl_manager = CCLManager(device, topology=ttnn.Topology.Linear, num_links=1)
+        self.ccl_manager = CCLManager(device, topology=ttnn.Topology.Linear, num_links=ccl_links)
         self.out_channels = torch_module.conv_out.out_channels
 
         self.decoder = WanDecoder3d(
