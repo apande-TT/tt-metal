@@ -320,6 +320,28 @@ def _sdpa_cfg(q):
     )
 
 
+def _compact_sdpa_cfg(q):
+    """The compact-tail SDPA config: the widest q chunk that still spreads over half the grid.
+
+    Every Q chunk streams its head's WHOLE K/V (the 160-row prefix plus all 640 tail rows) once, so
+    the op is K/V-read bound and the chunk count sets the traffic: 32 heads x 640 rows is 160 chunks
+    at q_chunk 128 (and 320 at 64, which measured slower) but 64 at 320, still >= half of 110 cores.
+    The k chunk is 4 tiles, the key axis padded up to it (SDPA fills the padded mask columns with
+    -inf): a one-tile chunk rescales the whole running output after every key tile, and a 5-tile
+    chunk (160, the widest that divides 800 keys) scrambled the masked output (PCC 0).
+    """
+    grid = q.device().compute_with_storage_grid_size()
+    cores = int(grid.x) * int(grid.y)
+    rows, seq = int(q.shape[0]) * int(q.shape[1]), int(q.shape[-2])
+    q_chunk = max(c for c in range(32, seq + 1, 32) if seq % c == 0 and (c == 32 or 2 * rows * (seq // c) >= cores))
+    return ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=(grid.x, grid.y),
+        exp_approx_mode=False,
+        q_chunk_size=q_chunk,
+        k_chunk_size=128,
+    )
+
+
 def _per_sample(t, batch, real, padded):
     """A compact `[1, H, batch * real, D]` k/v as the cache's per-sample `[batch, H, padded, D]`.
 
@@ -351,7 +373,6 @@ def _prefill_sdpa(q, k, v, kv_cache):
         # to the shared prefix plus its own sample's earlier tail positions.
         batch, real, padded = compact
         pk, pv = kv_cache.pop("prefix_kv")
-        grid = q.device().compute_with_storage_grid_size()
         a = ttnn.transformer.scaled_dot_product_attention(
             q,
             ttnn.concat([pk, k], dim=2),
@@ -359,12 +380,7 @@ def _prefill_sdpa(q, k, v, kv_cache):
             is_causal=False,
             attn_mask=kv_cache["prefix_mask"],
             scale=1.0,
-            program_config=ttnn.SDPAProgramConfig(
-                compute_with_storage_grid_size=(grid.x, grid.y),
-                exp_approx_mode=False,
-                q_chunk_size=next(c for c in (128, 64, 32) if int(q.shape[-2]) % c == 0),
-                k_chunk_size=32,
-            ),
+            program_config=_compact_sdpa_cfg(q),
         )
         rep = ttnn.Shape([batch, 1, 1, 1])
         k = ttnn.concat([ttnn.repeat(pk, rep), _per_sample(k, batch, real, padded)], dim=2)
