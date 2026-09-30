@@ -487,21 +487,43 @@ def _zero_tail(device, b, h, rows, width):
 def _seed_cache(kv, k, v):
     """Hand the prefill's POST-RoPE k/v to the cache, widened out to `kv["capacity"]`.
 
-    No copy and no second source of truth: the cache IS the prefill's own k/v with a zero tail
-    concatenated on the sequence axis, so the resident history cannot disagree with the prefill
-    that produced it. The tail slots are never READ before they are written -- a decode step
-    writes slot `position` and then attends to `[0, position]` -- so they only have to exist.
+    No second source of truth: the cache's first slots ARE the prefill's own k/v -- a zero tail
+    concatenated on the sequence axis the first time, the same buffer filled in place after -- so
+    the resident history cannot disagree with the prefill that produced it. The tail slots are
+    never READ before they are written -- a decode step writes slot `position` and then attends to
+    `[0, position]` -- so they only have to exist (and hold finite values).
     """
     capacity = int(kv.get("capacity") or 0)
-    for key, tensor in (("k", k), ("v", v)):
+    # The text stack hands back the previous prefill's buffers (same batch and capacity) with the
+    # staged fill tables; this prefill's slots are then written into them IN PLACE by one
+    # `paged_fill_cache` (block b = row b's C slots) instead of rebuilding all C around a zero tail.
+    resident = kv.pop("resident", None) or (None, None)
+    tables = kv.get("fill_tables")
+    for (key, tensor), home in zip((("k", k), ("v", v)), resident):
         if tensor.dtype != _CACHE_DTYPE:
             tensor = ttnn.typecast(tensor, _CACHE_DTYPE)
         shape = [int(s) for s in tensor.shape]
-        if capacity > shape[-2]:
-            pad = _zero_tail(tensor.device(), shape[0], shape[1], capacity - shape[-2], shape[-1])
-            tensor = ttnn.concat([tensor, pad], dim=2)
-        elif capacity and capacity < shape[-2]:
-            raise ValueError(f"kv capacity {capacity} is shorter than the prefill's {shape[-2]}")
+        full = shape[:2] + [capacity, shape[-1]]
+        if home is not None and [int(s) for s in home.shape] != full:
+            ttnn.deallocate(home)
+            home = None
+        if tables is not None and capacity > shape[-2]:
+            # The first prefill zero-fills the buffer; every prefill (the first too) seeds it by
+            # the SAME fill, so the correctness gate covers the path the traced prefill replays.
+            if home is None:
+                home = ttnn.zeros(full, dtype=_CACHE_DTYPE, layout=ttnn.TILE_LAYOUT, device=tensor.device())
+            ttnn.experimental.paged_fill_cache(home, tensor, tables[0], batch_idx_tensor=tables[1])
+            if tensor is not k and tensor is not v:
+                ttnn.deallocate(tensor)
+            tensor = home
+        else:
+            if home is not None:
+                ttnn.deallocate(home)
+            if capacity > shape[-2]:
+                pad = _zero_tail(tensor.device(), shape[0], shape[1], capacity - shape[-2], shape[-1])
+                tensor = ttnn.concat([tensor, pad], dim=2)
+            elif capacity and capacity < shape[-2]:
+                raise ValueError(f"kv capacity {capacity} is shorter than the prefill's {shape[-2]}")
         stale = kv.get(key)
         if stale is not None:
             try:
