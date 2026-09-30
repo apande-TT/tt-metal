@@ -127,11 +127,15 @@ def fold_single_frame_convs(stack, blocking=None):
 
     blocking: optional (in_channels, out_channels, kernel) -> (C_in_block, C_out_block, T_out_block,
     H_out_block, W_out_block) or None, overriding the folded conv's conv3d blocking (set before the
-    weights are prepared, which are laid out by C_in_block)."""
-    from models.tt_dit.models.vae.vae_wan2_1 import WanCausalConv3d
+    weights are prepared, which are laid out by C_in_block). It is applied to the stack's spatial
+    WanConv2d convs (the resample convs, already (1, kh, kw)) as well."""
+    from models.tt_dit.models.vae.vae_wan2_1 import WanCausalConv3d, WanConv2d
 
     n = 0
     for mod in list(walk(stack))[1:]:
+        if type(mod) is WanConv2d:
+            _reblock(mod, blocking)
+            continue
         if type(mod) is not WanCausalConv3d:
             continue
         kt, kh, kw = mod.kernel_size
@@ -150,19 +154,7 @@ def fold_single_frame_convs(stack, blocking=None):
             dtype=mod.dtype,
         )
 
-        blk = blocking(mod.in_channels, mod.out_channels, mod.kernel_size) if blocking else None
-        if blk is not None:
-            cib, cob, tb, hb, wb = blk
-            mod.conv_config = ttnn.Conv3dConfig(
-                weights_dtype=mod.dtype,
-                output_layout=ttnn.ROW_MAJOR_LAYOUT,
-                T_out_block=tb,
-                W_out_block=wb,
-                H_out_block=hb,
-                C_out_block=cob,
-                C_in_block=cib,
-                compute_with_storage_grid_size=mod.mesh_device.compute_with_storage_grid_size(),
-            )
+        _reblock(mod, blocking)
 
         def _prepare(state, _mod=mod):
             if "weight" in state:
@@ -172,3 +164,21 @@ def fold_single_frame_convs(stack, blocking=None):
         mod._prepare_torch_state = _prepare
         n += 1
     return n
+
+
+def _reblock(mod, blocking):
+    """Override a Wan conv's conv3d blocking with blocking(in_channels, out_channels, kernel), if given."""
+    blk = blocking(mod.in_channels, mod.out_channels, mod.kernel_size) if blocking else None
+    if blk is None:
+        return
+    cib, cob, tb, hb, wb = blk
+    mod.conv_config = ttnn.Conv3dConfig(
+        weights_dtype=mod.dtype,
+        output_layout=ttnn.ROW_MAJOR_LAYOUT,
+        T_out_block=tb,
+        W_out_block=wb,
+        H_out_block=hb,
+        C_out_block=cob,
+        C_in_block=cib,
+        compute_with_storage_grid_size=mod.mesh_device.compute_with_storage_grid_size(),
+    )
