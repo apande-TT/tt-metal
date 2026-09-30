@@ -28,6 +28,14 @@ def _replicated(device, t, dtype=ttnn.float32):
     )
 
 
+def _decoder_blocking(in_channels, out_channels, kernel):
+    """conv3d blocking for the decoder's folded float32 (1, 3, 3) convs: 96-channel input blocks and an
+    8 x 4 output patch per core (the fp32 table's default is 32 / 32 / 1 x 1, a single output position)."""
+    if tuple(kernel) != (1, 3, 3):
+        return None
+    return (96 if in_channels % 96 == 0 else 32, 32, 1, 8, 4)
+
+
 def pack_latents(z, B, C, H, W):
     """[B, C, H, W] -> [B, (H/2)(W/2), 4C] (QwenImageEditPipeline._pack_latents)."""
     z = ttnn.reshape(z, (B, C, H // 2, 2, W // 2, 2))
@@ -51,7 +59,9 @@ class TtQwenVAE:
         self.quant_conv = vae_pointwise.build(device, hf_vae.quant_conv)
         self.post_quant_conv = vae_pointwise.build(device, hf_vae.post_quant_conv)
         # image latents are single-frame: the decoder's causal convs keep only their live temporal tap
-        self.decoder = qwen_image_decoder3d.build(device, hf_vae.decoder, batch_parallel=True, single_frame=True)
+        self.decoder = qwen_image_decoder3d.build(
+            device, hf_vae.decoder, batch_parallel=True, single_frame=True, blocking=_decoder_blocking
+        )
         mean = torch.tensor(cfg.latents_mean, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
         std = torch.tensor(cfg.latents_std, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
         self.mean = _replicated(device, mean)
