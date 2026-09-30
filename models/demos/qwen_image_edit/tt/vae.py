@@ -29,11 +29,12 @@ def _replicated(device, t, dtype=ttnn.float32):
 
 
 def _decoder_blocking(in_channels, out_channels, kernel):
-    """conv3d blocking for the decoder's folded float32 (1, 3, 3) convs: 96-channel input blocks and an
-    8 x 4 output patch per core (the fp32 table's default is 32 / 32 / 1 x 1, a single output position)."""
+    """conv3d blocking for the decoder's folded float32 (1, 3, 3) convs: 96-channel input and output blocks
+    and an 8 x 4 output patch per core (the fp32 table's default is 32 / 32 / 1 x 1, a single output
+    position)."""
     if tuple(kernel) != (1, 3, 3):
         return None
-    return (96 if in_channels % 96 == 0 else 32, 32, 1, 8, 4)
+    return (96 if in_channels % 96 == 0 else 32, 96 if out_channels % 96 == 0 else 32, 1, 8, 4)
 
 
 def pack_latents(z, B, C, H, W):
