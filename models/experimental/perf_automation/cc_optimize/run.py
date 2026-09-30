@@ -3499,6 +3499,12 @@ def _progress_watch(pgid, log_path=None, stall_s=0.0):
             def moved(self, *_a, **_k):
                 return True
 
+            def note_progress(self, *_a, **_k):
+                return None
+
+            def limit(self):
+                return float(stall_s or 0.0)
+
         return _Blind()
 
 
@@ -3927,7 +3933,6 @@ def _run_device_proc(
             # (_llm_child_alive), which no hung run can fail. Cooling stays: it is a deliberate
             # pause this tool asked for.
             _watch = _progress_watch(pgid, None, stall_s)
-            max_gap = 0.0
             _over_budget = [False]
             _ceiling_mult = _hard_ceiling_mult()
             while proc.poll() is None:
@@ -3957,9 +3962,9 @@ def _run_device_proc(
                 # liveness signals read that as a wedge, which is exactly wrong.
                 moved = _watch.moved(now, last_progress, proc.pid) or _act[0] > last_progress or _cooling_now()
                 if moved:
-                    max_gap = max(max_gap, now - last_progress)
+                    _watch.note_progress(now, last_progress)  # the rule lives in ProgressWatch now
                     last_progress = now
-                limit = max(stall_s, int(3 * max_gap))
+                limit = int(_watch.limit())
                 idle = now - last_progress
                 if idle >= limit:
                     print(
@@ -4652,6 +4657,17 @@ def _next_target_summary(kernel_log: str) -> str:
     return _op_lever_label(op, rung)
 
 
+def _load_summary():
+    """summary.py, loaded fresh from disk by path -- the one loader, so the final report and the
+    heartbeat read the same rules. Raises when it cannot be loaded; callers decide the fallback."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("cc_summary", str(Path(__file__).parent / "summary.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _last_attempt_summary(kernel_log: str) -> str:
     """One line describing the most recent lever attempt on file: which op, which stack, which
     lever, and the outcome -- what the watchdog heartbeat should say instead of a bare timer nobody
@@ -4682,8 +4698,24 @@ def _last_attempt_summary(kernel_log: str) -> str:
     elif a.get("diverged"):
         status = "· diverged (uncounted)"
     else:
-        status = "· no gain"
+        status = _attempt_outcome(a, rows)
     return f"{_op_lever_label(op, rung)}: {status}"
+
+
+def _attempt_outcome(a: dict, rows: list) -> str:
+    """The outcome of attempt `a`, by the SAME rules the report's result column uses.
+
+    THE LAST ROW IS USUALLY THE ATTEMPT, NOT ITS COMMIT. The skill commits and then records, so a win
+    is followed by its own attempt row, and asking only "is the last row a commit" labelled every
+    banked win "no gain" -- the report's _banking_commit is what links the two. Its PCC failure
+    reads as one ("✗ PCC 0.932 < 0.95") rather than as a bare no-gain."""
+    try:
+        s = _load_summary()
+        if s._banking_commit(a, rows) is not None:
+            return "✓ win, saved"
+        return s._attempt_result(a, False, rows)
+    except Exception:  # noqa: BLE001 -- the heartbeat never fails for a report it cannot load
+        return "· no gain"
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -5041,12 +5073,17 @@ def _emit_summary(
     after_mode: str = "",
     stop_facts: dict | None = None,
 ) -> None:
-    import importlib.util
-
+    # THE HARDWARE THIS RUN DETECTED, from its own manifest. This function has no `manifest` in scope
+    # (it is a local of run_cc_optimize), and the residual line below read one anyway -- a NameError
+    # its except swallowed, so the final summary never carried a residual.
     try:
-        spec = importlib.util.spec_from_file_location("cc_summary", str(Path(__file__).parent / "summary.py"))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        _mani = _latest_manifest(repo_root / PERF_DIR)
+        _run_env = (json.loads(_mani.read_text()).get("env") or {}) if _mani else {}
+    except (OSError, ValueError, AttributeError):
+        _run_env = {}
+    try:
+        mod = _load_summary()
+        mod.set_run_env(_run_env)  # the report prices the machine the run detected -- no default
     except Exception as exc:  # noqa: BLE001
         print(f"  [optimize/cc] summary unavailable: {exc}")
         return
@@ -5071,7 +5108,7 @@ def _emit_summary(
 
             _prof = _read_baseline_profile_for_report(repo_root)
             if _prof:
-                residual = _rl.residual_report(_prof, (manifest or {}).get("env", {}) or {})
+                residual = _rl.residual_report(_prof, _run_env)
         except Exception:  # noqa: BLE001
             residual = None
     except Exception:  # noqa: BLE001
@@ -6199,15 +6236,19 @@ def _hf_snapshots(model_id: str) -> list:
 
 
 def _hf_cache_weight_bytes(model_id: str) -> int:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from agent import model_bytes as _mb
+
     best = 0
     for snap in _hf_snapshots(model_id):
         total = 0
-        for p in snap.iterdir():
-            if p.suffix.lower() in (".safetensors", ".bin", ".pt", ".pth"):
-                try:
-                    total += os.path.getsize(os.path.realpath(p))
-                except OSError:
-                    pass
+        # Where the checkpoint says its weights are -- the top level and every declared component's
+        # subfolder (model_bytes.weight_files) -- not the top level alone.
+        for _prefix, p in _mb.weight_files(snap, _mb._WEIGHT_SUFFIXES):
+            try:
+                total += os.path.getsize(os.path.realpath(p))
+            except OSError:
+                pass
         best = max(best, total)
     return best
 
@@ -6352,6 +6393,7 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
     experts = cfg.get("num_local_experts") or cfg.get("num_experts") or cfg.get("n_routed_experts")
     src = "checkpoint bytes + HF config"
     analytic_params = 0
+    _unread_w: list = []  # weight files the checkpoint holds that no lookup read (the gate below)
     _unit = ""  # bound before the try below, which can raise before assigning it (params_basis reads it)
     # ANALYTIC FIRST: every tensor's shape and dtype from the safetensors header, with the on-device
     # widths applied per name pattern. The checkpoint's FILE SIZE counts the stored dtype -- 15.0 GB of
@@ -6377,6 +6419,7 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
         # SIZE as the divisor: 1.34 GB of float32 instead of its param count, i.e. ~4 B/param, so the
         # xB -> xGB rule was bypassed for exactly the models least able to report the error themselves.
         if _snap:
+            _unread_w = _mb.unread_weight_files(_snap)
             _an = _mb.weight_bytes(
                 _snap,
                 # Unknown unit -> count as "token", which EXCLUDES lookup-only tensors. One row of an
@@ -6470,6 +6513,20 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
         "dominant_dtype": str(cfg.get("torch_dtype") or "bfloat16"),
         "source": src,
     }
+    # EVERY WEIGHT FILE IS READ, OR THE RUN SAYS WHICH WERE NOT. A layout the reader does not know used
+    # to cost the whole roofline without a word -- it simply rendered "n/a -- not measured". Recorded in
+    # the facts (so the report and the dashboard carry it) and printed as an ERROR; not raised, because
+    # a ceiling must never cost a run.
+    if _unread_w:
+        facts["weights_unread"] = list(_unread_w)
+        print(
+            "  [optimize/cc] ERROR: %d weight file(s) in the checkpoint were NOT read (%s%s) -- every "
+            "number derived from the weights (params, roofline, fidelity ladder) is missing or short. "
+            "The checkpoint's layout is not one model_bytes.weight_files knows."
+            % (len(_unread_w), ", ".join(_unread_w[:4]), ", ..." if len(_unread_w) > 4 else ""),
+            file=sys.stderr,
+            flush=True,
+        )
     # PARAMS drive the ceiling (xB -> xGB). Exact count from the headers when readable, else the count
     # the model NAME publishes; for MoE the A-suffix ("30B-A3B") is the ACTIVE count, which is the read
     # set a routed token streams.

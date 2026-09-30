@@ -20,16 +20,28 @@ SETUP = "_trace_setup"
 STEP = "_trace_step"
 INPUTS = "_trace_inputs"
 ITEMS = "_trace_items"
+# How many data-parallel groups share one call's items, each running its own items/SPLIT at the same
+# time. Absent means 1: every chip group runs the whole call (replicated), which is also what a
+# single-chip or TP-only pipeline is. Only the pipeline knows which of its stages it splits
+# (Qwen-Image-Edit splits the denoise batch over its DP columns and runs the encoders replicated).
+SPLIT = "_trace_split"
 
 # A stage cannot be measured at all without these: setup does host prep outside the trace, step is
 # the one fixed-shape call inside it.
 REQUIRED = (SETUP, STEP)
 
 # Absent, these degrade rather than break -- but each degrades silently, which is why the contract
-# reports them: INPUTS costs the stage its own boundary, ITEMS costs it a real arithmetic ceiling.
-OPTIONAL = (INPUTS, ITEMS)
+# reports them: INPUTS costs the stage its own boundary, ITEMS costs it a real arithmetic ceiling,
+# SPLIT (on a stage that is split) prices it as if one chip group did the whole batch.
+OPTIONAL = (INPUTS, ITEMS, SPLIT)
 
 ALL = REQUIRED + OPTIONAL
+
+
+# The tensor-parallel degree a pipeline runs at, when it states one -- read off the pipeline, never
+# assumed from the mesh the operator typed: a 4x8 Galaxy can run TP=8 x DP=4 or TP=4 x DP=8, and only
+# the model knows which (Qwen-Image-Edit: `self.tp = device.shape[TP_AXIS]`).
+TP_ATTR = "tp"
 
 
 def hook(stage: str, seam: str) -> str:

@@ -174,13 +174,26 @@ def _glob_first(dirs: list, pattern: str) -> list:
 # --------------------------------------------------------------------------- attempt normalization
 
 
-def _attempt_status(rec: dict) -> str:
+def _attempt_status(rec: dict, rows: list | None = None) -> str:
     """One word the UI can colour. beat_baseline is written ONLY by the commit (perf_mcp.py), so it
-    is the kept/reverted line; claimed_beat_baseline is what the agent believed before committing."""
+    is the kept/reverted line; claimed_beat_baseline is what the agent believed before committing.
+
+    WITH `rows`, AN ATTEMPT IS KEPT WHEN A COMMIT BANKED IT. The attempt row itself never carries
+    beat_baseline -- the commit writes a separate row -- so every banked win read "reverted" beside a
+    second "kept" row for its commit (Qwen-Image-Edit: six wins, six "reverted", six "kept"). The link
+    is the report's own (measurements.banking_commit), and a candidate whose PCC failed is discarded
+    however it measured (measurements.pcc_failed)."""
     if rec.get("wedged") or rec.get("measurement_failed"):
         return "wedged"
     if rec.get("beat_baseline"):
         return "kept"
+    if rows is not None:
+        from models.experimental.perf_automation.cc_optimize.measurements import banking_commit, pcc_failed
+
+        if banking_commit(rec, rows) is not None:
+            return "kept"
+        if pcc_failed(rec):
+            return "reverted"
     if rec.get("claimed_beat_baseline"):
         return "reverted"
     return "no-gain"
@@ -191,7 +204,7 @@ def _load_attempts(dirs: list, slug: str | None) -> list:
     union _load_attempts_all reads, so the dashboard agrees with the engine about what was tried."""
     pattern = "cc_kernlog_%s_*.json" % slug if slug else "cc_kernlog_*.json"
     logs = _glob_first(dirs, pattern + ".cumulative") + _glob_first(dirs, pattern)
-    out, seen = [], set()
+    recs, seen = [], set()
     for path in logs:
         data = _read_json(path)
         if not isinstance(data, list):
@@ -216,32 +229,46 @@ def _load_attempts(dirs: list, slug: str | None) -> list:
             if key in seen:
                 continue
             seen.add(key)
-            before = rec.get("fullpipe_best_ms")
-            after = rec.get("fullpipe_ms")
-            delta_pct = None
-            if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before:
-                delta_pct = (after - before) / before * 100.0
-            out.append(
-                {
-                    "op": rec.get("op_signature") or "?",
-                    "lever": rec.get("kernel_kind") or "?",
-                    "task": task,
-                    "status": _attempt_status(rec),
-                    "measured_ms": rec.get("measured_ms"),
-                    "fullpipe_ms": after,
-                    "fullpipe_delta_ms": rec.get("fullpipe_delta_ms"),
-                    "before_ms": before,
-                    "after_ms": after,
-                    "delta_pct": delta_pct,
-                    "commit": rec.get("commit"),
-                    "note": rec.get("note") or "",
-                    "stages": [s for s in (rec.get("stages") or []) if isinstance(s, dict)],
-                }
-            )
+            recs.append((rec, task))
+    from models.experimental.perf_automation.cc_optimize.measurements import banking_commit
+
+    rows = [r for r, _ in recs]
+    # A COMMIT ROW THAT BANKED AN ATTEMPT IS THAT ATTEMPT'S PROOF, NOT A SECOND HISTORY ENTRY: its sha
+    # goes onto the attempt. A commit row nothing links to still stands on its own, as it always did.
+    banked = {id(r): banking_commit(r, rows) for r in rows}
+    folded = {id(c) for c in banked.values() if c is not None}
+    out = []
+    for rec, task in recs:
+        if id(rec) in folded:
+            continue
+        _c = banked.get(id(rec))
+        before = rec.get("fullpipe_best_ms")
+        after = rec.get("fullpipe_ms")
+        delta_pct = None
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before:
+            delta_pct = (after - before) / before * 100.0
+        out.append(
+            {
+                "op": rec.get("op_signature") or "?",
+                "lever": rec.get("kernel_kind") or "?",
+                "task": task,
+                "status": _attempt_status(rec, rows),
+                "measured_ms": rec.get("measured_ms"),
+                "fullpipe_ms": after,
+                "fullpipe_delta_ms": rec.get("fullpipe_delta_ms"),
+                "before_ms": before,
+                "after_ms": after,
+                "delta_pct": delta_pct,
+                "commit": rec.get("commit") or (_c or {}).get("commit"),
+                "pcc": rec.get("pcc"),
+                "note": rec.get("note") or "",
+                "stages": [s for s in (rec.get("stages") or []) if isinstance(s, dict)],
+            }
+        )
     return out
 
 
-def _parse_batch(run_dir: Path) -> int | None:
+def _parse_batch(run_dir: Path, requested: int | None = None) -> int | None:
     """The resolved batch / concurrent-user count for the perf run.
 
     The perf harness reports the batch it actually ran (perf_adapter.batch_report_line, after
@@ -249,9 +276,31 @@ def _parse_batch(run_dir: Path) -> int | None:
     label throughput as per-user. Reads the newest profile log; returns None if not found."""
     from models.experimental.perf_automation.agent.perf_adapter import parse_batch_report
 
+    def _report_batch():
+        # Harnesses that don't print a PERF_BATCH_* token (e.g. diffusion pipelines that write CSV
+        # profiles, not a .log) still record the batch in RUN_REPORT.md ('batch: N') / console.log.
+        # Universal fallback so batch shows for ANY model, not just the LLM decode harness.
+        import re as _rre
+
+        for _f in ("RUN_REPORT.md", "console.log"):
+            try:
+                _t = (run_dir / _f).read_text(errors="replace")
+            except Exception:
+                continue
+            for _a, _b in _rre.findall(r"PERF_BATCH_[A-Z]+=(\d+)|batch:\s*(\d+)", _t)[::-1]:
+                if _a or _b:
+                    return int(_a or _b)
+        return None
+
+    _pb = run_dir / ".requested_batch"
+    if _pb.is_file():
+        try:
+            return int(_pb.read_text().strip())
+        except Exception:
+            pass
     prof = run_dir / "profiles"
     if not prof.is_dir():
-        return None
+        return _report_batch() or (int(requested) if requested else None)
     logs = sorted(prof.glob("*.log"), key=lambda p: (p.stat().st_mtime if p.exists() else 0.0), reverse=True)
     for lg in logs:
         try:
@@ -259,9 +308,16 @@ def _parse_batch(run_dir: Path) -> int | None:
         except Exception:
             continue
         served = parse_batch_report(txt)
+        if served is None:
+            import re as _re
+
+            _m = _re.findall(r"PERF_BATCH_[A-Z]+=(\d+)", txt)  # any batch-report token (STREAMS/ROWS/...)
+            served = int(_m[-1]) if _m else None
         if served is not None:
             return served
-    return None
+    # No harness batch report (e.g. a non-decode model that never prints one): fall back to the batch
+    # the run was ASKED to drive (--batch). Batch is a property of the run, not of the LLM decode path.
+    return _report_batch() or (int(requested) if requested else None)
 
 
 def _serving_metrics(
@@ -355,7 +411,7 @@ def _roofline_points(buckets: list) -> list:
 # --------------------------------------------------------------------------- the snapshot
 
 
-def collect_state(run_dir: Path, state_dirs: list, slug: str | None = None) -> dict:
+def collect_state(run_dir: Path, state_dirs: list, slug: str | None = None, requested_batch: int | None = None) -> dict:
     """Assemble the one JSON snapshot the dashboard renders. Every section is best-effort: a file
     that does not exist yet (baseline still measuring) simply omits its section, never fails."""
     run_dir = Path(run_dir)
@@ -388,9 +444,11 @@ def collect_state(run_dir: Path, state_dirs: list, slug: str | None = None) -> d
     fullpipe = None
     for f in _glob_first(
         state_dirs,
-        "perf_mcp_full_pipeline_baseline_1cq_%s_*.json" % slug
-        if slug
-        else "perf_mcp_full_pipeline_baseline_1cq_*.json",
+        (
+            "perf_mcp_full_pipeline_baseline_1cq_%s_*.json" % slug
+            if slug
+            else "perf_mcp_full_pipeline_baseline_1cq_*.json"
+        ),
     ):
         if f.name.endswith(".pending.json"):
             continue
@@ -538,7 +596,7 @@ def collect_state(run_dir: Path, state_dirs: list, slug: str | None = None) -> d
             if config.get(k) is not None
         },
         "metric": state.get("metric"),
-        "batch": _parse_batch(run_dir),
+        "batch": _parse_batch(run_dir, requested_batch),
         "stages": stages,
         "serving": serving,
         "headroom": headroom,

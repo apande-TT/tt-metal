@@ -2,17 +2,57 @@ import ast
 import json
 import os
 import re
+import time
 from pathlib import Path
 
+# ONE OWNER FOR THE NAME. bringup_plan defines it with the note that "the emitter, the lookup and
+# the already-scaffolded short-circuit must agree on the name" -- so this asks rather than spelling a
+# third copy. Imported lazily at module scope through a guard because trace_gate is imported from
+# inside functions in both directions and a hard import would couple the two at load time.
+try:
+    from .bringup_plan import BRINGUP_STATUS_FILENAME as _STATUS_FILE
+except Exception:  # noqa: BLE001 -- a partial checkout must still gate
+    _STATUS_FILE = "bringup_status.json"
 
-def read_graduation(demo_dir):
-    demo_dir = Path(demo_dir)
-    status_path = demo_dir / "bringup_status.json"
-    result = {}
-    if not status_path.is_file():
-        return result
+
+def _component_status_dirs(demo_dir):
+    """The bring-up dirs of a COMPOSITE model, discovered from what its own pipeline imports.
+
+    A composite e2e package holds no status file of its own: its parts were brought up separately and
+    each keeps its status beside its own stubs, anywhere in the checkout. Which dirs those are cannot
+    be guessed from the demo path and must not be typed -- so the PIPELINE is asked, by walking the
+    imports it actually makes (the same closure the correctness cache keys on) and keeping every
+    directory along the way that carries a status file. A model that renames or relocates its
+    components still resolves, because nothing here assumed where they were.
+
+    This is the case the gate was failing on: with no status file in the demo dir, `trace_policy`
+    reported `known: False` and `classify_trace_verdict` returned a hard FAIL -- correctly, on its
+    own terms, since nothing licenses skipping a trace on no evidence. But the evidence existed; it
+    was one directory away, and the agent was told to make the status readable from a dir it was
+    never written to. 25 graduated modules read as 0, every round.
+    """
     try:
-        data = json.loads(status_path.read_text())
+        from .commands.emit_e2e import _import_closure
+    except Exception:  # noqa: BLE001 - no walker available: no components to report
+        return []
+    out = []
+    seen = set()
+    for f in _import_closure(Path(demo_dir)):
+        for d in f.parents:
+            if d in seen:
+                continue
+            seen.add(d)
+            if (d / _STATUS_FILE).is_file():
+                out.append(d)
+    return sorted(out)
+
+
+def _graduation_in(status_dir, qualify=False):
+    """The graduation state recorded in ONE bring-up dir: {module: "sharded"|"native"|None}."""
+    status_dir = Path(status_dir)
+    result = {}
+    try:
+        data = json.loads((status_dir / _STATUS_FILE).read_text())
     except Exception:
         return result
     try:
@@ -23,19 +63,34 @@ def read_graduation(demo_dir):
         name = comp.get("name")
         if not name:
             continue
-        stub = demo_dir / "_stubs" / f"{_safe_id(name)}.py"
+        stub = status_dir / "_stubs" / f"{_safe_id(name)}.py"
         native = stub.with_suffix(".py.last_good_native").is_file()
         sharded = stub.with_suffix(".py.last_good_sharded").is_file()
         try:
             graduated = bool(_stub_has_graduated_any(stub))
         except Exception:
             graduated = False
+        # Qualified only when several dirs are being merged, where the same module name can occur in
+        # more than one component and an unqualified key would silently drop one. A single-dir model
+        # keeps the bare names it has always reported.
+        key = "%s/%s" % (status_dir.name, name) if qualify else name
         if graduated and sharded:
-            result[name] = "sharded"
+            result[key] = "sharded"
         elif graduated and native:
-            result[name] = "native"
+            result[key] = "native"
         else:
-            result[name] = None
+            result[key] = None
+    return result
+
+
+def read_graduation(demo_dir):
+    demo_dir = Path(demo_dir)
+    if (demo_dir / _STATUS_FILE).is_file():
+        return _graduation_in(demo_dir)
+    dirs = _component_status_dirs(demo_dir)
+    result = {}
+    for d in dirs:
+        result.update(_graduation_in(d, qualify=len(dirs) > 1))
     return result
 
 
@@ -65,11 +120,21 @@ def trace_engaged(trace_caps):
 
 
 def valid_overflow_proof(proof):
+    """A waiver needs a MEASURED budget, not a placeholder.
+
+    This accepted any proof where required > budget, and overflow_fix_loop filled budget_bytes with
+    0 when it gave up -- so anything exceeded it and every unfixed memory failure minted a valid
+    proof. Measured on a Qwen-Image-Edit run: a VAE decode that could not allocate a 100663296 B
+    DRAM buffer produced "trace waived: verified physical overflow required=191102976 > budget=0",
+    G6 went green, and the gate reported the pipeline trace-ready with no trace ever captured.
+    A budget of zero is not a statement about the device; it is the absence of one."""
     if not isinstance(proof, dict):
         return False
     required = proof.get("required_bytes")
     budget = proof.get("budget_bytes")
     if not isinstance(required, (int, float)) or not isinstance(budget, (int, float)):
+        return False
+    if budget <= 0:
         return False
     return required > budget
 
@@ -258,6 +323,83 @@ def caps_stale(demo_dir):
 _WEDGE_RETRY_ENV = "E2E_TRACE_WEDGE_RETRIES"
 _WEDGE_RETRIES = 2
 
+# WHAT THE CAPTURE SAW, IN THE FIELD THE AGENT ACTUALLY READS.
+#
+# `capture_detail` is the only model-specific evidence this gate produces: the stage markers the
+# capture printed before it stopped, one line per attempt. It was returned in the result and written
+# to the report -- and left OUT of `reasons`, which is the list the gate server turns into
+# next_target.reason and blocking[]. So the agent was handed the verdict PROSE only ("trace did not
+# engage ..."), identical every round, while the line naming where it stopped sat in a file nothing
+# told it to read: five rounds of guessing, no edits. The report keeps its own copy; this puts the
+# same fact into the pipe that reaches the agent.
+_CAPTURE_DETAIL_CHARS = 900  # next_target.reason is capped at 2000 -- leave room for the other blockers
+
+
+# WHAT A CAPTURE MAY COST, FROM WHAT ONE HAS COST.
+#
+# This was a literal 900 s in the signature below, and probes._execute ends a step absolutely at
+# _HARD_CEILING_MULT x its budget -- so 900 became a 3600 s wall. A Qwen-Image-Edit capture needed
+# longer and was SIGKILLed there twice, 3611 s apart, by the gate's own process, both times with one
+# stage traced and the next mid-replay. The ceiling is right to be absolute (it is the only guard
+# against work that progresses forever); what was wrong is that it multiplied a number typed for a
+# much smaller step.
+#
+# So the budget is sized by probes.sized_budget -- operator's value, else headroom over the longest
+# capture actually observed, else the old 900 as a FLOOR, so nothing gets tighter than before. The
+# observation has to OUTLIVE the process: the gate runs in a fresh interpreter every round, so an
+# in-memory record would never be read back. It is kept beside the demo's other gate state and
+# scoped to the run that measured it, because a cost measured on another board says nothing here.
+_CAPTURE_COST_FILE = ".e2e_capture_cost.json"
+_CAPTURE_BUDGET_ENV = "E2E_TRACE_CAPTURE_TIMEOUT"
+_CAPTURE_FLOOR_S = 900  # what the typed default used to be, kept as the floor
+
+
+def _run_stamp_of_this_run() -> str:
+    try:
+        from .commands.emit_e2e import run_stamp
+
+        return run_stamp()
+    except Exception:  # noqa: BLE001 -- no run identity is a valid answer
+        return ""
+
+
+def _observed_capture_s(demo_dir) -> float:
+    """The longest capture measured for this demo IN THIS RUN, or 0 when there is no such record."""
+    try:
+        doc = json.loads((Path(demo_dir) / _CAPTURE_COST_FILE).read_text())
+    except Exception:  # noqa: BLE001
+        return 0.0
+    if not isinstance(doc, dict) or doc.get("run") != _run_stamp_of_this_run():
+        return 0.0
+    try:
+        return max(0.0, float(doc.get("seconds") or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_capture_s(demo_dir, seconds: float) -> None:
+    """Keep the LONGEST observed; a budget that shrank on a lucky attempt would kill the next one."""
+    try:
+        if not seconds or seconds <= 0 or seconds <= _observed_capture_s(demo_dir):
+            return
+        (Path(demo_dir) / _CAPTURE_COST_FILE).write_text(
+            json.dumps({"run": _run_stamp_of_this_run(), "seconds": round(float(seconds), 1)})
+        )
+    except OSError:
+        pass
+
+
+def _capture_budget_s(demo_dir) -> int:
+    from models.experimental.perf_automation.agent import probes as _pr_budget
+
+    override = os.environ.get(_CAPTURE_BUDGET_ENV)
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    return _pr_budget.sized_budget(_observed_capture_s(demo_dir), _CAPTURE_FLOOR_S)
+
 
 def _wedge_retries() -> int:
     try:
@@ -271,8 +413,11 @@ def _is_wedge(status, detail) -> bool:
     return status == "invalid" and "WEDGE" in (detail or "")
 
 
-def run_fresh_trace_capture(demo_dir, timeout_s=900):
+def run_fresh_trace_capture(demo_dir, timeout_s=None):
     demo_dir = Path(demo_dir)
+    # None -> sized from what a capture has actually cost here (see _capture_budget_s). An explicit
+    # value from a caller still wins, so existing callers are unaffected.
+    timeout_s = int(timeout_s) if timeout_s else _capture_budget_s(demo_dir)
     perf = _perf_test(demo_dir)
     if perf is None:
         return None, "no perf test to capture"
@@ -285,11 +430,16 @@ def run_fresh_trace_capture(demo_dir, timeout_s=900):
     os.environ.setdefault("PERF_MCP_VALIDATE_TIMEOUT", str(timeout_s))
     attempts = []
     for attempt in range(1 + _wedge_retries()):
+        _t0 = time.monotonic()
         try:
             status, detail = validate_generated_perf_test(perf, task)
         except Exception as e:  # noqa: BLE001
             attempts.append("capture raised: %s" % e)
             break
+        finally:
+            # Recorded even for a FAILED attempt: how long it ran is a fact about this model's cost,
+            # and a capture killed at the wall is the strongest evidence the wall was too low.
+            _record_capture_s(demo_dir, time.monotonic() - _t0)
         attempts.append("%s %s" % (status, detail or ""))
         if not _is_wedge(status, detail):
             break
@@ -335,6 +485,8 @@ def evaluate_trace_gate(demo_dir, trace_caps=None, allow_no_trace=False, overflo
         reclaim_mesh()
     if verdict == "FAIL":
         reasons.append("G6 trace-gate: " + reason)
+        if capture_detail:
+            reasons.append("G6 trace-gate: what the capture itself reported: " + capture_detail[:_CAPTURE_DETAIL_CHARS])
         for g in glue:
             reasons.append("G6 trace-gate: " + g)
         if repin:
@@ -426,6 +578,12 @@ def glue_from_runtime(demo_dir):
 
 
 _OVERFLOW_MARKERS = ("trace region", "trace_region", "overflow", "out of memory", "oom", "not enough space")
+# THE REMEDY ONLY FITS ONE OF THESE. overflow_fix_loop's fix is to GROW the trace region, which is
+# right when the trace region is what overflowed and actively harmful otherwise: a bigger trace
+# region leaves LESS device memory, so on a plain buffer allocation failure the loop made the fault
+# worse on every one of its three doublings and then waived the gate. Matching the allocator's own
+# vocabulary, not the model's -- the same shape as _L1_MARKERS_* below.
+_REGION_MARKERS = ("trace region", "trace_region")
 _DEFAULT_TRACE_REGION = 23887872
 
 _L1_MARKERS_A = ("circular buffer", "max l1", "l1 size")
@@ -435,6 +593,12 @@ _L1_MARKERS_B = ("beyond max l1", "grow to", "l1 size of")
 def _is_overflow(detail):
     d = (detail or "").lower()
     return any(m in d for m in _OVERFLOW_MARKERS)
+
+
+def _is_region_overflow(detail):
+    """The trace REGION overflowed -- the one failure growing the region can fix."""
+    d = (detail or "").lower()
+    return any(m in d for m in _REGION_MARKERS)
 
 
 def is_l1_overflow(detail):
@@ -479,14 +643,19 @@ def overflow_fix_loop(demo_dir, capture_fn=None, max_rounds=3, base_region=_DEFA
         caps, detail = capture_fn(demo_dir)
         if caps and caps.get("trace_1cq"):
             return {"resolved": True, "caps": caps, "detail": "traced at region=%d" % region, "proof": None}
-        if not _is_overflow(detail):
+        if not _is_region_overflow(detail):
+            # An allocation failure that is NOT the trace region: growing the region cannot help and
+            # would take memory away from the thing that just ran out of it. Report it as it is.
             return {"resolved": False, "caps": caps, "detail": detail, "proof": None}
         region *= 2
+    # GIVING UP IS NOT A PROOF. Three doublings that did not help says this tool could not fix it;
+    # it says nothing about what the device can physically hold, and a waiver needs the latter.
     return {
         "resolved": False,
         "caps": caps,
-        "detail": "overflow persists after %d rounds (region grown to %d)" % (max_rounds, region),
-        "proof": {"required_bytes": region, "budget_bytes": 0, "rounds": max_rounds},
+        "detail": "trace region overflow persists after %d rounds (region grown to %d); no physical "
+        "budget was measured, so this is not a waiver -- the trace requirement stands" % (max_rounds, region),
+        "proof": None,
     }
 
 
@@ -507,7 +676,12 @@ def build_fix_directive(result):
     for g in result.get("glue_violations") or []:
         parts.append("Port to on-device ttnn (remove from traced step): " + g)
     if not parts:
+        # Nothing static to point at, so the only lead is what the capture reported. Without it this
+        # fell back to the verdict prose, which is the same sentence every round and names nothing.
         parts.append(result.get("reason", "trace did not engage"))
+        detail = result.get("capture_detail")
+        if detail:
+            parts.append("The capture's own last output was: " + detail[:_CAPTURE_DETAIL_CHARS])
     return " ".join(parts)
 
 

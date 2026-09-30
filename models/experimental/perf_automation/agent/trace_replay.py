@@ -42,6 +42,163 @@ _NOTE_MAX_DEPTH = 3
 _REPLAY_ITERS = max(1, int(os.environ.get("TT_TRACE_REPLAY_ITERS", "16")))
 
 
+# HOW MANY REPLAYS TO AVERAGE IS A CONSEQUENCE OF WHAT ONE COSTS, NOT A NUMBER PER MODEL.
+#
+# 16 is a noise-reduction choice, and a good one for a step costing milliseconds: the timer's own
+# jitter is a large fraction of one iteration, so averaging many is how the figure becomes stable.
+# For a stage costing 68 SECONDS an iteration it buys nothing measurable -- the jitter is already
+# negligible against the signal -- and costs 18 minutes of device time per stage. That is what put a
+# Qwen-Image-Edit capture past the budget it was given, where an absolute ceiling (4 x a typed 900 s)
+# killed it mid-progress, twice, 3611 s apart, with one stage traced and the next mid-replay.
+#
+# The caller already states the constraint: `run_fresh_trace_capture` puts its budget in the
+# environment and the capture child inherits it. So ONE replay is timed first, and only as many more
+# as that budget affords are added -- at least two, so there is always an average, and never more
+# than was asked for, so a cheap stage is measured exactly as before. The count is the means; the
+# budget is the constraint, and it is the caller's to state rather than this file's to guess.
+# BUDGETS ONLY. This listed PERF_MCP_MEASURE_STALL_SEC, which is a STALL WINDOW -- run.py passes it
+# as `stall_s=`, the no-progress detector's window, not an allowance for the work. Sizing a
+# measurement from it would have cut sample counts in the optimize domain, where it is routinely set,
+# for a reason that has nothing to do with how long the measurement may take.
+_REPLAY_BUDGET_ENVS = ("PERF_MCP_VALIDATE_TIMEOUT", "PERF_MCP_MEASURE_BACKSTOP")
+_MIN_REPLAY_ITERS = 2  # an average needs two; dimensionless, so it assumes nothing about the model
+
+
+def _measurement_budget_s(stages=1) -> float:
+    """This stage's share of the budget the caller gave the capture, or 0 when nothing was stated."""
+    for key in _REPLAY_BUDGET_ENVS:
+        try:
+            v = float(os.environ.get(key) or 0)
+        except ValueError:
+            v = 0.0
+        if v > 0:
+            return v / max(1, int(stages or 1))
+    return 0.0
+
+
+def _affordable_iters(requested, per_iter_s, budget_s) -> int:
+    """As many replays as the budget affords: >= _MIN_REPLAY_ITERS, <= what was asked for."""
+    try:
+        requested = max(1, int(requested))
+    except (TypeError, ValueError):
+        requested = 1
+    if not budget_s or not per_iter_s or per_iter_s <= 0:
+        return requested  # nothing stated, or no cost observed -> behave exactly as before
+    affordable = int(budget_s // per_iter_s)
+    return max(min(requested, _MIN_REPLAY_ITERS), min(requested, affordable))
+
+
+# A LOOP THAT PRINTS NOTHING READS AS A HANG, AND IT IS NOT ONE.
+#
+# Warmup, capture and replay ran their iterations in silence, and the replay batch is enqueued
+# non-blocking and then waited on in ONE `synchronize_device` -- so a stage whose step costs tens of
+# seconds produces no log line, no syscall and no stack movement for the whole of 3 + 16 iterations.
+# Every supervising watchdog in this tree judges liveness on exactly those signals
+# (probes.progress_signature), so it reports "no forward progress" and kills work that is perfectly
+# healthy. On 2026-09-29 that killed one Qwen-Image-Edit stage three times over, each kill reported as
+# a device wedge, and the retry loop re-ran the same silence.
+#
+# THE CURE FOR SILENCE IS TO SPEAK, NOT TO PICK A LARGER TIMEOUT. Whatever number anyone chooses is a
+# guess about a stage nobody has measured yet; a line per iteration is a fact. Growing the log is
+# already one of the four progress signals, so no watchdog, window or caller needs to change.
+#
+# The cadence is the one thing that must not be typed: it has to stay INSIDE whatever window is
+# supervising us, and only that supervisor knows it. It tells us in the environment, so the beat is
+# read from there and divided; a dimensionless divisor carries no assumption about the model, the
+# stage or the box. With nothing said, fall back to the tightest cadence any caller supervises at.
+_HEARTBEAT_DIVISOR = 4  # beats per supervising window, so a missed beat is never the first evidence
+_STALL_WINDOW_ENVS = ("PERF_MCP_VALIDATE_STALL_SEC", "PERF_MCP_MEASURE_STALL_SEC", "PERF_MCP_ROUND_STALL_SEC")
+
+
+def _heartbeat_s() -> float:
+    """Seconds between liveness lines: a fraction of the tightest window supervising this process."""
+    windows = []
+    for key in _STALL_WINDOW_ENVS:
+        try:
+            v = float(os.environ.get(key) or 0)
+        except ValueError:
+            v = 0.0
+        if v > 0:
+            windows.append(v)
+    if not windows:
+        try:  # what probes._execute supervises at when no caller narrowed it
+            from .probes import _execute
+
+            import inspect
+
+            windows.append(float(inspect.signature(_execute).parameters["stall_timeout_s"].default))
+        except Exception:  # noqa: BLE001
+            return 0.0  # nothing to stay inside of -> the caller is unsupervised, stay quiet
+    return max(1.0, min(windows) / _HEARTBEAT_DIVISOR)
+
+
+class _Alive:
+    """Say so, on a beat, while a blocking device call holds this process silent.
+
+    The same shape as the thermal wait's heartbeat (cc_optimize/run's _COOL_HEARTBEAT_S): a child
+    that is busy ON PURPOSE re-asserts it, rather than every supervisor being taught to expect this
+    particular silence."""
+
+    def __init__(self, what: str):
+        self._what = what
+        self._stop = None
+        self._t = None
+
+    def __enter__(self):
+        beat = _heartbeat_s()
+        if beat <= 0:
+            return self
+        import threading
+
+        self._stop = threading.Event()
+        t0 = time.monotonic()
+
+        def _beat():
+            while not self._stop.wait(beat):
+                print(
+                    "TRACE_STAGE_WAITING[%s] %ds on device" % (self._what, int(time.monotonic() - t0)),
+                    flush=True,
+                )
+
+        self._t = threading.Thread(target=_beat, daemon=True)
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self._stop is not None:
+            self._stop.set()
+            self._t.join(timeout=1)
+        return False
+
+
+def _iterate(step, iters, what, keep=False):
+    """Run `iters` steps, reporting on the heartbeat cadence, keeping the results only if asked.
+
+    THROTTLED, NOT PER-ITERATION, and it does not retain what it does not need: this runs inside a
+    timed region, a fast stage does thousands of iterations, and the replay loop deliberately drops
+    each result so the device buffers it holds are freed. Beating at the same cadence as the waits
+    costs nothing measurable and breaks the silence just as well."""
+    out = []
+    n = max(0, iters)
+    beat = _heartbeat_s()
+    last = time.monotonic()
+    # THE LOOP CAN ONLY SPEAK BETWEEN ITERATIONS, AND ONE ITERATION CAN OUTLAST THE WINDOW. A stage
+    # whose single step costs more than the supervising window is silent for the whole of it, so
+    # reporting per iteration is not enough on its own -- the beat has to come from somewhere that is
+    # not waiting on the step. Hence the heartbeat across the whole loop: the ITER lines mark
+    # progress, the heartbeat proves liveness, and no step duration can outrun it.
+    with _Alive(what):
+        for i in range(n):
+            r = step()
+            if keep:
+                out.append(r)
+            now = time.monotonic()
+            if i + 1 == n or (beat > 0 and now - last >= beat):
+                last = now
+                print("TRACE_STAGE_ITER[%s]=%d/%d" % (what, i + 1, n), flush=True)
+    return out
+
+
 def _warm(step, iters):
     """Run the warmup steps, keeping what each one handed back.
 
@@ -49,7 +206,7 @@ def _warm(step, iters):
     is the one thing the capture path and the self-traced path have in common -- putting the check in
     either alone would have missed every pipeline that takes the other, and gemma3 takes the other.
     """
-    return [step() for _ in range(max(0, iters))]
+    return _iterate(step, iters, "warmup", keep=True)  # _check_advance reads the samples
 
 
 def _check_advance(samples):
@@ -73,20 +230,38 @@ def _check_advance(samples):
 def _capture_step_trace(device, step):
     """Warm up, then capture exactly one host-op-free, fixed-shape step as a trace on cq0."""
     _check_advance(_warm(step, _WARMUP_ITERS))
-    ttnn.synchronize_device(device)
-    tid = ttnn.begin_trace_capture(device, cq_id=0)
-    step()
-    ttnn.end_trace_capture(device, tid, cq_id=0)
-    ttnn.synchronize_device(device)
+    with _Alive("capture"):
+        ttnn.synchronize_device(device)
+        tid = ttnn.begin_trace_capture(device, cq_id=0)
+        step()
+        ttnn.end_trace_capture(device, tid, cq_id=0)
+        ttnn.synchronize_device(device)
     return tid
 
 
-def _replay_1cq(device, tid, iters):
+def _replay_1cq(device, tid, iters, budget_s=0.0):
+    # The replays are enqueued non-blocking ON PURPOSE -- that is what makes this a steady-state
+    # throughput measurement -- so the wait is one silent block that no per-iteration print can
+    # break. Hence the heartbeat: it grows the log without touching the timed region.
+    #
+    # ONE FIRST, TO LEARN WHAT IT COSTS. Its own time is a valid steady-state sample (the trace is
+    # already captured and warmed), so nothing is spent to find out; it just decides how many more
+    # are worth adding. See _affordable_iters.
+    t1 = time.perf_counter()
+    ttnn.execute_trace(device, tid, cq_id=0, blocking=False)
+    with _Alive("replay 1"):
+        ttnn.synchronize_device(device)
+    one_s = time.perf_counter() - t1
+    n = _affordable_iters(iters, one_s, budget_s)
+    print("TRACE_STAGE_REPLAYS=%d of %d requested (%.1fs each)" % (n, iters, one_s), flush=True)
+    if n <= 1:
+        return one_s
     t0 = time.perf_counter()
-    for _ in range(iters):
+    for _ in range(n):
         ttnn.execute_trace(device, tid, cq_id=0, blocking=False)
-    ttnn.synchronize_device(device)
-    return (time.perf_counter() - t0) / iters
+    with _Alive("replay x%d" % n):
+        ttnn.synchronize_device(device)
+    return (time.perf_counter() - t0) / n
 
 
 # A REPLAYED TRACE DISPATCHES ONE OP. An eager pass dispatches one per ttnn call in the model --
@@ -246,7 +421,7 @@ def _report_read_set(stage_name, dispatches, ws_bytes):
     print("TRACE_STAGE_BYTES_NONE[%s] reason=%s" % (stage_name, _why), flush=True)
 
 
-def _measure_native(device, stage):
+def _measure_native(device, stage, budget_s=0.0):
     """Time a SELF-TRACED stage: the pipeline owns its trace capture (persistent-buffer / vLLM-style
     decode, e.g. GLM's decode(enable_trace=True)), so we must NOT begin_trace_capture around it --
     doing so raises "Writes/Reads are not supported during trace capture" because the step does
@@ -268,10 +443,18 @@ def _measure_native(device, stage):
     _report_read_set(stage.name, dispatched, _ws_bytes)
     ttnn.synchronize_device(device)
     t0 = time.perf_counter()
-    for _ in range(_REPLAY_ITERS):
-        stage.step()
-    ttnn.synchronize_device(device)
-    per_s = (time.perf_counter() - t0) / _REPLAY_ITERS
+    # Same rule as _replay_1cq: one step is a valid sample and tells us what the rest would cost.
+    _t1 = time.perf_counter()
+    stage.step()
+    _one = time.perf_counter() - _t1
+    _n = _affordable_iters(_REPLAY_ITERS, _one, budget_s)
+    print("TRACE_STAGE_REPLAYS=%d of %d requested (%.1fs each)" % (_n, _REPLAY_ITERS, _one), flush=True)
+    _iterate(stage.step, max(0, _n - 1), stage.name)
+    with _Alive(stage.name):
+        ttnn.synchronize_device(device)
+    # Divided by what actually RAN, not by what was requested: _n may be fewer, and dividing by the
+    # request would report a per-iteration time smaller than any iteration took.
+    per_s = (time.perf_counter() - t0) / max(1, _n)
     tp = getattr(stage, "trace_path", None)
     if callable(tp):
         try:
@@ -293,7 +476,7 @@ def _measure_native(device, stage):
     return per_s * 1000.0, path
 
 
-def _measure_stage(device, stage):
+def _measure_stage(device, stage, budget_s=0.0):
     """Capture stage.step as a trace, replay it on a single command queue, return (ms, path).
 
     THE READ SET IS OBSERVED HERE, for every stage. It was measured inside _measure_native, which
@@ -307,7 +490,7 @@ def _measure_stage(device, stage):
     is the quantity params x width is trying to approximate.
     """
     if getattr(stage, "self_traced", False):
-        return _measure_native(device, stage)
+        return _measure_native(device, stage, budget_s)
     _ws_bytes, _n = 0, None
     try:
         _n, _ws_bytes = _count_op_dispatches(stage.step)
@@ -318,7 +501,7 @@ def _measure_stage(device, stage):
         _report_read_set(stage.name, _n, _ws_bytes)
     tid = _capture_step_trace(device, stage.step)
     try:
-        per_s = _replay_1cq(device, tid, _REPLAY_ITERS)
+        per_s = _replay_1cq(device, tid, _REPLAY_ITERS, budget_s)
         path = "trace+1cq"
     finally:
         try:
@@ -481,6 +664,17 @@ def measure_adapter(adapter, device) -> float:
         except Exception:  # noqa: BLE001
             _dims = (1, 1)
     _dp, _tp = int(_dims[0]), int(_dims[1])
+    # THE PIPELINE'S OWN SPLIT, when it states one, over the mesh's axis order. rows x cols says how
+    # many chips, not which axis is tensor-parallel: Qwen-Image-Edit opens 8x4 and runs TP=8 over axis
+    # 0, which this printed as TP=4 (stage_marks.pipeline_tp; stage_seams.TP_ATTR).
+    try:
+        from .stage_marks import pipeline_tp as _pipeline_tp
+
+        _own_tp = _pipeline_tp(getattr(adapter, "_pipe", None) or adapter)
+        if _own_tp and (_dp * _tp) % _own_tp == 0:
+            _dp, _tp = (_dp * _tp) // _own_tp, _own_tp
+    except Exception:  # noqa: BLE001 -- an unstated split keeps the mesh's
+        pass
     print("DP=%d TP=%d shard_active=%s" % (_dp, _tp, bool(_dp * _tp > 1)), flush=True)
 
     stages = list(getattr(adapter, "stages", None) or [])
@@ -491,6 +685,9 @@ def measure_adapter(adapter, device) -> float:
         stages = [_LegacyStage(adapter)]
 
     results = []
+    # EACH STAGE GETS ITS SHARE, not the whole budget: they run in sequence, so a stage that spends
+    # everything leaves the ones after it nothing and the capture dies with rows missing.
+    _stage_budget = _measurement_budget_s(len(stages))
     for st in stages:
         try:
             from .probes import thermal_yield
@@ -503,7 +700,7 @@ def measure_adapter(adapter, device) -> float:
         # had no such guard, so a raise here lost every stage rather than one -- the whole replay,
         # and with it every roofline row, for a fault in a single tower. Same rule, one step later.
         try:
-            ms, path = _measure_stage(device, st)
+            ms, path = _measure_stage(device, st, _stage_budget)
         except Exception as exc:  # noqa: BLE001
             print(
                 "  [trace-replay] stage %r could not be measured (%s: %s); it gets no row, the "
@@ -522,6 +719,22 @@ def measure_adapter(adapter, device) -> float:
         _n = int(getattr(st, "items", 0) or 0)
         if _n > 0:
             print("TRACE_STAGE_ITEMS[%s]=%d" % (st.name, _n), flush=True)
+        # AND HOW MANY DATA-PARALLEL GROUPS SHARE THEM (stage_seams.SPLIT), so the ceiling prices what
+        # one chip does. Printed only for a stage that is split: 1 is the reader's fallback.
+        _sp = int(getattr(st, "split", 0) or 0)
+        if _sp > 1:
+            print("TRACE_STAGE_SPLIT[%s]=%d" % (st.name, _sp), flush=True)
+
+    # WHICH MODULES EACH STAGE RUNS, read from the pipeline's own code (stage_marks.stage_module_paths)
+    # so perf_mcp can price each stage's compute from the weights it actually multiplies instead of
+    # charging every stage the whole model. Silent when the stages cannot be matched.
+    try:
+        from .stage_marks import stage_module_paths as _stage_module_paths
+
+        for _sn, _sp in _stage_module_paths(getattr(adapter, "_pipe", None) or adapter).items():
+            print("TRACE_STAGE_MODULES[%s]=%s" % (_sn, ",".join(_sp)), flush=True)
+    except Exception:  # noqa: BLE001
+        pass
 
     pipeline_ms = sum(ms for _, ms, _ in results)
     # THE UNIT IS A STRUCTURAL FACT, so read the STRUCTURE, not a name. This matched

@@ -1419,6 +1419,23 @@ def _batch_gate_reason(requested: int, test_output: str) -> Optional[str]:
 #     about this code on THIS board, and device_recovery._run_stamp() already exists to say which
 #     run a piece of state belongs to -- see its docstring on state outliving the run that earned it.
 # Set $E2E_GATE_NO_CACHE=1 to re-run regardless.
+#
+# TWO CORRECTIONS, BOTH FROM WATCHING IT NEVER FIRE ON THE RUN IT WAS BUILT FOR.
+#
+# (1) IT RECORDED NOTHING. The record sat under `if not reasons` at the very END of this function,
+#     by which point `reasons` also carries the TRACE and STACK gates. Those run after correctness
+#     and, on the bring-up this was written for, were the only thing failing -- so a clean 3.5 h
+#     correctness pass was thrown away every round because a ten-minute gate after it had failed.
+#     The record now happens where correctness ENDS, on the correctness verdict alone.
+# (2) A HIT SKIPPED THE TRACE GATE TOO. The hit returned `(True, [])` from the top of the function,
+#     ahead of the trace and stack gates -- so the one time it did fire it would have waived exactly
+#     the gate that was failing. The hit now skips only the expensive thing, the tests/e2e RUN, and
+#     everything after it still runs.
+#
+# Skipping the run means the checks that read its OUTPUT (the batch report, the xfail/skip scan, the
+# measured PCC) would have nothing to read, and a check with no input must never read as a pass. So
+# the record keeps the lines that carry those facts and a hit replays them: the same verdict from the
+# same evidence, without the device work that produced it.
 _GATE_CACHE_FILE = ".e2e_correctness_pass.json"
 _GATE_CACHE_OFF_ENV = "E2E_GATE_NO_CACHE"
 _GATE_KEY_VERSION = 1
@@ -1432,7 +1449,7 @@ def _repo_root_of(demo_dir: Path) -> Optional[Path]:
     return None
 
 
-def _import_closure(demo_dir: Path) -> list:
+def _import_closure(demo_dir: Path, seeds: Optional[list] = None) -> list:
     """Every .py file the demo's own sources reach, transitively, inside this checkout.
 
     Walks the imports rather than assuming a layout: a graduated stub the pipeline composes may live
@@ -1441,7 +1458,13 @@ def _import_closure(demo_dir: Path) -> list:
     here."""
     root = _repo_root_of(demo_dir)
     seen, out = set(), []
-    work = sorted(demo_dir.rglob("*.py")) if demo_dir.is_dir() else []
+    # `seeds` lets a caller ask "what does THIS subset reach" -- the correctness verdict is decided
+    # by the tests the gate runs, not by every file that happens to sit in the directory. Default is
+    # unchanged: everything under the demo.
+    if seeds is not None:
+        work = sorted(seeds)
+    else:
+        work = sorted(demo_dir.rglob("*.py")) if demo_dir.is_dir() else []
     while work:
         f = work.pop()
         rf = f.resolve()
@@ -1461,6 +1484,15 @@ def _import_closure(demo_dir: Path) -> list:
                 mods += [a.name for a in node.names]
             elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
                 mods.append(node.module)
+                # `from pkg import a, b` may be importing SUBMODULES rather than attributes, and for
+                # some packages that is the ONLY form they are reached by. A namespace package (no
+                # __init__.py, which is how the bring-up tool leaves its stub packages) resolves
+                # through neither `pkg.py` nor `pkg/__init__.py`, so the module name alone finds
+                # nothing and that whole subtree went unwalked: its sources stayed out of the
+                # fingerprint, so editing one of them did not invalidate a cached pass, and its
+                # bring-up state stayed invisible to anything that discovers components this way.
+                # A name that is an attribute rather than a submodule simply resolves to no file.
+                mods += ["%s.%s" % (node.module, a.name) for a in node.names]
         for m in mods:
             rel = Path(*m.split("."))
             for cand in (root / rel.with_suffix(".py"), root / rel / "__init__.py"):
@@ -1469,46 +1501,126 @@ def _import_closure(demo_dir: Path) -> list:
     return out
 
 
-def _correctness_key(demo_dir: Path, pcc: float, batch: int) -> Optional[str]:
-    """Fingerprint of everything that decides the correctness verdict, or None if it cannot be taken.
+def _gate_test_files(demo_dir: Path) -> list:
+    """The tests the correctness gate RUNS -- one owner, so the fingerprint follows the gate.
+
+    The selection was spelled inline where the gate builds its argv; the fingerprint then hashed
+    EVERY file under the demo instead, and the two disagreed in the expensive direction."""
+    e2e = Path(demo_dir) / "tests" / "e2e"
+    tests = sorted(e2e.glob("test_*.py")) if e2e.is_dir() else []
+    return [f for f in tests if "perf" not in f.name] or tests
+
+
+def _correctness_seeds(demo_dir: Path) -> list:
+    """Every file that can change the CORRECTNESS verdict, and nothing that cannot.
+
+    THE CACHE THAT NEVER HIT. Seeding from every .py under the demo pulled in the PERF test -- the
+    one file the gate deliberately does not run -- and through its imports the whole trace-replay
+    measurement path. So editing the replay code invalidated a 3.5 h correctness pass that it cannot
+    possibly affect: measured on a live run, the key moved 8e9c4eb -> fe8e4b5 for an edit to a module
+    the gate never executes, and the pass was re-earned from scratch.
+
+    The pipeline's own reference to that package survives, because it is real: tt/ imports the batch
+    variable from it, and the batch decides what correctness measures. What drops out is the code
+    reached only from a test the gate excludes -- and which files those are is asked of
+    `_gate_test_files` rather than decided here, so the two cannot drift apart again."""
+    demo_dir = Path(demo_dir)
+    tests_root = demo_dir / "tests"
+    sources = [f for f in demo_dir.rglob("*.py") if tests_root not in f.parents]
+    return sorted(set(sources) | set(_gate_test_files(demo_dir)))
+
+
+def _source_fingerprint(demo_dir: Path, seeds: Optional[list] = None) -> Optional[str]:
+    """Content hash of every file that can change this demo's verdict, or None if it cannot be taken.
 
     Content, not mtimes: a checkout or a no-op rewrite must not invalidate a good answer, and a real
-    edit must."""
+    edit must. Two callers need exactly this fact and must agree on it -- the correctness cache (is
+    this the code that already passed?) and the loop's no-edit check (did the last round change
+    anything at all?) -- so it is taken once, here."""
     try:
-        from models.experimental.perf_automation.agent.device_recovery import _run_stamp
-
-        stamp = _run_stamp()
-    except Exception:  # noqa: BLE001
-        stamp = ""
-    if not stamp:
-        return None  # no run identity -> cannot scope a pass to this run -> never cache
-    try:
+        files = sorted(_import_closure(demo_dir, seeds=seeds))
+        if not files:
+            return None  # nothing found to hash: no evidence, NOT "the same as last time"
         h = hashlib.sha256()
-        h.update(repr((_GATE_KEY_VERSION, stamp, float(pcc), int(batch))).encode())
-        for f in sorted(_import_closure(demo_dir)):
+        for f in files:
             h.update(str(f).encode())
             h.update(f.read_bytes())
         return h.hexdigest()[:16]
-    except Exception:  # noqa: BLE001 - a key that cannot be taken must not block the gate
+    except Exception:  # noqa: BLE001 - a fingerprint that cannot be taken must not block the gate
         return None
 
 
-def _cached_correctness_pass(demo_dir: Path, key: Optional[str]) -> bool:
+def run_stamp() -> str:
+    """Which run this state belongs to, or "" when nothing said.
+
+    State that outlives the run that earned it is a latch -- device_recovery._run_stamp's own
+    docstring is the case history -- and more than one piece of gate state now has to be scoped the
+    same way, so they ask one function rather than each spelling the lookup."""
+    try:
+        from models.experimental.perf_automation.agent.device_recovery import _run_stamp
+
+        return _run_stamp() or ""
+    except Exception:  # noqa: BLE001 - no run identity is a valid answer, not an error
+        return ""
+
+
+def _correctness_key(demo_dir: Path, pcc: float, batch: int) -> Optional[str]:
+    """The correctness verdict's cache key: this demo's sources, plus the bar they were judged against.
+
+    None if it cannot be taken (no run identity, or the sources cannot be read) -> never cache."""
+    stamp = run_stamp()
+    if not stamp:
+        return None  # no run identity -> cannot scope a pass to this run -> never cache
+    # Narrow seeds ON PURPOSE: see _correctness_seeds. The no-edit check keeps the BROAD
+    # fingerprint, because there any edit at all is the thing it is looking for.
+    src = _source_fingerprint(demo_dir, seeds=_correctness_seeds(demo_dir))
+    if src is None:
+        return None
+    h = hashlib.sha256()
+    h.update(repr((_GATE_KEY_VERSION, stamp, float(pcc), int(batch), src)).encode())
+    return h.hexdigest()[:16]
+
+
+def _gate_pass_evidence(test_output: str) -> list:
+    """The lines of a PASSING gate run that the checks after it read: the batch report, and PCC.
+
+    Kept as the run's own lines rather than as parsed values, so the checks downstream stay the
+    single authority on what those lines mean and a cached verdict is reached the same way a live
+    one is."""
+    from models.experimental.perf_automation.agent.perf_adapter import parse_batch_report
+
+    keep = []
+    for line in (test_output or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.search(r"PCC[^=\n]*=\s*-?\d+(?:\.\d+)?", line) or parse_batch_report(line) is not None:
+            keep.append(line)
+    return keep
+
+
+def _cached_correctness_pass(demo_dir: Path, key: Optional[str]) -> Optional[list]:
+    """The evidence of a pass already earned for this exact code, or None. Falsy when absent."""
     if not key or os.environ.get(_GATE_CACHE_OFF_ENV) == "1":
-        return False
+        return None
     try:
         doc = json.loads((demo_dir / _GATE_CACHE_FILE).read_text())
     except Exception:  # noqa: BLE001
-        return False
-    return isinstance(doc, dict) and doc.get("key") == key
+        return None
+    if not isinstance(doc, dict) or doc.get("key") != key:
+        return None
+    ev = doc.get("evidence")
+    return list(ev) if isinstance(ev, list) else None
 
 
-def _record_correctness_pass(demo_dir: Path, key: Optional[str]) -> None:
+def _record_correctness_pass(demo_dir: Path, key: Optional[str], evidence: Optional[list] = None) -> None:
     """Remember a PASS only. A failure is what the loop is working on and must be re-run."""
     if not key or os.environ.get(_GATE_CACHE_OFF_ENV) == "1":
         return
     try:
-        (demo_dir / _GATE_CACHE_FILE).write_text(json.dumps({"key": key, "version": _GATE_KEY_VERSION}))
+        (demo_dir / _GATE_CACHE_FILE).write_text(
+            json.dumps({"key": key, "version": _GATE_KEY_VERSION, "evidence": list(evidence or [])})
+        )
     except OSError:
         pass
 
@@ -1528,9 +1640,9 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
     # it costs the whole round (see _correctness_key). Only a PASS is reused, and only within the run
     # that earned it.
     _key = _correctness_key(demo_dir, pcc, batch)
-    if _cached_correctness_pass(demo_dir, _key):
+    _cached_pass = _cached_correctness_pass(demo_dir, _key)
+    if _cached_pass is not None:
         print("  [gate] correctness unchanged since it passed this run -- reusing that verdict", flush=True)
-        return True, []
 
     demo_subdir = demo_dir / "demo"
     demo_entrypoints = sorted(demo_subdir.glob("demo_*.py")) if demo_subdir.is_dir() else []
@@ -1642,7 +1754,7 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
 
         gate_env[BATCH_ENV] = str(batch)
     pytest_out = ""
-    gate_tests = [f for f in test_files if "perf" not in f.name] or test_files
+    gate_tests = _gate_test_files(demo_dir) or test_files
     # A STOPWATCH CANNOT TELL "HUNG" FROM "SLOW", SO IT MUST NOT BE THE JUDGE.
     #
     # This ran pytest under subprocess.run(timeout=N) with N a typed constant, and a gate that
@@ -1679,6 +1791,10 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
     _gate_argv += [*_pr.PYTEST_NO_TIMEOUT, "-rA", "-s"]
 
     def _e2e_once():
+        # The run that already passed, on code that has not changed since, is still a pass; what the
+        # checks below it read is replayed from the record rather than re-earned on the device.
+        if _cached_pass is not None:
+            return _StepResult(True, "\n".join(_cached_pass + ["1 passed"]), detail=0)
         _gate_log.unlink(missing_ok=True)  # each attempt is judged on its own output
         try:
             rc = _pr._execute(
@@ -1722,8 +1838,31 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
         reasons.append(f"G2/G3: tests/e2e made no forward progress ({_e2e.detail})")
     else:
         if not _e2e.ok:
-            tail = "\n".join(pytest_out.splitlines()[-15:])
-            reasons.append(f"G2/G3: tests/e2e did not pass (pytest rc={_e2e.detail}); tail:\n{tail}")
+            # A KILLED RUN AND A FAILING RUN CALL FOR OPPOSITE RESPONSES, AND THIS TOLD THEM APART
+            # NOWHERE. A step reports through two channels -- its output and its exit status -- and a
+            # signal death says nothing in the first: SIGKILL has no handler, so there is no
+            # traceback and the output simply stops mid-line. This branch quoted the raw returncode
+            # and the literal last 15 lines, which for a killed run are whatever routine chatter
+            # happened to be printing. So a run terminated from outside arrived as "rc=-9" plus
+            # fifteen deprecation warnings, and the agent spent a round inferring the kill from `ps`
+            # before concluding, correctly, that nothing in the model was wrong.
+            #
+            # Both halves are already solved elsewhere and are reused rather than re-spelled:
+            # `signal_note` turns a negative returncode into the signal that caused it, and
+            # `_extract_error` picks a log's actual failure lines (its whitelist keeps the stage
+            # markers, so "how far it got" survives a hang that has no exception to anchor on).
+            from models.experimental.perf_automation.agent.perf_test_gen import _extract_error, signal_note
+
+            _sig = signal_note(_e2e.detail)
+            _why = _extract_error(pytest_out) or "\n".join(pytest_out.splitlines()[-15:])
+            if _sig:
+                reasons.append(
+                    f"G2/G3: tests/e2e was KILLED, not failed: {_sig}. The output stops mid-run with "
+                    f"no traceback because a signal leaves none. Nothing here says the pipeline is "
+                    f"wrong -- do not rewrite working code on this evidence. Last output:\n{_why}"
+                )
+            else:
+                reasons.append(f"G2/G3: tests/e2e did not pass (pytest rc={_e2e.detail}); tail:\n{_why}")
         if batch > 1:
             _batch_reason = _batch_gate_reason(batch, pytest_out)
             if _batch_reason:
@@ -1822,6 +1961,11 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
     elif _rt_off and _ack:
         print("[emit-e2e] WARNING: G6 trace gate DISABLED via E2E_I_KNOW_TRACE_IS_BROKEN=1")
         print("[emit-e2e]          emitted pipeline may not run trace in optimize.")
+
+    # ---- CORRECTNESS ENDS HERE. Everything below is the trace/stack gates, which are cheap and
+    # must be re-run every round; the expensive verdict above is the one worth keeping.
+    if not reasons:
+        _record_correctness_pass(demo_dir, _key, _gate_pass_evidence(pytest_out))
 
     if not _rt_off and not _anno and not reasons:
         probe_py = Path(__file__).resolve().parent.parent / "_trace_capture_probe.py"
@@ -1955,8 +2099,6 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
     if _stack_reason:
         reasons.append(_stack_reason)
 
-    if not reasons:
-        _record_correctness_pass(demo_dir, _key)
     return (len(reasons) == 0), reasons
 
 
@@ -2230,10 +2372,14 @@ def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_round
         max_rounds=max_rounds,
         claude_bin=agent_bin,
     )
-    final = gate_fn()
+    # A HALT ALREADY CARRIES THE VERDICT that caused it, and re-running the gate here would spend the
+    # whole thing again to reach the same answer -- the exact cost the halt exists to avoid.
+    final = res.get("state") if res.get("halted") else gate_fn()
     sep = "=" * 78
     print("\n" + sep)
     print(f"  cc engine: rounds={res['rounds']} can_stop={final.get('can_stop')} halted={res['halted']}")
+    if res.get("halted") and final.get("reason"):
+        print(f"  halted because: {final.get('reason')}")
     print(sep)
     if final.get("can_stop"):
         emit_e2e_report(model_id, demo_dir, verdict="PASS")
@@ -2887,6 +3033,11 @@ For EACH stage expose, ON THE PIPELINE object, the generic contract the perf eng
     it returns: an audio tower over 1500 frames that projects down to 375 outputs retires 1500.
     A recurring step (one token, one denoise step) returns 1. Omit it ONLY if the stage genuinely
     retires one item.
+  <stage>_trace_split(): ZERO-ARG, OPTIONAL. Only for a stage whose items are SPLIT across
+    data-parallel chip groups that run at the same time (each group gets items/split, e.g. the batch
+    sharded over a DP mesh axis): return that number of groups. The compute ceiling is per chip, so
+    an unstated split prices the stage as if one group did the whole batch. Omit it for a stage that
+    runs whole on every group (replicated) or on a single group.
 AR stages ALSO keep the decode contract (decode_prefill seeds resident self- AND, for a seq2seq
 decoder, cross-attn KV; decode_step reads them, never recomputes).
 
