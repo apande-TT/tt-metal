@@ -1,6 +1,7 @@
 """GATE_PCC (PLAN 8.6) — parse_pcc + verdict routing (no hardware)."""
 
 import json
+from pathlib import Path
 
 from agent.loop_context import LoopContext
 from agent.pcc_runner import parse_pcc
@@ -27,17 +28,17 @@ class _FakeCtx:
 
 
 def _patch_run(monkeypatch, tmp_path, stdout, returncode):
-    import subprocess
-
-    from agent import gitio, pcc_runner
+    from agent import gitio, pcc_runner, probes
 
     monkeypatch.setattr(gitio, "repo_root", lambda p: tmp_path)
+    monkeypatch.setattr(probes, "wait_for_memory_headroom_before_device_work", lambda *a, **k: None)
 
-    class _R:
-        def __init__(self):
-            self.stdout, self.stderr, self.returncode = stdout, "", returncode
+    def _fake_execute(cmd, cwd, env, timeout_s, log_path, **kw):
+        # the supervised runner streams the child's output to log_path and returns its exit code
+        Path(log_path).write_text(stdout)
+        return returncode
 
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _R())
+    monkeypatch.setattr(probes, "_execute", _fake_execute)
     return pcc_runner.run_pcc(_FakeCtx(tmp_path))
 
 
@@ -47,11 +48,10 @@ def test_run_pcc_ok_when_passed(monkeypatch, tmp_path):
 
 
 def test_run_pcc_high_pcc_nonzero_exit_is_ok(monkeypatch, tmp_path):
-    # PCC>=threshold but pytest exited non-zero on a BRING-UP gate (Gate-2 modules-invoked)
-    # or nanobind teardown -> NOT an edit-induced regression (fails on the baseline too).
-    # The perf loop's correctness signal is PCC, so this must be ok, not crash.
-    v = _patch_run(monkeypatch, tmp_path, "e2e PCC=0.999\nGate 2 failed: modules not invoked\n1 failed", 1)
-    assert v["status"] == "ok" and v["pcc"] == 0.999
+    # PCC>=threshold but pytest exited non-zero for nanobind teardown leaks (no case failed): NOT
+    # an edit-induced regression. The exit code is not the signal; the file's cases are.
+    v = _patch_run(monkeypatch, tmp_path, "e2e PCC=0.999\nnanobind: leaked 3 types\n===== 11 passed in 9.0s =====", 1)
+    assert v["status"] == "ok" and v["pcc"] == 0.999 and v["failed_tests"] == []
 
 
 # Verbatim pytest -sv output for a device fatal raised INSIDE the compare helper
@@ -138,3 +138,40 @@ def _ctx(tmp_path, code_fix=0, pcc_fix=0):
         json.dumps({"state": "GATE_PCC", "code_fix_attempts": code_fix, "pcc_fix_attempts": pcc_fix, "cost_usd": 0.0})
     )
     return LoopContext.from_run(run, index=[])
+
+
+def test_the_pcc_check_is_supervised(monkeypatch, tmp_path):
+    """A hung check is ended by the progress watch, not by a wall clock: Qwen-Image-Edit 2026-09-30
+    sat 7210 s twice on a device that went quiet 7 min in. A stall comes back as a crash with why."""
+    from agent import gitio, pcc_runner, probes
+
+    monkeypatch.setattr(gitio, "repo_root", lambda p: tmp_path)
+    monkeypatch.setattr(probes, "wait_for_memory_headroom_before_device_work", lambda *a, **k: None)
+    seen = {}
+
+    def _stalled(cmd, cwd, env, timeout_s, log_path, **kw):
+        seen.update(kw)
+        raise probes.TracyHangError("check_pcc made no forward progress for 600s")
+
+    monkeypatch.setattr(probes, "_execute", _stalled)
+    v = pcc_runner.run_pcc(_FakeCtx(tmp_path))
+    assert v["status"] == "crash" and "no forward progress" in v["error"]
+    assert seen.get("label") == "check_pcc" and "preexec_fn" in seen
+
+
+def test_a_finished_check_leaves_no_log_behind(monkeypatch, tmp_path):
+    """Each attempt gets its own log folder, removed once read -- a retry must not reuse a removed one."""
+    from agent import gitio, pcc_runner, probes
+
+    monkeypatch.setattr(gitio, "repo_root", lambda p: tmp_path)
+    monkeypatch.setattr(probes, "wait_for_memory_headroom_before_device_work", lambda *a, **k: None)
+    logs = []
+
+    def _fake_execute(cmd, cwd, env, timeout_s, log_path, **kw):
+        logs.append(Path(log_path))
+        Path(log_path).write_text("e2e PCC=0.999\n1 passed")
+        return 0
+
+    monkeypatch.setattr(probes, "_execute", _fake_execute)
+    v = pcc_runner.run_pcc(_FakeCtx(tmp_path))
+    assert v["status"] == "ok" and logs and not any(p.parent.exists() for p in logs)

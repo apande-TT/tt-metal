@@ -588,6 +588,75 @@ def _read_fullpipe_best_1cq():
         return (None, "")
 
 
+def _pcc_gate_baseline(repo_root: Path, mcp_env: dict, devices: str) -> None:
+    """Run the correctness file ONCE on the unedited model and record which of its cases fail there.
+
+    The gate's verdict (agent/pcc_runner._verdict_from_output) tolerates exactly those; any other
+    failing case blocks a win, whatever the PCC. Without the record NOTHING is tolerated -- right
+    for a model whose file passes clean, wrong for one that ships a bring-up case failing on its
+    own baseline (nemotron's Gate-2), which is why this runs before the first round instead of
+    being inferred later. perf_mcp reuses the record while HEAD is the sha it was taken at, so a
+    --persist relaunch does not pay for the run again. PERF_MCP_PCC_BASELINE=0 skips it (the
+    strict rule stays in force)."""
+    if os.environ.get("PERF_MCP_PCC_BASELINE", "1") != "1":
+        return
+    code = (
+        "import sys, json; sys.path.insert(0, sys.argv[1]); import perf_mcp as P\n"
+        "r = P.record_pcc_baseline()\n"
+        "print('PCC_BASELINE=' + json.dumps({k: r.get(k) for k in "
+        "('status', 'pcc', 'failed_tests', 'recorded', 'reused', 'error')}))\n"
+    )
+    env = cc_env(repo_root, devices)
+    env.update(mcp_env)
+    print(
+        "  [optimize/cc] correctness file on the UNEDITED model (BEFORE) — every case runs once, so a "
+        "win is judged against what already passes..."
+    )
+    from agent.probes import adaptive_backstop
+
+    _op = "pcc"
+    rc, out = _run_device_step(
+        [_python_bin(repo_root), "-c", code, str(repo_root / CC_DIR)],
+        repo_root / PERF_DIR,
+        env,
+        devices,
+        # never shorter than the runner's own inner backstop, or this outer bound would kill a gate
+        # the runner was still prepared to wait for
+        max(adaptive_timer(repo_root, _op, env_key="PERF_MCP_PCC_BACKSTOP"), adaptive_backstop()),
+        "correctness gate (BEFORE)",
+        observe_op=_op,
+        observe_root=repo_root,
+    )
+    doc = {}
+    for line in (out or "").splitlines():
+        if line.startswith("PCC_BASELINE="):
+            try:
+                doc = json.loads(line.split("=", 1)[1]) or {}
+            except ValueError:
+                doc = {}
+    failed = doc.get("failed_tests") if isinstance(doc.get("failed_tests"), list) else None
+    if rc is None or not doc.get("recorded") or failed is None:
+        why = str(doc.get("status") or ("killed" if rc is None else "unknown"))
+        if doc.get("error"):
+            why += "; " + str(doc.get("error"))[:200]
+        print(
+            "  [optimize/cc] WARNING: the correctness file could not be run on the unedited model "
+            "(%s) -- NO failing case will be tolerated this run" % why
+        )
+        return
+    how = "reused: recorded at this HEAD" if doc.get("reused") else "recorded"
+    if failed:
+        print(
+            "  [optimize/cc] correctness file on the UNEDITED model: %d case(s) already fail and are "
+            "tolerated: %s (%s); any OTHER failing case blocks a win" % (len(failed), ", ".join(failed), how)
+        )
+    else:
+        print(
+            "  [optimize/cc] correctness file on the UNEDITED model: every case passes (%s, PCC %s); "
+            "any failing case now blocks a win" % (how, doc.get("pcc"))
+        )
+
+
 def _fullpipe_e2e(repo_root: Path, mcp_env: dict, devices: str, label: str) -> float | None:
     _fp_t0 = time.monotonic()
     try:
@@ -620,7 +689,8 @@ def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str
         "    if hasattr(g,a): g=getattr(g,a); break\n"
         "r=g()\n"
         "print('FULLPIPE_MS=' + str(r.get('full_pipeline_ms')))\n"
-        "print('FULLPIPE_MODE=' + str(r.get('mode') or r.get('method') or ''))"
+        "print('FULLPIPE_MODE=' + str(r.get('mode') or r.get('method') or ''))\n"
+        "import json; print('FULLPIPE_STAGES=' + json.dumps(r.get('stages') or {}))"
     )
     env = cc_env(repo_root, devices)
     env.update(mcp_env)
@@ -657,7 +727,10 @@ def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str
     if rc is None:
         return (None, "")
     mode = ""
+    stages = {}
     for line in (out or "").splitlines():
+        if line.startswith("FULLPIPE_STAGES="):
+            stages = _stage_ms_of(line.split("=", 1)[1])
         if line.startswith("FULLPIPE_MS="):
             try:
                 ms = float(line.split("=", 1)[1])
@@ -682,8 +755,53 @@ def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str
             # pipeline's own structure; unknown prints nothing rather than a borrowed description.
             f"  (ALL layers{_e2e_shape()}{', ' + mode if mode else ''})"
         )
-        _ledger_fullpipe(ms, mode, label)
+        if _ledger_fullpipe(ms, mode, label) == _ledger().PHASE_BEFORE:
+            _ledger_stage_starts(stages, mode)
     return ms, mode
+
+
+def _stage_ms_of(raw: str) -> dict:
+    """{stage: ms} from the gate's `stages` field, which is {stage: ms} or {stage: {"ms": ...}}."""
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return {}
+    out = {}
+    for name, v in (doc or {}).items() if isinstance(doc, dict) else []:
+        ms = v.get("ms") if isinstance(v, dict) else v
+        if name and isinstance(ms, (int, float)) and ms > 0:
+            out[str(name)] = float(ms)
+    return out
+
+
+def _ledger_keys() -> tuple:
+    """(model, task) the ledger is keyed by -- the model's own name, as perf_mcp's writers use it."""
+    return (
+        os.environ.get("PERF_MCP_MODEL_NAME") or Path(os.environ.get("PERF_MCP_MODEL_ROOT", "") or "model").name,
+        os.environ.get("PERF_MCP_TASK", "main"),
+    )
+
+
+def _ledger_stage_starts(stages: dict, mode: str) -> None:
+    """Pin each stage's share of the BEFORE end-to-end reading, write-once (measurements.anchor).
+
+    Called only for the reading that became the ledger's BEFORE, so a resumed run -- whose BEFORE is
+    already pinned -- can never file a mid-run split as the start. Stage names are the gate's own."""
+    try:
+        led = _ledger()
+        _model, _task = _ledger_keys()
+        for name, ms in (stages or {}).items():
+            led.anchor(
+                led.KIND_STAGE_E2E,
+                ms,
+                depth=str(name).strip().lower(),
+                mode=mode or "unknown",
+                source="fullpipe-gate:BEFORE stage split",
+                model=_model,
+                task=_task,
+            )
+    except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost the measurement
+        pass
 
 
 def _ledger():
@@ -714,8 +832,9 @@ def _e2e_shape() -> str:
     return {"token": ", prefill + 1 decode", "step": ", 1 step", "inference": ", 1 forward pass"}.get(_u, "")
 
 
-def _ledger_fullpipe(ms: float, mode: str, label: str) -> None:
+def _ledger_fullpipe(ms: float, mode: str, label: str) -> str:
     """Record the whole-model gate reading AT THE MOMENT IT IS TAKEN, with the mode it was taken in.
+    Returns the phase it was filed under, or "" when it was not recorded.
 
     The mode matters more than the number: the BEFORE bookend is captured once and never re-taken,
     so an eager BEFORE could sit next to a trace+1cq AFTER and be subtracted, printing
@@ -730,10 +849,7 @@ def _ledger_fullpipe(ms: float, mode: str, label: str) -> None:
         # genuine before landed in the fallback, the later committed-best found nothing in the real
         # ledger and claimed the BEFORE slot, and the report printed
         # "40.13 ms -> (after not measured yet)" -- with 40.13 actually being the OPTIMIZED result.
-        _model = (
-            os.environ.get("PERF_MCP_MODEL_NAME") or Path(os.environ.get("PERF_MCP_MODEL_ROOT", "") or "model").name
-        )
-        _task = os.environ.get("PERF_MCP_TASK", "main")
+        _model, _task = _ledger_keys()
         seen = led.first(led.KIND_FULLPIPE, led.PHASE_BEFORE, model=_model, task=_task)
         # A RERUN'S OWN BASELINE IS NOT A RESULT. Write-once BEFORE is right for RESULTS -- it keeps the
         # original anchor alive across reruns so the headline reads 84.05 -> x instead of resetting.
@@ -748,9 +864,9 @@ def _ledger_fullpipe(ms: float, mode: str, label: str) -> None:
         # per-run baseline file, and the ledger keeps only readings that describe progress. An
         # UNLABELLED bookend still records: unknown provenance must fail toward keeping the reading.
         if seen and "before" in (label or "").strip().lower():
-            return
+            return ""
         phase = led.PHASE_AFTER if seen else led.PHASE_BEFORE
-        led.record(
+        ok = led.record(
             led.KIND_FULLPIPE,
             phase,
             ms,
@@ -760,8 +876,9 @@ def _ledger_fullpipe(ms: float, mode: str, label: str) -> None:
             model=_model,
             task=_task,
         )
+        return phase if ok else ""
     except Exception:  # noqa: BLE001
-        pass
+        return ""
 
 
 # Public alias: this is the ledger's whole-model bookend recorder.
@@ -4657,6 +4774,17 @@ def _next_target_summary(kernel_log: str) -> str:
     return _op_lever_label(op, rung)
 
 
+def _load_summary():
+    """summary.py, loaded fresh from disk by path -- the one loader, so the final report and the
+    heartbeat read the same rules. Raises when it cannot be loaded; callers decide the fallback."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("cc_summary", str(Path(__file__).parent / "summary.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _last_attempt_summary(kernel_log: str) -> str:
     """One line describing the most recent lever attempt on file: which op, which stack, which
     lever, and the outcome -- what the watchdog heartbeat should say instead of a bare timer nobody
@@ -4687,8 +4815,24 @@ def _last_attempt_summary(kernel_log: str) -> str:
     elif a.get("diverged"):
         status = "· diverged (uncounted)"
     else:
-        status = "· no gain"
+        status = _attempt_outcome(a, rows)
     return f"{_op_lever_label(op, rung)}: {status}"
+
+
+def _attempt_outcome(a: dict, rows: list) -> str:
+    """The outcome of attempt `a`, by the SAME rules the report's result column uses.
+
+    THE LAST ROW IS USUALLY THE ATTEMPT, NOT ITS COMMIT. The skill commits and then records, so a win
+    is followed by its own attempt row, and asking only "is the last row a commit" labelled every
+    banked win "no gain" -- the report's _banking_commit is what links the two. Its PCC failure
+    reads as one ("✗ PCC 0.932 < 0.95") rather than as a bare no-gain."""
+    try:
+        s = _load_summary()
+        if s._banking_commit(a, rows) is not None:
+            return "✓ win, saved"
+        return s._attempt_result(a, False, rows)
+    except Exception:  # noqa: BLE001 -- the heartbeat never fails for a report it cannot load
+        return "· no gain"
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -4941,8 +5085,7 @@ def _baseline_name() -> str:
     648 ms reading, while this run's own baseline sat in the keyed file at 2464.18 ms. Same defect
     as the full-pipeline scoreboard: a file any other process can write is not this run's baseline.
     """
-    model = os.environ.get("PERF_MCP_MODEL_NAME") or Path(os.environ.get("PERF_MCP_MODEL_ROOT", "") or "model").name
-    task = os.environ.get("PERF_MCP_TASK", "main")
+    model, task = _ledger_keys()
     return "perf_mcp_baseline_%s_%s.json" % (model, task)
 
 
@@ -5046,8 +5189,6 @@ def _emit_summary(
     after_mode: str = "",
     stop_facts: dict | None = None,
 ) -> None:
-    import importlib.util
-
     # THE HARDWARE THIS RUN DETECTED, from its own manifest. This function has no `manifest` in scope
     # (it is a local of run_cc_optimize), and the residual line below read one anyway -- a NameError
     # its except swallowed, so the final summary never carried a residual.
@@ -5057,9 +5198,7 @@ def _emit_summary(
     except (OSError, ValueError, AttributeError):
         _run_env = {}
     try:
-        spec = importlib.util.spec_from_file_location("cc_summary", str(Path(__file__).parent / "summary.py"))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        mod = _load_summary()
         mod.set_run_env(_run_env)  # the report prices the machine the run detected -- no default
     except Exception as exc:  # noqa: BLE001
         print(f"  [optimize/cc] summary unavailable: {exc}")
@@ -5758,6 +5897,7 @@ def optimize_pipeline(
         )
     else:
         before_ms, before_mode = _fullpipe_e2e(repo_root, mcp_env, devices, "BEFORE")
+    _pcc_gate_baseline(repo_root, mcp_env, devices)
     rounds, can_stop, halted = 0, False, False
     stall_sec = adaptive_timer(repo_root, "round", env_key="PERF_MCP_ROUND_STALL_SEC", mult=0.5)
     max_wedge = int(os.environ.get("PERF_MCP_MAX_WEDGE_STRIKES", "2") or "2")
