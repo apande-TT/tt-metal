@@ -83,30 +83,13 @@ bool CsvReader::parse_header(const std::string& line) {
         column_map_[headers[i]] = i;
     }
 
-    // Every column is required, so a renamed header fails loudly instead of silently defaulting the field
-    static constexpr const char* required_columns[] = {
-        COL_MECHANISM,
-        COL_PATTERN,
-        COL_MEMORY,
-        COL_ARCH,
-        COL_NUM_TRANSACTIONS,
-        COL_TRANSACTION_SIZE,
-        COL_NUM_SUBORDINATES,
-        COL_SAME_AXIS,
-        COL_STATEFUL,
-        COL_LOOPBACK,
-        COL_NOC_INDEX,
-        COL_LATENCY};
-
-    bool has_all_columns = true;
-    for (const char* column : required_columns) {
-        if (!column_map_.contains(column)) {
-            std::cerr << "CSV missing required column: " << column << std::endl;
-            has_all_columns = false;
-        }
+    if (!column_map_.contains(COL_TRANSACTION_SIZE) || !column_map_.contains(COL_NUM_TRANSACTIONS) ||
+        !column_map_.contains(COL_LATENCY)) {
+        std::cerr << "CSV missing required columns" << std::endl;
+        return false;
     }
 
-    return has_all_columns;
+    return true;
 }
 
 bool CsvReader::parse_data_line(const std::string& line, DataPoint& point) {

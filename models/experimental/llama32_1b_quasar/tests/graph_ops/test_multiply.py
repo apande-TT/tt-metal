@@ -26,7 +26,7 @@ import pytest
 import ttnn
 from models.experimental.llama32_1b_quasar.tests.graph_ops import graph_case as G
 
-_OP = ttnn.experimental.quasar.multiply
+_OP = ttnn.multiply
 
 CASES = [
     {
@@ -59,7 +59,7 @@ CASES = [
         ],
         "kwargs": {
             "input_tensor_a_activations": {"k": "acts", "v": ["SILU"]},
-            "dtype": {"k": "dtype", "v": "BFLOAT16"},
+            "dtype": {"k": "dtype", "v": "BFLOAT8_B"},
             "memory_config": {
                 "layout": "WIDTH_SHARDED",
                 "buffer": "L1",
@@ -69,7 +69,7 @@ CASES = [
         },
         "outs": [
             {
-                "dtype": "BFLOAT16",
+                "dtype": "BFLOAT8_B",
                 "k": "t",
                 "layout": "TILE",
                 "mem": {
@@ -103,12 +103,12 @@ CASES = [
         ],
         "kwargs": {
             "input_tensor_a_activations": {"k": "acts", "v": ["SILU"]},
-            "dtype": {"k": "dtype", "v": "BFLOAT16"},
+            "dtype": {"k": "dtype", "v": "BFLOAT8_B"},
             "memory_config": {"layout": "INTERLEAVED", "buffer": "DRAM", "shard": None, "k": "mem"},
         },
         "outs": [
             {
-                "dtype": "BFLOAT16",
+                "dtype": "BFLOAT8_B",
                 "k": "t",
                 "layout": "TILE",
                 "mem": {"buffer": "DRAM", "layout": "INTERLEAVED", "shard": None},

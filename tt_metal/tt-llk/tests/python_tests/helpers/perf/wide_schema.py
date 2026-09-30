@@ -143,11 +143,8 @@ DB_SCHEMA = [
     Column("arch", "string", False, "provenance", origin="ci"),
     Column("run_id", "string", False, "provenance", origin="ci"),
     Column("timestamp", "string", False, "provenance", origin="ci"),
-    # pr | nightly | baseline
-    Column("pipeline", "string", False, "provenance", origin="ci"),
-    Column(
-        "pr_number", "string", True, "provenance", origin="ci"
-    ),  # NULL for nightly and baseline runs
+    Column("pipeline", "string", False, "provenance", origin="ci"),  # pr | nightly
+    Column("pr_number", "string", True, "provenance", origin="ci"),  # NULL for nightly
 ]
 
 # Views onto the one schema, by who fills each column. The converter validates a

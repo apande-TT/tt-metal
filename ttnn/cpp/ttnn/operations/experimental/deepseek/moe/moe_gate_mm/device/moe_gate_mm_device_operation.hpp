@@ -4,12 +4,13 @@
 
 #pragma once
 
-#include <tuple>
-
-#include <tt-metalium/program_descriptors.hpp>
+#include <optional>
+#include <variant>
 
 #include "ttnn/tensor/tensor.hpp"
+#include "ttnn/device_operation.hpp"
 #include "moe_gate_mm_device_operation_types.hpp"
+#include "moe_gate_mm_program_factory.hpp"
 
 namespace ttnn::operations::experimental::deepseek::moe::moe_gate_mm {
 
@@ -18,11 +19,7 @@ struct MoEGateMMDeviceOperation {
     using tensor_args_t = moe_gate_mm::tensor_args_t;
     using spec_return_value_t = moe_gate_mm::spec_return_value_t;
     using tensor_return_value_t = moe_gate_mm::tensor_return_value_t;
-
-    static tt::tt_metal::ProgramDescriptor create_descriptor(
-        const operation_attributes_t& operation_attributes,
-        const tensor_args_t& tensor_args,
-        tensor_return_value_t& tensor_return_value);
+    using program_factory_t = std::variant<program::MoEGateMMProgramFactory>;
 
     static void validate_on_program_cache_hit(const operation_attributes_t&, const tensor_args_t&);
     static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);

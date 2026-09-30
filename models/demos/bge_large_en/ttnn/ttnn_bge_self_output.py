@@ -67,6 +67,7 @@ class TtnnBGESelfOutput:
             block_w=dim_t__x,
             inplace=True,
             legacy_reduction=True,
+            legacy_rsqrt=True,
         )
 
         output = self.LayerNorm(

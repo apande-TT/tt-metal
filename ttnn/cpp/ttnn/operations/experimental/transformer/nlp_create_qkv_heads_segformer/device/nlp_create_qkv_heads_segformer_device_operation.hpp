@@ -4,9 +4,8 @@
 
 #pragma once
 
-#include <tt-metalium/program_descriptors.hpp>
 #include "ttnn/operations/experimental/transformer/nlp_create_qkv_heads_segformer/device/nlp_create_qkv_heads_segformer_device_operation_types.hpp"
-#include "ttnn/device_operation.hpp"
+#include "ttnn/operations/experimental/transformer/nlp_create_qkv_heads_segformer/device/nlp_create_qkv_heads_segformer_program_factory.hpp"
 
 #include "ttnn/tensor/tensor.hpp"
 
@@ -17,14 +16,7 @@ struct NlpCreateHeadsSegformerDeviceOperation {
     using tensor_args_t = NlpCreateQkvHeadsSegformerInputs;
     using spec_return_value_t = NlpCreateQkvHeadsSegformerResultSpec;
     using tensor_return_value_t = NlpCreateQkvHeadsSegformerResult;
-
-    // The input and q-output buffer addresses are the only per-dispatch state; the work split and
-    // every per-core tile offset derive from the input's padded shape and the compute grid, both
-    // covered by the program hash. The address bindings are therefore the whole cache-hit refresh.
-    static tt::tt_metal::ProgramDescriptor create_descriptor(
-        const operation_attributes_t& operation_attributes,
-        const tensor_args_t& tensor_args,
-        tensor_return_value_t& output);
+    using program_factory_t = std::variant<NlpCreateQkvHeadsSegformerProgramFactory>;
 
     static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
 

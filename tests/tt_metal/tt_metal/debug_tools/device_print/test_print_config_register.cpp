@@ -280,7 +280,11 @@ static std::string int_to_hex(int value) {
 // Builds the compute-kernel program for the specified test configuration.
 static Program make_writer_program(distributed::MeshDevice& mesh_device, const ConfigRegPrintTestConfig& config) {
     experimental::ComputeHardwareConfig hw_config;
-    hw_config = experimental::ComputeHardwareConfig{};
+    if (mesh_device.arch() == tt::ARCH::QUASAR) {
+        hw_config = experimental::ComputeGen2Config{};
+    } else {
+        hw_config = experimental::ComputeGen1Config{};
+    }
 
     const experimental::KernelSpecName kKernel{"config_reg_writer"};
     experimental::ProgramSpec spec{

@@ -5,12 +5,10 @@
 #pragma once
 
 #include <core_coord.hpp>
-#include <iosfwd>
 #include <string>
 #include <vector>
 
 namespace tt::tt_metal {
-struct LLKMetadata;
 struct KernelSource;
 }  // namespace tt::tt_metal
 

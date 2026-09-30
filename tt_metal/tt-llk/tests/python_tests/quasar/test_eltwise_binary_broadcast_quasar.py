@@ -18,6 +18,7 @@ from helpers.llk_params import (
     BroadcastType,
     DestSync,
     ImpliedMathFormat,
+    MathFidelity,
     MathOperation,
     PerfRunType,
     format_dict,
@@ -84,6 +85,13 @@ def binary_broadcast_implied_math_formats(format, *, is_perf=False):
     return [ImpliedMathFormat.No, ImpliedMathFormat.Yes]
 
 
+def binary_broadcast_math_fidelities(format, mathop):
+    # Int8 is an exact integer op. Float16_b is full precision at LoFi.
+    if format.input_format in (DataFormat.Int8, DataFormat.Float16_b):
+        return [MathFidelity.LoFi]
+    return get_valid_math_fidelities(format, mathop)
+
+
 @pytest.mark.quasar
 @parametrize(
     formats=BINARY_BROADCAST_FORMATS,
@@ -94,7 +102,9 @@ def binary_broadcast_implied_math_formats(format, *, is_perf=False):
         MathOperation.Elwmul,
     ],
     broadcast_type=BROADCAST_TYPES,
-    math_fidelity=lambda formats, mathop: get_valid_math_fidelities(formats, mathop),
+    math_fidelity=lambda formats, mathop: binary_broadcast_math_fidelities(
+        formats, mathop
+    ),
     implied_math_format=lambda formats: binary_broadcast_implied_math_formats(formats),
     dest_sync_mode=lambda: binary_broadcast_dest_sync_modes(is_perf=False),
     input_dimensions=runtime(

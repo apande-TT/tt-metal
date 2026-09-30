@@ -8,7 +8,6 @@
 
 #include <tt_stl/assert.hpp>
 #include <core_coord.hpp>
-#include "common/work_split_internal.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <tuple>

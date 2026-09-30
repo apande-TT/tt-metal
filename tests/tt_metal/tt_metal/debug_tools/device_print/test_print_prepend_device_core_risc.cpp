@@ -70,32 +70,22 @@ Program MakeTensixPrependProgram(distributed::MeshDevice& mesh_device, const Cor
                  .source = source,
                  .num_threads = 1,
                  .hw_config =
-                     experimental::DataMovementHardwareConfig{
-                         .config_1xx =
-                             experimental::DataMovementHardwareConfig::DataMovement1XXConfig{
-                                 .processor = DataMovementProcessor::RISCV_0,
-                                 .noc = NOC::NOC_0,
-                             },
-                     },
+                     experimental::DataMovementGen1Config{
+                         .processor = DataMovementProcessor::RISCV_0, .noc = NOC::NOC_0},
              },
              experimental::KernelSpec{
                  .unique_id = kNcrisc,
                  .source = source,
                  .num_threads = 1,
                  .hw_config =
-                     experimental::DataMovementHardwareConfig{
-                         .config_1xx =
-                             experimental::DataMovementHardwareConfig::DataMovement1XXConfig{
-                                 .processor = DataMovementProcessor::RISCV_1,
-                                 .noc = NOC::NOC_1,
-                             },
-                     },
+                     experimental::DataMovementGen1Config{
+                         .processor = DataMovementProcessor::RISCV_1, .noc = NOC::NOC_1},
              },
              experimental::KernelSpec{
                  .unique_id = kCompute,
                  .source = source,
                  .num_threads = 1,
-                 .hw_config = experimental::ComputeHardwareConfig{},
+                 .hw_config = experimental::ComputeGen1Config{},
              }},
         .work_units = {experimental::WorkUnitSpec{
             .name = "main", .kernels = {kBrisc, kNcrisc, kCompute}, .target_nodes = experimental::NodeRange{cores}}},

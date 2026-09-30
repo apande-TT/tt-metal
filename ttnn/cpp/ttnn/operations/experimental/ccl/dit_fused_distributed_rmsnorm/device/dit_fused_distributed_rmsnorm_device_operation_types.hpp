@@ -41,8 +41,7 @@ struct DitFusedDistributedRmsnormParams {
     std::optional<DataType> dtype;
     MemoryConfig output_mem_config;
 
-    // CCL config. cluster_axis is a 0 placeholder for a local norm (ring_size == 1);
-    // every fabric-axis lookup is guarded on ring_size > 1.
+    // CCL config
     uint32_t cluster_axis;
     uint32_t num_links;
     uint32_t ring_size;

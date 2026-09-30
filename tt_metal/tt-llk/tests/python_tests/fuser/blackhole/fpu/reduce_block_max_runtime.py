@@ -7,17 +7,14 @@ from typing import List
 from fuser.block_data import BlockData
 from fuser.fpu_node import FpuNode
 from fuser.fuser_config import GlobalConfig
-from fuser.golden.fpu.reduce_block_max_row import reduce_block_max_row_golden
-from fuser.indexing import InvocationGranularity
 from fuser.l1_operation import L1Operation
+from fuser.tile_loop import LoopBlockRow, TileLoop
 
 from .reduce_block_max import ReduceBlockMaxFpu
 
 
 class ReduceBlockMaxRuntimeFpu(ReduceBlockMaxFpu):
-    granularity = InvocationGranularity.ROW
-
-    golden_fn = staticmethod(reduce_block_max_row_golden)
+    loop: TileLoop = LoopBlockRow()
 
     def get_headers(self) -> List[str]:
         return [
@@ -32,7 +29,7 @@ class ReduceBlockMaxRuntimeFpu(ReduceBlockMaxFpu):
         compute_unit: FpuNode,
         block: BlockData,
     ) -> str:
-        ct_dim = block.block_cols
+        ct_dim = block.block_tiles_x
         dest_acc = config.dest_acc.cpp_enum_value
         tensor_shape = compute_unit.src_a.tile_shape.cpp_value
         return f"_llk_math_reduce_block_max_row_init_runtime_<{dest_acc}>({ct_dim}, {tensor_shape});\n"
@@ -46,7 +43,7 @@ class ReduceBlockMaxRuntimeFpu(ReduceBlockMaxFpu):
     ) -> str:
         dest_acc = config.dest_acc.cpp_enum_value
         tensor_shape = compute_unit.src_a.tile_shape.cpp_value
-        return f"_llk_math_reduce_block_max_row_runtime_<{dest_acc}>({block.tile_id_dest}, {tensor_shape});\n"
+        return f"_llk_math_reduce_block_max_row_runtime_<{dest_acc}>({block.tile_id_block}, {tensor_shape});\n"
 
     def uninit(
         self,

@@ -9,11 +9,8 @@
 namespace ttnn::experimental::prim {
 
 struct PrepareChunkRecurrenceProgramFactory {
-    static ttnn::device_operation::MeshWorkloadArtifacts create_mesh_workload_artifacts(
-        const PrepareChunkRecurrenceParams&,
-        const PrepareChunkRecurrenceInputs&,
-        std::vector<Tensor>&,
-        const ttnn::MeshCoordinateRangeSet&);
+    static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
+        const PrepareChunkRecurrenceParams&, const PrepareChunkRecurrenceInputs&, std::vector<Tensor>&);
 };
 
 }  // namespace ttnn::experimental::prim

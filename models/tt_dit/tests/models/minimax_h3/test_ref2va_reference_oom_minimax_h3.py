@@ -37,7 +37,7 @@ CASES = [
 ]
 
 MESHES = [
-    pytest.param(shape, {**params, "l1_small_size": 16384}, id=param.id, marks=param.marks)
+    pytest.param(shape, {**params, "l1_small_size": 16384}, id=param.id)
     for param in [MESH_4X8_RING]
     for shape, params in [param.values]
 ]

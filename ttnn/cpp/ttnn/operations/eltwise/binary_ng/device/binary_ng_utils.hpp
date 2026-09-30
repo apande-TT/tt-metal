@@ -66,8 +66,6 @@ struct OpConfig {
         RSUB,
         GCD,
         LCM,
-        LOGADDEXP,
-        LOGADDEXP2,
         LEFT_SHIFT,
         RIGHT_SHIFT,
         LOGICAL_RIGHT_SHIFT,
@@ -94,19 +92,13 @@ struct OpConfig {
     };
 
     template <class EnumT>
-    OpConfig(
-        BinaryOpType binary_op_type,
-        std::in_place_type_t<EnumT>,
-        std::optional<DataType> dtype = std::nullopt,
-        const std::optional<binary::BinaryOpParams>& op_params = std::nullopt);
+    OpConfig(BinaryOpType binary_op_type, std::in_place_type_t<EnumT>, std::optional<DataType> dtype = std::nullopt);
 
     std::map<std::string, std::string> as_defines(DataType dtype) const;
 
     std::optional<unary::UnaryOpType> process_lhs;
     std::optional<unary::UnaryOpType> process_rhs;
-    // Carries a parameter: a bare UnaryOpType reaches get_op_init_and_func_default, which emits the
-    // paramless form and so inherits the compute API's default template argument.
-    std::optional<unary::EltwiseUnaryWithParam> postprocess;
+    std::optional<unary::UnaryOpType> postprocess;
     std::variant<FpuBinaryOp, SfpuBinaryOp> binary_op;
     bool is_sfpu_op() const;
 };

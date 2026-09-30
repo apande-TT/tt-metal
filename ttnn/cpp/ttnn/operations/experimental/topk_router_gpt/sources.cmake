@@ -5,6 +5,7 @@ set(TTNN_OP_EXPERIMENTAL_TOPK_ROUTER_GPT_API_HEADERS
     topk_router_gpt.hpp
     device/topk_router_gpt_device_operation.hpp
     device/topk_router_gpt_device_operation_types.hpp
+    device/topk_router_gpt_program_factory.hpp
 )
 
 set(TTNN_OP_EXPERIMENTAL_TOPK_ROUTER_GPT_SRCS

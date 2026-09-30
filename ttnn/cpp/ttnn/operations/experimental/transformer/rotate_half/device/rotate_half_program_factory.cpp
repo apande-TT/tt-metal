@@ -2,27 +2,24 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "rotate_half_device_operation.hpp"
+#include "rotate_half_program_factory.hpp"
 
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/constants.hpp>
-#include <tt-metalium/program_descriptors.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 
 namespace ttnn::experimental::prim {
 
 using namespace tt::tt_metal;
 
-ProgramDescriptor RotateHalfDeviceOperation::create_descriptor(
-    const operation_attributes_t& /*operation_attributes*/,
-    const tensor_args_t& input,
-    tensor_return_value_t& tensor_return_value) {
+RotateHalfProgramFactory::cached_program_t RotateHalfProgramFactory::create(
+    const RotateHalfParams& /*operation_attributes*/, const Tensor& input, Tensor& tensor_return_value) {
     using namespace tt::constants;
 
-    ProgramDescriptor desc;
+    Program program{};
 
     const CoreCoord core({0, 0});
-    const CoreRangeSet core_range(CoreRange(core, core));
+    CoreRange core_range(core, core);
 
     Tensor& output = tensor_return_value;
 
@@ -39,52 +36,32 @@ ProgramDescriptor RotateHalfDeviceOperation::create_descriptor(
     // Used for half of tensor that is multiplied
     const uint32_t src_mul_cb_index = 0;
     const uint32_t num_input_tiles = 2;
-    desc.cbs.push_back(CBDescriptor{
-        .total_size = num_input_tiles * single_tile_size,
-        .core_ranges = core_range,
-        .format_descriptors = {{CBFormatDescriptor{
-            .buffer_index = static_cast<uint8_t>(src_mul_cb_index),
-            .data_format = cb_data_format,
-            .page_size = single_tile_size,
-        }}},
-    });
+    CircularBufferConfig cb_src_mul_config =
+        CircularBufferConfig(num_input_tiles * single_tile_size, {{src_mul_cb_index, cb_data_format}})
+            .set_page_size(src_mul_cb_index, single_tile_size);
+    CreateCircularBuffer(program, core_range, cb_src_mul_config);
 
     // Used for bcast scalar
     const uint32_t src_scalar_cb_index = 1;
     const uint32_t num_scalar_tiles = 1;
-    desc.cbs.push_back(CBDescriptor{
-        .total_size = num_scalar_tiles * scalar_single_tile_size,
-        .core_ranges = core_range,
-        .format_descriptors = {{CBFormatDescriptor{
-            .buffer_index = static_cast<uint8_t>(src_scalar_cb_index),
-            .data_format = cb_data_format,
-            .page_size = scalar_single_tile_size,
-        }}},
-    });
+    CircularBufferConfig cb_src1_config =
+        CircularBufferConfig(num_scalar_tiles * scalar_single_tile_size, {{src_scalar_cb_index, cb_data_format}})
+            .set_page_size(src_scalar_cb_index, scalar_single_tile_size);
+    CreateCircularBuffer(program, core_range, cb_src1_config);
 
     // Used for half of tensor that is not multiplied
     const uint32_t src_no_mul_cb_index = 2;
-    desc.cbs.push_back(CBDescriptor{
-        .total_size = num_input_tiles * single_tile_size,
-        .core_ranges = core_range,
-        .format_descriptors = {{CBFormatDescriptor{
-            .buffer_index = static_cast<uint8_t>(src_no_mul_cb_index),
-            .data_format = cb_data_format,
-            .page_size = single_tile_size,
-        }}},
-    });
+    CircularBufferConfig cb_src_no_mul_config =
+        CircularBufferConfig(num_input_tiles * single_tile_size, {{src_no_mul_cb_index, cb_data_format}})
+            .set_page_size(src_no_mul_cb_index, single_tile_size);
+    CreateCircularBuffer(program, core_range, cb_src_no_mul_config);
 
     const uint32_t output_mul_cb_index = tt::CBIndex::c_16;
     const uint32_t num_output_tiles = 2;
-    desc.cbs.push_back(CBDescriptor{
-        .total_size = num_output_tiles * single_tile_size,
-        .core_ranges = core_range,
-        .format_descriptors = {{CBFormatDescriptor{
-            .buffer_index = static_cast<uint8_t>(output_mul_cb_index),
-            .data_format = cb_data_format,
-            .page_size = single_tile_size,
-        }}},
-    });
+    CircularBufferConfig cb_output_config =
+        CircularBufferConfig(num_output_tiles * single_tile_size, {{output_mul_cb_index, cb_data_format}})
+            .set_page_size(output_mul_cb_index, single_tile_size);
+    CreateCircularBuffer(program, core_range, cb_output_config);
     const uint32_t output_no_mul_cb_index = src_no_mul_cb_index;
 
     const uint16_t bfloat16_scalar = std::bit_cast<uint16_t>(bfloat16(-1.0f));
@@ -98,48 +75,70 @@ ProgramDescriptor RotateHalfDeviceOperation::create_descriptor(
     std::vector<uint32_t> writer_compile_time_args = {output_no_mul_cb_index, output_mul_cb_index};
     TensorAccessorArgs(*dst_buffer).append_to(writer_compile_time_args);
 
-    KernelDescriptor reader_desc;
-    reader_desc.kernel_source =
+    KernelHandle reader_kernel_id = CreateKernel(
+        program,
         "ttnn/cpp/ttnn/operations/experimental/transformer/rotate_half/device/kernels/dataflow/"
-        "reader_rotate_half_interleaved_start_id.cpp";
-    reader_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-    reader_desc.core_ranges = core_range;
-    reader_desc.compile_time_args = std::move(reader_compile_time_args);
-    reader_desc.config = ReaderConfigDescriptor{};
-    reader_desc.emplace_runtime_args(core, {src_buffer, num_rows, half_row_size, 0u});
+        "reader_rotate_half_interleaved_start_id.cpp",
+        core_range,
+        ReaderDataMovementConfig(reader_compile_time_args));
 
-    KernelDescriptor writer_desc;
-    writer_desc.kernel_source =
+    KernelHandle writer_kernel_id = CreateKernel(
+        program,
         "ttnn/cpp/ttnn/operations/experimental/transformer/rotate_half/device/kernels/dataflow/"
-        "writer_rotate_half_interleaved_start_id.cpp";
-    writer_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-    writer_desc.core_ranges = core_range;
-    writer_desc.compile_time_args = std::move(writer_compile_time_args);
-    writer_desc.config = WriterConfigDescriptor{};
-    writer_desc.emplace_runtime_args(core, {dst_buffer, num_rows, half_row_size, 0u});
+        "writer_rotate_half_interleaved_start_id.cpp",
+        core_range,
+        WriterDataMovementConfig(writer_compile_time_args));
 
-    KernelDescriptor bcast_desc;
-    bcast_desc.kernel_source = "ttnn/cpp/ttnn/operations/data_movement/bcast/device/kernels/compute/bcast_hw.cpp";
-    bcast_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-    bcast_desc.core_ranges = core_range;
-    bcast_desc.defines = {
+    std::map<std::string, std::string> bcast_compute_defines = {
         {"CHAIN_BCAST_OP", "compute_kernel_lib::BinaryFpuOp::Mul"},
         {"CHAIN_BCAST_DIM", "compute_kernel_lib::BroadcastDim::Scalar"},
         {"BCAST_SCALAR", "1"}};
-    bcast_desc.config = ComputeConfigDescriptor{};
-    bcast_desc.emplace_runtime_args(
-        core,
+
+    auto bcast_kernel_group_1_id = CreateKernel(
+        program,
+        "ttnn/cpp/ttnn/operations/data_movement/bcast/device/kernels/compute/bcast_hw.cpp",
+        core_range,
+        ComputeConfig{.compile_args = {}, .defines = bcast_compute_defines});
+
+    SetRuntimeArgs(program, reader_kernel_id, core_range, {src_buffer->address(), num_rows, half_row_size, 0});
+
+    SetRuntimeArgs(
+        program,
+        bcast_kernel_group_1_id,
+        core_range,
         {
-            1u,            // B
-            1u,            // Ht
+            1,             // B
+            1,             // Ht
             num_tiles / 2  // Wt
         });
 
-    desc.kernels.push_back(std::move(reader_desc));
-    desc.kernels.push_back(std::move(writer_desc));
-    desc.kernels.push_back(std::move(bcast_desc));
+    SetRuntimeArgs(program, writer_kernel_id, core_range, {dst_buffer->address(), num_rows, half_row_size, 0});
 
-    return desc;
+    return cached_program_t{
+        std::move(program), {.reader_kernel_id = reader_kernel_id, .writer_kernel_id = writer_kernel_id, .core = core}};
+}
+
+void RotateHalfProgramFactory::override_runtime_arguments(
+    cached_program_t& cached_program,
+    const RotateHalfParams& /*operation_attributes*/,
+    const Tensor& input,
+    Tensor& tensor_return_value) {
+    Buffer* src_buffer = input.buffer();
+    Buffer* dst_buffer = tensor_return_value.buffer();
+
+    const auto& core = cached_program.shared_variables.core;
+
+    {
+        auto& runtime_args =
+            GetRuntimeArgs(cached_program.program, cached_program.shared_variables.reader_kernel_id, core);
+        runtime_args[0] = src_buffer->address();
+    }
+
+    {
+        auto& runtime_args =
+            GetRuntimeArgs(cached_program.program, cached_program.shared_variables.writer_kernel_id, core);
+        runtime_args[0] = dst_buffer->address();
+    }
 }
 
 }  // namespace ttnn::experimental::prim

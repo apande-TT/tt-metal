@@ -2,21 +2,20 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List
+from typing import List, Tuple
 
+import torch
 from fuser.base_fpu import Fpu
 from fuser.block_data import BlockData
 from fuser.fpu_node import FpuNode
 from fuser.fuser_config import GlobalConfig
-from fuser.golden.fpu.reduce import reduce_golden
-from fuser.indexing import InvocationGranularity
 from fuser.l1_operation import L1Operation
+from fuser.tile_loop import LoopTileByTile, TileLoop
 from helpers.llk_params import DataFormat, ReduceDimension, ReducePool
 
 
 class ReduceFpu(Fpu):
-    granularity = InvocationGranularity.TILE
-    golden_fn = staticmethod(reduce_golden)
+    loop: TileLoop = LoopTileByTile()
 
     def __init__(self, reduce_dim: ReduceDimension, reduce_pool: ReducePool):
         self.reduce_dim = reduce_dim
@@ -27,6 +26,19 @@ class ReduceFpu(Fpu):
             "llk_math_common.h",
             "llk_math_reduce.h",
         ]
+
+    def golden(
+        self,
+        tensor_a: torch.Tensor,
+        tensor_b: torch.Tensor,
+        tensor_dst: torch.Tensor,
+        operation: L1Operation,
+        config: GlobalConfig,
+        compute_unit: FpuNode,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.reduce_golden(
+            tensor_a, tensor_b, tensor_dst, config, operation, compute_unit
+        )
 
     def init(
         self,
@@ -75,7 +87,7 @@ class ReduceFpu(Fpu):
 
         return (
             f"_llk_math_reduce_<{pool_type_cpp}, {reduce_dim_cpp}, {dest_acc}, {math_fidelity}, {is_int_fpu_en}>(\n"
-            f"{block.tile_id_dest}, {compute_unit.src_a.tile_shape.cpp_value}\n"
+            f"{block.tile_id_block}, {compute_unit.src_a.tile_shape.cpp_value}\n"
             f");\n"
         )
 

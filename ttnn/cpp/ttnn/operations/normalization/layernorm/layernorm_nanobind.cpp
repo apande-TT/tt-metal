@@ -5,7 +5,6 @@
 #include "layernorm_nanobind.hpp"
 
 #include <optional>
-#include <new>
 
 #include <fmt/format.h>
 #include <nanobind/nanobind.h>
@@ -38,25 +37,13 @@ void bind_normalization_layernorm_program_config(nb::module_& mod) {
 
     nb::class_<ttnn::prim::LayerNormDefaultProgramConfig>(mod, "LayerNormDefaultProgramConfig")
         .def(
-            "__init__",
-            [](prim::LayerNormDefaultProgramConfig* config,
-               bool legacy_reduction,
-               bool /*legacy_rsqrt*/,
-               bool use_welford) {
-                new (config) prim::LayerNormDefaultProgramConfig{
-                    .legacy_reduction = legacy_reduction, .use_welford = use_welford};
-            },
+            nb::init<bool, bool, bool>(),
             nb::kw_only(),
             nb::arg("legacy_reduction").noconvert() = false,
             nb::arg("legacy_rsqrt").noconvert() = false,
-            nb::arg("use_welford").noconvert() = false,
-            "legacy_rsqrt is deprecated, has no effect, and will be removed in a future release (issue #56336).")
+            nb::arg("use_welford").noconvert() = false)
         .def_rw("legacy_reduction", &prim::LayerNormDefaultProgramConfig::legacy_reduction)
-        .def_prop_rw(
-            "legacy_rsqrt",
-            [](const prim::LayerNormDefaultProgramConfig&) { return false; },
-            [](prim::LayerNormDefaultProgramConfig&, bool) {},
-            "Deprecated no-op; always returns False and will be removed in a future release (issue #56336).")
+        .def_rw("legacy_rsqrt", &prim::LayerNormDefaultProgramConfig::legacy_rsqrt)
         .def_rw("use_welford", &prim::LayerNormDefaultProgramConfig::use_welford)
         .def("__repr__", [](const ttnn::prim::LayerNormDefaultProgramConfig& config) {
             return fmt::format("{}", config);
@@ -64,25 +51,7 @@ void bind_normalization_layernorm_program_config(nb::module_& mod) {
 
     nb::class_<ttnn::prim::LayerNormShardedMultiCoreProgramConfig>(mod, "LayerNormShardedMultiCoreProgramConfig")
         .def(
-            "__init__",
-            [](prim::LayerNormShardedMultiCoreProgramConfig* config,
-               CoreCoord compute_with_storage_grid_size,
-               std::size_t subblock_w,
-               std::size_t block_h,
-               std::size_t block_w,
-               bool inplace,
-               bool legacy_reduction,
-               bool /*legacy_rsqrt*/,
-               bool use_welford) {
-                new (config) prim::LayerNormShardedMultiCoreProgramConfig{
-                    .compute_with_storage_grid_size = compute_with_storage_grid_size,
-                    .subblock_w = subblock_w,
-                    .block_h = block_h,
-                    .block_w = block_w,
-                    .inplace = inplace,
-                    .legacy_reduction = legacy_reduction,
-                    .use_welford = use_welford};
-            },
+            nb::init<CoreCoord, std::size_t, std::size_t, std::size_t, bool, bool, bool, bool>(),
             nb::kw_only(),
             nb::arg("compute_with_storage_grid_size"),
             nb::arg("subblock_w").noconvert(),
@@ -91,8 +60,7 @@ void bind_normalization_layernorm_program_config(nb::module_& mod) {
             nb::arg("inplace").noconvert(),
             nb::arg("legacy_reduction").noconvert() = false,
             nb::arg("legacy_rsqrt").noconvert() = false,
-            nb::arg("use_welford").noconvert() = false,
-            "legacy_rsqrt is deprecated, has no effect, and will be removed in a future release (issue #56336).")
+            nb::arg("use_welford").noconvert() = false)
         .def_rw(
             "compute_with_storage_grid_size",
             &prim::LayerNormShardedMultiCoreProgramConfig::compute_with_storage_grid_size)
@@ -101,11 +69,7 @@ void bind_normalization_layernorm_program_config(nb::module_& mod) {
         .def_rw("block_w", &prim::LayerNormShardedMultiCoreProgramConfig::block_w)
         .def_rw("inplace", &prim::LayerNormShardedMultiCoreProgramConfig::inplace)
         .def_rw("legacy_reduction", &prim::LayerNormShardedMultiCoreProgramConfig::legacy_reduction)
-        .def_prop_rw(
-            "legacy_rsqrt",
-            [](const prim::LayerNormShardedMultiCoreProgramConfig&) { return false; },
-            [](prim::LayerNormShardedMultiCoreProgramConfig&, bool) {},
-            "Deprecated no-op; always returns False and will be removed in a future release (issue #56336).")
+        .def_rw("legacy_rsqrt", &prim::LayerNormShardedMultiCoreProgramConfig::legacy_rsqrt)
         .def_rw("use_welford", &prim::LayerNormShardedMultiCoreProgramConfig::use_welford)
         .def("__repr__", [](const ttnn::prim::LayerNormShardedMultiCoreProgramConfig& config) {
             return fmt::format("{}", config);

@@ -358,26 +358,12 @@ class PipelineDecodeAdapter:
         pass
 
 
-def _stated_count(pipeline, stage: str, seam: str) -> int:
-    """What the pipeline's zero-arg <stage><seam>() returns, as a count; 0 when it states nothing.
-
-    For the optional counting seams (items, split): an unstated or failing count is 0, never a broken
-    run, and the reader decides what 0 falls back to."""
-    fn = getattr(pipeline, _seams.hook(stage, seam), None)
-    if not callable(fn):
-        return 0
-    try:
-        return max(0, int(fn() or 0))
-    except Exception:  # noqa: BLE001
-        return 0
-
-
 class _Stage:
     """One profilable unit emit-e2e emitted: a name and a host-op-free traceable step."""
 
-    __slots__ = ("name", "step", "self_traced", "trace_path", "items", "recurring", "split")
+    __slots__ = ("name", "step", "self_traced", "trace_path", "items", "recurring")
 
-    def __init__(self, name, step, self_traced=False, trace_path=None, items=0, recurring=None, split=0):
+    def __init__(self, name, step, self_traced=False, trace_path=None, items=0, recurring=None):
         self.name = name
         self.step = step
         self.self_traced = bool(self_traced)
@@ -395,9 +381,6 @@ class _Stage:
         # whether it looped or not. Explicit for the legacy contract, which retires one token per
         # call by definition; None when the stage stated no count, and the caller falls back.
         self.recurring = (self.items == 1) if recurring is None else bool(recurring)
-        # HOW MANY DATA-PARALLEL GROUPS SHARE THOSE ITEMS (stage_seams.SPLIT). 0 means "not stated",
-        # which the reader turns into 1 -- the stage runs whole on every group.
-        self.split = max(0, int(split or 0))
 
 
 class PipelineStageAdapter:
@@ -530,7 +513,13 @@ class PipelineStageAdapter:
             # pipeline knows what one call of this stage retires: an encoder's frame count is not the
             # prompt length and is not derivable from the byte model, which is why every stage but
             # the prompt-consuming one was priced at a single item. Absent, nothing changes.
-            _n = _stated_count(p, name, _seams.ITEMS)
+            _n = 0
+            _items_fn = getattr(p, _seams.hook(name, _seams.ITEMS), None)
+            if callable(_items_fn):
+                try:
+                    _n = max(0, int(_items_fn() or 0))
+                except Exception:  # noqa: BLE001 -- an unstated count is 0, never a broken run
+                    _n = 0
             stages.append(
                 _Stage(
                     name,
@@ -538,7 +527,6 @@ class PipelineStageAdapter:
                     _selft,
                     getattr(p, "trace_path", None) if _selft else None,
                     _n,
-                    split=_stated_count(p, name, _seams.SPLIT),
                 )
             )
         if stages:

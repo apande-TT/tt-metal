@@ -11,8 +11,6 @@
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/program_descriptors.hpp>
 
-#include "ttnn/distributed/types.hpp"
-
 namespace ttnn::experimental::prim {
 
 tt::tt_metal::ProgramDescriptor FusedRMSNormPreAllGatherProgramFactory::create_descriptor(
@@ -39,7 +37,7 @@ tt::tt_metal::ProgramDescriptor FusedRMSNormPreAllGatherProgramFactory::create_d
     ////////////////////////////////////////////////////////////////////////////
     //                       Device Setup
     //////////////////////////////////////////////////////////////////////////
-    MeshDevice* device = input_tensor.device();
+    IDevice* device = input_tensor.device();
     const auto grid_size = device->compute_with_storage_grid_size();
     const auto core_grid = CoreRange({0, 0}, {grid_size.x - 1, grid_size.y - 1});
     const CoreRangeSet core_grid_set(core_grid);

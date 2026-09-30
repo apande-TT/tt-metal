@@ -4,22 +4,20 @@
 
 from typing import List
 
+import torch
 from fuser.block_data import BlockData
 from fuser.fuser_config import GlobalConfig
-from fuser.golden.pack.untilize import untilize_golden
-from fuser.indexing import InvocationGranularity
 from fuser.l1_operation import L1Operation
 from fuser.operand import BfdResource, bfd_current
 from fuser.pack_node import PackNode
+from fuser.tile_loop import LoopBlockRow, TileLoop
+from helpers.llk_params import PackerReluType
 
 from .packer import Packer
 
 
 class PackUntilize(Packer):
-    granularity = InvocationGranularity.ROW
-
-    golden_fn = staticmethod(untilize_golden)
-
+    loop: TileLoop = LoopBlockRow()
     per_block_init = True
 
     def get_headers(self) -> List[str]:
@@ -27,6 +25,18 @@ class PackUntilize(Packer):
             "llk_pack.h",
             "llk_pack_untilize.h",
         ]
+
+    def golden(
+        self,
+        tensor: torch.Tensor,
+        pack_node: PackNode,
+        operation: L1Operation,
+        config: GlobalConfig,
+    ) -> torch.Tensor:
+        if pack_node.pack_relu != PackerReluType.NoRelu:
+            tensor = self.relu_golden(tensor, config, operation, pack_node)
+
+        return self.untilize_golden(tensor, config, operation, pack_node)
 
     def init(
         self,
@@ -36,7 +46,7 @@ class PackUntilize(Packer):
         block: BlockData,
     ) -> str:
         full_ct_dim = pack_node.output.tile_count_x
-        block_ct_dim = block.block_cols
+        block_ct_dim = block.block_tiles_x
         tensor_shape = pack_node.output.tile_shape.cpp_value
 
         return (
@@ -52,14 +62,15 @@ class PackUntilize(Packer):
         config: GlobalConfig,
         block: BlockData,
     ) -> str:
-        full_ct_dim = pack_node.output.tile_count_x
-        tensor_shape = pack_node.output.tile_shape.cpp_value
-        row_stride = full_ct_dim * pack_node.output.tile_shape.total_row_dim()
-        tile_row = f"({block.tile_id_out}) / {full_ct_dim}"
-        tile_col = f"({block.tile_id_out}) % {full_ct_dim}"
-        l1_row_idx = f"{row_stride} * ({tile_row}) + ({tile_col})"
+        tile_shape = pack_node.output.tile_shape
+        y_stride = (
+            pack_node.output.tile_count_x
+            * tile_shape.num_faces_r_dim
+            * tile_shape.face_r_dim
+        )
+        l1_row_idx = f"{y_stride} * ({block.block_y} + tile_y) + {block.block_x}"
 
         return (
-            f"_llk_pack_untilize_set_dst_offset_({tensor_shape}, {l1_row_idx});\n"
-            f"_llk_pack_untilize_({block.tile_id_dest}, 0);\n"
+            f"_llk_pack_untilize_set_dst_offset_({tile_shape.cpp_value}, {l1_row_idx});\n"
+            f"_llk_pack_untilize_({block.tile_id_block}, 0);\n"
         )

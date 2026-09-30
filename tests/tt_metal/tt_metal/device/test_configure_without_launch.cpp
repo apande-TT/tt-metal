@@ -19,7 +19,6 @@
 #include <tt-metalium/tt_metal.hpp>
 
 #include "device_fixture.hpp"
-#include "impl/program/slow_dispatch.hpp"
 
 namespace tt::tt_metal {
 
@@ -71,8 +70,7 @@ TEST_F(MeshDeviceFixture, TensixConfigureProgramWithoutLaunchInstallsButDoesNotR
         EXPECT_EQ(again.launch_kernel_config(), cfg.launch_kernel_config());
 
         // The same program, launched for real, runs.
-        slow_dispatch::LaunchProgramAsync(*device, program, /*force_slow_dispatch=*/false);
-        slow_dispatch::WaitProgramDone(*device, program);
+        detail::LaunchProgram(device, program);
         EXPECT_EQ(read_word(device, core, addr), MARKER) << "the same program launched normally writes the marker";
     }
 }

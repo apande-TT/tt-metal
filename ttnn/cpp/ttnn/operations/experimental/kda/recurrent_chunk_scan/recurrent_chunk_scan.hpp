@@ -26,8 +26,7 @@ std::vector<ttnn::Tensor> recurrent_chunk_scan(
     uint32_t groups_per_head = 1,
     const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt,
-    uint32_t sequence_parallel_axis = 0,
-    const std::optional<Tensor>& actual_end = std::nullopt);
+    uint32_t sequence_parallel_axis = 0);
 
 std::vector<ttnn::Tensor> summarize_chunk_recurrence(
     const ttnn::Tensor& v_beta,
@@ -41,7 +40,6 @@ std::vector<ttnn::Tensor> summarize_chunk_recurrence(
     uint32_t groups_per_head = 1,
     const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt,
-    uint32_t sequence_parallel_axis = 0,
-    const std::optional<Tensor>& actual_end = std::nullopt);
+    uint32_t sequence_parallel_axis = 0);
 
 }  // namespace ttnn::experimental::kda

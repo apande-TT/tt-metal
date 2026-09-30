@@ -23,8 +23,6 @@ import ttnn
 
 from models.common.lightweightmodule import LightweightModule
 from models.experimental.nomic_embed_text_v2_moe.tt.common import to_device, transpose_linear_weight
-from models.experimental.nomic_embed_text_v2_moe.tt.matmul_config import dense_linear
-from models.experimental.nomic_embed_text_v2_moe.tt.model_config import OpGroup
 
 
 class TtNomicBertAttention(LightweightModule):
@@ -47,18 +45,18 @@ class TtNomicBertAttention(LightweightModule):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
 
-        def weight(name, group):
+        def weight(name):
             return to_device(
                 transpose_linear_weight(state_dict[f"{state_dict_prefix}{name}.weight"]),
                 device,
-                dtype=tt_config.matmul_weight_dtype(group),
+                dtype=tt_config.weight_dtype,
             )
 
         def bias(name):
             return to_device(state_dict[f"{state_dict_prefix}{name}.bias"], device, dtype=tt_config.weight_dtype)
 
-        self.qkv_weight, self.qkv_bias = weight("Wqkv", OpGroup.QKV), bias("Wqkv")
-        self.out_weight, self.out_bias = weight("out_proj", OpGroup.ATTN_OUT), bias("out_proj")
+        self.qkv_weight, self.qkv_bias = weight("Wqkv"), bias("Wqkv")
+        self.out_weight, self.out_bias = weight("out_proj"), bias("out_proj")
 
     def _rotate(self, x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor) -> ttnn.Tensor:
         """Apply rotary position embedding to one of q or k.
@@ -97,17 +95,17 @@ class TtNomicBertAttention(LightweightModule):
         Returns:
             ttnn.Tensor: (B, 1, S, H).
         """
-        qkv = dense_linear(x, self.qkv_weight, self.qkv_bias, OpGroup.QKV, self.tt_config)
+        qkv = ttnn.linear(
+            x,
+            self.qkv_weight,
+            bias=self.qkv_bias,
+            compute_kernel_config=self.tt_config.compute_kernel_config,
+        )
 
         # Three-major, heads contiguous inside each of q, k and v. transpose_k_heads stays False
-        # because SDPA wants K as (B, A, S, D), not pre-transposed. qkv may sit in L1
-        # (dense_linear); the heads go to DRAM rather than inherit that.
+        # because SDPA wants K as (B, A, S, D), not pre-transposed.
         query, key, value = ttnn.experimental.nlp_create_qkv_heads(
-            qkv,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_heads,
-            transpose_k_heads=False,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            qkv, num_heads=self.num_heads, num_kv_heads=self.num_heads, transpose_k_heads=False
         )
         ttnn.deallocate(qkv)
 
@@ -124,7 +122,7 @@ class TtNomicBertAttention(LightweightModule):
             value,
             attn_mask=attn_mask,
             is_causal=False,
-            compute_kernel_config=self.tt_config.compute_kernel_config(OpGroup.SDPA),
+            compute_kernel_config=self.tt_config.compute_kernel_config,
         )
         for tensor in (rotated_query, rotated_key, value):
             ttnn.deallocate(tensor)
@@ -132,6 +130,11 @@ class TtNomicBertAttention(LightweightModule):
         concatenated = ttnn.experimental.nlp_concat_heads(context)
         ttnn.deallocate(context)
 
-        out = dense_linear(concatenated, self.out_weight, self.out_bias, OpGroup.ATTN_OUT, self.tt_config)
+        out = ttnn.linear(
+            concatenated,
+            self.out_weight,
+            bias=self.out_bias,
+            compute_kernel_config=self.tt_config.compute_kernel_config,
+        )
         ttnn.deallocate(concatenated)
         return out

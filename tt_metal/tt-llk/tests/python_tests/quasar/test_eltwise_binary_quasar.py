@@ -3,7 +3,6 @@
 
 import pytest
 import torch
-from helpers.constraints import get_valid_math_fidelities
 from helpers.format_config import DataFormat, InputOutputFormat
 from helpers.golden_generators import (
     EltwiseBinaryGolden,
@@ -13,13 +12,13 @@ from helpers.llk_params import (
     DestAccumulation,
     DestSync,
     ImpliedMathFormat,
+    MathFidelity,
     MathOperation,
     PerfRunType,
     format_dict,
 )
 from helpers.param_config import (
-    generate_reduced_input_dimensions,
-    get_num_blocks_and_num_tiles_in_block,
+    generate_unary_input_dimensions,
     input_output_formats,
     parametrize,
     quasar_mx_smoke,
@@ -37,7 +36,6 @@ from helpers.test_variant_parameters import (
     LOOP_FACTOR,
     MATH_FIDELITY,
     MATH_OP,
-    NUM_BLOCKS,
     NUM_FACES,
     NUM_TILES_IN_BLOCK,
     OUTPUT_TILE_CNT,
@@ -72,6 +70,22 @@ def eltwise_binary_implied_math_formats(formats, *, is_perf=False):
     if formats.input_format.is_mx_format():
         return [ImpliedMathFormat.Yes]
     return [ImpliedMathFormat.No, ImpliedMathFormat.Yes]
+
+
+def eltwise_binary_math_fidelities(mathop, formats):
+    # Add/sub ignore fidelity. Int8 is an exact integer op, and Float16_b is
+    # already full precision at LoFi: HiFi only touches the low 3 mantissa bits.
+    if mathop in [
+        MathOperation.Elwadd,
+        MathOperation.Elwsub,
+    ] or formats.input_format in (DataFormat.Int8, DataFormat.Float16_b):
+        return [MathFidelity.LoFi]
+    return [
+        MathFidelity.LoFi,
+        MathFidelity.HiFi2,
+        MathFidelity.HiFi3,
+        MathFidelity.HiFi4,
+    ]
 
 
 # For acc_to_dest setting, accumulate two result tiles into dest. Can be extended.
@@ -118,7 +132,7 @@ ELTWISE_FORMATS = (
         MathOperation.Elwsub,
         MathOperation.Elwmul,
     ],
-    math_fidelity=lambda formats, mathop: get_valid_math_fidelities(formats, mathop),
+    math_fidelity=eltwise_binary_math_fidelities,
     implied_math_format=lambda formats: eltwise_binary_implied_math_formats(
         formats, is_perf=False
     ),
@@ -126,7 +140,7 @@ ELTWISE_FORMATS = (
         formats, is_perf=False
     ),
     input_dimensions=runtime(
-        lambda dest_sync_dest_acc: generate_reduced_input_dimensions(
+        lambda dest_sync_dest_acc: generate_unary_input_dimensions(
             dest_sync_dest_acc[1], dest_sync_dest_acc[0]
         )
     ),
@@ -154,11 +168,6 @@ def test_eltwise_binary(
     dest_sync_mode, dest_acc = dest_sync_dest_acc
 
     num_tiles_per_accumulation = get_num_tiles_per_accumulation(acc_to_dest)
-
-    num_blocks, input_tiles_in_block = get_num_blocks_and_num_tiles_in_block(
-        dest_sync_mode, dest_acc, formats, input_dimensions
-    )
-    output_tiles_in_block = input_tiles_in_block // num_tiles_per_accumulation
 
     if formats.input_format == DataFormat.Int8:
         stimuli_spec = StimuliSpec.uniform(low=-127.0, high=127.0)
@@ -210,11 +219,7 @@ def test_eltwise_binary(
             OUTPUT_TILE_CNT(tile_cnt_res),
             NUM_FACES(num_faces),
             TEST_FACE_DIMS(),
-            NUM_BLOCKS(num_blocks),
-            NUM_TILES_IN_BLOCK(
-                input_tiles_in_block,
-                output_num_tiles_in_block=output_tiles_in_block,
-            ),
+            NUM_TILES_IN_BLOCK(num_tiles_per_accumulation),
             LOOP_FACTOR(loop_factor),
         ],
         "variant_stimuli": StimuliConfig(

@@ -789,6 +789,7 @@ class RefinerModelOptimisations1024x1024(RefinerModelOptimisationsBase, ModelOpt
             block_w=10,
             inplace=False,
             legacy_reduction=True,
+            legacy_rsqrt=True,
         )
         self.layernorm_configs["1536_config"] = ttnn.LayerNormShardedMultiCoreProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(5, 8),
@@ -797,6 +798,7 @@ class RefinerModelOptimisations1024x1024(RefinerModelOptimisationsBase, ModelOpt
             block_w=10,
             inplace=False,
             legacy_reduction=True,
+            legacy_rsqrt=True,
         )
         self.layernorm_configs["768_config"] = ttnn.LayerNormShardedMultiCoreProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(5, 8),
@@ -805,6 +807,7 @@ class RefinerModelOptimisations1024x1024(RefinerModelOptimisationsBase, ModelOpt
             block_w=5,
             inplace=False,
             legacy_reduction=True,
+            legacy_rsqrt=True,
         )
 
     def get_matmul_config(self, matmul_path):
@@ -1077,7 +1080,7 @@ class RefinerModelOptimisations1024x1024(RefinerModelOptimisationsBase, ModelOpt
             return self.layernorm_configs["1536_config"]
         elif "down_blocks.1" in module_path or "up_blocks.2" in module_path:
             return self.layernorm_configs["768_config"]
-        return ttnn.LayerNormDefaultProgramConfig(legacy_reduction=True)
+        return ttnn.LayerNormDefaultProgramConfig(legacy_reduction=True, legacy_rsqrt=True)
 
     def get_sdpa_config(self, module_path, is_self_attention):
         if not is_self_attention:

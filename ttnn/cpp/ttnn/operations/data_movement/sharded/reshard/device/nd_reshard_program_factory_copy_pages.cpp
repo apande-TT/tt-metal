@@ -53,6 +53,8 @@ ttnn::device_operation::ProgramArtifacts NdReshardCopyPagesFactory::create_progr
     const auto data_format = datatype_to_dataformat_converter(input.dtype());
     constexpr uint32_t num_tiles_in_dfb = 1;  // TODO: Try double buffering
 
+    auto* device = input.device();
+
     // ------------------------------------------------------------------
     // ProgramSpec (immutable)
     // ------------------------------------------------------------------
@@ -76,7 +78,7 @@ ttnn::device_operation::ProgramArtifacts NdReshardCopyPagesFactory::create_progr
                 .tensor_parameter_name = TensorParamName{kCPInputTensorParam}, .accessor_name = kCPInputTensorParam}},
             .compile_time_args = compile_time_args,
             .runtime_arg_schema = {.runtime_arg_names = {"start_page", "end_page"}},
-            .hw_config = ttnn::create_reader_datamovement_config(),
+            .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
         },
         KernelSpec{
             .unique_id = KernelSpecName{kCPWriterKernel},
@@ -90,7 +92,7 @@ ttnn::device_operation::ProgramArtifacts NdReshardCopyPagesFactory::create_progr
                 .tensor_parameter_name = TensorParamName{kCPOutputTensorParam}, .accessor_name = kCPOutputTensorParam}},
             .compile_time_args = compile_time_args,
             .runtime_arg_schema = {.runtime_arg_names = {"start_page", "end_page"}},
-            .hw_config = ttnn::create_writer_datamovement_config(),
+            .hw_config = ttnn::create_writer_datamovement_config(device->arch()),
         },
     };
 

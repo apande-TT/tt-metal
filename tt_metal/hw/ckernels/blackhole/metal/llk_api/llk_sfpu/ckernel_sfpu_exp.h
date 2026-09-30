@@ -51,22 +51,11 @@ sfpi_inline sfpi::vInt _float_to_int32_for_exp_21f_(sfpi::vFloat val) {
  * Use this variant when the caller has already clamped its input (e.g. i1's
  * asymptotic path operates on |x| ∈ [10, 88.5]).
  *
- * The overload taking c0, c1 and c2 is for a caller that evaluates it once per element
- * (e.g. logaddexp): it can load the fractional-part coefficients once, before its loop.
- * Each is a full fp32 value, two SFPLOADIs, which the one-argument form reloads on every
- * call. Pass EXP_21F_BF16_C0..C2, each as a float or as a vFloat already holding it: like
- * PolynomialEvaluator::eval, the overload takes either, so the one-argument form, which
- * passes floats, compiles exactly as it did before.
- *
  * @param val The input value, must be in the safe range described above.
  * @return sfpi::vFloat Result of exp(val), 21-bit accuracy (~3 FP32 ULP).
  */
-constexpr float EXP_21F_BF16_C0 = 1.0017248f;
-constexpr float EXP_21F_BF16_C1 = 7.839635491371155e-08f;
-constexpr float EXP_21F_BF16_C2 = 4.791750143340323e-15f;
-
-template <bool is_fp32_dest_acc_en, typename C0, typename C1, typename C2>
-sfpi_inline sfpi::vFloat _sfpu_exp_21f_bf16_unsafe_(sfpi::vFloat val, C0 c0, C1 c1, C2 c2) {
+template <bool is_fp32_dest_acc_en>
+sfpi_inline sfpi::vFloat _sfpu_exp_21f_bf16_unsafe_(sfpi::vFloat val) {
     constexpr float ONE_LN2 = 1.4426950216293334961f;
     sfpi::vFloat xlog2 = (val * ONE_LN2 + 127.f);
 
@@ -80,7 +69,7 @@ sfpi_inline sfpi::vFloat _sfpu_exp_21f_bf16_unsafe_(sfpi::vFloat val, C0 c0, C1 
 
     // To refine approximation of 2**(x_f), we use an approximation of 2**x on [0; 2^23]
     // This uses a 2nd degree polynomial adjustment of the fractional part
-    frac = PolynomialEvaluator::eval(frac, c0, c1, c2);
+    frac = PolynomialEvaluator::eval(frac, 1.0017248f, 7.839635491371155e-08f, 4.791750143340323e-15f);
 
     // Recombined exponent and mantissa: this is equivalent to 2**(x_i) * 2**(x_f)
     sfpi::vFloat y = sfpi::setexp(frac, exponential_part);
@@ -94,11 +83,6 @@ sfpi_inline sfpi::vFloat _sfpu_exp_21f_bf16_unsafe_(sfpi::vFloat val, C0 c0, C1 
     }
 
     return y;
-}
-
-template <bool is_fp32_dest_acc_en>
-sfpi_inline sfpi::vFloat _sfpu_exp_21f_bf16_unsafe_(sfpi::vFloat val) {
-    return _sfpu_exp_21f_bf16_unsafe_<is_fp32_dest_acc_en>(val, EXP_21F_BF16_C0, EXP_21F_BF16_C1, EXP_21F_BF16_C2);
 }
 
 /*
@@ -396,17 +380,21 @@ sfpi_inline sfpi::vFloat _sfpu_exp_fp32_accurate_(sfpi::vFloat a) {
         y *= std::numeric_limits<float>::infinity();
 
         e = sfpi::exexp(r, sfpi::ExponentMode::Biased) + i;
-        v_if(sfpi::nearby(e < 255)) {
+        // if e < 255
+        v_block {
+            sfpi::vInt e_lt_255 = __builtin_rvtt_sfpiadd_i(e.get(), -255, sfpi::SFPIADD_MOD1_CC_LT0);
+
             // y = 2**i * r
             y = sfpi::setexp(r, e);
 
-            v_if(sfpi::nearby(e < 1)) {
+            // if e < 1
+            v_if(e_lt_255 < -254) {
                 // underflow, including subnormals
                 y = 0.0f;
             }
             v_endif;
         }
-        v_endif;
+        v_endblock;
     }
 
     return y;

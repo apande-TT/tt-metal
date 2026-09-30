@@ -94,8 +94,7 @@ std::tuple<Tensor, Tensor, Tensor> rgb_to_yuv(
     RGBRange input_range = RGBRange::MinusOneToOne,
     YUVRange output_range = YUVRange::Limited,
     const std::optional<prim::YUVCoefficients>& coefficients = std::nullopt,
-    const std::optional<tt::tt_metal::MemoryConfig>& memory_config = std::nullopt,
-    bool wide_rows = false);
+    const std::optional<tt::tt_metal::MemoryConfig>& memory_config = std::nullopt);
 
 // BT.601 / BT.709 coefficients for input ∈ [-1, 1] → limited-range uint8.
 inline prim::YUVCoefficients yuv_bt601_coefficients() {

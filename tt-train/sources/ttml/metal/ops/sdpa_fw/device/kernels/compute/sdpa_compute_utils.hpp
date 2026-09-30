@@ -45,12 +45,7 @@ inline constexpr uint32_t round_up(uint32_t a, uint32_t b) {
 template <bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
 void recip_tile_first_column(uint32_t idst) {
     SFPU_UNARY_CALL(
-        DST_SYNC_MODE,
-        is_fp32_dest_acc_en,
-        calculate_sdpa_fw_recip_first_column,
-        (is_fp32_dest_acc_en),
-        idst,
-        VectorMode::C);
+        DST_SYNC_MODE, is_fp32_dest_acc_en, calculate_recip_first_column, (is_fp32_dest_acc_en), idst, VectorMode::C);
 }
 #endif  // TRISC_MATH
 
@@ -427,7 +422,7 @@ void recip_tile_inplace(uint32_t cb_in_idx) {
     reconfig_data_format(cb_in_idx, cb_in_idx);
     copy_init(cb_in_idx);
     copy_tile(cb_in_idx, /* tile_idx */ 0, dst_idx);
-    recip_tile_init();
+    recip_tile_init</* legacy_compat */ false>();
     MATH((recip_tile_first_column(dst_idx)));
     tile_regs_commit();
 

@@ -47,7 +47,7 @@ ttnn::device_operation::ProgramArtifacts BcastMultiCoreWProgramFactory::create_p
 
     const std::uint32_t bnc1 = (bN * bC == 1) ? 1 : 0;
 
-    MeshDevice* device = a.device();
+    IDevice* device = a.device();
 
     const tt::DataFormat src0_cb_data_format = datatype_to_dataformat_converter(a.dtype());
     const tt::DataFormat src1_cb_data_format = datatype_to_dataformat_converter(b.dtype());
@@ -127,7 +127,7 @@ ttnn::device_operation::ProgramArtifacts BcastMultiCoreWProgramFactory::create_p
              TensorBinding{.tensor_parameter_name = INPUT_B, .accessor_name = "src1"}},
         .runtime_arg_schema =
             {.runtime_arg_names = {"src0_num_tiles", "NCHtWt", "NC", "Ht", "Wt", "nc1", "start_id", "HtWt", "Wt_skip"}},
-        .hw_config = ttnn::create_reader_datamovement_config(),
+        .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
     };
 
     KernelSpec writer{
@@ -138,10 +138,10 @@ ttnn::device_operation::ProgramArtifacts BcastMultiCoreWProgramFactory::create_p
             .dfb_spec_name = OUT, .accessor_name = "out", .endpoint_type = DFBEndpointType::CONSUMER}},
         .tensor_bindings = {TensorBinding{.tensor_parameter_name = OUTPUT, .accessor_name = "dst"}},
         .runtime_arg_schema = {.runtime_arg_names = {"Ht", "Wt", "Wt_read", "Wt_skip", "NC", "HtWt"}},
-        .hw_config = ttnn::create_writer_datamovement_config(),
+        .hw_config = ttnn::create_writer_datamovement_config(device->arch()),
     };
 
-    ComputeHardwareConfig compute_hw = ComputeHardwareConfig{};  // legacy ComputeConfigDescriptor{} defaults
+    ComputeHardwareConfig compute_hw = ComputeGen1Config{};  // legacy ComputeConfigDescriptor{} defaults
     KernelSpec compute{
         .unique_id = COMPUTE,
         .source =

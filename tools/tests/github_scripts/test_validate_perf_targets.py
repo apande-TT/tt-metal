@@ -11,7 +11,7 @@ import types
 from pathlib import Path
 
 import yaml
-import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_PATH = REPO_ROOT / ".github/scripts/utils/validate_perf_targets.py"
@@ -876,21 +876,19 @@ def test_extract_metric_value_fails_for_ambiguous_unqualified_metric_name():
         assert "ambiguous" in str(exc)
 
 
-@pytest.mark.parametrize("metric", ["ifeval", "gpqa"])
-def test_task_accuracy_and_performance_from_the_same_run(tmp_path, metric):
-    _vision_scaffold(tmp_path, "task-demo")
-    accuracy_target, tolerance = (100, 0.2) if metric == "gpqa" else (80, 0.05)
+def test_ifeval_validates_accuracy_and_performance_from_the_same_run(tmp_path):
+    _vision_scaffold(tmp_path, "ifeval-demo")
     target = {
         "version": 1,
         "targets": {
-            "task-demo": {
+            "ifeval-demo": {
                 "skus": {
                     "wh_n150": {
                         "entries": [
                             {
                                 "batch_size": 1,
                                 "status": "active",
-                                "accuracy": {metric: accuracy_target, f"{metric}_tolerance": tolerance},
+                                "accuracy": {"ifeval": 80, "ifeval_tolerance": 0.05},
                                 "perf": {"decode_t/s/u": 120, "decode_t/s/u_tolerance": 0.15},
                             }
                         ]
@@ -900,19 +898,16 @@ def test_task_accuracy_and_performance_from_the_same_run(tmp_path, metric):
         },
     }
     (tmp_path / "models/model_targets.yaml").write_text(yaml.safe_dump(target))
-    path = tmp_path / "generated/benchmark_data/complete_run_task.json"
-    cases = [(80, 120, 0), (60, 120, 1), (80, 60, 1)]
-    if metric == "gpqa":
-        cases += [(90, 120, 0), (100, 120, 0), (79, 120, 1)]
-    for accuracy, throughput, expected_code in cases:
+    path = tmp_path / "generated/benchmark_data/complete_run_ifeval.json"
+    for accuracy, throughput, expected_code in [(80, 120, 0), (60, 120, 1), (80, 60, 1)]:
         _write_complete_run(
             path,
-            model="task-demo",
+            model="ifeval-demo",
             batch_size=1,
             seq_len=128,
             decode_tsu=throughput,
-            extra_measurements=[{"step_name": "inference", "name": f"{metric}_accuracy", "value": accuracy}],
+            extra_measurements=[{"step_name": "inference", "name": "ifeval_accuracy", "value": accuracy}],
         )
         result = _run_validator(tmp_path)
         assert result.returncode == expected_code, result.stdout + result.stderr
-        assert metric in result.stdout and "decode_t/s/u" in result.stdout
+        assert "ifeval" in result.stdout and "decode_t/s/u" in result.stdout

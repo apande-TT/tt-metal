@@ -2,25 +2,23 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List
+from typing import List, Tuple
 
+import torch
 from fuser.base_fpu import Fpu
 from fuser.block_data import BlockData
 from fuser.fpu_node import FpuNode
 from fuser.fuser_config import GlobalConfig
-from fuser.golden.fpu.datacopy import datacopy_golden
-from fuser.indexing import InvocationGranularity
 from fuser.l1_operation import L1Operation
 from fuser.quasar.unpacker.unpack_a import (
     _uses_upk_to_dest_semaphores,
     upk_to_dest_math_ack,
 )
+from fuser.tile_loop import LoopBlockRow, TileLoop
 
 
 class DatacopyFpu(Fpu):
-    granularity = InvocationGranularity.ROW
-    golden_fn = staticmethod(datacopy_golden)
-
+    loop: TileLoop = LoopBlockRow()
     per_block_init = True
 
     def get_headers(self) -> List[str]:
@@ -28,6 +26,19 @@ class DatacopyFpu(Fpu):
             "llk_math_common.h",
             "llk_math_eltwise_unary_datacopy.h",
         ]
+
+    def golden(
+        self,
+        tensor_a: torch.Tensor,
+        tensor_b: torch.Tensor,
+        tensor_dst: torch.Tensor,
+        operation: L1Operation,
+        config: GlobalConfig,
+        compute_unit: FpuNode,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.datacopy_golden(
+            tensor_a, tensor_b, tensor_dst, config, operation, compute_unit
+        )
 
     def init(
         self,
@@ -45,12 +56,11 @@ class DatacopyFpu(Fpu):
         face_r_dim = operation.tile_shape.face_r_dim
         num_rows_per_matrix = face_r_dim * num_faces
         en_32bit_dest = config.dest_acc.cpp_enum_value
-        num_matrices = block.block_cols
 
         return (
             f"// Operation {stage}: Datacopy FPU\n"
             f"_llk_math_eltwise_unary_datacopy_init_<{data_copy_type}, {en_32bit_dest}>"
-            f"({num_rows_per_matrix}, {num_matrices});\n"
+            f"({num_rows_per_matrix}, {block.block_tiles_x});\n"
         )
 
     def calculate(
@@ -65,7 +75,7 @@ class DatacopyFpu(Fpu):
                 return ""
             return upk_to_dest_math_ack()
 
-        return f"_llk_math_eltwise_unary_datacopy_({block.tile_id_dest});\n"
+        return f"_llk_math_eltwise_unary_datacopy_({block.tile_id_block});\n"
 
     def uninit(
         self,

@@ -13,7 +13,6 @@
 #include <cstdint>
 #include "api/compile_time_args.h"
 
-#include "overlay/fds_signalling.hpp"
 #include "quasar_fds_common.h"
 
 using fds_outbox::kMatchedGo;
@@ -44,10 +43,9 @@ void kernel_main() {
     }
 
     overlay::FdsDispatch::fds_clear_go();
-    overlay::FdsDispatch::fds_go(kSessionGo);
+    overlay::FdsDispatch::fds_go(/*ad_enable=*/false, kSessionGo);
 
     uint32_t result = kComplete;
-    bool auto_dispatch_value_queued = false;
     if (!fds_kernel::wait_group_count_nonzero(kTokenArmed, poll_iterations)) {
         result = kTimeoutArmed;
     }
@@ -58,9 +56,7 @@ void kernel_main() {
         overlay::FdsDispatch::fds_config_auto_dispatch_pacing(auto_dispatch_cycles);
         overlay::FdsDispatch::fds_config_auto_dispatch_outbox(TT_FDS_DISPATCH_DISPATCH_TO_TENSIX_REG_OFFSET);
         overlay::FdsDispatch::fds_enable_auto_dispatch();
-        while (overlay::FdsDispatch::fds_read_auto_dispatch_fifo_full() != 0) {
-        }
-        overlay::FdsDispatch::fds_go(kMismatchedGo);
+        overlay::FdsDispatch::fds_go(/*ad_enable=*/true, kMismatchedGo);
 
         if (!fds_kernel::wait_group_count_nonzero(kTokenSilenceChecked, poll_iterations)) {
             result = kTimeoutSilence;
@@ -72,23 +68,16 @@ void kernel_main() {
         // value must be delivered. Only the outbox moves; the feature stays enabled and the
         // pacing is not rewritten.
         overlay::FdsDispatch::fds_config_auto_dispatch_outbox(TT_FDS_DISPATCH_DISPATCH_TO_TENSIX_REG_ADDR);
-        while (overlay::FdsDispatch::fds_read_auto_dispatch_fifo_full() != 0) {
-        }
-        overlay::FdsDispatch::fds_go(kMatchedGo);
-        auto_dispatch_value_queued = true;
+        overlay::FdsDispatch::fds_go(/*ad_enable=*/true, kMatchedGo);
 
         if (!fds_kernel::wait_group_count_nonzero(kTokenDelivered, poll_iterations)) {
             result = kTimeoutDelivered;
         }
     }
 
-    if (auto_dispatch_value_queued) {
-        overlay::fds_signalling::wait_cycles(
-            overlay::auto_dispatch_drain_cycles(overlay::dispatch_auto_dispatch_queue_depth, auto_dispatch_cycles));
-    }
-
     // Back to the direct path; the output register collected the mismatched write, so clear it
-    // once the direct path is active again. The outbox stays on the output bus.
+    // once the direct path is active again. The outbox stays on the output bus and the pacing is
+    // left alone: the counter is mid-interval after the delivered go.
     overlay::FdsDispatch::fds_disable_auto_dispatch();
     overlay::FdsDispatch::fds_clear_go();
 

@@ -242,10 +242,15 @@ void reduce_c(uint32_t out_cb, uint32_t prev_cb, uint32_t cols, bool do_eltwise_
 }
 
 #ifdef TRISC_MATH
-template <bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
+template <bool legacy_compat = true, bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
 void recip_tile_first_column(uint32_t idst) {
     SFPU_UNARY_CALL(
-        DST_SYNC_MODE, is_fp32_dest_acc_en, calculate_recip_first_column, (is_fp32_dest_acc_en), idst, VectorMode::C);
+        DST_SYNC_MODE,
+        is_fp32_dest_acc_en,
+        calculate_recip_first_column,
+        (legacy_compat, is_fp32_dest_acc_en),
+        idst,
+        VectorMode::C);
 }
 #endif
 
@@ -257,8 +262,7 @@ void recip_block_inplace(uint32_t in_cb, uint32_t num_tiles) {
     // Precondition: in_cb has num_tiles produced
     // Postcondition: in_cb has num_tiles produced
     copy_tile_to_dst_init_short(in_cb);
-    // The first-column helper uses SFPI, not full-tile LOADMACRO/replay state.
-    MATH(SFPU_UNARY_INIT_FN(reciprocal, sfpu::sfpu_reciprocal_init, (APPROX)));
+    recip_tile_init();
     reconfig_data_format_srca(in_cb);
     pack_reconfig_data_format(in_cb);
 
@@ -875,7 +879,7 @@ void sigmoid_sub(uint32_t in0_cb, uint32_t in1_cb, uint32_t out_cb, uint32_t num
     cb_out.reserve_back(num_tiles);
     sub_tiles_init(in0_cb, in1_cb);
     exp_tile_init<false>();
-    // recip_tile_first_column() calls the scalar sfpu_reciprocal_iter path, so initialize exactly
+    // recip_tile_first_column<false>() calls the scalar sfpu_reciprocal_iter path, so initialize exactly
     // that SFPU state here. Blackhole needs vConstFloatPrgm0 = 2.0 for Newton-Raphson; Wormhole
     // needs vConstFloatPrgm0/1/2 loaded with reciprocal polynomial coefficients.
     // This init programs persistent SFPU constants, not per-tile data. It intentionally comes after
@@ -899,7 +903,8 @@ void sigmoid_sub(uint32_t in0_cb, uint32_t in1_cb, uint32_t out_cb, uint32_t num
             0 /*dst_index*/,
             VectorMode::C,
             0x3F800000 /*scalar*/));
-        MATH((recip_tile_first_column(0 /*dst_index*/)));
+        // recip_tile<false>(0, (int)VectorMode::C);
+        MATH((recip_tile_first_column<false>(0 /*dst_index*/)));
         tile_regs_commit();
         tile_regs_wait();
         pack_tile(0, out_cb);

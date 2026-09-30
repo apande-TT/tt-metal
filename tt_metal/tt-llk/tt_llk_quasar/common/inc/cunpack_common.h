@@ -139,17 +139,9 @@ __attribute__((noinline, optimize("no-jump-tables"))) bool is_quasar_unpack_reco
             return dst == DataFormat::UInt8;
 
         // -------------------------------------------------------------------------
-        // INT8 — INT8 / INT8_2x (2x-packed Src Reg storage; not Dest/SrcS)
+        // INT8 — INT8
         case DataFormat::Int8:
-            switch (dst)
-            {
-                case DataFormat::Int8:
-                    return true;
-                case DataFormat::Int8_2x:
-                    return !unpack_to_dest;
-                default:
-                    return false;
-            }
+            return dst == DataFormat::Int8;
 
         // -------------------------------------------------------------------------
         // INT16 — INT16

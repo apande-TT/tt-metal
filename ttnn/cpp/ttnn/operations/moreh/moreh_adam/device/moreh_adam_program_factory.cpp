@@ -57,7 +57,7 @@ ProgramDescriptor MorehAdamOperation::MorehAdamProgramFactory::create_descriptor
     ////////////////////////////////////////////////////////////////////////////
     //                      Device Setup
     ////////////////////////////////////////////////////////////////////////////
-    MeshDevice* device = param_in.device();
+    IDevice* device = param_in.device();
     auto grid = device->compute_with_storage_grid_size();
     const auto num_cores_y = grid.y;
 

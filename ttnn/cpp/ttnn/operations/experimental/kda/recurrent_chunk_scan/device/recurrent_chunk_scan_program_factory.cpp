@@ -70,6 +70,7 @@ ttnn::device_operation::MeshWorkloadArtifacts RecurrentChunkScanProgramFactory::
     const auto& final_decay_tensor = in.final_decay.mesh_tensor();
     const auto& t_inv_tensor = in.t_inv.mesh_tensor();
     const auto& device = v_beta_tensor.device();
+    const auto arch = device.arch();
 
     const uint32_t BH = attrs.batch_heads;
     const uint32_t NC = attrs.num_chunks;
@@ -206,7 +207,7 @@ ttnn::device_operation::MeshWorkloadArtifacts RecurrentChunkScanProgramFactory::
              {"summary", static_cast<uint32_t>(summary)},
              {"groups_per_head", attrs.groups_per_head}},
         .runtime_arg_schema = {.runtime_arg_names = {"head", "value_block", "num_chunks"}},
-        .hw_config = ttnn::create_reader_datamovement_config(),
+        .hw_config = ttnn::create_reader_datamovement_config(arch),
     };
     if (!summary) {
         reader.tensor_bindings.push_back(tt::tt_metal::experimental::TensorBinding{q_decay_tensor_name, "q_decay"});
@@ -246,7 +247,7 @@ ttnn::device_operation::MeshWorkloadArtifacts RecurrentChunkScanProgramFactory::
         .compile_time_args =
             {{"Ct", Ct}, {"Kt", Kt}, {"Vt", Vt}, {"Vt_full", Vt_full}, {"summary", static_cast<uint32_t>(summary)}},
         .runtime_arg_schema = {.runtime_arg_names = {"head", "value_block", "num_chunks", "group"}},
-        .hw_config = ttnn::create_writer_datamovement_config(),
+        .hw_config = ttnn::create_writer_datamovement_config(arch),
     };
 
     if (summary) {
@@ -261,8 +262,8 @@ ttnn::device_operation::MeshWorkloadArtifacts RecurrentChunkScanProgramFactory::
             tt::tt_metal::experimental::TensorBinding{final_state_tensor_name, "tail_final_state"});
     }
 
-    auto compute_hw = ttnn::to_compute_hardware_config(attrs.compute_kernel_config);
-    auto& unpack_modes = compute_hw.unpack_modes;
+    auto compute_hw = ttnn::to_compute_hardware_config(arch, attrs.compute_kernel_config);
+    auto& unpack_modes = tt::tt_metal::experimental::unpack_modes(compute_hw);
     for (const auto& name :
          {state_dfb_name,
           t_inv_dfb_name,
@@ -408,7 +409,9 @@ ttnn::device_operation::MeshWorkloadArtifacts RecurrentChunkScanProgramFactory::
         run_args.tensor_args.emplace(q_decay_tensor_name, q_decay_tensor);
         run_args.tensor_args.emplace(intra_tensor_name, intra_tensor);
         run_args.tensor_args.emplace(group_entry_states_tensor_name, in.group_entry_states->mesh_tensor());
-        run_args.tensor_args.emplace(tail_entry_states_tensor_name, in.tail_entry_states->mesh_tensor());
+        {
+            run_args.tensor_args.emplace(tail_entry_states_tensor_name, in.tail_entry_states->mesh_tensor());
+        }
     }
 
     if (summary) {
@@ -416,10 +419,7 @@ ttnn::device_operation::MeshWorkloadArtifacts RecurrentChunkScanProgramFactory::
         run_args.tensor_args.emplace(tail_final_state_tensor_name, outputs[3].mesh_tensor());
     }
     kda_factory_detail::bind_chronology(spec, run_args, in.actual_start, reader, compute);
-    kda_factory_detail::bind_actual_end(spec, run_args, in.actual_end, reader);
-    // The writer reads the chronology channel on the same condition as the reader publishes it.
-    writer.compile_time_args.insert({"has_actual_end", static_cast<uint32_t>(in.actual_end.has_value())});
-    if (summary || in.actual_end.has_value()) {
+    if (summary) {
         const tt::tt_metal::experimental::DFBSpecName writer_chronology{"chronology_writer"};
         spec.dataflow_buffers.push_back({
             .unique_id = writer_chronology,

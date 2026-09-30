@@ -10,8 +10,6 @@
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/program_descriptors.hpp>
 
-#include "ttnn/distributed/types.hpp"
-
 using uint32_t = std::uint32_t;
 using namespace tt::constants;
 using namespace tt::tt_metal;
@@ -31,7 +29,7 @@ tt::tt_metal::ProgramDescriptor PreAllGatherWelfordProgramFactory::create_descri
     const uint32_t Wt = W / TILE_WIDTH;
     const uint32_t Ht = H / TILE_HEIGHT;
 
-    MeshDevice* device = a.device();
+    IDevice* device = a.device();
     auto grid_size = device->compute_with_storage_grid_size();
 
     uint32_t num_tile_rows = NC * Ht;

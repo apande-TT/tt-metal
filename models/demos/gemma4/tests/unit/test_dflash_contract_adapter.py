@@ -75,13 +75,7 @@ def test_verify_count_pins_the_inherited_width_arithmetic(adapter):
     cls = adapter.Gemma4DFlashContractForCausalLM
     assert cls._SPEC_CONTRACT_K == 5
     assert cls._SPEC_V == 5 and cls._SPEC_N == 6
-
-
-def test_contract_rail_shares_the_base_and_not_the_block_rail(adapter):
-    cls = adapter.Gemma4DFlashContractForCausalLM
-    assert issubclass(cls, adapter.Gemma4DFlashBase)
-    assert not issubclass(cls, adapter.Gemma4DFlashForCausalLM)
-    assert not hasattr(cls, "_SPEC_BLOCK")
+    assert cls._SPEC_BLOCK >= 2
 
 
 @pytest.fixture

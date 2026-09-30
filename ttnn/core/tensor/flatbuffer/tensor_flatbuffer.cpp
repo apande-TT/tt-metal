@@ -271,12 +271,7 @@ Tensor from_flatbuffer(
     TT_FATAL(mesh_shape != nullptr, "Mesh shape is required for tensor");
     const tt::tt_metal::distributed::MeshShape ttnn_mesh_shape = from_flatbuffer(mesh_shape);
 
-    // File shards are host-local. Loading them must not initialize MetalContext or acquire device locks.
-    auto distributed_buffer = tt::tt_metal::DistributedHostBuffer::create(
-        ttnn_mesh_shape,
-        ttnn_mesh_shape,
-        tt::tt_metal::distributed::MeshCoordinate::zero_coordinate(ttnn_mesh_shape.dims()),
-        /*context=*/nullptr);
+    auto distributed_buffer = tt::tt_metal::DistributedHostBuffer::create(ttnn_mesh_shape);
     for (size_t i = 0; i < fb_tensor->shards()->size(); ++i) {
         const auto* shard = fb_tensor->shards()->Get(i);
 

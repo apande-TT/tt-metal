@@ -37,7 +37,7 @@ CASES = [
             {
                 "k": "t",
                 "shape": [1, 1, 32, 8192],
-                "dtype": "BFLOAT16",
+                "dtype": "BFLOAT8_B",
                 "layout": "TILE",
                 "mem": {
                     "layout": "WIDTH_SHARDED",
@@ -91,7 +91,7 @@ CASES = [
             {
                 "k": "t",
                 "shape": [1, 1, 32, 5376],
-                "dtype": "BFLOAT16",
+                "dtype": "BFLOAT8_B",
                 "layout": "TILE",
                 "mem": {
                     "layout": "WIDTH_SHARDED",

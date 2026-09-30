@@ -99,14 +99,11 @@ bool run_dm(distributed::MeshDevice& mesh_device, const MulticastAtomicConfig& t
 
     DataMovementHardwareConfig sender_hw_config;
     if (mesh_device.arch() == tt::ARCH::QUASAR) {
-        sender_hw_config = DataMovementHardwareConfig{};
+        sender_hw_config = DataMovementGen2Config{};
     } else {
-        sender_hw_config = DataMovementHardwareConfig{
-            .config_1xx =
-                DataMovementHardwareConfig::DataMovement1XXConfig{
-                    .processor = DataMovementProcessor::RISCV_0,
-                    .noc = test_config.noc_id,
-                },
+        sender_hw_config = DataMovementGen1Config{
+            .processor = DataMovementProcessor::RISCV_0,
+            .noc = test_config.noc_id,
         };
     }
     KernelSpec sender_spec{
@@ -128,14 +125,11 @@ bool run_dm(distributed::MeshDevice& mesh_device, const MulticastAtomicConfig& t
 
     DataMovementHardwareConfig receiver_hw_config;
     if (mesh_device.arch() == tt::ARCH::QUASAR) {
-        receiver_hw_config = DataMovementHardwareConfig{};
+        receiver_hw_config = DataMovementGen2Config{};
     } else {
-        receiver_hw_config = DataMovementHardwareConfig{
-            .config_1xx =
-                DataMovementHardwareConfig::DataMovement1XXConfig{
-                    .processor = DataMovementProcessor::RISCV_1,
-                    .noc = test_config.noc_id,
-                },
+        receiver_hw_config = DataMovementGen1Config{
+            .processor = DataMovementProcessor::RISCV_1,
+            .noc = test_config.noc_id,
         };
     }
     KernelSpec receiver_spec{

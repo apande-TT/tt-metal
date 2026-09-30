@@ -151,11 +151,7 @@ class TtCompressorBase(LightweightModule):
         self.sp_axis, self.tp_axis = sp_axis, tp_axis
         self.sp_factor = device.shape[sp_axis] if self.is_mesh else 1
         self.tp_factor = device.shape[tp_axis] if self.is_mesh else 1
-        if isinstance(topology, tuple):
-            assert self.sp_axis == 0 and self.tp_axis == 1, "per-axis topology tuple assumes sp_axis=0, tp_axis=1"
-            self.sp_ccl_topology, self.tp_ccl_topology = topology  # (sp_axis_0, tp_axis_1)
-        else:
-            self.sp_ccl_topology = self.tp_ccl_topology = topology
+        self.ccl_topology = topology
         self.tt_ccl = get_tt_ccl(device) if (self.is_mesh and (self.sp_factor > 1 or self.tp_factor > 1)) else None
         self.ccl_num_links = 2 if is_blackhole() else 1
         self.ops = TtCompressorUtils(
@@ -319,7 +315,7 @@ class TtHCACompressor(TtCompressorBase):
                     barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=self.tp_axis),
                     num_links=self.ccl_num_links,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    topology=self.tp_ccl_topology,
+                    topology=self.ccl_topology,
                     cluster_axis=self.tp_axis,
                 )
                 tensor = ttnn.experimental.all_gather_async(
@@ -331,7 +327,7 @@ class TtHCACompressor(TtCompressorBase):
                     barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=self.tp_axis),
                     num_links=self.ccl_num_links,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    topology=self.tp_ccl_topology,
+                    topology=self.ccl_topology,
                     cluster_axis=self.tp_axis,
                 )
                 if name == "kv":
@@ -371,7 +367,7 @@ class TtHCACompressor(TtCompressorBase):
                 barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=self.sp_axis),
                 num_links=self.ccl_num_links,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                topology=self.sp_ccl_topology,
+                topology=self.ccl_topology,
                 cluster_axis=self.sp_axis,
             )
 

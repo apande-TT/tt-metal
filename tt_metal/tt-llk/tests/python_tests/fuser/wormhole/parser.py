@@ -55,7 +55,9 @@ from fuser.validator import (
     require_dest_tiles,
     require_src_a_tiles,
 )
-from helpers.llk_params import MathOperation
+from helpers.llk_params import (
+    MathOperation,
+)
 from pydantic import Field
 
 from .fpu.datacopy import DatacopyFpu

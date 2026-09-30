@@ -151,15 +151,9 @@ def section_bytes(snapshot) -> dict:
     snap = Path(snapshot)
     if not snap.is_dir():
         return total
-    # Where the checkpoint says its weights are (model_bytes.weight_files): a component's tensors are
-    # one section, under the name the pipeline holds it by -- exactly what a flat file of the same
-    # tensors under their full module paths would report.
-    from .model_bytes import weight_files
-
-    for prefix, f in weight_files(snap):
+    for f in sorted(snap.glob("*.safetensors")):
         for k, v in _safetensors_section_bytes(f).items():
-            sec = prefix.rstrip(".") or k
-            total[sec] = total.get(sec, 0) + v
+            total[k] = total.get(k, 0) + v
     return total
 
 

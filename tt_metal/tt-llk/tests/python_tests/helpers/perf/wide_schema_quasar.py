@@ -119,11 +119,8 @@ DB_SCHEMA = [
     Column("arch", "string", False, "provenance", origin="ci"),
     Column("run_id", "string", False, "provenance", origin="ci"),
     Column("timestamp", "string", False, "provenance", origin="ci"),
-    # PR | nightly | baseline
-    Column("pipeline", "string", False, "provenance", origin="ci"),
-    Column(
-        "pr_number", "string", True, "provenance", origin="ci"
-    ),  # NULL for nightly and baseline runs
+    Column("pipeline", "string", False, "provenance", origin="ci"),  # PR | nightly
+    Column("pr_number", "string", True, "provenance", origin="ci"),  # NULL for nightly
 ]
 
 OUTPUT_SCHEMA = [c for c in DB_SCHEMA if c.origin == "test"]

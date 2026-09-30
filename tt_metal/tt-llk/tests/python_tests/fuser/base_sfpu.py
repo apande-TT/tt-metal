@@ -4,28 +4,30 @@
 
 from typing import TYPE_CHECKING, List
 
+import torch
+
 if TYPE_CHECKING:
     from .block_data import BlockData
     from .fuser_config import GlobalConfig
     from .l1_operation import L1Operation
     from .sfpu_node import SfpuNode
 
-from .indexing import InvocationGranularity
+from .golden import Golden
 
 
-class Sfpu:
+class Sfpu(Golden):
     """Base class for fused test SFPU code generators.
 
     Subclasses represent specific SFPU operations (e.g. UnarySfpu, BinarySfpu)
     and override methods to emit the C++ LLK calls that configure and drive the
-    SFPU Unit.
+    SFPU Unit, plus a Python golden function for test validation.
 
     Unlike Fpu, SFPU operates on dest register data that was already computed
     by a prior FPU stage or loaded via datacopy. It has no unpacker — SfpuNode
     has no unpacker field at all.
 
-    The lifecycle called by the pipeline is:
-        init() -> planned calls to calculate() -> uninit()
+    The lifecycle called by SfpuNode.sfpu_run() is:
+        init() -> calculate() -> uninit()
 
     Entirely skipped during UNPACK_ISOLATE, PACK_ISOLATE, and L1_CONGESTION perf runs.
 
@@ -33,11 +35,9 @@ class Sfpu:
         1. Subclass Sfpu
         2. Override get_headers() with the required LLK header files
         3. Override init(), calculate(), uninit() to emit the C++ LLK calls
-        4. Bind the corresponding callable from fuser.golden.sfpu
+        4. Override golden() to compute the expected SFPU result, calling
+           self.unary_sfpu_golden() or self.binary_sfpu_golden() as needed
     """
-
-    granularity = InvocationGranularity.NONE
-    input_count = 1
 
     def init(
         self,
@@ -46,7 +46,11 @@ class Sfpu:
         compute_unit: "SfpuNode",
         block: "BlockData",
     ) -> str:
-        """Return C++ code that initializes the SFPU before calculation."""
+        """Return C++ code that initializes the SFPU before calculation.
+
+        Called once per block. Override to emit the
+        _llk_math_eltwise_*_sfpu_init_<>() call.
+        """
         return ""
 
     def calculate(
@@ -56,7 +60,11 @@ class Sfpu:
         compute_unit: "SfpuNode",
         block: "BlockData",
     ) -> str:
-        """Return C++ code that performs one planned SFPU call."""
+        """Return C++ code that performs the SFPU operation.
+
+        Called once per block between init() and uninit().
+        Override to emit the sfpu calls.
+        """
         return ""
 
     def uninit(
@@ -66,11 +74,38 @@ class Sfpu:
         compute_unit: "SfpuNode",
         block: "BlockData",
     ) -> str:
-        """Return C++ code that tears down the SFPU after calculation."""
+        """Return C++ code that tears down the SFPU after calculation.
+
+        Called once per block after calculate(). Override if the SFPU
+        requires explicit cleanup.
+        """
         return ""
 
+    def golden(
+        self,
+        tensor: torch.Tensor,
+        operation: "L1Operation",
+        config: "GlobalConfig",
+        compute_unit: "SfpuNode",
+        batch_dims: tuple,
+        batch_tile_cnt: int,
+    ) -> torch.Tensor:
+        """Compute the golden SFPU result in Python.
+
+        Operates on tilized dest data per block. batch_dims and batch_tile_cnt
+        describe the current block's tile layout. Returns the transformed tensor.
+
+        Called by SfpuNode.golden() on each block of the tilized dest tensor.
+        """
+        return tensor
+
     def get_headers(self) -> List[str]:
-        """Return headers that declare this SFPU's generated calls."""
+        """Return the list of C++ LLK header filenames required by this SFPU.
+
+        These headers are #included in the generated test source file.
+        Override to return the headers that declare the SFPU functions
+        used by init(), calculate() and uninit().
+        """
         return []
 
     def __str__(self) -> str:

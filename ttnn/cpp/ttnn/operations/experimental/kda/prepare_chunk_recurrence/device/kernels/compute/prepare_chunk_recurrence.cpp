@@ -1,7 +1,5 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
-
-#include "ttnn/cpp/ttnn/operations/experimental/kda/chronological_selections/device/kernels/chronology.hpp"
 //
 // Chunk-parallel KDA prep. For cumulative vector gate G [C,K], factor
 // exp(G_i-G_j) inside each q/k dot as exp(G_i)*exp(-G_j):
@@ -614,9 +612,7 @@ inline void prepare_decay_outputs(
 }
 
 template <uint32_t Ct, uint32_t Kt, uint32_t Vt, uint32_t SCALE_BITS, uint32_t EPS_BITS>
-TT_KERNEL void compute(uint32_t work_item_start, uint32_t work_item_count, uint32_t num_chunks) {
-    DataflowBuffer control(dfb::chronology_compute);
-    const uint32_t valid_chunks = kda_chronology::receive(control).valid_rows / tt::constants::TILE_HEIGHT;
+TT_KERNEL void compute(uint32_t work_item_count) {
     static_assert(Ct == 1, "chunk KDA currently requires chunk_size=32");
 
     constexpr uint32_t chunk_matrix_tiles = Ct * Ct;
@@ -668,9 +664,6 @@ TT_KERNEL void compute(uint32_t work_item_start, uint32_t work_item_count, uint3
     ones.wait_front(chunk_matrix_tiles);
 
     for (uint32_t work_item = 0; work_item < work_item_count; ++work_item) {
-        if ((work_item_start + work_item) % num_chunks >= valid_chunks) {
-            continue;
-        }
         q.wait_front(chunk_key_tiles);
         k.wait_front(chunk_key_tiles);
         v.wait_front(chunk_value_tiles);

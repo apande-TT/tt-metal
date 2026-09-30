@@ -33,12 +33,10 @@ ARCHITECTURE="${TTSIM_ARCHITECTURE:-blackhole}"
 TEST_PATHS=()
 PYTEST_ARGS=()
 
-# Cache layout for auto-provisioned ttsim artifacts. The release tag comes from
-# tt_metal/ttsim-version, the same pin every tt-metal sim pipeline uses, so
-# bumping that one file moves this script too.
+# Cache layout for auto-provisioned ttsim artifacts. Version and hashes come
+# from the in-tree `ttsim-version` file (same pattern as `sfpi-version`), so
+# CI can pin the simulator by bumping one file.
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-TTSIM_VERSION_FILE="${REPO_ROOT}/tt_metal/ttsim-version"
-TTSIM_REPO="tenstorrent/ttsim"
 TTSIM_CACHE_ROOT="${TTSIM_CACHE_DIR:-${HOME}/.cache/ttsim}"
 
 # ──────────────────────────────────────────────────────────────
@@ -66,13 +64,10 @@ Options:
 
 Environment:
   TT_METAL_SIMULATOR    Optional. Path to libttsim_<arch>.so. If unset, the
-                        script downloads the release pinned in
-                        tt_metal/ttsim-version into
-                        \${TTSIM_CACHE_DIR:-\$HOME/.cache/ttsim} and exports
-                        this automatically.
+                        script downloads the version pinned in ./ttsim-version
+                        into \${TTSIM_CACHE_DIR:-\$HOME/.cache/ttsim} and
+                        exports this automatically.
   TTSIM_CACHE_DIR       Override the download cache root (default: ~/.cache/ttsim).
-  GH_TOKEN              Optional. Sent with the GitHub API request for the
-                        release digest, to avoid the unauthenticated rate limit.
 
 Examples:
   $(basename "$0")                              # blackhole, auto-downloads simulator
@@ -136,7 +131,7 @@ fi
 # from the .so path). This lets CI call the script as a one-liner.
 provision_ttsim() {
     local architecture="$1"
-    local so_name soc_src
+    local so_name soc_src hash_var
     # Upstream ttsim releases ship the .so with short suffixes (libttsim_bh.so
     # / libttsim_wh.so) so we map full architecture names → upstream suffix.
     case "$architecture" in
@@ -144,16 +139,19 @@ provision_ttsim() {
             architecture=blackhole
             so_name=libttsim_bh.so
             soc_src="${REPO_ROOT}/tt_metal/soc_descriptors/blackhole_140_arch.yaml"
+            hash_var=ttsim_bh_so_hash
             ;;
         wormhole|wormhole_b0|wh)
             architecture=wormhole
             so_name=libttsim_wh.so
             soc_src="${REPO_ROOT}/tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml"
+            hash_var=ttsim_wh_so_hash
             ;;
         quasar)
             architecture=quasar
             so_name=libttsim_qsr.so
             soc_src="${REPO_ROOT}/tt_metal/soc_descriptors/quasar_32_arch_ttsim.yaml"
+            hash_var=ttsim_qsr_so_hash
             ;;
         *)
             echo "ERROR: unknown --architecture '$architecture' (expected 'blackhole', 'wormhole', or 'quasar')" >&2
@@ -161,47 +159,33 @@ provision_ttsim() {
             ;;
     esac
 
-    if [[ ! -f "$TTSIM_VERSION_FILE" ]]; then
-        echo "ERROR: missing pin file: $TTSIM_VERSION_FILE" >&2
+    local version_file="${SCRIPT_DIR}/ttsim-version"
+    if [[ ! -f "$version_file" ]]; then
+        echo "ERROR: missing pin file: $version_file" >&2
         exit 1
     fi
-    local tag
-    tag="$(tr -d '[:space:]' < "$TTSIM_VERSION_FILE")"
-    if [[ -z "$tag" ]]; then
-        echo "ERROR: $TTSIM_VERSION_FILE is empty; expected a ${TTSIM_REPO} release tag" >&2
-        exit 1
-    fi
+    # shellcheck source=/dev/null
+    source "$version_file"
 
-    local cache_dir="${TTSIM_CACHE_ROOT}/${tag}/${architecture}"
+    local cache_dir="${TTSIM_CACHE_ROOT}/${ttsim_version}/${architecture}"
     local so_path="${cache_dir}/${so_name}"
     local soc_path="${cache_dir}/soc_descriptor.yaml"
-    local url="https://github.com/${TTSIM_REPO}/releases/download/${tag}/${so_name}"
+    local url="${ttsim_repo}/releases/download/${ttsim_tag}/${so_name}"
+    local expected_hash="${!hash_var}"
 
     mkdir -p "$cache_dir"
 
-    # A cached .so is only ever moved into place after it passed the digest
-    # check below, so its presence under the tag's directory is enough.
-    if [[ ! -f "$so_path" ]]; then
-        # GitHub records a sha256 digest for every release asset; checking
-        # against it replaces the per-arch hashes the pin file used to carry.
-        local expected_hash=""
-        local api_url="https://api.github.com/repos/${TTSIM_REPO}/releases/tags/${tag}"
-        local auth=()
-        [[ -n "${GH_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer ${GH_TOKEN}")
-        local release_json
-        if release_json=$(curl -fsSL --retry 5 --retry-delay 2 "${auth[@]}" "$api_url"); then
-            expected_hash=$(SO_NAME="$so_name" python3 -c '
-import json, os, sys
-for asset in json.load(sys.stdin).get("assets", []):
-    if asset.get("name") == os.environ["SO_NAME"]:
-        print((asset.get("digest") or "").removeprefix("sha256:"))
-' <<<"$release_json")
+    local need_download=1
+    if [[ -f "$so_path" ]]; then
+        local got
+        got=$(${ttsim_hashtype}sum "$so_path" | awk '{print $1}')
+        if [[ "$got" == "$expected_hash" ]]; then
+            need_download=0
+        else
+            echo "Cached ${so_name} ${ttsim_hashtype} mismatch (got=$got expected=$expected_hash); re-downloading" >&2
         fi
-        if [[ -z "$expected_hash" ]]; then
-            echo "ERROR: no sha256 digest for ${so_name} from $api_url; refusing an unverified download" >&2
-            exit 1
-        fi
-
+    fi
+    if [[ $need_download -eq 1 ]]; then
         echo "Downloading ${url}"
         local tmp="${so_path}.tmp.$$"
         if ! curl -fSL --retry 5 --retry-delay 2 -o "$tmp" "$url"; then
@@ -209,14 +193,12 @@ for asset in json.load(sys.stdin).get("assets", []):
             echo "ERROR: failed to download $url" >&2
             exit 1
         fi
-        if [[ -n "$expected_hash" ]]; then
-            local got
-            got=$(sha256sum "$tmp" | awk '{print $1}')
-            if [[ "$got" != "$expected_hash" ]]; then
-                rm -f "$tmp"
-                echo "ERROR: sha256 mismatch for ${so_name} (got=$got expected=$expected_hash)" >&2
-                exit 1
-            fi
+        local got
+        got=$(${ttsim_hashtype}sum "$tmp" | awk '{print $1}')
+        if [[ "$got" != "$expected_hash" ]]; then
+            rm -f "$tmp"
+            echo "ERROR: ${ttsim_hashtype} mismatch for ${so_name} (got=$got expected=$expected_hash)" >&2
+            exit 1
         fi
         mv "$tmp" "$so_path"
     fi

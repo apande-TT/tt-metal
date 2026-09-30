@@ -187,20 +187,10 @@ function cardSpec(S) {
     return cards;
   }
   const m = S.metric || {};
-  // WHAT THE METRIC COVERS. The optimized metric is read off a profiled SLICE (the ledger records its
-  // depth and how it was timed), while the stage cards beside it are full-pipeline times -- so say so,
-  // and show the end-to-end number the commit gate actually judges wins on right next to it.
-  const sc = m.scope || {};
-  const scopeTxt = (sc.depth != null || sc.mode)
-    ? "sampled slice" + (sc.depth != null ? " · depth " + sc.depth : "") + (sc.mode ? " · " + sc.mode + " per-op device time" : "") + " · not end-to-end"
-    : "current";
-  cards.push({k: (m.name || "metric"), v: m.current, unit: " " + (m.unit || "ms"), sub: scopeTxt,
+  cards.push({k: (m.name || "metric"), v: m.current, unit: " " + (m.unit || "ms"), sub: "current",
               d: deltaTxt(m.current, m.baseline, m.direction || "min")});
   cards.push({k: "baseline", v: m.baseline, unit: " " + (m.unit || "ms"), sub: "",
               d: m.target != null ? "target " + fmtMs(m.target) : ""});
-  if (S.fullpipe_ms != null)
-    cards.push({k: "end-to-end", v: S.fullpipe_ms, unit: " ms", sub: "all layers · what wins are judged on",
-                d: deltaTxt(S.fullpipe_ms, S.fullpipe_baseline_ms, "min")});
   (S.stages || []).slice(0, 3).forEach(s =>
     cards.push({k: s.name, v: s.ms, unit: " ms", sub: s.path || "", d: deltaTxt(s.ms, s.baseline_ms, "min")}));
   return cards;
@@ -388,11 +378,8 @@ function historyStages(S) {
    that converts to a rate (ms per token -> tokens per second), so it is the only one that reads upward.
 
    Every other stack is a one-shot latency with no gate behind it, so there is no banked best to show:
-   its best line is the running minimum of the readings of KEPT attempts -- the state the model actually
-   has -- called "best kept", and its axis stays in ms where lower is better. A discarded candidate
-   is still plotted but never moves the line: counting it drew Qwen-Image-Edit's vision_encode line down
-   to 16344 ms from a PCC-failed rewrite, and every later kept win floated ~6 s above a "best" the
-   model never had. */
+   its best line is the running minimum of what was actually measured, called "best recorded" to keep
+   the two apart, and its axis stays in ms where lower is better. */
 function historySeries(S, stage) {
   const tok = ((S.serving || {}).per_token || {}).stage;
   if (!stage || stage === tok) {
@@ -411,7 +398,7 @@ function historySeries(S, stage) {
       return st && st.ms != null ? st.ms : null;
     },
     best: null,
-    bestLabel: "best kept",
+    bestLabel: "best recorded",
     rate: null,
   };
 }
@@ -443,18 +430,15 @@ function historyChart(S, stage) {
 
   const goal = (sameQuantity && m.target != null) ? yOf(m.target) : null;
   // The best line: the engine's banked best where one exists, otherwise the running minimum of the
-  // KEPT readings -- only a kept attempt changes what the model is, so only it may move the line.
-  // It STARTS from the stage's pinned start (its share of the BEFORE end-to-end reading) when the run
-  // recorded one, so a stage whose big win came first shows that drop instead of starting after it.
-  const start = ser.stage ? ((S.stages || []).find(s => s.name === ser.stage) || {}).start_ms : null;
-  let runMin = (!ser.best && start != null) ? start : null;
+  // readings themselves (a plain description of the data, not a second opinion on what counts as best).
+  let runMin = null;
   const bestAt = at.map(a => {
     if (ser.best) return yOf(ser.best(a));
     const v = ser.value(a);
-    if (v != null && a.status === "kept" && (runMin == null || v < runMin)) runMin = v;
+    if (v != null && (runMin == null || v < runMin)) runMin = v;
     return yOf(runMin);
   });
-  const bests = bestAt.filter(v => v != null).concat(!ser.best && start != null ? [yOf(start)] : []);
+  const bests = bestAt.filter(v => v != null);
   const all = measured.map(a => yOf(ser.value(a))).concat(bests).concat(goal != null ? [goal] : []);
   let yMin = Math.min(...all), yMax = Math.max(...all);
   const pad = (yMax - yMin || Math.abs(yMax) || 1) * 0.12;
@@ -478,7 +462,6 @@ function historyChart(S, stage) {
   // best only ever improves, and an ordinary spline would bulge past its own endpoints and draw the
   // best briefly getting worse — a curve claiming something the run never measured.
   const line = [];
-  if (!ser.best && start != null && yOf(start) != null) line.push([X(0), Y(yOf(start))]);  // the run's start
   bestAt.forEach((b, i) => {
     if (b != null) line.push([X(i), Y(b)]);
   });

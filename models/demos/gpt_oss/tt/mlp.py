@@ -64,9 +64,7 @@ class MLP:
 
             # Create fused MoE config if requested
             fused_config = None
-            # moe_gpt and its packed weights require twelve DRAM-aligned cores.
-            # Blackhole uses the generic gather/matmul/reduce decode path.
-            if not ttnn.device.is_blackhole(mesh_device):
+            if use_throughput_experts:
                 fused_config = create_fused_moe_gpt_config(
                     mesh_device=mesh_device,
                     config=throughput_expert_config,

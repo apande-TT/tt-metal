@@ -67,7 +67,6 @@
 #include "program_command_sequence.hpp"
 #include "program_device_map.hpp"
 #include "program_impl.hpp"
-#include "slow_dispatch.hpp"
 #include "tt-metalium/program.hpp"
 #include <tt_stl/span.hpp>
 #include <tt_stl/strong_type.hpp>
@@ -358,7 +357,7 @@ detail::ProgramImpl::ProgramImpl(ContextId context_id) :
     cached_device_hash_(std::nullopt),
     context_id_(context_id),
     programmable_core_count_(MetalContext::instance(context_id).hal().get_programmable_core_type_count()),
-    max_dfbs_(MetalContext::instance(context_id).hal().get_num_dataflow_buffers()),
+    max_cbs_(MetalContext::instance(context_id).hal().get_arch_num_circular_buffers()),
     id(program_counter++) {
     for (uint32_t i = 0; i < programmable_core_count_; i++) {
         kernels_.push_back({});
@@ -368,10 +367,10 @@ detail::ProgramImpl::ProgramImpl(ContextId context_id) :
     }
 
     TT_ASSERT(
-        cb_mask_width_ >= max_dfbs_,
-        "CB mask width ({}) is insufficient for architecture's {} DFBs",
+        cb_mask_width_ >= max_cbs_,
+        "CB mask width ({}) is insufficient for architecture's {} CBs",
         cb_mask_width_,
-        max_dfbs_);
+        max_cbs_);
 
     program_configs_.resize(programmable_core_count_);
     program_config_sizes_.resize(programmable_core_count_ + 2);
@@ -1072,7 +1071,7 @@ void detail::ProgramImpl::update_kernel_groups(uint32_t programmable_core_type_i
         for (auto& [kernels, cores] : map) {
             // Start inclusive, max exclusive
             uint32_t max_local_cb_end_index = 0;
-            uint32_t min_remote_cb_start_index = max_dfbs_;
+            uint32_t min_remote_cb_start_index = max_cbs_;
             uint64_t local_cb_mask = 0;
             uint32_t num_dfbs = 0;
 
@@ -1131,7 +1130,7 @@ void detail::ProgramImpl::update_kernel_groups(uint32_t programmable_core_type_i
                                                 .get_programmable_core_type_index(HalProgrammableCoreType::TENSIX));
 
                                         std::string cb_ids;
-                                        for (uint32_t i = 0; i < max_dfbs_; i++) {
+                                        for (uint32_t i = 0; i < max_cbs_; i++) {
                                             if (non_contiguous_cbs & (1ULL << i)) {
                                                 if (!cb_ids.empty()) {
                                                     cb_ids += ",";
@@ -1264,17 +1263,17 @@ CBHandle detail::ProgramImpl::add_circular_buffer_(const std::shared_ptr<Circula
                 std::bitset<NUM_CIRCULAR_BUFFERS>& cb_indices = this->per_core_cb_indices_[logical_core];
                 std::bitset<NUM_CIRCULAR_BUFFERS>& local_cb_indices = this->per_core_local_cb_indices_[logical_core];
                 std::bitset<NUM_CIRCULAR_BUFFERS>& remote_cb_indices = this->per_core_remote_cb_indices_[logical_core];
-                uint32_t max_dfbs = max_dfbs_;
-                auto add_buffer_indices = [&cb_indices, max_dfbs](
+                uint32_t max_cbs = max_cbs_;
+                auto add_buffer_indices = [&cb_indices, max_cbs](
                                               const std::unordered_set<uint8_t>& buffer_indices,
                                               std::bitset<NUM_CIRCULAR_BUFFERS>& target_cb_indices) {
                     for (uint32_t buffer_index : buffer_indices) {
                         // TT_ASSERT since we validate when constructing the config that it's within range
                         TT_ASSERT(
-                            buffer_index < max_dfbs,
+                            buffer_index < max_cbs,
                             "Invalid circular buffer index: {} should be between 0 and {}",
                             buffer_index,
-                            max_dfbs);
+                            max_cbs);
                         if (cb_indices[buffer_index]) {
                             TT_THROW(
                                 "Invalid circular buffer index: Cannot add circular buffer at index {}, another "
@@ -1841,7 +1840,7 @@ void detail::ProgramImpl::bind_prefetcher_pipe_parameters(std::span<const Prefet
             it != prefetcher_pipe_parameters_.end(), "Program declares no PrefetcherPipeParameter '{}'", bind.name);
         PrefetcherPipeParameterBinding& binding = it->second;
 
-        if (binding.bound_pipe != nullptr && binding.bound_pipe_identity == prefetcher_pipe.identity()) {
+        if (binding.bound_pipe == &prefetcher_pipe) {
             continue;  // sticky: same object again is a no-op
         }
         TT_FATAL(
@@ -1888,7 +1887,6 @@ void detail::ProgramImpl::bind_prefetcher_pipe_parameters(std::span<const Prefet
                 *checked.pipe);
         }
         checked.binding->bound_pipe = checked.pipe;
-        checked.binding->bound_pipe_identity = checked.pipe->identity();
     }
 }
 
@@ -2202,7 +2200,7 @@ void detail::ProgramImpl::allocate_scratchpads(const IDevice* device) {
                 //  - SD: the slow-dispatch path writes it via WriteRuntimeArgsToDevice
                 if (!kernel->common_runtime_args().empty()) {
                     RuntimeArgsData& crta = kernel->common_runtime_args_data();
-                    crta[handle.addr_crta_word] = handle.allocated_address;
+                    crta.data()[handle.addr_crta_word] = handle.allocated_address;
                 }
             }
         }
@@ -3084,8 +3082,7 @@ void ProgramImpl::generate_trace_dispatch_commands(distributed::MeshDevice* mesh
 }
 
 void detail::ProgramImpl::compile(IDevice* device, bool force_slow_dispatch) {
-    // Always-on zone: tools/tracy reports "CompileProgram" as a default child call of ops.
-    TTZoneScopedDN(PROGRAM, "CompileProgram");
+    TTZoneScopedD(PROGRAM);
 
     const ContextId device_context_id = extract_context_id(device);
     // Metal 1.0 CreateProgram() always stores DEFAULT_CONTEXT_ID because no MetalEnv/device is
@@ -3680,7 +3677,7 @@ void detail::ProgramCompileGroup::finalize_offsets() {
 void detail::ProgramCompileGroup::write_runtime_args(bool force_slow_dispatch) {
     std::lock_guard lock(mutex_);
     for (auto& [device, program] : program_device_map_) {
-        slow_dispatch::WriteRuntimeArgsToDevice(*device, *program, force_slow_dispatch);
+        detail::WriteRuntimeArgsToDevice(device, *program, force_slow_dispatch);
     }
 }
 

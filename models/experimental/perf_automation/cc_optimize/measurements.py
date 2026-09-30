@@ -35,7 +35,6 @@ already-optimized model still reports against the TRUE original. Without that, t
 measures the optimized model, calls that its baseline, and the 2464 -> 648 result becomes
 unreportable the moment you restart.
 """
-
 from __future__ import annotations
 
 import contextlib
@@ -112,21 +111,6 @@ KIND_MATMUL_PARAMS = "matmul_params"
 # prefill chunk that changes size would move the ceiling under the measurement chasing it.
 KIND_STAGE_TOKENS = "stage_tokens"
 
-# EACH STAGE'S SHARE OF THE BEFORE END-TO-END READING (depth = stage). The whole-model BEFORE is pinned
-# as one number; its per-stage split was only ever held in the gate's best-so-far file, which every
-# win overwrites -- so a stage's own starting time was lost the moment it improved, and a stage whose
-# biggest win came first (Qwen-Image-Edit vision_encode, ~63.8 s -> 22.8 s) had no "before" anywhere.
-KIND_STAGE_E2E = "stage_e2e"
-
-# THE TENSOR-PARALLEL DEGREE the run's own marker reported (trace_replay: the pipeline's stated split,
-# else the mesh). Every ceiling divides a unit's bytes and FLOPs by it; pinned so a later round cannot
-# change the divisor under a measurement.
-KIND_TP_DEGREE = "tp_degree"
-
-# HOW MANY DATA-PARALLEL GROUPS SHARE A STAGE'S ITEMS (trace_replay: the pipeline's <stage>_trace_split).
-# The compute ceiling divides a stage's FLOPs by TP x this; pinned per stage for the same reason TP is.
-KIND_STAGE_SPLIT = "stage_split"
-
 PHASE_BEFORE = "before"
 PHASE_AFTER = "after"
 
@@ -179,45 +163,6 @@ def staircase_value(attempt) -> tuple:
     return None, ""
 
 
-def pcc_failed(attempt) -> bool:
-    """Did this attempt's OWN PCC reading fail? Such a candidate cannot have been banked --
-    gates_allow_banking refuses any PCC status but ok -- so it is never a win, whatever its delta.
-    False when the attempt recorded no PCC reading (older rows): absence is not a failure."""
-    st = str((attempt or {}).get("pcc_status") or "") if isinstance(attempt, dict) else ""
-    return bool(st) and st != "ok"
-
-
-def banks_the_same_state(win, commit_row) -> bool:
-    """Whether a commit row banked the end-to-end state this winning attempt reached: both rows carry
-    the reading taken at that moment, and equality of that one number links them. The commit row
-    takes its rung from whatever target was current at git_commit, so the lever names routinely
-    disagree -- the measurement is what the two rows share."""
-    fp = (win or {}).get("fullpipe_ms") if isinstance(win, dict) else None
-    return isinstance(fp, (int, float)) and isinstance(commit_row, dict) and commit_row.get("fullpipe_ms") == fp
-
-
-def banking_commit(attempt, rows, op_match=None):
-    """The commit row that banked `attempt`, or None. THE ONE matching rule -- the report's ticks,
-    its commit column and the dashboard all ask it.
-
-    The same end-to-end reading first: two wins on one op and rung are banked by two commits, and op +
-    rung alone would hand both the first commit's sha. `op_match(op_signature, commit_row)` (perf_mcp's
-    _op_match) is the fallback for a commit that recorded no reading of its own; without one only the
-    reading links them."""
-    if not isinstance(attempt, dict) or attempt.get("commit_record"):
-        return None
-    commits = [b for b in rows or [] if isinstance(b, dict) and b.get("commit_record")]
-    for b in commits:
-        if banks_the_same_state(attempt, b):
-            return b
-    if callable(op_match):
-        rung = str(attempt.get("kernel_kind") or "").strip().lower()
-        for b in commits:
-            if str(b.get("kernel_kind") or "").strip().lower() == rung and op_match(attempt.get("op_signature"), b):
-                return b
-    return None
-
-
 def winning_indices(attempts, baseline_ms=None) -> set:
     """Indices of the attempts that ACTUALLY made the model faster. THE ONE win rule for a sequence.
 
@@ -244,7 +189,7 @@ def winning_indices(attempts, baseline_ms=None) -> set:
         if isinstance(a, dict) and isinstance(a.get("fullpipe_delta_ms"), (int, float))
     ]
     if stamped:
-        return {i for i in stamped if attempts[i]["fullpipe_delta_ms"] < 0 and not pcc_failed(attempts[i])}
+        return {i for i in stamped if attempts[i]["fullpipe_delta_ms"] < 0}
 
     # ONE STAIRCASE PER RULER. A single `best` across mixed units let the smallest-scoped reading win
     # once and then disqualify everything else; see staircase_value.

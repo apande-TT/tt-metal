@@ -4,34 +4,38 @@
 
 from typing import TYPE_CHECKING, List
 
+import torch
+
 if TYPE_CHECKING:
     from .l1_operation import L1Operation
     from .fuser_config import GlobalConfig
     from .block_data import BlockData
     from .pack_node import PackNode
 
-from .indexing import InvocationGranularity
+from .golden import Golden
+from .tile_loop import TileLoop
 
 
-class Packer:
+class Packer(Golden):
     """Base class for fused test packer code generators.
 
     Subclasses override methods to emit the C++ LLK calls that configure and
-    drive the Pack thread.
+    drive the Pack thread, plus a Python golden function for test validation.
 
-    The pack lifecycle is driven by the planned call nest, which iterates
+    The pack lifecycle is driven by TileLoop.pack_loop(), which iterates
     over tiles in the block and calls pack() for each one:
-        init() -> planned calls to pack() -> uninit()
+        init() -> pack_loop() [which calls pack()] -> uninit()
 
     To create a new packer:
         1. Subclass Packer
         2. Override get_headers() with the required LLK header files
         3. Override init(), pack(), uninit() to emit the C++ LLK calls
-        4. Bind the corresponding callable from fuser.golden.pack
+        4. Override golden() to compute the expected pack result,
+           calling self.relu_golden() and self.l1_acc_golden() as needed
     """
 
     # Controls the tile iteration pattern for the pack loop.
-    granularity = InvocationGranularity.NONE
+    loop: TileLoop = TileLoop()
 
     # Set `per_block_init = True` if init() needs block dimensions and must
     # be called per-block inside the batch loop rather than hoisted out.
@@ -42,8 +46,28 @@ class Packer:
     requires_dest_remap: bool = False
 
     def get_headers(self) -> List[str]:
-        """Return the LLK header filenames that declare this packer's generated calls."""
+        """Return the list of C++ LLK header filenames required by this packer.
+
+        These headers are #included in the generated test source file. Override to
+        return the headers that declare the _llk_pack_*_ functions used by init(),
+        pack(), and uninit().
+        """
         return []
+
+    def golden(
+        self,
+        tensor: torch.Tensor,
+        pack_node: "PackNode",
+        operation: "L1Operation",
+        config: "GlobalConfig",
+    ) -> torch.Tensor:
+        """Compute the golden pack result in Python.
+
+        Returns the tensor after applying pack transforms.
+        Override and call self.relu_golden() or self.l1_acc_golden()
+        as needed based on the pack_node config.
+        """
+        return tensor
 
     def init(
         self,
@@ -52,7 +76,11 @@ class Packer:
         config: "GlobalConfig",
         block: "BlockData",
     ) -> str:
-        """Return C++ code that initializes the packer before the pack loop."""
+        """Return C++ code that initializes the packer before the pack loop.
+
+        Called once per block. Override to emit the _llk_pack_init_<>()
+        calls with the appropriate parameters
+        """
         return ""
 
     def pack(
@@ -62,8 +90,13 @@ class Packer:
         config: "GlobalConfig",
         block: "BlockData",
     ) -> str:
-        """Return C++ code for one planned pack call (dest index in
-        block.tile_id_dest, L1 output index in block.tile_id_out)."""
+        """Return C++ code that packs a single tile from dest to L1.
+
+        Called inside the tile loop by TileLoop.pack_loop(). Use
+        block.tile_id_block for the dest register index and
+        block.tile_id_global for the L1 output buffer index.
+        Override to emit the _llk_pack_<>() call.
+        """
         return ""
 
     def uninit(
@@ -73,5 +106,9 @@ class Packer:
         config: "GlobalConfig",
         block: "BlockData",
     ) -> str:
-        """Return C++ code that tears down the packer after the pack loop."""
+        """Return C++ code that uninitializes the packer after the pack loop.
+
+        Called once per block after the pack loop completes. Override if the
+        packer requires explicit cleanup.
+        """
         return ""

@@ -59,10 +59,7 @@ DataflowBufferSpec make_dfb(const DFBSpecName& unique_id, uint32_t num_tiles, tt
 // its unpack mode outright; every other buffer keeps the implicit unpack-to-SrcA/B default. This op
 // asks for the default everywhere, so the explicit entries carry that same choice.
 void require_unpack_mode(
-    ComputeHardwareConfig::ComputeUnpackModes& unpack_modes,
-    bool fp32_dest_acc_en,
-    const DFBSpecName& dfb,
-    tt::DataFormat data_format) {
+    ComputeUnpackModes& unpack_modes, bool fp32_dest_acc_en, const DFBSpecName& dfb, tt::DataFormat data_format) {
     if (fp32_dest_acc_en && data_format == tt::DataFormat::Float32) {
         unpack_modes.emplace(dfb, UnpackMode::UnpackToSrc);
     }
@@ -88,7 +85,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_2d(
     const bool weight_has_value = weight.has_value();
     const bool divisor_has_value = divisor.has_value();
 
-    tt::tt_metal::distributed::MeshDevice* device = target.device();
+    tt::tt_metal::IDevice* device = target.device();
     auto grid = device->compute_with_storage_grid_size();
     uint32_t core_h = grid.y;
 
@@ -259,7 +256,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_2d(
         .tensor_bindings = std::move(reader_tensor_bindings),
         .runtime_arg_schema =
             {.runtime_arg_names = {"ignore_index", "num_tiles_per_core", "start_id", "C", "weight_num_tile"}},
-        .hw_config = ttnn::create_reader_datamovement_config(),
+        .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
     };
 
     KernelSpec writer{
@@ -278,7 +275,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_2d(
                 TensorBinding{.tensor_parameter_name = TENSOR_INPUT_GRAD, .accessor_name = "input_grad"},
             },
         .runtime_arg_schema = {.runtime_arg_names = {"num_tiles_per_core", "start_id"}},
-        .hw_config = ttnn::create_writer_datamovement_config(),
+        .hw_config = ttnn::create_writer_datamovement_config(device->arch()),
     };
 
     Group<DFBBinding> compute_dfb_bindings{
@@ -328,7 +325,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_2d(
         });
     }
 
-    ComputeHardwareConfig::ComputeUnpackModes compute_unpack_modes;
+    ComputeUnpackModes compute_unpack_modes;
     require_unpack_mode(compute_unpack_modes, fp32_dest_acc_en, DFB_OUTPUT_GRAD, data_format);
     require_unpack_mode(compute_unpack_modes, fp32_dest_acc_en, DFB_TMP_WEIGHT, fp32_dest_acc_en_data_format);
     if (divisor_has_value) {
@@ -337,8 +334,8 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_2d(
         require_unpack_mode(compute_unpack_modes, fp32_dest_acc_en, DFB_TMP2, fp32_dest_acc_en_data_format);
     }
 
-    auto compute_hw_config = ttnn::to_compute_hardware_config(compute_kernel_config);
-    compute_hw_config.unpack_modes = std::move(compute_unpack_modes);
+    auto compute_hw_config = ttnn::to_compute_hardware_config(device->arch(), compute_kernel_config);
+    unpack_modes(compute_hw_config) = std::move(compute_unpack_modes);
 
     auto make_compute = [&](KernelSpecName unique_id, uint32_t units_per_core_group) {
         return KernelSpec{
@@ -450,7 +447,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_3d(
     const bool weight_has_value = weight.has_value();
     const bool divisor_has_value = divisor.has_value();
 
-    tt::tt_metal::distributed::MeshDevice* device = target.device();
+    tt::tt_metal::IDevice* device = target.device();
     auto grid = device->compute_with_storage_grid_size();
     uint32_t core_h = grid.y;
 
@@ -622,7 +619,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_3d(
         .runtime_arg_schema =
             {.runtime_arg_names =
                  {"ignore_index", "num_tiles_per_core", "start_id", "C", "num_inner_tile", "weight_num_tile"}},
-        .hw_config = ttnn::create_reader_datamovement_config(),
+        .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
     };
 
     KernelSpec writer{
@@ -641,7 +638,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_3d(
                 TensorBinding{.tensor_parameter_name = TENSOR_INPUT_GRAD, .accessor_name = "input_grad"},
             },
         .runtime_arg_schema = {.runtime_arg_names = {"num_tiles_per_core", "start_id"}},
-        .hw_config = ttnn::create_writer_datamovement_config(),
+        .hw_config = ttnn::create_writer_datamovement_config(device->arch()),
     };
 
     Group<DFBBinding> compute_dfb_bindings{
@@ -691,7 +688,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_3d(
         });
     }
 
-    ComputeHardwareConfig::ComputeUnpackModes compute_unpack_modes;
+    ComputeUnpackModes compute_unpack_modes;
     require_unpack_mode(compute_unpack_modes, fp32_dest_acc_en, DFB_OUTPUT_GRAD, data_format);
     require_unpack_mode(compute_unpack_modes, fp32_dest_acc_en, DFB_TMP_WEIGHT, fp32_dest_acc_en_data_format);
     if (divisor_has_value) {
@@ -700,8 +697,8 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_3d(
         require_unpack_mode(compute_unpack_modes, fp32_dest_acc_en, DFB_TMP2, fp32_dest_acc_en_data_format);
     }
 
-    auto compute_hw_config = ttnn::to_compute_hardware_config(compute_kernel_config);
-    compute_hw_config.unpack_modes = std::move(compute_unpack_modes);
+    auto compute_hw_config = ttnn::to_compute_hardware_config(device->arch(), compute_kernel_config);
+    unpack_modes(compute_hw_config) = std::move(compute_unpack_modes);
 
     auto make_compute = [&](KernelSpecName unique_id, uint32_t units_per_core_group) {
         return KernelSpec{
@@ -816,7 +813,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_4d(
     const bool weight_has_value = weight.has_value();
     const bool divisor_has_value = divisor.has_value();
 
-    tt::tt_metal::distributed::MeshDevice* device = target.device();
+    tt::tt_metal::IDevice* device = target.device();
     auto grid = device->compute_with_storage_grid_size();
     uint32_t core_h = grid.y;
 
@@ -988,7 +985,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_4d(
         .runtime_arg_schema =
             {.runtime_arg_names =
                  {"ignore_index", "num_tiles_per_core", "start_id", "C", "num_inner_tile", "weight_num_tile"}},
-        .hw_config = ttnn::create_reader_datamovement_config(),
+        .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
     };
 
     KernelSpec writer{
@@ -1007,7 +1004,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_4d(
                 TensorBinding{.tensor_parameter_name = TENSOR_INPUT_GRAD, .accessor_name = "input_grad"},
             },
         .runtime_arg_schema = {.runtime_arg_names = {"num_tiles_per_core", "start_id"}},
-        .hw_config = ttnn::create_writer_datamovement_config(),
+        .hw_config = ttnn::create_writer_datamovement_config(device->arch()),
     };
 
     Group<DFBBinding> compute_dfb_bindings{
@@ -1057,7 +1054,7 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_4d(
         });
     }
 
-    ComputeHardwareConfig::ComputeUnpackModes compute_unpack_modes;
+    ComputeUnpackModes compute_unpack_modes;
     require_unpack_mode(compute_unpack_modes, fp32_dest_acc_en, DFB_OUTPUT_GRAD, data_format);
     require_unpack_mode(compute_unpack_modes, fp32_dest_acc_en, DFB_TMP_WEIGHT, fp32_dest_acc_en_data_format);
     if (divisor_has_value) {
@@ -1066,8 +1063,8 @@ ttnn::device_operation::ProgramArtifacts moreh_nll_loss_backward_impl_4d(
         require_unpack_mode(compute_unpack_modes, fp32_dest_acc_en, DFB_TMP2, fp32_dest_acc_en_data_format);
     }
 
-    auto compute_hw_config = ttnn::to_compute_hardware_config(compute_kernel_config);
-    compute_hw_config.unpack_modes = std::move(compute_unpack_modes);
+    auto compute_hw_config = ttnn::to_compute_hardware_config(device->arch(), compute_kernel_config);
+    unpack_modes(compute_hw_config) = std::move(compute_unpack_modes);
 
     auto make_compute = [&](KernelSpecName unique_id, uint32_t units_per_core_group) {
         return KernelSpec{

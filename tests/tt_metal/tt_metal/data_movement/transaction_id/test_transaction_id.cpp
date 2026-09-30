@@ -42,10 +42,6 @@ struct TransactionIdConfig {
     //  1. Posted flag
 };
 
-inline bool three_distinct_cores(const CoreCoord& master, const CoreCoord& sub0, const CoreCoord& sub1) {
-    return master != sub0 && master != sub1 && sub0 != sub1;
-}
-
 /// @brief Does L1 Sender Core --> L1 Receiver Core or L1 Receiver Core --> L1 Sender Core
 /// @param mesh_device - MeshDevice to run the test on
 /// @param test_config - Configuration of the test -- see struct
@@ -112,14 +108,11 @@ bool run_dm(distributed::MeshDevice& mesh_device, const TransactionIdConfig& tes
 
     DataMovementHardwareConfig sender_hw_config;
     if (mesh_device.arch() == tt::ARCH::QUASAR) {
-        sender_hw_config = DataMovementHardwareConfig{};
+        sender_hw_config = DataMovementGen2Config{};
     } else {
-        sender_hw_config = DataMovementHardwareConfig{
-            .config_1xx =
-                DataMovementHardwareConfig::DataMovement1XXConfig{
-                    .processor = DataMovementProcessor::RISCV_0,
-                    .noc = test_config.noc_id,
-                },
+        sender_hw_config = DataMovementGen1Config{
+            .processor = DataMovementProcessor::RISCV_0,
+            .noc = test_config.noc_id,
         };
     }
     KernelSpec sender_spec{
@@ -243,12 +236,12 @@ TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdReadAfterWrit
     CoreCoord sub0_core_coord = {0, this->device().compute_with_storage_grid_size().y - 1};
     CoreCoord sub1_core_coord = {this->device().compute_with_storage_grid_size().x - 1, 0};
 
-    if (!unit_tests::dm::transaction_id::three_distinct_cores(master_core_coord, sub0_core_coord, sub1_core_coord)) {
-        auto grid = this->device().compute_with_storage_grid_size();
-        GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid.x << "x" << grid.y;
-    }
-
     if (this->device().arch() == ARCH::QUASAR) {
+        // Transaction ID test needs 3 distinct cores; skip if grid is too small
+        auto grid = this->device().compute_with_storage_grid_size();
+        if (grid.x * grid.y < 3) {
+            GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid.x << "x" << grid.y;
+        }
         unit_tests::dm::transaction_id::TransactionIdConfig test_config = {
             .test_id = 600,
             .master_core_coord = master_core_coord,
@@ -310,11 +303,6 @@ TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdReadAfterWrit
     CoreCoord sub0_core_coord = {0, this->device().compute_with_storage_grid_size().y - 1};
     CoreCoord sub1_core_coord = {this->device().compute_with_storage_grid_size().x - 1, 0};
 
-    if (!unit_tests::dm::transaction_id::three_distinct_cores(master_core_coord, sub0_core_coord, sub1_core_coord)) {
-        auto grid = this->device().compute_with_storage_grid_size();
-        GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid.x << "x" << grid.y;
-    }
-
     // Parameters
     uint32_t max_pages_per_transaction = 256;  // NOC_MAX_BURST_WORDS
 
@@ -358,11 +346,6 @@ TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdReadAfterWrit
     // Furthest cores from master
     CoreCoord sub0_core_coord = {0, this->device().compute_with_storage_grid_size().y - 1};
     CoreCoord sub1_core_coord = {this->device().compute_with_storage_grid_size().x - 1, 0};
-
-    if (!unit_tests::dm::transaction_id::three_distinct_cores(master_core_coord, sub0_core_coord, sub1_core_coord)) {
-        auto grid = this->device().compute_with_storage_grid_size();
-        GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid.x << "x" << grid.y;
-    }
 
     // Parameters
     uint32_t max_pages_per_transaction = 256;  // NOC_MAX_BURST_WORDS
@@ -409,11 +392,6 @@ TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdWriteAfterRea
     CoreCoord sub0_core_coord = {0, this->device().compute_with_storage_grid_size().y - 1};
     CoreCoord sub1_core_coord = {this->device().compute_with_storage_grid_size().x - 1, 0};
 
-    if (!unit_tests::dm::transaction_id::three_distinct_cores(master_core_coord, sub0_core_coord, sub1_core_coord)) {
-        auto grid = this->device().compute_with_storage_grid_size();
-        GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid.x << "x" << grid.y;
-    }
-
     // Parameters
     uint32_t max_pages_per_transaction =
         this->device().arch() == ARCH::BLACKHOLE ? 1024 : 2048;  // Max total transaction size == 64 KB
@@ -459,11 +437,6 @@ TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdWriteAfterRea
     CoreCoord sub0_core_coord = {0, this->device().compute_with_storage_grid_size().y - 1};
     CoreCoord sub1_core_coord = {this->device().compute_with_storage_grid_size().x - 1, 0};
 
-    if (!unit_tests::dm::transaction_id::three_distinct_cores(master_core_coord, sub0_core_coord, sub1_core_coord)) {
-        auto grid = this->device().compute_with_storage_grid_size();
-        GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid.x << "x" << grid.y;
-    }
-
     // Parameters
     uint32_t max_pages_per_transaction = 256;  // NOC_MAX_BURST_WORDS
 
@@ -497,6 +470,14 @@ TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdWriteAfterRea
 
 /* ========== Metal 2.0 variants ========== */
 
+namespace unit_tests::dm::transaction_id {
+// Helper: returns true if Quasar emulator can run a 3-core transaction_id test, otherwise GTEST_SKIP-ready.
+inline bool quasar_grid_ok(distributed::MeshDevice& mesh_device) {
+    auto grid = mesh_device.compute_with_storage_grid_size();
+    return grid.x * grid.y >= 3;
+}
+}  // namespace unit_tests::dm::transaction_id
+
 TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdReadAfterWrite_2_0) {
     auto arch_ = this->device().arch();
 
@@ -507,12 +488,11 @@ TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdReadAfterWrit
     CoreCoord sub0_core_coord = {0, this->device().compute_with_storage_grid_size().y - 1};
     CoreCoord sub1_core_coord = {this->device().compute_with_storage_grid_size().x - 1, 0};
 
-    if (!unit_tests::dm::transaction_id::three_distinct_cores(master_core_coord, sub0_core_coord, sub1_core_coord)) {
-        auto grid = this->device().compute_with_storage_grid_size();
-        GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid.x << "x" << grid.y;
-    }
-
     if (arch_ == ARCH::QUASAR) {
+        auto grid_dbg = this->device().compute_with_storage_grid_size();
+        if (!unit_tests::dm::transaction_id::quasar_grid_ok(this->device())) {
+            GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid_dbg.x << "x" << grid_dbg.y;
+        }
         unit_tests::dm::transaction_id::TransactionIdConfig test_config = {
             .test_id = 620,
             .master_core_coord = master_core_coord,
@@ -560,12 +540,10 @@ TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdReadAfterWrit
     CoreCoord sub0_core_coord = {0, this->device().compute_with_storage_grid_size().y - 1};
     CoreCoord sub1_core_coord = {this->device().compute_with_storage_grid_size().x - 1, 0};
 
-    if (!unit_tests::dm::transaction_id::three_distinct_cores(master_core_coord, sub0_core_coord, sub1_core_coord)) {
-        auto grid = this->device().compute_with_storage_grid_size();
-        GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid.x << "x" << grid.y;
-    }
-
     if (arch_ == ARCH::QUASAR) {
+        if (!unit_tests::dm::transaction_id::quasar_grid_ok(this->device())) {
+            GTEST_SKIP() << "Skipping: need 3 distinct cores on Quasar emulator";
+        }
         unit_tests::dm::transaction_id::TransactionIdConfig test_config = {
             .test_id = 621,
             .master_core_coord = master_core_coord,
@@ -614,12 +592,10 @@ TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdReadAfterWrit
     CoreCoord sub0_core_coord = {0, this->device().compute_with_storage_grid_size().y - 1};
     CoreCoord sub1_core_coord = {this->device().compute_with_storage_grid_size().x - 1, 0};
 
-    if (!unit_tests::dm::transaction_id::three_distinct_cores(master_core_coord, sub0_core_coord, sub1_core_coord)) {
-        auto grid = this->device().compute_with_storage_grid_size();
-        GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid.x << "x" << grid.y;
-    }
-
     if (arch_ == ARCH::QUASAR) {
+        if (!unit_tests::dm::transaction_id::quasar_grid_ok(this->device())) {
+            GTEST_SKIP() << "Skipping: need 3 distinct cores on Quasar emulator";
+        }
         unit_tests::dm::transaction_id::TransactionIdConfig test_config = {
             .test_id = 622,
             .master_core_coord = master_core_coord,
@@ -670,12 +646,10 @@ TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdWriteAfterRea
     CoreCoord sub0_core_coord = {0, this->device().compute_with_storage_grid_size().y - 1};
     CoreCoord sub1_core_coord = {this->device().compute_with_storage_grid_size().x - 1, 0};
 
-    if (!unit_tests::dm::transaction_id::three_distinct_cores(master_core_coord, sub0_core_coord, sub1_core_coord)) {
-        auto grid = this->device().compute_with_storage_grid_size();
-        GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid.x << "x" << grid.y;
-    }
-
     if (arch_ == ARCH::QUASAR) {
+        if (!unit_tests::dm::transaction_id::quasar_grid_ok(this->device())) {
+            GTEST_SKIP() << "Skipping: need 3 distinct cores on Quasar emulator";
+        }
         unit_tests::dm::transaction_id::TransactionIdConfig test_config = {
             .test_id = 630,
             .master_core_coord = master_core_coord,
@@ -724,12 +698,10 @@ TEST_F(UnitMeshFastDispatchFixture, TensixDataMovementTransactionIdWriteAfterRea
     CoreCoord sub0_core_coord = {0, this->device().compute_with_storage_grid_size().y - 1};
     CoreCoord sub1_core_coord = {this->device().compute_with_storage_grid_size().x - 1, 0};
 
-    if (!unit_tests::dm::transaction_id::three_distinct_cores(master_core_coord, sub0_core_coord, sub1_core_coord)) {
-        auto grid = this->device().compute_with_storage_grid_size();
-        GTEST_SKIP() << "Skipping: need 3 distinct cores but grid is only " << grid.x << "x" << grid.y;
-    }
-
     if (arch_ == ARCH::QUASAR) {
+        if (!unit_tests::dm::transaction_id::quasar_grid_ok(this->device())) {
+            GTEST_SKIP() << "Skipping: need 3 distinct cores on Quasar emulator";
+        }
         unit_tests::dm::transaction_id::TransactionIdConfig test_config = {
             .test_id = 631,
             .master_core_coord = master_core_coord,

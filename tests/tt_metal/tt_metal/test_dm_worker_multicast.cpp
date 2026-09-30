@@ -85,7 +85,7 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, DmWorkerMulticast) {
                          "peer_x",
                          "peer_y"},
                 },
-            .hw_config = experimental::DataMovementHardwareConfig{},
+            .hw_config = experimental::DataMovementGen2Config{},
         }},
         .work_units = {experimental::WorkUnitSpec{
             .name = "main",

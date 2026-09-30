@@ -17,9 +17,11 @@
 #include <umd/device/types/cluster_descriptor_types.hpp>  // ChipId
 #include "tt_metal/fabric/fabric_context.hpp"
 #include "tt_metal/fabric/fabric_builder_context.hpp"
+#include "tt_metal/fabric/fabric_tensix_builder.hpp"
 #include "tt_metal/fabric/fabric_edm_packet_header.hpp"
 #include "tt_metal/fabric/fabric_host_utils.hpp"
 #include "fabric/hw/inc/fabric_routing_mode.h"
+#include "impl/context/metal_context.hpp"
 
 namespace tt::tt_fabric {
 
@@ -230,18 +232,13 @@ size_t FabricContext::compute_max_payload_size_bytes(const tt_metal::Hal& hal, t
 }
 
 FabricContext::FabricContext(
-    ControlPlane& control_plane,
+    const ControlPlane& control_plane,
     const tt_metal::Hal& hal,
-    const tt::Cluster& cluster,
-    const llrt::RunTimeOptions& rtoptions,
+    tt::ARCH arch,
+    bool is_ubb_galaxy,
     tt::tt_fabric::FabricConfig fabric_config,
     const FabricRouterConfig& router_config) :
-    control_plane_(control_plane),
-    hal_(hal),
-    cluster_(cluster),
-    rtoptions_(rtoptions),
-    router_config_(router_config),
-    is_ubb_galaxy_(cluster.is_ubb_galaxy()) {
+    router_config_(router_config), is_ubb_galaxy_(is_ubb_galaxy) {
     // === Initialization order critical - dependencies flow downward ===
     // fabric_config_ → topology_ → routing flags → packet specs
 
@@ -263,10 +260,11 @@ FabricContext::FabricContext(
     this->compute_routing_mode();
 
     // Step 5: Compute packet specifications (depends on: routing flags)
-    this->compute_packet_specifications(control_plane, hal, cluster.arch());
+    this->compute_packet_specifications(control_plane, hal, arch);
 
     // Step 6: Additional independent configs
-    this->fabric_tensix_config_ = control_plane.get_fabric_tensix_config();
+    auto fabric_tensix_config = control_plane.get_fabric_tensix_config();
+    this->tensix_enabled_ = (fabric_tensix_config != tt::tt_fabric::FabricTensixConfig::DISABLED);
 
     // Compute intermesh VC configuration (requires ControlPlane to be initialized)
     // this->intermesh_vc_config_ = this->compute_intermesh_vc_config();

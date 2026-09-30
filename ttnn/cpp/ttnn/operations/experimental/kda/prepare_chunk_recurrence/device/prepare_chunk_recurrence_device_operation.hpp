@@ -35,9 +35,6 @@ std::vector<Tensor> prepare_chunk_recurrence(
     uint32_t num_heads,
     const tt::tt_metal::MemoryConfig& output_mem_config,
     const DeviceComputeKernelConfig& compute_kernel_config,
-    uint32_t output_bf16_mask,
-    const std::optional<Tensor>& actual_start,
-    const std::optional<Tensor>& actual_end,
-    uint32_t sequence_parallel_axis);
+    uint32_t output_bf16_mask);
 
 }  // namespace ttnn::experimental::prim

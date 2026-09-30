@@ -22,11 +22,9 @@ using namespace tt::tt_metal::experimental;
 namespace {
 // Helper function to compute core grid from device and operation attributes
 CoreRangeSet compute_core_grid(
-    const ManualSeedParams& operation_attributes,
-    const tt::tt_metal::distributed::MeshDevice& device,
-    uint32_t& out_num_cores) {
+    const ManualSeedParams& operation_attributes, const IDevice* device, uint32_t& out_num_cores) {
     // Get device core grid
-    const auto compute_with_storage_grid_size = device.compute_with_storage_grid_size();
+    const auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
     out_num_cores = compute_with_storage_grid_size.x * compute_with_storage_grid_size.y;
 
     // Create core grid
@@ -64,7 +62,7 @@ ttnn::device_operation::ProgramArtifacts ManualSeedSingleSeedToAllCoresProgramFa
 
     // Calculate core grid
     uint32_t num_cores{};
-    CoreRangeSet core_grid = compute_core_grid(operation_attributes, *operation_attributes.device, num_cores);
+    CoreRangeSet core_grid = compute_core_grid(operation_attributes, operation_attributes.device, num_cores);
 
     // Create compute kernel
     const std::string kernel_path =
@@ -75,7 +73,7 @@ ttnn::device_operation::ProgramArtifacts ManualSeedSingleSeedToAllCoresProgramFa
         .source = kernel_path,
         .compiler_options = {.opt_level = KernelBuildOptLevel::O3},
         .compile_time_args = {{"seed", operation_attributes.seeds.value_or(0)}},
-        .hw_config = ComputeHardwareConfig{},
+        .hw_config = ComputeGen1Config{},
     };
 
     ProgramSpec spec{
@@ -97,7 +95,7 @@ ttnn::device_operation::ProgramArtifacts ManualSeedSingleSeedSingleCoreProgramFa
     const KernelSpecName COMPUTE{"compute"};
 
     uint32_t num_cores{};
-    CoreRangeSet core_grid = compute_core_grid(operation_attributes, *operation_attributes.device, num_cores);
+    CoreRangeSet core_grid = compute_core_grid(operation_attributes, operation_attributes.device, num_cores);
     const auto& cores = corerange_to_cores(core_grid, num_cores, true);
     const auto& core_chosen = cores.at(operation_attributes.user_ids.value_or(0));
     CoreRangeSet chosen_core_ranges{CoreRange(core_chosen, core_chosen)};
@@ -111,7 +109,7 @@ ttnn::device_operation::ProgramArtifacts ManualSeedSingleSeedSingleCoreProgramFa
         .source = kernel_path,
         .compiler_options = {.opt_level = KernelBuildOptLevel::O3},
         .compile_time_args = {{"seed", operation_attributes.seeds.value_or(0)}},
-        .hw_config = ComputeHardwareConfig{},
+        .hw_config = ComputeGen1Config{},
     };
 
     ProgramSpec spec{
@@ -142,7 +140,7 @@ ttnn::device_operation::ProgramArtifacts ManualSeedSingleSeedSetCoresProgramFact
         "user_ids tensor must be provided for ManualSeedSingleSeedSetCoresProgramFactory");
 
     uint32_t num_cores{};
-    const CoreRangeSet core_grid = compute_core_grid(operation_attributes, *operation_attributes.device, num_cores);
+    const CoreRangeSet core_grid = compute_core_grid(operation_attributes, operation_attributes.device, num_cores);
     const std::vector<CoreCoord>& cores = corerange_to_cores(core_grid, num_cores, true);
 
     // Tensor config info
@@ -186,7 +184,7 @@ ttnn::device_operation::ProgramArtifacts ManualSeedSingleSeedSetCoresProgramFact
         }},
         .compile_time_args = {{"number_of_ids", number_of_ids}},
         .runtime_arg_schema = {.runtime_arg_names = {"core_id"}},
-        .hw_config = ttnn::create_reader_datamovement_config(),
+        .hw_config = ttnn::create_reader_datamovement_config(operation_attributes.device->arch()),
     };
 
     KernelRunArgs reader_run_args{.kernel = READER};
@@ -209,7 +207,7 @@ ttnn::device_operation::ProgramArtifacts ManualSeedSingleSeedSetCoresProgramFact
             .endpoint_type = DFBEndpointType::CONSUMER,
         }},
         .compile_time_args = {{"seed", operation_attributes.seeds.value_or(0)}},
-        .hw_config = ComputeHardwareConfig{},
+        .hw_config = ComputeGen1Config{},
     };
 
     ProgramSpec spec{
@@ -252,7 +250,7 @@ ttnn::device_operation::ProgramArtifacts ManualSeedSetSeedsSetCoresProgramFactor
         tensor_args.seeds.has_value(), "seeds tensor must be provided for ManualSeedSetSeedsSetCoresProgramFactory");
 
     uint32_t num_cores{};
-    const CoreRangeSet core_grid = compute_core_grid(operation_attributes, *operation_attributes.device, num_cores);
+    const CoreRangeSet core_grid = compute_core_grid(operation_attributes, operation_attributes.device, num_cores);
     const std::vector<CoreCoord>& cores = corerange_to_cores(core_grid, num_cores, true);
 
     // Tensor config info
@@ -314,7 +312,7 @@ ttnn::device_operation::ProgramArtifacts ManualSeedSetSeedsSetCoresProgramFactor
              }},
         .compile_time_args = {{"number_of_ids", number_of_ids}},
         .runtime_arg_schema = {.runtime_arg_names = {"core_id"}},
-        .hw_config = ttnn::create_reader_datamovement_config(),
+        .hw_config = ttnn::create_reader_datamovement_config(operation_attributes.device->arch()),
     };
 
     KernelRunArgs reader_run_args{.kernel = READER};
@@ -336,7 +334,7 @@ ttnn::device_operation::ProgramArtifacts ManualSeedSetSeedsSetCoresProgramFactor
             .accessor_name = "kernel_communication",
             .endpoint_type = DFBEndpointType::CONSUMER,
         }},
-        .hw_config = ComputeHardwareConfig{},
+        .hw_config = ComputeGen1Config{},
     };
 
     ProgramSpec spec{

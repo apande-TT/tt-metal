@@ -106,7 +106,7 @@ ProgramDescriptor UniformDeviceOperation::UniformProgramFactory::create_descript
     const operation_attributes_t& operation_attributes,
     const tensor_args_t& /*tensor_args*/,
     tensor_return_value_t& output) {
-    MeshDevice* device = output.device();
+    IDevice* device = output.device();
     const auto ws = uniform_work_split(output);
     const auto& all_cores = ws.all_cores;
     const auto num_cores_total = ws.cores.size();

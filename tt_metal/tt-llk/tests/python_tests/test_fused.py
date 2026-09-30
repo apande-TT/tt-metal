@@ -5,19 +5,18 @@
 import pytest
 from conftest import skip_for_coverage, skip_for_quasar
 from fuser.config_parser import FUSER_CONFIG_DIR, FuserConfigSchema
-from fuser.sweep import collect_fuser_cases
 
 yaml_files = sorted(FUSER_CONFIG_DIR.glob("*.yaml"))
-case_configs = collect_fuser_cases(yaml_files)
+test_names = [f.stem for f in yaml_files]
 
 
 @skip_for_quasar
 @skip_for_coverage
-@pytest.mark.parametrize("case_name", case_configs)
+@pytest.mark.parametrize("test_name", test_names, ids=test_names)
 def test_fuser(
-    case_name,
+    test_name,
     regenerate_cpp,
 ):
-    config = FuserConfigSchema.load(case_name, case_configs[case_name])
+    config = FuserConfigSchema.load(test_name)
     config.global_config.regenerate_cpp = regenerate_cpp
     config.run_regular_test()

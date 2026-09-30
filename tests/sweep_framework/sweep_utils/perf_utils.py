@@ -11,7 +11,6 @@ from typing import Any, Optional, Tuple, Dict
 
 from framework.sweeps_logger import sweeps_logger as logger
 from sweep_utils.roofline_utils import get_updated_message
-from sweep_utils.tensor_setup import setup_context
 
 
 # Device profiler keys to retain in simplified outputs
@@ -270,9 +269,7 @@ def prepare_program_cache_for_comparison(device) -> None:
     logger.info(f"Program cache cleared (entries after: {num_entries_after})")
 
 
-def execute_test(test_module, test_vector: dict, device, config: Any = None) -> Tuple[bool, Any, Optional[float]]:
-    """Run one vector. With device perf requested in `config`, tensor setup is built on the
-    host so the profiler window holds only the op (sweep_utils/tensor_setup.py)."""
+def execute_test(test_module, test_vector: dict, device) -> Tuple[bool, Any, Optional[float]]:
     # Filter 'device' from test_vector to avoid conflict with explicit device param
     if "device" in test_vector:
         test_vector = {k: v for k, v in test_vector.items() if k != "device"}
@@ -294,8 +291,7 @@ def execute_test(test_module, test_vector: dict, device, config: Any = None) -> 
     if accepts_absent:
         test_vector["__absent_keys__"] = absent_keys
 
-    with setup_context(test_module, config):
-        results = test_module.run(**test_vector, device=device)
+    results = test_module.run(**test_vector, device=device)
     if isinstance(results, list):
         status, message = results[0]
         e2e_ms = results[1] / 1000000  # Nanoseconds to milliseconds
@@ -330,7 +326,7 @@ def run_with_cache_comparison(
     prepare_program_cache_for_comparison(device)
 
     # First run (without cache)
-    status_uncached, message_uncached, e2e_uncached_ms = execute_test(test_module, test_vector, device, config)
+    status_uncached, message_uncached, e2e_uncached_ms = execute_test(test_module, test_vector, device)
 
     # A sweep module can set _SKIP_DEVICE_PERF (per-vector) to opt this vector out of
     # the profiler read -- e.g. conv2d's heavy FABRIC_1D path, where the profiler's
@@ -349,7 +345,7 @@ def run_with_cache_comparison(
         device_perf_uncached = gather_single_test_perf(_resolve_perf_device(device, test_module), status_uncached)
 
     # Second run (with cache)
-    status_cached, message_cached, e2e_cached_ms = execute_test(test_module, test_vector, device, config)
+    status_cached, message_cached, e2e_cached_ms = execute_test(test_module, test_vector, device)
 
     device_perf_cached = None
     if measure_dp:
@@ -415,7 +411,7 @@ def run_with_cache_comparison(
 def run_single(
     test_module, test_vector: dict, device, config: Any
 ) -> Tuple[bool, Any, Optional[float], Optional[dict], Optional[Dict]]:
-    status, message, e2e_ms = execute_test(test_module, test_vector, device, config)
+    status, message, e2e_ms = execute_test(test_module, test_vector, device)
 
     # Capture peak memory if enabled
     peak_memory = None

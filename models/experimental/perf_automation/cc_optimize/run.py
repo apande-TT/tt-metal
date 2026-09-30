@@ -620,8 +620,7 @@ def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str
         "    if hasattr(g,a): g=getattr(g,a); break\n"
         "r=g()\n"
         "print('FULLPIPE_MS=' + str(r.get('full_pipeline_ms')))\n"
-        "print('FULLPIPE_MODE=' + str(r.get('mode') or r.get('method') or ''))\n"
-        "import json; print('FULLPIPE_STAGES=' + json.dumps(r.get('stages') or {}))"
+        "print('FULLPIPE_MODE=' + str(r.get('mode') or r.get('method') or ''))"
     )
     env = cc_env(repo_root, devices)
     env.update(mcp_env)
@@ -658,10 +657,7 @@ def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str
     if rc is None:
         return (None, "")
     mode = ""
-    stages = {}
     for line in (out or "").splitlines():
-        if line.startswith("FULLPIPE_STAGES="):
-            stages = _stage_ms_of(line.split("=", 1)[1])
         if line.startswith("FULLPIPE_MS="):
             try:
                 ms = float(line.split("=", 1)[1])
@@ -686,53 +682,8 @@ def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str
             # pipeline's own structure; unknown prints nothing rather than a borrowed description.
             f"  (ALL layers{_e2e_shape()}{', ' + mode if mode else ''})"
         )
-        if _ledger_fullpipe(ms, mode, label) == _ledger().PHASE_BEFORE:
-            _ledger_stage_starts(stages, mode)
+        _ledger_fullpipe(ms, mode, label)
     return ms, mode
-
-
-def _stage_ms_of(raw: str) -> dict:
-    """{stage: ms} from the gate's `stages` field, which is {stage: ms} or {stage: {"ms": ...}}."""
-    try:
-        doc = json.loads(raw)
-    except ValueError:
-        return {}
-    out = {}
-    for name, v in (doc or {}).items() if isinstance(doc, dict) else []:
-        ms = v.get("ms") if isinstance(v, dict) else v
-        if name and isinstance(ms, (int, float)) and ms > 0:
-            out[str(name)] = float(ms)
-    return out
-
-
-def _ledger_keys() -> tuple:
-    """(model, task) the ledger is keyed by -- the model's own name, as perf_mcp's writers use it."""
-    return (
-        os.environ.get("PERF_MCP_MODEL_NAME") or Path(os.environ.get("PERF_MCP_MODEL_ROOT", "") or "model").name,
-        os.environ.get("PERF_MCP_TASK", "main"),
-    )
-
-
-def _ledger_stage_starts(stages: dict, mode: str) -> None:
-    """Pin each stage's share of the BEFORE end-to-end reading, write-once (measurements.anchor).
-
-    Called only for the reading that became the ledger's BEFORE, so a resumed run -- whose BEFORE is
-    already pinned -- can never file a mid-run split as the start. Stage names are the gate's own."""
-    try:
-        led = _ledger()
-        _model, _task = _ledger_keys()
-        for name, ms in (stages or {}).items():
-            led.anchor(
-                led.KIND_STAGE_E2E,
-                ms,
-                depth=str(name).strip().lower(),
-                mode=mode or "unknown",
-                source="fullpipe-gate:BEFORE stage split",
-                model=_model,
-                task=_task,
-            )
-    except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost the measurement
-        pass
 
 
 def _ledger():
@@ -763,9 +714,8 @@ def _e2e_shape() -> str:
     return {"token": ", prefill + 1 decode", "step": ", 1 step", "inference": ", 1 forward pass"}.get(_u, "")
 
 
-def _ledger_fullpipe(ms: float, mode: str, label: str) -> str:
+def _ledger_fullpipe(ms: float, mode: str, label: str) -> None:
     """Record the whole-model gate reading AT THE MOMENT IT IS TAKEN, with the mode it was taken in.
-    Returns the phase it was filed under, or "" when it was not recorded.
 
     The mode matters more than the number: the BEFORE bookend is captured once and never re-taken,
     so an eager BEFORE could sit next to a trace+1cq AFTER and be subtracted, printing
@@ -780,7 +730,10 @@ def _ledger_fullpipe(ms: float, mode: str, label: str) -> str:
         # genuine before landed in the fallback, the later committed-best found nothing in the real
         # ledger and claimed the BEFORE slot, and the report printed
         # "40.13 ms -> (after not measured yet)" -- with 40.13 actually being the OPTIMIZED result.
-        _model, _task = _ledger_keys()
+        _model = (
+            os.environ.get("PERF_MCP_MODEL_NAME") or Path(os.environ.get("PERF_MCP_MODEL_ROOT", "") or "model").name
+        )
+        _task = os.environ.get("PERF_MCP_TASK", "main")
         seen = led.first(led.KIND_FULLPIPE, led.PHASE_BEFORE, model=_model, task=_task)
         # A RERUN'S OWN BASELINE IS NOT A RESULT. Write-once BEFORE is right for RESULTS -- it keeps the
         # original anchor alive across reruns so the headline reads 84.05 -> x instead of resetting.
@@ -795,9 +748,9 @@ def _ledger_fullpipe(ms: float, mode: str, label: str) -> str:
         # per-run baseline file, and the ledger keeps only readings that describe progress. An
         # UNLABELLED bookend still records: unknown provenance must fail toward keeping the reading.
         if seen and "before" in (label or "").strip().lower():
-            return ""
+            return
         phase = led.PHASE_AFTER if seen else led.PHASE_BEFORE
-        ok = led.record(
+        led.record(
             led.KIND_FULLPIPE,
             phase,
             ms,
@@ -807,9 +760,8 @@ def _ledger_fullpipe(ms: float, mode: str, label: str) -> str:
             model=_model,
             task=_task,
         )
-        return phase if ok else ""
     except Exception:  # noqa: BLE001
-        return ""
+        pass
 
 
 # Public alias: this is the ledger's whole-model bookend recorder.
@@ -3547,12 +3499,6 @@ def _progress_watch(pgid, log_path=None, stall_s=0.0):
             def moved(self, *_a, **_k):
                 return True
 
-            def note_progress(self, *_a, **_k):
-                return None
-
-            def limit(self):
-                return float(stall_s or 0.0)
-
         return _Blind()
 
 
@@ -3981,6 +3927,7 @@ def _run_device_proc(
             # (_llm_child_alive), which no hung run can fail. Cooling stays: it is a deliberate
             # pause this tool asked for.
             _watch = _progress_watch(pgid, None, stall_s)
+            max_gap = 0.0
             _over_budget = [False]
             _ceiling_mult = _hard_ceiling_mult()
             while proc.poll() is None:
@@ -4010,9 +3957,9 @@ def _run_device_proc(
                 # liveness signals read that as a wedge, which is exactly wrong.
                 moved = _watch.moved(now, last_progress, proc.pid) or _act[0] > last_progress or _cooling_now()
                 if moved:
-                    _watch.note_progress(now, last_progress)  # the rule lives in ProgressWatch now
+                    max_gap = max(max_gap, now - last_progress)
                     last_progress = now
-                limit = int(_watch.limit())
+                limit = max(stall_s, int(3 * max_gap))
                 idle = now - last_progress
                 if idle >= limit:
                     print(
@@ -4705,17 +4652,6 @@ def _next_target_summary(kernel_log: str) -> str:
     return _op_lever_label(op, rung)
 
 
-def _load_summary():
-    """summary.py, loaded fresh from disk by path -- the one loader, so the final report and the
-    heartbeat read the same rules. Raises when it cannot be loaded; callers decide the fallback."""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("cc_summary", str(Path(__file__).parent / "summary.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def _last_attempt_summary(kernel_log: str) -> str:
     """One line describing the most recent lever attempt on file: which op, which stack, which
     lever, and the outcome -- what the watchdog heartbeat should say instead of a bare timer nobody
@@ -4746,24 +4682,8 @@ def _last_attempt_summary(kernel_log: str) -> str:
     elif a.get("diverged"):
         status = "· diverged (uncounted)"
     else:
-        status = _attempt_outcome(a, rows)
+        status = "· no gain"
     return f"{_op_lever_label(op, rung)}: {status}"
-
-
-def _attempt_outcome(a: dict, rows: list) -> str:
-    """The outcome of attempt `a`, by the SAME rules the report's result column uses.
-
-    THE LAST ROW IS USUALLY THE ATTEMPT, NOT ITS COMMIT. The skill commits and then records, so a win
-    is followed by its own attempt row, and asking only "is the last row a commit" labelled every
-    banked win "no gain" -- the report's _banking_commit is what links the two. Its PCC failure
-    reads as one ("✗ PCC 0.932 < 0.95") rather than as a bare no-gain."""
-    try:
-        s = _load_summary()
-        if s._banking_commit(a, rows) is not None:
-            return "✓ win, saved"
-        return s._attempt_result(a, False, rows)
-    except Exception:  # noqa: BLE001 -- the heartbeat never fails for a report it cannot load
-        return "· no gain"
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -5016,7 +4936,8 @@ def _baseline_name() -> str:
     648 ms reading, while this run's own baseline sat in the keyed file at 2464.18 ms. Same defect
     as the full-pipeline scoreboard: a file any other process can write is not this run's baseline.
     """
-    model, task = _ledger_keys()
+    model = os.environ.get("PERF_MCP_MODEL_NAME") or Path(os.environ.get("PERF_MCP_MODEL_ROOT", "") or "model").name
+    task = os.environ.get("PERF_MCP_TASK", "main")
     return "perf_mcp_baseline_%s_%s.json" % (model, task)
 
 
@@ -5120,17 +5041,12 @@ def _emit_summary(
     after_mode: str = "",
     stop_facts: dict | None = None,
 ) -> None:
-    # THE HARDWARE THIS RUN DETECTED, from its own manifest. This function has no `manifest` in scope
-    # (it is a local of run_cc_optimize), and the residual line below read one anyway -- a NameError
-    # its except swallowed, so the final summary never carried a residual.
+    import importlib.util
+
     try:
-        _mani = _latest_manifest(repo_root / PERF_DIR)
-        _run_env = (json.loads(_mani.read_text()).get("env") or {}) if _mani else {}
-    except (OSError, ValueError, AttributeError):
-        _run_env = {}
-    try:
-        mod = _load_summary()
-        mod.set_run_env(_run_env)  # the report prices the machine the run detected -- no default
+        spec = importlib.util.spec_from_file_location("cc_summary", str(Path(__file__).parent / "summary.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
     except Exception as exc:  # noqa: BLE001
         print(f"  [optimize/cc] summary unavailable: {exc}")
         return
@@ -5155,7 +5071,7 @@ def _emit_summary(
 
             _prof = _read_baseline_profile_for_report(repo_root)
             if _prof:
-                residual = _rl.residual_report(_prof, _run_env)
+                residual = _rl.residual_report(_prof, (manifest or {}).get("env", {}) or {})
         except Exception:  # noqa: BLE001
             residual = None
     except Exception:  # noqa: BLE001
@@ -6283,19 +6199,15 @@ def _hf_snapshots(model_id: str) -> list:
 
 
 def _hf_cache_weight_bytes(model_id: str) -> int:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from agent import model_bytes as _mb
-
     best = 0
     for snap in _hf_snapshots(model_id):
         total = 0
-        # Where the checkpoint says its weights are -- the top level and every declared component's
-        # subfolder (model_bytes.weight_files) -- not the top level alone.
-        for _prefix, p in _mb.weight_files(snap, _mb._WEIGHT_SUFFIXES):
-            try:
-                total += os.path.getsize(os.path.realpath(p))
-            except OSError:
-                pass
+        for p in snap.iterdir():
+            if p.suffix.lower() in (".safetensors", ".bin", ".pt", ".pth"):
+                try:
+                    total += os.path.getsize(os.path.realpath(p))
+                except OSError:
+                    pass
         best = max(best, total)
     return best
 
@@ -6440,7 +6352,6 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
     experts = cfg.get("num_local_experts") or cfg.get("num_experts") or cfg.get("n_routed_experts")
     src = "checkpoint bytes + HF config"
     analytic_params = 0
-    _unread_w: list = []  # weight files the checkpoint holds that no lookup read (the gate below)
     _unit = ""  # bound before the try below, which can raise before assigning it (params_basis reads it)
     # ANALYTIC FIRST: every tensor's shape and dtype from the safetensors header, with the on-device
     # widths applied per name pattern. The checkpoint's FILE SIZE counts the stored dtype -- 15.0 GB of
@@ -6466,7 +6377,6 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
         # SIZE as the divisor: 1.34 GB of float32 instead of its param count, i.e. ~4 B/param, so the
         # xB -> xGB rule was bypassed for exactly the models least able to report the error themselves.
         if _snap:
-            _unread_w = _mb.unread_weight_files(_snap)
             _an = _mb.weight_bytes(
                 _snap,
                 # Unknown unit -> count as "token", which EXCLUDES lookup-only tensors. One row of an
@@ -6560,20 +6470,6 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
         "dominant_dtype": str(cfg.get("torch_dtype") or "bfloat16"),
         "source": src,
     }
-    # EVERY WEIGHT FILE IS READ, OR THE RUN SAYS WHICH WERE NOT. A layout the reader does not know used
-    # to cost the whole roofline without a word -- it simply rendered "n/a -- not measured". Recorded in
-    # the facts (so the report and the dashboard carry it) and printed as an ERROR; not raised, because
-    # a ceiling must never cost a run.
-    if _unread_w:
-        facts["weights_unread"] = list(_unread_w)
-        print(
-            "  [optimize/cc] ERROR: %d weight file(s) in the checkpoint were NOT read (%s%s) -- every "
-            "number derived from the weights (params, roofline, fidelity ladder) is missing or short. "
-            "The checkpoint's layout is not one model_bytes.weight_files knows."
-            % (len(_unread_w), ", ".join(_unread_w[:4]), ", ..." if len(_unread_w) > 4 else ""),
-            file=sys.stderr,
-            flush=True,
-        )
     # PARAMS drive the ceiling (xB -> xGB). Exact count from the headers when readable, else the count
     # the model NAME publishes; for MoE the A-suffix ("30B-A3B") is the ACTIVE count, which is the read
     # set a routed token streams.

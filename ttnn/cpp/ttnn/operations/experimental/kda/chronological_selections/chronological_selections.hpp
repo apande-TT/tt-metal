@@ -10,6 +10,5 @@ Tensor chronological_selections(
     uint32_t local_rows,
     uint32_t batch_heads,
     uint32_t key_dim,
-    uint32_t value_dim,
-    const std::optional<Tensor>& actual_end = std::nullopt);
+    uint32_t value_dim);
 }

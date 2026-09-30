@@ -82,7 +82,7 @@ protected:
                 .source = kernel_src,
                 .num_threads = num_dms_,
                 .runtime_arg_schema = {.runtime_arg_names = {"sem_addr", "increment_times"}},
-                .hw_config = experimental::DataMovementHardwareConfig{},
+                .hw_config = experimental::DataMovementGen2Config{},
             });
             kernel_names.push_back(DM_KERNEL);
             params.kernel_run_args.push_back(make_run_params(DM_KERNEL));
@@ -95,12 +95,9 @@ protected:
                     .num_threads = 1,
                     .runtime_arg_schema = {.runtime_arg_names = {"sem_addr", "increment_times"}},
                     .hw_config =
-                        experimental::DataMovementHardwareConfig{
-                            .config_1xx =
-                                experimental::DataMovementHardwareConfig::DataMovement1XXConfig{
-                                    .processor = static_cast<tt_metal::DataMovementProcessor>(dm_id),
-                                    .noc = (dm_id == 1 ? NOC::RISCV_1_default : NOC::RISCV_0_default),
-                                },
+                        experimental::DataMovementGen1Config{
+                            .processor = static_cast<tt_metal::DataMovementProcessor>(dm_id),
+                            .noc = (dm_id == 1 ? NOC::RISCV_1_default : NOC::RISCV_0_default),
                         },
                 });
                 kernel_names.push_back(name);
@@ -151,7 +148,7 @@ protected:
             .source = kernel_path_cacheline,
             .num_threads = 1,
             .runtime_arg_schema = {.runtime_arg_names = {"base_addr", "report_addr", "residency_addr"}},
-            .hw_config = experimental::DataMovementHardwareConfig{},
+            .hw_config = experimental::DataMovementGen2Config{},
         };
         experimental::WorkUnitSpec main_wu{.name = "main", .kernels = {DM_KERNEL}, .target_nodes = core};
         experimental::ProgramSpec spec{
@@ -195,7 +192,7 @@ protected:
             .num_threads = num_dms_,
             .runtime_arg_schema =
                 {.runtime_arg_names = {"sem_addr", "lock_addr", "ret_base", "increment_times", "mode", "pairs"}},
-            .hw_config = experimental::DataMovementHardwareConfig{},
+            .hw_config = experimental::DataMovementGen2Config{},
         };
         experimental::WorkUnitSpec main_wu{.name = "main", .kernels = {DM_KERNEL}, .target_nodes = core};
         experimental::ProgramSpec spec{
@@ -280,7 +277,7 @@ TEST_F(NocSelfAtomicFixture, TestSelfVsRemoteNodeNocAtomic) {
         .source = kernel_path_noc,
         .num_threads = 1,
         .runtime_arg_schema = {.runtime_arg_names = {"sem_addr", "increment_times"}},
-        .hw_config = experimental::DataMovementHardwareConfig{},
+        .hw_config = experimental::DataMovementGen2Config{},
     };
     experimental::KernelSpec remote_spec{
         .unique_id = REMOTE_KERNEL,
@@ -288,23 +285,13 @@ TEST_F(NocSelfAtomicFixture, TestSelfVsRemoteNodeNocAtomic) {
         .num_threads = 1,
         .compiler_options = {.defines = {{"REMOTE_TARGET", "1"}}},
         .runtime_arg_schema = {.runtime_arg_names = {"sem_addr", "increment_times", "remote_noc_x", "remote_noc_y"}},
-        .hw_config = experimental::DataMovementHardwareConfig{},
+        .hw_config = experimental::DataMovementGen2Config{},
     };
     if (!is_quasar) {
-        self_spec.hw_config = experimental::DataMovementHardwareConfig{
-            .config_1xx =
-                experimental::DataMovementHardwareConfig::DataMovement1XXConfig{
-                    .processor = tt_metal::DataMovementProcessor::RISCV_0,
-                    .noc = NOC::RISCV_0_default,
-                },
-        };
-        remote_spec.hw_config = experimental::DataMovementHardwareConfig{
-            .config_1xx =
-                experimental::DataMovementHardwareConfig::DataMovement1XXConfig{
-                    .processor = tt_metal::DataMovementProcessor::RISCV_0,
-                    .noc = NOC::RISCV_0_default,
-                },
-        };
+        self_spec.hw_config = experimental::DataMovementGen1Config{
+            .processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default};
+        remote_spec.hw_config = experimental::DataMovementGen1Config{
+            .processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default};
     }
 
     experimental::WorkUnitSpec wu_0{.name = "wu_0", .kernels = {SELF_KERNEL}, .target_nodes = node_0};

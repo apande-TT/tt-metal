@@ -189,7 +189,7 @@ inline void validate(
 
         // Debug: Print first few values
         if (i < 8) {
-            log_debug(
+            log_info(
                 tt::LogTest,
                 "  Index {}: A={:.4f}, B={:.4f}, expected={:.4f}, actual={:.4f}",
                 i,

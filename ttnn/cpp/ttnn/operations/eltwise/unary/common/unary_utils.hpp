@@ -37,11 +37,7 @@ tt::tt_metal::ShardSpec adjust_to_shape(
     const tt::tt_metal::ShardSpec& shard_spec, const ttnn::Shape& from_shape, const ttnn::Shape& to_shape);
 
 // Synthesize a populated-shard output ShardSpec for specless sharded eltwise-unary outputs.
-// `output_element_size_bytes` reflects the output dtype (typecast can differ from input dtype).
 tt::tt_metal::ShardSpec generate_output_shard_spec(
-    const Tensor& input_tensor,
-    const ttnn::Shape& padded_out_shape,
-    tt::tt_metal::TensorMemoryLayout memory_layout,
-    uint32_t output_element_size_bytes);
+    const Tensor& input_tensor, const ttnn::Shape& padded_out_shape, tt::tt_metal::TensorMemoryLayout memory_layout);
 
 }  // namespace ttnn::operations::unary

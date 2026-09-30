@@ -90,7 +90,8 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreShardedProgramFactory::c
             .endpoint_type = DFBEndpointType::PRODUCER,
         }},
         .runtime_arg_schema = {.runtime_arg_names = {"num_tiles_per_core"}},
-        .hw_config = ttnn::create_reader_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
+        .hw_config =
+            ttnn::create_reader_datamovement_config(device->arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
 
     // Writer: interleaved scatter (TensorAccessor) or sharded in-place (handshake only).
@@ -111,7 +112,8 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreShardedProgramFactory::c
                 .accessor_name = "dst",
             }},
             .runtime_arg_schema = {.runtime_arg_names = {"num_pages", "start_id"}},
-            .hw_config = ttnn::create_writer_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
+            .hw_config =
+                ttnn::create_writer_datamovement_config(device->arch(), /*disable_dfb_implicit_sync_for_all=*/true),
         };
     } else {
         writer = KernelSpec{
@@ -125,21 +127,23 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreShardedProgramFactory::c
                 .endpoint_type = DFBEndpointType::CONSUMER,
             }},
             .runtime_arg_schema = {.runtime_arg_names = {"num_units"}},
-            .hw_config = ttnn::create_writer_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
+            .hw_config =
+                ttnn::create_writer_datamovement_config(device->arch(), /*disable_dfb_implicit_sync_for_all=*/true),
         };
     }
 
-    ComputeHardwareConfig compute_cfg;
+    ComputeGen1Config compute_cfg;
     compute_cfg.enable_32_bit_dest = fp32_llk_acc;
     if (fp32_llk_acc && input.dtype() != DataType::UINT8) {
         compute_cfg.unpack_modes.emplace(INPUT_DFB, UnpackMode::UnpackToDest);
     }
-    // Quasar gets only the common fields set above; WH/BH use compute_cfg as is.
+    // Gen2 (Quasar) config: a KernelSpec holds one generation and ValidateProgramSpec rejects a Gen1
+    // config on Quasar. Mirror the resolved Gen1 fields into a Gen2 config on Quasar; WH/BH keep Gen1.
     ComputeHardwareConfig compute_hw = compute_cfg;
     if (device->arch() == tt::ARCH::QUASAR) {
-        ComputeHardwareConfig compute_cfg_gen2;
+        ComputeGen2Config compute_cfg_gen2;
         compute_cfg_gen2.enable_32_bit_dest = compute_cfg.enable_32_bit_dest;
-        compute_cfg_gen2.unpack_modes = compute_cfg.unpack_modes;  // TODO(#52269): copied from WH/BH
+        compute_cfg_gen2.unpack_modes = compute_cfg.unpack_modes;  // TODO(#52269): copied from Gen1
         compute_hw = compute_cfg_gen2;
     }
     KernelSpec compute{

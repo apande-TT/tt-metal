@@ -68,8 +68,6 @@ struct BinaryNgDeviceOperation {
         // Sharded output's shape in pages on the accessor path. The inputs' equivalent rides in
         // tensor_args_t::to_hash(); the output has no Tensor at hash time, so it is carried here.
         std::optional<tt::tt_metal::Shape> c_tensor_shape_in_pages;
-        // Parameters of the op being run, for ops that take any; empty for ops that do not.
-        std::optional<binary::BinaryOpParams> op_params;
 
         DataType get_dtype() const;
 
@@ -99,8 +97,7 @@ struct BinaryNgDeviceOperation {
             "a_shard_volume",
             "b_shard_volume",
             "c_shard_volume",
-            "c_tensor_shape_in_pages",
-            "op_params");
+            "c_tensor_shape_in_pages");
 
         auto attribute_values() const {
             return std::make_tuple(
@@ -125,8 +122,7 @@ struct BinaryNgDeviceOperation {
                 a_shard_volume,
                 b_shard_volume,
                 c_shard_volume,
-                c_tensor_shape_in_pages,
-                binary_op_type == BinaryOpType::BIAS_GELU ? op_params : std::optional<binary::BinaryOpParams>{});
+                c_tensor_shape_in_pages);
         }
     };
 

@@ -42,7 +42,6 @@ class VisionAttention(LightweightModule):
         page_table=None,
         chunk_page_table=None,
         chunk_start_idx=None,
-        cu_window_seqlens=None,
     ):
         return self.forward_prefill(
             x,
@@ -52,7 +51,6 @@ class VisionAttention(LightweightModule):
             chunk_page_table=chunk_page_table,
             chunk_start_idx=chunk_start_idx,
             kv_cache=None,
-            cu_window_seqlens=cu_window_seqlens,
         )
 
     def __init(
@@ -290,7 +288,6 @@ class VisionAttention(LightweightModule):
         chunk_page_table=None,
         chunk_start_idx=None,
         kv_cache=None,
-        cu_window_seqlens=None,
     ):
         seq_len = x_11SH.shape[-2]
         assert seq_len % 128 == 0 and seq_len > 0, "Seqlen must be divisible by 128"
@@ -382,7 +379,6 @@ class VisionAttention(LightweightModule):
             k_heads_1KSD_8b,
             v_heads_1VSD_8b,
             is_causal=False,
-            cu_window_seqlens=cu_window_seqlens,
             scale=self.scale,
             compute_kernel_config=self.sdpa_prefill_compute_kernel_cfg,
             program_config=self.configuration.get_attn_sdpa_program_config(Mode.PREFILL, seq_len, None, None),

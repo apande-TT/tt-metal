@@ -33,7 +33,6 @@ struct AffineExclusiveScanInputs {
     Tensor tail_entry_states;
 
     Tensor actual_start;
-    std::optional<Tensor> actual_end;
 };
 
 }  // namespace ttnn::experimental::prim

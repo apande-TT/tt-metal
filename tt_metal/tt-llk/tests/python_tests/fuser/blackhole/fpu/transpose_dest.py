@@ -2,26 +2,39 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List
+from typing import List, Tuple
 
+import torch
 from fuser.base_fpu import Fpu
 from fuser.block_data import BlockData
 from fuser.fpu_node import FpuNode
 from fuser.fuser_config import GlobalConfig
-from fuser.golden.fpu.transpose_dest import transpose_dest_golden
-from fuser.indexing import InvocationGranularity
 from fuser.l1_operation import L1Operation
+from fuser.tile_loop import LoopTileByTile, TileLoop
 
 
 class TransposeDestFpu(Fpu):
-    granularity = InvocationGranularity.TILE
-    golden_fn = staticmethod(transpose_dest_golden)
+    loop: TileLoop = LoopTileByTile()
 
     def get_headers(self) -> List[str]:
         return [
             "llk_math_common.h",
             "llk_math_transpose_dest.h",
         ]
+
+    def golden(
+        self,
+        tensor_a: torch.Tensor,
+        tensor_b: torch.Tensor,
+        tensor_dst: torch.Tensor,
+        operation: L1Operation,
+        config: GlobalConfig,
+        compute_unit: FpuNode,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        golden_tensor = self.transpose_golden(
+            tensor_dst, config, operation, compute_unit
+        )
+        return tensor_a, tensor_b, golden_tensor
 
     def init(
         self,
@@ -43,7 +56,7 @@ class TransposeDestFpu(Fpu):
     ) -> str:
         is_32bit = config.dest_acc.cpp_enum_value
         transpose_faces = compute_unit.transpose_faces.cpp_enum_value
-        return f"_llk_math_transpose_dest_<{transpose_faces}, {is_32bit}>({block.tile_id_dest});\n"
+        return f"_llk_math_transpose_dest_<{transpose_faces}, {is_32bit}>({block.tile_id_block});\n"
 
     def uninit(
         self,

@@ -47,10 +47,8 @@ from fuser.validator import (
 )
 from helpers.llk_params import (
     BroadcastType,
-    MathFidelity,
     MathOperation,
     ReduceDimension,
-    ReducePool,
 )
 from pydantic import Field
 
@@ -85,7 +83,7 @@ _no_transpose_mismatch = reject(
 )
 
 _block_full_width = reject(
-    lambda s, a, b: s.block_size[1] != a.dimensions[1],
+    lambda s, a, b: s._block_size[1] != a.dimensions[1],
     "block width must be same as operand width",
 )
 
@@ -112,11 +110,6 @@ UNPACKER_MAP = {
             INT32_NEEDS_UNPACK_TO_DEST,
             NO_TRANSPOSE_UNPACK_TO_DEST,
             _no_transpose_mismatch,
-            reject(
-                lambda s, a, b: s.unpack_to_dest.value
-                and a.tile_shape.tile_dims != (32, 32),
-                "Quasar unpack_to_dest requires 32x32 tiles",
-            ),
         ],
     ),
     "UnpackerTilizeA": (
@@ -127,22 +120,11 @@ UNPACKER_MAP = {
             NO_TRANSPOSE,
             _block_full_width,
             NO_UNPACK_TO_DEST,
-            require_src_a_tiles((32, 32)),
         ],
     ),
     "UnpackerAB": (
         lambda s: UnpackerAB(),
-        [
-            IN0_REQUIRED,
-            IN1_REQUIRED,
-            NO_TRANSPOSE,
-            require_src_a_tiles((32, 32), (16, 16)),
-            reject(
-                lambda s, a, b: a.tile_shape.tile_dims != (32, 32)
-                and s.broadcast_type in (BroadcastType.Row, BroadcastType.Column),
-                "Quasar binary ROW/COL broadcast requires 32x32 tiles",
-            ),
-        ],
+        [IN0_REQUIRED, IN1_REQUIRED, NO_TRANSPOSE],
     ),
     "MatmulUnpacker": (
         lambda s: MatmulUnpacker(),
@@ -161,7 +143,7 @@ UNPACKER_MAP = {
         [IN0_REQUIRED, _broadcast_required, NO_TRANSPOSE, NO_UNPACK_TO_DEST],
     ),
     "UnpackReduceTilize": (
-        lambda s: UnpackReduceTilize(s.reduce_pool),
+        lambda s: UnpackReduceTilize(s.reduce_dim, s.reduce_pool),
         [
             IN0_REQUIRED,
             IN1_REQUIRED,
@@ -209,28 +191,10 @@ FPU_MAP = {
     "Reduce": (
         lambda s: ReduceFpu(s.reduce_dim, s.reduce_pool),
         [
-            IN0_REQUIRED,
-            IN1_REQUIRED,
             NO_REUSE_DEST,
             NO_BROADCAST,
             REDUCE_PARAMS_REQUIRED,
             forced_unpackers("ReduceUnpacker", "UnpackReduceTilize"),
-            reject(
-                lambda s, a, b: a.data_format.is_integer()
-                and a.tile_shape.tile_dims != (32, 32),
-                "Quasar integer Reduce requires 32x32 tiles",
-            ),
-            reject(
-                lambda s, a, b: a.data_format.is_integer()
-                and s.math_fidelity != MathFidelity.LoFi,
-                "Quasar integer Reduce requires LoFi fidelity",
-            ),
-            reject(
-                lambda s, a, b: a.data_format.is_integer()
-                and s.reduce_dim == ReduceDimension.Scalar
-                and s.reduce_pool != ReducePool.Max,
-                "Quasar integer scalar SUM/AVG is unsupported on the FPU",
-            ),
         ],
     ),
     "TransposeDest": (

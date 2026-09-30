@@ -770,15 +770,10 @@ def _golden_function_assign(
 ttnn.attach_golden_function(ttnn.assign, golden_function=_golden_function_assign)
 
 
-def _golden_function(a, b, *args, fast_and_approximate_mode=False, **kwargs):
+def _golden_function(a, b, *args, **kwargs):
     import torch
 
-    output_tensor = torch.nn.functional.gelu(torch.add(a, b))
-    if fast_and_approximate_mode:
-        # The device runs the lookup-table gelu here, which is deliberately outside the accurate
-        # reference's numerical contract, so comparing it against torch would always fail.
-        ttnn.decorators.set_golden_comparison_config(output_tensor, method="skip", scope="all")
-    return output_tensor
+    return torch.nn.functional.gelu(torch.add(a, b))
 
 
 ttnn.attach_golden_function(ttnn.bias_gelu, golden_function=_golden_function)

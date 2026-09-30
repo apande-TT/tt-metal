@@ -4,11 +4,14 @@
 
 #include <tt_stl/fmt.hpp>
 #include <cstdint>
+#include <filesystem>
 #include <algorithm>
 #include <memory>
 #include <mutex>
+#include <future>
 #include <set>
 #include <vector>
+#include <unordered_set>
 
 #include <tracy/Tracy.hpp>
 
@@ -33,6 +36,7 @@
 
 #include <umd/device/types/xy_pair.hpp>
 #include "debug/inspector/data.hpp"
+#include "debug/noc_logging.hpp"
 #include "debug/watcher_server.hpp"
 #include "debug/noc_debugging.hpp"
 #include "dispatch/topology.hpp"
@@ -169,8 +173,8 @@ void MetalContext::initialize(
     // DispatchCoreConfig{}, and comparing that against the already-resolved stored config would read as a
     // parameter change and tear down a context that in fact matches. Resolving first also leaves the stored
     // snapshot complete, which get_dispatch_core_axis() now requires.
-    DispatchCoreConfig resolved_config(
-        dispatch_core_config.get_dispatch_core_type(),
+    DispatchCoreConfig resolved_config = dispatch_core_config;
+    resolved_config.set_dispatch_core_axis(
         resolve_dispatch_core_axis(dispatch_core_config, get_cluster().arch(), get_fabric_tensix_config()));
 
     if (initialized_) {
@@ -674,6 +678,11 @@ tt_fabric::FabricReliabilityMode MetalContext::get_fabric_reliability_mode() con
 const tt_fabric::FabricRouterConfig& MetalContext::get_fabric_router_config() const {
     TT_FATAL(env_ != nullptr, "Missing MetalEnv for this MetalContext");
     return MetalEnvAccessor(*env_).impl().get_fabric_router_config();
+}
+
+void MetalContext::set_fabric_tensix_config(tt_fabric::FabricTensixConfig fabric_tensix_config) {
+    TT_FATAL(env_ != nullptr, "Missing MetalEnv for this MetalContext");
+    MetalEnvAccessor(*env_).impl().set_fabric_tensix_config(fabric_tensix_config);
 }
 
 tt_fabric::FabricTensixConfig MetalContext::get_fabric_tensix_config() const {
