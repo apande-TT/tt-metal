@@ -390,7 +390,14 @@ class TextStack:
                     )
                     for t in (cos, sin)
                 ),
-                "mask": ttnn.from_torch(mask.to(torch.bfloat16).contiguous(), **bf16),
+                # SDPA re-reads the whole mask for every one of the 32 heads; only 0 and -inf are in
+                # it, which bfloat4_b holds exactly, at 576 B a tile instead of 2048.
+                "mask": ttnn.from_torch(
+                    mask.to(torch.bfloat16).contiguous(),
+                    dtype=ttnn.bfloat4_b,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.device,
+                ),
                 "slot_mask": ttnn.from_torch(
                     slot_mask.to(torch.float32).contiguous(),
                     dtype=ttnn.float32,
