@@ -110,20 +110,24 @@ def build_mcp_config(python_bin: str, server_path: str | Path, env: dict, server
 #   3. The caller's own budget as the FLOOR -- what it wraps, so it can never be tighter.
 # The result only ever grows. A gate that ran long once is not evidence that the next one is hung.
 _GATE_STATUS_TIMEOUT_ENV = "E2E_GATE_STATUS_TIMEOUT"
-_GATE_STATUS_GROWTH = 4  # headroom over the longest observed gate, matching probes' ceiling multiple
 _gate_status_observed: dict = {}
 
 
 def _gate_status_budget(key: str, floor: int) -> int:
-    """Seconds this gate check may take: operator's value, else measured cost, else the floor."""
+    """Seconds this gate check may take: operator's value, else measured cost, else the floor.
+
+    The SIZING is probes.sized_budget -- one owner, because a second piece of gate state now needs
+    the same rule and two copies of "how long may this take" is how the 600 s window came to disagree
+    with the 2400 s one. What stays here is the OBSERVATION: this process's own longest gate."""
+    from models.experimental.perf_automation.agent import probes as _pr_budget
+
     override = os.environ.get(_GATE_STATUS_TIMEOUT_ENV)
     if override:
         try:
             return max(1, int(override))
         except ValueError:
             pass
-    observed = float(_gate_status_observed.get(key) or 0.0)
-    return max(int(floor), int(_GATE_STATUS_GROWTH * observed))
+    return _pr_budget.sized_budget(_gate_status_observed.get(key), floor)
 
 
 def _record_gate_status_cost(key: str, seconds: float) -> None:

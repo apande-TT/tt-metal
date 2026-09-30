@@ -80,9 +80,8 @@ def adaptive_backstop(floor_default: int = 3600, mult: int = 3, env_key: str = "
         except Exception:  # noqa: BLE001
             pass
         base = observed_tracy_baseline_seconds(m) or base
-    if ceil < floor:
-        ceil = floor
-    return min(ceil, max(floor, int(mult * base)))
+    # Same arithmetic as every other budget in this tree, so it is asked for rather than repeated.
+    return sized_budget(base, floor, mult=mult, ceiling_s=ceil)
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +666,46 @@ _GAP_MULT = 3
 # How far past its budget a still-moving step may run before the attempt is failed. A multiple, so
 # it scales with what the caller already said the work is worth.
 _HARD_CEILING_MULT = 4
+
+# HOW LONG A STEP MAY TAKE, WHEN NOBODY CAN KNOW IN ADVANCE.
+#
+# Every budget in this tree started as a number someone typed for the step they had in front of them,
+# and each one later killed a bigger step that was working: 2400 -> 600 s for the stall window, then
+# a 900 s capture budget whose 4x ceiling ended a trace capture twice while it was visibly
+# progressing. A typed number is a guess about work nobody has measured yet, so it is only ever the
+# FLOOR here -- never the answer while a measurement exists.
+#
+# Order: an operator's explicit value wins outright and unscaled; else headroom over the longest run
+# actually OBSERVED for this kind of work; else the caller's floor, so a wrapper can never be tighter
+# than what it wraps. The POLICY lives here, with the ceiling that enforces it. WHERE the observation
+# is kept stays with the caller -- one domain holds it in memory for the life of a process, another
+# must persist it because its gate is a fresh process every round -- and that is a storage question,
+# not a sizing one.
+_BUDGET_GROWTH = 4  # headroom over measured cost, the same multiple the ceiling uses
+
+
+def sized_budget(observed_s, floor_s, mult=None, ceiling_s=0) -> int:
+    """Headroom over MEASURED cost, never below `floor_s`, optionally capped at `ceiling_s`.
+
+    The arithmetic only. Reading an operator's override stays with each caller because the callers
+    genuinely differ -- one clamps a pinned value to at least a second, another passes it through as
+    given, and flattening that here would change what a pinned 0 means in the domain that allows it.
+    What must not differ, and did, is how a measurement becomes a budget."""
+    try:
+        observed = float(observed_s or 0.0)
+    except (TypeError, ValueError):
+        observed = 0.0
+    try:
+        floor = int(floor_s or 0)
+    except (TypeError, ValueError):
+        floor = 0
+    m = float(_BUDGET_GROWTH if mult is None else mult)
+    out = max(floor, int(m * observed))
+    try:
+        ceil = int(ceiling_s or 0)
+    except (TypeError, ValueError):
+        ceil = 0
+    return min(max(ceil, floor), out) if ceil else out
 
 
 def _pgroup_io_counters(pgid) -> tuple:

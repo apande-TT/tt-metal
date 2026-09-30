@@ -42,6 +42,52 @@ _NOTE_MAX_DEPTH = 3
 _REPLAY_ITERS = max(1, int(os.environ.get("TT_TRACE_REPLAY_ITERS", "16")))
 
 
+# HOW MANY REPLAYS TO AVERAGE IS A CONSEQUENCE OF WHAT ONE COSTS, NOT A NUMBER PER MODEL.
+#
+# 16 is a noise-reduction choice, and a good one for a step costing milliseconds: the timer's own
+# jitter is a large fraction of one iteration, so averaging many is how the figure becomes stable.
+# For a stage costing 68 SECONDS an iteration it buys nothing measurable -- the jitter is already
+# negligible against the signal -- and costs 18 minutes of device time per stage. That is what put a
+# Qwen-Image-Edit capture past the budget it was given, where an absolute ceiling (4 x a typed 900 s)
+# killed it mid-progress, twice, 3611 s apart, with one stage traced and the next mid-replay.
+#
+# The caller already states the constraint: `run_fresh_trace_capture` puts its budget in the
+# environment and the capture child inherits it. So ONE replay is timed first, and only as many more
+# as that budget affords are added -- at least two, so there is always an average, and never more
+# than was asked for, so a cheap stage is measured exactly as before. The count is the means; the
+# budget is the constraint, and it is the caller's to state rather than this file's to guess.
+# BUDGETS ONLY. This listed PERF_MCP_MEASURE_STALL_SEC, which is a STALL WINDOW -- run.py passes it
+# as `stall_s=`, the no-progress detector's window, not an allowance for the work. Sizing a
+# measurement from it would have cut sample counts in the optimize domain, where it is routinely set,
+# for a reason that has nothing to do with how long the measurement may take.
+_REPLAY_BUDGET_ENVS = ("PERF_MCP_VALIDATE_TIMEOUT", "PERF_MCP_MEASURE_BACKSTOP")
+_MIN_REPLAY_ITERS = 2  # an average needs two; dimensionless, so it assumes nothing about the model
+
+
+def _measurement_budget_s(stages=1) -> float:
+    """This stage's share of the budget the caller gave the capture, or 0 when nothing was stated."""
+    for key in _REPLAY_BUDGET_ENVS:
+        try:
+            v = float(os.environ.get(key) or 0)
+        except ValueError:
+            v = 0.0
+        if v > 0:
+            return v / max(1, int(stages or 1))
+    return 0.0
+
+
+def _affordable_iters(requested, per_iter_s, budget_s) -> int:
+    """As many replays as the budget affords: >= _MIN_REPLAY_ITERS, <= what was asked for."""
+    try:
+        requested = max(1, int(requested))
+    except (TypeError, ValueError):
+        requested = 1
+    if not budget_s or not per_iter_s or per_iter_s <= 0:
+        return requested  # nothing stated, or no cost observed -> behave exactly as before
+    affordable = int(budget_s // per_iter_s)
+    return max(min(requested, _MIN_REPLAY_ITERS), min(requested, affordable))
+
+
 # A LOOP THAT PRINTS NOTHING READS AS A HANG, AND IT IS NOT ONE.
 #
 # Warmup, capture and replay ran their iterations in silence, and the replay batch is enqueued
@@ -193,16 +239,29 @@ def _capture_step_trace(device, step):
     return tid
 
 
-def _replay_1cq(device, tid, iters):
+def _replay_1cq(device, tid, iters, budget_s=0.0):
     # The replays are enqueued non-blocking ON PURPOSE -- that is what makes this a steady-state
     # throughput measurement -- so the wait is one silent block that no per-iteration print can
     # break. Hence the heartbeat: it grows the log without touching the timed region.
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        ttnn.execute_trace(device, tid, cq_id=0, blocking=False)
-    with _Alive("replay x%d" % iters):
+    #
+    # ONE FIRST, TO LEARN WHAT IT COSTS. Its own time is a valid steady-state sample (the trace is
+    # already captured and warmed), so nothing is spent to find out; it just decides how many more
+    # are worth adding. See _affordable_iters.
+    t1 = time.perf_counter()
+    ttnn.execute_trace(device, tid, cq_id=0, blocking=False)
+    with _Alive("replay 1"):
         ttnn.synchronize_device(device)
-    return (time.perf_counter() - t0) / iters
+    one_s = time.perf_counter() - t1
+    n = _affordable_iters(iters, one_s, budget_s)
+    print("TRACE_STAGE_REPLAYS=%d of %d requested (%.1fs each)" % (n, iters, one_s), flush=True)
+    if n <= 1:
+        return one_s
+    t0 = time.perf_counter()
+    for _ in range(n):
+        ttnn.execute_trace(device, tid, cq_id=0, blocking=False)
+    with _Alive("replay x%d" % n):
+        ttnn.synchronize_device(device)
+    return (time.perf_counter() - t0) / n
 
 
 # A REPLAYED TRACE DISPATCHES ONE OP. An eager pass dispatches one per ttnn call in the model --
@@ -362,7 +421,7 @@ def _report_read_set(stage_name, dispatches, ws_bytes):
     print("TRACE_STAGE_BYTES_NONE[%s] reason=%s" % (stage_name, _why), flush=True)
 
 
-def _measure_native(device, stage):
+def _measure_native(device, stage, budget_s=0.0):
     """Time a SELF-TRACED stage: the pipeline owns its trace capture (persistent-buffer / vLLM-style
     decode, e.g. GLM's decode(enable_trace=True)), so we must NOT begin_trace_capture around it --
     doing so raises "Writes/Reads are not supported during trace capture" because the step does
@@ -384,10 +443,18 @@ def _measure_native(device, stage):
     _report_read_set(stage.name, dispatched, _ws_bytes)
     ttnn.synchronize_device(device)
     t0 = time.perf_counter()
-    _iterate(stage.step, _REPLAY_ITERS, stage.name)
+    # Same rule as _replay_1cq: one step is a valid sample and tells us what the rest would cost.
+    _t1 = time.perf_counter()
+    stage.step()
+    _one = time.perf_counter() - _t1
+    _n = _affordable_iters(_REPLAY_ITERS, _one, budget_s)
+    print("TRACE_STAGE_REPLAYS=%d of %d requested (%.1fs each)" % (_n, _REPLAY_ITERS, _one), flush=True)
+    _iterate(stage.step, max(0, _n - 1), stage.name)
     with _Alive(stage.name):
         ttnn.synchronize_device(device)
-    per_s = (time.perf_counter() - t0) / _REPLAY_ITERS
+    # Divided by what actually RAN, not by what was requested: _n may be fewer, and dividing by the
+    # request would report a per-iteration time smaller than any iteration took.
+    per_s = (time.perf_counter() - t0) / max(1, _n)
     tp = getattr(stage, "trace_path", None)
     if callable(tp):
         try:
@@ -409,7 +476,7 @@ def _measure_native(device, stage):
     return per_s * 1000.0, path
 
 
-def _measure_stage(device, stage):
+def _measure_stage(device, stage, budget_s=0.0):
     """Capture stage.step as a trace, replay it on a single command queue, return (ms, path).
 
     THE READ SET IS OBSERVED HERE, for every stage. It was measured inside _measure_native, which
@@ -423,7 +490,7 @@ def _measure_stage(device, stage):
     is the quantity params x width is trying to approximate.
     """
     if getattr(stage, "self_traced", False):
-        return _measure_native(device, stage)
+        return _measure_native(device, stage, budget_s)
     _ws_bytes, _n = 0, None
     try:
         _n, _ws_bytes = _count_op_dispatches(stage.step)
@@ -434,7 +501,7 @@ def _measure_stage(device, stage):
         _report_read_set(stage.name, _n, _ws_bytes)
     tid = _capture_step_trace(device, stage.step)
     try:
-        per_s = _replay_1cq(device, tid, _REPLAY_ITERS)
+        per_s = _replay_1cq(device, tid, _REPLAY_ITERS, budget_s)
         path = "trace+1cq"
     finally:
         try:
@@ -618,6 +685,9 @@ def measure_adapter(adapter, device) -> float:
         stages = [_LegacyStage(adapter)]
 
     results = []
+    # EACH STAGE GETS ITS SHARE, not the whole budget: they run in sequence, so a stage that spends
+    # everything leaves the ones after it nothing and the capture dies with rows missing.
+    _stage_budget = _measurement_budget_s(len(stages))
     for st in stages:
         try:
             from .probes import thermal_yield
@@ -630,7 +700,7 @@ def measure_adapter(adapter, device) -> float:
         # had no such guard, so a raise here lost every stage rather than one -- the whole replay,
         # and with it every roofline row, for a fault in a single tower. Same rule, one step later.
         try:
-            ms, path = _measure_stage(device, st)
+            ms, path = _measure_stage(device, st, _stage_budget)
         except Exception as exc:  # noqa: BLE001
             print(
                 "  [trace-replay] stage %r could not be measured (%s: %s); it gets no row, the "
@@ -649,6 +719,11 @@ def measure_adapter(adapter, device) -> float:
         _n = int(getattr(st, "items", 0) or 0)
         if _n > 0:
             print("TRACE_STAGE_ITEMS[%s]=%d" % (st.name, _n), flush=True)
+        # AND HOW MANY DATA-PARALLEL GROUPS SHARE THEM (stage_seams.SPLIT), so the ceiling prices what
+        # one chip does. Printed only for a stage that is split: 1 is the reader's fallback.
+        _sp = int(getattr(st, "split", 0) or 0)
+        if _sp > 1:
+            print("TRACE_STAGE_SPLIT[%s]=%d" % (st.name, _sp), flush=True)
 
     # WHICH MODULES EACH STAGE RUNS, read from the pipeline's own code (stage_marks.stage_module_paths)
     # so perf_mcp can price each stage's compute from the weights it actually multiplies instead of

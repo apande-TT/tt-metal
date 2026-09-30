@@ -2445,6 +2445,12 @@ def measure_candidate() -> dict:
     faster = delta > _win_threshold(base_dev)
     pt_ms = prof.get("per_token_ms")
     base_pt = baseline.get("per_token_ms")
+    # THE MEASUREMENT git_commit FOLLOWS. The skill's loop is measure_candidate -> git_commit ->
+    # record_kernel_attempt, so the stamp record_kernel_attempt makes lands one call too late:
+    # _record_committed_win found no measured_ms on the target and wrote no commit row, and with none
+    # anywhere the report ticked every faster try -- Qwen-Image-Edit showed 5 wins for 2 commits, two
+    # of them reverted for PCC. Stamped here as well, the order the agent calls them in stops mattering.
+    _stamp_target_measurement(dev)
     return {
         "verdict": "valid",
         "device_ms": dev,
@@ -2479,16 +2485,24 @@ def check_pcc() -> dict:
         if _is_measurement_failure(_msg):
             out = _measurement_failed_result(_msg)
             out["status"] = "measurement_failed"
-            record_gate_verdict("pcc", "measurement_failed")
+            record_gate_verdict("pcc", "measurement_failed", measurement_id=_measurement_id())
             return out
         _note_device_crash("check_pcc", _msg)
-        record_gate_verdict("pcc", "crash")
+        record_gate_verdict("pcc", "crash", measurement_id=_measurement_id())
         return {"status": "crash", "error": _msg}
     if res.get("status") == "crash":
         _note_device_crash("check_pcc", str(res.get("error") or ""))
     else:
         _note_device_ok()
-    record_gate_verdict("pcc", res.get("status"), pcc=res.get("pcc"))
+    # The id makes this reading ownable by exactly one attempt (_attempt_pcc_verdict), the same rule
+    # the end-to-end verdict follows; the threshold travels with it so the report can say what it missed.
+    record_gate_verdict(
+        "pcc",
+        res.get("status"),
+        pcc=res.get("pcc"),
+        threshold=res.get("threshold"),
+        measurement_id=_measurement_id(),
+    )
     return res
 
 
@@ -3253,6 +3267,7 @@ def _run_full_pipeline_ms():
     stage_paths = {}
     stage_isl = {}
     stage_modules: dict = {}  # {stage: module paths it runs}, from TRACE_STAGE_MODULES
+    stage_split: dict = {}  # {stage: data-parallel groups sharing its items}, from TRACE_STAGE_SPLIT
     # {stage: items PER REQUEST}, the legacy marker's unit. Kept apart from stage_isl, which holds
     # the TOTAL a stage states for one call.
     stage_isl_per_request = {}
@@ -3438,14 +3453,15 @@ def _run_full_pipeline_ms():
                         stage_modules[_mn] = _mv
                 except Exception:  # noqa: BLE001
                     pass
-            if "TRACE_STAGE_ITEMS[" in line:
-                try:
-                    _nm = line.split("TRACE_STAGE_ITEMS[", 1)[1].split("]", 1)[0].strip()
-                    _nv = int(line.split("]=", 1)[1].split()[0])
-                    if _nm and _nv > 0:
-                        stage_isl[_nm] = _nv
-                except Exception:  # noqa: BLE001
-                    pass
+            for _marker, _into in (("TRACE_STAGE_ITEMS[", stage_isl), ("TRACE_STAGE_SPLIT[", stage_split)):
+                if _marker in line:
+                    try:
+                        _nm = line.split(_marker, 1)[1].split("]", 1)[0].strip()
+                        _nv = int(line.split("]=", 1)[1].split()[0])
+                        if _nm and _nv > 0:
+                            _into[_nm] = _nv
+                    except Exception:  # noqa: BLE001
+                        pass
             if "PERF_ISL_TOKENS=" in line:
                 try:
                     _iv = int(line.split("PERF_ISL_TOKENS=", 1)[1].split()[0])
@@ -3602,16 +3618,20 @@ def _run_full_pipeline_ms():
         # column must not move while the run works. Observed per run, so unpinned it would follow a
         # change in prefill chunking straight into the ceiling.
         try:
-            for _tn, _tv in (stage_isl or {}).items():
-                if _tn and int(_tv or 0) > 0:
-                    _ledger().anchor(
-                        _ledger().KIND_STAGE_TOKENS,
-                        float(int(_tv)),
-                        depth=str(_tn).strip().lower(),
-                        mode="items",
-                        source="trace_replay observed item count",
-                        model=_MODEL_ROOT.name if _MODEL_ROOT else "",
-                    )
+            for _kind, _vals, _mode, _src in (
+                (_ledger().KIND_STAGE_TOKENS, stage_isl, "items", "trace_replay observed item count"),
+                (_ledger().KIND_STAGE_SPLIT, stage_split, "count", "trace_replay stated data-parallel split"),
+            ):
+                for _tn, _tv in (_vals or {}).items():
+                    if _tn and int(_tv or 0) > 0:
+                        _ledger().anchor(
+                            _kind,
+                            float(int(_tv)),
+                            depth=str(_tn).strip().lower(),
+                            mode=_mode,
+                            source=_src,
+                            model=_MODEL_ROOT.name if _MODEL_ROOT else "",
+                        )
         except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost a measurement
             pass
         _pin_stage_params_and_tp(stage_modules, tp)
@@ -5579,10 +5599,29 @@ def _baseline_at_record():
         return None
 
 
-def _consumed_verdict_path():
+def _consumed_verdict_path(gate: str = "fullpipe"):
     return state_dir() / (
-        "perf_mcp_fullpipe_consumed_%s_%s.json" % (_model_key(), os.environ.get("PERF_MCP_TASK", "main"))
+        "perf_mcp_%s_consumed_%s_%s.json" % (gate, _model_key(), os.environ.get("PERF_MCP_TASK", "main"))
     )
+
+
+def _claim_verdict(gate: str, ident) -> bool:
+    """Mark the measurement `ident` as owned by the attempt being recorded; False when an earlier
+    attempt already owns it (or it carries no identity). ONE MEASUREMENT, ONE ATTEMPT -- the rule the
+    end-to-end verdict has always had, shared so the PCC reading follows it too."""
+    if ident is None:
+        return False
+    path = _consumed_verdict_path(gate)
+    try:
+        if json.loads(path.read_text()) == ident:
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        path.write_text(json.dumps(ident))
+    except OSError:
+        pass
+    return True
 
 
 def _measurement_id() -> str:
@@ -5649,26 +5688,31 @@ def _attempt_fullpipe_verdict() -> dict:
     if not ms > 0:
         return out
 
-    ident = _verdict_identity(fp)
-    if ident is None:
-        # No measurement id -> this verdict cannot be traced to a trace replay. Not ownable.
+    # No measurement id -> this verdict cannot be traced to a trace replay, so it is not ownable; an
+    # id an earlier attempt already claimed belongs to that attempt.
+    if not _claim_verdict("fullpipe", _verdict_identity(fp)):
         return out
-    path = _consumed_verdict_path()
-    try:
-        already = json.loads(path.read_text())
-    except Exception:  # noqa: BLE001
-        already = None
-    if already == ident:
-        return out  # this measurement already belongs to an earlier attempt
 
     ref = _fullpipe_reference_ms(fp)
     out.update(own=True, ms=round(ms, 4), ref=None if ref is None else round(ref, 4))
     if ref is not None:
         out["win"], out["delta"], out["metric"] = _win_from_verdict(fp, ms, ref)
-    try:
-        path.write_text(json.dumps(ident))
-    except OSError:
-        pass
+    return out
+
+
+def _attempt_pcc_verdict() -> dict:
+    """{pcc, pcc_status, pcc_threshold} of the PCC reading this attempt owns, or {} when it owns none.
+
+    Owned exactly like the end-to-end verdict: the check_pcc run's own id, claimed once, so a later
+    attempt that ran no check of its own never borrows the previous one's accuracy."""
+    v = gate_verdicts().get("pcc") or {}
+    mid = v.get("measurement_id")
+    if not mid or not _claim_verdict("pcc", [str(v.get("sha") or ""), str(mid)]):
+        return {}
+    out = {"pcc_status": str(v.get("status") or "")}
+    for k, key in (("pcc", "pcc"), ("threshold", "pcc_threshold")):
+        if isinstance(v.get(k), (int, float)):
+            out[key] = float(v[k])
     return out
 
 
@@ -5994,6 +6038,9 @@ def record_kernel_attempt(
         "op_signature": op_signature,
         "kernel_kind": kernel_kind,
         "measured_ms": _ms,
+        # THE ACCURACY THIS CANDIDATE HAD, beside the time it had -- so a faster change that was
+        # reverted for PCC reads as that in the report, not as a bare negative delta.
+        **_attempt_pcc_verdict(),
         # ONE COMPARISON, MADE ONCE, FOR THIS ATTEMPT -- see _attempt_fullpipe_verdict. This attempt's
         # OWN end-to-end minus the running best; the SIGN IS THE VERDICT. The banked flag, the delta
         # the report prints and the win mark all read this one result, so they cannot disagree about
@@ -7142,11 +7189,13 @@ def _pin_stage_params_and_tp(stage_modules: dict, tp) -> None:
 
 
 def _tp_degree() -> int:
-    """TP for the ceilings: the operator's topology when the tool exported one, else the degree the
-    run's own marker reported (pinned), else 1."""
-    env_tp = int(os.environ.get("TT_PERF_MESH_COLS", "0") or "0")
-    if env_tp > 0:
-        return env_tp
+    """TP for the ceilings: the degree the run's own marker reported (pinned), else the topology the
+    tool exported, else 1.
+
+    THE MARKER FIRST. It is read off the device the model actually opened and, when the pipeline states
+    its own split (stage_seams.TP_ATTR), off the pipeline -- so for a model that states nothing it
+    equals the exported columns anyway, and for one that does it is the only right answer: a 4,8
+    Galaxy exported as 1x32 when the model cannot be probed, while Qwen-Image-Edit runs TP=8."""
     try:
         led = _ledger()
         v = led.anchor_value(led.KIND_TP_DEGREE, depth="pipeline", model=_MODEL_ROOT.name if _MODEL_ROOT else "")
@@ -7154,7 +7203,8 @@ def _tp_degree() -> int:
             return int(v)
     except Exception:  # noqa: BLE001
         pass
-    return 1
+    env_tp = int(os.environ.get("TT_PERF_MESH_COLS", "0") or "0")
+    return env_tp if env_tp > 0 else 1
 
 
 def _select_perf_target(rep: dict):

@@ -1015,25 +1015,58 @@ def _win_set(attempts, baseline_ms=None) -> set:
     if not any(isinstance(a, dict) and a.get("commit_record") for a in rows):
         return wins  # this ledger predates commit rows entirely; unfiltered is the honest answer
     _m = _perf_mcp()
-    _match = getattr(_m, "_op_match", None) if _m else None
-    if not callable(_match):
+    if not callable(getattr(_m, "_op_match", None) if _m else None):
         return wins  # cannot verify banking here; do not silently blank the report
-    banked = set()
-    for i in wins:
-        a = rows[i] if 0 <= i < len(rows) else None
-        if not isinstance(a, dict):
-            continue
-        rung = str(a.get("kernel_kind") or "").strip().lower()
-        sig = a.get("op_signature")
-        for b in rows:
-            if not isinstance(b, dict) or not b.get("commit_record"):
-                continue
-            if _banks_the_same_state(a, b) or (
-                str(b.get("kernel_kind") or "").strip().lower() == rung and _match(sig, b)
-            ):
-                banked.add(i)
-                break
-    return banked
+    return {i for i in wins if 0 <= i < len(rows) and _banking_commit(rows[i], rows) is not None}
+
+
+def _banking_commit(a, rows):
+    """The commit row that banked attempt `a`, or None. ONE matching rule for "was it banked" and
+    "by which commit": the end-to-end reading both rows share (_banks_the_same_state), else op +
+    rung via perf_mcp's own _op_match."""
+    if not isinstance(a, dict) or a.get("commit_record"):
+        return None
+    _m = _perf_mcp()
+    _match = getattr(_m, "_op_match", None) if _m else None
+    rung = str(a.get("kernel_kind") or "").strip().lower()
+    sig = a.get("op_signature")
+    commits = [b for b in rows or [] if isinstance(b, dict) and b.get("commit_record")]
+    # THE SAME READING FIRST. Two wins on one op and rung are banked by two commits; op + rung alone
+    # would hand both the first commit's sha, so it is only the fallback for a commit that recorded no
+    # end-to-end reading of its own.
+    for b in commits:
+        if _banks_the_same_state(a, b):
+            return b
+    for b in commits:
+        if callable(_match) and str(b.get("kernel_kind") or "").strip().lower() == rung and _match(sig, b):
+            return b
+    return None
+
+
+def _attempt_result(a, won: bool, rows) -> str:
+    """The per-attempt result cell: what happened to this try, from what its own row recorded.
+
+    ✓ only for a banked win, with the commit that banked it; a candidate the PCC gate failed says so
+    with the number it had, since "faster" is not a result when the change was reverted for it."""
+    # FIRST: a candidate whose own PCC reading failed cannot have been banked (gates_allow_banking
+    # refuses it), so no fallback may tick it -- whatever its delta says.
+    _led = _ledger()
+    if _led is not None and _led.pcc_failed(a):
+        _st = str(a.get("pcc_status") or "")
+        _p, _t = a.get("pcc"), a.get("pcc_threshold")
+        if isinstance(_p, (int, float)) and isinstance(_t, (int, float)):
+            return "✗ PCC %.3f < %.2f" % (_p, _t)
+        return "✗ PCC %s" % _st
+    if won:
+        _c = _banking_commit(a, rows)
+        _sha = str((_c or {}).get("commit") or "")[:11]
+        return "✓ win (%s)" % _sha if _sha else "✓ win"
+    if a.get("wedged"):
+        return "· wedged"
+    _d = a.get("fullpipe_delta_ms")
+    if isinstance(_d, (int, float)) and _d < 0 and any(isinstance(b, dict) and b.get("commit_record") for b in rows):
+        return "· not kept"  # faster on the replay, but no commit banked it
+    return "· no gain"
 
 
 # THE MATH-FIDELITY RUNGS, ONE LIST. _fidelity_breakdown held it as a local so the ladder always
@@ -1846,6 +1879,7 @@ def _measured_bw_gbps(rf: dict, ms):
 # function rather than a ledger import repeated at each use.
 _LED_PARAMS = "matmul_params"
 _LED_TOKENS = "stage_tokens"
+_LED_SPLIT = "stage_split"
 
 
 def _pinned_ceiling_input(kind: str, stage, model: str = "", task: str = ""):
@@ -1897,6 +1931,17 @@ def _stage_roofs(active_bytes, peak_bw_gbps, tp_degree, unit, profile=None, stag
         _v, _b = _share_and_basis(mf, stage)
         _share_bases[str(stage)] = _b
         return _v
+
+    def _split_of(stage) -> int:
+        """How many data-parallel groups share this stage's items, as pinned; 1 when none was stated.
+
+        Divides the per-item terms only. Every group streams its own full weight shard once per call,
+        so the weights' share of the read set does not shrink with the split -- the items do."""
+        try:
+            _v = _pinned_ceiling_input(_LED_SPLIT, stage, model, task)
+            return max(1, int(_v or 1))
+        except Exception:  # noqa: BLE001
+            return 1
 
     def _stage_block(stage):
         """The geometry of the block this stage runs, or None when it cannot be established.
@@ -2001,7 +2046,7 @@ def _stage_roofs(active_bytes, peak_bw_gbps, tp_degree, unit, profile=None, stag
             ) - float(_ab(mf, regime=stage, seq_len=0, batch=1, items=0, block=_blk) or 0.0)
         except Exception:  # noqa: BLE001 -- regime unknown to the byte model, or no byte model at all
             return base
-        return base + max(0.0, _extra) / tp
+        return base + max(0.0, _extra) / (tp * _split_of(stage))
 
     params = 0
     try:
@@ -2142,7 +2187,8 @@ def _stage_roofs(active_bytes, peak_bw_gbps, tp_degree, unit, profile=None, stag
         except Exception:  # noqa: BLE001
             pass
         _attn = (4.0 * _L * float(toks) * float(toks) * _H) if (_L and _H) else 0.0
-        flops = ((2.0 * float(_params) * float(toks) + _attn) / tp) if _params else 0.0
+        # PER CHIP: TP splits each item's math, the stage's data-parallel groups split the items.
+        flops = ((2.0 * float(_params) * float(toks) + _attn) / (tp * _split_of(name))) if _params else 0.0
         # THIS STAGE'S OWN PEAK, when the capture marked its ops. The value resolved above is the
         # dominant fidelity across the WHOLE profile, applied to every stack -- one variable, used
         # three times. It is right only while every stack runs the same math mode: on voxtral encode,
@@ -3707,15 +3753,18 @@ def render_summary(
         # Copy, the data movers, half of a typical run -- cannot be placed at all. Read from the
         # capture's marks; blank when the capture marked no stages, which is exactly how the column
         # renders for a model that emits none.
-        _ar = " %-44s\u2502 %-9s\u2502 %-18s\u2502 %-20s\u2502 %-22s\u2502 %s"
-        ah = _ar % ("op", "stack", "lever", "eager device_ms", "1CQ \u0394 vs current", "result")
+        # PCC: the accuracy this candidate had (its own check_pcc reading), "—" when it recorded none.
+        _ar = " %-44s\u2502 %-9s\u2502 %-18s\u2502 %-20s\u2502 %-22s\u2502 %-8s\u2502 %s"
+        ah = _ar % ("op", "stack", "lever", "eager device_ms", "1CQ \u0394 vs current", "PCC", "result")
         lines.append(ah)
         # THE RULE IS DERIVED FROM THE HEADER, not counted by hand. Hand-counted it drifted the
         # moment a field width changed -- crosses at 33/48/64/82 under dividers at 33/49/66/85.
         lines.append("".join("\u253c" if c == "\u2502" else "\u2500" for c in ah.ljust(140)))
         _unmeasured = 0
         for _i, a in enumerate(attempts):
-            if not isinstance(a, dict):
+            # A COMMIT ROW IS THE PROOF A WIN WAS BANKED, NOT AN ATTEMPT: it is read into the win's own
+            # result cell (its sha) and would otherwise print as a second, "no gain" copy of that try.
+            if not isinstance(a, dict) or a.get("commit_record"):
                 continue
             sig = _op_label(a.get("op_signature", "?"))
             lever = _disp_level(a.get("kernel_kind") or "?")
@@ -3753,9 +3802,13 @@ def render_summary(
             if gain_s == "n/m":
                 _unmeasured += 1
                 continue
-            res = "✓ win" if _i in _wins else ("· wedged" if a.get("wedged") else "· no gain")
+            res = _attempt_result(a, _i in _wins, attempts)
+            _pcc = a.get("pcc")
+            pcc_s = f"{_pcc:.4f}" if isinstance(_pcc, (int, float)) else "\u2014"
             lines.append(
-                (_ar % (sig, _stage_label(a.get("op_signature"), baseline_profile), lever, ms_s, gain_s, res)).rstrip()
+                (
+                    _ar % (sig, _stage_label(a.get("op_signature"), baseline_profile), lever, ms_s, gain_s, pcc_s, res)
+                ).rstrip()
             )
         if _unmeasured:
             lines.append("")

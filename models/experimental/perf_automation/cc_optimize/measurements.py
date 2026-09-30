@@ -116,6 +116,10 @@ KIND_STAGE_TOKENS = "stage_tokens"
 # change the divisor under a measurement.
 KIND_TP_DEGREE = "tp_degree"
 
+# HOW MANY DATA-PARALLEL GROUPS SHARE A STAGE'S ITEMS (trace_replay: the pipeline's <stage>_trace_split).
+# The compute ceiling divides a stage's FLOPs by TP x this; pinned per stage for the same reason TP is.
+KIND_STAGE_SPLIT = "stage_split"
+
 PHASE_BEFORE = "before"
 PHASE_AFTER = "after"
 
@@ -168,6 +172,14 @@ def staircase_value(attempt) -> tuple:
     return None, ""
 
 
+def pcc_failed(attempt) -> bool:
+    """Did this attempt's OWN PCC reading fail? Such a candidate cannot have been banked --
+    gates_allow_banking refuses any PCC status but ok -- so it is never a win, whatever its delta.
+    False when the attempt recorded no PCC reading (older rows): absence is not a failure."""
+    st = str((attempt or {}).get("pcc_status") or "") if isinstance(attempt, dict) else ""
+    return bool(st) and st != "ok"
+
+
 def winning_indices(attempts, baseline_ms=None) -> set:
     """Indices of the attempts that ACTUALLY made the model faster. THE ONE win rule for a sequence.
 
@@ -194,7 +206,7 @@ def winning_indices(attempts, baseline_ms=None) -> set:
         if isinstance(a, dict) and isinstance(a.get("fullpipe_delta_ms"), (int, float))
     ]
     if stamped:
-        return {i for i in stamped if attempts[i]["fullpipe_delta_ms"] < 0}
+        return {i for i in stamped if attempts[i]["fullpipe_delta_ms"] < 0 and not pcc_failed(attempts[i])}
 
     # ONE STAIRCASE PER RULER. A single `best` across mixed units let the smallest-scoped reading win
     # once and then disqualify everything else; see staircase_value.
