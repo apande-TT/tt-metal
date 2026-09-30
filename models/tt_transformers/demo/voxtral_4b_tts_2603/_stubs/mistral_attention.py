@@ -358,6 +358,28 @@ def _per_sample(t, batch, real, padded):
     return ttnn.to_layout(rows, ttnn.TILE_LAYOUT)
 
 
+class _Split:
+    """A compact prefill's k (or v) as the two pieces `_seed_cache` fills in place: the batch-1
+    prefix `[1, H, P, D]` every sample shares, and the tail `[H * batch, 1, real, D]` in the cache
+    dtype, one tile row per (head, sample). `slots` is the tail's padded width, so `filled` stays
+    P + slots, as it was for the joined seed."""
+
+    def __init__(self, prefix, tail, slots):
+        self.prefix, self.tail, self.slots = prefix, tail, int(slots)
+
+
+def _tail_rows(t, batch, real):
+    """A compact `[1, H, batch * real, D]` k/v as `[H * batch, 1, real, D]` TILE in the cache dtype.
+
+    Row `h * batch + b` is sample b's tail for head h, padded with zeros to its own tile row (the
+    decode slot mask keeps those slots closed until a step writes them). Head-major, as the compact
+    rows already are, so there is no permute: the tail fill's page table routes each row.
+    """
+    heads, width = int(t.shape[1]), int(t.shape[-1])
+    rows = ttnn.reshape(ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT), [heads * batch, 1, real, width])
+    return ttnn.to_layout(rows, ttnn.TILE_LAYOUT, dtype=_CACHE_DTYPE)
+
+
 def _prefill_sdpa(q, k, v, kv_cache):
     """Prefill SDPA, `(attn, k, v)` -- the k/v to seed the cache with, or None to seed nothing.
 
@@ -386,6 +408,10 @@ def _prefill_sdpa(q, k, v, kv_cache):
             scale=1.0,
             program_config=_compact_sdpa_cfg(q),
         )
+        if kv_cache.get("tail_fill") is not None and kv_cache.get("fill_tables") is not None:
+            # SEEDED IN PLACE, NEVER JOINED: `_seed_cache` fills the prefix and the tail into the
+            # resident cache separately, so the per-sample [batch, H, P + T, D] k/v is not built.
+            return a, _Split(pk, _tail_rows(k, batch, real), padded), _Split(pv, _tail_rows(v, batch, real), padded)
         rep = ttnn.Shape([batch, 1, 1, 1])
         k = ttnn.concat([ttnn.repeat(pk, rep), _per_sample(k, batch, real, padded)], dim=2)
         v = ttnn.concat([ttnn.repeat(pv, rep), _per_sample(v, batch, real, padded)], dim=2)
@@ -458,6 +484,8 @@ def _seed_cache(kv, k, v):
     never READ before they are written -- a decode step writes slot `position` and then attends to
     `[0, position]` -- so they only have to exist (and hold finite values).
     """
+    if isinstance(k, _Split):
+        return _seed_split(kv, k, v)
     capacity = int(kv.get("capacity") or 0)
     # The text stack hands back the previous prefill's buffers (same batch and capacity) with the
     # staged fill tables; this prefill's slots are then written into them IN PLACE by one
@@ -497,6 +525,50 @@ def _seed_cache(kv, k, v):
                 pass
         kv[key] = tensor
     kv["filled"] = int(k.shape[-2])
+
+
+def _seed_split(kv, k, v):
+    """`_seed_cache` for a compact prefill: the prefix and the tail go into the resident cache by
+    two in-place fills, and are never joined.
+
+    The prefix is cast to the cache dtype at batch 1, repeated there (half the bytes of a bf16
+    repeat) and filled into every sample's first P slots by the row-block fill tables. The tail is
+    already one tile row per (head, sample), and viewing the cache as `[B * H * C/32, 1, 32, D]` --
+    a zero-copy view, one block per tile row of one (sample, head) -- makes it a paged cache whose
+    page table (`kv["tail_fill"]`, staged by the text stack) sends row (h, b) to sample b, head h,
+    slot P. The permute to sample-major, the concat behind the repeated prefix and the full-width
+    typecast the joined seed paid for are all gone.
+    """
+    capacity = int(kv["capacity"])
+    resident = kv.pop("resident", None) or (None, None)
+    rows_fill, tail_fill = kv["fill_tables"], kv["tail_fill"]
+    tile = ttnn.TILE_SIZE
+    for (key, part), home in zip((("k", k), ("v", v)), resident):
+        heads, prefix_rows, width = (int(part.prefix.shape[i]) for i in (1, 2, 3))
+        batch = int(part.tail.shape[0]) // heads
+        full = [batch, heads, capacity, width]
+        if home is not None and [int(s) for s in home.shape] != full:
+            ttnn.deallocate(home)
+            home = None
+        if home is None:
+            home = ttnn.zeros(full, dtype=_CACHE_DTYPE, layout=ttnn.TILE_LAYOUT, device=part.tail.device())
+        narrow = ttnn.typecast(part.prefix, _CACHE_DTYPE)
+        ttnn.deallocate(part.prefix)
+        shared = ttnn.repeat(narrow, ttnn.Shape([batch, 1, 1, 1]))
+        ttnn.deallocate(narrow)
+        ttnn.experimental.paged_fill_cache(home, shared, rows_fill[0], batch_idx_tensor=rows_fill[1])
+        ttnn.deallocate(shared)
+        tile_rows = ttnn.reshape(home, [batch * heads * capacity // tile, 1, tile, width])
+        ttnn.experimental.paged_fill_cache(tile_rows, part.tail, tail_fill[0], batch_idx_tensor=tail_fill[1])
+        ttnn.deallocate(part.tail)
+        stale = kv.get(key)
+        if stale is not None and stale is not home:
+            try:
+                ttnn.deallocate(stale)
+            except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
+                pass
+        kv[key] = home
+    kv["filled"] = prefix_rows + k.slots
 
 
 # The additive mask for one decode position, `[1, 1, 1, C]`: 0 through `position`, a large
