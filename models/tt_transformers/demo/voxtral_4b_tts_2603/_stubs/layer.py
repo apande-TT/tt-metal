@@ -876,11 +876,22 @@ def build(device, torch_module):
         # and the two reductions and P@V read them back again, every layer of every step. About
         # 180 KB a core per tensor across the grid; at most two are alive at once.
         l1 = ttnn.L1_MEMORY_CONFIG
-        scores = _bmm(q, kv_cache["k"], transpose_b=True, memory_config=l1)
+        # Only the first `span` slots (the text stack's tile-rounded run up to this step's slot) are
+        # read: every slot past it is masked, so its exp is exactly 0 and it adds exactly nothing
+        # to the max, the row sum or P@V. The cut k/v sit in L1 while they are small.
+        span = min(cap, int(kv_cache.get("span") or cap))
+        keys, values = kv_cache["k"], kv_cache["v"]
+        if span < cap:
+            ends = [int(s) for s in keys.shape]
+            ends[-2] = span
+            cut = l1 if span <= 320 else None
+            keys = ttnn.slice(keys, [0, 0, 0, 0], ends, memory_config=cut)
+            values = ttnn.slice(values, [0, 0, 0, 0], ends, memory_config=cut)
+        scores = _bmm(q, keys, transpose_b=True, memory_config=l1)
         ttnn.deallocate(q)
         # The cache tail beyond `position` is zeros, and a zero key scores ZERO -- which is a
         # perfectly ordinary logit, not a small one. It has to be masked explicitly.
-        masked = ttnn.add(scores, _decode_mask(kv_cache, position, cap), memory_config=l1)
+        masked = ttnn.add(scores, _decode_mask(kv_cache, position, span), memory_config=l1)
         ttnn.deallocate(scores)
         # Normalise AFTER P@V: dividing the [B, n_kv, 32, head_dim] context by the row sums is the
         # same arithmetic as dividing the C/head_dim-times larger [B, n_kv, 32, C] weights first.
@@ -891,8 +902,11 @@ def build(device, torch_module):
             memory_config=l1,
         )
         ttnn.deallocate(masked)
-        ctx = ttnn.divide(_bmm(e, kv_cache["v"], memory_config=l1), ttnn.sum(e, dim=-1, keepdim=True, memory_config=l1))
+        ctx = ttnn.divide(_bmm(e, values, memory_config=l1), ttnn.sum(e, dim=-1, keepdim=True, memory_config=l1))
         ttnn.deallocate(e)
+        if span < cap:
+            ttnn.deallocate(keys)
+            ttnn.deallocate(values)
         merged = ttnn.to_layout(
             ttnn.reshape(
                 ttnn.slice(
