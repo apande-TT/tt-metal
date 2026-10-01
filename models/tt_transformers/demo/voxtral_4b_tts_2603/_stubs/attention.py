@@ -734,35 +734,31 @@ def build(device, torch_module):
         groups = n_heads // n_kv_heads
         flat = ttnn.reshape(hidden_states, [1, 1, batch, dim])
         fused = _lin(flat, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
-        q_width, kv_width = n_heads * head_dim, n_kv_heads * head_dim
-        rows = ttnn.to_layout(fused, ttnn.ROW_MAJOR_LAYOUT)
+        # ONE data-movement op splits the fused qkv by user and head, float32 preserved, into the
+        # decode shard layout (one user per core): q `[1, B, n_heads, head_dim]` and k / v in the
+        # cache's own `[1, B, n_kv, head_dim]` -- the n_kv heads share ONE tile per user there, where
+        # `[B, n_kv, 1, head_dim]` would pad every head to its own tile. It replaces an untilize and
+        # three slice / reshape / tilize chains. v is already the cache update's input layout.
+        q_s, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
+            fused,
+            num_heads=n_heads,
+            num_kv_heads=n_kv_heads,
+            memory_config=_decode_shard(fused.device(), batch, head_dim),
+        )
         ttnn.deallocate(fused)
-
-        def _head_split(start, width, heads_per_kv):
-            part = ttnn.slice(rows, [0, 0, 0, start], [1, 1, batch, start + width])
-            return ttnn.to_layout(ttnn.reshape(part, [batch, n_kv_heads, heads_per_kv, head_dim]), ttnn.TILE_LAYOUT)
 
         # The grouped query is `groups` rows of a 32-row tile. Zero-padding it to a LOGICAL full tile
         # costs nothing physically and lets every softmax reduction below skip its FillPad pass.
         q_rows = -(-groups // 32) * 32
         # q is RoPE'd with the heads as ROWS, `[B, 1, n_heads, head_dim]` (one tile per user), and
         # only then regrouped by kv head: the grouped `[B, n_kv, groups, head_dim]` form pads each
-        # group of `groups` rows out to a 32-row tile, 8x the tiles for the six RoPE ops.
-        q = ttnn.to_layout(
-            ttnn.reshape(ttnn.slice(rows, [0, 0, 0, 0], [1, 1, batch, q_width]), [batch, 1, n_heads, head_dim]),
-            ttnn.TILE_LAYOUT,
-        )
-
-        # k and v go straight into the cache's own `[1, B, n_kv, head_dim]` layout: the n_kv heads
-        # share ONE tile per user there, where `[B, n_kv, 1, head_dim]` pads every head to its own
-        # 32-row tile and k's RoPE would run on 32x the data.
-        def _cache_split(start):
-            part = ttnn.slice(rows, [0, 0, 0, start], [1, 1, batch, start + kv_width])
-            return ttnn.to_layout(ttnn.reshape(part, [1, batch, n_kv_heads, head_dim]), ttnn.TILE_LAYOUT)
-
-        k = _cache_split(q_width)
-        v = _cache_split(q_width + kv_width)
-        ttnn.deallocate(rows)
+        # group of `groups` rows out to a 32-row tile, 8x the tiles for the six RoPE ops. The RoPE
+        # ops read q and k interleaved.
+        q = ttnn.reshape(ttnn.to_memory_config(q_s, ttnn.L1_MEMORY_CONFIG), [batch, 1, n_heads, head_dim])
+        ttnn.deallocate(q_s)
+        k_s = k
+        k = ttnn.to_memory_config(k_s, ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(k_s)
         if position_embeddings is not None:
             cos, sin = position_embeddings
             signed = kv_cache.get("rope_signed") if kv_cache is not None else None
