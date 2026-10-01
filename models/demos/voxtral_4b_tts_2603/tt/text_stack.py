@@ -719,7 +719,8 @@ class TextStack:
         and a spelled-out softmax, whose float32 score tensors the stubs keep in L1. The grouped
         query's zero pad rows come from its tilize, relabelled logical by a view (no FillPad pass),
         and one nlp_create_qkv_heads_decode splits the fused qkv (in L1) by user and head; the gate,
-        up and their product sit in L1 for their one reader each.
+        up and their product sit in L1 for their one reader each, as do RoPE's terms; the head merge
+        untilizes only the real query rows (a zero-cost view drops the pad).
         """
         position = int(position)
         batch = int(embeds.shape[0])
