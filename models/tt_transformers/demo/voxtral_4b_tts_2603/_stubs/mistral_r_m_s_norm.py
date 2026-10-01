@@ -72,7 +72,15 @@ def _sq_mean(x):
     # x^2 and its row means live in L1 -- the mean is a one-core-per-tile-row reduce, which reads x^2
     # back faster from L1 -- and x^2 is freed before any other op runs (~72 KB a core at 640 rows).
     l1 = ttnn.L1_MEMORY_CONFIG
-    return ttnn.mean(ttnn.square(x, memory_config=l1), dim=-1, keepdim=True, memory_config=l1)
+    # A one-tile-row (decode-step) mean takes the FPU reduce path (x^2 truncated to TF32 on the way in)
+    # instead of the accurate SFPU one; the prefill's taller norms keep the accurate path.
+    return ttnn.mean(
+        ttnn.square(x, memory_config=l1),
+        dim=-1,
+        keepdim=True,
+        memory_config=l1,
+        fast_and_approximate_mode=rows <= 32,
+    )
 
 
 def build(device, torch_module):
