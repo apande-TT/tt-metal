@@ -264,7 +264,9 @@ def _fused_block(device, torch_block, layer_id, counter):
 
 
 def _composed_block(device, torch_block, layer_id, counter):
-    """`x + attention(attention_norm(x))` then `h + feed_forward(ffn_norm(h))`, from the leaves."""
+    """`x + attention(attention_norm(x))` then `h + feed_forward(ffn_norm(h))`, from the leaves.
+
+    The stubs' FFN down projection runs a full-grid 2D multicast at short heights (`_down_2d`)."""
     attn = _build_stub(_ATTN_STUB, device, torch_block.attention, counter)
     ff = _build_stub(_FF_STUB, device, torch_block.feed_forward, counter)
     g_attn = _norm_weight(torch_block.attention_norm, device)
