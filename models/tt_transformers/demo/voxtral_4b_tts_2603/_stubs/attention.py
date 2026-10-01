@@ -327,11 +327,13 @@ def _rope_prefill(q, k, cos, sin, half):
         return _rope(q, cos, sin, half), _rope(k, cos, sin, half)
     if cos.dtype != ttnn.bfloat16:
         cos, sin = ttnn.typecast(cos, ttnn.bfloat16), ttnn.typecast(sin, ttnn.bfloat16)
-    # SDPA is q's only reader and streams it chunk by chunk, so q lands in L1; k stays in DRAM
-    # because the stash phase holds the prefix k across the whole stack.
+    # SDPA is q's only reader and streams it chunk by chunk, so q lands in L1. The short prefix's k
+    # stays in DRAM because the stash phase holds it across the whole stack; the tall tail's is
+    # read at once (the joined SDPA k and the cache seed) and lands in L1 too.
+    tall = int(k.shape[-2]) >= 256
     return (
         ttnn.experimental.rotary_embedding(q, cos, sin, memory_config=ttnn.L1_MEMORY_CONFIG),
-        ttnn.experimental.rotary_embedding(k, cos, sin),
+        ttnn.experimental.rotary_embedding(k, cos, sin, memory_config=ttnn.L1_MEMORY_CONFIG if tall else None),
     )
 
 
@@ -448,7 +450,13 @@ def _split_heads(qkv, n_heads, n_kv_heads):
     l1 = ttnn.L1_MEMORY_CONFIG
     q = ttnn.slice(heads, [0, 0, 0, 0], [b, n_heads, s, d], memory_config=l1)
     k = ttnn.slice(heads, [0, n_heads, 0, 0], [b, n_heads + n_kv_heads, s, d], memory_config=l1)
-    v = ttnn.slice(heads, [0, n_heads + n_kv_heads, 0, 0], [b, n_heads + 2 * n_kv_heads, s, d])
+    # The tall tail's v is read at once too; the short prefix's is stashed across the stack.
+    v = ttnn.slice(
+        heads,
+        [0, n_heads + n_kv_heads, 0, 0],
+        [b, n_heads + 2 * n_kv_heads, s, d],
+        memory_config=l1 if s >= 256 else None,
+    )
     ttnn.deallocate(heads)
     return q, k, v
 
@@ -903,7 +911,7 @@ def build(device, torch_module):
         if kv_cache is not None and k is not None:
             _seed_cache(kv_cache, k, v)
         out = _lin(
-            ttnn.experimental.nlp_concat_heads(a),
+            ttnn.experimental.nlp_concat_heads(a, memory_config=ttnn.L1_MEMORY_CONFIG),
             wo,
             dtype=hidden_states.dtype,
             compute_kernel_config=_COMPUTE,
