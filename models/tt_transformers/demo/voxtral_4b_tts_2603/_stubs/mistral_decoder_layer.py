@@ -1062,11 +1062,10 @@ def build(device, torch_module):
         else:
             attn_out = _prefill_attn(xn, position_embeddings, kv_cache, seq)
         ttnn.deallocate(xn)
-        # A SHORT stream's (the 160-row prefix's, a decode step's) float32 residual lives in L1
-        # between blocks: both adds write it there and both norms read it from there instead of
-        # re-streaming it from DRAM. The 640-row tail's clashes with the fused SwiGLU's circular
-        # buffers, so it stays.
-        resid = ttnn.L1_MEMORY_CONFIG if lead * seq < 256 else None
+        # The float32 residual stream lives in L1 between blocks -- the 160-row prefix's, the 640-row
+        # tail's (~72 KB a core) and a decode step's: both adds write it there and both norms read
+        # it from there instead of re-streaming it from DRAM.
+        resid = ttnn.L1_MEMORY_CONFIG
         h = ttnn.add(h, attn_out, memory_config=resid)
         ttnn.deallocate(attn_out)
         if trim is not None:
