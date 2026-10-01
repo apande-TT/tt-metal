@@ -312,7 +312,12 @@ def _rope_signed(x, cos, sin_signed, half):
     ends = list(x.shape)
     lower = ttnn.slice(x, [0, 0, 0, 0], [ends[0], ends[1], ends[2], half])
     upper = ttnn.slice(x, [0, 0, 0, half], ends)
-    return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(ttnn.concat([upper, lower], dim=-1), sin_signed))
+    l1 = ttnn.L1_MEMORY_CONFIG  # every term is read once, by the next op
+    return ttnn.add(
+        ttnn.multiply(x, cos, memory_config=l1),
+        ttnn.multiply(ttnn.concat([upper, lower], dim=-1, memory_config=l1), sin_signed, memory_config=l1),
+        memory_config=l1,
+    )
 
 
 def _rope_prefill(q, k, cos, sin, half):
@@ -870,13 +875,15 @@ def build(device, torch_module):
         if span < cap:
             ttnn.deallocate(keys)
             ttnn.deallocate(values)
+        # Relabelling the context to its `groups` real rows is a zero-cost tile view, so the untilize
+        # drops the pad rows itself instead of writing all 32 and slicing them off.
+        valid = ttnn.reshape(
+            ctx,
+            ttnn.Shape([batch, n_kv_heads, groups, head_dim]),
+            ttnn.Shape([batch, n_kv_heads, q_rows, head_dim]),
+        )
         merged = ttnn.to_layout(
-            ttnn.reshape(
-                ttnn.slice(
-                    ttnn.to_layout(ctx, ttnn.ROW_MAJOR_LAYOUT), [0, 0, 0, 0], [batch, n_kv_heads, groups, head_dim]
-                ),
-                [1, 1, batch, n_heads * head_dim],
-            ),
+            ttnn.reshape(ttnn.to_layout(valid, ttnn.ROW_MAJOR_LAYOUT), [1, 1, batch, n_heads * head_dim]),
             ttnn.TILE_LAYOUT,
         )
         ttnn.deallocate(ctx)
