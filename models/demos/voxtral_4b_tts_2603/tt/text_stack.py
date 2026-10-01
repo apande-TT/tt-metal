@@ -188,7 +188,8 @@ class TextBlock:
             if kept is None:
                 return None
             h, decode = kept, True
-        hn = self.parts["norm_post"](h, dtype=None if decode else ttnn.bfloat16)
+        # ...and the post-attention one feeds only the fused SwiGLU's LoFi matmul: bfloat8_b.
+        hn = self.parts["norm_post"](h, dtype=None if decode else ttnn.bfloat8_b)
         mlp_out = self.parts["mlp"](hn)
         ttnn.deallocate(hn)
         out = ttnn.add(h, mlp_out)
