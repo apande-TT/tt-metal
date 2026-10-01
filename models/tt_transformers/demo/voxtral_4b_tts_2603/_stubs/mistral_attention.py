@@ -273,6 +273,28 @@ def _merge_heads(a, w, out_dtype, compute):
             merged = ttnn.experimental.nlp_concat_heads(heads, memory_config=merged_cfg)
             ttnn.deallocate(heads)
             return merged
+    grid = a.device().compute_with_storage_grid_size()
+    if b == 1 and rows >= 256 and rows % 32 == 0 and n_heads <= int(grid.x) * int(grid.y):
+        # A TALL one (the 640-row tail) feeds a 2D multicast, which wants it interleaved; still,
+        # one head per core merges on 32 cores where the interleaved op deals out 20 tile rows.
+        cores = ttnn.num_cores_to_corerangeset(n_heads, grid, row_wise=True)
+        heads_cfg = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(cores, [rows, head_dim], ttnn.ShardOrientation.ROW_MAJOR),
+        )
+        merged_cfg = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(cores, [rows, head_dim], ttnn.ShardOrientation.ROW_MAJOR),
+        )
+        heads = ttnn.to_memory_config(a, heads_cfg)
+        ttnn.deallocate(a)
+        merged = ttnn.experimental.nlp_concat_heads(heads, memory_config=merged_cfg)
+        ttnn.deallocate(heads)
+        out = ttnn.to_memory_config(merged, ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(merged)
+        return out
     return ttnn.experimental.nlp_concat_heads(a, memory_config=ttnn.L1_MEMORY_CONFIG)
 
 
