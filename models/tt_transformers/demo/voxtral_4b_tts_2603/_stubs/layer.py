@@ -480,8 +480,10 @@ def _split_heads(qkv, n_heads, n_kv_heads):
         qkv, num_heads=n_heads + 2 * n_kv_heads, num_kv_heads=0, transpose_k_heads=False
     )[0]
     b, _, s, d = (int(x) for x in heads.shape)
-    q = ttnn.slice(heads, [0, 0, 0, 0], [b, n_heads, s, d])
-    k = ttnn.slice(heads, [0, n_heads, 0, 0], [b, n_heads + n_kv_heads, s, d])
+    # q and k are read once, by the RoPE ops right after, so they land in L1.
+    l1 = ttnn.L1_MEMORY_CONFIG
+    q = ttnn.slice(heads, [0, 0, 0, 0], [b, n_heads, s, d], memory_config=l1)
+    k = ttnn.slice(heads, [0, n_heads, 0, 0], [b, n_heads + n_kv_heads, s, d], memory_config=l1)
     v = ttnn.slice(heads, [0, n_heads + n_kv_heads, 0, 0], [b, n_heads + 2 * n_kv_heads, s, d])
     ttnn.deallocate(heads)
     return q, k, v
