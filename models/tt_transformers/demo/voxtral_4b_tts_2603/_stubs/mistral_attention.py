@@ -703,12 +703,14 @@ def build(device, torch_module):
             else:
                 q = _rope(q, cos, sin, half)
                 k = _rope(k, cos, sin, half)
-        q = ttnn.to_layout(
-            ttnn.reshape(ttnn.to_layout(q, ttnn.ROW_MAJOR_LAYOUT), [batch, n_kv_heads, groups, head_dim]),
-            ttnn.TILE_LAYOUT,
+        # The tilize writes zeros into the tile rows past `groups`; relabelling them logical is a
+        # zero-cost view, where `ttnn.pad` re-filled the same zeros in a FillPad pass.
+        full = ttnn.Shape([batch, n_kv_heads, q_rows, head_dim])
+        q = ttnn.tilize_with_val_padding(
+            ttnn.reshape(ttnn.to_layout(q, ttnn.ROW_MAJOR_LAYOUT), [batch, n_kv_heads, groups, head_dim]), full, 0.0
         )
         if q_rows != groups:
-            q = ttnn.pad(q, [(0, 0), (0, 0), (0, q_rows - groups), (0, 0)], 0.0)
+            q = ttnn.reshape(q, full, full)
         # A split prefill leaves dead slots before the tail: position p lives at slot p + offset.
         idxs = [int(position) + int(kv_cache.get("slot_offset", 0))] * batch
         # `paged_update_cache` wants the decode layout `[1, B, n_kv, head_dim]` AND it wants that
