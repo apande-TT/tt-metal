@@ -722,9 +722,15 @@ class TextStack:
         # The additive mask row for `position` is the same for every layer: cut it off the staged
         # table ONCE per step and hand it to each block, instead of 26 slice + tilize pairs.
         cap = int(self.kv_capacity)
+        # THE ATTENTION SPAN: the tile-rounded run of slots up to and including this step's slot.
+        # Every slot past it is masked to -1e9, so its exp is exactly 0 and it adds exactly nothing
+        # to the max, the row sum or P@V -- attending over `[0, span)` instead of the whole
+        # capacity (sized for the 256-frame safety cap) returns the same bits for a fraction of
+        # the cache reads and score passes.
+        span = min(cap, _tile_ceil(position + self._slot_gap + 1))
         table = self._decode_mask if self._slot_mask is None else self._slot_mask
         mask_row = ttnn.to_layout(
-            ttnn.reshape(ttnn.slice(table, [position, 0], [position + 1, cap]), [1, 1, 1, cap]),
+            ttnn.reshape(ttnn.slice(table, [position, 0], [position + 1, span]), [1, 1, 1, span]),
             ttnn.TILE_LAYOUT,
         )
         # `rotate_half(x) * sin == cat(x2, x1) * cat(-sin1, sin2)`: the sign rides on a sin table
@@ -741,6 +747,7 @@ class TextStack:
         )
         for block in self.blocks:
             block.kv["mask_row"] = (position, mask_row)
+            block.kv["span"] = span
             block.kv["rope_signed"] = (position, sin_signed)
         hidden = folded
         try:
