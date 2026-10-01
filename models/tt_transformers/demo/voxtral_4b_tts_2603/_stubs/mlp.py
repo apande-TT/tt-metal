@@ -396,7 +396,7 @@ def build(device, torch_module):
 
     def mlp_forward(x, **kwargs):
         h, lead, seq, rank = _view4(x, dim)
-        if h.dtype == ttnn.bfloat16 and lead * seq >= 256:
+        if h.dtype in (ttnn.bfloat16, ttnn.bfloat8_b) and lead * seq >= 256:
             gated = _fused_swiglu(h, w_gu, w_ttl)
         else:
             gated = ttnn.multiply(

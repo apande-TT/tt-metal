@@ -951,12 +951,13 @@ def build(device, torch_module):
                 return None
             h, decode = kept, True
 
-        # Prefill's norm output is read only by the fused SwiGLU, once per N block: it lands in L1.
+        # Prefill's norm output is read only by the fused SwiGLU, once per N block: it lands in L1,
+        # bfloat8_b -- the LoFi matmul reads no more of its mantissa, and half the bytes cross the grid.
         hn = _rms_norm(
             h,
             g_post,
             eps_post,
-            dtype=None if decode else ttnn.bfloat16,
+            dtype=None if decode else ttnn.bfloat8_b,
             memory_config=None if decode else ttnn.L1_MEMORY_CONFIG,
         )
         if decode:
