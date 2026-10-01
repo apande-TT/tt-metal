@@ -130,12 +130,12 @@ def _fold_norm(norm, consumer, names):
 
 
 def _resid_memory(h):
-    """L1 for a short stream's residual (under 8 tile rows: the prefix, a decode step), else the
-    default (DRAM)."""
+    """L1 for the residual stream of every stream this stack runs (the prefix, the 640-row compact
+    tail, a decode step); anything taller stays in the default (DRAM)."""
     rows = 1
     for d in list(h.shape)[:-1]:
         rows *= int(d)
-    return ttnn.L1_MEMORY_CONFIG if rows < 256 else None
+    return ttnn.L1_MEMORY_CONFIG if rows <= 640 else None
 
 
 class TextBlock:
@@ -193,10 +193,9 @@ class TextBlock:
             decode=decode,
         )
         ttnn.deallocate(xn)
-        # A SHORT stream's (the 160-row prefix's, a decode step's) float32 residual lives in L1
-        # between blocks, like the acoustic stage's: both residual adds write it there and both
-        # norms read it from there, where in DRAM each pass re-streamed the whole tensor. The
-        # 640-row tail's (~72 KB a core) clashes with the fused SwiGLU's ~1 MB of circular buffers.
+        # The float32 residual stream lives in L1 between blocks, like the acoustic stage's -- the
+        # prefix's, the 640-row tail's (~72 KB a core) and a decode step's: both residual adds write
+        # it there and both norms read it from there, where in DRAM each pass re-streamed it.
         resid = _resid_memory(hidden_states)
         h = ttnn.add(hidden_states, attn_out, memory_config=resid)
         ttnn.deallocate(attn_out)
