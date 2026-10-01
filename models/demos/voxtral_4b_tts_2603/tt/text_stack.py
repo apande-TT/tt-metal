@@ -632,6 +632,9 @@ class TextStack:
         if batch != split["batch"]:
             raise ValueError(f"batch {batch} != the staged compact tail's {split['batch']}")
         self._arm_cache(batch, rows + split["tail_slots"])
+        # The prefix chain's linears are SHORT (5 tile rows): the stubs' `_lin` gives them a 1D
+        # in0-multicast config with 16-tile K blocks (`_short_cfg`) at their own HiFi4 + float32
+        # DEST, where ttnn's default streamed K two tiles at a time (the wide gate/up keeps it).
         pre_in = self._voiced(ttnn.slice(input_ids_tt, [0, 0], [1, rows]), split["keep_head"], split["placed_head"])
         tail_ids = ttnn.reshape(ttnn.slice(input_ids_tt, [0, start], [batch, real]), [1, batch * tail])
         tail_in = self._voiced(tail_ids, split["keep_tail"], split["placed_tail"])
