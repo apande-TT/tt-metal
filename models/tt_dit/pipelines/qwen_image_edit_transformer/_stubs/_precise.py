@@ -210,7 +210,12 @@ def split_limbs(x, n):
 def exact_matmul_bt(a, b):
     """float32 a @ float32 b^T (reduction over the last dim of both) with exact accumulation:
     QK_LIMBS-limb bf16 split (products of order < QK_LIMBS), 8 exact lanes over K, median of 3 lane
-    partitions."""
+    partitions (EXACT_MODE "guarded" of the text-encoder ports: one partition on the leading limb term,
+    glitch-guarded, the other terms dense)."""
+    from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te
+
+    if _te.EXACT_MODE == "guarded":
+        return _te.split_matmul(a, b, transpose_b=True, exact=True, limbs=QK_LIMBS)
     cfg = precise_config()
     pa_, pb_ = split_limbs(a, QK_LIMBS), split_limbs(b, QK_LIMBS)
     terms = [(pa_[i], pb_[j]) for i in range(QK_LIMBS) for j in range(QK_LIMBS) if i + j < QK_LIMBS]

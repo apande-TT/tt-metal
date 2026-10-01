@@ -23,6 +23,7 @@ cu_seqlens block structure (per-image / per-window attention) is expressed in th
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 import torch
@@ -199,6 +200,62 @@ def _median3(a, b, c):
     return ttnn.maximum(ttnn.minimum(a, b), ttnn.minimum(ttnn.maximum(a, b), c))
 
 
+# EXACT_MODE "median3": the median over LANE_PATTERNS of the full lane sum, every limb exact-lane
+# (8 lanes x limbs x 3 partitions: 48 matmuls per 2-limb linear, 72 at 3 limbs).
+# EXACT_MODE "guarded": only the LEADING limb takes exact lanes (one partition, 8 matmuls). The trailing
+# limbs are ~2^-8 of it, so their dense accumulation error (~2^-12 of their terms) is ~2^-20 of the
+# output's terms, float32's own level. The glitch guard is a bound, not a second partition: a dense
+# product is within 2^-12 * sum|terms| <= 2^-12 * |x_row| |w_col| (Cauchy-Schwarz) of the exact one, so
+# an exact-lane output further than GUARD_SLACK x that from the dense product holds a glitch -- or the
+# dense one does. There the median of (exact, dense, -dense(-x)) is kept: negating the input moves the
+# glitch, so two of the three agree. 8 + 2 + (limbs - 1) matmuls.
+EXACT_MODE = os.environ.get("QIE_EXACT_MODE", "median3")
+GUARD_SLACK = 4.0
+_COL_NORMS = {}
+
+
+def _norm_last(t, keepdim=True):
+    """L2 norm over the last dim, float32."""
+    t32 = t if t.dtype == ttnn.float32 else ttnn.typecast(t, ttnn.float32)
+    return ttnn.sqrt(ttnn.sum(ttnn.multiply(t32, t32), dim=-1, keepdim=keepdim))
+
+
+def _col_norms(w, transpose_b=False, cache=True):
+    """|w[:, n]| (the K reduction's columns) as [..., 1, N] float32; a weight's norms are cached."""
+    key = (id(w), transpose_b)
+    if cache and key in _COL_NORMS:
+        return _COL_NORMS[key][1]
+    if transpose_b:  # w: [..., N, K]
+        n = ttnn.transpose(_norm_last(w), -2, -1)
+    else:  # w: [..., K, N]
+        n = _norm_last(ttnn.transpose(w, -2, -1))
+        n = ttnn.transpose(n, -2, -1)
+    if cache:
+        _COL_NORMS[key] = (w, n)  # keep w referenced so its id stays unique
+    return n
+
+
+def _guarded(ex, dn, neg, a_norm, b_norm):
+    """ex where it is within the dense floor of dn, else median(ex, dn, neg)."""
+    tol = ttnn.multiply(ttnn.multiply(a_norm, b_norm), GUARD_SLACK * 2.0**-12)
+    return ttnn.where(ttnn.le(ttnn.abs(ttnn.subtract(ex, dn)), tol), ex, _median3(ex, dn, neg))
+
+
+def _guarded_sum(mm, parts, b_norm):
+    """EXACT_MODE "guarded" for a linear: mm(p) = p @ w; parts = the input's bf16 limbs."""
+    lead = parts[0]
+    ex = None
+    for lane in _lanes(lead, "strided"):
+        t = mm(lane)
+        ex = t if ex is None else ttnn.add(ex, t)
+    dn = mm(lead)
+    neg = ttnn.neg(mm(ttnn.neg(lead)))
+    y = _guarded(ex, dn, neg, _norm_last(lead), b_norm)
+    for part in parts[1:]:
+        y = ttnn.add(y, mm(part))
+    return y
+
+
 def _exact_sum(mm, parts):
     """median over LANE_PATTERNS of sum_{part, lane} mm(lane(part))."""
     ests = []
@@ -218,7 +275,9 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     cfg = precise_config()
     parts = split_bf16(x, limbs)
     mm = lambda p: ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32)  # noqa: E731
-    if exact:
+    if exact and EXACT_MODE == "guarded":
+        y = _guarded_sum(mm, parts, _col_norms(w))
+    elif exact:
         y = _exact_sum(mm, parts)
     else:
         y = None
@@ -256,6 +315,8 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
             t = mm(pa, pb)
             y = t if y is None else ttnn.add(y, t)
         return y
+    if EXACT_MODE == "guarded":
+        return _guarded_terms(mm, terms, a, b, transpose_b)
     ests = []
     for pattern in LANE_PATTERNS:
         y = None
@@ -265,6 +326,22 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
                 y = t if y is None else ttnn.add(y, t)
         ests.append(y)
     return _median3(*ests)
+
+
+def _guarded_terms(mm, terms, a, b, transpose_b):
+    """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
+    the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
+    (pa0, pb0), rest = terms[0], terms[1:]
+    ex = None
+    for lane in _lanes(pa0, "strided"):
+        t = mm(lane, pb0)
+        ex = t if ex is None else ttnn.add(ex, t)
+    dn = mm(pa0, pb0)
+    neg = ttnn.neg(mm(ttnn.neg(pa0), pb0))
+    y = _guarded(ex, dn, neg, _norm_last(a), _col_norms(b, transpose_b, cache=False))
+    for pa, pb in rest:
+        y = ttnn.add(y, mm(pa, pb))
+    return y
 
 
 def pad_rows(array, s_pad):

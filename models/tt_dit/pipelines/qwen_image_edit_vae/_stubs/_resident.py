@@ -183,11 +183,22 @@ def precise_affine(run, x, mode, device, extra=None, out=None):
     b = _flat(run(*variant(lambda t: ttnn.multiply(t, 0.0))))
     e_neg = ttnn.subtract(ttnn.multiply(b, 2.0), _flat(run(*variant(ttnn.neg))))
     if mode == "exact":
+        from models.demos.qwen_image_edit_text_encoder._stubs.attention import EXACT_MODE
+
         acc, n = None, 0
-        for m in _lane_masks(device, x.shape[-1]):
-            for limb in (f32, lambda t: ttnn.subtract(t, f32(t))):
+        hi, lo = f32, lambda t: ttnn.subtract(t, f32(t))
+        c = x.shape[-1]
+        # "guarded" (the text-encoder ports' switch): exact lanes on the hi limb only -- the lo limb is
+        # ~2^-8 of it, so its dense accumulation error is at float32's level -- and no run for a lane that
+        # holds no channel (conv_in's 3 input channels leave 5 of the 8 empty); the guard below stays
+        guarded = EXACT_MODE == "guarded"
+        masks = _lane_masks(device, c)[: min(8, c)] if guarded else _lane_masks(device, c)
+        for m in masks:
+            for limb in (hi,) if guarded else (hi, lo):
                 y = _flat(run(*variant(lambda t, m=m, limb=limb: ttnn.multiply(limb(t), m))))
                 acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
+        if guarded:
+            acc, n = ttnn.add(acc, _flat(run(*variant(lo)))), n + 1
         e_x = ttnn.subtract(acc, ttnn.multiply(b, float(n - 1)))  # each run added the bias once
         med = ttnn.maximum(ttnn.minimum(e_x, f0), ttnn.minimum(ttnn.maximum(e_x, f0), e_neg))
         tol = ttnn.add(ttnn.multiply(ttnn.abs(e_neg), 3e-3), 1e-3)
