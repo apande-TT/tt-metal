@@ -157,6 +157,42 @@ def _lin(x, w, **kwargs):
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
+def _down_2d(x, w, **kwargs):
+    """The FFN down projection of a SHORT (1-7 tile row) activation on the full grid, as a 2D multicast.
+
+    The 1D in0-multicast config `_lin` gives it puts one output column tile on each of 96 cores and
+    leaves ONE core to read and multicast the whole float32 activation (7 MB at 192 rows) block by
+    block, which every weight reader waits on. Here M goes over the grid rows (one activation row
+    sender each) and N over the grid columns, at `_short_cfg`'s own K block, so each output tile
+    sums the same K blocks in the same order. Falls back to `_lin`'s choice when the blocks outgrow L1.
+    """
+    shape = [int(d) for d in x.shape]
+    rows = 1
+    for d in shape[:-1]:
+        rows *= d
+    if 32 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs:
+        grid = x.device().compute_with_storage_grid_size()
+        gx, gy = int(grid.x), int(grid.y)
+        mt, nt = rows // 32, int(w.shape[-1]) // 32
+        out_dtype = kwargs.get("dtype") or x.dtype
+        kb = getattr(_short_cfg(x, w, rows, out_dtype), "in0_block_w", None)
+        per_n = -(-nt // gx)
+        size = lambda dt: _TILE_BYTES.get(dt, 2048)
+        fits = kb and 2 * kb * (size(x.dtype) + per_n * size(w.dtype)) + per_n * 2 * 4096 <= _L1_BUDGET
+        if fits and mt <= gy:
+            kwargs["program_config"] = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+                compute_with_storage_grid_size=(gx, gy),
+                in0_block_w=kb,
+                out_subblock_h=1,
+                out_subblock_w=max(s for s in range(1, 5) if per_n % s == 0),
+                per_core_M=1,
+                per_core_N=per_n,
+                transpose_mcast=False,
+                fused_activation=None,
+            )
+    return _lin(x, w, **kwargs)
+
+
 def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
@@ -584,7 +620,7 @@ def build(device, torch_module):
         elif ttl_down.supports(gated, w2_ttl):
             down = ttl_down.apply(gated, w2_ttl)
         else:
-            down = _lin(
+            down = _down_2d(
                 gated, w2, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
             )
         h4 = ttnn.add(h4, down, memory_config=ttnn.L1_MEMORY_CONFIG)
