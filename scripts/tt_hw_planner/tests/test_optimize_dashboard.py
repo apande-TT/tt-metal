@@ -448,3 +448,47 @@ def test_a_banked_attempt_is_kept_and_its_commit_row_is_folded_into_it(tmp_path)
     assert by_op["OpA"]["status"] == "kept" and by_op["OpA"]["commit"] == "70601b1d387aa"
     assert by_op["OpB"]["status"] == "reverted" and by_op["OpB"]["pcc"] == 0.654
     assert by_op["OpC"]["status"] == "kept", "a commit nothing links to still stands on its own"
+
+
+def test_the_metric_current_follows_the_ledger_when_it_is_the_same_reading():
+    """state.json is written once, when the loop starts; the ledger records every committed reading."""
+    from scripts.tt_hw_planner.optimize_dashboard import _metric_now
+
+    metric = {"name": "m", "baseline": 11615.7046, "current": 11615.7046}
+    rows = [
+        {"kind": "eager_per_op", "phase": "before", "value_ms": 11615.7046},
+        {"kind": "eager_per_op", "phase": "after", "value_ms": 8167.9},
+        {"kind": "eager_per_op", "phase": "after", "value_ms": 5257.9},
+    ]
+    assert _metric_now(metric, {"eager_per_op": rows})["current"] == 5257.9
+    assert _metric_now(metric, {})["current"] == 11615.7046, "no after row: unchanged"
+    other = {"name": "m", "baseline": 42.0, "current": 40.0}
+    assert _metric_now(other, {"eager_per_op": rows}) == other, "a different reading is not borrowed"
+    assert _metric_now(None, {"eager_per_op": rows}) is None
+
+
+def test_a_stage_history_line_moves_only_on_kept_attempts():
+    """A discarded candidate is plotted but never becomes the stage's "best": counting it drew
+    Qwen-Image-Edit's vision_encode line to a PCC-failed rewrite's 16344 ms, ~6 s below every kept win."""
+    from scripts.tt_hw_planner._optimize_dashboard_page import PAGE_HTML
+
+    i = PAGE_HTML.index("function historyChart(")
+    body = PAGE_HTML[i : PAGE_HTML.index("\nfunction ", i + 1)]
+    assert 'a.status === "kept" && (runMin == null || v < runMin)' in body
+    assert "v < runMin)) runMin = v" in body and 'bestLabel: "best kept"' in PAGE_HTML
+
+
+def test_the_metric_says_what_it_covers_and_the_end_to_end_sits_beside_it():
+    """A depth-limited per-op sum (5258 ms) beside full-pipeline stage times (24537 ms for one stage)
+    read as a contradiction; the card now names the slice and shows the end-to-end number too."""
+    from scripts.tt_hw_planner._optimize_dashboard_page import PAGE_HTML
+    from scripts.tt_hw_planner.optimize_dashboard import _fullpipe_baseline, _metric_now
+
+    metric = {"name": "m", "baseline": 100.0}
+    ledger = {
+        "eager_per_op": [{"phase": "before", "value_ms": 100.0, "depth": "2", "mode": "eager"}],
+        "fullpipe_e2e": [{"phase": "before", "value_ms": 900.0}, {"phase": "after", "value_ms": 500.0}],
+    }
+    assert _metric_now(metric, ledger)["scope"] == {"depth": "2", "mode": "eager"}
+    assert _fullpipe_baseline(ledger) == 900.0 and _fullpipe_baseline({}) is None
+    assert "not end-to-end" in PAGE_HTML and 'k: "end-to-end", v: S.fullpipe_ms' in PAGE_HTML

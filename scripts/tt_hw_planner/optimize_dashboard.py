@@ -199,6 +199,70 @@ def _attempt_status(rec: dict, rows: list | None = None) -> str:
     return "no-gain"
 
 
+def _metric_now(metric, ledger: dict):
+    """The run's metric with `current` taken from the ledger's latest committed reading of it.
+
+    state.json is written by the FSM when the loop starts and the optimize loop never touches it
+    again, so its `current` stayed at the baseline for the whole run (Qwen-Image-Edit: 11615.70 ms
+    "current" after six committed wins took it to 5257.93). The ledger's device-time readings are the
+    same quantity -- linked by evidence, not by name: when the ledger's first `before` reading IS the
+    metric's baseline, its latest `after` reading is the current value. Anything else is unchanged."""
+    if not isinstance(metric, dict):
+        return metric
+    from models.experimental.perf_automation.cc_optimize import measurements as _m
+
+    rows = [r for r in (ledger or {}).get(_m.KIND_EAGER) or [] if isinstance(r.get("value_ms"), (int, float))]
+    first = next((r for r in rows if r.get("phase") == _m.PHASE_BEFORE), None)
+    before = first["value_ms"] if first else None
+    afters = [r["value_ms"] for r in rows if r.get("phase") == _m.PHASE_AFTER]
+    base = metric.get("baseline")
+    if not (isinstance(base, (int, float)) and before is not None and abs(before - base) < 1e-6):
+        return metric
+    # WHAT THIS NUMBER COVERS, as the ledger recorded it: the profiled slice (its depth) and how it was
+    # timed, so the page can say it is not the end-to-end time. Summing a depth-limited per-op profile
+    # gives a number far below the full-pipeline stage times beside it, and read as "end to end" it
+    # looked like a contradiction (5258 ms device time next to 24537 ms for one stage alone).
+    out = {**metric, "scope": {"depth": first.get("depth"), "mode": first.get("mode")}}
+    if afters:
+        out["current"] = afters[-1]
+    return out
+
+
+def _stage_starts(stages: list, ledger: dict) -> None:
+    """Give each stage its START: its share of the BEFORE end-to-end reading, as the ledger pinned it.
+
+    `baseline_ms` used to come from the gate's best-so-far file, which every win overwrites, so a
+    stage card read baseline == current and no gain -- vae_decode "722 -> 722" after going from
+    ~3464 ms. With a pin, `start_ms` is that pin and `baseline_ms` follows it; without one (a run
+    from before the pin existed) nothing changes."""
+    from models.experimental.perf_automation.cc_optimize import measurements as _m
+
+    pins = {
+        str(r.get("depth") or "").strip().lower(): r["value_ms"]
+        for r in (ledger or {}).get(_m.KIND_STAGE_E2E) or []
+        if r.get("phase") == _m.PHASE_BEFORE and isinstance(r.get("value_ms"), (int, float))
+    }
+    for st in stages or []:
+        v = pins.get(str(st.get("name") or "").strip().lower())
+        if v is not None:
+            st["start_ms"] = v
+            st["baseline_ms"] = v
+
+
+def _fullpipe_baseline(ledger: dict):
+    """The end-to-end (all layers) reading the run started from, as the ledger pinned it, or None."""
+    from models.experimental.perf_automation.cc_optimize import measurements as _m
+
+    return next(
+        (
+            r["value_ms"]
+            for r in (ledger or {}).get(_m.KIND_FULLPIPE) or []
+            if r.get("phase") == _m.PHASE_BEFORE and isinstance(r.get("value_ms"), (int, float))
+        ),
+        None,
+    )
+
+
 def _load_attempts(dirs: list, slug: str | None) -> list:
     """Lever attempts for this model across tasks, archive (.cumulative) union live log — the same
     union _load_attempts_all reads, so the dashboard agrees with the engine about what was tried."""
@@ -489,6 +553,9 @@ def collect_state(run_dir: Path, state_dirs: list, slug: str | None = None, requ
             if isinstance(row, dict) and row.get("kind"):
                 ledger.setdefault(row["kind"], []).append(row)
 
+    metric = _metric_now(state.get("metric"), ledger)
+    _stage_starts(stages, ledger)
+
     # Throughput only when the run itself declared a per-token unit (the full-pipeline baseline's
     # "unit" field). Current comes from the ledger's committed after-rows — earliest-reading-wins
     # durability means the before row is the TRUE original, not this run's starting point.
@@ -595,13 +662,14 @@ def collect_state(run_dir: Path, state_dirs: list, slug: str | None = None, requ
             for k in ("metric", "devices", "pcc_test", "perf_test", "max_iter")
             if config.get(k) is not None
         },
-        "metric": state.get("metric"),
+        "metric": metric,
         "batch": _parse_batch(run_dir, requested_batch),
         "stages": stages,
         "serving": serving,
         "headroom": headroom,
         "throughput": throughput,
         "fullpipe_ms": (fullpipe or {}).get("full_pipeline_ms"),
+        "fullpipe_baseline_ms": _fullpipe_baseline(ledger),
         "attempts": attempts,
         "opportunities": opportunities,
         "hitl_proposal": proposal if isinstance(proposal, dict) else None,
@@ -680,16 +748,66 @@ def make_server(host: str, port: int, collect_fn, decision_fn=None) -> Threading
     return srv
 
 
+def _reclaim_dashboard_port(port: int) -> bool:
+    """Free ``port`` if a STALE planner dashboard/proxy is squatting it (a leftover from a prior run
+    or a manual serve), so a new run binds its expected port instead of falling back to a random one
+    the UI can't find. Terminates ONLY our own dashboard/proxy processes — identified by their command
+    line — never an unrelated service. Returns True if it freed the port. Linux-only, best-effort."""
+    import signal
+    import subprocess
+
+    pids: set[int] = set()
+    try:
+        out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return False
+    for line in out.splitlines():
+        if (":%d " % port) not in line:
+            continue
+        for m in re.findall(r"pid=(\d+)", line):
+            pids.add(int(m))
+    freed = False
+    for pid in pids:
+        try:
+            cl = Path("/proc/%d/cmdline" % pid).read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except Exception:
+            continue
+        # only OUR own dashboard/proxy squatters — never anything else
+        ours = ("optimize-dashboard" in cl) or ("dash_proxy" in cl) or ("tt_hw_planner" in cl and "dashboard" in cl)
+        if ours:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                freed = True
+            except Exception:
+                pass
+    if freed:
+        time.sleep(1.0)  # let the socket release before rebinding
+    return freed
+
+
+def _make_server_or_reclaim(host: str, port: int, collect_fn, decision_fn=None):
+    """make_server on the requested port; if it's busy because a stale planner dashboard/proxy holds
+    it, free that (our process only) and retry so the run keeps its expected port — falling back to a
+    free port only if the squatter isn't ours."""
+    try:
+        return make_server(host, port, collect_fn, decision_fn)
+    except OSError as exc:
+        if port == 0:
+            raise
+        if _reclaim_dashboard_port(port):
+            try:
+                srv = make_server(host, port, collect_fn, decision_fn)
+                print("  [dashboard] reclaimed port %d from a stale planner dashboard" % port)
+                return srv
+            except OSError:
+                pass
+        print("  [dashboard] port %d unavailable (%s); using a free port instead" % (port, exc))
+        return make_server(host, 0, collect_fn, decision_fn)
+
+
 def serve(host: str, port: int, collect_fn, decision_fn=None) -> int:
     """Blocking serve (standalone command). Returns on Ctrl+C."""
-    try:
-        srv = make_server(host, port, collect_fn, decision_fn)
-    except OSError as exc:
-        if port != 0:
-            print(f"  [dashboard] port {port} unavailable ({exc}); using a free port instead")
-            srv = make_server(host, 0, collect_fn, decision_fn)
-        else:
-            raise
+    srv = _make_server_or_reclaim(host, port, collect_fn, decision_fn)
     url = "http://%s:%d/" % (host if host not in ("0.0.0.0", "::") else "127.0.0.1", srv.server_address[1])
     print(f"  [dashboard] live optimize view: {url}  (Ctrl+C to stop)")
     try:
@@ -705,14 +823,7 @@ def serve_in_thread(host: str, port: int, collect_fn, decision_fn=None):
     """Non-blocking serve for ``optimize --dashboard``: daemon thread, dies with the run process."""
     import threading
 
-    try:
-        srv = make_server(host, port, collect_fn, decision_fn)
-    except OSError as exc:
-        if port != 0:
-            print(f"  [dashboard] port {port} unavailable ({exc}); using a free port instead")
-            srv = make_server(host, 0, collect_fn, decision_fn)
-        else:
-            raise
+    srv = _make_server_or_reclaim(host, port, collect_fn, decision_fn)
     t = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True)
     t.start()
     url = "http://%s:%d/" % (host if host not in ("0.0.0.0", "::") else "127.0.0.1", srv.server_address[1])
