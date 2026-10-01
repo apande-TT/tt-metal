@@ -82,9 +82,10 @@ def build(device, torch_module):
     # A unit gamma (one the caller folded into the consuming weights) costs a full pass for nothing.
     unit = bool(torch.all(norm.weight.detach() == 1))
 
-    def mistral_r_m_s_norm(hidden_states, dtype=None, **kwargs):
+    def mistral_r_m_s_norm(hidden_states, dtype=None, memory_config=None, **kwargs):
         """`dtype` narrows only the OUTPUT (e.g. bf16 for a norm that feeds a matmul); the
-        statistics and the scaling are float32 either way."""
+        statistics and the scaling are float32 either way. `memory_config` places the output (L1
+        for a norm whose only reader is the next matmul)."""
         shape = [int(s) for s in hidden_states.shape]
         seq = shape[-2]
         lead = 1
@@ -95,9 +96,11 @@ def build(device, torch_module):
             x = ttnn.typecast(x, ttnn.float32)
         scale = ttnn.add(_sq_mean(x), eps, activations=[ttnn.UnaryOpType.RSQRT])
         if unit:
-            out = ttnn.multiply(x, scale, dtype=dtype or ttnn.float32)
+            out = ttnn.multiply(x, scale, dtype=dtype or ttnn.float32, memory_config=memory_config)
         else:
-            out = ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32)
+            out = ttnn.multiply(
+                ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32, memory_config=memory_config
+            )
         return ttnn.reshape(out, [lead, seq, dim] if len(shape) == 3 else [lead, 1, seq, dim])
 
     return mistral_r_m_s_norm
