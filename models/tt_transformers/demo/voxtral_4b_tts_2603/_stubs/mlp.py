@@ -450,10 +450,12 @@ def build(device, torch_module):
         if h.dtype in (ttnn.bfloat16, ttnn.bfloat8_b) and lead * seq >= 256:
             gated = _fused_swiglu(h, w_gu, w_ttl)
         else:
+            l1 = ttnn.L1_MEMORY_CONFIG  # gate / up / their product are each read once, right after
             gated = ttnn.multiply(
-                _lin(h, w_gate, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
-                _lin(h, w_up, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
+                _lin(h, w_gate, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE, memory_config=l1),
+                _lin(h, w_up, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE, memory_config=l1),
                 input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+                memory_config=l1,
             )
         # Read once, by the residual add: L1.
         out = _lin(gated, w_down, dtype=x.dtype, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)

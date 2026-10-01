@@ -751,7 +751,9 @@ def build(device, torch_module):
         # `cos`/`sin` are `[1, 1, 1, head_dim]` and broadcast.
         groups = n_heads // n_kv_heads
         flat = ttnn.reshape(hidden_states, [1, 1, batch, dim])
-        fused = _lin(flat, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE)
+        fused = _lin(
+            flat, wqkv, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
+        )
         # ONE data-movement op splits the fused qkv by user and head, float32 preserved, into the
         # decode shard layout (one user per core): q `[1, B, n_heads, head_dim]` and k / v in the
         # cache's own `[1, B, n_kv, head_dim]` -- the n_kv heads share ONE tile per user there, where
