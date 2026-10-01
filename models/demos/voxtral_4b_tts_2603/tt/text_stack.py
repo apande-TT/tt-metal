@@ -640,6 +640,7 @@ class TextStack:
         # the tail's rotated k and its v land in L1 for the joined SDPA k/v and the cache seed.
         # The input norm's output, the fused qkv and its 48-head split all sit in L1 too.
         # So do o_proj's and the down projection's outputs, read once by their residual adds.
+        # The tail's q and k are height-sharded over 80 cores for their fused RoPE (stubs' `_rope_rows_sharded`).
         pre_in = self._voiced(ttnn.slice(input_ids_tt, [0, 0], [1, rows]), split["keep_head"], split["placed_head"])
         tail_ids = ttnn.reshape(ttnn.slice(input_ids_tt, [0, start], [batch, real]), [1, batch * tail])
         tail_in = self._voiced(tail_ids, split["keep_tail"], split["placed_tail"])
