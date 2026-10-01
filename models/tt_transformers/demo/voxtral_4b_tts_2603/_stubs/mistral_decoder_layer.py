@@ -236,6 +236,37 @@ def _lin(x, w, **kwargs):
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
+def _down_short(x, w, **kwargs):
+    """The down projection; a SHORT one (4-7 tile rows, the 160-row prefix) reads its activation
+    WIDTH-SHARDED in L1 in exactly the K blocks `_short_cfg`'s 1D multicast streams, so each block is
+    multicast from the core holding it instead of ONE sender reading the whole 2.9 MB activation.
+    Same config, same K order: the arithmetic is unchanged."""
+    shape = [int(d) for d in x.shape]
+    rows = 1
+    for d in shape[:-1]:
+        rows *= d
+    if 128 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs and not x.is_sharded():
+        fp32_dest = bool(getattr(kwargs.get("compute_kernel_config"), "fp32_dest_acc_en", False))
+        cfg = _short_cfg(x, w, rows, kwargs.get("dtype") or x.dtype, fp32_dest)
+        kb = getattr(cfg, "in0_block_w", None)
+        kt = shape[-1] // 32
+        grid = x.device().compute_with_storage_grid_size()
+        if kb and kt % kb == 0 and kt // kb <= int(grid.x) * int(grid.y):
+            mem = ttnn.create_sharded_memory_config(
+                shape=(rows, kb * 32),
+                core_grid=ttnn.num_cores_to_corerangeset(kt // kb, grid, row_wise=True),
+                strategy=ttnn.ShardStrategy.WIDTH,
+                orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                use_height_and_width_as_shard_shape=True,
+            )
+            xs = ttnn.to_memory_config(ttnn.reshape(x, [1, 1, rows, shape[-1]]), mem)
+            kwargs["program_config"] = cfg
+            y = ttnn.linear(xs, w, **kwargs)
+            ttnn.deallocate(xs)
+            return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
+    return _lin(x, w, **kwargs)
+
+
 def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
@@ -1137,7 +1168,9 @@ def build(device, torch_module):
         down_dtype = h.dtype if decode else ttnn.bfloat16
         h = ttnn.add(
             h,
-            _lin(gated, w_down, dtype=down_dtype, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            _down_short(
+                gated, w_down, dtype=down_dtype, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
+            ),
             memory_config=resid,
         )
         ttnn.deallocate(gated)
