@@ -356,6 +356,31 @@ def _rope_signed(x, cos, sin_signed, half):
     )
 
 
+def _rope_rows_sharded(x):
+    """A tall `x` HEIGHT-SHARDED in L1 over the most cores that split its tile rows evenly (the fused
+    RoPE then reads its rows locally and parallelises over the shard grid), or `x` unchanged."""
+    shape = [int(d) for d in x.shape]
+    if shape[-2] < 256:
+        return x
+    rows = 1
+    for d in shape[:-1]:
+        rows *= d
+    tr = rows // 32
+    grid = x.device().compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    cores = next((c for c in range(gx * gy, 0, -1) if tr % c == 0), None)
+    if not cores or cores < gx:
+        return x
+    mem = ttnn.create_sharded_memory_config(
+        shape=(rows // cores, shape[-1]),
+        core_grid=ttnn.num_cores_to_corerangeset(cores, ttnn.CoreCoord(gx, gy), row_wise=True),
+        strategy=ttnn.ShardStrategy.HEIGHT,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+    return ttnn.to_memory_config(x, mem)
+
+
 def _rope_prefill(q, k, cos, sin, half):
     """Prefill RoPE on q and k as ONE fused kernel each when the table is shared by the batch.
 
@@ -373,8 +398,10 @@ def _rope_prefill(q, k, cos, sin, half):
     # read at once (the joined SDPA k and the cache seed) and lands in L1 too.
     tall = int(k.shape[-2]) >= 256
     return (
-        ttnn.experimental.rotary_embedding(q, cos, sin, memory_config=ttnn.L1_MEMORY_CONFIG),
-        ttnn.experimental.rotary_embedding(k, cos, sin, memory_config=ttnn.L1_MEMORY_CONFIG if tall else None),
+        ttnn.experimental.rotary_embedding(_rope_rows_sharded(q), cos, sin, memory_config=ttnn.L1_MEMORY_CONFIG),
+        ttnn.experimental.rotary_embedding(
+            _rope_rows_sharded(k), cos, sin, memory_config=ttnn.L1_MEMORY_CONFIG if tall else None
+        ),
     )
 
 
