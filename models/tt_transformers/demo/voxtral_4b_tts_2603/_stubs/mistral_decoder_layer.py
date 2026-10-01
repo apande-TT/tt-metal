@@ -453,11 +453,13 @@ def _rope_signed(x, cos, sin_signed, half):
     )
 
 
-def _rope_rows_cfg(shape, device):
+def _rope_rows_cfg(shape, device, short=False):
     """The HEIGHT-sharded L1 config for a tall `[..., S, D]` RoPE input: the most cores that split its
     tile rows evenly (the fused RoPE then reads its rows locally and parallelises over the shard
-    grid), or None for a short one."""
-    if shape[-2] < 256:
+    grid), or None for a short one. `short` takes a short one too -- the head split slices it there
+    directly, so no reshard op is paid for it (the 160-row prefix's q: 80 cores, 2 rows each, where
+    the interleaved op deals 1-2 rows to 110)."""
+    if shape[-2] < 256 and not short:
         return None
     rows = 1
     for d in shape[:-1]:
@@ -500,15 +502,11 @@ def _rope_prefill(q, k, cos, sin, half):
         return _rope(q, cos, sin, half), _rope(k, cos, sin, half)
     if cos.dtype != ttnn.bfloat16:
         cos, sin = ttnn.typecast(cos, ttnn.bfloat16), ttnn.typecast(sin, ttnn.bfloat16)
-    # SDPA is q's only reader and streams it chunk by chunk, so q lands in L1. The short prefix's k
-    # stays in DRAM because the stash phase holds it across the whole stack; the tall tail's is
-    # read at once (the joined SDPA k and the cache seed) and lands in L1 too.
-    tall = int(k.shape[-2]) >= 256
+    # SDPA is q's only reader and streams it chunk by chunk, so q lands in L1, and k does too
+    # (interleaved, whatever layout the head split sliced it in).
     return (
         ttnn.experimental.rotary_embedding(_rope_rows_sharded(q), cos, sin, memory_config=ttnn.L1_MEMORY_CONFIG),
-        ttnn.experimental.rotary_embedding(
-            _rope_rows_sharded(k), cos, sin, memory_config=ttnn.L1_MEMORY_CONFIG if tall else None
-        ),
+        ttnn.experimental.rotary_embedding(_rope_rows_sharded(k), cos, sin, memory_config=ttnn.L1_MEMORY_CONFIG),
     )
 
 
@@ -629,8 +627,8 @@ def _split_heads(qkv, n_heads, n_kv_heads, rope=False):
     b, _, s, d = (int(x) for x in heads.shape)
     # q and k are read once, by the RoPE ops right after, so they land in L1.
     l1 = ttnn.L1_MEMORY_CONFIG
-    q_mem = _rope_rows_cfg([b, n_heads, s, d], heads.device()) if rope else None
-    k_mem = _rope_rows_cfg([b, n_kv_heads, s, d], heads.device()) if rope else None
+    q_mem = _rope_rows_cfg([b, n_heads, s, d], heads.device(), short=True) if rope else None
+    k_mem = _rope_rows_cfg([b, n_kv_heads, s, d], heads.device(), short=True) if rope else None
     q = ttnn.slice(heads, [0, 0, 0, 0], [b, n_heads, s, d], memory_config=q_mem or l1)
     k = ttnn.slice(heads, [0, n_heads, 0, 0], [b, n_heads + n_kv_heads, s, d], memory_config=k_mem or l1)
     # The tall tail's v is read at once too; the short prefix's is stashed across the stack.
