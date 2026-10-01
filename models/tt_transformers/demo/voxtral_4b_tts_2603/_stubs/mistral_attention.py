@@ -27,6 +27,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import ttl_kv
 
 # `ttnn.linear`/`ttnn.matmul` on their DEFAULTS leave `fp32_dest_acc_en` off, so the accumulator
 # rounds to bfloat16 at every step even when the activations are float32. The consumer of this
@@ -675,10 +676,15 @@ def _seed_split(kv, k, v):
             home = ttnn.zeros(full, dtype=_CACHE_DTYPE, layout=ttnn.TILE_LAYOUT, device=part.tail.device())
         narrow = ttnn.typecast(part.prefix, _CACHE_DTYPE)
         ttnn.deallocate(part.prefix)
-        shared = ttnn.repeat(narrow, ttnn.Shape([batch, 1, 1, 1]))
-        ttnn.deallocate(narrow)
-        ttnn.experimental.paged_fill_cache(home, shared, rows_fill[0], batch_idx_tensor=rows_fill[1])
-        ttnn.deallocate(shared)
+        if ttl_kv.supports(home, narrow):
+            # The tt-lang seed: each prefix tile row read once and written into every sample's rows.
+            ttl_kv.fill_prefix(home, narrow)
+            ttnn.deallocate(narrow)
+        else:
+            shared = ttnn.repeat(narrow, ttnn.Shape([batch, 1, 1, 1]))
+            ttnn.deallocate(narrow)
+            ttnn.experimental.paged_fill_cache(home, shared, rows_fill[0], batch_idx_tensor=rows_fill[1])
+            ttnn.deallocate(shared)
         tile_rows = ttnn.reshape(home, [batch * heads * capacity // tile, 1, tile, width])
         ttnn.experimental.paged_fill_cache(tile_rows, part.tail, tail_fill[0], batch_idx_tensor=tail_fill[1])
         ttnn.deallocate(part.tail)
