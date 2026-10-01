@@ -379,29 +379,36 @@ def _rope_signed(x, cos, sin_signed, half):
     )
 
 
-def _rope_rows_sharded(x):
-    """A tall `x` HEIGHT-SHARDED in L1 over the most cores that split its tile rows evenly (the fused
-    RoPE then reads its rows locally and parallelises over the shard grid), or `x` unchanged."""
-    shape = [int(d) for d in x.shape]
+def _rope_rows_cfg(shape, device):
+    """The HEIGHT-sharded L1 config for a tall `[..., S, D]` RoPE input: the most cores that split its
+    tile rows evenly (the fused RoPE then reads its rows locally and parallelises over the shard
+    grid), or None for a short one."""
     if shape[-2] < 256:
-        return x
+        return None
     rows = 1
     for d in shape[:-1]:
         rows *= d
     tr = rows // 32
-    grid = x.device().compute_with_storage_grid_size()
+    grid = device.compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
     cores = next((c for c in range(gx * gy, 0, -1) if tr % c == 0), None)
     if not cores or cores < gx:
-        return x
-    mem = ttnn.create_sharded_memory_config(
+        return None
+    return ttnn.create_sharded_memory_config(
         shape=(rows // cores, shape[-1]),
         core_grid=ttnn.num_cores_to_corerangeset(cores, ttnn.CoreCoord(gx, gy), row_wise=True),
         strategy=ttnn.ShardStrategy.HEIGHT,
         orientation=ttnn.ShardOrientation.ROW_MAJOR,
         use_height_and_width_as_shard_shape=True,
     )
-    return ttnn.to_memory_config(x, mem)
+
+
+def _rope_rows_sharded(x):
+    """A tall `x` in `_rope_rows_cfg`'s layout (as is when the head split already sliced it there)."""
+    if x.is_sharded():
+        return x
+    mem = _rope_rows_cfg([int(d) for d in x.shape], x.device())
+    return x if mem is None else ttnn.to_memory_config(x, mem)
 
 
 def _rope_prefill(q, k, cos, sin, half):
@@ -413,6 +420,9 @@ def _rope_prefill(q, k, cos, sin, half):
     table in the input's dtype; a per-row table (explicit position ids) keeps the spelled-out path.
     """
     if int(cos.shape[0]) != 1 or q.dtype != ttnn.bfloat16 or k.dtype != ttnn.bfloat16:
+        l1 = ttnn.L1_MEMORY_CONFIG
+        q = ttnn.to_memory_config(q, l1) if q.is_sharded() else q
+        k = ttnn.to_memory_config(k, l1) if k.is_sharded() else k
         return _rope(q, cos, sin, half), _rope(k, cos, sin, half)
     if cos.dtype != ttnn.bfloat16:
         cos, sin = ttnn.typecast(cos, ttnn.bfloat16), ttnn.typecast(sin, ttnn.bfloat16)
@@ -526,12 +536,14 @@ def _tail_rows(t, batch, real):
     return ttnn.to_layout(rows, ttnn.TILE_LAYOUT, dtype=_CACHE_DTYPE)
 
 
-def _split_heads(qkv, n_heads, n_kv_heads):
+def _split_heads(qkv, n_heads, n_kv_heads, rope=False):
     """`[B, 1, S, (n_heads + 2 n_kv) * D]` -> q `[B, n_heads, S, D]`, k / v `[B, n_kv, S, D]`.
 
     The fused split parallelises over tile rows only (5 cores for the 160-row prefix, 20 for the
     640-row tail). Asked for every section as a Q head (`num_kv_heads=0`) it runs head-parallel
     over the whole grid, and three head-range slices then hand back exactly the same q, k and v.
+    With `rope` (the fused RoPE reads q and k next) a tall q and k are sliced straight into
+    `_rope_rows_cfg`'s height-sharded layout, so no separate reshard runs before the RoPE.
     """
     heads = ttnn.experimental.nlp_create_qkv_heads(
         qkv,
@@ -543,8 +555,10 @@ def _split_heads(qkv, n_heads, n_kv_heads):
     b, _, s, d = (int(x) for x in heads.shape)
     # q and k are read once, by the RoPE ops right after, so they land in L1.
     l1 = ttnn.L1_MEMORY_CONFIG
-    q = ttnn.slice(heads, [0, 0, 0, 0], [b, n_heads, s, d], memory_config=l1)
-    k = ttnn.slice(heads, [0, n_heads, 0, 0], [b, n_heads + n_kv_heads, s, d], memory_config=l1)
+    q_mem = _rope_rows_cfg([b, n_heads, s, d], heads.device()) if rope else None
+    k_mem = _rope_rows_cfg([b, n_kv_heads, s, d], heads.device()) if rope else None
+    q = ttnn.slice(heads, [0, 0, 0, 0], [b, n_heads, s, d], memory_config=q_mem or l1)
+    k = ttnn.slice(heads, [0, n_heads, 0, 0], [b, n_heads + n_kv_heads, s, d], memory_config=k_mem or l1)
     # The tall tail's v is read at once too; the short prefix's is stashed across the stack.
     v = ttnn.slice(
         heads,
@@ -1004,7 +1018,7 @@ def build(device, torch_module):
 
         # The fused qkv's only reader is the head split right after: L1.
         qkv = _lin(x, wqkv, dtype=_SDPA_DTYPE, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
-        q, k, v = _split_heads(qkv, n_heads, n_kv_heads)
+        q, k, v = _split_heads(qkv, n_heads, n_kv_heads, rope=position_embeddings is not None)
         ttnn.deallocate(qkv)
 
         if position_embeddings is not None:
