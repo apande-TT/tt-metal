@@ -222,7 +222,10 @@ def _sq_mean(x):
     for d in shape[:-1]:
         rows *= d
     if rows < 256:
-        return ttnn.mean(ttnn.square(x), dim=-1, keepdim=True)
+        # Short (decode, prefix): x^2 and its row means stay in L1 -- the mean is a one-core-per-
+        # tile-row reduce, which reads x^2 back faster from L1 than from DRAM.
+        l1 = ttnn.L1_MEMORY_CONFIG
+        return ttnn.mean(ttnn.square(x, memory_config=l1), dim=-1, keepdim=True, memory_config=l1)
     stats = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=_STATS_COMPUTE, dtype=ttnn.float32)
     total = ttnn.slice(stats, [0] * len(shape), shape[:-1] + [1])
     return ttnn.multiply(total, 1.0 / shape[-1])
@@ -960,16 +963,24 @@ def build(device, torch_module):
     ):
         h, lead, seq, rank = _view4(hidden_states, dim)
 
-        xn = _rms_norm(h, g_in, eps_in, dtype=None if decode else ttnn.bfloat16)
+        # A decode step's norm output (the qkv matmul's only input) is small: L1.
+        xn = _rms_norm(
+            h,
+            g_in,
+            eps_in,
+            dtype=None if decode else ttnn.bfloat16,
+            memory_config=ttnn.L1_MEMORY_CONFIG if decode else None,
+        )
         if decode:
             attn_out = _decode_attn(xn, position_embeddings, kv_cache, position)
         else:
             attn_out = _prefill_attn(xn, position_embeddings, kv_cache, seq)
         ttnn.deallocate(xn)
-        # The SHORT prefill's (160-row prefix's) float32 residual stream lives in L1 between blocks:
-        # both adds write it there and both norms read it from there instead of re-streaming it from
-        # DRAM. The 640-row tail's clashes with the fused SwiGLU's circular buffers, so it stays.
-        resid = ttnn.L1_MEMORY_CONFIG if not decode and lead * seq < 256 else None
+        # A SHORT stream's (the 160-row prefix's, a decode step's) float32 residual lives in L1
+        # between blocks: both adds write it there and both norms read it from there instead of
+        # re-streaming it from DRAM. The 640-row tail's clashes with the fused SwiGLU's circular
+        # buffers, so it stays.
+        resid = ttnn.L1_MEMORY_CONFIG if lead * seq < 256 else None
         h = ttnn.add(h, attn_out, memory_config=resid)
         ttnn.deallocate(attn_out)
         if trim is not None:
@@ -989,7 +1000,7 @@ def build(device, torch_module):
             g_post,
             eps_post,
             dtype=None if decode else ttnn.bfloat8_b,
-            memory_config=None if decode else ttnn.L1_MEMORY_CONFIG,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         if decode:
             gated = ttnn.multiply(
@@ -1006,7 +1017,7 @@ def build(device, torch_module):
         h = ttnn.add(
             h,
             _lin(gated, w_down, dtype=down_dtype, compute_kernel_config=_COMPUTE),
-            memory_config=None if decode else resid,
+            memory_config=resid,
         )
         ttnn.deallocate(gated)
 

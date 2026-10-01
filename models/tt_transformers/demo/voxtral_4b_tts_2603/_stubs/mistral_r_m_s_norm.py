@@ -68,7 +68,10 @@ def _sq_mean(x):
     for d in shape[:-1]:
         rows *= d
     if rows < 256:
-        return ttnn.mean(ttnn.square(x), dim=-1, keepdim=True)
+        # Short (decode, prefix): x^2 and its row means stay in L1 -- the mean is a one-core-per-
+        # tile-row reduce, which reads x^2 back faster from L1 than from DRAM.
+        l1 = ttnn.L1_MEMORY_CONFIG
+        return ttnn.mean(ttnn.square(x, memory_config=l1), dim=-1, keepdim=True, memory_config=l1)
     stats = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=_STATS_COMPUTE, dtype=ttnn.float32)
     total = ttnn.slice(stats, [0] * len(shape), shape[:-1] + [1])
     return ttnn.multiply(total, 1.0 / shape[-1])
