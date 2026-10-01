@@ -641,6 +641,7 @@ class TextStack:
         # The input norm's output, the fused qkv and its 48-head split all sit in L1 too.
         # So do o_proj's and the down projection's outputs, read once by their residual adds.
         # The tail's q and k are height-sharded over 80 cores for their fused RoPE (stubs' `_rope_rows_sharded`).
+        # A decode step's norms take the FPU reduce path for their row mean (stubs' `_sq_mean`).
         # The prefix's down projection reads its activation width-sharded in its K blocks (stubs' `_down_short`).
         pre_in = self._voiced(ttnn.slice(input_ids_tt, [0, 0], [1, rows]), split["keep_head"], split["placed_head"])
         tail_ids = ttnn.reshape(ttnn.slice(input_ids_tt, [0, start], [batch, real]), [1, batch * tail])
