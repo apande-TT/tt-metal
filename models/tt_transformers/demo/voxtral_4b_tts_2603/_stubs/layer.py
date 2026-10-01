@@ -952,7 +952,11 @@ def build(device, torch_module):
         else:
             attn_out = _prefill_attn(xn, position_embeddings, kv_cache, seq)
         ttnn.deallocate(xn)
-        h = ttnn.add(h, attn_out)
+        # The SHORT prefill's (160-row prefix's) float32 residual stream lives in L1 between blocks:
+        # both adds write it there and both norms read it from there instead of re-streaming it from
+        # DRAM. The 640-row tail's clashes with the fused SwiGLU's circular buffers, so it stays.
+        resid = ttnn.L1_MEMORY_CONFIG if not decode and lead * seq < 256 else None
+        h = ttnn.add(h, attn_out, memory_config=resid)
         ttnn.deallocate(attn_out)
         if trim is not None:
             # The stack reads only some of this block's rows (its last block): `trim` keeps those as
@@ -985,7 +989,11 @@ def build(device, torch_module):
         # Prefill hands the down projection over in bf16, as the composed kinds' mlp and every wo
         # already do; the residual it is added into stays float32.
         down_dtype = h.dtype if decode else ttnn.bfloat16
-        h = ttnn.add(h, _lin(gated, w_down, dtype=down_dtype, compute_kernel_config=_COMPUTE))
+        h = ttnn.add(
+            h,
+            _lin(gated, w_down, dtype=down_dtype, compute_kernel_config=_COMPUTE),
+            memory_config=None if decode else resid,
+        )
         ttnn.deallocate(gated)
 
         return h if trim is not None else _restore(h, lead, seq, rank, dim)
