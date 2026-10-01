@@ -460,6 +460,11 @@ def _bmm(a, b, transpose_b=False):
         per_core_M=pm,
         per_core_N=n,
     )
+    # `cfg` is built and DELIBERATELY NOT PASSED. Passing it (27033d4462: vocode 80 -> 70 ms) broke
+    # the audio -- bisected against Whisper WER, dropped in 7b8f10ef4b3 -- and retrying it with K
+    # transposed explicitly and per_core_M = m or 1 put the waveform at PCC ~0 (2026-10-01). These
+    # float32 products need some other fix; the per-stage PCC tests cannot see a vocode error, only
+    # test_gate3_e2e_pcc and the WER/MOS test can.
     return ttnn.matmul(a, b, transpose_b=transpose_b, compute_kernel_config=_COMPUTE)
 
 
