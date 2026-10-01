@@ -57,6 +57,10 @@ FLOAT32 ACTIVATIONS, BFLOAT16 WEIGHTS. All-bfloat16 put the full chain at PCC 0.
 is fine alone, but eight residual blocks plus five convolutions compound. Q/K/V and the ALiBi mask
 narrow to bfloat16 for SDPA, which rejects float32 outright.
 
+The codec attention's two head-batched products take a full-grid reuse program config with each
+(batch, head) one whole-M block (the codec stubs' `_bmm`): splitting M across blocks is what broke
+the audio before (27033d4462).
+
 No device is ever opened here.
 """
 from __future__ import annotations
