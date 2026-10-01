@@ -444,8 +444,10 @@ class TextStack:
                 "keep_tail": ttnn.from_torch(_compact(keep), **fp32),
                 "placed_tail": ttnn.from_torch(_compact(placed), **fp32),
                 # The fused RoPE re-reads these for every head's tile rows (32x for q), so they sit
-                # in L1 like the prefix's tables (~160 KB each). (The stubs' `_merge_heads` merges
-                # the short prefix's heads straight into o_proj's width-sharded K blocks, the tail's one head per core.)
+                # in L1 like the prefix's tables (~160 KB each). The tail's q and k are sliced
+                # straight into the RoPE's height-sharded layout. (The stubs' `_merge_heads` merges
+                # the short prefix's heads straight into o_proj's width-sharded K blocks, the tail's
+                # one head per core.)
                 "rope_tail": tuple(
                     ttnn.from_torch(
                         t[start:real].repeat(batch, 1).reshape(1, 1, batch * tail, -1).to(torch.bfloat16).contiguous(),
