@@ -319,7 +319,7 @@ def _rope_prefill(q, k, cos, sin, half):
     )
 
 
-def _bmm(a, b, transpose_b=False):
+def _bmm(a, b, transpose_b=False, memory_config=None):
     """Head-batched decode attention `a @ b` spread over the full grid.
 
     Without a program config the `[B, n_kv, groups, C]` products land on a handful of cores (probs @ V
@@ -337,7 +337,9 @@ def _bmm(a, b, transpose_b=False):
         per_core_M=m,
         per_core_N=n,
     )
-    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE)
+    return ttnn.matmul(
+        a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE, memory_config=memory_config
+    )
 
 
 def _sdpa_cfg(q):
@@ -869,16 +871,27 @@ def build(device, torch_module):
         # [B, n_kv, C, head_dim] K cache every step.
         # Scale the [B, n_kv, 32, head_dim] query, not the [B, n_kv, 32, C] scores: one pass over
         # a tensor C/head_dim times smaller.
-        scores = _bmm(q, kv_cache["k"], transpose_b=True)
+        # The [B, n_kv, 32, C] float32 scores (~20 MB at B=32, C=608) and everything derived from
+        # them live in L1: in DRAM the mask add and the exp pass each moved ~40 MB at ~265 GB/s,
+        # and the two reductions and P@V read them back again, every layer of every step. About
+        # 180 KB a core per tensor across the grid; at most two are alive at once.
+        l1 = ttnn.L1_MEMORY_CONFIG
+        scores = _bmm(q, kv_cache["k"], transpose_b=True, memory_config=l1)
         ttnn.deallocate(q)
         # The cache tail beyond `position` is zeros, and a zero key scores ZERO -- which is a
         # perfectly ordinary logit, not a small one. It has to be masked explicitly.
-        scores = ttnn.add(scores, _decode_mask(kv_cache, position, cap))
+        masked = ttnn.add(scores, _decode_mask(kv_cache, position, cap), memory_config=l1)
+        ttnn.deallocate(scores)
         # Normalise AFTER P@V: dividing the [B, n_kv, 32, head_dim] context by the row sums is the
         # same arithmetic as dividing the C/head_dim-times larger [B, n_kv, 32, C] weights first.
-        e = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
-        ttnn.deallocate(scores)
-        ctx = ttnn.divide(_bmm(e, kv_cache["v"]), ttnn.sum(e, dim=-1, keepdim=True))
+        e = ttnn.subtract(
+            masked,
+            ttnn.max(masked, dim=-1, keepdim=True, memory_config=l1),
+            activations=[ttnn.UnaryOpType.EXP],
+            memory_config=l1,
+        )
+        ttnn.deallocate(masked)
+        ctx = ttnn.divide(_bmm(e, kv_cache["v"], memory_config=l1), ttnn.sum(e, dim=-1, keepdim=True, memory_config=l1))
         ttnn.deallocate(e)
         merged = ttnn.to_layout(
             ttnn.reshape(
