@@ -58,6 +58,14 @@ import torch
 import ttnn
 from models.demos.voxtral_4b_tts_2603.tt import common
 
+def _keep_none(h):
+    """The prefix chain's last-block `trim`: none of its rows are read, only its stashed k/v, so
+    the fused stubs skip that block's attention output (`keeps_none`) as well as its FFN."""
+    return None
+
+
+_keep_none.keeps_none = True
+
 # The four interchangeable block kinds, in the order `i % 4` assigns them.
 BLOCK_KINDS = ("layer", "mistral_decoder_layer", "composed", "mistral_composed")
 
@@ -464,6 +472,14 @@ class TextStack:
                     layout=ttnn.TILE_LAYOUT,
                     device=self.device,
                 ),
+                # Its rows for each sample's last tail position: the last block's attention runs on
+                # those rows alone when only they are read (see `_last_tail_rows`).
+                "mask_last": ttnn.from_torch(
+                    mask[:, :, tail - 1 :: tail].to(torch.bfloat16).contiguous(),
+                    dtype=ttnn.bfloat4_b,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.device,
+                ),
                 "slot_mask": ttnn.from_torch(
                     slot_mask.to(torch.float32).contiguous(),
                     dtype=ttnn.float32,
@@ -598,9 +614,13 @@ class TextStack:
             [batch, self.hidden_size],
         )
 
-    def _last_tail_rows(self, batch, tail):
+    def _last_tail_rows(self, batch, tail, mask_last=None):
         """A `trim` for the compact tail `[1, 1, batch * tail, H]` (sample-major): each sample's last
-        row, as `[1, 1, batch, H]`. The rows are `tail` apart and off-tile, so they are picked ROW_MAJOR."""
+        row, as `[1, 1, batch, H]`. The rows are `tail` apart and off-tile, so they are picked ROW_MAJOR.
+
+        It also tells the last block WHICH rows it keeps (`every`: the last of each `tail` rows) and
+        hands over `mask_last`, those rows of the tail's SDPA mask, so the fused stubs run that
+        block's attention on the kept rows only."""
         hidden = self.hidden_size
 
         def trim(h):
@@ -610,6 +630,8 @@ class TextStack:
             ttnn.deallocate(rm)
             return ttnn.to_layout(ttnn.reshape(rows, [1, 1, batch, hidden]), ttnn.TILE_LAYOUT)
 
+        trim.every = tail
+        trim.mask = mask_last
         return trim
 
     def _voiced(self, ids, keep, placed):
@@ -653,8 +675,8 @@ class TextStack:
             block.kv["prefix_phase"] = "stash"
         # With no hidden state asked for, the prefix's last block is read only for its k/v (its
         # attention stashes them), and the tail's only for each sample's last row.
-        pre_trim = None if need_hidden else (lambda h: None)
-        tail_trim = None if need_hidden else self._last_tail_rows(batch, tail)
+        pre_trim = None if need_hidden else _keep_none
+        tail_trim = None if need_hidden else self._last_tail_rows(batch, tail, split.get("mask_last"))
         try:
             pre_out = self._run_chain(pre_in, self._prefill_rope(pre_in, None), trim=pre_trim)
             for block in self.blocks:
