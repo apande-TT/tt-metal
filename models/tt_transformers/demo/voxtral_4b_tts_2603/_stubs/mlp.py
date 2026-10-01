@@ -155,12 +155,58 @@ def _row_cfg(x, w, out_dtype):
     )
 
 
+def _short_cfg(x, w, rows, out_dtype, fp32_dest):
+    """A 1D in0-multicast config for a SHORT (4-7 tile row) linear -- the 160-row shared prefix.
+
+    ttnn's default there streams K two tiles at a time with 1x1 subblocks (144 multicast rounds at
+    K=9216) and reached ~22% of DRAM bandwidth. As in `_row_cfg`, every core owns a slice of N and
+    streams only its own weight columns while the few activation rows are multicast, here in
+    16-tile K blocks (18 rounds at K=9216). The caller's compute config is kept (HiFi4 + float32
+    DEST for the prefix every sample attends to), so a float32 DEST caps the subblock at 4 tiles.
+    """
+    grid = x.device().compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    mt, kt, nt = rows // 32, int(w.shape[-2]) // 32, int(w.shape[-1]) // 32
+    per_n = next(p for p in range(-(-nt // (gx * gy)), nt + 1) if nt % p == 0)
+    if per_n > 2:  # wide N (the composed gate/up): ttnn's own choice measured faster (105 vs 118 us)
+        return None
+    size = lambda dt: _TILE_BYTES.get(dt, 2048)
+    fixed = mt * per_n * (size(out_dtype) + (4096 if fp32_dest else 0))
+    kb = next(
+        (
+            c
+            for c in (16, 8, 6, 4, 3, 2, 1)
+            if kt % c == 0 and fixed + 2 * c * (mt * size(x.dtype) + per_n * size(w.dtype)) <= _L1_BUDGET // 2
+        ),
+        None,
+    )
+    if kb is None:
+        return None
+    cap = 4 if fp32_dest else 8
+    sub = max(
+        ((h, s) for h in _divisors(mt) for s in _divisors(per_n) if h * s <= cap and (h == 1 or s == per_n)),
+        key=lambda hs: (hs[0] * hs[1], hs[1]),
+    )
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=(gx, gy),
+        in0_block_w=kb,
+        out_subblock_h=sub[0],
+        out_subblock_w=sub[1],
+        per_core_M=mt,
+        per_core_N=per_n,
+        fuse_batch=True,
+        fused_activation=None,
+        mcast_in0=True,
+    )
+
+
 def _lin(x, w, **kwargs):
     """`ttnn.linear` with the leading batch folded into M, so the weight streams ONCE.
 
     A `[B, 1, S, K]` activation against a 2-D weight runs as B separate `S x K x N` matmuls that
     each re-read the whole weight from DRAM; `[1, 1, B*S, K]` is one matmul that reads it once.
-    Tall results (>= 8 tile rows) also get a hand-sized full-grid program config.
+    Tall results (>= 8 tile rows) also get a hand-sized full-grid program config, short ones
+    (4-7 tile rows) a 1D in0-multicast one.
     """
     shape = [int(d) for d in x.shape]
     lead = 1
@@ -174,6 +220,11 @@ def _lin(x, w, **kwargs):
         kwargs["compute_kernel_config"] = _TALL_COMPUTE
     elif rows == 32 and "program_config" not in kwargs:
         cfg = _row_cfg(x, w, kwargs.get("dtype") or x.dtype)
+        if cfg is not None:
+            kwargs["program_config"] = cfg
+    elif 128 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs:
+        fp32_dest = bool(getattr(kwargs.get("compute_kernel_config"), "fp32_dest_acc_en", False))
+        cfg = _short_cfg(x, w, rows, kwargs.get("dtype") or x.dtype, fp32_dest)
         if cfg is not None:
             kwargs["program_config"] = cfg
     if lead == 1:
