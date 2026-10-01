@@ -188,8 +188,14 @@ class TextBlock:
             if kept is None:
                 return None
             h, decode = kept, True
-        # ...and the post-attention one feeds only the fused SwiGLU's LoFi matmul: bfloat8_b.
-        hn = self.parts["norm_post"](h, dtype=None if decode else ttnn.bfloat8_b)
+        # ...and the post-attention one feeds only the fused SwiGLU's LoFi matmul: bfloat8_b, in L1
+        # like the fused kinds' (the SwiGLU's output then lands in L1 too, where the down
+        # projection reads it).
+        hn = self.parts["norm_post"](
+            h,
+            dtype=None if decode else ttnn.bfloat8_b,
+            memory_config=None if decode else ttnn.L1_MEMORY_CONFIG,
+        )
         mlp_out = self.parts["mlp"](hn)
         ttnn.deallocate(hn)
         out = ttnn.add(h, mlp_out)
