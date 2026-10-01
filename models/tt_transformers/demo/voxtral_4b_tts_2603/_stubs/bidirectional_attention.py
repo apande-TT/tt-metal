@@ -328,7 +328,9 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens, readout=
     q = ttnn.reshape(q, [1, n_kv_heads, repeats * q_rows, head_dim])
 
     q = q if scale is None else ttnn.multiply(q, scale)
-    scores = _bmm(q, k, per_core_m=1, transpose_b=True, dtype=ttnn.float32)
+    # 3 tile rows a core (64 cores), not 2 (96): each (head, key block) is re-read by 8 M blocks
+    # instead of 12, a quarter fewer input tiles for the memory-bound scores.
+    scores = _bmm(q, k, per_core_m=3, transpose_b=True, dtype=ttnn.float32)
     scores = ttnn.add(scores, _compact_mask(h.device(), rows, tokens, repeats, q_rows))
     weights = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
