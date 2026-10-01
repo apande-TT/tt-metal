@@ -60,21 +60,19 @@ _STATS_COMPUTE = ttnn.WormholeComputeKernelConfig(
 
 
 def _sq_mean(x):
-    """`mean(x^2, -1)` of a float32 `x`. A tall (prefill) `x` gets its row sums of squares from
-    `rms_norm_pre_all_gather` -- ONE read of `x`, float32 accumulation and a float32 `[rows, 32]`
-    result whose column 0 is the sum -- instead of writing `x^2` out and reading it back to reduce."""
+    """`mean(x^2, -1)` of a float32 `x`, as a square then a row-mean reduce at every height.
+
+    A tall `x` used to take `rms_norm_pre_all_gather` (one read of `x`, float32 row sums); measured
+    on the 640-row tail it ran ~71 us a norm (65 us on its 20 cores, one per tile row, plus the
+    slice and scale) where the square into L1 and the one-core-per-tile-row mean take ~45 us."""
     shape = [int(d) for d in x.shape]
     rows = 1
     for d in shape[:-1]:
         rows *= d
-    if rows < 256:
-        # Short (decode, prefix): x^2 and its row means stay in L1 -- the mean is a one-core-per-
-        # tile-row reduce, which reads x^2 back faster from L1 than from DRAM.
-        l1 = ttnn.L1_MEMORY_CONFIG
-        return ttnn.mean(ttnn.square(x, memory_config=l1), dim=-1, keepdim=True, memory_config=l1)
-    stats = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=_STATS_COMPUTE, dtype=ttnn.float32)
-    total = ttnn.slice(stats, [0] * len(shape), shape[:-1] + [1])
-    return ttnn.multiply(total, 1.0 / shape[-1])
+    # x^2 and its row means live in L1 -- the mean is a one-core-per-tile-row reduce, which reads x^2
+    # back faster from L1 -- and x^2 is freed before any other op runs (~72 KB a core at 640 rows).
+    l1 = ttnn.L1_MEMORY_CONFIG
+    return ttnn.mean(ttnn.square(x, memory_config=l1), dim=-1, keepdim=True, memory_config=l1)
 
 
 def build(device, torch_module):
