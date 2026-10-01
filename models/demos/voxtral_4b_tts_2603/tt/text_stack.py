@@ -689,7 +689,8 @@ class TextStack:
         """ONE token per user: `[B, 1, 1, 3072]` -> `[B, 3072]`, from the RESIDENT cache.
 
         Nothing recomputes the prefix. Each layer appends this token's k/v to its own cache slot
-        `position` and flash-decode reads positions `[0, position]` back out of it.
+        `position` and reads positions `[0, position]` back out of it through two batched matmuls
+        and a spelled-out softmax, whose float32 score tensors the stubs keep in L1.
         """
         position = int(position)
         batch = int(embeds.shape[0])
