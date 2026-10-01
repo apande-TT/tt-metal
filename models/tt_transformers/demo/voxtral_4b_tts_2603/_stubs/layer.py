@@ -479,7 +479,11 @@ def _split_heads(qkv, n_heads, n_kv_heads):
     over the whole grid, and three head-range slices then hand back exactly the same q, k and v.
     """
     heads = ttnn.experimental.nlp_create_qkv_heads(
-        qkv, num_heads=n_heads + 2 * n_kv_heads, num_kv_heads=0, transpose_k_heads=False
+        qkv,
+        num_heads=n_heads + 2 * n_kv_heads,
+        num_kv_heads=0,
+        transpose_k_heads=False,
+        memory_config=ttnn.L1_MEMORY_CONFIG,
     )[0]
     b, _, s, d = (int(x) for x in heads.shape)
     # q and k are read once, by the RoPE ops right after, so they land in L1.
@@ -1011,7 +1015,8 @@ def build(device, torch_module):
         return ttnn.reshape(out, held[:-1] + [dim])
 
     def _prefill_attn(xn, position_embeddings, kv_cache, seq):
-        qkv = _lin(xn, wqkv, dtype=_SDPA_DTYPE, compute_kernel_config=_COMPUTE)
+        # The fused qkv's only reader is the head split right after: L1.
+        qkv = _lin(xn, wqkv, dtype=_SDPA_DTYPE, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
         q, k, v = _split_heads(qkv, n_heads, n_kv_heads)
         ttnn.deallocate(qkv)
         if position_embeddings is not None:
@@ -1046,7 +1051,7 @@ def build(device, torch_module):
             g_in,
             eps_in,
             dtype=None if decode else ttnn.bfloat16,
-            memory_config=ttnn.L1_MEMORY_CONFIG if decode else None,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         if decode:
             attn_out = _decode_attn(xn, position_embeddings, kv_cache, position)
