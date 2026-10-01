@@ -636,6 +636,7 @@ class TextStack:
         # in0-multicast config with 16-tile K blocks (`_short_cfg`) at their own HiFi4 + float32
         # DEST, where ttnn's default streamed K two tiles at a time (the wide gate/up keeps it).
         # Both chains split their fused qkv head-parallel over the whole grid (`_split_heads`).
+        # Every norm's row mean of squares is a square (into L1) + mean reduce, at both heights.
         pre_in = self._voiced(ttnn.slice(input_ids_tt, [0, 0], [1, rows]), split["keep_head"], split["placed_head"])
         tail_ids = ttnn.reshape(ttnn.slice(input_ids_tt, [0, start], [batch, real]), [1, batch * tail])
         tail_in = self._voiced(tail_ids, split["keep_tail"], split["placed_tail"])
