@@ -433,6 +433,24 @@ def _tail_rows(t, batch, real):
     return ttnn.to_layout(rows, ttnn.TILE_LAYOUT, dtype=_CACHE_DTYPE)
 
 
+def _split_heads(qkv, n_heads, n_kv_heads):
+    """`[B, 1, S, (n_heads + 2 n_kv) * D]` -> q `[B, n_heads, S, D]`, k / v `[B, n_kv, S, D]`.
+
+    The fused split parallelises over tile rows only (5 cores for the 160-row prefix, 20 for the
+    640-row tail). Asked for every section as a Q head (`num_kv_heads=0`) it runs head-parallel
+    over the whole grid, and three head-range slices then hand back exactly the same q, k and v.
+    """
+    heads = ttnn.experimental.nlp_create_qkv_heads(
+        qkv, num_heads=n_heads + 2 * n_kv_heads, num_kv_heads=0, transpose_k_heads=False
+    )[0]
+    b, _, s, d = (int(x) for x in heads.shape)
+    q = ttnn.slice(heads, [0, 0, 0, 0], [b, n_heads, s, d])
+    k = ttnn.slice(heads, [0, n_heads, 0, 0], [b, n_heads + n_kv_heads, s, d])
+    v = ttnn.slice(heads, [0, n_heads + n_kv_heads, 0, 0], [b, n_heads + 2 * n_kv_heads, s, d])
+    ttnn.deallocate(heads)
+    return q, k, v
+
+
 def _prefill_sdpa(q, k, v, kv_cache):
     """Prefill SDPA, `(attn, k, v)` -- the k/v to seed the cache with, or None to seed nothing.
 
@@ -870,9 +888,7 @@ def build(device, torch_module):
         x, lead, seq, rank = _view4(hidden_states, dim)
 
         qkv = _lin(x, wqkv, dtype=_SDPA_DTYPE, compute_kernel_config=_COMPUTE)
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv, num_heads=n_heads, num_kv_heads=n_kv_heads, transpose_k_heads=False
-        )
+        q, k, v = _split_heads(qkv, n_heads, n_kv_heads)
         ttnn.deallocate(qkv)
 
         if position_embeddings is not None:
