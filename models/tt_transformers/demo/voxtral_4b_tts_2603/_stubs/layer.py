@@ -1008,6 +1008,7 @@ def build(device, torch_module):
             wo,
             dtype=xn.dtype,
             compute_kernel_config=_COMPUTE,
+            memory_config=ttnn.L1_MEMORY_CONFIG,  # read once, by the residual add
         )
         ttnn.deallocate(merged)
         # Back in the caller's own shape, so the residual add downstream lines up whichever form
@@ -1032,6 +1033,7 @@ def build(device, torch_module):
             wo,
             dtype=xn.dtype,
             compute_kernel_config=_COMPUTE,
+            memory_config=ttnn.L1_MEMORY_CONFIG,  # read once, by the residual add
         )
 
     def layer_forward(
@@ -1098,7 +1100,7 @@ def build(device, torch_module):
         down_dtype = h.dtype if decode else ttnn.bfloat16
         h = ttnn.add(
             h,
-            _lin(gated, w_down, dtype=down_dtype, compute_kernel_config=_COMPUTE),
+            _lin(gated, w_down, dtype=down_dtype, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
             memory_config=resid,
         )
         ttnn.deallocate(gated)

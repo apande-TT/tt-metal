@@ -455,7 +455,8 @@ def build(device, torch_module):
                 _lin(h, w_up, dtype=ttnn.bfloat16, compute_kernel_config=_COMPUTE),
                 input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             )
-        out = _lin(gated, w_down, dtype=x.dtype, compute_kernel_config=_COMPUTE)
+        # Read once, by the residual add: L1.
+        out = _lin(gated, w_down, dtype=x.dtype, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
         ttnn.deallocate(gated)
         return _restore(out, lead, seq, rank, out_dim)
 

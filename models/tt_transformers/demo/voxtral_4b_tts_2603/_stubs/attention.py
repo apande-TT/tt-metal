@@ -883,6 +883,7 @@ def build(device, torch_module):
             wo,
             dtype=hidden_states.dtype,
             compute_kernel_config=_COMPUTE,
+            memory_config=ttnn.L1_MEMORY_CONFIG,  # read once, by the residual add
         )
         ttnn.deallocate(merged)
         # Back in the caller's own shape, so the residual add downstream lines up whichever form
@@ -920,6 +921,7 @@ def build(device, torch_module):
             wo,
             dtype=hidden_states.dtype,
             compute_kernel_config=_COMPUTE,
+            memory_config=ttnn.L1_MEMORY_CONFIG,  # read once, by the residual add
         )
         return _restore(out, lead, seq, rank, out_dim)
 
