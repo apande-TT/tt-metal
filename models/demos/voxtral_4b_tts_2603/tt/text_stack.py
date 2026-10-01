@@ -129,6 +129,14 @@ def _fold_norm(norm, consumer, names):
     return unit, folded
 
 
+def _resid_memory(h, decode):
+    """L1 for a short prefill's residual stream (under 8 tile rows), else the default (DRAM)."""
+    rows = 1
+    for d in list(h.shape)[:-1]:
+        rows *= int(d)
+    return ttnn.L1_MEMORY_CONFIG if not decode and rows < 256 else None
+
+
 class TextBlock:
     """ONE decoder layer, in whichever of the four interchangeable kinds built it.
 
@@ -180,7 +188,12 @@ class TextBlock:
             decode=decode,
         )
         ttnn.deallocate(xn)
-        h = ttnn.add(hidden_states, attn_out)
+        # The SHORT prefill's (the 160-row prefix's) float32 residual stream lives in L1 between
+        # blocks, like the acoustic stage's: both residual adds write it there and both norms read
+        # it from there, where in DRAM each pass re-streamed the whole tensor. The 640-row tail's
+        # (~72 KB a core) clashes with the fused SwiGLU's ~1 MB of circular buffers, so it stays.
+        resid = _resid_memory(hidden_states, decode)
+        h = ttnn.add(hidden_states, attn_out, memory_config=resid)
         ttnn.deallocate(attn_out)
         if trim is not None:
             kept = trim(h)
@@ -198,7 +211,7 @@ class TextBlock:
         )
         mlp_out = self.parts["mlp"](hn)
         ttnn.deallocate(hn)
-        out = ttnn.add(h, mlp_out)
+        out = ttnn.add(h, mlp_out, memory_config=_resid_memory(h, decode))
         ttnn.deallocate(h)
         ttnn.deallocate(mlp_out)
         return out
