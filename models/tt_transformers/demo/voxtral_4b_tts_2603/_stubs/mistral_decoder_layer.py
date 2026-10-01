@@ -516,6 +516,7 @@ def _prefill_sdpa(q, k, v, kv_cache):
             attn_mask=kv_cache["prefix_mask"],
             scale=1.0,
             program_config=_compact_sdpa_cfg(q),
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         if kv_cache.get("tail_fill") is not None and kv_cache.get("fill_tables") is not None:
             # SEEDED IN PLACE, NEVER JOINED: `_seed_cache` fills the prefix and the tail into the
@@ -538,7 +539,10 @@ def _prefill_sdpa(q, k, v, kv_cache):
             q, k, v, is_causal=False, attn_mask=kv_cache["prefix_mask"], scale=1.0, program_config=_sdpa_cfg(q)
         )
         return a, k, v
-    a = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0, program_config=_sdpa_cfg(q))
+    # The attention output's only reader is the head merge right after: L1.
+    a = ttnn.transformer.scaled_dot_product_attention(
+        q, k, v, is_causal=True, scale=1.0, program_config=_sdpa_cfg(q), memory_config=ttnn.L1_MEMORY_CONFIG
+    )
     if phase == "stash":
         kv_cache["prefix_kv"] = (k, v)
         return a, None, None
