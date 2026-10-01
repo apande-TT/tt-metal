@@ -267,6 +267,42 @@ def _down_short(x, w, **kwargs):
     return _lin(x, w, **kwargs)
 
 
+def _merge_heads(a, w, out_dtype, compute):
+    """`nlp_concat_heads` of the attention output `a` `[1, H, S, D]`, laid out for its o_proj `w`.
+
+    Interleaved, the merge deals out one 32-row tile per core, so the 160-row prefix ran on 5
+    cores. A SHORT one (4-7 tile rows) is height-sharded instead, as many heads per core as fill one
+    of `_short_cfg`'s K blocks, and every core merges its heads into its own column block of a
+    WIDTH-sharded result -- the layout `_down_short` feeds the 1D multicast, so o_proj multicasts
+    each K block from the core holding it. Same config, same K order: the arithmetic is unchanged.
+    """
+    b, n_heads, rows, head_dim = (int(d) for d in a.shape)
+    if b == 1 and 128 <= rows < 256 and rows % 32 == 0 and head_dim % 32 == 0:
+        fp32_dest = bool(getattr(compute, "fp32_dest_acc_en", False))
+        cfg = _short_cfg(a, w, rows, out_dtype or a.dtype, fp32_dest)
+        kb = getattr(cfg, "in0_block_w", None)
+        per_core = kb * 32 // head_dim if kb and (kb * 32) % head_dim == 0 else 0
+        grid = a.device().compute_with_storage_grid_size()
+        if per_core and n_heads % per_core == 0 and n_heads // per_core <= int(grid.x) * int(grid.y):
+            cores = ttnn.num_cores_to_corerangeset(n_heads // per_core, grid, row_wise=True)
+            heads_cfg = ttnn.MemoryConfig(
+                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                ttnn.BufferType.L1,
+                ttnn.ShardSpec(cores, [per_core * rows, head_dim], ttnn.ShardOrientation.ROW_MAJOR),
+            )
+            merged_cfg = ttnn.MemoryConfig(
+                ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                ttnn.BufferType.L1,
+                ttnn.ShardSpec(cores, [rows, per_core * head_dim], ttnn.ShardOrientation.ROW_MAJOR),
+            )
+            heads = ttnn.to_memory_config(a, heads_cfg)
+            ttnn.deallocate(a)
+            merged = ttnn.experimental.nlp_concat_heads(heads, memory_config=merged_cfg)
+            ttnn.deallocate(heads)
+            return merged
+    return ttnn.experimental.nlp_concat_heads(a, memory_config=ttnn.L1_MEMORY_CONFIG)
+
+
 def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
@@ -1108,13 +1144,16 @@ def build(device, torch_module):
         a, k, v = _prefill_sdpa(q, k, v, kv_cache)
         if kv_cache is not None and k is not None:
             _seed_cache(kv_cache, k, v)
-        return _lin(
-            ttnn.experimental.nlp_concat_heads(a, memory_config=ttnn.L1_MEMORY_CONFIG),
+        merged = _merge_heads(a, wo, xn.dtype, _COMPUTE)
+        out = _lin(
+            merged,
             wo,
             dtype=xn.dtype,
             compute_kernel_config=_COMPUTE,
             memory_config=ttnn.L1_MEMORY_CONFIG,  # read once, by the residual add
         )
+        ttnn.deallocate(merged)
+        return out
 
     def layer_forward(
         hidden_states,
