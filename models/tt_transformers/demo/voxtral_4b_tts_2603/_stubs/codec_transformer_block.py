@@ -305,13 +305,18 @@ def _largest_divisor(n, cap):
 
 
 def _bmm(a, b, transpose_b=False):
-    """Head-batched attention `a @ b` over the full grid, every (batch, head, 4-tile M block) its own
-    work unit. With no program config these `[B, H, S, S]` products ran on 16-64 cores."""
+    """Head-batched attention `a @ b` over the full grid, every (batch, head) its own work unit.
+    With no program config these `[B, H, S, S]` products ran on 1-64 cores at 237-818 us."""
     m, k, n = (-(-int(d) // 32) for d in (a.shape[-2], a.shape[-1], b.shape[-2 if transpose_b else -1]))
-    pm = _largest_divisor(m, 4)
-    # Whole-K, whole-N blocks: a long sequence (a longer utterance) outgrows L1, so fall back then.
+    # NEVER SPLIT M. The reuse factory steps a WHOLE batch (M x K tiles of `a`) between the output
+    # blocks one core owns, so once M is split into blocks and there are more blocks than cores a
+    # core's second M block reads and writes the next head's rows. That is what broke the audio in
+    # 27033d4462 (4-tile M blocks), and what a 1-tile split did on the long sequences the e2e test
+    # decodes. Here every (batch, head) is one whole-M block -- B * H = 128 of them, more than the
+    # grid, so a split is never safe -- the acoustic stubs' rule; a block that outgrows L1 (a longer
+    # utterance) falls back to the default.
     tile = lambda t: 4096 if t.dtype == ttnn.float32 else 2048
-    if 2 * pm * k * tile(a) + 2 * k * n * tile(b) + 2 * pm * n * 4096 > 1_200_000:
+    if 2 * m * k * tile(a) + 2 * k * n * tile(b) + 2 * m * n * 4096 > 1_200_000:
         return ttnn.matmul(a, b, transpose_b=transpose_b, compute_kernel_config=_COMPUTE)
     grid = a.device().compute_with_storage_grid_size()
     cfg = ttnn.MatmulMultiCoreReuseProgramConfig(
@@ -319,15 +324,10 @@ def _bmm(a, b, transpose_b=False):
         in0_block_w=k,
         out_subblock_h=1,
         out_subblock_w=_largest_divisor(n, 4),
-        per_core_M=pm,
+        per_core_M=m,
         per_core_N=n,
     )
-    # `cfg` is built and DELIBERATELY NOT PASSED. Passing it (27033d4462: vocode 80 -> 70 ms) broke
-    # the audio -- bisected against Whisper WER, dropped in 7b8f10ef4b3 -- and retrying it with K
-    # transposed explicitly and per_core_M = m or 1 put the waveform at PCC ~0 (2026-10-01). These
-    # float32 products need some other fix; the per-stage PCC tests cannot see a vocode error, only
-    # test_gate3_e2e_pcc and the WER/MOS test can.
-    return ttnn.matmul(a, b, transpose_b=transpose_b, compute_kernel_config=_COMPUTE)
+    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE)
 
 
 def build(device, torch_module):
