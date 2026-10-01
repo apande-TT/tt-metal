@@ -708,7 +708,8 @@ class TextStack:
 
         Nothing recomputes the prefix. Each layer appends this token's k/v to its own cache slot
         `position` and reads positions `[0, position]` back out of it through two batched matmuls
-        and a spelled-out softmax, whose float32 score tensors the stubs keep in L1.
+        and a spelled-out softmax, whose float32 score tensors the stubs keep in L1. The grouped
+        query's zero pad rows come from its tilize, relabelled logical by a view (no FillPad pass).
         """
         position = int(position)
         batch = int(embeds.shape[0])
