@@ -129,12 +129,13 @@ def _fold_norm(norm, consumer, names):
     return unit, folded
 
 
-def _resid_memory(h, decode):
-    """L1 for a short prefill's residual stream (under 8 tile rows), else the default (DRAM)."""
+def _resid_memory(h):
+    """L1 for a short stream's residual (under 8 tile rows: the prefix, a decode step), else the
+    default (DRAM)."""
     rows = 1
     for d in list(h.shape)[:-1]:
         rows *= int(d)
-    return ttnn.L1_MEMORY_CONFIG if not decode and rows < 256 else None
+    return ttnn.L1_MEMORY_CONFIG if rows < 256 else None
 
 
 class TextBlock:
@@ -179,7 +180,11 @@ class TextBlock:
             )
         # The composed kinds spell out what the fused stubs do internally, from the leaf stubs.
         # A prefill norm feeds only a matmul, so it hands over bf16; decode keeps float32.
-        xn = self.parts["norm_in"](hidden_states, dtype=None if decode else ttnn.bfloat16)
+        xn = self.parts["norm_in"](
+            hidden_states,
+            dtype=None if decode else ttnn.bfloat16,
+            memory_config=ttnn.L1_MEMORY_CONFIG if decode else None,
+        )
         attn_out = self.parts["attention"](
             xn,
             position_embeddings=position_embeddings,
@@ -188,11 +193,11 @@ class TextBlock:
             decode=decode,
         )
         ttnn.deallocate(xn)
-        # The SHORT prefill's (the 160-row prefix's) float32 residual stream lives in L1 between
-        # blocks, like the acoustic stage's: both residual adds write it there and both norms read
-        # it from there, where in DRAM each pass re-streamed the whole tensor. The 640-row tail's
-        # (~72 KB a core) clashes with the fused SwiGLU's ~1 MB of circular buffers, so it stays.
-        resid = _resid_memory(hidden_states, decode)
+        # A SHORT stream's (the 160-row prefix's, a decode step's) float32 residual lives in L1
+        # between blocks, like the acoustic stage's: both residual adds write it there and both
+        # norms read it from there, where in DRAM each pass re-streamed the whole tensor. The
+        # 640-row tail's (~72 KB a core) clashes with the fused SwiGLU's ~1 MB of circular buffers.
+        resid = _resid_memory(hidden_states)
         h = ttnn.add(hidden_states, attn_out, memory_config=resid)
         ttnn.deallocate(attn_out)
         if trim is not None:
@@ -207,11 +212,11 @@ class TextBlock:
         hn = self.parts["norm_post"](
             h,
             dtype=None if decode else ttnn.bfloat8_b,
-            memory_config=None if decode else ttnn.L1_MEMORY_CONFIG,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         mlp_out = self.parts["mlp"](hn)
         ttnn.deallocate(hn)
-        out = ttnn.add(h, mlp_out, memory_config=_resid_memory(h, decode))
+        out = ttnn.add(h, mlp_out, memory_config=_resid_memory(h))
         ttnn.deallocate(h)
         ttnn.deallocate(mlp_out)
         return out
