@@ -637,7 +637,8 @@ class TextStack:
         # DEST, where ttnn's default streamed K two tiles at a time (the wide gate/up keeps it).
         # Both chains split their fused qkv head-parallel over the whole grid (`_split_heads`), q and k into L1.
         # Every norm's row mean of squares is a square (into L1) + mean reduce, at both heights.
-        # Both chains' SDPA outputs land in L1 for the head merge.
+        # Both chains' SDPA outputs land in L1 for the head merge, whose output lands in L1 for o_proj;
+        # the tail's rotated k and its v land in L1 for the joined SDPA k/v and the cache seed.
         pre_in = self._voiced(ttnn.slice(input_ids_tt, [0, 0], [1, rows]), split["keep_head"], split["placed_head"])
         tail_ids = ttnn.reshape(ttnn.slice(input_ids_tt, [0, start], [batch, real]), [1, batch * tail])
         tail_in = self._voiced(tail_ids, split["keep_tail"], split["placed_tail"])
