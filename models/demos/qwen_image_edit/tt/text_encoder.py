@@ -47,8 +47,10 @@ def _replicated(device, t, dtype, layout=ttnn.TILE_LAYOUT):
 LM_EXACT = False
 # the vision tower needs the exact 8-lane K reduction (without it the image PCC measured 0.55), but it
 # forms it with one lane pattern instead of the median of three: the median only outvotes a rare
-# power-of-two glitch, and it triples the ~24 matmuls + masks + adds of every vision linear
-VISION_EXACT = ("strided",)
+# power-of-two glitch, and it triples the ~24 matmuls + masks + adds of every vision linear.
+# Back to the median (True = every lane pattern): on tt-metal f6b166e383 one image's min PCC fell to
+# 0.942 with a single pattern and the median holds it at the gate (models without this win: 0.9607).
+VISION_EXACT = True
 # mesh axis the vision batch is split over (the tower's TP=4 runs on the other axis)
 VISION_DP_AXIS = 0
 
