@@ -267,6 +267,49 @@ def _down_short(x, w, **kwargs):
     return _lin(x, w, **kwargs)
 
 
+def _last_of_each(x, every):
+    """Row `every - 1` of each group of `every` rows of `x [1, H, R, D]`, as `[1, H, R // every, D]`.
+
+    The rows are `every` apart and off-tile, so they are picked ROW_MAJOR (the stack's own
+    `_last_tail_rows` picks the same rows of the residual)."""
+    _, heads, rows, width = (int(d) for d in x.shape)
+    rm = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+    groups = ttnn.reshape(rm, [heads, rows // every, every, width])
+    picked = ttnn.slice(groups, [0, 0, every - 1, 0], [heads, rows // every, every, width])
+    ttnn.deallocate(rm)
+    return ttnn.to_layout(ttnn.reshape(picked, [1, heads, rows // every, width]), ttnn.TILE_LAYOUT)
+
+
+def _kept_rows_lin(x, w, full_rows, **kwargs):
+    """A linear over a few KEPT rows of a tall (`full_rows`) activation, computed exactly as the tall
+    linear computes them: the 2D config's own K block and the tall compute config, here as a 1D
+    in0 multicast over the kept tile rows. Same K blocks, same accumulation: same bits per row."""
+    out_dtype = kwargs.get("dtype") or x.dtype
+    cfg2d = _mcast_cfg(x, w, full_rows, out_dtype)
+    rows = 1
+    for d in [int(s) for s in x.shape][:-1]:
+        rows *= d
+    if cfg2d is None or rows % 32:
+        return _lin(x, w, **kwargs)
+    grid = x.device().compute_with_storage_grid_size()
+    gx, gy = int(grid.x), int(grid.y)
+    nt = int(w.shape[-1]) // 32
+    per_n = next(p for p in range(-(-nt // (gx * gy)), nt + 1) if nt % p == 0)
+    kwargs["program_config"] = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=(gx, gy),
+        in0_block_w=cfg2d.in0_block_w,
+        out_subblock_h=1,
+        out_subblock_w=max(s for s in range(1, 5) if per_n % s == 0),
+        per_core_M=rows // 32,
+        per_core_N=per_n,
+        fuse_batch=True,
+        fused_activation=None,
+        mcast_in0=True,
+    )
+    kwargs["compute_kernel_config"] = _TALL_COMPUTE
+    return ttnn.linear(x, w, **kwargs)
+
+
 def _merge_heads(a, w, out_dtype, compute):
     """`nlp_concat_heads` of the attention output `a` `[1, H, S, D]`, laid out for its o_proj `w`.
 
@@ -642,8 +685,12 @@ def _split_heads(qkv, n_heads, n_kv_heads, rope=False):
     return q, k, v
 
 
-def _prefill_sdpa(q, k, v, kv_cache):
+def _prefill_sdpa(q, k, v, kv_cache, keep=None):
     """Prefill SDPA, `(attn, k, v)` -- the k/v to seed the cache with, or None to seed nothing.
+
+    `keep` is the stack's LAST block reading only some rows: "none" (the prefix chain, read only for
+    its stashed k/v -- no SDPA at all, attn None) or `(every, mask)` (the compact tail, read only at
+    each sample's last row: SDPA runs on those q rows alone, against `mask`'s matching rows).
 
     With no `kv_cache["prefix_phase"]` this is the plain causal SDPA. A text stack running a SHARED
     prompt prefix once calls every layer twice: "stash" (the batch-1 prefix) keeps its k/v in the
@@ -659,6 +706,11 @@ def _prefill_sdpa(q, k, v, kv_cache):
         # to the shared prefix plus its own sample's earlier tail positions.
         batch, real, padded = compact
         pk, pv = kv_cache.pop("prefix_kv")
+        mask = kv_cache["prefix_mask"]
+        if isinstance(keep, tuple):
+            # Same k chunks, so each kept row's scores, softmax and output are bit for bit the ones
+            # the whole tail's SDPA gives it.
+            q, mask = _last_of_each(q, keep[0]), keep[1]
         # The joined k/v is SDPA's alone (the cache is built from pk/k below) and every q chunk
         # streams it whole, so it sits in L1 (~1.6 MB each); the mask SDPA insists on reading from DRAM.
         a = ttnn.transformer.scaled_dot_product_attention(
@@ -666,7 +718,7 @@ def _prefill_sdpa(q, k, v, kv_cache):
             ttnn.concat([pk, k], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG),
             ttnn.concat([pv, v], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG),
             is_causal=False,
-            attn_mask=kv_cache["prefix_mask"],
+            attn_mask=mask,
             scale=1.0,
             program_config=_compact_sdpa_cfg(q),
             memory_config=ttnn.L1_MEMORY_CONFIG,
@@ -692,6 +744,9 @@ def _prefill_sdpa(q, k, v, kv_cache):
             q, k, v, is_causal=False, attn_mask=kv_cache["prefix_mask"], scale=1.0, program_config=_sdpa_cfg(q)
         )
         return a, k, v
+    if phase == "stash" and keep == "none":
+        kv_cache["prefix_kv"] = (k, v)
+        return None, None, None
     # The attention output's only reader is the head merge right after: L1.
     a = ttnn.transformer.scaled_dot_product_attention(
         q, k, v, is_causal=True, scale=1.0, program_config=_sdpa_cfg(q), memory_config=ttnn.L1_MEMORY_CONFIG
@@ -1165,7 +1220,7 @@ def build(device, torch_module):
         # of the one-token stream came in.
         return ttnn.reshape(out, held[:-1] + [dim])
 
-    def _prefill_attn(xn, position_embeddings, kv_cache, seq):
+    def _prefill_attn(xn, position_embeddings, kv_cache, seq, trim=None):
         # The fused qkv's only reader is the head split right after: L1.
         qkv = _lin(xn, wqkv, dtype=_SDPA_DTYPE, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
         q, k, v = _split_heads(qkv, n_heads, n_kv_heads, rope=position_embeddings is not None)
@@ -1175,9 +1230,35 @@ def build(device, torch_module):
             cos = _broadcast4(cos, seq, head_dim)
             sin = _broadcast4(sin, seq, head_dim)
             q, k = _rope_prefill(q, k, cos, sin, half)
-        a, k, v = _prefill_sdpa(q, k, v, kv_cache)
+        # The stack's last block reads only some rows (`trim`): their attention is all that runs.
+        keep = None
+        phase = kv_cache.get("prefix_phase") if kv_cache is not None else None
+        if trim is not None and getattr(trim, "keeps_none", False) and phase == "stash":
+            keep = "none"
+        elif (
+            trim is not None
+            and getattr(trim, "every", None)
+            and getattr(trim, "mask", None) is not None
+            and phase == "extend"
+            and kv_cache.get("prefix_compact") is not None
+        ):
+            keep = (trim.every, trim.mask)
+        a, k, v = _prefill_sdpa(q, k, v, kv_cache, keep=keep)
         if kv_cache is not None and k is not None:
             _seed_cache(kv_cache, k, v)
+        if a is None:
+            return None
+        if isinstance(keep, tuple):
+            merged = ttnn.experimental.nlp_concat_heads(a, memory_config=ttnn.L1_MEMORY_CONFIG)
+            out = _kept_rows_lin(
+                merged,
+                wo,
+                int(xn.shape[0]) * int(xn.shape[1]) * int(xn.shape[2]),
+                dtype=xn.dtype,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
+            ttnn.deallocate(merged)
+            return out
         merged = _merge_heads(a, wo, xn.dtype, _COMPUTE)
         out = _lin(
             merged,
@@ -1211,14 +1292,25 @@ def build(device, torch_module):
         if decode:
             attn_out = _decode_attn(xn, position_embeddings, kv_cache, position)
         else:
-            attn_out = _prefill_attn(xn, position_embeddings, kv_cache, seq)
+            attn_out = _prefill_attn(xn, position_embeddings, kv_cache, seq, trim=trim)
         ttnn.deallocate(xn)
+        if attn_out is None:
+            return None  # the last block of a chain read only for its k/v
         # The float32 residual stream lives in L1 between blocks -- the 160-row prefix's, the 640-row
         # tail's (~72 KB a core) and a decode step's: both adds write it there and both norms read
         # it from there instead of re-streaming it from DRAM.
         resid = ttnn.L1_MEMORY_CONFIG
-        h = ttnn.add(h, attn_out, memory_config=resid)
-        ttnn.deallocate(attn_out)
+        if trim is not None and not decode and int(attn_out.shape[-2]) != int(h.shape[-2]):
+            # The attention ran on the kept rows only: the residual is trimmed to them first.
+            kept = trim(h)
+            h = ttnn.add(kept, attn_out, memory_config=resid)
+            ttnn.deallocate(kept)
+            ttnn.deallocate(attn_out)
+            trim, decode, kept_rows = None, True, True
+        else:
+            h = ttnn.add(h, attn_out, memory_config=resid)
+            ttnn.deallocate(attn_out)
+            kept_rows = False
         if trim is not None:
             # The stack reads only some of this block's rows (its last block): `trim` keeps those as
             # `[1, 1, rows, dim]` (or None when none are read), and the FFN runs on them as a decode
@@ -1261,6 +1353,6 @@ def build(device, torch_module):
         )
         ttnn.deallocate(gated)
 
-        return h if trim is not None else _restore(h, lead, seq, rank, dim)
+        return h if trim is not None or kept_rows else _restore(h, lead, seq, rank, dim)
 
     return layer_forward
