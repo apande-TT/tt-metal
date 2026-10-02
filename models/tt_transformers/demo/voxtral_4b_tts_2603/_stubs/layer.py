@@ -26,7 +26,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import ttl_kv, ttl_swiglu
+from models.demos.voxtral_4b_tts_2603.tt import cpp_down_dec, ttl_kv, ttl_swiglu
 
 # SDPA takes bfloat16 and nothing wider (`sdpa_device_operation.cpp:43`), and the KV cache is read
 # by the same op family, so q/k/v and the cache are bf16 while the residual stream stays float32.
@@ -1049,6 +1049,7 @@ def build(device, torch_module):
     )
     # bf8_b halves the weight both the prefill (LoFi) and decode down projections unpack.
     w_down = _from_torch(mlp.down_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
+    w_down_cpp = cpp_down_dec.shard(mlp.down_proj.weight.detach().transpose(0, 1).contiguous(), device)
     g_in = None
     g_post = None
     eps_in = float(layer.input_layernorm.variance_epsilon)
@@ -1346,13 +1347,13 @@ def build(device, torch_module):
         # Prefill hands the down projection over in bf16, as the composed kinds' mlp and every wo
         # already do; the residual it is added into stays float32.
         down_dtype = h.dtype if decode else ttnn.bfloat16
-        h = ttnn.add(
-            h,
-            _down_short(
+        if decode and down_dtype == ttnn.float32 and cpp_down_dec.serves(gated, w_down_cpp):
+            down = cpp_down_dec.apply(gated, w_down_cpp)  # the C++ decode down projection, every layer
+        else:
+            down = _down_short(
                 gated, w_down, dtype=down_dtype, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
-            ),
-            memory_config=resid,
-        )
+            )
+        h = ttnn.add(h, down, memory_config=resid)
         ttnn.deallocate(gated)
 
         return h if trim is not None or kept_rows else _restore(h, lead, seq, rank, dim)

@@ -20,7 +20,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import ttl_swiglu
+from models.demos.voxtral_4b_tts_2603.tt import cpp_down_dec, ttl_swiglu
 
 # `ttnn.linear`/`ttnn.matmul` on their DEFAULTS leave `fp32_dest_acc_en` off, so the accumulator
 # rounds to bfloat16 at every step even when the activations are float32. The consumer of this
@@ -460,6 +460,7 @@ def build(device, torch_module):
     )
     # bf8_b halves the weight both the prefill (LoFi) and decode down projections unpack.
     w_down = _from_torch(mlp.down_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
+    w_down_cpp = cpp_down_dec.shard(mlp.down_proj.weight.detach().transpose(0, 1).contiguous(), device)
     # Prefill's fused SwiGLU weight, bf4_b against the bf16 norm output; the float32 decode
     # activation keeps the separate pair above.
     w_gu = _from_torch(
@@ -489,9 +490,12 @@ def build(device, torch_module):
                 memory_config=l1,
             )
         # Read once, by the residual add: L1.
-        out = _down_short(
-            gated, w_down, dtype=x.dtype, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
-        )
+        if x.dtype == ttnn.float32 and cpp_down_dec.serves(gated, w_down_cpp):
+            out = cpp_down_dec.apply(gated, w_down_cpp)  # the C++ decode down projection, every layer
+        else:
+            out = _down_short(
+                gated, w_down, dtype=x.dtype, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG
+            )
         ttnn.deallocate(gated)
         return _restore(out, lead, seq, rank, out_dim)
 
