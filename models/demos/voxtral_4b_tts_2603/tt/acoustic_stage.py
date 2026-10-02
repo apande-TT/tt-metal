@@ -66,7 +66,7 @@ import ttnn
 from models.demos.voxtral_4b_tts_2603.tt import common
 
 # One tile holds the whole sequence: 3 real tokens + 29 pad rows. (The stubs' head-batched `_bmm`
-# runs the 192-row scores 3 tile rows a core; o_proj runs as a full-grid 2D multicast.)
+# runs the 192-row scores 3 tile rows a core; o_proj runs as a full-grid 2D multicast; the readout gate/up run HiFi2.)
 _TILE = 32
 _N_REAL_TOKENS = 3
 
