@@ -169,6 +169,9 @@ class QwenImageEditTT:
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise as _tr_precise
 
         _tr_precise.ENABLED = bool(precise_transformer)
+        # exact QK^T with its 3 terms x 8 lanes folded into K: 3 matmuls per attention instead of 72
+        # matmuls + 69 float32 adds of the [Sq, Sk] logits (denoise trace 25.7 s -> 15.9 s, pcc 0.9587)
+        _tr_precise.FOLD_LANES = True
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
