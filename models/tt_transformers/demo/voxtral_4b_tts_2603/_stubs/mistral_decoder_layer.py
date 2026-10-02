@@ -236,33 +236,62 @@ def _lin(x, w, **kwargs):
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
+class _Like:
+    """What `_short_cfg` reads of an activation (its device and dtype), before the tensor exists."""
+
+    def __init__(self, device, dtype):
+        self._device, self.dtype = device, dtype
+
+    def device(self):
+        return self._device
+
+
+def _down_k_split(device, x_dtype, rows, k, w, out_dtype, fp32_dest):
+    """`_short_cfg`'s 1D config for a SHORT down projection and the WIDTH-SHARDED L1 layout of its
+    activation in exactly that config's K blocks, or None."""
+    cfg = _short_cfg(_Like(device, x_dtype), w, rows, out_dtype, fp32_dest)
+    kb = getattr(cfg, "in0_block_w", None)
+    kt = k // 32
+    grid = device.compute_with_storage_grid_size()
+    if not (kb and kt % kb == 0 and kt // kb <= int(grid.x) * int(grid.y)):
+        return None
+    mem = ttnn.create_sharded_memory_config(
+        shape=(rows, kb * 32),
+        core_grid=ttnn.num_cores_to_corerangeset(kt // kb, grid, row_wise=True),
+        strategy=ttnn.ShardStrategy.WIDTH,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+    return cfg, mem
+
+
 def _down_short(x, w, **kwargs):
     """The down projection; a SHORT one (4-7 tile rows, the 160-row prefix) reads its activation
     WIDTH-SHARDED in L1 in exactly the K blocks `_short_cfg`'s 1D multicast streams, so each block is
     multicast from the core holding it instead of ONE sender reading the whole 2.9 MB activation.
-    Same config, same K order: the arithmetic is unchanged."""
+    Same config, same K order: the arithmetic is unchanged. An activation its producer already wrote
+    in that layout is read as it is."""
     shape = [int(d) for d in x.shape]
     rows = 1
     for d in shape[:-1]:
         rows *= d
-    if 128 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs and not x.is_sharded():
+    if 128 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs:
         fp32_dest = bool(getattr(kwargs.get("compute_kernel_config"), "fp32_dest_acc_en", False))
-        cfg = _short_cfg(x, w, rows, kwargs.get("dtype") or x.dtype, fp32_dest)
-        kb = getattr(cfg, "in0_block_w", None)
-        kt = shape[-1] // 32
-        grid = x.device().compute_with_storage_grid_size()
-        if kb and kt % kb == 0 and kt // kb <= int(grid.x) * int(grid.y):
-            mem = ttnn.create_sharded_memory_config(
-                shape=(rows, kb * 32),
-                core_grid=ttnn.num_cores_to_corerangeset(kt // kb, grid, row_wise=True),
-                strategy=ttnn.ShardStrategy.WIDTH,
-                orientation=ttnn.ShardOrientation.ROW_MAJOR,
-                use_height_and_width_as_shard_shape=True,
+        split = _down_k_split(x.device(), x.dtype, rows, shape[-1], w, kwargs.get("dtype") or x.dtype, fp32_dest)
+        if split is not None:
+            cfg, mem = split
+            ready = (
+                x.is_sharded()
+                and len(shape) == 4
+                and shape[:2] == [1, 1]
+                and list(x.memory_config().shard_spec.shape) == list(mem.shard_spec.shape)
+                and x.memory_config().shard_spec.grid == mem.shard_spec.grid
             )
-            xs = ttnn.to_memory_config(ttnn.reshape(x, [1, 1, rows, shape[-1]]), mem)
+            xs = x if ready else ttnn.to_memory_config(ttnn.reshape(x, [1, 1, rows, shape[-1]]), mem)
             kwargs["program_config"] = cfg
             y = ttnn.linear(xs, w, **kwargs)
-            ttnn.deallocate(xs)
+            if not ready:
+                ttnn.deallocate(xs)
             return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
     return _lin(x, w, **kwargs)
 
@@ -953,9 +982,10 @@ def _ttl_swiglu_weights(gate, up, device):
     return tuple(_from_torch(w.contiguous(), device, dtype=ttnn.bfloat16) for w in (gate, up))
 
 
-def _fused_swiglu(h, w_gu, w_ttl=None):
+def _fused_swiglu(h, w_gu, w_ttl=None, memory_config=None):
     """Prefill `silu(h @ Wg) * (h @ Wu)` as ONE matmul: no gate/up tensors are written and there
-    is no separate multiply pass over them."""
+    is no separate multiply pass over them. `memory_config` is where the matmul writes its result
+    (the down projection's K-block layout for the short prefix)."""
     if w_ttl is not None and ttl_swiglu.supports(h, w_ttl[0]):
         return ttl_swiglu.apply(h, *w_ttl)
     grid = h.device().compute_with_storage_grid_size()
@@ -983,7 +1013,13 @@ def _fused_swiglu(h, w_gu, w_ttl=None):
         compute_with_storage_grid_size=grid,
     )
     return ttnn.experimental.minimal_matmul(
-        h, w_gu, fuse_swiglu=True, config=cfg, dtype=ttnn.bfloat16, compute_kernel_config=_TALL_COMPUTE
+        h,
+        w_gu,
+        fuse_swiglu=True,
+        config=cfg,
+        dtype=ttnn.bfloat16,
+        compute_kernel_config=_TALL_COMPUTE,
+        memory_config=memory_config,
     )
 
 
@@ -1342,7 +1378,22 @@ def build(device, torch_module):
                 memory_config=l1,
             )
         else:
-            gated = _fused_swiglu(hn, w_gu, w_ttl)
+            # The short prefix's SwiGLU writes straight into the down projection's K-block shards.
+            rows = 1
+            for d in list(hn.shape)[:-1]:
+                rows *= int(d)
+            split = None
+            if 128 <= rows < 256 and rows % 32 == 0 and len(list(hn.shape)) == 4:
+                split = _down_k_split(
+                    h.device(),
+                    ttnn.bfloat16,
+                    rows,
+                    int(w_down.shape[-2]),
+                    w_down,
+                    ttnn.bfloat16,
+                    bool(getattr(_COMPUTE, "fp32_dest_acc_en", False)),
+                )
+            gated = _fused_swiglu(hn, w_gu, w_ttl, memory_config=split[1] if split else None)
         ttnn.deallocate(hn)
         # Prefill hands the down projection over in bf16, as the composed kinds' mlp and every wo
         # already do; the residual it is added into stays float32.
