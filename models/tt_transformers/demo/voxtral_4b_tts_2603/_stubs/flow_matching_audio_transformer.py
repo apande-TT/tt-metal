@@ -501,7 +501,8 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens, readout=
     # softmax that produced it stay float32.
     out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.float32), [1, n_heads, q_rows, head_dim])
     # bf16 into L1: the residual add is its only reader, and fp32 in DRAM doubles the bytes it writes.
-    return _lin(
+    # o_proj is a short, wide-K linear like the FFN down: the full grid as a 2D multicast (`_down_2d`).
+    return _down_2d(
         _concat_heads(out),
         wo,
         dtype=ttnn.float32,

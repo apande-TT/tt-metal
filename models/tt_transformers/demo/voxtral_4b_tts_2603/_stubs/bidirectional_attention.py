@@ -200,6 +200,42 @@ def _leading(shape) -> int:
     return batch
 
 
+def _down_2d(x, w, **kwargs):
+    """The FFN down projection of a SHORT (1-7 tile row) activation on the full grid, as a 2D multicast.
+
+    The 1D in0-multicast config `_lin` gives it puts one output column tile on each of 96 cores and
+    leaves ONE core to read and multicast the whole float32 activation (7 MB at 192 rows) block by
+    block, which every weight reader waits on. Here M goes over the grid rows (one activation row
+    sender each) and N over the grid columns, at `_short_cfg`'s own K block, so each output tile
+    sums the same K blocks in the same order. Falls back to `_lin`'s choice when the blocks outgrow L1.
+    """
+    shape = [int(d) for d in x.shape]
+    rows = 1
+    for d in shape[:-1]:
+        rows *= d
+    if 32 <= rows < 256 and rows % 32 == 0 and "program_config" not in kwargs:
+        grid = x.device().compute_with_storage_grid_size()
+        gx, gy = int(grid.x), int(grid.y)
+        mt, nt = rows // 32, int(w.shape[-1]) // 32
+        out_dtype = kwargs.get("dtype") or x.dtype
+        kb = getattr(_short_cfg(x, w, rows, out_dtype), "in0_block_w", None)
+        per_n = -(-nt // gx)
+        size = lambda dt: _TILE_BYTES.get(dt, 2048)
+        fits = kb and 2 * kb * (size(x.dtype) + per_n * size(w.dtype)) + per_n * 2 * 4096 <= _L1_BUDGET
+        if fits and mt <= gy:
+            kwargs["program_config"] = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+                compute_with_storage_grid_size=(gx, gy),
+                in0_block_w=kb,
+                out_subblock_h=1,
+                out_subblock_w=max(s for s in range(1, 5) if per_n % s == 0),
+                per_core_M=1,
+                per_core_N=per_n,
+                transpose_mcast=False,
+                fused_activation=None,
+            )
+    return _lin(x, w, **kwargs)
+
+
 def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
     if device.__class__.__name__ == "MeshDevice":
@@ -338,7 +374,8 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens, readout=
     # bf16 context: the head merge moves it and o_proj multicasts it whole.
     out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.float32), [1, n_heads, q_rows, head_dim])
     # bf16 into L1: the residual add is its only reader, and fp32 in DRAM doubles the bytes it writes.
-    return _lin(
+    # o_proj is a short, wide-K linear like the FFN down: the full grid as a 2D multicast (`_down_2d`).
+    return _down_2d(
         _concat_heads(out),
         wo,
         dtype=ttnn.float32,
