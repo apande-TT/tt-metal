@@ -20,6 +20,7 @@ import ttnn
 
 ENABLED = False  # the pipeline switches this on; the per-component PCC tests keep the graduated path
 EXACT_QK = True  # within precise mode: exact-lane QK^T (else the dense 3-term split)
+FOLD_LANES = False  # exact QK^T as one K-folded matmul per lane pattern (the pipeline switches this on)
 EXACT_LANES = 8
 PATTERNS = ("strided", "rot1", "rot3")
 _MASKS = {}
@@ -76,23 +77,52 @@ def _median3(a, b, c):
     return ttnn.maximum(ttnn.minimum(a, b), ttnn.minimum(ttnn.maximum(a, b), c))
 
 
+def _folded_mask(device, k, pattern, terms):
+    """[1, terms * EXACT_LANES * k] 0/1 mask: block (term, lane r) keeps K entries of lane r."""
+    key = (id(device), k, pattern, "folded", terms)
+    if key not in _MASKS:
+        lane = [_lane_of(i, pattern) for i in range(k)]
+        vals = [1.0 if lane[i] == r else 0.0 for _ in range(terms) for r in range(EXACT_LANES) for i in range(k)]
+        n = len(vals)
+        _MASKS[key] = ttnn.typecast(ttnn.Tensor(vals, [1, n], ttnn.float32, ttnn.TILE_LAYOUT, device), ttnn.bfloat16)
+    return _MASKS[key]
+
+
 def exact_matmul_bt(a, b):
     """float32 a @ float32 b^T (reduction over the last dim of both) with exact accumulation:
-    3-term bf16 split (ah.bh + ah.bl + al.bh), 8 exact lanes over K, median of 3 lane partitions."""
+    3-term bf16 split (ah.bh + ah.bl + al.bh), 8 exact lanes over K, median of 3 lane partitions.
+
+    The 3 terms x 8 lanes are folded into the reduction dim: a's masked lane copies and b's matching
+    pieces are laid side by side along K, so each pattern is ONE matmul over 24*K instead of 24 matmuls
+    and 23 float32 adds of the full [Sq, Sk] logits. Every 32-group of the folded K still lies inside one
+    (term, lane) block, so each tile dot keeps <= 4 nonzeros and stays exact; the blocks are summed in
+    the float32 accumulator, as the adds did."""
     cfg = precise_config()
     ah, al = split_bf16(a)
     bh, bl = split_bf16(b)
     k = a.shape[-1]
+    if not FOLD_LANES:
+        ests = []
+        for pattern in PATTERNS:
+            y = None
+            for m in _masks(a.device(), k, pattern):
+                for pa, pb in ((ah, bh), (ah, bl), (al, bh)):
+                    t = ttnn.matmul(
+                        ttnn.multiply(pa, m), pb, transpose_b=True, compute_kernel_config=cfg, dtype=ttnn.float32
+                    )
+                    y = t if y is None else ttnn.add(y, t)
+            ests.append(y)
+        return _median3(*ests)
+    n = EXACT_LANES
+    a_rep = ttnn.concat([ah] * (2 * n) + [al] * n, dim=-1)
+    b_rep = ttnn.concat([bh] * n + [bl] * n + [bh] * n, dim=-1)
     ests = []
     for pattern in PATTERNS:
-        y = None
-        for m in _masks(a.device(), k, pattern):
-            for pa, pb in ((ah, bh), (ah, bl), (al, bh)):
-                t = ttnn.matmul(
-                    ttnn.multiply(pa, m), pb, transpose_b=True, compute_kernel_config=cfg, dtype=ttnn.float32
-                )
-                y = t if y is None else ttnn.add(y, t)
-        ests.append(y)
+        pa = ttnn.multiply(a_rep, _folded_mask(a.device(), k, pattern, 3))
+        ests.append(ttnn.matmul(pa, b_rep, transpose_b=True, compute_kernel_config=cfg, dtype=ttnn.float32))
+        ttnn.deallocate(pa)
+    ttnn.deallocate(a_rep)
+    ttnn.deallocate(b_rep)
     return _median3(*ests)
 
 
