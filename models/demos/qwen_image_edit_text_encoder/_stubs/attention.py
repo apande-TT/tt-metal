@@ -227,6 +227,65 @@ def _exact_sum(mm, parts, patterns=LANE_PATTERNS):
 
 # core grid for the non-exact split_linear products (None: ttnn.linear picks its own)
 LINEAR_CORE_GRID = None
+# hand-shaped 2-D multicast config for those products on LINEAR_CORE_GRID (False: core_grid only;
+# ttnn then picks per_core_N=19 for the LM MLP, i.e. 1x1 subblocks and 2-row output blocks that
+# re-stream the weight per block)
+LINEAR_BLOCK = False
+# True: M over the grid columns (x), N over the rows (y)
+LINEAR_BLOCK_TRANSPOSE = False
+# L1 tiles per core for the float32 output block
+_OUT_BLOCK_TILES = 160
+
+
+def _divisors(n):
+    return [d for d in range(1, n + 1) if n % d == 0]
+
+
+def _block_config(x, w):
+    """2-D multicast with the output block / subblock picked per shape: every core re-receives its in0
+    rows once per output-block column pass and its in1 columns once per output-block row pass, so the
+    pick minimises that per-core traffic divided by sqrt(subblock tiles) (subblocks up to 4 tiles with
+    the fp32 dest), with the output block within _OUT_BLOCK_TILES. Per-core M/N are rounded up to even
+    tile counts so a 2-wide subblock always exists (ttnn's own pick for the LM MLP, per_core_N=19, is
+    stuck at 1x1). None when the shapes are not tile aligned or M is a single tile row."""
+    grid = LINEAR_CORE_GRID
+    xs, ws = [int(d) for d in x.shape], [int(d) for d in w.shape]
+    m = math.prod(xs[:-1])
+    if m % TILE or ws[-2] % TILE or ws[-1] % TILE or m // TILE < 2:
+        return None
+    m_t, k_t, n_t = m // TILE, ws[-2] // TILE, ws[-1] // TILE
+    rows, cols = (grid.x, grid.y) if LINEAR_BLOCK_TRANSPOSE else (grid.y, grid.x)
+    even = lambda v: v + (v % 2)  # noqa: E731
+    per_m, per_n = even(-(-m_t // rows)), even(-(-n_t // cols))
+    best = None
+    for out_h in _divisors(per_m):
+        for out_w in _divisors(per_n):
+            if out_h * out_w > _OUT_BLOCK_TILES:
+                continue
+            sub = max(
+                ((sh, sw) for sh in _divisors(out_h) for sw in _divisors(out_w) if sh * sw <= 4),
+                key=lambda t: (t[0] * t[1], t[1]),
+            )
+            traffic = per_m * (per_n // out_w) + per_n * (per_m // out_h)
+            score = traffic / math.sqrt(sub[0] * sub[1])
+            if best is None or score < best[0]:
+                best = (score, out_h, out_w, sub)
+    _, out_h, out_w, (sub_h, sub_w) = best
+    # in0 / in1 K blocks double-buffered next to the output block
+    in0_w = max(d for d in _divisors(k_t) if d <= 8 and 2 * (out_h + out_w) * d * 2048 <= 512 * 1024)
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=(grid.x, grid.y),
+        in0_block_w=in0_w,
+        out_subblock_h=sub_h,
+        out_subblock_w=sub_w,
+        out_block_h=out_h,
+        out_block_w=out_w,
+        per_core_M=per_m,
+        per_core_N=per_n,
+        transpose_mcast=LINEAR_BLOCK_TRANSPOSE,
+        fused_activation=None,
+        fuse_batch=True,
+    )
 
 
 def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2):
@@ -238,9 +297,11 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     if exact:
         y = _exact_sum(mm, parts, _patterns(exact))
     else:
+        pc = _block_config(x, w) if LINEAR_BLOCK and LINEAR_CORE_GRID is not None else None
+        kw = dict(program_config=pc) if pc is not None else dict(core_grid=LINEAR_CORE_GRID)
         y = None
         for part in parts:
-            t = ttnn.linear(part, w, compute_kernel_config=cfg, dtype=ttnn.float32, core_grid=LINEAR_CORE_GRID)
+            t = ttnn.linear(part, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw)
             y = t if y is None else ttnn.add(y, t)
     # bias added separately in float32 (the fused bias add of ttnn.linear rounds: 3.1e-4 -> 5.1e-4)
     return ttnn.add(y, ttnn.typecast(bias, ttnn.float32)) if bias is not None else y
