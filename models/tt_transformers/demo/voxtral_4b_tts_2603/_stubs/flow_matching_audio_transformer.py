@@ -503,7 +503,8 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens, readout=
 
     # bf16 context: the head merge moves it and o_proj multicasts it whole; the scores and the
     # softmax that produced it stay float32.
-    out = ttnn.reshape(_bmm(weights, v, per_core_m=1, dtype=ttnn.float32), [1, n_heads, q_rows, head_dim])
+    # 3 tile rows a core (64 cores), as the scores: each (head, V) block is re-read by 8 M blocks, not 12.
+    out = ttnn.reshape(_bmm(weights, v, per_core_m=3, dtype=ttnn.float32), [1, n_heads, q_rows, head_dim])
     # bf16 into L1: the residual add is its only reader, and fp32 in DRAM doubles the bytes it writes.
     # o_proj is a short, wide-K linear like the FFN down: the full grid as a 2D multicast (`_down_2d`).
     return _down_2d(
