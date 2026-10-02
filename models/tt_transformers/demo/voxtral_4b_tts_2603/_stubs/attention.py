@@ -27,7 +27,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import ttl_kv
+from models.demos.voxtral_4b_tts_2603.tt import cpp_scores_dec, ttl_kv
 
 # `ttnn.linear`/`ttnn.matmul` on their DEFAULTS leave `fp32_dest_acc_en` off, so the accumulator
 # rounds to bfloat16 at every step even when the activations are float32. The consumer of this
@@ -836,6 +836,8 @@ def build(device, torch_module):
     # The 640-row tail's o_proj reads a bfloat4_b copy (prefix and decode keep bf8_b).
     wo4 = _from_torch(m.o_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat4_b)
 
+    use_cpp_scores = cpp_scores_dec.claim()
+
     def _decode(hidden_states, position_embeddings, kv_cache, position):
         """ONE token per user, attending to the RESIDENT cache instead of recomputing the prefix.
 
@@ -960,7 +962,10 @@ def build(device, torch_module):
             cut = l1 if span <= 320 else None
             keys = ttnn.slice(keys, [0, 0, 0, 0], ends, memory_config=cut)
             values = ttnn.slice(values, [0, 0, 0, 0], ends, memory_config=cut)
-        scores = _bmm(q, keys, transpose_b=True, memory_config=l1)
+        if use_cpp_scores and cpp_scores_dec.supports(q, keys):
+            scores = cpp_scores_dec.apply(q, keys)  # the C++ decode scores
+        else:
+            scores = _bmm(q, keys, transpose_b=True, memory_config=l1)
         ttnn.deallocate(q)
         # The cache tail beyond `position` is zeros, and a zero key scores ZERO -- which is a
         # perfectly ordinary logit, not a small one. It has to be masked explicitly.

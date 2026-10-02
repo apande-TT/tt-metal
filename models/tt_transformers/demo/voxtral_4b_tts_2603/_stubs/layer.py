@@ -26,7 +26,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import cpp_down_dec, ttl_kv, ttl_swiglu
+from models.demos.voxtral_4b_tts_2603.tt import cpp_down_dec, cpp_scores_dec, ttl_kv, ttl_swiglu
 
 # SDPA takes bfloat16 and nothing wider (`sdpa_device_operation.cpp:43`), and the KV cache is read
 # by the same op family, so q/k/v and the cache are bf16 while the residual stream stays float32.
@@ -1091,6 +1091,8 @@ def build(device, torch_module):
     eps_in = float(layer.input_layernorm.variance_epsilon)
     eps_post = float(layer.post_attention_layernorm.variance_epsilon)
 
+    use_cpp_scores = cpp_scores_dec.claim()
+
     def _decode_attn(xn, position_embeddings, kv_cache, position):
         """ONE token per user, attending to the RESIDENT cache instead of recomputing the prefix.
 
@@ -1215,7 +1217,10 @@ def build(device, torch_module):
             cut = l1 if span <= 320 else None
             keys = ttnn.slice(keys, [0, 0, 0, 0], ends, memory_config=cut)
             values = ttnn.slice(values, [0, 0, 0, 0], ends, memory_config=cut)
-        scores = _bmm(q, keys, transpose_b=True, memory_config=l1)
+        if use_cpp_scores and cpp_scores_dec.supports(q, keys):
+            scores = cpp_scores_dec.apply(q, keys)  # the C++ decode scores
+        else:
+            scores = _bmm(q, keys, transpose_b=True, memory_config=l1)
         ttnn.deallocate(q)
         # The cache tail beyond `position` is zeros, and a zero key scores ZERO -- which is a
         # perfectly ordinary logit, not a small one. It has to be masked explicitly.
