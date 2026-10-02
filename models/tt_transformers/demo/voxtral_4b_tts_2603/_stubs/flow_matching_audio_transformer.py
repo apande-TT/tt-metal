@@ -227,6 +227,10 @@ _COMPUTE = ttnn.WormholeComputeKernelConfig(
 
 
 # Tall (>= 8 tile rows) linears are compute-bound, so they run one fidelity rung below HiFi4.
+# The readout block's 64-row gate/up: HiFi2 at the same float32 DEST + packer accumulation.
+_READOUT_FFN_COMPUTE = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+)
 _TALL_COMPUTE = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=True
 )
@@ -613,9 +617,11 @@ def _compile_block(device, blk, mask):
                     memory_config=ttnn.L1_MEMORY_CONFIG,
                 ),
             )
+        short = int(hn.shape[0]) * int(hn.shape[1]) * int(hn.shape[2]) < 128
+        ckc = _READOUT_FFN_COMPUTE if short else _TALL_COMPUTE
         gated = ttnn.multiply(
-            _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
-            _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=_TALL_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG),
+            _lin(hn, w1, dtype=ttnn.float32, compute_kernel_config=ckc, memory_config=ttnn.L1_MEMORY_CONFIG),
+            _lin(hn, w3, dtype=ttnn.float32, compute_kernel_config=ckc, memory_config=ttnn.L1_MEMORY_CONFIG),
             input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             # Consumed once, by the down projection: hand it over in L1, not through DRAM, and in
             # bf16 -- the down projection multicasts all of it to every core, and its bf8_b weight
