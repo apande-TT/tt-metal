@@ -73,7 +73,7 @@ def shard(w2, device):
     ncores_max = int(grid.x) * int(grid.y)
     banks = int(device.dram_grid_size().x)
     nt = n // _TILE
-    want = int(os.environ.get("VOXTRAL_CPP_DOWN_DEC_PN", "2"))
+    want = int(os.environ.get("VOXTRAL_CPP_DOWN_DEC_PN", "3"))
     pn = next(
         (p for p in range(max(1, want), nt + 1) if nt % p == 0 and nt // p <= ncores_max and (nt // p) % banks == 0),
         None,
