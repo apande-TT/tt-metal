@@ -346,7 +346,7 @@ def _lin(x, w, **kwargs):
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
-def _bmm(a, b, per_core_m=None, transpose_b=False, dtype=None):
+def _bmm(a, b, per_core_m=None, transpose_b=False, dtype=None, memory_config=None):
     """Head-batched `a @ b` spread over the full grid.
 
     Without a program config the `[B, H, 32, 128] x [B, H, 128, 32]` score product lands on ONE
@@ -376,7 +376,15 @@ def _bmm(a, b, per_core_m=None, transpose_b=False, dtype=None):
         per_core_M=per_m,
         per_core_N=n,
     )
-    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE, dtype=dtype)
+    return ttnn.matmul(
+        a,
+        b,
+        transpose_b=transpose_b,
+        program_config=cfg,
+        compute_kernel_config=_COMPUTE,
+        dtype=dtype,
+        memory_config=memory_config,
+    )
 
 
 def _attention(h, wqkv, wo, n_heads, n_kv_heads, scale, attn_mask):
@@ -496,8 +504,13 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens, readout=
     q = q if scale is None else ttnn.multiply(q, scale)
     # 3 tile rows a core (64 cores), not 2 (96): each (head, key block) is re-read by 8 M blocks
     # instead of 12, a quarter fewer input tiles for the memory-bound scores.
-    scores = _bmm(q, k, per_core_m=3, transpose_b=True, dtype=ttnn.float32)
-    scores = ttnn.add(scores, _compact_mask(h.device(), rows, tokens, repeats, q_rows))
+    # The float32 scores land in L1 (~43 KB a core) for the mask add alone, which writes DRAM as
+    # before and frees them, so nothing big holds L1 through the softmax and the FFN behind it.
+    raw = _bmm(q, k, per_core_m=3, transpose_b=True, dtype=ttnn.float32, memory_config=ttnn.L1_MEMORY_CONFIG)
+    scores = ttnn.add(
+        raw, _compact_mask(h.device(), rows, tokens, repeats, q_rows), memory_config=ttnn.DRAM_MEMORY_CONFIG
+    )
+    ttnn.deallocate(raw)
     weights = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
     weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
