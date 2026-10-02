@@ -18,7 +18,7 @@ Gates:
   1  every routed graduated stub is ttnn: no torch compute in its forward code (static scan), and the
      forward fires zero host aten ops (host_op_observer, the authoritative runtime check)
   2  all 25 graduated modules were invoked by that forward
-  3  every sample's final image PCC vs its own golden >= PCC_TARGET (0.95)
+  3  every sample's final image PCC vs its own golden >= PCC_TARGET (0.99)
 Also asserted: the full scheduler schedule ran (no step cap); the outputs are distinct; each output
 matches its own golden better than any other sample's golden.
 """
@@ -38,8 +38,8 @@ from models.demos.qwen_image_edit.tt import pipeline as P
 from models.demos.qwen_image_edit.tt.inputs import EditConfig
 from models.experimental.perf_automation.agent.perf_adapter import BATCH_ENV, batch_report_line
 
-# the gate's bar for this run (emit-e2e --pcc-target 0.95), applied to EVERY sample
-PCC_TARGET = 0.95
+# the gate's bar for this run (emit-e2e --pcc-target 0.99), applied to EVERY sample
+PCC_TARGET = 0.99
 # the batch the harness asks for (perf_adapter.BATCH_ENV); the gate's batch, 32, when it asks for none
 E2E_BATCH = int(os.environ.get(BATCH_ENV) or 32)
 # the correctness gate: per-sample image PCC vs the independently computed HF golden (not teacher-forced)
