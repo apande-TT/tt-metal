@@ -88,6 +88,8 @@ class TtQwenTextEncoder:
         # the LM's 2-limb projections run on the full core grid (ttnn.linear's own pick left it partial)
         grid = device.compute_with_storage_grid_size()
         _te_attention.LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
+        _te_attention.LINEAR_BLOCK = True
+        _te_attention.LINEAR_BLOCK_TRANSPOSE = True
         self.set_precise(True)
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
