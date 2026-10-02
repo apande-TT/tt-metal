@@ -833,6 +833,8 @@ def build(device, torch_module):
         dtype=ttnn.bfloat8_b,
     )
     wo = _from_torch(m.o_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
+    # The 640-row tail's o_proj reads a bfloat4_b copy (prefix and decode keep bf8_b).
+    wo4 = _from_torch(m.o_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat4_b)
 
     def _decode(hidden_states, position_embeddings, kv_cache, position):
         """ONE token per user, attending to the RESIDENT cache instead of recomputing the prefix.
@@ -1031,7 +1033,7 @@ def build(device, torch_module):
         merged = _merge_heads(a, wo, hidden_states.dtype, _COMPUTE)
         out = _lin(
             merged,
-            wo,
+            wo4 if int(merged.shape[-2]) >= 256 else wo,
             dtype=hidden_states.dtype,
             compute_kernel_config=_COMPUTE,
             memory_config=ttnn.L1_MEMORY_CONFIG,  # read once, by the residual add
