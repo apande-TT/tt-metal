@@ -172,6 +172,8 @@ class QwenImageEditTT:
         # exact QK^T with its 3 terms x 8 lanes folded into K: 3 matmuls per attention instead of 72
         # matmuls + 69 float32 adds of the [Sq, Sk] logits (denoise trace 25.7 s -> 15.9 s, pcc 0.9587)
         _tr_precise.FOLD_LANES = True
+        # the transformer's exact fp32 TP reduce gathers, slices and adds each token chunk in L1
+        _tr_ccl.L1_GATHER_BYTES = 48 * 1024 * 1024
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
