@@ -703,3 +703,24 @@ def cached_golden(key: str, compute):
     value = compute()
     torch.save(value, path)
     return value
+
+
+# One device copy per DISTINCT build-time mask. The codec builds an ALiBi mask per block build (12)
+# but holds only 4 distinct ones (one per sliding window); each is [1, 8, 2048, 2048] float32 --
+# 134 MB of DRAM and a ~0.7 ms device tilize to upload. Entries match on exact CONTENT
+# (torch.equal), so a shared mask is the very tensor the caller would have uploaded. Reset when
+# a different device object is seen.
+_SHARED_MASKS = {"device": None, "entries": []}
+
+
+def shared_device_mask(device, mask, dtype, upload):
+    """The device tensor for host `mask` at `dtype` on `device`: `upload(mask)` the first time,
+    the same tensor for every later identical mask."""
+    if _SHARED_MASKS["device"] is not device:
+        _SHARED_MASKS["device"], _SHARED_MASKS["entries"] = device, []
+    for host, dt, dev in _SHARED_MASKS["entries"]:
+        if dt == dtype and host.shape == mask.shape and torch.equal(host, mask):
+            return dev
+    dev = upload(mask)
+    _SHARED_MASKS["entries"].append((mask, dtype, dev))
+    return dev
