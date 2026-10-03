@@ -29,6 +29,7 @@ import math
 import torch
 
 import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import common
 
 _SHARD_HEIGHT = 32
 # 2048 rows = 256 codec frames after the decoder's 8x upsampling, which is the whole stage's frame
@@ -339,14 +340,17 @@ def build(device, torch_module):
     blk = torch_module
     dim = int(blk.dim)
 
-    mask = _from_torch(
+    # One upload per distinct mask on this device (tt/common.shared_device_mask): every block build
+    # with the same window shares it.
+    mask = common.shared_device_mask(
+        device,
         _alibi_window_mask(
             blk.attention.alibi_slopes.detach(),
             int(blk.attention.sliding_window),
             _MASK_MAX_SEQ,
         ),
-        device,
-        dtype=ttnn.float32,
+        ttnn.float32,
+        lambda m: _from_torch(m, device, dtype=ttnn.float32),
     )
     block = _compile_block(device, blk, mask)
 

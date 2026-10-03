@@ -42,6 +42,7 @@ import math
 import torch
 
 import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import common
 
 # A PERSISTENT ZERO BUFFER, NOT A PER-CALL `ttnn.zeros`.
 # `ttnn.zeros` builds its tensor on the host and enqueues a WRITE to land it on the device, and a
@@ -497,14 +498,17 @@ def build(device, torch_module):
         elif name == "CausalConvTranspose1d":
             stages.append(_compile_causal_conv_transpose1d(device, blk))
         elif name == "CodecTransformer":
-            mask = _from_torch(
+            # One upload per distinct mask on this device (tt/common.shared_device_mask): every block build
+            # with the same window shares it.
+            mask = common.shared_device_mask(
+                device,
                 _alibi_window_mask(
                     blk.layers["0"].attention.alibi_slopes.detach(),
                     int(blk.args.attn_sliding_window_size),
                     _MASK_MAX_SEQ,
                 ),
-                device,
-                dtype=ttnn.float32,
+                ttnn.float32,
+                lambda m: _from_torch(m, device, dtype=ttnn.float32),
             )
             blocks = [_compile_codec_block(device, blk.layers[str(i)], mask) for i in blk.layers_ids]
 

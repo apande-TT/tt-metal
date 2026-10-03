@@ -32,6 +32,7 @@ import math
 import torch
 
 import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import common
 
 _SHARD_HEIGHT = 32
 # 2048 rows = 256 codec frames after the decoder's 8x upsampling, which is the whole stage's
@@ -265,10 +266,13 @@ def build(device, torch_module):
     q_eps = float(attn.q_norm.eps) if qk_norm else 0.0
     k_eps = float(attn.k_norm.eps) if qk_norm else 0.0
 
-    mask = _from_torch(
-        _alibi_window_mask(attn.alibi_slopes.detach(), int(attn.sliding_window), _MASK_MAX_SEQ),
+    # One upload per distinct mask on this device (tt/common.shared_device_mask): every block build
+    # with the same window shares it.
+    mask = common.shared_device_mask(
         device,
-        dtype=ttnn.float32,
+        _alibi_window_mask(attn.alibi_slopes.detach(), int(attn.sliding_window), _MASK_MAX_SEQ),
+        ttnn.float32,
+        lambda m: _from_torch(m, device, dtype=ttnn.float32),
     )
 
     def codec_attention(x, **kwargs):
