@@ -25,6 +25,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import cpp_shift_add
 
 # A PERSISTENT ZERO BUFFER, NOT A PER-CALL `ttnn.zeros`.
 # `ttnn.zeros` builds its tensor on the host and enqueues a WRITE to land it on the device, and a
@@ -132,19 +133,29 @@ def build(device, torch_module):
         shape = [int(v) for v in x.shape]
         length = shape[-1]
         batch = shape[0] if len(shape) >= 3 else 1
-        x4 = ttnn.reshape(ttnn.transpose(x, -2, -1), [batch, 1, length, in_channels])
 
         active_taps = taps if weight is None else _taps_from(weight)
 
-        if pad > 0:
-            zeros = _zeros_like_buf(device, [batch, 1, pad, in_channels], x4.dtype)
-            x4 = ttnn.concat([zeros, x4, zeros], dim=2)
         padded_len = length + 2 * pad
         out_len = (padded_len - effective_kernel) // stride + 1
 
         # `x_rm`: a caller holding the same rows ROW_MAJOR (`[B, 1, L, C]`) lets the taps be cut there --
-        # a row-offset slice of a TILE tensor untilizes it whole for every tap.
+        # a row-offset slice of a TILE tensor untilizes it whole for every tap. With it, `x` only gives the
+        # shape: its channels-last transpose is never made.
         x_rm = kwargs.get("x_rm") if pad == 0 else None
+        if x_rm is not None and cpp_shift_add.supports(x_rm, active_taps, stride, dilation):
+            # structural: ONE tilize of the rows and ONE product against the taps side by side; the row shift
+            # happens on the narrow tap outputs (tt/cpp_shift_add), not as K copies of the wide input.
+            acc = cpp_shift_add.conv_wide(x_rm, cpp_shift_add.wide_weight(active_taps), out_len, _COMPUTE)
+            if bias is not None:
+                acc = ttnn.add(acc, bias)
+            return ttnn.reshape(ttnn.transpose(acc, -2, -1), [batch, out_channels, out_len])
+        x4 = None
+        if x_rm is None:
+            x4 = ttnn.reshape(ttnn.transpose(x, -2, -1), [batch, 1, length, in_channels])
+            if pad > 0:
+                zeros = _zeros_like_buf(device, [batch, 1, pad, in_channels], x4.dtype)
+                x4 = ttnn.concat([zeros, x4, zeros], dim=2)
         acc = None
         for i, tap in enumerate(active_taps):
             begin = i * dilation

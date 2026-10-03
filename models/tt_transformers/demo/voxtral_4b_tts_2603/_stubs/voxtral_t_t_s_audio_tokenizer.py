@@ -42,7 +42,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import common, cpp_band_attn, cpp_softmax
+from models.demos.voxtral_4b_tts_2603.tt import common, cpp_band_attn, cpp_shift_add, cpp_softmax
 
 # A PERSISTENT ZERO BUFFER, NOT A PER-CALL `ttnn.zeros`.
 # `ttnn.zeros` builds its tensor on the host and enqueues a WRITE to land it on the device, and a
@@ -352,6 +352,18 @@ def _compile_causal_conv1d(device, mod):
     bias = None
     if conv.bias is not None:
         bias = _from_torch(conv.bias.detach().reshape(1, 1, 1, out_channels), device)
+    # structural: the K taps side by side, for one wide product over the padded rows (tt/cpp_shift_add).
+    wide = cpp_shift_add.wide_weight(taps) if kernel > 1 and stride == 1 and dilation == 1 else None
+
+    def _wide_linear(x, w, **kwargs):
+        # The tall codec linears' own full-grid config and HiFi2 (what each per-tap product ran).
+        cfg = _mcast_cfg(x, w, int(x.shape[-2]), ttnn.float32)
+        if cfg is not None:
+            kwargs["program_config"] = cfg
+            kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+            )
+        return ttnn.linear(x, w, **kwargs)
 
     def run(x4):
         batch, length = int(x4.shape[0]), int(x4.shape[-2])
@@ -382,6 +394,11 @@ def _compile_causal_conv1d(device, mod):
         padded_len = length + padding_total + extra
         out_len = (padded_len - effective_kernel) // stride + 1
 
+        if wide is not None and padded_rm is not None and cpp_shift_add.supports(padded_rm, taps, stride, dilation):
+            # structural: ONE tilize of the padded rows and ONE product against the taps side by side; the
+            # row shift happens on the narrow tap outputs (tt/cpp_shift_add), not as K copies of the input.
+            acc = cpp_shift_add.conv_wide(padded_rm, wide, out_len, _COMPUTE, linear=_wide_linear)
+            return acc if bias is None else ttnn.add(acc, bias)
         acc = None
         for i, tap in enumerate(taps):
             begin = i * dilation
