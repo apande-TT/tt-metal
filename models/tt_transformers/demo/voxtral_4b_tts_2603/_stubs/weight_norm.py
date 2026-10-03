@@ -36,9 +36,13 @@ def build(device, torch_module):
     def weight_norm(weight_g, weight_v=None, **kwargs):
         if weight_v is None:
             raise ValueError("weight_norm needs both weight_g and weight_v")
-        v = ttnn.typecast(weight_v, ttnn.float32)
-        g = ttnn.typecast(weight_g, ttnn.float32)
-        sq_sum = ttnn.sum(ttnn.sum(ttnn.multiply(v, v), dim=-1, keepdim=True), dim=-2, keepdim=True)
+        # Widened only when not float32 already: a float32 -> float32 typecast is a full copy of the
+        # tile-padded v (k = 7 padded to 32: a 31 MB pass for the codec output projection).
+        v = weight_v if weight_v.dtype == ttnn.float32 else ttnn.typecast(weight_v, ttnn.float32)
+        g = weight_g if weight_g.dtype == ttnn.float32 else ttnn.typecast(weight_g, ttnn.float32)
+        # One reduction over both trailing axes: each separate pass fills the tile padding and re-reads the
+        # whole padded tensor (k = 7 is padded to a tile width), so two passes cost two of each.
+        sq_sum = ttnn.sum(ttnn.multiply(v, v), dim=[-2, -1], keepdim=True)
         return ttnn.multiply(v, ttnn.multiply(ttnn.rsqrt(sq_sum), g))
 
     return weight_norm

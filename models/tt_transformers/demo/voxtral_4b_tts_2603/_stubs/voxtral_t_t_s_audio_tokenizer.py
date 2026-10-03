@@ -371,6 +371,16 @@ def _compile_causal_conv1d(device, mod):
         target = (math.ceil(n_frames) - 1) * stride + (effective_kernel - padding_total)
         extra = target - length
 
+        mode = "reflect" if reflect else "replicate"
+        if wide is not None and (padding_total > 0 or extra > 0) and cpp_shift_add.supports_unpadded(x4, mode):
+            # structural: the wide product straight from the UNPADDED rows, the padding resolved in the shift-add
+            # (a padded row's product is the product of the row it copies) -- no row-major copy, no concat.
+            out_len = (length + padding_total + extra - effective_kernel) // stride + 1
+            acc = cpp_shift_add.conv_wide_unpadded(
+                x4, wide, mode, padding_total, out_len, _COMPUTE, linear=_wide_linear
+            )
+            return acc if bias is None else ttnn.add(acc, bias)
+
         # Edge rows cut and joined ROW_MAJOR, the padded block tilized once (a one-row TILE slice is
         # re-tilized row by row, and a TILE concat of unaligned pieces untilizes them all again).
         xr = ttnn.to_layout(x4, ttnn.ROW_MAJOR_LAYOUT) if padding_total > 0 or extra > 0 else x4

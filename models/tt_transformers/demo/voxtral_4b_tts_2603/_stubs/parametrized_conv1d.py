@@ -127,14 +127,47 @@ def build(device, torch_module):
             for i in range(kernel)
         ]
 
+    def _wide_from(weight):
+        """`cpp_shift_add.wide_weight(_taps_from(weight))` without the (2, 1, 0) permute of the k-last weight.
+
+        The device weight is `[C_out, C_in, k]` with k (7) padded to a whole tile, so permuting k to the front
+        moves a mostly-padding tensor element by element. Instead: swap the last two axes (a tile transpose),
+        swap the two leading axes (whole rows move), pad C_out to a tile multiple, view the `[k, C_out', C_in]`
+        block as `[k * C_out', C_in]` and transpose it -- the k taps side by side, `[C_in, k * C_out']`. The
+        same values as the per-tap path (pure data movement, then the same bf16 narrowing).
+        """
+        cp = -(-out_channels // 32) * 32
+        wk = ttnn.permute(ttnn.transpose(weight, -2, -1), (1, 0, 2))
+        if cp != out_channels:
+            wk = ttnn.pad(wk, [(0, 0), (0, cp - out_channels), (0, 0)], 0.0)
+        flat = ttnn.reshape(wk, [kernel * cp, in_channels])
+        return ttnn.typecast(ttnn.transpose(flat, -2, -1), ttnn.bfloat16), kernel, out_channels
+
     def parametrized_conv1d(x, weight=None, **kwargs):
         # `[B, C, L]` in, `[B, C_out, L']` out. The leading bound comes from the TENSOR, never from
         # a literal 1: the pipeline stacks 32 independent samples on axis 0.
         shape = [int(v) for v in x.shape]
         length = shape[-1]
         batch = shape[0] if len(shape) >= 3 else 1
+        if pad == 0 and kwargs.get("x_rm") is not None:
+            # The rows the caller hands over ROW_MAJOR (`[B, 1, L, C]`) are the conv's input; `x` is not read.
+            length = int(kwargs["x_rm"].shape[-2])
 
-        active_taps = taps if weight is None else _taps_from(weight)
+        x_cl = kwargs.get("x_cl") if pad == 0 else None
+        if x_cl is not None and cpp_shift_add.supports_unpadded(x_cl, kwargs.get("pad_mode")) and kernel > 1:
+            # structural: the caller's UNPADDED channels-last TILE rows, its padding (reflect / replicate)
+            # resolved in the shift-add -- no padded copy of the rows is ever built (tt/cpp_shift_add).
+            real = int(x_cl.shape[-2])
+            front, back = int(kwargs.get("pad_front", 0)), int(kwargs.get("pad_back", 0))
+            out_len = (real + front + back - effective_kernel) // stride + 1
+            wide = cpp_shift_add.wide_weight(taps) if weight is None else _wide_from(weight)
+            acc = cpp_shift_add.conv_wide_unpadded(x_cl, wide, kwargs["pad_mode"], front, out_len, _COMPUTE)
+            if bias is not None:
+                acc = ttnn.add(acc, bias)
+            if kwargs.get("cl_out"):
+                # The caller takes the result channels-LAST, `[B, L', C_out]`.
+                return ttnn.reshape(acc, [batch, out_len, out_channels])
+            return ttnn.reshape(ttnn.transpose(acc, -2, -1), [batch, out_channels, out_len])
 
         padded_len = length + 2 * pad
         out_len = (padded_len - effective_kernel) // stride + 1
@@ -143,13 +176,15 @@ def build(device, torch_module):
         # a row-offset slice of a TILE tensor untilizes it whole for every tap. With it, `x` only gives the
         # shape: its channels-last transpose is never made.
         x_rm = kwargs.get("x_rm") if pad == 0 else None
-        if x_rm is not None and cpp_shift_add.supports(x_rm, active_taps, stride, dilation):
+        if x_rm is not None and cpp_shift_add.supports(x_rm, taps, stride, dilation):
             # structural: ONE tilize of the rows and ONE product against the taps side by side; the row shift
             # happens on the narrow tap outputs (tt/cpp_shift_add), not as K copies of the wide input.
-            acc = cpp_shift_add.conv_wide(x_rm, cpp_shift_add.wide_weight(active_taps), out_len, _COMPUTE)
+            wide = cpp_shift_add.wide_weight(taps) if weight is None else _wide_from(weight)
+            acc = cpp_shift_add.conv_wide(x_rm, wide, out_len, _COMPUTE)
             if bias is not None:
                 acc = ttnn.add(acc, bias)
             return ttnn.reshape(ttnn.transpose(acc, -2, -1), [batch, out_channels, out_len])
+        active_taps = taps if weight is None else _taps_from(weight)
         x4 = None
         if x_rm is None:
             x4 = ttnn.reshape(ttnn.transpose(x, -2, -1), [batch, 1, length, in_channels])
