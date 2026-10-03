@@ -164,6 +164,17 @@ def _weight(linear, device):
     return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
 
 
+def _folded_weight(linear, device, rows=None, cols=None):
+    """`_weight` with a per-INPUT-channel scale `rows` and a per-OUTPUT-channel scale `cols` folded in
+    (a float32 product on the host): `(x * g) @ W == x @ (g W)` and `(x @ W) * s == x @ (W s)`."""
+    w = linear.weight.detach().float().transpose(0, 1)
+    if rows is not None:
+        w = w * rows.float().reshape(-1, 1)
+    if cols is not None:
+        w = w * cols.float().reshape(1, -1)
+    return _from_torch(w.contiguous(), device)
+
+
 def _alibi_window_mask(slopes, window, seq):
     """`[1, H, seq, seq]`: ALiBi bias `slope[h] * (j - i)`, blocked where `j > i` or `j < i - window`.
 
@@ -191,23 +202,27 @@ def _compile_block(device, blk, mask):
     scale = 1.0 / math.sqrt(head_dim)
     qk_norm = bool(args.qk_norm)
 
-    attn_gamma = _norm_gamma(blk.attention_norm, device)
+    # The norms' gammas and the LayerScales are folded into the weights beside them, so no
+    # per-channel multiply of the [B, 1, T, dim] float32 stream runs in the forward.
+    attn_gamma = ffn_gamma = None
+    attn_g = blk.attention_norm.weight.detach()
+    ffn_g = blk.ffn_norm.weight.detach()
+    attn_ls = blk.attention_scale.detach() if blk.layer_scale else None
+    ffn_ls = blk.ffn_scale.detach() if blk.layer_scale else None
     attn_eps = float(blk.attention_norm.eps)
-    ffn_gamma = _norm_gamma(blk.ffn_norm, device)
     ffn_eps = float(blk.ffn_norm.eps)
 
-    wq, wk, wv, wo = (_weight(m, device) for m in (attn.wq, attn.wk, attn.wv, attn.wo))
+    wq, wk, wv = (_folded_weight(m, device, rows=attn_g) for m in (attn.wq, attn.wk, attn.wv))
+    wo = _folded_weight(attn.wo, device, cols=attn_ls)
     q_gamma = _norm_gamma(attn.q_norm, device) if qk_norm else None
     k_gamma = _norm_gamma(attn.k_norm, device) if qk_norm else None
     q_eps = float(attn.q_norm.eps) if qk_norm else 0.0
     k_eps = float(attn.k_norm.eps) if qk_norm else 0.0
 
-    w1, w2, w3 = (_weight(m, device) for m in (ff.w1, ff.w2, ff.w3))
+    w1, w3 = (_folded_weight(m, device, rows=ffn_g) for m in (ff.w1, ff.w3))
+    w2 = _folded_weight(ff.w2, device, cols=ffn_ls)
 
-    attn_scale = ffn_scale = None
-    if blk.layer_scale:
-        attn_scale = _from_torch(blk.attention_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32)
-        ffn_scale = _from_torch(blk.ffn_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32)
+    attn_scale = ffn_scale = None  # folded into wo / w2
 
     if blk.post_attention_norm is not None or blk.post_ffn_norm is not None:
         raise NotImplementedError("post_attention_norm / post_ffn_norm are not ported")
@@ -285,7 +300,8 @@ def _rms_norm(x, gamma, eps):
     reason, so the two bodies agree.
     """
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
-    return ttnn.multiply(ttnn.multiply(x, scale), gamma)
+    y = ttnn.multiply(x, scale)
+    return y if gamma is None else ttnn.multiply(y, gamma)
 
 
 def _softmax(x, dim=-1):
