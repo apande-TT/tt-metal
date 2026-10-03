@@ -25,7 +25,10 @@ void kernel_main() {
     constexpr uint32_t H = get_compile_time_arg_val(2);    // heads
     constexpr uint32_t MMT = get_compile_time_arg_val(3);  // mask row tiles
     constexpr uint32_t MST = get_compile_time_arg_val(4);  // mask column tiles
-    constexpr auto aq = TensorAccessorArgs<5>();
+    // 0: q / k / v are [B, H, T, D]; 1: they are the MERGED [B, 1, T, H * D] (head h in column tiles
+    // h * DT ..), read in place -- no concat + head split before the kernel, no head merge after it.
+    constexpr uint32_t MERGED = get_compile_time_arg_val(5);
+    constexpr auto aq = TensorAccessorArgs<6>();
     constexpr auto ak = TensorAccessorArgs<aq.next_compile_time_args_offset()>();
     constexpr auto av = TensorAccessorArgs<ak.next_compile_time_args_offset()>();
     constexpr auto am = TensorAccessorArgs<av.next_compile_time_args_offset()>();
@@ -51,11 +54,15 @@ void kernel_main() {
     }
     cb_push_back(cb_scale, 1);
 
+    // The page of head bh's tile row t, head_dim tile d.
+    auto page = [](uint32_t bh, uint32_t t, uint32_t d) -> uint32_t {
+        return MERGED ? ((bh / H) * RT + t) * (H * DT) + (bh % H) * DT + d : (bh * RT + t) * DT + d;
+    };
+
     for (uint32_t u = u0; u < u0 + nu; ++u) {
         const uint32_t r = u % RT;
         const uint32_t bh = u / RT;
         const uint32_t h = bh % H;
-        const uint32_t row0 = bh * RT;
         const uint32_t prev = r > 0 ? r - 1 : 0;
         const uint32_t mrow = (h * MMT + r) * MST;
 
@@ -66,15 +73,15 @@ void kernel_main() {
         uint32_t lk = get_write_ptr(cb_k);
         const uint32_t lm = get_write_ptr(cb_mask);
         for (uint32_t d = 0; d < DT; ++d) {
-            noc_async_read_page((row0 + r) * DT + d, sq, lq);
+            noc_async_read_page(page(bh, r, d), sq, lq);
             lq += tile_bytes;
         }
         for (uint32_t d = 0; d < DT; ++d) {
-            noc_async_read_page((row0 + prev) * DT + d, sk, lk);
+            noc_async_read_page(page(bh, prev, d), sk, lk);
             lk += tile_bytes;
         }
         for (uint32_t d = 0; d < DT; ++d) {
-            noc_async_read_page((row0 + r) * DT + d, sk, lk);
+            noc_async_read_page(page(bh, r, d), sk, lk);
             lk += tile_bytes;
         }
         noc_async_read_page(mrow + (r > 0 ? r - 1 : 1), sm, lm);
@@ -87,11 +94,11 @@ void kernel_main() {
         cb_reserve_back(cb_v, 2 * DT);
         uint32_t lv = get_write_ptr(cb_v);
         for (uint32_t d = 0; d < DT; ++d) {
-            noc_async_read_page((row0 + prev) * DT + d, sv, lv);
+            noc_async_read_page(page(bh, prev, d), sv, lv);
             lv += tile_bytes;
         }
         for (uint32_t d = 0; d < DT; ++d) {
-            noc_async_read_page((row0 + r) * DT + d, sv, lv);
+            noc_async_read_page(page(bh, r, d), sv, lv);
             lv += tile_bytes;
         }
         noc_async_read_barrier();

@@ -4,7 +4,7 @@
 
 // The writer of the C++ banded codec attention (see tt/cpp_band_attn.py): fills each unit's row max and
 // row sum across their tiles (binary_ng's reader-side column broadcast, as tt/cpp_softmax's writer
-// does) and writes the unit's DT context tiles.
+// does) and writes the unit's DT context tiles (into the merged [B, 1, T, H * D] layout when MERGED).
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -40,7 +40,10 @@ void kernel_main() {
     const uint32_t nu = get_arg_val<uint32_t>(2);
 
     constexpr uint32_t DT = get_compile_time_arg_val(0);
-    constexpr auto ay = TensorAccessorArgs<1>();
+    constexpr uint32_t H = get_compile_time_arg_val(1);
+    constexpr uint32_t RT = get_compile_time_arg_val(2);
+    constexpr uint32_t MERGED = get_compile_time_arg_val(3);  // 1: write the merged [B, 1, T, H * D]
+    constexpr auto ay = TensorAccessorArgs<4>();
     const auto sy = TensorAccessor(ay, y_addr);
 
     constexpr uint32_t cb_max = 7;
@@ -56,7 +59,9 @@ void kernel_main() {
         cb_wait_front(cb_out, DT);
         uint32_t l1 = get_read_ptr(cb_out);
         for (uint32_t d = 0; d < DT; ++d) {
-            noc_async_write_page(u * DT + d, sy, l1);
+            const uint32_t pg = MERGED ? ((u / RT / H) * RT + u % RT) * (H * DT) + ((u / RT) % H) * DT + d
+                                       : u * DT + d;
+            noc_async_write_page(pg, sy, l1);
             l1 += tile_bytes;
         }
         noc_async_write_barrier();

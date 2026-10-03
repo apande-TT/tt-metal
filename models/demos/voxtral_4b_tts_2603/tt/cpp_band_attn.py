@@ -79,6 +79,40 @@ def supports(q, k, v, mask, window) -> bool:
         return False
 
 
+def supports_merged(q, k, v, mask, window, n_heads) -> bool:
+    """The merged-head form: q / k / v `[B, 1, T, n_heads * D]` float32 TILE (head h = column tiles h * D/32 ..),
+    the layout the q / k / v linears produce -- read in place, the context written back the same way."""
+    try:
+        b, one, t, hd = (int(x) for x in q.shape)
+        h = int(n_heads)
+        mb, mh, mm, ms = (int(x) for x in mask.shape)
+        d = hd // h if h else 0
+        return (
+            enabled()
+            and one == 1
+            and h > 0
+            and hd % h == 0
+            and window is not None
+            and 0 <= int(window) < _TILE
+            and tuple(int(x) for x in k.shape) == (b, 1, t, hd)
+            and tuple(int(x) for x in v.shape) == (b, 1, t, hd)
+            and mb == 1
+            and mh == h
+            and mm >= t
+            and ms >= 2 * _TILE
+            and mm % _TILE == 0
+            and ms % _TILE == 0
+            and t % _TILE == 0
+            and d % _TILE == 0
+            and d // _TILE <= 4
+            and all(x.dtype == ttnn.float32 for x in (q, k, v, mask))
+            and all(x.layout == ttnn.TILE_LAYOUT for x in (q, k, v, mask))
+            and not any(x.is_sharded() for x in (q, k, v, mask))
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _cb(cores, index, tiles):
     return ttnn.CBDescriptor(
         total_size=tiles * _FP32_TILE,
@@ -89,10 +123,17 @@ def _cb(cores, index, tiles):
     )
 
 
-def apply(q, k, v, mask, scale, memory_config=None):
-    """`softmax(q @ k^T * scale + mask) @ v`, float32 `[B, H, T, D]` (DRAM unless `memory_config`)."""
+def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None):
+    """`softmax(q @ k^T * scale + mask) @ v`, float32 `[B, H, T, D]` (DRAM unless `memory_config`). With
+    `merged_heads`, q / k / v and the result are the merged `[B, 1, T, H * D]` (see `supports_merged`)."""
     device = q.device()
-    b, h, t, d = (int(x) for x in q.shape)
+    merged = bool(merged_heads)
+    if merged:
+        b, _, t, hd = (int(x) for x in q.shape)
+        h = int(merged_heads)
+        d = hd // h
+    else:
+        b, h, t, d = (int(x) for x in q.shape)
     mmt, mst = int(mask.shape[2]) // _TILE, int(mask.shape[3]) // _TILE
     rt, dt = t // _TILE, d // _TILE
     units = b * h * rt
@@ -102,7 +143,11 @@ def apply(q, k, v, mask, scale, memory_config=None):
     base, extra = divmod(units, ncores)
     cores = ttnn.num_cores_to_corerangeset(ncores, grid, row_wise=True)
     y = ttnn.allocate_tensor_on_device(
-        ttnn.Shape([b, h, t, d]), ttnn.float32, ttnn.TILE_LAYOUT, device, memory_config or ttnn.DRAM_MEMORY_CONFIG
+        ttnn.Shape([b, 1, t, h * d] if merged else [b, h, t, d]),
+        ttnn.float32,
+        ttnn.TILE_LAYOUT,
+        device,
+        memory_config or ttnn.DRAM_MEMORY_CONFIG,
     )
     scale_bits = struct.unpack("<I", struct.pack("<f", float(scale)))[0]
     qa, ka, va, ma, ya = (x.buffer_address() for x in (q, k, v, mask, y))
@@ -120,7 +165,7 @@ def apply(q, k, v, mask, scale, memory_config=None):
             kernel_source=_READER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt, rt, h, mmt, mst]
+            compile_time_args=[dt, rt, h, mmt, mst, int(merged)]
             + _accessor_args(q)
             + _accessor_args(k)
             + _accessor_args(v)
@@ -140,7 +185,7 @@ def apply(q, k, v, mask, scale, memory_config=None):
             kernel_source=_WRITER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt] + _accessor_args(y),
+            compile_time_args=[dt, h, rt, int(merged)] + _accessor_args(y),
             runtime_args=rw,
             config=ttnn.WriterConfigDescriptor(),
         ),
@@ -174,7 +219,7 @@ def apply(q, k, v, mask, scale, memory_config=None):
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
     desc.custom_program_hash = (
-        hash(("voxtral_cpp_band_attn", b, h, rt, dt, mmt, mst, scale_bits, qa, ka, va, ma, ya, str(memory_config)))
+        hash(("voxtral_cpp_band_attn", b, h, rt, dt, mmt, mst, merged, scale_bits, qa, ka, va, ma, ya, str(memory_config)))
         & 0xFFFFFFFFFFFFFFFF
     )
     ttnn.generic_op([q, k, v, mask, y], desc)
