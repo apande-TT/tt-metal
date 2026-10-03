@@ -90,6 +90,8 @@ class TtQwenTextEncoder:
         _te_attention.LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         _te_attention.LINEAR_BLOCK = True
         _te_attention.LINEAR_BLOCK_TRANSPOSE = True
+        # the exact fp32 TP all-reduce gathers and sums in L1, in chunks of at most 48 MB per gather
+        _te_attention.EXACT_REDUCE_L1_BYTES = 48 * 1024 * 1024
         self.set_precise(True)
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
