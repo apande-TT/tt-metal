@@ -338,21 +338,24 @@ def _compile_causal_conv1d(device, mod):
         target = (math.ceil(n_frames) - 1) * stride + (effective_kernel - padding_total)
         extra = target - length
 
+        # Edge rows cut and joined ROW_MAJOR, the padded block tilized once (a one-row TILE slice is
+        # re-tilized row by row, and a TILE concat of unaligned pieces untilizes them all again).
+        xr = ttnn.to_layout(x4, ttnn.ROW_MAJOR_LAYOUT) if padding_total > 0 or extra > 0 else x4
         pieces = []
         if padding_total > 0:
             if reflect:
-                pieces.extend(_row(x4, i) for i in range(padding_total, 0, -1))
+                pieces.extend(_row(xr, i) for i in range(padding_total, 0, -1))
             else:
-                first = _row(x4, 0)
+                first = _row(xr, 0)
                 pieces.append(first if padding_total == 1 else ttnn.repeat(first, [1, 1, padding_total, 1]))
-        pieces.append(x4)
+        pieces.append(xr)
         if extra > 0:
             if reflect:
-                pieces.extend(_row(x4, length - 1 - i) for i in range(1, extra + 1))
+                pieces.extend(_row(xr, length - 1 - i) for i in range(1, extra + 1))
             else:
-                last = _row(x4, length - 1)
+                last = _row(xr, length - 1)
                 pieces.append(last if extra == 1 else ttnn.repeat(last, [1, 1, extra, 1]))
-        padded = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=2)
+        padded = pieces[0] if len(pieces) == 1 else ttnn.to_layout(ttnn.concat(pieces, dim=2), ttnn.TILE_LAYOUT)
 
         padded_len = length + padding_total + extra
         out_len = (padded_len - effective_kernel) // stride + 1
