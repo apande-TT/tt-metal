@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Gate helpers shared by the e2e test and the demo.
+"""Gate 1 static check used by the e2e test.
 
 Gate 1 (native): no torch compute op in the forward code of a routed graduated stub or of the chain.
 Weight preparation (__init__ / build / weight-layout helpers) and host input metadata are exempt; the
 runtime counterpart is host_op_selftest(), which must see zero non-benign aten ops in the forward.
-Gate 2 (invoked): every graduated module's counter moved during the real forward.
+Gate 2 (invoked) is tt/tracker.py.
 """
 from __future__ import annotations
 
@@ -137,8 +137,3 @@ def gate1_native(stub_modules, chain_modules=()):
         if v:
             out[m.__name__] = v
     return out
-
-
-def gate2_invoked(tracker, names):
-    counts = tracker.snapshot()
-    return {n: int(counts.get(n, 0)) for n in names}, [n for n in names if counts.get(n, 0) == 0]

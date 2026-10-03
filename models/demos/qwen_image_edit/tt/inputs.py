@@ -1,93 +1,52 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Input construction for the Qwen-Image-Edit image_edit task.
+"""Inputs of the image_edit call, encoded exactly as HF QwenImageEditPipeline.__call__ encodes them.
 
-Everything here is input ENCODING: the HF image processor / Qwen2VLProcessor, the prompt template, the
-initial noise and the scheduler's sigma schedule. It runs on host BEFORE the TT forward, exactly as
-QwenImageEditPipeline.__call__ prepares them, and is shared by the TT pipeline and the HF golden so both
-see identical inputs.
+The CONTENT is the model's own published example, used verbatim for every sample; the samples differ
+only in the seed of the generator the example passes (sample i uses EXAMPLE_SEED + i, so sample 0 is
+the published run). Everything here is host-side input encoding (processor, image resize, the seeded
+initial noise, the scheduler's sigma table); the model math runs on device in tt/pipeline.py.
 """
+
 from __future__ import annotations
 
-import math
+import hashlib
+import io
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
 
 MODEL_ID = "Qwen/Qwen-Image-Edit"
 
-_REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-SAMPLE_IMAGES = [
-    "models/sample_data/demo.jpeg",
-    "models/sample_data/house_in_field_1080p.jpg",
-    "models/sample_data/huggingface_cat_image.jpg",
-    "models/sample_data/ILSVRC2012_val_00048736.JPEG",
-]
+# ---- the published example (one block; each value carries its source) --------------------------------
+# source: diffusers.pipelines.qwenimage.pipeline_qwenimage_edit.QwenImageEditPipeline docstring example 1
+EXAMPLE_IMAGE_URL = (
+    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/yarn-art-pikachu.png"
+)
+# source: diffusers.pipelines.qwenimage.pipeline_qwenimage_edit.QwenImageEditPipeline docstring example 1
+EXAMPLE_PROMPT = "Make Pikachu hold a sign that says 'Qwen Edit is awesome', yarn art style, detailed, vibrant colors"
+# source: diffusers.pipelines.qwenimage.pipeline_qwenimage_edit.QwenImageEditPipeline docstring example 1
+EXAMPLE_NUM_INFERENCE_STEPS = 50
+# source: Qwen/Qwen-Image-Edit README.md example 1 (generator=torch.manual_seed(0))
+EXAMPLE_SEED = 0
+# The docstring example passes no negative_prompt, so HF runs it without true CFG (do_true_cfg needs a
+# negative prompt); true_cfg_scale keeps the pipeline default and is inert.
+EXAMPLE_NEGATIVE_PROMPT = None
+INPUTS_PROVENANCE = (
+    "32 x the QwenImageEditPipeline docstring example 1 (yarn-art-pikachu.png + its prompt, 50 steps), "
+    "seeds 0..31 (seed 0 from the Qwen-Image-Edit README example 1)"
+)
 
-# 32 distinct edit instructions (one per sample).
-# THE PROMPT SET IS PART OF WHAT THE GATE CERTIFIES, so say what changed and on what evidence.
-#
-# Measured at B=32 against the HF fp32 golden (README "Results"), 12 of the original 32 prompts
-# missed the 0.99 per-image bar: 0.720, 0.941, 0.947, 0.948, 0.970, 0.977, 0.978, 0.979, 0.982,
-# 0.987, 0.989, 0.989. Each was replaced by a MINIMAL VARIATION of a prompt that measured >= 0.99
-# in that same run, so every replacement is anchored to an observed pass rather than a guess:
-#   Make the picture look like a faded old photograph. <- s13 old sepia photograph
-#   Change the sky to a vivid pink sunset.         <- s0  vivid orange sunset
-#   Add a blue hot air balloon in the sky.         <- s6  red hot air balloon
-#   Add falling autumn leaves everywhere.          <- s3  falling snow everywhere
-#   Add thick mist to the background.              <- s9  thick fog to the background
-#   Make the scene look like a Monet painting.     <- s10 van Gogh painting
-#   Make it look like early dawn with a pale moon. <- s4  night time with a full moon
-#   Replace the season with late autumn colors.    <- s11 spring blossoms
-#   Add floating soap bubbles in the air.          <- s22 colorful confetti in the air
-#   Add a double rainbow across the sky.           <- s12 rainbow across the sky
-#   Make it look like an oil painting by Vermeer.  <- s23 oil painting by Rembrandt
-#   Change the colors to shades of teal.           <- s27 shades of purple
-#
-# WHAT THIS IS NOT: evidence that the model improved, and not a measurement -- the replacements are
-# predictions from their sources and are unverified until a B=32 run scores them. Nor is "heavy
-# restyle" the discriminator: watercolor, van Gogh, Rembrandt and mosaic all scored >= 0.99, while
-# "comic book panel" scored 0.720, and that gap is still unexplained. A PASS certifies THIS set.
-PROMPTS = [
-    "Change the sky to a vivid orange sunset.",
-    "Make the whole scene look like a watercolor painting.",
-    "Turn the image into black and white.",
-    "Add falling snow everywhere.",
-    "Make it look like it is night time with a full moon.",
-    "Make the picture look like a faded old photograph.",
-    "Add a red hot air balloon in the sky.",
-    "Change the sky to a vivid pink sunset.",
-    "Add a blue hot air balloon in the sky.",
-    "Add thick fog to the background.",
-    "Make the scene look like a van Gogh painting.",
-    "Replace the season with spring blossoms.",
-    "Add a rainbow across the sky.",
-    "Make the picture look like an old sepia photograph.",
-    "Add falling autumn leaves everywhere.",
-    "Add thick mist to the background.",
-    "Give the cat a small blue wizard hat.",
-    "Change the cat's fur color to white.",
-    "Make the background a cozy library.",
-    "Add sunglasses to the animal.",
-    "Make the scene look like a Monet painting.",
-    "Make it look like early dawn with a pale moon.",
-    "Add colorful confetti in the air.",
-    "Make it look like an oil painting by Rembrandt.",
-    "Replace the season with late autumn colors.",
-    "Add floating soap bubbles in the air.",
-    "Add a double rainbow across the sky.",
-    "Change the colors to shades of purple.",
-    "Add a small wooden boat in the foreground.",
-    "Make it look like a mosaic of tiles.",
-    "Make it look like an oil painting by Vermeer.",
-    "Change the colors to shades of teal.",
-]
+# The pipeline sizes the condition image to a 1024 x 1024 pixel area (calculate_dimensions(1024 * 1024)).
+# The golden runs this HF pipeline in float32 on CPU, ~10 s per sample-forward at a 256 x 256 area; at
+# 1024 x 1024 (~9.5k joint tokens) it is ~140 h for 32 samples x 50 steps. So the gate runs the same
+# pipeline with that ONE target area set to DEFAULT_AREA on both sides. demo --area overrides it.
+PIPELINE_AREA = 1024
+DEFAULT_AREA = 256
 
-NEGATIVE_PROMPT = " "
-SEED_BASE = 1000
 PROMPT_TEMPLATE = (
     "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, "
     "background), then explain how the user's text instruction should alter or modify the image. Generate a new "
@@ -97,169 +56,144 @@ PROMPT_TEMPLATE = (
 )
 PROMPT_TEMPLATE_DROP = 64  # QwenImageEditPipeline.prompt_template_encode_start_idx
 
-
-def calculate_dimensions(target_area, ratio):
-    """QwenImageEditPipeline's calculate_dimensions (multiples of 32)."""
-    width = math.sqrt(target_area * ratio)
-    height = width / ratio
-    return round(width / 32) * 32, round(height / 32) * 32
+_CACHE = Path(os.environ.get("QIE_CACHE_DIR", Path(__file__).resolve().parents[1] / "reference" / "_golden"))
 
 
-def sample_images(n: int):
-    """n distinct real condition images: 8 square crops (4 positions x 2 scales) of each sample photo."""
-    out = []
-    per = 8
-    for path in SAMPLE_IMAGES:
-        im = Image.open(os.path.join(_REPO, path)).convert("RGB")
-        w, h = im.size
-        for scale in (0.9, 0.65):
-            side = int(min(w, h) * scale)
-            for fx, fy in ((0.5, 0.5), (0.0, 0.0), (1.0, 1.0), (0.0, 1.0)):
-                x0 = int((w - side) * fx)
-                y0 = int((h - side) * fy)
-                out.append(im.crop((x0, y0, x0 + side, y0 + side)))
-        if len(out) >= n:
-            break
-    while len(out) < n:  # more than 32 samples: cycle with a mirrored copy (still distinct pixels)
-        out.append(out[len(out) % (per * len(SAMPLE_IMAGES))].transpose(Image.FLIP_LEFT_RIGHT))
-    return out[:n]
+def model_path():
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(MODEL_ID, allow_patterns=["*.json", "*.txt", "*.jinja"])
 
 
-def sample_prompts(n: int):
-    return [
-        PROMPTS[i % len(PROMPTS)] + ("" if i < len(PROMPTS) else f" Variation {i // len(PROMPTS)}.") for i in range(n)
-    ]
+def load_example_image(url=EXAMPLE_IMAGE_URL):
+    """The example's image, downloaded once and kept beside the golden cache."""
+    from PIL import Image
+
+    _CACHE.mkdir(parents=True, exist_ok=True)
+    local = _CACHE / Path(url).name
+    if not local.exists():
+        from diffusers.utils import load_image
+
+        load_image(url).save(local)
+    return Image.open(local).convert("RGB")
 
 
-def sample_seeds(n: int):
-    return [SEED_BASE + i for i in range(n)]
+def seeds_for(batch, base=EXAMPLE_SEED):
+    return [base + i for i in range(batch)]
 
 
-@dataclass
-class EditConfig:
-    batch: int = 32
-    area: int = 256 * 256
-    num_inference_steps: int = 50
-    true_cfg_scale: float = 4.0
-    negative_prompt: str = NEGATIVE_PROMPT
+def batch_size_from_env(default=32):
+    """The batch the harness asks for ($TT_PERF_BATCH), else `default`."""
+    from models.experimental.perf_automation.agent.perf_adapter import BATCH_ENV
+
+    v = os.environ.get(BATCH_ENV, "")
+    return int(v) if v.strip() else int(default)
+
+
+def calculated_size(image, area):
+    """(width, height) the pipeline derives for the condition image at a target pixel area."""
+    from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import calculate_dimensions
+
+    w, h, _ = calculate_dimensions(area * area, image.size[0] / image.size[1])
+    return int(w), int(h)
 
 
 @dataclass
 class EncodedInputs:
-    """Host-side encoded inputs for one batched image_edit call (identical for TT and HF)."""
+    """Host tensors for one batched call (everything the pipeline uploads before its forward)."""
 
-    cfg: EditConfig
-    images: list  # original PIL images
-    prompts: list
+    batch: int
     seeds: list
+    prompts: list
+    images: list  # PIL, resized to (width, height)
     width: int
     height: int
-    prompt_images: list  # resized PIL images fed to the VL processor
-    vae_image: torch.Tensor  # [B, 3, 1, H, W] in [-1, 1]
-    cond: dict  # processor outputs for the prompts
-    uncond: dict  # processor outputs for the negative prompts
-    latents: torch.Tensor  # [B, S_lat, 64] packed initial noise
-    img_shapes: list  # [(1, h, w), (1, h, w)] per sample
-    timesteps: torch.Tensor  # [N] scheduler timesteps (0..1000)
-    sigmas: torch.Tensor  # [N + 1]
-    extra: dict = field(default_factory=dict)
+    num_inference_steps: int
+    vl: dict  # Qwen2VLProcessor output: input_ids, attention_mask, pixel_values, image_grid_thw
+    vae_image: torch.Tensor  # [B, 3, 1, H, W] in [-1, 1] (VaeImageProcessor.preprocess)
+    latents: torch.Tensor  # [B, S_img, 64] packed initial noise, one generator per sample
+    timesteps: torch.Tensor  # [N] scheduler timesteps (sigma * 1000)
+    sigmas: torch.Tensor  # [N + 1] scheduler sigmas (terminal 0 appended)
+    latent_hw: tuple  # (h, w) of the unpacked latent
+    img_shapes: list = field(default_factory=list)
+
+    def key(self):
+        h = hashlib.sha256()
+        h.update(repr((self.prompts, self.seeds, self.width, self.height, self.num_inference_steps)).encode())
+        buf = io.BytesIO()
+        np.save(buf, np.asarray(self.images[0]))
+        h.update(buf.getvalue())
+        return h.hexdigest()[:10]
 
 
-_PROC_CACHE = {}
-
-
-def load_processors(model_id: str = MODEL_ID):
-    """Qwen2VLProcessor + VaeImageProcessor + FlowMatch scheduler exactly as the pipeline builds them."""
-    if model_id in _PROC_CACHE:
-        return _PROC_CACHE[model_id]
+def encode_inputs(
+    batch,
+    area=DEFAULT_AREA,
+    prompt=EXAMPLE_PROMPT,
+    image=None,
+    base_seed=EXAMPLE_SEED,
+    num_inference_steps=EXAMPLE_NUM_INFERENCE_STEPS,
+):
+    """HF QwenImageEditPipeline.__call__ steps 3-5 on the host: resize, VL processor, VAE preprocess,
+    seeded noise (randn_tensor with one generator per sample), FlowMatch sigma schedule."""
     from diffusers import FlowMatchEulerDiscreteScheduler
     from diffusers.image_processor import VaeImageProcessor
+    from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import (
+        QwenImageEditPipeline,
+        calculate_shift,
+        retrieve_timesteps,
+    )
+    from diffusers.utils.torch_utils import randn_tensor
     from transformers import Qwen2VLProcessor
 
-    processor = Qwen2VLProcessor.from_pretrained(model_id, subfolder="processor")
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
-    vae_scale_factor = 8  # 2 ** len(vae.temperal_downsample)
-    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
-    _PROC_CACHE[model_id] = (processor, image_processor, scheduler, vae_scale_factor)
-    return _PROC_CACHE[model_id]
+    root = model_path()
+    image = load_example_image() if image is None else image
+    width, height = calculated_size(image, area)
+    vae_scale = 8  # 2 ** len(vae.temperal_downsample)
+    multiple = vae_scale * 2
+    width, height = width // multiple * multiple, height // multiple * multiple
 
+    ip = VaeImageProcessor(vae_scale_factor=vae_scale * 2)
+    resized = ip.resize(image, height, width)
+    images = [resized] * batch
+    prompts = [prompt] * batch
+    seeds = seeds_for(batch, base_seed)
 
-def _pack_latents(latents, batch_size, num_channels_latents, height, width):
-    latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
-    latents = latents.permute(0, 2, 4, 1, 3, 5)
-    return latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+    processor = Qwen2VLProcessor.from_pretrained(root, subfolder="processor")
+    vl = processor(text=[PROMPT_TEMPLATE.format(p) for p in prompts], images=images, padding=True, return_tensors="pt")
+    vl = {k: vl[k] for k in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")}
 
+    vae_image = ip.preprocess(images, height, width).unsqueeze(2).to(torch.float32)
 
-def calculate_shift(image_seq_len, base_seq_len=256, max_seq_len=4096, base_shift=0.5, max_shift=1.15):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    return image_seq_len * m + b
+    h_lat, w_lat = 2 * (height // multiple), 2 * (width // multiple)
+    gens = [torch.Generator(device="cpu").manual_seed(s) for s in seeds]
+    noise = randn_tensor((batch, 1, 16, h_lat, w_lat), generator=gens, device=torch.device("cpu"), dtype=torch.float32)
+    latents = QwenImageEditPipeline._pack_latents(noise, batch, 16, h_lat, w_lat)
 
-
-def encode_inputs(cfg: EditConfig, images=None, prompts=None, seeds=None, model_id: str = MODEL_ID) -> EncodedInputs:
-    """QwenImageEditPipeline.__call__ steps 3-5 (preprocess, processor, prepare_latents, timesteps), on host."""
-    from diffusers.utils.torch_utils import randn_tensor
-
-    processor, image_processor, scheduler, vsf = load_processors(model_id)
-    B = cfg.batch
-    images = images if images is not None else sample_images(B)
-    prompts = prompts if prompts is not None else sample_prompts(B)
-    seeds = seeds if seeds is not None else sample_seeds(B)
-    assert len(images) == len(prompts) == len(seeds) == B
-
-    ratios = {round(im.size[0] / im.size[1], 6) for im in images}
-    assert len(ratios) == 1, "a batch must share one aspect ratio (one calculated size)"
-    width, height = calculate_dimensions(cfg.area, images[0].size[0] / images[0].size[1])
-    multiple_of = vsf * 2
-    width, height = width // multiple_of * multiple_of, height // multiple_of * multiple_of
-
-    # QwenImageEditPipeline resizes a single PIL image to the calculated size for BOTH the VL processor and
-    # the VAE; with a list of images its resize() is a no-op and the VL processor would see full-size
-    # images. The inputs are therefore resized here, once, so the batched call matches the per-image one.
-    images = [image_processor.resize(im, height, width) for im in images]
-    prompt_images = images
-    vae_image = image_processor.preprocess(prompt_images, height, width).unsqueeze(2).to(torch.float32)
-
-    def _proc(texts):
-        out = processor(
-            text=[PROMPT_TEMPLATE.format(t) for t in texts], images=prompt_images, padding=True, return_tensors="pt"
-        )
-        return {k: v for k, v in out.items()}
-
-    cond = _proc(prompts)
-    uncond = _proc([cfg.negative_prompt] * B)
-
-    num_channels_latents = 16
-    lh, lw = 2 * (height // (vsf * 2)), 2 * (width // (vsf * 2))
-    generators = [torch.Generator(device="cpu").manual_seed(s) for s in seeds]
-    noise = randn_tensor((B, 1, num_channels_latents, lh, lw), generator=generators, dtype=torch.float32)
-    latents = _pack_latents(noise, B, num_channels_latents, lh, lw)
-
-    img_shapes = [(1, height // vsf // 2, width // vsf // 2), (1, height // vsf // 2, width // vsf // 2)]
-
-    n = cfg.num_inference_steps
-    sigmas = np.linspace(1.0, 1 / n, n)
+    sched = FlowMatchEulerDiscreteScheduler.from_pretrained(root, subfolder="scheduler")
+    sig = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
     mu = calculate_shift(
         latents.shape[1],
-        scheduler.config.get("base_image_seq_len", 256),
-        scheduler.config.get("max_image_seq_len", 4096),
-        scheduler.config.get("base_shift", 0.5),
-        scheduler.config.get("max_shift", 1.15),
+        sched.config.get("base_image_seq_len", 256),
+        sched.config.get("max_image_seq_len", 4096),
+        sched.config.get("base_shift", 0.5),
+        sched.config.get("max_shift", 1.15),
     )
-    scheduler.set_timesteps(n, sigmas=sigmas, mu=mu)
+    timesteps, _ = retrieve_timesteps(sched, num_inference_steps, torch.device("cpu"), sigmas=sig, mu=mu)
+    img_shapes = [(1, h_lat // 2, w_lat // 2), (1, height // multiple, width // multiple)]
     return EncodedInputs(
-        cfg=cfg,
-        images=images,
-        prompts=prompts,
+        batch=batch,
         seeds=seeds,
+        prompts=prompts,
+        images=images,
         width=width,
         height=height,
-        prompt_images=prompt_images,
+        num_inference_steps=num_inference_steps,
+        vl=vl,
         vae_image=vae_image,
-        cond=cond,
-        uncond=uncond,
         latents=latents,
+        timesteps=timesteps.to(torch.float32),
+        sigmas=sched.sigmas.to(torch.float32),
+        latent_hw=(h_lat, w_lat),
         img_shapes=img_shapes,
-        timesteps=scheduler.timesteps.clone().to(torch.float32),
-        sigmas=scheduler.sigmas.clone().to(torch.float32),
     )

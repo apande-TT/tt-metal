@@ -1,53 +1,46 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""QwenImageTransformer2DModel forward, chained from the graduated transformer ports.
+"""QwenImageTransformer2DModel.forward chained from the graduated ports (one denoising forward).
 
-    img  = img_in(cat[latents, image_latents])                       patch_embed port (Linear 64 -> 3072)
-    txt  = txt_in(txt_norm(prompt_embeds))                           RMSNorm(3584) + the same Linear port
-    temb = qwen_timestep_proj_embeddings(t / 1000)                   timesteps -> timestep_embedding
-    rope = qwen_embed_rope([(1,h,w), (1,h,w)], txt_len)              computed once per run
-    txt, img = qwen_image_transformer_block_i(img, txt, temb, rope, mask)   x 60 (attention + feed_forward)
-    out  = proj_out(ada_layer_norm_continuous(img, temb))            decoder_head port
+    hs   = img_in(cat[latents, image_latents])                       patch_embed port
+    txt  = txt_in(txt_norm(prompt_embeds))                           float32 RMSNorm + patch_embed port
+    temb = qwen_timestep_proj_embeddings(t)                          timesteps -> timestep_embedding
+    rope = qwen_embed_rope(img_shapes, txt_len)                      constant for a call: built in prepare
+    txt, hs = qwen_image_transformer_block_i(hs, txt, temb, rope)    x N (feed_forward inside each block)
+    out  = proj_out(ada_layer_norm_continuous(hs, temb))             decoder_head port
+
+TP=8 over the whole mesh: the block ports shard over every device (their collectives run axis 1 then
+axis 0), the small projections are replicated.
 """
+
 from __future__ import annotations
 
 import torch
 
 import ttnn
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import (
+    _precise,
     ada_layer_norm_continuous,
-    decoder_head,
-    patch_embed,
     qwen_embed_rope,
     qwen_image_transformer_block,
     qwen_timestep_proj_embeddings,
 )
+from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs.decoder_head import TtQwenDecoderHead
+from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs.patch_embed import TtQwenPatchEmbed
 
 
-def _hifi(device):
-    return ttnn.init_device_compute_kernel_config(
-        device.arch(),
-        math_fidelity=ttnn.MathFidelity.HiFi4,
-        math_approx_mode=False,
-        fp32_dest_acc_en=True,
-        packer_l1_acc=False,
-    )
+def _replicated(device, t, dtype=ttnn.float32):
+    kw = {"mesh_mapper": ttnn.ReplicateTensorToMesh(device)} if isinstance(device, ttnn.MeshDevice) else {}
+    return ttnn.from_torch(t.contiguous(), dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device, **kw)
 
 
 class TtRMSNorm32:
-    """diffusers RMSNorm(dim, eps, elementwise_affine=True) in float32 (txt_norm)."""
+    """diffusers RMSNorm (txt_norm) in float32: x * rsqrt(mean(x^2) + eps) * w."""
 
     def __init__(self, device, torch_module):
         self.eps = float(torch_module.eps)
-        w = torch_module.weight.detach().to(torch.float32).reshape(1, -1)
-        self.w = ttnn.from_torch(
-            w,
-            dtype=ttnn.float32,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
-        )
-        self.cfg = _hifi(device)
+        self.w = _replicated(device, torch_module.weight.detach().to(torch.float32).reshape(1, -1))
+        self.cfg = _precise.precise_config()
 
     def __call__(self, x):
         ms = ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True, compute_kernel_config=self.cfg)
@@ -55,62 +48,54 @@ class TtRMSNorm32:
 
 
 class TtQwenImageTransformer:
-    def __init__(self, device, torch_module, layers=None, tracker=None):
+    def __init__(self, device, hf_transformer, layers=None, tracker=None, precise=True):
         self.device = device
-        self.hf_config = torch_module.config
-        n = (
-            len(torch_module.transformer_blocks)
-            if layers is None
-            else max(1, min(int(layers), len(torch_module.transformer_blocks)))
-        )
-        self.num_layers = n
-        tr = tracker
-
-        self.img_in = patch_embed.build(device, torch_module.img_in)
-        self.txt_norm = TtRMSNorm32(device, torch_module.txt_norm)
-        self.txt_in = patch_embed.build(device, torch_module.txt_in)
-
-        self.time_text_embed = qwen_timestep_proj_embeddings.build(device, torch_module.time_text_embed)
-        self.pos_embed = qwen_embed_rope.build(device, torch_module.pos_embed)
-        # The repeated stack: a plain list of same-typed graduated block ports.
-        self.transformer_blocks = [
-            qwen_image_transformer_block.build(device, blk) for blk in list(torch_module.transformer_blocks)[:n]
-        ]
-        self.norm_out = ada_layer_norm_continuous.build(device, torch_module.norm_out)
-        self.proj_out = decoder_head.build(device, torch_module.proj_out)
-
-        if tr is not None:
-            from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import (
-                feed_forward,
-                timestep_embedding,
-                timesteps,
-            )
-
-            tr.track("qwen_timestep_proj_embeddings", self.time_text_embed, stub_module=qwen_timestep_proj_embeddings)
-            tr.track("timesteps", self.time_text_embed.time_proj, stub_module=timesteps)
-            tr.track("timestep_embedding", self.time_text_embed.timestep_embedder, stub_module=timestep_embedding)
-            tr.track("qwen_embed_rope", self.pos_embed, stub_module=qwen_embed_rope)
+        tr = hf_transformer
+        assert not getattr(tr, "zero_cond_t", False), "zero_cond_t checkpoints are not ported"
+        assert not tr.config.guidance_embeds, "guidance-distilled checkpoints are not ported"
+        blocks = list(tr.transformer_blocks)
+        self.num_layers = len(blocks) if layers is None else max(1, min(int(layers), len(blocks)))
+        # precise mode of the ports (see _stubs/_precise.py): float32 matmul inputs as bf16 limbs, exact-lane
+        # QK^T with q / k as 3 limbs (the ~4e4 attention logits feed a near-argmax softmax) and exact-lane
+        # linears. Measured per-step velocity error vs a float64 HF forward (step 45, 8 seeds, golden
+        # conditioning): dense linears + 2-limb QK 5.6e-4..2.5e-3; this 1.1e-4..1.5e-3; HF float32 itself
+        # 2.1e-5..6.1e-4.
+        _precise.ENABLED = bool(precise)
+        if precise:
+            _precise.QK_LIMBS = 3
+            _precise.EXACT_LINEAR = True
+        self.img_in = TtQwenPatchEmbed(device, tr.img_in)
+        self.txt_norm = TtRMSNorm32(device, tr.txt_norm)
+        self.txt_in = TtQwenPatchEmbed(device, tr.txt_in)
+        self.time_text_embed = qwen_timestep_proj_embeddings.build(device, tr.time_text_embed)
+        self.pos_embed = qwen_embed_rope.build(device, tr.pos_embed)
+        self.transformer_blocks = [qwen_image_transformer_block.build(device, b) for b in blocks[: self.num_layers]]
+        self.norm_out = ada_layer_norm_continuous.build(device, tr.norm_out)
+        self.proj_out = TtQwenDecoderHead(device, tr.proj_out)
+        self.out_channels = int(tr.config.out_channels) * int(tr.config.patch_size) ** 2
+        if tracker is not None:
+            tracker.track("qwen_timestep_proj_embeddings", self.time_text_embed)
+            tracker.track("timesteps", self.time_text_embed.time_proj)
+            tracker.track("timestep_embedding", self.time_text_embed.timestep_embedder)
+            tracker.track("qwen_embed_rope", self.pos_embed)
+            tracker.track("ada_layer_norm_continuous", self.norm_out)
             for blk in self.transformer_blocks:
-                tr.track("qwen_image_transformer_block", blk, stub_module=qwen_image_transformer_block)
+                tracker.track("qwen_image_transformer_block", blk)
                 inner = blk.stack.blocks[0]
-                tr.track("feed_forward", inner.img_ff, stub_module=feed_forward)
-                tr.track("feed_forward", inner.txt_ff, stub_module=feed_forward)
-            tr.track("ada_layer_norm_continuous", self.norm_out, stub_module=ada_layer_norm_continuous)
+                tracker.track("feed_forward", inner.img_ff)
+                tracker.track("feed_forward", inner.txt_ff)
 
-    def rope(self, img_shapes, txt_len):
-        """(img_freqs [S_img, 128], txt_freqs [txt_len, 128]) float32 [cos | sin] device tables."""
+    def rotary(self, img_shapes, txt_len):
+        """(img [S_img, 128], txt [L, 128]) float32 [cos | sin] tables for one call's shapes."""
+        # HF passes img_shapes per batch entry ([[noise_shape, image_shape]] * B) and reads entry 0
         return self.pos_embed([list(img_shapes)], max_txt_seq_len=int(txt_len))
 
-    def __call__(self, hidden_states, encoder_hidden_states, timestep, rotary, attention_mask=None):
-        """hidden_states [B, S_img, 64] fp32, encoder_hidden_states [B, L, 3584] fp32, timestep [B] (= t/1000),
-        rotary from rope(), attention_mask [B, 1, 1, L + S_img] (1 = attend) or None. -> [B, S_img, 64] fp32."""
-        img = self.img_in(hidden_states)
-        txt = self.txt_in(self.txt_norm(encoder_hidden_states))
-        temb = self.time_text_embed(timestep, img)
-        jak = {"attention_mask": attention_mask} if attention_mask is not None else None
+    def __call__(self, latent_in, timestep, prompt_embeds, rotary):
+        """latent_in [B, S, 64] fp32, timestep [B, 1] fp32 (= t / 1000), prompt_embeds [B, L, 3584] fp32
+        -> [B, S, 64] fp32 (the forward's `sample`)."""
+        hs = self.img_in(latent_in)
+        txt = self.txt_in(self.txt_norm(prompt_embeds))
+        temb = self.time_text_embed(timestep, hs)
         for blk in self.transformer_blocks:
-            txt, img = blk(
-                img, encoder_hidden_states=txt, temb=temb, image_rotary_emb=rotary, joint_attention_kwargs=jak
-            )
-        img = self.norm_out(img, temb)
-        return self.proj_out(img)
+            txt, hs = blk(hidden_states=hs, encoder_hidden_states=txt, temb=temb, image_rotary_emb=rotary)
+        return self.proj_out(self.norm_out(hs, temb))

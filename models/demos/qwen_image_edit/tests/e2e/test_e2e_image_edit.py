@@ -1,55 +1,43 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end Qwen-Image-Edit on TT (Call 1: image_edit), against the HF QwenImageEditPipeline golden.
+"""E2E gate for Call 1, image_edit: image + instruction -> edited image, on the 2x4 mesh.
 
-Real input: B condition images (B = $TT_PERF_BATCH, 32 when unset; crops of the photos in
-models/sample_data), B distinct edit instructions and B seeds from 1000 (the bundled set). They are
-encoded with the HF Qwen2VLProcessor, VaeImageProcessor and FlowMatch scheduler (tt/inputs.py). One chained TT forward (tt/pipeline.py:
-run_image_edit, the same function the demo calls) takes them to B edited images in one program per
-step. The golden is the HF pipeline in float32 on CPU with the same inputs and the same initial noise
-(reference/golden.py). It takes hours on CPU, so it is precomputed and cached; this test fails fast if
-it is missing and never builds it.
+Inputs (provenance): 32 x the QwenImageEditPipeline docstring example 1 (yarn-art-pikachu.png + its
+prompt, 50 steps), seeds 0..B-1 (seed 0 from the Qwen-Image-Edit README example 1), at the 256 x 256
+condition area (tt/inputs.py). B is $TT_PERF_BATCH (default 32).
 
-Mesh: Galaxy 8x4. The denoise batch is split over the 4 mesh columns (DP=4, 8 samples per column)
-with the transformer TP=8 down each column, which is what makes B=32 x 50 steps fit the 45 min the
-harness allows the whole run. Every sample is scored against its own golden.
+Golden: the HF QwenImageEditPipeline itself, float32 on CPU, same inputs and generators
+(reference/golden.py; built on first use and cached).
 
-Gates:
-  1  every routed graduated stub is ttnn: no torch compute in its forward code (static scan), and the
-     forward fires zero host aten ops (host_op_observer, the authoritative runtime check)
-  2  all 25 graduated modules were invoked by that forward
-  3  every sample's final image PCC vs its own golden >= PCC_TARGET (0.99)
-Also asserted: the full scheduler schedule ran (no step cap); the outputs are distinct; each output
-matches its own golden better than any other sample's golden.
+  Gate 1  every routed graduated stub (and the chain around it) is ttnn: no torch compute in its forward
+          code (static scan, tt/gates.py), and the forward (everything after the input upload) fires
+          zero host aten ops (host_op_observer, the authoritative runtime check)
+  Gate 2  every one of the 25 graduated modules is invoked on the forward path
+  Gate 3  min over samples of image PCC vs the golden >= 0.99 (printed as `e2e PCC=` on every run)
 """
+
 from __future__ import annotations
 
 import importlib
-import os
 
 import pytest
 import torch
 
-import ttnn
-from models.common.utility_functions import comp_pcc
-from models.demos.qwen_image_edit.reference.golden import golden_path, load_or_build_golden
+from models.demos.qwen_image_edit.demo.mesh import DEVICE_PARAMS, MESH_SHAPE
+from models.demos.qwen_image_edit.reference.golden import load_golden
 from models.demos.qwen_image_edit.tt import gates
-from models.demos.qwen_image_edit.tt import pipeline as P
-from models.demos.qwen_image_edit.tt.inputs import EditConfig
-from models.experimental.perf_automation.agent.perf_adapter import BATCH_ENV, batch_report_line
+from models.demos.qwen_image_edit.tt import inputs as I
+from models.demos.qwen_image_edit.tt.pipeline import build_pipeline, run_image_edit, to_host
+from models.demos.qwen_image_edit.tt.tracker import ALL_GRADUATED, GRADUATED, Tracker
 
-# the gate's bar for this run (emit-e2e --pcc-target 0.99), applied to EVERY sample
+E2E_CORRECTNESS_GATE = "test_image_edit_e2e"
 PCC_TARGET = 0.99
-# the batch the harness asks for (perf_adapter.BATCH_ENV); the gate's batch, 32, when it asks for none
-E2E_BATCH = int(os.environ.get(BATCH_ENV) or 32)
-# the correctness gate: per-sample image PCC vs the independently computed HF golden (not teacher-forced)
-E2E_CORRECTNESS_GATE = "test_e2e_image_edit"
 STUB_PKGS = {
     "text_encoder": "models.demos.qwen_image_edit_text_encoder._stubs.",
     "vae": "models.tt_dit.pipelines.qwen_image_edit_vae._stubs.",
     "transformer": "models.tt_dit.pipelines.qwen_image_edit_transformer._stubs.",
 }
-# the non-graduated ports the chain routes through (their forwards are scanned too)
+# the non-graduated ports the graduated ones route through (their forwards are scanned too)
 GLUE = {
     "text_encoder": ["attention", "encoder_stack", "layer", "token_embed", "v_l_rotary_embedding"],
     "vae": ["mlp", "_resident"],
@@ -57,105 +45,91 @@ GLUE = {
 }
 CHAIN = ["pipeline", "text_encoder", "transformer", "vae"]
 
-MESH_PARAMS = pytest.mark.parametrize(
-    "device_params",
-    [
-        {
-            "l1_small_size": 24576,
-            "trace_region_size": P.DEVICE_PARAMS["trace_region_size"],
-            "fabric_config": ttnn.FabricConfig.FABRIC_1D,
-        }
-    ],
-    indirect=True,
-)
-MESH = pytest.mark.parametrize("mesh_device", [P.MESH_SHAPE], indirect=True)
+
+def _pcc_rows(a, b):
+    """Per-sample PCC between [B, ...] tensors."""
+    a = a.double().flatten(1)
+    b = b.double().flatten(1)
+    a = a - a.mean(1, keepdim=True)
+    b = b - b.mean(1, keepdim=True)
+    return (a * b).sum(1) / (a.norm(dim=1) * b.norm(dim=1) + 1e-30)
 
 
-def _config():
-    steps = int(os.environ.get("QIE_STEPS", "50"))  # QwenImageEditPipeline default
-    return EditConfig(batch=E2E_BATCH, num_inference_steps=steps)
+def _pcc_matrix(a, b):
+    a = a.double().flatten(1)
+    b = b.double().flatten(1)
+    a = (a - a.mean(1, keepdim=True)) / (a - a.mean(1, keepdim=True)).norm(dim=1, keepdim=True)
+    b = (b - b.mean(1, keepdim=True)) / (b - b.mean(1, keepdim=True)).norm(dim=1, keepdim=True)
+    return a @ b.t()
 
 
-@pytest.fixture(scope="module")
-def golden():
-    """The cached HF golden. Requested first so a missing golden fails before the device or the HF
-    model is touched; it is never built here (hours on CPU: python -m models.demos.qwen_image_edit.
-    reference.golden --batch 32 --steps 50)."""
-    cfg = _config()
-    g = load_or_build_golden(cfg, build_if_missing=False)
-    if g is None:
-        pytest.fail(f"cached golden missing: {golden_path(cfg)} (build it with reference/golden.py first)")
-    return g
+@pytest.mark.parametrize("device_params", [DEVICE_PARAMS], indirect=True)
+@pytest.mark.parametrize("mesh_device", [MESH_SHAPE], indirect=True)
+def test_image_edit_e2e(mesh_device):
+    B = I.batch_size_from_env()
+    print(f"PERF_BATCH_STREAMS={B}", flush=True)
+    print(f"inputs: {I.INPUTS_PROVENANCE}", flush=True)
+    enc = I.encode_inputs(B)
+    golden = load_golden(enc)  # HF float32 reference for exactly these seeds
 
+    tracker = Tracker()
+    pipe = build_pipeline(mesh_device, tracker=tracker)
+    tracker.reset()  # count the forward only
+    steps_run = []
+    out = run_image_edit(pipe, enc, use_trace=True, on_step=lambda i, st: steps_run.append(i), observe_host_ops=True)
+    image = to_host(out["image"], mesh_device).float()
+    latents = to_host(out["latents"], mesh_device).float()
+    prompt = to_host(out["prompt_embeds"], mesh_device).float()
+    image_latents = to_host(out["image_latents"], mesh_device).float()
 
-@pytest.fixture(scope="module")
-def hf_pipe():
-    return P.load_hf_reference(torch.float32)
+    # horizon: the scheduler's full schedule ran (both sides use the example's num_inference_steps)
+    n_sched = len(enc.timesteps)
+    assert n_sched == I.EXAMPLE_NUM_INFERENCE_STEPS and len(steps_run) == n_sched
+    assert golden["step_latents"].shape[0] == n_sched
 
+    # per-stage localisation (reported, the final image is gated)
+    from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import QwenImageEditPipeline
 
-# the harness's hang budget for the whole run (build + 32-sample x 50-step forward + checks)
-@pytest.mark.timeout(2700)
-@MESH_PARAMS
-@MESH
-def test_e2e_image_edit(golden, mesh_device, hf_pipe):
-    cfg = _config()
+    gl = golden["image_latents"]
+    gl = QwenImageEditPipeline._pack_latents(gl, gl.shape[0], gl.shape[1], gl.shape[3], gl.shape[4])
+    for name, tt, ref in (
+        ("prompt_embeds", prompt, golden["prompt_embeds"]),
+        ("image_latents", image_latents, gl),
+        ("final_latents", latents, golden["step_latents"][-1]),
+    ):
+        p = _pcc_rows(tt, ref.float())
+        print(f"stage {name}: min pcc {p.min().item():.6f} mean {p.mean().item():.6f}", flush=True)
 
-    pipe = P.build_pipeline(mesh_device, model=hf_pipe, cfg=cfg)
-    enc = pipe.encode(cfg)
-    p = pipe.prepare(enc)
-    B = p.B  # the batch this test actually drives, read from the pipeline
-    assert B == cfg.batch == golden["image"].shape[0]
-    print(batch_report_line(B), flush=True)
-    print(f"[e2e] batch={B} steps={p.num_steps} size={enc.width}x{enc.height} cfg_scale={p.cfg_scale}", flush=True)
+    # Gate 1: native ttnn (static) and on device (runtime)
+    mods = [importlib.import_module(STUB_PKGS[g] + n) for g, ns in GRADUATED.items() for n in ns]
+    mods += [importlib.import_module(STUB_PKGS[g] + n) for g, ns in GLUE.items() for n in ns]
+    mods += [importlib.import_module("models.demos.qwen_image_edit.tt." + n) for n in CHAIN]
+    violations = gates.gate1_native(mods)
+    print(f"gate1 torch compute in forward code: {violations or 'none'}", flush=True)
+    v = out["host_ops"]
+    print(f"gate1 host ops in the forward: {v['n_host_ops']} {v['host_ops'][:8]}", flush=True)
+    # Gate 2: every graduated module on the forward path
+    report = tracker.report()
+    print(f"gate2 invocations: {report}", flush=True)
+    missing = tracker.missing()
 
-    # ---- the real forward, under the host-op observer (inputs already encoded + uploaded) ----------
-    # The traced scheduler steps are enqueued non-blocking, so without this the host waits on the
-    # chips in silence for the whole schedule (measured: 1216 s with no output at B=32), and the
-    # gate's progress watchdog (600 s of no log growth) kills a healthy run as a hang. Waiting on
-    # each step and reporting it keeps the run visibly progressing; the ops and their order are
-    # unchanged, so the result is too.
-    def _report_step(i, _latents):
-        ttnn.synchronize_device(mesh_device)
-        print(f"[e2e] scheduler step {i + 1}/{p.num_steps} done", flush=True)
-
-    verdict, out = pipe.host_op_selftest(p, on_step=_report_step)
-    image = P.to_host(out).to(torch.float32)
-    latents = P.to_host(pipe.last_latents).to(torch.float32)
-    ref = golden["image"].to(torch.float32)
-
-    # ---- horizon: the whole schedule ran (no cap) ------------------------------------------------------
-    assert pipe.steps_run == p.num_steps == cfg.num_inference_steps, (pipe.steps_run, p.num_steps)
-
-    # ---- Gate 1: native ttnn ---------------------------------------------------------------------------
-    stub_mods = [importlib.import_module(STUB_PKGS[g] + n) for g, ns in P.GRADUATED.items() for n in ns]
-    glue_mods = [importlib.import_module(STUB_PKGS[g] + n) for g, ns in GLUE.items() for n in ns]
-    chain_mods = [importlib.import_module("models.demos.qwen_image_edit.tt." + n) for n in CHAIN]
-    violations = gates.gate1_native(stub_mods + glue_mods, chain_mods)
-    print(f"[gate1] static torch-compute scan: {violations or 'clean'}", flush=True)
-    print(f"[gate1] host_op_observer: on_device={verdict['on_device']} host_ops={verdict['host_ops'][:12]}", flush=True)
-
-    # ---- Gate 2: every graduated module invoked --------------------------------------------------------
-    counts, missing = gates.gate2_invoked(pipe.tracker, P.GRADUATED_ALL)
-    print(f"[gate2] invocation counts: {counts}", flush=True)
-
-    # ---- Gate 3: per-sample image PCC vs its own golden ------------------------------------------------
-    pccs = [float(comp_pcc(ref[b], image[b], PCC_TARGET)[1]) for b in range(B)]
-    lat_pccs = [float(comp_pcc(golden["step_latents"][-1][b], latents[b], PCC_TARGET)[1]) for b in range(B)]
-    for b in range(B):
-        print(
-            f"[gate3] sample {b:2d} image PCC {pccs[b]:.6f} latent PCC {lat_pccs[b]:.6f}  '{enc.prompts[b]}'",
-            flush=True,
-        )
-    # independence: distinct outputs, and each output is closest to its own golden
-    cross = torch.tensor([[float(comp_pcc(ref[j], image[i], 0.0)[1]) for j in range(B)] for i in range(B)])
-    own_best = bool((cross.argmax(dim=1) == torch.arange(B)).all())
-    distinct = all((image[i] - image[j]).abs().max() > 1e-3 for i in range(B) for j in range(i + 1, B))
-    achieved_pcc = min(pccs)
-    print(f"[e2e] independence: distinct={distinct} own-golden-best={own_best}", flush=True)
-    print(f"e2e PCC={achieved_pcc}", flush=True)
-
-    assert not violations, f"Gate 1: torch compute in the forward: {violations}"
-    assert verdict["on_device"], f"Gate 1: host aten ops in the forward: {verdict['host_ops']}"
-    assert not missing, f"Gate 2: graduated modules never invoked: {missing}"
-    assert distinct and own_best, f"outputs are not {B} independent samples"
-    assert achieved_pcc >= PCC_TARGET, f"Gate 3: min image PCC {achieved_pcc:.6f} < {PCC_TARGET} ({pccs})"
+    # Gate 3: per-sample image PCC vs the HF golden
+    ref_img = golden["image"].float()
+    assert image.shape == ref_img.shape, (image.shape, ref_img.shape)
+    pcc = _pcc_rows(image, ref_img)
+    for i, s in enumerate(enc.seeds):
+        print(f"sample {i} seed {s}: image pcc {pcc[i].item():.6f}", flush=True)
+    # independence: each output matches its OWN golden best, and the outputs are not all one image
+    if B > 1:
+        m = _pcc_matrix(image, ref_img)
+        own_best = bool((m.argmax(1) == torch.arange(B)).all())
+        spread = float((image - image[:1]).abs().amax())
+        print(f"independence: own-golden best for every sample {own_best}; max |x_i - x_0| {spread:.4f}")
+        assert own_best and spread > 0
+    achieved_pcc = float(pcc.min())
+    print(f"e2e PCC={achieved_pcc:.6f}", flush=True)
+    assert not violations, f"torch compute in the forward: {violations}"
+    assert v["on_device"], v["reason"]
+    assert not missing, f"graduated modules not invoked: {missing}"
+    assert len(report) == len(ALL_GRADUATED) == 25
+    assert achieved_pcc >= PCC_TARGET, f"min image PCC {achieved_pcc:.6f} < {PCC_TARGET} over {B} samples"

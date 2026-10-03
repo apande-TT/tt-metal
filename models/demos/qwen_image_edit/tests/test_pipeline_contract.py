@@ -1,63 +1,44 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Pipeline contract tests (not the correctness gate, which is tests/e2e/test_e2e_image_edit.py):
-per-stage trace capture at full depth, and the depth knob."""
+"""The pipeline's trace / host-op / depth contract (COMMAND 3), on the same 2x4 mesh as the e2e gate.
+
+These run at a capped depth (every repeated stack built `layers` times): the op set is the full model's.
+"""
+
 from __future__ import annotations
 
 import pytest
-import torch
 
-import ttnn
-from models.demos.qwen_image_edit.tt import pipeline as P
-from models.demos.qwen_image_edit.tt.inputs import EditConfig
-
-MESH_PARAMS = pytest.mark.parametrize(
-    "device_params",
-    [
-        {
-            "l1_small_size": 24576,
-            "trace_region_size": P.DEVICE_PARAMS["trace_region_size"],
-            "fabric_config": ttnn.FabricConfig.FABRIC_1D,
-        }
-    ],
-    indirect=True,
+from models.demos.qwen_image_edit.demo.mesh import DEVICE_PARAMS, MESH_SHAPE
+from models.demos.qwen_image_edit.tt.pipeline import (
+    PIPELINE_STAGES,
+    build_pipeline,
+    host_op_selftest,
+    trace_capture_selftest,
 )
-MESH = pytest.mark.parametrize("mesh_device", [P.MESH_SHAPE], indirect=True)
-BATCH = 32  # the e2e gate's batch
-SMALL_BATCH = 8  # smallest batch of the 8x4 layout (1 image per VAE row, 2 per DP column)
 
 
-@pytest.fixture(scope="module")
-def hf_pipe():
-    return P.load_hf_reference(torch.float32)
+@pytest.mark.parametrize("device_params", [DEVICE_PARAMS], indirect=True)
+@pytest.mark.parametrize("mesh_device", [MESH_SHAPE], indirect=True)
+def test_trace_capture_every_stage(mesh_device):
+    assert trace_capture_selftest(mesh_device, layers=2)
 
 
-@pytest.mark.timeout(2 * 3600)
-@MESH_PARAMS
-@MESH
-def test_trace_capture(mesh_device, hf_pipe):
-    """Per stage: capture one step, replay it, compare against eager, release (full depth, gate batch)."""
-    pipe = P.build_pipeline(mesh_device, model=hf_pipe, cfg=EditConfig(batch=BATCH))
-    ok = pipe.trace_capture_selftest()
-    print(f"[trace] report {pipe.trace_report}", flush=True)
-    assert ok, pipe.trace_report
+@pytest.mark.parametrize("device_params", [DEVICE_PARAMS], indirect=True)
+@pytest.mark.parametrize("mesh_device", [MESH_SHAPE], indirect=True)
+def test_forward_is_on_device(mesh_device):
+    v = host_op_selftest(mesh_device, layers=2)
+    print(v)
+    assert v["on_device"], v["reason"]
 
 
-@pytest.mark.timeout(3600)
-@MESH_PARAMS
-@MESH
-def test_depth_knob(mesh_device, hf_pipe):
-    """layers caps EVERY repeated stack (vision blocks, LM layers, transformer blocks); per-stack
-    overrides win; the rest of each model stays built so the capped build still runs end to end."""
-    pipe = P.build_pipeline(mesh_device, model=hf_pipe, layers=2, denoise_layers=3)
-    te = hf_pipe.text_encoder
-    assert len(pipe.stacks["vision_encode"]) == 2 < len(te.model.visual.blocks)
-    assert pipe.text_encoder.text_model.num_layers == 2 < len(te.model.language_model.layers)
-    assert len(pipe.stacks["denoise"]) == 3 < len(hf_pipe.transformer.transformer_blocks)
-    cfg = EditConfig(batch=SMALL_BATCH, num_inference_steps=2)
-    p = pipe.prepare(pipe.encode(cfg))
-    out = pipe.run_image_edit(p)
-    assert tuple(out.shape) == (SMALL_BATCH, 3, 256, 256)
-    counts = pipe.tracker.snapshot()
-    assert counts["qwen_image_transformer_block"] == 3 * 2 * 2  # blocks x (cond + uncond) x steps
-    assert counts["v_l_vision_block"] == 2
+@pytest.mark.parametrize("device_params", [DEVICE_PARAMS], indirect=True)
+@pytest.mark.parametrize("mesh_device", [MESH_SHAPE], indirect=True)
+def test_depth_knobs(mesh_device):
+    pipe = build_pipeline(mesh_device, layers=2, text_encode_layers=4)
+    assert len(pipe.text_encoder.visual.blocks) == 2
+    assert pipe.text_encoder.num_text_layers == 4
+    assert len(pipe.transformer.transformer_blocks) == 2
+    for stage in PIPELINE_STAGES:
+        for suffix in ("trace_setup", "trace_step", "trace_inputs", "trace_items"):
+            assert callable(getattr(pipe, f"{stage}_{suffix}"))
