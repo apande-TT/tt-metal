@@ -262,9 +262,11 @@ def _compile_codec_block(device, blk, mask, window=None):
         seq = int(h.shape[-2])
         # bf16 normalised rows into the q / k / v linears (fp32 DEST; q / k / v come back fp32).
         xn = _rms_norm(h, attn_gamma, attn_eps, dtype=ttnn.bfloat16)
-        q = _fold_linear(xn, wq, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
-        k = _fold_linear(xn, wk, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
-        v = _fold_linear(xn, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
+        # A sub-tile sequence (T < 32: one padded tile row a sample) keeps its small q / k / v in L1.
+        qkv_mem = ttnn.L1_MEMORY_CONFIG if int(xn.shape[-2]) < 32 else None
+        q = _fold_linear(xn, wq, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
+        k = _fold_linear(xn, wk, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
+        v = _fold_linear(xn, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
         if qk_norm:
             q = _rms_norm(q, q_gamma, q_eps)
             k = _rms_norm(k, k_gamma, k_eps)

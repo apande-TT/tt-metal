@@ -367,10 +367,12 @@ def _bmm(a, b, per_core_m=None, transpose_b=False, dtype=None, memory_config=Non
     # so while M is split into blocks there must be no more blocks than cores -- otherwise a core's
     # second M block reads and writes the next head's rows (the 192-row compact acoustic attention,
     # 8 x 24 blocks, and the codec attention regression 27033d4462).
-    per_m = next(
-        p
-        for p in range(min(per_core_m or m, m), m + 1)
-        if m % p == 0 and (p == m or batch * (m // p) <= grid.x * grid.y)
+    # The divisor of M NEAREST the requested block (ties to the smaller, more cores): 8 tile rows asked
+    # for 3 get 2 (32 cores, 12.0 us) rather than 4 (16 cores, 16.4 us); 24 rows keep 3.
+    want = per_core_m or m
+    per_m = min(
+        (p for p in range(1, m + 1) if m % p == 0 and (p == m or batch * (m // p) <= grid.x * grid.y)),
+        key=lambda p: (abs(p - want), p),
     )
     cfg = ttnn.MatmulMultiCoreReuseProgramConfig(
         compute_with_storage_grid_size=(grid.x, grid.y),

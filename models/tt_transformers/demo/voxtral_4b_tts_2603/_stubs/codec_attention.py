@@ -304,9 +304,11 @@ def build(device, torch_module):
             )
         h = ttnn.reshape(x, [batch, 1, seq, dim])
 
-        q = _lin(h, wq, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
-        k = _lin(h, wk, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
-        v = _lin(h, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
+        # A sub-tile sequence (T < 32: one padded tile row a sample) keeps its small q / k / v in L1.
+        qkv_mem = ttnn.L1_MEMORY_CONFIG if int(h.shape[-2]) < 32 else None
+        q = _lin(h, wq, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
+        k = _lin(h, wk, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
+        v = _lin(h, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
         if qk_norm:
             q = _rms_norm(q, q_gamma, q_eps)
             k = _rms_norm(k, k_gamma, k_eps)
