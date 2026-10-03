@@ -142,16 +142,20 @@ def build(device, torch_module):
         padded_len = length + 2 * pad
         out_len = (padded_len - effective_kernel) // stride + 1
 
+        # `x_rm`: a caller holding the same rows ROW_MAJOR (`[B, 1, L, C]`) lets the taps be cut there --
+        # a row-offset slice of a TILE tensor untilizes it whole for every tap.
+        x_rm = kwargs.get("x_rm") if pad == 0 else None
         acc = None
         for i, tap in enumerate(active_taps):
             begin = i * dilation
             end = begin + (out_len - 1) * stride + 1
-            seg = ttnn.slice(
-                x4,
-                [0, 0, begin, 0],
-                [batch, 1, end, in_channels],
-                [1, 1, stride, 1] if stride > 1 else None,
-            )
+            step = [1, 1, stride, 1] if stride > 1 else None
+            if x_rm is not None:
+                seg = ttnn.to_layout(
+                    ttnn.slice(x_rm, [0, 0, begin, 0], [batch, 1, end, in_channels], step), ttnn.TILE_LAYOUT
+                )
+            else:
+                seg = ttnn.slice(x4, [0, 0, begin, 0], [batch, 1, end, in_channels], step)
             term = _tap_linear(seg, tap, compute_kernel_config=_COMPUTE)
             acc = term if acc is None else ttnn.add(acc, term)
         if bias is not None:

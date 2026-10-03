@@ -32,7 +32,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import common
+from models.demos.voxtral_4b_tts_2603.tt import common, cpp_softmax
 
 _SHARD_HEIGHT = 32
 # 2048 rows = 256 codec frames after the decoder's 8x upsampling, which is the whole stage's
@@ -319,11 +319,14 @@ def build(device, torch_module):
             transpose_k_heads=False,
         )
         scores = _bmm(qh, kh, transpose_b=True)
-        scores = ttnn.add(
-            ttnn.multiply(scores, scale),
-            ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq]),
-        )
-        a = _bmm(_softmax(scores), vh)
+        scaled = ttnn.multiply(scores, scale)
+        if cpp_softmax.supports(scaled, mask):
+            # Mask add + softmax in one pass, the mask read in place from the prebuilt one (no per-call
+            # slice copy): tt/cpp_softmax replays these same float32 SFPU ops.
+            weights = cpp_softmax.apply(scaled, mask)
+        else:
+            weights = _softmax(ttnn.add(scaled, ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq])))
+        a = _bmm(weights, vh)
         ttnn.deallocate(scores)
         a = ttnn.experimental.nlp_concat_heads(a)
         return ttnn.reshape(

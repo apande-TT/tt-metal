@@ -42,7 +42,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import common
+from models.demos.voxtral_4b_tts_2603.tt import common, cpp_softmax
 
 # A PERSISTENT ZERO BUFFER, NOT A PER-CALL `ttnn.zeros`.
 # `ttnn.zeros` builds its tensor on the host and enqueues a WRITE to land it on the device, and a
@@ -277,11 +277,14 @@ def _compile_codec_block(device, blk, mask):
             transpose_k_heads=False,
         )
         scores = _bmm(qh, kh, transpose_b=True)
-        scores = ttnn.add(
-            ttnn.multiply(scores, scale),
-            ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq]),
-        )
-        a = _bmm(_softmax(scores), vh)
+        scaled = ttnn.multiply(scores, scale)
+        if cpp_softmax.supports(scaled, mask):
+            # Mask add + softmax in one pass, the mask read in place from the prebuilt one (no per-call
+            # slice copy): tt/cpp_softmax replays these same float32 SFPU ops.
+            weights = cpp_softmax.apply(scaled, mask)
+        else:
+            weights = _softmax(ttnn.add(scaled, ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq])))
+        a = _bmm(weights, vh)
         ttnn.deallocate(scores)
         r = _fold_linear(
             ttnn.experimental.nlp_concat_heads(a),
@@ -355,7 +358,8 @@ def _compile_causal_conv1d(device, mod):
             else:
                 last = _row(xr, length - 1)
                 pieces.append(last if extra == 1 else ttnn.repeat(last, [1, 1, extra, 1]))
-        padded = pieces[0] if len(pieces) == 1 else ttnn.to_layout(ttnn.concat(pieces, dim=2), ttnn.TILE_LAYOUT)
+        padded_rm = None if len(pieces) == 1 else ttnn.concat(pieces, dim=2)
+        padded = pieces[0] if padded_rm is None else None
 
         padded_len = length + padding_total + extra
         out_len = (padded_len - effective_kernel) // stride + 1
@@ -364,12 +368,15 @@ def _compile_causal_conv1d(device, mod):
         for i, tap in enumerate(taps):
             begin = i * dilation
             end = begin + (out_len - 1) * stride + 1
-            seg = ttnn.slice(
-                padded,
-                [0, 0, begin, 0],
-                [batch, 1, end, in_channels],
-                [1, 1, stride, 1] if stride > 1 else None,
-            )
+            step = [1, 1, stride, 1] if stride > 1 else None
+            if padded_rm is not None:
+                # Cut from the row-major rows, then tilized: a row-offset slice of a TILE tensor
+                # untilizes it whole for every tap.
+                seg = ttnn.to_layout(
+                    ttnn.slice(padded_rm, [0, 0, begin, 0], [batch, 1, end, in_channels], step), ttnn.TILE_LAYOUT
+                )
+            else:
+                seg = ttnn.slice(padded, [0, 0, begin, 0], [batch, 1, end, in_channels], step)
             term = _fold_linear(seg, tap, compute_kernel_config=_COMPUTE)
             acc = term if acc is None else ttnn.add(acc, term)
         return acc if bias is None else ttnn.add(acc, bias)
