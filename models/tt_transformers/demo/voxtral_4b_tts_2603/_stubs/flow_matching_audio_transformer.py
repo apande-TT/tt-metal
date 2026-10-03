@@ -46,7 +46,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import cpp_down, cpp_swiglu, ttl_down
+from models.demos.voxtral_4b_tts_2603.tt import cpp_down, cpp_pv_dec, cpp_softmax, cpp_swiglu, ttl_down
 
 _TILE = 32
 _MASK_NEG = -1.0e9
@@ -512,17 +512,27 @@ def _compact_attention(h, wqkv, wo, n_heads, n_kv_heads, scale, tokens, readout=
     # The float32 scores land in L1 (~43 KB a core) for the mask add alone, which writes DRAM as
     # before and frees them, so nothing big holds L1 through the softmax and the FFN behind it.
     raw = _bmm(q, k, per_core_m=3, transpose_b=True, dtype=ttnn.float32, memory_config=ttnn.L1_MEMORY_CONFIG)
-    scores = ttnn.add(
-        raw, _compact_mask(h.device(), rows, tokens, repeats, q_rows), memory_config=ttnn.DRAM_MEMORY_CONFIG
-    )
-    ttnn.deallocate(raw)
-    weights = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
-    weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
+    cmask = _compact_mask(h.device(), rows, tokens, repeats, q_rows)
+    if cpp_softmax.supports(raw, cmask):
+        # The mask add and the whole softmax in ONE pass over the scores (tt/cpp_softmax): the same
+        # float32 SFPU primitives in the same order as the five-op chain below, bit-identical.
+        weights = cpp_softmax.apply(raw, cmask)
+        ttnn.deallocate(raw)
+    else:
+        scores = ttnn.add(raw, cmask, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(raw)
+        weights = ttnn.subtract(scores, ttnn.max(scores, dim=-1, keepdim=True), activations=[ttnn.UnaryOpType.EXP])
+        weights = ttnn.divide(weights, ttnn.sum(weights, dim=-1, keepdim=True))
 
     # bf16 context: the head merge moves it and o_proj multicasts it whole; the scores and the
     # softmax that produced it stay float32.
     # 3 tile rows a core (64 cores), as the scores: each (head, V) block is re-read by 8 M blocks, not 12.
-    out = ttnn.reshape(_bmm(weights, v, per_core_m=3, dtype=ttnn.float32), [1, n_heads, q_rows, head_dim])
+    if q_rows == 64 and cpp_pv_dec.supports_rows(weights, v):
+        # The readout: the C++ P@V, one (kv head, query tile row) unit a core over 64 cores.
+        pv_out = cpp_pv_dec.apply(weights, v, rb=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    else:
+        pv_out = _bmm(weights, v, per_core_m=3, dtype=ttnn.float32)
+    out = ttnn.reshape(pv_out, [1, n_heads, q_rows, head_dim])
     # bf16 into L1: the residual add is its only reader, and fp32 in DRAM doubles the bytes it writes.
     # o_proj is a short, wide-K linear like the FFN down: the full grid as a 2D multicast (`_down_2d`).
     return _down_2d(
