@@ -177,7 +177,7 @@ def _folded_weight(linear, device, rows=None, cols=None):
     if cols is not None:
         w = w * cols.float().reshape(1, -1)
     # dtype rung: the part chain's codec linear weights as bf16 (the whole-section body's dtype).
-    return _from_torch(w.contiguous(), device, dtype=ttnn.bfloat16)
+    return _from_torch(w.contiguous(), device, dtype=ttnn.bfloat8_b)  # dtype rung: bf8_b codec weights
 
 
 def _alibi_window_mask(slopes, window, seq):

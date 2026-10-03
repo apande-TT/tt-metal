@@ -269,7 +269,7 @@ def build(device, torch_module):
 
     # dtype rung: the part chain's codec linear weights as bf16 (the whole-section body's dtype).
     wq, wk, wv, wo = (
-        _from_torch(m.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat16)
+        _from_torch(m.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)  # dtype rung
         for m in (attn.wq, attn.wk, attn.wv, attn.wo)
     )
     q_gamma = _norm_gamma(attn.q_norm, device) if qk_norm else None

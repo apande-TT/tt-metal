@@ -97,7 +97,7 @@ def _folded_weight(linear, device, rows=None, cols=None):
         w = w * rows.float().reshape(-1, 1)
     if cols is not None:
         w = w * cols.float().reshape(1, -1)
-    return _from_torch(w.contiguous(), device)
+    return _from_torch(w.contiguous(), device, dtype=ttnn.bfloat8_b)  # dtype rung: bf8_b codec weights
 
 
 _TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
