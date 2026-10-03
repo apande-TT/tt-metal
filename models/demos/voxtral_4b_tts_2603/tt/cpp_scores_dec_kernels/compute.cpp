@@ -19,6 +19,7 @@ void kernel_main() {
 
     constexpr uint32_t DT = get_compile_time_arg_val(0);
     constexpr uint32_t ST = get_compile_time_arg_val(1);
+    constexpr uint32_t PAD = get_compile_time_arg_val(2);  // pad key rows the reader pushes after the ST
 
     constexpr auto cb_q = tt::CBIndex::c_0;
     constexpr auto cb_k = tt::CBIndex::c_1;
@@ -42,6 +43,10 @@ void kernel_main() {
             pack_tile(0, cb_y);
             tile_regs_release();
             cb_push_back(cb_y, 1);
+        }
+        if constexpr (PAD > 0) {
+            cb_wait_front(cb_k, PAD * DT);
+            cb_pop_front(cb_k, PAD * DT);
         }
         cb_pop_front(cb_q, DT);
     }

@@ -26,6 +26,7 @@ _COMPUTE = str(_DIR / "compute.cpp")
 _WRITER = str(_DIR / "writer.cpp")
 
 _TILE = 32
+_RB = 4  # key tile rows a read barrier
 _TILE_BYTES = {ttnn.float32: 4096, ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
 
 
@@ -52,18 +53,49 @@ def _accessor_args(tensor):
     return list(acc.get_compile_time_args())
 
 
-def supports(q, k) -> bool:
+def supports(q, k, span=None) -> bool:
+    """`span`: read only the first `span` key rows of `k` (the whole cache, read in place)."""
     try:
         b, h, rows, d = (int(s) for s in q.shape)
-        kb, kh, span, kd = (int(s) for s in k.shape)
+        kb, kh, cap, kd = (int(s) for s in k.shape)
+        span = cap if span is None else int(span)
         return (
             enabled()
             and rows == _TILE
+            and span <= cap
+            and cap % _TILE == 0
             and d == kd
             and d % _TILE == 0
             and span % _TILE == 0
             and (b, h) == (kb, kh)
             and q.dtype == ttnn.float32
+            and k.dtype in _TILE_BYTES
+            and not q.is_sharded()
+            and not k.is_sharded()
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def supports_grouped(q, k, span, groups) -> bool:
+    """The RoPE output `q [B, 1, n_kv * groups, head_dim]` read in place as the grouped query (unit
+    (b, h) takes heads h * groups ..), against the whole cache `k` read to `span`."""
+    try:
+        b, one, nh, d = (int(s) for s in q.shape)
+        kb, kh, cap, kd = (int(s) for s in k.shape)
+        return (
+            enabled()
+            and one == 1
+            and nh == kh * int(groups)
+            and nh <= _TILE
+            and b == kb
+            and d == kd
+            and d % _TILE == 0
+            and int(span) <= cap
+            and int(span) % _TILE == 0
+            and cap % _TILE == 0
+            and q.dtype == ttnn.float32
+            and q.layout == ttnn.TILE_LAYOUT
             and k.dtype in _TILE_BYTES
             and not q.is_sharded()
             and not k.is_sharded()
@@ -81,12 +113,21 @@ def _cb(cores, index, fmt, tiles):
     )
 
 
-def apply(q, k):
-    """`q @ k^T` per (user, kv head), float32 `[B, n_kv, 32, span]` in L1."""
+def apply(q, k, span=None, groups=None):
+    """`q @ k^T` per (user, kv head) over the first `span` key rows (default: all), float32
+    `[B, n_kv, 32, span]` in L1. With `groups`, q is the RoPE output `[B, 1, n_kv * groups, head_dim]`,
+    regrouped by kv head in the reader."""
     device = q.device()
-    b, h, rows, d = (int(s) for s in q.shape)
-    span = int(k.shape[-2])
-    dt, st, units = d // _TILE, span // _TILE, b * h
+    if groups:
+        b, _, _, d = (int(s) for s in q.shape)
+        h, rows = int(k.shape[1]), _TILE
+    else:
+        b, h, rows, d = (int(s) for s in q.shape)
+    cap = int(k.shape[-2])
+    span = cap if span is None else int(span)
+    dt, st, ss, units = d // _TILE, span // _TILE, cap // _TILE, b * h
+    rb = min(_RB, st)
+    pad = -(-st // rb) * rb - st
     grid = device.compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
     ncores = min(units, gx * gy)
@@ -110,7 +151,7 @@ def apply(q, k):
             kernel_source=_READER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt, st] + _accessor_args(q) + _accessor_args(k),
+            compile_time_args=[dt, st, ss, rb, int(groups or 0), h] + _accessor_args(q) + _accessor_args(k),
             runtime_args=rr,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -118,7 +159,7 @@ def apply(q, k):
             kernel_source=_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt, st],
+            compile_time_args=[dt, st, pad],
             runtime_args=rc,
             config=ttnn.ComputeConfigDescriptor(),
         ),
@@ -138,10 +179,10 @@ def apply(q, k):
     cfg.math_approx_mode = False
     cbs = [
         _cb(cores, 0, ttnn.float32, 2 * dt),
-        _cb(cores, 1, k.dtype, 2 * dt),
+        _cb(cores, 1, k.dtype, 2 * rb * dt),
         _cb(cores, 16, ttnn.float32, 2),
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-    desc.custom_program_hash = hash(("voxtral_cpp_scores_dec", b, h, dt, st, str(k.dtype), qa, ka, ya)) & 0xFFFFFFFFFFFFFFFF
+    desc.custom_program_hash = hash(("voxtral_cpp_scores_dec", b, h, dt, st, ss, rb, int(groups or 0), str(k.dtype), qa, ka, ya)) & 0xFFFFFFFFFFFFFFFF
     ttnn.generic_op([q, k, y], desc)
     return y
