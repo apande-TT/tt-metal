@@ -70,7 +70,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import common
+from models.demos.voxtral_4b_tts_2603.tt import common, cpp_wave
 
 # fp32 accumulation in DEST for the ops this module owns (the stubs carry their own copy).
 _COMPUTE = ttnn.WormholeComputeKernelConfig(
@@ -238,7 +238,7 @@ def _norm_gamma(norm, device):
     return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
 
 
-def _rms_norm(x, gamma, eps):
+def _rms_norm(x, gamma, eps, dtype=None):
     """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
 
     NOT `ttnn.rms_norm`: on this model's real inputs the stock op sits at 9.65e-4 relative error
@@ -250,8 +250,11 @@ def _rms_norm(x, gamma, eps):
     already spell it out; this is the same four ops so the two bodies agree.
     """
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
+    # `dtype`: the normalised rows can be written narrower (bf16) for the linears that read them.
+    if gamma is None:
+        return ttnn.multiply(x, scale, dtype=dtype) if dtype is not None else ttnn.multiply(x, scale)
     y = ttnn.multiply(x, scale)
-    return y if gamma is None else ttnn.multiply(y, gamma)
+    return ttnn.multiply(y, gamma, dtype=dtype) if dtype is not None else ttnn.multiply(y, gamma)
 
 
 class _StackOfOne:
@@ -334,14 +337,14 @@ def _attention_block(device, blk, attention_stub):
         batch, seq = int(x3.shape[0]), int(x3.shape[-2])
         h = ttnn.reshape(x3, [batch, 1, seq, dim])
 
-        xn = _rms_norm(h, attn_gamma, attn_eps)
+        xn = _rms_norm(h, attn_gamma, attn_eps, dtype=ttnn.bfloat16)  # bf16 rows into the attention stub's q / k / v
         r = attention_stub(ttnn.reshape(xn, [batch, seq, dim]))
         r = ttnn.reshape(r, [batch, 1, seq, dim])
         if attn_scale is not None:
             r = ttnn.multiply(r, attn_scale)
         h = ttnn.add(h, r)
 
-        hn = _rms_norm(h, ffn_gamma, ffn_eps)
+        hn = _rms_norm(h, ffn_gamma, ffn_eps, dtype=ttnn.bfloat16)
         r = _lin(
             ttnn.multiply(
                 # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
@@ -545,6 +548,21 @@ class VocodeStage:
 
         unshifted = self._unshift(codes)
         split = self._resolve_split(batch, split_at)
+        if cpp_wave.enabled():
+            # Both bodies hand back channels-last [B_i, (1,) L, patch] TILE and ONE C++ pass writes the
+            # ROW_MAJOR waveform rows in place (tt/cpp_wave): no TILE re-tile of the flatten, no concat.
+            if split <= 0:
+                parts = [self._whole_section(unshifted, flat=False)]
+            elif split >= batch:
+                parts = [self._part_chain(unshifted, flat=False)]
+            else:
+                part = ttnn.slice(unshifted, [0, 0, 0], [split, rows, frames])
+                whole = ttnn.slice(unshifted, [split, 0, 0], [batch, rows, frames])
+                parts = [self._part_chain(part, flat=False), self._whole_section(whole, flat=False)]
+            if cpp_wave.supports(parts):
+                return cpp_wave.apply(parts)
+            flat = [ttnn.reshape(p, [int(p.shape[0]), 1, int(p.shape[-2]) * int(p.shape[-1])]) for p in parts]
+            return flat[0] if len(flat) == 1 else ttnn.concat(flat, dim=0)
         if split <= 0:
             return self._whole_section(unshifted)
         if split >= batch:
@@ -700,7 +718,7 @@ def build_vocode_stage(device, hf_model, layers=None, counter=None, split_at=Non
         # the latent narrow is what put the full chain at PCC 0.9873.
         return ttnn.typecast(joined, ttnn.float32)
 
-    def part_chain(codes, probe=None):
+    def part_chain(codes, probe=None, flat=True):
         """`probe`, if a list, collects every stage's output -- the latent, one entry per
         `codec.decoder_blocks` position IN THE REFERENCE'S ORDER, then `output_proj`. It is what
         lets a test say WHICH stage of a thirteen-stage codec moved, instead of reading one
@@ -720,7 +738,10 @@ def build_vocode_stage(device, hf_model, layers=None, counter=None, split_at=Non
             raise AssertionError(f"output_proj emitted {channels} channels, expected {patch_size}")
         # "b (c h) t -> b c (t h)" with h = patch_size and c = 1: channels-LAST row-major order is
         # already `t * patch + h`, so the de-patch is a transpose and a flatten.
-        return ttnn.reshape(ttnn.transpose(h, -2, -1), [batch, 1, length * patch_size])
+        channels_last = ttnn.transpose(h, -2, -1)
+        if not flat:
+            return channels_last  # [B, L, patch]: tt/cpp_wave flattens it into the batch's waveform
+        return ttnn.reshape(channels_last, [batch, 1, length * patch_size])
 
     whole_section = stub("voxtral_t_t_s_audio_tokenizer", codec)
 
