@@ -439,13 +439,18 @@ def _reflect_padded_conv(mod, conv_stub, weight_fn):
         target = (math.ceil(n_frames) - 1) * stride + (effective_kernel - padding_total)
         extra = target - length
 
+        # The edge rows are cut and joined ROW_MAJOR, and the padded block tilized once: a one-row
+        # slice of a TILE tensor comes back row-major and is re-tilized row by row, and a TILE concat
+        # of non-tile-aligned pieces untilizes them all again.
+        x_rm = ttnn.to_layout(x4, ttnn.ROW_MAJOR_LAYOUT) if padding_total + extra > 0 else x4
+
         def row(index):
-            return ttnn.slice(x4, [0, 0, index, 0], [batch, 1, index + 1, channels])
+            return ttnn.slice(x_rm, [0, 0, index, 0], [batch, 1, index + 1, channels])
 
         pieces = [row(i) for i in range(padding_total, 0, -1)]
-        pieces.append(x4)
+        pieces.append(x_rm)
         pieces.extend(row(length - 1 - i) for i in range(1, extra + 1))
-        padded = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=2)
+        padded = pieces[0] if len(pieces) == 1 else ttnn.to_layout(ttnn.concat(pieces, dim=2), ttnn.TILE_LAYOUT)
 
         padded_len = length + padding_total + extra
         cf = ttnn.transpose(ttnn.reshape(padded, [batch, padded_len, channels]), -2, -1)
