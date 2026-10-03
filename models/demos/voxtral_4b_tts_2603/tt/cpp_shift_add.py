@@ -54,11 +54,18 @@ def _cb(cores, index, tiles):
     )
 
 
-def shift_add(y, batch, rows_per_sample, out_rows, taps, tap_cols, out_cols, memory_config=None):
-    """`out[b, t, c] = sum_k Y[b * rows_per_sample + t + k, k * tap_cols + c]`, float32 `[B, 1, out_rows, out_cols]`.
+_MODES = {None: 0, "reflect": 1, "replicate": 2}
+
+
+def shift_add(
+    y, batch, rows_per_sample, out_rows, taps, tap_cols, out_cols, pad_mode=None, pad_front=0, real_rows=0, memory_config=None
+):
+    """`out[b, t, c] = sum_k Y[b * rows_per_sample + src(t + k), k * tap_cols + c]`, float32 `[B, 1, out_rows, out_cols]`.
 
     `y` is `[1, 1, batch * rows_per_sample, taps * tap_cols]` float32 TILE (rows_per_sample and tap_cols
-    tile multiples)."""
+    tile multiples). With no `pad_mode`, Y holds the padded rows (src(p) = p); with `pad_mode` 'reflect' or
+    'replicate', Y holds the `real_rows` unpadded rows and padded row p resolves to the row its padding copies
+    (`pad_front` rows in front, the rest behind)."""
     device = y.device()
     rpt, ct = rows_per_sample // _TILE, tap_cols // _TILE
     rt, ot = -(-out_rows // _TILE), -(-out_cols // _TILE)
@@ -91,7 +98,8 @@ def shift_add(y, batch, rows_per_sample, out_rows, taps, tap_cols, out_cols, mem
             kernel_source=_READER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[taps, rpt, rt, ot, ct, yct, yrt] + _accessor_args(y),
+            compile_time_args=[taps, rpt, rt, ot, ct, yct, _MODES[pad_mode], int(pad_front), int(real_rows)]
+            + _accessor_args(y),
             runtime_args=rr,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -126,7 +134,7 @@ def shift_add(y, batch, rows_per_sample, out_rows, taps, tap_cols, out_cols, mem
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
     desc.custom_program_hash = (
-        hash(("voxtral_cpp_shift_add", batch, rpt, rt, ot, ct, taps, yct, yrt, ya, oa, str(memory_config)))
+        hash(("voxtral_cpp_shift_add", batch, rpt, rt, ot, ct, taps, yct, yrt, pad_mode, pad_front, real_rows, ya, oa, str(memory_config)))
         & 0xFFFFFFFFFFFFFFFF
     )
     ttnn.generic_op([y, out], desc)
@@ -170,6 +178,37 @@ def wide_weight(taps):
     tap_cols = -(-cout // _TILE) * _TILE
     blocks = taps if tap_cols == cout else [ttnn.pad(t, [(0, 0), (0, tap_cols - cout)], 0.0) for t in taps]
     return ttnn.concat(blocks, dim=-1), len(taps), cout
+
+
+def conv_wide_unpadded(x_cl, wide, pad_mode, pad_front, out_len, compute_kernel_config, linear=None):
+    """The same conv straight from the UNPADDED channels-last TILE rows `x_cl` `[B, 1, L, C_in]` (L a tile
+    multiple): Y = X @ W_wide on the L real rows, and the reflect / replicate padding resolved in the shift-add
+    (a padded row's product is the product of the row it copies) -- no untilize, no edge-row concat, no tilize."""
+    w, k, cout = wide
+    batch, _, length, cin = (int(v) for v in x_cl.shape)
+    tap_cols = -(-cout // _TILE) * _TILE
+    x = ttnn.reshape(x_cl, [1, 1, batch * length, cin])
+    y = (linear or ttnn.linear)(x, w, compute_kernel_config=compute_kernel_config, dtype=ttnn.float32)
+    out = shift_add(y, batch, length, out_len, k, tap_cols, cout, pad_mode=pad_mode, pad_front=pad_front, real_rows=length)
+    ttnn.deallocate(y)
+    return out
+
+
+def supports_unpadded(x_cl, pad_mode) -> bool:
+    try:
+        return (
+            enabled()
+            and pad_mode in ("reflect", "replicate")
+            and x_cl.layout == ttnn.TILE_LAYOUT
+            and x_cl.dtype == ttnn.float32
+            and len(x_cl.shape) == 4
+            and int(x_cl.shape[1]) == 1
+            and int(x_cl.shape[-2]) % _TILE == 0
+            and int(x_cl.shape[-2]) >= _TILE
+            and not x_cl.is_sharded()
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 def conv_wide(x_rm, wide, out_len, compute_kernel_config, linear=None):

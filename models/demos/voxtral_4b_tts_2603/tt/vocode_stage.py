@@ -70,7 +70,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import common, cpp_wave
+from models.demos.voxtral_4b_tts_2603.tt import common, cpp_shift_add, cpp_wave
 
 # fp32 accumulation in DEST for the ops this module owns (the stubs carry their own copy).
 _COMPUTE = ttnn.WormholeComputeKernelConfig(
@@ -383,11 +383,16 @@ def _group_runner(blocks):
     """
 
     def run(x_cf):
+        return ttnn.transpose(run_cl(x_cf), -2, -1)
+
+    def run_cl(x_cf):
+        """The group's output left channels-LAST (`[B, L, C]`), for a next step that takes it that way."""
         h = ttnn.transpose(x_cf, -2, -1)
         for block in blocks:
             h = block(h)
-        return ttnn.transpose(h, -2, -1)
+        return h
 
+    run.run_cl = run_cl
     return run
 
 
@@ -445,6 +450,13 @@ def _reflect_padded_conv(mod, conv_stub, weight_fn):
         target = (math.ceil(n_frames) - 1) * stride + (effective_kernel - padding_total)
         extra = target - length
 
+        if stride == 1 and cpp_shift_add.supports_unpadded(x4, "reflect"):
+            # The conv takes the UNPADDED rows and resolves the reflect padding itself (a padded row's product
+            # is the product of the row it mirrors): no row-major copy, no edge-row concat, no tilize.
+            return conv_stub(
+                x_cf, weight=weight_fn(), x_cl=x4, pad_front=padding_total, pad_back=extra, pad_mode="reflect"
+            )
+
         # The edge rows are cut and joined ROW_MAJOR, and the padded block tilized once: a one-row
         # slice of a TILE tensor comes back row-major and is re-tilized row by row, and a TILE concat
         # of non-tile-aligned pieces untilizes them all again.
@@ -460,12 +472,33 @@ def _reflect_padded_conv(mod, conv_stub, weight_fn):
         padded_len = length + padding_total + extra
         if padded_rm is not None:
             # The conv works from the row-major rows alone (no tilize of them, no channels-first transpose that
-            # the stub would only transpose back); the [B, C, L] it is handed is a shape-only view of them.
-            shape_only = ttnn.reshape(padded_rm, [batch, channels, padded_len])
-            return conv_stub(shape_only, weight=weight_fn(), x_rm=padded_rm)
+            # the stub would only transpose back): it takes its length from `x_rm`, and `x` is not read.
+            # (A [B, C, L'] reshape of the rows would NOT be a view: ROW_MAJOR rows change length.)
+            return conv_stub(x_cf, weight=weight_fn(), x_rm=padded_rm)
         cf = ttnn.transpose(ttnn.reshape(pieces[0], [batch, padded_len, channels]), -2, -1)
         return conv_stub(cf, weight=weight_fn())
 
+
+    def run_cl(x3):
+        """`run` on CHANNELS-LAST rows `[B, L, C]` (a transformer group's own layout), returning channels-last
+        `[B, L', C_out]`: the conv reads its rows channels-last anyway, so neither side transposes."""
+        batch, length, channels = (int(v) for v in x3.shape)
+        x4 = ttnn.reshape(x3, [batch, 1, length, channels])
+        n_frames = (length - effective_kernel + padding_total) / stride + 1
+        extra = (math.ceil(n_frames) - 1) * stride + (effective_kernel - padding_total) - length
+        if stride == 1 and length > padding_total and cpp_shift_add.supports_unpadded(x4, "reflect"):
+            return conv_stub(
+                x3,
+                weight=weight_fn(),
+                x_cl=x4,
+                pad_front=padding_total,
+                pad_back=extra,
+                pad_mode="reflect",
+                cl_out=True,
+            )
+        return ttnn.transpose(run(ttnn.transpose(x3, -2, -1)), -2, -1)
+
+    run.run_cl = run_cl
     return run
 
 
@@ -741,19 +774,31 @@ def build_vocode_stage(device, hf_model, layers=None, counter=None, split_at=Non
         h = latent(codes)
         if probe is not None:
             probe.append(("latent", h))
+        # Without a probe, the last transformer group hands its CHANNELS-LAST output straight to output_proj,
+        # which returns channels-last too: the group's transpose to channels-first, the conv's transpose back,
+        # and the conv's own transpose out and the de-patch transpose back all cancel (pure data movement).
+        handoff = probe is None and hasattr(chain[-1], "run_cl") and hasattr(output_proj, "run_cl")
         for index, step in enumerate(chain):
+            if handoff and index == len(chain) - 1:
+                h = step.run_cl(h)
+                break
             h = step(h)
             if probe is not None:
                 probe.append((f"decoder_blocks[{index}]", h))
-        h = output_proj(h)
-        if probe is not None:
-            probe.append(("output_proj", h))
-        batch, channels, length = (int(v) for v in h.shape)
+        if handoff:
+            channels_last = output_proj.run_cl(h)
+            batch, length, channels = (int(v) for v in channels_last.shape)
+        else:
+            h = output_proj(h)
+            if probe is not None:
+                probe.append(("output_proj", h))
+            batch, channels, length = (int(v) for v in h.shape)
         if channels != patch_size:
             raise AssertionError(f"output_proj emitted {channels} channels, expected {patch_size}")
-        # "b (c h) t -> b c (t h)" with h = patch_size and c = 1: channels-LAST row-major order is
-        # already `t * patch + h`, so the de-patch is a transpose and a flatten.
-        channels_last = ttnn.transpose(h, -2, -1)
+        if not handoff:
+            # "b (c h) t -> b c (t h)" with h = patch_size and c = 1: channels-LAST row-major order is
+            # already `t * patch + h`, so the de-patch is a transpose and a flatten.
+            channels_last = ttnn.transpose(h, -2, -1)
         if not flat:
             return channels_last  # [B, L, patch]: tt/cpp_wave flattens it into the batch's waveform
         return ttnn.reshape(channels_last, [batch, 1, length * patch_size])
