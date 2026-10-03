@@ -259,6 +259,8 @@ LINEAR_CORE_GRID = None
 # (None: ttnn picks its own; a core_grid alone gets in0_block_w=1, whose fp32 partial reloads break
 # the exact-lane sum: e2e PCC 0.9395)
 EXACT_CORE_GRID = None
+# core grid for split_linear's exact-lane products (None: ttnn.linear picks its own)
+EXACT_LINEAR_CORE_GRID = None
 # hand-shaped 2-D multicast config for those products on LINEAR_CORE_GRID (False: core_grid only;
 # ttnn then picks per_core_N=19 for the LM MLP, i.e. 1x1 subblocks and 2-row output blocks that
 # re-stream the weight per block)
@@ -325,7 +327,9 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part."""
     cfg = precise_config()
     parts = split_bf16(x, limbs)
-    mm = lambda p: ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32)  # noqa: E731
+    mm = lambda p: ttnn.linear(  # noqa: E731
+        p, w, compute_kernel_config=cfg, dtype=ttnn.float32, core_grid=EXACT_LINEAR_CORE_GRID
+    )
     if exact:
         y = _exact_sum(mm, parts, _patterns(exact))
     else:
