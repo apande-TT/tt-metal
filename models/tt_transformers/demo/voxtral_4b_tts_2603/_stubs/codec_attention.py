@@ -300,9 +300,9 @@ def build(device, torch_module):
             )
         h = ttnn.reshape(x, [batch, 1, seq, dim])
 
-        q = _lin(h, wq, compute_kernel_config=_COMPUTE)
-        k = _lin(h, wk, compute_kernel_config=_COMPUTE)
-        v = _lin(h, wv, compute_kernel_config=_COMPUTE)
+        q = _lin(h, wq, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
+        k = _lin(h, wk, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
+        v = _lin(h, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
         if qk_norm:
             q = _rms_norm(q, q_gamma, q_eps)
             k = _rms_norm(k, k_gamma, k_eps)

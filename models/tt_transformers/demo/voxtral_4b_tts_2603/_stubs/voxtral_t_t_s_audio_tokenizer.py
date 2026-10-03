@@ -257,10 +257,11 @@ def _compile_codec_block(device, blk, mask):
 
     def block(h):
         seq = int(h.shape[-2])
-        xn = _rms_norm(h, attn_gamma, attn_eps)
-        q = _fold_linear(xn, wq, compute_kernel_config=_COMPUTE)
-        k = _fold_linear(xn, wk, compute_kernel_config=_COMPUTE)
-        v = _fold_linear(xn, wv, compute_kernel_config=_COMPUTE)
+        # bf16 normalised rows into the q / k / v linears (fp32 DEST; q / k / v come back fp32).
+        xn = _rms_norm(h, attn_gamma, attn_eps, dtype=ttnn.bfloat16)
+        q = _fold_linear(xn, wq, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
+        k = _fold_linear(xn, wk, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
+        v = _fold_linear(xn, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
         if qk_norm:
             q = _rms_norm(q, q_gamma, q_eps)
             k = _rms_norm(k, k_gamma, k_eps)
@@ -292,7 +293,7 @@ def _compile_codec_block(device, blk, mask):
             r = ttnn.multiply(r, attn_scale)
         h = ttnn.add(h, r)
 
-        hn = _rms_norm(h, ffn_gamma, ffn_eps)
+        hn = _rms_norm(h, ffn_gamma, ffn_eps, dtype=ttnn.bfloat16)
         r = _fold_linear(
             ttnn.multiply(
                 # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
@@ -412,7 +413,7 @@ def _norm_gamma(norm, device):
     return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
 
 
-def _rms_norm(x, gamma, eps):
+def _rms_norm(x, gamma, eps, dtype=None):
     """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
 
     NOT `ttnn.rms_norm`: on this model's real inputs the stock op sits at ~9.65e-4 relative error
@@ -424,8 +425,11 @@ def _rms_norm(x, gamma, eps):
     reason, so the two bodies agree.
     """
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
+    # `dtype`: the normalised rows can be written narrower (bf16) for the linears that read them.
+    if gamma is None:
+        return ttnn.multiply(x, scale, dtype=dtype) if dtype is not None else ttnn.multiply(x, scale)
     y = ttnn.multiply(x, scale)
-    return y if gamma is None else ttnn.multiply(y, gamma)
+    return ttnn.multiply(y, gamma, dtype=dtype) if dtype is not None else ttnn.multiply(y, gamma)
 
 
 def _softmax(x, dim=-1):
@@ -584,6 +588,9 @@ def build(device, torch_module):
         h = output_proj(h)
 
         # "b (c h) t -> b c (t h)" with h = patch_size: channels-last, that is just a flatten.
+        # flat=False hands back the channels-last [B, 1, T, patch] for a caller that flattens itself.
+        if not kwargs.get("flat", True):
+            return h
         out_frames = int(h.shape[-2])
         return ttnn.reshape(h, [batch, 1, out_frames * patch_size])
 
