@@ -81,7 +81,8 @@ def supports(q, k, v, mask, window) -> bool:
 
 def supports_merged(q, k, v, mask, window, n_heads) -> bool:
     """The merged-head form: q / k / v `[B, 1, T, n_heads * D]` float32 TILE (head h = column tiles h * D/32 ..),
-    the layout the q / k / v linears produce -- read in place, the context written back the same way."""
+    the layout the q / k / v linears produce -- read in place, the context written back the same way. Any T:
+    the padded rows of a partial last tile row hold keys past T, which the causal mask always blocks."""
     try:
         b, one, t, hd = (int(x) for x in q.shape)
         h = int(n_heads)
@@ -102,7 +103,7 @@ def supports_merged(q, k, v, mask, window, n_heads) -> bool:
             and ms >= 2 * _TILE
             and mm % _TILE == 0
             and ms % _TILE == 0
-            and t % _TILE == 0
+            and t > 0
             and d % _TILE == 0
             and d // _TILE <= 4
             and all(x.dtype == ttnn.float32 for x in (q, k, v, mask))
@@ -135,7 +136,9 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None):
     else:
         b, h, t, d = (int(x) for x in q.shape)
     mmt, mst = int(mask.shape[2]) // _TILE, int(mask.shape[3]) // _TILE
-    rt, dt = t // _TILE, d // _TILE
+    # A partial last tile row (T not tile-aligned) is one more row of units: its padding rows compute
+    # garbage nobody reads, and every key past T is above the diagonal, so the causal mask blocks it.
+    rt, dt = -(-t // _TILE), d // _TILE
     units = b * h * rt
     grid = device.compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
