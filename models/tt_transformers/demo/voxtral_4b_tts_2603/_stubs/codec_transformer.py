@@ -136,6 +136,10 @@ def _lin(x, w, **kwargs):
         cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
             kwargs["program_config"] = cfg
+            # Fidelity rung: the tall (compute-bound) codec linears at HiFi2.
+            kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+            )
     if lead == 1:
         return ttnn.linear(x, w, **kwargs)
     y = ttnn.linear(ttnn.reshape(x, [1, 1, rows, shape[-1]]), w, **kwargs)
@@ -172,7 +176,8 @@ def _folded_weight(linear, device, rows=None, cols=None):
         w = w * rows.float().reshape(-1, 1)
     if cols is not None:
         w = w * cols.float().reshape(1, -1)
-    return _from_torch(w.contiguous(), device)
+    # dtype rung: the part chain's codec linear weights as bf16 (the whole-section body's dtype).
+    return _from_torch(w.contiguous(), device, dtype=ttnn.bfloat16)
 
 
 def _alibi_window_mask(slopes, window, seq):
@@ -269,12 +274,15 @@ def _compile_block(device, blk, mask):
         hn = _rms_norm(h, ffn_gamma, ffn_eps)
         r = _lin(
             ttnn.multiply(
-                _lin(hn, w1, compute_kernel_config=_COMPUTE),
-                _lin(hn, w3, compute_kernel_config=_COMPUTE),
+                # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
+                # and writes the fp32 residual branch.
+                _lin(hn, w1, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16),
+                _lin(hn, w3, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16),
                 input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             ),
             w2,
             compute_kernel_config=_COMPUTE,
+            dtype=ttnn.float32,
         )
         if ffn_scale is not None:
             r = ttnn.multiply(r, ffn_scale)
@@ -326,6 +334,12 @@ def _largest_divisor(n, cap):
     return max(d for d in range(1, min(n, cap) + 1) if n % d == 0)
 
 
+# Fidelity: the codec attention's head-batched products at HiFi2 (fp32 DEST kept).
+_BMM_HIFI2 = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+)
+
+
 def _bmm(a, b, transpose_b=False):
     """Head-batched attention `a @ b` over the full grid, every (batch, head) its own work unit.
     With no program config these `[B, H, S, S]` products ran on 1-64 cores at 237-818 us."""
@@ -339,7 +353,7 @@ def _bmm(a, b, transpose_b=False):
     # utterance) falls back to the default.
     tile = lambda t: 4096 if t.dtype == ttnn.float32 else 2048
     if 2 * m * k * tile(a) + 2 * k * n * tile(b) + 2 * m * n * 4096 > 1_200_000:
-        return ttnn.matmul(a, b, transpose_b=transpose_b, compute_kernel_config=_COMPUTE)
+        return ttnn.matmul(a, b, transpose_b=transpose_b, compute_kernel_config=_BMM_HIFI2)
     grid = a.device().compute_with_storage_grid_size()
     cfg = ttnn.MatmulMultiCoreReuseProgramConfig(
         compute_with_storage_grid_size=(grid.x, grid.y),
@@ -349,7 +363,7 @@ def _bmm(a, b, transpose_b=False):
         per_core_M=m,
         per_core_N=n,
     )
-    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_COMPUTE)
+    return ttnn.matmul(a, b, transpose_b=transpose_b, program_config=cfg, compute_kernel_config=_BMM_HIFI2)
 
 
 def build(device, torch_module):
