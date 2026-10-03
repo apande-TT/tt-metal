@@ -51,6 +51,8 @@ LM_EXACT = False
 # Back to the median (True = every lane pattern): on tt-metal f6b166e383 one image's min PCC fell to
 # 0.942 with a single pattern and the median holds it at the gate (models without this win: 0.9607).
 VISION_EXACT = True
+# bf16 limbs of the vision MLP's input in the precise path (the rest of the tower uses 3)
+VISION_MLP_LIMBS = 2
 # mesh axis the vision batch is split over (the tower's TP=4 runs on the other axis)
 VISION_DP_AXIS = 0
 
@@ -96,6 +98,8 @@ class TtQwenTextEncoder:
         v_l_text_model.SPLIT_HANDOFF = True
         # the vision attention's exact-lane products: one batch-parallel full-K block per core on the grid
         _te_attention.EXACT_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
+        # and its exact-lane linears on the full core grid (ttnn's own pick: 30-48 cores)
+        _te_attention.EXACT_LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         self.set_precise(True)
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
@@ -134,7 +138,9 @@ class TtQwenTextEncoder:
             b = blk.block
             b.attn.precise = b.mlp.precise = b.norm1.precise = b.norm2.precise = on
             b.precise_inputs = on
-            b.attn.limbs = b.mlp.limbs = vl
+            b.attn.limbs = vl
+            # the MLP input carried as 2 bf16 limbs (~16 mantissa bits) instead of 3: 48 lane products, not 72
+            b.mlp.limbs = min(vl, VISION_MLP_LIMBS)
             b.attn.exact = b.mlp.exact = VISION_EXACT
         self.visual.merger.merger.precise = on
         self.visual.merger.merger.ln_q.precise = on
