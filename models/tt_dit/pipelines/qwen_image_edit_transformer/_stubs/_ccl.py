@@ -27,6 +27,9 @@ import contextlib
 import ttnn
 
 _CHUNK_BYTES = 48 * 1024 * 1024  # per-partial bytes gathered at once
+# L1 bytes for one gathered chunk of the exact reduce (0: gather into DRAM in _CHUNK_BYTES pieces). With
+# it set, each token chunk's gather + slices + float32 adds stay in L1 and only its sum goes to DRAM.
+L1_GATHER_BYTES = 0
 _CURRENT = object()  # sentinel: "the current build-time TP axis"
 _TP_AXIS = None  # build-time default; ports capture it in __init__
 
@@ -96,17 +99,42 @@ def mesh_axes(device, axis=_CURRENT):
     return [ax for ax in (1, 0) if shape[ax] > 1]
 
 
-def _gather_sum_once(y, ax, n):
+def _gather_sum_once(y, ax, n, mem=None):
     shape = list(y.shape)
+    kw = {} if mem is None else {"memory_config": mem}
     g = ttnn.all_gather(
-        ttnn.reshape(y, [1] + shape), dim=0, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear
+        ttnn.reshape(y, [1] + shape), dim=0, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear, **kw
     )
     out = None
     for i in range(n):
-        part = ttnn.slice(g, [i] + [0] * len(shape), [i + 1] + shape)
-        out = part if out is None else ttnn.add(out, part)
+        part = ttnn.slice(g, [i] + [0] * len(shape), [i + 1] + shape, **kw)
+        out = part if out is None else ttnn.add(out, part, **kw)
     ttnn.deallocate(g)
     return ttnn.reshape(out, shape)
+
+
+def _gather_sum_l1(y, ax, n, nbytes):
+    """_gather_sum_once per whole-tile token chunk whose n-fold gather fits L1_GATHER_BYTES; the
+    chunk's gather, slices and adds stay in L1 (same adds, same order) and its sum goes to DRAM."""
+    shape = list(y.shape)
+    rows = shape[-2]
+    per_row = n * nbytes // rows
+    step = (L1_GATHER_BYTES // per_row) // 32 * 32
+    if step >= rows:
+        s = _gather_sum_once(y, ax, n, mem=ttnn.L1_MEMORY_CONFIG)
+        out = ttnn.to_memory_config(s, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(s)
+        return out
+    outs = []
+    for lo in range(0, rows, step):
+        start, end = [0] * len(shape), list(shape)
+        start[-2], end[-2] = lo, min(rows, lo + step)
+        yc = ttnn.slice(y, start, end)
+        s = _gather_sum_once(yc, ax, n, mem=ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(yc)
+        outs.append(ttnn.to_memory_config(s, ttnn.DRAM_MEMORY_CONFIG))
+        ttnn.deallocate(s)
+    return ttnn.concat(outs, dim=len(shape) - 2)
 
 
 def _gather_sum(y, device, ax):
@@ -116,6 +144,8 @@ def _gather_sum(y, device, ax):
     nbytes = 4 if y.dtype == ttnn.float32 else 2
     for s in shape:
         nbytes *= s
+    if L1_GATHER_BYTES and len(shape) >= 2 and shape[-2] % 32 == 0 and n * nbytes * 32 // shape[-2] <= L1_GATHER_BYTES:
+        return _gather_sum_l1(y, ax, n, nbytes)
     if nbytes <= _CHUNK_BYTES or len(shape) < 2 or shape[-2] <= 32:
         return _gather_sum_once(y, ax, n)
     # chunk along the token (second-to-last) dim in whole tiles
