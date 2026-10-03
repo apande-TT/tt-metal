@@ -32,7 +32,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import common, cpp_softmax
+from models.demos.voxtral_4b_tts_2603.tt import common, cpp_band_attn, cpp_softmax
 
 _SHARD_HEIGHT = 32
 # 2048 rows = 256 codec frames after the decoder's 8x upsampling, which is the whole stage's
@@ -68,7 +68,7 @@ def _mcast_cfg(x, w, rows, out_dtype):
     M goes over the grid rows and N over the grid columns. Per-core M/N are searched a few tiles
     above the minimum (a slightly larger block often divides into better subblocks), and when the
     whole per-core output does not fit L1 it is split into out-blocks. Ranked by per-core work,
-    then subblock area (fp32 DEST caps it at 4 tiles), then out-block area, then K-block width.
+    then subblock area (fp32 DEST caps it at 4 tiles), then K-block width, then out-block area.
     """
     grid = x.device().compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
@@ -104,7 +104,10 @@ def _mcast_cfg(x, w, rows, out_dtype):
                         ),
                         key=lambda hs: (hs[0] * hs[1], hs[1]),
                     )
-                    score = (pm * pn, -sub[0] * sub[1], -bh * bw, -kb)
+                    # K block before out-block area: at in0_block_w=1 every K step re-packs the whole
+                    # fp32 out block (the 4096 x 1024 x 4096 FFN up: 343 us at 13 x 12 / kb 1, 249 at
+                    # 13 x 4 / kb 8).
+                    score = (pm * pn, -sub[0] * sub[1], -kb, -bh * bw)
                     if best is None or score < best[0]:
                         best = (score, pm, pn, bh, bw, kb, sub)
     if best is None:
@@ -277,11 +280,12 @@ def build(device, torch_module):
     q_eps = float(attn.q_norm.eps) if qk_norm else 0.0
     k_eps = float(attn.k_norm.eps) if qk_norm else 0.0
 
+    window = int(attn.sliding_window)
     # One upload per distinct mask on this device (tt/common.shared_device_mask): every block build
     # with the same window shares it.
     mask = common.shared_device_mask(
         device,
-        _alibi_window_mask(attn.alibi_slopes.detach(), int(attn.sliding_window), _MASK_MAX_SEQ),
+        _alibi_window_mask(attn.alibi_slopes.detach(), window, _MASK_MAX_SEQ),
         ttnn.float32,
         lambda m: _from_torch(m, device, dtype=ttnn.float32),
     )
@@ -318,16 +322,23 @@ def build(device, torch_module):
             num_kv_heads=n_kv_heads,
             transpose_k_heads=False,
         )
-        scores = _bmm(qh, kh, transpose_b=True)
-        scaled = ttnn.multiply(scores, scale)
-        if cpp_softmax.supports(scaled, mask):
-            # Mask add + softmax in one pass, the mask read in place from the prebuilt one (no per-call
-            # slice copy): tt/cpp_softmax replays these same float32 SFPU ops.
-            weights = cpp_softmax.apply(scaled, mask)
+        if cpp_band_attn.supports(qh, kh, vh, mask, window):
+            # structural: the sliding window (< one tile) as a BANDED attention -- each query tile row
+            # against its own and the previous key tile row only (tt/cpp_band_attn, one generic_op for
+            # scores, scale, mask, softmax and P@V). Every other tile of the full chain is masked to an
+            # exact zero weight, so the context is the same.
+            a = cpp_band_attn.apply(qh, kh, vh, mask, scale)
         else:
-            weights = _softmax(ttnn.add(scaled, ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq])))
-        a = _bmm(weights, vh)
-        ttnn.deallocate(scores)
+            scores = _bmm(qh, kh, transpose_b=True)
+            scaled = ttnn.multiply(scores, scale)
+            if cpp_softmax.supports(scaled, mask):
+                # Mask add + softmax in one pass, the mask read in place from the prebuilt one (no per-call
+                # slice copy): tt/cpp_softmax replays these same float32 SFPU ops.
+                weights = cpp_softmax.apply(scaled, mask)
+            else:
+                weights = _softmax(ttnn.add(scaled, ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq])))
+            a = _bmm(weights, vh)
+            ttnn.deallocate(scores)
         a = ttnn.experimental.nlp_concat_heads(a)
         return ttnn.reshape(
             _lin(a, wo, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
