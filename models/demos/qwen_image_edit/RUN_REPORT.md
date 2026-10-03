@@ -5,15 +5,13 @@ verdict: **PASS**
 
 trace engaged
 
-graduated on-device: 0, ungraduated: 0
-
-fresh capture: invalid [perf_test_gen] WEDGE: tracy run made no forward progress for 300s -- no log growth, no syscalls, no bytes and an unchanged stack. CPU alone is not progress; a livelock has plenty of it. Process group killed; log: /tmp/perf_node__poe2rki/run.log; killed process group + tt-smi -r (reset_ok=True)
+graduated on-device: 51, ungraduated: 0
 <!-- END trace-gate -->
 
 <!-- BEGIN bringup -->
 # Bring-up run report — `Qwen/Qwen-Image-Edit`
 
-_Generated: 2026-09-26 16:42:38 UTC_
+_Generated: 2026-10-03 06:24:00 UTC_
 
 ## Outcome
 
@@ -41,9 +39,9 @@ End-to-end / demo:
 ```bash
 python -m pytest qwen_image_edit/tests/e2e/test_e2e_image_edit.py -svv
 python -m pytest qwen_image_edit/tests/e2e/test_image_edit_perf.py -svv
-python -m pytest qwen_image_edit/tests/e2e/test_main_perf.py -svv
 python -m pytest qwen_image_edit/demo/demo.py::test_demo -svv
 python -m pytest qwen_image_edit/demo/demo_image_edit.py::test_demo -svv
+python -m pytest qwen_image_edit/demo/mesh.py::test_demo -svv
 ```
 
 ## Next steps
@@ -52,7 +50,7 @@ python -m pytest qwen_image_edit/demo/demo_image_edit.py::test_demo -svv
 <!-- BEGIN emit-e2e -->
 # E2E report — `Qwen/Qwen-Image-Edit`
 
-_Generated: 2026-09-26 16:42:38 UTC_
+_Generated: 2026-10-03 06:24:00 UTC_
 
 **Verdict: PASS**
 
