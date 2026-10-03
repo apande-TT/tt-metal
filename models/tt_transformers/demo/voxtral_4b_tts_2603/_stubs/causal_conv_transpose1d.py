@@ -63,6 +63,11 @@ _COMPUTE = ttnn.WormholeComputeKernelConfig(
 # bfloat16); those live in the codebook stubs.
 def _from_torch(t, device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
     t = t.to(torch.bfloat16) if dtype == ttnn.bfloat16 else t.to(torch.float32)
+    if layout == ttnn.TILE_LAYOUT and t.numel() <= 262144:
+        # A small tensor (a gamma, a bias, a layer scale) tilizes on the HOST: tilized on the device it is
+        # a whole single-core op (~80 us for a 1 x 1024 float32 row) at load time.
+        mapper = ttnn.ReplicateTensorToMesh(device) if device.__class__.__name__ == "MeshDevice" else None
+        return ttnn.to_device(ttnn.from_torch(t, dtype=dtype, layout=layout, mesh_mapper=mapper), device)
     if device.__class__.__name__ == "MeshDevice":
         return ttnn.from_torch(
             t,
