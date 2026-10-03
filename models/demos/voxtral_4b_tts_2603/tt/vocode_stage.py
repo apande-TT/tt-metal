@@ -117,7 +117,7 @@ def _mcast_cfg(x, w, rows, out_dtype):
     M goes over the grid rows and N over the grid columns. Per-core M/N are searched a few tiles
     above the minimum (a slightly larger block often divides into better subblocks), and when the
     whole per-core output does not fit L1 it is split into out-blocks. Ranked by per-core work,
-    then subblock area (fp32 DEST caps it at 4 tiles), then out-block area, then K-block width.
+    then subblock area (fp32 DEST caps it at 4 tiles), then K-block width, then out-block area.
     """
     grid = x.device().compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
@@ -153,7 +153,10 @@ def _mcast_cfg(x, w, rows, out_dtype):
                         ),
                         key=lambda hs: (hs[0] * hs[1], hs[1]),
                     )
-                    score = (pm * pn, -sub[0] * sub[1], -bh * bw, -kb)
+                    # K block before out-block area: at in0_block_w=1 every K step re-packs the whole
+                    # fp32 out block (the 4096 x 1024 x 4096 FFN up: 343 us at 13 x 12 / kb 1, 249 at
+                    # 13 x 4 / kb 8).
+                    score = (pm * pn, -sub[0] * sub[1], -kb, -bh * bw)
                     if best is None or score < best[0]:
                         best = (score, pm, pn, bh, bw, kb, sub)
     if best is None:
@@ -238,7 +241,7 @@ def _norm_gamma(norm, device):
     return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
 
 
-def _rms_norm(x, gamma, eps, dtype=None):
+def _rms_norm(x, gamma, eps, dtype=None, memory_config=None):
     """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
 
     NOT `ttnn.rms_norm`: on this model's real inputs the stock op sits at 9.65e-4 relative error
@@ -250,11 +253,15 @@ def _rms_norm(x, gamma, eps, dtype=None):
     already spell it out; this is the same four ops so the two bodies agree.
     """
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
-    # `dtype`: the normalised rows can be written narrower (bf16) for the linears that read them.
+    # `dtype`: the normalised rows can be written narrower (bf16) for the linears that read them;
+    # `memory_config`: and placed where they read them from.
+    out = {"dtype": dtype} if dtype is not None else {}
+    if memory_config is not None:
+        out["memory_config"] = memory_config
     if gamma is None:
-        return ttnn.multiply(x, scale, dtype=dtype) if dtype is not None else ttnn.multiply(x, scale)
+        return ttnn.multiply(x, scale, **out)
     y = ttnn.multiply(x, scale)
-    return ttnn.multiply(y, gamma, dtype=dtype) if dtype is not None else ttnn.multiply(y, gamma)
+    return ttnn.multiply(y, gamma, **out)
 
 
 class _StackOfOne:
@@ -344,19 +351,18 @@ def _attention_block(device, blk, attention_stub):
             r = ttnn.multiply(r, attn_scale)
         h = ttnn.add(h, r)
 
-        hn = _rms_norm(h, ffn_gamma, ffn_eps, dtype=ttnn.bfloat16)
-        r = _lin(
-            ttnn.multiply(
-                # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
-                # and writes the fp32 residual branch.
-                _lin(hn, w1, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16),
-                _lin(hn, w3, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16),
-                input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
-            ),
-            w2,
-            compute_kernel_config=_COMPUTE,
-            dtype=ttnn.float32,
-        )
+        # shard rung: the FFN's two activations -- the normed rows w1 / w3 read and the gated product w2
+        # reads -- live in L1 (interleaved) while they fit, so the matmuls' in0 reads skip DRAM.
+        ffn_mem = common.l1_while_rows_fit(h)
+        hn = _rms_norm(h, ffn_gamma, ffn_eps, dtype=ttnn.bfloat16, memory_config=ffn_mem)
+        # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
+        # and writes the fp32 residual branch.
+        gate = _lin(hn, w1, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16)
+        up = _lin(hn, w3, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16)
+        ttnn.deallocate(hn)
+        gated = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=ffn_mem)
+        r = _lin(gated, w2, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
+        ttnn.deallocate(gated)
         if ffn_scale is not None:
             r = ttnn.multiply(r, ffn_scale)
         return ttnn.reshape(ttnn.add(h, r), [batch, seq, dim])

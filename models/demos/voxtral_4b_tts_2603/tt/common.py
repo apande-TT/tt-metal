@@ -724,3 +724,15 @@ def shared_device_mask(device, mask, dtype, upload):
     dev = upload(mask)
     _SHARED_MASKS["entries"].append((mask, dtype, dev))
     return dev
+
+
+def l1_while_rows_fit(x, max_rows=4096):
+    """`ttnn.L1_MEMORY_CONFIG` for an activation of `x`'s rows (every leading axis folded) up to
+    `max_rows`, else None (the op's DRAM default). At 4096 rows a [rows, 4096] bf16 intermediate is
+    ~300 KB per core interleaved over the 110 L1 banks -- room left for a matmul's circular buffers."""
+    import ttnn
+
+    rows = 1
+    for d in list(x.shape)[:-1]:
+        rows *= int(d)
+    return ttnn.L1_MEMORY_CONFIG if rows <= max_rows else None
