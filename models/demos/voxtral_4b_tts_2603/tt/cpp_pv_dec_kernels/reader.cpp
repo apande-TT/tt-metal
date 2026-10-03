@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // The input stream of the C++ decode attention P@V (see tt/cpp_pv_dec.py). For each of this core's
-// (user, kv head) units it reads, per span tile j, the exp-weight tile e[j] and the values' tile row
-// v[j] (DT tiles of head_dim).
+// units -- a (user, kv head)'s query tile row -- it reads, per span tile j, the exp-weight tile e[j] and
+// the values' tile row v[j] (DT tiles of head_dim).
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -19,7 +19,8 @@ void kernel_main() {
     constexpr uint32_t ST = get_compile_time_arg_val(1);
     constexpr uint32_t SS = get_compile_time_arg_val(2);  // the unit's cache tile rows (read in place)
     constexpr uint32_t RB = get_compile_time_arg_val(3);  // span tiles a read barrier (padded to RB)
-    constexpr auto ae = TensorAccessorArgs<4>();
+    constexpr uint32_t MT = get_compile_time_arg_val(4);  // query tile rows a (user, kv head): MT units share its V
+    constexpr auto ae = TensorAccessorArgs<5>();
     constexpr auto av = TensorAccessorArgs<ae.next_compile_time_args_offset()>();
     const auto se = TensorAccessor(ae, e_addr);
     const auto sv = TensorAccessor(av, v_addr);
@@ -38,7 +39,7 @@ void kernel_main() {
             for (uint32_t j = j0; j < j0 + RB && j < ST; ++j) {
                 noc_async_read_page(u * ST + j, se, le);
                 le += e_bytes;
-                const uint32_t t = (u * SS + j) * DT;
+                const uint32_t t = ((u / MT) * SS + j) * DT;
                 for (uint32_t d = 0; d < DT; ++d) {
                     noc_async_read_page(t + d, sv, l1);
                     l1 += v_bytes;

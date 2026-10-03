@@ -73,6 +73,28 @@ def supports(e, v) -> bool:
         return False
 
 
+def supports_rows(e, v) -> bool:
+    """The full-span multi-row form (the acoustic readout's `[1, H, M, S] @ [1, H, S, D]`): float32 V."""
+    try:
+        b, h, rows, span = (int(s) for s in e.shape)
+        vb, vh, cap, d = (int(s) for s in v.shape)
+        return (
+            enabled()
+            and rows % _TILE == 0
+            and span == cap
+            and span % _TILE == 0
+            and d % _TILE == 0
+            and d // _TILE <= 4
+            and (b, h) == (vb, vh)
+            and e.dtype == ttnn.float32
+            and v.dtype == ttnn.float32
+            and not e.is_sharded()
+            and not v.is_sharded()
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _cb(cores, index, fmt, tiles):
     page = _TILE_BYTES[fmt]
     return ttnn.CBDescriptor(
@@ -82,13 +104,16 @@ def _cb(cores, index, fmt, tiles):
     )
 
 
-def apply(e, v):
-    """`e @ v` per (user, kv head), float32 `[B, n_kv, 32, d]` in L1."""
+def apply(e, v, rb=_RB, memory_config=None):
+    """`e @ v` per (user, kv head), float32 `[B, n_kv, rows, d]` (L1 unless `memory_config`).
+
+    Each query tile row of a (user, kv head) is its own unit; its V tile rows are re-read per unit."""
     device = e.device()
     b, h, rows, span = (int(s) for s in e.shape)
     d = int(v.shape[-1])
-    dt, st, ss, units = d // _TILE, span // _TILE, int(v.shape[-2]) // _TILE, b * h
-    rb = min(_RB, st)
+    mt = rows // _TILE
+    dt, st, ss, units = d // _TILE, span // _TILE, int(v.shape[-2]) // _TILE, b * h * mt
+    rb = min(rb, st)
     pad = -(-st // rb) * rb - st
     grid = device.compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
@@ -96,7 +121,7 @@ def apply(e, v):
     base, extra = divmod(units, ncores)
     cores = ttnn.num_cores_to_corerangeset(ncores, grid, row_wise=True)
     y = ttnn.allocate_tensor_on_device(
-        ttnn.Shape([b, h, rows, d]), ttnn.float32, ttnn.TILE_LAYOUT, device, ttnn.L1_MEMORY_CONFIG
+        ttnn.Shape([b, h, rows, d]), ttnn.float32, ttnn.TILE_LAYOUT, device, memory_config or ttnn.L1_MEMORY_CONFIG
     )
     ea, va, ya = e.buffer_address(), v.buffer_address(), y.buffer_address()
     rr, rc, rw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -113,7 +138,7 @@ def apply(e, v):
             kernel_source=_READER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt, st, ss, rb] + _accessor_args(e) + _accessor_args(v),
+            compile_time_args=[dt, st, ss, rb, mt] + _accessor_args(e) + _accessor_args(v),
             runtime_args=rr,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -146,7 +171,7 @@ def apply(e, v):
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
     desc.custom_program_hash = (
-        hash(("voxtral_cpp_pv_dec", b, h, dt, st, ss, rb, str(v.dtype), ea, va, ya)) & 0xFFFFFFFFFFFFFFFF
+        hash(("voxtral_cpp_pv_dec", b, h, mt, dt, st, ss, rb, str(v.dtype), ea, va, ya)) & 0xFFFFFFFFFFFFFFFF
     )
     ttnn.generic_op([e, v, y], desc)
     return y

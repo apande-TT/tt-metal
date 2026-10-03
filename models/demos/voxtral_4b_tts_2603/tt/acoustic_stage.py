@@ -63,10 +63,10 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import common
+from models.demos.voxtral_4b_tts_2603.tt import common, cpp_argmax
 
 # One tile holds the whole sequence: 3 real tokens + 29 pad rows. (The stubs' head-batched `_bmm`
-# runs the 192-row scores (into L1 for the mask add) and P@V 3 tile rows a core; o_proj runs as a full-grid 2D multicast; the readout gate/up run HiFi2.)
+# runs the 192-row scores (into L1 for the mask add) and P@V 3 tile rows a core; o_proj runs as a full-grid 2D multicast; the readout gate/up run HiFi2; mask add + softmax are one C++ pass; the readout P@V is C++; the argmax runs tt/cpp_argmax.)
 _TILE = 32
 _N_REAL_TOKENS = 3
 
@@ -372,15 +372,52 @@ class AcousticStage:
         if rows % _TILE:
             return None
         whole = body == self._whole_body
+        if self.n_steps > _TILE:
+            return self._t_proj_rows(whole, self._t_rows(rows, step), rows)
 
         def make():
-            t = self._t_rows(rows, step)
-            if whole:
-                return self.whole.time_projection(t)
-            t_emb = ttnn.reshape(self.parts["time_embedding"](t), [1, 1, rows, self.dim])
-            return _lin(t_emb, self.parts["w_time"], compute_kernel_config=_COMPUTE)
+            # Row `step` of the all-steps projection, broadcast to `rows` (`+ 0` is exact in float32).
+            row = ttnn.slice(self._t_proj_steps(whole), [0, 0, step, 0], [1, 1, step + 1, self.dim])
+            zeros = _from_torch(torch.zeros(1, 1, rows, self.dim), self.device, dtype=ttnn.float32)
+            out = ttnn.add(zeros, row)
+            ttnn.deallocate(row)
+            ttnn.deallocate(zeros)
+            return out
 
         return self._const(("t_proj", whole, rows, step), make)
+
+    def _t_proj_rows(self, whole, t, rows):
+        if whole:
+            return self.whole.time_projection(t)
+        t_emb = ttnn.reshape(self.parts["time_embedding"](t), [1, 1, rows, self.dim])
+        # ttnn's own default for it (1D, 2-tile K blocks, one output column tile a core), pinned so
+        # the 32-row all-steps call keeps the K blocks the per-step calls ran.
+        n_tiles = int(self.parts["w_time"].shape[-1]) // _TILE
+        grid = t_emb.device().compute_with_storage_grid_size()
+        cfg = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(int(grid.x), int(grid.y)),
+            in0_block_w=2,
+            out_subblock_h=2 if (rows // _TILE) % 2 == 0 else 1,
+            out_subblock_w=1,
+            per_core_M=rows // _TILE,
+            per_core_N=-(-n_tiles // (int(grid.x) * int(grid.y))),
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+        )
+        return _lin(t_emb, self.parts["w_time"], compute_kernel_config=_COMPUTE, program_config=cfg)
+
+    def _t_proj_steps(self, whole):
+        """Every step's time projection in ONE 32-row matmul -- step i's timestep in row i -- so the
+        3072 x 3072 weight streams once per body instead of once per step. A row's result depends only
+        on that row, under the same config and K blocks the per-step projection ran."""
+
+        def make():
+            t = torch.zeros(_TILE, 1, dtype=torch.float32)
+            t[: self.n_steps, 0] = torch.tensor(self.timesteps[: self.n_steps], dtype=torch.float32)
+            return self._t_proj_rows(whole, _from_torch(t, self.device, dtype=ttnn.float32), _TILE)
+
+        return self._const(("t_proj_steps", whole), make)
 
     def _pad(self, rows):
         """The 29 pad rows of the one-tile sequence (part-chain side)."""
@@ -661,7 +698,10 @@ class AcousticStage:
         )
 
         masked = ttnn.add(semantic_logits, self._logit_mask(batch))
-        semantic_code = ttnn.argmax(ttnn.to_layout(masked, ttnn.ROW_MAJOR_LAYOUT), dim=-1, keepdim=True)
+        if cpp_argmax.supports(masked):
+            semantic_code = cpp_argmax.argmax(masked)  # the C++ argmax, read from the TILE logits in place
+        else:
+            semantic_code = ttnn.argmax(ttnn.to_layout(masked, ttnn.ROW_MAJOR_LAYOUT), dim=-1, keepdim=True)
 
         code_f = ttnn.typecast(ttnn.to_layout(semantic_code, ttnn.TILE_LAYOUT), ttnn.float32)
         finished = ttnn.repeat(ttnn.eq(code_f, float(self.end_audio_id)), [1, self.n_acoustic])
