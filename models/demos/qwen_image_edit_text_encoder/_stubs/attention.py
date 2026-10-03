@@ -255,6 +255,10 @@ def _exact_sum(mm, parts, patterns=LANE_PATTERNS):
 
 # core grid for the non-exact split_linear products (None: ttnn.linear picks its own)
 LINEAR_CORE_GRID = None
+# core grid for split_matmul's exact-lane batched products, each on a full-K batch-parallel config
+# (None: ttnn picks its own; a core_grid alone gets in0_block_w=1, whose fp32 partial reloads break
+# the exact-lane sum: e2e PCC 0.9395)
+EXACT_CORE_GRID = None
 # hand-shaped 2-D multicast config for those products on LINEAR_CORE_GRID (False: core_grid only;
 # ttnn then picks per_core_N=19 for the LM MLP, i.e. 1x1 subblocks and 2-row output blocks that
 # re-stream the weight per block)
@@ -345,6 +349,32 @@ def rotate_half(t):
     return ttnn.concat([ttnn.neg(x2), x1], dim=-1)
 
 
+def _bmm_full_k_config(a, b, transpose_b):
+    """Batch-parallel (one output block per core) config for an exact-lane batched product, with the
+    WHOLE K in one in0 block: each output tile is formed in the fp32 dest in one pass, never spilled
+    and reloaded between K blocks. None when the shapes are not tile aligned or the blocks overflow L1."""
+    a_s, b_s = [int(d) for d in a.padded_shape], [int(d) for d in b.padded_shape]
+    k, n = (b_s[-1], b_s[-2]) if transpose_b else (b_s[-2], b_s[-1])
+    m = a_s[-2]
+    if m % TILE or k % TILE or n % TILE:
+        return None
+    m_t, k_t, n_t = m // TILE, k // TILE, n // TILE
+    # double-buffered bf16 in0/in1 blocks + the float32 output block must fit one core's L1
+    if (2 * m_t * k_t + 2 * k_t * n_t) * 2048 + m_t * n_t * 4096 > 1024 * 1024:
+        return None
+    sub_w = max(d for d in range(1, min(n_t, 4) + 1) if n_t % d == 0)
+    sub_h = max(d for d in range(1, min(m_t, 4 // sub_w) + 1) if m_t % d == 0)
+    grid = EXACT_CORE_GRID
+    return ttnn.MatmulMultiCoreReuseProgramConfig(
+        compute_with_storage_grid_size=(grid.x, grid.y),
+        in0_block_w=k_t,
+        out_subblock_h=sub_h,
+        out_subblock_w=sub_w,
+        per_core_M=m_t,
+        per_core_N=n_t,
+    )
+
+
 def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2):
     """float32 a @ float32 b over bf16 limbs of both operands, keeping the limb products whose order
     (i + j) is below `limbs` (2 limbs: ah.bh + ah.bl + al.bh; 3 limbs: six terms, ~float32). With
@@ -353,8 +383,9 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     pa_all = split_bf16(a, limbs)
     pb_all = split_bf16(b, limbs)
     terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
+    pc = _bmm_full_k_config(pa_all[0], pb_all[0], transpose_b) if exact and EXACT_CORE_GRID is not None else None
     mm = lambda p, q: ttnn.matmul(  # noqa: E731
-        p, q, transpose_b=transpose_b, compute_kernel_config=cfg, dtype=ttnn.float32
+        p, q, transpose_b=transpose_b, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc
     )
     if not exact:
         y = None
