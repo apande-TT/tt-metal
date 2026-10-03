@@ -273,31 +273,38 @@ def _compile_codec_block(device, blk, mask, window=None):
         # and the whole reduction in FLOAT32, which SDPA cannot do at any fidelity. Matches the
         # part-chain stubs (`codec_transformer`, `codec_transformer_block`, `codec_attention`)
         # exactly, so the two halves of the batch run the same arithmetic.
-        qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
-            ttnn.concat([q, k, v], dim=-1),
-            num_heads=n_heads,
-            num_kv_heads=n_kv_heads,
-            transpose_k_heads=False,
-        )
-        if cpp_band_attn.supports(qh, kh, vh, mask, window):
-            # structural: the sliding window (< one tile) as a BANDED attention -- each query tile row
-            # against its own and the previous key tile row only (tt/cpp_band_attn, one generic_op for
-            # scores, scale, mask, softmax and P@V). Every other tile of the full chain is masked to an
-            # exact zero weight, so the context is the same.
-            a = cpp_band_attn.apply(qh, kh, vh, mask, scale)
+        if n_kv_heads == n_heads and cpp_band_attn.supports_merged(q, k, v, mask, window, n_heads):
+            # structural: the banded attention reads each head's q / k / v tiles IN PLACE from the merged
+            # [B, 1, T, H * D] linear outputs and writes the context back merged -- no q / k / v concat, no
+            # nlp_create_qkv_heads, no nlp_concat_heads (pure data movement, the same values).
+            a = cpp_band_attn.apply(q, k, v, mask, scale, merged_heads=n_heads)
         else:
-            scores = _bmm(qh, kh, transpose_b=True)
-            scaled = ttnn.multiply(scores, scale)
-            if cpp_softmax.supports(scaled, mask):
-                # Mask add + softmax in one pass, the mask read in place from the prebuilt one (no per-call
-                # slice copy): tt/cpp_softmax replays these same float32 SFPU ops.
-                weights = cpp_softmax.apply(scaled, mask)
+            qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
+                ttnn.concat([q, k, v], dim=-1),
+                num_heads=n_heads,
+                num_kv_heads=n_kv_heads,
+                transpose_k_heads=False,
+            )
+            if cpp_band_attn.supports(qh, kh, vh, mask, window):
+                # structural: the sliding window (< one tile) as a BANDED attention -- each query tile row
+                # against its own and the previous key tile row only (tt/cpp_band_attn, one generic_op for
+                # scores, scale, mask, softmax and P@V). Every other tile of the full chain is masked to an
+                # exact zero weight, so the context is the same.
+                a = cpp_band_attn.apply(qh, kh, vh, mask, scale)
             else:
-                weights = _softmax(ttnn.add(scaled, ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq])))
-            a = _bmm(weights, vh)
-            ttnn.deallocate(scores)
+                scores = _bmm(qh, kh, transpose_b=True)
+                scaled = ttnn.multiply(scores, scale)
+                if cpp_softmax.supports(scaled, mask):
+                    # Mask add + softmax in one pass, the mask read in place from the prebuilt one (no per-call
+                    # slice copy): tt/cpp_softmax replays these same float32 SFPU ops.
+                    weights = cpp_softmax.apply(scaled, mask)
+                else:
+                    weights = _softmax(ttnn.add(scaled, ttnn.slice(mask, [0, 0, 0, 0], [1, n_heads, seq, seq])))
+                a = _bmm(weights, vh)
+                ttnn.deallocate(scores)
+            a = ttnn.experimental.nlp_concat_heads(a)
         r = _fold_linear(
-            ttnn.experimental.nlp_concat_heads(a),
+            a,
             wo,
             dtype=ttnn.float32,
             compute_kernel_config=_COMPUTE,

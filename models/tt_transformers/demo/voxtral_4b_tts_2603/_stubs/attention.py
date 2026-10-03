@@ -27,7 +27,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import cpp_pv_dec, cpp_scores_dec, ttl_kv
+from models.demos.voxtral_4b_tts_2603.tt import cpp_pv_dec, cpp_scores_dec, cpp_tail_rows, ttl_kv
 
 # `ttnn.linear`/`ttnn.matmul` on their DEFAULTS leave `fp32_dest_acc_en` off, so the accumulator
 # rounds to bfloat16 at every step even when the activations are float32. The consumer of this
@@ -605,7 +605,13 @@ def _prefill_sdpa(q, k, v, kv_cache):
         if kv_cache.get("tail_fill") is not None and kv_cache.get("fill_tables") is not None:
             # SEEDED IN PLACE, NEVER JOINED: `_seed_cache` fills the prefix and the tail into the
             # resident cache separately, so the per-sample [batch, H, P + T, D] k/v is not built.
-            return a, _Split(pk, _tail_rows(k, batch, real), padded), _Split(pv, _tail_rows(v, batch, real), padded)
+            if cpp_tail_rows.supports([k, v], batch, real, _CACHE_DTYPE):
+                # structural: both tails regrouped TILE -> TILE in ONE generic_op (tt/cpp_tail_rows) instead of
+                # an untilize, a ROW_MAJOR view and a tilize-with-padding for each of k and v.
+                kt, vt = cpp_tail_rows.apply([k, v], batch, real, _CACHE_DTYPE)
+            else:
+                kt, vt = _tail_rows(k, batch, real), _tail_rows(v, batch, real)
+            return a, _Split(pk, kt, padded), _Split(pv, vt, padded)
         rep = ttnn.Shape([batch, 1, 1, 1])
         k = ttnn.concat([ttnn.repeat(pk, rep), _per_sample(k, batch, real, padded)], dim=2)
         v = ttnn.concat([ttnn.repeat(pv, rep), _per_sample(v, batch, real, padded)], dim=2)

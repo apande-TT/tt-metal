@@ -26,7 +26,14 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import cpp_down_dec, cpp_pv_dec, cpp_scores_dec, ttl_kv, ttl_swiglu
+from models.demos.voxtral_4b_tts_2603.tt import (
+    cpp_down_dec,
+    cpp_pv_dec,
+    cpp_scores_dec,
+    cpp_tail_rows,
+    ttl_kv,
+    ttl_swiglu,
+)
 
 # SDPA takes bfloat16 and nothing wider (`sdpa_device_operation.cpp:43`), and the KV cache is read
 # by the same op family, so q/k/v and the cache are bf16 while the residual stream stays float32.
@@ -760,7 +767,13 @@ def _prefill_sdpa(q, k, v, kv_cache, keep=None):
         if kv_cache.get("tail_fill") is not None and kv_cache.get("fill_tables") is not None:
             # SEEDED IN PLACE, NEVER JOINED: `_seed_cache` fills the prefix and the tail into the
             # resident cache separately, so the per-sample [batch, H, P + T, D] k/v is not built.
-            return a, _Split(pk, _tail_rows(k, batch, real), padded), _Split(pv, _tail_rows(v, batch, real), padded)
+            if cpp_tail_rows.supports([k, v], batch, real, _CACHE_DTYPE):
+                # structural: both tails regrouped TILE -> TILE in ONE generic_op (tt/cpp_tail_rows) instead of
+                # an untilize, a ROW_MAJOR view and a tilize-with-padding for each of k and v.
+                kt, vt = cpp_tail_rows.apply([k, v], batch, real, _CACHE_DTYPE)
+            else:
+                kt, vt = _tail_rows(k, batch, real), _tail_rows(v, batch, real)
+            return a, _Split(pk, kt, padded), _Split(pv, vt, padded)
         rep = ttnn.Shape([batch, 1, 1, 1])
         k = ttnn.concat([ttnn.repeat(pk, rep), _per_sample(k, batch, real, padded)], dim=2)
         v = ttnn.concat([ttnn.repeat(pv, rep), _per_sample(v, batch, real, padded)], dim=2)
