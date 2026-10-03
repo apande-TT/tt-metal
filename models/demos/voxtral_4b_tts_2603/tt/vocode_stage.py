@@ -189,6 +189,10 @@ def _lin(x, w, **kwargs):
         cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
             kwargs["program_config"] = cfg
+            # Fidelity: the tall (compute-bound) codec linears at HiFi2 (the attention products too).
+            kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+            )
     if lead == 1:
         return ttnn.linear(x, w, **kwargs)
     y = ttnn.linear(ttnn.reshape(x, [1, 1, rows, shape[-1]]), w, **kwargs)
@@ -225,7 +229,8 @@ def _folded_weight(linear, device, rows=None, cols=None):
         w = w * rows.float().reshape(-1, 1)
     if cols is not None:
         w = w * cols.float().reshape(1, -1)
-    return _from_torch(w.contiguous(), device)
+    # dtype rung: the part chain's codec linear weights as bf16 (the whole-section body's dtype).
+    return _from_torch(w.contiguous(), device, dtype=ttnn.bfloat16)
 
 
 def _norm_gamma(norm, device):
@@ -339,12 +344,15 @@ def _attention_block(device, blk, attention_stub):
         hn = _rms_norm(h, ffn_gamma, ffn_eps)
         r = _lin(
             ttnn.multiply(
-                _lin(hn, w1, compute_kernel_config=_COMPUTE),
-                _lin(hn, w3, compute_kernel_config=_COMPUTE),
+                # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
+                # and writes the fp32 residual branch.
+                _lin(hn, w1, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16),
+                _lin(hn, w3, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16),
                 input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
             ),
             w2,
             compute_kernel_config=_COMPUTE,
+            dtype=ttnn.float32,
         )
         if ffn_scale is not None:
             r = ttnn.multiply(r, ffn_scale)
