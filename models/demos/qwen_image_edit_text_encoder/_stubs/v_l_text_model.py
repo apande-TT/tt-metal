@@ -23,6 +23,9 @@ from models.demos.qwen_image_edit_text_encoder._stubs.attention import mesh_shap
 from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtRMSNorm, _fp32
 from models.demos.qwen_image_edit_text_encoder._stubs.token_embed import TtTokenEmbed
 
+# row-stage hand-off gathers only one 1/stage_rows piece per row (False: every row's full copy)
+SPLIT_HANDOFF = False
+
 
 class TtTextModel:
     """Composed of the graduated ports: 28 x v_l_decoder_layer, each with its language_model_layers_0_mlp.
@@ -79,14 +82,30 @@ class TtTextModel:
         emb = np.concatenate([freqs, freqs], axis=-1)
         return np.cos(emb) * self.rope_scale, np.sin(emb) * self.rope_scale
 
-    @staticmethod
-    def _take_row(x, row):
-        """Every chip gets row `row`'s copy of x (all_gather over the row axis moves bits exactly)."""
+    def _take_row(self, x, row):
+        """Every chip gets row `row`'s copy of x (all_gather over the row axis moves bits exactly).
+
+        Every row of row's stage holds the same valid x, so with SPLIT_HANDOFF each row of the mesh sends
+        only the 1/stage_rows piece (r mod stage_rows) of it: [x] * stages split over the rows gives row
+        r exactly that piece, and the gather's block for row's stage is x again -- stages x the bytes
+        of x on the fabric and in the output instead of rows x."""
         b = x.shape[0]
-        g = ttnn.all_gather(x, dim=0, cluster_axis=0, num_links=1, topology=ttnn.Topology.Linear)
-        start = [row * b] + [0] * (len(x.shape) - 1)
-        end = [(row + 1) * b] + list(x.shape)[1:]
-        return ttnn.slice(g, start, end)
+        shape = list(x.shape)
+        rows = self.stage_rows * (2 if self.row_stages else 1)
+        if SPLIT_HANDOFF and self.row_stages and b % self.stage_rows == 0:
+            stages = rows // self.stage_rows
+            xs = ttnn.concat([x] * stages, dim=0)
+            p = ttnn.mesh_partition(xs, dim=0, cluster_axis=0)
+            ttnn.deallocate(xs)
+            g = ttnn.all_gather(p, dim=0, cluster_axis=0, num_links=1, topology=ttnn.Topology.Linear)
+            ttnn.deallocate(p)
+            s0 = (row // self.stage_rows) * b
+        else:
+            g = ttnn.all_gather(x, dim=0, cluster_axis=0, num_links=1, topology=ttnn.Topology.Linear)
+            s0 = row * b
+        out = ttnn.slice(g, [s0] + [0] * (len(shape) - 1), [s0 + b] + shape[1:])
+        ttnn.deallocate(g)
+        return out
 
     def forward_padded(self, x, tt_cos, tt_sin, tt_mask):
         """Device path: x [B, 1, s_pad, C] fp32 -> norm(layers(x)) [B, 1, s_pad, C], replicated. Rotary
