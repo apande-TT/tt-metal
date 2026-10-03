@@ -107,23 +107,51 @@ def upload_rows(device, arrays, dtype=ttnn.bfloat16, col_dim=None, layout=ttnn.T
     return ttnn.reshape(tt, list(tt.shape)[1:])
 
 
+# L1 bytes for one gathered chunk of exact_all_reduce (0: gather the whole tensor into DRAM)
+EXACT_REDUCE_L1_BYTES = 0
+
+
+def _gather_sum(y, n, cluster_axis, mem=None):
+    """all_gather the float32 partials over `cluster_axis` and add the n slices in float32; the gathered
+    tensor and the running sum live in `mem` (None: the input's memory config)."""
+    shape = list(y.shape)
+    kw = {} if mem is None else {"memory_config": mem}
+    g = ttnn.all_gather(
+        ttnn.reshape(y, [1] + shape), dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear, **kw
+    )
+    out = None
+    for i in range(n):
+        part = ttnn.slice(g, [i] + [0] * len(shape), [i + 1] + shape, **kw)
+        out = part if out is None else ttnn.add(out, part, **kw)
+    ttnn.deallocate(g)
+    return ttnn.reshape(out, shape)
+
+
 def exact_all_reduce(y, device, cluster_axis=1):
     """Sum over the TP axis without rounding: gather the float32 partials (bit-exact data movement) and
     add them in float32. ttnn.all_reduce rounds float32 partials at bf16 level (measured ~7e-3 abs on
-    O(3) sums on this T3K), which a 32-block fp32 residual stream accumulates."""
+    O(3) sums on this T3K), which a 32-block fp32 residual stream accumulates.
+
+    With EXACT_REDUCE_L1_BYTES set, a tensor whose gather would not fit is reduced in leading-dim chunks
+    whose gather + slices + adds stay in L1 (the same adds in the same order; only the final sum of each
+    chunk is written back to DRAM)."""
     n = mesh_shape(device)[cluster_axis]
     if n == 1:
         return y
     shape = list(y.shape)
-    g = ttnn.all_gather(
-        ttnn.reshape(y, [1] + shape), dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear
-    )
-    out = None
-    for i in range(n):
-        part = ttnn.slice(g, [i] + [0] * len(shape), [i + 1] + shape)
-        out = part if out is None else ttnn.add(out, part)
-    ttnn.deallocate(g)
-    return ttnn.reshape(out, shape)
+    per_item = n * math.prod(shape[1:]) * 4
+    if not EXACT_REDUCE_L1_BYTES or len(shape) < 2 or per_item > EXACT_REDUCE_L1_BYTES:
+        return _gather_sum(y, n, cluster_axis)
+    c = max(d for d in range(1, shape[0] + 1) if shape[0] % d == 0 and d * per_item <= EXACT_REDUCE_L1_BYTES)
+    outs = []
+    for b0 in range(0, shape[0], c):
+        yc = ttnn.slice(y, [b0] + [0] * (len(shape) - 1), [b0 + c] + shape[1:])
+        s = _gather_sum(yc, n, cluster_axis, mem=ttnn.L1_MEMORY_CONFIG)
+        ttnn.deallocate(yc)
+        outs.append(ttnn.to_memory_config(s, ttnn.DRAM_MEMORY_CONFIG))
+        ttnn.deallocate(s)
+    out = outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=0)
+    return out
 
 
 def split_bf16(x, limbs=2):
