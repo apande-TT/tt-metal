@@ -27,7 +27,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import cpp_scores_dec, ttl_kv
+from models.demos.voxtral_4b_tts_2603.tt import cpp_pv_dec, cpp_scores_dec, ttl_kv
 
 # `ttnn.linear`/`ttnn.matmul` on their DEFAULTS leave `fp32_dest_acc_en` off, so the accumulator
 # rounds to bfloat16 at every step even when the activations are float32. The consumer of this
@@ -837,6 +837,7 @@ def build(device, torch_module):
     wo4 = _from_torch(m.o_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat4_b)
 
     use_cpp_scores = cpp_scores_dec.claim()
+    use_cpp_pv = cpp_pv_dec.claim()
 
     def _decode(hidden_states, position_embeddings, kv_cache, position):
         """ONE token per user, attending to the RESIDENT cache instead of recomputing the prefix.
@@ -900,14 +901,27 @@ def build(device, torch_module):
             else:
                 q = _rope(q, cos, sin, half)
                 k = _rope(k, cos, sin, half)
-        # The tilize writes zeros into the tile rows past `groups`; relabelling them logical is a
-        # zero-cost view, where `ttnn.pad` re-filled the same zeros in a FillPad pass.
-        full = ttnn.Shape([batch, n_kv_heads, q_rows, head_dim])
-        q = ttnn.tilize_with_val_padding(
-            ttnn.reshape(ttnn.to_layout(q, ttnn.ROW_MAJOR_LAYOUT), [batch, n_kv_heads, groups, head_dim]), full, 0.0
+        # The C++ scores can read the RoPE'd q in place, gathering each kv head's `groups` rows into a
+        # zeroed tile itself (the same grouped layout), when it also reads the cache in place.
+        cap_kv = int(kv_cache["k"].shape[-2])
+        span_kv = min(cap_kv, int(kv_cache.get("span") or cap_kv))
+        q_in_place = (
+            span_kv < cap_kv
+            and use_cpp_scores
+            and use_cpp_pv
+            and cpp_scores_dec.supports_grouped(q, kv_cache["k"], span_kv, groups)
         )
-        if q_rows != groups:
-            q = ttnn.reshape(q, full, full)
+        if not q_in_place:
+            # The tilize writes zeros into the tile rows past `groups`; relabelling them logical is a
+            # zero-cost view, where `ttnn.pad` re-filled the same zeros in a FillPad pass.
+            full = ttnn.Shape([batch, n_kv_heads, q_rows, head_dim])
+            q = ttnn.tilize_with_val_padding(
+                ttnn.reshape(ttnn.to_layout(q, ttnn.ROW_MAJOR_LAYOUT), [batch, n_kv_heads, groups, head_dim]),
+                full,
+                0.0,
+            )
+            if q_rows != groups:
+                q = ttnn.reshape(q, full, full)
         # A split prefill leaves dead slots before the tail: position p lives at slot p + offset.
         idxs = [int(position) + int(kv_cache.get("slot_offset", 0))] * batch
         # `paged_update_cache` wants the decode layout `[1, B, n_kv, head_dim]` AND it wants that
@@ -956,13 +970,22 @@ def build(device, torch_module):
         # to the max, the row sum or P@V. The cut k/v sit in L1 while they are small.
         span = min(cap, int(kv_cache.get("span") or cap))
         keys, values = kv_cache["k"], kv_cache["v"]
-        if span < cap:
+        # The C++ scores and P@V read the live span of the cache IN PLACE (their reads stride over the
+        # cache rows), so no cut of k / v is copied out each step.
+        in_place = q_in_place or (
+            span < cap and use_cpp_scores and use_cpp_pv and cpp_scores_dec.supports(q, keys, span)
+        )
+        cut_kv = span < cap and not in_place
+        if cut_kv:
             ends = [int(s) for s in keys.shape]
             ends[-2] = span
             cut = l1 if span <= 320 else None
             keys = ttnn.slice(keys, [0, 0, 0, 0], ends, memory_config=cut)
             values = ttnn.slice(values, [0, 0, 0, 0], ends, memory_config=cut)
-        if use_cpp_scores and cpp_scores_dec.supports(q, keys):
+        if in_place:
+            # the C++ decode scores, keys (and q, when grouped there) read in place
+            scores = cpp_scores_dec.apply(q, keys, span, groups=groups if q_in_place else None)
+        elif use_cpp_scores and cpp_scores_dec.supports(q, keys):
             scores = cpp_scores_dec.apply(q, keys)  # the C++ decode scores
         else:
             scores = _bmm(q, keys, transpose_b=True, memory_config=l1)
@@ -980,9 +1003,13 @@ def build(device, torch_module):
             memory_config=l1,
         )
         ttnn.deallocate(masked)
-        ctx = ttnn.divide(_bmm(e, values, memory_config=l1), ttnn.sum(e, dim=-1, keepdim=True, memory_config=l1))
+        if use_cpp_pv and cpp_pv_dec.supports(e, values):
+            pv = cpp_pv_dec.apply(e, values)  # the C++ decode P@V
+        else:
+            pv = _bmm(e, values, memory_config=l1)
+        ctx = ttnn.divide(pv, ttnn.sum(e, dim=-1, keepdim=True, memory_config=l1))
         ttnn.deallocate(e)
-        if span < cap:
+        if cut_kv:
             ttnn.deallocate(keys)
             ttnn.deallocate(values)
         # Relabelling the context to its `groups` real rows is a zero-cost tile view, so the untilize
