@@ -94,6 +94,8 @@ class TtQwenTextEncoder:
         _te_attention.EXACT_REDUCE_L1_BYTES = 48 * 1024 * 1024
         # the row-stage hand-off moves one piece per row instead of every row's full copy
         v_l_text_model.SPLIT_HANDOFF = True
+        # the vision attention's exact-lane products: one batch-parallel full-K block per core on the grid
+        _te_attention.EXACT_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         self.set_precise(True)
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
