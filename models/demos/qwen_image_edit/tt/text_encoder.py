@@ -92,6 +92,8 @@ class TtQwenTextEncoder:
         _te_attention.LINEAR_BLOCK_TRANSPOSE = True
         # the exact fp32 TP all-reduce gathers and sums in L1, in chunks of at most 48 MB per gather
         _te_attention.EXACT_REDUCE_L1_BYTES = 48 * 1024 * 1024
+        # the row-stage hand-off moves one piece per row instead of every row's full copy
+        v_l_text_model.SPLIT_HANDOFF = True
         self.set_precise(True)
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
