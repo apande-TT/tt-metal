@@ -217,6 +217,17 @@ def _matmul_weight(linear, device):
     return _from_torch(linear.weight.detach().transpose(0, 1).contiguous(), device)
 
 
+def _folded_weight(linear, device, rows=None, cols=None):
+    """`_weight` with a per-INPUT-channel scale `rows` and a per-OUTPUT-channel scale `cols` folded in
+    (a float32 product on the host): `(x * g) @ W == x @ (g W)` and `(x @ W) * s == x @ (W s)`."""
+    w = linear.weight.detach().float().transpose(0, 1)
+    if rows is not None:
+        w = w * rows.float().reshape(-1, 1)
+    if cols is not None:
+        w = w * cols.float().reshape(1, -1)
+    return _from_torch(w.contiguous(), device)
+
+
 def _norm_gamma(norm, device):
     """`[1, 1, 1, dim]` float32 TILE -- the form `_rms_norm`'s final multiply takes."""
     return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
@@ -234,7 +245,8 @@ def _rms_norm(x, gamma, eps):
     already spell it out; this is the same four ops so the two bodies agree.
     """
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
-    return ttnn.multiply(ttnn.multiply(x, scale), gamma)
+    y = ttnn.multiply(x, scale)
+    return y if gamma is None else ttnn.multiply(y, gamma)
 
 
 class _StackOfOne:
@@ -300,15 +312,18 @@ def _attention_block(device, blk, attention_stub):
     dim = int(blk.dim)
     attn_gamma = _norm_gamma(blk.attention_norm, device)
     attn_eps = float(blk.attention_norm.eps)
-    ffn_gamma = _norm_gamma(blk.ffn_norm, device)
+    # The FFN norm's gamma and LayerScale are folded into w1 / w3 and w2 (the attention side's
+    # belong to the codec_attention stub's weights, which this skeleton does not build).
+    ffn_gamma = None
+    ffn_g = blk.ffn_norm.weight.detach()
+    ffn_ls = blk.ffn_scale.detach() if blk.layer_scale else None
     ffn_eps = float(blk.ffn_norm.eps)
-    w1 = _matmul_weight(blk.feed_forward.w1, device)
-    w2 = _matmul_weight(blk.feed_forward.w2, device)
-    w3 = _matmul_weight(blk.feed_forward.w3, device)
+    w1 = _folded_weight(blk.feed_forward.w1, device, rows=ffn_g)
+    w2 = _folded_weight(blk.feed_forward.w2, device, cols=ffn_ls)
+    w3 = _folded_weight(blk.feed_forward.w3, device, rows=ffn_g)
     attn_scale = ffn_scale = None
     if blk.layer_scale:
         attn_scale = _from_torch(blk.attention_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32)
-        ffn_scale = _from_torch(blk.ffn_scale.detach().reshape(1, 1, 1, dim), device, dtype=ttnn.float32)
 
     def run(x3, **kwargs):
         batch, seq = int(x3.shape[0]), int(x3.shape[-2])
