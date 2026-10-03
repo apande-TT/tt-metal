@@ -42,15 +42,18 @@ def _accessor_args(tensor):
 
 
 def supports(raw, mask) -> bool:
+    """`raw` `[B, H, M, S]`; `mask` `[1, 1 or H, MM >= M, MS >= S]`, read from its top-left corner."""
     try:
         b, h, m, s = (int(x) for x in raw.shape)
         mb, mh, mm, ms = (int(x) for x in mask.shape)
         return (
             enabled()
-            and b == 1
             and mb == 1
             and mh in (1, h)
-            and (mm, ms) == (m, s)
+            and mm >= m
+            and ms >= s
+            and mm % _TILE == 0
+            and ms % _TILE == 0
             and m % _TILE == 0
             and s % _TILE == 0
             and raw.dtype == ttnn.float32
@@ -75,19 +78,19 @@ def _cb(cores, index, tiles):
 
 
 def apply(raw, mask, memory_config=None):
-    """`softmax(raw + mask, dim=-1)` as float32 `[1, H, M, S]` (DRAM unless `memory_config`)."""
+    """`softmax(raw + mask, dim=-1)` as float32 `[B, H, M, S]` (DRAM unless `memory_config`)."""
     device = raw.device()
-    _, h, m, s = (int(x) for x in raw.shape)
-    mh = int(mask.shape[1])
+    b, h, m, s = (int(x) for x in raw.shape)
+    mh, mmt, mst = int(mask.shape[1]), int(mask.shape[2]) // _TILE, int(mask.shape[3]) // _TILE
     mt, st = m // _TILE, s // _TILE
-    units = h * mt
+    units = b * h * mt
     grid = device.compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
     ncores = min(units, gx * gy)
     base, extra = divmod(units, ncores)
     cores = ttnn.num_cores_to_corerangeset(ncores, grid, row_wise=True)
     y = ttnn.allocate_tensor_on_device(
-        ttnn.Shape([1, h, m, s]), ttnn.float32, ttnn.TILE_LAYOUT, device, memory_config or ttnn.DRAM_MEMORY_CONFIG
+        ttnn.Shape([b, h, m, s]), ttnn.float32, ttnn.TILE_LAYOUT, device, memory_config or ttnn.DRAM_MEMORY_CONFIG
     )
     ra, ma, ya = raw.buffer_address(), mask.buffer_address(), y.buffer_address()
     rr, rc, rw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -104,7 +107,7 @@ def apply(raw, mask, memory_config=None):
             kernel_source=_READER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[st, mt, mh] + _accessor_args(raw) + _accessor_args(mask),
+            compile_time_args=[st, mt, mh, h, mmt, mst] + _accessor_args(raw) + _accessor_args(mask),
             runtime_args=rr,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -149,7 +152,7 @@ def apply(raw, mask, memory_config=None):
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
     desc.custom_program_hash = (
-        hash(("voxtral_cpp_softmax", h, mt, st, mh, ra, ma, ya, str(memory_config))) & 0xFFFFFFFFFFFFFFFF
+        hash(("voxtral_cpp_softmax", b, h, mt, st, mh, mmt, mst, ra, ma, ya, str(memory_config))) & 0xFFFFFFFFFFFFFFFF
     )
     ttnn.generic_op([raw, mask, y], desc)
     return y

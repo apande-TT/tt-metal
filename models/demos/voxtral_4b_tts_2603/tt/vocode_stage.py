@@ -450,10 +450,14 @@ def _reflect_padded_conv(mod, conv_stub, weight_fn):
         pieces = [row(i) for i in range(padding_total, 0, -1)]
         pieces.append(x_rm)
         pieces.extend(row(length - 1 - i) for i in range(1, extra + 1))
-        padded = pieces[0] if len(pieces) == 1 else ttnn.to_layout(ttnn.concat(pieces, dim=2), ttnn.TILE_LAYOUT)
+        padded_rm = None if len(pieces) == 1 else ttnn.concat(pieces, dim=2)
+        padded = pieces[0] if padded_rm is None else ttnn.to_layout(padded_rm, ttnn.TILE_LAYOUT)
 
         padded_len = length + padding_total + extra
         cf = ttnn.transpose(ttnn.reshape(padded, [batch, padded_len, channels]), -2, -1)
+        if padded_rm is not None:
+            # The conv cuts its k taps from the row-major rows (no whole-tensor untilize per tap).
+            return conv_stub(cf, weight=weight_fn(), x_rm=padded_rm)
         return conv_stub(cf, weight=weight_fn())
 
     return run
