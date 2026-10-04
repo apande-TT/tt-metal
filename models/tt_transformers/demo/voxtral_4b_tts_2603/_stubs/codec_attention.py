@@ -411,15 +411,17 @@ def build(device, torch_module):
                 a = _bmm(weights, vh)
                 ttnn.deallocate(scores)
             a = ttnn.experimental.nlp_concat_heads(a)
+        # shard: q / k / v are dead once the attention has run -- free their L1 before o_proj.
+        for dead in (q, k, v):
+            ttnn.deallocate(dead)
         o_mem = (
             qkv_mem
             if qkv_mem is not None
             else (ttnn.L1_MEMORY_CONFIG if qk_rows * int(wo.shape[-1]) * 4 <= (16 << 20) else None)
         )
-        return ttnn.reshape(
-            # shard: a short sequence's o_proj rows stay in L1 (qkv_mem), and so do tall ones up to 16 MB.
-            _lin(a, wo, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=o_mem),
-            [batch, seq, out_dim],
-        )
+        # shard: a short sequence's o_proj rows stay in L1 (qkv_mem), and so do tall ones up to 16 MB.
+        out = _lin(a, wo, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=o_mem)
+        ttnn.deallocate(a)
+        return ttnn.reshape(out, [batch, seq, out_dim])
 
     return codec_attention

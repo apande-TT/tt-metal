@@ -29,7 +29,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import common, cpp_band_attn, cpp_softmax
+from models.demos.voxtral_4b_tts_2603.tt import common, cpp_addnorm, cpp_band_attn, cpp_softmax
 
 _SHARD_HEIGHT = 32
 # 2048 rows = 256 codec frames after the decoder's 8x upsampling, which is the whole stage's frame
@@ -255,14 +255,21 @@ def _compile_block(device, blk, mask, window=None):
 
     def block(h):
         seq = int(h.shape[-2])
-        if seq < 32 and h.memory_config().buffer_type != ttnn.BufferType.L1:
+        # shard: the float32 residual stream lives in L1 while it is <= 1024 rows (<= 4 MB, ~37 KB a core), so the
+        # residual adds and the fused norms read and write L1 instead of DRAM (was: only a short sequence). At
+        # 2048 rows its 8 MB on top of the FFN's L1 hidden clashed with the up projection's buffers. The group
+        # runners hand it back in its input's memory (common.restore_memory).
+        if common.l1_while_rows_fit(h, 1024) is not None and h.memory_config().buffer_type != ttnn.BufferType.L1:
             # shard: a short sequence's float32 residual stream (~19 KB a core) moves to L1, so the
             # residual adds and every step of the spelled-out RMS norms read and write L1 instead of DRAM.
             h = ttnn.to_memory_config(h, ttnn.L1_MEMORY_CONFIG)
         # bf16 normalised rows into the q / k / v linears (fp32 DEST; q / k come back bf16, v fp32).
         # shard: a short sequence's normed rows (q / k / v's input) in L1.
         xn_mem = ttnn.L1_MEMORY_CONFIG if int(h.shape[-2]) < 32 else None
-        xn = _rms_norm(h, attn_gamma, attn_eps, dtype=ttnn.bfloat16, memory_config=xn_mem)
+        # shard: the attention norm's bf16 rows (q / k / v's in0) land in L1 up to 2048 rows (<= 4 MB).
+        xn = _rms_norm(
+            h, attn_gamma, attn_eps, dtype=ttnn.bfloat16, memory_config=xn_mem or common.l1_while_rows_fit(h, 2048)
+        )
 
         # A sub-tile sequence (T < 32: one padded tile row a sample) keeps its small q / k / v in L1.
         qkv_mem = ttnn.L1_MEMORY_CONFIG if int(xn.shape[-2]) < 32 else None
@@ -340,6 +347,10 @@ def _compile_block(device, blk, mask, window=None):
                 a = _bmm(weights, vh)
                 ttnn.deallocate(scores)
             a = ttnn.experimental.nlp_concat_heads(a)
+        # shard: q / k / v and the normed rows they came from are dead once the attention has run -- free their L1
+        # here rather than at the block's return, so the o_proj / FFN buffers have it.
+        for dead in (q, k, v, xn):
+            ttnn.deallocate(dead)
         # shard: the float32 residual branches (o_proj, w2) land in L1 while the rows fit (<= 4096).
         res_mem = xn_mem if xn_mem is not None else common.l1_while_rows_fit(h)
         r = _lin(
@@ -349,15 +360,28 @@ def _compile_block(device, blk, mask, window=None):
             dtype=ttnn.float32,
             compute_kernel_config=_COMPUTE,
         )
+        ttnn.deallocate(a)
         if attn_scale is not None:
             r = ttnn.multiply(r, attn_scale)
-        h = ttnn.add(h, r)
+        fused_hn = None
+        if ffn_gamma is None and cpp_addnorm.supports(h, r):
+            # cpp rung: the residual add and the FFN norm as one generic_op (tt/cpp_addnorm): h and r read
+            # once, the stock float32 SFPU add, the norm's row kept in L1, the normed rows written bf16.
+            h, fused_hn = cpp_addnorm.apply(
+                h, r, ffn_eps, dtype=ttnn.bfloat16, memory_config=common.l1_while_rows_fit(h)
+            )
+        else:
+            h = ttnn.add(h, r)
         ttnn.deallocate(r)  # shard: free the attention branch's L1 before the FFN norm
 
         # shard rung: the FFN's two activations -- the normed rows w1 / w3 read and the gated product w2
         # reads (the latter only to 2048 rows) -- live in L1 (interleaved) while they fit, so in0 reads skip DRAM.
         ffn_mem = common.l1_while_rows_fit(h)
-        hn = _rms_norm(h, ffn_gamma, ffn_eps, dtype=ttnn.bfloat16, memory_config=ffn_mem)
+        hn = (
+            fused_hn
+            if fused_hn is not None
+            else _rms_norm(h, ffn_gamma, ffn_eps, dtype=ttnn.bfloat16, memory_config=ffn_mem)
+        )
         # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
         # and writes the fp32 residual branch.
         # dtype: a tall FFN hidden (>= 256 rows) is written bf8_b -- w1 / w3 write, and the gated multiply

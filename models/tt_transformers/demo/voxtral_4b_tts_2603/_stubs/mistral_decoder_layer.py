@@ -32,6 +32,7 @@ from models.demos.voxtral_4b_tts_2603.tt import (
     cpp_kv_join,
     cpp_pv_dec,
     cpp_scores_dec,
+    cpp_sqmean,
     cpp_tail_rows,
     ttl_kv,
     ttl_swiglu,
@@ -454,6 +455,10 @@ def _sq_mean(x):
     l1 = ttnn.L1_MEMORY_CONFIG
     # A one-tile-row (decode-step) mean takes the FPU reduce path (x^2 truncated to TF32 on the way in)
     # instead of the accurate SFPU one; the prefill's taller norms keep the accurate path.
+    if rows > 32 and cpp_sqmean.supports(x):
+        # cpp: the square and the row mean as ONE generic_op on two cores a tile row (tt/cpp_sqmean) -- the same
+        # float32 SFPU steps in the same order, so every mean is the stock one, bit for bit.
+        return cpp_sqmean.sq_mean(x, memory_config=l1)
     return ttnn.mean(
         ttnn.square(x, memory_config=l1),
         dim=-1,
