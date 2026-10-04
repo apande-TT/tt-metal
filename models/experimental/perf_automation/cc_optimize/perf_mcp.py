@@ -2628,6 +2628,54 @@ def _adaptive_run(cmd, cwd, env, label="device run", stall_s=None, backstop=None
     return _AdaptiveResult(rc, "".join(buf))
 
 
+def _trace_region_memory_path():
+    """Where the trace region a full-pipeline run last FIT in is remembered, keyed like the verdicts."""
+    return state_dir() / ("perf_mcp_trace_region_%s_%s.json" % (_model_key(), os.environ.get("PERF_MCP_TASK", "main")))
+
+
+def _trace_region_board_key() -> str:
+    """The board the remembered size belongs to, from what Step 1 detected; "" when it is not known.
+
+    A size that fit one board is not carried to another: per-chip trace bytes follow the per-chip work,
+    and a Blackhole box has more DRAM than a Wormhole Galaxy."""
+    try:
+        parts = [str(_ENV.get(k) or "").strip() for k in ("arch", "dram_capacity_bytes", "device_count")]
+        return ":".join(parts) if all(parts) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def remembered_trace_region() -> int:
+    """The trace region a full-pipeline run of this model last fit in on this board, or 0."""
+    key = _trace_region_board_key()
+    if not key:
+        return 0
+    try:
+        return max(0, int((json.loads(_trace_region_memory_path().read_text()) or {}).get(key) or 0))
+    except Exception:  # noqa: BLE001 -- absent or unreadable: nothing remembered
+        return 0
+
+
+def _remember_trace_region(nbytes: int) -> None:
+    """Keep the largest region a run that MEASURED something fit in. Best-effort: never costs the run."""
+    key = _trace_region_board_key()
+    try:
+        nbytes = int(nbytes or 0)
+        if not key or nbytes <= _TRACE_REGION_DEFAULT or nbytes <= remembered_trace_region():
+            return
+        p = _trace_region_memory_path()
+        try:
+            doc = json.loads(p.read_text()) or {}
+        except Exception:  # noqa: BLE001
+            doc = {}
+        doc[key] = nbytes
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(doc))
+        os.replace(str(tmp), str(p))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _grow_trace_region_and_retry(cmd, repo, env, out, r):
     """Re-run with a bigger trace region until the capture fits, growing up to the DRAM-derived
     ceiling. Model- and hardware-agnostic. Fires on EITHER of the two ways a too-small region shows up:
@@ -2932,7 +2980,11 @@ def _persist_stage_ms(
     from prose can put time in the wrong pool and be acted on. These names come from the
     PIPELINE_STAGES the model declares, measured by the harness.
     """
-    if not stage_ms:
+    # THE BATCH OUTLIVES A FAILED TIMING. The replay states its batch even when every stage raised, and
+    # returning here dropped it, so the report printed "batch: not reported" for a run that served 32.
+    # Recorded with no stages -- which every reader already treats as "not measured" -- and only when
+    # this run has no stage file yet, so a crash never overwrites timings this run did measure.
+    if not stage_ms and (not stage_batch or read_stage_ms(model=_model_key())):
         return
     try:
         p = _stage_ms_path()
@@ -3182,6 +3234,13 @@ def _run_full_pipeline_ms():
     _cur_reg = int(env.get("TT_PERF_TRACE_REGION") or 0)
     if _TRACE_REGION_DEFAULT > _cur_reg:
         env["TT_PERF_TRACE_REGION"] = str(_TRACE_REGION_DEFAULT)
+    # AND AT THE SIZE THIS MODEL LAST FIT IN ON THIS BOARD (remembered_trace_region). The grow below is
+    # per call: it fixed env for that one run and the next check started at the default again, so every
+    # check ran the model twice -- once to overflow, once for real. Qwen-Image-Edit on a WH Galaxy
+    # (2026-10-02): 192 MB -> overflow -> 1.43 GB on EVERY check, ~30 min each against ~10 for one run.
+    _mem_reg = remembered_trace_region()
+    if _mem_reg > int(env.get("TT_PERF_TRACE_REGION") or 0) and _mem_reg <= _TRACE_REGION_MAX:
+        env["TT_PERF_TRACE_REGION"] = str(_mem_reg)
     _prof = os.environ.get("PERF_MCP_PROFILE_ENV")
     if _prof:
         try:
@@ -3276,6 +3335,8 @@ def _run_full_pipeline_ms():
     stage_isl = {}
     stage_modules: dict = {}  # {stage: module paths it runs}, from TRACE_STAGE_MODULES
     stage_split: dict = {}  # {stage: data-parallel groups sharing its items}, from TRACE_STAGE_SPLIT
+    stage_seq_split: dict = {}  # {stage: chip groups splitting one request's tokens}, from TRACE_STAGE_SEQ_SPLIT
+    stage_repeats: dict = {}  # {stage: times one request runs its step}, from TRACE_STAGE_REPEATS
     # {stage: items PER REQUEST}, the legacy marker's unit. Kept apart from stage_isl, which holds
     # the TOTAL a stage states for one call.
     stage_isl_per_request = {}
@@ -3290,6 +3351,7 @@ def _run_full_pipeline_ms():
     # guess: if the run reports no topology the scorecard prints 'unknown' rather than fabricating a mesh
     # (the old hardcoded 1x1 silently mislabelled a genuine multi-chip trace as single-chip).
     dp = tp = None
+    sp = None  # the marker's sequence-parallel degree; absent on a pipeline that states none
     shard = None
     batch = 1
     decode_path = prefill_path = "n/a"
@@ -3338,6 +3400,13 @@ def _run_full_pipeline_ms():
         # a different depth. perf_test_gen has had this since a5aa6a96af ("no fixed magic number")
         # -- it was simply never wired into this path.
         out, r = _grow_trace_region_and_retry(cmd, repo, env, out, r)
+        try:
+            from agent.tracy_tool import per_token_readings as _ptr
+
+            if any(v > 0 for v in _ptr(out or "")):
+                _remember_trace_region(int(env.get("TT_PERF_TRACE_REGION") or 0))
+        except Exception:  # noqa: BLE001 -- remembering is a shortcut, never a reason to fail the run
+            pass
         # UMD prints the clamp itself, so the run tells us whether its own clock was valid. Cheaper
         # and more reliable than sampling telemetry alongside, which aliases against short runs.
         if _run_reported_clamp(out):
@@ -3461,7 +3530,12 @@ def _run_full_pipeline_ms():
                         stage_modules[_mn] = _mv
                 except Exception:  # noqa: BLE001
                     pass
-            for _marker, _into in (("TRACE_STAGE_ITEMS[", stage_isl), ("TRACE_STAGE_SPLIT[", stage_split)):
+            for _marker, _into in (
+                ("TRACE_STAGE_ITEMS[", stage_isl),
+                ("TRACE_STAGE_SPLIT[", stage_split),
+                ("TRACE_STAGE_SEQ_SPLIT[", stage_seq_split),
+                ("TRACE_STAGE_REPEATS[", stage_repeats),
+            ):
                 if _marker in line:
                     try:
                         _nm = line.split(_marker, 1)[1].split("]", 1)[0].strip()
@@ -3531,6 +3605,9 @@ def _run_full_pipeline_ms():
             m = _re.search(r"DP=(\d+)\s+TP=(\d+)", line)
             if m:
                 dp, tp = int(m.group(1)), int(m.group(2))
+                _msp = _re.search(r"\bSP=(\d+)", line)
+                if _msp:
+                    sp = int(_msp.group(1))
             if "shard_active=True" in line:
                 shard = True
             elif "shard_active=False" in line:
@@ -3569,13 +3646,17 @@ def _run_full_pipeline_ms():
         _tp_s = ("%d" % tp) if tp is not None else "unknown"
         _dp_s = ("%d" % dp) if dp is not None else "unknown"
         _shard_s = "unknown" if shard is None else str(shard)
+        # SP is named only when the run's marker stated a token split, so a scorecard that never saw one
+        # reads exactly as before and every reader of the TP=/DP= fields is untouched.
+        _sp_s = (" SP=%d" % sp) if (sp is not None and sp > 1) else ""
         sys.stderr.write(
-            "[full-pipeline-gate] PERF_SCORECARD mesh=%s TP=%s DP=%s shard=%s on_device=%s "
+            "[full-pipeline-gate] PERF_SCORECARD mesh=%s TP=%s DP=%s%s shard=%s on_device=%s "
             "ISL=%s OSL=%s batch=%d TTFT_ms=%s prefill_path=%s decode_ms=%s decode_path=%s TSU=%.2f TS=%.2f\n"
             % (
                 _mesh_s,
                 _tp_s,
                 _dp_s,
+                _sp_s,
                 _shard_s,
                 (dec is not None or pf is not None),
                 isl,
@@ -3629,6 +3710,8 @@ def _run_full_pipeline_ms():
             for _kind, _vals, _mode, _src in (
                 (_ledger().KIND_STAGE_TOKENS, stage_isl, "items", "trace_replay observed item count"),
                 (_ledger().KIND_STAGE_SPLIT, stage_split, "count", "trace_replay stated data-parallel split"),
+                (_ledger().KIND_STAGE_SEQ_SPLIT, stage_seq_split, "count", "trace_replay stated sequence split"),
+                (_ledger().KIND_STAGE_REPEATS, stage_repeats, "count", "trace_replay stated repeats per request"),
             ):
                 for _tn, _tv in (_vals or {}).items():
                     if _tn and int(_tv or 0) > 0:
@@ -7748,6 +7831,43 @@ def _stages_short_of_achievable() -> list:
         return []
 
 
+def stage_cost_weights(profile) -> dict:
+    """{stage: how much more one profiled ms of that stage costs in the real pipeline}, mean 1.
+
+    The ranking reads op gaps off the PROFILE, and the profile is a capped capture: every block
+    stack the depth knob cuts runs 2 blocks, every stack it cannot cut runs in full. So the stages
+    are not sampled alike -- Qwen-Image-Edit 2026-10-02: denoise was 31% of the profile and ~49% of
+    the full pipeline, the VAE 18.5% and ~1.4% -- and a gap in an under-sampled stage ranked below
+    an equal real cost elsewhere. Each stage's weight is its full-pipeline time (this run's own
+    trace_replay, read_stage_ms) over its profiled time (stage_buckets), divided by the mean so the
+    units stay those of the profile and a stage without both readings sits at the mean (1).
+
+    {} when either side is missing -- no replay yet, an unmarked capture -- and the ranking is then
+    exactly the unweighted one. Stage names are whatever the capture and the replay report."""
+    try:
+        full = read_stage_ms(model=_model_key()) or {}
+        ratios = {}
+        for stage, buckets in ((profile or {}).get("stage_buckets") or {}).items():
+            prof_ms = sum(float(b.get("device_ms") or 0.0) for b in (buckets or []) if isinstance(b, dict))
+            if prof_ms > 0 and float(full.get(stage) or 0.0) > 0:
+                ratios[stage] = float(full[stage]) / prof_ms
+        if len(ratios) < 2:
+            return {}  # one stage has nothing to be weighed against
+        mean = sum(ratios.values()) / len(ratios)
+        return {k: v / mean for k, v in ratios.items()}
+    except Exception:  # noqa: BLE001 -- a weight that cannot be read leaves the ranking unweighted
+        return {}
+
+
+def _blocking_order_key(b: dict, short_names) -> tuple:
+    """The work queue's order, in ONE place: an op in a stage already inside its band goes last, then
+    the largest gap first, the gap weighed by its stage's real cost (`cost_weight`, 1 when absent).
+    An op the capture could not place ("" stage) is never demoted."""
+    done = 1 if (short_names and b.get("stage") and b.get("stage") not in short_names) else 0
+    gap = b.get("eff_gap_ms") or b.get("gap_ms") or 0.0
+    return (done, -float(gap) * float(b.get("cost_weight") or 1.0))
+
+
 def stage_of_op(op, profile) -> str:
     """Which stage this op costs the most in, read from the capture, or "" when it cannot say.
 
@@ -8171,12 +8291,13 @@ def termination_check() -> dict:
     # unplaced work would bury whatever the marks failed to cover. When nothing is short the key is
     # constant and the order is exactly what it was.
     _short_names = _short_stage_names()
-    blocking.sort(
-        key=lambda b: (
-            1 if (_short_names and b.get("stage") and b.get("stage") not in _short_names) else 0,
-            -(b.get("eff_gap_ms") or b.get("gap_ms") or 0.0),
-        )
-    )
+    # WEIGHED BY WHAT THE STAGE REALLY COSTS (stage_cost_weights): the gap is read off a capped
+    # profile that samples the stages unequally. The gap itself is reported unchanged; only the
+    # order uses the weight, and with no weights every op's is 1 and the order is the old one.
+    _weights = stage_cost_weights(prof)
+    for b in blocking:
+        b["cost_weight"] = round(float(_weights.get(b.get("stage") or "", 1.0)), 4)
+    blocking.sort(key=lambda b: _blocking_order_key(b, _short_names))
     can_stop = not blocking
     # AND NOTHING MATERIAL MAY BE UNTRIED. `blocking` empties as each op's checklist fills, so an op
     # that was never SELECTED never appears there and never blocks -- which is how a run ends with

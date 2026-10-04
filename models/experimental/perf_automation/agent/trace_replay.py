@@ -27,6 +27,7 @@ FORWARD_WALL_MS.
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import time
@@ -289,6 +290,23 @@ def _replay_1cq(device, tid, iters, budget_s=0.0):
     return (time.perf_counter() - t0) / n
 
 
+def _replay(device, tid, iters, budget_s=0.0):
+    """Run whatever `_replay_1cq` is in force, handing it the budget only if it accepts one.
+
+    A perf test may install its own replay over _replay_1cq, and one written before the budget
+    existed takes three arguments. Qwen-Image-Edit 2026-10-01: its per-iteration progress replay was
+    called with four, every stage raised TypeError, and the run timed nothing for hours. The budget
+    is additive, so such a replay is called exactly as it was before it."""
+    fn = _replay_1cq
+    try:
+        inspect.signature(fn).bind(device, tid, iters, budget_s)
+    except TypeError:
+        return fn(device, tid, iters)
+    except ValueError:  # no signature to read -- call it the current way
+        pass
+    return fn(device, tid, iters, budget_s)
+
+
 # A REPLAYED TRACE DISPATCHES ONE OP. An eager pass dispatches one per ttnn call in the model --
 # 3,564 of them for a 48-layer gemma-3 prefill. Nothing else about the two paths differs by three
 # orders of magnitude, so the dispatch count is the signal, and anything above this is eager.
@@ -526,7 +544,7 @@ def _measure_stage(device, stage, budget_s=0.0):
         _report_read_set(stage.name, _n, _ws_bytes)
     tid = _capture_step_trace(device, stage.step)
     try:
-        per_s = _replay_1cq(device, tid, _REPLAY_ITERS, budget_s)
+        per_s = _replay(device, tid, _REPLAY_ITERS, budget_s)
         path = "trace+1cq"
     finally:
         try:
@@ -700,7 +718,19 @@ def measure_adapter(adapter, device) -> float:
             _dp, _tp = (_dp * _tp) // _own_tp, _own_tp
     except Exception:  # noqa: BLE001 -- an unstated split keeps the mesh's
         pass
-    print("DP=%d TP=%d shard_active=%s" % (_dp, _tp, bool(_dp * _tp > 1)), flush=True)
+    # THE PIPELINE'S OWN SEQUENCE SPLIT, when it states one (stage_marks.pipeline_sp; stage_seams.SP_ATTR):
+    # those rows are groups cutting one request's tokens, not replicas, so the replica count is what is
+    # left of the rows once they are taken out. SP=1 when unstated, which is every pipeline until now.
+    _seqp = 1
+    try:
+        from .stage_marks import pipeline_sp as _pipeline_sp
+
+        _own_sp = _pipeline_sp(getattr(adapter, "_pipe", None) or adapter)
+        if _own_sp > 1 and _dp % _own_sp == 0:
+            _dp, _seqp = _dp // _own_sp, _own_sp
+    except Exception:  # noqa: BLE001 -- an unstated split keeps every row a replica
+        pass
+    print("DP=%d TP=%d SP=%d shard_active=%s" % (_dp, _tp, _seqp, bool(_dp * _tp * _seqp > 1)), flush=True)
 
     stages = list(getattr(adapter, "stages", None) or [])
     if not stages:
@@ -749,6 +779,14 @@ def measure_adapter(adapter, device) -> float:
         _sp = int(getattr(st, "split", 0) or 0)
         if _sp > 1:
             print("TRACE_STAGE_SPLIT[%s]=%d" % (st.name, _sp), flush=True)
+        # AND HOW MANY GROUPS CUT ONE REQUEST'S TOKENS in it (stage_seams.SEQ_SPLIT), for the same reason.
+        _sq = int(getattr(st, "seq_split", 0) or 0)
+        if _sq > 1:
+            print("TRACE_STAGE_SEQ_SPLIT[%s]=%d" % (st.name, _sq), flush=True)
+        # AND HOW MANY TIMES ONE REQUEST RUNS IT (stage_seams.REPEATS): the pass below times it once.
+        _rp = int(getattr(st, "repeats", 0) or 0)
+        if _rp > 1:
+            print("TRACE_STAGE_REPEATS[%s]=%d" % (st.name, _rp), flush=True)
 
     # WHICH MODULES EACH STAGE RUNS, read from the pipeline's own code (stage_marks.stage_module_paths)
     # so perf_mcp can price each stage's compute from the weights it actually multiplies instead of
