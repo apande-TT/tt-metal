@@ -104,6 +104,7 @@ class TtQwenVAE:
         self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel=True, dtype=ttnn.float32)
         self.decoder = qwen_image_decoder3d.build(device, hf_vae.decoder, batch_parallel=True)
         _block_fp32_convs(self.encoder.encoder)
+        _block_fp32_convs(self.decoder.decoder)
         self.quant_conv = PointwiseConv32(device, hf_vae.quant_conv)
         self.post_quant_conv = PointwiseConv32(device, hf_vae.post_quant_conv)
         mean = torch.tensor(cfg.latents_mean, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
