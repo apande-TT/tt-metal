@@ -27,7 +27,9 @@ import torch
 
 import ttnn
 from models.demos.voxtral_4b_tts_2603.tt import (
+    cpp_ctx_merge,
     cpp_down_dec,
+    cpp_kv_join,
     cpp_pv_dec,
     cpp_scores_dec,
     cpp_tail_rows,
@@ -754,10 +756,16 @@ def _prefill_sdpa(q, k, v, kv_cache, keep=None):
             q, mask = _last_of_each(q, keep[0]), keep[1]
         # The joined k/v is SDPA's alone (the cache is built from pk/k below) and every q chunk
         # streams it whole, so it sits in L1 (~1.6 MB each); the mask SDPA insists on reading from DRAM.
+        if cpp_kv_join.supports(pk, k, pv, v):
+            # cpp: both joined operands written by ONE generic_op (tt/cpp_kv_join), tile for tile.
+            jk, jv = cpp_kv_join.join(pk, k, pv, v, memory_config=ttnn.L1_MEMORY_CONFIG)
+        else:
+            jk = ttnn.concat([pk, k], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG)
+            jv = ttnn.concat([pv, v], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG)
         a = ttnn.transformer.scaled_dot_product_attention(
             q,
-            ttnn.concat([pk, k], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG),
-            ttnn.concat([pv, v], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG),
+            jk,
+            jv,
             is_causal=False,
             attn_mask=mask,
             scale=1.0,
@@ -1280,23 +1288,34 @@ def build(device, torch_module):
             pv = cpp_pv_dec.apply(e, values)  # the C++ decode P@V
         else:
             pv = _bmm(e, values, memory_config=l1)
-        ctx = ttnn.divide(pv, ttnn.sum(e, dim=-1, keepdim=True, memory_config=l1))
-        ttnn.deallocate(e)
-        if cut_kv:
-            ttnn.deallocate(keys)
-            ttnn.deallocate(values)
-        # Relabelling the context to its `groups` real rows is a zero-cost tile view, so the untilize
-        # drops the pad rows itself instead of writing all 32 and slicing them off.
-        valid = ttnn.reshape(
-            ctx,
-            ttnn.Shape([batch, n_kv_heads, groups, head_dim]),
-            ttnn.Shape([batch, n_kv_heads, q_rows, head_dim]),
-        )
-        merged = ttnn.to_layout(
-            ttnn.reshape(ttnn.to_layout(valid, ttnn.ROW_MAJOR_LAYOUT), [1, 1, batch, n_heads * head_dim]),
-            ttnn.TILE_LAYOUT,
-        )
-        ttnn.deallocate(ctx)
+        ssum = ttnn.sum(e, dim=-1, keepdim=True, memory_config=l1)
+        if groups * n_kv_heads == n_heads and cpp_ctx_merge.supports(pv, ssum, groups):
+            # structural: the normalise and the head merge in ONE generic_op (tt/cpp_ctx_merge) -- each merged
+            # tile's batch rows gathered from the P@V tiles and divided by their row sums; the divide, the
+            # untilize, the row-major relayout and the tilize are gone. The same bits.
+            merged = cpp_ctx_merge.apply(pv, ssum, groups)
+            ttnn.deallocate(e)
+            if cut_kv:
+                ttnn.deallocate(keys)
+                ttnn.deallocate(values)
+        else:
+            ctx = ttnn.divide(pv, ssum)
+            ttnn.deallocate(e)
+            if cut_kv:
+                ttnn.deallocate(keys)
+                ttnn.deallocate(values)
+            # Relabelling the context to its `groups` real rows is a zero-cost tile view, so the untilize
+            # drops the pad rows itself instead of writing all 32 and slicing them off.
+            valid = ttnn.reshape(
+                ctx,
+                ttnn.Shape([batch, n_kv_heads, groups, head_dim]),
+                ttnn.Shape([batch, n_kv_heads, q_rows, head_dim]),
+            )
+            merged = ttnn.to_layout(
+                ttnn.reshape(ttnn.to_layout(valid, ttnn.ROW_MAJOR_LAYOUT), [1, 1, batch, n_heads * head_dim]),
+                ttnn.TILE_LAYOUT,
+            )
+            ttnn.deallocate(ctx)
         out = _lin(
             ttnn.reshape(merged, [1, 1, batch, n_heads * head_dim]),
             wo,

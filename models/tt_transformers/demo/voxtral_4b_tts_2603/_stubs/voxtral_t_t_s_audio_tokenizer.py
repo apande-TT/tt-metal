@@ -188,6 +188,13 @@ def _fold_linear(x, w, **kwargs):
     if lead == 1:
         return ttnn.linear(x, w, **kwargs)
     rows = lead * shape[-2]
+    padded = lead * (-(-shape[-2] // 32) * 32)
+    if shape[-2] % 32 != 0 and padded >= 128 and "program_config" not in kwargs:
+        # grid: an unaligned per-sample length -- the 4-D rows go straight into a full-grid 2D config (it folds the
+        # batch over each sample's tile-padded rows), so neither side needs the fold's row-major relayout.
+        cfg = _mcast_cfg(x, w, padded, kwargs.get("dtype") or x.dtype)
+        if cfg is not None:
+            return ttnn.linear(x, w, program_config=cfg, **kwargs)
     if rows >= 256 and rows % 32 == 0 and "program_config" not in kwargs:
         cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
