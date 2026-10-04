@@ -449,8 +449,9 @@ def _compile_causal_conv_transpose1d(device, mod):
     wide = cpp_upsample2.wide_weight(taps) if cpp_upsample2.enabled() and out_channels % 32 == 0 else None
 
     def _wide_linear(x, w, **kwargs):
-        # The tall codec linears' own full-grid config and HiFi2 (what the aligned per-tap products ran).
-        cfg = _mcast_cfg(x, w, int(x.shape[-2]), ttnn.float32)
+        # The tall codec linears' own full-grid config and HiFi2 (what the aligned per-tap products ran), over
+        # the batch-folded, tile-padded rows of the 4-D input.
+        cfg = _mcast_cfg(x, w, cpp_upsample2.tile_rows(x), ttnn.float32)
         if cfg is not None:
             kwargs["program_config"] = cfg
             kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(

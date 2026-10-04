@@ -125,7 +125,7 @@ def build(device, torch_module):
     wide = cpp_upsample2.wide_weight(taps) if cpp_upsample2.enabled() and out_channels % 32 == 0 else None
 
     def _wide_linear(x, w, **kwargs):
-        return ttnn.linear(x, w, program_config=_grid_cfg(x, w, int(x.shape[-2])), **kwargs)
+        return ttnn.linear(x, w, program_config=_grid_cfg(x, w, cpp_upsample2.tile_rows(x)), **kwargs)
 
     def parametrized_conv_transpose1d(x, **kwargs):
         # `[B, C, L]` in, `[B, C, 2L + 2]` out. The leading bound comes from the TENSOR, never from
