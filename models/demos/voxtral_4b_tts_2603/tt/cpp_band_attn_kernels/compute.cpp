@@ -33,6 +33,9 @@ constexpr uint32_t OUT_NARROW = get_compile_time_arg_val(1);  // 1: the context 
 // real rows get the very same arithmetic; rows 16..31 (padding nobody reads) keep stale finite values.
 constexpr uint32_t HALF = get_compile_time_arg_val(2);
 constexpr VectorMode VM = HALF ? VectorMode::R : VectorMode::RC;
+// QK_NARROW: q / k arrive as bf16 (the fused codec qk-norm's output). The unpacker takes their format for the
+// score product only; every other operand (the SFPU steps' tiles, P, v) is float32 as before.
+constexpr uint32_t QK_NARROW = get_compile_time_arg_val(3);
 
 #define VM_BINARY(FN, OP, RM_ARGS, a, b, o) \
     MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, FN, (APPROX, OP, 8, DST_ACCUM_MODE RM_ARGS), a, b, o, VM)))
@@ -100,6 +103,9 @@ void kernel_main() {
         // S = q @ k^T over the band, one tile at a time, summed over head_dim in fp32 DEST.
         cb_wait_front(cb_q, DT);
         cb_wait_front(cb_k, NB * DT);
+        if constexpr (QK_NARROW) {
+            reconfig_data_format<SrcOrder::Reverse>(cb_q, cb_k);
+        }
         matmul_init(cb_q, cb_k, 1);
         for (uint32_t j = 0; j < NB; ++j) {
             tile_regs_acquire();
@@ -115,6 +121,11 @@ void kernel_main() {
         }
         cb_pop_front(cb_q, DT);
         cb_pop_front(cb_k, NB * DT);
+        if constexpr (QK_NARROW) {
+            // Back to the float32 matmul-operand state the all-float32 kernel runs in from here on (SrcA = v's
+            // format, SrcB = P's): the SFPU steps' copies unpack straight to DEST from it, and P @ v needs it.
+            reconfig_data_format<SrcOrder::Reverse>(cb_p, cb_v);
+        }
 
         // s = S * scale + mask
         cb_wait_front(cb_raw, NB);

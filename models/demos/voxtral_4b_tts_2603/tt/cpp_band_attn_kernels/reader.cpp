@@ -28,7 +28,9 @@ void kernel_main() {
     // 0: q / k / v are [B, H, T, D]; 1: they are the MERGED [B, 1, T, H * D] (head h in column tiles
     // h * DT ..), read in place -- no concat + head split before the kernel, no head merge after it.
     constexpr uint32_t MERGED = get_compile_time_arg_val(5);
-    constexpr auto aq = TensorAccessorArgs<6>();
+    // q / k tile bytes: 4096 (float32) or 2048 (bf16, the fused codec qk-norm's output).
+    constexpr uint32_t QK_BYTES = get_compile_time_arg_val(6);
+    constexpr auto aq = TensorAccessorArgs<7>();
     constexpr auto ak = TensorAccessorArgs<aq.next_compile_time_args_offset()>();
     constexpr auto av = TensorAccessorArgs<ak.next_compile_time_args_offset()>();
     constexpr auto am = TensorAccessorArgs<av.next_compile_time_args_offset()>();
@@ -74,15 +76,15 @@ void kernel_main() {
         const uint32_t lm = get_write_ptr(cb_mask);
         for (uint32_t d = 0; d < DT; ++d) {
             noc_async_read_page(page(bh, r, d), sq, lq);
-            lq += tile_bytes;
+            lq += QK_BYTES;
         }
         for (uint32_t d = 0; d < DT; ++d) {
             noc_async_read_page(page(bh, prev, d), sk, lk);
-            lk += tile_bytes;
+            lk += QK_BYTES;
         }
         for (uint32_t d = 0; d < DT; ++d) {
             noc_async_read_page(page(bh, r, d), sk, lk);
-            lk += tile_bytes;
+            lk += QK_BYTES;
         }
         noc_async_read_page(mrow + (r > 0 ? r - 1 : 1), sm, lm);
         noc_async_read_page(mrow + r, sm, lm + tile_bytes);

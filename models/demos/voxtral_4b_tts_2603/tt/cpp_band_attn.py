@@ -52,7 +52,7 @@ def _accessor_args(tensor):
 
 
 def supports(q, k, v, mask, window) -> bool:
-    """q / k / v `[B, H, T, D]` float32 TILE (T tile-aligned, D <= 128); `mask` `[1, H, MM, MS]` float32 TILE
+    """q / k / v `[B, H, T, D]` float32 TILE (q / k may both be bf16; T tile-aligned, D <= 128); `mask` `[1, H, MM, MS]` float32 TILE
     with MM >= T and at least two column tiles; `window` < 32, so a row's keys never leave its band."""
     try:
         b, h, t, d = (int(x) for x in q.shape)
@@ -72,7 +72,9 @@ def supports(q, k, v, mask, window) -> bool:
             and t % _TILE == 0
             and d % _TILE == 0
             and d // _TILE <= 4
-            and all(x.dtype == ttnn.float32 for x in (q, k, v, mask))
+            and q.dtype in (ttnn.float32, ttnn.bfloat16)
+            and k.dtype == q.dtype
+            and all(x.dtype == ttnn.float32 for x in (v, mask))
             and all(x.layout == ttnn.TILE_LAYOUT for x in (q, k, v, mask))
             and not any(x.is_sharded() for x in (q, k, v, mask))
         )
@@ -107,7 +109,9 @@ def supports_merged(q, k, v, mask, window, n_heads) -> bool:
             and t > 0
             and d % _TILE == 0
             and d // _TILE <= 4
-            and all(x.dtype == ttnn.float32 for x in (q, k, v, mask))
+            and q.dtype in (ttnn.float32, ttnn.bfloat16)
+            and k.dtype == q.dtype
+            and all(x.dtype == ttnn.float32 for x in (v, mask))
             and all(x.layout == ttnn.TILE_LAYOUT for x in (q, k, v, mask))
             and not any(x.is_sharded() for x in (q, k, v, mask))
         )
@@ -165,6 +169,10 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None, dtype=ttn
         memory_config or ttnn.DRAM_MEMORY_CONFIG,
     )
     scale_bits = struct.unpack("<I", struct.pack("<f", float(scale)))[0]
+    # dtype: bf16 q / k (the fused codec qk-norm's output) are read as the score product's operands as they are --
+    # the kernel switches the unpacker to their format around that product only.
+    qk_narrow = q.dtype == ttnn.bfloat16
+    qk_bytes = 2048 if qk_narrow else _FP32_TILE
     qa, ka, va, ma, ya = (x.buffer_address() for x in (q, k, v, mask, y))
     rr, rc, rw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     u0 = 0
@@ -180,7 +188,7 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None, dtype=ttn
             kernel_source=_READER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt, rt, h, mmt, mst, int(merged)]
+            compile_time_args=[dt, rt, h, mmt, mst, int(merged), qk_bytes]
             + _accessor_args(q)
             + _accessor_args(k)
             + _accessor_args(v)
@@ -192,7 +200,7 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None, dtype=ttn
             kernel_source=_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt, int(dtype != ttnn.float32), half],
+            compile_time_args=[dt, int(dtype != ttnn.float32), half, int(qk_narrow)],
             runtime_args=rc,
             config=ttnn.ComputeConfigDescriptor(),
         ),
@@ -217,8 +225,8 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None, dtype=ttn
         modes[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
     cbs = [
-        _cb(cores, 0, 2 * dt),  # q tile row
-        _cb(cores, 1, 4 * dt),  # k band (2 tile rows)
+        _bf16_cb(cores, 0, 2 * dt) if qk_narrow else _cb(cores, 0, 2 * dt),  # q tile row
+        _bf16_cb(cores, 1, 4 * dt) if qk_narrow else _cb(cores, 1, 4 * dt),  # k band (2 tile rows)
         _cb(cores, 2, 4 * dt),  # v band (2 tile rows)
         _cb(cores, 3, 2),  # raw scores
         _cb(cores, 4, 1),  # scale tile
@@ -233,7 +241,7 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None, dtype=ttn
         _cb(cores, 16, 2 * dt) if dtype == ttnn.float32 else _bf16_cb(cores, 16, 2 * dt),  # context tile row
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-    key = ("voxtral_cpp_band_attn", b, h, rt, dt, mmt, mst, merged, half, scale_bits, qa, ka, va, ma, ya)
+    key = ("voxtral_cpp_band_attn", b, h, rt, dt, mmt, mst, merged, half, qk_narrow, scale_bits, qa, ka, va, ma, ya)
     desc.custom_program_hash = hash(key + (str(memory_config), str(dtype))) & 0xFFFFFFFFFFFFFFFF
     ttnn.generic_op([q, k, v, mask, y], desc)
     return y

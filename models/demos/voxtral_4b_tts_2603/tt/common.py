@@ -746,3 +746,51 @@ def l1_while_rows_fit(x, max_rows=4096):
     for d in list(x.shape)[:-1]:
         rows *= int(d)
     return ttnn.L1_MEMORY_CONFIG if rows <= max_rows else None
+
+
+_CODEC_NORM_CFG = []
+
+
+def codec_fused_norm() -> bool:
+    return os.environ.get("VOXTRAL_CODEC_FUSED_NORM", "1") == "1"
+
+
+def codec_rms_norm(x, gamma, eps, dtype=None, memory_config=None):
+    """The CODEC's RMS norm `x * rsqrt(mean(x^2) + eps) * gamma` as ONE stock `ttnn.rms_norm`.
+
+    structural: the spelled-out form is five ops (square, mean, + eps, rsqrt, multiply; six with a
+    gamma), each a full pass over the rows -- on a 4096-row codec block that is ~200 us a norm, and
+    the codec runs three to four norms a block. The fused op reads the rows once per pass inside one
+    kernel. Run at HiFi4 with float32 DEST and an exact rsqrt: its error is the FPU's tf32 operand
+    rounding (~1e-3 relative), not the bf16 accumulation that put the default-config op at a 1.029 norm
+    ratio. The codec is feed-forward (nothing downstream rounds onto a grid), so that error reaches the
+    waveform as noise; the acoustic / text stacks keep their exact spelled-out norms.
+
+    The op writes its input's dtype, so another `dtype` is one typecast, from an L1 intermediate.
+    """
+    import ttnn
+
+    if not _CODEC_NORM_CFG:
+        _CODEC_NORM_CFG.append(
+            ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                packer_l1_acc=False,
+            )
+        )
+    want = dtype or x.dtype
+    if want == x.dtype:
+        return ttnn.rms_norm(
+            x, epsilon=eps, weight=gamma, memory_config=memory_config, compute_kernel_config=_CODEC_NORM_CFG[0]
+        )
+    y = ttnn.rms_norm(
+        x,
+        epsilon=eps,
+        weight=gamma,
+        memory_config=l1_while_rows_fit(x) or ttnn.DRAM_MEMORY_CONFIG,
+        compute_kernel_config=_CODEC_NORM_CFG[0],
+    )
+    out = ttnn.typecast(y, want, memory_config=memory_config or x.memory_config())
+    ttnn.deallocate(y)
+    return out

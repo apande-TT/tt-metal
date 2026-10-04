@@ -31,6 +31,9 @@ _WRITER = str(_DIR / "writer.cpp")
 _TILE = 32
 _FP32_TILE = 4096
 _NUM_CBS = 64
+# shard: the wide product Y lands in L1 (interleaved over the grid) while it fits this many bytes (the
+# output_proj caller runs the product at HiFi2).
+_Y_L1_BYTES = 16 * 1024 * 1024
 
 
 def enabled() -> bool:
@@ -44,13 +47,12 @@ def _accessor_args(tensor):
     return list(acc.get_compile_time_args())
 
 
-def _cb(cores, index, tiles):
+def _cb(cores, index, tiles, fmt=ttnn.float32):
+    tile_bytes = _FP32_TILE if fmt == ttnn.float32 else _FP32_TILE // 2
     return ttnn.CBDescriptor(
-        total_size=tiles * _FP32_TILE,
+        total_size=tiles * tile_bytes,
         core_ranges=cores,
-        format_descriptors=[
-            ttnn.CBFormatDescriptor(buffer_index=index, data_format=ttnn.float32, page_size=_FP32_TILE)
-        ],
+        format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=fmt, page_size=tile_bytes)],
     )
 
 
@@ -62,13 +64,14 @@ def shift_add(
 ):
     """`out[b, t, c] = sum_k Y[b * rows_per_sample + src(t + k), k * tap_cols + c]`, float32 `[B, 1, out_rows, out_cols]`.
 
-    `y` is `[1, 1, batch * rows_per_sample, taps * tap_cols]` float32 TILE (rows_per_sample and tap_cols
-    tile multiples). With no `pad_mode`, Y holds the padded rows (src(p) = p); with `pad_mode` 'reflect' or
+    `y` is `[1, 1, batch * rows_per_sample, taps * tap_cols]` float32 or bfloat16 TILE (rows_per_sample and
+    tap_cols tile multiples; a bf16 Y is gathered as bf16 tiles and summed in fp32 DEST). With no `pad_mode`, Y holds the padded rows (src(p) = p); with `pad_mode` 'reflect' or
     'replicate', Y holds the `real_rows` unpadded rows and padded row p resolves to the row its padding copies
     (`pad_front` rows in front, the rest behind)."""
     device = y.device()
     rpt, ct = rows_per_sample // _TILE, tap_cols // _TILE
     rt, ot = -(-out_rows // _TILE), -(-out_cols // _TILE)
+    y_fmt = ttnn.bfloat16 if y.dtype == ttnn.bfloat16 else ttnn.float32
     yrt, yct = int(y.shape[-2]) // _TILE, int(y.shape[-1]) // _TILE
     units = batch * rt * ot
     grid = device.compute_with_storage_grid_size()
@@ -99,6 +102,7 @@ def shift_add(
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[taps, rpt, rt, ot, ct, yct, _MODES[pad_mode], int(pad_front), int(real_rows)]
+            + [2 if y_fmt == ttnn.bfloat16 else 4]
             + _accessor_args(y),
             runtime_args=rr,
             config=ttnn.ReaderConfigDescriptor(),
@@ -125,16 +129,36 @@ def shift_add(
     cfg.fp32_dest_acc_en = True
     cfg.math_approx_mode = False
     modes = [ttnn.UnpackToDestMode.Default] * _NUM_CBS
-    modes[0] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    if y_fmt == ttnn.float32:
+        modes[0] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
     cbs = [
-        _cb(cores, 0, 2 * taps),  # shifted tap tiles
-        _cb(cores, 1, 2),  # reader scratch: the two Y tile rows a shift spans
+        _cb(cores, 0, 2 * taps, y_fmt),  # shifted tap tiles
+        _cb(cores, 1, 2 * taps, y_fmt),  # reader scratch: the two Y tile rows each tap's shift spans
         _cb(cores, 16, 2),  # summed output tile
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
     desc.custom_program_hash = (
-        hash(("voxtral_cpp_shift_add", batch, rpt, rt, ot, ct, taps, yct, yrt, pad_mode, pad_front, real_rows, ya, oa, str(memory_config)))
+        hash(
+            (
+                "voxtral_cpp_shift_add",
+                batch,
+                rpt,
+                rt,
+                ot,
+                ct,
+                taps,
+                yct,
+                yrt,
+                pad_mode,
+                pad_front,
+                real_rows,
+                str(y_fmt),
+                ya,
+                oa,
+                str(memory_config),
+            )
+        )
         & 0xFFFFFFFFFFFFFFFF
     )
     ttnn.generic_op([y, out], desc)
@@ -180,15 +204,26 @@ def wide_weight(taps):
     return ttnn.concat(blocks, dim=-1), len(taps), cout
 
 
-def conv_wide_unpadded(x_cl, wide, pad_mode, pad_front, out_len, compute_kernel_config, linear=None):
+def _y_mem(x, w, y_dtype):
+    """shard: Y in L1 while it fits `_Y_L1_BYTES` (the product writes it and the shift-add gathers it there)."""
+    es = 4 if y_dtype == ttnn.float32 else 2
+    nbytes = int(x.shape[-2]) * int(w.shape[-1]) * es
+    return {"memory_config": ttnn.L1_MEMORY_CONFIG} if nbytes <= _Y_L1_BYTES else {}
+
+
+def conv_wide_unpadded(
+    x_cl, wide, pad_mode, pad_front, out_len, compute_kernel_config, linear=None, y_dtype=ttnn.bfloat16
+):
     """The same conv straight from the UNPADDED channels-last TILE rows `x_cl` `[B, 1, L, C_in]` (L a tile
     multiple): Y = X @ W_wide on the L real rows, and the reflect / replicate padding resolved in the shift-add
-    (a padded row's product is the product of the row it copies) -- no untilize, no edge-row concat, no tilize."""
+    (a padded row's product is the product of the row it copies) -- no untilize, no edge-row concat, no tilize.
+    dtype: the wide product Y is written `y_dtype` (bf16 by default: half the bytes of its write and of the
+    shift-add's reads; the K taps still sum in fp32 DEST)."""
     w, k, cout = wide
     batch, _, length, cin = (int(v) for v in x_cl.shape)
     tap_cols = -(-cout // _TILE) * _TILE
     x = ttnn.reshape(x_cl, [1, 1, batch * length, cin])
-    y = (linear or ttnn.linear)(x, w, compute_kernel_config=compute_kernel_config, dtype=ttnn.float32)
+    y = (linear or ttnn.linear)(x, w, compute_kernel_config=compute_kernel_config, dtype=y_dtype, **_y_mem(x, w, y_dtype))
     out = shift_add(y, batch, length, out_len, k, tap_cols, cout, pad_mode=pad_mode, pad_front=pad_front, real_rows=length)
     ttnn.deallocate(y)
     return out
@@ -211,11 +246,11 @@ def supports_unpadded(x_cl, pad_mode) -> bool:
         return False
 
 
-def conv_wide(x_rm, wide, out_len, compute_kernel_config, linear=None):
+def conv_wide(x_rm, wide, out_len, compute_kernel_config, linear=None, y_dtype=ttnn.bfloat16):
     """`out[b, t] = sum_k x_rm[b, 0, t + k] @ W_k` for t < out_len, float32 `[B, 1, out_len, C_out]` TILE.
 
     `x_rm` is `[B, 1, Lp, C_in]` float32 ROW_MAJOR (Lp >= out_len + K - 1); `wide` is `wide_weight(taps)`.
-    `linear(x, w, **kw)` (default ttnn.linear) runs the one wide product."""
+    `linear(x, w, **kw)` (default ttnn.linear) runs the one wide product, written `y_dtype`."""
     w, k, cout = wide
     batch, _, lp, cin = (int(v) for v in x_rm.shape)
     tap_cols = -(-cout // _TILE) * _TILE
@@ -224,7 +259,7 @@ def conv_wide(x_rm, wide, out_len, compute_kernel_config, linear=None):
     if rp > lp:
         x_rm = ttnn.concat([x_rm, _zeros_rm(device, [batch, 1, rp - lp, cin], x_rm.dtype)], dim=2)
     x = ttnn.to_layout(ttnn.reshape(x_rm, [1, 1, batch * rp, cin]), ttnn.TILE_LAYOUT)
-    y = (linear or ttnn.linear)(x, w, compute_kernel_config=compute_kernel_config, dtype=ttnn.float32)
+    y = (linear or ttnn.linear)(x, w, compute_kernel_config=compute_kernel_config, dtype=y_dtype, **_y_mem(x, w, y_dtype))
     ttnn.deallocate(x)
     out = shift_add(y, batch, rp, out_len, k, tap_cols, cout)
     ttnn.deallocate(y)

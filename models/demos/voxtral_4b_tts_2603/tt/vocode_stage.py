@@ -138,8 +138,9 @@ def _mcast_cfg(x, w, rows, out_dtype):
                     kb = next(
                         (
                             c
-                            # grid: a short M (<= 2 tile rows a core) takes a K block of 16 -- half the K steps.
-                            for c in ((16, 8, 4, 2, 1) if pm <= 2 else (8, 4, 2, 1))
+                            # grid: a short M (<= 2 tile rows a core) or a long K (>= 64 tiles) takes a K block of 16 --
+                            # half the K steps (half the float32 partial packs of the out block).
+                            for c in ((16, 8, 4, 2, 1) if pm <= 2 or kt >= 64 else (8, 4, 2, 1))
                             if kt % c == 0 and bh * bw * os_ + 2 * c * (bh * xs + bw * ws) <= _L1_BUDGET
                         ),
                         None,
@@ -278,6 +279,10 @@ def _rms_norm(x, gamma, eps, dtype=None, memory_config=None):
         # does not FillPad the padding first, and the result is viewed back without a fill.
         out = _rms_norm(ttnn.reshape(x, padded, padded), gamma, eps, dtype=dtype, memory_config=memory_config)
         return ttnn.reshape(out, shape, padded, skip_padding_fill=True)
+    if common.codec_fused_norm():
+        # structural: the whole norm as ONE stock ttnn.rms_norm at HiFi4 / fp32 DEST / exact rsqrt
+        # (common.codec_rms_norm) instead of five or six full passes over the rows.
+        return common.codec_rms_norm(x, gamma, eps, dtype=dtype, memory_config=memory_config)
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
     # `dtype`: the normalised rows can be written narrower (bf16) for the linears that read them;
     # `memory_config`: and placed where they read them from.
@@ -385,6 +390,7 @@ def _attention_block(device, blk, attention_stub):
         if attn_scale is not None:
             r = ttnn.multiply(r, attn_scale)
         h = ttnn.add(h, r)
+        ttnn.deallocate(r)  # shard: free the attention branch's L1 before the FFN norm
 
         # shard rung: the FFN's two activations -- the normed rows w1 / w3 read and the gated product w2
         # reads (the latter only to 2048 rows) -- live in L1 (interleaved) while they fit, so in0 reads skip DRAM.
@@ -412,7 +418,15 @@ def _attention_block(device, blk, attention_stub):
         ttnn.deallocate(gate)
         ttnn.deallocate(up)
         # shard: the float32 w2 residual branch lands in L1 while the rows fit (<= 4096).
-        r = _lin(gated, w2, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=ffn_mem)
+        # fidelity: the FFN down at LoFi on its tall full-grid path (fp32 DEST kept).
+        r = _lin(
+            gated,
+            w2,
+            compute_kernel_config=_COMPUTE,
+            dtype=ttnn.float32,
+            memory_config=ffn_mem,
+            fidelity=ttnn.MathFidelity.LoFi,
+        )
         ttnn.deallocate(gated)
         if ffn_scale is not None:
             r = ttnn.multiply(r, ffn_scale)

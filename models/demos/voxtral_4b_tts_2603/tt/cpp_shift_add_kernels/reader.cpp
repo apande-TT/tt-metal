@@ -38,6 +38,16 @@ inline uint32_t src_row(uint32_t p) {
     }
 }
 
+// The 32 padded rows p .. p + 31 all map linearly (src = p - P, or src = p for MODE 0): no padding row among them.
+template <uint32_t MODE, uint32_t P, uint32_t L, uint32_t LAST>
+inline bool interior(uint32_t p) {
+    if constexpr (MODE == 0) {
+        return p + 31 <= LAST;
+    } else {
+        return p >= P && p + 31 - P < L;
+    }
+}
+
 void kernel_main() {
     const uint32_t y_addr = get_arg_val<uint32_t>(0);
     const uint32_t u0 = get_arg_val<uint32_t>(1);
@@ -52,60 +62,87 @@ void kernel_main() {
     constexpr uint32_t MODE = get_compile_time_arg_val(6);  // 0 pre-padded, 1 reflect, 2 replicate
     constexpr uint32_t P = get_compile_time_arg_val(7);     // front padding rows (MODE 1 / 2)
     constexpr uint32_t L = get_compile_time_arg_val(8);     // real rows a sample (MODE 1 / 2)
-    constexpr auto ay = TensorAccessorArgs<9>();
+    constexpr uint32_t ES = get_compile_time_arg_val(9);    // Y element bytes: 4 float32, 2 bfloat16
+    constexpr auto ay = TensorAccessorArgs<10>();
     const auto sy = TensorAccessor(ay, y_addr);
     // The last Y row a source may be (MODE 0 clamps into the sample's block; padding rows of the output only).
     constexpr uint32_t LAST = RPT * 32 - 1;
 
     constexpr uint32_t cb_in = 0;
     constexpr uint32_t cb_scratch = 1;
-    constexpr uint32_t tile_bytes = 4096;  // fp32
-    constexpr uint32_t seg = 64;           // 16 fp32 values: one face row
-    constexpr uint32_t face = 1024;
+    constexpr uint32_t tile_bytes = 1024 * ES;
+    constexpr uint32_t seg = 16 * ES;  // 16 values: one face row (32 B for bf16 -- L1 reads stay 16 B aligned)
+    constexpr uint32_t face = 256 * ES;
 
-    cb_reserve_back(cb_scratch, 2);
+    // structural: a unit's 2 K source tiles are read in ONE batch (one barrier), then its K shifted tiles are
+    // gathered in one batch (one barrier) -- not a read / barrier / gather / barrier round trip per tap.
+    cb_reserve_back(cb_scratch, 2 * K);
     const uint32_t scratch = get_write_ptr(cb_scratch);
 
     for (uint32_t u = u0; u < u0 + nu; ++u) {
         const uint32_t c = u % OT;
         const uint32_t r = (u / OT) % RT;
         const uint32_t b = u / (OT * RT);
+        uint32_t first[K];
         for (uint32_t k = 0; k < K; ++k) {
             const uint32_t col = k * CT + c;
             const uint32_t p0 = 32 * r + k;
-            // The source rows of this tap's 32 rows span at most two Y tile rows: find the first.
-            uint32_t lo = src_row<MODE, P, L, LAST>(p0);
-            for (uint32_t i = 1; i < 32; ++i) {
-                const uint32_t s = src_row<MODE, P, L, LAST>(p0 + i);
-                lo = s < lo ? s : lo;
+            // The source rows of this tap's 32 rows span at most two Y tile rows: find the first (an interior
+            // run of rows maps linearly, so its first row is the minimum; only an edge run is scanned).
+            uint32_t lo;
+            if (interior<MODE, P, L, LAST>(p0)) {
+                lo = p0 - (MODE == 0 ? 0 : P);
+            } else {
+                lo = src_row<MODE, P, L, LAST>(p0);
+                for (uint32_t i = 1; i < 32; ++i) {
+                    const uint32_t s = src_row<MODE, P, L, LAST>(p0 + i);
+                    lo = s < lo ? s : lo;
+                }
             }
             const uint32_t t0 = lo >> 5;
             const uint32_t t1 = t0 + 1 < RPT ? t0 + 1 : t0;
-            noc_async_read_page((b * RPT + t0) * YCT + col, sy, scratch);
-            noc_async_read_page((b * RPT + t1) * YCT + col, sy, scratch + tile_bytes);
-            noc_async_read_barrier();
-            cb_reserve_back(cb_in, 1);
-            const uint32_t dst0 = get_write_ptr(cb_in);
+            first[k] = t0;
+            noc_async_read_page((b * RPT + t0) * YCT + col, sy, scratch + (2 * k) * tile_bytes);
+            noc_async_read_page((b * RPT + t1) * YCT + col, sy, scratch + (2 * k + 1) * tile_bytes);
+        }
+        noc_async_read_barrier();
+        cb_reserve_back(cb_in, K);
+        const uint32_t base = get_write_ptr(cb_in);
+        for (uint32_t k = 0; k < K; ++k) {
+            const uint32_t p0 = 32 * r + k;
+            const uint32_t t0 = first[k];
+            const uint32_t dst0 = base + k * tile_bytes;
+            const uint32_t tap = scratch + (2 * k) * tile_bytes;
+            const bool linear = interior<MODE, P, L, LAST>(p0);
+            const uint32_t s_first = linear ? p0 - (MODE == 0 ? 0 : P) - 32 * t0 : 0;
             uint32_t i = 0;
             while (i < 32) {
-                const uint32_t s = src_row<MODE, P, L, LAST>(p0 + i) - 32 * t0;
-                // Extend the run while both sides stay contiguous inside one 16-row face.
-                uint32_t n = 1;
-                while (i + n < 32 && ((i + n) & 15) != 0 && ((s + n) & 15) != 0 &&
-                       src_row<MODE, P, L, LAST>(p0 + i + n) - 32 * t0 == s + n) {
-                    ++n;
+                uint32_t s, n;
+                if (linear) {
+                    // Interior rows are contiguous: a run ends only at a 16-row face boundary on either side.
+                    s = s_first + i;
+                    const uint32_t a = 16 - (i & 15), bnd = 16 - (s & 15);
+                    n = a < bnd ? a : bnd;
+                } else {
+                    s = src_row<MODE, P, L, LAST>(p0 + i) - 32 * t0;
+                    // Extend the run while both sides stay contiguous inside one 16-row face.
+                    n = 1;
+                    while (i + n < 32 && ((i + n) & 15) != 0 && ((s + n) & 15) != 0 &&
+                           src_row<MODE, P, L, LAST>(p0 + i + n) - 32 * t0 == s + n) {
+                        ++n;
+                    }
                 }
                 const uint32_t ts = s >> 5;
                 const uint32_t ri = s & 31;
                 for (uint32_t f = 0; f < 2; ++f) {
-                    const uint32_t src = scratch + ts * tile_bytes + ((ri >> 4) * 2 + f) * face + (ri & 15) * seg;
+                    const uint32_t src = tap + ts * tile_bytes + ((ri >> 4) * 2 + f) * face + (ri & 15) * seg;
                     const uint32_t dst = dst0 + ((i >> 4) * 2 + f) * face + (i & 15) * seg;
                     noc_async_read(get_noc_addr(src), dst, n * seg);
                 }
                 i += n;
             }
-            noc_async_read_barrier();
-            cb_push_back(cb_in, 1);
         }
+        noc_async_read_barrier();
+        cb_push_back(cb_in, K);
     }
 }
