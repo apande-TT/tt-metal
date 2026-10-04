@@ -169,11 +169,16 @@ def _lane_masks(device, c):
     return _LANE_MASKS[key]
 
 
-def precise_affine(run, x, mode, device, extra=None, out=None, bias=None):
+def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad=None):
     """run(x, extra) -> output, affine in (x, extra) (a conv / linear with bias); channels on the last dim.
     Returns the output in run's own layout and shape, evaluated per `mode` (see above). `out`: run(x, extra)
     if the caller already has it. `bias`: run's [1, C_out] bias when run(0, 0) is exactly it (a float32
-    conv3d adds its bias unrounded); the zero-input run is then built from it instead of convolved."""
+    conv3d adds its bias unrounded); the zero-input run is then built from it instead of convolved.
+    `prepad(x, extra) -> x_padded`: the zero padding / halo exchange / masking run applies before its core,
+    with `run` then the core alone. Every input variant below maps 0 to 0, so padding commutes with it
+    and is done once instead of once per run."""
+    if prepad is not None:
+        x, extra = prepad(x, extra), None
     out = run(x, extra) if out is None else out
     shape, layout = list(out.shape), out.layout
     f0 = _flat(out)
@@ -190,21 +195,27 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None):
     def back(u, like):
         return ttnn.reshape(ttnn.to_layout(u, like.layout), list(like.shape))
 
-    def variant(fn):
-        xv = back(fn(to3(x)), x)
-        ev = None if extra is None else back(fn(to3(extra)), extra)
-        return xv, ev
-
+    # each run's limb / lane is a transient of the operand's tile copy
     f32 = lambda t: ttnn.typecast(ttnn.typecast(t, ttnn.bfloat16), ttnn.float32)  # noqa: E731
+    hi, lo = f32, lambda t: ttnn.subtract(t, f32(t))
+    # with prepad the tile copy is shared by every run; without it each run tilizes its own (the decoder's
+    # float32 median mode keeps that transient-only footprint: it has no headroom for a held copy)
+    shared = [to3(x)] + ([] if extra is None else [to3(extra)]) if prepad is not None else None
+
+    def run_on(fn):
+        tiles = shared or [to3(x)] + ([] if extra is None else [to3(extra)])
+        xv = back(fn(tiles[0]), x)
+        ev = None if extra is None else back(fn(tiles[1]), extra)
+        return _flat(run(xv, ev))
+
     b = _bias_flat(bias, shape)
     if b is None:
-        b = _flat(run(*variant(lambda t: ttnn.multiply(t, 0.0))))
-    e_neg = ttnn.subtract(ttnn.multiply(b, 2.0), _flat(run(*variant(ttnn.neg))))
+        b = run_on(lambda t: ttnn.multiply(t, 0.0))
+    e_neg = ttnn.subtract(ttnn.multiply(b, 2.0), run_on(ttnn.neg))
     if mode == "exact":
         from models.demos.qwen_image_edit_text_encoder._stubs.attention import EXACT_MODE
 
         acc, n = None, 0
-        hi, lo = f32, lambda t: ttnn.subtract(t, f32(t))
         c = x.shape[-1]
         # "guarded" (the text-encoder ports' switch): exact lanes on the hi limb only -- the lo limb is
         # ~2^-8 of it, so its dense accumulation error is at float32's level -- and no run for a lane that
@@ -213,19 +224,20 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None):
         masks = _lane_masks(device, c)[: min(8, c)] if guarded else _lane_masks(device, c)
         for m in masks:
             for limb in (hi,) if guarded else (hi, lo):
-                y = _flat(run(*variant(lambda t, m=m, limb=limb: ttnn.multiply(limb(t), m))))
+                y = run_on(lambda t, m=m, limb=limb: ttnn.multiply(limb(t), m))
                 acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
         if guarded:
-            acc, n = ttnn.add(acc, _flat(run(*variant(lo)))), n + 1
+            acc, n = ttnn.add(acc, run_on(lo)), n + 1
         e_x = ttnn.subtract(acc, ttnn.multiply(b, float(n - 1)))  # each run added the bias once
         med = ttnn.maximum(ttnn.minimum(e_x, f0), ttnn.minimum(ttnn.maximum(e_x, f0), e_neg))
         tol = ttnn.add(ttnn.multiply(ttnn.abs(e_neg), 3e-3), 1e-3)
         res = ttnn.where(ttnn.le(ttnn.abs(ttnn.subtract(e_x, e_neg)), tol), e_x, med)
     else:
-        e_split = ttnn.subtract(
-            ttnn.add(_flat(run(*variant(f32))), _flat(run(*variant(lambda t: ttnn.subtract(t, f32(t)))))), b
-        )
+        e_split = ttnn.subtract(ttnn.add(run_on(hi), run_on(lo)), b)
         res = ttnn.maximum(ttnn.minimum(f0, e_neg), ttnn.minimum(ttnn.maximum(f0, e_neg), e_split))
+    for t, src in zip(shared or [], [x, extra]):
+        if src.layout != ttnn.TILE_LAYOUT:  # else to3 may have returned a view of src
+            ttnn.deallocate(t)
     return ttnn.reshape(ttnn.to_layout(res, layout), shape)
 
 

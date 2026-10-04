@@ -395,6 +395,18 @@ class WanCausalConv3d(Module):
 
         returns: (B, T, H, W, C) fractured on H and W, ROW_MAJOR layout
         """
+        return self.conv_padded(self.pad_input(x_BTHWC, logical_h, cache_x_BTHWC, logical_w=logical_w))
+
+    def pad_input(
+        self,
+        x_BTHWC: ttnn.Tensor,
+        logical_h: int,
+        cache_x_BTHWC: ttnn.Tensor | None = None,
+        logical_w: int = 0,
+    ) -> ttnn.Tensor:
+        """The input side of forward: cache concat, width masking, causal T padding and the H/W halo
+        exchange. Every step maps zeros to zeros, so for an input transform f with f(0) = 0,
+        conv_padded(f(pad_input(x))) == forward(f(x))."""
         assert x_BTHWC.layout == ttnn.ROW_MAJOR_LAYOUT, f"WanCausalConv3d expects ROW_MAJOR input, got {x_BTHWC.layout}"
         # NOTE: T padding is handled explicitly and depends on the cache
         t_front_padding = self.external_padding[0]
@@ -473,7 +485,10 @@ class WanCausalConv3d(Module):
                 logical_h=fused_logical_h,
                 t_front_pad=t_front_padding if fuse_t_front_pad else 0,
             )
+        return x_BTHWC
 
+    def conv_padded(self, x_BTHWC: ttnn.Tensor) -> ttnn.Tensor:
+        """The conv of forward on an input pad_input already prepared."""
         x_BTHWC = ttnn.experimental.conv3d(
             input_tensor=x_BTHWC,
             weight_tensor=self.weight.data,
