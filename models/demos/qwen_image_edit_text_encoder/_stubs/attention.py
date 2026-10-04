@@ -127,6 +127,28 @@ def _gather_sum(y, n, cluster_axis, mem=None):
     return ttnn.reshape(out, shape)
 
 
+# exact reduce as an all_to_all over the batch (each device receives every partial of its 1/n of the batch),
+# local float32 adds in source order, and an all_gather of the sums: ~2(n-1)/n of the tensor on the fabric
+# instead of (n-1)x, and 1/n of the slices/adds (same adds, same order)
+A2A_REDUCE = False
+
+
+def _a2a_sum(y, n, cluster_axis):
+    """y [B, 1, S, C] with B % n == 0. The all_to_all splits out_dim 0 over the devices and stacks the
+    sources along in_dim 1: [B / n, n, S, C], block i = source device i's partial of this device's batch."""
+    shape = list(y.shape)
+    g = ttnn.experimental.all_to_all_async_generic(
+        y, in_dim=1, out_dim=0, cluster_axis=cluster_axis, topology=ttnn.Topology.Linear
+    )
+    part = [shape[0] // n, 1] + shape[2:]
+    out = None
+    for i in range(n):
+        p = ttnn.slice(g, [0, i, 0, 0], [part[0], i + 1] + shape[2:])
+        out = p if out is None else ttnn.add(out, p)
+    ttnn.deallocate(g)
+    return ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear)
+
+
 def exact_all_reduce(y, device, cluster_axis=1):
     """Sum over the TP axis without rounding: gather the float32 partials (bit-exact data movement) and
     add them in float32. ttnn.all_reduce rounds float32 partials at bf16 level (measured ~7e-3 abs on
@@ -139,6 +161,8 @@ def exact_all_reduce(y, device, cluster_axis=1):
     if n == 1:
         return y
     shape = list(y.shape)
+    if A2A_REDUCE and len(shape) == 4 and shape[1] == 1 and shape[0] % n == 0:
+        return _a2a_sum(y, n, cluster_axis)
     per_item = n * math.prod(shape[1:]) * 4
     if not EXACT_REDUCE_L1_BYTES or len(shape) < 2 or per_item > EXACT_REDUCE_L1_BYTES:
         return _gather_sum(y, n, cluster_axis)
