@@ -73,8 +73,9 @@ class AdaLayerNormContinuous:
         affine (bf16 scale/shift would round the float32 product to bf16)."""
         x = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
         c = ttnn.silu(c if c.dtype == ttnn.float32 else ttnn.typecast(c, ttnn.float32))
-        scale = _precise.linear(c, self.w_scale, bias=self.b_scale32)
-        shift = _precise.linear(c, self.w_shift, bias=self.b_shift32)
+        cp = _precise.split_bf16(c) if _precise.SHARE_SPLIT else None  # scale and shift share c's split
+        scale = _precise.linear(c, self.w_scale, bias=self.b_scale32, parts=cp)
+        shift = _precise.linear(c, self.w_shift, bias=self.b_shift32, parts=cp)
         B = scale.shape[0]
         scale = ttnn.reshape(scale, (B, 1, self.dim))
         shift = ttnn.reshape(shift, (B, 1, self.dim))

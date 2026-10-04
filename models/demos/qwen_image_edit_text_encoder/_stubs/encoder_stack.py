@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 import ttnn
+from models.demos.qwen_image_edit_text_encoder._stubs import attention as _attention
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     TtVisionAttention,
     block_mask,
@@ -34,6 +35,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     pad_to_tile,
     replicate,
     shard_mapper,
+    split_bf16,
     split_linear,
     upload,
     upload_rows,
@@ -132,8 +134,11 @@ class TtVisionMLP:
             cfg = self.compute_cfg
             L = getattr(self, "limbs", 2)
             ex = getattr(self, "exact", True)
-            gate = split_linear(x, self.w_gate, bias=self.b_gate, compute_kernel_config=cfg, exact=ex, limbs=L)
-            up = split_linear(x, self.w_up, bias=self.b_up, compute_kernel_config=cfg, exact=ex, limbs=L)
+            xp = split_bf16(x, L) if _attention.SHARE_SPLIT else None  # gate and up share x's limbs
+            gate = split_linear(
+                x, self.w_gate, bias=self.b_gate, compute_kernel_config=cfg, exact=ex, limbs=L, parts=xp
+            )
+            up = split_linear(x, self.w_up, bias=self.b_up, compute_kernel_config=cfg, exact=ex, limbs=L, parts=xp)
             h = ttnn.multiply(ttnn.silu(gate), up)
             out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex, limbs=L)
             if self.tp > 1:

@@ -133,10 +133,10 @@ class TtQwenJointAttention:
         )
 
     # ---- helpers -------------------------------------------------------------------------------
-    def _proj(self, x, wb, dtype=ttnn.float32):
+    def _proj(self, x, wb, dtype=ttnn.float32, parts=None):
         w, b = wb
         if _precise.ENABLED:
-            return _precise.linear(x, w, bias=b)
+            return _precise.linear(x, w, bias=b, parts=parts)
         return ttnn.linear(x, w, bias=b, dtype=dtype, compute_kernel_config=self.hifi)
 
     def _heads(self, x):  # [B, S, Hl*D] -> [B, Hl, S, D]
@@ -222,12 +222,15 @@ class TtQwenJointAttention:
         img_f, txt_f = (None, None) if image_rotary_emb is None else image_rotary_emb
         img_f, txt_f = _as_tt(img_f, d), _as_tt(txt_f, d)
 
-        qi = self._rope(self._rms(self._heads(self._proj(hs, self.img_q)), self.nw_img_q), img_f)
-        ki = self._rope(self._rms(self._heads(self._proj(hs, self.img_k)), self.nw_img_k), img_f)
-        vi = self._heads(self._proj(hs, self.img_v, vdt))
-        qt = self._rope(self._rms(self._heads(self._proj(ehs, self.txt_q)), self.nw_txt_q), txt_f)
-        kt = self._rope(self._rms(self._heads(self._proj(ehs, self.txt_k)), self.nw_txt_k), txt_f)
-        vt = self._heads(self._proj(ehs, self.txt_v, vdt))
+        share = _precise.ENABLED and _precise.SHARE_SPLIT
+        hp = _precise.split_bf16(hs) if share else None  # q/k/v of one stream share its hi/lo split
+        ep = _precise.split_bf16(ehs) if share else None
+        qi = self._rope(self._rms(self._heads(self._proj(hs, self.img_q, parts=hp)), self.nw_img_q), img_f)
+        ki = self._rope(self._rms(self._heads(self._proj(hs, self.img_k, parts=hp)), self.nw_img_k), img_f)
+        vi = self._heads(self._proj(hs, self.img_v, vdt, parts=hp))
+        qt = self._rope(self._rms(self._heads(self._proj(ehs, self.txt_q, parts=ep)), self.nw_txt_q), txt_f)
+        kt = self._rope(self._rms(self._heads(self._proj(ehs, self.txt_k, parts=ep)), self.nw_txt_k), txt_f)
+        vt = self._heads(self._proj(ehs, self.txt_v, vdt, parts=ep))
 
         # Joint sequence order is [text, image].
         k = ttnn.concat([kt, ki], dim=2)

@@ -253,6 +253,8 @@ def _exact_sum(mm, parts, patterns=LANE_PATTERNS):
     return _vote(ests)
 
 
+# projections of one activation share its bf16 limb split (MLP gate / up)
+SHARE_SPLIT = False
 # core grid for the non-exact split_linear products (None: ttnn.linear picks its own)
 LINEAR_CORE_GRID = None
 # core grid for split_matmul's exact-lane batched products, each on a full-K batch-parallel config
@@ -322,11 +324,12 @@ def _block_config(x, w):
     )
 
 
-def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2):
+def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2, parts=None):
     """float32 x @ bf16 w (+ bias) -> float32. x is carried as `limbs` bf16 parts (exact products). With
-    exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part."""
+    exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part.
+    parts: split_bf16(x, limbs) when several projections share x (split once, not once per projection)."""
     cfg = precise_config()
-    parts = split_bf16(x, limbs)
+    parts = split_bf16(x, limbs) if parts is None else parts
     mm = lambda p: ttnn.linear(  # noqa: E731
         p, w, compute_kernel_config=cfg, dtype=ttnn.float32, core_grid=EXACT_LINEAR_CORE_GRID
     )

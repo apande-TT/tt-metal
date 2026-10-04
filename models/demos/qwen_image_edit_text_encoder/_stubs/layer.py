@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 import ttnn
+from models.demos.qwen_image_edit_text_encoder._stubs import attention as _attention
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     MASK_NEG,
     exact_all_reduce,
@@ -31,6 +32,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     pad_to_tile,
     rotate_half,
     shard_mapper,
+    split_bf16,
     split_linear,
     split_matmul,
     upload,
@@ -249,8 +251,9 @@ class TtTextMLP:
         if getattr(self, "precise", False):
             cfg = self.compute_cfg
             ex = getattr(self, "exact", True)
-            gate = split_linear(x, self.w_gate, compute_kernel_config=cfg, exact=ex)
-            up = split_linear(x, self.w_up, compute_kernel_config=cfg, exact=ex)
+            xp = split_bf16(x, 2) if _attention.SHARE_SPLIT else None  # gate and up share x's limbs
+            gate = split_linear(x, self.w_gate, compute_kernel_config=cfg, exact=ex, parts=xp)
+            up = split_linear(x, self.w_up, compute_kernel_config=cfg, exact=ex, parts=xp)
             out = split_linear(ttnn.multiply(ttnn.silu(gate), up), self.w_down, compute_kernel_config=cfg, exact=ex)
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)

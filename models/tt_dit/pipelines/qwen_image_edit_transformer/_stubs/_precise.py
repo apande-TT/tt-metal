@@ -19,6 +19,7 @@ from __future__ import annotations
 import ttnn
 
 ENABLED = False  # the pipeline switches this on; the per-component PCC tests keep the graduated path
+SHARE_SPLIT = False  # projections of one activation share its hi/lo split (the pipeline switches this on)
 EXACT_QK = True  # within precise mode: exact-lane QK^T (else the dense 3-term split)
 FOLD_LANES = False  # exact QK^T as one K-folded matmul per lane pattern (the pipeline switches this on)
 EXACT_LANES = 8
@@ -39,10 +40,11 @@ def split_bf16(x):
     return hi, lo
 
 
-def linear(x, w, bias=None, compute_kernel_config=None):
-    """float32 x @ bf16 w -> float32, x as bf16 hi + lo; bias (float32) added separately."""
+def linear(x, w, bias=None, compute_kernel_config=None, parts=None):
+    """float32 x @ bf16 w -> float32, x as bf16 hi + lo; bias (float32) added separately. parts: x's
+    (hi, lo) from split_bf16 when several projections share x (split once, not once per projection)."""
     cfg = precise_config()
-    hi, lo = split_bf16(x)
+    hi, lo = split_bf16(x) if parts is None else parts
     y = ttnn.add(
         ttnn.linear(hi, w, compute_kernel_config=cfg, dtype=ttnn.float32),
         ttnn.linear(lo, w, compute_kernel_config=cfg, dtype=ttnn.float32),
