@@ -6,7 +6,7 @@
 // tt/cpp_upsample2.py). For output tile (b, R, c), row p = 2i + j (m = 16R + i) takes Y row m - 1 of tap block
 // 2 + j: rows i >= 1 are rows i - 1 of the same half-tile the "now" term reads (faces 2h, 2h + 1 of Y tile row
 // R >> 1), and row i = 0 is the row just before it -- row 15 of the top half (h = 1) or row 31 of the previous
-// Y tile row (h = 0), two 64 B face-row reads per block; m - 1 outside [0, L) and output rows past out_len read
+// Y tile row (h = 0), two face-row reads per block; m - 1 outside [0, L) and output rows past out_len read
 // zeros. The gathered tile goes to the compute kernel, which adds it to the "now" tile; the sum comes back here
 // and is written. The next unit's delayed tile is gathered before waiting on this unit's sum, so the three
 // cores overlap.
@@ -25,7 +25,8 @@ void kernel_main() {
     constexpr uint32_t OL = get_compile_time_arg_val(2);
     constexpr uint32_t OR = get_compile_time_arg_val(3);
     constexpr uint32_t CT = get_compile_time_arg_val(4);
-    constexpr auto ay = TensorAccessorArgs<5>();
+    constexpr uint32_t ES = get_compile_time_arg_val(5);  // Y element bytes: 4 (float32) or 2 (bfloat16)
+    constexpr auto ay = TensorAccessorArgs<6>();
     constexpr auto ao = TensorAccessorArgs<ay.next_compile_time_args_offset()>();
     const auto sy = TensorAccessor(ay, y_addr);
     const auto so = TensorAccessor(ao, o_addr);
@@ -34,15 +35,20 @@ void kernel_main() {
     constexpr uint32_t cb_delayed = 1;
     constexpr uint32_t cb_scratch = 3;
     constexpr uint32_t cb_out = 16;
-    constexpr uint32_t face = 1024;
-    constexpr uint32_t half = 2048;
-    constexpr uint32_t seg = 64;
+    constexpr uint32_t face = 256 * ES;
+    constexpr uint32_t half = 2 * face;
+    constexpr uint32_t seg = 16 * ES;
+    // A face row's DRAM read is widened to the 64 B-aligned span holding it (a bfloat16 row is 32 B, and DRAM
+    // reads are 64 B aligned): row 15 sits `lag` bytes into that span.
+    constexpr uint32_t span = 64;
+    constexpr uint32_t row15 = 15 * seg;
+    constexpr uint32_t lag = row15 % span;
 
     cb_reserve_back(cb_scratch, 2);
     // [block 2 half | block 3 half | prev rows: block 2 (left, right), block 3 (left, right) | zeros]
     const uint32_t scratch = get_write_ptr(cb_scratch);
     const uint32_t prev = scratch + 2 * half;
-    const uint32_t zeros = prev + 4 * seg;
+    const uint32_t zeros = prev + 4 * span;
     volatile tt_l1_ptr uint32_t* z = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(zeros);
     for (uint32_t w = 0; w < seg / 4; ++w) {
         z[w] = 0;
@@ -68,9 +74,9 @@ void kernel_main() {
                 const uint32_t pf = h ? 0 : 2;
                 for (uint32_t f = 0; f < 2; ++f) {
                     noc_async_read(
-                        sy.get_noc_addr((b * RTY + pt) * YCT + col, (pf + f) * face + 15 * seg),
-                        prev + (2 * j + f) * seg,
-                        seg);
+                        sy.get_noc_addr((b * RTY + pt) * YCT + col, (pf + f) * face + row15 - lag),
+                        prev + (2 * j + f) * span,
+                        span);
                 }
             }
         }
@@ -86,7 +92,7 @@ void kernel_main() {
             for (uint32_t f = 0; f < 2; ++f) {
                 uint32_t src;
                 if (i == 0) {
-                    src = has_prev && out ? prev + (2 * j + f) * seg : zeros;
+                    src = has_prev && out ? prev + (2 * j + f) * span + lag : zeros;
                 } else {
                     src = m0 + i - 1 < L && out ? scratch + j * half + f * face + (i - 1) * seg : zeros;
                 }

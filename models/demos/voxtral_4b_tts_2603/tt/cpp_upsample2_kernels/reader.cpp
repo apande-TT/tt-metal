@@ -6,7 +6,7 @@
 // (sample b, output tile row R, column tile c): output rows p = 32R .. 32R + 31 are m = 16R + (p >> 1) with
 // parity j = p & 1, and their "now" term is Y row m of tap block j -- rows 16h .. 16h + 15 (h = R & 1) of Y
 // tile row R >> 1, i.e. the two contiguous faces 2h, 2h + 1 of that tile (one 2 KB half-tile read per block).
-// The 32 rows are gathered into one tile in output order by LOCAL NoC reads, one 64 B face row at a time
+// The 32 rows are gathered into one tile in output order by LOCAL NoC reads, one face row at a time
 // (rows alternate between the two blocks, so no run is longer than a row); m >= L (Y's per-sample tile
 // padding) and output rows past out_len read zeros.
 
@@ -23,15 +23,16 @@ void kernel_main() {
     constexpr uint32_t OL = get_compile_time_arg_val(2);   // output rows a sample
     constexpr uint32_t OR = get_compile_time_arg_val(3);   // output tile rows a sample
     constexpr uint32_t CT = get_compile_time_arg_val(4);   // column tiles a tap block (= output column tiles)
-    constexpr auto ay = TensorAccessorArgs<5>();
+    constexpr uint32_t ES = get_compile_time_arg_val(5);   // Y element bytes: 4 (float32) or 2 (bfloat16)
+    constexpr auto ay = TensorAccessorArgs<6>();
     const auto sy = TensorAccessor(ay, y_addr);
     constexpr uint32_t YCT = 4 * CT;
 
     constexpr uint32_t cb_now = 0;
     constexpr uint32_t cb_scratch = 2;
-    constexpr uint32_t face = 1024;  // fp32 16 x 16
-    constexpr uint32_t half = 2048;  // two faces: 16 rows of a tile
-    constexpr uint32_t seg = 64;     // one face row
+    constexpr uint32_t face = 256 * ES;  // 16 x 16
+    constexpr uint32_t half = 2 * face;  // two faces: 16 rows of a tile
+    constexpr uint32_t seg = 16 * ES;    // one face row
 
     cb_reserve_back(cb_scratch, 2);
     const uint32_t scratch = get_write_ptr(cb_scratch);  // [block 0 half | block 1 half | zeros]

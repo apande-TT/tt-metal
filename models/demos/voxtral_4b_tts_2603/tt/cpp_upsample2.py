@@ -45,13 +45,12 @@ def _accessor_args(tensor):
     return list(acc.get_compile_time_args())
 
 
-def _cb(cores, index, tiles):
+def _cb(cores, index, tiles, fmt=ttnn.float32):
+    page = _FP32_TILE if fmt == ttnn.float32 else _FP32_TILE // 2
     return ttnn.CBDescriptor(
-        total_size=tiles * _FP32_TILE,
+        total_size=tiles * page,
         core_ranges=cores,
-        format_descriptors=[
-            ttnn.CBFormatDescriptor(buffer_index=index, data_format=ttnn.float32, page_size=_FP32_TILE)
-        ],
+        format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=fmt, page_size=page)],
     )
 
 
@@ -82,9 +81,12 @@ def supports(x_cl, taps) -> bool:
 def interleave_add(y, batch, length, cout, out_len, memory_config=None):
     """`out[b, 2m + j] = Y[b, m, j-block] + Y[b, m - 1, (2 + j)-block]`, float32 `[B, 1, out_len, C_out]`.
 
-    `y` is `[B, 1, L, 4 * C_out]` float32 TILE (each sample's L rows tile-padded); rows m outside [0, L) read as
-    zero; out_len <= 2L + 2, and the output's own padding rows are written as zeros."""
+    `y` is `[B, 1, L, 4 * C_out]` float32 or bfloat16 TILE (each sample's L rows tile-padded); rows m outside
+    [0, L) read as zero; out_len <= 2L + 2, and the output's own padding rows are written as zeros. A bfloat16 `y`
+    is gathered as bfloat16 and widened exactly into the float32 DEST the add runs in."""
     device = y.device()
+    ydt = ttnn.float32 if y.dtype == ttnn.float32 else ttnn.bfloat16
+    es = 4 if ydt == ttnn.float32 else 2
     rty, ct = -(-length // _TILE), cout // _TILE
     orows = -(-out_len // _TILE)
     units = batch * orows * ct
@@ -110,7 +112,7 @@ def interleave_add(y, batch, length, cout, out_len, memory_config=None):
         rc[cx][cy] = [nu]
         rw[cx][cy] = [ya, oa, u0, nu]
         u0 += nu
-    dims = [length, rty, out_len, orows, ct]
+    dims = [length, rty, out_len, orows, ct, es]
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=_READER,
@@ -142,37 +144,40 @@ def interleave_add(y, batch, length, cout, out_len, memory_config=None):
     cfg.fp32_dest_acc_en = True
     cfg.math_approx_mode = False
     modes = [ttnn.UnpackToDestMode.Default] * _NUM_CBS
-    modes[0] = ttnn.UnpackToDestMode.UnpackToDestFp32
-    modes[1] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    if ydt == ttnn.float32:
+        modes[0] = ttnn.UnpackToDestMode.UnpackToDestFp32
+        modes[1] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
     cbs = [
-        _cb(cores, 0, 2),  # gathered "now" tiles
-        _cb(cores, 1, 2),  # gathered "delayed" tiles
+        _cb(cores, 0, 2, ydt),  # gathered "now" tiles
+        _cb(cores, 1, 2, ydt),  # gathered "delayed" tiles
         _cb(cores, 2, 2),  # reader scratch: two half-tiles + a zero row
         _cb(cores, 3, 2),  # writer scratch: two half-tiles, the previous rows, a zero row
         _cb(cores, 16, 2),  # summed output tiles
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
     desc.custom_program_hash = (
-        hash(("voxtral_cpp_upsample2", batch, length, rty, orows, ct, out_len, ya, oa, str(memory_config)))
+        hash(("voxtral_cpp_upsample2", batch, length, rty, orows, ct, out_len, es, ya, oa, str(memory_config)))
         & 0xFFFFFFFFFFFFFFFF
     )
     ttnn.generic_op([y, out], desc)
     return out
 
 
-def apply(x_cl, wide, cout, out_len, compute_kernel_config, linear=None):
+def apply(x_cl, wide, cout, out_len, compute_kernel_config, linear=None, y_dtype=ttnn.bfloat16):
     """The transposed conv of `x_cl` `[B, 1, L, C_in]` (float32 TILE) as `[B, 1, out_len, C_out]` float32 TILE:
     ONE product against `wide` (`wide_weight(taps)`) and ONE interleaving shift-add. `out_len` 2L + 2 is the
     bare conv, 2L its causal trim. The product runs on the 4-D rows (a 2-D multicast config folds the batch
     into M over each sample's tile-padded rows, so an unaligned L needs no relayout); `linear(x, w, **kw)`
     (default ttnn.linear) runs it."""
     batch, _, length, _ = (int(v) for v in x_cl.shape)
-    # shard: a small wide product (<= 16 MB of float32) lands in L1 for the shift-add that reads it.
+    # dtype: the wide product Y written bfloat16 by default (`y_dtype`) -- half its write and the shift-add's
+    # reads; the two terms are still added in float32 (the gathered tiles widen exactly into the fp32 DEST).
+    # shard: a small wide product (<= 16 MB) lands in L1 for the shift-add that reads it.
     kw = {}
-    if tile_rows(x_cl) * int(wide.shape[-1]) * 4 <= (16 << 20):
+    if tile_rows(x_cl) * int(wide.shape[-1]) * (4 if y_dtype == ttnn.float32 else 2) <= (16 << 20):
         kw["memory_config"] = ttnn.L1_MEMORY_CONFIG
-    y = (linear or ttnn.linear)(x_cl, wide, compute_kernel_config=compute_kernel_config, dtype=ttnn.float32, **kw)
+    y = (linear or ttnn.linear)(x_cl, wide, compute_kernel_config=compute_kernel_config, dtype=y_dtype, **kw)
     out = interleave_add(y, batch, length, cout, out_len)
     ttnn.deallocate(y)
     return out

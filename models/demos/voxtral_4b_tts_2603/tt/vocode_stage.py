@@ -138,7 +138,8 @@ def _mcast_cfg(x, w, rows, out_dtype):
                     kb = next(
                         (
                             c
-                            for c in (8, 4, 2, 1)
+                            # grid: a short M (<= 2 tile rows a core) takes a K block of 16 -- half the K steps.
+                            for c in ((16, 8, 4, 2, 1) if pm <= 2 else (8, 4, 2, 1))
                             if kt % c == 0 and bh * bw * os_ + 2 * c * (bh * xs + bw * ws) <= _L1_BUDGET
                         ),
                         None,
@@ -269,6 +270,14 @@ def _rms_norm(x, gamma, eps, dtype=None, memory_config=None):
     stubs beside this file (`flow_matching_audio_transformer`, `acoustic_transformer_block`)
     already spell it out; this is the same four ops so the two bodies agree.
     """
+    shape, padded = x.shape, x.padded_shape
+    dims, pdims = [int(v) for v in shape], [int(v) for v in padded]  # (a ttnn.Shape does not slice)
+    if dims[:-1] != pdims[:-1] and dims[-1] == pdims[-1]:
+        # datamove: only the ROWS carry tile padding (a short / unaligned length) -- the norm runs on the whole
+        # tiles through a zero-cost view (rows are independent; the padding rows are finite), so the mean's reduce
+        # does not FillPad the padding first, and the result is viewed back without a fill.
+        out = _rms_norm(ttnn.reshape(x, padded, padded), gamma, eps, dtype=dtype, memory_config=memory_config)
+        return ttnn.reshape(out, shape, padded, skip_padding_fill=True)
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
     # `dtype`: the normalised rows can be written narrower (bf16) for the linears that read them;
     # `memory_config`: and placed where they read them from.
@@ -370,7 +379,7 @@ def _attention_block(device, blk, attention_stub):
         # dtype: the codec q / k projections write bf16; the fp32 qk-norm writes the float32 the band attention takes.
         # shard: the stubs keep tall bf16 q / k (<= 8 MB each) and a float32 v (<= 16 MB) in L1.
         # dtype: the conv-transpose stubs build their wide [C_in, 4 C_out] weight on the host as bf8_b
-        # (and run its product at HiFi2).
+        # (and run its product at LoFi, fp32 DEST).
         r = attention_stub(ttnn.reshape(xn, [batch, seq, dim]))
         r = ttnn.reshape(r, [batch, 1, seq, dim])
         if attn_scale is not None:
@@ -434,8 +443,28 @@ def _group_runner(blocks):
             h = block(h)
         return h
 
+    def cl(x_cl):
+        """The group CHANNELS-LAST in and out (`[B, L, C]`): a neighbour that hands over / takes channels-last
+        rows saves the transpose pair a channels-first handoff costs (pure data movement)."""
+        h = x_cl
+        for block in blocks:
+            h = block(h)
+        return h
+
     run.run_cl = run_cl
+    run.cl = cl
     return run
+
+
+def _cl_conv(conv_stub):
+    """A conv stub run CHANNELS-LAST in and out: `[B, L, C]` -> `[B, L', C_out]` through its `x_cl` /
+    `cl_out` keywords (the stub reads and writes its rows channels-last anyway)."""
+
+    def cl(x_cl):
+        batch, length, channels = (int(v) for v in x_cl.shape)
+        return conv_stub(x_cl, x_cl=ttnn.reshape(x_cl, [batch, 1, length, channels]), cl_out=True)
+
+    return cl
 
 
 def _trimmed_upsample(mod, conv_stub):
@@ -460,10 +489,21 @@ def _trimmed_upsample(mod, conv_stub):
             return out
         return ttnn.slice(out, [0, 0, 0], [batch, channels, length - right])
 
+    def cl(x_cl):
+        """`run` CHANNELS-LAST in and out (`[B, L, C]` -> `[B, L', C_out]`)."""
+        batch, length, channels = (int(v) for v in x_cl.shape)
+        out = conv_stub(x_cl, trim_right=right, x_cl=ttnn.reshape(x_cl, [batch, 1, length, channels]), cl_out=True)
+        rows, out_channels = int(out.shape[-2]), int(out.shape[-1])
+        full = length * stride + total
+        if right == 0 or rows == full - right:
+            return out
+        return ttnn.slice(out, [0, 0, 0], [batch, rows - right, out_channels])
+
+    run.cl = cl
     return run
 
 
-def _reflect_padded_conv(mod, conv_stub, weight_fn):
+def _reflect_padded_conv(mod, conv_stub, weight_fn, wide_fn=None):
     """`output_proj`: the REFLECT causal padding, then the bare conv fed a device-side weight.
 
     `pad_mode="reflect"` mirrors about index 0 and EXCLUDES it -- the six padded rows are
@@ -501,17 +541,7 @@ def _reflect_padded_conv(mod, conv_stub, weight_fn):
                 x_cf, weight=weight_fn(), x_cl=x4, pad_front=padding_total, pad_back=extra, pad_mode="reflect"
             )
 
-        # The edge rows are cut and joined ROW_MAJOR, and the padded block tilized once: a one-row
-        # slice of a TILE tensor comes back row-major and is re-tilized row by row, and a TILE concat
-        # of non-tile-aligned pieces untilizes them all again.
-        x_rm = ttnn.to_layout(x4, ttnn.ROW_MAJOR_LAYOUT) if padding_total + extra > 0 else x4
-
-        def row(index):
-            return ttnn.slice(x_rm, [0, 0, index, 0], [batch, 1, index + 1, channels])
-
-        pieces = [row(i) for i in range(padding_total, 0, -1)]
-        pieces.append(x_rm)
-        pieces.extend(row(length - 1 - i) for i in range(1, extra + 1))
+        pieces = _reflect_rows(x4, batch, length, channels, extra)
         padded_rm = None if len(pieces) == 1 else ttnn.concat(pieces, dim=2)
         padded_len = length + padding_total + extra
         if padded_rm is not None:
@@ -522,6 +552,22 @@ def _reflect_padded_conv(mod, conv_stub, weight_fn):
         cf = ttnn.transpose(ttnn.reshape(pieces[0], [batch, padded_len, channels]), -2, -1)
         return conv_stub(cf, weight=weight_fn())
 
+    def _reflect_rows(x4, batch, length, channels, extra):
+        """The reflect-padded rows as ROW_MAJOR pieces `[pad rows..., x, tail rows...]` (one piece: no padding).
+
+        The edge rows are cut and joined ROW_MAJOR, and the padded block tilized once: a one-row slice of a
+        TILE tensor comes back row-major and is re-tilized row by row, and a TILE concat of non-tile-aligned
+        pieces untilizes them all again."""
+        x_rm = ttnn.to_layout(x4, ttnn.ROW_MAJOR_LAYOUT) if padding_total + extra > 0 else x4
+
+        def row(index):
+            return ttnn.slice(x_rm, [0, 0, index, 0], [batch, 1, index + 1, channels])
+
+        pieces = [row(i) for i in range(padding_total, 0, -1)]
+        pieces.append(x_rm)
+        pieces.extend(row(length - 1 - i) for i in range(1, extra + 1))
+        return pieces
+
     def run_cl(x3):
         """`run` on CHANNELS-LAST rows `[B, L, C]` (a transformer group's own layout), returning channels-last
         `[B, L', C_out]`: the conv reads its rows channels-last anyway, so neither side transposes."""
@@ -529,16 +575,24 @@ def _reflect_padded_conv(mod, conv_stub, weight_fn):
         x4 = ttnn.reshape(x3, [batch, 1, length, channels])
         n_frames = (length - effective_kernel + padding_total) / stride + 1
         extra = (math.ceil(n_frames) - 1) * stride + (effective_kernel - padding_total) - length
+        # structural: `wide_fn()` reconstructs the weight-normed weight straight in the conv's wide layout
+        # (parametrization_list(wide=True) -> weight_norm's wide path), so no k-last permute reaches the conv.
+        weight = {"wide_weight": wide_fn()} if wide_fn is not None else {"weight": weight_fn()}
         if stride == 1 and length > padding_total and cpp_shift_add.supports_unpadded(x4, "reflect"):
             return conv_stub(
                 x3,
-                weight=weight_fn(),
                 x_cl=x4,
                 pad_front=padding_total,
                 pad_back=extra,
                 pad_mode="reflect",
                 cl_out=True,
+                **weight,
             )
+        if stride == 1 and length > padding_total and padding_total + extra > 0:
+            # An unaligned length: the padded rows built ROW_MAJOR from the channels-last rows, the result taken
+            # channels-last -- no transpose out to channels-first and back.
+            padded_rm = ttnn.concat(_reflect_rows(x4, batch, length, channels, extra), dim=2)
+            return conv_stub(x3, x_rm=padded_rm, cl_out=True, **weight)
         return ttnn.transpose(run(ttnn.transpose(x3, -2, -1)), -2, -1)
 
     run.run_cl = run_cl
@@ -748,19 +802,26 @@ def build_vocode_stage(device, hf_model, layers=None, counter=None, split_at=Non
     # therefore run, each at a position nothing else computes.
     n_upsamplers = sum(1 for b in codec.decoder_blocks if type(b).__name__ == "CausalConvTranspose1d")
     chain = []
+    # structural: the same steps CHANNELS-LAST in and out, so neighbours hand rows over without the transpose
+    # pair a channels-first handoff costs (each conv reads and writes channels-last rows anyway).
+    cl_chain = []
     seen_groups = seen_upsamplers = 0
     for blk in codec.decoder_blocks:
         kind = type(blk).__name__
         if kind == "CausalConv1d":
             chain.append(stub("causal_conv1d", blk))
+            cl_chain.append(_cl_conv(chain[-1]))
         elif kind == "CodecTransformer":
             chain.append(group_runners[seen_groups])
+            cl_chain.append(chain[-1].cl)
             seen_groups += 1
         elif kind == "CausalConvTranspose1d":
             if seen_upsamplers == n_upsamplers - 1:
                 chain.append(_trimmed_upsample(blk, stub("parametrized_conv_transpose1d", blk.conv)))
+                cl_chain.append(chain[-1].cl)
             else:
                 chain.append(stub("causal_conv_transpose1d", blk))
+                cl_chain.append(_cl_conv(chain[-1]))
             seen_upsamplers += 1
         else:
             raise NotImplementedError(f"decoder block {kind} is not ported")
@@ -773,6 +834,7 @@ def build_vocode_stage(device, hf_model, layers=None, counter=None, split_at=Non
         codec.output_proj,
         stub("parametrized_conv1d", codec.output_proj.conv),
         lambda: plist(weight_norm=wnorm),
+        wide_fn=lambda: plist(weight_norm=wnorm, wide=True),
     )
     patch_size = int(codec.patch_size)
 
@@ -821,13 +883,19 @@ def build_vocode_stage(device, hf_model, layers=None, counter=None, split_at=Non
         # which returns channels-last too: the group's transpose to channels-first, the conv's transpose back,
         # and the conv's own transpose out and the de-patch transpose back all cancel (pure data movement).
         handoff = probe is None and hasattr(chain[-1], "run_cl") and hasattr(output_proj, "run_cl")
-        for index, step in enumerate(chain):
-            if handoff and index == len(chain) - 1:
-                h = step.run_cl(h)
-                break
-            h = step(h)
-            if probe is not None:
-                probe.append((f"decoder_blocks[{index}]", h))
+        if handoff and len(cl_chain) == len(chain):
+            # Every step channels-last: ONE transpose of the latent, none between steps.
+            h = ttnn.transpose(h, -2, -1)
+            for step in cl_chain:
+                h = step(h)
+        else:
+            for index, step in enumerate(chain):
+                if handoff and index == len(chain) - 1:
+                    h = step.run_cl(h)
+                    break
+                h = step(h)
+                if probe is not None:
+                    probe.append((f"decoder_blocks[{index}]", h))
         if handoff:
             channels_last = output_proj.run_cl(h)
             batch, length, channels = (int(v) for v in channels_last.shape)
