@@ -280,12 +280,21 @@ def _compile_codec_block(device, blk, mask, window=None):
         # dtype: q / k leave their projections as bf16 (half the write; the fp32 qk-norm reads half and writes
         # the float32 the band attention takes); v stays float32.
         qk_dt = ttnn.bfloat16 if qk_norm else ttnn.float32
-        q = _fold_linear(xn, wq, compute_kernel_config=_COMPUTE, dtype=qk_dt, memory_config=qkv_mem)
-        k = _fold_linear(xn, wk, compute_kernel_config=_COMPUTE, dtype=qk_dt, memory_config=qkv_mem)
-        v = _fold_linear(xn, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
+        # shard: tall bf16 q / k (<= 8 MB each) stay in L1 for the qk-norm, which writes its float32 to DRAM.
+        qk_rows = 1
+        for d in list(xn.padded_shape)[:-1]:
+            qk_rows *= int(d)
+        qk_l1 = qkv_mem is None and qk_norm and qk_rows * int(wq.shape[-1]) * 2 <= (8 << 20)
+        qk_mem = ttnn.L1_MEMORY_CONFIG if qk_l1 else qkv_mem
+        norm_mem = ttnn.DRAM_MEMORY_CONFIG if qk_l1 else None
+        q = _fold_linear(xn, wq, compute_kernel_config=_COMPUTE, dtype=qk_dt, memory_config=qk_mem)
+        k = _fold_linear(xn, wk, compute_kernel_config=_COMPUTE, dtype=qk_dt, memory_config=qk_mem)
+        # shard: a tall float32 v (<= 16 MB) stays in L1 for the band attention.
+        v_mem = ttnn.L1_MEMORY_CONFIG if qkv_mem is None and qk_rows * int(wv.shape[-1]) * 4 <= (16 << 20) else qkv_mem
+        v = _fold_linear(xn, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=v_mem)
         if qk_norm:
-            q = _rms_norm(q, q_gamma, q_eps, dtype=ttnn.float32)
-            k = _rms_norm(k, k_gamma, k_eps, dtype=ttnn.float32)
+            q = _rms_norm(q, q_gamma, q_eps, dtype=ttnn.float32, memory_config=norm_mem)
+            k = _rms_norm(k, k_gamma, k_eps, dtype=ttnn.float32, memory_config=norm_mem)
         # SDPA rejects float32 outright (`sdpa_device_operation.cpp:43`) -- so this does not call
         # it. Spelling the attention out as two matmuls and a softmax keeps Q/K/V, the ALiBi mask
         # and the whole reduction in FLOAT32, which SDPA cannot do at any fidelity. Matches the
@@ -295,7 +304,16 @@ def _compile_codec_block(device, blk, mask, window=None):
             # structural: the banded attention reads each head's q / k / v tiles IN PLACE from the merged
             # [B, 1, T, H * D] linear outputs and writes the context back merged -- no q / k / v concat, no
             # nlp_create_qkv_heads, no nlp_concat_heads (pure data movement, the same values).
-            a = cpp_band_attn.apply(q, k, v, mask, scale, merged_heads=n_heads)
+            # dtype: the context leaves as bf16 (o_proj reads half; the softmax and both products stay
+            # float32 in DEST) and, when it is small (<= 8 MB), in L1.
+            ctx_mem = (
+                qkv_mem
+                if qkv_mem is not None
+                else (ttnn.L1_MEMORY_CONFIG if qk_rows * int(wo.shape[-2]) * 2 <= (8 << 20) else None)
+            )
+            a = cpp_band_attn.apply(
+                q, k, v, mask, scale, memory_config=ctx_mem, merged_heads=n_heads, dtype=ttnn.bfloat16
+            )
         else:
             qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
                 ttnn.concat([q, k, v], dim=-1),
