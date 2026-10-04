@@ -780,6 +780,9 @@ def codec_rms_norm(x, gamma, eps, dtype=None, memory_config=None):
             )
         )
     want = dtype or x.dtype
+    y = _codec_norm_sharded(x, gamma, eps, want, memory_config)
+    if y is not None:
+        return y
     if want == x.dtype:
         return ttnn.rms_norm(
             x, epsilon=eps, weight=gamma, memory_config=memory_config, compute_kernel_config=_CODEC_NORM_CFG[0]
@@ -794,3 +797,67 @@ def codec_rms_norm(x, gamma, eps, dtype=None, memory_config=None):
     out = ttnn.typecast(y, want, memory_config=memory_config or x.memory_config())
     ttnn.deallocate(y)
     return out
+
+
+# grid: the codec norms at short lengths run block-sharded over a 8-column grid, so the interleaved op's one core
+# per tile row (16 cores at 512 rows) becomes 64.
+_NORM_GRID_COLS = 8
+
+
+def _codec_norm_sharded(x, gamma, eps, dtype, memory_config):
+    """`codec_rms_norm` on the block-sharded layout (`LayerNormShardedMultiCoreProgramConfig`), or None.
+
+    The interleaved op deals one tile row to a core, so a 512-row norm runs on 16 cores. Sharded, each
+    core takes a [rows / gy, dim / 8] block and the partial sums are combined across the row's 8 cores.
+    Taken only where that occupies more cores than the interleaved op (<= 1024 rows); the shard copy in
+    and the output's `sharded_to_interleaved` (which also casts to `dtype`, replacing the typecast) are
+    the price.
+    """
+    import ttnn
+
+    shape = [int(d) for d in x.shape]
+    rows = 1
+    for d in shape[:-1]:
+        rows *= d
+    dim = shape[-1]
+    if rows % 32 or dim % (32 * _NORM_GRID_COLS) or x.is_sharded():
+        return None
+    mt, wt = rows // 32, dim // 32
+    grid = x.device().compute_with_storage_grid_size()
+    gx = _NORM_GRID_COLS
+    gy = max(d for d in range(1, int(grid.y) + 1) if mt % d == 0)
+    if gx > int(grid.x) or gx * gy <= mt:
+        return None
+    block_w = wt // gx
+    cores = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))})
+    mem = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.BLOCK_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(cores, [mt // gy * 32, dim // gx], ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    cfg = ttnn.LayerNormShardedMultiCoreProgramConfig(
+        compute_with_storage_grid_size=(gx, gy),
+        subblock_w=min(block_w, 4),
+        block_h=mt // gy,
+        block_w=block_w,
+        inplace=False,
+    )
+    xs = ttnn.to_memory_config(ttnn.reshape(x, [1, 1, rows, dim]), mem)
+    y = ttnn.rms_norm(
+        xs, epsilon=eps, weight=gamma, memory_config=mem, program_config=cfg, compute_kernel_config=_CODEC_NORM_CFG[0]
+    )
+    ttnn.deallocate(xs)
+    out = ttnn.sharded_to_interleaved(y, memory_config or x.memory_config(), output_dtype=dtype)
+    ttnn.deallocate(y)
+    return ttnn.reshape(out, shape)
+
+
+def restore_memory(h, want):
+    """`h` moved back to the buffer type of `want` (a MemoryConfig: DRAM / L1) when the blocks in between
+    changed it -- a codec group may keep its residual stream in L1, and the conv(-transpose) after the group
+    sizes its own L1 products assuming the stream is not there."""
+    import ttnn
+
+    if h.memory_config().buffer_type == want.buffer_type or want.is_sharded() or h.is_sharded():
+        return h
+    return ttnn.to_memory_config(h, want)
