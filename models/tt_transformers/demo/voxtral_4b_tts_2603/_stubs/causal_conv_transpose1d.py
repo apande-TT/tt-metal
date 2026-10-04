@@ -28,6 +28,7 @@ import math
 import torch
 
 import ttnn
+from models.demos.voxtral_4b_tts_2603.tt import cpp_upsample2
 
 # A PERSISTENT ZERO BUFFER, NOT A PER-CALL `ttnn.zeros`.
 # `ttnn.zeros` builds its tensor on the host and enqueues a WRITE to land it on the device, and a
@@ -79,6 +80,16 @@ def _from_torch(t, device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
 
 
+def _grid_cfg(x, w, rows):
+    """The codec linears' hand-sized full-grid 2D-mcast config (tt/vocode_stage._mcast_cfg) for a tall tap
+    product, or None. Left to the default, a float32 tap product picks in0_block_w=1 -- every K step re-packs
+    the whole float32 out block (2048 x 1024 x 1024: 114 us at kb 1)."""
+    from models.demos.voxtral_4b_tts_2603.tt.vocode_stage import _mcast_cfg
+
+    padded = -(-int(rows) // 32) * 32
+    return _mcast_cfg(x, w, padded, x.dtype) if padded >= 128 else None
+
+
 def _tap_linear(x, w, **kwargs):
     """`ttnn.linear` for one tap with the leading batch folded into M, so the tap streams ONCE.
 
@@ -90,6 +101,9 @@ def _tap_linear(x, w, **kwargs):
     lead = 1
     for d in shape[:-2]:
         lead *= d
+    cfg = _grid_cfg(x, w, lead * shape[-2])
+    if cfg is not None and "program_config" not in kwargs:
+        kwargs["program_config"] = cfg
     if lead == 1:
         return ttnn.linear(x, w, **kwargs)
     y = ttnn.linear(ttnn.reshape(x, [1, 1, lead * shape[-2], shape[-1]]), w, **kwargs)
@@ -116,6 +130,11 @@ def build(device, torch_module):
     bias = None
     if conv.bias is not None:
         bias = _from_torch(conv.bias.detach().reshape(1, 1, 1, out_channels), device)
+    # structural: the four taps side by side, for ONE product and ONE interleaving shift-add (tt/cpp_upsample2).
+    wide = cpp_upsample2.wide_weight(taps) if cpp_upsample2.enabled() and out_channels % 32 == 0 else None
+
+    def _wide_linear(x, w, **kwargs):
+        return ttnn.linear(x, w, program_config=_grid_cfg(x, w, int(x.shape[-2])), **kwargs)
 
     def causal_conv_transpose1d(x, **kwargs):
         # `[B, C, L]` in, `[B, C, 2L]` out. The leading bound comes from the TENSOR, never from a
@@ -124,6 +143,15 @@ def build(device, torch_module):
         length = shape[-1]
         batch = shape[0] if len(shape) >= 3 else 1
         x4 = ttnn.reshape(ttnn.transpose(x, -2, -1), [batch, 1, length, in_channels])
+
+        if wide is not None and cpp_upsample2.supports(x4, taps):
+            # out[2m + j] = x[m] @ W_j + x[m - 1] @ W_{2+j}, written interleaved and trimmed to 2L in one pass:
+            # no zero-row concats (untilize + concat + tilize each), no even | odd concat, no relayout reshape.
+            out_len = length * stride
+            out = cpp_upsample2.apply(x4, wide, out_channels, out_len, _COMPUTE, linear=_wide_linear)
+            if bias is not None:
+                out = ttnn.add(out, bias)
+            return ttnn.reshape(ttnn.transpose(out, -2, -1), [batch, out_channels, out_len])
 
         zero_row = _zeros_like_buf(device, [batch, 1, 1, out_channels], x4.dtype)
 

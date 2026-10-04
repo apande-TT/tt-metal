@@ -42,7 +42,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import common, cpp_band_attn, cpp_shift_add, cpp_softmax
+from models.demos.voxtral_4b_tts_2603.tt import common, cpp_band_attn, cpp_shift_add, cpp_softmax, cpp_upsample2
 
 # A PERSISTENT ZERO BUFFER, NOT A PER-CALL `ttnn.zeros`.
 # `ttnn.zeros` builds its tensor on the host and enqueues a WRITE to land it on the device, and a
@@ -445,15 +445,36 @@ def _compile_causal_conv_transpose1d(device, mod):
     bias = None
     if conv.bias is not None:
         bias = _from_torch(conv.bias.detach().reshape(1, 1, 1, out_channels), device)
+    # structural: the four taps side by side, for ONE product and ONE interleaving shift-add (tt/cpp_upsample2).
+    wide = cpp_upsample2.wide_weight(taps) if cpp_upsample2.enabled() and out_channels % 32 == 0 else None
+
+    def _wide_linear(x, w, **kwargs):
+        # The tall codec linears' own full-grid config and HiFi2 (what the aligned per-tap products ran).
+        cfg = _mcast_cfg(x, w, int(x.shape[-2]), ttnn.float32)
+        if cfg is not None:
+            kwargs["program_config"] = cfg
+            kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+            )
+        return ttnn.linear(x, w, **kwargs)
 
     def run(x4):
         batch, length = int(x4.shape[0]), int(x4.shape[-2])
+        if wide is not None and cpp_upsample2.supports(x4, taps):
+            # out[2m + j] = x[m] @ W_j + x[m - 1] @ W_{2+j}, written interleaved and trimmed to 2L in one pass:
+            # no zero-row concats (untilize + concat + tilize each), no even | odd concat, no relayout reshape.
+            out = cpp_upsample2.apply(x4, wide, out_channels, length * stride, _COMPUTE, linear=_wide_linear)
+            return out if bias is None else ttnn.add(out, bias)
         zero_row = _zeros_like_buf(device, [batch, 1, 1, out_channels], x4.dtype)
 
         def _delayed(tap):
             """`tap` applied to the PREVIOUS input step: a zero row, then steps 0..L-2."""
             head = ttnn.slice(x4, [0, 0, 0, 0], [batch, 1, length - 1, in_channels])
-            return ttnn.concat([zero_row, _fold_linear(head, tap, compute_kernel_config=_COMPUTE)], dim=2)
+            # grid: the unaligned rows miss `_fold_linear`'s config -- the hand full-grid one (rows padded to a tile).
+            rows = -(-batch * (length - 1) // 32) * 32
+            cfg = _mcast_cfg(head, tap, rows, head.dtype) if rows >= 128 else None
+            extra = {} if cfg is None else {"program_config": cfg}
+            return ttnn.concat([zero_row, _fold_linear(head, tap, compute_kernel_config=_COMPUTE, **extra)], dim=2)
 
         even = ttnn.add(_fold_linear(x4, taps[0], compute_kernel_config=_COMPUTE), _delayed(taps[2]))
         odd = ttnn.add(_fold_linear(x4, taps[1], compute_kernel_config=_COMPUTE), _delayed(taps[3]))
