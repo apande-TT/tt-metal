@@ -34,7 +34,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs import (
     vision_transformer_pretrained_model,
 )
 from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
-from models.demos.qwen_image_edit_text_encoder._stubs.attention import pad_to_tile
+from models.demos.qwen_image_edit_text_encoder._stubs.attention import MASK_NEG, pad_to_tile
 from models.demos.qwen_image_edit_text_encoder._stubs.layer import text_attention_mask
 
 
@@ -53,6 +53,9 @@ LM_EXACT = False
 VISION_EXACT = True
 # bf16 limbs of the vision MLP's input in the precise path (the rest of the tower uses 3)
 VISION_MLP_LIMBS = 2
+# negatives reuse the prompts' K/V of their common token prefix (whole tiles): the LM is causal, so
+# those positions' hidden states are identical, and only the negatives' tail is run (attending to it)
+PREFIX_SHARE = True
 # mesh axis the vision batch is split over (the tower's TP=4 runs on the other axis)
 VISION_DP_AXIS = 0
 
@@ -230,6 +233,25 @@ class TtQwenTextEncoder:
         mu = am_u[:, drop:lu].to(torch.float32)
         p.keep_cond = _replicated(d, mc.reshape(B, lc - drop, 1), ttnn.float32)
         p.keep_uncond = _replicated(d, mu.reshape(B, lu - drop, 1), ttnn.float32)
+        # shared prefix: prompts and negatives agree on their first `first_diff` tokens (template +
+        # image), so the negatives' first P (whole tiles, >= the dropped template) hidden states are the
+        # prompts'; the negatives run only [P, P + suffix) against the prompts' cached prefix K/V
+        n = min(ids_c.shape[1], ids_u.shape[1])
+        diff = (ids_c[:, :n] != ids_u[:, :n]).any(0).nonzero()
+        first_diff = int(diff[0]) if diff.numel() else n
+        P = (first_diff // 32) * 32
+        p.prefix = None
+        if PREFIX_SHARE and drop <= P < lu and bool((am_c[:, :P] == am_u[:, :P]).all()):
+            su = pad_to_tile(lu - P)
+            if P + su <= s_pad:
+                q = np.arange(P, P + su)[:, None]
+                keys = np.arange(P + su)[None, :]
+                causal = np.where(keys <= q, 0.0, MASK_NEG).astype(np.float32)
+                pad = np.where(am_u[:, : P + su].numpy().astype(bool), 0.0, MASK_NEG).astype(np.float32)
+                m = np.maximum(causal[None, None] + pad[:, None, None, :], MASK_NEG)
+                m = np.tile(m, (1, 1, self.group, 1))
+                p.prefix = (P, su)
+                p.mask_suffix = _replicated(d, torch.from_numpy(m), ttnn.float32)
         # QwenImageEditPipeline.encode_prompt: an all-ones mask is dropped (None)
         p.mask_cond = None if bool(mc.all()) else mc
         p.mask_uncond = None if bool(mu.all()) else mu
@@ -277,16 +299,33 @@ class TtQwenTextEncoder:
         img = ttnn.typecast(img, ttnn.float32)
         cos, sin = self._rope(p.positions)
         drop = PROMPT_TEMPLATE_DROP
+        prefix = getattr(p, "prefix", None)
+        kv = {"mode": "store", "P": prefix[0], "cache": {}} if prefix else None
         outs = []
+        h_cond = None
         for lo, L, keep in ((0, p.len_cond, p.keep_cond), (B, p.len_uncond, p.keep_uncond)):
             t = ttnn.slice(tok, [lo, 0, 0], [lo + B, s_pad, C])
             x = ttnn.concat(
                 [ttnn.slice(t, [0, 0, 0], [B, a, C]), img, ttnn.slice(t, [0, a + m, 0], [B, s_pad, C])], dim=1
             )  # sequence lo + b uses condition image b
             x = ttnn.reshape(x, (B, 1, s_pad, C))
-            mask = ttnn.slice(p.mask, [lo, 0, 0, 0], [lo + B] + list(p.mask.shape)[1:])
-            h = self.text_model.forward_padded(x, cos, sin, mask)  # [B, 1, s_pad, C] replicated
-            h = ttnn.slice(h, [0, 0, drop, 0], [B, 1, drop + L, C])
+            if lo and prefix:
+                # negatives: run [P, P + su) only, attending to the prompts' cached prefix K/V
+                P, su = prefix
+                xs = ttnn.slice(x, [0, 0, P, 0], [B, 1, P + su, C])
+                rows = lambda r: ttnn.slice(r, [0, 0, P, 0], list(r.shape)[:2] + [P + su, r.shape[-1]])  # noqa: E731
+                kv["mode"] = "use"
+                hs = self.text_model.forward_padded(xs, rows(cos), rows(sin), p.mask_suffix, kv=kv)
+                h = ttnn.concat(
+                    [ttnn.slice(h_cond, [0, 0, drop, 0], [B, 1, P, C]), ttnn.slice(hs, [0, 0, 0, 0], [B, 1, drop + L - P, C])],
+                    dim=2,
+                )
+                kv["cache"].clear()
+            else:
+                mask = ttnn.slice(p.mask, [lo, 0, 0, 0], [lo + B] + list(p.mask.shape)[1:])
+                h_full = self.text_model.forward_padded(x, cos, sin, mask, kv=kv)  # [B, 1, s_pad, C] replicated
+                h_cond = h_full if prefix else None
+                h = ttnn.slice(h_full, [0, 0, drop, 0], [B, 1, drop + L, C])
             outs.append(ttnn.multiply(ttnn.reshape(h, (B, L, C)), keep))
             ttnn.deallocate(x)
         return outs[0], outs[1]
