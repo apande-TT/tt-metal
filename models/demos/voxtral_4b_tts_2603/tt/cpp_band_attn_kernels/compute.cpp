@@ -23,9 +23,11 @@
 #include "api/compute/eltwise_unary/exp.h"
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/pack.h"
+#include "api/compute/reconfig_data_format.h"
 
 constexpr uint32_t DT = get_compile_time_arg_val(0);
 constexpr uint32_t NB = 2;  // key tiles in the band
+constexpr uint32_t OUT_NARROW = get_compile_time_arg_val(1);  // 1: the context CB is narrower than float32
 
 constexpr auto cb_q = tt::CBIndex::c_0;
 constexpr auto cb_k = tt::CBIndex::c_1;
@@ -78,7 +80,9 @@ inline void reduce_row(uint32_t cb_in, uint32_t cb_out_) {
 void kernel_main() {
     const uint32_t nu = get_arg_val<uint32_t>(0);
 
-    compute_kernel_hw_startup<SrcOrder::Reverse>(cb_q, cb_k, cb_out);
+    // The packer starts on a float32 CB (every intermediate is float32); a narrower context CB is switched to
+    // around its own pack only.
+    compute_kernel_hw_startup<SrcOrder::Reverse>(cb_q, cb_k, OUT_NARROW ? cb_raw : cb_out);
     cb_wait_front(cb_scale, 1);
 
     for (uint32_t u = 0; u < nu; ++u) {
@@ -191,8 +195,14 @@ void kernel_main() {
         cb_pop_front(cb_v, NB * DT);
         cb_reserve_back(cb_out, DT);
         tile_regs_wait();
+        if constexpr (OUT_NARROW) {
+            pack_reconfig_data_format(cb_raw, cb_out);
+        }
         for (uint32_t d = 0; d < DT; ++d) {
             pack_tile(d, cb_out);
+        }
+        if constexpr (OUT_NARROW) {
+            pack_reconfig_data_format(cb_out, cb_raw);
         }
         tile_regs_release();
         cb_push_back(cb_out, DT);

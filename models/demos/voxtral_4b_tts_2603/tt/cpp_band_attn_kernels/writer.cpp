@@ -51,7 +51,7 @@ void kernel_main() {
     constexpr uint32_t cb_sum = 10;
     constexpr uint32_t cb_sumf = 11;
     constexpr uint32_t cb_out = 16;
-    constexpr uint32_t tile_bytes = 4096;
+    const uint32_t tile_bytes = get_tile_size(cb_out);
 
     for (uint32_t u = u0; u < u0 + nu; ++u) {
         fill_cb(cb_max, cb_maxf);

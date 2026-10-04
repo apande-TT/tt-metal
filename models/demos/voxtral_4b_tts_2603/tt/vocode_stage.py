@@ -360,6 +360,7 @@ def _attention_block(device, blk, attention_stub):
         xn_mem = ttnn.L1_MEMORY_CONFIG if int(h.shape[-2]) < 32 else None
         xn = _rms_norm(h, attn_gamma, attn_eps, dtype=ttnn.bfloat16, memory_config=xn_mem)
         # dtype: the codec q / k projections write bf16; the fp32 qk-norm writes the float32 the band attention takes.
+        # shard: the stubs keep tall bf16 q / k (<= 8 MB each) and a float32 v (<= 16 MB) in L1.
         r = attention_stub(ttnn.reshape(xn, [batch, seq, dim]))
         r = ttnn.reshape(r, [batch, 1, seq, dim])
         if attn_scale is not None:

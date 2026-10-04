@@ -17,6 +17,7 @@ output is bit-identical.
 
 On unless VOXTRAL_CPP_BAND_ATTN=0.
 """
+
 from __future__ import annotations
 
 import os
@@ -124,9 +125,18 @@ def _cb(cores, index, tiles):
     )
 
 
-def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None):
+def _bf16_cb(cores, index, tiles):
+    return ttnn.CBDescriptor(
+        total_size=tiles * 2048,
+        core_ranges=cores,
+        format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=ttnn.bfloat16, page_size=2048)],
+    )
+
+
+def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None, dtype=ttnn.float32):
     """`softmax(q @ k^T * scale + mask) @ v`, float32 `[B, H, T, D]` (DRAM unless `memory_config`). With
-    `merged_heads`, q / k / v and the result are the merged `[B, 1, T, H * D]` (see `supports_merged`)."""
+    `merged_heads`, q / k / v and the result are the merged `[B, 1, T, H * D]` (see `supports_merged`). `dtype`:
+    the context's dtype (float32 or bfloat16; the softmax and both products stay float32 in DEST either way)."""
     device = q.device()
     merged = bool(merged_heads)
     if merged:
@@ -147,7 +157,7 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None):
     cores = ttnn.num_cores_to_corerangeset(ncores, grid, row_wise=True)
     y = ttnn.allocate_tensor_on_device(
         ttnn.Shape([b, 1, t, h * d] if merged else [b, h, t, d]),
-        ttnn.float32,
+        dtype,
         ttnn.TILE_LAYOUT,
         device,
         memory_config or ttnn.DRAM_MEMORY_CONFIG,
@@ -180,7 +190,7 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None):
             kernel_source=_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt],
+            compile_time_args=[dt, int(dtype != ttnn.float32)],
             runtime_args=rc,
             config=ttnn.ComputeConfigDescriptor(),
         ),
@@ -218,12 +228,10 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None):
         _cb(cores, 10, 1),  # row sum (column 0)
         _cb(cores, 11, 1),  # row sum, column-filled
         _cb(cores, 12, 2),  # weights P
-        _cb(cores, 16, 2 * dt),  # context tile row
+        _cb(cores, 16, 2 * dt) if dtype == ttnn.float32 else _bf16_cb(cores, 16, 2 * dt),  # context tile row
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-    desc.custom_program_hash = (
-        hash(("voxtral_cpp_band_attn", b, h, rt, dt, mmt, mst, merged, scale_bits, qa, ka, va, ma, ya, str(memory_config)))
-        & 0xFFFFFFFFFFFFFFFF
-    )
+    key = ("voxtral_cpp_band_attn", b, h, rt, dt, mmt, mst, merged, scale_bits, qa, ka, va, ma, ya)
+    desc.custom_program_hash = hash(key + (str(memory_config), str(dtype))) & 0xFFFFFFFFFFFFFFFF
     ttnn.generic_op([q, k, v, mask, y], desc)
     return y

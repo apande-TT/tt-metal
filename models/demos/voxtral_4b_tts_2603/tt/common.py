@@ -12,6 +12,7 @@ ships the verified reconstruction of the reference
 (`tests/pcc/_reference_loader.py`), which is what `load_reference_model()`
 delegates to.
 """
+
 from __future__ import annotations
 
 import base64
@@ -707,21 +708,30 @@ def cached_golden(key: str, compute):
 
 # One device copy per DISTINCT build-time mask. The codec builds an ALiBi mask per block build (12)
 # but holds only 4 distinct ones (one per sliding window); each is [1, 8, 2048, 2048] float32 --
-# 134 MB of DRAM and a ~0.7 ms device tilize to upload. Entries match on exact CONTENT
+# 134 MB of DRAM (tilized on the host: a ~0.7 ms device tilize otherwise). Entries match on exact CONTENT
 # (torch.equal), so a shared mask is the very tensor the caller would have uploaded. Reset when
 # a different device object is seen.
 _SHARED_MASKS = {"device": None, "entries": []}
 
 
 def shared_device_mask(device, mask, dtype, upload):
-    """The device tensor for host `mask` at `dtype` on `device`: `upload(mask)` the first time,
-    the same tensor for every later identical mask."""
+    """The device tensor for host `mask` at `dtype` on `device`, the same tensor for every later identical
+    mask. A float32 / bfloat16 mask is tilized on the HOST and copied up already tiled: the device
+    tilize of a [1, 8, 2048, 2048] float32 mask is ~680 us of device time per window; other dtypes go
+    through `upload(mask)`."""
+    import ttnn
+
     if _SHARED_MASKS["device"] is not device:
         _SHARED_MASKS["device"], _SHARED_MASKS["entries"] = device, []
     for host, dt, dev in _SHARED_MASKS["entries"]:
         if dt == dtype and host.shape == mask.shape and torch.equal(host, mask):
             return dev
-    dev = upload(mask)
+    if dtype in (ttnn.float32, ttnn.bfloat16):
+        mapper = ttnn.ReplicateTensorToMesh(device) if device.__class__.__name__ == "MeshDevice" else None
+        t = mask.to(torch.float32 if dtype == ttnn.float32 else torch.bfloat16).contiguous()
+        dev = ttnn.to_device(ttnn.from_torch(t, dtype=dtype, layout=ttnn.TILE_LAYOUT, mesh_mapper=mapper), device)
+    else:
+        dev = upload(mask)
     _SHARED_MASKS["entries"].append((mask, dtype, dev))
     return dev
 
