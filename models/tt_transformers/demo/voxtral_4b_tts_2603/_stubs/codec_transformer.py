@@ -141,6 +141,10 @@ def _lin(x, w, **kwargs):
         # batch over each sample's tile-padded rows), so neither side needs the fold's row-major relayout.
         cfg = _mcast_cfg(x, w, padded, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
+            # fidelity: HiFi2, as the tall codec linears run (LoFi fails the e2e gate).
+            kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+            )
             return ttnn.linear(x, w, program_config=cfg, **kwargs)
     if rows >= 256 and rows % 32 == 0 and "program_config" not in kwargs:
         cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
@@ -244,17 +248,22 @@ def _compile_block(device, blk, mask, window=None):
 
     def block(h):
         seq = int(h.shape[-2])
-        # bf16 normalised rows into the q / k / v linears (fp32 DEST; q / k / v come back fp32).
-        xn = _rms_norm(h, attn_gamma, attn_eps, dtype=ttnn.bfloat16)
+        # bf16 normalised rows into the q / k / v linears (fp32 DEST; q / k come back bf16, v fp32).
+        # shard: a short sequence's normed rows (q / k / v's input) in L1.
+        xn_mem = ttnn.L1_MEMORY_CONFIG if int(h.shape[-2]) < 32 else None
+        xn = _rms_norm(h, attn_gamma, attn_eps, dtype=ttnn.bfloat16, memory_config=xn_mem)
 
         # A sub-tile sequence (T < 32: one padded tile row a sample) keeps its small q / k / v in L1.
         qkv_mem = ttnn.L1_MEMORY_CONFIG if int(xn.shape[-2]) < 32 else None
-        q = _lin(xn, wq, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
-        k = _lin(xn, wk, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
+        # dtype: q / k leave their projections as bf16 (half the write; the fp32 qk-norm reads half and writes
+        # the float32 the band attention takes); v stays float32.
+        qk_dt = ttnn.bfloat16 if qk_norm else ttnn.float32
+        q = _lin(xn, wq, compute_kernel_config=_COMPUTE, dtype=qk_dt, memory_config=qkv_mem)
+        k = _lin(xn, wk, compute_kernel_config=_COMPUTE, dtype=qk_dt, memory_config=qkv_mem)
         v = _lin(xn, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
         if qk_norm:
-            q = _rms_norm(q, q_gamma, q_eps)
-            k = _rms_norm(k, k_gamma, k_eps)
+            q = _rms_norm(q, q_gamma, q_eps, dtype=ttnn.float32)
+            k = _rms_norm(k, k_gamma, k_eps, dtype=ttnn.float32)
 
         # SDPA rejects float32 outright (`sdpa_device_operation.cpp:43`) -- so this does not call
         # it. Spelling the attention out as two matmuls and a softmax keeps Q/K/V, the ALiBi mask
@@ -294,6 +303,7 @@ def _compile_block(device, blk, mask, window=None):
         r = _lin(
             a,
             wo,
+            memory_config=xn_mem,  # shard: a short sequence's rows stay in L1
             dtype=ttnn.float32,
             compute_kernel_config=_COMPUTE,
         )
@@ -307,8 +317,8 @@ def _compile_block(device, blk, mask, window=None):
         hn = _rms_norm(h, ffn_gamma, ffn_eps, dtype=ttnn.bfloat16, memory_config=ffn_mem)
         # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
         # and writes the fp32 residual branch.
-        gate = _lin(hn, w1, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16)
-        up = _lin(hn, w3, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16)
+        gate = _lin(hn, w1, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16, memory_config=xn_mem)
+        up = _lin(hn, w3, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16, memory_config=xn_mem)
         ttnn.deallocate(hn)
         gated = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=ffn_mem)
         r = _lin(gated, w2, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)

@@ -145,6 +145,10 @@ def _lin(x, w, **kwargs):
         # batch over each sample's tile-padded rows), so neither side needs the fold's row-major relayout.
         cfg = _mcast_cfg(x, w, padded, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
+            # fidelity: HiFi2, as the tall codec linears run (LoFi fails the e2e gate).
+            kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+            )
             return ttnn.linear(x, w, program_config=cfg, **kwargs)
     if rows >= 256 and rows % 32 == 0 and "program_config" not in kwargs:
         cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
@@ -197,7 +201,7 @@ def _norm_gamma(norm, device):
     return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1), device, dtype=ttnn.float32)
 
 
-def _rms_norm(x, gamma, eps):
+def _rms_norm(x, gamma, eps, dtype=None):
     """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
 
     NOT `ttnn.rms_norm`: on this model's real inputs the stock op sits at ~9.65e-4 relative error
@@ -209,7 +213,8 @@ def _rms_norm(x, gamma, eps):
     reason, so the two bodies agree.
     """
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
-    return ttnn.multiply(ttnn.multiply(x, scale), gamma)
+    out = {"dtype": dtype} if dtype is not None else {}
+    return ttnn.multiply(ttnn.multiply(x, scale), gamma, **out)
 
 
 def _softmax(x, dim=-1):
@@ -313,12 +318,15 @@ def build(device, torch_module):
 
         # A sub-tile sequence (T < 32: one padded tile row a sample) keeps its small q / k / v in L1.
         qkv_mem = ttnn.L1_MEMORY_CONFIG if int(h.shape[-2]) < 32 else None
-        q = _lin(h, wq, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
-        k = _lin(h, wk, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
+        # dtype: q / k leave their projections as bf16 (half the write; the fp32 qk-norm reads half and writes
+        # the float32 the band attention takes); v stays float32.
+        qk_dt = ttnn.bfloat16 if qk_norm else ttnn.float32
+        q = _lin(h, wq, compute_kernel_config=_COMPUTE, dtype=qk_dt, memory_config=qkv_mem)
+        k = _lin(h, wk, compute_kernel_config=_COMPUTE, dtype=qk_dt, memory_config=qkv_mem)
         v = _lin(h, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=qkv_mem)
         if qk_norm:
-            q = _rms_norm(q, q_gamma, q_eps)
-            k = _rms_norm(k, k_gamma, k_eps)
+            q = _rms_norm(q, q_gamma, q_eps, dtype=ttnn.float32)
+            k = _rms_norm(k, k_gamma, k_eps, dtype=ttnn.float32)
 
         # SDPA rejects float32 outright (`sdpa_device_operation.cpp:43`) -- so this does not call
         # it. Spelling the attention out as two matmuls and a softmax keeps Q/K/V, the ALiBi mask
@@ -356,7 +364,8 @@ def build(device, torch_module):
                 ttnn.deallocate(scores)
             a = ttnn.experimental.nlp_concat_heads(a)
         return ttnn.reshape(
-            _lin(a, wo, dtype=ttnn.float32, compute_kernel_config=_COMPUTE),
+            # shard: a short sequence's o_proj rows stay in L1 (qkv_mem).
+            _lin(a, wo, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=qkv_mem),
             [batch, seq, out_dim],
         )
 
