@@ -53,6 +53,8 @@ LM_EXACT = False
 VISION_EXACT = True
 # bf16 limbs of the vision MLP's input in the precise path (the rest of the tower uses 3)
 VISION_MLP_LIMBS = 2
+# bf16 limbs of the vision attention's operands in the precise path
+VISION_ATTN_LIMBS = 2
 # negatives reuse the prompts' K/V of their common token prefix (whole tiles): the LM is causal, so
 # those positions' hidden states are identical, and only the negatives' tail is run (attending to it)
 PREFIX_SHARE = True
@@ -141,7 +143,8 @@ class TtQwenTextEncoder:
             b = blk.block
             b.attn.precise = b.mlp.precise = b.norm1.precise = b.norm2.precise = on
             b.precise_inputs = on
-            b.attn.limbs = vl
+            # attention operands as 2 bf16 limbs too: 3 limb terms per exact product instead of 6
+            b.attn.limbs = min(vl, VISION_ATTN_LIMBS)
             # the MLP input carried as 2 bf16 limbs (~16 mantissa bits) instead of 3: 48 lane products, not 72
             b.mlp.limbs = min(vl, VISION_MLP_LIMBS)
             b.attn.exact = b.mlp.exact = VISION_EXACT
