@@ -33,6 +33,7 @@ from models.demos.voxtral_4b_tts_2603.tt import (
     cpp_pv_dec,
     cpp_scores_dec,
     cpp_sqmean,
+    cpp_swiglu_mm,
     cpp_tail_rows,
     ttl_kv,
     ttl_swiglu,
@@ -1035,6 +1036,15 @@ def _fused_swiglu(h, w_gu, w_ttl=None, memory_config=None):
     # At <= 2 M tiles a core the bf4_b weight's blocks are small enough for 8-tile K blocks
     # (half the K steps of 4) within the ~1 MB of L1 that still traces.
     wide = m_blk <= 2
+    if cpp_swiglu_mm.supports(h, w_gu, 18, int(grid.x)):
+        # cpp: the same arithmetic tile for tile (the same K blocks, in the same order), the weight streamed by every core
+        # instead of minimal_matmul's grid.x column readers; handed to `memory_config` by one copy.
+        gated = cpp_swiglu_mm.apply(h, w_gu, 8 if wide else 4, 18, int(grid.x))
+        if memory_config is None or memory_config == gated.memory_config():
+            return gated
+        out = ttnn.to_memory_config(gated, memory_config)
+        ttnn.deallocate(gated)
+        return out
     cfg = ttnn.MinimalMatmulConfig(
         M_block_size=m_blk,
         K_block_size=8 if wide else 4,
