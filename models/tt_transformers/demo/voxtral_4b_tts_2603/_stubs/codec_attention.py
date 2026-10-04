@@ -356,7 +356,7 @@ def build(device, torch_module):
                 else (ttnn.L1_MEMORY_CONFIG if qk_rows * int(wo.shape[-2]) * 2 <= (8 << 20) else None)
             )
             a = cpp_band_attn.apply(
-                q, k, v, mask, scale, memory_config=ctx_mem, merged_heads=n_heads, dtype=ttnn.bfloat16
+                q, k, v, mask, scale, memory_config=ctx_mem, merged_heads=n_heads, dtype=ttnn.bfloat16, real_rows=seq
             )
         else:
             qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
@@ -383,9 +383,14 @@ def build(device, torch_module):
                 a = _bmm(weights, vh)
                 ttnn.deallocate(scores)
             a = ttnn.experimental.nlp_concat_heads(a)
+        o_mem = (
+            qkv_mem
+            if qkv_mem is not None
+            else (ttnn.L1_MEMORY_CONFIG if qk_rows * int(wo.shape[-1]) * 4 <= (16 << 20) else None)
+        )
         return ttnn.reshape(
-            # shard: a short sequence's o_proj rows stay in L1 (qkv_mem).
-            _lin(a, wo, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=qkv_mem),
+            # shard: a short sequence's o_proj rows stay in L1 (qkv_mem), and so do tall ones up to 16 MB.
+            _lin(a, wo, dtype=ttnn.float32, compute_kernel_config=_COMPUTE, memory_config=o_mem),
             [batch, seq, out_dim],
         )
 

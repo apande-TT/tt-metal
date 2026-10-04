@@ -271,6 +271,10 @@ def _compile_codec_block(device, blk, mask, window=None):
 
     def block(h):
         seq = int(h.shape[-2])
+        if seq < 32 and h.memory_config().buffer_type != ttnn.BufferType.L1:
+            # shard: a short sequence's float32 residual stream (~19 KB a core) moves to L1, so the
+            # residual adds and every step of the spelled-out RMS norms read and write L1 instead of DRAM.
+            h = ttnn.to_memory_config(h, ttnn.L1_MEMORY_CONFIG)
         # bf16 normalised rows into the q / k / v linears (fp32 DEST; q / k come back bf16, v fp32).
         # shard: a short sequence's normed rows (q / k / v's input) in L1.
         xn_mem = ttnn.L1_MEMORY_CONFIG if int(h.shape[-2]) < 32 else None
@@ -312,7 +316,7 @@ def _compile_codec_block(device, blk, mask, window=None):
                 else (ttnn.L1_MEMORY_CONFIG if qk_rows * int(wo.shape[-2]) * 2 <= (8 << 20) else None)
             )
             a = cpp_band_attn.apply(
-                q, k, v, mask, scale, memory_config=ctx_mem, merged_heads=n_heads, dtype=ttnn.bfloat16
+                q, k, v, mask, scale, memory_config=ctx_mem, merged_heads=n_heads, dtype=ttnn.bfloat16, real_rows=seq
             )
         else:
             qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
@@ -339,10 +343,12 @@ def _compile_codec_block(device, blk, mask, window=None):
                 a = _bmm(weights, vh)
                 ttnn.deallocate(scores)
             a = ttnn.experimental.nlp_concat_heads(a)
+        # shard: the float32 residual branches (o_proj, w2) land in L1 while the rows fit (<= 4096).
+        res_mem = xn_mem if xn_mem is not None else common.l1_while_rows_fit(h)
         r = _fold_linear(
             a,
             wo,
-            memory_config=xn_mem,  # shard: a short sequence's rows stay in L1
+            memory_config=res_mem,  # shard: the residual branch stays in L1 while the rows fit
             dtype=ttnn.float32,
             compute_kernel_config=_COMPUTE,
         )
@@ -351,7 +357,7 @@ def _compile_codec_block(device, blk, mask, window=None):
         h = ttnn.add(h, r)
 
         # shard rung: the FFN's two activations -- the normed rows w1 / w3 read and the gated product w2
-        # reads -- live in L1 (interleaved) while they fit, so the matmuls' in0 reads skip DRAM.
+        # reads (the latter only to 2048 rows) -- live in L1 (interleaved) while they fit, so in0 reads skip DRAM.
         ffn_mem = common.l1_while_rows_fit(h)
         hn = _rms_norm(h, ffn_gamma, ffn_eps, dtype=ttnn.bfloat16, memory_config=ffn_mem)
         # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
@@ -359,8 +365,10 @@ def _compile_codec_block(device, blk, mask, window=None):
         gate = _fold_linear(hn, w1, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16, memory_config=xn_mem)
         up = _fold_linear(hn, w3, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16, memory_config=xn_mem)
         ttnn.deallocate(hn)
-        gated = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=ffn_mem)
-        r = _fold_linear(gated, w2, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
+        # shard: past 2048 rows the gated rows go to DRAM so w2's float32 output fits in L1 instead.
+        gated_mem = common.l1_while_rows_fit(h, 2048)
+        gated = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=gated_mem)
+        r = _fold_linear(gated, w2, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=ffn_mem)
         ttnn.deallocate(gated)
         if ffn_scale is not None:
             r = ttnn.multiply(r, ffn_scale)
@@ -481,7 +489,15 @@ def _compile_causal_conv_transpose1d(device, mod):
     if conv.bias is not None:
         bias = _from_torch(conv.bias.detach().reshape(1, 1, 1, out_channels), device)
     # structural: the four taps side by side, for ONE product and ONE interleaving shift-add (tt/cpp_upsample2).
-    wide = cpp_upsample2.wide_weight(taps) if cpp_upsample2.enabled() and out_channels % 32 == 0 else None
+    # dtype: the wide weight built on the HOST as bf8_b (the taps side by side, as wide_weight lays
+    # them out) instead of a device concat of float32 / bf16 taps.
+    wide = (
+        _from_torch(
+            torch.cat([weight[:, :, i] for i in range(kernel)], dim=-1).contiguous(), device, dtype=ttnn.bfloat8_b
+        )
+        if cpp_upsample2.enabled() and out_channels % 32 == 0
+        else None
+    )
 
     def _wide_linear(x, w, **kwargs):
         # The tall codec linears' own full-grid config and HiFi2 (what the aligned per-tap products ran), over

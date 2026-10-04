@@ -131,9 +131,21 @@ def build(device, torch_module):
     if conv.bias is not None:
         bias = _from_torch(conv.bias.detach().reshape(1, 1, 1, out_channels), device)
     # structural: the four taps side by side, for ONE product and ONE interleaving shift-add (tt/cpp_upsample2).
-    wide = cpp_upsample2.wide_weight(taps) if cpp_upsample2.enabled() and out_channels % 32 == 0 else None
+    # dtype: the wide weight built on the HOST as bf8_b (the taps side by side, as wide_weight lays
+    # them out) instead of a device concat of float32 / bf16 taps.
+    wide = (
+        _from_torch(
+            torch.cat([weight[:, :, i] for i in range(kernel)], dim=-1).contiguous(), device, dtype=ttnn.bfloat8_b
+        )
+        if cpp_upsample2.enabled() and out_channels % 32 == 0
+        else None
+    )
 
     def _wide_linear(x, w, **kwargs):
+        # fidelity: HiFi2 + fp32 DEST, as the whole-section body's wide product runs.
+        kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+        )
         return ttnn.linear(x, w, program_config=_grid_cfg(x, w, cpp_upsample2.tile_rows(x)), **kwargs)
 
     def causal_conv_transpose1d(x, **kwargs):
