@@ -108,6 +108,8 @@ class TtQwenTextEncoder:
         # the vision token permutations as one bf16 matmul per limb (one-hot rows: each output is a single
         # 1 * v product, already exact without the exact-lane decomposition)
         vision_transformer_pretrained_model.ONEHOT_PERMUTE = True
+        # MLP gate / up share their input's bf16 limb split (LM and vision tower)
+        _te_attention.SHARE_SPLIT = True
         self.set_precise(True)
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
