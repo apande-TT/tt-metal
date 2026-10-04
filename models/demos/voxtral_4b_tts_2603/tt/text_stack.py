@@ -890,7 +890,8 @@ class TextStack:
             block.kv = None
             if not kv:
                 continue
-            for tensor in (kv.get("k"), kv.get("v"), *(kv.get("resident") or ())):
+            shared = kv.get("prefix_shared") or {}
+            for tensor in (kv.get("k"), kv.get("v"), *(kv.get("resident") or ()), *shared.values()):
                 if tensor is None:
                     continue
                 try:

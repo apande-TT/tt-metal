@@ -14,6 +14,7 @@ void kernel_main() {
     const uint32_t v_addr = get_arg_val<uint32_t>(1);
     const uint32_t u0 = get_arg_val<uint32_t>(2);
     const uint32_t nu = get_arg_val<uint32_t>(3);
+    const uint32_t p_addr = get_arg_val<uint32_t>(4);  // the shared prefix's values (PT > 0)
 
     constexpr uint32_t DT = get_compile_time_arg_val(0);
     constexpr uint32_t ST = get_compile_time_arg_val(1);
@@ -25,10 +26,15 @@ void kernel_main() {
     constexpr uint32_t PACKED = get_compile_time_arg_val(5);
     constexpr uint32_t G = get_compile_time_arg_val(6);
     constexpr uint32_t NKV = get_compile_time_arg_val(7);
-    constexpr auto ae = TensorAccessorArgs<8>();
+    // PT > 0: the first PT value tile rows (the prompt prefix every user shares) come from ONE shared copy
+    // `[1, NKV, PT * 32, head_dim]` -- the bytes each user's cache would hold there.
+    constexpr uint32_t PT = get_compile_time_arg_val(8);
+    constexpr auto ae = TensorAccessorArgs<9>();
     constexpr auto av = TensorAccessorArgs<ae.next_compile_time_args_offset()>();
+    constexpr auto ap = TensorAccessorArgs<av.next_compile_time_args_offset()>();
     const auto se = TensorAccessor(ae, e_addr);
     const auto sv = TensorAccessor(av, v_addr);
+    const auto sp = TensorAccessor(ap, p_addr);
 
     constexpr uint32_t cb_e = 0;
     constexpr uint32_t cb_v = 1;
@@ -64,10 +70,18 @@ void kernel_main() {
                     noc_async_read_page(u * ST + j, se, le);
                 }
                 le += e_bytes;
-                const uint32_t t = ((u / MT) * SS + j) * DT;
-                for (uint32_t d = 0; d < DT; ++d) {
-                    noc_async_read_page(t + d, sv, l1);
-                    l1 += v_bytes;
+                if (j < PT) {
+                    const uint32_t t = (((u / MT) % NKV) * PT + j) * DT;
+                    for (uint32_t d = 0; d < DT; ++d) {
+                        noc_async_read_page(t + d, sp, l1);
+                        l1 += v_bytes;
+                    }
+                } else {
+                    const uint32_t t = ((u / MT) * SS + j) * DT;
+                    for (uint32_t d = 0; d < DT; ++d) {
+                        noc_async_read_page(t + d, sv, l1);
+                        l1 += v_bytes;
+                    }
                 }
             }
             noc_async_read_barrier();

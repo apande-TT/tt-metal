@@ -106,7 +106,7 @@ def _cb(cores, index, fmt, tiles):
     )
 
 
-def apply(e, v, rb=_RB, memory_config=None, groups=None):
+def apply(e, v, rb=_RB, memory_config=None, groups=None, prefix=None):
     """`e @ v` per (user, kv head), float32 `[B, n_kv, rows, d]` (L1 unless `memory_config`).
 
     Each query tile row of a (user, kv head) is its own unit; its V tile rows are re-read per unit. With `groups`,
@@ -130,12 +130,16 @@ def apply(e, v, rb=_RB, memory_config=None, groups=None):
         ttnn.Shape([b, h, rows, d]), ttnn.float32, ttnn.TILE_LAYOUT, device, memory_config or ttnn.L1_MEMORY_CONFIG
     )
     ea, va, ya = e.buffer_address(), v.buffer_address(), y.buffer_address()
+    # `prefix` (cpp_scores_dec.prefix_ok): the first P value rows come from that shared copy.
+    pt = int(prefix.shape[-2]) // _TILE if prefix is not None else 0
+    pref = prefix if prefix is not None else v
+    pa = pref.buffer_address()
     rr, rc, rw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     u0 = 0
     for c in range(ncores):
         cy, cx = divmod(c, gx)
         nu = base + (1 if c < extra else 0)
-        rr[cx][cy] = [ea, va, u0, nu]
+        rr[cx][cy] = [ea, va, u0, nu, pa]
         rc[cx][cy] = [nu]
         rw[cx][cy] = [ya, u0, nu]
         u0 += nu
@@ -144,7 +148,10 @@ def apply(e, v, rb=_RB, memory_config=None, groups=None):
             kernel_source=_READER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt, st, ss, rb, mt, int(packed), int(groups or 0), h] + _accessor_args(e) + _accessor_args(v),
+            compile_time_args=[dt, st, ss, rb, mt, int(packed), int(groups or 0), h, pt]
+            + _accessor_args(e)
+            + _accessor_args(v)
+            + _accessor_args(pref),
             runtime_args=rr,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -180,5 +187,5 @@ def apply(e, v, rb=_RB, memory_config=None, groups=None):
     # cores, and leaves the raw addresses out -- a cache hit re-applies this descriptor's runtime args. Hashing
     # the addresses made a step whose tensors landed elsewhere miss the cache, and a miss inside a trace
     # capture is a compile + binary write the capture refuses.
-    ttnn.generic_op([e, v, y], desc)
+    ttnn.generic_op([e, v] + ([prefix] if prefix is not None else []) + [y], desc)
     return y

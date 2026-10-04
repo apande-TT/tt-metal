@@ -118,12 +118,31 @@ def _cb(cores, index, fmt, tiles):
     )
 
 
-def apply(q, k, span=None, groups=None, packed=False):
+def prefix_ok(k, prefix) -> bool:
+    """`prefix`: the shared `[1, n_kv, P, head_dim]` copy of every user's first P cache rows (P a tile multiple)."""
+    try:
+        return (
+            prefix is not None
+            and prefix.dtype == k.dtype
+            and prefix.layout == ttnn.TILE_LAYOUT
+            and not prefix.is_sharded()
+            and int(prefix.shape[0]) == 1
+            and int(prefix.shape[1]) == int(k.shape[1])
+            and int(prefix.shape[-1]) == int(k.shape[-1])
+            and int(prefix.shape[-2]) % _TILE == 0
+            and int(prefix.shape[-2]) <= int(k.shape[-2])
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def apply(q, k, span=None, groups=None, packed=False, prefix=None):
     """`q @ k^T` per (user, kv head) over the first `span` key rows (default: all), float32
     `[B, n_kv, 32, span]` in L1. With `groups`, q is the RoPE output `[B, 1, n_kv * groups, head_dim]`,
     regrouped by kv head in the reader. `packed` (with `groups`, n_kv * groups == 32): the scores come back
     `[B, 1, 32, span]` -- kv head h's `groups` real rows at rows h * groups .., every row of every tile real,
-    so the mask add / max / exp / sum after it run on n_kv-times fewer tiles (each row's values unchanged)."""
+    so the mask add / max / exp / sum after it run on n_kv-times fewer tiles (each row's values unchanged).
+    `prefix` (see prefix_ok): the first P key rows are read from that shared copy instead of each user's cache."""
     device = q.device()
     if groups:
         b, _, _, d = (int(s) for s in q.shape)
@@ -145,12 +164,15 @@ def apply(q, k, span=None, groups=None, packed=False):
         ttnn.Shape([b, 1 if packed else h, rows, span]), ttnn.float32, ttnn.TILE_LAYOUT, device, ttnn.L1_MEMORY_CONFIG
     )
     qa, ka, ya = q.buffer_address(), k.buffer_address(), y.buffer_address()
+    pt = int(prefix.shape[-2]) // _TILE if prefix is not None else 0
+    pref = prefix if prefix is not None else k
+    pa = pref.buffer_address()
     rr, rc, rw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     u0 = 0
     for c in range(ncores):
         cy, cx = divmod(c, gx)
         nu = base + (1 if c < extra else 0)
-        rr[cx][cy] = [qa, ka, u0, nu]
+        rr[cx][cy] = [qa, ka, u0, nu, pa]
         rc[cx][cy] = [nu]
         rw[cx][cy] = [ya, u0, nu]
         u0 += nu
@@ -159,7 +181,10 @@ def apply(q, k, span=None, groups=None, packed=False):
             kernel_source=_READER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt, st, ss, rb, int(groups or 0), h] + _accessor_args(q) + _accessor_args(k),
+            compile_time_args=[dt, st, ss, rb, int(groups or 0), h, pt]
+            + _accessor_args(q)
+            + _accessor_args(k)
+            + _accessor_args(pref),
             runtime_args=rr,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -195,5 +220,5 @@ def apply(q, k, span=None, groups=None, packed=False):
     # cores, and leaves the raw addresses out -- a cache hit re-applies this descriptor's runtime args. Hashing
     # the addresses made a step whose tensors landed elsewhere miss the cache, and a miss inside a trace
     # capture is a compile + binary write the capture refuses.
-    ttnn.generic_op([q, k, y], desc)
+    ttnn.generic_op([q, k] + ([prefix] if prefix is not None else []) + [y], desc)
     return y
