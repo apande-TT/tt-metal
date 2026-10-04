@@ -1014,7 +1014,7 @@ def _ttl_swiglu_weights(gate, up, device):
     return tuple(_from_torch(w.contiguous(), device, dtype=ttnn.bfloat16) for w in (gate, up))
 
 
-def _fused_swiglu(h, w_gu, w_ttl=None, memory_config=None):
+def _fused_swiglu(h, w_gu, w_ttl=None, memory_config=None, w_cpp=None):
     """Prefill `silu(h @ Wg) * (h @ Wu)` as ONE matmul: no gate/up tensors are written and there
     is no separate multiply pass over them. `memory_config` is where the matmul writes its result
     (the down projection's K-block layout for the short prefix)."""
@@ -1036,10 +1036,11 @@ def _fused_swiglu(h, w_gu, w_ttl=None, memory_config=None):
     # At <= 2 M tiles a core the bf4_b weight's blocks are small enough for 8-tile K blocks
     # (half the K steps of 4) within the ~1 MB of L1 that still traces.
     wide = m_blk <= 2
-    if cpp_swiglu_mm.supports(h, w_gu, 18, int(grid.x)):
+    w_c = w_cpp if w_cpp is not None else w_gu
+    if cpp_swiglu_mm.supports(h, w_c, 18, int(grid.x)):
         # cpp: the same arithmetic tile for tile (the same K blocks, in the same order), the weight streamed by every core
         # instead of minimal_matmul's grid.x column readers; handed to `memory_config` by one copy.
-        gated = cpp_swiglu_mm.apply(h, w_gu, 8 if wide else 4, 18, int(grid.x))
+        gated = cpp_swiglu_mm.apply(h, w_c, 8 if wide else 4, 18, int(grid.x))
         if memory_config is None or memory_config == gated.memory_config():
             return gated
         out = ttnn.to_memory_config(gated, memory_config)
@@ -1111,14 +1112,22 @@ def build(device, torch_module):
     )
     # Prefill's fused SwiGLU weight, bf4_b against the bf16 norm output (minimal_matmul takes mixed
     # dtypes); decode keeps the separate gate/up above for its float32 activation.
-    w_gu = _from_torch(
-        _swiglu_pairs(
-            mlp.gate_proj.weight.detach().float().transpose(0, 1) * g_post_t,
-            mlp.up_proj.weight.detach().float().transpose(0, 1) * g_post_t,
-        ),
-        device,
-        dtype=ttnn.bfloat4_b,
+    gu_pairs = _swiglu_pairs(
+        mlp.gate_proj.weight.detach().float().transpose(0, 1) * g_post_t,
+        mlp.up_proj.weight.detach().float().transpose(0, 1) * g_post_t,
     )
+    w_gu = _from_torch(gu_pairs, device, dtype=ttnn.bfloat4_b)
+    # The short prefix's C++ SwiGLU reads a copy with its tile columns re-laid bank-contiguous per core; the same
+    # conversion of the same pairs, so every tile is minimal_matmul's.
+    w_gu_cpp = cpp_swiglu_mm.relayout(
+        gu_pairs,
+        device,
+        lambda t: _from_torch(t, device, dtype=ttnn.bfloat4_b),
+        18,
+        int(device.compute_with_storage_grid_size().x),
+        8,
+    )
+    del gu_pairs
     w_ttl = _ttl_swiglu_weights(
         mlp.gate_proj.weight.detach().float().transpose(0, 1) * g_post_t,
         mlp.up_proj.weight.detach().float().transpose(0, 1) * g_post_t,
@@ -1489,7 +1498,7 @@ def build(device, torch_module):
                     ttnn.bfloat16,
                     bool(getattr(_COMPUTE, "fp32_dest_acc_en", False)),
                 )
-            gated = _fused_swiglu(hn, w_gu, w_ttl, memory_config=split[1] if split else None)
+            gated = _fused_swiglu(hn, w_gu, w_ttl, memory_config=split[1] if split else None, w_cpp=w_gu_cpp)
         ttnn.deallocate(hn)
         # Prefill hands the down projection over in bf16, as the composed kinds' mlp and every wo
         # already do; the residual it is added into stays float32.
