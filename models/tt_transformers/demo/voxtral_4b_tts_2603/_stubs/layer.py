@@ -1268,9 +1268,19 @@ def build(device, torch_module):
             cut = l1 if span <= 320 else None
             keys = ttnn.slice(keys, [0, 0, 0, 0], ends, memory_config=cut)
             values = ttnn.slice(values, [0, 0, 0, 0], ends, memory_config=cut)
+        # structural: with q grouped in place and the context merge in C++, kv head h's `groups` real score rows
+        # land at rows h * groups .. of ONE 32-row tile row a sample (cpp_scores_dec packed=True) -- the mask add,
+        # max, exp and sum below touch n_kv-times fewer tiles; every row's values are the same (all per-row ops).
+        packed = (
+            q_in_place
+            and use_cpp_pv
+            and groups * n_kv_heads == n_heads == 32
+            and cpp_ctx_merge.enabled()
+            and cpp_scores_dec.packed_enabled()
+        )
         if in_place:
             # the C++ decode scores, keys (and q, when grouped there) read in place
-            scores = cpp_scores_dec.apply(q, keys, span, groups=groups if q_in_place else None)
+            scores = cpp_scores_dec.apply(q, keys, span, groups=groups if q_in_place else None, packed=packed)
         elif use_cpp_scores and cpp_scores_dec.supports(q, keys):
             scores = cpp_scores_dec.apply(q, keys)  # the C++ decode scores
         else:
@@ -1289,11 +1299,13 @@ def build(device, torch_module):
             memory_config=l1,
         )
         ttnn.deallocate(masked)
-        if use_cpp_pv and cpp_pv_dec.supports(e, values):
-            pv = cpp_pv_dec.apply(e, values)  # the C++ decode P@V
+        if use_cpp_pv and cpp_pv_dec.supports(e, values, groups=groups if packed else None):
+            pv = cpp_pv_dec.apply(e, values, groups=groups if packed else None)  # the C++ decode P@V
         else:
             pv = _bmm(e, values, memory_config=l1)
         ssum = ttnn.sum(e, dim=-1, keepdim=True, memory_config=l1)
+        if packed and not cpp_ctx_merge.supports(pv, ssum, groups):
+            raise RuntimeError("packed decode scores need the C++ context merge")
         if groups * n_kv_heads == n_heads and cpp_ctx_merge.supports(pv, ssum, groups):
             # structural: the normalise and the head merge in ONE generic_op (tt/cpp_ctx_merge) -- each merged
             # tile's batch rows gathered from the P@V tiles and divided by their row sums; the divide, the
