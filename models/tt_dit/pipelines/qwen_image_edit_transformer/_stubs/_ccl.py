@@ -30,6 +30,8 @@ _CHUNK_BYTES = 48 * 1024 * 1024  # per-partial bytes gathered at once
 # L1 bytes for one gathered chunk of the exact reduce (0: gather into DRAM in _CHUNK_BYTES pieces). With
 # it set, each token chunk's gather + slices + float32 adds stay in L1 and only its sum goes to DRAM.
 L1_GATHER_BYTES = 0
+# with it: each chunk's own partial is also staged in L1, so the gather reads L1 instead of DRAM
+L1_GATHER_INPUT = False
 _CURRENT = object()  # sentinel: "the current build-time TP axis"
 _TP_AXIS = None  # build-time default; ports capture it in __init__
 
@@ -129,7 +131,7 @@ def _gather_sum_l1(y, ax, n, nbytes):
     for lo in range(0, rows, step):
         start, end = [0] * len(shape), list(shape)
         start[-2], end[-2] = lo, min(rows, lo + step)
-        yc = ttnn.slice(y, start, end)
+        yc = ttnn.slice(y, start, end, memory_config=ttnn.L1_MEMORY_CONFIG if L1_GATHER_INPUT else None)
         s = _gather_sum_once(yc, ax, n, mem=ttnn.L1_MEMORY_CONFIG)
         ttnn.deallocate(yc)
         outs.append(ttnn.to_memory_config(s, ttnn.DRAM_MEMORY_CONFIG))
