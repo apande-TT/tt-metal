@@ -53,18 +53,32 @@ void kernel_main() {
 
     for (uint32_t k = 0; k < nk; ++k) {
         tile_regs_acquire();
+        // Tiles go through DEST three at a time (dst 1..3) so each SFPU init covers three tiles; the fold
+        // still adds them into dst 0 one after another, in tile order -- the stock fold's order.
+        copy_init(cb_x);
         for (uint32_t w = 0; w < WT; w += BATCH) {
             cb_wait_front(cb_x, BATCH);
-            for (uint32_t i = 0; i < BATCH; ++i) {
-                const uint32_t dst = (w + i == 0) ? 0 : 1;
-                copy_init(cb_x);
-                copy_tile(cb_x, i, dst);
+            uint32_t i = 0;
+            if (w == 0) {
+                copy_tile(cb_x, 0, 0);
                 square_tile_init();
-                square_half(dst);
-                if (w + i > 0) {
-                    add_binary_tile_init();
-                    add_half(0, 1, 0);
+                square_half(0);
+                i = 1;
+            }
+            while (i < BATCH) {
+                const uint32_t n = (BATCH - i) < 3 ? (BATCH - i) : 3;
+                for (uint32_t j = 0; j < n; ++j) {
+                    copy_tile(cb_x, i + j, 1 + j);
                 }
+                square_tile_init();
+                for (uint32_t j = 0; j < n; ++j) {
+                    square_half(1 + j);
+                }
+                add_binary_tile_init();
+                for (uint32_t j = 0; j < n; ++j) {
+                    add_half(0, 1 + j, 0);
+                }
+                i += n;
             }
             cb_pop_front(cb_x, BATCH);
         }

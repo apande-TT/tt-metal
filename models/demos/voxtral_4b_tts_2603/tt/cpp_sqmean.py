@@ -27,6 +27,10 @@ _DIR = pathlib.Path(__file__).resolve().parent / "cpp_sqmean_kernels"
 _READER = str(_DIR / "reader.cpp")
 _COMPUTE = str(_DIR / "compute.cpp")
 _WRITER = str(_DIR / "writer.cpp")
+_READER4 = str(_DIR / "reader4.cpp")
+_COMPUTE4 = str(_DIR / "compute4.cpp")
+_WRITER4 = str(_DIR / "writer4.cpp")
+_BATCH4 = 6  # CB slots (4 tiles' face each) a read barrier
 
 _TILE = 32
 _FP32_TILE = 4096
@@ -75,6 +79,114 @@ def supports(x, site="text") -> bool:
 
 def sq_mean(x, memory_config=None):
     """`mean(x^2, -1, keepdim=True)` as float32 `[..., rows, 1]` (`memory_config`, else x's)."""
+    rows = 1
+    for d in [int(v) for v in x.shape][:-1]:
+        rows *= d
+    grid = x.device().compute_with_storage_grid_size()
+    if 4 * (rows // _TILE) <= int(grid.x) * int(grid.y) and int(x.shape[-1]) % (_TILE * 4 * _BATCH4) == 0:
+        return _sq_mean_quad(x, memory_config)
+    return _sq_mean_halves(x, memory_config)
+
+
+def _inv_bits(dim):
+    """The stock reduce's post-multiply scalar: the float32 1 / dim, as ttnn.mean computes it."""
+    return int(np.array([np.float32(1.0) / np.float32(dim)], dtype=np.float32).view(np.uint32)[0])
+
+
+def _cfg(compute_cfg, unpack_to_dest):
+    # The stock square / reduce config: HiFi4, fp32 DEST, exact SFPU functions, half-sync DEST, x unpacked
+    # straight to DEST (no SrcA tf32 step).
+    compute_cfg.math_fidelity = ttnn.MathFidelity.HiFi4
+    compute_cfg.fp32_dest_acc_en = True
+    compute_cfg.math_approx_mode = False
+    compute_cfg.dst_full_sync_en = False
+    modes = [ttnn.UnpackToDestMode.Default] * _NUM_CBS
+    for i in unpack_to_dest:
+        modes[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    compute_cfg.unpack_to_dest_mode = modes
+
+
+def _fp32_cb(cores, index, tiles):
+    return ttnn.CBDescriptor(
+        total_size=tiles * _FP32_TILE,
+        core_ranges=cores,
+        format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=ttnn.float32, page_size=_FP32_TILE)],
+    )
+
+
+def _sq_mean_quad(x, memory_config=None):
+    """Four cores a tile row: one face each (four tiles' face to a CB tile: the stock calculate_square on all four,
+    then the stock fold's adds face after face), the odd face shipped to its even partner, which runs the stock row
+    reduce on the assembled face pair. Every mean is still the stock one, bit for bit."""
+    device = x.device()
+    shape = [int(d) for d in x.shape]
+    rows = 1
+    for d in shape[:-1]:
+        rows *= d
+    dim = shape[-1]
+    wt = dim // _TILE
+    units = 4 * (rows // _TILE)
+    grid = device.compute_with_storage_grid_size()
+    gx = int(grid.x)
+    cores = ttnn.num_cores_to_corerangeset(units, grid, row_wise=True)
+    y = ttnn.allocate_tensor_on_device(
+        ttnn.Shape(shape[:-1] + [1]), ttnn.float32, ttnn.TILE_LAYOUT, device, memory_config or x.memory_config()
+    )
+    xa, ya = x.buffer_address(), y.buffer_address()
+    rr, rc, rw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    for c in range(units):
+        cy, cx = divmod(c, gx)
+        row, face = c // 4, c % 4
+        role, half = face % 2, face // 2
+        partner = c - 1 if role else c + 1
+        py, px = divmod(partner, gx)
+        pcore = device.worker_core_from_logical_core(ttnn.CoreCoord(px, py))
+        rr[cx][cy] = [xa, row, face]
+        rc[cx][cy] = [role]
+        rw[cx][cy] = [role, ya, row, half, int(pcore.x), int(pcore.y)]
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_READER4,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[wt, _BATCH4] + _accessor_args(x),
+            runtime_args=rr,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_COMPUTE4,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[wt, _BATCH4, _inv_bits(dim)],
+            runtime_args=rc,
+            config=ttnn.ComputeConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_WRITER4,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=_accessor_args(y),
+            runtime_args=rw,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    _cfg(kernels[1].config, (0, 2))
+    cbs = [
+        _fp32_cb(cores, 0, 2 * _BATCH4),  # x faces, four tiles' to a CB slot
+        _fp32_cb(cores, 1, 1),  # this core's folded face (face 0 of the tile)
+        _fp32_cb(cores, 2, 1),  # the assembled [even face | odd face] tile (role 0)
+        _fp32_cb(cores, 16, 1),  # the reduced half
+    ]
+    sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=cores, initial_value=0)]
+    desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
+    key = ("voxtral_cpp_sqmean4", units, wt, xa, ya, str(memory_config))
+    desc.custom_program_hash = hash(key) & 0xFFFFFFFFFFFFFFFF
+    ttnn.generic_op([x, y], desc)
+    return y
+
+
+def _sq_mean_halves(x, memory_config=None):
+    """Two cores a tile row: one 16-row half each (VectorMode::R)."""
     device = x.device()
     shape = [int(d) for d in x.shape]
     rows = 1
