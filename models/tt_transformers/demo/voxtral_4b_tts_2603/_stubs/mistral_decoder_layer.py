@@ -31,6 +31,7 @@ from models.demos.voxtral_4b_tts_2603.tt import (
     cpp_down_dec,
     cpp_kv_join,
     cpp_pv_dec,
+    cpp_rope_dec,
     cpp_scores_dec,
     cpp_sqmean,
     cpp_swiglu_mm,
@@ -1201,8 +1202,14 @@ def build(device, torch_module):
             cos, sin = position_embeddings
             signed = kv_cache.get("rope_signed") if kv_cache is not None else None
             if signed is not None and signed[0] == int(position):
-                q = _rope_signed(q, cos, signed[1], half)
-                k = _rope_signed(k, cos, signed[1], half)
+                full = kv_cache.get("rope_full")
+                if full is not None and full[0] == int(position) and cpp_rope_dec.supports([q, k], full[1], full[2]):
+                    # cpp: q's and k's RoPE in ONE generic_op (tt/cpp_rope_dec) -- binary_ng's float32 SFPU
+                    # multiplies and add in its order, the rotate-half a tile swap: the same bits, 1 op not 12.
+                    q, k = cpp_rope_dec.apply([q, k], full[1], full[2])
+                else:
+                    q = _rope_signed(q, cos, signed[1], half)
+                    k = _rope_signed(k, cos, signed[1], half)
             else:
                 q = _rope(q, cos, sin, half)
                 k = _rope(k, cos, sin, half)
