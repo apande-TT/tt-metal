@@ -50,8 +50,9 @@ def _accessor_args(tensor):
     return list(acc.get_compile_time_args())
 
 
-def supports(e, v) -> bool:
-    """`v` may be the whole cache: its first `span` rows (e's width) are read in place."""
+def supports(e, v, groups=None) -> bool:
+    """`v` may be the whole cache: its first `span` rows (e's width) are read in place. With `groups`, e may be
+    the packed `[B, 1, 32, span]` (n_kv * groups == 32)."""
     try:
         b, h, rows, span = (int(s) for s in e.shape)
         vb, vh, cap, d = (int(s) for s in v.shape)
@@ -63,7 +64,8 @@ def supports(e, v) -> bool:
             and span % _TILE == 0
             and d % _TILE == 0
             and d // _TILE <= 4
-            and (b, h) == (vb, vh)
+            and b == vb
+            and (h == vh or (groups and h == 1 and vh * int(groups) == rows))
             and e.dtype == ttnn.float32
             and v.dtype in _TILE_BYTES
             and not e.is_sharded()
@@ -104,12 +106,16 @@ def _cb(cores, index, fmt, tiles):
     )
 
 
-def apply(e, v, rb=_RB, memory_config=None):
+def apply(e, v, rb=_RB, memory_config=None, groups=None):
     """`e @ v` per (user, kv head), float32 `[B, n_kv, rows, d]` (L1 unless `memory_config`).
 
-    Each query tile row of a (user, kv head) is its own unit; its V tile rows are re-read per unit."""
+    Each query tile row of a (user, kv head) is its own unit; its V tile rows are re-read per unit. With `groups`,
+    e is the packed `[B, 1, 32, span]` (cpp_scores_dec packed=True): unit (b, h) gathers its `groups` rows."""
     device = e.device()
     b, h, rows, span = (int(s) for s in e.shape)
+    packed = bool(groups) and h == 1 and int(v.shape[1]) * int(groups) == rows
+    if packed:
+        h = int(v.shape[1])
     d = int(v.shape[-1])
     mt = rows // _TILE
     dt, st, ss, units = d // _TILE, span // _TILE, int(v.shape[-2]) // _TILE, b * h * mt
@@ -138,7 +144,7 @@ def apply(e, v, rb=_RB, memory_config=None):
             kernel_source=_READER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt, st, ss, rb, mt] + _accessor_args(e) + _accessor_args(v),
+            compile_time_args=[dt, st, ss, rb, mt, int(packed), int(groups or 0), h] + _accessor_args(e) + _accessor_args(v),
             runtime_args=rr,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -170,8 +176,9 @@ def apply(e, v, rb=_RB, memory_config=None):
         _cb(cores, 16, ttnn.float32, 2 * dt),
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-    desc.custom_program_hash = (
-        hash(("voxtral_cpp_pv_dec", b, h, mt, dt, st, ss, rb, str(v.dtype), ea, va, ya)) & 0xFFFFFFFFFFFFFFFF
-    )
+    # No custom hash: the default one covers every compile arg (the accessors' buffer types too), the CBs and the
+    # cores, and leaves the raw addresses out -- a cache hit re-applies this descriptor's runtime args. Hashing
+    # the addresses made a step whose tensors landed elsewhere miss the cache, and a miss inside a trace
+    # capture is a compile + binary write the capture refuses.
     ttnn.generic_op([e, v, y], desc)
     return y

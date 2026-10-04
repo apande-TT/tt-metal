@@ -34,6 +34,11 @@ def enabled() -> bool:
     return os.environ.get("VOXTRAL_CPP_SCORES_DEC", "1") == "1"
 
 
+def packed_enabled() -> bool:
+    """The packed [B, 1, 32, span] score layout (see `apply`); off with VOXTRAL_CPP_PACKED_DEC=0."""
+    return enabled() and os.environ.get("VOXTRAL_CPP_PACKED_DEC", "1") == "1"
+
+
 _LAYERS = int(os.environ.get("VOXTRAL_CPP_SCORES_DEC_LAYERS", "1000"))
 _claimed = [0]
 
@@ -113,10 +118,12 @@ def _cb(cores, index, fmt, tiles):
     )
 
 
-def apply(q, k, span=None, groups=None):
+def apply(q, k, span=None, groups=None, packed=False):
     """`q @ k^T` per (user, kv head) over the first `span` key rows (default: all), float32
     `[B, n_kv, 32, span]` in L1. With `groups`, q is the RoPE output `[B, 1, n_kv * groups, head_dim]`,
-    regrouped by kv head in the reader."""
+    regrouped by kv head in the reader. `packed` (with `groups`, n_kv * groups == 32): the scores come back
+    `[B, 1, 32, span]` -- kv head h's `groups` real rows at rows h * groups .., every row of every tile real,
+    so the mask add / max / exp / sum after it run on n_kv-times fewer tiles (each row's values unchanged)."""
     device = q.device()
     if groups:
         b, _, _, d = (int(s) for s in q.shape)
@@ -133,8 +140,9 @@ def apply(q, k, span=None, groups=None):
     ncores = min(units, gx * gy)
     base, extra = divmod(units, ncores)
     cores = ttnn.num_cores_to_corerangeset(ncores, grid, row_wise=True)
+    packed = bool(packed and groups and h * int(groups) == _TILE)
     y = ttnn.allocate_tensor_on_device(
-        ttnn.Shape([b, h, rows, span]), ttnn.float32, ttnn.TILE_LAYOUT, device, ttnn.L1_MEMORY_CONFIG
+        ttnn.Shape([b, 1 if packed else h, rows, span]), ttnn.float32, ttnn.TILE_LAYOUT, device, ttnn.L1_MEMORY_CONFIG
     )
     qa, ka, ya = q.buffer_address(), k.buffer_address(), y.buffer_address()
     rr, rc, rw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -167,7 +175,7 @@ def apply(q, k, span=None, groups=None):
             kernel_source=_WRITER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[st] + _accessor_args(y),
+            compile_time_args=[st, int(packed), int(groups or 0), h] + _accessor_args(y),
             runtime_args=rw,
             config=ttnn.WriterConfigDescriptor(),
         ),
@@ -183,6 +191,9 @@ def apply(q, k, span=None, groups=None):
         _cb(cores, 16, ttnn.float32, 2),
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-    desc.custom_program_hash = hash(("voxtral_cpp_scores_dec", b, h, dt, st, ss, rb, int(groups or 0), str(k.dtype), qa, ka, ya)) & 0xFFFFFFFFFFFFFFFF
+    # No custom hash: the default one covers every compile arg (the accessors' buffer types too), the CBs and the
+    # cores, and leaves the raw addresses out -- a cache hit re-applies this descriptor's runtime args. Hashing
+    # the addresses made a step whose tensors landed elsewhere miss the cache, and a miss inside a trace
+    # capture is a compile + binary write the capture refuses.
     ttnn.generic_op([q, k, y], desc)
     return y

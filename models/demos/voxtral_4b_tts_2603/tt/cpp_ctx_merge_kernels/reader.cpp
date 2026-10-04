@@ -21,7 +21,9 @@ void kernel_main() {
     constexpr uint32_t KV = get_compile_time_arg_val(1);  // kv heads
     constexpr uint32_t G = get_compile_time_arg_val(2);   // query rows a kv head
     constexpr uint32_t DT = get_compile_time_arg_val(3);  // d tiles a head
-    constexpr auto apv = TensorAccessorArgs<4>();
+    // PACKED: the row sums are the packed [B, 1, 32, 1] (kv head g's G rows at rows g * G ..; see cpp_scores_dec).
+    constexpr uint32_t PACKED = get_compile_time_arg_val(4);
+    constexpr auto apv = TensorAccessorArgs<5>();
     constexpr auto as = TensorAccessorArgs<apv.next_compile_time_args_offset()>();
     const auto spv = TensorAccessor(apv, pv_addr);
     const auto ss = TensorAccessor(as, s_addr);
@@ -57,7 +59,12 @@ void kernel_main() {
                 for (uint32_t f = 0; f < 2; ++f) {
                     noc_async_read(spv.get_noc_addr(bg * DT + dt, (rf + f) * face + ro), num + drow + f * face, seg);
                 }
-                noc_async_read(ss.get_noc_addr(bg, rf * face + ro), scratch + i * seg, seg);
+                if constexpr (PACKED) {
+                    const uint32_t R = g * G + r;
+                    noc_async_read(ss.get_noc_addr(b, (R >> 4) * 2 * face + (R & 15) * seg), scratch + i * seg, seg);
+                } else {
+                    noc_async_read(ss.get_noc_addr(bg, rf * face + ro), scratch + i * seg, seg);
+                }
             }
         }
         noc_async_read_barrier();

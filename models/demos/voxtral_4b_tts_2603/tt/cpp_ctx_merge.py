@@ -65,7 +65,8 @@ def supports(pv, s, groups) -> bool:
             and srows == _TILE
             and sw == _TILE
             and int(s.shape[-1]) == 1
-            and (sb, skv) == (b, kv)
+            and sb == b
+            and (skv == kv or (skv == 1 and kv * int(groups) == _TILE))
             and 0 < int(groups) <= _TILE
             and d % _TILE == 0
             and not pv.is_sharded()
@@ -79,6 +80,8 @@ def apply(pv, s, groups, memory_config=None):
     """`reshape(untilize(pv / s)[:, :, :groups], [1, 1, B, KV * groups * D])` as float32 TILE, in one pass."""
     device = pv.device()
     batch, kv, _, d = (int(v) for v in pv.shape)
+    # packed: the row sums come in cpp_scores_dec's packed [B, 1, 32, 1] layout (kv head g's rows at g * groups ..).
+    packed = int(s.shape[1]) == 1 and kv > 1
     dt = d // _TILE
     ct = kv * groups * dt
     bt = -(-batch // _TILE)
@@ -107,7 +110,7 @@ def apply(pv, s, groups, memory_config=None):
             kernel_source=_READER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[batch, kv, int(groups), dt] + _accessor_args(pv) + _accessor_args(s),
+            compile_time_args=[batch, kv, int(groups), dt, int(packed)] + _accessor_args(pv) + _accessor_args(s),
             runtime_args=rr,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -143,8 +146,9 @@ def apply(pv, s, groups, memory_config=None):
         _cb(cores, 16, 2),  # merged output tiles
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-    desc.custom_program_hash = (
-        hash(("voxtral_cpp_ctx_merge", batch, kv, int(groups), dt, pa, sa, oa, str(mem))) & 0xFFFFFFFFFFFFFFFF
-    )
+    # No custom hash: the default one covers every compile arg (the accessors' buffer types too), the CBs and the
+    # cores, and leaves the raw addresses out -- a cache hit re-applies this descriptor's runtime args. Hashing
+    # the addresses made a step whose tensors landed elsewhere miss the cache, and a miss inside a trace
+    # capture is a compile + binary write the capture refuses.
     ttnn.generic_op([pv, s, out], desc)
     return out
