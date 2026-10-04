@@ -28,10 +28,31 @@ from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     hifi4_config,
     pad_rows,
     pad_to_tile,
+    precise_config,
+    split_bf16,
     split_matmul,
     upload,
 )
 from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import _bf16, _fp32, _one_hot, _vision_metadata
+
+# precise path: the token permutations as one bf16 matmul per limb of x (True) instead of split_matmul's
+# exact-lane decomposition (each output of a one-hot product is a single 1 * v term, already exact)
+ONEHOT_PERMUTE = False
+
+
+def _onehot_matmul(p, x, limbs):
+    """p (one-hot rows, exact in bf16) @ float32 x -> float32, exactly: every output element is ONE product
+    1 * v, so each limb's matmul is exact under any accumulation, and the limb outputs (8 mantissa bits
+    each, 2^-8 apart) sum back to x's rows exactly in float32."""
+    cfg = precise_config()
+    pb = p if p.dtype == ttnn.bfloat16 else ttnn.typecast(p, ttnn.bfloat16)
+    y = None
+    for part in split_bf16(x, limbs):
+        t = ttnn.matmul(pb, part, compute_kernel_config=cfg, dtype=ttnn.float32)
+        y = t if y is None else ttnn.add(y, t)
+    return y
+
+
 from models.demos.qwen_image_edit_text_encoder._stubs.v_l_patch_merger import TtVLPatchMerger
 from models.demos.qwen_image_edit_text_encoder._stubs.v_l_vision_block import TtVLVisionBlock
 from models.demos.qwen_image_edit_text_encoder._stubs.vision_patch_embed import TtVisionPatchEmbed
@@ -111,13 +132,16 @@ class TtVisionTransformer:
         cfg = self.compute_cfg
         if self.precise:
             x = self.patch_embed(pixels, dtype=ttnn.float32, precise=True)
-            x = split_matmul(
-                c.perm,
-                x,
-                compute_kernel_config=cfg,
-                exact=getattr(self, "exact", True),
-                limbs=getattr(self, "limbs", 2),
-            )
+            if ONEHOT_PERMUTE:
+                x = _onehot_matmul(c.perm, x, getattr(self, "limbs", 2))
+            else:
+                x = split_matmul(
+                    c.perm,
+                    x,
+                    compute_kernel_config=cfg,
+                    exact=getattr(self, "exact", True),
+                    limbs=getattr(self, "limbs", 2),
+                )
         else:
             x = self.patch_embed(pixels, dtype=ttnn.float32)
             x = ttnn.matmul(c.perm, x, compute_kernel_config=cfg, dtype=ttnn.float32)
@@ -128,7 +152,9 @@ class TtVisionTransformer:
         m_rows = merged.shape[-2]
         if c.m_pad != m_rows:
             merged = ttnn.pad(merged, [(0, 0), (0, 0), (0, c.m_pad - m_rows), (0, 0)], 0.0)
-        if self.precise:
+        if self.precise and ONEHOT_PERMUTE:
+            merged = _onehot_matmul(c.unperm, merged, getattr(self, "limbs", 2))
+        elif self.precise:
             merged = split_matmul(
                 c.unperm,
                 merged,
