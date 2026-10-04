@@ -195,6 +195,10 @@ def _lin(x, w, **kwargs):
         # batch over each sample's tile-padded rows), so neither side needs the fold's row-major relayout.
         cfg = _mcast_cfg(x, w, padded, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
+            # fidelity: HiFi2, as the tall codec linears run (LoFi fails the e2e gate).
+            kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+            )
             return ttnn.linear(x, w, program_config=cfg, **kwargs)
     if rows >= 256 and rows % 32 == 0 and "program_config" not in kwargs:
         cfg = _mcast_cfg(x, w, rows, kwargs.get("dtype") or x.dtype)
@@ -352,7 +356,10 @@ def _attention_block(device, blk, attention_stub):
         batch, seq = int(x3.shape[0]), int(x3.shape[-2])
         h = ttnn.reshape(x3, [batch, 1, seq, dim])
 
-        xn = _rms_norm(h, attn_gamma, attn_eps, dtype=ttnn.bfloat16)  # bf16 rows into the attention stub's q / k / v
+        # bf16 rows into the attention stub's q / k / v; shard: a short sequence's normed rows in L1.
+        xn_mem = ttnn.L1_MEMORY_CONFIG if int(h.shape[-2]) < 32 else None
+        xn = _rms_norm(h, attn_gamma, attn_eps, dtype=ttnn.bfloat16, memory_config=xn_mem)
+        # dtype: the codec q / k projections write bf16; the fp32 qk-norm writes the float32 the band attention takes.
         r = attention_stub(ttnn.reshape(xn, [batch, seq, dim]))
         r = ttnn.reshape(r, [batch, 1, seq, dim])
         if attn_scale is not None:
@@ -365,8 +372,8 @@ def _attention_block(device, blk, attention_stub):
         hn = _rms_norm(h, ffn_gamma, ffn_eps, dtype=ttnn.bfloat16, memory_config=ffn_mem)
         # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
         # and writes the fp32 residual branch.
-        gate = _lin(hn, w1, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16)
-        up = _lin(hn, w3, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16)
+        gate = _lin(hn, w1, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16, memory_config=xn_mem)
+        up = _lin(hn, w3, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16, memory_config=xn_mem)
         ttnn.deallocate(hn)
         gated = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=ffn_mem)
         r = _lin(gated, w2, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
