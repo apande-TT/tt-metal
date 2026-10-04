@@ -11,6 +11,8 @@ decode (__call__ tail):
 """
 from __future__ import annotations
 
+import contextlib
+
 import torch
 
 import ttnn
@@ -26,6 +28,60 @@ def _replicated(device, t, dtype=ttnn.float32):
         device=device,
         mesh_mapper=ttnn.ReplicateTensorToMesh(device),
     )
+
+
+def _host_conv3d_weights(w, c_in_block, alignment=32):
+    """ttnn.experimental.prepare_conv3d_weights (groups=1) on host: [O, I, kD, kH, kW] -> [-1, O] with
+    I zero-padded to `alignment` and split into c_in_block row blocks (permute (2,3,4,1,0), pad, reshape,
+    permute (3,0,1,2,4,5), reshape) -- the same layout, without the device round trip at load."""
+    w = w.permute(2, 3, 4, 1, 0)
+    c = w.shape[3]
+    if c % alignment:
+        zeros = torch.zeros(*w.shape[:3], alignment - c % alignment, w.shape[4], dtype=w.dtype)
+        w = torch.cat([w, zeros], dim=3)
+    kd, kh, kw, ca, o = w.shape
+    assert ca % c_in_block == 0, (ca, c_in_block)
+    w = w.reshape(kd, kh, kw, ca // c_in_block, c_in_block, o).permute(3, 0, 1, 2, 4, 5)
+    return w.reshape(-1, o).contiguous()
+
+
+@contextlib.contextmanager
+def _host_weight_prep():
+    """While the VAE ports load, the Wan conv layers prepare their weights on host (bit-identical layout)
+    instead of uploading each one, permuting it on device and reading it back. Other users of these
+    classes are untouched (restored on exit)."""
+    from models.tt_dit.models.vae import vae_wan2_1 as wan
+
+    dtypes = {ttnn.bfloat16: torch.bfloat16, ttnn.float32: torch.float32}
+    saved = {}
+
+    def _make(cls, unsqueeze):
+        orig = cls._prepare_torch_state
+
+        def _prepare_torch_state(self, state):
+            tdt = dtypes.get(self.dtype)
+            if "weight" not in state or tdt is None or not self.conv_config.C_in_block:
+                return orig(self, state)
+            w = state["weight"]
+            w = w.unsqueeze(2) if unsqueeze else w
+            # from_torch(dtype) rounds before the permutes; rounding commutes with them
+            state["weight"] = _host_conv3d_weights(w.to(tdt), self.conv_config.C_in_block)
+            if "bias" in state:
+                state["bias"] = state["bias"].reshape(1, -1)
+
+        return orig, _prepare_torch_state
+
+    for cls, unsqueeze in ((wan.WanCausalConv3d, False), (wan.WanConv2d, True)):
+        saved[cls], cls._prepare_torch_state = _make(cls, unsqueeze)
+    try:
+        yield
+    finally:
+        for cls, orig in saved.items():
+            cls._prepare_torch_state = orig
+
+
+# weights of the VAE's Wan conv layers prepared on host at load (False: ttnn's device prepare)
+HOST_WEIGHT_PREP = True
 
 
 def _decoder_blocking(in_channels, out_channels, kernel):
@@ -56,18 +112,19 @@ class TtQwenVAE:
         self.device = device
         cfg = hf_vae.config
         self.z_dim = int(cfg.z_dim)
-        self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel=True)
-        self.quant_conv = vae_pointwise.build(device, hf_vae.quant_conv)
-        self.post_quant_conv = vae_pointwise.build(device, hf_vae.post_quant_conv)
-        # image latents are single-frame: the decoder's causal convs keep only their live temporal tap
-        self.decoder = qwen_image_decoder3d.build(
-            device,
-            hf_vae.decoder,
-            batch_parallel=True,
-            single_frame=True,
-            blocking=_decoder_blocking,
-            ccl_links=2,  # the decoder's gathers / halo exchanges over 2 fabric links instead of 1
-        )
+        with _host_weight_prep() if HOST_WEIGHT_PREP else contextlib.nullcontext():
+            self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel=True)
+            self.quant_conv = vae_pointwise.build(device, hf_vae.quant_conv)
+            self.post_quant_conv = vae_pointwise.build(device, hf_vae.post_quant_conv)
+            # image latents are single-frame: the decoder's causal convs keep only their live temporal tap
+            self.decoder = qwen_image_decoder3d.build(
+                device,
+                hf_vae.decoder,
+                batch_parallel=True,
+                single_frame=True,
+                blocking=_decoder_blocking,
+                ccl_links=2,  # the decoder's gathers / halo exchanges over 2 fabric links instead of 1
+            )
         mean = torch.tensor(cfg.latents_mean, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
         std = torch.tensor(cfg.latents_std, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
         self.mean = _replicated(device, mean)
