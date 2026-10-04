@@ -116,7 +116,9 @@ class TtQwenVAE:
         self.decode_max_batch = 16
         # Images per encoder program. Re-measured 2026-10-03, same setup: 32 in one program fails allocating a
         # 50 MB buffer (4.19 MB per bank needed, largest free block 3.30 MB); 16 fits (8.92 GB per chip).
-        self.encode_max_batch = 16
+        # 8 (2026-10-04): the exact convs now hold the padded input's bf16 limbs across their lane runs,
+        # which at 16 ran the eager e2e out of memory; 8 per program costs ~1% and the shared limbs save ~7%.
+        self.encode_max_batch = 8
         # encoder convs exact-lane (its image latents condition every denoising step), decoder convs median
         self.precise_convs = self._precise_ports(self.encoder, "encoder", hf_vae.encoder, conv_mode="exact")
         self.precise_convs += self._precise_ports(self.decoder, "decoder", hf_vae.decoder, conv_mode="median")

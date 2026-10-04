@@ -202,11 +202,16 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
     # float32 median mode keeps that transient-only footprint: it has no headroom for a held copy)
     shared = [to3(x)] + ([] if extra is None else [to3(extra)]) if prepad is not None else None
 
-    def run_on(fn):
-        tiles = shared or [to3(x)] + ([] if extra is None else [to3(extra)])
+    def run_on(fn, tiles=None):
+        tiles = tiles or shared or [to3(x)] + ([] if extra is None else [to3(extra)])
         xv = back(fn(tiles[0]), x)
         ev = None if extra is None else back(fn(tiles[1]), extra)
         return _flat(run(xv, ev))
+
+    def free(ts, srcs=None):
+        for t, src in zip(ts, srcs or ts):
+            if src.layout != ttnn.TILE_LAYOUT or srcs is None:  # a tile src: to3 may have returned a view of it
+                ttnn.deallocate(t)
 
     b = _bias_flat(bias, shape)
     if b is None:
@@ -222,12 +227,25 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
         # holds no channel (conv_in's 3 input channels leave 5 of the 8 empty); the guard below stays
         guarded = EXACT_MODE == "guarded"
         masks = _lane_masks(device, c)[: min(8, c)] if guarded else _lane_masks(device, c)
-        for m in masks:
-            for limb in (hi,) if guarded else (hi, lo):
-                y = run_on(lambda t, m=m, limb=limb: ttnn.multiply(limb(t), m))
+        if guarded and shared:
+            # the shared copy's hi limb is formed once for all the lanes, its lo limb once after them
+            his = [hi(t) for t in shared]
+            for m in masks:
+                y = run_on(lambda t, m=m: ttnn.multiply(t, m), his)
                 acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
-        if guarded:
-            acc, n = ttnn.add(acc, run_on(lo)), n + 1
+            los = [ttnn.subtract(t, h) for t, h in zip(shared, his)]
+            free(his)
+            free(shared, [x, extra])
+            shared = None
+            acc, n = ttnn.add(acc, run_on(lambda t: t, los)), n + 1
+            free(los)
+        else:
+            for m in masks:
+                for limb in (hi,) if guarded else (hi, lo):
+                    y = run_on(lambda t, m=m, limb=limb: ttnn.multiply(limb(t), m))
+                    acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
+            if guarded:
+                acc, n = ttnn.add(acc, run_on(lo)), n + 1
         e_x = ttnn.subtract(acc, ttnn.multiply(b, float(n - 1)))  # each run added the bias once
         med = ttnn.maximum(ttnn.minimum(e_x, f0), ttnn.minimum(ttnn.maximum(e_x, f0), e_neg))
         tol = ttnn.add(ttnn.multiply(ttnn.abs(e_neg), 3e-3), 1e-3)
@@ -235,9 +253,8 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
     else:
         e_split = ttnn.subtract(ttnn.add(run_on(hi), run_on(lo)), b)
         res = ttnn.maximum(ttnn.minimum(f0, e_neg), ttnn.minimum(ttnn.maximum(f0, e_neg), e_split))
-    for t, src in zip(shared or [], [x, extra]):
-        if src.layout != ttnn.TILE_LAYOUT:  # else to3 may have returned a view of src
-            ttnn.deallocate(t)
+    if shared:
+        free(shared, [x, extra])
     return ttnn.reshape(ttnn.to_layout(res, layout), shape)
 
 
