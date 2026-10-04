@@ -177,6 +177,8 @@ class QwenImageEditTT:
         # the transformer's exact fp32 TP reduce gathers, slices and adds each token chunk in L1
         _tr_ccl.L1_GATHER_BYTES = 48 * 1024 * 1024
         _tr_ccl.L1_GATHER_INPUT = True  # and each chunk's own partial is staged in L1 for the gather
+        # where the tokens split into whole tiles per device: all_to_all + local adds + all_gather instead
+        _tr_ccl.A2A_REDUCE = True
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
