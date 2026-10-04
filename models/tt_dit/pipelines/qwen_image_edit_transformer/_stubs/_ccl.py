@@ -139,6 +139,32 @@ def _gather_sum_l1(y, ax, n, nbytes):
     return ttnn.concat(outs, dim=len(shape) - 2)
 
 
+# exact reduce as an all_to_all (each device receives every partial of its 1/n token slice), local float32
+# adds of those 1/n slices, and an all_gather of the sums: ~2(n-1)/n of the tensor on the fabric instead of
+# the (n-1)x of gathering every partial, and 1/n of the slices/adds. Same adds in the same order.
+A2A_REDUCE = False
+
+
+def _a2a_sum(y, ax, n):
+    shape = list(y.shape)
+    lead = [1] * (4 - len(shape)) + shape  # 4D for the all_to_all
+    y4 = ttnn.reshape(y, lead)
+    # out_dim (the rows) is split over the devices and in_dim (0) grows by n: [n * lead0, lead1, rows / n,
+    # cols], block i = source device i's partial of this device's row slice
+    g = ttnn.experimental.all_to_all_async_generic(
+        y4, in_dim=0, out_dim=2, cluster_axis=ax, topology=ttnn.Topology.Linear
+    )
+    part = list(g.shape)
+    part[0] //= n
+    out = None
+    for i in range(n):
+        p = ttnn.slice(g, [i * part[0], 0, 0, 0], [(i + 1) * part[0]] + part[1:])
+        out = p if out is None else ttnn.add(out, p)
+    ttnn.deallocate(g)
+    out = ttnn.all_gather(out, dim=2, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear)
+    return ttnn.reshape(out, shape)
+
+
 def _gather_sum(y, device, ax):
     """Exact float32 reduce over mesh axis `ax`: gather every partial on a new leading dim, then add."""
     n = tuple(device.shape)[ax]
@@ -146,6 +172,8 @@ def _gather_sum(y, device, ax):
     nbytes = 4 if y.dtype == ttnn.float32 else 2
     for s in shape:
         nbytes *= s
+    if A2A_REDUCE and 2 <= len(shape) <= 4 and shape[-2] % (32 * n) == 0:
+        return _a2a_sum(y, ax, n)
     if L1_GATHER_BYTES and len(shape) >= 2 and shape[-2] % 32 == 0 and n * nbytes * 32 // shape[-2] <= L1_GATHER_BYTES:
         return _gather_sum_l1(y, ax, n, nbytes)
     if nbytes <= _CHUNK_BYTES or len(shape) < 2 or shape[-2] <= 32:
