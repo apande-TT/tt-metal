@@ -269,12 +269,76 @@ def _exact_sum(mm, parts):
     return _median3(*ests)
 
 
+_LINEAR_CONFIGS = {}
+
+
+def _largest_divisor(n, cap, step=1):
+    """Largest d <= cap dividing n with d % step == 0 (at least step)."""
+    for d in range(min(n, cap), 0, -1):
+        if n % d == 0 and d % step == 0:
+            return d
+    return step
+
+
+def linear_program_config(x, w):
+    """2D-multicast config for a batched float32-output linear x [..., M, K] @ w [K, N], or None (auto).
+
+    The auto pick for these shapes is a 1D in0-multicast config with fuse_batch off: it loops over the
+    batch and streams the whole weight from DRAM once per batch entry (LM gate/up at B=32: ~1.1 GB per
+    matmul per chip), on the N/3 cores the N width fills. Folding the batch into M and multicasting both
+    operands over the full grid reads each weight column block once per output block row; the per-core
+    float32 output streams through L1 in out_block_h x out_block_w blocks. The K reduction runs in
+    in0_block_w steps with float32 partials either way."""
+    xs, ws = list(x.shape), list(w.shape)
+    if len(ws) != 2 or xs[-2] % 32 or xs[-1] % 32 or ws[-1] % 32:
+        return None
+    rows = 1
+    for d in xs[:-1]:
+        rows *= d
+    mt, kt, nt = rows // 32, xs[-1] // 32, ws[-1] // 32
+    if mt < 8 or kt < 4 or nt < 8:
+        return None
+    grid = w.device().compute_with_storage_grid_size()
+    key = (mt, kt, nt, grid.x, grid.y)
+    if key not in _LINEAR_CONFIGS:
+        gx, gy = grid.x, grid.y
+        pcm = -(-mt // gy)
+        pcn = -(-nt // gx)
+        pcn += pcn % 2 if pcn > 1 else 0  # an even width admits 2-wide subblocks
+        obw = _largest_divisor(pcn, 24)
+        sbw = 2 if obw % 2 == 0 else 1
+        # output block <= 120 float32 tiles (480 KB), height a multiple of the subblock height
+        sbh_pref = 2 if sbw == 2 else 4
+        obh = _largest_divisor(pcm, max(1, 120 // obw))
+        sbh = _largest_divisor(obh, sbh_pref)
+        if sbh * sbw > 4:
+            sbh = 1
+        bw = _largest_divisor(kt, 4)
+        while bw > 1 and obw * bw * 2 * 2048 > 320 * 1024:  # double-buffered bf16 in1 block <= 320 KB
+            bw = _largest_divisor(kt, bw - 1)
+        _LINEAR_CONFIGS[key] = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+            compute_with_storage_grid_size=(gx, gy),
+            in0_block_w=bw,
+            out_subblock_h=sbh,
+            out_subblock_w=sbw,
+            out_block_h=obh,
+            out_block_w=obw,
+            per_core_M=pcm,
+            per_core_N=pcn,
+            transpose_mcast=False,
+            fused_activation=None,
+            fuse_batch=True,
+        )
+    return _LINEAR_CONFIGS[key]
+
+
 def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2):
     """float32 x @ bf16 w (+ bias) -> float32. x is carried as `limbs` bf16 parts (exact products). With
     exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part."""
     cfg = precise_config()
     parts = split_bf16(x, limbs)
-    mm = lambda p: ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32)  # noqa: E731
+    pc = linear_program_config(x, w)
+    mm = lambda p: ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc)  # noqa: E731
     if exact and EXACT_MODE == "guarded":
         y = _guarded_sum(mm, parts, _col_norms(w))
     elif exact:
