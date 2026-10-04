@@ -141,12 +141,14 @@ class TtTextAttention:
     def mask(self, attention_mask, b, s, s_pad):
         return upload(self.device, text_attention_mask(attention_mask, b, s, s_pad, self.group), dtype=ttnn.float32)
 
-    def forward_padded(self, x, tt_cos, tt_sin, tt_mask):
-        """x: [B, 1, s_pad, C] bf16 replicated -> [B, 1, s_pad, C] bf16 replicated."""
+    def forward_padded(self, x, tt_cos, tt_sin, tt_mask, kv=None):
+        """x: [B, 1, s_pad, C] bf16 replicated -> [B, 1, s_pad, C] bf16 replicated. kv: prefix K/V cache
+        (see _forward_precise; precise path only)."""
         D, hl, kvl, G = self.head_dim, self.hl, self.kvl, self.group
         b, s_pad = x.shape[0], x.shape[-2]
         if self.precise:
-            return self._forward_precise(x, tt_cos, tt_sin, tt_mask)
+            return self._forward_precise(x, tt_cos, tt_sin, tt_mask, kv=kv)
+        assert kv is None, "the prefix K/V cache is implemented on the precise path only"
         # q/k carry large biases in Qwen2 (scores of O(100s)); keep the score path in fp32.
         qkv = ttnn.linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=self.compute_cfg, dtype=ttnn.float32)
 
@@ -179,7 +181,10 @@ class TtTextAttention:
             out = ttnn.all_reduce(out, cluster_axis=1, topology=ttnn.Topology.Linear)
         return out
 
-    def _forward_precise(self, x, tt_cos, tt_sin, tt_mask):
+    def _forward_precise(self, x, tt_cos, tt_sin, tt_mask, kv=None):
+        """kv = (mode, cache, key, P) or None. "store": keep this call's roped K and V of positions [0, P)
+        in cache[key]. "use": x holds positions [P, P + s) only; the cached prefix K/V are prepended, so
+        the queries attend to [0, P + s) (tt_cos/tt_sin/tt_mask are for those positions)."""
         D, hl, kvl, G = self.head_dim, self.hl, self.kvl, self.group
         b, s_pad = x.shape[0], x.shape[-2]
         cfg = self.compute_cfg
@@ -199,6 +204,13 @@ class TtTextAttention:
             return ttnn.add(ttnn.multiply(t, cos), ttnn.multiply(rotate_half(t), sin))
 
         q, k = _rope(q), _rope(k)
+        if kv is not None:
+            mode, cache, key, P = kv
+            if mode == "store":
+                cache[key] = (ttnn.slice(k, [0, 0, 0, 0], [b, kvl, P, D]), ttnn.slice(v, [0, 0, 0, 0], [b, kvl, P, D]))
+            else:
+                kp, vp = cache[key]
+                k, v = ttnn.concat([kp, k], dim=2), ttnn.concat([vp, v], dim=2)
         q = ttnn.reshape(q, (b, kvl, G * s_pad, D))
         scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex)
         scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask)
@@ -263,10 +275,11 @@ class TtTextDecoderLayer:
         self.self_attn = TtTextAttention(device, torch_module.self_attn, pair=pn("self_attn"))
         self.mlp = mlp if mlp is not None else TtTextMLP(device, torch_module.mlp, pair=pn("mlp"))
 
-    def forward_padded(self, x, tt_cos, tt_sin, tt_mask):
-        """x: [B, 1, s_pad, C] fp32 residual stream (branch inputs stay fp32 with precise_inputs)."""
+    def forward_padded(self, x, tt_cos, tt_sin, tt_mask, kv=None):
+        """x: [B, 1, s_pad, C] fp32 residual stream (branch inputs stay fp32 with precise_inputs).
+        kv: the attention's prefix K/V cache argument (TtTextAttention._forward_precise)."""
         cast = _fp32 if getattr(self, "precise_inputs", False) else _bf16
-        a = self.self_attn.forward_padded(cast(self.input_layernorm(x)), tt_cos, tt_sin, tt_mask)
+        a = self.self_attn.forward_padded(cast(self.input_layernorm(x)), tt_cos, tt_sin, tt_mask, kv=kv)
         x = ttnn.add(x, _fp32(a))
         return ttnn.add(x, _fp32(self.mlp(cast(self.post_attention_layernorm(x)))))
 

@@ -107,15 +107,20 @@ class TtTextModel:
         ttnn.deallocate(g)
         return out
 
-    def forward_padded(self, x, tt_cos, tt_sin, tt_mask):
+    def forward_padded(self, x, tt_cos, tt_sin, tt_mask, kv=None):
         """Device path: x [B, 1, s_pad, C] fp32 -> norm(layers(x)) [B, 1, s_pad, C], replicated. Rotary
-        tables ([B|1, 1, s_pad, D]) and the additive causal/padding mask are prepared outside."""
-        for lyr in self.layers:
-            x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask)
+        tables ([B|1, 1, s_pad, D]) and the additive causal/padding mask are prepared outside.
+
+        kv: optional shared-prefix K/V cache {"mode": "store" | "use", "P": P, "cache": {}}. "store"
+        keeps every layer's roped K/V of positions [0, P); "use" runs x = positions [P, P + s) of
+        sequences whose first P tokens match the stored ones, attending to the cached prefix."""
+        key = lambda i, j: None if kv is None else (kv["mode"], kv["cache"], (i, j), kv["P"])  # noqa: E731
+        for j, lyr in enumerate(self.layers):
+            x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask, kv=key(0, j))
         if self.row_stages:
             x = self._take_row(x, 0)  # layers [0, n/2) done on the stage-0 rows -> hand to every row
-            for lyr in self.layers:
-                x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask)
+            for j, lyr in enumerate(self.layers):
+                x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask, kv=key(1, j))
             x = self._take_row(x, self.stage_rows)  # layers [n/2, n) done on the stage-1 rows -> everyone
         return self.norm(x)
 
