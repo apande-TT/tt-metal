@@ -143,6 +143,7 @@ def _gather_sum_l1(y, ax, n, nbytes):
 # adds of those 1/n slices, and an all_gather of the sums: ~2(n-1)/n of the tensor on the fabric instead of
 # the (n-1)x of gathering every partial, and 1/n of the slices/adds. Same adds in the same order.
 A2A_REDUCE = False
+A2A_SUM_L1 = False  # the all_to_all's per-source slices and their float32 sum in L1 (all_gathered from there)
 
 
 def _a2a_sum(y, ax, n):
@@ -156,12 +157,15 @@ def _a2a_sum(y, ax, n):
     )
     part = list(g.shape)
     part[0] //= n
+    kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if A2A_SUM_L1 else {}
     out = None
     for i in range(n):
-        p = ttnn.slice(g, [i * part[0], 0, 0, 0], [(i + 1) * part[0]] + part[1:])
-        out = p if out is None else ttnn.add(out, p)
+        p = ttnn.slice(g, [i * part[0], 0, 0, 0], [(i + 1) * part[0]] + part[1:], **kw)
+        out = p if out is None else ttnn.add(out, p, **kw)
     ttnn.deallocate(g)
-    out = ttnn.all_gather(out, dim=2, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear)
+    out = ttnn.all_gather(
+        out, dim=2, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    )
     return ttnn.reshape(out, shape)
 
 
