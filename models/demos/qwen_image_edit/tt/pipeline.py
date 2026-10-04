@@ -460,6 +460,13 @@ class QwenImageEditTT:
             s["p"], 0, s["latents"], s["img_lat"], s["pe"], s["neg"], s["rope_c"], s["rope_u"], t=s["t"], dt=s["dt"]
         )
 
+    def denoise_trace_repeats(self):
+        """How many times ONE image-edit request runs denoise_trace_step: its scheduler's step count.
+
+        The production schedule (EditConfig's default), not this instance's cfg -- the perf test builds
+        a shortened schedule to time one step, and the count is about a real request."""
+        return int(EditConfig().num_inference_steps)
+
     def denoise_trace_items(self):
         p = self._trace_prepared(self._trace_inputs_common())
         lc, lu = p.te.len_cond, p.te.len_uncond
