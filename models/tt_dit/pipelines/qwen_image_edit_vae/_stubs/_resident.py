@@ -139,6 +139,21 @@ def _flat(t):
     return ttnn.to_layout(ttnn.reshape(t, (n // 32, 32)), ttnn.TILE_LAYOUT) if n % 32 == 0 else None
 
 
+def _bias_flat(bias, shape):
+    """_flat of the [*, C] tensor whose every row is `bias` (None when that layout does not apply). The
+    flat view's row r holds channels (32 r) mod C .. +31, so for C % 32 == 0 it is bias as (C/32, 32)
+    repeated n/C times: one output-sized buffer, no copy of the output kept alive."""
+    if bias is None:
+        return None
+    c, n = shape[-1], 1
+    for d in shape:
+        n *= d
+    if c % 32 or tuple(bias.shape) != (1, c) or n % c:
+        return None
+    rows = ttnn.reshape(ttnn.to_layout(bias, ttnn.ROW_MAJOR_LAYOUT), (c // 32, 32))
+    return ttnn.to_layout(ttnn.repeat(rows, (n // c, 1)), ttnn.TILE_LAYOUT)
+
+
 _LANE_MASKS = {}
 
 
@@ -154,10 +169,11 @@ def _lane_masks(device, c):
     return _LANE_MASKS[key]
 
 
-def precise_affine(run, x, mode, device, extra=None, out=None):
+def precise_affine(run, x, mode, device, extra=None, out=None, bias=None):
     """run(x, extra) -> output, affine in (x, extra) (a conv / linear with bias); channels on the last dim.
     Returns the output in run's own layout and shape, evaluated per `mode` (see above). `out`: run(x, extra)
-    if the caller already has it."""
+    if the caller already has it. `bias`: run's [1, C_out] bias when run(0, 0) is exactly it (a float32
+    conv3d adds its bias unrounded); the zero-input run is then built from it instead of convolved."""
     out = run(x, extra) if out is None else out
     shape, layout = list(out.shape), out.layout
     f0 = _flat(out)
@@ -180,7 +196,9 @@ def precise_affine(run, x, mode, device, extra=None, out=None):
         return xv, ev
 
     f32 = lambda t: ttnn.typecast(ttnn.typecast(t, ttnn.bfloat16), ttnn.float32)  # noqa: E731
-    b = _flat(run(*variant(lambda t: ttnn.multiply(t, 0.0))))
+    b = _bias_flat(bias, shape)
+    if b is None:
+        b = _flat(run(*variant(lambda t: ttnn.multiply(t, 0.0))))
     e_neg = ttnn.subtract(ttnn.multiply(b, 2.0), _flat(run(*variant(ttnn.neg))))
     if mode == "exact":
         from models.demos.qwen_image_edit_text_encoder._stubs.attention import EXACT_MODE

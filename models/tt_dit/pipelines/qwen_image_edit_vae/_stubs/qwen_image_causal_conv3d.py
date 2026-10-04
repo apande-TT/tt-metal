@@ -53,7 +53,9 @@ class TtQwenImageCausalConv3d(ResidentPort):
         run = lambda t, c: self._body_forward(self.conv, t, logical_h, c, logical_w=logical_w)  # noqa: E731
         if not self.precise:
             return run(x, cache_x_BTHWC)
-        return precise_affine(run, x, self.precise, self.conv.mesh_device, extra=cache_x_BTHWC)
+        return precise_affine(
+            run, x, self.precise, self.conv.mesh_device, extra=cache_x_BTHWC, bias=self.conv.bias.data
+        )
 
     def __init__(self, device, torch_module):
         self.device = device
