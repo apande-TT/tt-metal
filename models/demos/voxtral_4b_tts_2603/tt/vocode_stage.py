@@ -63,6 +63,7 @@ the audio before (27033d4462).
 
 No device is ever opened here.
 """
+
 from __future__ import annotations
 
 import math
@@ -410,9 +411,11 @@ def _trimmed_upsample(mod, conv_stub):
         raise NotImplementedError(f"a non-zero left trim ({total - right}) is not ported")
 
     def run(x_cf):
-        out = conv_stub(x_cf)
+        # The stub writes the trimmed length itself when it can (`trim_right`); otherwise it is cut here.
+        out = conv_stub(x_cf, trim_right=right)
         batch, channels, length = (int(v) for v in out.shape)
-        if right == 0:
+        full = int(x_cf.shape[-1]) * stride + total
+        if right == 0 or length == full - right:
             return out
         return ttnn.slice(out, [0, 0, 0], [batch, channels, length - right])
 
@@ -477,7 +480,6 @@ def _reflect_padded_conv(mod, conv_stub, weight_fn):
             return conv_stub(x_cf, weight=weight_fn(), x_rm=padded_rm)
         cf = ttnn.transpose(ttnn.reshape(pieces[0], [batch, padded_len, channels]), -2, -1)
         return conv_stub(cf, weight=weight_fn())
-
 
     def run_cl(x3):
         """`run` on CHANNELS-LAST rows `[B, L, C]` (a transformer group's own layout), returning channels-last
