@@ -23,6 +23,7 @@ import torch
 import ttnn
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import split_linear
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import qwen_image_decoder3d, qwen_image_encoder3d
+from models.tt_dit.utils.conv3d import _walk_conv3d_modules
 
 _PORT_NAMES = {
     "TtQwenImageCausalConv3d": "qwen_image_causal_conv3d",
@@ -72,6 +73,25 @@ class PointwiseConv32:
         return ttnn.permute(ttnn.reshape(y, (B, H, W, self.cout)), (0, 3, 1, 2))
 
 
+def _block_fp32_convs(stack, h_block=8, w_block=4):
+    """Give a float32 Wan stack's conv3d layers a real output blocking.
+
+    get_conv3d_config has no float32 entry for the VAE's shapes, so every float32 conv falls back to
+    (C_in 32, C_out 32, T 1, H 1, W 1): one output pixel per work unit. Only the OUTPUT blocking moves
+    here (C_out / H / W); C_in_block stays, so the prepared weights and the reduction order of every
+    output element are unchanged."""
+    n = 0
+    for m in _walk_conv3d_modules(stack):
+        c = m.conv_config
+        if m.dtype != ttnn.float32 or (c.T_out_block, c.H_out_block, c.W_out_block) != (1, 1, 1):
+            continue
+        cout = m.out_channels
+        c.C_out_block = next(b for b in (96, 64, 32) if cout % b == 0) if cout % 32 == 0 else c.C_out_block
+        c.H_out_block, c.W_out_block = h_block, w_block
+        n += 1
+    return n
+
+
 class TtQwenVAE:
     def __init__(self, device, hf_vae, tracker=None):
         self.device = device
@@ -83,6 +103,7 @@ class TtQwenVAE:
         # error (image-latent PCC 0.99999) moved the final latents ~10x more than the denoiser's own
         self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel=True, dtype=ttnn.float32)
         self.decoder = qwen_image_decoder3d.build(device, hf_vae.decoder, batch_parallel=True)
+        _block_fp32_convs(self.encoder.encoder)
         self.quant_conv = PointwiseConv32(device, hf_vae.quant_conv)
         self.post_quant_conv = PointwiseConv32(device, hf_vae.post_quant_conv)
         mean = torch.tensor(cfg.latents_mean, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
