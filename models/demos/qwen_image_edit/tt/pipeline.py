@@ -176,6 +176,7 @@ class QwenImageEditTT:
         _tr_precise.SHARE_SPLIT = True
         # the transformer's exact fp32 TP reduce gathers, slices and adds each token chunk in L1
         _tr_ccl.L1_GATHER_BYTES = 48 * 1024 * 1024
+        _tr_ccl.L1_GATHER_INPUT = True  # and each chunk's own partial is staged in L1 for the gather
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
