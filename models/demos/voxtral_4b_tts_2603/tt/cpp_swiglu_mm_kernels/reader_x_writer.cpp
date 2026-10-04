@@ -14,6 +14,8 @@ void kernel_main() {
     const uint32_t y_addr = get_arg_val<uint32_t>(1);
     const uint32_t n0 = get_arg_val<uint32_t>(2);  // first output column tile
     const uint32_t rev = get_arg_val<uint32_t>(3);  // K blocks last to first (the weight stream's order)
+    const uint32_t core = get_arg_val<uint32_t>(4);  // rotates the read order, so the cores do not all
+                                                     // queue on the same source tile at once
 
     constexpr uint32_t MT = get_compile_time_arg_val(0);
     constexpr uint32_t KB = get_compile_time_arg_val(1);
@@ -34,13 +36,12 @@ void kernel_main() {
     for (uint32_t i = 0; i < NB; ++i) {
         const uint32_t b = rev ? NB - 1 - i : i;
         cb_reserve_back(cb_x, MT * KB);
-        uint32_t l1 = get_write_ptr(cb_x);
-        for (uint32_t r = 0; r < MT; ++r) {
-            const uint32_t t = r * KT + b * KB;
-            for (uint32_t k = 0; k < KB; ++k) {
-                noc_async_read_page(t + k, sx, l1);
-                l1 += x_bytes;
-            }
+        const uint32_t l1 = get_write_ptr(cb_x);
+        for (uint32_t s = 0; s < MT * KB; ++s) {
+            const uint32_t slot = (s + core) % (MT * KB);  // slot = r * KB + k
+            const uint32_t r = slot / KB;
+            const uint32_t k = slot - r * KB;
+            noc_async_read_page(r * KT + b * KB + k, sx, l1 + slot * x_bytes);
         }
         noc_async_read_barrier();
         cb_push_back(cb_x, MT * KB);

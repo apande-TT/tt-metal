@@ -27,6 +27,11 @@ void kernel_main() {
     constexpr uint32_t NB = get_compile_time_arg_val(2);  // K blocks
     constexpr uint32_t W = get_compile_time_arg_val(3);   // fused gate / up column tiles this core owns
     constexpr uint32_t SW = get_compile_time_arg_val(4);  // subblock width (divides W, <= 8)
+    // XALL: x is resident whole (multicast, recv_x_writer.cpp) -- block b at offset b * MT * KB, handed over in
+    // this core's K order (REV: last block first) and popped only at the end. Else x arrives a block at a time
+    // in that order through a ring.
+    constexpr uint32_t XALL = get_compile_time_arg_val(5);
+    const uint32_t rev = XALL ? get_arg_val<uint32_t>(0) : 0;
 
     constexpr auto cb_x = tt::CBIndex::c_0;
     constexpr auto cb_w = tt::CBIndex::c_1;
@@ -42,12 +47,18 @@ void kernel_main() {
     // The accumulator: every partial of this core's MT x W tiles, packed in place block after block.
     cb_reserve_back(cb_p, MT * W);
     for (uint32_t b = 0; b < NB; ++b) {
-        cb_wait_front(cb_x, MT * KB);
+        uint32_t x0 = 0;
+        if constexpr (XALL) {
+            cb_wait_front(cb_x, (b + 1) * MT * KB);
+            x0 = (rev ? NB - 1 - b : b) * MT * KB;
+        } else {
+            cb_wait_front(cb_x, MT * KB);
+        }
         cb_wait_front(cb_w, KB * W);
         for (uint32_t m = 0; m < MT; ++m) {
             for (uint32_t n0 = 0; n0 < W; n0 += SW) {
                 tile_regs_acquire();
-                uint32_t i0 = m * KB;
+                uint32_t i0 = x0 + m * KB;
                 uint32_t i1 = n0;
                 for (uint32_t k = 0; k < KB; ++k) {
                     matmul_block(cb_x, cb_w, i0, i1, 0, false, SW, 1, KB);
@@ -62,11 +73,16 @@ void kernel_main() {
                 tile_regs_release();
             }
         }
-        cb_pop_front(cb_x, MT * KB);
+        if constexpr (!XALL) {
+            cb_pop_front(cb_x, MT * KB);
+        }
         cb_pop_front(cb_w, KB * W);
         if (b == 0) {
             pack_reconfig_l1_acc(1);
         }
+    }
+    if constexpr (XALL) {
+        cb_pop_front(cb_x, NB * MT * KB);
     }
     cb_push_back(cb_p, MT * W);
     pack_reconfig_l1_acc(0);
