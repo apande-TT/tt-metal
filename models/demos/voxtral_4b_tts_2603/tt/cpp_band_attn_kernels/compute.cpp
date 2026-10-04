@@ -28,6 +28,17 @@
 constexpr uint32_t DT = get_compile_time_arg_val(0);
 constexpr uint32_t NB = 2;  // key tiles in the band
 constexpr uint32_t OUT_NARROW = get_compile_time_arg_val(1);  // 1: the context CB is narrower than float32
+// HALF: every real query row is in the tile's top 16 (a short sequence, T <= 16), so the
+// elementwise SFPU steps run on faces 0 and 1 only (VectorMode::R, sdpa_flash_decode's 16 x 32 half tile): the
+// real rows get the very same arithmetic; rows 16..31 (padding nobody reads) keep stale finite values.
+constexpr uint32_t HALF = get_compile_time_arg_val(2);
+constexpr VectorMode VM = HALF ? VectorMode::R : VectorMode::RC;
+
+#define VM_BINARY(FN, OP, RM_ARGS, a, b, o) \
+    MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, FN, (APPROX, OP, 8, DST_ACCUM_MODE RM_ARGS), a, b, o, VM)))
+#define NO_RM
+#define RM_NE , ckernel::DstRoundingMode::NearestEven
+#define RM_DEF , ckernel::DstRoundingMode::Default
 
 constexpr auto cb_q = tt::CBIndex::c_0;
 constexpr auto cb_k = tt::CBIndex::c_1;
@@ -58,9 +69,9 @@ inline void reduce_row(uint32_t cb_in, uint32_t cb_out_) {
     for (uint32_t w = 1; w < NB; ++w) {
         copy_tile(cb_in, w, 1);
         if constexpr (IS_MAX) {
-            binary_max_tile(0, 1, 0);
+            binary_max_tile(0, 1, 0, VM);
         } else {
-            add_binary_tile(0, 1, 0);
+            VM_BINARY(calculate_sfpu_binary, ckernel::BinaryOp::ADD, RM_DEF, 0, 1, 0);
         }
     }
     if constexpr (IS_MAX) {
@@ -116,11 +127,11 @@ void kernel_main() {
             copy_init(cb_scale);
             copy_tile(cb_scale, 0, 1);
             mul_binary_tile_init();
-            mul_binary_tile(0, 1, 0);
+            VM_BINARY(calculate_sfpu_binary_mul, ckernel::BinaryOp::MUL, NO_RM, 0, 1, 0);
             copy_init(cb_mask);
             copy_tile(cb_mask, j, 1);
             add_binary_tile_init();
-            add_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
+            VM_BINARY(calculate_sfpu_binary, ckernel::BinaryOp::ADD, RM_NE, 0, 1, 0);
             tile_regs_commit();
             tile_regs_wait();
             pack_tile(0, cb_s);
@@ -144,9 +155,9 @@ void kernel_main() {
             copy_init(cb_maxf);
             copy_tile(cb_maxf, 0, 1);
             sub_binary_tile_init();
-            sub_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
+            VM_BINARY(calculate_sfpu_binary, ckernel::BinaryOp::SUB, RM_NE, 0, 1, 0);
             exp_tile_init();
-            exp_tile(0);
+            exp_tile(0, VM);
             tile_regs_commit();
             tile_regs_wait();
             pack_tile(0, cb_e);
@@ -170,7 +181,7 @@ void kernel_main() {
             copy_init(cb_sumf);
             copy_tile(cb_sumf, 0, 1);
             div_binary_tile_init();
-            div_binary_tile(0, 1, 0);
+            VM_BINARY(calculate_sfpu_binary_div, ckernel::BinaryOp::DIV, NO_RM, 0, 1, 0);
             tile_regs_commit();
             tile_regs_wait();
             pack_tile(0, cb_p);

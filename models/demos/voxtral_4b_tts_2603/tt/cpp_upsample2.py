@@ -168,7 +168,11 @@ def apply(x_cl, wide, cout, out_len, compute_kernel_config, linear=None):
     into M over each sample's tile-padded rows, so an unaligned L needs no relayout); `linear(x, w, **kw)`
     (default ttnn.linear) runs it."""
     batch, _, length, _ = (int(v) for v in x_cl.shape)
-    y = (linear or ttnn.linear)(x_cl, wide, compute_kernel_config=compute_kernel_config, dtype=ttnn.float32)
+    # shard: a small wide product (<= 16 MB of float32) lands in L1 for the shift-add that reads it.
+    kw = {}
+    if tile_rows(x_cl) * int(wide.shape[-1]) * 4 <= (16 << 20):
+        kw["memory_config"] = ttnn.L1_MEMORY_CONFIG
+    y = (linear or ttnn.linear)(x_cl, wide, compute_kernel_config=compute_kernel_config, dtype=ttnn.float32, **kw)
     out = interleave_add(y, batch, length, cout, out_len)
     ttnn.deallocate(y)
     return out

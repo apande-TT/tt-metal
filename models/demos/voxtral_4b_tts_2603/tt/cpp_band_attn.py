@@ -133,7 +133,7 @@ def _bf16_cb(cores, index, tiles):
     )
 
 
-def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None, dtype=ttnn.float32):
+def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None, dtype=ttnn.float32, real_rows=None):
     """`softmax(q @ k^T * scale + mask) @ v`, float32 `[B, H, T, D]` (DRAM unless `memory_config`). With
     `merged_heads`, q / k / v and the result are the merged `[B, 1, T, H * D]` (see `supports_merged`). `dtype`:
     the context's dtype (float32 or bfloat16; the softmax and both products stay float32 in DEST either way)."""
@@ -149,6 +149,8 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None, dtype=ttn
     # A partial last tile row (T not tile-aligned) is one more row of units: its padding rows compute
     # garbage nobody reads, and every key past T is above the diagonal, so the causal mask blocks it.
     rt, dt = -(-t // _TILE), d // _TILE
+    # a short sequence (every real query row in a tile's top 16) runs the SFPU steps half-tile
+    half = int(real_rows is not None and rt == 1 and int(real_rows) <= 16)
     units = b * h * rt
     grid = device.compute_with_storage_grid_size()
     gx, gy = int(grid.x), int(grid.y)
@@ -190,7 +192,7 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None, dtype=ttn
             kernel_source=_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[dt, int(dtype != ttnn.float32)],
+            compile_time_args=[dt, int(dtype != ttnn.float32), half],
             runtime_args=rc,
             config=ttnn.ComputeConfigDescriptor(),
         ),
@@ -231,7 +233,7 @@ def apply(q, k, v, mask, scale, memory_config=None, merged_heads=None, dtype=ttn
         _cb(cores, 16, 2 * dt) if dtype == ttnn.float32 else _bf16_cb(cores, 16, 2 * dt),  # context tile row
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-    key = ("voxtral_cpp_band_attn", b, h, rt, dt, mmt, mst, merged, scale_bits, qa, ka, va, ma, ya)
+    key = ("voxtral_cpp_band_attn", b, h, rt, dt, mmt, mst, merged, half, scale_bits, qa, ka, va, ma, ya)
     desc.custom_program_hash = hash(key + (str(memory_config), str(dtype))) & 0xFFFFFFFFFFFFFFFF
     ttnn.generic_op([q, k, v, mask, y], desc)
     return y

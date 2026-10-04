@@ -355,12 +355,17 @@ def _attention_block(device, blk, attention_stub):
     def run(x3, **kwargs):
         batch, seq = int(x3.shape[0]), int(x3.shape[-2])
         h = ttnn.reshape(x3, [batch, 1, seq, dim])
+        if seq < 32 and h.memory_config().buffer_type != ttnn.BufferType.L1:
+            # shard: a short sequence's float32 residual stream moves to L1 (residual adds + norms in L1).
+            h = ttnn.to_memory_config(h, ttnn.L1_MEMORY_CONFIG)
 
         # bf16 rows into the attention stub's q / k / v; shard: a short sequence's normed rows in L1.
         xn_mem = ttnn.L1_MEMORY_CONFIG if int(h.shape[-2]) < 32 else None
         xn = _rms_norm(h, attn_gamma, attn_eps, dtype=ttnn.bfloat16, memory_config=xn_mem)
         # dtype: the codec q / k projections write bf16; the fp32 qk-norm writes the float32 the band attention takes.
         # shard: the stubs keep tall bf16 q / k (<= 8 MB each) and a float32 v (<= 16 MB) in L1.
+        # dtype: the conv-transpose stubs build their wide [C_in, 4 C_out] weight on the host as bf8_b
+        # (and run its product at HiFi2).
         r = attention_stub(ttnn.reshape(xn, [batch, seq, dim]))
         r = ttnn.reshape(r, [batch, 1, seq, dim])
         if attn_scale is not None:
@@ -368,7 +373,7 @@ def _attention_block(device, blk, attention_stub):
         h = ttnn.add(h, r)
 
         # shard rung: the FFN's two activations -- the normed rows w1 / w3 read and the gated product w2
-        # reads -- live in L1 (interleaved) while they fit, so the matmuls' in0 reads skip DRAM.
+        # reads (the latter only to 2048 rows) -- live in L1 (interleaved) while they fit, so in0 reads skip DRAM.
         ffn_mem = common.l1_while_rows_fit(h)
         hn = _rms_norm(h, ffn_gamma, ffn_eps, dtype=ttnn.bfloat16, memory_config=ffn_mem)
         # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
@@ -376,8 +381,11 @@ def _attention_block(device, blk, attention_stub):
         gate = _lin(hn, w1, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16, memory_config=xn_mem)
         up = _lin(hn, w3, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16, memory_config=xn_mem)
         ttnn.deallocate(hn)
-        gated = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=ffn_mem)
-        r = _lin(gated, w2, compute_kernel_config=_COMPUTE, dtype=ttnn.float32)
+        # shard: past 2048 rows the gated rows go to DRAM so w2's float32 output fits in L1 instead.
+        gated_mem = common.l1_while_rows_fit(h, 2048)
+        gated = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=gated_mem)
+        # shard: the float32 w2 residual branch lands in L1 while the rows fit (<= 4096).
+        r = _lin(gated, w2, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=ffn_mem)
         ttnn.deallocate(gated)
         if ffn_scale is not None:
             r = ttnn.multiply(r, ffn_scale)
