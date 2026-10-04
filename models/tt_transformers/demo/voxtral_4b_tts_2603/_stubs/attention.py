@@ -24,6 +24,8 @@ still measures the same arithmetic it graduated on."""
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 import ttnn
@@ -703,6 +705,7 @@ def _seed_cache(kv, k, v):
     """
     if isinstance(k, _Split):
         return _seed_split(kv, k, v)
+    _drop_shared_prefix(kv)  # this prefill writes every row: a shared prefix from an earlier one is stale
     capacity = int(kv.get("capacity") or 0)
     # The text stack hands back the previous prefill's buffers (same batch and capacity) with the
     # staged fill tables; this prefill's slots are then written into them IN PLACE by one
@@ -760,6 +763,8 @@ def _seed_split(kv, k, v):
     resident = kv.pop("resident", None) or (None, None)
     rows_fill, tail_fill = kv["fill_tables"], kv["tail_fill"]
     tile = ttnn.TILE_SIZE
+    _drop_shared_prefix(kv)
+    shared = {}
     for (key, part), home in zip((("k", k), ("v", v)), resident):
         heads, prefix_rows, width = (int(part.prefix.shape[i]) for i in (1, 2, 3))
         batch = int(part.tail.shape[0]) // heads
@@ -769,9 +774,17 @@ def _seed_split(kv, k, v):
             home = None
         if home is None:
             home = ttnn.zeros(full, dtype=_CACHE_DTYPE, layout=ttnn.TILE_LAYOUT, device=part.tail.device())
-        narrow = ttnn.typecast(part.prefix, _CACHE_DTYPE)
+        if _SHARED_PREFIX:
+            # structural: the prefix every user shares stays ONE copy (DRAM, the cache's dtype) -- the C++
+            # decode scores / P@V read their first rows from it (cpp_scores_dec / cpp_pv_dec `prefix`), so it is
+            # never written into all `batch` users' rows; any other cache read fills it in first.
+            narrow = ttnn.typecast(part.prefix, _CACHE_DTYPE, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            narrow = ttnn.typecast(part.prefix, _CACHE_DTYPE)
         ttnn.deallocate(part.prefix)
-        if ttl_kv.supports(home, narrow):
+        if _SHARED_PREFIX and cpp_scores_dec.prefix_ok(home, narrow):
+            shared[key] = narrow
+        elif ttl_kv.supports(home, narrow):
             # The tt-lang seed: each prefix tile row read once and written into every sample's rows.
             ttl_kv.fill_prefix(home, narrow)
             ttnn.deallocate(narrow)
@@ -790,7 +803,41 @@ def _seed_split(kv, k, v):
             except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
                 pass
         kv[key] = home
+    if shared:
+        kv["prefix_shared"] = shared
+        if len(shared) != 2:  # only one of k / v qualified: fill it in like the other
+            _materialize_prefix(kv)
     kv["filled"] = prefix_rows + k.slots
+
+
+_SHARED_PREFIX = os.environ.get("VOXTRAL_SHARED_PREFIX", "1") == "1"
+
+
+def _drop_shared_prefix(kv):
+    shared = kv.pop("prefix_shared", None)
+    for t in (shared or {}).values():
+        try:
+            ttnn.deallocate(t)
+        except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
+            pass
+
+
+def _materialize_prefix(kv):
+    """Write the shared prefix (kv["prefix_shared"]) into every user's first cache rows, for a read of the cache
+    that is not the C++ decode scores / P@V's -- the fill `_seed_split` skipped."""
+    shared = kv.pop("prefix_shared", None)
+    if not shared:
+        return
+    rows_fill = kv.get("fill_tables")
+    for key, narrow in shared.items():
+        home = kv[key]
+        if ttl_kv.supports(home, narrow):
+            ttl_kv.fill_prefix(home, narrow)
+        else:
+            rep = ttnn.repeat(narrow, ttnn.Shape([int(home.shape[0]), 1, 1, 1]))
+            ttnn.experimental.paged_fill_cache(home, rep, rows_fill[0], batch_idx_tensor=rows_fill[1])
+            ttnn.deallocate(rep)
+        ttnn.deallocate(narrow)
 
 
 # The additive mask for one decode position, `[1, 1, 1, C]`: 0 through `position`, a large
@@ -1006,6 +1053,19 @@ def build(device, torch_module):
         in_place = q_in_place or (
             span < cap and use_cpp_scores and use_cpp_pv and cpp_scores_dec.supports(q, keys, span)
         )
+        # The prompt prefix every user shares may sit in ONE copy (`_seed_split`): only the C++ in-place scores and
+        # P@V read it from there; any other read of the cache has it written into every user's rows first.
+        shared_prefix = kv_cache.get("prefix_shared")
+        if shared_prefix is not None and not (
+            in_place
+            and use_cpp_pv
+            and cpp_scores_dec.prefix_ok(keys, shared_prefix.get("k"))
+            and cpp_scores_dec.prefix_ok(values, shared_prefix.get("v"))
+            and int(shared_prefix["k"].shape[-2]) <= span
+        ):
+            _materialize_prefix(kv_cache)
+            shared_prefix = None
+            keys, values = kv_cache["k"], kv_cache["v"]
         cut_kv = span < cap and not in_place
         if cut_kv:
             ends = [int(s) for s in keys.shape]
@@ -1025,7 +1085,14 @@ def build(device, torch_module):
         )
         if in_place:
             # the C++ decode scores, keys (and q, when grouped there) read in place
-            scores = cpp_scores_dec.apply(q, keys, span, groups=groups if q_in_place else None, packed=packed)
+            scores = cpp_scores_dec.apply(
+                q,
+                keys,
+                span,
+                groups=groups if q_in_place else None,
+                packed=packed,
+                prefix=shared_prefix["k"] if shared_prefix is not None else None,
+            )
         elif use_cpp_scores and cpp_scores_dec.supports(q, keys):
             scores = cpp_scores_dec.apply(q, keys)  # the C++ decode scores
         else:
@@ -1045,8 +1112,17 @@ def build(device, torch_module):
         )
         ttnn.deallocate(masked)
         if use_cpp_pv and cpp_pv_dec.supports(e, values, groups=groups if packed else None):
-            pv = cpp_pv_dec.apply(e, values, groups=groups if packed else None)  # the C++ decode P@V
+            pv = cpp_pv_dec.apply(  # the C++ decode P@V
+                e,
+                values,
+                groups=groups if packed else None,
+                prefix=shared_prefix["v"] if shared_prefix is not None else None,
+            )
         else:
+            if shared_prefix is not None:
+                _materialize_prefix(kv_cache)
+                shared_prefix = None
+                values = kv_cache["v"]
             pv = _bmm(e, values, memory_config=l1)
         ssum = ttnn.sum(e, dim=-1, keepdim=True, memory_config=l1)
         if packed and not cpp_ctx_merge.supports(pv, ssum, groups):
