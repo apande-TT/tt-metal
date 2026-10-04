@@ -6,9 +6,10 @@
 // tt/cpp_upsample2.py). For output tile (b, R, c), row p = 2i + j (m = 16R + i) takes Y row m - 1 of tap block
 // 2 + j: rows i >= 1 are rows i - 1 of the same half-tile the "now" term reads (faces 2h, 2h + 1 of Y tile row
 // R >> 1), and row i = 0 is the row just before it -- row 15 of the top half (h = 1) or row 31 of the previous
-// Y tile row (h = 0), two 64 B face-row reads per block; m - 1 < 0 or m - 1 >= L reads zeros. The gathered
-// tile goes to the compute kernel, which adds it to the "now" tile; the sum comes back here and is written.
-// The next unit's delayed tile is gathered before waiting on this unit's sum, so the three cores overlap.
+// Y tile row (h = 0), two 64 B face-row reads per block; m - 1 outside [0, L) and output rows past out_len read
+// zeros. The gathered tile goes to the compute kernel, which adds it to the "now" tile; the sum comes back here
+// and is written. The next unit's delayed tile is gathered before waiting on this unit's sum, so the three
+// cores overlap.
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -19,10 +20,12 @@ void kernel_main() {
     const uint32_t u0 = get_arg_val<uint32_t>(2);
     const uint32_t nu = get_arg_val<uint32_t>(3);
 
-    constexpr uint32_t RTY = get_compile_time_arg_val(0);
-    constexpr uint32_t OR = get_compile_time_arg_val(1);
-    constexpr uint32_t CT = get_compile_time_arg_val(2);
-    constexpr auto ay = TensorAccessorArgs<3>();
+    constexpr uint32_t L = get_compile_time_arg_val(0);
+    constexpr uint32_t RTY = get_compile_time_arg_val(1);
+    constexpr uint32_t OL = get_compile_time_arg_val(2);
+    constexpr uint32_t OR = get_compile_time_arg_val(3);
+    constexpr uint32_t CT = get_compile_time_arg_val(4);
+    constexpr auto ay = TensorAccessorArgs<5>();
     constexpr auto ao = TensorAccessorArgs<ay.next_compile_time_args_offset()>();
     const auto sy = TensorAccessor(ay, y_addr);
     const auto so = TensorAccessor(ao, o_addr);
@@ -51,8 +54,9 @@ void kernel_main() {
         const uint32_t b = u / (CT * OR);
         const uint32_t ty = R >> 1;
         const uint32_t h = R & 1;
-        const bool valid = ty < RTY;  // rows m - 1 = 16R .. 16R + 14 are real
-        const bool has_prev = R > 0;  // row m - 1 = 16R - 1 (always < L once R > 0: 16R - 1 < 16 * OR - 1 <= L)
+        const uint32_t m0 = 16 * R;
+        const bool valid = m0 < L;               // some of rows m - 1 = 16R .. 16R + 14 are real
+        const bool has_prev = R > 0 && m0 <= L;  // row m - 1 = 16R - 1 is real
         for (uint32_t j = 0; j < 2; ++j) {
             const uint32_t col = (2 + j) * CT + c;
             if (valid) {
@@ -77,13 +81,14 @@ void kernel_main() {
         for (uint32_t p = 0; p < 32; ++p) {
             const uint32_t i = p >> 1;
             const uint32_t j = p & 1;
+            const bool out = 32 * R + p < OL;
             const uint32_t dst = dst0 + (p >> 4) * 2 * face + (p & 15) * seg;
             for (uint32_t f = 0; f < 2; ++f) {
                 uint32_t src;
                 if (i == 0) {
-                    src = has_prev ? prev + (2 * j + f) * seg : zeros;
+                    src = has_prev && out ? prev + (2 * j + f) * seg : zeros;
                 } else {
-                    src = valid ? scratch + j * half + f * face + (i - 1) * seg : zeros;
+                    src = m0 + i - 1 < L && out ? scratch + j * half + f * face + (i - 1) * seg : zeros;
                 }
                 noc_async_read_one_packet_with_state(src, dst + f * face);
             }

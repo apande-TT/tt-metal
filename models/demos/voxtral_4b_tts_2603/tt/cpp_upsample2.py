@@ -61,7 +61,8 @@ def wide_weight(taps):
 
 
 def supports(x_cl, taps) -> bool:
-    """`x_cl` `[B, 1, L, C_in]` float32 TILE with L a tile multiple, four taps whose C_out is a tile multiple."""
+    """`x_cl` `[B, 1, L, C_in]` float32 TILE (any L: each sample's rows stay tile-padded), four taps whose C_out
+    is a tile multiple."""
     try:
         return (
             enabled()
@@ -70,8 +71,7 @@ def supports(x_cl, taps) -> bool:
             and x_cl.dtype == ttnn.float32
             and len(x_cl.shape) == 4
             and int(x_cl.shape[1]) == 1
-            and int(x_cl.shape[-2]) % _TILE == 0
-            and int(x_cl.shape[-2]) >= _TILE
+            and int(x_cl.shape[-2]) >= 1
             and int(taps[0].shape[-1]) % _TILE == 0
             and not x_cl.is_sharded()
         )
@@ -80,11 +80,12 @@ def supports(x_cl, taps) -> bool:
 
 
 def interleave_add(y, batch, length, cout, out_len, memory_config=None):
-    """`out[b, 2m + j] = Y[b * L + m, j-block] + Y[b * L + m - 1, (2 + j)-block]`, float32 `[B, 1, out_len, C_out]`.
+    """`out[b, 2m + j] = Y[b, m, j-block] + Y[b, m - 1, (2 + j)-block]`, float32 `[B, 1, out_len, C_out]`.
 
-    `y` is `[1, 1, B * L, 4 * C_out]` float32 TILE; rows m outside [0, L) read as zero; out_len <= 2L + 2."""
+    `y` is `[B, 1, L, 4 * C_out]` float32 TILE (each sample's L rows tile-padded); rows m outside [0, L) read as
+    zero; out_len <= 2L + 2, and the output's own padding rows are written as zeros."""
     device = y.device()
-    rty, ct = length // _TILE, cout // _TILE
+    rty, ct = -(-length // _TILE), cout // _TILE
     orows = -(-out_len // _TILE)
     units = batch * orows * ct
     grid = device.compute_with_storage_grid_size()
@@ -109,7 +110,7 @@ def interleave_add(y, batch, length, cout, out_len, memory_config=None):
         rc[cx][cy] = [nu]
         rw[cx][cy] = [ya, oa, u0, nu]
         u0 += nu
-    dims = [rty, orows, ct]
+    dims = [length, rty, out_len, orows, ct]
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=_READER,
@@ -153,20 +154,30 @@ def interleave_add(y, batch, length, cout, out_len, memory_config=None):
     ]
     desc = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
     desc.custom_program_hash = (
-        hash(("voxtral_cpp_upsample2", batch, rty, orows, ct, out_len, ya, oa, str(memory_config))) & 0xFFFFFFFFFFFFFFFF
+        hash(("voxtral_cpp_upsample2", batch, length, rty, orows, ct, out_len, ya, oa, str(memory_config)))
+        & 0xFFFFFFFFFFFFFFFF
     )
     ttnn.generic_op([y, out], desc)
     return out
 
 
 def apply(x_cl, wide, cout, out_len, compute_kernel_config, linear=None):
-    """The transposed conv of `x_cl` `[B, 1, L, C_in]` (float32 TILE, L a tile multiple) as
-    `[B, 1, out_len, C_out]` float32 TILE: ONE product against `wide` (`wide_weight(taps)`) and ONE interleaving
-    shift-add. `out_len` 2L + 2 is the bare conv, 2L its causal trim. `linear(x, w, **kw)` (default
-    ttnn.linear) runs the product."""
-    batch, _, length, cin = (int(v) for v in x_cl.shape)
-    x = ttnn.reshape(x_cl, [1, 1, batch * length, cin])
-    y = (linear or ttnn.linear)(x, wide, compute_kernel_config=compute_kernel_config, dtype=ttnn.float32)
+    """The transposed conv of `x_cl` `[B, 1, L, C_in]` (float32 TILE) as `[B, 1, out_len, C_out]` float32 TILE:
+    ONE product against `wide` (`wide_weight(taps)`) and ONE interleaving shift-add. `out_len` 2L + 2 is the
+    bare conv, 2L its causal trim. The product runs on the 4-D rows (a 2-D multicast config folds the batch
+    into M over each sample's tile-padded rows, so an unaligned L needs no relayout); `linear(x, w, **kw)`
+    (default ttnn.linear) runs it."""
+    batch, _, length, _ = (int(v) for v in x_cl.shape)
+    y = (linear or ttnn.linear)(x_cl, wide, compute_kernel_config=compute_kernel_config, dtype=ttnn.float32)
     out = interleave_add(y, batch, length, cout, out_len)
     ttnn.deallocate(y)
     return out
+
+
+def tile_rows(x):
+    """The rows a batch-folded product of `x` runs over: the leading dims times the tile-padded row count."""
+    shape = [int(v) for v in x.shape]
+    lead = 1
+    for d in shape[:-2]:
+        lead *= d
+    return lead * (-(-shape[-2] // _TILE) * _TILE)

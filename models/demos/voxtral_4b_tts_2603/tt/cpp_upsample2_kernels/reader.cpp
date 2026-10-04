@@ -7,7 +7,8 @@
 // parity j = p & 1, and their "now" term is Y row m of tap block j -- rows 16h .. 16h + 15 (h = R & 1) of Y
 // tile row R >> 1, i.e. the two contiguous faces 2h, 2h + 1 of that tile (one 2 KB half-tile read per block).
 // The 32 rows are gathered into one tile in output order by LOCAL NoC reads, one 64 B face row at a time
-// (rows alternate between the two blocks, so no run is longer than a row); m >= L reads zeros.
+// (rows alternate between the two blocks, so no run is longer than a row); m >= L (Y's per-sample tile
+// padding) and output rows past out_len read zeros.
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -17,10 +18,12 @@ void kernel_main() {
     const uint32_t u0 = get_arg_val<uint32_t>(1);
     const uint32_t nu = get_arg_val<uint32_t>(2);
 
-    constexpr uint32_t RTY = get_compile_time_arg_val(0);  // Y tile rows a sample (L / 32)
-    constexpr uint32_t OR = get_compile_time_arg_val(1);   // output tile rows a sample
-    constexpr uint32_t CT = get_compile_time_arg_val(2);   // column tiles a tap block (= output column tiles)
-    constexpr auto ay = TensorAccessorArgs<3>();
+    constexpr uint32_t L = get_compile_time_arg_val(0);    // real rows a sample
+    constexpr uint32_t RTY = get_compile_time_arg_val(1);  // Y tile rows a sample (ceil(L / 32))
+    constexpr uint32_t OL = get_compile_time_arg_val(2);   // output rows a sample
+    constexpr uint32_t OR = get_compile_time_arg_val(3);   // output tile rows a sample
+    constexpr uint32_t CT = get_compile_time_arg_val(4);   // column tiles a tap block (= output column tiles)
+    constexpr auto ay = TensorAccessorArgs<5>();
     const auto sy = TensorAccessor(ay, y_addr);
     constexpr uint32_t YCT = 4 * CT;
 
@@ -44,8 +47,8 @@ void kernel_main() {
         const uint32_t b = u / (CT * OR);
         const uint32_t ty = R >> 1;
         const uint32_t h = R & 1;
-        const bool valid = ty < RTY;
-        if (valid) {
+        const uint32_t m0 = 16 * R;
+        if (m0 < L) {
             for (uint32_t j = 0; j < 2; ++j) {
                 noc_async_read(sy.get_noc_addr((b * RTY + ty) * YCT + j * CT + c, h * half), scratch + j * half, half);
             }
@@ -57,9 +60,10 @@ void kernel_main() {
         for (uint32_t p = 0; p < 32; ++p) {
             const uint32_t i = p >> 1;
             const uint32_t j = p & 1;
+            const bool real = m0 + i < L && 32 * R + p < OL;
             const uint32_t dst = dst0 + (p >> 4) * 2 * face + (p & 15) * seg;
             for (uint32_t f = 0; f < 2; ++f) {
-                const uint32_t src = valid ? scratch + j * half + f * face + i * seg : zeros;
+                const uint32_t src = real ? scratch + j * half + f * face + i * seg : zeros;
                 noc_async_read_one_packet_with_state(src, dst + f * face);
             }
         }
