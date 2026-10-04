@@ -105,6 +105,9 @@ class TtQwenTextEncoder:
         _te_attention.EXACT_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         # and its exact-lane linears on the full core grid (ttnn's own pick: 30-48 cores)
         _te_attention.EXACT_LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
+        # the vision token permutations as one bf16 matmul per limb (one-hot rows: each output is a single
+        # 1 * v product, already exact without the exact-lane decomposition)
+        vision_transformer_pretrained_model.ONEHOT_PERMUTE = True
         self.set_precise(True)
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
