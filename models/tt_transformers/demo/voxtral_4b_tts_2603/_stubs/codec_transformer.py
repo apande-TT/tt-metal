@@ -103,7 +103,10 @@ def _mcast_cfg(x, w, rows, out_dtype):
                     # K block before out-block area: at in0_block_w=1 every K step re-packs the whole
                     # fp32 out block (the 4096 x 1024 x 4096 FFN up: 343 us at 13 x 12 / kb 1, 249 at
                     # 13 x 4 / kb 8).
-                    score = (pm * pn, -sub[0] * sub[1], -kb, -bh * bw)
+                    # grid: past a K block of 4, fewer out blocks down M before a wider K block -- each extra
+                    # M out block re-reads (and re-multicasts) the core column's whole weight block (the fp32
+                    # 4096 x 1024 x 1792 conv product: 13 one-row blocks at kb 8 ran 326 us).
+                    score = (pm * pn, -sub[0] * sub[1], -min(kb, 4), pm // bh, -kb, -bh * bw)
                     if best is None or score < best[0]:
                         best = (score, pm, pn, bh, bw, kb, sub)
     if best is None:
@@ -130,6 +133,8 @@ def _lin(x, w, **kwargs):
     each re-read the whole weight from DRAM; `[1, 1, B*S, K]` is one matmul that reads it once.
     Tall results (>= 8 tile rows) also get a hand-sized full-grid program config.
     """
+    # fidelity: a caller may ask for a lower fidelity than the tall linears' HiFi2 (the FFN gate / up: LoFi).
+    fidelity = kwargs.pop("fidelity", ttnn.MathFidelity.HiFi2)
     shape = [int(d) for d in x.shape]
     lead = 1
     for d in shape[:-2]:
@@ -141,9 +146,9 @@ def _lin(x, w, **kwargs):
         # batch over each sample's tile-padded rows), so neither side needs the fold's row-major relayout.
         cfg = _mcast_cfg(x, w, padded, kwargs.get("dtype") or x.dtype)
         if cfg is not None:
-            # fidelity: HiFi2, as the tall codec linears run (LoFi fails the e2e gate).
+            # fidelity: HiFi2 unless the caller asks lower (LoFi on EVERY codec linear fails the e2e gate).
             kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
-                math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+                math_fidelity=fidelity, fp32_dest_acc_en=True, packer_l1_acc=True
             )
             return ttnn.linear(x, w, program_config=cfg, **kwargs)
     if rows >= 256 and rows % 32 == 0 and "program_config" not in kwargs:
@@ -152,7 +157,7 @@ def _lin(x, w, **kwargs):
             kwargs["program_config"] = cfg
             # Fidelity rung: the tall (compute-bound) codec linears at HiFi2.
             kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
-                math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+                math_fidelity=fidelity, fp32_dest_acc_en=True, packer_l1_acc=True
             )
     if lead == 1:
         return ttnn.linear(x, w, **kwargs)
@@ -341,12 +346,25 @@ def _compile_block(device, blk, mask, window=None):
         hn = _rms_norm(h, ffn_gamma, ffn_eps, dtype=ttnn.bfloat16, memory_config=ffn_mem)
         # dtype: the FFN hidden (w1 / w3 outputs, the gate) in bf16; w2 still sums in fp32 DEST
         # and writes the fp32 residual branch.
-        gate = _lin(hn, w1, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16, memory_config=xn_mem)
-        up = _lin(hn, w3, compute_kernel_config=_COMPUTE, dtype=ttnn.bfloat16, memory_config=xn_mem)
+        # dtype: a tall FFN hidden (>= 256 rows) is written bf8_b -- w1 / w3 write, and the gated multiply
+        # reads, half the bytes; so is the gated product the multiply writes and w2 reads.
+        hid_dt = ttnn.bfloat16 if common.l1_while_rows_fit(h, 255) else ttnn.bfloat8_b
+        # shard: the bf8_b hidden (<= 2048 rows: ~9 MB each) lands in L1 for the gated multiply that reads it.
+        hid_mem = common.l1_while_rows_fit(h, 2048)
+        gate = _lin(
+            hn, w1, compute_kernel_config=_COMPUTE, dtype=hid_dt, memory_config=hid_mem, fidelity=ttnn.MathFidelity.LoFi
+        )
+        up = _lin(
+            hn, w3, compute_kernel_config=_COMPUTE, dtype=hid_dt, memory_config=hid_mem, fidelity=ttnn.MathFidelity.LoFi
+        )
         ttnn.deallocate(hn)
         # shard: past 2048 rows the gated rows go to DRAM so w2's float32 output fits in L1 instead.
         gated_mem = common.l1_while_rows_fit(h, 2048)
-        gated = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=gated_mem)
+        gated = ttnn.multiply(
+            gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], dtype=hid_dt, memory_config=gated_mem
+        )
+        ttnn.deallocate(gate)
+        ttnn.deallocate(up)
         r = _lin(gated, w2, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=ffn_mem)
         ttnn.deallocate(gated)
         if ffn_scale is not None:

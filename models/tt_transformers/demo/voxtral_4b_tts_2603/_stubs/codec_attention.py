@@ -107,7 +107,10 @@ def _mcast_cfg(x, w, rows, out_dtype):
                     # K block before out-block area: at in0_block_w=1 every K step re-packs the whole
                     # fp32 out block (the 4096 x 1024 x 4096 FFN up: 343 us at 13 x 12 / kb 1, 249 at
                     # 13 x 4 / kb 8).
-                    score = (pm * pn, -sub[0] * sub[1], -kb, -bh * bw)
+                    # grid: past a K block of 4, fewer out blocks down M before a wider K block -- each extra
+                    # M out block re-reads (and re-multicasts) the core column's whole weight block (the fp32
+                    # 4096 x 1024 x 1792 conv product: 13 one-row blocks at kb 8 ran 326 us).
+                    score = (pm * pn, -sub[0] * sub[1], -min(kb, 4), pm // bh, -kb, -bh * bw)
                     if best is None or score < best[0]:
                         best = (score, pm, pn, bh, bw, kb, sub)
     if best is None:

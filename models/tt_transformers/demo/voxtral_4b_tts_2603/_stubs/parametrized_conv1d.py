@@ -92,6 +92,20 @@ def _tap_linear(x, w, **kwargs):
     return ttnn.reshape(y, shape[:-1] + [int(y.shape[-1])])
 
 
+def _wide_linear(x, w, **kwargs):
+    """The wide conv product (`[1, 1, B*L, C_in] x [C_in, K * C_out]`) on the codec linears' hand-sized
+    full-grid 2D-mcast config (tt/vocode_stage._mcast_cfg) -- left to the default, its float32 rows pick
+    in0_block_w=1 (every K step re-packs the whole float32 out block: 4096 x 1024 x 1792 ran 287 us)."""
+    from models.demos.voxtral_4b_tts_2603.tt.vocode_stage import _mcast_cfg
+
+    rows = int(x.shape[-2])
+    # grid: the full-grid config for the tall products (the fidelity stays the caller's).
+    cfg = _mcast_cfg(x, w, rows, ttnn.float32) if rows >= 128 and rows % 32 == 0 else None
+    if cfg is not None:
+        kwargs["program_config"] = cfg
+    return ttnn.linear(x, w, **kwargs)
+
+
 def build(device, torch_module):
     conv = torch_module
 
@@ -161,7 +175,9 @@ def build(device, torch_module):
             front, back = int(kwargs.get("pad_front", 0)), int(kwargs.get("pad_back", 0))
             out_len = (real + front + back - effective_kernel) // stride + 1
             wide = cpp_shift_add.wide_weight(taps) if weight is None else _wide_from(weight)
-            acc = cpp_shift_add.conv_wide_unpadded(x_cl, wide, kwargs["pad_mode"], front, out_len, _COMPUTE)
+            acc = cpp_shift_add.conv_wide_unpadded(
+                x_cl, wide, kwargs["pad_mode"], front, out_len, _COMPUTE, linear=_wide_linear
+            )
             if bias is not None:
                 acc = ttnn.add(acc, bias)
             if kwargs.get("cl_out"):
