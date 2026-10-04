@@ -88,8 +88,9 @@ def _mcast_cfg(x, w, rows, out_dtype):
                     kb = next(
                         (
                             c
-                            # grid: a short M (<= 2 tile rows a core) takes a K block of 16 -- half the K steps.
-                            for c in ((16, 8, 4, 2, 1) if pm <= 2 else (8, 4, 2, 1))
+                            # grid: a short M (<= 2 tile rows a core) or a long K (>= 64 tiles) takes a K block of 16 --
+                            # half the K steps (half the float32 partial packs of the out block).
+                            for c in ((16, 8, 4, 2, 1) if pm <= 2 or kt >= 64 else (8, 4, 2, 1))
                             if kt % c == 0 and bh * bw * os_ + 2 * c * (bh * xs + bw * ws) <= _L1_BUDGET
                         ),
                         None,
@@ -224,6 +225,10 @@ def _rms_norm(x, gamma, eps, dtype=None, memory_config=None):
         # does not FillPad the padding first, and the result is viewed back without a fill.
         out = _rms_norm(ttnn.reshape(x, padded, padded), gamma, eps, dtype=dtype, memory_config=memory_config)
         return ttnn.reshape(out, shape, padded, skip_padding_fill=True)
+    if common.codec_fused_norm():
+        # structural: the whole norm as ONE stock ttnn.rms_norm at HiFi4 / fp32 DEST / exact rsqrt
+        # (common.codec_rms_norm) instead of five or six full passes over the rows.
+        return common.codec_rms_norm(x, gamma, eps, dtype=dtype, memory_config=memory_config)
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
     out = {"dtype": dtype} if dtype is not None else {}
     if memory_config is not None:
@@ -348,8 +353,16 @@ def build(device, torch_module):
         v_mem = ttnn.L1_MEMORY_CONFIG if qkv_mem is None and qk_rows * int(wv.shape[-1]) * 4 <= (16 << 20) else qkv_mem
         v = _lin(h, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=v_mem)
         if qk_norm:
-            q = _rms_norm(q, q_gamma, q_eps, dtype=ttnn.float32, memory_config=norm_mem)
-            k = _rms_norm(k, k_gamma, k_eps, dtype=ttnn.float32, memory_config=norm_mem)
+            # dtype: with the fused norm q / k leave it as bf16, where the projections put them (L1 while they
+            # fit) -- the band attention takes bf16 q / k as its score product's operands, so no float32 copy.
+            fused = common.codec_fused_norm()
+            qk_out = ttnn.bfloat16 if fused else ttnn.float32
+            out_mem = qk_mem if fused else norm_mem
+            qn = _rms_norm(q, q_gamma, q_eps, dtype=qk_out, memory_config=out_mem)
+            ttnn.deallocate(q)
+            kn = _rms_norm(k, k_gamma, k_eps, dtype=qk_out, memory_config=out_mem)
+            ttnn.deallocate(k)
+            q, k = qn, kn
 
         # SDPA rejects float32 outright (`sdpa_device_operation.cpp:43`) -- so this does not call
         # it. Spelling the attention out as two matmuls and a softmax keeps Q/K/V, the ALiBi mask
@@ -372,7 +385,10 @@ def build(device, torch_module):
             )
         else:
             qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
-                ttnn.concat([q, k, v], dim=-1),
+                ttnn.concat(
+                    [ttnn.typecast(q, v.dtype), ttnn.typecast(k, v.dtype)] + [v] if q.dtype != v.dtype else [q, k, v],
+                    dim=-1,
+                ),
                 num_heads=n_heads,
                 num_kv_heads=n_kv_heads,
                 transpose_k_heads=False,

@@ -99,10 +99,17 @@ def _wide_linear(x, w, **kwargs):
     from models.demos.voxtral_4b_tts_2603.tt.vocode_stage import _mcast_cfg
 
     rows = int(x.shape[-2])
-    # grid: the full-grid config for the tall products (the fidelity stays the caller's).
-    cfg = _mcast_cfg(x, w, rows, ttnn.float32) if rows >= 128 and rows % 32 == 0 else None
+    # grid: the full-grid config for the tall products (the fidelity stays the caller's), sized by the
+    # product's real output dtype.
+    out_dtype = kwargs.get("dtype") or ttnn.float32
+    cfg = _mcast_cfg(x, w, rows, out_dtype) if rows >= 128 and rows % 32 == 0 else None
     if cfg is not None:
         kwargs["program_config"] = cfg
+        # fidelity: the tall wide product at HiFi2 (fp32 DEST kept) -- what the tokenizer half's same output
+        # conv runs; HiFi4 doubled its math passes.
+        kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+        )
     return ttnn.linear(x, w, **kwargs)
 
 

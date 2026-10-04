@@ -134,8 +134,9 @@ def _mcast_cfg(x, w, rows, out_dtype):
                     kb = next(
                         (
                             c
-                            # grid: a short M (<= 2 tile rows a core) takes a K block of 16 -- half the K steps.
-                            for c in ((16, 8, 4, 2, 1) if pm <= 2 else (8, 4, 2, 1))
+                            # grid: a short M (<= 2 tile rows a core) or a long K (>= 64 tiles) takes a K block of 16 --
+                            # half the K steps (half the float32 partial packs of the out block).
+                            for c in ((16, 8, 4, 2, 1) if pm <= 2 or kt >= 64 else (8, 4, 2, 1))
                             if kt % c == 0 and bh * bw * os_ + 2 * c * (bh * xs + bw * ws) <= _L1_BUDGET
                         ),
                         None,
@@ -303,8 +304,16 @@ def _compile_codec_block(device, blk, mask, window=None):
         v_mem = ttnn.L1_MEMORY_CONFIG if qkv_mem is None and qk_rows * int(wv.shape[-1]) * 4 <= (16 << 20) else qkv_mem
         v = _fold_linear(xn, wv, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=v_mem)
         if qk_norm:
-            q = _rms_norm(q, q_gamma, q_eps, dtype=ttnn.float32, memory_config=norm_mem)
-            k = _rms_norm(k, k_gamma, k_eps, dtype=ttnn.float32, memory_config=norm_mem)
+            # dtype: with the fused norm q / k leave it as bf16, where the projections put them (L1 while they
+            # fit) -- the band attention takes bf16 q / k as its score product's operands, so no float32 copy.
+            fused = common.codec_fused_norm()
+            qk_out = ttnn.bfloat16 if fused else ttnn.float32
+            out_mem = qk_mem if fused else norm_mem
+            qn = _rms_norm(q, q_gamma, q_eps, dtype=qk_out, memory_config=out_mem)
+            ttnn.deallocate(q)
+            kn = _rms_norm(k, k_gamma, k_eps, dtype=qk_out, memory_config=out_mem)
+            ttnn.deallocate(k)
+            q, k = qn, kn
         # SDPA rejects float32 outright (`sdpa_device_operation.cpp:43`) -- so this does not call
         # it. Spelling the attention out as two matmuls and a softmax keeps Q/K/V, the ALiBi mask
         # and the whole reduction in FLOAT32, which SDPA cannot do at any fidelity. Matches the
@@ -326,7 +335,10 @@ def _compile_codec_block(device, blk, mask, window=None):
             )
         else:
             qh, kh, vh = ttnn.experimental.nlp_create_qkv_heads(
-                ttnn.concat([q, k, v], dim=-1),
+                ttnn.concat(
+                    [ttnn.typecast(q, v.dtype), ttnn.typecast(k, v.dtype)] + [v] if q.dtype != v.dtype else [q, k, v],
+                    dim=-1,
+                ),
                 num_heads=n_heads,
                 num_kv_heads=n_kv_heads,
                 transpose_k_heads=False,
@@ -361,6 +373,7 @@ def _compile_codec_block(device, blk, mask, window=None):
         if attn_scale is not None:
             r = ttnn.multiply(r, attn_scale)
         h = ttnn.add(h, r)
+        ttnn.deallocate(r)  # shard: free the attention branch's L1 before the FFN norm
 
         # shard rung: the FFN's two activations -- the normed rows w1 / w3 read and the gated product w2
         # reads (the latter only to 2048 rows) -- live in L1 (interleaved) while they fit, so in0 reads skip DRAM.
@@ -387,7 +400,15 @@ def _compile_codec_block(device, blk, mask, window=None):
         )
         ttnn.deallocate(gate)
         ttnn.deallocate(up)
-        r = _fold_linear(gated, w2, compute_kernel_config=_COMPUTE, dtype=ttnn.float32, memory_config=ffn_mem)
+        # fidelity: the FFN down at LoFi on its tall full-grid path (fp32 DEST kept).
+        r = _fold_linear(
+            gated,
+            w2,
+            compute_kernel_config=_COMPUTE,
+            dtype=ttnn.float32,
+            memory_config=ffn_mem,
+            fidelity=ttnn.MathFidelity.LoFi,
+        )
         ttnn.deallocate(gated)
         if ffn_scale is not None:
             r = ttnn.multiply(r, ffn_scale)
@@ -418,8 +439,9 @@ def _compile_causal_conv1d(device, mod):
     wide = cpp_shift_add.wide_weight(taps) if kernel > 1 and stride == 1 and dilation == 1 else None
 
     def _wide_linear(x, w, **kwargs):
-        # The tall codec linears' own full-grid config and HiFi2 (what each per-tap product ran).
-        cfg = _mcast_cfg(x, w, int(x.shape[-2]), ttnn.float32)
+        # The tall codec linears' own full-grid config and HiFi2 (what each per-tap product ran), sized by
+        # the product's real output dtype.
+        cfg = _mcast_cfg(x, w, int(x.shape[-2]), kwargs.get("dtype") or ttnn.float32)
         if cfg is not None:
             kwargs["program_config"] = cfg
             kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
@@ -579,6 +601,10 @@ def _rms_norm(x, gamma, eps, dtype=None, memory_config=None):
         # does not FillPad the padding first, and the result is viewed back without a fill.
         out = _rms_norm(ttnn.reshape(x, padded, padded), gamma, eps, dtype=dtype, memory_config=memory_config)
         return ttnn.reshape(out, shape, padded, skip_padding_fill=True)
+    if common.codec_fused_norm():
+        # structural: the whole norm as ONE stock ttnn.rms_norm at HiFi4 / fp32 DEST / exact rsqrt
+        # (common.codec_rms_norm) instead of five or six full passes over the rows.
+        return common.codec_rms_norm(x, gamma, eps, dtype=dtype, memory_config=memory_config)
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
     # `dtype`: the normalised rows can be written narrower (bf16) for the linears that read them;
     # `memory_config`: and placed where they read them from.
