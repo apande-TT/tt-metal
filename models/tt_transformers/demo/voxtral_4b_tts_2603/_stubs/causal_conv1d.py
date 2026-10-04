@@ -127,10 +127,17 @@ def build(device, torch_module):
     def causal_conv1d(x, **kwargs):
         # `[B, C, L]` in, `[B, C_out, L']` out. The leading bound comes from the TENSOR, never from
         # a literal 1: the pipeline stacks 32 independent samples on axis 0.
-        shape = [int(v) for v in x.shape]
-        length = shape[-1]
-        batch = shape[0] if len(shape) >= 3 else 1
-        x4 = ttnn.reshape(ttnn.transpose(x, -2, -1), [batch, 1, length, in_channels])
+        # structural: a caller holding CHANNELS-LAST rows hands them over as `x_cl` (`[B, 1, L, C]`, `x` is then
+        # not read) and may take the result channels-last too (`cl_out`): no transpose either side.
+        x_cl = kwargs.get("x_cl")
+        if x_cl is not None:
+            batch, _, length, _ = (int(v) for v in x_cl.shape)
+            x4 = x_cl
+        else:
+            shape = [int(v) for v in x.shape]
+            length = shape[-1]
+            batch = shape[0] if len(shape) >= 3 else 1
+            x4 = ttnn.reshape(ttnn.transpose(x, -2, -1), [batch, 1, length, in_channels])
 
         n_frames = (length - effective_kernel + padding_total) / stride + 1
         target = (math.ceil(n_frames) - 1) * stride + (effective_kernel - padding_total)
@@ -170,6 +177,8 @@ def build(device, torch_module):
         if bias is not None:
             acc = ttnn.add(acc, bias)
 
+        if kwargs.get("cl_out"):
+            return ttnn.reshape(acc, [batch, out_len, out_channels])
         return ttnn.reshape(ttnn.transpose(acc, -2, -1), [batch, out_channels, out_len])
 
     return causal_conv1d

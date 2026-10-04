@@ -36,6 +36,8 @@ def build(device, torch_module):
     def weight_norm(weight_g, weight_v=None, **kwargs):
         if weight_v is None:
             raise ValueError("weight_norm needs both weight_g and weight_v")
+        if kwargs.get("taps") is not None:
+            return _wide(weight_g, weight_v, int(kwargs["taps"]), kwargs["pad"], kwargs.get("dtype"))
         # Widened only when not float32 already: a float32 -> float32 typecast is a full copy of the
         # tile-padded v (k = 7 padded to 32: a 31 MB pass for the codec output projection).
         v = weight_v if weight_v.dtype == ttnn.float32 else ttnn.typecast(weight_v, ttnn.float32)
@@ -46,3 +48,24 @@ def build(device, torch_module):
         return ttnn.multiply(v, ttnn.multiply(ttnn.rsqrt(sq_sum), g))
 
     return weight_norm
+
+
+def _wide(g, v, taps, pad, dtype=None):
+    """The same reconstruction on a conv's WIDE layout: `v` is `[.., C_in, taps * C']` -- tap t's output channels
+    at columns `t * C' ..` (C' the tile-padded C_out, padding columns zero) -- and `g` / `pad` are `[.., 1, C']`
+    (`pad` 1.0 on the padding channels so their zero norm stays finite; their `g` is 0).
+
+    structural: the conv takes this layout as is, so the k-last `[C_out, C_in, k]` reconstruction (k padded to a
+    whole tile) and its permutes into it are gone. One row reduction over C_in, the taps' partial sums added per
+    output channel (tile-aligned column blocks), one scale row broadcast down the rows."""
+    cp = int(g.shape[-1])
+    cols = ttnn.sum(ttnn.multiply(v, v), dim=-2, keepdim=True)
+    dims = [int(d) for d in cols.shape]  # (a ttnn.Shape does not slice)
+    rank, lead = len(dims), dims[:-1]
+    sq = None
+    for t in range(taps):
+        part = ttnn.slice(cols, [0] * (rank - 1) + [t * cp], lead + [(t + 1) * cp])
+        sq = part if sq is None else ttnn.add(sq, part)
+    scale = ttnn.multiply(ttnn.rsqrt(ttnn.add(sq, pad)), g)
+    out = {"dtype": dtype} if dtype is not None else {}
+    return ttnn.multiply(v, ttnn.concat([scale] * taps, dim=-1), **out)

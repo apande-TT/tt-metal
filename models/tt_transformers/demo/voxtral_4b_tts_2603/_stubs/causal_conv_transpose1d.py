@@ -80,14 +80,14 @@ def _from_torch(t, device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
     return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device)
 
 
-def _grid_cfg(x, w, rows):
+def _grid_cfg(x, w, rows, out_dtype=None):
     """The codec linears' hand-sized full-grid 2D-mcast config (tt/vocode_stage._mcast_cfg) for a tall tap
     product, or None. Left to the default, a float32 tap product picks in0_block_w=1 -- every K step re-packs
     the whole float32 out block (2048 x 1024 x 1024: 114 us at kb 1)."""
     from models.demos.voxtral_4b_tts_2603.tt.vocode_stage import _mcast_cfg
 
     padded = -(-int(rows) // 32) * 32
-    return _mcast_cfg(x, w, padded, x.dtype) if padded >= 128 else None
+    return _mcast_cfg(x, w, padded, out_dtype or x.dtype) if padded >= 128 else None
 
 
 def _tap_linear(x, w, **kwargs):
@@ -142,19 +142,28 @@ def build(device, torch_module):
     )
 
     def _wide_linear(x, w, **kwargs):
-        # fidelity: HiFi2 + fp32 DEST, as the whole-section body's wide product runs.
+        # fidelity: LoFi + fp32 DEST, as the whole-section body's wide product runs.
         kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
-            math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+            math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=True
         )
-        return ttnn.linear(x, w, program_config=_grid_cfg(x, w, cpp_upsample2.tile_rows(x)), **kwargs)
+        cfg = _grid_cfg(x, w, cpp_upsample2.tile_rows(x), kwargs.get("dtype"))
+        return ttnn.linear(x, w, program_config=cfg, **kwargs)
 
     def causal_conv_transpose1d(x, **kwargs):
         # `[B, C, L]` in, `[B, C, 2L]` out. The leading bound comes from the TENSOR, never from a
         # literal 1: the pipeline stacks 32 independent samples on axis 0.
-        shape = [int(v) for v in x.shape]
-        length = shape[-1]
-        batch = shape[0] if len(shape) >= 3 else 1
-        x4 = ttnn.reshape(ttnn.transpose(x, -2, -1), [batch, 1, length, in_channels])
+        # structural: a caller holding CHANNELS-LAST rows hands them over as `x_cl` (`[B, 1, L, C]`, `x` is then
+        # not read) and may take the result channels-last too (`cl_out`): no transpose either side.
+        x_cl = kwargs.get("x_cl")
+        cl_out = bool(kwargs.get("cl_out"))
+        if x_cl is not None:
+            batch, _, length, _ = (int(v) for v in x_cl.shape)
+            x4 = x_cl
+        else:
+            shape = [int(v) for v in x.shape]
+            length = shape[-1]
+            batch = shape[0] if len(shape) >= 3 else 1
+            x4 = ttnn.reshape(ttnn.transpose(x, -2, -1), [batch, 1, length, in_channels])
 
         if wide is not None and cpp_upsample2.supports(x4, taps):
             # out[2m + j] = x[m] @ W_j + x[m - 1] @ W_{2+j}, written interleaved and trimmed to 2L in one pass:
@@ -163,6 +172,8 @@ def build(device, torch_module):
             out = cpp_upsample2.apply(x4, wide, out_channels, out_len, _COMPUTE, linear=_wide_linear)
             if bias is not None:
                 out = ttnn.add(out, bias)
+            if cl_out:
+                return ttnn.reshape(out, [batch, out_len, out_channels])
             return ttnn.reshape(ttnn.transpose(out, -2, -1), [batch, out_channels, out_len])
 
         zero_row = _zeros_like_buf(device, [batch, 1, 1, out_channels], x4.dtype)
@@ -183,6 +194,8 @@ def build(device, torch_module):
         if bias is not None:
             interleaved = ttnn.add(interleaved, bias)
 
+        if cl_out:
+            return ttnn.reshape(interleaved, [batch, length * stride, out_channels])
         return ttnn.reshape(ttnn.transpose(interleaved, -2, -1), [batch, out_channels, length * stride])
 
     return causal_conv_transpose1d

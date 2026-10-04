@@ -174,7 +174,11 @@ def build(device, torch_module):
             real = int(x_cl.shape[-2])
             front, back = int(kwargs.get("pad_front", 0)), int(kwargs.get("pad_back", 0))
             out_len = (real + front + back - effective_kernel) // stride + 1
-            wide = cpp_shift_add.wide_weight(taps) if weight is None else _wide_from(weight)
+            if kwargs.get("wide_weight") is not None:
+                # A weight already reconstructed in the wide `[C_in, k * C']` layout (parametrization_list(wide=True)).
+                wide = (kwargs["wide_weight"], kernel, out_channels)
+            else:
+                wide = cpp_shift_add.wide_weight(taps) if weight is None else _wide_from(weight)
             acc = cpp_shift_add.conv_wide_unpadded(
                 x_cl, wide, kwargs["pad_mode"], front, out_len, _COMPUTE, linear=_wide_linear
             )
@@ -195,10 +199,17 @@ def build(device, torch_module):
         if x_rm is not None and cpp_shift_add.supports(x_rm, taps, stride, dilation):
             # structural: ONE tilize of the rows and ONE product against the taps side by side; the row shift
             # happens on the narrow tap outputs (tt/cpp_shift_add), not as K copies of the wide input.
-            wide = cpp_shift_add.wide_weight(taps) if weight is None else _wide_from(weight)
-            acc = cpp_shift_add.conv_wide(x_rm, wide, out_len, _COMPUTE)
+            if kwargs.get("wide_weight") is not None:
+                # A weight already reconstructed in the wide `[C_in, k * C']` layout (parametrization_list(wide=True)).
+                wide = (kwargs["wide_weight"], kernel, out_channels)
+            else:
+                wide = cpp_shift_add.wide_weight(taps) if weight is None else _wide_from(weight)
+            acc = cpp_shift_add.conv_wide(x_rm, wide, out_len, _COMPUTE, linear=_wide_linear)
             if bias is not None:
                 acc = ttnn.add(acc, bias)
+            if kwargs.get("cl_out"):
+                # The caller takes the result channels-LAST, `[B, L', C_out]`.
+                return ttnn.reshape(acc, [batch, out_len, out_channels])
             return ttnn.reshape(ttnn.transpose(acc, -2, -1), [batch, out_channels, out_len])
         active_taps = taps if weight is None else _taps_from(weight)
         x4 = None

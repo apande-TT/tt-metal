@@ -134,7 +134,8 @@ def _mcast_cfg(x, w, rows, out_dtype):
                     kb = next(
                         (
                             c
-                            for c in (8, 4, 2, 1)
+                            # grid: a short M (<= 2 tile rows a core) takes a K block of 16 -- half the K steps.
+                            for c in ((16, 8, 4, 2, 1) if pm <= 2 else (8, 4, 2, 1))
                             if kt % c == 0 and bh * bw * os_ + 2 * c * (bh * xs + bw * ws) <= _L1_BUDGET
                         ),
                         None,
@@ -518,13 +519,13 @@ def _compile_causal_conv_transpose1d(device, mod):
     )
 
     def _wide_linear(x, w, **kwargs):
-        # The tall codec linears' own full-grid config and HiFi2 (what the aligned per-tap products ran), over
-        # the batch-folded, tile-padded rows of the 4-D input.
-        cfg = _mcast_cfg(x, w, cpp_upsample2.tile_rows(x), ttnn.float32)
+        # The tall codec linears' own full-grid config, over the batch-folded, tile-padded rows of the 4-D input.
+        # fidelity: the transposed-conv products at LoFi (fp32 DEST kept).
+        cfg = _mcast_cfg(x, w, cpp_upsample2.tile_rows(x), kwargs.get("dtype") or ttnn.float32)
         if cfg is not None:
             kwargs["program_config"] = cfg
             kwargs["compute_kernel_config"] = ttnn.WormholeComputeKernelConfig(
-                math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, packer_l1_acc=True
+                math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=True
             )
         return ttnn.linear(x, w, **kwargs)
 
@@ -570,6 +571,14 @@ def _rms_norm(x, gamma, eps, dtype=None, memory_config=None):
     the chain looked broken. `tt/vocode_stage.py` spells out the same four ops for the same
     reason, so the two bodies agree.
     """
+    shape, padded = x.shape, x.padded_shape
+    dims, pdims = [int(v) for v in shape], [int(v) for v in padded]  # (a ttnn.Shape does not slice)
+    if dims[:-1] != pdims[:-1] and dims[-1] == pdims[-1]:
+        # datamove: only the ROWS carry tile padding (a short / unaligned length) -- the norm runs on the whole
+        # tiles through a zero-cost view (rows are independent; the padding rows are finite), so the mean's reduce
+        # does not FillPad the padding first, and the result is viewed back without a fill.
+        out = _rms_norm(ttnn.reshape(x, padded, padded), gamma, eps, dtype=dtype, memory_config=memory_config)
+        return ttnn.reshape(out, shape, padded, skip_padding_fill=True)
     scale = ttnn.rsqrt(ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps))
     # `dtype`: the normalised rows can be written narrower (bf16) for the linears that read them;
     # `memory_config`: and placed where they read them from.
