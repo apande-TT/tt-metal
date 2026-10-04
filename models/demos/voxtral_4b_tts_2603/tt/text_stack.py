@@ -56,7 +56,7 @@ import copy
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import common
+from models.demos.voxtral_4b_tts_2603.tt import common, cpp_rope_dec
 
 def _keep_none(h):
     """The prefix chain's last-block `trim`: none of its rows are read, only its stashed k/v, so
@@ -790,10 +790,15 @@ class TextStack:
             ],
             dim=-1,
         )
+        # The C++ RoPE (tt/cpp_rope_dec) reads cos and the signed sin as full tile rows: made ONCE a step here.
+        rope_full = None
+        if cpp_rope_dec.enabled():
+            rope_full = (position, cpp_rope_dec.full_rows(rope[0]), cpp_rope_dec.full_rows(sin_signed))
         for block in self.blocks:
             block.kv["mask_row"] = (position, mask_row)
             block.kv["span"] = span
             block.kv["rope_signed"] = (position, sin_signed)
+            block.kv["rope_full"] = rope_full
         hidden = folded
         try:
             for block in self.blocks:
