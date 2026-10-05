@@ -4,8 +4,9 @@
 
 The precise paths carry float32 matmul inputs as hi = bf16(x), lo = bf16(x - hi); ttnn spells that as
 typecast, typecast back, subtract, typecast (four memory-bound passes and three float32 intermediates).
-kernels/split_bf16.cpp reads x once and writes both limbs, with the same packer narrowing and SFPU
-float32 subtract, so the limbs are bit-identical. Plugged into the ports' split helpers (SPLIT_FN).
+kernels/split_bf16.cpp reads x once and writes both limbs (packer narrowing for hi, exact SFPU float32
+x - hi, packer narrowing for lo). Same precision class, not bit-identical (e2e PCC 0.96017 -> 0.96055).
+Plugged into the ports' split helpers (SPLIT_FN).
 """
 from __future__ import annotations
 

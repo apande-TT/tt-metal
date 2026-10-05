@@ -6,8 +6,9 @@
 //   x (cb 0, float32, unpacked to DEST as float32) -> packed to hi (cb 16) and to a scratch copy (cb 24);
 //   the scratch hi is widened back to float32 in DEST next to a second copy of x, subtracted with the
 //   SFPU float32 subtract (round to nearest even), and packed to lo (cb 17).
-// The packer's float32 -> bf16 narrowing and the SFPU subtract are the ones ttnn.typecast and
-// ttnn.subtract use, so the limbs equal the typecast / subtract / typecast chain bit for bit.
+// hi is the packer's float32 -> bf16 narrowing and x - hi is exact in float32, so hi + lo carries ~16
+// mantissa bits of x as the typecast / subtract / typecast chain does. The two are not bit-identical
+// (measured: e2e PCC 0.96017 -> 0.96055), the narrowing rounding differing on some values.
 
 #include <cstdint>
 
