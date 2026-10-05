@@ -187,6 +187,13 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
 
     def to3(t):
         s = list(t.shape)
+        if t.layout != ttnn.TILE_LAYOUT:
+            # every op on the copy is elementwise: fold all rows into one dim so the tiles are dense (a narrow
+            # W, e.g. a 10-wide halo-padded shard, would otherwise pad each 32-row tile to a third full)
+            rows = 1
+            for d in s[:-1]:
+                rows *= d
+            return ttnn.to_layout(ttnn.reshape(t, (1, rows, s[-1])), ttnn.TILE_LAYOUT)
         lead = 1
         for d in s[:-2]:
             lead *= d
