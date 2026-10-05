@@ -56,7 +56,7 @@ import copy
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import common, cpp_rope_dec
+from models.demos.voxtral_4b_tts_2603.tt import common, cpp_fold_rows, cpp_rope_dec, cpp_row_tile
 
 def _keep_none(h):
     """The prefix chain's last-block `trim`: none of its rows are read, only its stashed k/v, so
@@ -145,6 +145,14 @@ def _resid_memory(h):
         rows *= int(d)
     return ttnn.L1_MEMORY_CONFIG if rows <= 640 else None
 
+
+
+def _row_tile(row):
+    """A row-major `[1, 1, 1, W]` row as TILE: tt/cpp_row_tile (the row into row 0 of zeroed tiles, many cores) in
+    place of the one-core tilize-with-padding -- the same bits."""
+    if cpp_row_tile.supports(row):
+        return cpp_row_tile.apply(row)
+    return ttnn.to_layout(row, ttnn.TILE_LAYOUT)
 
 class TextBlock:
     """ONE decoder layer, in whichever of the four interchangeable kinds built it.
@@ -762,7 +770,11 @@ class TextStack:
         # the middle dims pad 1 -> 32, so every residual add and norm would touch 32x the data the
         # step carries. Everything between here and the exit is elementwise or reduces over the
         # last dim, so neither cares which leading axis holds the batch.
-        folded = ttnn.reshape(embeds, [1, 1, batch, self.hidden_size])
+        if cpp_fold_rows.supports(embeds) and int(embeds.shape[0]) == batch:
+            # cpp: the fold as ONE gather of the B real rows (tt/cpp_fold_rows), not a re-tile of the padded tensor.
+            folded = cpp_fold_rows.apply(embeds)
+        else:
+            folded = ttnn.reshape(embeds, [1, 1, batch, self.hidden_size])
         rope = self._decode_rope(batch, position)
         # The additive mask row for `position` is the same for every layer: cut it off the staged
         # table ONCE per step and hand it to each block, instead of 26 slice + tilize pairs.
@@ -774,10 +786,7 @@ class TextStack:
         # the cache reads and score passes.
         span = min(cap, _tile_ceil(position + self._slot_gap + 1))
         table = self._decode_mask if self._slot_mask is None else self._slot_mask
-        mask_row = ttnn.to_layout(
-            ttnn.reshape(ttnn.slice(table, [position, 0], [position + 1, span]), [1, 1, 1, span]),
-            ttnn.TILE_LAYOUT,
-        )
+        mask_row = _row_tile(ttnn.reshape(ttnn.slice(table, [position, 0], [position + 1, span]), [1, 1, 1, span]))
         # `rotate_half(x) * sin == cat(x2, x1) * cat(-sin1, sin2)`: the sign rides on a sin table
         # built once per step, so no layer negates half its q and k.
         sin = rope[1]
@@ -836,10 +845,7 @@ class TextStack:
         # height-sharded `[1, B, 1, head_dim]` form existed for decode-mode
         # `rotary_embedding_hf`, which those stubs no longer call (it typecasts to bfloat16).
         return tuple(
-            ttnn.to_layout(
-                ttnn.reshape(ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT), [1, 1, 1, int(t.shape[-1])]),
-                ttnn.TILE_LAYOUT,
-            )
+            _row_tile(ttnn.reshape(ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT), [1, 1, 1, int(t.shape[-1])]))
             for t in (cos, sin)
         )
 
