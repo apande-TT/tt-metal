@@ -46,7 +46,7 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import cpp_down, cpp_pv_dec, cpp_softmax, cpp_swiglu, ttl_down
+from models.demos.voxtral_4b_tts_2603.tt import cpp_down, cpp_pv_dec, cpp_softmax, cpp_sqmean, cpp_swiglu, ttl_down
 
 _TILE = 32
 _MASK_NEG = -1.0e9
@@ -124,7 +124,14 @@ def _rms_norm(x, gamma, eps, dtype=None):
     sampler downstream rounds onto 21 levels 0.1 apart in x, so 2.7e-3 through seven norms is
     worth ~1% of the output codes and 1.2e-7 is worth none of them.
     """
-    inv = ttnn.add(ttnn.mean(ttnn.square(x), dim=-1, keepdim=True), eps, activations=[ttnn.UnaryOpType.RSQRT])
+    if cpp_sqmean.supports(x, site="acoustic"):
+        # cpp: the square and the row mean as ONE generic_op, a tile row split over four cores (tt/cpp_sqmean) --
+        # the stock float32 SFPU steps in the same order, so every mean is bit for bit the stock one (checked
+        # against ttnn.mean(ttnn.square(x)) on every acoustic norm: max difference 0).
+        mean = cpp_sqmean.sq_mean(x)
+    else:
+        mean = ttnn.mean(ttnn.square(x), dim=-1, keepdim=True)
+    inv = ttnn.add(mean, eps, activations=[ttnn.UnaryOpType.RSQRT])
     if gamma is None:  # folded into the consuming weights
         return ttnn.multiply(x, inv, dtype=dtype or ttnn.float32)
     return ttnn.multiply(ttnn.multiply(x, inv), gamma, dtype=dtype or ttnn.float32)
