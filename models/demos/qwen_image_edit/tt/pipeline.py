@@ -178,6 +178,7 @@ class QwenImageEditTT:
         # projections of one activation (q/k/v, ada-norm scale/shift) share its hi/lo split, and the image and
         # text queries share the joint K's folded operand and V's limbs
         _tr_precise.SHARE_SPLIT = True
+        _tr_precise.FF_HIDDEN_L1 = True  # the FF hidden activation (25 MB fp32) is staged in L1 for its split
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import attention as _tr_attention
 
         _tr_attention.HEADS_INPUT_L1 = True  # the head split reads its input from L1
