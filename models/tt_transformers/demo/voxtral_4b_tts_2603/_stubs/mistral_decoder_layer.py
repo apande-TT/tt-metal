@@ -33,6 +33,7 @@ from models.demos.voxtral_4b_tts_2603.tt import (
     cpp_down_dec,
     cpp_kv_join,
     cpp_pv_dec,
+    cpp_qkv_rope,
     cpp_rope_dec,
     cpp_scores_dec,
     cpp_sqmean,
@@ -734,6 +735,28 @@ def _split_heads(qkv, n_heads, n_kv_heads, rope=False):
         memory_config=l1 if s >= 256 else None,
     )
     ttnn.deallocate(heads)
+    return q, k, v
+
+
+def _qkv_heads_rope(qkv, n_heads, n_kv_heads, position_embeddings, seq, head_dim, half):
+    """The prefill head split + RoPE: `(q, k, v)` from the fused qkv projection.
+
+    cpp: when the fused RoPE's form applies (a batch-1 bf16 table, bf16 qkv), ONE generic_op (tt/cpp_qkv_rope)
+    reads q / k / v straight out of the fused rows and runs the STOCK RoPE compute kernel on them -- the head split,
+    its three slices and the two rotary ops gone, the same bits. Else the stock split + `_rope_prefill`."""
+    if position_embeddings is not None:
+        cos, sin = position_embeddings
+        cos = _broadcast4(cos, seq, head_dim)
+        sin = _broadcast4(sin, seq, head_dim)
+        if int(cos.shape[0]) == 1 and qkv.dtype == ttnn.bfloat16:
+            cb, sb = cos, sin
+            if cb.dtype != ttnn.bfloat16:
+                cb, sb = ttnn.typecast(cb, ttnn.bfloat16), ttnn.typecast(sb, ttnn.bfloat16)
+            if cpp_qkv_rope.supports(qkv, n_heads, n_kv_heads, cb, sb):
+                return cpp_qkv_rope.apply(qkv, n_heads, n_kv_heads, cb, sb)
+    q, k, v = _split_heads(qkv, n_heads, n_kv_heads, rope=position_embeddings is not None)
+    if position_embeddings is not None:
+        q, k = _rope_prefill(q, k, cos, sin, half)
     return q, k, v
 
 
@@ -1450,13 +1473,8 @@ def build(device, torch_module):
     def _prefill_attn(xn, position_embeddings, kv_cache, seq, trim=None):
         # The fused qkv's only reader is the head split right after: L1.
         qkv = _lin(xn, wqkv, dtype=_SDPA_DTYPE, compute_kernel_config=_COMPUTE, memory_config=ttnn.L1_MEMORY_CONFIG)
-        q, k, v = _split_heads(qkv, n_heads, n_kv_heads, rope=position_embeddings is not None)
+        q, k, v = _qkv_heads_rope(qkv, n_heads, n_kv_heads, position_embeddings, seq, head_dim, half)
         ttnn.deallocate(qkv)
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            cos = _broadcast4(cos, seq, head_dim)
-            sin = _broadcast4(sin, seq, head_dim)
-            q, k = _rope_prefill(q, k, cos, sin, half)
         # The stack's last block reads only some rows (`trim`): their attention is all that runs.
         keep = None
         phase = kv_cache.get("prefix_phase") if kv_cache is not None else None
