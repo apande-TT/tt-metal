@@ -178,10 +178,17 @@ def exact_all_reduce(y, device, cluster_axis=1):
     return out
 
 
+# optional replacement for the 2-limb split of a float32 tensor: a callable x32 -> (hi, lo), e.g. a
+# fused kernel; None: typecast / typecast / subtract / typecast
+SPLIT_FN = None
+
+
 def split_bf16(x, limbs=2):
     """float32 -> `limbs` bf16 parts summing to x (2 limbs ~16 mantissa bits, 3 limbs ~24 = float32).
     A matmul consumes its inputs as bf16; the limbs keep every product exact against bf16 weights."""
     x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
+    if limbs == 2 and SPLIT_FN is not None and x32.layout == ttnn.TILE_LAYOUT and x32.is_sharded() is False:
+        return tuple(SPLIT_FN(x32))
     parts = []
     rest = x32
     for i in range(limbs):

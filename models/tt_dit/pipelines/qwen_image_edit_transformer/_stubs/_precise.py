@@ -33,8 +33,15 @@ def precise_config():
     )
 
 
+# optional replacement for the hi/lo split of a float32 tensor: a callable x32 -> (hi, lo), e.g. a fused
+# kernel; None: typecast / typecast / subtract / typecast
+SPLIT_FN = None
+
+
 def split_bf16(x):
     x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
+    if SPLIT_FN is not None and x32.layout == ttnn.TILE_LAYOUT and x32.is_sharded() is False:
+        return SPLIT_FN(x32)
     hi = ttnn.typecast(x32, ttnn.bfloat16)
     lo = ttnn.typecast(ttnn.subtract(x32, ttnn.typecast(hi, ttnn.float32)), ttnn.bfloat16)
     return hi, lo
