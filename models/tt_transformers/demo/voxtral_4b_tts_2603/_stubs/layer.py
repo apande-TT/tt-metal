@@ -34,6 +34,7 @@ from models.demos.voxtral_4b_tts_2603.tt import (
     cpp_kv_join,
     cpp_pv_dec,
     cpp_qkv_rope,
+    cpp_qkv_rope_dec,
     cpp_rope_dec,
     cpp_scores_dec,
     cpp_sqmean,
@@ -1248,41 +1249,62 @@ def build(device, torch_module):
         # cache's own `[1, B, n_kv, head_dim]` -- the n_kv heads share ONE tile per user there, where
         # `[B, n_kv, 1, head_dim]` would pad every head to its own tile. It replaces an untilize and
         # three slice / reshape / tilize chains. v is already the cache update's input layout.
-        q_s, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
-            fused,
-            num_heads=n_heads,
-            num_kv_heads=n_kv_heads,
-            memory_config=_decode_shard(fused.device(), batch, head_dim),
-        )
-        ttnn.deallocate(fused)
+        shard = _decode_shard(fused.device(), batch, head_dim)
+        rope_full = kv_cache.get("rope_full") if kv_cache is not None else None
+        rope_signed = kv_cache.get("rope_signed") if kv_cache is not None else None
+        if (
+            position_embeddings is not None
+            and rope_full is not None
+            and rope_full[0] == int(position)
+            and rope_signed is not None
+            and rope_signed[0] == int(position)
+            and cpp_qkv_rope_dec.supports(fused, n_heads, n_kv_heads, rope_full[1], rope_full[2], shard)
+        ):
+            # cpp: the head split, q's and k's moves and their RoPE in ONE generic_op (tt/cpp_qkv_rope_dec): q
+            # interleaved and RoPE'd, k RoPE'd and v straight into the cache update's shard layout -- the same bits.
+            q, k, v = cpp_qkv_rope_dec.apply(fused, n_heads, n_kv_heads, rope_full[1], rope_full[2], shard)
+            ttnn.deallocate(fused)
+            q_rows = -(-groups // 32) * 32
+        else:
+            q_s, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
+                fused,
+                num_heads=n_heads,
+                num_kv_heads=n_kv_heads,
+                memory_config=shard,
+            )
+            ttnn.deallocate(fused)
 
-        # The grouped query is `groups` rows of a 32-row tile. Zero-padding it to a LOGICAL full tile
-        # costs nothing physically and lets every softmax reduction below skip its FillPad pass.
-        q_rows = -(-groups // 32) * 32
-        # q is RoPE'd with the heads as ROWS, `[B, 1, n_heads, head_dim]` (one tile per user), and
-        # only then regrouped by kv head: the grouped `[B, n_kv, groups, head_dim]` form pads each
-        # group of `groups` rows out to a 32-row tile, 8x the tiles for the six RoPE ops. The RoPE
-        # ops read q and k interleaved.
-        q = ttnn.reshape(ttnn.to_memory_config(q_s, ttnn.L1_MEMORY_CONFIG), [batch, 1, n_heads, head_dim])
-        ttnn.deallocate(q_s)
-        k_s = k
-        k = ttnn.to_memory_config(k_s, ttnn.L1_MEMORY_CONFIG)
-        ttnn.deallocate(k_s)
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            signed = kv_cache.get("rope_signed") if kv_cache is not None else None
-            if signed is not None and signed[0] == int(position):
-                full = kv_cache.get("rope_full")
-                if full is not None and full[0] == int(position) and cpp_rope_dec.supports([q, k], full[1], full[2]):
-                    # cpp: q's and k's RoPE in ONE generic_op (tt/cpp_rope_dec) -- binary_ng's float32 SFPU
-                    # multiplies and add in its order, the rotate-half a tile swap: the same bits, 1 op not 12.
-                    q, k = cpp_rope_dec.apply([q, k], full[1], full[2])
+            # The grouped query is `groups` rows of a 32-row tile. Zero-padding it to a LOGICAL full tile
+            # costs nothing physically and lets every softmax reduction below skip its FillPad pass.
+            q_rows = -(-groups // 32) * 32
+            # q is RoPE'd with the heads as ROWS, `[B, 1, n_heads, head_dim]` (one tile per user), and
+            # only then regrouped by kv head: the grouped `[B, n_kv, groups, head_dim]` form pads each
+            # group of `groups` rows out to a 32-row tile, 8x the tiles for the six RoPE ops. The RoPE
+            # ops read q and k interleaved.
+            q = ttnn.reshape(ttnn.to_memory_config(q_s, ttnn.L1_MEMORY_CONFIG), [batch, 1, n_heads, head_dim])
+            ttnn.deallocate(q_s)
+            k_s = k
+            k = ttnn.to_memory_config(k_s, ttnn.L1_MEMORY_CONFIG)
+            ttnn.deallocate(k_s)
+            if position_embeddings is not None:
+                cos, sin = position_embeddings
+                signed = kv_cache.get("rope_signed") if kv_cache is not None else None
+                if signed is not None and signed[0] == int(position):
+                    full = kv_cache.get("rope_full")
+                    if (
+                        full is not None
+                        and full[0] == int(position)
+                        and cpp_rope_dec.supports([q, k], full[1], full[2])
+                    ):
+                        # cpp: q's and k's RoPE in ONE generic_op (tt/cpp_rope_dec) -- binary_ng's float32 SFPU
+                        # multiplies and add in its order, the rotate-half a tile swap: the same bits, 1 op not 12.
+                        q, k = cpp_rope_dec.apply([q, k], full[1], full[2])
+                    else:
+                        q = _rope_signed(q, cos, signed[1], half)
+                        k = _rope_signed(k, cos, signed[1], half)
                 else:
-                    q = _rope_signed(q, cos, signed[1], half)
-                    k = _rope_signed(k, cos, signed[1], half)
-            else:
-                q = _rope(q, cos, sin, half)
-                k = _rope(k, cos, sin, half)
+                    q = _rope(q, cos, sin, half)
+                    k = _rope(k, cos, sin, half)
         # The C++ scores can read the RoPE'd q in place, gathering each kv head's `groups` rows into a
         # zeroed tile itself (the same grouped layout), when it also reads the cache in place.
         cap_kv = int(kv_cache["k"].shape[-2])
