@@ -21,6 +21,16 @@ _TT_METAL = os.environ.get("TT_METAL_HOME", "")
 
 def fused_split_bf16(x):
     """x float32 TILE (interleaved) -> (hi, lo) bf16 TILE in x's memory config."""
+    return _split(x, "split_bf16.cpp", gelu=False)
+
+
+def fused_gelu_split_bf16(x):
+    """x float32 TILE (interleaved) -> (hi, lo) bf16 limbs of ttnn.gelu(x, variant=Tanh), the GELU computed
+    in the split kernel (kernels/gelu_split_bf16.cpp) so its output never round-trips DRAM."""
+    return _split(x, "gelu_split_bf16.cpp", gelu=True)
+
+
+def _split(x, compute_kernel, gelu):
     device = x.device()
     mem = x.memory_config()
     if mem.buffer_type == ttnn.BufferType.L1:  # an L1 input still gets its limbs in DRAM (L1 limbs clash with matmuls)
@@ -43,6 +53,8 @@ def fused_split_bf16(x):
         )
 
     cbs = [_cb(0, ttnn.float32, 4096), _cb(16, ttnn.bfloat16, 2048), _cb(17, ttnn.bfloat16, 2048), _cb(24, ttnn.bfloat16, 2048)]
+    if gelu:  # float32 scratch of the GELU output, reloaded for x - hi
+        cbs.append(_cb(25, ttnn.float32, 4096))
     rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     start = 0
     for group, per in ((group1, per1), (group2, per2)):
@@ -59,6 +71,8 @@ def fused_split_bf16(x):
     cfg.math_approx_mode = False
     modes = [ttnn.UnpackToDestMode.Default] * 32
     modes[0] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    if gelu:
+        modes[25] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
     kernels = [
         ttnn.KernelDescriptor(
@@ -81,7 +95,7 @@ def fused_split_bf16(x):
             config=ttnn.WriterConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_KERNELS, "split_bf16.cpp"),
+            kernel_source=os.path.join(_KERNELS, compute_kernel),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[],

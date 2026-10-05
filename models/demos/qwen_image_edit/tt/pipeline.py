@@ -39,7 +39,7 @@ import ttnn
 from models.demos.qwen_image_edit.mesh import DEVICE_PARAMS, MESH_SHAPE  # noqa: F401 (re-exported)
 from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
-from models.demos.qwen_image_edit.tt.limb_split import fused_split_bf16
+from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.tracker import InvocationTracker
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
@@ -193,6 +193,7 @@ class QwenImageEditTT:
         # the precise paths' float32 -> (hi, lo) bf16 splits as one C++ kernel pass (transformer + text encoder)
         _tr_precise.SPLIT_FN = fused_split_bf16
         _te_attention.SPLIT_FN = fused_split_bf16
+        _tr_precise.GELU_SPLIT_FN = fused_gelu_split_bf16  # the FF GELU fused into its down projection's split
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
