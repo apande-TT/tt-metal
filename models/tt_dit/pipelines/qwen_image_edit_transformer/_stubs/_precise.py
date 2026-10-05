@@ -21,6 +21,9 @@ import ttnn
 ENABLED = False  # the pipeline switches this on; the per-component PCC tests keep the graduated path
 SHARE_SPLIT = False  # projections of one activation share its hi/lo split (the pipeline switches this on)
 FF_HIDDEN_L1 = False  # the feed-forward's GELU output (the down projection's input) is written to L1
+# optional fused GELU + split for the feed-forward: a callable pre-activation x32 -> (hi, lo) of gelu_tanh(x);
+# None: ttnn.gelu then split_bf16
+GELU_SPLIT_FN = None
 EXACT_QK = True  # within precise mode: exact-lane QK^T (else the dense 3-term split)
 FOLD_LANES = False  # exact QK^T as one K-folded matmul per lane pattern (the pipeline switches this on)
 EXACT_LANES = 8
