@@ -39,10 +39,12 @@ import ttnn
 from models.demos.qwen_image_edit.mesh import DEVICE_PARAMS, MESH_SHAPE  # noqa: F401 (re-exported)
 from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
+from models.demos.qwen_image_edit.tt.limb_split import fused_split_bf16
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.tracker import InvocationTracker
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
 from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
+from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl as _tr_ccl
 
 PIPELINE_STAGES = ["vision_encode", "text_encode", "vae_encode", "denoise", "vae_decode"]
@@ -186,6 +188,9 @@ class QwenImageEditTT:
         _tr_ccl.A2A_REDUCE = True
         _tr_ccl.A2A_SUM_L1 = True  # with its per-source slices and their sum in L1
         _tr_ccl.A2A_SUM_FN = fused_block_sum  # the local sum of the n source blocks as one C++ kernel
+        # the precise paths' float32 -> (hi, lo) bf16 splits as one C++ kernel pass (transformer + text encoder)
+        _tr_precise.SPLIT_FN = fused_split_bf16
+        _te_attention.SPLIT_FN = fused_split_bf16
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
