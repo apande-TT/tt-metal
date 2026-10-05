@@ -107,6 +107,8 @@ class TtQwenTextEncoder:
         _te_attention.EXACT_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         # and its exact-lane linears on the full core grid (ttnn's own pick: 30-48 cores)
         _te_attention.EXACT_LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
+        # and keeps the lane copies / products / sums of products up to 6 MB in L1
+        _te_attention.EXACT_SUM_L1_BYTES = 6 * 1024 * 1024
         # the vision token permutations as one bf16 matmul per limb (one-hot rows: each output is a single
         # 1 * v product, already exact without the exact-lane decomposition)
         vision_transformer_pretrained_model.ONEHOT_PERMUTE = True
