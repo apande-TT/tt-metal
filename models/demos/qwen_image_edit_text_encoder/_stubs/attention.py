@@ -271,17 +271,30 @@ def _vote(ests):
     return ests[0] if len(ests) == 1 else _median3(*ests)
 
 
-def _exact_sum(mm, parts, patterns=LANE_PATTERNS):
-    """median over `patterns` of sum_{part, lane} mm(lane(part))."""
+# small exact-lane products keep their lane copies, products and running sums in L1 (bytes per float32
+# product; 0: everything in DRAM)
+EXACT_SUM_L1_BYTES = 0
+
+
+def _exact_sum(mm, parts, patterns=LANE_PATTERNS, out_bytes=0):
+    """median over `patterns` of sum_{part, lane} mm(lane(part)). mm(lane, memory_config) -> product.
+    With EXACT_SUM_L1_BYTES >= out_bytes the lane copies, products and sums live in L1 (one lane copy
+    at a time) and only the voted result goes to DRAM."""
+    l1 = bool(EXACT_SUM_L1_BYTES) and 0 < out_bytes <= EXACT_SUM_L1_BYTES
+    mem = ttnn.L1_MEMORY_CONFIG if l1 else None
+    kw = {"memory_config": mem} if l1 else {}
     ests = []
     for pattern in patterns:
         y = None
         for part in parts:
-            for lane in _lanes(part, pattern):
-                t = mm(lane)
-                y = t if y is None else ttnn.add(y, t)
+            for m in _lane_masks(part.device(), part.shape[-1], part.dtype, pattern):
+                lane = ttnn.multiply(part, m, **kw)
+                t = mm(lane, mem)
+                ttnn.deallocate(lane)
+                y = t if y is None else ttnn.add(y, t, **kw)
         ests.append(y)
-    return _vote(ests)
+    out = _vote(ests)
+    return ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out
 
 
 # projections of one activation share its bf16 limb split (MLP gate / up)
@@ -361,11 +374,14 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     parts: split_bf16(x, limbs) when several projections share x (split once, not once per projection)."""
     cfg = precise_config()
     parts = split_bf16(x, limbs) if parts is None else parts
-    mm = lambda p: ttnn.linear(  # noqa: E731
-        p, w, compute_kernel_config=cfg, dtype=ttnn.float32, core_grid=EXACT_LINEAR_CORE_GRID
-    )
+
+    def mm(p, mem=None):
+        kw = {} if mem is None else {"memory_config": mem}
+        return ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32, core_grid=EXACT_LINEAR_CORE_GRID, **kw)
+
     if exact:
-        y = _exact_sum(mm, parts, _patterns(exact))
+        out_bytes = 4 * math.prod([int(d) for d in x.padded_shape][:-1]) * int(w.padded_shape[-1])
+        y = _exact_sum(mm, parts, _patterns(exact), out_bytes=out_bytes)
     else:
         pc = _block_config(x, w) if LINEAR_BLOCK and LINEAR_CORE_GRID is not None else None
         kw = dict(program_config=pc) if pc is not None else dict(core_grid=LINEAR_CORE_GRID)
