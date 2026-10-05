@@ -113,7 +113,8 @@ class TtQwenVAE:
         # Images per decoder program. Re-measured 2026-10-03 on this 2x4 T3K mesh with every stage's weights
         # resident (7.95 GB per chip after text encode, B=32): 32 in one program fails allocating a 201 MB
         # DRAM buffer (16.8 MB per bank needed, largest free block 10.1 MB); 16 fits (9.01 GB per chip).
-        self.decode_max_batch = 16
+        # 8 (2026-10-05): the precise convs now hold their padded input's tile copy across their runs.
+        self.decode_max_batch = 8
         # Images per encoder program. Re-measured 2026-10-03, same setup: 32 in one program fails allocating a
         # 50 MB buffer (4.19 MB per bank needed, largest free block 3.30 MB); 16 fits (8.92 GB per chip).
         # 8 (2026-10-04): the exact convs now hold the padded input's bf16 limbs across their lane runs,

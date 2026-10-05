@@ -217,8 +217,7 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
     # each run's limb / lane is a transient of the operand's tile copy
     f32 = lambda t: ttnn.typecast(ttnn.typecast(t, ttnn.bfloat16), ttnn.float32)  # noqa: E731
     hi, lo = f32, lambda t: ttnn.subtract(t, f32(t))
-    # with prepad the tile copy is shared by every run; without it each run tilizes its own (the decoder's
-    # float32 median mode keeps that transient-only footprint: it has no headroom for a held copy)
+    # with prepad the tile copy is shared by every run; without it each run tilizes its own
     shared = [to3(x)] + ([] if extra is None else [to3(extra)]) if prepad is not None else None
 
     def run_on(fn, tiles=None):

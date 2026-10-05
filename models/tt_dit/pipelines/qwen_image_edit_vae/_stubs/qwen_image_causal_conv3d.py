@@ -53,12 +53,8 @@ class TtQwenImageCausalConv3d(ResidentPort):
         run = lambda t, c: self._body_forward(self.conv, t, logical_h, c, logical_w=logical_w)  # noqa: E731
         if not self.precise:
             return run(x, cache_x_BTHWC)
-        if self.precise != "exact":
-            return precise_affine(
-                run, x, self.precise, self.conv.mesh_device, extra=cache_x_BTHWC, bias=self.conv.bias.data
-            )
         conv = self.conv
-        # exact mode (~11 runs): pad / halo-exchange once; every run then convolves its variant of the padded input
+        # pad / halo-exchange once; every run then convolves its variant of the padded input
         return precise_affine(
             lambda t, _e: conv.conv_padded(t),
             x,
