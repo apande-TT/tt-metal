@@ -132,17 +132,27 @@ def attach_block_ports(stack, device, parallel_config, ccl_manager, torch_stack=
 #                median of (exact, plain, negated) where it does not.
 
 
+def _flat_rows(t):
+    """Whether t folds to (1, rows, C) as a view: row-major with tile-aligned C (its pages stay C wide;
+    the (n/32, 32) view would re-page it, a full copy)."""
+    s = list(t.shape)
+    return t.layout != ttnn.TILE_LAYOUT and s[-1] % 32 == 0
+
+
 def _flat(t):
     n = 1
     for d in t.shape:
         n *= d
+    if _flat_rows(t):
+        return ttnn.to_layout(ttnn.reshape(t, (1, n // t.shape[-1], t.shape[-1])), ttnn.TILE_LAYOUT)
     return ttnn.to_layout(ttnn.reshape(t, (n // 32, 32)), ttnn.TILE_LAYOUT) if n % 32 == 0 else None
 
 
-def _bias_flat(bias, shape):
-    """_flat of the [*, C] tensor whose every row is `bias` (None when that layout does not apply). The
-    flat view's row r holds channels (32 r) mod C .. +31, so for C % 32 == 0 it is bias as (C/32, 32)
-    repeated n/C times: one output-sized buffer, no copy of the output kept alive."""
+def _bias_flat(bias, shape, rows_layout=False):
+    """_flat of the [*, C] tensor whose every row is `bias` (None when that layout does not apply). In the
+    (1, rows, C) fold it is bias itself as (1, 1, C), broadcast by the ops that use it. In the (n/32, 32)
+    view row r holds channels (32 r) mod C .. +31, so for C % 32 == 0 it is bias as (C/32, 32) repeated
+    n/C times: one output-sized buffer, no copy of the output kept alive."""
     if bias is None:
         return None
     c, n = shape[-1], 1
@@ -150,6 +160,8 @@ def _bias_flat(bias, shape):
         n *= d
     if c % 32 or tuple(bias.shape) != (1, c) or n % c:
         return None
+    if rows_layout:
+        return ttnn.reshape(bias, (1, 1, c))
     rows = ttnn.reshape(ttnn.to_layout(bias, ttnn.ROW_MAJOR_LAYOUT), (c // 32, 32))
     return ttnn.to_layout(ttnn.repeat(rows, (n // c, 1)), ttnn.TILE_LAYOUT)
 
@@ -220,10 +232,12 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
             if src.layout != ttnn.TILE_LAYOUT or srcs is None:  # a tile src: to3 may have returned a view of it
                 ttnn.deallocate(t)
 
-    b = _bias_flat(bias, shape)
+    b = _bias_flat(bias, shape, rows_layout=_flat_rows(out))
     if b is None:
         b = run_on(lambda t: ttnn.multiply(t, 0.0))
-    e_neg = ttnn.subtract(ttnn.multiply(b, 2.0), run_on(ttnn.neg))
+    # 2 b - op(-x), written (-op(-x)) + 2 b so that only the right operand broadcasts (b may be (1, 1, C))
+    neg = [ttnn.UnaryWithParam(ttnn.UnaryOpType.NEG)]
+    e_neg = ttnn.add(run_on(ttnn.neg), ttnn.multiply(b, 2.0), input_tensor_a_activations=neg)
     if mode == "exact":
         from models.demos.qwen_image_edit_text_encoder._stubs.attention import EXACT_MODE
 
