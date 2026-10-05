@@ -175,7 +175,8 @@ class QwenImageEditTT:
         # exact QK^T with its 3 terms x 8 lanes folded into K: 3 matmuls per attention instead of 72
         # matmuls + 69 float32 adds of the [Sq, Sk] logits (denoise trace 25.7 s -> 15.9 s, pcc 0.9587)
         _tr_precise.FOLD_LANES = True
-        # projections of one activation (q/k/v, ada-norm scale/shift) share its hi/lo split
+        # projections of one activation (q/k/v, ada-norm scale/shift) share its hi/lo split, and the image and
+        # text queries share the joint K's folded operand and V's limbs
         _tr_precise.SHARE_SPLIT = True
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import attention as _tr_attention
 
