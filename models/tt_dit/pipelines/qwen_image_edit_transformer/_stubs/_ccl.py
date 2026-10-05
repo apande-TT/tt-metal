@@ -146,14 +146,25 @@ A2A_REDUCE = False
 A2A_SUM_L1 = False  # the all_to_all's per-source slices and their float32 sum in L1 (all_gathered from there)
 
 
+def _a2a_split_dim(lead, n):
+    """The 4D dim _a2a_sum splits over the devices: the rows when they split into whole tiles, else the
+    batch (dim 1) when it splits evenly; None when neither does."""
+    if lead[2] % (32 * n) == 0:
+        return 2
+    if lead[1] % n == 0:
+        return 1
+    return None
+
+
 def _a2a_sum(y, ax, n):
     shape = list(y.shape)
     lead = [1] * (4 - len(shape)) + shape  # 4D for the all_to_all
+    d = _a2a_split_dim(lead, n)
     y4 = ttnn.reshape(y, lead)
-    # out_dim (the rows) is split over the devices and in_dim (0) grows by n: [n * lead0, lead1, rows / n,
-    # cols], block i = source device i's partial of this device's row slice
+    # out_dim d is split over the devices and in_dim (0) grows by n: block i of dim 0 = source device i's
+    # partial of this device's slice of dim d
     g = ttnn.experimental.all_to_all_async_generic(
-        y4, in_dim=0, out_dim=2, cluster_axis=ax, topology=ttnn.Topology.Linear
+        y4, in_dim=0, out_dim=d, cluster_axis=ax, topology=ttnn.Topology.Linear
     )
     part = list(g.shape)
     part[0] //= n
@@ -164,7 +175,7 @@ def _a2a_sum(y, ax, n):
         out = p if out is None else ttnn.add(out, p, **kw)
     ttnn.deallocate(g)
     out = ttnn.all_gather(
-        out, dim=2, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        out, dim=d, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear, memory_config=ttnn.DRAM_MEMORY_CONFIG
     )
     return ttnn.reshape(out, shape)
 
@@ -176,7 +187,7 @@ def _gather_sum(y, device, ax):
     nbytes = 4 if y.dtype == ttnn.float32 else 2
     for s in shape:
         nbytes *= s
-    if A2A_REDUCE and 2 <= len(shape) <= 4 and shape[-2] % (32 * n) == 0:
+    if A2A_REDUCE and 2 <= len(shape) <= 4 and _a2a_split_dim([1] * (4 - len(shape)) + shape, n) is not None:
         return _a2a_sum(y, ax, n)
     if L1_GATHER_BYTES and len(shape) >= 2 and shape[-2] % 32 == 0 and n * nbytes * 32 // shape[-2] <= L1_GATHER_BYTES:
         return _gather_sum_l1(y, ax, n, nbytes)
