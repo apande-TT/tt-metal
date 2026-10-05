@@ -353,6 +353,10 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     cfg = precise_config()
     parts = split_bf16(x, limbs)
     pc = linear_program_config(x, w)
+    if pc is not None:  # the hand config's float32 output CB takes the K-step partials in L1 directly
+        cfg = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
+        )
     mm = lambda p: ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc)  # noqa: E731
     if exact and EXACT_MODE == "guarded":
         y = _guarded_sum(mm, parts, _col_norms(w))
