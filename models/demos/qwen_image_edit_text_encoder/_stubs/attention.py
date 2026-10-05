@@ -294,8 +294,10 @@ def linear_program_config(x, w):
     operands over the full grid reads each weight column block once per output block row; the per-core
     float32 output streams through L1 in out_block_h x out_block_w blocks. The K reduction runs in
     in0_block_w steps with float32 partials either way."""
-    xs, ws = list(x.shape), list(w.shape)
-    if len(ws) != 2 or xs[-2] % 32 or xs[-1] % 32 or ws[-1] % 32:
+    # tile layout pads every batch entry's rows to a tile, so the batch folds over the PADDED rows (a
+    # 110-token text stream is 4 tile rows per sample either way)
+    xs, ws = list(x.padded_shape), list(w.shape)
+    if x.layout != ttnn.TILE_LAYOUT or len(ws) != 2 or xs[-1] % 32 or ws[-1] % 32:
         return None
     rows = 1
     for d in xs[:-1]:
