@@ -141,6 +141,8 @@ class TtQwenJointAttention:
 
     def _heads(self, x):  # [B, S, Hl*D] -> [B, Hl, S, D]
         B, S = x.shape[0], x.shape[1]
+        if HEADS_INPUT_L1:
+            x = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)
         x = ttnn.reshape(x, (B, S, self.local_heads, self.head_dim))
         return ttnn.permute(x, (0, 2, 1, 3))
 
@@ -245,6 +247,10 @@ class TtQwenJointAttention:
         img = self._out(self._attend(qi, kh, kl, v, mask_add), self.img_out)
         txt = self._out(self._attend(qt, kh, kl, v, mask_add), self.txt_out)
         return img, txt
+
+
+# the head split's input is moved to L1 before its reshape (False: read from DRAM)
+HEADS_INPUT_L1 = False
 
 
 def build(device, torch_module=None):
