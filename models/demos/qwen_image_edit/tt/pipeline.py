@@ -37,6 +37,7 @@ import torch
 
 import ttnn
 from models.demos.qwen_image_edit.mesh import DEVICE_PARAMS, MESH_SHAPE  # noqa: F401 (re-exported)
+from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.tracker import InvocationTracker
@@ -181,7 +182,7 @@ class QwenImageEditTT:
         # float32 adds + all_gather instead of gathering every partial
         _tr_ccl.A2A_REDUCE = True
         _tr_ccl.A2A_SUM_L1 = True  # with its per-source slices and their sum in L1
-        _tr_ccl.A2A_FUSED_SUM = True  # the local sum of the n source blocks as one C++ kernel
+        _tr_ccl.A2A_SUM_FN = fused_block_sum  # the local sum of the n source blocks as one C++ kernel
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
