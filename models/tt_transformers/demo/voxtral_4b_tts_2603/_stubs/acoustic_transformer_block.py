@@ -33,7 +33,15 @@ import math
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import cpp_down, cpp_pv_dec, cpp_softmax, cpp_sqmean, cpp_swiglu, ttl_down
+from models.demos.voxtral_4b_tts_2603.tt import (
+    cpp_bcast_mul,
+    cpp_down,
+    cpp_pv_dec,
+    cpp_softmax,
+    cpp_sqmean,
+    cpp_swiglu,
+    ttl_down,
+)
 
 _TILE = 32
 _COMPUTE = ttnn.WormholeComputeKernelConfig(
@@ -221,6 +229,14 @@ def _gamma(norm, device):
     return _from_torch(norm.weight.detach().reshape(1, 1, 1, -1).contiguous(), device, dtype=ttnn.float32)
 
 
+def _scale_rows(x, scale, dtype=None, memory_config=None):
+    """`x * scale` for a per-row `scale` (a norm's rsqrt): tt/cpp_bcast_mul -- the stock multiply's own bits,
+    its reads and writes batched -- where it takes the shapes, else the stock multiply."""
+    if cpp_bcast_mul.supports(x, scale, dtype, memory_config):
+        return cpp_bcast_mul.mul_col(x, scale, dtype=dtype, memory_config=memory_config)
+    return ttnn.multiply(x, scale, dtype=dtype, memory_config=memory_config)
+
+
 def _rms_norm(x, gamma, eps, dtype=None):
     """RMSNorm in float32: `x * rsqrt(mean(x^2) + eps) * gamma`.
 
@@ -239,8 +255,8 @@ def _rms_norm(x, gamma, eps, dtype=None):
         mean = ttnn.mean(ttnn.square(x), dim=-1, keepdim=True)
     inv = ttnn.add(mean, eps, activations=[ttnn.UnaryOpType.RSQRT])
     if gamma is None:  # folded into the consuming weights
-        return ttnn.multiply(x, inv, dtype=dtype or ttnn.float32)
-    return ttnn.multiply(ttnn.multiply(x, inv), gamma, dtype=dtype or ttnn.float32)
+        return _scale_rows(x, inv, dtype=dtype or ttnn.float32)
+    return ttnn.multiply(_scale_rows(x, inv), gamma, dtype=dtype or ttnn.float32)
 
 
 _NORM_COMPUTE = ttnn.WormholeComputeKernelConfig(

@@ -29,6 +29,7 @@ import torch
 
 import ttnn
 from models.demos.voxtral_4b_tts_2603.tt import (
+    cpp_bcast_mul,
     cpp_ctx_merge,
     cpp_down_dec,
     cpp_kv_join,
@@ -474,6 +475,14 @@ def _sq_mean(x):
     )
 
 
+def _scale_rows(x, scale, dtype=None, memory_config=None):
+    """`x * scale` for a per-row `scale` (a norm's rsqrt): tt/cpp_bcast_mul -- the stock multiply's own bits,
+    its reads and writes batched -- where it takes the shapes, else the stock multiply."""
+    if cpp_bcast_mul.supports(x, scale, dtype, memory_config):
+        return cpp_bcast_mul.mul_col(x, scale, dtype=dtype, memory_config=memory_config)
+    return ttnn.multiply(x, scale, dtype=dtype, memory_config=memory_config)
+
+
 def _rms_norm(x, gamma, eps, dtype=None, memory_config=None):
     """`x * rsqrt(mean(x^2) + eps) * gamma`, spelled out, entirely in float32.
 
@@ -488,8 +497,8 @@ def _rms_norm(x, gamma, eps, dtype=None, memory_config=None):
     """
     scale = ttnn.add(_sq_mean(x), eps, activations=[ttnn.UnaryOpType.RSQRT])
     if gamma is None:  # folded into the consuming weights
-        return ttnn.multiply(x, scale, dtype=dtype or ttnn.float32, memory_config=memory_config)
-    return ttnn.multiply(ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32, memory_config=memory_config)
+        return _scale_rows(x, scale, dtype=dtype or ttnn.float32, memory_config=memory_config)
+    return ttnn.multiply(_scale_rows(x, scale), gamma, dtype=dtype or ttnn.float32, memory_config=memory_config)
 
 
 def _view4(x, dim):

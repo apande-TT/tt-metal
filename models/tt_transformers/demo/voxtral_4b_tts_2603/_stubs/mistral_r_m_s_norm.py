@@ -39,7 +39,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.demos.voxtral_4b_tts_2603.tt import cpp_sqmean
+from models.demos.voxtral_4b_tts_2603.tt import cpp_bcast_mul, cpp_sqmean
 
 
 def _from_torch(t, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
@@ -93,6 +93,14 @@ def _sq_mean(x):
     )
 
 
+def _scale_rows(x, scale, dtype=None, memory_config=None):
+    """`x * scale` for a per-row `scale` (a norm's rsqrt): tt/cpp_bcast_mul -- the stock multiply's own bits,
+    its reads and writes batched -- where it takes the shapes, else the stock multiply."""
+    if cpp_bcast_mul.supports(x, scale, dtype, memory_config):
+        return cpp_bcast_mul.mul_col(x, scale, dtype=dtype, memory_config=memory_config)
+    return ttnn.multiply(x, scale, dtype=dtype, memory_config=memory_config)
+
+
 def build(device, torch_module):
     norm = torch_module
     dim = int(norm.weight.shape[-1])
@@ -115,11 +123,9 @@ def build(device, torch_module):
             x = ttnn.typecast(x, ttnn.float32)
         scale = ttnn.add(_sq_mean(x), eps, activations=[ttnn.UnaryOpType.RSQRT])
         if unit:
-            out = ttnn.multiply(x, scale, dtype=dtype or ttnn.float32, memory_config=memory_config)
+            out = _scale_rows(x, scale, dtype=dtype or ttnn.float32, memory_config=memory_config)
         else:
-            out = ttnn.multiply(
-                ttnn.multiply(x, scale), gamma, dtype=dtype or ttnn.float32, memory_config=memory_config
-            )
+            out = ttnn.multiply(_scale_rows(x, scale), gamma, dtype=dtype or ttnn.float32, memory_config=memory_config)
         return ttnn.reshape(out, [lead, seq, dim] if len(shape) == 3 else [lead, 1, seq, dim])
 
     return mistral_r_m_s_norm
