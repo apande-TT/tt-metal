@@ -203,26 +203,31 @@ def _metric_now(metric, ledger: dict):
     """The run's metric with `current` taken from the ledger's latest committed reading of it.
 
     state.json is written by the FSM when the loop starts and the optimize loop never touches it
-    again, so its `current` stayed at the baseline for the whole run (Qwen-Image-Edit: 11615.70 ms
-    "current" after six committed wins took it to 5257.93). The ledger's device-time readings are the
-    same quantity -- linked by evidence, not by name: when the ledger's first `before` reading IS the
-    metric's baseline, its latest `after` reading is the current value. Anything else is unchanged."""
+    again, so its `current` stays at the start-of-run value for the whole run even as the ledger
+    records every committed win (voxtral: `device_ms` read 535.46 "current" after the device-time
+    series had fallen to 397.64; qwen the same). The ledger's device-time readings are the SAME
+    quantity -- linked by EVIDENCE, not by name: the metric's baseline IS one of this series'
+    readings. The FSM may pin that baseline to a reading taken mid-run at the resident depth, not the
+    series' first `before` (voxtral's 535.46 is a depth-26 `after` of a 609 -> 398 series), so match
+    the reading the baseline equals, then `current` is the latest reading AT THAT SAME DEPTH and
+    `scope` names that slice. A metric whose baseline matches no reading is a different quantity and is
+    left untouched (its `current` is not borrowed from an unrelated series)."""
     if not isinstance(metric, dict):
         return metric
     from models.experimental.perf_automation.cc_optimize import measurements as _m
 
     rows = [r for r in (ledger or {}).get(_m.KIND_EAGER) or [] if isinstance(r.get("value_ms"), (int, float))]
-    first = next((r for r in rows if r.get("phase") == _m.PHASE_BEFORE), None)
-    before = first["value_ms"] if first else None
-    afters = [r["value_ms"] for r in rows if r.get("phase") == _m.PHASE_AFTER]
     base = metric.get("baseline")
-    if not (isinstance(base, (int, float)) and before is not None and abs(before - base) < 1e-6):
+    if not isinstance(base, (int, float)) or not rows:
         return metric
-    # WHAT THIS NUMBER COVERS, as the ledger recorded it: the profiled slice (its depth) and how it was
-    # timed, so the page can say it is not the end-to-end time. Summing a depth-limited per-op profile
-    # gives a number far below the full-pipeline stage times beside it, and read as "end to end" it
-    # looked like a contradiction (5258 ms device time next to 24537 ms for one stage alone).
-    out = {**metric, "scope": {"depth": first.get("depth"), "mode": first.get("mode")}}
+    # The reading the pinned baseline equals (anywhere in the series, not just the first `before`):
+    # that is the proof this series IS the headline metric, and it tells us which depth/slice it is.
+    matched = next((r for r in rows if abs(r["value_ms"] - base) < 1e-6), None)
+    if matched is None:
+        return metric
+    depth = matched.get("depth")
+    afters = [r["value_ms"] for r in rows if r.get("phase") == _m.PHASE_AFTER and r.get("depth") == depth]
+    out = {**metric, "scope": {"depth": depth, "mode": matched.get("mode")}}
     if afters:
         out["current"] = afters[-1]
     return out
@@ -475,6 +480,31 @@ def _roofline_points(buckets: list) -> list:
 # --------------------------------------------------------------------------- the snapshot
 
 
+def _parallelism(ledger: dict, topology, batch) -> "dict | None":
+    """Parallel-scaling facts for the Scaling view, read from the run itself (never a mesh string):
+    tensor-parallel degree (ledger `tp_degree`), device count (board topology), the implied data-
+    parallel degree, and the batch/users. None when the run declares nothing."""
+
+    def _num(r):
+        if not isinstance(r, dict):
+            return None
+        for k in ("value", "value_ms", "degree"):
+            v = r.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                return int(v)
+        return None
+
+    tp = None
+    for r in (ledger or {}).get("tp_degree") or []:
+        n = _num(r)
+        if n:
+            tp = n
+    devices = len(topology) if isinstance(topology, dict) and topology else None
+    dp = (devices // tp) if (tp and devices and devices >= tp and devices % tp == 0) else None
+    out = {"tp": tp, "dp": dp, "devices": devices, "batch": batch}
+    return out if any(v is not None for v in out.values()) else None
+
+
 def collect_state(run_dir: Path, state_dirs: list, slug: str | None = None, requested_batch: int | None = None) -> dict:
     """Assemble the one JSON snapshot the dashboard renders. Every section is best-effort: a file
     that does not exist yet (baseline still measuring) simply omits its section, never fails."""
@@ -538,7 +568,11 @@ def collect_state(run_dir: Path, state_dirs: list, slug: str | None = None, requ
         {
             "name": n,
             "ms": stages_cur.get(n),
-            "baseline_ms": stages_base.get(n),
+            # The committed-best split is the CURRENT time, not the baseline -- using it for both
+            # read baseline == current and hid every per-stage gain. The per-stage baseline is the
+            # START, recorded only as a KIND_STAGE_E2E pin; _stage_starts fills it below where one
+            # exists. No pin -> None (the UI shows current + the real end-to-end gain instead).
+            "baseline_ms": None,
             "path": stage_paths.get(n),
             "bytes": stage_bytes.get(n),
         }
@@ -679,6 +713,7 @@ def collect_state(run_dir: Path, state_dirs: list, slug: str | None = None, requ
         "env": env or None,
         "thermal": thermal,
         "topology": topology,
+        "parallelism": _parallelism(ledger, topology, _parse_batch(run_dir, requested_batch)),
     }
 
 
