@@ -176,9 +176,15 @@ class TtQwenJointAttention:
         mm = lambda a, b: ttnn.matmul(a, b, transpose_b=True, dtype=ttnn.float32, compute_kernel_config=self.hifi)
         return ttnn.add(ttnn.add(mm(qh, kh), mm(qh, kl)), mm(ql, kh))
 
-    def _attend(self, q, kh, kl, v, mask_add):
+    def _attend(self, q, kh, kl, v, mask_add, shared=None):
+        """shared (precise + SHARE_SPLIT): (K's folded operand or None, V's (hi, lo)), built once for
+        the image and text queries that attend to the same joint K / V."""
+        k_rep, v_parts = shared if shared is not None else (None, None)
         if _precise.ENABLED:  # kh = k (float32) in precise mode
-            s = _precise.exact_matmul_bt(q, kh) if _precise.EXACT_QK else _precise.matmul_bt(q, kh)
+            if _precise.EXACT_QK:
+                s = _precise.exact_matmul_bt(q, kh, b_rep=k_rep)
+            else:
+                s = _precise.matmul_bt(q, kh)
         else:
             s = self._qk(q, kh, kl)
         if mask_add is not None:
@@ -189,7 +195,7 @@ class TtQwenJointAttention:
         e = ttnn.exp(ttnn.subtract(s, mx))
         p = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=self.hifi))
         if _precise.ENABLED:
-            o = _precise.matmul(p, v)  # float32 [B, Hl, Sq, D]
+            o = _precise.matmul(p, v, b_parts=v_parts)  # float32 [B, Hl, Sq, D]
         else:
             o = ttnn.matmul(
                 ttnn.typecast(p, ttnn.bfloat16), v, dtype=ttnn.bfloat16, compute_kernel_config=self.hifi
@@ -244,8 +250,14 @@ class TtQwenJointAttention:
             m = _as_tt(attention_mask, d)  # 1 = attend, 0 = masked; [B, 1, 1, S_joint]
             mask_add = ttnn.multiply(ttnn.subtract(m, 1.0), 1e30)
 
-        img = self._out(self._attend(qi, kh, kl, v, mask_add), self.img_out)
-        txt = self._out(self._attend(qt, kh, kl, v, mask_add), self.txt_out)
+        shared = None
+        if share:  # the image and text queries share the joint K's folded operand and V's limbs
+            k_rep = _precise.fold_b(kh) if (_precise.EXACT_QK and _precise.FOLD_LANES) else None
+            shared = (k_rep, _precise.split_bf16(v))
+        img = self._out(self._attend(qi, kh, kl, v, mask_add, shared), self.img_out)
+        txt = self._out(self._attend(qt, kh, kl, v, mask_add, shared), self.txt_out)
+        if shared is not None and shared[0] is not None:
+            ttnn.deallocate(shared[0])
         return img, txt
 
 

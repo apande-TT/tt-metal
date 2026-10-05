@@ -97,7 +97,15 @@ def _folded_mask(device, k, pattern, terms):
     return _MASKS[key]
 
 
-def exact_matmul_bt(a, b):
+def fold_b(b):
+    """b's K-folded operand of the FOLD_LANES exact_matmul_bt ([bh] * n + [bl] * n + [bh] * n along K):
+    built once and passed as b_rep when several products share b (e.g. the joint attention's K)."""
+    bh, bl = split_bf16(b)
+    n = EXACT_LANES
+    return ttnn.concat([bh] * n + [bl] * n + [bh] * n, dim=-1)
+
+
+def exact_matmul_bt(a, b, b_rep=None):
     """float32 a @ float32 b^T (reduction over the last dim of both) with exact accumulation:
     3-term bf16 split (ah.bh + ah.bl + al.bh), 8 exact lanes over K, median of 3 lane partitions.
 
@@ -108,9 +116,9 @@ def exact_matmul_bt(a, b):
     the float32 accumulator, as the adds did."""
     cfg = precise_config()
     ah, al = split_bf16(a)
-    bh, bl = split_bf16(b)
     k = a.shape[-1]
     if not FOLD_LANES:
+        bh, bl = split_bf16(b)
         ests = []
         for pattern in PATTERNS:
             y = None
@@ -124,22 +132,26 @@ def exact_matmul_bt(a, b):
         return _median3(*ests)
     n = EXACT_LANES
     a_rep = ttnn.concat([ah] * (2 * n) + [al] * n, dim=-1)
-    b_rep = ttnn.concat([bh] * n + [bl] * n + [bh] * n, dim=-1)
+    own_b = b_rep is None
+    if own_b:
+        b_rep = fold_b(b)
     ests = []
     for pattern in PATTERNS:
         pa = ttnn.multiply(a_rep, _folded_mask(a.device(), k, pattern, 3))
         ests.append(ttnn.matmul(pa, b_rep, transpose_b=True, compute_kernel_config=cfg, dtype=ttnn.float32))
         ttnn.deallocate(pa)
     ttnn.deallocate(a_rep)
-    ttnn.deallocate(b_rep)
+    if own_b:
+        ttnn.deallocate(b_rep)
     return _median3(*ests)
 
 
-def matmul(a, b):
-    """float32 a @ float32 b -> float32 as the 3-term bf16 split (dense accumulation)."""
+def matmul(a, b, b_parts=None):
+    """float32 a @ float32 b -> float32 as the 3-term bf16 split (dense accumulation). b_parts: b's
+    (hi, lo) when several products share b."""
     cfg = precise_config()
     ah, al = split_bf16(a)
-    bh, bl = split_bf16(b)
+    bh, bl = split_bf16(b) if b_parts is None else b_parts
     mm = lambda p, q: ttnn.matmul(p, q, compute_kernel_config=cfg, dtype=ttnn.float32)  # noqa: E731
     return ttnn.add(ttnn.add(mm(ah, bh), mm(ah, bl)), mm(al, bh))
 
