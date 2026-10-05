@@ -1174,8 +1174,6 @@ def build(device, torch_module):
         dtype=ttnn.bfloat8_b,
     )
     wo = _from_torch(attn.o_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
-    # The 640-row tail's o_proj reads a bfloat4_b copy (prefix and decode keep bf8_b).
-    wo4 = _from_torch(attn.o_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat4_b)
     # Decode-only now (prefill runs the fused `w_gu` below): a one-token step streams these from
     # DRAM every step, so bf8_b halves what it reads.
     w_gate, w_up = (
@@ -1529,7 +1527,10 @@ def build(device, torch_module):
         merged = _merge_heads(a, wo, xn.dtype, _COMPUTE)
         out = _lin(
             merged,
-            wo4 if int(merged.shape[-2]) >= 256 else wo,
+            # The tall tail read a bfloat4_b copy of Wo here (2026-10-02, 0.19 ms). Dropped 2026-10-05: the
+            # coarser weight shifted the first frames' codes and clipped demo row 15's opening words
+            # ("A cartographer" -> "redrew the coastline"), unseen by the corpus-level gates.
+            wo,
             dtype=xn.dtype,
             compute_kernel_config=_COMPUTE,
             memory_config=ttnn.L1_MEMORY_CONFIG,  # read once, by the residual add

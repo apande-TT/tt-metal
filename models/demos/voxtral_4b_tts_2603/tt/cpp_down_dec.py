@@ -39,7 +39,14 @@ def _log(msg):
 
 
 def enabled() -> bool:
-    return os.environ.get("VOXTRAL_CPP_DOWN_DEC", "1") == "1"
+    # OFF by default since 2026-10-05. Numerically this kernel matches the stock down projection to
+    # rounding order (same bf8_b weight, HiFi4, fp32 accumulation; the teacher-forced codes test is
+    # green with it), but free-running greedy decode is chaotic, and that rounding put demo row 18
+    # into a repeat loop ("discovering very, very, very, very books", 147 frames for 13 words) that the
+    # corpus-level WER/MOS margins and the trajectory-aligned PCC gates could not see. Bisected over
+    # the optimize run's 84 gated states and confirmed by switching it off on the final code. It is
+    # worth 0.23 ms of 89.4 per inference (decode 14.19 -> 14.42 ms). Opt back in to keep working on it.
+    return os.environ.get("VOXTRAL_CPP_DOWN_DEC", "0") == "1"
 
 
 _LAYERS = int(os.environ.get("VOXTRAL_CPP_DOWN_DEC_LAYERS", "1000"))

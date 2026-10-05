@@ -929,8 +929,6 @@ def build(device, torch_module):
         dtype=ttnn.bfloat8_b,
     )
     wo = _from_torch(m.o_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
-    # The 640-row tail's o_proj reads a bfloat4_b copy (prefix and decode keep bf8_b).
-    wo4 = _from_torch(m.o_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat4_b)
 
     use_cpp_scores = cpp_scores_dec.claim()
     use_cpp_pv = cpp_pv_dec.claim()
@@ -1234,7 +1232,10 @@ def build(device, torch_module):
         merged = _merge_heads(a, wo, hidden_states.dtype, _COMPUTE)
         out = _lin(
             merged,
-            wo4 if int(merged.shape[-2]) >= 256 else wo,
+            # The tall tail read a bfloat4_b copy of Wo here (2026-10-02, 0.19 ms). Dropped 2026-10-05: the
+            # coarser weight shifted the first frames' codes and clipped demo row 15's opening words
+            # ("A cartographer" -> "redrew the coastline"), unseen by the corpus-level gates.
+            wo,
             dtype=hidden_states.dtype,
             compute_kernel_config=_COMPUTE,
             memory_config=ttnn.L1_MEMORY_CONFIG,  # read once, by the residual add
