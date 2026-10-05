@@ -38,11 +38,13 @@ _NUM_CBS = 64
 _BATCH = 4
 
 
-# Sites the split square-mean is taken at. Only the text stack's norms (layer / mistral_decoder_layer /
-# mistral_r_m_s_norm `_sq_mean`): wired at the acoustic and final norms too it failed
-# test_discrete_codes_equal_the_teacher_forced_reference and the WER / MOS gate (bisected 2026-10-04), so
-# those keep the stock square + mean.
-_SITES = {"text"}
+# Sites the split square-mean is taken at: the text stack's norms (layer / mistral_decoder_layer /
+# mistral_r_m_s_norm `_sq_mean`) and the acoustic transformer's (acoustic_transformer_block /
+# flow_matching_audio_transformer `_rms_norm`). The 2-core halves version wired at the acoustic and final norms
+# failed test_discrete_codes and the WER / MOS gate (2026-10-04); the 4-core version was checked against
+# ttnn.mean(ttnn.square(x)) on every acoustic norm of the gate run (max difference 0) before being wired there.
+# The final norm keeps the stock square + mean.
+_SITES = {"text", "acoustic"}
 
 
 def enabled(site="text") -> bool:
