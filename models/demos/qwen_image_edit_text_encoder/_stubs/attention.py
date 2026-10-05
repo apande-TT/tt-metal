@@ -323,6 +323,14 @@ def linear_program_config(x, w):
         bw = _largest_divisor(kt, 4)
         while bw > 1 and obw * bw * 2 * 2048 > 320 * 1024:  # double-buffered bf16 in1 block <= 320 KB
             bw = _largest_divisor(kt, bw - 1)
+        # a deeper K step halves the float32 partial spill / reload per output block (packer_l1_acc is off)
+        # when a >= 3-row output block still fits ~1000 KB of L1 beside the doubled operand blocks
+        # when an output block of >= 4 x 4 tiles still fits ~1000 KB of L1 beside the doubled operand blocks
+        if kt % 8 == 0:
+            obw8 = _largest_divisor(pcn, 12, sbw)
+            obh8 = _largest_divisor(pcm, max(1, (1000 * 1024 // 4096 - obw8 * 8) // (obw8 + 8)), sbh)
+            if obh8 >= 4 and obw8 >= 4 and obh8 % sbh == 0 and obw8 % sbw == 0:
+                obh, obw, bw = obh8, obw8, 8
         _LINEAR_CONFIGS[key] = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
             compute_with_storage_grid_size=(gx, gy),
             in0_block_w=bw,
