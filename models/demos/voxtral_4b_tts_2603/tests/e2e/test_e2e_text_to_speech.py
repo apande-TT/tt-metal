@@ -30,6 +30,7 @@ A RENDERED SIGNAL IS SCORED, not only correlated: Whisper WER against the reques
 UTMOS22 naturalness estimate, over each row's full output cut at its own end frame. The thresholds
 are read off the HF golden scored the same way (`WER_MARGIN`, `MOS_MARGIN`).
 """
+
 from __future__ import annotations
 
 import json
@@ -58,6 +59,17 @@ E2E_CORRECTNESS_GATE = "test_discrete_codes_equal_the_teacher_forced_reference"
 # The TT output may be at most this much worse than the HF golden on the same 32 prompts.
 WER_MARGIN = 0.05  # absolute corpus word error rate
 MOS_MARGIN = 0.20  # mean UTMOS22, on its 1-5 scale
+
+# AND PER ROW, against the golden's rendering of the SAME prompt. The corpus margins pool 32 rows, so
+# one row can collapse inside them: on 2026-10-05 row 18 fell into a repeat loop ("very, very, very,
+# very books"), lost three words and ran 147 frames against the golden's ~70, and every check in this
+# file stayed green -- corpus WER moved 0.023 -> 0.036 under the 0.05 margin, and the PCC gates are
+# teacher-forced onto the TT trajectory so a loop is rendered faithfully. Each row is therefore also
+# held to the golden's own row (test_no_row_is_worse_than_the_golden_s_own_row).
+ROW_WER_MARGIN = 0.20  # absolute, per row: two to three words on these 13-16 word prompts, inside Whisper's noise
+ROW_MOS_MARGIN = 0.75  # UTMOS22 per row; the per-clip predictor is far noisier than its mean
+ROW_LENGTH_RATIO = 1.5  # a row may run at most this much longer than the golden's row ...
+ROW_LENGTH_SLACK = 8  # ... plus this many frames (0.64 s), so a short row is not held to the ratio alone
 
 # A reference decision is DECIDABLE when its own margin clears this many standard deviations of
 # the error the device's arithmetic puts on it; codes inside that band are ties and are counted,
@@ -488,18 +500,35 @@ def test_discrete_codes_equal_the_teacher_forced_reference(device, hf_model, evi
     assert int(sem_wrong.sum()) == 0, f"{int(sem_wrong.sum())} DECIDABLE semantic codes differ from the reference"
 
 
+def _signal_scores(evidence):
+    """Both arms scored ONCE per module: Whisper and UTMOS over 64 clips are minutes of CPU, and the
+    corpus check and the per-row check read the same numbers. Both sides are cut at their OWN rows'
+    end frames and scored identically."""
+    if "_signal_scores" not in evidence:
+        from models.demos.voxtral_4b_tts_2603.reference import quality
+
+        tt, free, texts = evidence["tt"], evidence["free"], evidence["texts"]
+        rate = tt["sampling_rate"]
+        evidence["_signal_scores"] = (
+            quality.score(pipeline.trim_to_end(tt), rate, texts),
+            quality.score(pipeline.trim_to_end(free), rate, texts),
+        )
+    return evidence["_signal_scores"]
+
+
+def _row_end(arm, i: int) -> int:
+    """The frame a row stopped at; a row that never stopped ran to the end of the batch."""
+    end = int(arm["end_frame"][i])
+    return end if end >= 0 else int(arm["frames_decoded"])
+
+
 def test_signal_quality_wer_and_mos(evidence):
     """SCORE the rendered signal: intelligibility (WER) and naturalness (MOS), against the HF golden.
 
-    Both sides are cut at their OWN rows' end frames and scored identically. The TT output must be
-    no worse than the free-running HF golden by the stated margins.
+    The TT output must be no worse than the free-running HF golden by the stated CORPUS margins;
+    the per-row companion below holds each row to the golden's own row.
     """
-    from models.demos.voxtral_4b_tts_2603.reference import quality
-
-    tt, free, texts = evidence["tt"], evidence["free"], evidence["texts"]
-    rate = tt["sampling_rate"]
-    tt_scores = quality.score(pipeline.trim_to_end(tt), rate, texts)
-    hf_scores = quality.score(pipeline.trim_to_end(free), rate, texts)
+    tt_scores, hf_scores = _signal_scores(evidence)
     for i in range(evidence["batch"]):
         print(
             f"[{i:02d}] TT WER={tt_scores['wer'][i]:.3f} MOS={tt_scores['mos'][i]:.2f} | "
@@ -512,6 +541,43 @@ def test_signal_quality_wer_and_mos(evidence):
     print(f"mean MOS:   TT={tt_mos:.3f} HF={hf_mos:.3f} (margin {MOS_MARGIN})")
     assert tt_wer <= hf_wer + WER_MARGIN, f"TT wer {tt_wer:.4f} is worse than the HF golden's {hf_wer:.4f}"
     assert tt_mos >= hf_mos - MOS_MARGIN, f"TT mos {tt_mos:.3f} is worse than the HF golden's {hf_mos:.3f}"
+
+
+def test_no_row_is_worse_than_the_golden_s_own_row(evidence):
+    """PER ROW: each prompt's rendering is held to the golden's rendering of the SAME prompt.
+
+    Three conditions, each relative to the golden's own row rather than an absolute, because the
+    three ways a free-running row goes wrong are the three a corpus mean hides: a repeat loop runs
+    LONG, drops WORDS, and sounds WRONG. 2026-10-05, row 18 after two rounding-order wins: 147 frames
+    against the golden's ~70, "discovering very, very, very, very books" for "discovering several
+    very rare books", UTMOS 2.7 -- with corpus WER 0.036 and every other test green.
+
+    The length condition is the one that cannot be fooled by the scorer; under the perf harness's
+    capped horizon (HARNESS_CAPPED) it does not apply, exactly as the termination assert does not.
+    """
+    tt, free, batch = evidence["tt"], evidence["free"], evidence["batch"]
+    tt_scores, hf_scores = _signal_scores(evidence)
+    failures = []
+    for i in range(batch):
+        tt_end, hf_end = _row_end(tt, i), _row_end(free, i)
+        said = tt_scores["transcripts"][i]
+        if not HARNESS_CAPPED and tt_end > hf_end * ROW_LENGTH_RATIO + ROW_LENGTH_SLACK:
+            failures.append(
+                f"[{i:02d}] ran {tt_end} frames against the golden's {hf_end} (a repeat loop runs long): {said!r}"
+            )
+        if tt_scores["wer"][i] > hf_scores["wer"][i] + ROW_WER_MARGIN:
+            failures.append(
+                f"[{i:02d}] WER {tt_scores['wer'][i]:.3f} against the golden's {hf_scores['wer'][i]:.3f}: {said!r}"
+            )
+        if tt_scores["mos"][i] < hf_scores["mos"][i] - ROW_MOS_MARGIN:
+            failures.append(
+                f"[{i:02d}] MOS {tt_scores['mos'][i]:.2f} against the golden's {hf_scores['mos'][i]:.2f}: {said!r}"
+            )
+    bad_rows = sorted({int(f[1:3]) for f in failures})
+    print(
+        f"\nper-row check: {batch - len(bad_rows)}/{batch} rows hold to the golden's own row; failing rows: {bad_rows}"
+    )
+    assert not failures, "rows worse than the golden's rendering of the same prompt:\n  " + "\n  ".join(failures)
 
 
 def test_free_running_divergence_is_reported(evidence):
