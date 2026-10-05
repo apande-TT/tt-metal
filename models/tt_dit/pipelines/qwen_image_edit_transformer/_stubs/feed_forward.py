@@ -69,7 +69,8 @@ class TtQwenFeedForward:
         if not isinstance(x, ttnn.Tensor):
             x = _replicated(x.to(torch.float32), self.device, ttnn.bfloat16)
         if _precise.ENABLED:
-            h = ttnn.gelu(_precise.linear(x, self.w1, bias=self.b1), variant=self.variant)
+            kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if _precise.FF_HIDDEN_L1 else {}
+            h = ttnn.gelu(_precise.linear(x, self.w1, bias=self.b1), variant=self.variant, **kw)
             y = _precise.linear(h, self.w2)
             if self.tp > 1:
                 y = _ccl.all_reduce(y, self.device, axis=self.tp_axis)
