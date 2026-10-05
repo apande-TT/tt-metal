@@ -301,6 +301,9 @@ def _exact_sum(mm, parts, patterns=LANE_PATTERNS, out_bytes=0):
 SHARE_SPLIT = False
 # core grid for the non-exact split_linear products (None: ttnn.linear picks its own)
 LINEAR_CORE_GRID = None
+# split_matmul's exact-lane products up to this many float32 bytes keep lane copies, products and sums in
+# L1 (0: DRAM)
+EXACT_BMM_L1_BYTES = 0
 # core grid for split_matmul's exact-lane batched products, each on a full-K batch-parallel config
 # (None: ttnn picks its own; a core_grid alone gets in0_block_w=1, whose fp32 partial reloads break
 # the exact-lane sum: e2e PCC 0.9395)
@@ -438,24 +441,35 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     pb_all = split_bf16(b, limbs)
     terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
     pc = _bmm_full_k_config(pa_all[0], pb_all[0], transpose_b) if exact and EXACT_CORE_GRID is not None else None
-    mm = lambda p, q: ttnn.matmul(  # noqa: E731
-        p, q, transpose_b=transpose_b, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc
-    )
+
+    def mm(p, q, **kw):
+        return ttnn.matmul(
+            p, q, transpose_b=transpose_b, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc, **kw
+        )
+
     if not exact:
         y = None
         for pa, pb in terms:
             t = mm(pa, pb)
             y = t if y is None else ttnn.add(y, t)
         return y
+    # small products keep their lane copies (one at a time), products and running sums in L1
+    a_s, b_s = [int(d) for d in pa_all[0].padded_shape], [int(d) for d in pb_all[0].padded_shape]
+    out_bytes = 4 * math.prod(a_s[:-1]) * (b_s[-2] if transpose_b else b_s[-1])
+    l1 = bool(EXACT_BMM_L1_BYTES) and out_bytes <= EXACT_BMM_L1_BYTES
+    kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}
     ests = []
     for pattern in _patterns(exact):
         y = None
         for pa, pb in terms:
-            for lane in _lanes(pa, pattern):
-                t = mm(lane, pb)
-                y = t if y is None else ttnn.add(y, t)
+            for m in _lane_masks(pa.device(), pa.shape[-1], pa.dtype, pattern):
+                lane = ttnn.multiply(pa, m, **kw)
+                t = mm(lane, pb, **kw)
+                ttnn.deallocate(lane)
+                y = t if y is None else ttnn.add(y, t, **kw)
         ests.append(y)
-    return _vote(ests)
+    out = _vote(ests)
+    return ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out
 
 
 def pad_rows(array, s_pad):
