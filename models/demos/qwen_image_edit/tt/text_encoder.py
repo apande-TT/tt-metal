@@ -116,6 +116,10 @@ class TtQwenTextEncoder:
         vision_transformer_pretrained_model.ONEHOT_PERMUTE = True
         # MLP gate / up share their input's bf16 limb split (LM and vision tower)
         _te_attention.SHARE_SPLIT = True
+        # the LM attention moves heads by per-head slices + concat, not a padded reshape + permute
+        from models.demos.qwen_image_edit_text_encoder._stubs import layer as _te_layer
+
+        _te_layer.HEADS_BY_SLICES = True
         self.set_precise(True)
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group

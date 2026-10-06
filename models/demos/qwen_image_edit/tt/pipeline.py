@@ -182,6 +182,7 @@ class QwenImageEditTT:
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import attention as _tr_attention
 
         _tr_attention.HEADS_INPUT_L1 = True  # the head split reads its input from L1
+        _tr_attention.HEADS_BY_SLICES = True  # heads in/out by per-head slices, not a padded permute
         # the transformer's exact fp32 TP reduce gathers, slices and adds each token chunk in L1
         _tr_ccl.L1_GATHER_BYTES = 48 * 1024 * 1024
         _tr_ccl.L1_GATHER_INPUT = True  # and each chunk's own partial is staged in L1 for the gather
