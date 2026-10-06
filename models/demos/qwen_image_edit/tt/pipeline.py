@@ -18,12 +18,14 @@ the uploaded encoded inputs and the output image runs on device.
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 import torch
 
 import ttnn
 from models.demos.qwen_image_edit.tt import inputs as I
+from models.demos.qwen_image_edit.tt.guard_kernel import guard_tail
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
 from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
@@ -96,6 +98,9 @@ class TtQwenImageEditPipeline:
         # denoise step 257 -> 83 s. The stubs' own default stays "median3" (their PCC tests unchanged).
         if precise:
             _te_attention.EXACT_MODE = "guarded"
+        # the guarded tail (~9 float32 passes per precise product) as one fused kernel, bit-identical, while
+        # the text encoder runs (see _fused_tail)
+        self.fused_tail = guard_tail if precise else None
         pick = lambda v: layers if v is None else v  # noqa: E731
         self.text_encoder = TtQwenTextEncoder(
             device,
@@ -136,11 +141,22 @@ class TtQwenImageEditPipeline:
         return up
 
     # ---- stages (device only) ----------------------------------------------------------------------
+    @contextlib.contextmanager
+    def _fused_tail(self):
+        """The fused guarded-tail kernel for the text encoder's precise products (vision tower and LM)."""
+        prev, _te_attention.GUARD_TAIL = _te_attention.GUARD_TAIL, self.fused_tail
+        try:
+            yield
+        finally:
+            _te_attention.GUARD_TAIL = prev
+
     def vision_encode(self, up):
-        return self.text_encoder.encode_vision(up.te)
+        with self._fused_tail():
+            return self.text_encoder.encode_vision(up.te)
 
     def text_encode(self, up, image_embeds):
-        return self.text_encoder.encode_text(up.te, image_embeds)
+        with self._fused_tail():
+            return self.text_encoder.encode_text(up.te, image_embeds)
 
     def vae_encode(self, up):
         return self.vae.encode(up.vae_image)
