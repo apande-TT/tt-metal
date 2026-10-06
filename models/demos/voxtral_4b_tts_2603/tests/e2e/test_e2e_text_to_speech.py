@@ -56,6 +56,16 @@ PCC_TARGET = 0.99
 # waveform); the per-cell minimum is printed and only has to clear this sanity floor.
 X_FINAL_CELL_FLOOR = 0.95
 
+# The text stack's prefill hidden is the state every later stage consumes, and it is held TIGHTER
+# than PCC_TARGET, on two axes. 2026-10-06: the first optimize run's bf8_b -> bf4_b fused SwiGLU
+# weight (cc7e1259a4b) inflated the residual stream's three massive channels by 1-4 %, so the final
+# RMSNorm scaled every other channel down ~1 %: prefill hidden PCC 0.9914 (min over rows) with
+# |tt|/|ref| 0.9895 -- inside PCC_TARGET, every downstream teacher-forced check green, and the speech
+# ~2 dB quieter with words lost on some rows. Back on bf8_b it reads 0.9971 / 0.9994. The norm ratio
+# is what separates the two; the PCC floor alone does not.
+PREFILL_HIDDEN_FLOOR = 0.995  # min over rows
+PREFILL_NORM_TOL = 0.005  # |tt|/|ref| within this of 1
+
 # The one test a consumer that takes a SINGLE node should run as the correctness gate -- optimize
 # re-runs it after every change and reverts whatever fails it. It is the discrete-code test, not
 # the waveform PCC: the waveform golden is teacher-forced onto THIS pipeline's own codes, so it
@@ -321,10 +331,8 @@ def test_per_stage_pcc(evidence):
         return float(a.norm() / b.norm())
 
     prefill = min(common.pcc(tt["prefill_hidden"][i], hf["prefill_hidden"][i]) for i in range(batch))
-    print(
-        f"\nstage PCC  prefill hidden  (min over {batch})          = {prefill:.6f}  "
-        f"|tt|/|ref|={ratio(tt['prefill_hidden'], hf['prefill_hidden']):.5f}"
-    )
+    prefill_ratio = ratio(tt["prefill_hidden"], hf["prefill_hidden"])
+    print(f"\nstage PCC  prefill hidden  (min over {batch})          = {prefill:.6f}  |tt|/|ref|={prefill_ratio:.5f}")
     per_frame = [
         min(common.pcc(diag_tt[t]["llm_hidden"][i], hf["llm_hiddens"][t][i]) for i in range(batch))
         for t in range(frames)
@@ -365,7 +373,13 @@ def test_per_stage_pcc(evidence):
         f"worst single cell {x_final_cell:.6f} at frame {worst_t}, row {worst_i} "
         f"(cells < {PCC_TARGET}: {int((cell < PCC_TARGET).sum())} of {frames * batch})"
     )
-    assert prefill >= PCC_TARGET, f"the text stack is below target at {prefill:.6f}"
+    assert (
+        prefill >= PREFILL_HIDDEN_FLOOR
+    ), f"the text stack's prefill hidden is at {prefill:.6f} on its worst row, below its {PREFILL_HIDDEN_FLOOR} floor"
+    assert abs(prefill_ratio - 1.0) <= PREFILL_NORM_TOL, (
+        f"the text stack's prefill hidden is systematically off in level: |tt|/|ref| {prefill_ratio:.5f} is more than "
+        f"{PREFILL_NORM_TOL} from 1 (a level error passes the PCC floor; see PREFILL_NORM_TOL)"
+    )
     assert hidden >= PCC_TARGET, (
         f"the decode step drifts: frame-wise hidden PCC {hidden:.6f}. The reference is fed THIS "
         f"pipeline's own codes, so a drop here is the KV cache, positions or the audio-token embedding"
