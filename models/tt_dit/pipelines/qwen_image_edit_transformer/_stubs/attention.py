@@ -141,6 +141,13 @@ class TtQwenJointAttention:
 
     def _heads(self, x):  # [B, S, Hl*D] -> [B, Hl, S, D]
         B, S = x.shape[0], x.shape[1]
+        if HEADS_BY_SLICES:  # one tile-aligned column block per head, stacked on dim 1 (no padded permute)
+            D = self.head_dim
+            parts = [
+                ttnn.reshape(ttnn.slice(x, (0, 0, h * D), (B, S, (h + 1) * D)), (B, 1, S, D))
+                for h in range(self.local_heads)
+            ]
+            return parts[0] if len(parts) == 1 else ttnn.concat(parts, dim=1)
         if HEADS_INPUT_L1:
             x = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)
         x = ttnn.reshape(x, (B, S, self.local_heads, self.head_dim))
@@ -201,6 +208,11 @@ class TtQwenJointAttention:
                 ttnn.typecast(p, ttnn.bfloat16), v, dtype=ttnn.bfloat16, compute_kernel_config=self.hifi
             )  # [B, Hl, Sq, D]
         B, Sq = o.shape[0], o.shape[2]
+        if HEADS_BY_SLICES:  # heads side by side along the width by slices + concat (no padded permute)
+            D = self.head_dim
+            parts = [ttnn.slice(o, (0, h, 0, 0), (B, h + 1, Sq, D)) for h in range(self.local_heads)]
+            o = parts[0] if len(parts) == 1 else ttnn.concat(parts, dim=-1)
+            return ttnn.reshape(o, (B, Sq, self.local_heads * D))
         o = ttnn.permute(o, (0, 2, 1, 3))
         return ttnn.reshape(o, (B, Sq, self.local_heads * self.head_dim))
 
@@ -263,6 +275,8 @@ class TtQwenJointAttention:
 
 # the head split's input is moved to L1 before its reshape (False: read from DRAM)
 HEADS_INPUT_L1 = False
+# heads in/out by per-head slices + concat instead of reshape + permute (which pads the head count to a tile)
+HEADS_BY_SLICES = False
 
 
 def build(device, torch_module=None):

@@ -40,6 +40,10 @@ from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
 )
 from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtRMSNorm, _bf16, _fp32
 
+# the precise attention moves heads in and out of the fused projections by per-head slices + concat
+# instead of reshape + permute (which pads the head count to a tile in the permuted layout)
+HEADS_BY_SLICES = False
+
 
 def _t(lin):
     return lin.weight.detach().float().t().contiguous()
@@ -194,6 +198,9 @@ class TtTextAttention:
         qkv = split_linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=cfg, exact=ex)
 
         def _heads(lo, n):
+            if HEADS_BY_SLICES:  # one tile-aligned column block per head, stacked on dim 1 (no padded permute)
+                parts = [ttnn.slice(qkv, [0, 0, 0, (lo + h) * D], [b, 1, s_pad, (lo + h + 1) * D]) for h in range(n)]
+                return parts[0] if n == 1 else ttnn.concat(parts, dim=1)
             t = ttnn.slice(qkv, [0, 0, 0, lo * D], [b, 1, s_pad, (lo + n) * D])
             t = ttnn.reshape(t, (b, s_pad, n, D))
             return ttnn.permute(t, (0, 2, 1, 3))
@@ -221,8 +228,11 @@ class TtTextAttention:
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
         o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex)  # [B, kvl, G*S, D]
         o = ttnn.reshape(o, (b, hl, s_pad, D))
-        o = ttnn.permute(o, (0, 2, 1, 3))
-        o = ttnn.reshape(o, (b, 1, s_pad, hl * D))
+        if HEADS_BY_SLICES:  # heads side by side along the width by slices + concat (no padded permute)
+            o = ttnn.concat([ttnn.slice(o, [0, h, 0, 0], [b, h + 1, s_pad, D]) for h in range(hl)], dim=-1)
+        else:
+            o = ttnn.permute(o, (0, 2, 1, 3))
+            o = ttnn.reshape(o, (b, 1, s_pad, hl * D))
         out = split_linear(o, self.wo, compute_kernel_config=cfg, exact=ex)
         if self.tp > 1:
             out = exact_all_reduce(out, self.device)
