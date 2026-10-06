@@ -310,6 +310,10 @@ EXACT_BMM_L1_BYTES = 0
 EXACT_CORE_GRID = None
 # core grid for split_linear's exact-lane products (None: ttnn.linear picks its own)
 EXACT_LINEAR_CORE_GRID = None
+# fn(a_limbs, b_limbs, lanes, transpose_b, memory_config) -> one lane pattern's exact-lane product
+# (sum over limb terms and lanes; lanes = lane id of each K entry), or None to run the stock ops
+# (None: ttnn multiply + matmul + add per lane)
+EXACT_BMM_FN = None
 # lane patterns of the vision attention's P @ V exact-lane product (None: the attention's own `exact`,
 # i.e. the median of all LANE_PATTERNS; e.g. ("strided",): one pattern, no vote)
 VISION_PV_PATTERNS = None
@@ -462,6 +466,18 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     l1 = bool(EXACT_BMM_L1_BYTES) and out_bytes <= EXACT_BMM_L1_BYTES
     kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}
     ests = []
+    if EXACT_BMM_FN is not None:
+        k = int(pa_all[0].shape[-1])
+        mem = ttnn.L1_MEMORY_CONFIG if l1 else ttnn.DRAM_MEMORY_CONFIG
+        for pattern in _patterns(exact):
+            y = EXACT_BMM_FN(pa_all, pb_all, [_lane_of(i, pattern) for i in range(k)], transpose_b, mem)
+            if y is None:
+                break
+            ests.append(y)
+        else:
+            out = _vote(ests)
+            return ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out
+        ests = []
     for pattern in _patterns(exact):
         y = None
         for pa, pb in terms:
