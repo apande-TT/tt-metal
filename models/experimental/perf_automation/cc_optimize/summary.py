@@ -1872,6 +1872,7 @@ def _measured_bw_gbps(rf: dict, ms):
 _LED_PARAMS = "matmul_params"
 _LED_TOKENS = "stage_tokens"
 _LED_SPLIT = "stage_split"
+_LED_SEQ_SPLIT = "stage_seq_split"
 
 
 def _pinned_ceiling_input(kind: str, stage, model: str = "", task: str = ""):
@@ -1883,6 +1884,32 @@ def _pinned_ceiling_input(kind: str, stage, model: str = "", task: str = ""):
         return led.anchor_value(kind, depth=str(stage or "").strip().lower(), model=model, task=task)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _per_request_note(model: str = "", task: str = "") -> str:
+    """What the full-pipeline line covers, when a stage runs more than once per request; "" otherwise.
+
+    The pass times each stage's step once. A stage the pipeline replays per request -- it states how
+    many times through <stage>_trace_repeats, pinned as KIND_STAGE_REPEATS -- costs that many steps,
+    so the line read as one request when it was one step of each stage: Qwen-Image-Edit's 35.7 s
+    covered 1 of its 50 denoise steps. Names and counts are the pipeline's own; with no stage stating
+    more than one, nothing is printed and the report is unchanged."""
+    try:
+        reps = _ledger().stage_repeats(model=model, task=task)
+        if not reps:
+            return ""
+        from cc_optimize.perf_mcp import read_stage_ms
+
+        stage_ms = read_stage_ms(model=model) or {}
+        which = ", ".join("%s %dx" % (k, v) for k, v in sorted(reps.items()))
+        note = "  that pass ran each stage's step once; one request runs %s" % which
+        known = {k.lower(): v for k, v in stage_ms.items()}
+        if known and all(k in known for k in reps):
+            total = sum(v * reps.get(k, 1) for k, v in known.items())
+            note += " -> ~%.0f ms per request (this run's stage times x repeats)" % total
+        return note
+    except Exception:  # noqa: BLE001 -- a note that cannot be formed is simply not printed
+        return ""
 
 
 def _stage_roofs(active_bytes, peak_bw_gbps, tp_degree, unit, profile=None, stage_ms=None, model="", task=""):
@@ -1924,16 +1951,26 @@ def _stage_roofs(active_bytes, peak_bw_gbps, tp_degree, unit, profile=None, stag
         _share_bases[str(stage)] = _b
         return _v
 
+    def _groups_of(kind, stage) -> int:
+        """How many chip groups share this stage's work along `kind`, as pinned; 1 when none was stated."""
+        try:
+            _v = _pinned_ceiling_input(kind, stage, model, task)
+            return max(1, int(_v or 1))
+        except Exception:  # noqa: BLE001
+            return 1
+
     def _split_of(stage) -> int:
         """How many data-parallel groups share this stage's items, as pinned; 1 when none was stated.
 
         Divides the per-item terms only. Every group streams its own full weight shard once per call,
         so the weights' share of the read set does not shrink with the split -- the items do."""
-        try:
-            _v = _pinned_ceiling_input(_LED_SPLIT, stage, model, task)
-            return max(1, int(_v or 1))
-        except Exception:  # noqa: BLE001
-            return 1
+        return _groups_of(_LED_SPLIT, stage)
+
+    def _seq_split_of(stage) -> int:
+        """How many chip groups split one request's tokens in this stage (stage_seams.SEQ_SPLIT), as
+        pinned; 1 when none was stated. Divides the per-token terms exactly as the data-parallel split
+        does: each group's share of the tokens shrinks, the weights it streams do not."""
+        return _groups_of(_LED_SEQ_SPLIT, stage)
 
     def _stage_block(stage):
         """The geometry of the block this stage runs, or None when it cannot be established.
@@ -2038,7 +2075,7 @@ def _stage_roofs(active_bytes, peak_bw_gbps, tp_degree, unit, profile=None, stag
             ) - float(_ab(mf, regime=stage, seq_len=0, batch=1, items=0, block=_blk) or 0.0)
         except Exception:  # noqa: BLE001 -- regime unknown to the byte model, or no byte model at all
             return base
-        return base + max(0.0, _extra) / (tp * _split_of(stage))
+        return base + max(0.0, _extra) / (tp * _split_of(stage) * _seq_split_of(stage))
 
     params = 0
     try:
@@ -2179,8 +2216,14 @@ def _stage_roofs(active_bytes, peak_bw_gbps, tp_degree, unit, profile=None, stag
         except Exception:  # noqa: BLE001
             pass
         _attn = (4.0 * _L * float(toks) * float(toks) * _H) if (_L and _H) else 0.0
-        # PER CHIP: TP splits each item's math, the stage's data-parallel groups split the items.
-        flops = ((2.0 * float(_params) * float(toks) + _attn) / (tp * _split_of(name))) if _params else 0.0
+        # PER CHIP: TP splits each item's math, the stage's data-parallel groups split the items, and
+        # its sequence-parallel groups split each item's tokens (a group scores only its own queries,
+        # so the attention term shrinks with the sequence split too).
+        flops = (
+            ((2.0 * float(_params) * float(toks) + _attn) / (tp * _split_of(name) * _seq_split_of(name)))
+            if _params
+            else 0.0
+        )
         # THIS STAGE'S OWN PEAK, when the capture marked its ops. The value resolved above is the
         # dominant fidelity across the WHOLE profile, applied to every stack -- one variable, used
         # three times. It is right only while every stack runs the same math mode: on voxtral encode,
@@ -3579,6 +3622,9 @@ def render_summary(
     _fp = _ledger_line(_ledger().KIND_FULLPIPE, "trace+1CQ %s" % _trace_scope, model, task)
     if _fp:
         lines.append(_fp)
+        _per_req = _per_request_note(model, task)
+        if _per_req:
+            lines.append(_per_req)
     lines.append("")
 
     if not isinstance(throughput, dict):

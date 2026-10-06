@@ -614,7 +614,10 @@ _STRUCTURAL_RUNGS = {"structural", "gather", "fusion", "fuse", "sparse", "cache"
 # The rungs whose whole claim is that a KERNEL was written, and therefore the only ones whose
 # records may be required to show one in the source. Everything else -- a knob, a structural
 # restructure, a gate lever -- changes the model without leaving a kernel marker behind.
-_KERNEL_AUTHORED_RUNGS = {"tt-lang", "ttl", "cpp", "c++", "metalium"}
+# The fusion ladder's two kernel rungs (see _FUSION_LADDER) write a kernel for a GROUP of ops, so they
+# carry the same proof-of-kernel requirement as the single-op ones.
+_FUSE_KERNEL_KINDS = frozenset({"fuse-cpp", "fuse-tt-lang"})
+_KERNEL_AUTHORED_RUNGS = {"tt-lang", "ttl", "cpp", "c++", "metalium"} | _FUSE_KERNEL_KINDS
 # THE ladder, in climb order, for each roofline binding. ONE table, because the module used to hold
 # two orderings of the same rungs and only one of them knew what the op was waiting on:
 # `_KNOB_ORDER` (below, now derived from here) steered the per-op gate correctly, while a separate
@@ -2628,6 +2631,54 @@ def _adaptive_run(cmd, cwd, env, label="device run", stall_s=None, backstop=None
     return _AdaptiveResult(rc, "".join(buf))
 
 
+def _trace_region_memory_path():
+    """Where the trace region a full-pipeline run last FIT in is remembered, keyed like the verdicts."""
+    return state_dir() / ("perf_mcp_trace_region_%s_%s.json" % (_model_key(), os.environ.get("PERF_MCP_TASK", "main")))
+
+
+def _trace_region_board_key() -> str:
+    """The board the remembered size belongs to, from what Step 1 detected; "" when it is not known.
+
+    A size that fit one board is not carried to another: per-chip trace bytes follow the per-chip work,
+    and a Blackhole box has more DRAM than a Wormhole Galaxy."""
+    try:
+        parts = [str(_ENV.get(k) or "").strip() for k in ("arch", "dram_capacity_bytes", "device_count")]
+        return ":".join(parts) if all(parts) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def remembered_trace_region() -> int:
+    """The trace region a full-pipeline run of this model last fit in on this board, or 0."""
+    key = _trace_region_board_key()
+    if not key:
+        return 0
+    try:
+        return max(0, int((json.loads(_trace_region_memory_path().read_text()) or {}).get(key) or 0))
+    except Exception:  # noqa: BLE001 -- absent or unreadable: nothing remembered
+        return 0
+
+
+def _remember_trace_region(nbytes: int) -> None:
+    """Keep the largest region a run that MEASURED something fit in. Best-effort: never costs the run."""
+    key = _trace_region_board_key()
+    try:
+        nbytes = int(nbytes or 0)
+        if not key or nbytes <= _TRACE_REGION_DEFAULT or nbytes <= remembered_trace_region():
+            return
+        p = _trace_region_memory_path()
+        try:
+            doc = json.loads(p.read_text()) or {}
+        except Exception:  # noqa: BLE001
+            doc = {}
+        doc[key] = nbytes
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(doc))
+        os.replace(str(tmp), str(p))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _grow_trace_region_and_retry(cmd, repo, env, out, r):
     """Re-run with a bigger trace region until the capture fits, growing up to the DRAM-derived
     ceiling. Model- and hardware-agnostic. Fires on EITHER of the two ways a too-small region shows up:
@@ -3186,6 +3237,13 @@ def _run_full_pipeline_ms():
     _cur_reg = int(env.get("TT_PERF_TRACE_REGION") or 0)
     if _TRACE_REGION_DEFAULT > _cur_reg:
         env["TT_PERF_TRACE_REGION"] = str(_TRACE_REGION_DEFAULT)
+    # AND AT THE SIZE THIS MODEL LAST FIT IN ON THIS BOARD (remembered_trace_region). The grow below is
+    # per call: it fixed env for that one run and the next check started at the default again, so every
+    # check ran the model twice -- once to overflow, once for real. Qwen-Image-Edit on a WH Galaxy
+    # (2026-10-02): 192 MB -> overflow -> 1.43 GB on EVERY check, ~30 min each against ~10 for one run.
+    _mem_reg = remembered_trace_region()
+    if _mem_reg > int(env.get("TT_PERF_TRACE_REGION") or 0) and _mem_reg <= _TRACE_REGION_MAX:
+        env["TT_PERF_TRACE_REGION"] = str(_mem_reg)
     _prof = os.environ.get("PERF_MCP_PROFILE_ENV")
     if _prof:
         try:
@@ -3280,6 +3338,8 @@ def _run_full_pipeline_ms():
     stage_isl = {}
     stage_modules: dict = {}  # {stage: module paths it runs}, from TRACE_STAGE_MODULES
     stage_split: dict = {}  # {stage: data-parallel groups sharing its items}, from TRACE_STAGE_SPLIT
+    stage_seq_split: dict = {}  # {stage: chip groups splitting one request's tokens}, from TRACE_STAGE_SEQ_SPLIT
+    stage_repeats: dict = {}  # {stage: times one request runs its step}, from TRACE_STAGE_REPEATS
     # {stage: items PER REQUEST}, the legacy marker's unit. Kept apart from stage_isl, which holds
     # the TOTAL a stage states for one call.
     stage_isl_per_request = {}
@@ -3294,6 +3354,7 @@ def _run_full_pipeline_ms():
     # guess: if the run reports no topology the scorecard prints 'unknown' rather than fabricating a mesh
     # (the old hardcoded 1x1 silently mislabelled a genuine multi-chip trace as single-chip).
     dp = tp = None
+    sp = None  # the marker's sequence-parallel degree; absent on a pipeline that states none
     shard = None
     batch = 1
     decode_path = prefill_path = "n/a"
@@ -3342,6 +3403,13 @@ def _run_full_pipeline_ms():
         # a different depth. perf_test_gen has had this since a5aa6a96af ("no fixed magic number")
         # -- it was simply never wired into this path.
         out, r = _grow_trace_region_and_retry(cmd, repo, env, out, r)
+        try:
+            from agent.tracy_tool import per_token_readings as _ptr
+
+            if any(v > 0 for v in _ptr(out or "")):
+                _remember_trace_region(int(env.get("TT_PERF_TRACE_REGION") or 0))
+        except Exception:  # noqa: BLE001 -- remembering is a shortcut, never a reason to fail the run
+            pass
         # UMD prints the clamp itself, so the run tells us whether its own clock was valid. Cheaper
         # and more reliable than sampling telemetry alongside, which aliases against short runs.
         if _run_reported_clamp(out):
@@ -3465,7 +3533,12 @@ def _run_full_pipeline_ms():
                         stage_modules[_mn] = _mv
                 except Exception:  # noqa: BLE001
                     pass
-            for _marker, _into in (("TRACE_STAGE_ITEMS[", stage_isl), ("TRACE_STAGE_SPLIT[", stage_split)):
+            for _marker, _into in (
+                ("TRACE_STAGE_ITEMS[", stage_isl),
+                ("TRACE_STAGE_SPLIT[", stage_split),
+                ("TRACE_STAGE_SEQ_SPLIT[", stage_seq_split),
+                ("TRACE_STAGE_REPEATS[", stage_repeats),
+            ):
                 if _marker in line:
                     try:
                         _nm = line.split(_marker, 1)[1].split("]", 1)[0].strip()
@@ -3535,6 +3608,9 @@ def _run_full_pipeline_ms():
             m = _re.search(r"DP=(\d+)\s+TP=(\d+)", line)
             if m:
                 dp, tp = int(m.group(1)), int(m.group(2))
+                _msp = _re.search(r"\bSP=(\d+)", line)
+                if _msp:
+                    sp = int(_msp.group(1))
             if "shard_active=True" in line:
                 shard = True
             elif "shard_active=False" in line:
@@ -3573,13 +3649,17 @@ def _run_full_pipeline_ms():
         _tp_s = ("%d" % tp) if tp is not None else "unknown"
         _dp_s = ("%d" % dp) if dp is not None else "unknown"
         _shard_s = "unknown" if shard is None else str(shard)
+        # SP is named only when the run's marker stated a token split, so a scorecard that never saw one
+        # reads exactly as before and every reader of the TP=/DP= fields is untouched.
+        _sp_s = (" SP=%d" % sp) if (sp is not None and sp > 1) else ""
         sys.stderr.write(
-            "[full-pipeline-gate] PERF_SCORECARD mesh=%s TP=%s DP=%s shard=%s on_device=%s "
+            "[full-pipeline-gate] PERF_SCORECARD mesh=%s TP=%s DP=%s%s shard=%s on_device=%s "
             "ISL=%s OSL=%s batch=%d TTFT_ms=%s prefill_path=%s decode_ms=%s decode_path=%s TSU=%.2f TS=%.2f\n"
             % (
                 _mesh_s,
                 _tp_s,
                 _dp_s,
+                _sp_s,
                 _shard_s,
                 (dec is not None or pf is not None),
                 isl,
@@ -3633,6 +3713,8 @@ def _run_full_pipeline_ms():
             for _kind, _vals, _mode, _src in (
                 (_ledger().KIND_STAGE_TOKENS, stage_isl, "items", "trace_replay observed item count"),
                 (_ledger().KIND_STAGE_SPLIT, stage_split, "count", "trace_replay stated data-parallel split"),
+                (_ledger().KIND_STAGE_SEQ_SPLIT, stage_seq_split, "count", "trace_replay stated sequence split"),
+                (_ledger().KIND_STAGE_REPEATS, stage_repeats, "count", "trace_replay stated repeats per request"),
             ):
                 for _tn, _tv in (_vals or {}).items():
                     if _tn and int(_tv or 0) > 0:
@@ -5844,14 +5926,46 @@ _ORDER_LEVER = (("order", "structural-order"), "PERF_MCP_MAX_ORDER_ATTEMPTS")
 _CONV_LEVER = (("conv-prep", "structural-conv"), "PERF_MCP_MAX_CONV_ATTEMPTS")
 _SPLIT_LEVER = (("split", "structural-split"), "PERF_MCP_MAX_SPLIT_ATTEMPTS")
 _STOCK_LEVER = (("stock", "structural-stock"), "PERF_MCP_MAX_STOCK_ATTEMPTS")
-_GATE_LEVERS = (_FOLD_LEVER, _ORDER_LEVER, _CONV_LEVER, _SPLIT_LEVER, _STOCK_LEVER)
+# THE FUSION LADDER: what a group of ops repeated within a layer is offered, in order, each rung only
+# once the one before it is spent without a win. The fold used to be the whole of it -- three tries
+# and the group closed, so a group the fold could not help never reached the step that could:
+# Qwen-Image-Edit's precise matmuls (the same weight multiplied by the bf16 hi and lo parts of one
+# input, then summed in fp32) were folded where they could be and never offered a fused kernel.
+#   fold        concatenate the repeats into one wider or batched op           (_FOLD_LEVER)
+#   share       compute an input the repeats share once, not per op            (_SHARE_LEVER)
+#   fuse-ttnn   use ttnn's own fused forms for the group (GUIDELINES 06)        (_FUSE_TTNN_LEVER)
+#   fuse-cpp    one C++ kernel for the whole group via ttnn.generic_op          (_FUSE_CPP_LEVER)
+#   fuse-tt-lang  the same kernel in tt-lang, when tt-lang is installed          (_FUSE_TTL_LEVER)
+_SHARE_LEVER = (("share", "structural-share"), "PERF_MCP_MAX_SHARE_ATTEMPTS")
+_FUSE_TTNN_LEVER = (("fuse-ttnn", "structural-fuse-ttnn"), "PERF_MCP_MAX_FUSE_TTNN_ATTEMPTS")
+_FUSE_CPP_LEVER = (("fuse-cpp",), "PERF_MCP_MAX_FUSE_CPP_ATTEMPTS")
+_FUSE_TTL_LEVER = (("fuse-tt-lang",), "PERF_MCP_MAX_FUSE_TTL_ATTEMPTS")
+_FUSION_LADDER = (_FOLD_LEVER, _SHARE_LEVER, _FUSE_TTNN_LEVER, _FUSE_CPP_LEVER, _FUSE_TTL_LEVER)
+_GATE_LEVERS = (
+    _FOLD_LEVER,
+    _ORDER_LEVER,
+    _CONV_LEVER,
+    _SPLIT_LEVER,
+    _STOCK_LEVER,
+    _SHARE_LEVER,
+    _FUSE_TTNN_LEVER,
+    _FUSE_CPP_LEVER,
+    _FUSE_TTL_LEVER,
+)
 _GATE_ATTEMPT_DEFAULT = "3"
-_GATE_KINDS = frozenset(k for kinds, _cap_env in _GATE_LEVERS for k in kinds)
+# The rungs after the fold take one try each by default: "none: <why it does not apply>" is the
+# expected answer for most groups, and three apiece would spend a dozen attempts walking a group that
+# nothing helps. Each stays overridable through its own env var.
+_GATE_CAP_DEFAULTS = {cap_env: "1" for _kinds, cap_env in _FUSION_LADDER[1:]}
+# Kinds recorded without a kernel marker. The fusion ladder's kernel rungs are NOT among them: like
+# cpp and tt-lang they must show a kernel in the source (_KERNEL_AUTHORED_RUNGS).
+_GATE_KINDS = frozenset(k for kinds, _cap_env in _GATE_LEVERS for k in kinds) - _FUSE_KERNEL_KINDS
 
 
 def _gate_cap(cap_env: str) -> int:
     """How many recorded attempts retire a structural gate that was never won."""
-    return int(os.environ.get(cap_env, _GATE_ATTEMPT_DEFAULT) or _GATE_ATTEMPT_DEFAULT)
+    default = _GATE_CAP_DEFAULTS.get(cap_env, _GATE_ATTEMPT_DEFAULT)
+    return int(os.environ.get(cap_env, default) or default)
 
 
 def _gate_retired(lever, attempts: list) -> bool:
@@ -6631,6 +6745,85 @@ def _decode_gate(prof: dict, attempts: list) -> dict | None:
     }
 
 
+def _attempt_counts_for_the_ladder(a: dict) -> bool:
+    """Does this recorded attempt answer the rung it names?
+
+    A kernel rung's claim needs a kernel in the source -- a tt-lang/C++ record with no marker cannot
+    clear an op. The fusion ladder's kernel rungs add one honest answer that leaves no kernel behind:
+    `none: <why this group has nothing to fuse>`, which the rung invites by name. Dropping that record
+    would let the recorder count the rung spent while the gate kept asking for it -- the deadlock the
+    gate allowances exist to prevent."""
+    kind = _normalise_rung(a.get("kernel_kind"))
+    if a.get("kernel_detected_in_source") or kind not in _KERNEL_AUTHORED_RUNGS:
+        return True
+    return kind in _FUSE_KERNEL_KINDS and str(a.get("note") or "").strip().lower().startswith("none:")
+
+
+def _fusion_rung(attempts: list):
+    """The fusion ladder's rung a repeated group is on, or None when it is answered.
+
+    Answered means a MEASURED win on any rung -- the group is fused, nothing below it is owed -- or every
+    rung spent to its cap. Otherwise the first rung not yet spent, in _FUSION_LADDER order. The tt-lang
+    rung is skipped where tt-lang is not installed: a rung nobody can climb must not hold a group open."""
+    for kinds, _cap_env in _FUSION_LADDER:
+        if any(_ledger().is_win(a) for a in attempts if (a.get("kernel_kind") or "").lower() in kinds):
+            return None
+    for lever in _FUSION_LADDER:
+        if lever is _FUSE_TTL_LEVER and not _ttl_available():
+            continue
+        if not _gate_retired(lever, attempts):
+            return lever
+    return None
+
+
+# What each rung after the fold asks of the agent. Keyed by the rung's own kind, which the text names
+# verbatim, so the instruction and the recorder's vocabulary are one contract.
+_FUSION_RUNG_ASKS = {
+    "share": (
+        "SHARE WHAT THE REPEATS HAVE IN COMMON -- the fold is spent on this group. If the repeats start "
+        "from the same input (split, normalised, cast or projected once PER OP), compute that once and "
+        "hand every repeat the shared result: the same math, fewer ops, bit-identical by construction."
+    ),
+    "fuse-ttnn": (
+        "USE TTNN'S OWN FUSED FORMS for the group -- an activation into its producing matmul, a cast "
+        "into the reshard, a unary chain, add+norm: recall_knobs(op_class) returns GUIDELINES 06."
+    ),
+    "fuse-cpp": (
+        "ONE KERNEL FOR THE WHOLE GROUP -- author a C++ kernel via ttnn.generic_op that does the "
+        "repeated products AND their combine in one pass (GUIDELINES 06 #fuse-group-kernel, 12): e.g. "
+        "the same weight against several parts of one input, accumulated into one fp32 destination "
+        "(fp32_dest_acc_en) and written once, instead of one matmul per part plus an add chain through "
+        "DRAM. It must reproduce the multi-op path (check_pcc; bit-identical where the math is exact)."
+    ),
+    "fuse-tt-lang": (
+        "ONE KERNEL FOR THE WHOLE GROUP, in tt-lang (GUIDELINES 06 #fuse-group-kernel, 11) -- the same "
+        "group kernel as the fuse-cpp rung, for when C++ did not pay or tt-lang expresses it better."
+    ),
+}
+
+
+def _fusion_rung_target(lever, worst: dict, baseline: int, gap: float) -> dict:
+    """The work item for a repeated group on a rung after the fold -- same shape as the fold's own."""
+    kind = lever[0][0]
+    op = str(worst.get("op_code") or "repeated_op")
+    per_layer = int(worst.get("count") or 0) // max(1, baseline)
+    return {
+        "op": op,
+        "op_class": str(worst.get("bucket") or ""),
+        "gap_ms": round(gap, 4),
+        "bound_by": worst.get("bound_by"),
+        "grid": worst.get("grid"),
+        "weight_dtype": worst.get("weight_dtype"),
+        "next_rung": lever[0][-1],
+        "reason": (
+            "%s %r runs %dx per layer. Measure, and record_kernel_attempt(op=%r,'%s',measured_ms,"
+            "beat_baseline) -- or, when the rung cannot apply to this group, record it with "
+            "note='none: <why not>' and the ladder moves on. It clears on a MEASURED win."
+        )
+        % (_FUSION_RUNG_ASKS[kind], op, per_layer, op, kind),
+    }
+
+
 def _fold_gate(prof: dict, attempts: list) -> dict | None:
     """One op fingerprint evaluated many times per layer -- fold the repeats into one wider matmul.
 
@@ -6675,9 +6868,12 @@ def _fold_gate(prof: dict, attempts: list) -> dict | None:
     gap = sum(float(o.get("gap_ms") or 0.0) for o in cands)
     if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
         return None
-    if _gate_retired(_FOLD_LEVER, attempts):
-        return None  # (2) measured win, or (3) capped
+    lever = _fusion_rung(attempts)
+    if lever is None:
+        return None  # (2) a measured win on any rung, or (3) every rung spent
     worst = max(cands, key=lambda o: float(o.get("gap_ms") or 0.0))
+    if lever is not _FOLD_LEVER:
+        return _fusion_rung_target(lever, worst, baseline, gap)
     return {
         "op": str(worst.get("op_code") or "repeated_op"),
         "op_class": str(worst.get("bucket") or ""),
@@ -7752,6 +7948,68 @@ def _stages_short_of_achievable() -> list:
         return []
 
 
+def stage_repeats_per_request(stages) -> dict:
+    """{stage: N} for each stage the pipeline stated ONE REQUEST runs N > 1 times, as pinned.
+
+    Read from the ledger (measurements.KIND_STAGE_REPEATS), which trace_replay's TRACE_STAGE_REPEATS
+    marker fills from the pipeline's own <stage>_trace_repeats(). Stages that stated nothing are
+    absent: they run once. {} when nothing was stated or the ledger cannot be read."""
+    try:
+        pinned = _ledger().stage_repeats(model=_model_key(), task=os.environ.get("PERF_MCP_TASK", "main"))
+        return {st: pinned[str(st).strip().lower()] for st in stages or () if str(st).strip().lower() in pinned}
+    except Exception:  # noqa: BLE001 -- unread counts leave every stage at one run
+        return {}
+
+
+def stage_cost_weights(profile) -> dict:
+    """{stage: what one profiled ms of that stage costs a REQUEST, relative to the others}.
+
+    Two corrections to the profile's op gaps, multiplied:
+
+    SAMPLING. The profile is a capped capture: every block stack the depth knob cuts runs 2 blocks,
+    every stack it cannot cut runs in full, so the stages are not sampled alike -- Qwen-Image-Edit
+    2026-10-02: denoise was 31% of the profile and ~49% of the full pipeline, the VAE 18.5% and
+    ~1.4%. That weight is a stage's full-pipeline time (this run's own trace_replay, read_stage_ms)
+    over its profiled time (stage_buckets), divided by the mean; it needs both readings for at least
+    two stages.
+
+    REPEATS. The full-pipeline pass runs each stage's step once, and a request runs some of them
+    many times (stage_repeats_per_request): Qwen-Image-Edit's denoise step runs 50 times per edit,
+    so a millisecond saved there is worth 50 elsewhere -- 99% of a request's time sat in a stage the
+    ranking weighed like any other.
+
+    {} when neither correction applies -- no replay yet, an unmarked capture, no stage stating a
+    repeat count -- and the ranking is then exactly the unweighted one. Stage names are whatever the
+    capture and the pipeline report."""
+    try:
+        stages = list(((profile or {}).get("stage_buckets") or {}).keys())
+        sampled = {}
+        full = read_stage_ms(model=_model_key()) or {}
+        ratios = {}
+        for stage, buckets in ((profile or {}).get("stage_buckets") or {}).items():
+            prof_ms = sum(float(b.get("device_ms") or 0.0) for b in (buckets or []) if isinstance(b, dict))
+            if prof_ms > 0 and float(full.get(stage) or 0.0) > 0:
+                ratios[stage] = float(full[stage]) / prof_ms
+        if len(ratios) >= 2:  # one stage has nothing to be weighed against
+            mean = sum(ratios.values()) / len(ratios)
+            sampled = {k: v / mean for k, v in ratios.items()}
+        reps = stage_repeats_per_request(stages)
+        if not reps:
+            return sampled
+        return {st: sampled.get(st, 1.0) * reps.get(st, 1) for st in stages}
+    except Exception:  # noqa: BLE001 -- a weight that cannot be read leaves the ranking unweighted
+        return {}
+
+
+def _blocking_order_key(b: dict, short_names) -> tuple:
+    """The work queue's order, in ONE place: an op in a stage already inside its band goes last, then
+    the largest gap first, the gap weighed by its stage's real cost (`cost_weight`, 1 when absent).
+    An op the capture could not place ("" stage) is never demoted."""
+    done = 1 if (short_names and b.get("stage") and b.get("stage") not in short_names) else 0
+    gap = b.get("eff_gap_ms") or b.get("gap_ms") or 0.0
+    return (done, -float(gap) * float(b.get("cost_weight") or 1.0))
+
+
 def stage_of_op(op, profile) -> str:
     """Which stage this op costs the most in, read from the capture, or "" when it cannot say.
 
@@ -8062,11 +8320,7 @@ def termination_check() -> dict:
     # rung back as next_target. Observed on voxtral_4b_tts_2603 2026-09-21: the vocab head sat at
     # `structural` with six structural attempts on file, every one of them unrecordable, and
     # finish_round could not be satisfied by any action the agent was able to take.
-    attempts = [
-        a
-        for a in _load_attempts_all()
-        if a.get("kernel_detected_in_source") or _normalise_rung(a.get("kernel_kind")) not in _KERNEL_AUTHORED_RUNGS
-    ]
+    attempts = [a for a in _load_attempts_all() if _attempt_counts_for_the_ladder(a)]
     blocking, cleared = [], []
     material = _material_gap_ms(dev)
     for o in rep.get("open_ops") or []:
@@ -8151,6 +8405,8 @@ def termination_check() -> dict:
     fold_block = _fold_gate(_gate_prof, attempts)
     if fold_block:
         blocking.append(fold_block)
+    # Exactly as before the fusion ladder: these three ride with the FOLD rung, not the later ones.
+    if fold_block and fold_block.get("next_rung") == _FOLD_LEVER[0][-1]:
         order_block = _order_gate(_gate_prof, attempts)
         if order_block:
             blocking.append(order_block)
@@ -8175,12 +8431,13 @@ def termination_check() -> dict:
     # unplaced work would bury whatever the marks failed to cover. When nothing is short the key is
     # constant and the order is exactly what it was.
     _short_names = _short_stage_names()
-    blocking.sort(
-        key=lambda b: (
-            1 if (_short_names and b.get("stage") and b.get("stage") not in _short_names) else 0,
-            -(b.get("eff_gap_ms") or b.get("gap_ms") or 0.0),
-        )
-    )
+    # WEIGHED BY WHAT THE STAGE REALLY COSTS (stage_cost_weights): the gap is read off a capped
+    # profile that samples the stages unequally. The gap itself is reported unchanged; only the
+    # order uses the weight, and with no weights every op's is 1 and the order is the old one.
+    _weights = stage_cost_weights(prof)
+    for b in blocking:
+        b["cost_weight"] = round(float(_weights.get(b.get("stage") or "", 1.0)), 4)
+    blocking.sort(key=lambda b: _blocking_order_key(b, _short_names))
     can_stop = not blocking
     # AND NOTHING MATERIAL MAY BE UNTRIED. `blocking` empties as each op's checklist fills, so an op
     # that was never SELECTED never appears there and never blocks -- which is how a run ends with

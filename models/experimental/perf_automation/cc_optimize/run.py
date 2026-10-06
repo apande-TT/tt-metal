@@ -113,20 +113,21 @@ termination_check() is the SOLE authority on whether more optimization is needed
 LOOP:
   git_head -> termination_check -> read next_target.
   REUSE-FIRST: call recall_knobs(next_target.op_class, next_target.grid, next_target.bound_by) and APPLY/ADAPT any matching catalogued knob (heed its negative knowledge) BEFORE improvising one.
-  WARM-START (matmul fidelity/dtype): a matmul_sweep.json may exist in the model directory (Glob for it once) — a pre-pass table of PCC-verified best (fidelity, dtype) per matmul shape, measured EAGER so treat each entry as a STARTING GUESS, not a verdict. When next_target is a matmul on the knob:fidelity or knob:dtype rung, look up next_target's shape (m,k,n) in that table and APPLY its recommended fidelity/dtype FIRST, then check_pcc + measure_candidate + check_lever_coverage and commit/revert AS USUAL (the eager guess still must pass the trace-mode verify). If the file is missing or the shape is absent, proceed normally.
+  WARM-START (matmul fidelity/dtype): a matmul_sweep.json may exist in the model directory (Glob for it once) — a pre-pass table of PCC-verified best (fidelity, dtype) per matmul shape, measured EAGER so treat each entry as a STARTING GUESS, not a verdict. When next_target is a matmul on the knob:fidelity or knob:dtype rung, look up next_target's shape (m,k,n) in that table and APPLY its recommended fidelity/dtype FIRST, then measure_candidate + check_full_pipeline_latency + check_lever_coverage, and check_pcc only if those say faster (ORDER below) and commit/revert AS USUAL (the eager guess still must pass the trace-mode verify). If the file is missing or the shape is absent, proceed normally.
   Do EXACTLY next_target.rung on next_target.op:
-    knob:grid  -> full-grid program_config. check_pcc; measure_candidate; commit a real win else revert. record_kernel_attempt(op,'grid',measured_ms,beat_baseline).
-    knob:block -> the cores are already occupied; SHAPE the work on them. HAND-WRITE the matmul program config instead of naming a core_grid: pick in0_block_w, out_subblock_h/w and per_core_M/N for this shape, and try BOTH multicast orientations (transpose_mcast) rather than assuming one. Naming a core grid leaves ttnn a 1-D multicast with 1x1 subblocks, which is why an op can hold the whole grid at the lowest fidelity and still sit many times off its floor -- 'it is already full-grid' does NOT satisfy this rung. Offered only where M spans more than one tile row, so a single-token projection is never sent here. check_pcc; measure_candidate; commit a real win else revert. record_kernel_attempt(op,'block',measured_ms,beat_baseline) EVEN IF no gain (that marks the knob tried).
-    knob:fidelity -> lower math fidelity (HiFi4->HiFi2->LoFi) on this compute-bound op. check_pcc; measure_candidate; commit a win else revert. record_kernel_attempt(op,'fidelity',measured_ms,beat_baseline) EVEN IF pcc forced a revert (that marks the knob tried).
-    knob:dtype -> lower that op's WEIGHT dtype (bf16->bf8_b->bf4_b). check_pcc; measure_candidate; commit a win else revert. record_kernel_attempt(op,'dtype',measured_ms,beat_baseline) EVEN IF pcc forced a revert (that marks the knob tried).
-    knob:shard -> shard the op's weights/activations into L1 (height/width shard) to cut DRAM reads. check_pcc; measure_candidate; commit a win else revert. record_kernel_attempt(op,'shard',measured_ms,beat_baseline) EVEN IF no gain (that marks the knob tried).
-    structural-decode / kv-cache -> the decode loop is repeat_prefill: it re-runs the FULL prefill every token because there is NO KV-cache (use_cache=False). This is a DISTINCT lever from the trace dispatch lever — trace removes DISPATCH gaps, it does NOT remove the REDUNDANT RECOMPUTE, so 'trace is already applied' does NOT satisfy this and 'irreducible' is NOT an acceptable answer. You MUST ADD a KV-cache + a single-token decode_step (each token attends to CACHED K/V and computes seq_len=1, not a re-prefill); Read the recipe via recall_knobs(op_class='decode'). check_pcc; measure the per-token ms; commit only a real win. record_kernel_attempt(op='generation_loop','kv-cache',measured_ms,beat_baseline). This target clears ONLY on a MEASURED per-token reduction from the cache (bounded retries; do NOT record 'none/irreducible' for it).
-    tt-lang    -> author a tt-lang (ttl) kernel (Read GUIDELINES/11). check_pcc; measure_candidate; commit a win else revert. record_kernel_attempt(op,'tt-lang',measured_ms,beat_baseline).
-    cpp        -> author a C++ Metalium kernel via ttnn.generic_op (Read GUIDELINES/12). check_pcc; measure_candidate; commit a win else revert. record_kernel_attempt(op,'cpp',measured_ms,beat_baseline).
+    knob:grid  -> full-grid program_config. measure_candidate; check_full_pipeline_latency; check_pcc only if both say faster (ORDER below); commit a real win else revert. record_kernel_attempt(op,'grid',measured_ms,beat_baseline).
+    knob:block -> the cores are already occupied; SHAPE the work on them. HAND-WRITE the matmul program config instead of naming a core_grid: pick in0_block_w, out_subblock_h/w and per_core_M/N for this shape, and try BOTH multicast orientations (transpose_mcast) rather than assuming one. Naming a core grid leaves ttnn a 1-D multicast with 1x1 subblocks, which is why an op can hold the whole grid at the lowest fidelity and still sit many times off its floor -- 'it is already full-grid' does NOT satisfy this rung. Offered only where M spans more than one tile row, so a single-token projection is never sent here. measure_candidate; check_full_pipeline_latency; check_pcc only if both say faster (ORDER below); commit a real win else revert. record_kernel_attempt(op,'block',measured_ms,beat_baseline) EVEN IF no gain (that marks the knob tried).
+    knob:fidelity -> lower math fidelity (HiFi4->HiFi2->LoFi) on this compute-bound op. measure_candidate; check_full_pipeline_latency; check_pcc only if both say faster (ORDER below); commit a win else revert. record_kernel_attempt(op,'fidelity',measured_ms,beat_baseline) EVEN IF pcc forced a revert (that marks the knob tried).
+    knob:dtype -> lower that op's WEIGHT dtype (bf16->bf8_b->bf4_b). measure_candidate; check_full_pipeline_latency; check_pcc only if both say faster (ORDER below); commit a win else revert. record_kernel_attempt(op,'dtype',measured_ms,beat_baseline) EVEN IF pcc forced a revert (that marks the knob tried).
+    knob:shard -> shard the op's weights/activations into L1 (height/width shard) to cut DRAM reads. measure_candidate; check_full_pipeline_latency; check_pcc only if both say faster (ORDER below); commit a win else revert. record_kernel_attempt(op,'shard',measured_ms,beat_baseline) EVEN IF no gain (that marks the knob tried).
+    structural-decode / kv-cache -> the decode loop is repeat_prefill: it re-runs the FULL prefill every token because there is NO KV-cache (use_cache=False). This is a DISTINCT lever from the trace dispatch lever — trace removes DISPATCH gaps, it does NOT remove the REDUNDANT RECOMPUTE, so 'trace is already applied' does NOT satisfy this and 'irreducible' is NOT an acceptable answer. You MUST ADD a KV-cache + a single-token decode_step (each token attends to CACHED K/V and computes seq_len=1, not a re-prefill); Read the recipe via recall_knobs(op_class='decode'). measure the per-token ms; check_pcc only if it is faster (ORDER below); commit only a real win. record_kernel_attempt(op='generation_loop','kv-cache',measured_ms,beat_baseline). This target clears ONLY on a MEASURED per-token reduction from the cache (bounded retries; do NOT record 'none/irreducible' for it).
+    tt-lang    -> author a tt-lang (ttl) kernel (Read GUIDELINES/11). measure_candidate; check_full_pipeline_latency; check_pcc only if both say faster (ORDER below); commit a win else revert. record_kernel_attempt(op,'tt-lang',measured_ms,beat_baseline).
+    cpp        -> author a C++ Metalium kernel via ttnn.generic_op (Read GUIDELINES/12). measure_candidate; check_full_pipeline_latency; check_pcc only if both say faster (ORDER below); commit a win else revert. record_kernel_attempt(op,'cpp',measured_ms,beat_baseline).
   COVERAGE — the profiled slice is a REPRESENTATIVE set of layers, not all of them, so after a dtype knob or a kernel swap call check_lever_coverage(op_match, stale_dtype, new_dtype) to CONFIRM the lever reached EVERY layer instance. A repeated block is ONE class instantiated N times, so editing the SHARED block definition/config propagates to all N; editing an instance-specific path (e.g. layers[0], a per-layer override) changes only that one and silently misses the rest. If fully_applied is false, REAPPLY on the shared definition (target the reported missed_blocks) and re-check until fully_applied — a partial application is NOT a real win even if the slice looks faster.
   ALWAYS pass note= to record_kernel_attempt: ONE line stating (a) WHY you tried this lever on this op (the hypothesis — e.g. 'op is DRAM-bw bound, bf8_b weights halve reads') and (b) WHY it won or failed (the outcome reason — e.g. 'kept: 4.1->3.6ms', 'reverted: PCC 0.71<0.95', 'no gain: 4.1->4.1ms bw-bound', 'OOM under trace'). This note is streamed LIVE into the model's RUN_REPORT.md the instant the attempt resolves (win OR fail), so it must explain the reasoning, not just restate the numbers. ALSO pass stages_json to record_kernel_attempt whenever you have per-stage trace timings (the SAME JSON list of {{"name","ms","dominant?"}} you'd pass hitl_gate, e.g. from check_full_pipeline_latency's stage breakdown) — this renders the block-level timing table in RUN_REPORT.md so BOTH hitl and non-hitl runs show where device time went per stage/block.
   TWO measurements are fed back to you each step — use BOTH: (1) measure_candidate returns the per-op tracy device_ms (the fast steering signal that tells you WHICH op moved); (2) check_full_pipeline_latency returns the robust whole-pipeline trace+1cq per-token ms (its `mode` field = trace+1cq, `full_pipeline_ms` + `delta_pct` vs best) — this is the per-iteration VERDICT you bank a compute win on. This is the ONLY production metric — the run is trace+1cq end to end: trace+1cq always engages (a single command queue), so a dtype/grid/fusion/kernel win it confirms is real. The BEFORE number is one 1cq bookend run and the AFTER number is simply your last committed 1cq verdict (no second full-model run at the end).
   (IRON RULE: a real win = check_pcc ok AND check_full_pipeline_latency status 'ok' (moved TOWARD the target / not diverged, at its trace+1cq mode) AND measure_candidate verdict 'valid' AND is_real_gain AND (for a dtype/kernel lever) check_lever_coverage fully_applied (reached every layer, not just the profiled slice). REJECTED, pcc-fail, or a DIVERGED full-pipeline latency is never a win — revert. Note: check_full_pipeline_latency never fails for missing the target, only for getting SLOWER than the trace+1cq best-so-far.)
+  ORDER (time before correctness): run check_pcc LAST, and only for a candidate that measure_candidate and check_full_pipeline_latency call faster (or that reports a stage_win). A slower or diverged candidate is reverted and recorded WITHOUT it: the end-to-end correctness run is the longest step of an attempt (~25 min on a 50-step diffusion model) and its answer cannot turn a slower candidate into a win. This changes WHEN check_pcc runs, never WHETHER a win needs it: every commit still requires check_pcc ok.
   WRITE-BACK: after you COMMIT a win you IMPROVISED (recall_knobs had no match), call distill_knob to persist the general technique; if the win RE-USED a provisional lever learned on another model, pass its id to distill_knob to graduate it.
   Re-run termination_check. Repeat. NEVER stop while can_stop=false. NEVER reason a lever "won't help" — prove it by measuring + recording the attempt. For a structural-decode/kv-cache target you may NOT record 'none'/'irreducible' and you may NOT point at an already-applied trace lever as the resolution — you MUST add the KV-cache and prove it by a measured per-token reduction; the gate will keep returning this target until a kv-cache attempt actually lowers the number.
 
@@ -141,7 +142,7 @@ _HITL_PROMPT = (
     _PROMPT
     + """
 
-HITL MODE (human-in-the-loop): you do NOT have git_commit / git_revert. After you apply ONE lever and measure it (check_pcc; measure_candidate; check_full_pipeline_latency; check_lever_coverage for a dtype/kernel lever), call hitl_gate(tried_op, tried_lever, why_tried, is_win, why_not, next_target, next_why, before_ms, after_ms, stages_json) INSTEAD of committing. stages_json = the per-stage trace timings you just measured, a JSON list of {{"name","ms"}} (add "dominant" if known). hitl_gate returns {{action}}: on 'commit' or 'revert' the operator's git action is ALREADY DONE for you — move to the next target; on 'try', apply the operator's returned knob next. Exactly ONE lever per hitl_gate call; never batch. record_kernel_attempt as usual so RUN_REPORT stays live."""
+HITL MODE (human-in-the-loop): you do NOT have git_commit / git_revert. After you apply ONE lever and measure it (measure_candidate; check_full_pipeline_latency; check_lever_coverage for a dtype/kernel lever; then check_pcc only if they say faster), call hitl_gate(tried_op, tried_lever, why_tried, is_win, why_not, next_target, next_why, before_ms, after_ms, stages_json) INSTEAD of committing. stages_json = the per-stage trace timings you just measured, a JSON list of {{"name","ms"}} (add "dominant" if known). hitl_gate returns {{action}}: on 'commit' or 'revert' the operator's git action is ALREADY DONE for you — move to the next target; on 'try', apply the operator's returned knob next. Exactly ONE lever per hitl_gate call; never batch. record_kernel_attempt as usual so RUN_REPORT stays live."""
 )
 
 
@@ -437,6 +438,7 @@ def _mcp_config(repo_root: Path, manifest_path: str, pipe: dict, devices: str, k
         "TT_PERF_MODULE_LEVEL",
         "TT_PERF_MESH_ROWS",
         "TT_PERF_MESH_COLS",
+        "TT_PERF_MESH_SP",
         "TT_PERF_SHARD_DEGREE",
     ):
         _v = os.environ.get(_k)
@@ -524,8 +526,9 @@ _HALT_REMEDY = {
 }
 
 
-def _reset_fullpipe_baselines() -> None:
-    """Drop the full-pipeline (trace+1cq) bar ONLY when there is no usable one for this (model, task).
+def _reset_fullpipe_baselines(head_sha: str = "") -> None:
+    """Drop the full-pipeline (trace+1cq) bar ONLY when there is no usable one for this (model, task),
+    or when the one there was measured on a different model tree than the one this run starts from.
 
     This used to unlink the file unconditionally at task start, and that single line defeated every
     protection built around the bar. The sequence each run was:
@@ -546,12 +549,38 @@ def _reset_fullpipe_baselines() -> None:
 
     So: a usable bar for THIS (model, task) is kept and reused. Anything else -- no file, an
     unparseable one, a non-positive value -- is cleared so the run establishes a fresh one.
-    PERF_MCP_FORCE_REBASELINE=1 forces the old unconditional behaviour."""
+    PERF_MCP_FORCE_REBASELINE=1 forces the old unconditional behaviour.
+
+    A BAR MEASURED ON A DIFFERENT TREE IS NOT A BAR. The scoreboard records the commit its reading
+    was taken at (perf_mcp._record_fullpipe_candidate stamps HEAD when a reading is banked). A plain
+    --persist relaunch after a run starts from that same commit -- the last win -- and reuses the bar,
+    which is the case above. But when the tree this run starts from is a DIFFERENT commit, the stored
+    best describes code that no longer exists, and nothing in the run would ever notice: Voxtral,
+    2026-10-05, two levers had been undone by hand and tt-metal updated; the current code measured
+    90.6 ms against a stored best of 89.36, so every reading would have been graded a regression
+    until something beat code that was gone -- a 1.3 ms handicap on every win. No environment
+    variable should be needed to avoid that from the same launch command, so the bar is reused only
+    while its commit is the commit the run starts at; otherwise it is dropped here, with a line
+    saying so, and this run's BEFORE establishes the new one. A bar with no recorded commit (written
+    before the stamp existed) is kept, as before, and so is one when HEAD cannot be read. NOTHING
+    ELSE the run remembers is touched: the ledger with the campaign's own BEFORE and the roofline
+    pins, the lever attempts, the gate verdicts and the knob memory all stay."""
     p = state_dir() / _fullpipe_1cq_name()
-    if str(os.environ.get("PERF_MCP_FORCE_REBASELINE", "")).lower() not in ("1", "true", "yes"):
+    forced = str(os.environ.get("PERF_MCP_FORCE_REBASELINE", "")).lower() in ("1", "true", "yes")
+    if not forced:
         try:
-            if float(json.loads(p.read_text()).get("full_pipeline_ms") or 0.0) > 0:
-                return
+            doc = json.loads(p.read_text())
+            ms = float(doc.get("full_pipeline_ms") or 0.0)
+            recorded = str(doc.get("sha") or "")
+            if ms > 0:
+                if not recorded or not head_sha or recorded == head_sha:
+                    return
+                print(
+                    "  [optimize/cc] full-pipeline bar %.4f ms was measured at %s but this run starts at %s -- a bar "
+                    "measured on a different tree is not a bar; dropping it so this run's BEFORE establishes the "
+                    "new one (nothing else the run remembers is touched)" % (ms, recorded[:11], head_sha[:11]),
+                    flush=True,
+                )
         except Exception:  # noqa: BLE001
             pass
     try:
@@ -922,6 +951,7 @@ def _parse_facts(raw: str, sigs: set | None) -> dict:
     facts = {
         "dp": 1,
         "tp": 1,
+        "sp": 1,
         "shard_active": False,
         "host_ops": [],
         "n_op_types": len(sigs or ()),
@@ -930,10 +960,13 @@ def _parse_facts(raw: str, sigs: set | None) -> dict:
     _raw = raw or ""
     _tp = re.search(r"\bTP=(\d+)", _raw)
     _dp = re.search(r"\bDP=(\d+)", _raw)
+    _sp = re.search(r"\bSP=(\d+)", _raw)
     if _tp:
         facts["tp"] = int(_tp.group(1))
     if _dp:
         facts["dp"] = int(_dp.group(1))
+    if _sp:
+        facts["sp"] = int(_sp.group(1))
     facts["parallelism_known"] = bool(_tp or _dp)
     if re.search(r"shard(?:_active)?\s*=\s*(?:True|true|1|yes)", _raw):
         facts["shard_active"] = True
@@ -3330,6 +3363,9 @@ def _print_scorecard(
         arch = env.get("arch") or "?"
         chips = env.get("device_count") or env.get("mesh_chips") or _chip_count(devices)
         dp, tp = facts.get("dp", 1), facts.get("tp", 1)
+        # Named only when the run split tokens, so every scorecard that did not reads as before.
+        _sp = int(facts.get("sp", 1) or 1)
+        _sp_s = " x SP=%d" % _sp if _sp > 1 else ""
         host_ops = facts.get("host_ops", [])
         probed = bool(facts) and facts.get("n_op_types", 0) > 0
         on_device = probed and not host_ops
@@ -3342,8 +3378,8 @@ def _print_scorecard(
         L.append("  │ hardware          : %s  x%s chip(s)" % (arch, chips))
         if facts.get("parallelism_known"):
             L.append(
-                "  │ parallelism       : TP=%s x DP=%s  (%s)"
-                % (tp, dp, "sharded mesh" if facts.get("shard_active") else "single-chip / replicated")
+                "  │ parallelism       : TP=%s x DP=%s%s  (%s)"
+                % (tp, dp, _sp_s, "sharded mesh" if facts.get("shard_active") else "single-chip / replicated")
             )
         else:
             L.append("  │ parallelism       : UNKNOWN  (no TP/DP line in the probe output — not assumed 1x1)")
@@ -3534,6 +3570,33 @@ def _reset_devices(devices: str) -> str:
     return "device reset (%s)" % last
 
 
+def _agent_module(name: str, standalone_name: str):
+    """agent/<name>.py, imported the way THIS process can see it, as a package module wherever possible.
+
+    Three routes, in order: `agent.<name>` (the engine's own directory is on sys.path), then the same
+    module under the package this file was imported from (`<pkg>.agent.<name>`, derived from
+    __package__ -- the supervisor in commands/optimize.py imports run.py by its full dotted name with
+    only the repo root on sys.path), then by file path. The last route gives the module no package,
+    so its own relative imports fail: that is how the supervisor's reclaim printed "reclaim fell
+    back to reset (attempted relative import with no known parent package)" and fell back to a bare
+    tt-smi -r instead of the reap-and-verify reset (Qwen-Image-Edit, 2026-09-30)."""
+    import importlib
+
+    _pkg = (__package__ or "").rpartition(".")[0]
+    for _dotted in ["agent." + name] + (["%s.agent.%s" % (_pkg, name)] if _pkg else []):
+        try:
+            return importlib.import_module(_dotted)
+        except Exception:  # noqa: BLE001 -- not importable this way; try the next
+            continue
+    import importlib.util as _ilu
+
+    _p = Path(__file__).resolve().parents[1] / "agent" / ("%s.py" % name)
+    _spec = _ilu.spec_from_file_location(standalone_name, str(_p))
+    _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m)
+    return _m
+
+
 def _dr():
     """The shared device-recovery primitive (agent/device_recovery.py), imported lazily and by path
     because run.py is itself loaded by path from perf_mcp/optimize with a bare sys.path."""
@@ -3542,15 +3605,7 @@ def _dr():
         return _DR_MOD
     except NameError:
         pass
-    try:
-        from agent import device_recovery as _m
-    except Exception:  # noqa: BLE001
-        import importlib.util as _ilu
-
-        _p = Path(__file__).resolve().parents[1] / "agent" / "device_recovery.py"
-        _spec = _ilu.spec_from_file_location("tt_device_recovery", str(_p))
-        _m = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_m)
+    _m = _agent_module("device_recovery", "tt_device_recovery")
     globals()["_DR_MOD"] = _m
     return _m
 
@@ -3563,15 +3618,7 @@ def _ap():
         return _AP_MOD
     except NameError:
         pass
-    try:
-        from agent import agent_provider as _m
-    except Exception:  # noqa: BLE001
-        import importlib.util as _ilu
-
-        _p = Path(__file__).resolve().parents[1] / "agent" / "agent_provider.py"
-        _spec = _ilu.spec_from_file_location("tt_agent_provider", str(_p))
-        _m = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_m)
+    _m = _agent_module("agent_provider", "tt_agent_provider")
     globals()["_AP_MOD"] = _m
     return _m
 
@@ -5944,7 +5991,7 @@ def optimize_pipeline(
     prompt = (_HITL_PROMPT if hitl else _PROMPT).format(model=model_name, task=task, metric=metric)
     start_sha = _git(repo_root, "rev-parse", "HEAD")
     mcp_env = cfg["mcpServers"]["perf-mcp"]["env"]
-    _reset_fullpipe_baselines()
+    _reset_fullpipe_baselines(start_sha)
     # The BEFORE bookend is a full-model run of several minutes AND it defines the bar every win is
     # graded against. If this (model, task) already has one, re-measuring it can only move the bar to
     # whatever the board felt like doing today -- which is exactly how a clamped 68.3241 ms replaced a
@@ -6496,8 +6543,15 @@ def _decide_parallelism_route(
                 cfg = {**_hf_cache_dims(mid), **cfg}
         heads = int(cfg.get("num_attention_heads") or cfg.get("num_heads") or 1)
         hidden = int(cfg.get("hidden_size") or cfg.get("d_model") or 1)
-        route = decide_parallelism(weight_bytes, cap, chips, heads, hidden, metric)
+        # The sequence-parallel degree optimize PLANNED for this mesh (exported beside the mesh pair);
+        # the route honours it, so the chips the token groups use are never also swept for TP. Unplanned,
+        # the route is exactly what it was.
+        from agent.perf_adapter import resolve_seq_parallel
+
+        route = decide_parallelism(weight_bytes, cap, chips, heads, hidden, metric, sp=resolve_seq_parallel())
         print(f"  [optimize/cc] parallelism route: {route['route']} — {route['reason']}")
+        if int(route.get("sp", 1) or 1) > 1:
+            print("  [optimize/cc] sequence-parallel planned; the per-matmul TP sweep stays off for these chips")
         if route.get("tp_regime"):
             os.environ["TT_PERF_TP_REGIME"] = "1"
             os.environ["TT_PERF_TP_FLOOR"] = str(route.get("floor", 1))
