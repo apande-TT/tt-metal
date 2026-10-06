@@ -130,6 +130,11 @@ class PreparedInputs:
     """Device-resident encoded inputs for one batched image_edit call (uploaded once, outside the forward)."""
 
 
+def _wide_block_config(x, w):
+    """_te_attention._block_config for x @ w with K < N, else None (ttnn's own pick)."""
+    return _te_attention._block_config(x, w) if int(w.shape[-2]) < int(w.shape[-1]) else None
+
+
 class QwenImageEditTT:
     """Resident TT pipeline. Build with build_pipeline()."""
 
@@ -195,6 +200,10 @@ class QwenImageEditTT:
         _tr_precise.SPLIT_FN = fused_split_bf16
         _te_attention.SPLIT_FN = fused_split_bf16
         _tr_precise.GELU_SPLIT_FN = fused_gelu_split_bf16  # the FF GELU fused into its down projection's split
+        # the transformer's wide-output limb linears (K < N: attention out, FF up, ada-norm) on the text encoder's
+        # full-grid 2-D multicast block configs. Long-K narrow-N ones (q/k/v, FF down) stay on ttnn's pick:
+        # there the 2-D blocks measured slower (512 x 3072 x 384: 23.1 -> 41.8 ms)
+        _tr_precise.LINEAR_PC_FN = _wide_block_config
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
