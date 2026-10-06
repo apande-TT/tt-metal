@@ -120,9 +120,10 @@ class TtQwenVAE:
         # 8 (2026-10-04): the exact convs now hold the padded input's bf16 limbs across their lane runs,
         # which at 16 ran the eager e2e out of memory; 8 per program costs ~1% and the shared limbs save ~7%.
         self.encode_max_batch = 8
-        # encoder convs exact-lane (its image latents condition every denoising step), decoder convs median
+        # encoder convs exact-lane (its image latents condition every denoising step); decoder convs the
+        # exact-product split alone (two convs each instead of the median's four)
         self.precise_convs = self._precise_ports(self.encoder, "encoder", hf_vae.encoder, conv_mode="exact")
-        self.precise_convs += self._precise_ports(self.decoder, "decoder", hf_vae.decoder, conv_mode="median")
+        self.precise_convs += self._precise_ports(self.decoder, "decoder", hf_vae.decoder, conv_mode="split")
         if tracker is not None:
             tracker.track("qwen_image_encoder3d", self.encoder)
             tracker.track("qwen_image_decoder3d", self.decoder)

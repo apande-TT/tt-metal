@@ -191,11 +191,6 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
     and is done once instead of once per run."""
     if prepad is not None:
         x, extra = prepad(x, extra), None
-    out = run(x, extra) if out is None else out
-    shape, layout = list(out.shape), out.layout
-    f0 = _flat(out)
-    if f0 is None or mode not in ("median", "exact"):
-        return out
 
     def to3(t):
         s = list(t.shape)
@@ -217,6 +212,29 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
     # each run's limb / lane is a transient of the operand's tile copy
     f32 = lambda t: ttnn.typecast(ttnn.typecast(t, ttnn.bfloat16), ttnn.float32)  # noqa: E731
     hi, lo = f32, lambda t: ttnn.subtract(t, f32(t))
+    if mode == "split":
+        # the exact-product split alone, op(x_hi) + op(x_lo) - b: two runs, no plain run and no vote
+        ops = [to3(x)] + ([] if extra is None else [to3(extra)])
+
+        def raw(fn):
+            return run(back(fn(ops[0]), x), None if extra is None else back(fn(ops[1]), extra))
+
+        o_hi = raw(hi)
+        shape, layout = list(o_hi.shape), o_hi.layout
+        f_hi = _flat(o_hi)
+        if f_hi is None:  # no flat view of this output: the plain run
+            return run(x, extra)
+        y = ttnn.add(f_hi, _flat(raw(lo)))
+        b = _bias_flat(bias, shape, rows_layout=_flat_rows(o_hi))
+        b = b if b is not None else _flat(raw(lambda t: ttnn.multiply(t, 0.0)))
+        return ttnn.reshape(ttnn.to_layout(ttnn.subtract(y, b), layout), shape)
+
+    out = run(x, extra) if out is None else out
+    shape, layout = list(out.shape), out.layout
+    f0 = _flat(out)
+    if f0 is None or mode not in ("median", "exact"):
+        return out
+
     # with prepad the tile copy is shared by every run; without it each run tilizes its own
     shared = [to3(x)] + ([] if extra is None else [to3(extra)]) if prepad is not None else None
 
