@@ -18,6 +18,7 @@ import torch
 import ttnn
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import mlp as vae_pointwise
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import qwen_image_decoder3d, qwen_image_encoder3d
+from models.tt_dit.utils.conv3d import get_conv3d_config
 
 
 def _replicated(device, t, dtype=ttnn.float32):
@@ -93,6 +94,16 @@ def _decoder_blocking(in_channels, out_channels, kernel):
     return (96 if in_channels % 96 == 0 else 32, 96 if out_channels % 96 == 0 else 32, 1, 8, 4)
 
 
+def _encoder_blocking(in_channels, out_channels, kernel):
+    """conv3d blocking for the encoder's folded bf16 (1, 3, 3) convs: the tuned blocking of the same channels'
+    (3, 3, 3) conv (1/3 of its K, so it fits L1 too); the bf16 table has no (1, 3, 3) entries for these
+    channels and its default is a single output position per core."""
+    if tuple(kernel) != (1, 3, 3):
+        return None
+    c = get_conv3d_config(in_channels, out_channels, (3, 3, 3), ttnn.bfloat16, grid_size=(1, 1))
+    return (c.C_in_block, c.C_out_block, c.T_out_block, c.H_out_block, c.W_out_block)
+
+
 def pack_latents(z, B, C, H, W):
     """[B, C, H, W] -> [B, (H/2)(W/2), 4C] (QwenImageEditPipeline._pack_latents)."""
     z = ttnn.reshape(z, (B, C, H // 2, 2, W // 2, 2))
@@ -113,7 +124,11 @@ class TtQwenVAE:
         cfg = hf_vae.config
         self.z_dim = int(cfg.z_dim)
         with _host_weight_prep() if HOST_WEIGHT_PREP else contextlib.nullcontext():
-            self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel=True)
+            # the edit image is a single frame too: the encoder's causal convs keep only their live temporal
+            # tap, so neither their T front pad nor its zero frames' MACs run
+            self.encoder = qwen_image_encoder3d.build(
+                device, hf_vae.encoder, batch_parallel=True, single_frame=True, blocking=_encoder_blocking, ccl_links=2
+            )
             self.quant_conv = vae_pointwise.build(device, hf_vae.quant_conv)
             self.post_quant_conv = vae_pointwise.build(device, hf_vae.post_quant_conv)
             # image latents are single-frame: the decoder's causal convs keep only their live temporal tap
