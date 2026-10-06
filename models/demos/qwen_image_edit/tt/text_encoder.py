@@ -111,6 +111,7 @@ class TtQwenTextEncoder:
         _te_attention.EXACT_SUM_L1_BYTES = 6 * 1024 * 1024
         # and the attention's exact-lane products (QK^T ~7.9 MB, PV ~2.2 MB) likewise
         _te_attention.EXACT_BMM_L1_BYTES = 8 * 1024 * 1024
+        _te_attention.VISION_PV_PATTERNS = ("strided",)  # vision P @ V: one lane pattern, no median of three
         # the vision token permutations as one bf16 matmul per limb (one-hot rows: each output is a single
         # 1 * v product, already exact without the exact-lane decomposition)
         vision_transformer_pretrained_model.ONEHOT_PERMUTE = True
