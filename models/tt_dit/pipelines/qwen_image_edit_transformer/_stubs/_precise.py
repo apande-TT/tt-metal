@@ -24,6 +24,9 @@ FF_HIDDEN_L1 = False  # the feed-forward's GELU output (the down projection's in
 # optional fused GELU + split for the feed-forward: a callable pre-activation x32 -> (hi, lo) of gelu_tanh(x);
 # None: ttnn.gelu then split_bf16
 GELU_SPLIT_FN = None
+# optional program config picker for linear's limb matmuls: a callable (x_limb, w) -> program_config or
+# None (None: ttnn.linear's own pick)
+LINEAR_PC_FN = None
 EXACT_QK = True  # within precise mode: exact-lane QK^T (else the dense 3-term split)
 FOLD_LANES = False  # exact QK^T as one K-folded matmul per lane pattern (the pipeline switches this on)
 EXACT_LANES = 8
@@ -56,9 +59,11 @@ def linear(x, w, bias=None, compute_kernel_config=None, parts=None):
     (hi, lo) from split_bf16 when several projections share x (split once, not once per projection)."""
     cfg = precise_config()
     hi, lo = split_bf16(x) if parts is None else parts
+    pc = LINEAR_PC_FN(hi, w) if LINEAR_PC_FN is not None else None
+    kw = {"program_config": pc} if pc is not None else {}
     y = ttnn.add(
-        ttnn.linear(hi, w, compute_kernel_config=cfg, dtype=ttnn.float32),
-        ttnn.linear(lo, w, compute_kernel_config=cfg, dtype=ttnn.float32),
+        ttnn.linear(hi, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw),
+        ttnn.linear(lo, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw),
     )
     if bias is not None:
         y = ttnn.add(y, bias if bias.dtype == ttnn.float32 else ttnn.typecast(bias, ttnn.float32))
