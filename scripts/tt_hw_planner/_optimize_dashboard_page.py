@@ -194,13 +194,29 @@ function cardSpec(S) {
   const scopeTxt = (sc.depth != null || sc.mode)
     ? "sampled slice" + (sc.depth != null ? " · depth " + sc.depth : "") + (sc.mode ? " · " + sc.mode + " per-op device time" : "") + " · not end-to-end"
     : "current";
-  cards.push({k: (m.name || "metric"), v: m.current, unit: " " + (m.unit || "ms"), sub: scopeTxt,
-              d: deltaTxt(m.current, m.baseline, m.direction || "min")});
-  cards.push({k: "baseline", v: m.baseline, unit: " " + (m.unit || "ms"), sub: "",
-              d: m.target != null ? "target " + fmtMs(m.target) : ""});
-  if (S.fullpipe_ms != null)
+  // A sampled-slice headline metric that was never re-measured this run stays at baseline
+  // (current == baseline) and reads as "stuck" even when the full pipeline the commit gate judges
+  // moved a lot (e.g. an image-diffusion run optimized end-to-end, not on an eager per-op probe).
+  // In that case LEAD with the end-to-end result and demote the frozen slice, so the headline is
+  // the real win rather than a one-shot probe. When the slice DID move (an LLM re-measuring its
+  // device-time series), nothing changes.
+  const sliceStuck = (m.current != null && m.baseline != null && Math.abs(m.current - m.baseline) < 1e-6);
+  const e2eMoved = (S.fullpipe_ms != null && S.fullpipe_baseline_ms != null && Math.abs(S.fullpipe_ms - S.fullpipe_baseline_ms) > 1e-6);
+  if (sliceStuck && e2eMoved) {
     cards.push({k: "end-to-end", v: S.fullpipe_ms, unit: " ms", sub: "all layers · what wins are judged on",
                 d: deltaTxt(S.fullpipe_ms, S.fullpipe_baseline_ms, "min")});
+    cards.push({k: "end-to-end baseline", v: S.fullpipe_baseline_ms, unit: " ms", sub: "before optimize", d: ""});
+    cards.push({k: (m.name || "metric"), v: m.current, unit: " " + (m.unit || "ms"),
+                sub: scopeTxt + " · not re-measured this run", d: "baseline probe"});
+  } else {
+    cards.push({k: (m.name || "metric"), v: m.current, unit: " " + (m.unit || "ms"), sub: scopeTxt,
+                d: deltaTxt(m.current, m.baseline, m.direction || "min")});
+    cards.push({k: "baseline", v: m.baseline, unit: " " + (m.unit || "ms"), sub: "",
+                d: m.target != null ? "target " + fmtMs(m.target) : ""});
+    if (S.fullpipe_ms != null)
+      cards.push({k: "end-to-end", v: S.fullpipe_ms, unit: " ms", sub: "all layers · what wins are judged on",
+                  d: deltaTxt(S.fullpipe_ms, S.fullpipe_baseline_ms, "min")});
+  }
   (S.stages || []).slice(0, 3).forEach(s =>
     cards.push({k: s.name, v: s.ms, unit: " ms", sub: s.path || "", d: deltaTxt(s.ms, s.baseline_ms, "min")}));
   return cards;
@@ -485,6 +501,16 @@ function historyChart(S, stage) {
   if (line.length > 1) {
     g += `<path d="${smoothPath(line)}" fill="none" stroke="#3b82f6" stroke-width="2" stroke-opacity="0.9"
       stroke-linecap="round"/>`;
+  } else {
+    // No banked "best" to follow -- this run gated its wins elsewhere, so no attempt is "kept" and
+    // the best line has nothing to track. Connect the readings themselves so each stack still shows
+    // its trajectory instead of loose dots. This is the path of what was tried, not a claim about
+    // the model's best state, so it is drawn dashed and dimmer than a real best line.
+    const read = [];
+    at.forEach((a, i) => { const v = yOf(ser.value(a)); if (v != null) read.push(X(i) + "," + Y(v)); });
+    if (read.length > 1)
+      g += `<polyline points="${read.join(" ")}" fill="none" stroke="#3b82f6" stroke-width="1.8"
+        stroke-opacity="0.5" stroke-dasharray="5 4" stroke-linecap="round"/>`;
   }
 
   at.forEach((a, i) => {
@@ -511,6 +537,7 @@ function historyChart(S, stage) {
   let legend = Object.keys(counts).map(k =>
     `<span><i style="background:${HIST_COLOR[k] || "#8494ad"}"></i>${esc(HIST_LEGEND[k] || k)} (${counts[k]})</span>`).join("");
   if (line.length > 1) legend += `<span><i style="background:#3b82f6"></i>${esc(ser.bestLabel)}</span>`;
+  else legend += `<span><i style="background:#3b82f6"></i>readings (no banked best)</span>`;
   if (goal != null) legend += `<span><i style="background:#f87171"></i>goal (${esc(m.name || "target")})</span>`;
 
   return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${g}
