@@ -23,6 +23,7 @@ TILE = 32
 _DIR = "models/demos/qwen_image_edit/tt/kernels"
 _READER = f"{_DIR}/guard_tail_reader.cpp"
 _COMPUTE = f"{_DIR}/guard_tail_compute.cpp"
+_VOTE_COMPUTE = f"{_DIR}/vote_tail_compute.cpp"
 _WRITER = "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp"
 _IN_CBS = (0, 1, 2, 3, 4)
 _OUT_CB = 16
@@ -41,7 +42,8 @@ def _cores(grid, n_tiles):
     return out
 
 
-def _program(ins, y, n_tiles):
+def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0, 0, 0, 0, 0)):
+    """Five float32 tile operands -> y, tile by tile; operand k read at page i % mods[k] when nonzero."""
     grid = y.device().compute_with_storage_grid_size()
     work = _cores(grid, n_tiles)
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
@@ -63,7 +65,7 @@ def _program(ins, y, n_tiles):
     reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     addrs = [t.buffer_address() for t in ins]
     for c, start, count in work:
-        reader_rt[c.x][c.y] = addrs + [count, start]
+        reader_rt[c.x][c.y] = addrs + [count, start] + list(mods)
         compute_rt[c.x][c.y] = [count]
         writer_rt[c.x][c.y] = [y.buffer_address(), count, start]
 
@@ -85,7 +87,7 @@ def _program(ins, y, n_tiles):
             config=ttnn.ReaderConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
-            kernel_source=_COMPUTE,
+            kernel_source=compute,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[],
@@ -129,5 +131,35 @@ def guard_tail(ex, dn, nn, tol, lo_fn):
     # the inputs are dead after the tail: free them now, not at the caller's return (the text encoder and
     # the denoiser run at the edge of DRAM, where the later free fragments it)
     for t in ins:
+        ttnn.deallocate(t)
+    return y
+
+
+def vote_tail(acc, bn, f0, e_neg, tol):
+    """where(|e_x - e_neg| <= tol, e_x, median(e_x, f0, e_neg)), e_x = acc - bn: precise_affine's exact-mode
+    vote tail (models/tt_dit/pipelines/qwen_image_edit_vae/_stubs/_resident.py, VOTE_TAIL), ~8 float32 ttnn
+    passes over the conv output, here one, bit-identical. Same-shape interleaved float32 tile tensors [..., M, C]
+    (M and C tile-aligned); bn that shape or a (1, 1, C) row broadcast over the rows. Consumes (deallocates)
+    every operand. Returns None for a shape it does not take."""
+    s = list(acc.shape)
+    if len(s) < 2 or s[-2] % TILE or s[-1] % TILE or not all(_plain(t, s) for t in (acc, f0, e_neg, tol)):
+        return None
+    c = s[-1]
+    if _plain(bn, s):
+        row, mods = None, (0, 0, 0, 0, 0)
+    elif list(bn.shape) == [1, 1, c] and bn.dtype == ttnn.float32 and bn.layout == ttnn.TILE_LAYOUT:
+        # the bias row as a full (32, C) block: tile column j of every output row reads its page j
+        row = ttnn.repeat(bn, (1, TILE, 1))
+        mods = (0, c // TILE, 0, 0, 0)
+    else:
+        return None
+    n_tiles = 1
+    for d in s[:-2]:
+        n_tiles *= d
+    n_tiles *= (s[-2] // TILE) * (c // TILE)
+    ins = [acc, bn if row is None else row, f0, e_neg, tol]
+    y = ttnn.empty_like(acc)
+    ttnn.generic_op(ins + [y], _program(ins, y, n_tiles, compute=_VOTE_COMPUTE, mods=mods))
+    for t in ins + ([] if row is None else [bn]):
         ttnn.deallocate(t)
     return y

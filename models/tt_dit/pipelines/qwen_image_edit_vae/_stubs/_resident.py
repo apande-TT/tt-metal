@@ -132,6 +132,12 @@ def attach_block_ports(stack, device, parallel_config, ccl_manager, torch_stack=
 #                median of (exact, plain, negated) where it does not.
 
 
+# Optional fused kernel for mode "exact"'s vote tail: VOTE_TAIL(acc, bn, f0, e_neg, tol) -> the res below
+# (bit-identical), consuming (deallocating) its operands; bn the (n - 1) b bias to take off acc (output-shaped,
+# or a (1, 1, C) row). None for a shape it does not take -- then the ttnn spelling runs.
+VOTE_TAIL = None
+
+
 def _flat_rows(t):
     """Whether t folds to (1, rows, C) as a view: row-major with tile-aligned C (its pages stay C wide;
     the (n/32, 32) view would re-page it, a full copy)."""
@@ -284,10 +290,13 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
                     acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
             if guarded:
                 acc, n = ttnn.add(acc, run_on(lo)), n + 1
-        e_x = ttnn.subtract(acc, ttnn.multiply(b, float(n - 1)))  # each run added the bias once
-        med = ttnn.maximum(ttnn.minimum(e_x, f0), ttnn.minimum(ttnn.maximum(e_x, f0), e_neg))
+        bn = ttnn.multiply(b, float(n - 1))  # each run added the bias once
         tol = ttnn.add(ttnn.multiply(ttnn.abs(e_neg), 3e-3), 1e-3)
-        res = ttnn.where(ttnn.le(ttnn.abs(ttnn.subtract(e_x, e_neg)), tol), e_x, med)
+        res = None if VOTE_TAIL is None else VOTE_TAIL(acc, bn, f0, e_neg, tol)
+        if res is None:
+            e_x = ttnn.subtract(acc, bn)
+            med = ttnn.maximum(ttnn.minimum(e_x, f0), ttnn.minimum(ttnn.maximum(e_x, f0), e_neg))
+            res = ttnn.where(ttnn.le(ttnn.abs(ttnn.subtract(e_x, e_neg)), tol), e_x, med)
     else:
         e_split = ttnn.subtract(ttnn.add(run_on(hi), run_on(lo)), b)
         res = ttnn.maximum(ttnn.minimum(f0, e_neg), ttnn.minimum(ttnn.maximum(f0, e_neg), e_split))

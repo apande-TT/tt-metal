@@ -25,11 +25,12 @@ import torch
 
 import ttnn
 from models.demos.qwen_image_edit.tt import inputs as I
-from models.demos.qwen_image_edit.tt.guard_kernel import guard_tail
+from models.demos.qwen_image_edit.tt.guard_kernel import guard_tail, vote_tail
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
 from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
 from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
+from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import _resident as _vae_resident
 
 # Stages from the HF reference (model_index.json): the Qwen2.5-VL text_encoder is a vision tower + an
 # LM, the vae encodes the condition image and decodes the result, and the transformer is the step the
@@ -101,6 +102,8 @@ class TtQwenImageEditPipeline:
         # the guarded tail (~9 float32 passes per precise product) as one fused kernel, bit-identical, while
         # the text encoder runs (see _fused_tail)
         self.fused_tail = guard_tail if precise else None
+        # likewise the VAE encoder's exact-conv vote tail (~8 float32 passes per conv) while it encodes
+        self.vote_tail = vote_tail if precise else None
         pick = lambda v: layers if v is None else v  # noqa: E731
         self.text_encoder = TtQwenTextEncoder(
             device,
@@ -141,14 +144,20 @@ class TtQwenImageEditPipeline:
         return up
 
     # ---- stages (device only) ----------------------------------------------------------------------
+    @staticmethod
     @contextlib.contextmanager
-    def _fused_tail(self):
-        """The fused guarded-tail kernel for the text encoder's precise products (vision tower and LM)."""
-        prev, _te_attention.GUARD_TAIL = _te_attention.GUARD_TAIL, self.fused_tail
+    def _hook(module, name, fn):
+        """module.name = fn for the duration (a port's optional fused-kernel hook)."""
+        prev = getattr(module, name)
+        setattr(module, name, fn)
         try:
             yield
         finally:
-            _te_attention.GUARD_TAIL = prev
+            setattr(module, name, prev)
+
+    def _fused_tail(self):
+        """The fused guarded-tail kernel for the text encoder's precise products (vision tower and LM)."""
+        return self._hook(_te_attention, "GUARD_TAIL", self.fused_tail)
 
     def vision_encode(self, up):
         with self._fused_tail():
@@ -159,7 +168,8 @@ class TtQwenImageEditPipeline:
             return self.text_encoder.encode_text(up.te, image_embeds)
 
     def vae_encode(self, up):
-        return self.vae.encode(up.vae_image)
+        with self._hook(_vae_resident, "VOTE_TAIL", self.vote_tail):
+            return self.vae.encode(up.vae_image)
 
     def denoise_setup_state(self, up, prompt_embeds, image_latents):
         """Persistent buffers: latents (updated in place), image latents, prompt embeddings, RoPE tables,

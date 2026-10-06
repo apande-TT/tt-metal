@@ -2,7 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Streams the same tile range of the five guarded-tail operands (ex, dn, nn, tol, lo) into CBs c_0..c_4.
+// Streams the same tile range of five float32 tail operands into CBs c_0..c_4 (the guarded tail's ex, dn, nn,
+// tol, lo; the VAE vote tail's acc, bn, f0, e_neg, tol). Operand k reads page i % mod_k when mod_k is nonzero:
+// a (32, C) row block broadcast over every row of tiles (C / 32 tiles per row, so tile i's column is i % mod).
 
 #include <cstdint>
 
@@ -19,6 +21,11 @@ void kernel_main() {
     const uint32_t addr4 = get_arg_val<uint32_t>(4);
     const uint32_t num_tiles = get_arg_val<uint32_t>(5);
     const uint32_t start_id = get_arg_val<uint32_t>(6);
+    const uint32_t mod0 = get_arg_val<uint32_t>(7);
+    const uint32_t mod1 = get_arg_val<uint32_t>(8);
+    const uint32_t mod2 = get_arg_val<uint32_t>(9);
+    const uint32_t mod3 = get_arg_val<uint32_t>(10);
+    const uint32_t mod4 = get_arg_val<uint32_t>(11);
 
     constexpr auto args0 = TensorAccessorArgs<0>();
     constexpr auto args1 = TensorAccessorArgs<args0.next_compile_time_args_offset()>();
@@ -40,11 +47,11 @@ void kernel_main() {
         cb2.reserve_back(1);
         cb3.reserve_back(1);
         cb4.reserve_back(1);
-        noc.async_read(src0, cb0, bytes, {.page_id = i}, {.offset_bytes = 0});
-        noc.async_read(src1, cb1, bytes, {.page_id = i}, {.offset_bytes = 0});
-        noc.async_read(src2, cb2, bytes, {.page_id = i}, {.offset_bytes = 0});
-        noc.async_read(src3, cb3, bytes, {.page_id = i}, {.offset_bytes = 0});
-        noc.async_read(src4, cb4, bytes, {.page_id = i}, {.offset_bytes = 0});
+        noc.async_read(src0, cb0, bytes, {.page_id = mod0 ? i % mod0 : i}, {.offset_bytes = 0});
+        noc.async_read(src1, cb1, bytes, {.page_id = mod1 ? i % mod1 : i}, {.offset_bytes = 0});
+        noc.async_read(src2, cb2, bytes, {.page_id = mod2 ? i % mod2 : i}, {.offset_bytes = 0});
+        noc.async_read(src3, cb3, bytes, {.page_id = mod3 ? i % mod3 : i}, {.offset_bytes = 0});
+        noc.async_read(src4, cb4, bytes, {.page_id = mod4 ? i % mod4 : i}, {.offset_bytes = 0});
         noc.async_read_barrier();
         cb0.push_back(1);
         cb1.push_back(1);
