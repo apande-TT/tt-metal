@@ -310,6 +310,9 @@ EXACT_BMM_L1_BYTES = 0
 EXACT_CORE_GRID = None
 # core grid for split_linear's exact-lane products (None: ttnn.linear picks its own)
 EXACT_LINEAR_CORE_GRID = None
+# lane patterns of the vision attention's P @ V exact-lane product (None: the attention's own `exact`,
+# i.e. the median of all LANE_PATTERNS; e.g. ("strided",): one pattern, no vote)
+VISION_PV_PATTERNS = None
 # hand-shaped 2-D multicast config for those products on LINEAR_CORE_GRID (False: core_grid only;
 # ttnn then picks per_core_N=19 for the LM MLP, i.e. 1x1 subblocks and 2-row output blocks that
 # re-stream the weight per block)
@@ -595,7 +598,8 @@ class TtVisionAttention:
         mx = ttnn.max(scores, dim=-1, keepdim=True)
         e = ttnn.exp(ttnn.subtract(scores, mx))
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
-        o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex, limbs=L)
+        pv_ex = VISION_PV_PATTERNS if ex and VISION_PV_PATTERNS else ex
+        o = split_matmul(probs, v, compute_kernel_config=cfg, exact=pv_ex, limbs=L)
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.reshape(o, (n, 1, s_pad, loc))
         out = split_linear(o, self.wproj, compute_kernel_config=cfg, exact=ex, limbs=L)
