@@ -1114,7 +1114,7 @@ def _fused_swiglu(h, w_gu, w_ttl=None, memory_config=None, w_cpp=None):
     grid = ttnn.CoreCoord(int(grid.x), -(-(rows // 32) // share))
     # A share of <= 8 tiles fits one M block, so each core streams its weight columns ONCE.
     m_blk = share if share <= 8 else -(-share // 2)
-    # At <= 2 M tiles a core the bf4_b weight's blocks are small enough for 8-tile K blocks
+    # At <= 2 M tiles a core the bf8_b weight's blocks are small enough for 8-tile K blocks
     # (half the K steps of 4) within the ~1 MB of L1 that still traces.
     wide = m_blk <= 2
     w_c = w_cpp if w_cpp is not None else w_gu
@@ -1189,19 +1189,22 @@ def build(device, torch_module):
         _from_torch((p.weight.detach().float().transpose(0, 1) * g_post_t).contiguous(), device, dtype=ttnn.bfloat8_b)
         for p in (mlp.gate_proj, mlp.up_proj)
     )
-    # Prefill's fused SwiGLU weight, bf4_b against the bf16 norm output (minimal_matmul takes mixed
-    # dtypes); decode keeps the separate gate/up above for its float32 activation.
+    # Prefill's fused SwiGLU weight, bf8_b against the bf16 norm output (minimal_matmul takes mixed
+    # dtypes); decode keeps the separate gate/up above for its float32 activation. NOT bf4_b: the
+    # 2026-09-25 bf8_b->bf4_b lever (cc7e1259a4b) inflated the residual stream's massive channels
+    # (0, 1, 2) by 1-4 % over the 26 layers, so the final norm scaled every other channel DOWN --
+    # prefill hidden |tt|/|hf| 0.9895, PCC 0.9931; back on bf8_b it is 0.9994 / 0.9992 (2026-10-06).
     gu_pairs = _swiglu_pairs(
         mlp.gate_proj.weight.detach().float().transpose(0, 1) * g_post_t,
         mlp.up_proj.weight.detach().float().transpose(0, 1) * g_post_t,
     )
-    w_gu = _from_torch(gu_pairs, device, dtype=ttnn.bfloat4_b)
+    w_gu = _from_torch(gu_pairs, device, dtype=ttnn.bfloat8_b)
     # The short prefix's C++ SwiGLU reads a copy with its tile columns re-laid bank-contiguous per core; the same
     # conversion of the same pairs, so every tile is minimal_matmul's.
     w_gu_cpp = cpp_swiglu_mm.relayout(
         gu_pairs,
         device,
-        lambda t: _from_torch(t, device, dtype=ttnn.bfloat4_b),
+        lambda t: _from_torch(t, device, dtype=ttnn.bfloat8_b),
         18,
         int(device.compute_with_storage_grid_size().x),
         8,

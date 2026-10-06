@@ -436,7 +436,7 @@ def _fused_swiglu(h, w_gu, w_ttl=None):
     grid = ttnn.CoreCoord(int(grid.x), -(-(rows // 32) // share))
     # A share of <= 8 tiles fits one M block, so each core streams its weight columns ONCE.
     m_blk = share if share <= 8 else -(-share // 2)
-    # At <= 2 M tiles a core the bf4_b weight's blocks are small enough for 8-tile K blocks
+    # At <= 2 M tiles a core the bf8_b weight's blocks are small enough for 8-tile K blocks
     # (half the K steps of 4) within the ~1 MB of L1 that still traces.
     wide = m_blk <= 2
     cfg = ttnn.MinimalMatmulConfig(
@@ -466,15 +466,17 @@ def build(device, torch_module):
     # bf8_b halves the weight both the prefill (LoFi) and decode down projections unpack.
     w_down = _from_torch(mlp.down_proj.weight.detach().transpose(0, 1).contiguous(), device, dtype=ttnn.bfloat8_b)
     w_down_cpp = cpp_down_dec.shard(mlp.down_proj.weight.detach().transpose(0, 1).contiguous(), device)
-    # Prefill's fused SwiGLU weight, bf4_b against the bf16 norm output; the float32 decode
-    # activation keeps the separate pair above.
+    # Prefill's fused SwiGLU weight, bf8_b against the bf16 norm output; the float32 decode
+    # activation keeps the separate pair above. NOT bf4_b (the 2026-09-25 lever cc7e1259a4b):
+    # see layer.py -- it inflated the residual stream's massive channels and the final norm then
+    # attenuated everything else (prefill hidden PCC 0.9931 -> 0.9992 back on bf8_b, 2026-10-06).
     w_gu = _from_torch(
         _swiglu_pairs(
             mlp.gate_proj.weight.detach().float().transpose(0, 1),
             mlp.up_proj.weight.detach().float().transpose(0, 1),
         ),
         device,
-        dtype=ttnn.bfloat4_b,
+        dtype=ttnn.bfloat8_b,
     )
     w_ttl = _ttl_swiglu_weights(
         mlp.gate_proj.weight.detach().float().transpose(0, 1),
