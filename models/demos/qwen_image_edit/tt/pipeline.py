@@ -25,6 +25,7 @@ import torch
 
 import ttnn
 from models.demos.qwen_image_edit.tt import inputs as I
+from models.demos.qwen_image_edit.tt import round_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import guard_tail, vote_tail
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
@@ -104,6 +105,10 @@ class TtQwenImageEditPipeline:
         self.fused_tail = guard_tail if precise else None
         # likewise the VAE encoder's exact-conv vote tail (~8 float32 passes per conv) while it encodes
         self.vote_tail = vote_tail if precise else None
+        # and its hi limbs' bf16 rounding, one pass instead of two typecasts
+        self.round_bf16 = round_ttl.round_bf16 if precise else None
+        if precise:
+            round_ttl.prepare(device)
         pick = lambda v: layers if v is None else v  # noqa: E731
         self.text_encoder = TtQwenTextEncoder(
             device,
@@ -168,7 +173,9 @@ class TtQwenImageEditPipeline:
             return self.text_encoder.encode_text(up.te, image_embeds)
 
     def vae_encode(self, up):
-        with self._hook(_vae_resident, "VOTE_TAIL", self.vote_tail):
+        with self._hook(_vae_resident, "VOTE_TAIL", self.vote_tail), self._hook(
+            _vae_resident, "ROUND_BF16", self.round_bf16
+        ):
             return self.vae.encode(up.vae_image)
 
     def denoise_setup_state(self, up, prompt_embeds, image_latents):

@@ -136,6 +136,10 @@ def attach_block_ports(stack, device, parallel_config, ccl_manager, torch_stack=
 # (bit-identical), consuming (deallocating) its operands; bn the (n - 1) b bias to take off acc (output-shaped,
 # or a (1, 1, C) row). None for a shape it does not take -- then the ttnn spelling runs.
 VOTE_TAIL = None
+# Optional fused kernel for the bf16 rounding of a float32 tile tensor, as float32 (the hi limb):
+# ROUND_BF16(t) -> typecast(typecast(t, bf16), float32) in one pass, t untouched; None for a shape it does not
+# take.
+ROUND_BF16 = None
 
 
 def _flat_rows(t):
@@ -216,7 +220,10 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
         return ttnn.reshape(ttnn.to_layout(u, like.layout), list(like.shape))
 
     # each run's limb / lane is a transient of the operand's tile copy
-    f32 = lambda t: ttnn.typecast(ttnn.typecast(t, ttnn.bfloat16), ttnn.float32)  # noqa: E731
+    def f32(t):  # t rounded to bf16, as float32
+        y = None if ROUND_BF16 is None else ROUND_BF16(t)
+        return ttnn.typecast(ttnn.typecast(t, ttnn.bfloat16), ttnn.float32) if y is None else y
+
     hi, lo = f32, lambda t: ttnn.subtract(t, f32(t))
     if mode == "split":
         # the exact-product split alone, op(x_hi) + op(x_lo) - b: two runs, no plain run and no vote
