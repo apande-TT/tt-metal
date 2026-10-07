@@ -670,9 +670,28 @@ def _prefill_sdpa(q, k, v, kv_cache):
         )
         return a, k, v
     # The attention output's only reader is the head merge right after: L1.
-    a = ttnn.transformer.scaled_dot_product_attention(
-        q, k, v, is_causal=True, scale=1.0, program_config=_sdpa_cfg(q), memory_config=ttnn.L1_MEMORY_CONFIG
-    )
+    # A ragged batch left-/right-pads each body to the common width and stages an additive
+    # [1, 1, S, S] (or [B, 1, S, S]) mask that closes every row's pad columns -- causal folded
+    # IN, so is_causal is off. With no pad (the graduated case) there is no mask and this is the
+    # unchanged is_causal path, bit-identical to what the per-component PCC test graduated on.
+    # (check_mask_equiv.py: is_causal == additive-causal-mask at PCC 1.0, and an additive pad
+    # mask == physically dropping those keys at PCC 1.0.)
+    prefill_mask = kv_cache.get("prefill_mask") if kv_cache is not None else None
+    if prefill_mask is not None:
+        a = ttnn.transformer.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=False,
+            attn_mask=prefill_mask,
+            scale=1.0,
+            program_config=_sdpa_cfg(q),
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+    else:
+        a = ttnn.transformer.scaled_dot_product_attention(
+            q, k, v, is_causal=True, scale=1.0, program_config=_sdpa_cfg(q), memory_config=ttnn.L1_MEMORY_CONFIG
+        )
     if phase == "stash":
         kv_cache["prefix_kv"] = (k, v)
         return a, None, None

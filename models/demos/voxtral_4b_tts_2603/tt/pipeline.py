@@ -41,6 +41,7 @@ which gives `[prefill, decode]`; the model card's `pipeline_tag: text-to-speech`
 repeated stack -- without a stage of its own there would be nowhere to put that stack's depth
 knob, and one number cannot describe a three-section model.
 """
+
 from __future__ import annotations
 
 import os
@@ -230,6 +231,7 @@ class VoxtralTTSPipeline:
         max_frames=None,
         collect=False,
         voice=None,
+        pad_mask=None,
     ):
         """THE REAL TASK: tokenized text -> a 24 kHz waveform, all on device.
 
@@ -302,8 +304,8 @@ class VoxtralTTSPipeline:
             # Everything below runs from the PRODUCTION prefill -- the one the traced stages run,
             # whose last block computes only the rows read out. With `collect`, a whole-prompt
             # prefill runs first for the per-stage check's hidden state; the second re-seeds the cache.
-            prefill_hidden = self.text.prefill_voiced(ids_tt, voice)[0] if collect else None
-            _, llm_hidden = self.text.prefill_voiced(ids_tt, voice, need_hidden=False)
+            prefill_hidden = self.text.prefill_voiced(ids_tt, voice, pad_mask=pad_mask)[0] if collect else None
+            _, llm_hidden = self.text.prefill_voiced(ids_tt, voice, need_hidden=False, pad_mask=pad_mask)
 
         frames, diagnostics = [], []
         # The stop test is accumulated ON DEVICE. `finished |= semantic == stop_id` in torch would

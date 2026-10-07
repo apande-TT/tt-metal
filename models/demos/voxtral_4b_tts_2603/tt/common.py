@@ -288,11 +288,27 @@ def available_voices(model_id: str = HF_MODEL_ID) -> dict:
     return dict(((meta.get("audio") or {}).get("voice_num_audio_tokens") or {}))
 
 
-def build_voice_prompt(texts, voice: str, model_id: str = HF_MODEL_ID):
+_PAD_ID = 0
+
+
+def build_voice_prompt(
+    texts,
+    voice: str,
+    model_id: str = HF_MODEL_ID,
+    bodies=None,
+    pad: bool = False,
+    return_pad_mask: bool = False,
+    pad_to: int = None,
+):
     """`(input_ids [B, S], audio_mask [B, S] bool, voice_embedding [N, hidden])` for `texts`.
 
     Every row carries the same voice, so the placeholder block is the same width on each and the
-    batch stays rectangular without padding.
+    batch stays rectangular. With `pad=False` the text bodies must already tokenize to one common
+    width (the graduated, unpadded batch). With `pad=True` a RAGGED batch is right-padded: each
+    body is extended to the batch's max body width with `_PAD_ID`, and the pad columns are reported
+    through `pad_mask` so the prefill/decode attention masks can close them -- so a pad token is
+    never attended and its id is irrelevant. When `return_pad_mask=True` a 4th value `pad_mask
+    [B, S]` (True on the padded body columns of the full prompt) is appended to the tuple.
     """
     tok = load_tokenizer(model_id)
     emb = load_voice_embedding(voice, model_id)
@@ -305,24 +321,41 @@ def build_voice_prompt(texts, voice: str, model_id: str = HF_MODEL_ID):
     n_audio = int(emb.shape[0])
 
     bos = tok.bos_id if hasattr(tok, "bos_id") else 1
-    bodies = [tok.encode(text, bos=False) for text in texts]
+    if bodies is None:
+        bodies = [tok.encode(text, bos=False) for text in texts]
 
-    # NO PADDING. The prefill has no per-row padding mask, so a pad token is CONTENT to the model --
-    # and a BOS run in the middle of the prompt measurably destroys the conditioning (see
-    # SPEECH_TEXTS). A ragged batch is refused rather than silently degraded.
-    widths = sorted({len(b) for b in bodies})
-    if len(widths) != 1:
+    # A pad token is CONTENT to a plain causal prefill -- and a BOS run mid-prompt measurably
+    # destroys the conditioning (see SPEECH_TEXTS). So with pad=False a ragged batch is refused;
+    # with pad=True the pad columns are reported and the attention mask closes them, so the model
+    # never attends a pad and its id does not matter.
+    lens = [len(b) for b in bodies]
+    widths = sorted(set(lens))
+    if len(widths) != 1 and not pad:
         raise ValueError(f"speech texts must tokenize to one common length for an unpadded batch; got widths {widths}")
-    rows = [
-        [bos, _BEGIN_AUDIO_ID]
-        + [_AUDIO_ID] * n_audio
-        + [_NEXT_AUDIO_TEXT_ID]
-        + body
-        + [_REPEAT_AUDIO_TEXT_ID, _BEGIN_AUDIO_ID]
-        for body in bodies
-    ]
+    # Pad to a FIXED canonical width (the tuned shape) when asked, so the device shape never
+    # changes -- the stubs' L1 placement is hand-tuned for SPEECH_TEXTS' width and any OTHER
+    # width overflows L1. Longer text is split into <= pad_to-token chunks upstream.
+    width = int(pad_to) if pad_to is not None else max(lens)
+    if max(lens) > width:
+        raise ValueError(
+            f"a body tokenizes to {max(lens)} > pad_to={width}; split long text into <= {width}-token chunks"
+        )
+    prefix = [bos, _BEGIN_AUDIO_ID] + [_AUDIO_ID] * n_audio + [_NEXT_AUDIO_TEXT_ID]
+    suffix = [_REPEAT_AUDIO_TEXT_ID, _BEGIN_AUDIO_ID]
+    body_start = len(prefix)
+    rows, pads = [], []
+    for body in bodies:
+        npad = width - len(body)
+        padded_body = list(body) + [_PAD_ID] * npad
+        rows.append(prefix + padded_body + suffix)
+        # pad columns live at the END of the body region, [body_start + len(body), body_start + width)
+        pad_row = [False] * (body_start + len(body)) + [True] * npad + [False] * len(suffix)
+        pads.append(pad_row)
     input_ids = torch.tensor(rows, dtype=torch.long)
-    return input_ids, input_ids == _AUDIO_ID, emb
+    audio_mask = input_ids == _AUDIO_ID
+    if return_pad_mask:
+        return input_ids, audio_mask, emb, torch.tensor(pads, dtype=torch.bool)
+    return input_ids, audio_mask, emb
 
 
 def build_batch_inputs(batch: int = DEFAULT_BATCH, seq_len: int = DEFAULT_SEQ_LEN, model_id: str = HF_MODEL_ID):

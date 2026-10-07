@@ -49,6 +49,7 @@ cache leaves the prefill arithmetic bit-for-bit what the per-component PCC tests
 
 This module NEVER opens a device.
 """
+
 from __future__ import annotations
 
 import copy
@@ -57,6 +58,7 @@ import torch
 
 import ttnn
 from models.demos.voxtral_4b_tts_2603.tt import common, cpp_fold_rows, cpp_rope_dec, cpp_row_tile
+
 
 def _keep_none(h):
     """The prefix chain's last-block `trim`: none of its rows are read, only its stashed k/v, so
@@ -146,13 +148,13 @@ def _resid_memory(h):
     return ttnn.L1_MEMORY_CONFIG if rows <= 640 else None
 
 
-
 def _row_tile(row):
     """A row-major `[1, 1, 1, W]` row as TILE: tt/cpp_row_tile (the row into row 0 of zeroed tiles, many cores) in
     place of the one-core tilize-with-padding -- the same bits."""
     if cpp_row_tile.supports(row):
         return cpp_row_tile.apply(row)
     return ttnn.to_layout(row, ttnn.TILE_LAYOUT)
+
 
 class TextBlock:
     """ONE decoder layer, in whichever of the four interchangeable kinds built it.
@@ -259,6 +261,7 @@ class TextStack:
         # prefix and the tail; decode then writes position p at slot p + gap through this table.
         self._slot_gap = 0
         self._slot_mask = None
+        self._pad_cols = None
         # Positions for the decode gather, staged ONCE at build: row p is `[p] * max_batch`, so a
         # step selects its own row with a `ttnn.slice` and the forward makes no host call at all.
         self.max_batch = int(common.DEFAULT_BATCH)
@@ -497,7 +500,7 @@ class TextStack:
             }
         }
 
-    def prefill_voiced(self, input_ids_tt, voice, position_ids_tt=None, real_len=None, need_hidden=True):
+    def prefill_voiced(self, input_ids_tt, voice, position_ids_tt=None, real_len=None, need_hidden=True, pad_mask=None):
         """Prefill with the speaker's voice substituted into the prompt's `[AUDIO]` rows, ON DEVICE.
 
         Substitution, not concatenation: the ids and therefore the positions and the causal mask
@@ -524,7 +527,7 @@ class TextStack:
         voiced = ttnn.add(kept, voice["placed"])
         ttnn.deallocate(kept)
         try:
-            return self.prefill_embeds(voiced, position_ids_tt=position_ids_tt, real_len=real_len)
+            return self.prefill_embeds(voiced, position_ids_tt=position_ids_tt, real_len=real_len, pad_mask=pad_mask)
         finally:
             ttnn.deallocate(voiced)
 
@@ -557,7 +560,7 @@ class TextStack:
         finally:
             ttnn.deallocate(embeds)
 
-    def prefill_embeds(self, embeds, position_ids_tt=None, real_len=None):
+    def prefill_embeds(self, embeds, position_ids_tt=None, real_len=None, pad_mask=None):
         """`[B, 1, S, 3072]` -> `(hidden [B, 1, real, 3072], last_hidden [B, 3072])`.
 
         The TTS decode feeds audio-token EMBEDDINGS rather than ids, so the embedding table is not
@@ -579,7 +582,41 @@ class TextStack:
         # `ttnn.slice` of its own build-time table, and freeing a view of that would take the
         # table with it.
         rope = self._prefill_rope(embeds, position_ids_tt)
-        out = self._run_chain(embeds, rope)
+        # RAGGED BATCH: a `pad_mask [B, seq]` (True on padded KEY columns) turns the plain causal
+        # prefill into an explicit additive [B, 1, seq, seq] mask -- causal folded in, plus every
+        # row's pad columns closed -- so a padded token is never attended even though the body it
+        # pads sits mid-prompt. The per-row pad columns are kept for decode too. With no pad_mask
+        # this is the untouched is_causal prefill (check_mask_equiv.py: is_causal == additive PCC 1.0).
+        self._pad_cols = None
+        prefill_mask = None
+        if pad_mask is not None:
+            pm = pad_mask.to(torch.bool)
+            if int(pm.shape[0]) != batch:
+                raise ValueError(f"pad_mask batch {int(pm.shape[0])} != {batch}")
+            if int(pm.shape[1]) < seq:
+                pm = torch.cat([pm, torch.ones(batch, seq - int(pm.shape[1]), dtype=torch.bool)], dim=1)
+            elif int(pm.shape[1]) > seq:
+                pm = pm[:, :seq]
+            add = torch.zeros(batch, 1, seq, seq, dtype=torch.float32)
+            add.masked_fill_(torch.ones(seq, seq, dtype=torch.bool).triu(1).reshape(1, 1, seq, seq), float("-inf"))
+            add.masked_fill_(pm.reshape(batch, 1, 1, seq), float("-inf"))
+            prefill_mask = ttnn.from_torch(add, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+            cap = int(self.kv_capacity)
+            padcol = torch.zeros(batch, cap, dtype=torch.float32)
+            w = min(seq, cap)
+            padcol[:, :w].masked_fill_(pm[:, :w], -1e9)
+            self._pad_cols = ttnn.from_torch(
+                padcol, dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device
+            )
+            for block in self.blocks:
+                block.kv["prefill_mask"] = prefill_mask
+        try:
+            out = self._run_chain(embeds, rope)
+        finally:
+            if prefill_mask is not None:
+                for block in self.blocks:
+                    block.kv.pop("prefill_mask", None)
+                ttnn.deallocate(prefill_mask)
         self._slot_gap = 0
         self._slot_mask = None
         # The REAL length, so the first decode step writes slot `real` and flash-decode's
@@ -787,6 +824,15 @@ class TextStack:
         span = min(cap, _tile_ceil(position + self._slot_gap + 1))
         table = self._decode_mask if self._slot_mask is None else self._slot_mask
         mask_row = _row_tile(ttnn.reshape(ttnn.slice(table, [position, 0], [position + 1, span]), [1, 1, 1, span]))
+        if getattr(self, "_pad_cols", None) is not None:
+            # RAGGED BATCH: add the per-row pad columns so a padded KEY is masked for every decode
+            # step too. Broadcasts [1,1,1,span] + [B,1,1,span] -> [B,1,1,span]; the stub's
+            # `ttnn.add(scores, mask_row)` then masks per batch row.
+            pad_row = ttnn.to_layout(
+                ttnn.reshape(ttnn.slice(self._pad_cols, [0, 0], [batch, span]), [batch, 1, 1, span]),
+                ttnn.TILE_LAYOUT,
+            )
+            mask_row = ttnn.add(mask_row, pad_row)
         # `rotate_half(x) * sin == cat(x2, x1) * cat(-sin1, sin2)`: the sign rides on a sin table
         # built once per step, so no layer negates half its q and k.
         sin = rope[1]
@@ -905,6 +951,7 @@ class TextStack:
                 except Exception:  # noqa: BLE001 - an already-freed buffer is fine to skip
                     pass
         self.filled = 0
+        self._pad_cols = None
 
     # ---- introspection -----------------------------------------------------------------
 
@@ -986,9 +1033,11 @@ def build_text_stack(device, hf_model, layers=None, counter=None, kv_capacity=No
                 kind,
                 index,
                 parts,
-                stubs=(kind,)
-                if kind in ("layer", "mistral_decoder_layer")
-                else ("mistral_r_m_s_norm", attn_name, mlp_name),
+                stubs=(
+                    (kind,)
+                    if kind in ("layer", "mistral_decoder_layer")
+                    else ("mistral_r_m_s_norm", attn_name, mlp_name)
+                ),
             )
         )
 
