@@ -240,6 +240,9 @@ def _col_norms(w, transpose_b=False, cache=True):
 # shape it does not take -- then without calling rest_fn, so the ttnn spelling below keeps its own order (the
 # trailing product formed after the guard: the denoiser has no room to hold it through the guard).
 GUARD_TAIL = None
+# Optional fused kernel for the strided lane split: LANE_SPLIT(lead) -> the EXACT_LANES lanes of the bf16 lead
+# limb (each equal to lead * its strided mask), or None for a shape it does not take.
+LANE_SPLIT = None
 
 
 def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None):
@@ -267,8 +270,11 @@ def _guarded_sums(mms, parts, b_norms):
     a separate _guarded_sum would give."""
     lead = parts[0]
     exs = [None] * len(mms)
-    for m in _lane_masks(lead.device(), lead.shape[-1], lead.dtype, "strided"):
-        lane = ttnn.multiply(lead, m)
+    lanes = None if LANE_SPLIT is None else LANE_SPLIT(lead)
+    if lanes is None:  # one lane at a time
+        masks = _lane_masks(lead.device(), lead.shape[-1], lead.dtype, "strided")
+        lanes = (ttnn.multiply(lead, m) for m in masks)
+    for lane in lanes:
         for i, mm in enumerate(mms):
             t = mm(lane)
             exs[i] = t if exs[i] is None else ttnn.add(exs[i], t)

@@ -25,7 +25,7 @@ import torch
 
 import ttnn
 from models.demos.qwen_image_edit.tt import inputs as I
-from models.demos.qwen_image_edit.tt import round_ttl
+from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import guard_tail, vote_tail
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
@@ -103,6 +103,10 @@ class TtQwenImageEditPipeline:
         # the guarded tail (~9 float32 passes per precise product) as one fused kernel, bit-identical, while
         # the text encoder runs (see _fused_tail)
         self.fused_tail = guard_tail if precise else None
+        # and their lead limb's 8 exact lanes formed in one pass
+        self.lane_split = lanes_ttl.lanes8 if precise else None
+        if precise:
+            lanes_ttl.prepare(device)
         # likewise the VAE encoder's exact-conv vote tail (~8 float32 passes per conv) while it encodes
         self.vote_tail = vote_tail if precise else None
         # and its hi limbs' bf16 rounding, one pass instead of two typecasts
@@ -160,9 +164,14 @@ class TtQwenImageEditPipeline:
         finally:
             setattr(module, name, prev)
 
+    @contextlib.contextmanager
     def _fused_tail(self):
-        """The fused guarded-tail kernel for the text encoder's precise products (vision tower and LM)."""
-        return self._hook(_te_attention, "GUARD_TAIL", self.fused_tail)
+        """The fused guarded-tail and lane-split kernels for the text encoder's precise products (vision
+        tower and LM)."""
+        with self._hook(_te_attention, "GUARD_TAIL", self.fused_tail), self._hook(
+            _te_attention, "LANE_SPLIT", self.lane_split
+        ):
+            yield
 
     def vision_encode(self, up):
         with self._fused_tail():
