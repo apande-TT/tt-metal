@@ -54,11 +54,45 @@ _BOX_TARGET = {
     "GalaxyBH": ("blackhole", "p150x4", "P150x4"),
     "P150": ("blackhole", "p150", "P150"),
     "P300": ("blackhole", "p300", "P300"),
-    "T3K": ("wormhole_b0", "n300x4", "N300x4"),
+    "T3K": ("wormhole_b0", "n300x4", "T3K"),
     "GalaxyWH": ("wormhole_b0", "galaxy", "TG"),
     "N150": ("wormhole_b0", "n150", "N150"),
     "N300": ("wormhole_b0", "n300", "N300"),
 }
+
+# The vLLM plugin (vllm_tt_plugin/utils/dp_discovery.py) accepts ONLY these mesh_device labels, or a
+# literal "(rows, cols)" tuple; anything else raises at manifest-load. Keep this in sync with it.
+_PLUGIN_MESH = {
+    "BH-Galaxy",
+    "N150",
+    "N150x4",
+    "N300",
+    "P100",
+    "P150",
+    "P150x2",
+    "P150x4",
+    "P150x8",
+    "P300",
+    "P300x2",
+    "QB2",
+    "T3K",
+    "TG",
+}
+
+
+def _validate_mesh_device(mesh_device: str) -> None:
+    """Raise before publishing if mesh_device is not a value the vLLM plugin will accept."""
+    import re as _re
+
+    if mesh_device in _PLUGIN_MESH:
+        return
+    if _re.fullmatch(r"\(\s*\d+\s*,\s*\d+\s*\)", str(mesh_device)):
+        return
+    raise ValueError(
+        "mesh_device %r is not accepted by the vLLM plugin -- expected one of %s or a '(rows, cols)' "
+        "tuple. Fix the box->mesh mapping or pass --mesh with a valid value."
+        % (mesh_device, ", ".join(sorted(_PLUGIN_MESH)))
+    )
 
 
 def _box_from_env(env: dict | None) -> str | None:
@@ -135,6 +169,7 @@ def _write_tt_model_yaml(
             "no serve target: the run's detected hardware (%s) is no single known box and no --box / "
             "--arch / --hardware / --mesh was given" % (state.get("env") or {}).get("arch")
         )
+    _validate_mesh_device(mesh_device)
     thr = state.get("throughput") or {}
     sv = state.get("serving") or {}
     pt = sv.get("per_token") or {}
@@ -163,6 +198,10 @@ def _write_tt_model_yaml(
         f"  tt_metal: {checkout}",
         "  code:",
         "    - models/common",
+        # The vLLM adapter subclasses a base generator from models/tt_transformers/tt/generator_vllm
+        # (initialize_vllm_model etc.), so that package MUST be in the image or the import fails at
+        # serve time and the engine dies with AttributeError.
+        "    - models/tt_transformers",
         f"    - models/demos/{slug}",
         '  ubuntu: "22.04"',
         '  python: "3.12"',
@@ -468,6 +507,39 @@ def _detect_arch_and_type(demo_dir: Path) -> tuple[str | None, str | None]:
         arch = (d.get("architectures") or [None])[0]
         if arch:
             return arch, d.get("model_type")
+    return None, None
+
+
+def _detect_mistral_format(demo_dir, model_root, weights) -> tuple:
+    """Architecture for a MISTRAL-FORMAT native checkpoint, which ships params.json (+
+    consolidated.safetensors / tekken.json) and NO HF config.json -- so _detect_arch_and_type finds
+    nothing. Such a checkpoint is a Mistral causal-LM backbone, so report MistralForCausalLM (a stock
+    generator) and the adapter can be scaffolded like any model. Looks in the demo, the model root,
+    then the (cached) weights repo. Returns (arch, model_type) or (None, None)."""
+    import glob as _g
+
+    cands = []
+    for base in (demo_dir, model_root):
+        if base:
+            cands += _g.glob(str(Path(base) / "**" / "params.json"), recursive=True)
+    if not cands and weights:
+        try:
+            from huggingface_hub import snapshot_download
+
+            repo = weights if Path(weights).is_dir() else snapshot_download(weights, allow_patterns=["params.json"])
+            p = Path(repo) / "params.json"
+            if p.is_file():
+                cands.append(str(p))
+        except Exception:
+            pass
+    for p in cands:
+        try:
+            d = json.loads(Path(p).read_text())
+        except Exception:
+            continue
+        # mistral-format spec markers, and NOT an HF config (which carries 'architectures'):
+        if {"dim", "n_layers", "n_heads"} <= set(d) and "architectures" not in d:
+            return "MistralForCausalLM", "mistral"
     return None, None
 
 
@@ -1077,6 +1149,17 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
             arch_det, mtype = _detect_arch_and_type(Path(mr))
     if not arch_det and getattr(args, "hf_arch", None):
         arch_det, mtype = args.hf_arch, None
+    _mistral_fallback = False
+    if not arch_det:
+        # Mistral-format native checkpoints (no HF config.json) -- e.g. Voxtral -- are Mistral
+        # causal-LM backbones; detect them so the adapter still scaffolds and the container builds.
+        _mr2 = (state.get("model") or {}).get("root")
+        arch_det, mtype = _detect_mistral_format(
+            Path(demo_dir), Path(_mr2) if _mr2 else None, getattr(args, "weights", None)
+        )
+        if arch_det:
+            _mistral_fallback = True
+            print(f"  [publish-hf] no HF config.json; detected mistral-format checkpoint -> {arch_det}")
     # Servability is decided by the architecture: a plugin built-in (stock generator) serves; a novel
     # arch gets a scaffolded stub and is NOT servable until an adapter is written. Drives honest card
     # labeling below — the tool never claims a stub package can serve.
@@ -1085,7 +1168,9 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
     servable = True
     if arch_det and not adapter_ready:
         _base_cls, _is_stub_arch = _pick_base_generator(arch_det, mtype)
-        servable = not _is_stub_arch
+        # A mistral-format fallback is an UNVERIFIED backbone guess (no HF config; the real model may
+        # be custom, e.g. a TTS head), so never claim it serves until a real adapter is written.
+        servable = (not _is_stub_arch) and not _mistral_fallback
     if adapter_ready:
         print(f"  [publish-hf] real vLLM adapter detected: {bundle_dir}  (servable — preserved, not scaffolded)")
         if getattr(args, "container", False) and not getattr(args, "vllm_path", None):
@@ -1110,7 +1195,9 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
             checkout, extra, arch_det, mtype, getattr(args, "weights", None), slug
         )
         state_note = (
-            "STUB — not servable until an adapter is written" if is_stub else "stock generator — servable as-is"
+            "STUB — not servable until an adapter is written"
+            if (is_stub or _mistral_fallback)
+            else "stock generator — servable as-is"
         )
         print(f"  [publish-hf] vLLM bundle {'created' if created else 'exists'}: {bpath}  ({state_note})")
 
