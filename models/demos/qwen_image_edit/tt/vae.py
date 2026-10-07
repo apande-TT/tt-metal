@@ -101,7 +101,8 @@ class TtQwenVAE:
         self.batch_factor = rows
         # float32 encoder: the image latents condition every denoising step, and the bf16 encoder's
         # error (image-latent PCC 0.99999) moved the final latents ~10x more than the denoiser's own
-        self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel=True, dtype=ttnn.float32)
+        # whole images per chip (batch over both mesh axes): no halo exchange / width masking at any conv
+        self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel="full", dtype=ttnn.float32)
         self.decoder = qwen_image_decoder3d.build(device, hf_vae.decoder, batch_parallel=True)
         _block_fp32_convs(self.encoder.encoder)
         _block_fp32_convs(self.decoder.decoder)

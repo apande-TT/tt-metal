@@ -39,18 +39,29 @@ class TtQwenImageEncoder3d:
         """batch_parallel: split the batch over mesh axis 0 (DP) instead of partitioning H there. The
         Wan causal conv fuses its temporal front pad into the H halo exchange, and that fused
         neighbor_pad only takes B=1; with H unsplit the pad is a plain ttnn.pad and B > 1 runs.
+        batch_parallel="full": split the batch over BOTH mesh axes (axis 0, then axis 1), so every chip holds
+        whole images: no H or W partition, hence no halo exchange or width masking at any conv. The batch
+        must divide the mesh size.
         dtype: the Wan stack's activation / weight dtype (graduated: bfloat16)."""
         self.device = device
         self.dtype = dtype
         mesh_shape = _mesh_shape(device)
         self.batch_axis = _H_AXIS if (batch_parallel and mesh_shape[_H_AXIS] > 1) else None
+        # mesh axes the batch is split over, in partition order (gathered back in reverse)
+        self.batch_axes = [self.batch_axis] if self.batch_axis is not None else []
+        if batch_parallel == "full" and mesh_shape[_W_AXIS] > 1:
+            self.batch_axes.append(_W_AXIS)
         self.parallel_config = VaeHWParallelConfig(
             height_parallel=ParallelFactor(
                 factor=1 if self.batch_axis is not None else mesh_shape[_H_AXIS], mesh_axis=_H_AXIS
             ),
-            width_parallel=ParallelFactor(factor=mesh_shape[_W_AXIS], mesh_axis=_W_AXIS),
+            width_parallel=ParallelFactor(
+                factor=1 if _W_AXIS in self.batch_axes else mesh_shape[_W_AXIS], mesh_axis=_W_AXIS
+            ),
         )
-        self.batch_factor = mesh_shape[_H_AXIS] if self.batch_axis is not None else 1
+        self.batch_factor = 1
+        for a in self.batch_axes:
+            self.batch_factor *= mesh_shape[a]
         self.ccl_manager = CCLManager(device, topology=ttnn.Topology.Linear, num_links=1)
         self.out_channels = torch_module.conv_out.out_channels
 
@@ -95,9 +106,11 @@ class TtQwenImageEncoder3d:
         if c_pad:
             x = ttnn.pad(x, [(0, 0), (0, 0), (0, 0), (0, 0), (0, c_pad)], value=0.0)
         x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
-        if self.batch_axis is not None:
-            assert B % self.batch_factor == 0, f"batch {B} must divide the {self.batch_factor}-way batch axis"
-            x = ttnn.mesh_partition(x, dim=0, cluster_axis=self.batch_axis)
+        pad_b = -B % self.batch_factor
+        if pad_b:  # zero images up to a multiple of the batch split, dropped from the output below
+            x = ttnn.pad(x, [(0, pad_b), (0, 0), (0, 0), (0, 0), (0, 0)], value=0.0)
+        for a in self.batch_axes:
+            x = ttnn.mesh_partition(x, dim=0, cluster_axis=a)
         if pc.height_parallel.factor > 1:
             x = ttnn.mesh_partition(x, dim=2, cluster_axis=pc.height_parallel.mesh_axis)
         if pc.width_parallel.factor > 1:
@@ -108,12 +121,15 @@ class TtQwenImageEncoder3d:
         tt_feat_idx = [0]
         out, _logical_h, _logical_w = self.encoder(x, H, feat_cache=tt_feat_cache, feat_idx=tt_feat_idx, logical_w=W)
 
-        out = self.ccl_manager.all_gather(out, dim=3, mesh_axis=pc.width_parallel.mesh_axis, use_hyperparams=False)
+        if pc.width_parallel.factor > 1:
+            out = self.ccl_manager.all_gather(out, dim=3, mesh_axis=pc.width_parallel.mesh_axis, use_hyperparams=False)
         if pc.height_parallel.factor > 1:
             out = self.ccl_manager.all_gather(out, dim=2, mesh_axis=pc.height_parallel.mesh_axis, use_hyperparams=False)
-        if self.batch_axis is not None:
-            out = self.ccl_manager.all_gather(out, dim=0, mesh_axis=self.batch_axis, use_hyperparams=False)
+        for a in reversed(self.batch_axes):
+            out = self.ccl_manager.all_gather(out, dim=0, mesh_axis=a, use_hyperparams=False)
 
+        if pad_b:
+            out = ttnn.slice(out, (0, 0, 0, 0, 0), (B,) + tuple(out.shape)[1:])
         out = ttnn.to_layout(out, ttnn.TILE_LAYOUT)
         out = ttnn.permute(out, (0, 4, 1, 2, 3))  # BCTHW
         if out.shape[1] != self.out_channels:
