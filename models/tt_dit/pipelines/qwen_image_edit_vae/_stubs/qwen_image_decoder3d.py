@@ -115,15 +115,21 @@ class TtQwenImageDecoder3d:
         tt_feat_idx = [0]
         out, _logical_h, _logical_w = self.decoder(x, H, feat_cache=tt_feat_cache, feat_idx=tt_feat_idx, logical_w=W)
 
+        # gather with W and C merged into one row: the ROW_MAJOR all_gather of this fp32 3-channel output
+        # (12-byte rows) corrupts it (row 0 of some W-shards came back zero, other pixels off by up to 1.0)
+        ob, ot, oh, ow, oc = out.shape
+        out = ttnn.reshape(out, (ob, ot, oh, ow * oc))
         out = self.ccl_manager.all_gather(out, dim=3, mesh_axis=pc.width_parallel.mesh_axis, use_hyperparams=False)
         if pc.height_parallel.factor > 1:
             out = self.ccl_manager.all_gather(out, dim=2, mesh_axis=pc.height_parallel.mesh_axis, use_hyperparams=False)
+        if self.batch_axis is not None:
+            out = self.ccl_manager.all_gather(out, dim=0, mesh_axis=self.batch_axis, use_hyperparams=False)
+        out = ttnn.reshape(out, (out.shape[0], ot, out.shape[2], out.shape[3] // oc, oc))
+        if pc.height_parallel.factor > 1:
             ob, ot, oh, ow, oc = out.shape
             lh, lw = H * oh // Hp, W * ow // Wp
             if (oh, ow) != (lh, lw):
                 out = ttnn.slice(out, (0, 0, 0, 0, 0), (ob, ot, lh, lw, oc))
-        if self.batch_axis is not None:
-            out = self.ccl_manager.all_gather(out, dim=0, mesh_axis=self.batch_axis, use_hyperparams=False)
 
         out = ttnn.to_layout(out, ttnn.TILE_LAYOUT)
         out = ttnn.permute(out, (0, 4, 1, 2, 3))  # BCTHW
