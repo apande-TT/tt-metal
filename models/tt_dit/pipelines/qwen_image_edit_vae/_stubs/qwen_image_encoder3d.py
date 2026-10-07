@@ -17,21 +17,9 @@ from __future__ import annotations
 
 import ttnn
 from models.tt_dit.models.vae.vae_wan2_1 import WanEncoder3D
-from models.tt_dit.parallel.config import ParallelFactor, VaeHWParallelConfig
 from models.tt_dit.parallel.manager import CCLManager
+from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._batch_split import BatchSplit
 from models.tt_dit.utils.conv3d import aligned_channels, count_convs
-
-# Mesh axis that carries the W partition; the other axis (size 1 on a 1xN mesh) carries H.
-_H_AXIS = 0
-_W_AXIS = 1
-
-
-def _mesh_shape(device):
-    try:
-        shape = tuple(device.shape)
-    except (AttributeError, TypeError):
-        return (1, 1)
-    return shape if len(shape) == 2 else (1, 1)
 
 
 class TtQwenImageEncoder3d:
@@ -45,23 +33,10 @@ class TtQwenImageEncoder3d:
         dtype: the Wan stack's activation / weight dtype (graduated: bfloat16)."""
         self.device = device
         self.dtype = dtype
-        mesh_shape = _mesh_shape(device)
-        self.batch_axis = _H_AXIS if (batch_parallel and mesh_shape[_H_AXIS] > 1) else None
-        # mesh axes the batch is split over, in partition order (gathered back in reverse)
-        self.batch_axes = [self.batch_axis] if self.batch_axis is not None else []
-        if batch_parallel == "full" and mesh_shape[_W_AXIS] > 1:
-            self.batch_axes.append(_W_AXIS)
-        self.parallel_config = VaeHWParallelConfig(
-            height_parallel=ParallelFactor(
-                factor=1 if self.batch_axis is not None else mesh_shape[_H_AXIS], mesh_axis=_H_AXIS
-            ),
-            width_parallel=ParallelFactor(
-                factor=1 if _W_AXIS in self.batch_axes else mesh_shape[_W_AXIS], mesh_axis=_W_AXIS
-            ),
-        )
-        self.batch_factor = 1
-        for a in self.batch_axes:
-            self.batch_factor *= mesh_shape[a]
+        self.split = BatchSplit(device, batch_parallel)
+        self.parallel_config = self.split.parallel_config
+        self.batch_axis = self.split.axes[0] if self.split.axes else None
+        self.batch_factor = self.split.factor
         self.ccl_manager = CCLManager(device, topology=ttnn.Topology.Linear, num_links=1)
         self.out_channels = torch_module.conv_out.out_channels
 
@@ -96,40 +71,19 @@ class TtQwenImageEncoder3d:
     def __call__(self, x, feat_cache=None, feat_idx=None, **_ignored):
         # x: replicated TILE [B, C=3, T, H, W] (BCTHW, like the torch reference).
         B, C, T, H, W = x.shape
-        pc = self.parallel_config
-        assert (
-            H % pc.height_parallel.factor == 0 and W % pc.width_parallel.factor == 0
-        ), f"image {H}x{W} must divide the {pc.height_parallel.factor}x{pc.width_parallel.factor} spatial mesh"
-
         x = ttnn.permute(x, (0, 2, 3, 4, 1))  # BTHWC
         c_pad = aligned_channels(C) - C
         if c_pad:
             x = ttnn.pad(x, [(0, 0), (0, 0), (0, 0), (0, 0), (0, c_pad)], value=0.0)
         x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
-        pad_b = -B % self.batch_factor
-        if pad_b:  # zero images up to a multiple of the batch split, dropped from the output below
-            x = ttnn.pad(x, [(0, pad_b), (0, 0), (0, 0), (0, 0), (0, 0)], value=0.0)
-        for a in self.batch_axes:
-            x = ttnn.mesh_partition(x, dim=0, cluster_axis=a)
-        if pc.height_parallel.factor > 1:
-            x = ttnn.mesh_partition(x, dim=2, cluster_axis=pc.height_parallel.mesh_axis)
-        if pc.width_parallel.factor > 1:
-            x = ttnn.mesh_partition(x, dim=3, cluster_axis=pc.width_parallel.mesh_axis)
+        x, pad_b = self.split.scatter(x)
 
         # Fresh causal-conv cache, exactly as the reference's first (and only) chunk sees it.
         tt_feat_cache = [None] * self.num_convs
         tt_feat_idx = [0]
         out, _logical_h, _logical_w = self.encoder(x, H, feat_cache=tt_feat_cache, feat_idx=tt_feat_idx, logical_w=W)
 
-        if pc.width_parallel.factor > 1:
-            out = self.ccl_manager.all_gather(out, dim=3, mesh_axis=pc.width_parallel.mesh_axis, use_hyperparams=False)
-        if pc.height_parallel.factor > 1:
-            out = self.ccl_manager.all_gather(out, dim=2, mesh_axis=pc.height_parallel.mesh_axis, use_hyperparams=False)
-        for a in reversed(self.batch_axes):
-            out = self.ccl_manager.all_gather(out, dim=0, mesh_axis=a, use_hyperparams=False)
-
-        if pad_b:
-            out = ttnn.slice(out, (0, 0, 0, 0, 0), (B,) + tuple(out.shape)[1:])
+        out = self.split.gather(out, self.ccl_manager, B, pad_b)
         out = ttnn.to_layout(out, ttnn.TILE_LAYOUT)
         out = ttnn.permute(out, (0, 4, 1, 2, 3))  # BCTHW
         if out.shape[1] != self.out_channels:
