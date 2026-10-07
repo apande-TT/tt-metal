@@ -260,19 +260,35 @@ def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None):
     return y if rest_fn is None else ttnn.add(y, rest_fn())
 
 
+def _guarded_sums(mms, parts, b_norms):
+    """EXACT_MODE "guarded" for linears of ONE input: mms[i](p) = p @ w_i; parts = the input's bf16 limbs.
+    The input side (each lane, the negated lead limb, its row norms) is formed once for all the weights,
+    one lane at a time; each weight's own sums run in the same order as alone, so every output is the one
+    a separate _guarded_sum would give."""
+    lead = parts[0]
+    exs = [None] * len(mms)
+    for m in _lane_masks(lead.device(), lead.shape[-1], lead.dtype, "strided"):
+        lane = ttnn.multiply(lead, m)
+        for i, mm in enumerate(mms):
+            t = mm(lane)
+            exs[i] = t if exs[i] is None else ttnn.add(exs[i], t)
+        ttnn.deallocate(lane)
+    neg_lead, a_norm = ttnn.neg(lead), _norm_last(lead)
+    ys = []
+    for i, mm in enumerate(mms):
+        dn = mm(lead)
+        rest = [lambda p=part, mm=mm: mm(p) for part in parts[1:2]]
+        y = _guarded(exs[i], dn, mm(neg_lead), a_norm, b_norms[i], *rest)
+        exs[i] = None
+        for part in parts[2:]:
+            y = ttnn.add(y, mm(part))
+        ys.append(y)
+    return ys
+
+
 def _guarded_sum(mm, parts, b_norm):
     """EXACT_MODE "guarded" for a linear: mm(p) = p @ w; parts = the input's bf16 limbs."""
-    lead = parts[0]
-    ex = None
-    for lane in _lanes(lead, "strided"):
-        t = mm(lane)
-        ex = t if ex is None else ttnn.add(ex, t)
-    dn = mm(lead)
-    rest = [lambda p=part: mm(p) for part in parts[1:2]]
-    y = _guarded(ex, dn, mm(ttnn.neg(lead)), _norm_last(lead), b_norm, *rest)
-    for part in parts[2:]:
-        y = ttnn.add(y, mm(part))
-    return y
+    return _guarded_sums([mm], parts, [b_norm])[0]
 
 
 def _exact_sum(mm, parts):
@@ -361,17 +377,38 @@ def linear_program_config(x, w):
     return _LINEAR_CONFIGS[key]
 
 
-def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2):
-    """float32 x @ bf16 w (+ bias) -> float32. x is carried as `limbs` bf16 parts (exact products). With
-    exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part."""
+def _linear_mm(x, w):
+    """p -> p @ w in float32 for the bf16 parts p of x (the precise linears' matmul)."""
     cfg = precise_config()
-    parts = split_bf16(x, limbs)
     pc = linear_program_config(x, w)
     if pc is not None:  # the hand config's float32 output CB takes the K-step partials in L1 directly
         cfg = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
         )
-    mm = lambda p: ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc)  # noqa: E731
+    return lambda p: ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc)
+
+
+def _add_bias(y, bias):
+    # bias added separately in float32 (the fused bias add of ttnn.linear rounds: 3.1e-4 -> 5.1e-4)
+    return ttnn.add(y, ttnn.typecast(bias, ttnn.float32)) if bias is not None else y
+
+
+def split_linears(x, ws, biases=None, compute_kernel_config=None, exact=True, limbs=2):
+    """[split_linear(x, w, b) for w, b in zip(ws, biases)] (the same values), the input-side work of the
+    guarded mode (limbs, lanes, negation, norms) done once for all of them -- e.g. an MLP's gate and up."""
+    biases = biases or [None] * len(ws)
+    if not (exact and EXACT_MODE == "guarded"):
+        return [split_linear(x, w, b, compute_kernel_config, exact, limbs) for w, b in zip(ws, biases)]
+    parts = split_bf16(x, limbs)
+    ys = _guarded_sums([_linear_mm(x, w) for w in ws], parts, [_col_norms(w) for w in ws])
+    return [_add_bias(y, b) for y, b in zip(ys, biases)]
+
+
+def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2):
+    """float32 x @ bf16 w (+ bias) -> float32. x is carried as `limbs` bf16 parts (exact products). With
+    exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part."""
+    parts = split_bf16(x, limbs)
+    mm = _linear_mm(x, w)
     if exact and EXACT_MODE == "guarded":
         y = _guarded_sum(mm, parts, _col_norms(w))
     elif exact:
@@ -381,8 +418,7 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
         for part in parts:
             t = mm(part)
             y = t if y is None else ttnn.add(y, t)
-    # bias added separately in float32 (the fused bias add of ttnn.linear rounds: 3.1e-4 -> 5.1e-4)
-    return ttnn.add(y, ttnn.typecast(bias, ttnn.float32)) if bias is not None else y
+    return _add_bias(y, bias)
 
 
 def rotate_half(t):

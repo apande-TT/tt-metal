@@ -36,6 +36,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     replicate,
     shard_mapper,
     split_linear,
+    split_linears,
     upload,
     upload_rows,
 )
@@ -132,8 +133,9 @@ class TtVisionMLP:
         if self.precise:
             cfg = self.compute_cfg
             L = getattr(self, "limbs", 2)
-            gate = split_linear(x, self.w_gate, bias=self.b_gate, compute_kernel_config=cfg, limbs=L)
-            up = split_linear(x, self.w_up, bias=self.b_up, compute_kernel_config=cfg, limbs=L)
+            gate, up = split_linears(
+                x, [self.w_gate, self.w_up], biases=[self.b_gate, self.b_up], compute_kernel_config=cfg, limbs=L
+            )
             h = ttnn.multiply(ttnn.silu(gate), up)
             out = split_linear(h, self.w_down, compute_kernel_config=cfg, limbs=L)
             if self.tp > 1:

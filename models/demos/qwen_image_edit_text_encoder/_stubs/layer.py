@@ -33,6 +33,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     rotate_half,
     shard_mapper,
     split_linear,
+    split_linears,
     split_matmul,
     upload,
     upload_rows,
@@ -238,8 +239,7 @@ class TtTextMLP:
         if getattr(self, "precise", False):
             cfg = self.compute_cfg
             ex = getattr(self, "exact", True)
-            gate = split_linear(x, self.w_gate, compute_kernel_config=cfg, exact=ex)
-            up = split_linear(x, self.w_up, compute_kernel_config=cfg, exact=ex)
+            gate, up = split_linears(x, [self.w_gate, self.w_up], compute_kernel_config=cfg, exact=ex)
             out = split_linear(ttnn.multiply(ttnn.silu(gate), up), self.w_down, compute_kernel_config=cfg, exact=ex)
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)
