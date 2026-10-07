@@ -136,7 +136,7 @@ class TtVisionMLP:
             gate, up = split_linears(
                 x, [self.w_gate, self.w_up], biases=[self.b_gate, self.b_up], compute_kernel_config=cfg, limbs=L
             )
-            h = ttnn.multiply(ttnn.silu(gate), up)
+            h = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)])
             out = split_linear(h, self.w_down, compute_kernel_config=cfg, limbs=L)
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)

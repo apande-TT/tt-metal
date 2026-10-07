@@ -240,7 +240,8 @@ class TtTextMLP:
             cfg = self.compute_cfg
             ex = getattr(self, "exact", True)
             gate, up = split_linears(x, [self.w_gate, self.w_up], compute_kernel_config=cfg, exact=ex)
-            out = split_linear(ttnn.multiply(ttnn.silu(gate), up), self.w_down, compute_kernel_config=cfg, exact=ex)
+            h = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)])
+            out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex)
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)
             return out
