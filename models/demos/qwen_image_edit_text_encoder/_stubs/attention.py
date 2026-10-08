@@ -457,6 +457,45 @@ def rotate_half(t):
     return ttnn.concat([ttnn.neg(x2), x1], dim=-1)
 
 
+# Optional program-config hook for split_matmul's batched products: BMM_CONFIG(p, q, transpose_b) -> a program
+# config for p @ q (q transposed when transpose_b), or None (auto).
+BMM_CONFIG = None
+_BMM_CONFIGS = {}
+
+
+def bmm_program_config(p, q, transpose_b=False):
+    """Full-grid config for a batched bf16 product p [..., M, K] @ q [..., K, N] (q [..., N, K] if transpose_b)
+    with float32 output: one batch entry's whole M x N output block per work unit, spread over the whole grid,
+    and the whole K in one step (the K reduction order of each output tile is unchanged). The auto pick for
+    the vision attention products (32 images x 4 heads, 352 tokens) used 36 / 18 of the 64 cores. None when
+    the shape does not suit it."""
+    ps, qs = list(p.padded_shape), list(q.padded_shape)
+    if len(ps) < 3 or ps[:-2] != qs[:-2] or ps[-1] % 32 or ps[-2] % 32:
+        return None
+    mt, kt = ps[-2] // 32, ps[-1] // 32
+    nt = (qs[-2] if transpose_b else qs[-1]) // 32
+    batch = 1
+    for d in ps[:-2]:
+        batch *= d
+    grid = q.device().compute_with_storage_grid_size()
+    # double-buffered bf16 operand blocks + the float32 output block within ~1 MB of L1
+    if batch < grid.x * grid.y or (2 * (mt * kt + kt * nt) * 2048 + mt * nt * 4096) > 1000 * 1024:
+        return None
+    key = (mt, kt, nt, grid.x, grid.y)
+    if key not in _BMM_CONFIGS:
+        sbw = _largest_divisor(nt, 4)
+        sbh = _largest_divisor(mt, max(1, 4 // sbw))
+        _BMM_CONFIGS[key] = ttnn.MatmulMultiCoreReuseProgramConfig(
+            compute_with_storage_grid_size=(grid.x, grid.y),
+            in0_block_w=kt,
+            out_subblock_h=sbh,
+            out_subblock_w=sbw,
+            per_core_M=mt,
+            per_core_N=nt,
+        )
+    return _BMM_CONFIGS[key]
+
+
 def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2):
     """float32 a @ float32 b over bf16 limbs of both operands, keeping the limb products whose order
     (i + j) is below `limbs` (2 limbs: ah.bh + ah.bl + al.bh; 3 limbs: six terms, ~float32). With
@@ -466,7 +505,12 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     pb_all = split_bf16(b, limbs)
     terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
     mm = lambda p, q: ttnn.matmul(  # noqa: E731
-        p, q, transpose_b=transpose_b, compute_kernel_config=cfg, dtype=ttnn.float32
+        p,
+        q,
+        transpose_b=transpose_b,
+        compute_kernel_config=cfg,
+        dtype=ttnn.float32,
+        program_config=None if BMM_CONFIG is None else BMM_CONFIG(p, q, transpose_b),
     )
     if not exact:
         y = None

@@ -111,6 +111,8 @@ class TtQwenImageEditPipeline:
         self.sum_parts = sum_parts if precise else None
         # and their inputs' two bf16 limbs in one pass
         self.split_limbs = split_limbs if precise else None
+        # and their batched attention products on the full core grid
+        self.bmm_config = _te_attention.bmm_program_config if precise else None
         if precise:
             lanes_ttl.prepare(device)
         # likewise the VAE encoder's exact-conv vote tail (~8 float32 passes per conv) while it encodes
@@ -172,15 +174,19 @@ class TtQwenImageEditPipeline:
 
     @contextlib.contextmanager
     def _fused_tail(self):
-        """The fused guarded-tail and lane-split kernels for the text encoder's precise products (vision
-        tower and LM)."""
-        with self._hook(_te_attention, "GUARD_TAIL", self.fused_tail), self._hook(
-            _te_attention, "LANE_SPLIT", self.lane_split
-        ), self._hook(_te_attention, "LO_FIDELITY", self.lo_fidelity), self._hook(
-            _te_attention, "SUM_PARTS", self.sum_parts
-        ), self._hook(
-            _te_attention, "SPLIT_LIMBS", self.split_limbs
-        ):
+        """The text encoder's precise-product hooks (fused kernels, the lo limb's fidelity, the batched products'
+        program configs) for the vision tower and the LM."""
+        hooks = {
+            "GUARD_TAIL": self.fused_tail,
+            "LANE_SPLIT": self.lane_split,
+            "LO_FIDELITY": self.lo_fidelity,
+            "SUM_PARTS": self.sum_parts,
+            "SPLIT_LIMBS": self.split_limbs,
+            "BMM_CONFIG": self.bmm_config,
+        }
+        with contextlib.ExitStack() as stack:
+            for name, fn in hooks.items():
+                stack.enter_context(self._hook(_te_attention, name, fn))
             yield
 
     def vision_encode(self, up):
