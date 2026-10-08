@@ -1,5 +1,6 @@
-# Extra deps for the Voxtral transcription-request input format
-# (transformers.VoxtralProcessor.apply_transcription_request).
+# Pinned for the Voxtral processor + reference API the port was validated against.
+transformers==4.56.0
+# Voxtral transcription-request input format (VoxtralProcessor.apply_transcription_request).
 mistral_common
 pydantic_extra_types
 pycountry

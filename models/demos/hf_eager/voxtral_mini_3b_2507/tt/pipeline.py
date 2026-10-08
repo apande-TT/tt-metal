@@ -184,7 +184,7 @@ class VoxtralTTPipeline:
         el_out_tt = el(_to_tt(layer0_in, dev))
         self.invoked.add("voxtral_encoder_layer")
         with torch.no_grad():
-            el_ref = model.audio_tower.layers[0](layer0_in.to(torch.bfloat16), attention_mask=None).to(torch.float32)
+            el_ref = model.audio_tower.layers[0](layer0_in.to(torch.bfloat16), attention_mask=None, layer_head_mask=None)[0].to(torch.float32)
         _, p = comp_pcc(el_ref, _tt_to_torch(el_out_tt), 0.0)
         self.verify_pcc["voxtral_encoder_layer"] = float(p)
         del el
