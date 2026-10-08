@@ -171,6 +171,11 @@ class QwenImageEditTT:
             tracker=self.tracker,
         )
         self.vae = TtQwenVAE(device, hf_pipe.vae, tracker=self.tracker)
+        from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import attention as _tr_attention
+
+        # q/k/v (and the text stream's add_q/k/v) as one fused column-parallel weight per stream: one limb
+        # linear pair reads the activation limbs and the weights once instead of three times
+        _tr_attention.FUSED_QKV = True
         with _tr_ccl.tp_axis(TP_AXIS):  # TP=8 over mesh axis 0, replicated over axis 1 (see _ccl)
             self.transformer = TtQwenImageTransformer(
                 device, hf_pipe.transformer, layers=pick(denoise_layers), tracker=self.tracker
