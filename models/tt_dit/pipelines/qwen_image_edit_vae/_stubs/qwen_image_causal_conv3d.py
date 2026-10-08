@@ -63,6 +63,8 @@ class TtQwenImageCausalConv3d(ResidentPort):
             extra=cache_x_BTHWC,
             bias=conv.bias.data,
             prepad=lambda t, c: conv.pad_input(t, logical_h, c, logical_w=logical_w),
+            weight=conv.weight.data,
+            run_w=lambda t, w: conv.conv_padded(t, weight=w),
         )
 
     def __init__(self, device, torch_module):

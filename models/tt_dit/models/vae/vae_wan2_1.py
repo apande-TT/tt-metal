@@ -487,11 +487,12 @@ class WanCausalConv3d(Module):
             )
         return x_BTHWC
 
-    def conv_padded(self, x_BTHWC: ttnn.Tensor) -> ttnn.Tensor:
-        """The conv of forward on an input pad_input already prepared."""
+    def conv_padded(self, x_BTHWC: ttnn.Tensor, weight: ttnn.Tensor | None = None) -> ttnn.Tensor:
+        """The conv of forward on an input pad_input already prepared; `weight`: a stand-in for the prepared
+        weight (same shape and layout), e.g. a masked copy of it."""
         x_BTHWC = ttnn.experimental.conv3d(
             input_tensor=x_BTHWC,
-            weight_tensor=self.weight.data,
+            weight_tensor=self.weight.data if weight is None else weight,
             bias_tensor=self.bias.data,
             device=self.mesh_device,
             config=self.conv_config,

@@ -191,14 +191,35 @@ def _lane_masks(device, c):
     return _LANE_MASKS[key]
 
 
-def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad=None):
+_WEIGHT_LANE_MASKS = {}
+
+
+def _weight_lane_masks(device, rows):
+    """[rows, 1] 0/1 masks, mask r keeping the rows j % 8 == r: a prepared conv3d weight's rows run
+    [C_in block][kD][kH][kW][channel in block] with C_in_block % 8 == 0, so row j's input channel is j mod 8 too."""
+    key = (id(device), rows)
+    if key not in _WEIGHT_LANE_MASKS:
+        _WEIGHT_LANE_MASKS[key] = [
+            ttnn.Tensor(
+                [1.0 if j % 8 == r else 0.0 for j in range(rows)], [rows, 1], ttnn.float32, ttnn.TILE_LAYOUT, device
+            )
+            for r in range(8)
+        ]
+    return _WEIGHT_LANE_MASKS[key]
+
+
+def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad=None, weight=None, run_w=None):
     """run(x, extra) -> output, affine in (x, extra) (a conv / linear with bias); channels on the last dim.
     Returns the output in run's own layout and shape, evaluated per `mode` (see above). `out`: run(x, extra)
     if the caller already has it. `bias`: run's [1, C_out] bias when run(0, 0) is exactly it (a float32
     conv3d adds its bias unrounded); the zero-input run is then built from it instead of convolved.
     `prepad(x, extra) -> x_padded`: the zero padding / halo exchange / masking run applies before its core,
     with `run` then the core alone. Every input variant below maps 0 to 0, so padding commutes with it
-    and is done once instead of once per run."""
+    and is done once instead of once per run.
+    `weight`, `run_w(x, w)`: run's prepared conv3d weight and run with a stand-in weight. Given both, an exact
+    lane masks the WEIGHT's input-channel rows instead of the input: conv(x * m_r, W) = conv(x, W * m_r^T) with
+    the very same products (the zeros now come from the weight), so the hi limb is untilized once for all the
+    lanes and each lane costs a weight-sized multiply, not an input-sized multiply plus an untilize."""
     if prepad is not None:
         x, extra = prepad(x, extra), None
 
@@ -281,9 +302,18 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
         if guarded and shared:
             # the shared copy's hi limb is formed once for all the lanes, its lo limb once after them
             his = [hi(t) for t in shared]
-            for m in masks:
-                y = run_on(lambda t, m=m: ttnn.multiply(t, m), his)
-                acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
+            if weight is not None and run_w is not None and len(his) == 1:
+                h_rm = back(his[0], x)
+                for _m, wm in zip(masks, _weight_lane_masks(device, weight.shape[0])):
+                    w_r = ttnn.multiply(weight, wm)
+                    y = _flat(run_w(h_rm, w_r))
+                    ttnn.deallocate(w_r)
+                    acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
+                ttnn.deallocate(h_rm)
+            else:
+                for m in masks:
+                    y = run_on(lambda t, m=m: ttnn.multiply(t, m), his)
+                    acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
             los = [ttnn.subtract(t, h) for t, h in zip(shared, his)]
             free(his)
             free(shared, [x, extra])
