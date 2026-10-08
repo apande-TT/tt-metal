@@ -105,6 +105,8 @@ class TtQwenImageEditPipeline:
         self.fused_tail = guard_tail if precise else None
         # and their lead limb's 8 exact lanes formed in one pass
         self.lane_split = lanes_ttl.lanes8 if precise else None
+        # and their trailing (lo) limb's product at HiFi2: its error is ~2^-8 below the output's scale
+        self.lo_fidelity = ttnn.MathFidelity.HiFi2 if precise else ttnn.MathFidelity.HiFi4
         if precise:
             lanes_ttl.prepare(device)
         # likewise the VAE encoder's exact-conv vote tail (~8 float32 passes per conv) while it encodes
@@ -170,7 +172,7 @@ class TtQwenImageEditPipeline:
         tower and LM)."""
         with self._hook(_te_attention, "GUARD_TAIL", self.fused_tail), self._hook(
             _te_attention, "LANE_SPLIT", self.lane_split
-        ):
+        ), self._hook(_te_attention, "LO_FIDELITY", self.lo_fidelity):
             yield
 
     def vision_encode(self, up):
