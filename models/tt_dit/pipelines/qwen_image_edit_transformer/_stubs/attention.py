@@ -303,8 +303,18 @@ class TtQwenJointAttention:
         if share:  # the image and text queries share the joint K's folded operand and V's limbs
             k_rep = _precise.fold_b(kh) if (_precise.EXACT_QK and _precise.FOLD_LANES) else None
             shared = (k_rep, _precise.split_bf16(v))
-        img = self._out(self._attend(qi, kh, kl, v, mask_add, shared), self.img_out)
-        txt = self._out(self._attend(qt, kh, kl, v, mask_add, shared), self.txt_out)
+        if JOINT_QUERIES:  # one attention over the joint [text, image] queries; rows split after P @ V
+            L = qt.shape[2]
+            o = self._attend(ttnn.concat([qt, qi], dim=2), kh, kl, v, mask_add, shared)
+            B, S, W = o.shape[0], o.shape[1], o.shape[2]
+            o_txt = ttnn.slice(o, (0, 0, 0), (B, L, W))
+            o_img = ttnn.slice(o, (0, L, 0), (B, S, W))
+            ttnn.deallocate(o)
+            img = self._out(o_img, self.img_out)
+            txt = self._out(o_txt, self.txt_out)
+        else:
+            img = self._out(self._attend(qi, kh, kl, v, mask_add, shared), self.img_out)
+            txt = self._out(self._attend(qt, kh, kl, v, mask_add, shared), self.txt_out)
         if shared is not None and shared[0] is not None:
             ttnn.deallocate(shared[0])
         return img, txt
@@ -316,6 +326,8 @@ HEADS_INPUT_L1 = False
 HEADS_BY_SLICES = False
 # q/k/v (and add_q/k/v) projections as one column-parallel weight per stream (read at build: set before building)
 FUSED_QKV = False
+# the image and text queries attend as one joint query block (one QK^T / softmax / P @ V) instead of two
+JOINT_QUERIES = False
 
 
 def build(device, torch_module=None):
