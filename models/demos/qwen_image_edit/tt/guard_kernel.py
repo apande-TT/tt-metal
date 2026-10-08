@@ -29,7 +29,7 @@ _SPLIT_COMPUTE = f"{_DIR}/split_limbs_compute.cpp"
 _TWO_OUT_WRITER = f"{_DIR}/two_out_writer.cpp"
 _WRITER = "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp"
 _IN_CBS = (0, 1, 2, 3, 4)
-_OUT_CB = 16  # the outputs' CBs: c_16, then c_17
+_OUT_CB = 16  # the outputs' CBs: c_16, then c_17, c_18
 _FP32_TILE_BYTES = 4096
 
 
@@ -46,7 +46,7 @@ def _cores(grid, n_tiles):
 
 
 def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0,) * 5, offs=(0,) * 5, compute_args=()):
-    """Up to five float32 tile operands -> y (one tensor, or a pair written through c_16 / c_17), tile by tile;
+    """Up to five float32 tile operands -> y (one tensor, or two / three written through c_16..c_18), tile by tile;
     operand k read at page (i % mods[k] when nonzero, else i) + offs[k]."""
     n_in = len(ins)
     ys = list(y) if isinstance(y, (list, tuple)) else [y]
@@ -75,7 +75,10 @@ def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0,) * 5, offs=(0,) * 5, co
     for c, start, count in work:
         reader_rt[c.x][c.y] = addrs + [count, start] + list(mods) + list(offs)
         compute_rt[c.x][c.y] = [count]
-        writer_rt[c.x][c.y] = [t.buffer_address() for t in ys] + [count, start]
+        if len(ys) == 1:
+            writer_rt[c.x][c.y] = [ys[0].buffer_address(), count, start]
+        else:  # the multi-output writer takes three address slots
+            writer_rt[c.x][c.y] = [t.buffer_address() for t in ys] + [0] * (3 - len(ys)) + [count, start]
 
     compute_cfg = ttnn.ComputeConfigDescriptor(
         math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, dst_full_sync_en=True
@@ -106,8 +109,12 @@ def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0,) * 5, offs=(0,) * 5, co
             kernel_source=_WRITER if len(ys) == 1 else _TWO_OUT_WRITER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=([_OUT_CB] if len(ys) == 1 else [])
-            + [a for t in ys for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            compile_time_args=(
+                [_OUT_CB] + ttnn.TensorAccessorArgs(ys[0]).get_compile_time_args()
+                if len(ys) == 1
+                else [len(ys)]
+                + [a for t in ys + ys[:1] * (3 - len(ys)) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+            ),
             runtime_args=writer_rt,
             config=ttnn.WriterConfigDescriptor(),
         ),
@@ -199,9 +206,12 @@ def sum_parts(g, n):
     return ttnn.generic_op([g, y], program)
 
 
-def split_limbs(x):
-    """(bf16(x), bf16(x - bf16(x))): split_bf16's two limbs of an interleaved float32 tile tensor in one pass
-    (bit-identical: the same SFPU typecast / subtract), or None for a tensor it does not take."""
+def split_limbs(x, limbs=2):
+    """split_bf16's `limbs` (2 or 3) bf16 limbs of an interleaved float32 tile tensor in one pass -- hi = bf16(x),
+    then the bf16 of each remainder -- with the same SFPU typecast / subtract; or None for a tensor it does
+    not take."""
+    if limbs not in (2, 3):
+        return None
     if x.dtype != ttnn.float32 or x.layout != ttnn.TILE_LAYOUT or x.is_sharded() or len(x.shape) < 2:
         return None
     ps = list(x.padded_shape)
@@ -209,7 +219,7 @@ def split_limbs(x):
     for d in ps[:-2]:
         pages *= d
     pages *= (ps[-2] // TILE) * (ps[-1] // TILE)
-    hi, lo = (
+    outs = [
         ttnn.empty(
             list(x.shape),
             dtype=ttnn.bfloat16,
@@ -217,7 +227,7 @@ def split_limbs(x):
             device=x.device(),
             memory_config=x.memory_config(),
         )
-        for _ in range(2)
-    )
-    ttnn.generic_op([x, hi, lo], _program([x], [hi, lo], pages, compute=_SPLIT_COMPUTE))
-    return hi, lo
+        for _ in range(limbs)
+    ]
+    ttnn.generic_op([x] + outs, _program([x], outs, pages, compute=_SPLIT_COMPUTE, compute_args=[limbs]))
+    return tuple(outs)
