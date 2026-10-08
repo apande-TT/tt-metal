@@ -131,10 +131,19 @@ def exact_all_reduce(y, device, cluster_axis=1):
     return ttnn.reshape(out, shape)
 
 
+# Optional fused kernel for split_bf16's two limbs: SPLIT_LIMBS(x32) -> (hi, lo) equal to the loop below, or
+# None for a tensor it does not take.
+SPLIT_LIMBS = None
+
+
 def split_bf16(x, limbs=2):
     """float32 -> `limbs` bf16 parts summing to x (2 limbs ~16 mantissa bits, 3 limbs ~24 = float32).
     A matmul consumes its inputs as bf16; the limbs keep every product exact against bf16 weights."""
     x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
+    if limbs == 2 and SPLIT_LIMBS is not None:
+        parts = SPLIT_LIMBS(x32)
+        if parts is not None:
+            return parts
     parts = []
     rest = x32
     for i in range(limbs):

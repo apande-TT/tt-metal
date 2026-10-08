@@ -26,7 +26,7 @@ import torch
 import ttnn
 from models.demos.qwen_image_edit.tt import inputs as I
 from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl
-from models.demos.qwen_image_edit.tt.guard_kernel import guard_tail, sum_parts, vote_tail
+from models.demos.qwen_image_edit.tt.guard_kernel import guard_tail, split_limbs, sum_parts, vote_tail
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
 from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
@@ -109,6 +109,8 @@ class TtQwenImageEditPipeline:
         self.lo_fidelity = ttnn.MathFidelity.HiFi2 if precise else ttnn.MathFidelity.HiFi4
         # and their TP all-reduce's sum of the gathered float32 partials in one pass (no slice copies)
         self.sum_parts = sum_parts if precise else None
+        # and their inputs' two bf16 limbs in one pass
+        self.split_limbs = split_limbs if precise else None
         if precise:
             lanes_ttl.prepare(device)
         # likewise the VAE encoder's exact-conv vote tail (~8 float32 passes per conv) while it encodes
@@ -176,6 +178,8 @@ class TtQwenImageEditPipeline:
             _te_attention, "LANE_SPLIT", self.lane_split
         ), self._hook(_te_attention, "LO_FIDELITY", self.lo_fidelity), self._hook(
             _te_attention, "SUM_PARTS", self.sum_parts
+        ), self._hook(
+            _te_attention, "SPLIT_LIMBS", self.split_limbs
         ):
             yield
 

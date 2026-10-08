@@ -25,9 +25,11 @@ _READER = f"{_DIR}/guard_tail_reader.cpp"
 _COMPUTE = f"{_DIR}/guard_tail_compute.cpp"
 _VOTE_COMPUTE = f"{_DIR}/vote_tail_compute.cpp"
 _SUM_COMPUTE = f"{_DIR}/sum_parts_compute.cpp"
+_SPLIT_COMPUTE = f"{_DIR}/split_limbs_compute.cpp"
+_TWO_OUT_WRITER = f"{_DIR}/two_out_writer.cpp"
 _WRITER = "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp"
 _IN_CBS = (0, 1, 2, 3, 4)
-_OUT_CB = 16
+_OUT_CB = 16  # the outputs' CBs: c_16, then c_17
 _FP32_TILE_BYTES = 4096
 
 
@@ -44,23 +46,24 @@ def _cores(grid, n_tiles):
 
 
 def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0,) * 5, offs=(0,) * 5, compute_args=()):
-    """Up to five float32 tile operands -> y, tile by tile; operand k read at page (i % mods[k] when nonzero,
-    else i) + offs[k]."""
+    """Up to five float32 tile operands -> y (one tensor, or a pair written through c_16 / c_17), tile by tile;
+    operand k read at page (i % mods[k] when nonzero, else i) + offs[k]."""
     n_in = len(ins)
-    grid = y.device().compute_with_storage_grid_size()
+    ys = list(y) if isinstance(y, (list, tuple)) else [y]
+    grid = ys[0].device().compute_with_storage_grid_size()
     work = _cores(grid, n_tiles)
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
 
-    cbs = [
-        ttnn.CBDescriptor(
-            total_size=2 * _FP32_TILE_BYTES,
+    def cb_desc(cb, dtype):
+        page = _FP32_TILE_BYTES if dtype == ttnn.float32 else _FP32_TILE_BYTES // 2
+        return ttnn.CBDescriptor(
+            total_size=2 * page,
             core_ranges=cores,
-            format_descriptors=[
-                ttnn.CBFormatDescriptor(buffer_index=cb, data_format=ttnn.float32, page_size=_FP32_TILE_BYTES)
-            ],
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=cb, data_format=dtype, page_size=page)],
         )
-        for cb in _IN_CBS[:n_in] + (_OUT_CB,)
-    ]
+
+    cbs = [cb_desc(cb, ttnn.float32) for cb in _IN_CBS[:n_in]]
+    cbs += [cb_desc(_OUT_CB + k, t.dtype) for k, t in enumerate(ys)]
 
     pad = len(_IN_CBS) - n_in  # the reader's unused operand slots repeat operand 0 (never read)
     reader_cta = []
@@ -72,7 +75,7 @@ def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0,) * 5, offs=(0,) * 5, co
     for c, start, count in work:
         reader_rt[c.x][c.y] = addrs + [count, start] + list(mods) + list(offs)
         compute_rt[c.x][c.y] = [count]
-        writer_rt[c.x][c.y] = [y.buffer_address(), count, start]
+        writer_rt[c.x][c.y] = [t.buffer_address() for t in ys] + [count, start]
 
     compute_cfg = ttnn.ComputeConfigDescriptor(
         math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, dst_full_sync_en=True
@@ -100,10 +103,11 @@ def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0,) * 5, offs=(0,) * 5, co
             config=compute_cfg,
         ),
         ttnn.KernelDescriptor(
-            kernel_source=_WRITER,
+            kernel_source=_WRITER if len(ys) == 1 else _TWO_OUT_WRITER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[_OUT_CB] + ttnn.TensorAccessorArgs(y).get_compile_time_args(),
+            compile_time_args=([_OUT_CB] if len(ys) == 1 else [])
+            + [a for t in ys for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
             runtime_args=writer_rt,
             config=ttnn.WriterConfigDescriptor(),
         ),
@@ -193,3 +197,27 @@ def sum_parts(g, n):
         ins, y, pages, compute=_SUM_COMPUTE, offs=[k * pages for k in range(n)] + [0] * (5 - n), compute_args=[n]
     )
     return ttnn.generic_op([g, y], program)
+
+
+def split_limbs(x):
+    """(bf16(x), bf16(x - bf16(x))): split_bf16's two limbs of an interleaved float32 tile tensor in one pass
+    (bit-identical: the same SFPU typecast / subtract), or None for a tensor it does not take."""
+    if x.dtype != ttnn.float32 or x.layout != ttnn.TILE_LAYOUT or x.is_sharded() or len(x.shape) < 2:
+        return None
+    ps = list(x.padded_shape)
+    pages = 1
+    for d in ps[:-2]:
+        pages *= d
+    pages *= (ps[-2] // TILE) * (ps[-1] // TILE)
+    hi, lo = (
+        ttnn.empty(
+            list(x.shape),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=x.device(),
+            memory_config=x.memory_config(),
+        )
+        for _ in range(2)
+    )
+    ttnn.generic_op([x, hi, lo], _program([x], [hi, lo], pages, compute=_SPLIT_COMPUTE))
+    return hi, lo
