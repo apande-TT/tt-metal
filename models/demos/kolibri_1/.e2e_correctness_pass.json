@@ -1,0 +1,1 @@
+{"key": "7f132f1e8ce1d86b", "version": 1, "evidence": ["PERF_BATCH_STREAMS=32", "[prefill] final hidden PCC(min over rows)=0.995323 norm ratio=0.998870", "[prefill] prompt-position logits PCC(min over rows)=0.999232", "e2e PCC=0.998572"]}

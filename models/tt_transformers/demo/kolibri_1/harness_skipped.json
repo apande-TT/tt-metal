@@ -1,0 +1,8 @@
+{
+  "harness_skipped_components": [
+    "encoder_stack",
+    "layer",
+    "mlp",
+    "model"
+  ]
+}

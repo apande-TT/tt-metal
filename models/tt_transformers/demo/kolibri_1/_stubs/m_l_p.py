@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Pure-TTNN Kolibri-1 SwiGLU expert (`m_l_p`, `model.layers.0.mlp.experts.0`), tensor-parallel.
+
+The canonical `MLP` (models/tt_transformers/tt/mlp.py) is built from `ModelArgs`, which cannot load
+the `kolibri1` config (not a transformers model type), and the weights are FP8 block-quantised, so
+the expert is written directly in ttnn ops. Reference (`Kolibri1MLP` in tests/pcc/_reference_loader.py):
+
+    y = down_proj(silu(gate_proj(x)) * up_proj(x))       # 2560 -> 512 -> 2560, FP8 weights
+
+The 128x128 block scales are folded in on the host (`dequantize()`), weights live on device as bf16.
+
+Tensor parallel over the last mesh axis (TP chips): gate_proj / up_proj are column-parallel (each
+chip holds inter/TP of the intermediate features, so SwiGLU stays chip-local) and down_proj is
+row-parallel over the same split; one all_reduce sums the partial outputs. The input is replicated.
+"""
+from __future__ import annotations
+
+import torch
+
+import ttnn
+
+
+class TtKolibri1MLP:
+    def __init__(self, device, torch_module) -> None:
+        self.device = device
+        gate = torch_module.gate_proj.dequantize(torch.float32).t()  # [hidden, inter]
+        up = torch_module.up_proj.dequantize(torch.float32).t()
+        down = torch_module.down_proj.dequantize(torch.float32).t()  # [inter, hidden]
+
+        self._is_mesh = isinstance(device, ttnn.MeshDevice)
+        mesh_shape = list(device.shape) if self._is_mesh else [1, 1]
+        tp = mesh_shape[-1]
+        if gate.shape[-1] % (tp * 32):
+            tp = 1
+        self.tp = tp
+        self.tp_axis = len(mesh_shape) - 1
+        self.mesh_shape = mesh_shape
+
+        self.w_gate = self._upload(gate, -1)
+        self.w_up = self._upload(up, -1)
+        self.w_down = self._upload(down, -2)
+        self.mm_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def _upload(self, t, shard_dim):
+        mapper = None
+        if self._is_mesh:
+            mapper = (
+                ttnn.ShardTensor2dMesh(self.device, mesh_shape=self.mesh_shape, dims=(None, shard_dim))
+                if self.tp > 1
+                else ttnn.ReplicateTensorToMesh(self.device)
+            )
+        return ttnn.from_torch(
+            t.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device, mesh_mapper=mapper
+        )
+
+    def __call__(self, x, **kwargs):
+        shape = list(x.shape)
+        x = ttnn.reshape(x, [1, 1, -1, shape[-1]])
+        if x.dtype != ttnn.bfloat16:
+            x = ttnn.typecast(x, ttnn.bfloat16)
+        g = ttnn.linear(x, self.w_gate, compute_kernel_config=self.mm_cfg)
+        u = ttnn.linear(x, self.w_up, compute_kernel_config=self.mm_cfg)
+        act = ttnn.multiply(ttnn.silu(g), u)
+        ttnn.deallocate(g)
+        ttnn.deallocate(u)
+        out = ttnn.linear(act, self.w_down, compute_kernel_config=self.mm_cfg)
+        ttnn.deallocate(act)
+        if self.tp > 1:
+            out = ttnn.all_reduce(out, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
+        return ttnn.reshape(out, shape)
+
+
+# Module-level `build` — primary test entry point.
+def build(device, torch_module=None):
+    return TtKolibri1MLP.build(device, torch_module)
+
+
+# Backward-compatible slug shim.
+def m_l_p(device, torch_module=None):
+    return TtKolibri1MLP.build(device, torch_module)

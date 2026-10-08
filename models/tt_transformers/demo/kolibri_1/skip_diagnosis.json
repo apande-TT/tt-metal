@@ -1,0 +1,24 @@
+{
+  "diagnoses": [
+    {
+      "component": "encoder_stack",
+      "verdict": "manual",
+      "summary": "Not a module of this model: Kolibri-1 is a decoder-only text LLM with no encoder. 'encoder_stack' is a template role (reuse target llama_vision_encoder) invented when discovery failed; submodule_path is null, capture resolved nothing, and none of the test's candidate paths (vision_model.encoder, vision_encoder, encoder, model.encoder, backbone) exist. The only stack is model.layers, whose element is already the graduated decoder_layer component, so binding it here would double-count. Gate kept re-issuing rung 'shard' (shard attempts never cap; this skip text is not a harness marker), so it could not reach mark_manual on its own."
+    },
+    {
+      "component": "layer",
+      "verdict": "manual",
+      "summary": "Duplicate template role, no distinct module: 'layer' was scaffolded from the llama_layernorm (LayerNorm) template with submodule_path null; Kolibri-1 has no LayerNorm (its norms are RMSNorms, covered by r_m_s_norm). Capture bound 'layer' to model.layers.0, which is exactly the decoder_layer component already graduated tensor-parallel (PCC 0.999998), so a pass here would count the same module twice. Gate kept re-issuing rung 'shard' for an unbound role and cannot reach mark_manual on its own."
+    },
+    {
+      "component": "mlp",
+      "verdict": "manual",
+      "summary": "Duplicate template role, no distinct module: 'mlp' is the generic swiglu_mlp template role (submodule_path null; its test's candidate paths are vision/encoder paths that do not exist in Kolibri-1). Capture bound it to model.layers.0.mlp.experts.0 -- the exact module the m_l_p component already graduated tensor-parallel on (PCC 0.999984). The only other SwiGLU in the model, mlp.shared_experts, is the same Kolibri1MLP class and shape (covered by m_l_p and by the MoE inside decoder_layer), so a pass here would count the same code twice. Gate kept re-issuing rung 'shard' and cannot reach mark_manual on its own."
+    },
+    {
+      "component": "model",
+      "verdict": "manual",
+      "summary": "NOT A SKIP -- the sharded test RAN and FAILED: gathered PCC 0.9645 vs the fp32 golden after 50 layers (target 0.99). Needs a human decision on the model-level gate, not a stub fix: (1) every layer is locally accurate -- fed the fp32 reference input, all 50 TT layers score whole-layer PCC >= 0.99936, attention >= 0.9985 (lowest on the NoPE full-attention layers), MoE >= 0.9997, router top-6 differs on <= 2/64 tokens per layer; (2) the drift is chaotic amplification through discrete top-6-of-384 routing: the torch reference itself computed in bf16 (same weights) already falls to PCC 0.9909 / 0.9874 by layer 20 (TT: 0.9918 / 0.9913 at 20 layers), and fp32 residual / fp32 router / fp32 attention on CPU still leave 0.989-0.996 at 20 layers; (3) exact expert weights (bf16) need 37.7 GB/chip vs 34 GB DRAM, so experts are bfp8. A free-running 50-layer comparison to an fp32 golden at 0.99 is beyond any bf16 implementation; options are a teacher-forced per-layer model gate, a bf16 golden, or a t"
+    }
+  ]
+}

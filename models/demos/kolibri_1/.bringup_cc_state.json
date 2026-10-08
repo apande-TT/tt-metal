@@ -1,0 +1,48 @@
+{
+  "shard_reset_done": true,
+  "shard_attempts": {
+    "attention": 1,
+    "decoder_head": 1,
+    "decoder_layer": 2,
+    "encoder_stack": 1,
+    "f_p8_linear": 1,
+    "m_l_p": 1,
+    "model": 2,
+    "router": 1,
+    "sparse_moe_block": 1
+  },
+  "harness_skipped": [
+    "encoder_stack",
+    "layer",
+    "mlp",
+    "model"
+  ],
+  "last_failure_class": {
+    "model": "OTHER",
+    "r_m_s_norm": "OTHER"
+  },
+  "last_failure_text": {
+    "model": "  - FAILED  models.tt_transformers.demo.kolibri_1.tests.pcc.test_model_sharded::test_model_sharded[blackhole-4-device_params0]\n      AssertionError: sharded PCC 0.9645270713543739 below target 0.99 for model at TP=4\n### models.tt_transformers.demo.kolibri_1.tests.pcc.test_model_sharded::test_model_sharded[blackhole-4-device_params0]\nAssertionError: sharded PCC 0.9645270713543739 below target 0.99 for model at TP=4\nassert False\nmesh_device = MeshDevice(1x4 grid, 4 devices)\n\n    @pytest.mark.parametrize(\n        \"device_params\",\n        [{\"l1_small_size\": 24576, \"fabric_config\": ttnn.FabricConfig.FABRIC_1D}],\n        indirect=True,\n    )\n    @pytest.mark.parametrize(\"mesh_device\", [_MESH], indirect=True)\n    # The repo-wide 300 s pytest-timeout cannot cover loading the 78 GB FP8 checkpoint, staging 50 layers'\n    # weights onto the mesh and running the fp32 reference; stays under the bring-up runner's own wall.\n    @pytest.mark.timeout(3600)\n    def test_model_sharded(mesh_device):\n        torch.manual_seed(int(os.environ.get(\"TT_PLANNER_TEST_SEED\", \"0\") or \"0\"))\n    \n        torch_module, sample_kwargs, primary = _sd._build_torch_reference()\n        try:\n            torch_module = torch_module.float()\n        except Exception:\n            pass\n        for _k in list(sample_kwargs.keys()):\n            _v = sample_kwargs[_k]\n            if isinstance(_v, torch.Tensor) and _v.is_floating_point():\n                sample_kwargs[_k] = _v.to(torch.float32)\n        _pn, _pt = primary\n        if isinstance(_pt, torch.Tensor) and _pt.is_floating_point():\n            primary = (_pn, _pt.to(torch.float32))\n    \n        try:\n            torch_out, sample_kwargs = _sd._reference_forward(torch_module, sample_kwargs)\n        except Exception as exc:\n            pytest.skip(f\"HF reference forward raised {type(exc).__name__}: {exc}\")\n        torch_out = _sd._normalize_out(torch_out)\n        _sd._check_captured_fidelity(torch_out)\n    \n        ttnn_module = _sd._build_ttnn_port(mesh_device, torch_module)\n        primary_name, primary_tensor = primary\n        ttnn_input = _sd._ttnn_from_torch_mesh_safe(primary_tensor, mesh_device)\n        extra = {k: v for k, v in sample_kwargs.items() if k != primary_name}\n        ttnn_out = ttnn_module(ttnn_input, **extra)\n        if isinstance(ttnn_out, tuple) and ttnn_out:\n            ttnn_out = ttnn_out[0]\n        ttnn_out_torch = _sd._ttnn_to_torch_mesh_safe(ttnn_out, mesh_device).to(torch.float32)\n    \n        if isinstance(torch_out, torch.Tensor):\n            torch_out = torch_out.to(torch.float32)\n    \n        ok, pcc = comp_pcc(torch_out, ttnn_out_torch, _sd.PCC_TARGET)\n        print(\n            f\"[bringup] SHARDED PCC={pcc} target={_sd.PCC_TARGET} tp={_TP} \"\n            f\"component={_sd.COMPONENT_NAME}\",\n            flush=True,\n        )\n>       assert ok, f\"sharded PCC {pcc} below target {_sd.PCC_TARGET} for {_sd.COMPONENT_NAME} at TP={_TP}\"\nE       AssertionError: sharded PCC 0.9645270713543739 below target 0.99 for model at TP=4\nE       assert False\n\nmodels/tt_transformers/demo/kolibri_1/tests/pcc/test_model_sharded.py:83: AssertionError",
+    "r_m_s_norm": "  - FAILED  models.tt_transformers.demo.kolibri_1.tests.pcc.test_r_m_s_norm::test_r_m_s_norm[device_params0]\n      RuntimeError: ModelArgs(mesh_device=device) failed for 'r_m_s_norm': ValueError: The checkpoint you are trying to load has model type `kolibri1` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.\n### models.tt_transformers.demo.kolibri_1.tests.pcc.test_r_m_s_norm::test_r_m_s_norm[device_params0]\nRuntimeError: ModelArgs(mesh_device=device) failed for 'r_m_s_norm': ValueError: The checkpoint you are trying to load has model type `kolibri1` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.\nYou can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`. LLM refinement: adjust the ModelArgs constructor args to match this model's config.\ncls = <class 'transformers.models.auto.configuration_auto.AutoConfig'>\npretrained_model_name_or_path = 'Aleph-Alpha/Kolibri-1'\nkwargs = {'_from_auto': True, 'local_files_only': False, 'name_or_path': 'Aleph-Alpha/Kolibri-1'}\ntrust_remote_code = False, code_revision = None\nconfig_dict = {'_commit_hash': '35bc4d3be745502227a67247de77d70e691614ee', 'architectures': ['Kolibri1ForCausalLM'], 'attention_bias': False, 'attention_dropout': 0.0, ...}\nunused_kwargs = {'name_or_path': 'Aleph-Alpha/Kolibri-1'}\nhas_remote_code = False, has_local_code = False, explicit_local_code = False\n\n    @classmethod\n    @replace_list_option_in_docstrings()\n    def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike[str], **kwargs):\n        r\"\"\"\n        Instantiate one of the configuration classes of the library from a pretrained model configuration.\n    \n        The configuration class to instantiate is selected based on the `model_type` property of the config object that\n        is loaded, or when it's missing, by falling back to using pattern matching on `pretrained_model_name_or_path`:\n    \n        List options\n    \n        Args:\n            pretrained_model_name_or_path (`str` or `os.PathLike`):\n                Can be either:\n    \n                    - A string, the *model id* of a pretrained model configuration hosted inside a model repo on\n                      huggingface.co.\n                    - A path to a *directory* containing a configuration file saved using the\n                      [`~PreTrainedConfig.save_pretrained`] method, or the [`~PreTrainedModel.save_pretrained`] method,\n                      e.g., `./my_model_directory/`.\n                    - a path to a saved configuration JSON *file*, e.g.,\n                      `./my_model_directory/configuration.json`.\n            cache_dir (`str` or `os.PathLike`, *optional*):\n                Path to a directory in which a downloaded pretrained model configuration should be cached if the\n                standard cache should not be used.\n            force_download (`bool`, *optional*, defaults to `False`):\n                Whether or not to force the (re-)download the model weights and configuration files and override the\n                cached versions if they exist.\n            proxies (`dict[str, str]`, *optional*):\n                A dictionary of proxy servers to use by protocol or endpoint, e.g., `{'http': 'foo.bar:3128',\n                'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.\n            revision (`str`, *optional*, defaults to `\"main\"`):\n                The specific model version to use. It can be a branch name, a tag name, or a commit id, since we use "
+  },
+  "attempts": {
+    "r_m_s_norm": 1,
+    "token_embed": 1
+  },
+  "best_pcc": {
+    "r_m_s_norm": 0.999998,
+    "token_embed": 1.0
+  },
+  "consecutive_same_class": {
+    "r_m_s_norm": 0,
+    "token_embed": 0
+  },
+  "pcc_history": {
+    "r_m_s_norm": [
+      0.999998
+    ],
+    "token_embed": [
+      1.0
+    ]
+  }
+}

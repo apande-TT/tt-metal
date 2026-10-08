@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Pure-TTNN Kolibri-1 FP8 linear (`f_p8_linear`, e.g. `model.layers.0.self_attn.q_proj`), tensor-parallel.
+
+Reference (`Kolibri1FP8Linear` in tests/pcc/_reference_loader.py): a bias-free linear whose weight
+ships as float8_e4m3fn with one fp32 inverse scale per 128x128 block,
+
+    y = x @ dequantize(weight).T        # dequantize = weight * weight_scale_inv per block
+
+The block scales are folded in on the host (`dequantize()`), and the dequantised weight lives on
+device as bf16 -- every fp8 value times its fp32 scale, rounded once.
+
+Tensor parallel over the last mesh axis (TP chips): column-parallel over the output features. Each
+chip holds out/TP contiguous output columns, computes its slice, and one all_gather along the
+feature axis gives every chip the full output. The input is replicated.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+
+class TtKolibri1FP8Linear:
+    def __init__(self, device, torch_module) -> None:
+        self.device = device
+        w = torch_module.dequantize(torch.float32).t().contiguous()  # [in, out]
+
+        is_mesh = isinstance(device, ttnn.MeshDevice)
+        mesh_shape = list(device.shape) if is_mesh else [1, 1]
+        tp = mesh_shape[-1]
+        if w.shape[-1] % (tp * 32):
+            tp = 1
+        self.tp = tp
+        self.tp_axis = len(mesh_shape) - 1
+
+        mapper = None
+        if is_mesh:
+            mapper = (
+                ttnn.ShardTensor2dMesh(device, mesh_shape=mesh_shape, dims=(None, -1))
+                if tp > 1
+                else ttnn.ReplicateTensorToMesh(device)
+            )
+        self.w = ttnn.from_torch(w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=mapper)
+        self.mm_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def __call__(self, x, **kwargs):
+        shape = list(x.shape)
+        x = ttnn.reshape(x, [1, 1, -1, shape[-1]])
+        if x.dtype != ttnn.bfloat16:
+            x = ttnn.typecast(x, ttnn.bfloat16)
+        out = ttnn.linear(x, self.w, compute_kernel_config=self.mm_cfg)
+        if self.tp > 1:
+            out = ttnn.all_gather(out, dim=3, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
+        return ttnn.reshape(out, shape[:-1] + [out.shape[-1]])
+
+
+# Module-level `build` — primary test entry point.
+def build(device, torch_module=None):
+    return TtKolibri1FP8Linear.build(device, torch_module)
+
+
+# Backward-compatible slug shim.
+def f_p8_linear(device, torch_module=None):
+    return TtKolibri1FP8Linear.build(device, torch_module)

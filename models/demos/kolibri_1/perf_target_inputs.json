@@ -1,0 +1,21 @@
+{
+  "stage_roots": {
+    "prefill": "model",
+    "decode": "model"
+  },
+  "device_weight_bytes": 754795520,
+  "device_census_complete": true,
+  "device_section_bytes": {
+    "embed": 655360000,
+    "unmatched": 655360000,
+    "model": 99435520,
+    "layers": 99429888,
+    "moe": 98380800,
+    "router": 98304000,
+    "norm_w": 1024000,
+    "attn": 25088,
+    "norm": 5120,
+    "rope": 512
+  },
+  "bytes_per_param": 2.0001
+}

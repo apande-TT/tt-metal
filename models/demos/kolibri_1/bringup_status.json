@@ -1,0 +1,263 @@
+{
+  "new_model_id": "Aleph-Alpha/Kolibri-1",
+  "new_model_type": "kolibri1",
+  "sibling_hf_id": null,
+  "sibling_model_type": null,
+  "backend": {
+    "name": "tt_transformers / simple_text_demo",
+    "demo_path": "models/tt_transformers/demo/simple_text_demo.py"
+  },
+  "counts": {
+    "REUSE": 4,
+    "ADAPT": 4,
+    "NEW": 5
+  },
+  "common_reuse": [
+    {
+      "purpose": "LayerNorm / RMSNorm",
+      "path": "models/common/rmsnorm.py"
+    },
+    {
+      "purpose": "LightweightModule base",
+      "path": "models/common/lightweightmodule.py"
+    },
+    {
+      "purpose": "Tensor helpers",
+      "path": "models/common/tensor_utils.py"
+    },
+    {
+      "purpose": "Generic utility funcs",
+      "path": "models/common/utility_functions.py"
+    }
+  ],
+  "components": [
+    {
+      "name": "token_embed",
+      "kind": "token_embed",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 2560,
+        "num_hidden_layers": 50,
+        "num_attention_heads": 48,
+        "num_key_value_heads": 4,
+        "hidden_act": "silu",
+        "vocab_size": 128000,
+        "max_position_embeddings": 262144
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/embedding.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: embedding -> models/tt_transformers/tt/embedding.py::ScaledEmbedding (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
+      "submodule_path": "model.embed_tokens",
+      "class_name": "Embedding"
+    },
+    {
+      "name": "attention",
+      "kind": "attention",
+      "status": "REUSE",
+      "new_shape": {
+        "hidden_size": 2560,
+        "num_hidden_layers": 50,
+        "num_attention_heads": 48,
+        "num_key_value_heads": 4,
+        "hidden_act": "silu",
+        "vocab_size": 128000,
+        "max_position_embeddings": 262144
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0.",
+      "submodule_path": "model.layers.0.self_attn",
+      "class_name": "Kolibri1Attention"
+    },
+    {
+      "name": "mlp",
+      "kind": "mlp",
+      "status": "REUSE",
+      "new_shape": {
+        "hidden_size": 2560,
+        "num_hidden_layers": 50,
+        "num_attention_heads": 48,
+        "num_key_value_heads": 4,
+        "hidden_act": "silu",
+        "vocab_size": 128000,
+        "max_position_embeddings": 262144
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh.",
+      "submodule_path": null,
+      "class_name": null
+    },
+    {
+      "name": "layer",
+      "kind": "layer",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 2560,
+        "num_hidden_layers": 50,
+        "num_attention_heads": 48,
+        "num_key_value_heads": 4,
+        "hidden_act": "silu",
+        "vocab_size": 128000,
+        "max_position_embeddings": 262144
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_layernorm.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: llama_layernorm -> models/tt_transformers/tt/multimodal/llama_layernorm.py::TtLayerNorm (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
+      "submodule_path": null,
+      "class_name": null
+    },
+    {
+      "name": "encoder_stack",
+      "kind": "encoder_stack",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 2560,
+        "num_hidden_layers": 50,
+        "num_attention_heads": 48,
+        "num_key_value_heads": 4,
+        "hidden_act": "silu",
+        "vocab_size": 128000,
+        "max_position_embeddings": 262144
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_vision_encoder.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: llama_vision_encoder -> models/tt_transformers/tt/multimodal/llama_vision_encoder.py::TtLlamaVisionEncoder (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
+      "submodule_path": null,
+      "class_name": null
+    },
+    {
+      "name": "decoder_head",
+      "kind": "decoder_head",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 2560,
+        "num_hidden_layers": 50,
+        "num_attention_heads": 48,
+        "num_key_value_heads": 4,
+        "hidden_act": "silu",
+        "vocab_size": 128000,
+        "max_position_embeddings": 262144
+      },
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/lm_head.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: lm_head -> models/tt_transformers/tt/lm_head.py::LMHead (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
+      "submodule_path": "lm_head",
+      "class_name": "Linear"
+    },
+    {
+      "name": "model",
+      "kind": "Kolibri1Model",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/kolibri1/modeling_kolibri1.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=58302 sample_paths=['model'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "model",
+      "class_name": "Kolibri1Model"
+    },
+    {
+      "name": "decoder_layer",
+      "kind": "Kolibri1DecoderLayer",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/kolibri1/modeling_kolibri1.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=50 leaves=58300 sample_paths=['model.layers.0', 'model.layers.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "model.layers.0",
+      "class_name": "Kolibri1DecoderLayer"
+    },
+    {
+      "name": "f_p8_linear",
+      "kind": "Kolibri1FP8Linear",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/kolibri1/modeling_kolibri1.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=57950 leaves=57950 sample_paths=['model.layers.0.self_attn.q_proj', 'model.layers.0.self_attn.k_proj'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "model.layers.0.self_attn.q_proj",
+      "class_name": "Kolibri1FP8Linear"
+    },
+    {
+      "name": "sparse_moe_block",
+      "kind": "Kolibri1SparseMoeBlock",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/kolibri1/modeling_kolibri1.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=50 leaves=57800 sample_paths=['model.layers.0.mlp', 'model.layers.1.mlp'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "model.layers.0.mlp",
+      "class_name": "Kolibri1SparseMoeBlock"
+    },
+    {
+      "name": "m_l_p",
+      "kind": "Kolibri1MLP",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | module-tree: occ=19250 leaves=57750 sample_paths=['model.layers.0.mlp.experts.0', 'model.layers.0.mlp.experts.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "model.layers.0.mlp.experts.0",
+      "class_name": "Kolibri1MLP"
+    },
+    {
+      "name": "r_m_s_norm",
+      "kind": "Kolibri1RMSNorm",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/common/rmsnorm.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: rmsnorm_text -> models/common/rmsnorm.py::RMSNorm (REUSE). derived from compatibility.py BUILDING_BLOCKS 'RMSNorm (text)'. ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip. | module-tree: occ=301 leaves=301 sample_paths=['model.layers.0.self_attn.q_norm', 'model.layers.0.self_attn.k_norm'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "model.layers.0.self_attn.q_norm",
+      "class_name": "Kolibri1RMSNorm"
+    },
+    {
+      "name": "router",
+      "kind": "Kolibri1Router",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/kolibri1/modeling_kolibri1.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=50 leaves=50 sample_paths=['model.layers.0.mlp.gate', 'model.layers.1.mlp.gate'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "model.layers.0.mlp.gate",
+      "class_name": "Kolibri1Router"
+    }
+  ],
+  "notes": [
+    "Sibling config could not be fetched; classification falls back to NEW for components without a clear file match. Set HF_TOKEN or pre-download `None` and re-run for a sharper diff.",
+    "Top sibling candidates (per-component reuse targets are pulled from whichever sibling provides them, not only the first): tt_transformers / simple_text_demo (score 40: category 'LLM' default (generic runner)); NemotronH (nemotron_h hybrid Mamba2/MoE) (score 30: category 'LLM' default); falcon7b_common (auto-upstream) (score 30: category 'LLM' default)"
+  ],
+  "ranked_siblings": [
+    {
+      "rank": 1,
+      "backend": "tt_transformers / simple_text_demo",
+      "score": 40,
+      "reason": "category 'LLM' default (generic runner)"
+    },
+    {
+      "rank": 2,
+      "backend": "NemotronH (nemotron_h hybrid Mamba2/MoE)",
+      "score": 30,
+      "reason": "category 'LLM' default"
+    },
+    {
+      "rank": 3,
+      "backend": "falcon7b_common (auto-upstream)",
+      "score": 30,
+      "reason": "category 'LLM' default"
+    }
+  ]
+}

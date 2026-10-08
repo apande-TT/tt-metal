@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Pure-TTNN Kolibri-1 RMSNorm (`r_m_s_norm`, e.g. `model.layers.0.self_attn.q_norm`).
+
+The canonical `RMSNorm` (models/common/rmsnorm.py) is built from `ModelArgs`, which cannot load the
+`kolibri1` config (not a transformers model type), so the norm is a direct `ttnn.rms_norm`.
+Reference (`Kolibri1RMSNorm` in tests/pcc/_reference_loader.py), over the last dim:
+
+    y = x * rsqrt(mean(x^2) + eps) * weight
+
+The same class serves the per-head q/k norms (dim = head_dim 128) and the hidden-size norms (2560).
+The weight is replicated on every chip: a norm has nothing to split.
+"""
+from __future__ import annotations
+
+import ttnn
+
+
+class TtKolibri1RMSNorm:
+    def __init__(self, device, torch_module) -> None:
+        self.eps = float(torch_module.variance_epsilon)
+        mapper = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
+        self.weight = ttnn.from_torch(
+            torch_module.weight.float().reshape(1, 1, -1, 32),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=device,
+            mesh_mapper=mapper,
+        )
+        self.cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
+        )
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def __call__(self, x, **kwargs):
+        return ttnn.rms_norm(x, epsilon=self.eps, weight=self.weight, compute_kernel_config=self.cfg)
+
+
+# Module-level `build` — primary test entry point.
+def build(device, torch_module=None):
+    return TtKolibri1RMSNorm.build(device, torch_module)
+
+
+# Backward-compatible slug shim.
+def r_m_s_norm(device, torch_module=None):
+    return TtKolibri1RMSNorm.build(device, torch_module)

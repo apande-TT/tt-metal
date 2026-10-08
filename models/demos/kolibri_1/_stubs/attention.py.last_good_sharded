@@ -1,0 +1,188 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Pure-TTNN Kolibri-1 attention (`attention`, `model.layers.0.self_attn`), tensor-parallel.
+
+The canonical `Attention` (models/tt_transformers/tt/attention.py) cannot be built here:
+`ModelArgs(mesh_device=...)` loads the HF config through AutoConfig, and `kolibri1` is not a
+transformers model type. So the forward is written directly in ttnn ops, following the reference
+(`Kolibri1Attention` in tests/pcc/_reference_loader.py):
+
+    q, k, v = q_proj(x), k_proj(x), v_proj(x)          # FP8 block-quantised weights, dequantised
+    q, k    = q_norm(q), k_norm(k)                     # per-head RMSNorm over head_dim
+    if sliding layer: q, k = neox RoPE(q, k, position_ids)   (full layers are NoPE)
+    attn    = softmax(q k^T * head_dim**-0.5 + causal/sliding mask) v     # GQA 48 q / 4 kv heads
+    out     = o_proj(attn)
+
+The sliding window (513) covers the current token plus the 512 before it; SDPA's
+`sliding_window_size` has exactly that meaning (left window = size - 1).
+
+Tensor parallel over the last mesh axis (TP chips): q/k/v are column-parallel by HEAD, so each chip
+holds 48/TP query heads and the 4/TP kv head(s) they share (whole GQA groups, no repeat_kv), packed
+as one fused [q | k | v] weight per chip. Norms, RoPE and SDPA run per chip with no traffic. o_proj
+is row-parallel over the same head split, and one all_reduce sums the partial outputs so every chip
+ends with the full hidden state. The q/k norm weights and the RoPE tables are replicated.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+_ROPE_TABLE_LEN = 32768
+
+
+class TtKolibri1Attention:
+    def __init__(self, device, torch_module) -> None:
+        self.device = device
+        n_heads = int(torch_module.num_heads)
+        n_kv = int(torch_module.num_kv_heads)
+        head_dim = int(torch_module.head_dim)
+        self.head_dim = head_dim
+        self.scale = float(torch_module.scaling)
+        self.sliding_window = torch_module.sliding_window
+        self.is_sliding = bool(torch_module.is_sliding)
+        self.eps = float(torch_module.q_norm.variance_epsilon)
+
+        self._is_mesh = isinstance(device, ttnn.MeshDevice)
+        mesh_shape = list(device.shape) if self._is_mesh else [1, 1]
+        tp = mesh_shape[-1]
+        if n_heads % tp or n_kv % tp:
+            tp = 1
+        self.tp = tp
+        self.tp_axis = len(mesh_shape) - 1
+        self.mesh_shape = mesh_shape
+        self.n_local_heads = n_heads // tp
+        self.n_local_kv = n_kv // tp
+
+        # [in, out] fp32 weights; dequantize() applies the 128x128 block scales.
+        wq = torch_module.q_proj.dequantize(torch.float32).t()
+        wk = torch_module.k_proj.dequantize(torch.float32).t()
+        wv = torch_module.v_proj.dequantize(torch.float32).t()
+        wo = torch_module.o_proj.dequantize(torch.float32).t()
+
+        qw, kw = self.n_local_heads * head_dim, self.n_local_kv * head_dim
+        wqkv = torch.concat(
+            [
+                torch.concat([wq[:, d * qw : (d + 1) * qw], wk[:, d * kw : (d + 1) * kw], wv[:, d * kw : (d + 1) * kw]], 1)
+                for d in range(tp)
+            ],
+            dim=1,
+        )
+        self.wqkv = self._upload(wqkv, shard_dim=-1)
+        self.wo = self._upload(wo, shard_dim=-2)
+
+        rm = ttnn.ROW_MAJOR_LAYOUT
+        self.q_norm_w = self._upload(torch_module.q_norm.weight.float().reshape(1, 1, head_dim // 32, 32), layout=rm)
+        self.k_norm_w = self._upload(torch_module.k_norm.weight.float().reshape(1, 1, head_dim // 32, 32), layout=rm)
+
+        if self.is_sliding:
+            half = head_dim // 2
+            inv_freq = 1.0 / (torch_module.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+            freqs = torch.arange(_ROPE_TABLE_LEN, dtype=torch.float32)[:, None] * inv_freq
+            emb = torch.concat((freqs, freqs), dim=-1)
+            self.cos_table = self._upload(emb.cos(), layout=rm)
+            self.sin_table = self._upload(emb.sin(), layout=rm)
+            # x @ rot == rotate_half(x) == cat(-x[half:], x[:half])
+            rot = torch.zeros(head_dim, head_dim)
+            rot[torch.arange(half) + half, torch.arange(half)] = -1.0
+            rot[torch.arange(half), torch.arange(half) + half] = 1.0
+            self.rot = self._upload(rot)
+
+        arch = device.arch()
+        self.mm_cfg = ttnn.init_device_compute_kernel_config(
+            arch, math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
+        )
+        self.sdpa_cfg = ttnn.init_device_compute_kernel_config(
+            arch, math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=False, packer_l1_acc=False
+        )
+        self.grid = device.compute_with_storage_grid_size()
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def _upload(self, t, shard_dim=None, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16):
+        mapper = None
+        if self._is_mesh:
+            if shard_dim is not None and self.tp > 1:
+                mapper = ttnn.ShardTensor2dMesh(self.device, mesh_shape=self.mesh_shape, dims=(None, shard_dim))
+            else:
+                mapper = ttnn.ReplicateTensorToMesh(self.device)
+        return ttnn.from_torch(t.contiguous(), dtype=dtype, layout=layout, device=self.device, mesh_mapper=mapper)
+
+    def _rope(self, x, cos, sin):
+        rotated = ttnn.matmul(x, self.rot, compute_kernel_config=self.mm_cfg)
+        return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(rotated, sin))
+
+    def __call__(self, hidden_states, position_ids=None, attention_mask=None, past_key_value=None, **kwargs):
+        if attention_mask is not None or past_key_value is not None:
+            raise NotImplementedError("Kolibri-1 TT attention: padding masks and the KV cache are not wired yet")
+        shape = list(hidden_states.shape)
+        B, T, H = shape[0], shape[-2], shape[-1]
+        D = self.head_dim
+        x = ttnn.reshape(hidden_states, [B, 1, T, H])
+        if x.dtype != ttnn.bfloat16:
+            x = ttnn.typecast(x, ttnn.bfloat16)
+
+        xqkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.mm_cfg)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            xqkv,
+            num_heads=self.n_local_heads,
+            num_kv_heads=self.n_local_kv,
+            transpose_k_heads=False,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        ttnn.deallocate(xqkv)
+
+        q = ttnn.rms_norm(q, epsilon=self.eps, weight=self.q_norm_w, compute_kernel_config=self.mm_cfg)
+        k = ttnn.rms_norm(k, epsilon=self.eps, weight=self.k_norm_w, compute_kernel_config=self.mm_cfg)
+
+        if self.is_sliding:
+            positions = torch.arange(T).expand(B, T) if position_ids is None else position_ids
+            pos = ttnn.from_torch(
+                positions.to(torch.int32),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if self._is_mesh else None,
+            )
+            cos = ttnn.reshape(ttnn.embedding(pos, self.cos_table, layout=ttnn.TILE_LAYOUT), [B, 1, T, D])
+            sin = ttnn.reshape(ttnn.embedding(pos, self.sin_table, layout=ttnn.TILE_LAYOUT), [B, 1, T, D])
+            q = self._rope(q, cos, sin)
+            k = self._rope(k, cos, sin)
+
+        chunk = next(c for c in (256, 128, 64, 32) if T % c == 0 or c == 32)
+        attn = ttnn.transformer.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            scale=self.scale,
+            sliding_window_size=self.sliding_window,
+            compute_kernel_config=self.sdpa_cfg,
+            program_config=ttnn.SDPAProgramConfig(
+                compute_with_storage_grid_size=self.grid,
+                q_chunk_size=chunk,
+                k_chunk_size=chunk,
+                exp_approx_mode=False,
+            ),
+        )
+        ttnn.deallocate(q)
+        ttnn.deallocate(k)
+        ttnn.deallocate(v)
+
+        attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        out = ttnn.linear(attn, self.wo, compute_kernel_config=self.mm_cfg)
+        ttnn.deallocate(attn)
+        if self.tp > 1:
+            out = ttnn.all_reduce(out, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
+        return ttnn.reshape(out, shape)
+
+
+# Module-level `build` — primary test entry point.
+def build(device, torch_module=None):
+    return TtKolibri1Attention.build(device, torch_module)
+
+
+# Backward-compatible slug shim.
+def attention(device, torch_module=None):
+    return TtKolibri1Attention.build(device, torch_module)
