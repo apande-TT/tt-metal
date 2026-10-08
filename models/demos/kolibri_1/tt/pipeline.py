@@ -68,7 +68,14 @@ class KolibriPipeline:
             log(f"[build] layer {i} ({n + 1}/{len(self.layer_ids)}) {time.time() - t0:.0f}s", flush=True)
         self.norm = FinalNorm(device, ck.final_norm())
         self.head = LMHead(device, ck.lm_head())
-        self.sampler = Sampler(device, self.batch, self.settings.top_k, self.settings.top_p, self.settings.temperature)
+        self.sampler = Sampler(
+            device,
+            self.batch,
+            self.settings.top_k,
+            self.settings.top_p,
+            self.settings.temperature,
+            vocab=int(self.config.vocab_size),
+        )
         self.rope = self._share_rope_tables()
         self.positions = self._up(
             torch.arange(self.capacity, dtype=torch.float32).expand(1, 1, self.batch, -1).contiguous(), ttnn.float32

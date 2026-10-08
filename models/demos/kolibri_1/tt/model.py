@@ -340,14 +340,39 @@ class DecoderLayer(TtKolibri1DecoderLayer):
 
 
 # ----------------------------------------------------------------------------------------------- sampler
+def _topk_tree(n_tiles: int, k_tiles: int, cores: int):
+    """Group counts, stage by stage, of a top-k tree over a row n_tiles tiles wide (None: no tree).
+
+    ttnn's top-k for k > 64 sorts each tile row on one core, so one [B, V] row of logits is ~17 us per
+    tile on a single core (69 ms at V = 128000). Each stage splits the row into g groups of w tiles,
+    one tile row per group (g <= cores, so every group gets its own core); g * k_tiles tiles survive
+    into the next stage. A row of at most 20 tiles is left to one final top-k."""
+    plan, cap = [], 40
+    while n_tiles > 20:
+        w = next((w for w in range(min(cap, n_tiles - 1), 2 * k_tiles - 1, -1) if n_tiles % w == 0), None)
+        if w is None or n_tiles // w > cores:
+            return None
+        plan.append(n_tiles // w)
+        n_tiles, cap = (n_tiles // w) * k_tiles, 20
+    return plan or None
+
+
 class Sampler:
     """generation_config's rule on device, fp32 throughout: top_k on logits/T, top_p over those k
     (exclusive cumulative probability < p keeps a token), then inverse CDF in TOKEN-ID order over the
-    kept set against the step's uniform. Mirrors tests/e2e/golden.py::host_sample op for op."""
+    kept set against the step's uniform. Mirrors tests/e2e/golden.py::host_sample op for op.
 
-    def __init__(self, device, batch: int, top_k: int, top_p: float, temperature: float) -> None:
+    The top-k runs as a tree (_topk_tree). A [B, N] tile tensor and a [B*g, N/g] one have the same DRAM
+    pages in the same order (page = tile row * row tiles + tile col, and B is whole tile rows), so each
+    regrouping is a metadata view -- no data moves -- and every stage carries the token ids along as
+    top-k labels. The inverse CDF then needs only the <= k kept tokens: sorted by token id and
+    cumulated in that order, which is the full-vocabulary cumsum with its zero terms dropped (the same
+    non-zero terms, added in the same order)."""
+
+    def __init__(self, device, batch: int, top_k: int, top_p: float, temperature: float, vocab: int = 0) -> None:
         self.device = device
         self.top_k, self.top_p, self.temperature = int(top_k), float(top_p), float(temperature)
+        self.k_pad = -(-self.top_k // 32) * 32
         mapper = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
         self.ranks = ttnn.from_torch(
             torch.arange(self.top_k, dtype=torch.float32).expand(1, 1, batch, -1).contiguous(),
@@ -356,12 +381,40 @@ class Sampler:
             device=device,
             mesh_mapper=mapper,
         )
+        grid = device.compute_with_storage_grid_size()
+        tree_ok = vocab > 0 and batch % 32 == 0 and vocab % 32 == 0
+        self.plan = _topk_tree(vocab // 32, self.k_pad // 32, grid.x * grid.y) if tree_ok else None
+        self.token_index = None
+        if self.plan:
+            vocab_index = torch.arange(vocab, dtype=torch.int32).expand(1, 1, batch, -1).contiguous()
+            self.token_index = ttnn.from_torch(
+                vocab_index, dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=mapper
+            )
+
+    def _top_k(self, x):
+        """x [1, 1, B, V] -> (values [1, 1, B, k] largest first, their token ids [1, 1, B, k] uint32)."""
+        if not self.plan:
+            return ttnn.topk(x, k=self.top_k, dim=-1, largest=True, sorted=True)
+        B, n = x.shape[-2], x.shape[-1]
+        labels = self.token_index
+        for g in self.plan:
+            grouped = [1, 1, B * g, n // g]
+            x, labels = ttnn.topk(
+                ttnn.experimental.view(x, grouped),
+                k=self.k_pad,
+                dim=-1,
+                largest=True,
+                sorted=True,
+                indices_tensor=ttnn.experimental.view(labels, grouped),
+            )
+            n = g * self.k_pad
+            x, labels = ttnn.experimental.view(x, [1, 1, B, n]), ttnn.experimental.view(labels, [1, 1, B, n])
+        return ttnn.topk(x, k=self.top_k, dim=-1, largest=True, sorted=True, indices_tensor=labels)
 
     def __call__(self, logits, u):
         """logits [1, 1, B, V] fp32, u [1, 1, B, 1] fp32 -> token ids [1, 1, B, 1] fp32 (exact integers)."""
         x = logits if self.temperature == 1.0 else ttnn.multiply(logits, 1.0 / self.temperature)
-        vals, ids = ttnn.topk(x, k=self.top_k, dim=-1, largest=True, sorted=True)
-        ttnn.deallocate(ids)
+        vals, tok_ids = self._top_k(x)
         B = vals.shape[-2]
         vmax = ttnn.slice(vals, [0, 0, 0, 0], [1, 1, B, 1])
         e = ttnn.exp(ttnn.subtract(vals, vmax))
@@ -370,8 +423,13 @@ class Sampler:
         n_keep = ttnn.sum(ttnn.lt(excl, self.top_p), dim=-1, keepdim=True)
         last = ttnn.eq(self.ranks, ttnn.subtract(ttnn.maximum(n_keep, 1.0), 1.0))
         cut = ttnn.sum(ttnn.multiply(vals, last), dim=-1, keepdim=True)
-        q = ttnn.multiply(ttnn.exp(ttnn.subtract(x, vmax)), ttnn.ge(x, cut))
-        cdf = ttnn.cumsum(q, dim=-1)
-        V = cdf.shape[-1]
-        z = ttnn.slice(cdf, [0, 0, 0, V - 1], [1, 1, B, V])
-        return ttnn.sum(ttnn.le(cdf, ttnn.multiply(u, z)), dim=-1, keepdim=True)
+        q = ttnn.multiply(e, ttnn.ge(vals, cut))
+        # The k candidates in token-id order: largest-first on -id is ascending id; q follows by gather.
+        neg_id, order = ttnn.topk(
+            ttnn.neg(ttnn.typecast(tok_ids, ttnn.float32)), k=self.top_k, dim=-1, largest=True, sorted=True
+        )
+        cdf = ttnn.cumsum(ttnn.gather(q, -1, order), dim=-1)
+        z = ttnn.slice(cdf, [0, 0, 0, self.top_k - 1], [1, 1, B, self.top_k])
+        # Positions whose CDF is <= u*z precede the sampled token (the CDF only rises at kept tokens).
+        at = ttnn.sum(ttnn.le(cdf, ttnn.multiply(u, z)), dim=-1, keepdim=True)
+        return ttnn.neg(ttnn.sum(ttnn.multiply(neg_id, ttnn.eq(self.ranks, at)), dim=-1, keepdim=True))
