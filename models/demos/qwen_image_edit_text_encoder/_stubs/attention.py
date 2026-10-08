@@ -104,6 +104,11 @@ def upload_rows(device, arrays, dtype=ttnn.bfloat16, col_dim=None, layout=ttnn.T
     return ttnn.reshape(tt, list(tt.shape)[1:])
 
 
+# Optional fused kernel for exact_all_reduce's sum: SUM_PARTS(g, n) -> the left-to-right float32 sum of the n
+# slabs of g = [n, ...] (bit-identical to the slice + add chain below), or None for a g it does not take.
+SUM_PARTS = None
+
+
 def exact_all_reduce(y, device, cluster_axis=1):
     """Sum over the TP axis without rounding: gather the float32 partials (bit-exact data movement) and
     add them in float32. ttnn.all_reduce rounds float32 partials at bf16 level (measured ~7e-3 abs on
@@ -115,7 +120,10 @@ def exact_all_reduce(y, device, cluster_axis=1):
     g = ttnn.all_gather(
         ttnn.reshape(y, [1] + shape), dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear
     )
-    out = None
+    out = None if SUM_PARTS is None else SUM_PARTS(g, n)
+    if out is not None:
+        ttnn.deallocate(g)
+        return ttnn.reshape(out, shape)
     for i in range(n):
         part = ttnn.slice(g, [i] + [0] * len(shape), [i + 1] + shape)
         out = part if out is None else ttnn.add(out, part)

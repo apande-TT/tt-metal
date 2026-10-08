@@ -24,6 +24,7 @@ _DIR = "models/demos/qwen_image_edit/tt/kernels"
 _READER = f"{_DIR}/guard_tail_reader.cpp"
 _COMPUTE = f"{_DIR}/guard_tail_compute.cpp"
 _VOTE_COMPUTE = f"{_DIR}/vote_tail_compute.cpp"
+_SUM_COMPUTE = f"{_DIR}/sum_parts_compute.cpp"
 _WRITER = "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp"
 _IN_CBS = (0, 1, 2, 3, 4)
 _OUT_CB = 16
@@ -42,8 +43,10 @@ def _cores(grid, n_tiles):
     return out
 
 
-def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0, 0, 0, 0, 0)):
-    """Five float32 tile operands -> y, tile by tile; operand k read at page i % mods[k] when nonzero."""
+def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0,) * 5, offs=(0,) * 5, compute_args=()):
+    """Up to five float32 tile operands -> y, tile by tile; operand k read at page (i % mods[k] when nonzero,
+    else i) + offs[k]."""
+    n_in = len(ins)
     grid = y.device().compute_with_storage_grid_size()
     work = _cores(grid, n_tiles)
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
@@ -56,16 +59,18 @@ def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0, 0, 0, 0, 0)):
                 ttnn.CBFormatDescriptor(buffer_index=cb, data_format=ttnn.float32, page_size=_FP32_TILE_BYTES)
             ],
         )
-        for cb in _IN_CBS + (_OUT_CB,)
+        for cb in _IN_CBS[:n_in] + (_OUT_CB,)
     ]
 
+    pad = len(_IN_CBS) - n_in  # the reader's unused operand slots repeat operand 0 (never read)
     reader_cta = []
-    for t in ins:
+    for t in list(ins) + [ins[0]] * pad:
         reader_cta.extend(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    reader_cta.append(n_in)
     reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
-    addrs = [t.buffer_address() for t in ins]
+    addrs = [t.buffer_address() for t in ins] + [0] * pad
     for c, start, count in work:
-        reader_rt[c.x][c.y] = addrs + [count, start] + list(mods)
+        reader_rt[c.x][c.y] = addrs + [count, start] + list(mods) + list(offs)
         compute_rt[c.x][c.y] = [count]
         writer_rt[c.x][c.y] = [y.buffer_address(), count, start]
 
@@ -90,7 +95,7 @@ def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0, 0, 0, 0, 0)):
             kernel_source=compute,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[],
+            compile_time_args=list(compute_args),
             runtime_args=compute_rt,
             config=compute_cfg,
         ),
@@ -163,3 +168,28 @@ def vote_tail(acc, bn, f0, e_neg, tol):
     for t in ins + ([] if row is None else [bn]):
         ttnn.deallocate(t)
     return y
+
+
+def sum_parts(g, n):
+    """((g[0] + g[1]) + g[2]) + ... for an interleaved float32 tile tensor g = [n, ...] (the TP all-reduce's
+    gathered partials), in one pass: each slab is read at its page offset, with no slice copies, and added
+    in the order of the ttnn.add chain (bit-identical). Returns g[0]'s shape; None for an n or a g it does not
+    take. g is left as it is."""
+    s = list(g.shape)
+    if not 2 <= n <= len(_IN_CBS) or s[0] != n or len(s) < 3:
+        return None
+    if g.dtype != ttnn.float32 or g.layout != ttnn.TILE_LAYOUT or g.is_sharded():
+        return None
+    ps = list(g.padded_shape)
+    pages = 1
+    for d in ps[1:-2]:
+        pages *= d
+    pages *= (ps[-2] // TILE) * (ps[-1] // TILE)
+    y = ttnn.empty(
+        s[1:], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=g.device(), memory_config=g.memory_config()
+    )
+    ins = [g] * n
+    program = _program(
+        ins, y, pages, compute=_SUM_COMPUTE, offs=[k * pages for k in range(n)] + [0] * (5 - n), compute_args=[n]
+    )
+    return ttnn.generic_op([g, y], program)
