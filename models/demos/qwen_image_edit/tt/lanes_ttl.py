@@ -1,16 +1,17 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The 8 exact-lane copies of a precise linear's lead limb in ONE tt-lang pass.
+"""The 8 exact-lane copies of a precise linear's lead limb, and its negation, in ONE tt-lang pass.
 
 The guarded precise linears (models/demos/qwen_image_edit_text_encoder/_stubs/attention.py, LANE_SPLIT) mask
 their bf16 lead limb into 8 lanes, lane r keeping the K entries with k % 8 == r: 8 ttnn multiplies, each
 reading the whole limb. Since 32 % 8 == 0, lane r's mask is the same 32x32 tile at every K tile (ones in the
 columns j with j % 8 == r), so this kernel reads each limb tile once and writes its 8 masked copies. The
 masks multiply on the SFPU (x * 1 = x, x * 0 = 0 exactly; a negative x masks to -0, which adds as +0), so
-every lane equals the ttnn one.
+every lane equals the ttnn one. The negated limb (the guard's negated-input product) is the SFPU negation of a
+bf16 value, exact as well.
 
 `prepare(device)` uploads the 8 mask tiles once, at build time (the forward makes no host uploads);
-`lanes8(lead)` returns the 8 lanes, or None for a shape it does not take.
+`lanes8(lead)` returns (the 8 lanes, -lead), or None for a shape it does not take.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ def _make_op():
         y5: ttnn.Tensor,
         y6: ttnn.Tensor,
         y7: ttnn.Tensor,
+        yn: ttnn.Tensor,
     ):
         grid_cols, grid_rows = ttl.grid_size(dims=2)
         rows = x.shape[0] // TILE
@@ -57,6 +59,7 @@ def _make_op():
         o5 = ttl.make_dataflow_buffer_like(y5, shape=(1, 1), block_count=2)
         o6 = ttl.make_dataflow_buffer_like(y6, shape=(1, 1), block_count=2)
         o7 = ttl.make_dataflow_buffer_like(y7, shape=(1, 1), block_count=2)
+        on = ttl.make_dataflow_buffer_like(yn, shape=(1, 1), block_count=2)
 
         @ttl.compute()
         def compute():
@@ -95,6 +98,8 @@ def _make_op():
                                         o.store(a * m6)
                                     with o7.reserve() as o:
                                         o.store(a * m7)
+                                    with on.reserve() as o:
+                                        o.store(ttl.math.neg(a))
 
         @ttl.datamovement()
         def read():
@@ -146,6 +151,9 @@ def _make_op():
                             with o7.wait() as o:
                                 tx = ttl.copy(o, y7[row : row + 1, col : col + 1])
                                 tx.wait()
+                            with on.wait() as o:
+                                tx = ttl.copy(o, yn[row : row + 1, col : col + 1])
+                                tx.wait()
 
     return _lanes
 
@@ -165,7 +173,7 @@ def prepare(device):
 
 
 def lanes8(lead):
-    """The 8 lanes of a bf16 interleaved tile tensor [..., M, K] (M, K tile-aligned), or None."""
+    """(the 8 lanes, -lead) of a bf16 interleaved tile tensor [..., M, K] (M, K tile-aligned), or None."""
     s = list(lead.shape)
     if len(s) < 2 or s[-2] % TILE or s[-1] % TILE:
         return None
@@ -186,7 +194,7 @@ def lanes8(lead):
         # ttl keeps the compiling call's arguments for the process lifetime: give it a copy to pin and free it,
         # and hand back copies of the outputs
         x = ttnn.clone(x)
-    ys = [ttnn.empty_like(x) for _ in range(LANES)]
+    ys = [ttnn.empty_like(x) for _ in range(LANES + 1)]  # the lanes, then -lead
     _OP[0](x, _MASKS[id(dev)], *ys)
     if first:
         _COMPILED.add(key)
@@ -196,4 +204,5 @@ def lanes8(lead):
             outs.append(ttnn.clone(y))
             ttnn.deallocate(y)
         ys = outs
-    return [ttnn.view(y, s) for y in ys]
+    ys = [ttnn.view(y, s) for y in ys]
+    return ys[:LANES], ys[LANES]

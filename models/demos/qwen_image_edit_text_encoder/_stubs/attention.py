@@ -248,8 +248,8 @@ def _col_norms(w, transpose_b=False, cache=True):
 # shape it does not take -- then without calling rest_fn, so the ttnn spelling below keeps its own order (the
 # trailing product formed after the guard: the denoiser has no room to hold it through the guard).
 GUARD_TAIL = None
-# Optional fused kernel for the strided lane split: LANE_SPLIT(lead) -> the EXACT_LANES lanes of the bf16 lead
-# limb (each equal to lead * its strided mask), or None for a shape it does not take.
+# Optional fused kernel for the strided lane split: LANE_SPLIT(lead) -> (the EXACT_LANES lanes of the bf16 lead
+# limb, each equal to lead * its strided mask; -lead), or None for a shape it does not take.
 LANE_SPLIT = None
 # Math fidelity of the guarded mode's trailing-limb product (the lo limb, ~2^-8 of x): HiFi4 keeps it exact like
 # the lead limb's; a lower fidelity's product error on it lands ~2^-8 below the output's own scale.
@@ -282,16 +282,19 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None):
     lo_mms = lo_mms or mms
     lead = parts[0]
     exs = [None] * len(mms)
-    lanes = None if LANE_SPLIT is None else LANE_SPLIT(lead)
-    if lanes is None:  # one lane at a time
+    split = None if LANE_SPLIT is None else LANE_SPLIT(lead)
+    if split is None:  # one lane at a time
         masks = _lane_masks(lead.device(), lead.shape[-1], lead.dtype, "strided")
-        lanes = (ttnn.multiply(lead, m) for m in masks)
+        lanes, neg_lead = (ttnn.multiply(lead, m) for m in masks), None
+    else:
+        lanes, neg_lead = split
     for lane in lanes:
         for i, mm in enumerate(mms):
             t = mm(lane)
             exs[i] = t if exs[i] is None else ttnn.add(exs[i], t)
         ttnn.deallocate(lane)
-    neg_lead, a_norm = ttnn.neg(lead), _norm_last(lead)
+    neg_lead = ttnn.neg(lead) if neg_lead is None else neg_lead
+    a_norm = _norm_last(lead)
     ys = []
     for i, mm in enumerate(mms):
         dn = mm(lead)
