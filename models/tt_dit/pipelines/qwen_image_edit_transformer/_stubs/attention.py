@@ -93,12 +93,32 @@ class TtQwenJointAttention:
                 w, b = w[perm], b[perm]
             return _sharded(w.t(), device, dim=-1), _sharded(b.reshape(1, -1), device, dim=-1, dtype=ttnn.float32)
 
-        self.img_q = w_col(m.to_q, True)
-        self.img_k = w_col(m.to_k, True)
-        self.img_v = w_col(m.to_v, False)
-        self.txt_q = w_col(m.add_q_proj, True)
-        self.txt_k = w_col(m.add_k_proj, True)
-        self.txt_v = w_col(m.add_v_proj, False)
+        def w_qkv(lq, lk, lv):
+            # one column-parallel weight per chip: [this chip's q | k | v] columns, so a single (limb) matmul
+            # reads the activation and the three weights once
+            ws, bs = [], []
+            for lin, permute in ((lq, True), (lk, True), (lv, False)):
+                w = lin.weight.detach().to(torch.float32)
+                b = lin.bias.detach().to(torch.float32) if lin.bias is not None else torch.zeros(w.shape[0])
+                if permute:
+                    w, b = w[perm], b[perm]
+                ws.append(w.t().reshape(w.shape[1], self.tp, -1))
+                bs.append(b.reshape(1, self.tp, -1))
+            w = torch.stack(ws, dim=2).reshape(ws[0].shape[0], -1)
+            b = torch.stack(bs, dim=2).reshape(1, -1)
+            return _sharded(w, device, dim=-1), _sharded(b, device, dim=-1, dtype=ttnn.float32)
+
+        self.fused_qkv = FUSED_QKV
+        if self.fused_qkv:
+            self.img_qkv = w_qkv(m.to_q, m.to_k, m.to_v)
+            self.txt_qkv = w_qkv(m.add_q_proj, m.add_k_proj, m.add_v_proj)
+        else:
+            self.img_q = w_col(m.to_q, True)
+            self.img_k = w_col(m.to_k, True)
+            self.img_v = w_col(m.to_v, False)
+            self.txt_q = w_col(m.add_q_proj, True)
+            self.txt_k = w_col(m.add_k_proj, True)
+            self.txt_v = w_col(m.add_v_proj, False)
 
         def w_row(lin):
             w = lin.weight.detach().to(torch.float32)
@@ -139,15 +159,17 @@ class TtQwenJointAttention:
             return _precise.linear(x, w, bias=b, parts=parts)
         return ttnn.linear(x, w, bias=b, dtype=dtype, compute_kernel_config=self.hifi)
 
-    def _heads(self, x):  # [B, S, Hl*D] -> [B, Hl, S, D]
+    def _heads(self, x, off=0):  # [B, S, Hl*D] (at column off of x) -> [B, Hl, S, D]
         B, S = x.shape[0], x.shape[1]
         if HEADS_BY_SLICES:  # one tile-aligned column block per head, stacked on dim 1 (no padded permute)
             D = self.head_dim
             parts = [
-                ttnn.reshape(ttnn.slice(x, (0, 0, h * D), (B, S, (h + 1) * D)), (B, 1, S, D))
+                ttnn.reshape(ttnn.slice(x, (0, 0, off + h * D), (B, S, off + (h + 1) * D)), (B, 1, S, D))
                 for h in range(self.local_heads)
             ]
             return parts[0] if len(parts) == 1 else ttnn.concat(parts, dim=1)
+        if off or x.shape[-1] != self.local_heads * self.head_dim:
+            x = ttnn.slice(x, (0, 0, off), (B, S, off + self.local_heads * self.head_dim))
         if HEADS_INPUT_L1:
             x = ttnn.to_memory_config(x, ttnn.L1_MEMORY_CONFIG)
         x = ttnn.reshape(x, (B, S, self.local_heads, self.head_dim))
@@ -245,12 +267,27 @@ class TtQwenJointAttention:
         share = _precise.ENABLED and _precise.SHARE_SPLIT
         hp = _precise.split_bf16(hs) if share else None  # q/k/v of one stream share its hi/lo split
         ep = _precise.split_bf16(ehs) if share else None
-        qi = self._rope(self._rms(self._heads(self._proj(hs, self.img_q, parts=hp)), self.nw_img_q), img_f)
-        ki = self._rope(self._rms(self._heads(self._proj(hs, self.img_k, parts=hp)), self.nw_img_k), img_f)
-        vi = self._heads(self._proj(hs, self.img_v, vdt, parts=hp))
-        qt = self._rope(self._rms(self._heads(self._proj(ehs, self.txt_q, parts=ep)), self.nw_txt_q), txt_f)
-        kt = self._rope(self._rms(self._heads(self._proj(ehs, self.txt_k, parts=ep)), self.nw_txt_k), txt_f)
-        vt = self._heads(self._proj(ehs, self.txt_v, vdt, parts=ep))
+        if self.fused_qkv:  # one projection per stream; q/k/v are column blocks of its float32 output
+            n = self.local_heads * self.head_dim
+            yi = self._proj(hs, self.img_qkv, parts=hp)
+            yt = self._proj(ehs, self.txt_qkv, parts=ep)
+            qi = self._rope(self._rms(self._heads(yi), self.nw_img_q), img_f)
+            ki = self._rope(self._rms(self._heads(yi, n), self.nw_img_k), img_f)
+            vi = self._heads(yi, 2 * n)
+            qt = self._rope(self._rms(self._heads(yt), self.nw_txt_q), txt_f)
+            kt = self._rope(self._rms(self._heads(yt, n), self.nw_txt_k), txt_f)
+            vt = self._heads(yt, 2 * n)
+            if vdt != ttnn.float32:
+                vi, vt = ttnn.typecast(vi, vdt), ttnn.typecast(vt, vdt)
+            ttnn.deallocate(yi)
+            ttnn.deallocate(yt)
+        else:
+            qi = self._rope(self._rms(self._heads(self._proj(hs, self.img_q, parts=hp)), self.nw_img_q), img_f)
+            ki = self._rope(self._rms(self._heads(self._proj(hs, self.img_k, parts=hp)), self.nw_img_k), img_f)
+            vi = self._heads(self._proj(hs, self.img_v, vdt, parts=hp))
+            qt = self._rope(self._rms(self._heads(self._proj(ehs, self.txt_q, parts=ep)), self.nw_txt_q), txt_f)
+            kt = self._rope(self._rms(self._heads(self._proj(ehs, self.txt_k, parts=ep)), self.nw_txt_k), txt_f)
+            vt = self._heads(self._proj(ehs, self.txt_v, vdt, parts=ep))
 
         # Joint sequence order is [text, image].
         k = ttnn.concat([kt, ki], dim=2)
@@ -277,6 +314,8 @@ class TtQwenJointAttention:
 HEADS_INPUT_L1 = False
 # heads in/out by per-head slices + concat instead of reshape + permute (which pads the head count to a tile)
 HEADS_BY_SLICES = False
+# q/k/v (and add_q/k/v) projections as one column-parallel weight per stream (read at build: set before building)
+FUSED_QKV = False
 
 
 def build(device, torch_module=None):
