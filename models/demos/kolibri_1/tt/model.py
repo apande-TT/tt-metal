@@ -23,6 +23,7 @@ evidence that every graduated module runs inside the real forward path).
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 
 import torch
 
@@ -250,6 +251,113 @@ class Attention(TtKolibri1Attention):
 
 
 # ----------------------------------------------------------------------------------------------------- MoE
+_KERNELS = Path(__file__).resolve().parent / "kernels"
+_ROUTED_OUT = {}
+
+
+class RoutedGateUp:
+    """Decode gate/up over the ROUTED experts only (tt/kernels/routed_gate_up_*.cpp, one generic_op).
+
+    One decode step routes its 32 tokens to ~40% of a chip's 96 experts, yet the dense [32, 2560] x
+    [2560, 96*512] gate and up matmuls stream every expert's columns. The kernel reads a [1, 96] mask of the
+    experts any token chose, deals their weight columns round-robin over all cores, and computes only
+    those, each column's K accumulated in fp32 dest at HiFi4 (the dense op's math). Outputs land in
+    persistent [32, 96*512] buffers shared by every layer: a column it skips keeps whatever finite value an
+    earlier call left, and its routing weight is exactly 0, so it contributes nothing downstream."""
+
+    def __init__(self, device, w_gate, w_up, n_experts: int, inter: int) -> None:
+        self.w_gate, self.w_up = w_gate, w_up
+        g = device.compute_with_storage_grid_size()
+        self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(g.x - 1, g.y - 1))])
+        self.core_xy = [(x, y) for y in range(g.y) for x in range(g.x)]
+        self.kt, self.nt = w_gate.shape[-2] // ttnn.TILE_SIZE, w_gate.shape[-1] // ttnn.TILE_SIZE
+        self.n_experts, self.cpe = n_experts, inter // ttnn.TILE_SIZE
+        self.kb = next(b for b in (16, 10, 8, 5, 4, 2, 1) if self.kt % b == 0)
+        self.max_slots = -(-self.nt // len(self.core_xy))
+        key = (id(device), self.nt)
+        if key not in _ROUTED_OUT:
+            shape = [1, 1, ttnn.TILE_SIZE, self.nt * ttnn.TILE_SIZE]
+            _ROUTED_OUT[key] = tuple(
+                ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device) for _ in range(2)
+            )
+        self.g_out, self.u_out = _ROUTED_OUT[key]
+
+    @staticmethod
+    def _cb(index, fmt, page, pages, cores):
+        return ttnn.CBDescriptor(
+            total_size=page * pages,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=fmt, page_size=page)],
+        )
+
+    def __call__(self, x, mask):
+        """x [1, 1, 32, K] bf16 tile, mask [1, 1, 1, n_experts] fp32 row-major (non-zero = routed) ->
+        the persistent (gate, up) [1, 1, 32, N] bf16 outputs, routed columns written."""
+        x_tile, w_tile = 2048, 1088  # bf16 / bfp8_b tile bytes
+        cores = self.cores
+        cbs = [
+            self._cb(0, ttnn.bfloat16, x_tile, self.kt, cores),
+            self._cb(1, ttnn.bfloat8_b, w_tile, 2 * self.kb, cores),
+            self._cb(2, ttnn.bfloat8_b, w_tile, 2 * self.kb, cores),
+            self._cb(3, ttnn.float32, 512, 1, cores),
+            self._cb(4, ttnn.uint32, 16, 1, cores),
+            self._cb(5, ttnn.uint32, 16 * (-(-4 * (1 + self.max_slots) // 16)), 1, cores),
+            self._cb(16, ttnn.bfloat16, x_tile, 2, cores),
+            self._cb(17, ttnn.bfloat16, x_tile, 2, cores),
+        ]
+        acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+        reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        addrs = [t.buffer_address() for t in (x, self.w_gate, self.w_up, mask)]
+        for i, (cx, cy) in enumerate(self.core_xy):
+            reader_rt[cx][cy] = addrs + [i]
+            writer_rt[cx][cy] = [self.g_out.buffer_address(), self.u_out.buffer_address()]
+        file = ttnn.KernelDescriptor.SourceType.FILE_PATH
+        kernels = [
+            ttnn.KernelDescriptor(
+                kernel_source=str(_KERNELS / "routed_gate_up_reader.cpp"),
+                source_type=file,
+                core_ranges=cores,
+                compile_time_args=[
+                    self.kt,
+                    self.nt,
+                    self.n_experts,
+                    self.cpe,
+                    len(self.core_xy),
+                    self.kb,
+                    self.max_slots,
+                    x_tile,
+                    w_tile,
+                ]
+                + acc(x, self.w_gate, self.w_up, mask),
+                runtime_args=reader_rt,
+                config=ttnn.ReaderConfigDescriptor(),
+            ),
+            ttnn.KernelDescriptor(
+                kernel_source=str(_KERNELS / "routed_gate_up_writer.cpp"),
+                source_type=file,
+                core_ranges=cores,
+                compile_time_args=acc(self.g_out, self.u_out),
+                runtime_args=writer_rt,
+                config=ttnn.WriterConfigDescriptor(),
+            ),
+            ttnn.KernelDescriptor(
+                kernel_source=str(_KERNELS / "routed_gate_up_compute.cpp"),
+                source_type=file,
+                core_ranges=cores,
+                compile_time_args=[self.kt, self.kb],
+                runtime_args=[],
+                config=ttnn.ComputeConfigDescriptor(
+                    math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
+                ),
+            ),
+        ]
+        ttnn.generic_op(
+            [x, self.w_gate, self.w_up, mask, self.g_out, self.u_out],
+            ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs),
+        )
+        return self.g_out, self.u_out
+
+
 class MoE(TtKolibri1SparseMoeBlock):
     """The graduated sparse MoE block with its router logits from the graduated router stub and its
     ungated shared expert as the graduated m_l_p stub (the routed experts are the block's own)."""
@@ -280,6 +388,13 @@ class MoE(TtKolibri1SparseMoeBlock):
             fused_activation=None,
             mcast_in0=True,
         )
+        self.routed_gate_up = RoutedGateUp(device, self.w_gate, self.w_up, self.n_local, self.inter)
+
+    def _routed_mask(self, weights):
+        """[1, 1, 32, n_exp] routing weights (replicated) -> this chip's [1, 1, 1, n_local] row-major mask, non-zero
+        where any token routed to the expert."""
+        w = ttnn.mesh_partition(weights, dim=3, cluster_axis=self.tp_axis) if self.tp > 1 else weights
+        return ttnn.to_layout(ttnn.max(w, dim=2, keepdim=True), ttnn.ROW_MAJOR_LAYOUT)
 
     def routing_weights(self, x):
         logits = self.router(x)
@@ -306,14 +421,20 @@ class MoE(TtKolibri1SparseMoeBlock):
         x = x_in if x_in.dtype == ttnn.bfloat16 else ttnn.typecast(x_in, ttnn.bfloat16)
         weights = self.routing_weights(x_in if self.router_fp32_input else x)
         col_scale = ttnn.linear(weights, self.expand, dtype=ttnn.bfloat16, compute_kernel_config=self.hifi4)
+        decode = x.shape[-2] == ttnn.TILE_SIZE
+        if decode:  # only the routed experts' columns (persistent outputs, not freed)
+            mask = self._routed_mask(weights)
+            g, u = self.routed_gate_up(x, mask)
+            ttnn.deallocate(mask)
+        else:
+            g = ttnn.linear(x, self.w_gate, compute_kernel_config=self.hifi2)
+            u = ttnn.linear(x, self.w_up, compute_kernel_config=self.hifi2)
         ttnn.deallocate(weights)
-        g = ttnn.linear(x, self.w_gate, compute_kernel_config=self.hifi2)
-        u = ttnn.linear(x, self.w_up, compute_kernel_config=self.hifi2)
         act = ttnn.multiply(ttnn.multiply(ttnn.silu(g), u), col_scale)
-        ttnn.deallocate(g)
-        ttnn.deallocate(u)
+        if not decode:
+            ttnn.deallocate(g)
+            ttnn.deallocate(u)
         ttnn.deallocate(col_scale)
-        decode = act.shape[-2] == ttnn.TILE_SIZE
         out = ttnn.linear(
             act,
             self.w_down,
