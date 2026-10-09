@@ -4,11 +4,13 @@
 
 // The guarded exact-lane tail of the precise linears, one float32 tile at a time:
 //
-//     y = where(|ex - dn| > tol, median(ex, dn, -nn), ex) + lo
+//     y = where(|ex - dn| > tol, median(ex, dn, -nn), ex) + lo  [+ lo2]
 //
+// With the compile-time HAS_LO2, a sixth operand (c_5: the next trailing limb's product) is added last, the add
+// the ttnn spelling makes after the tail.
 // with the same SFPU calls ttnn's float32 binary_ng / ternary ops make for the ttnn spelling (sub, abs,
 // gt, min, max, negative, where<Float32>, add), on operands unpacked straight to the float32 DST, so the
-// result is bit-identical to it. Seven DST slots: dst_full_sync_en gives eight float32 tiles.
+// result is bit-identical to it. Up to eight DST slots: dst_full_sync_en gives eight float32 tiles.
 
 #include <cstdint>
 
@@ -27,9 +29,10 @@
 
 void kernel_main() {
     const uint32_t num_tiles = get_arg_val<uint32_t>(0);
-    constexpr uint32_t cb_ex = 0, cb_dn = 1, cb_nn = 2, cb_tol = 3, cb_lo = 4, cb_out = 16;
+    constexpr uint32_t has_lo2 = get_compile_time_arg_val(0);
+    constexpr uint32_t cb_ex = 0, cb_dn = 1, cb_nn = 2, cb_tol = 3, cb_lo = 4, cb_lo2 = 5, cb_out = 16;
     // DST slots
-    constexpr uint32_t EX = 0, DN = 1, NN = 2, TOL = 3, LO = 4, FAR = 5, TMP = 6;
+    constexpr uint32_t EX = 0, DN = 1, NN = 2, TOL = 3, LO = 4, FAR = 5, TMP = 6, LO2 = 7;
 
     compute_kernel_hw_startup(cb_ex, cb_out);
     for (uint32_t i = 0; i < num_tiles; ++i) {
@@ -38,6 +41,9 @@ void kernel_main() {
         cb_wait_front(cb_nn, 1);
         cb_wait_front(cb_tol, 1);
         cb_wait_front(cb_lo, 1);
+        if constexpr (has_lo2) {
+            cb_wait_front(cb_lo2, 1);
+        }
         cb_reserve_back(cb_out, 1);
 
         tile_regs_acquire();
@@ -72,6 +78,12 @@ void kernel_main() {
         where_tile<DataFormat::Float32>(FAR, TOL, EX, EX);  // far ? median : ex
         add_binary_tile_init();
         add_binary_tile(EX, LO, EX);  // + lo
+        if constexpr (has_lo2) {
+            copy_init(cb_lo2);
+            copy_tile(cb_lo2, 0, LO2);
+            add_binary_tile_init();
+            add_binary_tile(EX, LO2, EX);  // + lo2
+        }
         tile_regs_commit();
 
         tile_regs_wait();
@@ -84,5 +96,8 @@ void kernel_main() {
         cb_pop_front(cb_nn, 1);
         cb_pop_front(cb_tol, 1);
         cb_pop_front(cb_lo, 1);
+        if constexpr (has_lo2) {
+            cb_pop_front(cb_lo2, 1);
+        }
     }
 }

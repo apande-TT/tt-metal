@@ -252,7 +252,7 @@ def _col_norms(w, transpose_b=False, cache=True):
     return n
 
 
-# Optional fused kernel for the guarded tail: GUARD_TAIL(ex, dn, nn, tol, rest_fn) -> the value _guarded
+# Optional fused kernel for the guarded tail: GUARD_TAIL(ex, dn, nn, tol, rest_fn[, rest2_fn]) -> the value _guarded
 # returns (bit-identical), consuming (deallocating) ex, dn, nn, tol and rest_fn()'s product, or None for a
 # shape it does not take -- then without calling rest_fn, so the ttnn spelling below keeps its own order (the
 # trailing product formed after the guard: the denoiser has no room to hold it through the guard).
@@ -265,14 +265,14 @@ LANE_SPLIT = None
 LO_FIDELITY = ttnn.MathFidelity.HiFi4
 
 
-def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None):
+def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None, rest2_fn=None):
     """ex where it is within the dense floor of dn, else median(ex, dn, -nn), plus rest_fn() (the trailing
     limb terms' first product) when given; nn = mm(-x), the negated-input product before its sign is restored.
     The negation and the |ex - dn| are fused into the binary ops that consume them and the slack scales the
     [.., M, 1] norm, so no output-sized pass is spent on any of them."""
     tol = ttnn.multiply(ttnn.multiply(a_norm, GUARD_SLACK * 2.0**-12), b_norm)
     if rest_fn is not None and GUARD_TAIL is not None:
-        y = GUARD_TAIL(ex, dn, nn, tol, rest_fn)
+        y = GUARD_TAIL(ex, dn, nn, tol, rest_fn) if rest2_fn is None else GUARD_TAIL(ex, dn, nn, tol, rest_fn, rest2_fn)
         if y is not None:
             return y
     near = ttnn.le(ttnn.subtract(ex, dn, activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.ABS)]), tol)
@@ -280,7 +280,9 @@ def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None):
     neg = [ttnn.UnaryWithParam(ttnn.UnaryOpType.NEG)]
     med = ttnn.maximum(lo, ttnn.minimum(hi, nn, input_tensor_b_activations=neg))  # median(ex, dn, -nn)
     y = ttnn.where(near, ex, med)
-    return y if rest_fn is None else ttnn.add(y, rest_fn())
+    if rest_fn is not None:
+        y = ttnn.add(y, rest_fn())
+    return y if rest2_fn is None else ttnn.add(y, rest2_fn())
 
 
 def _guarded_sums(mms, parts, b_norms, lo_mms=None):
@@ -307,10 +309,11 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None):
     ys = []
     for i, mm in enumerate(mms):
         dn = mm(lead)
-        rest = [lambda p=part, mm=lo_mms[i]: mm(p) for part in parts[1:2]]
+        # the trailing limbs' first two products go into the fused tail; any further ones are added after it
+        rest = [lambda p=part, mm=lo_mms[i] if k == 0 else mm: mm(p) for k, part in enumerate(parts[1:3])]
         y = _guarded(exs[i], dn, mm(neg_lead), a_norm, b_norms[i], *rest)
         exs[i] = None
-        for part in parts[2:]:
+        for part in parts[3:]:
             y = ttnn.add(y, mm(part))
         ys.append(y)
     return ys
@@ -540,9 +543,9 @@ def _guarded_terms(mm, terms, a, b, transpose_b):
         t = mm(lane, pb0)
         ex = t if ex is None else ttnn.add(ex, t)
     dn = mm(pa0, pb0)
-    first = [lambda pa=pa, pb=pb: mm(pa, pb) for pa, pb in rest[:1]]
+    first = [lambda pa=pa, pb=pb: mm(pa, pb) for pa, pb in rest[:2]]
     y = _guarded(ex, dn, mm(ttnn.neg(pa0), pb0), _norm_last(a), _col_norms(b, transpose_b, cache=False), *first)
-    for pa, pb in rest[1:]:
+    for pa, pb in rest[2:]:
         y = ttnn.add(y, mm(pa, pb))
     return y
 

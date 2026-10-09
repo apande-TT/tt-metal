@@ -28,7 +28,7 @@ _SUM_COMPUTE = f"{_DIR}/sum_parts_compute.cpp"
 _SPLIT_COMPUTE = f"{_DIR}/split_limbs_compute.cpp"
 _TWO_OUT_WRITER = f"{_DIR}/two_out_writer.cpp"
 _WRITER = "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp"
-_IN_CBS = (0, 1, 2, 3, 4)
+_IN_CBS = (0, 1, 2, 3, 4, 5)
 _OUT_CB = 16  # the outputs' CBs: c_16, then c_17, c_18
 _FP32_TILE_BYTES = 4096
 
@@ -45,9 +45,11 @@ def _cores(grid, n_tiles):
     return out
 
 
-def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0,) * 5, offs=(0,) * 5, compute_args=()):
-    """Up to five float32 tile operands -> y (one tensor, or two / three written through c_16..c_18), tile by tile;
-    operand k read at page (i % mods[k] when nonzero, else i) + offs[k]."""
+def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(), offs=(), compute_args=()):
+    """Up to six float32 tile operands -> y (one tensor, or two / three written through c_16..c_18), tile by tile;
+    operand k read at page (i % mods[k] when nonzero, else i) + offs[k] (missing mods / offs are 0)."""
+    mods = list(mods) + [0] * (len(_IN_CBS) - len(mods))
+    offs = list(offs) + [0] * (len(_IN_CBS) - len(offs))
     n_in = len(ins)
     ys = list(y) if isinstance(y, (list, tuple)) else [y]
     grid = ys[0].device().compute_with_storage_grid_size()
@@ -73,7 +75,8 @@ def _program(ins, y, n_tiles, compute=_COMPUTE, mods=(0,) * 5, offs=(0,) * 5, co
     reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     addrs = [t.buffer_address() for t in ins] + [0] * pad
     for c, start, count in work:
-        reader_rt[c.x][c.y] = addrs + [count, start] + list(mods) + list(offs)
+        # runtime layout: addr0..4, count, start, mod0..4, off0..4, then addr5, mod5, off5
+        reader_rt[c.x][c.y] = addrs[:5] + [count, start] + mods[:5] + offs[:5] + [addrs[5], mods[5], offs[5]]
         compute_rt[c.x][c.y] = [count]
         if len(ys) == 1:
             writer_rt[c.x][c.y] = [ys[0].buffer_address(), count, start]
@@ -126,10 +129,10 @@ def _plain(t, s):
     return list(t.shape) == s and t.dtype == ttnn.float32 and t.layout == ttnn.TILE_LAYOUT and not t.is_sharded()
 
 
-def guard_tail(ex, dn, nn, tol, lo_fn):
-    """where(|ex - dn| <= tol, ex, median(ex, dn, -nn)) + lo_fn() for same-shape interleaved float32 tile
-    tensors [..., M, N] (M and N tile-aligned). Consumes (deallocates) ex, dn, nn, tol and lo_fn()'s tensor.
-    Returns None for a shape it does not take, before calling lo_fn."""
+def guard_tail(ex, dn, nn, tol, lo_fn, lo2_fn=None):
+    """where(|ex - dn| <= tol, ex, median(ex, dn, -nn)) + lo_fn() [+ lo2_fn()] for same-shape interleaved float32
+    tile tensors [..., M, N] (M and N tile-aligned). Consumes (deallocates) ex, dn, nn, tol and the lo_fn() /
+    lo2_fn() tensors. Returns None for a shape it does not take, before calling lo_fn."""
     s = list(ex.shape)
     if len(s) < 2 or s[-2] % TILE or s[-1] % TILE or not all(_plain(t, s) for t in (ex, dn, nn, tol)):
         return None
@@ -142,8 +145,15 @@ def guard_tail(ex, dn, nn, tol, lo_fn):
         n_tiles *= d
     n_tiles *= (s[-2] // TILE) * (s[-1] // TILE)
     ins = [ex, dn, nn, tol, lo]
+    if lo2_fn is not None:
+        lo2 = lo2_fn()
+        if not _plain(lo2, s):  # not expected, as for lo
+            ttnn.deallocate(lo2)
+            ttnn.deallocate(lo)
+            return None
+        ins.append(lo2)
     y = ttnn.empty_like(ex)
-    ttnn.generic_op(ins + [y], _program(ins, y, n_tiles))
+    ttnn.generic_op(ins + [y], _program(ins, y, n_tiles, compute_args=[int(lo2_fn is not None)]))
     # the inputs are dead after the tail: free them now, not at the caller's return (the text encoder and
     # the denoiser run at the edge of DRAM, where the later free fragments it)
     for t in ins:
