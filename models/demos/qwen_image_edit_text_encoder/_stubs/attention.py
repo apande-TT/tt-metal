@@ -172,12 +172,12 @@ LANE_PATTERNS = ("strided", "rot1", "rot3")
 _LANE_MASKS = {}
 
 
-def precise_config():
+def precise_config(fidelity=ttnn.MathFidelity.HiFi4):
     """HiFi4 + fp32 dest, packer_l1_acc OFF. With L1 accumulation on, the auto-picked matmul configs of
     several of this model's shapes lose 3-5x (measured: vision qkv 1.4e-3, LM gate 1.7e-3 relative vs
     3.1e-4 with it off, bf16-exact operands)."""
     return ttnn.WormholeComputeKernelConfig(
-        math_fidelity=ttnn.MathFidelity.HiFi4,
+        math_fidelity=fidelity,
         math_approx_mode=False,
         fp32_dest_acc_en=True,
         packer_l1_acc=False,
@@ -263,6 +263,10 @@ LANE_SPLIT = None
 # Math fidelity of the guarded mode's trailing-limb product (the lo limb, ~2^-8 of x): HiFi4 keeps it exact like
 # the lead limb's; a lower fidelity's product error on it lands ~2^-8 below the output's own scale.
 LO_FIDELITY = ttnn.MathFidelity.HiFi4
+# Math fidelity of the guard's negated-input product nn: it only decides an output where the guard trips (a
+# glitch), as the tie-break in median(ex, dn, -nn), where a lower fidelity's ~2^-7 product error still leaves the
+# median a sound value; everywhere else the exact-lane sum is kept.
+NN_FIDELITY = ttnn.MathFidelity.HiFi4
 
 
 def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None, rest2_fn=None):
@@ -285,12 +289,13 @@ def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None, rest2_fn=None):
     return y if rest2_fn is None else ttnn.add(y, rest2_fn())
 
 
-def _guarded_sums(mms, parts, b_norms, lo_mms=None):
+def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None):
     """EXACT_MODE "guarded" for linears of ONE input: mms[i](p) = p @ w_i; parts = the input's bf16 limbs.
     The input side (each lane, the negated lead limb, its row norms) is formed once for all the weights,
     one lane at a time; each weight's own sums run in the same order as alone, so every output is the one
     a call for that weight alone would give. lo_mms: the matmuls for the trailing limb (default mms)."""
     lo_mms = lo_mms or mms
+    nn_mms = nn_mms or mms
     lead = parts[0]
     exs = [None] * len(mms)
     split = None if LANE_SPLIT is None else LANE_SPLIT(lead)
@@ -311,7 +316,7 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None):
         dn = mm(lead)
         # the trailing limbs' first two products go into the fused tail; any further ones are added after it
         rest = [lambda p=part, mm=lo_mms[i] if k == 0 else mm: mm(p) for k, part in enumerate(parts[1:3])]
-        y = _guarded(exs[i], dn, mm(neg_lead), a_norm, b_norms[i], *rest)
+        y = _guarded(exs[i], dn, nn_mms[i](neg_lead), a_norm, b_norms[i], *rest)
         exs[i] = None
         for part in parts[3:]:
             y = ttnn.add(y, mm(part))
@@ -407,7 +412,7 @@ def linear_program_config(x, w):
 
 def _linear_mm(x, w, fidelity=ttnn.MathFidelity.HiFi4):
     """p -> p @ w in float32 for the bf16 parts p of x (the precise linears' matmul)."""
-    cfg = precise_config()
+    cfg = precise_config(fidelity)
     pc = linear_program_config(x, w)
     if pc is not None:  # the hand config's float32 output CB takes the K-step partials in L1 directly
         cfg = ttnn.WormholeComputeKernelConfig(
@@ -429,7 +434,8 @@ def split_linears(x, ws, biases=None, compute_kernel_config=None, exact=True, li
         return [split_linear(x, w, b, compute_kernel_config, exact, limbs) for w, b in zip(ws, biases)]
     parts = split_bf16(x, limbs)
     lo_mms = [_linear_mm(x, w, LO_FIDELITY) for w in ws]
-    ys = _guarded_sums([_linear_mm(x, w) for w in ws], parts, [_col_norms(w) for w in ws], lo_mms)
+    nn_mms = [_linear_mm(x, w, NN_FIDELITY) for w in ws]
+    ys = _guarded_sums([_linear_mm(x, w) for w in ws], parts, [_col_norms(w) for w in ws], lo_mms, nn_mms)
     return [_add_bias(y, b) for y, b in zip(ys, biases)]
 
 
@@ -439,7 +445,9 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     parts = split_bf16(x, limbs)
     mm = _linear_mm(x, w)
     if exact and EXACT_MODE == "guarded":
-        y = _guarded_sums([mm], parts, [_col_norms(w)], [_linear_mm(x, w, LO_FIDELITY)])[0]
+        y = _guarded_sums(
+            [mm], parts, [_col_norms(w)], [_linear_mm(x, w, LO_FIDELITY)], [_linear_mm(x, w, NN_FIDELITY)]
+        )[0]
     elif exact:
         y = _exact_sum(mm, parts)
     else:
