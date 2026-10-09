@@ -16,6 +16,8 @@ and takes the median of 3 rotated lane partitions (a rare power-of-two tile glit
 """
 from __future__ import annotations
 
+import math
+
 import ttnn
 
 ENABLED = False  # the pipeline switches this on; the per-component PCC tests keep the graduated path
@@ -27,6 +29,10 @@ GELU_SPLIT_FN = None
 # optional program config picker for linear's limb matmuls: a callable (x_limb, w) -> a program_config, a
 # ttnn.CoreGrid (ttnn.linear's own pick on that grid) or None (ttnn.linear's own pick)
 LINEAR_PC_FN = None
+# optional fused epilogue of linear: a callable (y_hi, y_lo, bias_rows) -> (y_hi + y_lo) + bias in one pass, with
+# bias_rows the float32 bias row replicated over a tile's 32 rows; None: two ttnn.add
+LINEAR_SUM_BIAS_FN = None
+_BIAS_ROWS = {}
 EXACT_QK = True  # within precise mode: exact-lane QK^T (else the dense 3-term split)
 FOLD_LANES = False  # exact QK^T as one K-folded matmul per lane pattern (the pipeline switches this on)
 EXACT_LANES = 8
@@ -64,13 +70,30 @@ def linear(x, w, bias=None, compute_kernel_config=None, parts=None):
     hi, lo = split_bf16(x) if parts is None else parts
     pc = LINEAR_PC_FN(hi, w) if LINEAR_PC_FN is not None else None
     kw = {} if pc is None else {"core_grid": pc} if isinstance(pc, ttnn.CoreGrid) else {"program_config": pc}
-    y = ttnn.add(
-        ttnn.linear(hi, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw),
-        ttnn.linear(lo, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw),
-    )
+    y_hi = ttnn.linear(hi, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw)
+    y_lo = ttnn.linear(lo, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw)
+    if LINEAR_SUM_BIAS_FN is not None and bias is not None and bias.dtype == ttnn.float32:
+        n = int(y_hi.padded_shape[-1])
+        one_row = math.prod(int(d) for d in list(bias.shape)[:-1]) == 1  # a bias row broadcast over the rows
+        if one_row and n % 32 == 0 and int(bias.padded_shape[-1]) == n and not y_hi.is_sharded():
+            y = LINEAR_SUM_BIAS_FN(y_hi, y_lo, _bias_rows(bias))
+            ttnn.deallocate(y_hi)
+            ttnn.deallocate(y_lo)
+            return y
+    y = ttnn.add(y_hi, y_lo)
     if bias is not None:
         y = ttnn.add(y, bias if bias.dtype == ttnn.float32 else ttnn.typecast(bias, ttnn.float32))
     return y
+
+
+def _bias_rows(bias):
+    """float32 [32, N]: the bias row replicated over a tile's rows (built once per bias tensor)."""
+    if id(bias) not in _BIAS_ROWS:
+        n = int(bias.shape[-1])
+        row = ttnn.reshape(bias, (1, n)) if len(bias.shape) != 2 else bias
+        zeros = ttnn.zeros([32, n], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=bias.device())
+        _BIAS_ROWS[id(bias)] = (bias, ttnn.add(zeros, row))  # 0 + b: the row broadcast over 32 rows, exact
+    return _BIAS_ROWS[id(bias)][1]
 
 
 def _lane_of(k, pattern):
