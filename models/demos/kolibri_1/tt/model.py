@@ -423,6 +423,19 @@ class MoE(TtKolibri1SparseMoeBlock):
         gu = torch.stack([g.reshape(k, n // 32, 32), u.reshape(k, n // 32, 32)], dim=2).reshape(k, 2 * n)
         return super()._upload(gu, shard_dim, dtype)
 
+    def _gate_up_prefill_mm(self, m_tiles):
+        """Fused gate/up on the full grid with the M tiles split evenly over the core rows in one round (ttnn's
+        default 8-tile M block leaves rows idle on the last round, e.g. 16 blocks over 10 rows)."""
+        g = self.grid
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=-(-m_tiles // g.y),
+            K_block_size=8,
+            N_block_size=8,
+            subblock_h=1,
+            subblock_w=4,
+            compute_with_storage_grid_size=ttnn.CoreCoord(g.x, g.y),
+        )
+
     def _routed_mask(self, weights):
         """[1, 1, 32, n_exp] routing weights (replicated) -> this chip's [1, 1, 1, n_local] row-major mask, non-zero
         where any token routed to the expert."""
@@ -470,6 +483,7 @@ class MoE(TtKolibri1SparseMoeBlock):
                 fuse_swiglu=True,
                 dtype=ttnn.bfloat16,
                 compute_kernel_config=self.gate_up_prefill_cfg,
+                config=self._gate_up_prefill_mm(x.shape[-2] // ttnn.TILE_SIZE),
             )
             act = ttnn.multiply(swi, col_scale)
             ttnn.deallocate(swi)
