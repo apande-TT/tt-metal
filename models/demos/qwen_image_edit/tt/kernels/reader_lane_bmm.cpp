@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Reader of the exact-lane batched product (lane_bmm.cpp). Streams, for this core's work units:
-//   cb 2: the 8 * Kt diagonal 0/1 lane tiles (lane r, K tile kt -> tile r * Kt + kt), once;
+// Reader of the exact-lane batched products (lane_bmm.cpp, exact_qk.cpp). Streams, for this core's work units:
+//   cb 2: the n_diag diagonal 0/1 lane tiles (pattern p, lane r, K tile kt -> tile (p * 8 + r) * Kt + kt), once;
 //   per unit (batch b, row tile mt, output columns [nt0, nt1)):
 //     cb 0: a's row block of both limbs (limb i, K tile kt -> i * Kt + kt);
 //     cb 1: per output column nt, b's column block of both limbs (limb j, K tile kt -> j * Kt + kt),
@@ -29,7 +29,8 @@ void kernel_main() {
     constexpr uint32_t chunks = get_compile_time_arg_val(3);
     constexpr uint32_t csize = get_compile_time_arg_val(4);
     constexpr uint32_t transpose_b = get_compile_time_arg_val(5);
-    constexpr auto a0_args = TensorAccessorArgs<6>();
+    constexpr uint32_t n_diag = get_compile_time_arg_val(6);
+    constexpr auto a0_args = TensorAccessorArgs<7>();
     constexpr auto a1_args = TensorAccessorArgs<a0_args.next_compile_time_args_offset()>();
     constexpr auto b0_args = TensorAccessorArgs<a1_args.next_compile_time_args_offset()>();
     constexpr auto b1_args = TensorAccessorArgs<b0_args.next_compile_time_args_offset()>();
@@ -50,12 +51,12 @@ void kernel_main() {
     DataflowBuffer db(cb_b);
     DataflowBuffer dd(cb_d);
 
-    dd.reserve_back(8 * Kt);
-    for (uint32_t t = 0; t < 8 * Kt; ++t) {
+    dd.reserve_back(n_diag);
+    for (uint32_t t = 0; t < n_diag; ++t) {
         noc.async_read(dg, dd, page, {.page_id = t}, {.offset_bytes = t * page});
     }
     noc.async_read_barrier();
-    dd.push_back(8 * Kt);
+    dd.push_back(n_diag);
 
     for (uint32_t u = start_unit; u < start_unit + num_units; ++u) {
         const uint32_t rb = u / chunks;

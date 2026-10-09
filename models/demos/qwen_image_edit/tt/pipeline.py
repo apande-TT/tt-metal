@@ -38,6 +38,7 @@ import torch
 import ttnn
 from models.demos.qwen_image_edit.mesh import DEVICE_PARAMS, MESH_SHAPE  # noqa: F401 (re-exported)
 from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum
+from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
 from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
@@ -190,6 +191,9 @@ class QwenImageEditTT:
         # exact QK^T with its 3 terms x 8 lanes folded into K: 3 matmuls per attention instead of 72
         # matmuls + 69 float32 adds of the [Sq, Sk] logits (denoise trace 25.7 s -> 15.9 s, pcc 0.9587)
         _tr_precise.FOLD_LANES = True
+        # and its three lane patterns + median as one C++ kernel (lane copies made per row block, each pattern
+        # accumulated in DEST in the folded K order): no folded query operand, masks or [Sq, Sk] estimates
+        _tr_precise.EXACT_QK_FN = fused_exact_qk
         # projections of one activation (q/k/v, ada-norm scale/shift) share its hi/lo split, and the image and
         # text queries share the joint K's folded operand and V's limbs
         _tr_precise.SHARE_SPLIT = True

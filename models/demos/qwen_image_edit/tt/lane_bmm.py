@@ -48,6 +48,15 @@ def fused_lane_bmm(pa, pb, lanes, transpose_b, mem):
     """pa, pb: (hi, lo) bf16 TILE limbs of a [..., M, K] and b [..., K, N] ([..., N, K] if transpose_b),
     same batch dims; lanes: lane id of each of a's K entries. -> float32 [..., M, N] in `mem`.
     None when the operands do not fit the kernel (the caller then runs the stock path)."""
+    k_t = int(pa[0].padded_shape[-1]) // _TILE if len(pa) == 2 else 0
+    diag = lambda device: _diag_tiles(device, lanes, k_t)  # noqa: E731
+    return lane_program(pa, pb, transpose_b, mem, diag, _LANES * k_t, 2 * _LANES * k_t, "lane_bmm.cpp")
+
+
+def lane_program(pa, pb, transpose_b, mem, diag_fn, n_diag, n_copies, compute_kernel):
+    """One exact-lane product program over two-limb operands (reader_lane_bmm.cpp + compute_kernel + the
+    stock tile writer): diag_fn(device) -> the n_diag diagonal lane tiles, n_copies lane-copy tiles per row
+    block in cb 3. -> float32 [..., M, N] in `mem`, or None when the operands do not fit the kernel."""
     if len(pa) != 2 or len(pb) != 2:
         return None
     a_s, b_s = [int(v) for v in pa[0].padded_shape], [int(v) for v in pb[0].padded_shape]
@@ -58,14 +67,14 @@ def fused_lane_bmm(pa, pb, lanes, transpose_b, mem):
     if k_t != (b_s[-1] if transpose_b else b_s[-2]) // _TILE:
         return None
     # cb tiles per core: a and b blocks (2 limbs, double-buffered b), the lane tiles, the lane copies
-    if (2 * k_t + 4 * k_t + _LANES * k_t + 2 * _LANES * k_t) * 2048 + 2 * 4096 > 900 * 1024:
+    if (2 * k_t + 4 * k_t + n_diag + n_copies) * 2048 + 2 * 4096 > 900 * 1024:
         return None
     device = pa[0].device()
     batch = math.prod(a_s[:-2])
     n_logical = int(pb[0].shape[-2] if transpose_b else pb[0].shape[-1])
     out_shape = list(pa[0].shape)[:-1] + [n_logical]
     out = ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), ttnn.float32, ttnn.TILE_LAYOUT, device, mem)
-    diag = _diag_tiles(device, lanes, k_t)
+    diag = diag_fn(device)
 
     grid = device.compute_with_storage_grid_size()
     cores_n = grid.x * grid.y
@@ -87,8 +96,8 @@ def fused_lane_bmm(pa, pb, lanes, transpose_b, mem):
     cbs = [
         _cb(0, ttnn.bfloat16, 2048, 2 * k_t),
         _cb(1, ttnn.bfloat16, 2048, 4 * k_t),
-        _cb(2, ttnn.bfloat16, 2048, _LANES * k_t),
-        _cb(3, ttnn.bfloat16, 2048, 2 * _LANES * k_t),
+        _cb(2, ttnn.bfloat16, 2048, n_diag),
+        _cb(3, ttnn.bfloat16, 2048, n_copies),
         _cb(16, ttnn.float32, 4096, 2),
     ]
     rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -117,7 +126,7 @@ def fused_lane_bmm(pa, pb, lanes, transpose_b, mem):
             kernel_source=os.path.join(_KERNELS, "reader_lane_bmm.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=ct + acc,
+            compile_time_args=ct + [n_diag] + acc,
             runtime_args=rd_rt,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -133,7 +142,7 @@ def fused_lane_bmm(pa, pb, lanes, transpose_b, mem):
             config=ttnn.WriterConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_KERNELS, "lane_bmm.cpp"),
+            kernel_source=os.path.join(_KERNELS, compute_kernel),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=ct,
