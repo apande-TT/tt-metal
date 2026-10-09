@@ -19,7 +19,11 @@ void kernel_main() {
     constexpr uint32_t MAX_SLOTS = get_compile_time_arg_val(6);    // max columns one core can own
     constexpr uint32_t x_tile_bytes = get_compile_time_arg_val(7);
     constexpr uint32_t w_tile_bytes = get_compile_time_arg_val(8);
-    constexpr auto x_args = TensorAccessorArgs<9>();
+    // Gate column c is weight column c * STRIDE, up is UP pages after it: (1, 0) for separate gate/up tensors,
+    // (2, 1) for one tile-pair-interleaved [g0 u0 g1 u1 ...] weight.
+    constexpr uint32_t STRIDE = get_compile_time_arg_val(9);
+    constexpr uint32_t UP = get_compile_time_arg_val(10);
+    constexpr auto x_args = TensorAccessorArgs<11>();
     constexpr auto wg_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
     constexpr auto wu_args = TensorAccessorArgs<wg_args.next_compile_time_args_offset()>();
     constexpr auto m_args = TensorAccessorArgs<wu_args.next_compile_time_args_offset()>();
@@ -81,9 +85,9 @@ void kernel_main() {
             const uint32_t g_l1 = get_write_ptr(cb_g);
             const uint32_t u_l1 = get_write_ptr(cb_u);
             for (uint32_t k = 0; k < KB; ++k) {
-                const uint32_t page = (kb + k) * Nt + col;
+                const uint32_t page = (kb + k) * Nt + col * STRIDE;
                 noc_async_read_page(page, wg, g_l1 + k * w_tile_bytes);
-                noc_async_read_page(page, wu, u_l1 + k * w_tile_bytes);
+                noc_async_read_page(page + UP, wu, u_l1 + k * w_tile_bytes);
             }
             noc_async_read_barrier();
             cb_push_back(cb_g, KB);

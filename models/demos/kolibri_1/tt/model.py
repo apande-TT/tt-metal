@@ -265,13 +265,17 @@ class RoutedGateUp:
     persistent [32, 96*512] buffers shared by every layer: a column it skips keeps whatever finite value an
     earlier call left, and its routing weight is exactly 0, so it contributes nothing downstream."""
 
-    def __init__(self, device, w_gate, w_up, n_experts: int, inter: int) -> None:
+    def __init__(self, device, w_gate, w_up, n_experts: int, inter: int, interleaved: bool = False) -> None:
+        """interleaved: w_gate is w_up, one tile-pair-interleaved [K, 2*N] weight (gate column c at 2c, up at
+        2c + 1); else separate [K, N] gate and up tensors."""
         self.w_gate, self.w_up = w_gate, w_up
+        self.col_stride, self.up_offset = (2, 1) if interleaved else (1, 0)
         g = device.compute_with_storage_grid_size()
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(g.x - 1, g.y - 1))])
         self.core_xy = [(x, y) for y in range(g.y) for x in range(g.x)]
-        self.kt, self.nt = w_gate.shape[-2] // ttnn.TILE_SIZE, w_gate.shape[-1] // ttnn.TILE_SIZE
+        self.kt, self.row_tiles = w_gate.shape[-2] // ttnn.TILE_SIZE, w_gate.shape[-1] // ttnn.TILE_SIZE
         self.n_experts, self.cpe = n_experts, inter // ttnn.TILE_SIZE
+        self.nt = n_experts * self.cpe  # output columns
         self.kb = next(b for b in (16, 10, 8, 5, 4, 2, 1) if self.kt % b == 0)
         self.max_slots = -(-self.nt // len(self.core_xy))
         key = (id(device), self.nt)
@@ -319,7 +323,7 @@ class RoutedGateUp:
                 core_ranges=cores,
                 compile_time_args=[
                     self.kt,
-                    self.nt,
+                    self.row_tiles,
                     self.n_experts,
                     self.cpe,
                     len(self.core_xy),
@@ -327,6 +331,8 @@ class RoutedGateUp:
                     self.max_slots,
                     x_tile,
                     w_tile,
+                    self.col_stride,
+                    self.up_offset,
                 ]
                 + acc(x, self.w_gate, self.w_up, mask),
                 runtime_args=reader_rt,
@@ -363,10 +369,19 @@ class MoE(TtKolibri1SparseMoeBlock):
     ungated shared expert as the graduated m_l_p stub (the routed experts are the block's own)."""
 
     def __init__(self, device, moe) -> None:
+        self._held_gate = None
         super().__init__(device, moe)
+        # The stub's _upload calls (see _upload below) left gate and up as ONE tile-pair-interleaved weight.
+        self.w_gu, self.w_up = self.w_up, None
         # Expert matmuls at HiFi4 (the stub uses HiFi2, which drops activation mantissa bits), except the
-        # compute-bound prefill gate/up, which runs at the stub's HiFi2.
-        self.gate_up_prefill_cfg = self.hifi2
+        # compute-bound prefill gate/up (fused SwiGLU), at HiFi3.
+        self.gate_up_prefill_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi3,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
         self.hifi2 = self.hifi4
         self.router = Router(device, moe.gate)
         self.shared = SharedExpert(device, moe.shared_experts)
@@ -390,27 +405,23 @@ class MoE(TtKolibri1SparseMoeBlock):
             fused_activation=None,
             mcast_in0=True,
         )
-        self.routed_gate_up = RoutedGateUp(device, self.w_gate, self.w_up, self.n_local, self.inter)
+        self.routed_gate_up = RoutedGateUp(device, self.w_gu, self.w_gu, self.n_local, self.inter, interleaved=True)
         self.grid = g
 
-    def _gate_up_prefill_pc(self, m_tiles):
-        """Prefill gate/up, [M, 2560] x [2560, 96*512] on the 1D multicast (N 14 tiles per core): K in blocks
-        of 16, not ttnn's 2, so each output block packs its fp32 partial to L1 5 times instead of 40."""
-        g = self.grid
-        n_tiles = self.w_gate.shape[-1] // ttnn.TILE_SIZE
-        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
-            compute_with_storage_grid_size=(g.x, g.y),
-            in0_block_w=16,
-            out_subblock_h=2,
-            out_subblock_w=2,
-            out_block_h=16,
-            out_block_w=2,
-            per_core_M=m_tiles,
-            per_core_N=-(-n_tiles // (g.x * g.y)),
-            fuse_batch=True,
-            fused_activation=None,
-            mcast_in0=True,
-        )
+    def _upload(self, t, shard_dim, dtype):
+        """The stub uploads the routed gate, then up, each [hidden, n_exp * inter]. Hold the gate and upload
+        both as one weight whose 32-column tiles alternate gate, up ([g0 u0 g1 u1 ...]): the layout
+        minimal_matmul_split's fused SwiGLU reads, and still one contiguous expert range per TP shard."""
+        routed = shard_dim == -1 and dtype != ttnn.bfloat16 and t.shape[-1] == self.n_local * self.tp * self.inter
+        if not routed:
+            return super()._upload(t, shard_dim, dtype)
+        if self._held_gate is None:
+            self._held_gate = t
+            return None
+        g, u, self._held_gate = self._held_gate, t, None
+        k, n = g.shape
+        gu = torch.stack([g.reshape(k, n // 32, 32), u.reshape(k, n // 32, 32)], dim=2).reshape(k, 2 * n)
+        return super()._upload(gu, shard_dim, dtype)
 
     def _routed_mask(self, weights):
         """[1, 1, 32, n_exp] routing weights (replicated) -> this chip's [1, 1, 1, n_local] row-major mask, non-zero
@@ -448,15 +459,20 @@ class MoE(TtKolibri1SparseMoeBlock):
             mask = self._routed_mask(weights)
             g, u = self.routed_gate_up(x, mask)
             ttnn.deallocate(mask)
-        else:
-            pc = self._gate_up_prefill_pc(x.shape[-2] // ttnn.TILE_SIZE)
-            g = ttnn.linear(x, self.w_gate, program_config=pc, compute_kernel_config=self.gate_up_prefill_cfg)
-            u = ttnn.linear(x, self.w_up, program_config=pc, compute_kernel_config=self.gate_up_prefill_cfg)
         ttnn.deallocate(weights)
-        act = ttnn.multiply(ttnn.multiply(ttnn.silu(g), u), col_scale)
-        if not decode:
-            ttnn.deallocate(g)
-            ttnn.deallocate(u)
+        if decode:
+            act = ttnn.multiply(ttnn.multiply(ttnn.silu(g), u), col_scale)
+        else:  # gate and up in ONE matmul, SwiGLU fused into its pack: silu(x @ W_gate) * (x @ W_up)
+            (swi,) = ttnn.experimental.minimal_matmul_split(
+                x,
+                self.w_gu,
+                chunks=1,
+                fuse_swiglu=True,
+                dtype=ttnn.bfloat16,
+                compute_kernel_config=self.gate_up_prefill_cfg,
+            )
+            act = ttnn.multiply(swi, col_scale)
+            ttnn.deallocate(swi)
         ttnn.deallocate(col_scale)
         out = ttnn.linear(
             act,
