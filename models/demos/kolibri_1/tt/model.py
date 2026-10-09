@@ -404,6 +404,22 @@ class Sampler:
             device=device,
             mesh_mapper=mapper,
         )
+        # Prefix sums over the k candidates as matmuls against 0/1 triangles (inclusive: i <= j, exclusive:
+        # i < j). ttnn.cumsum runs this [B, k] scan on one core at ~150 us; see _scan for exactness.
+        tri = torch.ones(self.top_k, self.top_k)
+        self.tri_incl, self.tri_excl = (
+            ttnn.from_torch(
+                t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=mapper
+            )
+            for t in (torch.triu(tri), torch.triu(tri, diagonal=1))
+        )
+        self.scan_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
         grid = device.compute_with_storage_grid_size()
         tree_ok = vocab > 0 and batch % 32 == 0 and vocab % 32 == 0
         self.plan = _topk_tree(vocab // 32, self.k_pad // 32, grid.x * grid.y) if tree_ok else None
@@ -434,6 +450,18 @@ class Sampler:
             x, labels = ttnn.experimental.view(x, [1, 1, B, n]), ttnn.experimental.view(labels, [1, 1, B, n])
         return ttnn.topk(x, k=self.top_k, dim=-1, largest=True, sorted=True, indices_tensor=labels)
 
+    def _scan(self, x, tri):
+        """Prefix sums of x [1, 1, B, k] fp32 along k, to fp32 accuracy: x is split into three bf16 parts
+        (8 mantissa bits each, so h + m + l == x exactly), each part times a 0/1 triangle is a sum of exact
+        products (HiFi4), and the matmul accumulates in fp32."""
+        f32, bf16 = ttnn.float32, ttnn.bfloat16
+        h = ttnn.typecast(x, bf16)
+        r = ttnn.subtract(x, ttnn.typecast(h, f32))
+        m = ttnn.typecast(r, bf16)
+        lo = ttnn.typecast(ttnn.subtract(r, ttnn.typecast(m, f32)), bf16)
+        s = [ttnn.matmul(part, tri, dtype=f32, compute_kernel_config=self.scan_cfg) for part in (lo, m, h)]
+        return ttnn.add(ttnn.add(s[0], s[1]), s[2])
+
     def __call__(self, logits, u):
         """logits [1, 1, B, V] fp32, u [1, 1, B, 1] fp32 -> token ids [1, 1, B, 1] fp32 (exact integers)."""
         x = logits if self.temperature == 1.0 else ttnn.multiply(logits, 1.0 / self.temperature)
@@ -442,7 +470,7 @@ class Sampler:
         vmax = ttnn.slice(vals, [0, 0, 0, 0], [1, 1, B, 1])
         e = ttnn.exp(ttnn.subtract(vals, vmax))
         p = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True))
-        excl = ttnn.subtract(ttnn.cumsum(p, dim=-1), p)
+        excl = self._scan(p, self.tri_excl)
         n_keep = ttnn.sum(ttnn.lt(excl, self.top_p), dim=-1, keepdim=True)
         last = ttnn.eq(self.ranks, ttnn.subtract(ttnn.maximum(n_keep, 1.0), 1.0))
         cut = ttnn.sum(ttnn.multiply(vals, last), dim=-1, keepdim=True)
@@ -451,7 +479,7 @@ class Sampler:
         neg_id, order = ttnn.topk(
             ttnn.neg(ttnn.typecast(tok_ids, ttnn.float32)), k=self.top_k, dim=-1, largest=True, sorted=True
         )
-        cdf = ttnn.cumsum(ttnn.gather(q, -1, order), dim=-1)
+        cdf = self._scan(ttnn.gather(q, -1, order), self.tri_incl)
         z = ttnn.slice(cdf, [0, 0, 0, self.top_k - 1], [1, 1, B, self.top_k])
         # Positions whose CDF is <= u*z precede the sampled token (the CDF only rises at kept tokens).
         at = ttnn.sum(ttnn.le(cdf, ttnn.multiply(u, z)), dim=-1, keepdim=True)
