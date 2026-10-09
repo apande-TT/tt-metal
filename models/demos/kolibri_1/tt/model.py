@@ -436,6 +436,22 @@ class MoE(TtKolibri1SparseMoeBlock):
             compute_with_storage_grid_size=ttnn.CoreCoord(g.x, g.y),
         )
 
+    def _down_prefill_mm(self, m_tiles):
+        """Prefill down projection on the full grid: minimal_matmul lays M along x when M > N (else along y);
+        each axis gets an even ceil(tiles / cores) block in one round (ttnn's default config left 10 of the
+        110 cores idle)."""
+        g, n_tiles = self.grid, self.w_down.shape[-1] // ttnn.TILE_SIZE
+        m_cores, n_cores = (g.x, g.y) if m_tiles > n_tiles else (g.y, g.x)
+        n_block = -(-n_tiles // n_cores)
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=-(-m_tiles // m_cores),
+            K_block_size=8,
+            N_block_size=n_block,
+            subblock_h=1,
+            subblock_w=next(w for w in (4, 2, 1) if n_block % w == 0),
+            compute_with_storage_grid_size=ttnn.CoreCoord(g.x, g.y),
+        )
+
     def _routed_mask(self, weights):
         """[1, 1, 32, n_exp] routing weights (replicated) -> this chip's [1, 1, 1, n_local] row-major mask, non-zero
         where any token routed to the expert."""
@@ -488,12 +504,16 @@ class MoE(TtKolibri1SparseMoeBlock):
             act = ttnn.multiply(swi, col_scale)
             ttnn.deallocate(swi)
         ttnn.deallocate(col_scale)
-        out = ttnn.linear(
-            act,
-            self.w_down,
-            program_config=self.down_decode_pc if decode else None,
-            compute_kernel_config=self.hifi2,
-        )
+        if decode:
+            out = ttnn.linear(act, self.w_down, program_config=self.down_decode_pc, compute_kernel_config=self.hifi2)
+        else:
+            out = ttnn.experimental.minimal_matmul(
+                act,
+                self.w_down,
+                config=self._down_prefill_mm(act.shape[-2] // ttnn.TILE_SIZE),
+                compute_kernel_config=self.hifi2,
+                dtype=ttnn.bfloat16,
+            )
         ttnn.deallocate(act)
         if self.tp > 1:
             out = ttnn.all_reduce(out, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
