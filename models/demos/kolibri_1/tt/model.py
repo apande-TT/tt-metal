@@ -389,6 +389,26 @@ class MoE(TtKolibri1SparseMoeBlock):
             mcast_in0=True,
         )
         self.routed_gate_up = RoutedGateUp(device, self.w_gate, self.w_up, self.n_local, self.inter)
+        self.grid = g
+
+    def _gate_up_prefill_pc(self, m_tiles):
+        """Prefill gate/up, [M, 2560] x [2560, 96*512] on the 1D multicast (N 14 tiles per core): K in blocks
+        of 16, not ttnn's 2, so each output block packs its fp32 partial to L1 5 times instead of 40."""
+        g = self.grid
+        n_tiles = self.w_gate.shape[-1] // ttnn.TILE_SIZE
+        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(g.x, g.y),
+            in0_block_w=16,
+            out_subblock_h=2,
+            out_subblock_w=2,
+            out_block_h=16,
+            out_block_w=2,
+            per_core_M=m_tiles,
+            per_core_N=-(-n_tiles // (g.x * g.y)),
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+        )
 
     def _routed_mask(self, weights):
         """[1, 1, 32, n_exp] routing weights (replicated) -> this chip's [1, 1, 1, n_local] row-major mask, non-zero
@@ -427,8 +447,9 @@ class MoE(TtKolibri1SparseMoeBlock):
             g, u = self.routed_gate_up(x, mask)
             ttnn.deallocate(mask)
         else:
-            g = ttnn.linear(x, self.w_gate, compute_kernel_config=self.hifi2)
-            u = ttnn.linear(x, self.w_up, compute_kernel_config=self.hifi2)
+            pc = self._gate_up_prefill_pc(x.shape[-2] // ttnn.TILE_SIZE)
+            g = ttnn.linear(x, self.w_gate, program_config=pc, compute_kernel_config=self.hifi2)
+            u = ttnn.linear(x, self.w_up, program_config=pc, compute_kernel_config=self.hifi2)
         ttnn.deallocate(weights)
         act = ttnn.multiply(ttnn.multiply(ttnn.silu(g), u), col_scale)
         if not decode:
