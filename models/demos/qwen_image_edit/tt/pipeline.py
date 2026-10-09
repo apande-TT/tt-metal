@@ -37,7 +37,7 @@ import torch
 
 import ttnn
 from models.demos.qwen_image_edit.mesh import DEVICE_PARAMS, MESH_SHAPE  # noqa: F401 (re-exported)
-from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum
+from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_sum_bias
 from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
 from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16
@@ -221,6 +221,8 @@ class QwenImageEditTT:
         # the full grid for short activations: there the 2-D blocks measured slower (512 x 3072 x 384: 23.1 ->
         # 41.8 ms)
         _tr_precise.LINEAR_PC_FN = _limb_linear_config
+        # and their limb products' sum + float32 bias add as one C++ kernel pass (same adds, same order)
+        _tr_precise.LINEAR_SUM_BIAS_FN = lambda a, b, bias_rows: fused_sum_bias(a, b, bias_rows, ttnn.DRAM_MEMORY_CONFIG)
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {

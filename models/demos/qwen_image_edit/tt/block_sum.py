@@ -20,31 +20,54 @@ _TT_METAL = os.environ.get("TT_METAL_HOME", "")
 
 def fused_block_sum(g, n, part, mem):
     """g [n * part[0], ...] float32 TILE -> sum of its n blocks of shape `part` (block i = source i)."""
-    device = g.device()
-    out = ttnn.allocate_tensor_on_device(ttnn.Shape(part), ttnn.float32, ttnn.TILE_LAYOUT, device, mem)
+    out = ttnn.allocate_tensor_on_device(ttnn.Shape(part), ttnn.float32, ttnn.TILE_LAYOUT, g.device(), mem)
+    block_tiles = _tiles(out)
+    reader_ct = [block_tiles, n] + list(ttnn.TensorAccessorArgs(g).get_compile_time_args())
+    return _sum_program([g], out, n, "reader_sum_blocks.cpp", reader_ct)
+
+
+def fused_sum_bias(a, b, bias_rows, mem):
+    """(a + b) + bias for float32 TILE a, b of one shape [..., N] and bias_rows [32, N] float32 (the bias row
+    replicated over a tile's rows): the limb products' sum and the bias add of a precise linear in one pass,
+    the same two SFPU float32 adds in the same order as ttnn.add(ttnn.add(a, b), bias)."""
+    out = ttnn.allocate_tensor_on_device(a.shape, ttnn.float32, ttnn.TILE_LAYOUT, a.device(), mem)
+    reader_ct = [int(a.padded_shape[-1]) // 32]
+    for t in (a, b, bias_rows):
+        reader_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    return _sum_program([a, b, bias_rows], out, 3, "reader_sum_bias.cpp", reader_ct)
+
+
+def _tiles(t):
     vol = 1
-    for d in out.padded_shape:
+    for d in t.padded_shape:
         vol *= int(d)
-    block_tiles = vol // 1024
+    return vol // 1024
+
+
+def _sum_program(srcs, out, n, reader, reader_ct):
+    """kernels/sum_blocks.cpp over the n source tiles `reader` streams per output tile of `out`; the reader's
+    runtime args are the source addresses, then (tile count, first tile)."""
+    device = out.device()
     grid = device.compute_with_storage_grid_size()
     all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
-    _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, block_tiles)
+    _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, _tiles(out))
     page = 4096  # one float32 tile
     cbs = [
         ttnn.CBDescriptor(
-            total_size=2 * page,
+            total_size=pages * page,
             core_ranges=cores,
             format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.float32, page_size=page)],
         )
-        for i in (0, 16)
+        for i, pages in ((0, 2 * n), (16, 2))  # the n source tiles of an output tile double-buffered
     ]
     rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    addrs = [t.buffer_address() for t in srcs]
     start = 0
     for group, per in ((group1, per1), (group2, per2)):
         for r in group.ranges():
             for x in range(r.start.x, r.end.x + 1):
                 for y in range(r.start.y, r.end.y + 1):
-                    rd_rt[x][y] = [g.buffer_address(), per, start]
+                    rd_rt[x][y] = addrs + [per, start]
                     wr_rt[x][y] = [out.buffer_address(), per, start]
                     cp_rt[x][y] = [per]
                     start += per
@@ -57,10 +80,10 @@ def fused_block_sum(g, n, part, mem):
     cfg.unpack_to_dest_mode = modes
     kernels = [
         ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_KERNELS, "reader_sum_blocks.cpp"),
+            kernel_source=os.path.join(_KERNELS, reader),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[block_tiles, n] + list(ttnn.TensorAccessorArgs(g).get_compile_time_args()),
+            compile_time_args=reader_ct,
             runtime_args=rd_rt,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -85,6 +108,4 @@ def fused_block_sum(g, n, part, mem):
         ),
     ]
     prog = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-    return ttnn.generic_op([g, out], prog)
-
-
+    return ttnn.generic_op(srcs + [out], prog)
