@@ -310,6 +310,10 @@ EXACT_BMM_L1_BYTES = 0
 EXACT_CORE_GRID = None
 # core grid for split_linear's exact-lane products (None: ttnn.linear picks its own)
 EXACT_LINEAR_CORE_GRID = None
+# split_linear's exact-lane products stage the bf16 weight and the activation limbs in L1 once per call when
+# together they take at most this many bytes (each of the limbs x lanes x patterns products re-reads them;
+# 0: read from DRAM)
+EXACT_OPERANDS_L1_BYTES = 0
 # fn(a_limbs, b_limbs, lanes, transpose_b, memory_config) -> one lane pattern's exact-lane product
 # (sum over limb terms and lanes; lanes = lane id of each K entry), or None to run the stock ops
 # (None: ttnn multiply + matmul + add per lane)
@@ -385,6 +389,15 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     cfg = precise_config()
     parts = split_bf16(x, limbs) if parts is None else parts
 
+    staged = []
+    if exact and EXACT_OPERANDS_L1_BYTES:  # every lane product re-reads the weight and a limb: stage them in L1
+        w_bytes = 2 * math.prod([int(d) for d in w.padded_shape])
+        p_bytes = 2 * math.prod([int(d) for d in parts[0].padded_shape])
+        if w.dtype == ttnn.bfloat16 and w_bytes + len(parts) * p_bytes <= EXACT_OPERANDS_L1_BYTES:
+            w = ttnn.to_memory_config(w, ttnn.L1_MEMORY_CONFIG)
+            parts = tuple(ttnn.to_memory_config(p, ttnn.L1_MEMORY_CONFIG) for p in parts)
+            staged = [w, *parts]
+
     def mm(p, mem=None):
         kw = {} if mem is None else {"memory_config": mem}
         return ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32, core_grid=EXACT_LINEAR_CORE_GRID, **kw)
@@ -392,6 +405,8 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     if exact:
         out_bytes = 4 * math.prod([int(d) for d in x.padded_shape][:-1]) * int(w.padded_shape[-1])
         y = _exact_sum(mm, parts, _patterns(exact), out_bytes=out_bytes)
+        for t in staged:
+            ttnn.deallocate(t)
     else:
         pc = _block_config(x, w) if LINEAR_BLOCK and LINEAR_CORE_GRID is not None else None
         kw = dict(program_config=pc) if pc is not None else dict(core_grid=LINEAR_CORE_GRID)
