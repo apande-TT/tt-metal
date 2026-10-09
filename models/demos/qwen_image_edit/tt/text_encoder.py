@@ -113,6 +113,9 @@ class TtQwenTextEncoder:
         _te_attention.EXACT_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         # and its exact-lane linears on the full core grid (ttnn's own pick: 30-48 cores)
         _te_attention.EXACT_LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
+        # with their weight and activation limbs (vision qkv / proj / MLP: <= 4 MB per chip) staged in L1 once
+        # per projection instead of re-read from DRAM by each lane product
+        _te_attention.EXACT_OPERANDS_L1_BYTES = 4 * 1024 * 1024
         # and keeps the lane copies / products / sums of products up to 6 MB in L1
         _te_attention.EXACT_SUM_L1_BYTES = 6 * 1024 * 1024
         # and the attention's exact-lane products (QK^T ~7.9 MB, PV ~2.2 MB) likewise
