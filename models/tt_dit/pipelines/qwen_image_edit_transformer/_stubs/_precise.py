@@ -30,6 +30,9 @@ LINEAR_PC_FN = None
 EXACT_QK = True  # within precise mode: exact-lane QK^T (else the dense 3-term split)
 FOLD_LANES = False  # exact QK^T as one K-folded matmul per lane pattern (the pipeline switches this on)
 EXACT_LANES = 8
+# optional fused exact QK^T: a callable ((ah, al), (bh, bl), [lane ids of K per pattern]) -> the float32
+# median over PATTERNS of the exact-lane a @ b^T, or None (the stock exact-lane ops then run)
+EXACT_QK_FN = None
 PATTERNS = ("strided", "rot1", "rot3")
 _MASKS = {}
 
@@ -126,6 +129,10 @@ def exact_matmul_bt(a, b, b_rep=None):
     cfg = precise_config()
     ah, al = split_bf16(a)
     k = a.shape[-1]
+    if EXACT_QK_FN is not None and b_rep is None:
+        y = EXACT_QK_FN((ah, al), split_bf16(b), [[_lane_of(i, p) for i in range(k)] for p in PATTERNS])
+        if y is not None:
+            return y
     if not FOLD_LANES:
         bh, bl = split_bf16(b)
         ests = []

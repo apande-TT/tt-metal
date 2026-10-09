@@ -301,7 +301,8 @@ class TtQwenJointAttention:
 
         shared = None
         if share:  # the image and text queries share the joint K's folded operand and V's limbs
-            k_rep = _precise.fold_b(kh) if (_precise.EXACT_QK and _precise.FOLD_LANES) else None
+            fold = _precise.EXACT_QK and _precise.FOLD_LANES and _precise.EXACT_QK_FN is None
+            k_rep = _precise.fold_b(kh) if fold else None
             shared = (k_rep, _precise.split_bf16(v))
         if JOINT_QUERIES:  # one attention over the joint [text, image] queries; rows split after P @ V
             L = qt.shape[2]
