@@ -263,6 +263,23 @@ class MoE(TtKolibri1SparseMoeBlock):
         for name in ("ws_gate", "ws_up", "ws_down", "w_router"):  # replaced by the two stubs above
             ttnn.deallocate(getattr(self, name))
             setattr(self, name, None)
+        # Down projection, decode: one tile row of tokens against [n_local*inter, hidden] is a pure weight
+        # stream split over N (80 tiles -> 80 cores, each streaming one weight column, which sits in a
+        # single DRAM bank). ttnn's default walks K in blocks of 2 tiles, so the time goes to 768
+        # multicast/sync rounds rather than to bytes; a wide K block streams the same column in few rounds.
+        g = device.compute_with_storage_grid_size()
+        k_tiles = self.w_down.shape[-2] // ttnn.TILE_SIZE
+        self.down_decode_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(g.x, g.y),
+            in0_block_w=next(w for w in (16, 8, 4, 2, 1) if k_tiles % w == 0),
+            out_subblock_h=1,
+            out_subblock_w=1,
+            per_core_M=1,
+            per_core_N=1,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+        )
 
     def routing_weights(self, x):
         logits = self.router(x)
@@ -296,7 +313,13 @@ class MoE(TtKolibri1SparseMoeBlock):
         ttnn.deallocate(g)
         ttnn.deallocate(u)
         ttnn.deallocate(col_scale)
-        out = ttnn.linear(act, self.w_down, compute_kernel_config=self.hifi2)
+        decode = act.shape[-2] == ttnn.TILE_SIZE
+        out = ttnn.linear(
+            act,
+            self.w_down,
+            program_config=self.down_decode_pc if decode else None,
+            compute_kernel_config=self.hifi2,
+        )
         ttnn.deallocate(act)
         if self.tp > 1:
             out = ttnn.all_reduce(out, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)

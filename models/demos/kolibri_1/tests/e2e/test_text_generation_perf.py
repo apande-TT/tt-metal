@@ -1,11 +1,9 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Kolibri-1 text-generation PERFORMANCE test (perf only, no PCC).
+"""Kolibri-1 text_generation performance test: the demo's pipeline (tt/pipeline.py) built and run
+in-process on the QB2's self-opened 1x4 Blackhole mesh (TP=4), bounded and profiler-safe.
 
-Builds and runs the pipeline exactly as demo/demo_text_generation.py does: the demo's own open_mesh()
-(QB2 1x4 Blackhole mesh, TP=4), build_pipeline(mesh, layers=..., batch=...), then
-pipe.generate(prompt, seeds, max_new_tokens=...), with user b sampling under seed b. Every device op
-runs in this process so tracy sees all of them.
+    pytest models/demos/kolibri_1/tests/e2e/test_text_generation_perf.py
 """
 from __future__ import annotations
 
@@ -14,13 +12,13 @@ import inspect
 import os
 import time
 
-import pytest  # noqa: F401
 import torch
-
 import ttnn
+
 from models.demos.kolibri_1.demo.mesh import close_mesh, open_mesh
 from models.demos.kolibri_1.tt import inputs as kin
 from models.demos.kolibri_1.tt.pipeline import build_pipeline
+from models.experimental.perf_automation.agent.perf_test_gen import prompt_ids_for_isl
 
 # ONE VARIABLE FOR ONE THING. There were two: PERF_OSL_TOKENS, which the test PRINTED, and
 # PERF_OSL_TOKENS, which the loop actually RAN -- with its own default of 4, from the generator's
@@ -65,110 +63,129 @@ PERF_LAYERS = int(_pl) if (_pl.isdigit() and int(_pl) > 0) else None
 
 # TOPOLOGY. --devices/--mesh are planned by the tool and exported as TT_PERF_MESH_ROWS/COLS;
 # resolve_mesh_shape is how a run honours them. Give it the SOURCE's own shape as the default, so an
-# unset env behaves exactly as the demo does. The demo SELF-OPENS (demo/mesh.open_mesh, QB2 1x4,
-# TP=4), so this test self-opens the same way and hands that mesh to the pipeline.
+# unset env behaves exactly as the demo does. If the source uses a `mesh_device` FIXTURE, keep that
+# fixture + its parametrize and feed this tuple in; if it SELF-OPENS, pass it to MeshShape().
+# A copied MESH_DEVICE board table on its own cannot see --devices/--mesh.
 from models.experimental.perf_automation.agent.perf_adapter import resolve_batch, resolve_mesh_shape  # noqa: E402,F401
 
-_SOURCE_MESH = (1, 4)  # demo_text_generation: QB2 1x4 Blackhole mesh, TP=4
+_SOURCE_MESH = (1, 4)  # demo/mesh.open_mesh(): the QB2's 1x4 Blackhole mesh, TP=4
 _MESH_SHAPE = resolve_mesh_shape(default_rows=_SOURCE_MESH[0], default_cols=_SOURCE_MESH[1])
 
+# The demo SELF-OPENS its mesh, so there is no device_params fixture: the trace region is reserved on
+# that same open call, ONCE, for baseline and every candidate. The tool measures trace+1cq end to end.
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
-# The demo's open_mesh owns fabric / L1 setup; the only params this test adds are the trace region,
-# and only when that open accepts them (otherwise the trace block falls back by itself).
-_DEV_PARAMS = {}
-if _PERF_TRACE:
-    # Reserve the trace region at device-open, ONCE, for baseline and every candidate. The tool
-    # measures trace+1cq end to end, so the device opens with a single command queue.
-    _DEV_PARAMS["trace_region_size"] = int(os.environ.get("TT_PERF_TRACE_REGION", "41943040"))
-    _DEV_PARAMS["num_command_queues"] = 1
 
 
-def _shape_kwargs(params, rows, cols):
-    """How open_mesh takes a mesh shape, if it takes one at all."""
-    for name in ("mesh_shape", "shape"):
-        if name in params:
-            dflt = params[name].default
-            if isinstance(dflt, (tuple, list)) or (name == "shape" and type(dflt).__name__ != "MeshShape"):
-                return {name: (rows, cols)}
-            return {name: ttnn.MeshShape(rows, cols)}
-    for r, c in (("rows", "cols"), ("num_rows", "num_cols")):
-        if r in params and c in params:
-            return {r: rows, c: cols}
-    return None
+def _trace_open_kwargs(params) -> dict:
+    """trace_region_size / num_command_queues for the open, never below what the source itself reserves."""
+    env = os.environ.get("TT_PERF_TRACE_REGION")
+    region = int(env) if env else 41943040
+    src = params["trace_region_size"].default if "trace_region_size" in params else None
+    if not env and isinstance(src, int) and src > region:
+        region = src
+    return {"trace_region_size": region, "num_command_queues": 1}
+
+
+def _open_planned_mesh():
+    """Only when --devices/--mesh plans a shape open_mesh() cannot take: open that shape directly.
+    FABRIC only when the mesh spans more than one chip (a 1x1 run must not train idle ethernet)."""
+    if _MESH_SHAPE[0] * _MESH_SHAPE[1] > 1:
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+    kw = {"l1_small_size": 24576}
+    if _PERF_TRACE:
+        kw.update(_trace_open_kwargs({}))
+    return ttnn.open_mesh_device(ttnn.MeshShape(*_MESH_SHAPE), **kw)
+
+
+def _close_planned_mesh(mesh):
+    ttnn.close_mesh_device(mesh)
+    if _MESH_SHAPE[0] * _MESH_SHAPE[1] > 1:
+        ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
 
 
 def _open_perf_mesh():
-    """Open the mesh the way the demo does (open_mesh()). Returns (mesh, opened_by_hand)."""
-    rows, cols = _MESH_SHAPE
-    try:
-        params = inspect.signature(open_mesh).parameters
-    except (TypeError, ValueError):
-        params = {}
+    """Open the mesh the way the demo does (open_mesh), handing it the planned shape and the trace
+    region when it accepts them. Returns (mesh, close_fn)."""
+    params = inspect.signature(open_mesh).parameters
     var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
     kw = {}
-    if (rows, cols) != _SOURCE_MESH:
-        shape_kw = _shape_kwargs(params, rows, cols)
-        if shape_kw is None:
-            # open_mesh hardwires the demo's 1x4 and cannot take the planned shape: open it directly,
-            # with fabric only when the planned mesh spans more than one chip.
-            print("MESH_OPEN=direct %dx%d (open_mesh takes no shape)" % (rows, cols), flush=True)
-            if rows * cols > 1:
-                ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
-            return ttnn.open_mesh_device(ttnn.MeshShape(rows, cols), **_DEV_PARAMS), True
-        kw.update(shape_kw)
-    trace_kw = {k: v for k, v in _DEV_PARAMS.items() if k in params or var_kw}
-    if trace_kw:
-        try:
-            return open_mesh(**kw, **trace_kw), False
-        except TypeError as _e:
-            print("TRACE_OPEN_KWARGS_REJECTED=%r" % (_e,), flush=True)
-    return open_mesh(**kw), False
+    if _PERF_TRACE:
+        kw.update({n: v for n, v in _trace_open_kwargs(params).items() if n in params or var_kw})
+    if tuple(_MESH_SHAPE) != _SOURCE_MESH:
+        shape_param = next((n for n in ("mesh_shape", "shape") if n in params), None)
+        if shape_param is not None:
+            default = params[shape_param].default
+            kw[shape_param] = tuple(_MESH_SHAPE) if isinstance(default, (tuple, list)) else ttnn.MeshShape(*_MESH_SHAPE)
+        elif "rows" in params and "cols" in params:
+            kw.update(rows=_MESH_SHAPE[0], cols=_MESH_SHAPE[1])
+        else:
+            return _open_planned_mesh(), _close_planned_mesh
+    return open_mesh(**kw), close_mesh
 
 
-def _build_batch_kw():
-    """The demo's batch argument: an explicit TT_PERF_BATCH override, else the model's own default."""
-    if PERF_BATCH > 0:
-        return {"batch": PERF_BATCH}
-    try:
-        b = int(kin.batch_size())
-    except Exception:  # noqa: BLE001
-        b = 0
-    return {"batch": b} if b > 0 else {}
+def _batch_kwargs() -> dict:
+    # 0 = ask the pipeline: omit batch so build_pipeline uses its own declared batch.
+    return {"batch": PERF_BATCH} if PERF_BATCH > 0 else {}
 
 
-def _pipe_batch(pipe, build_kw):
-    """Ask the pipeline what batch it was built for (one seed per user, as the demo does)."""
+def _pipeline_batch(pipe) -> int:
     if PERF_BATCH > 0:
         return PERF_BATCH
-    for attr in ("max_batch_size", "batch_size", "batch"):
-        v = getattr(pipe, attr, None)
-        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+    for name in ("max_batch_size", "batch_size", "batch"):
+        v = getattr(pipe, name, None)
+        if isinstance(v, int) and v > 0:
             return v
-    return int(build_kw.get("batch") or 32)  # the demo's documented default
+    return kin.batch_size()
 
 
-def _isl_prompt_ids(tok):
-    from models.experimental.perf_automation.agent.perf_test_gen import prompt_ids_for_isl
-
-    return prompt_ids_for_isl(tok, PERF_ISL_TOKENS)
-
-
-def _as_demo_prompt(ids, ref):
-    """Shape the ISL prompt ids like kin.encode_prompt's output, which pipe.generate expects."""
-    flat = [int(t) for t in ids.reshape(-1).tolist()]
-    if isinstance(ref, (list, tuple)):
-        return flat
-    if isinstance(ref, torch.Tensor):
-        return torch.tensor(flat, dtype=ref.dtype).reshape(*([1] * (ref.dim() - 1)), -1)
-    return ids
+def _like_demo_prompt(ids, like):
+    """The ISL prompt in the same container the demo hands generate() (kin.encode_prompt's type), so a
+    [1, ISL] tensor is never read as a one-token list."""
+    flat = [int(t) for t in torch.as_tensor(ids).reshape(-1).tolist()]
+    if torch.is_tensor(like):
+        return torch.tensor(flat, dtype=like.dtype).reshape(*like.shape[:-1], len(flat))
+    if isinstance(like, tuple):
+        return tuple(flat)
+    return flat
 
 
 def test_text_generation_perf():
-    mesh, _opened_by_hand = _open_perf_mesh()
+    tok = kin.load_tokenizer()
+    mesh, _close = _open_perf_mesh()
+    print("PERF_MESH_SHAPE=%dx%d" % tuple(_MESH_SHAPE), flush=True)
     try:
-
+        # 1) build the pipeline EXACTLY as demo/demo_text_generation.py does
+        # 2) drain the device profiler every PERF_FLUSH_EVERY ops. MODEL-AGNOSTIC: wrap EVERY ttnn
+        #    operation (type 'FastOperation') across ttnn + its op submodules, so the flush counter
+        #    tracks TOTAL device dispatch for ANY op mix. A curated op list under-counts (sdpa/eltwise/
+        #    transpose/reduction slip through) and the 12000-marker buffer overflows on some device,
+        #    dropping ops -> non-reproducible device_ms. Wrapping by TYPE never misses an op.
         def _eager_forward():
-            gc.collect()
+            pipe = build_pipeline(mesh, layers=PERF_LAYERS, **_batch_kwargs())
+            # --- per-stage marks (injected) ---------------------------------------------------
+            # Runs HERE, at the end of the function that built the pipeline, because that object is a LOCAL of
+            # this scope: an earlier version copied the test's own PipelineStageAdapter(...) arguments into the
+            # profiling branch and raised NameError, since the generator had defined them inside another
+            # function. Handed locals() rather than a name, so nothing depends on how the test spells things.
+            print("STAGE_MARKS_ENTER", flush=True)
+            try:
+                from models.experimental.perf_automation.agent import stage_marks as _tt_sm2
+
+                print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals()), flush=True)
+            except Exception as _tt_e2:  # noqa: BLE001
+                print("STAGE_MARKS_SKIPPED=%r" % (_tt_e2,), flush=True)
+            seeds = list(range(_pipeline_batch(pipe)))
+            _prompt_ids = prompt_ids_for_isl(tok, PERF_ISL_TOKENS)
+            prompt = _like_demo_prompt(_prompt_ids, kin.encode_prompt(tok, kin.CARD_MESSAGE))
+            print("PERF_ISL_TOKENS=%d" % _prompt_ids.shape[-1], flush=True)
+            print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
+            print("PERF_EAGER_OSL_TOKENS=%d" % _EAGER_OSL_TOKENS, flush=True)
+            print("PERF_BATCH_USERS=%d" % len(seeds), flush=True)
+            try:
+                ttnn.ReadDeviceProfiler(mesh)  # drain whatever the build dispatched
+            except Exception:
+                pass
+
             counter = [0]
             _orig = []
 
@@ -185,13 +202,6 @@ def test_text_generation_perf():
 
                 return inner
 
-            tok = kin.load_tokenizer()
-            _ids = _isl_prompt_ids(tok)
-            prompt = _as_demo_prompt(_ids, kin.encode_prompt(tok, kin.CARD_MESSAGE))
-            print("PERF_ISL_TOKENS=%d" % int(_ids.shape[-1]), flush=True)
-            print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
-            print("PERF_EAGER_OSL_TOKENS=%d" % _EAGER_OSL_TOKENS, flush=True)
-
             _mods = [ttnn] + [getattr(ttnn, _m, None) for _m in ("transformer", "experimental")]
             for _mod in [_m for _m in _mods if _m is not None]:
                 for _n in dir(_mod):
@@ -199,28 +209,8 @@ def test_text_generation_perf():
                     if type(_op).__name__ == "FastOperation":  # every dispatched ttnn op, by type
                         _orig.append((_mod, _n, _op))
                         setattr(_mod, _n, _draining(_op))
+            _fw0 = time.monotonic()
             try:
-                build_kw = _build_batch_kw()
-                pipe = build_pipeline(mesh, layers=PERF_LAYERS, **build_kw)
-                # --- per-stage marks (injected) ---------------------------------------------------
-                # Runs HERE, at the end of the function that built the pipeline, because that object is a LOCAL of
-                # this scope: an earlier version copied the test's own PipelineStageAdapter(...) arguments into the
-                # profiling branch and raised NameError, since the generator had defined them inside another
-                # function. Handed locals() rather than a name, so nothing depends on how the test spells things.
-                print("STAGE_MARKS_ENTER", flush=True)
-                try:
-                    from models.experimental.perf_automation.agent import stage_marks as _tt_sm2
-
-                    print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals()), flush=True)
-                except Exception as _tt_e2:  # noqa: BLE001
-                    print("STAGE_MARKS_SKIPPED=%r" % (_tt_e2,), flush=True)
-                try:
-                    ttnn.ReadDeviceProfiler(mesh)
-                except Exception:
-                    pass
-                seeds = list(range(_pipe_batch(pipe, build_kw)))
-                print("PERF_BATCH_USERS=%d" % len(seeds), flush=True)
-                _fw0 = time.monotonic()
                 out = pipe.generate(prompt, seeds, max_new_tokens=_EAGER_OSL_TOKENS)
                 try:
                     ttnn.ReadDeviceProfiler(mesh)
@@ -231,27 +221,25 @@ def test_text_generation_perf():
                     setattr(_mod, _n, _f)
             print("FORWARD_WALL_MS=%.4f" % ((time.monotonic() - _fw0) * 1000.0))
             assert out is not None  # perf only — NO PCC
-            assert len(out["tokens"]) == len(seeds)
-            print(
-                "[perf] %d users, %s steps, %d tokens"
-                % (len(seeds), out.get("steps"), sum(len(ids) for ids in out["tokens"])),
-                flush=True,
-            )
-            del pipe
+            assert out["tokens"], "pipeline produced no output"
+            n = sum(len(ids) for ids in out["tokens"])
+            print("[perf] %d users, %s steps, %d tokens" % (len(seeds), out.get("steps"), n), flush=True)
+            # free the eager build's weights + KV before a trace pass builds its own on this mesh
+            del pipe, out
             gc.collect()
 
         def _traced_forward():
-            from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter
             from models.experimental.perf_automation.agent.trace_replay import measure_adapter
+            from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter
 
             def _build_for_perf(dev):
                 from models.demos.kolibri_1.tt.pipeline import build_pipeline
 
-                return build_pipeline(dev, layers=PERF_LAYERS, **_build_batch_kw())
+                return build_pipeline(dev, layers=PERF_LAYERS, **_batch_kwargs())
 
             # ISL: build the prompt to EXACTLY PERF_ISL_TOKENS tokens rather than writing an example
             # sentence, so the measurement condition is the tool's choice and not the generator's.
-            _prompt_ids = _isl_prompt_ids(kin.load_tokenizer())
+            _prompt_ids = prompt_ids_for_isl(tok, PERF_ISL_TOKENS)
             print("PERF_ISL_TOKENS=%d" % _prompt_ids.shape[-1], flush=True)
             print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
             # Stage adapter profiles WHATEVER emit-e2e emitted: every PIPELINE_STAGES entry gets
@@ -288,6 +276,7 @@ def test_text_generation_perf():
             # a generated test simply omitted this, which is why five earlier attempts measured nothing.
             try:
                 from models.experimental.perf_automation.agent import stage_marks as _tt_sm
+                from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter as _TtPSA
             except Exception:  # noqa: BLE001
                 _tt_sm = None
             if _tt_sm is not None:
@@ -298,9 +287,4 @@ def test_text_generation_perf():
             if _PERF_TRACE:
                 _try_traced()
     finally:
-        close_mesh(mesh)
-        if _opened_by_hand:
-            try:
-                ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
-            except Exception:
-                pass
+        _close(mesh)
