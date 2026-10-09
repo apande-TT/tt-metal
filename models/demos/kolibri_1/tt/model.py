@@ -364,7 +364,9 @@ class MoE(TtKolibri1SparseMoeBlock):
 
     def __init__(self, device, moe) -> None:
         super().__init__(device, moe)
-        # Expert matmuls at HiFi4 (the stub uses HiFi2, which drops activation mantissa bits).
+        # Expert matmuls at HiFi4 (the stub uses HiFi2, which drops activation mantissa bits), except the
+        # compute-bound prefill gate/up, which runs at the stub's HiFi2.
+        self.gate_up_prefill_cfg = self.hifi2
         self.hifi2 = self.hifi4
         self.router = Router(device, moe.gate)
         self.shared = SharedExpert(device, moe.shared_experts)
@@ -448,8 +450,8 @@ class MoE(TtKolibri1SparseMoeBlock):
             ttnn.deallocate(mask)
         else:
             pc = self._gate_up_prefill_pc(x.shape[-2] // ttnn.TILE_SIZE)
-            g = ttnn.linear(x, self.w_gate, program_config=pc, compute_kernel_config=self.hifi2)
-            u = ttnn.linear(x, self.w_up, program_config=pc, compute_kernel_config=self.hifi2)
+            g = ttnn.linear(x, self.w_gate, program_config=pc, compute_kernel_config=self.gate_up_prefill_cfg)
+            u = ttnn.linear(x, self.w_up, program_config=pc, compute_kernel_config=self.gate_up_prefill_cfg)
         ttnn.deallocate(weights)
         act = ttnn.multiply(ttnn.multiply(ttnn.silu(g), u), col_scale)
         if not decode:
