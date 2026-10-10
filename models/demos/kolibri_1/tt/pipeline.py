@@ -21,7 +21,15 @@ import torch
 import ttnn
 from models.demos.kolibri_1.tt import inputs as kin
 from models.demos.kolibri_1.tt.checkpoint import Checkpoint, layer_indices
-from models.demos.kolibri_1.tt.model import DecoderLayer, Embedding, FinalNorm, LMHead, Sampler, StepState
+from models.demos.kolibri_1.tt.model import (
+    DecoderLayer,
+    Embedding,
+    FinalNorm,
+    LMHead,
+    Sampler,
+    StepState,
+    host_side_uploads,
+)
 
 PIPELINE_STAGES = ["prefill", "decode"]
 
@@ -61,21 +69,22 @@ class KolibriPipeline:
         self.head_dim = int(self.config.head_dim)
 
         t0 = time.time()
-        self.embed = Embedding(device, ck.embed_tokens())
-        self.layers = []
-        for n, i in enumerate(self.layer_ids):
-            self.layers.append(DecoderLayer(device, ck.decoder_layer(i), self.batch, self.capacity))
-            log(f"[build] layer {i} ({n + 1}/{len(self.layer_ids)}) {time.time() - t0:.0f}s", flush=True)
-        self.norm = FinalNorm(device, ck.final_norm())
-        self.head = LMHead(device, ck.lm_head())
-        self.sampler = Sampler(
-            device,
-            self.batch,
-            self.settings.top_k,
-            self.settings.top_p,
-            self.settings.temperature,
-            vocab=int(self.config.vocab_size),
-        )
+        with host_side_uploads():  # weights converted / tiled on the host, not by device ops at every build
+            self.embed = Embedding(device, ck.embed_tokens())
+            self.layers = []
+            for n, i in enumerate(self.layer_ids):
+                self.layers.append(DecoderLayer(device, ck.decoder_layer(i), self.batch, self.capacity))
+                log(f"[build] layer {i} ({n + 1}/{len(self.layer_ids)}) {time.time() - t0:.0f}s", flush=True)
+            self.norm = FinalNorm(device, ck.final_norm())
+            self.head = LMHead(device, ck.lm_head())
+            self.sampler = Sampler(
+                device,
+                self.batch,
+                self.settings.top_k,
+                self.settings.top_p,
+                self.settings.temperature,
+                vocab=int(self.config.vocab_size),
+            )
         self.rope = self._share_rope_tables()
         self.positions = self._up(
             torch.arange(self.capacity, dtype=torch.float32).expand(1, 1, self.batch, -1).contiguous(), ttnn.float32

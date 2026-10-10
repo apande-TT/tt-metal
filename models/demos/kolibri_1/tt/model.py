@@ -22,6 +22,7 @@ evidence that every graduated module runs inside the real forward path).
 """
 from __future__ import annotations
 
+import contextlib
 import struct
 from collections import Counter
 from pathlib import Path
@@ -53,6 +54,29 @@ GRADUATED = (
 INVOCATIONS = Counter()
 
 DRAM = ttnn.DRAM_MEMORY_CONFIG
+
+
+@contextlib.contextmanager
+def host_side_uploads():
+    """While the model builds, every ttnn.from_torch(..., device=...) converts and lays out its tensor on the HOST
+    and then copies it. Given an fp32 torch tensor and a bf16 / tile-layout target, ttnn uploads first and
+    converts on the device (tilize, typecast, untilize): ~19 ms of device time per build here, 14 ms of it the
+    128000 x 2560 embedding table. fp32 -> bf16 rounds to nearest even on either side."""
+    orig = ttnn.from_torch
+
+    def from_torch(tensor, *args, device=None, memory_config=None, **kwargs):
+        if device is None:
+            return orig(tensor, *args, memory_config=memory_config, **kwargs)
+        if isinstance(tensor, torch.Tensor) and tensor.dtype == torch.float32 and kwargs.get("dtype") == ttnn.bfloat16:
+            tensor = tensor.to(torch.bfloat16)
+        host = orig(tensor, *args, **kwargs)
+        return ttnn.to_device(host, device, memory_config=memory_config or DRAM)
+
+    ttnn.from_torch = from_torch
+    try:
+        yield
+    finally:
+        ttnn.from_torch = orig
 
 
 class StepState:
