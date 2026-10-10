@@ -106,7 +106,8 @@ def fused_limb_linear(hi, lo, w, mem):
             kernel_source=os.path.join(_KERNELS, "writer_limb_linear.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=compute_cores,
-            compile_time_args=[n_t, mb, nb, units, n_cores] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            compile_time_args=[n_t, mb, nb, units, n_cores]
+            + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
             runtime_args=wr_rt,
             config=ttnn.WriterConfigDescriptor(),
         ),
