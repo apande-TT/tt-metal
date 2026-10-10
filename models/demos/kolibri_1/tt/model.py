@@ -234,18 +234,20 @@ class Attention(TtKolibri1Attention):
             return self._prefill(hidden_states, st)
         return self._decode(hidden_states, st)
 
-    def _rope(self, x, cos, sin):
+    def _rope(self, x, cos, sin, prefill=False):
         """The stub's RoPE, with rotate-half run as ONE [rows, D] x [D, D] matmul over the full grid (as a batch of
         B * heads [T, D] products ttnn ran it on 16 cores, ~1.1 ms for Q at 4096 tokens). rot is 0 / +-1, so each
         output element is one input element: exact either way."""
         shape = list(x.shape)
         d = shape[-1]
         rows = x.volume() // d
-        if rows >= 2048 and len(shape) == 4:
-            # Prefill: every user's positions are 0 .. T-1 (the pipeline writes arange(Tp) for all), so one
-            # [1, 1, T, D] cos / sin row set serves all of them, and ttnn's fused HF rotary op computes
+        if prefill:
+            # Prefill: every user's positions are 0 .. T-1 (the pipeline writes arange(Tp)), so one [1, 1, T, D]
+            # cos / sin row set serves all of them, and ttnn's fused HF rotary op computes
             # x * cos + rotate_half(x) * sin in one pass (was the rotate-half matmul and three binary ops).
             T = shape[-2]
+            if list(cos.shape) == [1, 1, T, d]:  # the step's own tables (a full-range slice returns its input)
+                return ttnn.experimental.rotary_embedding(x, cos, sin)
             cos1 = ttnn.slice(cos, [0, 0, 0, 0], [1, 1, T, d])
             sin1 = ttnn.slice(sin, [0, 0, 0, 0], [1, 1, T, d])
             out = ttnn.experimental.rotary_embedding(x, cos1, sin1)
@@ -277,8 +279,8 @@ class Attention(TtKolibri1Attention):
         q = ttnn.rms_norm(q, epsilon=self.eps, weight=self.q_norm_w, compute_kernel_config=self.mm_cfg)
         k = ttnn.rms_norm(k, epsilon=self.eps, weight=self.k_norm_w, compute_kernel_config=self.mm_cfg)
         if self.is_sliding:
-            q = self._rope(q, st.cos, st.sin)
-            k = self._rope(k, st.cos, st.sin)
+            q = self._rope(q, st.cos, st.sin, st.mode == "prefill")
+            k = self._rope(k, st.cos, st.sin, st.mode == "prefill")
         return q, k
 
     def _out(self, attn_heads, shape):
@@ -330,8 +332,15 @@ class Attention(TtKolibri1Attention):
         ttnn.deallocate(xqkv)
         q, k = self._qk(q, k, st)
         flat = [1, B * self.n_local_kv, T, self.head_dim]
-        ttnn.fill_cache(self._k_fill, ttnn.reshape(k, flat), batch_idx=0)
-        ttnn.fill_cache(self._v_fill, ttnn.reshape(v, flat), batch_idx=0)
+        kf, vf = ttnn.reshape(k, flat), ttnn.reshape(v, flat)
+        if B < self.batch:  # one prompt shared by all users, prefilled once: its K,V go into every user's rows
+            kf = ttnn.repeat(kf, [1, self.batch // B, 1, 1])
+            vf = ttnn.repeat(vf, [1, self.batch // B, 1, 1])
+        ttnn.fill_cache(self._k_fill, kf, batch_idx=0)
+        ttnn.fill_cache(self._v_fill, vf, batch_idx=0)
+        if B < self.batch:
+            ttnn.deallocate(kf)
+            ttnn.deallocate(vf)
         chunk = next(c for c in (256, 128, 64, 32) if T % c == 0 or c == 32)
         attn = ttnn.transformer.scaled_dot_product_attention(
             q,

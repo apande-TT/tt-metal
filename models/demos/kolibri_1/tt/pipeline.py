@@ -5,8 +5,8 @@
     ids  -> token_embed -> 50 x decoder_layer(attention[o_proj = f_p8_linear], sparse_moe_block[router,
             m_l_p]) -> r_m_s_norm -> decoder_head -> on-device sampler -> next id -> token_embed -> ...
 
-Stages (Kolibri1ForCausalLM is a causal LM): prefill = the prompt for all B users in one pass, filling
-the resident K,V caches and sampling the first token; decode = one token per user per step, reading
+Stages (Kolibri1ForCausalLM is a causal LM): prefill = the prompt all B users share, run once, filling
+every user's resident K,V cache rows and sampling each user's first token; decode = one token per user per step, reading
 and extending those caches. Each step's output token is written into a resident buffer that the next
 decode step reads, so the generation loop never moves data host->device; the host only reads the B
 sampled ids back to apply the model's stop rule.
@@ -90,6 +90,7 @@ class KolibriPipeline:
             torch.arange(self.capacity, dtype=torch.float32).expand(1, 1, self.batch, -1).contiguous(), ttnn.float32
         )
         self.prompt_len = None
+        self._prefill_hn = None
         log(
             f"[build] {len(self.layers)} layers, batch {self.batch}, KV capacity {self.capacity} ({time.time() - t0:.0f}s)"
         )
@@ -134,8 +135,9 @@ class KolibriPipeline:
         pad = self.settings.pad_id
         rm, u32 = ttnn.ROW_MAJOR_LAYOUT, ttnn.uint32
         self.prompt_len, self.prefill_len = T, Tp
-        self._write("prefill_ids", torch.tensor([list(prompt_ids) + [pad] * (Tp - T)] * B, dtype=torch.int32), u32, rm)
-        self._write("prefill_pos", torch.arange(Tp, dtype=torch.int32).expand(B, Tp), u32, rm)
+        # One prompt for all B users (B samples of it, seed b on row b): the prefill runs it once, at batch 1.
+        self._write("prefill_ids", torch.tensor([list(prompt_ids) + [pad] * (Tp - T)], dtype=torch.int32), u32, rm)
+        self._write("prefill_pos", torch.arange(Tp, dtype=torch.int32).reshape(1, Tp), u32, rm)
         uni = kin.sampling_uniforms(seeds, kin.uniforms_length())[: self.capacity]  # [C, B]
         self._write("u_table", uni.t().reshape(1, 1, B, self.capacity), ttnn.float32)
         self._write("last_col", torch.full((1, 1, B, 1), float(T - 1)), ttnn.float32)
@@ -169,23 +171,34 @@ class KolibriPipeline:
 
     def prefill_forward(self):
         """Prompt for all B users -> K,V caches filled, first token sampled. Returns (logits [1,1,B,V] at the
-        last prompt position, token ids [1,1,B,1]); keeps the final-norm hidden state in self.prefill_hidden."""
+        last prompt position, token ids [1,1,B,1]); keeps the final-norm hidden state (see prefill_hidden).
+
+        Every user has the same prompt (load_request takes one), so the layers run it once, at batch 1: each
+        attention layer writes its K,V into all B users' cache rows, and the last position's state is repeated
+        to the B rows the head and the sampler (one uniform per user) read."""
         B, T, Tp, H = self.batch, self.prompt_len, self.prefill_len, self.hidden
-        cos, sin = self._rope_rows(self.prefill_pos, [B, 1, Tp, self.head_dim])
+        cos, sin = self._rope_rows(self.prefill_pos, [1, 1, Tp, self.head_dim])
         st = StepState("prefill", cos, sin)
-        h = ttnn.typecast(ttnn.reshape(self.embed(self.prefill_ids), [B, 1, Tp, H]), ttnn.float32)
+        h = ttnn.typecast(ttnn.reshape(self.embed(self.prefill_ids), [1, 1, Tp, H]), ttnn.float32)
         hn = self.norm(self._stack(h, st))
-        # Position T-1 of every user: first the tile-aligned 32-row block that holds it (no data reordering), then the
-        # row, so the untilize behind a non-aligned slice touches 32 rows per user instead of all Tp.
+        # Position T-1: first the tile-aligned 32-row block that holds it (no data reordering), then the row, so the
+        # untilize behind a non-aligned slice touches 32 rows instead of all Tp.
         tr = (T - 1) // 32 * 32
-        block = ttnn.slice(hn, [0, 0, tr, 0], [B, 1, tr + 32, H])
-        last = ttnn.reshape(ttnn.slice(block, [0, 0, T - 1 - tr, 0], [B, 1, T - tr, H]), [1, 1, B, H])
+        block = ttnn.slice(hn, [0, 0, tr, 0], [1, 1, tr + 32, H])
+        row = ttnn.slice(block, [0, 0, T - 1 - tr, 0], [1, 1, T - tr, H])
         ttnn.deallocate(block)
+        last = ttnn.repeat(row, [1, 1, B, 1])
+        ttnn.deallocate(row)
         logits = self.head(last)
         tok = self.sampler(logits, self._uniform(self.last_col))
         self._commit(tok)
-        self.prefill_hidden = hn
+        self._prefill_hn = hn
         return logits, tok
+
+    @property
+    def prefill_hidden(self):
+        """Every user's final-norm prefill state [B, 1, Tp, H] (the shared prompt's, one copy per user)."""
+        return ttnn.repeat(self._prefill_hn, [self.batch, 1, 1, 1])
 
     def decode_forward(self):
         """One token per user at its current position; advances the resident position counters."""
@@ -241,10 +254,11 @@ class KolibriPipeline:
         return logits
 
     def prefill_trace_items(self) -> int:
-        """Tokens one prefill call runs through the 50 decoder layers: B users x the padded prompt."""
+        """Tokens one prefill call runs through the 50 decoder layers: the padded prompt, once (all B users
+        share it; see prefill_forward)."""
         if self.prompt_len is None:
             self.prefill_trace_setup(self.prefill_trace_inputs())
-        return self.batch * self.prefill_len
+        return self.prefill_len
 
     def decode_trace_inputs(self) -> dict:
         return self._stage_inputs()
