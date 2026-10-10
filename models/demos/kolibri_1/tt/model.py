@@ -295,7 +295,7 @@ class Attention(TtKolibri1Attention):
         n_block = -(-n_tiles // n_cores)
         return ttnn.MinimalMatmulConfig(
             M_block_size=-(-m_tiles // m_cores),
-            K_block_size=8,
+            K_block_size=4,  # K blocks of 8 put the circular buffers over the L1 input
             N_block_size=n_block,
             subblock_h=1,
             subblock_w=next(w for w in (4, 3, 2, 1) if n_block % w == 0),
@@ -318,6 +318,7 @@ class Attention(TtKolibri1Attention):
             compute_kernel_config=self.mm_cfg,
             dtype=ttnn.bfloat16,
         )
+        ttnn.deallocate(x)  # the input norm's L1 output: free it before SDPA's circular buffers
         xqkv = ttnn.reshape(xqkv, [B, 1, T, n])
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             xqkv,
@@ -356,6 +357,7 @@ class Attention(TtKolibri1Attention):
         if x.dtype != ttnn.bfloat16:
             x = ttnn.typecast(x, ttnn.bfloat16)
         xqkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.mm_cfg)
+        ttnn.deallocate(x)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
             xqkv, num_heads=self.n_local_heads, num_kv_heads=self.n_local_kv, memory_config=self.heads_mem
         )
@@ -840,9 +842,10 @@ class DecoderLayer(TtKolibri1DecoderLayer):
         L1 = ttnn.L1_MEMORY_CONFIG  # the residual adds read their bf16 operand from L1 (~190 KB a core at 4096 rows)
         hb = ttnn.typecast(h, ttnn.bfloat16, memory_config=L1)  # the norm's bf16 input, too, only lives across it
         x = ttnn.rms_norm(
-            hb, epsilon=self.eps, weight=self.norm_w["input_layernorm"], memory_config=DRAM, compute_kernel_config=self.norm_cfg
+            hb, epsilon=self.eps, weight=self.norm_w["input_layernorm"], memory_config=L1, compute_kernel_config=self.norm_cfg
         )
         ttnn.deallocate(hb)
+        # x (L1) feeds only the QKV projection, which frees it.
         a = self.attn(x, position_ids, attention_mask, past_key_value)
         n = ttnn.rms_norm(
             a, epsilon=self.eps, weight=self.norm_w["post_attn_norm"], memory_config=L1, compute_kernel_config=self.norm_cfg
