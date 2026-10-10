@@ -218,6 +218,13 @@ class Attention(TtKolibri1Attention):
             packer_l1_acc=False,
         )
 
+    def _upload(self, t, shard_dim=None, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16):
+        """The fused QKV weight (the stub's only column-sharded upload) is stored bfloat8_b, converted on the host
+        from the fp32 dequantised weight."""
+        if shard_dim == -1:
+            dtype = ttnn.bfloat8_b
+        return super()._upload(t, shard_dim, layout, dtype)
+
     def __call__(self, hidden_states, position_ids=None, attention_mask=None, past_key_value=None, **kwargs):
         INVOCATIONS["attention"] += 1
         st = past_key_value
