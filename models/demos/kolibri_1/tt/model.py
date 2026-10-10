@@ -279,6 +279,7 @@ class Attention(TtKolibri1Attention):
 # ----------------------------------------------------------------------------------------------------- MoE
 _KERNELS = Path(__file__).resolve().parent / "kernels"
 _ROUTED_OUT = {}
+_PLANES = {}  # (device, rows, hidden) -> the grouped experts' persistent fp32 partial planes
 
 
 class RoutedGateUp:
@@ -434,6 +435,7 @@ class GroupedExperts:
         )
         modes = [ttnn.UnpackToDestMode.Default] * 64
         modes[0] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the fp32 partial planes, summed exactly
+        modes[5] = ttnn.UnpackToDestMode.UnpackToDestFp32  # their 0/1 row masks
         self.sum_cfg.unpack_to_dest_mode = modes
 
     def __call__(self, x, w):
@@ -462,19 +464,20 @@ class GroupedExperts:
         n_e = ttnn.sum(ttnn.sign(w), dim=2, keepdim=True, compute_kernel_config=self.count_cfg)
         counts = ttnn.to_layout(n_e, ttnn.ROW_MAJOR_LAYOUT)
         ttnn.deallocate(n_e)
-        y = ttnn.empty(
-            [1, self.kmax, m, hidden],
-            dtype=ttnn.float32,
-            layout=ttnn.TILE_LAYOUT,
-            device=self.device,
-            memory_config=DRAM,
-        )
+        # The fp32 partial planes persist across calls, zeroed once: a row a plane does not receive this call keeps
+        # an earlier call's finite value, which the combine multiplies by its 0 mask.
+        key = (id(self.device), m, hidden)
+        if key not in _PLANES:
+            _PLANES[key] = ttnn.zeros(
+                [1, self.kmax, m, hidden], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device
+            )
+        y = _PLANES[key]
         self._experts(x_rm, wt_rm, w_rm, counts, y, m)
         out = ttnn.empty(
             [1, 1, m, hidden], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=DRAM
         )
         self._combine(y, w_rm, out, m)
-        for t in (x_rm, wt_rm, w_rm, counts, y):
+        for t in (x_rm, wt_rm, w_rm, counts):
             ttnn.deallocate(t)
         return out
 
@@ -547,10 +550,11 @@ class GroupedExperts:
         kt, mt, nc, wrow = self.kt, m // ttnn.TILE_SIZE, len(self.core_xy), w_rm.shape[-1] * 4
         cw = next(w for w in (8, 5, 4, 2, 1) if kt % w == 0)  # output tiles per (row, column-chunk) unit
         cbs = [
-            cb(0, ttnn.float32, 4096, 2 * self.kmax, c),  # partial planes of one output tile
-            cb(4, ttnn.uint32, 16, 2, c),  # planes per tile row -> compute
+            cb(0, ttnn.float32, 4096, 2 * self.kmax * cw, c),  # partial planes of a unit's cw output tiles
+            cb(4, ttnn.uint32, 16, 2, c),  # planes and all-rows-valid bits per unit -> compute
+            cb(5, ttnn.float32, 4096, 2 * self.kmax, c),  # a 0/1 row mask per plane
             cb(9, ttnn.float32, wrow * 32, 1, c),  # weight rows of the tile row's 32 tokens
-            cb(16, ttnn.bfloat16, 2048, 2, c),  # summed output tiles
+            cb(16, ttnn.bfloat16, 2048, 2 * cw, c),  # summed output tiles
         ]
         reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for i, (cx, cy) in enumerate(self.core_xy):

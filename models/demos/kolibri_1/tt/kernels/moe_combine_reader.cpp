@@ -3,10 +3,12 @@
 
 // Prefill routed experts, combine (reader). Units of (token tile row, CW output tiles) are dealt round-robin over the
 // cores, so the work splits evenly whatever the row count (whole rows left 18 of 110 cores doing two). For each row,
-// cnt_j = how many local experts token j routed to; planes 0 .. max_j cnt_j - 1 of the fp32 partial buffer are
-// read tile by tile, and in plane k the rows of tokens with cnt_j <= k (never written this call) are zeroed.
-// A row no token routed here still gets one all-zero plane, so compute always sums at least one. Every push
-// is KMAX tiles (the planes used first), so a reservation never wraps the circular buffer.
+// cnt_j = how many local experts token j routed to; planes 0 .. max_j cnt_j - 1 of the fp32 partial buffer hold the
+// row's partial sums. A unit's planes x CW tiles are read in ONE batch (one barrier), and while they land, one fp32
+// mask tile per plane is built: row j = 1.0 where cnt_j > k, else 0. Rows a plane never received keep an earlier
+// call's finite values (the buffer persists, zeroed once); compute multiplies them by the 0. Per plane, bit k of the
+// `full` word says every row is valid, so compute skips its mask. Pushes are always KMAX * CW and KMAX tiles (the
+// planes used first), so a reservation never wraps the circular buffer.
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -25,8 +27,9 @@ void kernel_main() {
     const auto y = TensorAccessor(y_args, get_arg_val<uint32_t>(1));
     const uint32_t core = get_arg_val<uint32_t>(2);
 
-    constexpr uint32_t cb_p = 0, cb_cnt = 4, cb_rows = 9;
-    constexpr uint32_t face = 1024, frow = 64, tile = 4096;
+    constexpr uint32_t cb_p = 0, cb_cnt = 4, cb_mask = 5, cb_rows = 9;
+    constexpr uint32_t face = 1024, tile = 4096;  // fp32 tile geometry
+    constexpr uint32_t one = 0x3f800000u;         // 1.0f
 
     cb_reserve_back(cb_rows, 1);
     const uint32_t rows_l1 = get_write_ptr(cb_rows);
@@ -47,31 +50,40 @@ void kernel_main() {
             cnt[j] = c;
             planes = c > planes ? c : planes;
         }
-        cb_reserve_back(cb_cnt, 1);
-        *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_cnt)) = planes;
-        cb_push_back(cb_cnt, 1);
+        planes = planes < KMAX ? planes : KMAX;
 
-        for (uint32_t nn = n0; nn < n0 + CW; ++nn) {
-            cb_reserve_back(cb_p, KMAX);
-            const uint32_t l1 = get_write_ptr(cb_p);
-            for (uint32_t k = 0; k < planes; ++k) {
-                noc_async_read_page((k * MT + r) * Kt + nn, y, l1 + k * tile);
+        cb_reserve_back(cb_p, KMAX * CW);
+        const uint32_t p_l1 = get_write_ptr(cb_p);
+        for (uint32_t k = 0; k < planes; ++k) {
+            for (uint32_t c = 0; c < CW; ++c) {
+                noc_async_read_page((k * MT + r) * Kt + n0 + c, y, p_l1 + (k * CW + c) * tile);
             }
-            noc_async_read_barrier();
-            for (uint32_t k = 0; k < planes; ++k) {
-                for (uint32_t j = 0; j < 32; ++j) {
-                    if (cnt[j] > k) {
-                        continue;
-                    }
-                    volatile tt_l1_ptr uint32_t* p = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
-                        l1 + k * tile + (j / 16) * 2 * face + (j % 16) * frow);
-                    for (uint32_t i = 0; i < frow / 4; ++i) {
-                        p[i] = 0;
-                        p[face / 4 + i] = 0;
-                    }
+        }
+
+        cb_reserve_back(cb_mask, KMAX);
+        const uint32_t m_l1 = get_write_ptr(cb_mask);
+        uint32_t full = 0;
+        for (uint32_t k = 0; k < planes; ++k) {
+            uint32_t valid = 0;
+            for (uint32_t j = 0; j < 32; ++j) {
+                const uint32_t v = cnt[j] > k ? one : 0u;
+                valid += v != 0;
+                volatile tt_l1_ptr uint32_t* p =
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(m_l1 + k * tile + (j / 16) * 2 * face + (j % 16) * 64);
+                for (uint32_t i = 0; i < 16; ++i) {
+                    p[i] = v;
+                    p[face / 4 + i] = v;
                 }
             }
-            cb_push_back(cb_p, KMAX);
+            full |= (valid == 32 ? 1u : 0u) << k;
         }
+        cb_reserve_back(cb_cnt, 1);
+        volatile tt_l1_ptr uint32_t* hdr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_cnt));
+        hdr[0] = planes;
+        hdr[1] = full;
+        cb_push_back(cb_cnt, 1);
+        cb_push_back(cb_mask, KMAX);
+        noc_async_read_barrier();
+        cb_push_back(cb_p, KMAX * CW);
     }
 }
