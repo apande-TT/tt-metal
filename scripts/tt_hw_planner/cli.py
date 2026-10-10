@@ -81,6 +81,12 @@ def _dtypes_for(category: str, user: List[str], source_dtype: str = "") -> List[
     return ["bf16"]
 
 
+def _add_dtype_override_arg(parser: argparse.ArgumentParser, help_text: str) -> None:
+    """Single definition of the optional ``--dtype`` override shared by the
+    bring-up subcommands; choices come from ``DTYPE_BYTES``."""
+    parser.add_argument("--dtype", default=None, choices=list(DTYPE_BYTES.keys()), help=help_text)
+
+
 def _parse_mesh(s: str) -> Tuple[int, int]:
     parts = s.replace("x", ",").split(",")
     if len(parts) != 2:
@@ -8652,6 +8658,8 @@ def cmd_bringup(args) -> int:
         f"--auto-max-iters=24 --auto-max-attempts-per-component=5 "
         f"--isolation=worktree"
     )
+    if full.dtype:
+        print(f"  Weight dtype override: --dtype={full.dtype}")
     print(
         f"  Brain G8 will orchestrate: budget-extend, cap-extend, " f"phantom-cleanup, sync, demo-emit, demo-recovery"
     )
@@ -10233,6 +10241,7 @@ from .commands.op_synth import cmd_op_synth  # noqa: F401
 from .commands.emit_e2e import cmd_emit_e2e  # noqa: F401
 from .commands.optimize import cmd_optimize  # noqa: F401
 from .commands.optimize_dashboard import cmd_optimize_dashboard  # noqa: F401
+from .commands.autocommit import wrap as _autocommit_wrap, add_commit_push_args as _add_commit_push_args  # noqa: F401
 from .commands.publish_hf import cmd_publish_hf  # noqa: F401
 from .commands.run_demo import cmd_run_demo  # noqa: F401
 from .commands.auto_onboard import cmd_auto_onboard  # noqa: F401
@@ -10296,12 +10305,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "valid shapes before scaffold/autofill/LLM run. Default: planner picks."
         ),
     )
-    pup.add_argument(
-        "--dtype",
-        default=None,
-        choices=list(DTYPE_BYTES.keys()),
-        help="override dtype for prepare/execute and auto-iterate reruns",
-    )
+    _add_dtype_override_arg(pup, "override dtype for prepare/execute and auto-iterate reruns")
     pup.add_argument("--batch", type=int, default=1, help="batch size for prepare/execute (default: 1)")
     pup.add_argument("--max-seq-len", type=int, default=1024, help="max sequence length for prepare/execute")
     pup.add_argument(
@@ -10665,7 +10669,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "On failure, the worktree is preserved for debug. Pass --isolation none to opt out."
         ),
     )
-    pup.set_defaults(func=cmd_up)
+    _add_commit_push_args(pup)
+    pup.set_defaults(func=_autocommit_wrap(cmd_up, "auto-up"))
 
     # `auto-up` is a zero-flag entry-point: hands the model_id to `up`
     # with all brain-orchestrated defaults locked in. Power users keep
@@ -10694,6 +10699,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--mesh",
         required=True,
         help="Mesh shape, e.g. '1,4' or '2x2' (required); must be canonical for --box.",
+    )
+    _add_dtype_override_arg(
+        paut,
+        "override the weight dtype (default: planner picks); e.g. bfp4_b for a model "
+        "that only fits the box at 4-bit weights. Applies to the memory-fit gate, "
+        "prepare/execute and auto-iterate reruns, same as `up --dtype`.",
     )
     paut.add_argument(
         "--reverify",
@@ -10732,12 +10743,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         required=True,
         help="mesh shape (e.g. '1,4') (required); must be canonical for --box.",
     )
-    pprom.add_argument(
-        "--dtype",
-        default=None,
-        choices=list(DTYPE_BYTES.keys()),
-        help="override dtype for reruns",
-    )
+    _add_dtype_override_arg(pprom, "override dtype for reruns")
     pprom.add_argument("--batch", type=int, default=1)
     pprom.add_argument("--max-seq-len", type=int, default=1024)
     pprom.add_argument("--max-generated-tokens", type=int, default=200)
@@ -11153,12 +11159,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="override the planner's box pick",
     )
     pprep.add_argument("--mesh", default=None, help="override the planner's mesh (requires --box, e.g. 1,4)")
-    pprep.add_argument(
-        "--dtype",
-        default=None,
-        choices=list(DTYPE_BYTES.keys()),
-        help="override the planner's dtype pick",
-    )
+    _add_dtype_override_arg(pprep, "override the planner's dtype pick")
     pprep.add_argument("--batch", type=int, default=1, help="pytest --batch_size (default 1)")
     pprep.add_argument("--max-seq-len", type=int, default=1024, help="pytest --max_seq_len (default 1024)")
     pprep.add_argument(
@@ -11424,7 +11425,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "on a 32 GB Blackhole box). Omit to keep the prompt unchanged."
         ),
     )
-    pe2e.set_defaults(func=cmd_emit_e2e)
+    _add_commit_push_args(pe2e)
+    pe2e.set_defaults(func=_autocommit_wrap(cmd_emit_e2e, "emit-e2e"))
 
     popt = sub.add_parser(
         "optimize",
@@ -11625,7 +11627,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         dest="dashboard_port",
         help="port for the --dashboard server (default 8798; falls back to a free port if taken).",
     )
-    popt.set_defaults(func=cmd_optimize)
+    popt.add_argument(
+        "--achievable-low",
+        dest="achievable_low",
+        default=None,
+        help="Low end of the roofline ACHIEVABLE band shown in RUN_REPORT (percent or fraction, "
+        "e.g. 70 or 0.7). Use together with --achievable-high.",
+    )
+    popt.add_argument(
+        "--achievable-high",
+        dest="achievable_high",
+        default=None,
+        help="High end of the roofline ACHIEVABLE band (percent or fraction, e.g. 90 or 0.9). Use "
+        "together with --achievable-low. Default: the model's physics-derived band "
+        "(dense 60-80%%, MoE 37.5-50%%).",
+    )
+    _add_commit_push_args(popt)
+    popt.set_defaults(func=_autocommit_wrap(cmd_optimize, "optimize"))
 
     pdash = sub.add_parser(
         "optimize-dashboard",
@@ -11733,6 +11751,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     pph.add_argument("--tt-model-bin", dest="tt_model_bin", help="path to the tt-model executable")
     pph.add_argument("--public", action="store_true", help="push the bundle public (shared by link)")
     pph.add_argument("--publish", action="store_true", help="push public AND list in the catalog")
+    pph.add_argument(
+        "--no-commit-push", dest="commit_push", action="store_false", default=True,
+        help="Do NOT auto-commit+push the model to its repo after a clean publish (default: do).",
+    )
+    pph.add_argument(
+        "--commit-remote", default=None,
+        help="Git remote for the post-publish auto-commit (default: branch upstream, else 'apande', else 'origin').",
+    )
+    pph.add_argument(
+        "--no-mirror-upstream", dest="mirror_upstream", action="store_false", default=True,
+        help="Do NOT mirror the upstream HF model card (default: publish a card matching the upstream model's structure, with a TT-validated header).",
+    )
     pph.set_defaults(func=cmd_publish_hf)
 
     prd = sub.add_parser(
