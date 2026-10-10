@@ -267,6 +267,39 @@ LO_FIDELITY = ttnn.MathFidelity.HiFi4
 # glitch), as the tie-break in median(ex, dn, -nn), where a lower fidelity's ~2^-7 product error still leaves the
 # median a sound value; everywhere else the exact-lane sum is kept.
 NN_FIDELITY = ttnn.MathFidelity.HiFi4
+# Optional fused kernel for the exact-lane sums: LANE_SUM(ts) -> ((ts[0] + ts[1]) + ...) (bit-identical to the
+# ttnn.add chain) for up to LANE_SUM_WIDTH products, consuming them, or None for a list it does not take.
+LANE_SUM = None
+LANE_SUM_WIDTH = 6
+
+
+class _LaneAcc:
+    """The left-to-right float32 sum of the products pushed into it: a ttnn.add per product, or with LANE_SUM
+    one fused pass per LANE_SUM_WIDTH operands (the running sum first), in the same order."""
+
+    def __init__(self):
+        self.pending = []
+
+    def push(self, t):
+        self.pending.append(t)
+        if LANE_SUM is None:
+            if len(self.pending) == 2:
+                self.pending = [ttnn.add(self.pending[0], self.pending[1])]
+        elif len(self.pending) == LANE_SUM_WIDTH:
+            self._flush()
+
+    def _flush(self):
+        if len(self.pending) > 1:
+            y = LANE_SUM(self.pending)
+            if y is None:
+                y = self.pending[0]
+                for t in self.pending[1:]:
+                    y = ttnn.add(y, t)
+            self.pending = [y]
+
+    def value(self):
+        self._flush()
+        return self.pending[0]
 
 
 def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None, rest2_fn=None):
@@ -289,6 +322,15 @@ def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None, rest2_fn=None):
     return y if rest2_fn is None else ttnn.add(y, rest2_fn())
 
 
+def _lead_lanes(lead):
+    """(the strided lanes of the bf16 lead limb, one at a time; -lead, or None when not formed here)."""
+    split = None if LANE_SPLIT is None else LANE_SPLIT(lead)
+    if split is None:
+        masks = _lane_masks(lead.device(), lead.shape[-1], lead.dtype, "strided")
+        return (ttnn.multiply(lead, m) for m in masks), None
+    return split
+
+
 def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None):
     """EXACT_MODE "guarded" for linears of ONE input: mms[i](p) = p @ w_i; parts = the input's bf16 limbs.
     The input side (each lane, the negated lead limb, its row norms) is formed once for all the weights,
@@ -297,18 +339,13 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None):
     lo_mms = lo_mms or mms
     nn_mms = nn_mms or mms
     lead = parts[0]
-    exs = [None] * len(mms)
-    split = None if LANE_SPLIT is None else LANE_SPLIT(lead)
-    if split is None:  # one lane at a time
-        masks = _lane_masks(lead.device(), lead.shape[-1], lead.dtype, "strided")
-        lanes, neg_lead = (ttnn.multiply(lead, m) for m in masks), None
-    else:
-        lanes, neg_lead = split
+    accs = [_LaneAcc() for _ in mms]
+    lanes, neg_lead = _lead_lanes(lead)
     for lane in lanes:
         for i, mm in enumerate(mms):
-            t = mm(lane)
-            exs[i] = t if exs[i] is None else ttnn.add(exs[i], t)
+            accs[i].push(mm(lane))
         ttnn.deallocate(lane)
+    exs = [acc.value() for acc in accs]
     neg_lead = ttnn.neg(lead) if neg_lead is None else neg_lead
     a_norm = _norm_last(lead)
     ys = []
@@ -546,13 +583,16 @@ def _guarded_terms(mm, terms, a, b, transpose_b):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
     (pa0, pb0), rest = terms[0], terms[1:]
-    ex = None
-    for lane in _lanes(pa0, "strided"):
-        t = mm(lane, pb0)
-        ex = t if ex is None else ttnn.add(ex, t)
+    acc = _LaneAcc()
+    lanes, neg0 = _lead_lanes(pa0)
+    for lane in lanes:
+        acc.push(mm(lane, pb0))
+        ttnn.deallocate(lane)
+    ex = acc.value()
     dn = mm(pa0, pb0)
     first = [lambda pa=pa, pb=pb: mm(pa, pb) for pa, pb in rest[:2]]
-    y = _guarded(ex, dn, mm(ttnn.neg(pa0), pb0), _norm_last(a), _col_norms(b, transpose_b, cache=False), *first)
+    neg0 = ttnn.neg(pa0) if neg0 is None else neg0
+    y = _guarded(ex, dn, mm(neg0, pb0), _norm_last(a), _col_norms(b, transpose_b, cache=False), *first)
     for pa, pb in rest[2:]:
         y = ttnn.add(y, mm(pa, pb))
     return y

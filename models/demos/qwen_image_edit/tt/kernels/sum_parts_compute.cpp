@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// y = ((p0 + p1) + p2) + ...: the float32 sum of N (compile-time, 2..5) operands from c_0.., one tile at a time,
+// y = ((p0 + p1) + p2) + ...: the float32 sum of N (compile-time, 2..6) operands from c_0.., one tile at a time,
 // left to right with the SFPU add ttnn's float32 binary_ng uses, on operands unpacked straight to the float32
 // DST -- bit-identical to the chain of ttnn.add calls in that order.
 

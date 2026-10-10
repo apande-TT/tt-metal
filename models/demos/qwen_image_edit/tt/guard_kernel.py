@@ -216,6 +216,27 @@ def sum_parts(g, n):
     return ttnn.generic_op([g, y], program)
 
 
+def sum_list(ts):
+    """((ts[0] + ts[1]) + ts[2]) + ... for 2..6 same-shape interleaved float32 tile tensors (an exact-lane sum's
+    products), in one pass, bit-identical to the ttnn.add chain. Consumes (deallocates) ts. None for a list it
+    does not take (ts left as they are)."""
+    if not 2 <= len(ts) <= len(_IN_CBS):
+        return None
+    s = list(ts[0].shape)
+    if len(s) < 2 or not all(_plain(t, s) for t in ts):
+        return None
+    ps = list(ts[0].padded_shape)
+    pages = 1
+    for d in ps[:-2]:
+        pages *= d
+    pages *= (ps[-2] // TILE) * (ps[-1] // TILE)
+    y = ttnn.empty_like(ts[0])
+    ttnn.generic_op(list(ts) + [y], _program(ts, y, pages, compute=_SUM_COMPUTE, compute_args=[len(ts)]))
+    for t in ts:
+        ttnn.deallocate(t)
+    return y
+
+
 def split_limbs(x, limbs=2):
     """split_bf16's `limbs` (2 or 3) bf16 limbs of an interleaved float32 tile tensor in one pass -- hi = bf16(x),
     then the bf16 of each remainder -- with the same SFPU typecast / subtract; or None for a tensor it does
