@@ -1,0 +1,32 @@
+{
+  "component": "r_m_s_norm",
+  "submodule_path": "model.layers.0.input_layernorm",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1,
+          2048
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      1,
+      2048
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

@@ -1,0 +1,104 @@
+{
+  "last_failure_class": {
+    "attention": "HANG",
+    "decoder_head": "HANG",
+    "encoder_stack": "HANG",
+    "layer": "HANG",
+    "m_l_p": "HANG",
+    "mlp": "HANG",
+    "token_embed": "HANG"
+  },
+  "last_failure_text": {
+    "attention": "focused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nfocused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nLast reported stage(s) before kill:\n    models/demos/minicpm5_2b/tests/pcc/test_attention.py::test_attention: stage=ttnn_to_torch\nkernel wchan of pytest tree:\n  pid=506070 comm=python wchan=futex_wait_queue",
+    "decoder_head": "focused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nfocused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nLast reported stage(s) before kill:\n    models/demos/minicpm5_2b/tests/pcc/test_decoder_head.py::test_decoder_head: stage=ttnn_to_torch\nkernel wchan of pytest tree:\n  pid=517592 comm=python wchan=futex_wait_queue",
+    "layer": "focused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nfocused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nLast reported stage(s) before kill:\n    models/demos/minicpm5_2b/tests/pcc/test_layer.py::test_layer: stage=ttnn_to_torch\nkernel wchan of pytest tree:\n  pid=526355 comm=python wchan=futex_wait_queue",
+    "m_l_p": "focused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nfocused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nLast reported stage(s) before kill:\n    models/demos/minicpm5_2b/tests/pcc/test_m_l_p.py::test_m_l_p: stage=ttnn_to_torch\nkernel wchan of pytest tree:\n  pid=545527 comm=python wchan=futex_wait_queue",
+    "mlp": "focused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nfocused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nLast reported stage(s) before kill:\n    models/demos/minicpm5_2b/tests/pcc/test_mlp.py::test_mlp: stage=ttnn_to_torch\nkernel wchan of pytest tree:\n  pid=557946 comm=python wchan=futex_wait_queue",
+    "token_embed": "focused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nfocused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nLast reported stage(s) before kill:\n    models/demos/minicpm5_2b/tests/pcc/test_token_embed.py::test_token_embed: stage=ttnn_to_torch\nkernel wchan of pytest tree:\n  pid=566774 comm=python wchan=futex_wait_queue",
+    "encoder_stack": "focused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nfocused pytest WALL-CLOCK BUDGET EXHAUSTED at 1800s \u2014 killing process group (likely a hang)\nLast reported stage(s) before kill:\n    models/demos/minicpm5_2b/tests/pcc/test_encoder_stack.py::test_encoder_stack: stage=ttnn_to_torch\nkernel wchan of pytest tree:\n  pid=575412 comm=python wchan=futex_wait_queue"
+  },
+  "hang_stub_sha": {
+    "m_l_p": "14e15691dce46842ec6571f65ed79ca88974497ac112eea6b2691e352bee46a0",
+    "mlp": "dfcb82446007307c591b1356d90f6cd48614675b49c67cbafc27d9a079b28fab",
+    "token_embed": "892567e239546b36da689838087839a71dc8d81ac327da1efb9f51bd4d940756"
+  },
+  "hang_device_dirty": false,
+  "shard_reset_done": true,
+  "attempts": {
+    "attention": 3,
+    "decoder_head": 1,
+    "decoder_layer": 1,
+    "encoder_stack": 5,
+    "layer": 1,
+    "m_l_p": 1,
+    "mlp": 1,
+    "r_m_s_norm": 1,
+    "rotary_embedding": 1,
+    "token_embed": 2
+  },
+  "best_pcc": {
+    "attention": 0.99,
+    "decoder_head": 0.99,
+    "decoder_layer": 0.99,
+    "layer": 0.99,
+    "m_l_p": 0.9999820579253275,
+    "mlp": 0.9999820579253275,
+    "r_m_s_norm": 0.99,
+    "rotary_embedding": 0.99,
+    "token_embed": 1.0,
+    "encoder_stack": 0.9999976715500043
+  },
+  "consecutive_same_class": {
+    "attention": 0,
+    "decoder_head": 0,
+    "decoder_layer": 0,
+    "encoder_stack": 0,
+    "layer": 0,
+    "m_l_p": 0,
+    "mlp": 0,
+    "r_m_s_norm": 0,
+    "rotary_embedding": 0,
+    "token_embed": 0
+  },
+  "pcc_history": {
+    "attention": [
+      0.99,
+      0.99
+    ],
+    "decoder_head": [
+      0.99
+    ],
+    "decoder_layer": [
+      0.99
+    ],
+    "layer": [
+      0.99
+    ],
+    "m_l_p": [
+      0.9999820579253275
+    ],
+    "mlp": [
+      0.9999820579253275
+    ],
+    "r_m_s_norm": [
+      0.99
+    ],
+    "rotary_embedding": [
+      0.99
+    ],
+    "token_embed": [
+      1.0
+    ],
+    "encoder_stack": [
+      0.99
+    ]
+  },
+  "prev_recorded_class": {
+    "encoder_stack": "HARNESS_SKIP"
+  },
+  "last_pcc": {
+    "encoder_stack": 0.0
+  },
+  "harness_skip_reason": {},
+  "decomposed": []
+}

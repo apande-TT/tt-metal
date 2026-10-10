@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn port of the token embedding (model.embed_tokens) for `openbmb/MiniCPM5-2B`.
+
+HF semantics: weight[input_ids], table [vocab=130560, hidden=2048], no scaling.
+"""
+from __future__ import annotations
+
+import torch
+
+import ttnn
+
+
+class TtTokenEmbed:
+    def __init__(self, device, torch_module):
+        self.device = device
+        w = torch_module.weight.detach().to(torch.bfloat16)
+        self.weights = ttnn.from_torch(
+            w,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def __call__(self, input_ids, *args, **kwargs):
+        if not isinstance(input_ids, ttnn.Tensor):
+            raise TypeError("TtTokenEmbed reads token ids from device; upload them before the call")
+        ids = input_ids
+        if ids.dtype != ttnn.uint32:
+            if ids.layout != ttnn.TILE_LAYOUT:
+                ids = ttnn.to_layout(ids, ttnn.TILE_LAYOUT)
+            ids = ttnn.typecast(ids, ttnn.uint32)
+        if ids.layout != ttnn.ROW_MAJOR_LAYOUT:
+            ids = ttnn.to_layout(ids, ttnn.ROW_MAJOR_LAYOUT)
+        return ttnn.embedding(ids, self.weights, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+
+def build(device, torch_module=None):
+    return TtTokenEmbed(device, torch_module)
+
+
+def token_embed(device, torch_module=None):
+    return TtTokenEmbed(device, torch_module)

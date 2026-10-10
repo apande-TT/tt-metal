@@ -1,0 +1,7 @@
+{
+  "ttnn_dispatch": 39,
+  "torch_ops": 4,
+  "torch_op_names": [
+    "__dlpack__"
+  ]
+}

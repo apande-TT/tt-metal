@@ -1,0 +1,91 @@
+{
+  "model_id": "openbmb/MiniCPM5-2B",
+  "source_b_dir": "models/demos/minicpm5_2b",
+  "source_b_note": "The bring-up tool wrote Source B to models/tt_transformers/demo/minicpm5_2b; the whole package was moved to models/demos/minicpm5_2b, the directory the brief and the e2e gate name.",
+  "source_a": {
+    "architectures": ["LlamaForCausalLM"],
+    "is_encoder_decoder": false,
+    "auto_model_registry": {
+      "MODEL_FOR_CAUSAL_LM": "LlamaForCausalLM",
+      "MODEL_FOR_SEQUENCE_CLASSIFICATION": "LlamaForSequenceClassification (no trained head in the checkpoint)",
+      "MODEL_FOR_TOKEN_CLASSIFICATION": "LlamaForTokenClassification (no trained head in the checkpoint)",
+      "MODEL_FOR_QUESTION_ANSWERING": "LlamaForQuestionAnswering (no trained head in the checkpoint)"
+    },
+    "checkpoint_heads": ["lm_head"],
+    "config": {
+      "hidden_size": 2048, "num_hidden_layers": 42, "num_attention_heads": 16, "num_key_value_heads": 2,
+      "head_dim": 128, "intermediate_size": 6144, "vocab_size": 130560, "rms_norm_eps": 1e-06,
+      "rope_theta": 5000000, "rope_scaling": null, "tie_word_embeddings": false,
+      "max_position_embeddings": 131072, "torch_dtype": "bfloat16"
+    },
+    "generation_config": {
+      "do_sample": true, "temperature": 1.0, "top_p": 0.95,
+      "top_k": "unset in generation_config.json -> transformers global default 50 (GenerationConfig._get_default_generation_params)",
+      "eos_token_id": [1, 130073], "pad_token_id": 1, "bos_token_id": 0
+    },
+    "published_example": {
+      "source": "README.md example 1",
+      "messages": [{"role": "user", "content": "Who are you? Please briefly introduce yourself."}],
+      "apply_chat_template": {"tokenize": true, "add_generation_prompt": true, "enable_thinking": true, "return_dict": true, "return_tensors": "pt"},
+      "max_new_tokens": 128,
+      "skip_special_tokens": true,
+      "prompt_len_tokens": 20
+    }
+  },
+  "graduated_modules": {
+    "verification": "All 10 bring-up components have a live _stubs/<name>.py byte-identical to _stubs/<name>.py.last_good_native and a native_probe.json (ttnn dispatch > 0). No .last_good_sharded exists (TP=1, parallelism_manifest chips=1). bringup_status statuses: NEW=decoder_layer; ADAPT=token_embed, attention, layer, encoder_stack, decoder_head; REUSE=mlp, m_l_p, r_m_s_norm, rotary_embedding. The four REUSE entries nonetheless carry graduated native stubs + last_good_native snapshots, so they are graduated work products here and are routed too; none is left out.",
+    "list": [
+      {"name": "token_embed", "hf_module": "model.embed_tokens", "stub": "_stubs/token_embed.py", "class": "TtTokenEmbed", "role": "token ids -> hidden [B,S,2048] (prefill and every decode step)"},
+      {"name": "rotary_embedding", "hf_module": "model.rotary_emb", "stub": "_stubs/rotary_embedding.py", "class": "TtRotaryEmbedding", "role": "on-device cos/sin from device position ids, every prefill and decode step, fed to every attention"},
+      {"name": "encoder_stack", "hf_module": "model.layers (ModuleList, 42)", "stub": "_stubs/encoder_stack.py", "class": "TtDecoderStack", "role": "THE repeated-block container: holds the 42 decoder layers as one same-typed list and chains them (its __call__ is the layer loop)"},
+      {"name": "decoder_layer", "hf_module": "model.layers[i] (LlamaDecoderLayer), even i", "stub": "_stubs/decoder_layer.py", "class": "TtDecoderLayer", "role": "pre-norm residual block body for even layers"},
+      {"name": "layer", "hf_module": "model.layers[i] (LlamaDecoderLayer), odd i", "stub": "_stubs/layer.py", "class": "TtDecoderLayer (layer.build)", "role": "pre-norm residual block body for odd layers (same class, so the stack stays same-typed)"},
+      {"name": "attention", "hf_module": "model.layers[i].self_attn", "stub": "_stubs/attention.py", "class": "TtAttention", "role": "GQA self-attention inside every layer, writes/reads the device-resident KV cache"},
+      {"name": "mlp", "hf_module": "model.layers[i].mlp, even i", "stub": "_stubs/mlp.py", "class": "TtMlp", "role": "SwiGLU MLP inside even layers"},
+      {"name": "m_l_p", "hf_module": "model.layers[i].mlp, odd i", "stub": "_stubs/m_l_p.py", "class": "TtMLP", "role": "SwiGLU MLP inside odd layers"},
+      {"name": "r_m_s_norm", "hf_module": "model.layers[i].input_layernorm / post_attention_layernorm, model.norm", "stub": "_stubs/r_m_s_norm.py", "class": "TtRMSNorm", "role": "every RMSNorm: 2 per layer + the final norm"},
+      {"name": "decoder_head", "hf_module": "lm_head", "stub": "_stubs/decoder_head.py", "class": "DecoderHead", "role": "final hidden -> logits [B,1,130560]"}
+    ],
+    "not_graduated": []
+  },
+  "task_heads": [
+    {
+      "call": "Call 1",
+      "task": "text-generation (LlamaForCausalLM.generate)",
+      "input": "tokenizer.apply_chat_template(published example, verbatim) -> input_ids [1,20], tiled to B=32 identical rows",
+      "output": "generated token ids [B, <=128] + decoded text (skip_special_tokens=True)",
+      "reference": "HF LlamaForCausalLM (fp32 weights from the bf16 checkpoint) model.generate(): generation_config's sampling chain (top_k 50 -> top_p 0.95, temperature 1.0) realised as Gumbel-max with per-sample seeded noise (seed = BASE_SEED + i), eos [1,130073], max_new_tokens 128 from the example",
+      "stubs_routed": ["token_embed", "rotary_embedding", "encoder_stack", "decoder_layer", "layer", "attention", "mlp", "m_l_p", "r_m_s_norm", "decoder_head"],
+      "chain": [
+        "prefill: ids[B,Sp] -> token_embed -> rotary_embedding(pos) -> encoder_stack[42 x (decoder_layer|layer){r_m_s_norm, attention(+KV write), r_m_s_norm, mlp|m_l_p}] -> slice last real token -> r_m_s_norm(final) -> decoder_head -> on-device top-k/top-p/Gumbel argmax -> token",
+        "decode (per token): token -> token_embed -> rotary_embedding(pos) -> encoder_stack (KV read+write at pos) -> r_m_s_norm -> decoder_head -> on-device sampler -> token; pos += 1 on device"
+      ],
+      "pass_definition": "Gate 1 every routed stub is ttnn (no torch compute in hot path); Gate 2 every one of the 10 graduated stubs is invoked inside the real forward (invocation counters, > 0 each, counts consistent with 42 layers); Gate 3 e2e logits PCC >= 0.99 on every one of the 32 rows over the WHOLE generated output, prefill hidden state PCC >= 0.995 (min over rows) and |tt|/|ref| within 0.5%, generated tokens equal the HF reference under the same stop rule",
+      "validation_metric": "e2e PCC = min over 32 rows of PCC(TT step logits over all generated steps, HF logits at the same positions); printed as `e2e PCC=<x>` every run",
+      "behavioral_proof": "decoded text of each row is the model's thinking-mode self introduction; 32 rows differ (distinct seeds) and each matches its own HF golden row",
+      "decode_horizon": "model stop rule: eos_token_id [1,130073] OR the published example's max_new_tokens=128, applied identically to TT and HF; safety cap = max_position_embeddings - prompt_len (asserted not reached)",
+      "batch": "B=32 from $TT_PERF_BATCH; content identical, seeds BASE_SEED+i",
+      "self_validation": [
+        "re-run tests/pcc for every edited stub (B=1 API kept)",
+        "tests/e2e/test_e2e_minicpm5_2b.py::test_generate_matches_hf_generate (E2E_CORRECTNESS_GATE, independent HF generate golden)",
+        "tests/e2e/test_e2e_minicpm5_2b.py::test_teacher_forced_logits (non-gate, reference on TT trajectory)",
+        "trace_capture_selftest + host_op_selftest",
+        "demo/demo_text_generation.py run end to end"
+      ]
+    }
+  ],
+  "shared_modules_between_calls": "single call - one builder",
+  "trace_contract": {
+    "PIPELINE_STAGES": ["prefill", "decode"],
+    "prefill": "pin S to capacity Sp (prompt rounded to tile) in persistent ids/pos/mask buffers; items = B x Sp",
+    "decode": "persistent token/pos/noise buffers; KV caches [B,2,C,128] per layer resident; items = B; repeats = max_new_tokens (128)"
+  },
+  "memory_budget": {
+    "source": "registered QB2 figures: 1 of 4 Blackhole chips opened, 32 GB DRAM, 29.2 GB usable at TP=1",
+    "weights_bf16_gb": 4.5,
+    "weights_measured": "TRACE_WEIGHT_BYTES=4498739200 (trace replay weight census, this run)",
+    "kv_cache": "42 layers x 2 (k,v) x B=32 x 2 heads x C x 128 x 2 B = 1.38 MB x C (C=160 -> 0.22 GB)",
+    "sampling_noise_bf16_gb": "max_new_tokens x B x vocab x 2 B = 128 x 32 x 130560 x 2 = 1.07 GB",
+    "fits": "~5.6 GB << 29.2 GB usable; not measured by this plan"
+  }
+}

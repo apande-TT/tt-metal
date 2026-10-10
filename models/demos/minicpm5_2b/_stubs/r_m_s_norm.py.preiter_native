@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn port of `LlamaRMSNorm` (model.layers.0.input_layernorm) for `openbmb/MiniCPM5-2B`.
+
+HF semantics: x * rsqrt(mean(x^2) + eps) * weight over the 2048-wide hidden dim.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+
+class TtRMSNorm:
+    def __init__(self, device, torch_module):
+        self.device = device
+        self.eps = getattr(torch_module, "variance_epsilon", None) or getattr(torch_module, "eps", 1e-6)
+        self.compute_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
+        w = torch_module.weight.detach().to(torch.float32).reshape(1, 1, -1)
+        self.weight = ttnn.from_torch(w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+    def __call__(self, x, *args, **kwargs):
+        if not isinstance(x, ttnn.Tensor):
+            x = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+        return ttnn.rms_norm(
+            x,
+            epsilon=self.eps,
+            weight=self.weight,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_cfg,
+        )
+
+
+def build(device, torch_module=None):
+    return TtRMSNorm(device, torch_module)
+
+
+def r_m_s_norm(device, torch_module=None):
+    return TtRMSNorm(device, torch_module)

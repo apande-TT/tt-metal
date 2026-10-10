@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn port of `lm_head` (decoder_head) for `openbmb/MiniCPM5-2B`.
+
+HF semantics: logits = x @ W^T, Linear(2048 -> 130560, bias=False).
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+
+def _mesh_kw(device, **kw):
+    kw["device"] = device
+    try:
+        if isinstance(device, ttnn.MeshDevice):
+            kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(device)
+    except AttributeError:
+        pass
+    return kw
+
+
+class DecoderHead:
+    def __init__(self, device, torch_module):
+        self.device = device
+        self.compute_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+        w = torch_module.weight.detach().to(torch.float32).t().contiguous()
+        self.weight = ttnn.from_torch(
+            w,
+            **_mesh_kw(device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG),
+        )
+
+    def __call__(self, x, *args, **kwargs):
+        if not isinstance(x, ttnn.Tensor):
+            x = ttnn.from_torch(x, **_mesh_kw(self.device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT))
+        elif x.layout != ttnn.TILE_LAYOUT:
+            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        return ttnn.linear(
+            x, self.weight, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+
+
+def build(device, torch_module=None):
+    return DecoderHead(device, torch_module)
+
+
+def decoder_head(device, torch_module=None):
+    return DecoderHead(device, torch_module)

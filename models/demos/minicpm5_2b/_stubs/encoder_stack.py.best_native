@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn port of `encoder_stack` (model.layers) for `openbmb/MiniCPM5-2B`.
+
+MiniCPM5-2B is a decoder-only Llama-architecture LM with no vision tower, so the planner's
+llama_vision_encoder mapping does not apply: the model's block stack is `model.layers`, a
+ModuleList of LlamaDecoderLayer. Each block reuses the graduated native `TtDecoderLayer` port
+and the stack chains them in order. The PCC harness unwraps the ModuleList to its first block.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+from models.demos.minicpm5_2b._stubs.decoder_layer import TtDecoderLayer
+
+
+class TtDecoderStack:
+    def __init__(self, device, torch_module):
+        self.device = device
+        if isinstance(torch_module, (torch.nn.ModuleList, torch.nn.Sequential)):
+            blocks = list(torch_module)
+        else:
+            blocks = [torch_module]
+        self.layers = [TtDecoderLayer(device, blk) for blk in blocks]
+
+    def __call__(self, hidden_states, position_embeddings=None, past_key_values=None, **kwargs):
+        x = hidden_states
+        for layer in self.layers:
+            x = layer(x, position_embeddings=position_embeddings, past_key_values=past_key_values)
+        return x
+
+
+def build(device, torch_module=None):
+    return TtDecoderStack(device, torch_module)
+
+
+def encoder_stack(device, torch_module=None):
+    return TtDecoderStack(device, torch_module)

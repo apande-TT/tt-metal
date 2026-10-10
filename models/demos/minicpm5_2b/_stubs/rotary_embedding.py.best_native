@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn port of `LlamaRotaryEmbedding` (model.rotary_emb) for `openbmb/MiniCPM5-2B`.
+
+HF semantics: freqs = position_ids[..., None] * inv_freq; emb = cat(freqs, freqs);
+returns (cos(emb) * scale, sin(emb) * scale), each [B, S, head_dim=128].
+Angles are formed in fp32 on device so large positions keep their phase.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+
+class TtRotaryEmbedding:
+    def __init__(self, device, torch_module):
+        self.device = device
+        self.scaling = float(getattr(torch_module, "attention_scaling", 1.0) or 1.0)
+        inv_freq = torch_module.inv_freq.detach().to(torch.float32)
+        inv_freq = torch.cat([inv_freq, inv_freq]).reshape(1, 1, 1, -1)
+        self.head_dim = inv_freq.shape[-1]
+        self.inv_freq = ttnn.from_torch(inv_freq, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+
+    def __call__(self, x, position_ids=None, *args, **kwargs):
+        if position_ids is None:
+            raise ValueError("TtRotaryEmbedding requires position_ids")
+        if not isinstance(position_ids, ttnn.Tensor):
+            pos = ttnn.from_torch(position_ids, dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
+        else:
+            pos = ttnn.typecast(position_ids, ttnn.float32)
+        b, s = pos.shape[0], pos.shape[-1]
+        pos = ttnn.reshape(pos, (1, b, s, 1))
+        pos = ttnn.to_layout(pos, ttnn.TILE_LAYOUT)
+        emb = ttnn.multiply(pos, self.inv_freq)
+        cos = ttnn.cos(emb)
+        sin = ttnn.sin(emb)
+        ttnn.deallocate(emb)
+        if self.scaling != 1.0:
+            cos = ttnn.multiply(cos, self.scaling)
+            sin = ttnn.multiply(sin, self.scaling)
+        cos = ttnn.reshape(ttnn.typecast(cos, ttnn.bfloat16), (b, s, self.head_dim))
+        sin = ttnn.reshape(ttnn.typecast(sin, ttnn.bfloat16), (b, s, self.head_dim))
+        return cos, sin
+
+
+def build(device, torch_module=None):
+    return TtRotaryEmbedding(device, torch_module)
+
+
+def rotary_embedding(device, torch_module=None):
+    return TtRotaryEmbedding(device, torch_module)
