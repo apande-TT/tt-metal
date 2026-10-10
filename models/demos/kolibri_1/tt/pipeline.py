@@ -175,7 +175,12 @@ class KolibriPipeline:
         st = StepState("prefill", cos, sin)
         h = ttnn.typecast(ttnn.reshape(self.embed(self.prefill_ids), [B, 1, Tp, H]), ttnn.float32)
         hn = self.norm(self._stack(h, st))
-        last = ttnn.reshape(ttnn.slice(hn, [0, 0, T - 1, 0], [B, 1, T, H]), [1, 1, B, H])
+        # Position T-1 of every user: first the tile-aligned 32-row block that holds it (no data reordering), then the
+        # row, so the untilize behind a non-aligned slice touches 32 rows per user instead of all Tp.
+        tr = (T - 1) // 32 * 32
+        block = ttnn.slice(hn, [0, 0, tr, 0], [B, 1, tr + 32, H])
+        last = ttnn.reshape(ttnn.slice(block, [0, 0, T - 1 - tr, 0], [B, 1, T - tr, H]), [1, 1, B, H])
+        ttnn.deallocate(block)
         logits = self.head(last)
         tok = self.sampler(logits, self._uniform(self.last_col))
         self._commit(tok)
