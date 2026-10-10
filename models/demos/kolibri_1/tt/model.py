@@ -884,12 +884,48 @@ class Sampler:
                 vocab_index, dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=mapper
             )
 
+    def _merge(self, x, labels, groups):
+        """x, labels [1, 1, B, groups * k] (each group's top k, largest first) -> the row's top k as a groups-way
+        merge, one core per user row (tt/kernels/topk_merge.cpp)."""
+        B, k = x.shape[-2], self.top_k
+        vals = ttnn.empty([1, 1, B, k], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+        ids = ttnn.empty([1, 1, B, k], dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=self.device)
+        rt = ttnn.RuntimeArgs()
+        for i, (cx, cy) in enumerate(self.count_xy):
+            rt[cx][cy] = [t.buffer_address() for t in (x, labels, vals, ids)] + [i]
+        kernel = ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "topk_merge.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=self.count_cores,
+            compile_time_args=[groups, k]
+            + [a for t in (x, labels, vals, ids) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            runtime_args=rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        scratch = 64 + 2 * groups * k * 4 + 2 * k * 4 + 2 * (-(-groups * 4 // 64) * 64)
+        cb = RoutedGateUp._cb(0, ttnn.uint32, -(-scratch // 32) * 32, 1, self.count_cores)
+        ttnn.generic_op([x, labels, vals, ids], ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
+        return vals, ids
+
     def _top_k(self, x):
         """x [1, 1, B, V] -> (values [1, 1, B, k] largest first, their token ids [1, 1, B, k] uint32)."""
         if not self.plan:
             return ttnn.topk(x, k=self.top_k, dim=-1, largest=True, sorted=True)
         B, n = x.shape[-2], x.shape[-1]
         labels = self.token_index
+        if self.k_pad == self.top_k:  # first stage on ttnn, then one merge of its sorted group lists
+            g = self.plan[0]
+            grouped = [1, 1, B * g, n // g]
+            x, labels = ttnn.topk(
+                ttnn.experimental.view(x, grouped),
+                k=self.k_pad,
+                dim=-1,
+                largest=True,
+                sorted=True,
+                indices_tensor=ttnn.experimental.view(labels, grouped),
+            )
+            flat = [1, 1, B, g * self.k_pad]
+            return self._merge(ttnn.experimental.view(x, flat), ttnn.experimental.view(labels, flat), g)
         for g in self.plan:
             grouped = [1, 1, B * g, n // g]
             x, labels = ttnn.topk(
