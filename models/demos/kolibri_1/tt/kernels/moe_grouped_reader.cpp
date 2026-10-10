@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Prefill routed experts, token-gathered (reader). The work is cut into UNITS: 64 consecutive tokens of one
-// expert's routed-token list (expert e has ceil(n_e / 64) of them), enumerated in expert order and dealt
+// Prefill routed experts, token-gathered (reader). The work is cut into UNITS: 32 * RB consecutive tokens of one
+// expert's routed-token list (expert e has ceil(n_e / (32 * RB)) of them), enumerated in expert order and dealt
 // round-robin over the cores, so a heavily routed expert is spread over many cores instead of serialising one.
-// Per unit: the unit's token list (to the writer), the two routing-weight tiles (every element of row j = the
+// Per unit: the unit's token list (to the writer), the RB routing-weight tiles (every element of row j = the
 // fp32 weight of the j-th token), the tokens' x rows (row-major, one page per token) for compute to tilize,
 // and expert e's gate/up and down weight tiles, streamed once per unit.
 #include <cstdint>
@@ -32,7 +32,8 @@ void kernel_main() {
     constexpr uint32_t row_bytes = get_compile_time_arg_val(7);  // one row-major x row
     constexpr uint32_t NC = get_compile_time_arg_val(8);         // cores
     constexpr uint32_t MAX_UNITS = get_compile_time_arg_val(9);  // most units one core can be dealt
-    constexpr auto x_args = TensorAccessorArgs<10>();
+    constexpr uint32_t RB = get_compile_time_arg_val(10);        // 32-token row blocks per unit
+    constexpr auto x_args = TensorAccessorArgs<11>();
     constexpr auto gu_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
     constexpr auto wd_args = TensorAccessorArgs<gu_args.next_compile_time_args_offset()>();
     constexpr auto wt_args = TensorAccessorArgs<wd_args.next_compile_time_args_offset()>();
@@ -46,7 +47,8 @@ void kernel_main() {
     const uint32_t core = get_arg_val<uint32_t>(5);
 
     constexpr uint32_t cb_rm = 0, cb_g = 1, cb_u = 2, cb_scale = 3, cb_count = 4, cb_list = 5, cb_wt = 6, cb_wd = 7;
-    constexpr uint32_t U = 64;  // tokens per unit (two 32-row blocks)
+    constexpr uint32_t cb_nrb = 11;
+    constexpr uint32_t U = 32 * RB;  // tokens per unit
 
     // This core's units, from the per-expert routed-token counts ([1, E] fp32).
     cb_reserve_back(cb_wt, 1);
@@ -99,9 +101,9 @@ void kernel_main() {
 
         // Routing-weight tiles (fp32): all 32 elements of row j of tile rr = weight of token rr * 32 + j, i.e. its
         // two 16-wide face rows; pad rows are 0, so their activations are exactly 0.
-        cb_reserve_back(cb_scale, 2);
+        cb_reserve_back(cb_scale, RB);
         volatile tt_l1_ptr uint32_t* s32 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_scale));
-        for (uint32_t j = 0; j < 2 * 32; ++j) {
+        for (uint32_t j = 0; j < U; ++j) {
             const uint32_t f = j < n ? w[list[2 + j]] : 0;
             volatile tt_l1_ptr uint32_t* row = s32 + (j / 32) * 1024 + ((j % 32) / 16) * 512 + (j % 16) * 16;
             for (uint32_t q = 0; q < 16; ++q) {
@@ -109,10 +111,15 @@ void kernel_main() {
                 row[256 + q] = f;
             }
         }
-        cb_push_back(cb_scale, 2);
+        cb_push_back(cb_scale, RB);
 
-        // The two row blocks' x rows, 32 row-major rows each (pad rows repeat the unit's last token).
-        for (uint32_t rr = 0; rr < 2; ++rr) {
+        // The unit's row blocks (only those holding tokens: compute skips the rest), 32 row-major x rows each
+        // (pad rows repeat the unit's last token).
+        const uint32_t nrb = n ? (n + 31) / 32 : 1;
+        cb_reserve_back(cb_nrb, 1);
+        *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_nrb)) = nrb;
+        cb_push_back(cb_nrb, 1);
+        for (uint32_t rr = 0; rr < nrb; ++rr) {
             cb_reserve_back(cb_rm, Kt);
             const uint32_t l1 = get_write_ptr(cb_rm);
             for (uint32_t j = 0; j < 32; ++j) {

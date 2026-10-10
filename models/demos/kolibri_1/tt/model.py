@@ -370,7 +370,7 @@ class GroupedExperts:
 
     The dense prefill path ran all of a chip's 96 experts on every token -- [M, 2560] x [2560, 96*1024] gate/up
     and [M, 96*512] x [96*512, 2560] down -- while a token uses 6 of 384 experts, ~1.5 of a chip's 96. Here the
-    work is cut into units of 64 tokens routed to one expert, dealt round-robin over all cores (routing is
+    work is cut into units of 128 tokens routed to one expert, dealt round-robin over all cores (routing is
     skewed: one expert can get half the tokens). A unit gathers its tokens' rows and runs gate/up (fp32 dest,
     HiFi4), silu(gate) * up * the fp32 routing weight (all in fp32 dest) and the down projection on those rows
     only, streaming the expert's weights once. Each output row lands in plane k of an fp32 [K, M, hidden]
@@ -392,8 +392,10 @@ class GroupedExperts:
         self.nt_gu = w_gu.shape[-1] // ttnn.TILE_SIZE
         self.kmax = min(top_k, n_experts)
         self.kb = next(b for b in (8, 5, 4, 2, 1) if self.kt % b == 0)
+        self.rb = 4  # 32-token row blocks per unit: 128 tokens per pass over an expert's weights
+        # 2 * rb fp32 dest tiles (gate, up per row block) need full-sync dest.
         self.mm_cfg = ttnn.ComputeConfigDescriptor(
-            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, dst_full_sync_en=True
         )
         modes = [ttnn.UnpackToDestMode.Default] * 64
         modes[3] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the routing weights, multiplied in fp32 dest
@@ -471,20 +473,22 @@ class GroupedExperts:
         row_bytes, wrow = x_rm.shape[-1] * 2, w_rm.shape[-1] * 4
         r32 = lambda n: -(-n // 32) * 32
         nc = len(self.core_xy)
-        max_units = -(-(-(-m * self.kmax // 64) + self.n_experts) // nc)  # all units, worst case, dealt over nc
+        rb, unit = self.rb, 32 * self.rb
+        max_units = -(-(-(-m * self.kmax // unit) + self.n_experts) // nc)  # all units, worst case, dealt over nc
         cbs = [
             cb(0, ttnn.bfloat16, bf, kt, c),  # 32 gathered row-major x rows (tilize input)
             cb(1, ttnn.bfloat8_b, w_tile, 2 * kb, c),  # gate weight tiles
             cb(2, ttnn.bfloat8_b, w_tile, 2 * kb, c),  # up weight tiles
-            cb(3, ttnn.float32, f32, 2, c),  # routing-weight tiles (row j = token j's weight)
+            cb(3, ttnn.float32, f32, rb, c),  # routing-weight tiles (row j = token j's weight)
             cb(4, ttnn.uint32, 16, 1, c),  # unit count -> compute
-            cb(5, ttnn.uint32, r32(4 * (2 + 64)), 3, c),  # unit count, then each unit's [e, n, tokens] -> writer
+            cb(5, ttnn.uint32, r32(4 * (2 + unit)), 3, c),  # unit count, then each unit's [e, n, tokens] -> writer
             cb(6, ttnn.float32, r32(4 * max(m, self.n_experts)), 1, c),  # counts, then an expert's weight row
             cb(7, ttnn.bfloat8_b, w_tile, 2 * cpe, c),  # down weight tiles
-            cb(8, ttnn.bfloat16, bf, 2 * kt, c),  # tilized x, two row blocks
-            cb(9, ttnn.float32, wrow * 64, 1, c),  # weight rows of a unit's tokens (writer: ranks)
-            cb(17, ttnn.float32, f32, 2 * cpe, c),  # act = silu(gate) * up * routing weight
-            cb(18, ttnn.float32, f32, 4, c),  # expert output tiles
+            cb(8, ttnn.bfloat16, bf, rb * kt, c),  # tilized x, rb row blocks
+            cb(9, ttnn.float32, wrow * unit, 1, c),  # weight rows of a unit's tokens (writer: ranks)
+            cb(11, ttnn.uint32, 16, 2, c),  # row blocks holding tokens, per unit -> compute
+            cb(17, ttnn.float32, f32, rb * cpe, c),  # act = silu(gate) * up * routing weight
+            cb(18, ttnn.float32, f32, 2 * rb, c),  # expert output tiles
         ]
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         addrs = [t.buffer_address() for t in (x_rm, self.w_gu, self.w_down, wt_rm, counts)]
@@ -494,15 +498,15 @@ class GroupedExperts:
         kernels = [
             self._kernel(
                 "moe_grouped_reader.cpp",
-                [kt, self.nt_gu, cpe, m, kb, self.n_experts, w_tile, row_bytes, nc, max_units]
+                [kt, self.nt_gu, cpe, m, kb, self.n_experts, w_tile, row_bytes, nc, max_units, rb]
                 + self._acc(x_rm, self.w_gu, self.w_down, wt_rm, counts),
                 reader_rt,
                 ttnn.ReaderConfigDescriptor(),
             ),
             self._kernel(
-                "moe_grouped_writer.cpp", [kt, m, wrow] + self._acc(w_rm, y), writer_rt, ttnn.WriterConfigDescriptor()
+                "moe_grouped_writer.cpp", [kt, m, wrow, rb] + self._acc(w_rm, y), writer_rt, ttnn.WriterConfigDescriptor()
             ),
-            self._kernel("moe_grouped_compute.cpp", [kt, kb, cpe], [], self.mm_cfg),
+            self._kernel("moe_grouped_compute.cpp", [kt, kb, cpe, rb], [], self.mm_cfg),
         ]
         ttnn.generic_op(
             [x_rm, self.w_gu, self.w_down, wt_rm, counts, w_rm, y],
@@ -512,6 +516,7 @@ class GroupedExperts:
     def _combine(self, y, w_rm, out, m):
         cb, c = RoutedGateUp._cb, self.cores
         kt, mt, nc, wrow = self.kt, m // ttnn.TILE_SIZE, len(self.core_xy), w_rm.shape[-1] * 4
+        cw = next(w for w in (8, 5, 4, 2, 1) if kt % w == 0)  # output tiles per (row, column-chunk) unit
         cbs = [
             cb(0, ttnn.float32, 4096, 2 * self.kmax, c),  # partial planes of one output tile
             cb(4, ttnn.uint32, 16, 2, c),  # planes per tile row -> compute
@@ -526,14 +531,14 @@ class GroupedExperts:
         kernels = [
             self._kernel(
                 "moe_combine_reader.cpp",
-                [kt, mt, self.n_experts, nc, wrow, self.kmax] + self._acc(w_rm, y),
+                [kt, mt, self.n_experts, nc, wrow, self.kmax, cw] + self._acc(w_rm, y),
                 reader_rt,
                 ttnn.ReaderConfigDescriptor(),
             ),
             self._kernel(
-                "moe_combine_writer.cpp", [kt, mt, nc] + self._acc(out), writer_rt, ttnn.WriterConfigDescriptor()
+                "moe_combine_writer.cpp", [kt, mt, nc, cw] + self._acc(out), writer_rt, ttnn.WriterConfigDescriptor()
             ),
-            self._kernel("moe_combine_compute.cpp", [kt, mt, nc, self.kmax], compute_rt, self.sum_cfg),
+            self._kernel("moe_combine_compute.cpp", [kt, mt, nc, self.kmax, cw], compute_rt, self.sum_cfg),
         ]
         ttnn.generic_op([y, w_rm, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
 

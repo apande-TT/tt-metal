@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Prefill routed experts, combine (reader). Token tile rows are dealt round-robin over the cores. For each row,
+// Prefill routed experts, combine (reader). Units of (token tile row, CW output tiles) are dealt round-robin over the
+// cores, so the work splits evenly whatever the row count (whole rows left 18 of 110 cores doing two). For each row,
 // cnt_j = how many local experts token j routed to; planes 0 .. max_j cnt_j - 1 of the fp32 partial buffer are
 // read tile by tile, and in plane k the rows of tokens with cnt_j <= k (never written this call) are zeroed.
 // A row no token routed here still gets one all-zero plane, so compute always sums at least one. Every push
@@ -17,7 +18,8 @@ void kernel_main() {
     constexpr uint32_t NC = get_compile_time_arg_val(3);  // cores
     constexpr uint32_t wrow_bytes = get_compile_time_arg_val(4);
     constexpr uint32_t KMAX = get_compile_time_arg_val(5);  // most routed local experts a token can have
-    constexpr auto w_args = TensorAccessorArgs<6>();
+    constexpr uint32_t CW = get_compile_time_arg_val(6);    // output tiles per unit (divides Kt)
+    constexpr auto w_args = TensorAccessorArgs<7>();
     constexpr auto y_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
     const auto wr = TensorAccessor(w_args, get_arg_val<uint32_t>(0));
     const auto y = TensorAccessor(y_args, get_arg_val<uint32_t>(1));
@@ -29,7 +31,8 @@ void kernel_main() {
     cb_reserve_back(cb_rows, 1);
     const uint32_t rows_l1 = get_write_ptr(cb_rows);
     uint32_t cnt[32];
-    for (uint32_t r = core; r < MT; r += NC) {
+    for (uint32_t unit = core; unit < MT * (Kt / CW); unit += NC) {
+        const uint32_t r = unit / (Kt / CW), n0 = (unit % (Kt / CW)) * CW;
         for (uint32_t j = 0; j < 32; ++j) {
             noc_async_read_page(r * 32 + j, wr, rows_l1 + j * wrow_bytes);
         }
@@ -48,7 +51,7 @@ void kernel_main() {
         *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_cnt)) = planes;
         cb_push_back(cb_cnt, 1);
 
-        for (uint32_t nn = 0; nn < Kt; ++nn) {
+        for (uint32_t nn = n0; nn < n0 + CW; ++nn) {
             cb_reserve_back(cb_p, KMAX);
             const uint32_t l1 = get_write_ptr(cb_p);
             for (uint32_t k = 0; k < planes; ++k) {

@@ -13,7 +13,8 @@ void kernel_main() {
     constexpr uint32_t Kt = get_compile_time_arg_val(0);  // output tiles per row
     constexpr uint32_t M = get_compile_time_arg_val(1);
     constexpr uint32_t wrow_bytes = get_compile_time_arg_val(2);  // one row of the [M, E] fp32 weights
-    constexpr auto w_args = TensorAccessorArgs<3>();
+    constexpr uint32_t RB = get_compile_time_arg_val(3);          // 32-token row blocks per unit
+    constexpr auto w_args = TensorAccessorArgs<4>();
     constexpr auto y_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
     const auto wr = TensorAccessor(w_args, get_arg_val<uint32_t>(0));
     const auto y = TensorAccessor(y_args, get_arg_val<uint32_t>(1));
@@ -28,8 +29,8 @@ void kernel_main() {
 
     cb_reserve_back(cb_rows, 1);
     const uint32_t rows_l1 = get_write_ptr(cb_rows);
-    uint32_t page_row[64];  // per token: plane-k tile row index (k * MT + t / 32) * Kt
-    uint32_t dst_off[64];   // per token: offset of its row within a tile
+    uint32_t page_row[32 * RB];  // per token: plane-k tile row index (k * MT + t / 32) * Kt
+    uint32_t dst_off[32 * RB];   // per token: offset of its row within a tile
     for (uint32_t i = 0; i < units; ++i) {
         cb_wait_front(cb_list, 1);
         volatile tt_l1_ptr uint32_t* list = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_list));
@@ -49,7 +50,7 @@ void kernel_main() {
             dst_off[j] = (rt / 16) * 2 * face + (rt % 16) * frow;
         }
         for (uint32_t nn = 0; nn < Kt; ++nn) {
-            cb_wait_front(cb_y, 2);
+            cb_wait_front(cb_y, RB);
             const uint32_t l1 = get_read_ptr(cb_y);
             for (uint32_t j = 0; j < n; ++j) {
                 const uint32_t src = l1 + (j / 32) * tile + ((j % 32) / 16) * 2 * face + (j % 16) * frow;
@@ -58,7 +59,7 @@ void kernel_main() {
                 noc_async_write(src + face, y.get_noc_addr(page, dst_off[j] + face), frow);
             }
             noc_async_writes_flushed();
-            cb_pop_front(cb_y, 2);
+            cb_pop_front(cb_y, RB);
         }
         cb_pop_front(cb_list, 1);
     }
