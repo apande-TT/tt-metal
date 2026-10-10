@@ -114,7 +114,8 @@ class TtQwenImageEditPipeline:
         self.lane_sum = sum_list if precise else None
         # and their inputs' two bf16 limbs in one pass
         self.split_limbs = split_limbs if precise else None
-        # and their batched attention products on the full core grid
+        # and their batched attention products on the full core grid (the vision token permutations take two dense
+        # limb products: a one-hot row selection is exact without lanes)
         self.bmm_config = _te_attention.bmm_program_config if precise else None
         if precise:
             lanes_ttl.prepare(device)

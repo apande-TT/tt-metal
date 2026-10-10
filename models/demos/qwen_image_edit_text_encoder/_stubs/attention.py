@@ -581,6 +581,20 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     return _median3(*ests)
 
 
+def onehot_matmul(a, b, limbs=2):
+    """split_matmul(a, b, limbs=limbs) for a 0/1 matrix a with at most one 1 per row (a row selection: the
+    vision token permutations). Each output entry is then one product, exact in any accumulation order, so the
+    exact lanes and the guard return its value unchanged: a's single bf16 limb against each of b's limbs, summed
+    in order (b's limbs, as the guarded sum adds them) -- the same value from `limbs` dense matmuls."""
+    cfg = precise_config()
+    a = a if a.dtype == ttnn.bfloat16 else ttnn.typecast(a, ttnn.bfloat16)  # 0 / 1: exact
+    acc = _LaneAcc()
+    for part in split_bf16(b, limbs):
+        pc = None if BMM_CONFIG is None else BMM_CONFIG(a, part)
+        acc.push(ttnn.matmul(a, part, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc))
+    return acc.value()
+
+
 def _guarded_terms(mm, terms, a, b, transpose_b):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""

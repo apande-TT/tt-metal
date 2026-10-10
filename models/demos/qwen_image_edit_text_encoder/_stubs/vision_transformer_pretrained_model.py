@@ -27,9 +27,9 @@ import ttnn
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     block_mask,
     hifi4_config,
+    onehot_matmul,
     pad_rows,
     pad_to_tile,
-    split_matmul,
     upload,
 )
 from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import _bf16, _fp32, _one_hot, _vision_metadata
@@ -96,7 +96,8 @@ class TtVisionTransformer:
             sin,
             mask_full,
             mask_win,
-            upload(self.device, perm, dtype=ttnn.float32),
+            # 0 / 1: bf16 is exact, and the precise path's row-selection products take it as is
+            upload(self.device, perm, dtype=ttnn.bfloat16 if self.precise else ttnn.float32),
             upload(self.device, unperm),
             s,
             s_pad,
@@ -112,7 +113,7 @@ class TtVisionTransformer:
         cfg = self.compute_cfg
         if self.precise:
             x = self.patch_embed(pixels, dtype=ttnn.float32, precise=True)
-            x = split_matmul(c.perm, x, compute_kernel_config=cfg, limbs=getattr(self, "limbs", 2))
+            x = onehot_matmul(c.perm, x, limbs=getattr(self, "limbs", 2))
         else:
             x = self.patch_embed(pixels, dtype=ttnn.float32)
             x = ttnn.matmul(c.perm, x, compute_kernel_config=cfg, dtype=ttnn.float32)
@@ -124,7 +125,7 @@ class TtVisionTransformer:
         if c.m_pad != m_rows:
             merged = ttnn.pad(merged, [(0, 0), (0, 0), (0, c.m_pad - m_rows), (0, 0)], 0.0)
         if self.precise:
-            merged = split_matmul(c.unperm, merged, compute_kernel_config=cfg, limbs=getattr(self, "limbs", 2))
+            merged = onehot_matmul(c.unperm, merged, limbs=getattr(self, "limbs", 2))
         else:
             merged = ttnn.matmul(c.unperm, merged, compute_kernel_config=cfg)
         out = merged.shape[-1]
