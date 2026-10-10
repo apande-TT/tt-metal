@@ -823,7 +823,7 @@ def _topk_tree(n_tiles: int, k_tiles: int, cores: int):
         if w is None or n_tiles // w > cores:
             return None
         plan.append(n_tiles // w)
-        n_tiles, cap = (n_tiles // w) * k_tiles, 20
+        n_tiles, cap = (n_tiles // w) * k_tiles, 10
     return plan or None
 
 
