@@ -38,6 +38,7 @@ import torch
 import ttnn
 from models.demos.qwen_image_edit.mesh import DEVICE_PARAMS, MESH_SHAPE  # noqa: F401 (re-exported)
 from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_sum_bias
+from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
 from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16
@@ -223,6 +224,11 @@ class QwenImageEditTT:
         _tr_precise.LINEAR_PC_FN = _limb_linear_config
         # and their limb products' sum + float32 bias add as one C++ kernel pass (same adds, same order)
         _tr_precise.LINEAR_SUM_BIAS_FN = lambda a, b, bias_rows: fused_sum_bias(a, b, bias_rows, ttnn.DRAM_MEMORY_CONFIG)
+        # long-K limb linears (K >= N: the fused q/k/v) as one C++ program: both limbs' products accumulated in the
+        # float32 DEST from one multicast stream of the weight
+        _tr_precise.LIMB_LINEAR_FN = lambda hi, lo, w: (
+            fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG) if int(w.shape[-2]) >= int(w.shape[-1]) else None
+        )
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
