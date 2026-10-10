@@ -200,6 +200,34 @@ class Attention(TtKolibri1Attention):
             return self._prefill(hidden_states, st)
         return self._decode(hidden_states, st)
 
+    def _rope(self, x, cos, sin):
+        """The stub's RoPE, with rotate-half run as ONE [rows, D] x [D, D] matmul over the full grid (as a batch of
+        B * heads [T, D] products ttnn ran it on 16 cores, ~1.1 ms for Q at 4096 tokens). rot is 0 / +-1, so each
+        output element is one input element: exact either way."""
+        shape = list(x.shape)
+        d = shape[-1]
+        rows = x.volume() // d
+        if rows >= 2048:
+            g = self.device.compute_with_storage_grid_size()
+            pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                compute_with_storage_grid_size=(g.x, g.y),
+                in0_block_w=d // ttnn.TILE_SIZE,
+                out_subblock_h=1,
+                out_subblock_w=min(4, d // ttnn.TILE_SIZE),
+                per_core_M=-(-(rows // ttnn.TILE_SIZE) // (g.x * g.y)),
+                per_core_N=d // ttnn.TILE_SIZE,
+                fuse_batch=True,
+                fused_activation=None,
+                mcast_in0=False,
+            )
+            rotated = ttnn.matmul(
+                ttnn.reshape(x, [1, 1, rows, d]), self.rot, program_config=pc, compute_kernel_config=self.mm_cfg
+            )
+            rotated = ttnn.reshape(rotated, shape)
+        else:
+            rotated = ttnn.matmul(x, self.rot, compute_kernel_config=self.mm_cfg)
+        return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(rotated, sin))
+
     def _qk(self, q, k, st):
         q = ttnn.rms_norm(q, epsilon=self.eps, weight=self.q_norm_w, compute_kernel_config=self.mm_cfg)
         k = ttnn.rms_norm(k, epsilon=self.eps, weight=self.k_norm_w, compute_kernel_config=self.mm_cfg)
