@@ -22,6 +22,7 @@ evidence that every graduated module runs inside the real forward path).
 """
 from __future__ import annotations
 
+import struct
 from collections import Counter
 from pathlib import Path
 
@@ -176,13 +177,38 @@ class Attention(TtKolibri1Attention):
         out = self.o_proj(attn_heads)
         return ttnn.reshape(out, shape)
 
+    def _qkv_prefill_mm(self, m_tiles, n_tiles):
+        """Full-grid blocks for the prefill QKV projection: minimal_matmul lays M along x when M > N (else along y);
+        each axis gets an even ceil(tiles / cores) block in one round."""
+        g = self.device.compute_with_storage_grid_size()
+        m_cores, n_cores = (g.x, g.y) if m_tiles > n_tiles else (g.y, g.x)
+        n_block = -(-n_tiles // n_cores)
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=-(-m_tiles // m_cores),
+            K_block_size=8,
+            N_block_size=n_block,
+            subblock_h=1,
+            subblock_w=next(w for w in (4, 3, 2, 1) if n_block % w == 0),
+            compute_with_storage_grid_size=ttnn.CoreCoord(g.x, g.y),
+        )
+
     def _prefill(self, hidden_states, st):
         shape = list(hidden_states.shape)
         B, T, H = shape[0], shape[-2], shape[-1]
         x = ttnn.reshape(hidden_states, [B, 1, T, H])
         if x.dtype != ttnn.bfloat16:
             x = ttnn.typecast(x, ttnn.bfloat16)
-        xqkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.mm_cfg)
+        # One [B*T, H] x [H, qkv] minimal_matmul over the full grid (as a batch of B [T, H] products ttnn ran 56
+        # cores, ~1.9 ms per layer at B*T = 4096).
+        n = self.wqkv.shape[-1]
+        xqkv = ttnn.experimental.minimal_matmul(
+            ttnn.reshape(x, [1, 1, B * T, H]),
+            self.wqkv,
+            config=self._qkv_prefill_mm(B * T // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE),
+            compute_kernel_config=self.mm_cfg,
+            dtype=ttnn.bfloat16,
+        )
+        xqkv = ttnn.reshape(xqkv, [B, 1, T, n])
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             xqkv,
             num_heads=self.n_local_heads,
@@ -768,6 +794,13 @@ class Sampler:
             device=device,
             mesh_mapper=mapper,
         )
+        # top_p count kernel (tt/kernels/topp_count.cpp): one core per user row.
+        g = device.compute_with_storage_grid_size()
+        self.count_xy = [(i % g.x, i // g.x) for i in range(batch)]
+        self.count_cores = ttnn.CoreRangeSet(
+            [ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in self.count_xy]
+        )
+        self.top_p_bits = struct.unpack("<I", struct.pack("<f", self.top_p))[0]
         # Inclusive prefix sums over the k candidates in token-id order as matmuls against a 0/1 triangle
         # (ttnn.cumsum runs this [B, k] scan on one core at ~150 us); see _scan for its accuracy.
         self.tri_incl = ttnn.from_torch(
@@ -828,6 +861,27 @@ class Sampler:
         s = [ttnn.matmul(part, tri, dtype=f32, compute_kernel_config=self.scan_cfg) for part in (lo, m, h)]
         return ttnn.add(ttnn.add(s[0], s[1]), s[2])
 
+    def _n_keep(self, p):
+        """p [1, 1, B, k] fp32 (descending) -> n_keep [1, 1, B, 1] fp32: how many leading candidates have an
+        exclusive cumulative probability below top_p, the sums taken one by one in fp32 (tt/kernels/topp_count.cpp)."""
+        B = p.shape[-2]
+        out = ttnn.empty([1, 1, B, 1], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+        rt = ttnn.RuntimeArgs()
+        for i, (cx, cy) in enumerate(self.count_xy):
+            rt[cx][cy] = [p.buffer_address(), out.buffer_address(), i]
+        kernel = ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "topp_count.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=self.count_cores,
+            compile_time_args=[self.top_k // ttnn.TILE_SIZE, self.top_p_bits]
+            + [a for t in (p, out) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            runtime_args=rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        cb = RoutedGateUp._cb(0, ttnn.float32, 64 + (self.top_k // ttnn.TILE_SIZE) * 128 + 64, 1, self.count_cores)
+        ttnn.generic_op([p, out], ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
+        return out
+
     def __call__(self, logits, u):
         """logits [1, 1, B, V] fp32, u [1, 1, B, 1] fp32 -> token ids [1, 1, B, 1] fp32 (exact integers)."""
         x = logits if self.temperature == 1.0 else ttnn.multiply(logits, 1.0 / self.temperature)
@@ -836,11 +890,9 @@ class Sampler:
         vmax = ttnn.slice(vals, [0, 0, 0, 0], [1, 1, B, 1])
         e = ttnn.exp(ttnn.subtract(vals, vmax))
         p = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True))
-        # The top_p cut from exact exclusive sums (ttnn.cumsum: sequential fp32 on the SFPU). The triangle-matmul
-        # scan was off by 3.4e-4 median / 8.6e-4 max here (descending p reaches ~1 in a few terms), enough to
-        # flip the 0.97 cut against the host rule (e2e: device sampler != host sampler at sample 4, step 100).
-        excl = ttnn.subtract(ttnn.cumsum(p, dim=-1), p)
-        n_keep = ttnn.sum(ttnn.lt(excl, self.top_p), dim=-1, keepdim=True)
+        # The top_p cut from exact exclusive sums (the triangle-matmul scan was off by 3.4e-4 median / 8.6e-4 max here,
+        # enough to flip the 0.97 cut against the host rule: e2e device sampler != host sampler at sample 4, step 100).
+        n_keep = self._n_keep(p)
         last = ttnn.eq(self.ranks, ttnn.subtract(ttnn.maximum(n_keep, 1.0), 1.0))
         cut = ttnn.sum(ttnn.multiply(vals, last), dim=-1, keepdim=True)
         q = ttnn.multiply(e, ttnn.ge(vals, cut))
