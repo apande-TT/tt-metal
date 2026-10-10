@@ -355,9 +355,11 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None):
         rest = [lambda p=part, mm=lo_mms[i] if k == 0 else mm: mm(p) for k, part in enumerate(parts[1:3])]
         y = _guarded(exs[i], dn, nn_mms[i](neg_lead), a_norm, b_norms[i], *rest)
         exs[i] = None
+        acc = _LaneAcc()
+        acc.push(y)
         for part in parts[3:]:
-            y = ttnn.add(y, mm(part))
-        ys.append(y)
+            acc.push(mm(part))
+        ys.append(acc.value())
     return ys
 
 
@@ -593,9 +595,12 @@ def _guarded_terms(mm, terms, a, b, transpose_b):
     first = [lambda pa=pa, pb=pb: mm(pa, pb) for pa, pb in rest[:2]]
     neg0 = ttnn.neg(pa0) if neg0 is None else neg0
     y = _guarded(ex, dn, mm(neg0, pb0), _norm_last(a), _col_norms(b, transpose_b, cache=False), *first)
+    # the further terms (3 limbs: three more) summed after it, in order, through the lane-sum pass
+    acc = _LaneAcc()
+    acc.push(y)
     for pa, pb in rest[2:]:
-        y = ttnn.add(y, mm(pa, pb))
-    return y
+        acc.push(mm(pa, pb))
+    return acc.value()
 
 
 def pad_rows(array, s_pad):

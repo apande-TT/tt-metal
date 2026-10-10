@@ -109,7 +109,8 @@ class TtQwenImageEditPipeline:
         self.lo_fidelity = ttnn.MathFidelity.HiFi2 if precise else ttnn.MathFidelity.HiFi4
         # and their TP all-reduce's sum of the gathered float32 partials in one pass (no slice copies)
         self.sum_parts = sum_parts if precise else None
-        # and their exact-lane sums' products added six at a time in one pass (no add chain round trips)
+        # and their exact-lane sums' products, and the trailing limb terms after the guard, added six at a time in
+        # one pass (no add chain round trips)
         self.lane_sum = sum_list if precise else None
         # and their inputs' two bf16 limbs in one pass
         self.split_limbs = split_limbs if precise else None
