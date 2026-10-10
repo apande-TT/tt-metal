@@ -90,6 +90,19 @@ class SharedExpert(TtKolibri1MLP):
         INVOCATIONS["m_l_p"] += 1
         return super().__call__(x, **kwargs)
 
+    def partial(self, x):
+        """The stub's forward without its all_reduce: x [1, 1, N, hidden] bf16 -> this chip's partial output, which
+        the MoE block adds to its routed partial so ONE all_reduce sums both."""
+        INVOCATIONS["m_l_p"] += 1
+        g = ttnn.linear(x, self.w_gate, compute_kernel_config=self.mm_cfg)
+        u = ttnn.linear(x, self.w_up, compute_kernel_config=self.mm_cfg)
+        act = ttnn.multiply(ttnn.silu(g), u)
+        ttnn.deallocate(g)
+        ttnn.deallocate(u)
+        out = ttnn.linear(act, self.w_down, compute_kernel_config=self.mm_cfg)
+        ttnn.deallocate(act)
+        return out
+
 
 class FinalNorm(TtKolibri1RMSNorm):
     def __call__(self, x, **kwargs):
@@ -678,10 +691,15 @@ class MoE(TtKolibri1SparseMoeBlock):
             if w is not weights:
                 ttnn.deallocate(w)
         ttnn.deallocate(weights)
+        # The routed and the shared expert are both row-parallel over the chips: add their partial sums here and
+        # reduce once (the shared stub's own all_reduce made it two collectives per layer).
+        shared = self.shared.partial(x)
+        total = ttnn.add(out, shared, dtype=ttnn.bfloat16)
+        ttnn.deallocate(out)
+        ttnn.deallocate(shared)
         if self.tp > 1:
-            out = ttnn.all_reduce(out, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
-        out = ttnn.add(out, self.shared(x))
-        return ttnn.reshape(out, shape)
+            total = ttnn.all_reduce(total, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
+        return ttnn.reshape(total, shape)
 
 
 # --------------------------------------------------------------------------------------------- the layer
