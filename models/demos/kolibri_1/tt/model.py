@@ -383,6 +383,14 @@ class MoE(TtKolibri1SparseMoeBlock):
             packer_l1_acc=True,
         )
         self.hifi2 = self.hifi4
+        # Prefill down projection (compute-bound) at LoFi, fp32 dest kept.
+        self.down_prefill_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.LoFi,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
         self.router = Router(device, moe.gate)
         self.shared = SharedExpert(device, moe.shared_experts)
         for name in ("ws_gate", "ws_up", "ws_down", "w_router"):  # replaced by the two stubs above
@@ -511,7 +519,7 @@ class MoE(TtKolibri1SparseMoeBlock):
                 act,
                 self.w_down,
                 config=self._down_prefill_mm(act.shape[-2] // ttnn.TILE_SIZE),
-                compute_kernel_config=self.hifi2,
+                compute_kernel_config=self.down_prefill_cfg,
                 dtype=ttnn.bfloat16,
             )
         ttnn.deallocate(act)
