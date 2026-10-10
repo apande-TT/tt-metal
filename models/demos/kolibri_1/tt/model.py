@@ -99,8 +99,35 @@ class Embedding(TtKolibri1Embedding):
 
 class FP8Linear(TtKolibri1FP8Linear):
     def __call__(self, x, **kwargs):
+        """The stub's column-parallel projection; at prefill sizes the matmul runs as a full-grid minimal_matmul
+        (ttnn.linear's default config used 100 of the 110 cores for [4096, 6144] x [6144, 640])."""
         INVOCATIONS["f_p8_linear"] += 1
-        return super().__call__(x, **kwargs)
+        shape = list(x.shape)
+        x = ttnn.reshape(x, [1, 1, -1, shape[-1]])
+        if x.dtype != ttnn.bfloat16:
+            x = ttnn.typecast(x, ttnn.bfloat16)
+        rows = x.shape[-2]
+        if rows < 2048:
+            out = ttnn.linear(x, self.w, compute_kernel_config=self.mm_cfg)
+        else:
+            g = self.device.compute_with_storage_grid_size()
+            m_tiles, n_tiles = rows // ttnn.TILE_SIZE, self.w.shape[-1] // ttnn.TILE_SIZE
+            m_cores, n_cores = (g.x, g.y) if m_tiles > n_tiles else (g.y, g.x)
+            n_block = -(-n_tiles // n_cores)
+            cfg = ttnn.MinimalMatmulConfig(
+                M_block_size=-(-m_tiles // m_cores),
+                K_block_size=8,
+                N_block_size=n_block,
+                subblock_h=1,
+                subblock_w=next(w for w in (4, 3, 2, 1) if n_block % w == 0),
+                compute_with_storage_grid_size=ttnn.CoreCoord(g.x, g.y),
+            )
+            out = ttnn.experimental.minimal_matmul(
+                x, self.w, config=cfg, compute_kernel_config=self.mm_cfg, dtype=ttnn.bfloat16
+            )
+        if self.tp > 1:
+            out = ttnn.all_gather(out, dim=3, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
+        return ttnn.reshape(out, shape[:-1] + [out.shape[-1]])
 
 
 class Router(TtKolibri1Router):
