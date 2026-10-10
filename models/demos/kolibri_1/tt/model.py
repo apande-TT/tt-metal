@@ -792,11 +792,13 @@ class DecoderLayer(TtKolibri1DecoderLayer):
         h = hidden_states
         # The attention reads its input as bf16: normalize a bf16 copy of the residual (typecast + bf16 norm, 105 MB
         # at 4096 rows) instead of an fp32 norm whose output the attention then typecasts (147 MB).
-        hb = ttnn.typecast(h, ttnn.bfloat16)
-        x = self._norm(hb, "input_layernorm")
+        L1 = ttnn.L1_MEMORY_CONFIG  # the residual adds read their bf16 operand from L1 (~190 KB a core at 4096 rows)
+        hb = ttnn.typecast(h, ttnn.bfloat16, memory_config=L1)  # the norm's bf16 input, too, only lives across it
+        x = ttnn.rms_norm(
+            hb, epsilon=self.eps, weight=self.norm_w["input_layernorm"], memory_config=DRAM, compute_kernel_config=self.norm_cfg
+        )
         ttnn.deallocate(hb)
         a = self.attn(x, position_ids, attention_mask, past_key_value)
-        L1 = ttnn.L1_MEMORY_CONFIG  # the residual adds read their bf16 operand from L1 (~190 KB a core at 4096 rows)
         n = ttnn.rms_norm(
             a, epsilon=self.eps, weight=self.norm_w["post_attn_norm"], memory_config=L1, compute_kernel_config=self.norm_cfg
         )
