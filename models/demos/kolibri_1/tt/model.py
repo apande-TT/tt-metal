@@ -207,6 +207,17 @@ class Attention(TtKolibri1Attention):
         shape = list(x.shape)
         d = shape[-1]
         rows = x.volume() // d
+        if rows >= 2048 and len(shape) == 4:
+            # Prefill: every user's positions are 0 .. T-1 (the pipeline writes arange(Tp) for all), so one
+            # [1, 1, T, D] cos / sin row set serves all of them, and ttnn's fused HF rotary op computes
+            # x * cos + rotate_half(x) * sin in one pass (was the rotate-half matmul and three binary ops).
+            T = shape[-2]
+            cos1 = ttnn.slice(cos, [0, 0, 0, 0], [1, 1, T, d])
+            sin1 = ttnn.slice(sin, [0, 0, 0, 0], [1, 1, T, d])
+            out = ttnn.experimental.rotary_embedding(x, cos1, sin1)
+            ttnn.deallocate(cos1)
+            ttnn.deallocate(sin1)
+            return out
         if rows >= 2048:
             g = self.device.compute_with_storage_grid_size()
             pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
@@ -865,22 +876,6 @@ class Sampler:
             [ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in self.count_xy]
         )
         self.top_p_bits = struct.unpack("<I", struct.pack("<f", self.top_p))[0]
-        # Inclusive prefix sums over the k candidates in token-id order as matmuls against a 0/1 triangle
-        # (ttnn.cumsum runs this [B, k] scan on one core at ~150 us); see _scan for its accuracy.
-        self.tri_incl = ttnn.from_torch(
-            torch.triu(torch.ones(self.top_k, self.top_k)),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
-            mesh_mapper=mapper,
-        )
-        self.scan_cfg = ttnn.init_device_compute_kernel_config(
-            device.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi4,
-            math_approx_mode=False,
-            fp32_dest_acc_en=True,
-            packer_l1_acc=False,
-        )
         grid = device.compute_with_storage_grid_size()
         tree_ok = vocab > 0 and batch % 32 == 0 and vocab % 32 == 0
         self.plan = _topk_tree(vocab // 32, self.k_pad // 32, grid.x * grid.y) if tree_ok else None
@@ -947,20 +942,6 @@ class Sampler:
             x, labels = ttnn.experimental.view(x, [1, 1, B, n]), ttnn.experimental.view(labels, [1, 1, B, n])
         return ttnn.topk(x, k=self.top_k, dim=-1, largest=True, sorted=True, indices_tensor=labels)
 
-    def _scan(self, x, tri):
-        """Prefix sums of x [1, 1, B, k] fp32 along k: x split into three bf16 parts (h + m + l == x exactly),
-        each part times a 0/1 triangle (exact products, HiFi4). NOT fp32-exact: the FPU rounds a tile's running
-        dot product to ~12 bits relative to its magnitude, so a sum that has reached ~1 is off by up to ~2^-11
-        (measured: median 0, max 2.4e-4 of z on the token-order CDF; median 3.4e-4 on the descending-p
-        exclusive sums, which is why the top_p cut uses ttnn.cumsum)."""
-        f32, bf16 = ttnn.float32, ttnn.bfloat16
-        h = ttnn.typecast(x, bf16)
-        r = ttnn.subtract(x, ttnn.typecast(h, f32))
-        m = ttnn.typecast(r, bf16)
-        lo = ttnn.typecast(ttnn.subtract(r, ttnn.typecast(m, f32)), bf16)
-        s = [ttnn.matmul(part, tri, dtype=f32, compute_kernel_config=self.scan_cfg) for part in (lo, m, h)]
-        return ttnn.add(ttnn.add(s[0], s[1]), s[2])
-
     def _n_keep(self, p):
         """p [1, 1, B, k] fp32 (descending) -> n_keep [1, 1, B, 1] fp32: how many leading candidates have an
         exclusive cumulative probability below top_p, the sums taken one by one in fp32 (tt/kernels/topp_count.cpp)."""
@@ -982,6 +963,30 @@ class Sampler:
         ttnn.generic_op([p, out], ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
         return out
 
+    def _at(self, q, u):
+        """q [1, 1, B, k] fp32 (kept weights in token-id order), u [1, 1, B, 1] -> at [1, 1, B, 1] fp32: how many
+        positions have an inclusive cumulative sum <= u * z, z the total, the sums taken one by one in fp32
+        (tt/kernels/sample_at.cpp; host_sample's cumsum is fp64, and the triangle-matmul scan this replaces was off
+        by up to 2.4e-4, which put u on the wrong side of a CDF edge on some trajectories)."""
+        B = q.shape[-2]
+        out = ttnn.empty([1, 1, B, 1], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+        rt = ttnn.RuntimeArgs()
+        for i, (cx, cy) in enumerate(self.count_xy):
+            rt[cx][cy] = [q.buffer_address(), u.buffer_address(), out.buffer_address(), i]
+        kernel = ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "sample_at.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=self.count_cores,
+            compile_time_args=[self.top_k // ttnn.TILE_SIZE]
+            + [a for t in (q, u, out) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            runtime_args=rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        row_bytes = (self.top_k // ttnn.TILE_SIZE) * 128  # the row's two 64 B face rows per tile
+        cb = RoutedGateUp._cb(0, ttnn.float32, 64 + row_bytes + 64 + 64, 1, self.count_cores)
+        ttnn.generic_op([q, u, out], ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
+        return out
+
     def __call__(self, logits, u):
         """logits [1, 1, B, V] fp32, u [1, 1, B, 1] fp32 -> token ids [1, 1, B, 1] fp32 (exact integers)."""
         x = logits if self.temperature == 1.0 else ttnn.multiply(logits, 1.0 / self.temperature)
@@ -1000,8 +1005,6 @@ class Sampler:
         neg_id, order = ttnn.topk(
             ttnn.neg(ttnn.typecast(tok_ids, ttnn.float32)), k=self.top_k, dim=-1, largest=True, sorted=True
         )
-        cdf = self._scan(ttnn.gather(q, -1, order), self.tri_incl)
-        z = ttnn.slice(cdf, [0, 0, 0, self.top_k - 1], [1, 1, B, self.top_k])
         # Positions whose CDF is <= u*z precede the sampled token (the CDF only rises at kept tokens).
-        at = ttnn.sum(ttnn.le(cdf, ttnn.multiply(u, z)), dim=-1, keepdim=True)
+        at = self._at(ttnn.gather(q, -1, order), u)
         return ttnn.neg(ttnn.sum(ttnn.multiply(neg_id, ttnn.eq(self.ranks, at)), dim=-1, keepdim=True))
