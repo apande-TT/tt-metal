@@ -796,14 +796,19 @@ class DecoderLayer(TtKolibri1DecoderLayer):
         x = self._norm(hb, "input_layernorm")
         ttnn.deallocate(hb)
         a = self.attn(x, position_ids, attention_mask, past_key_value)
-        n = self._norm(a, "post_attn_norm")
+        L1 = ttnn.L1_MEMORY_CONFIG  # the residual adds read their bf16 operand from L1 (~190 KB a core at 4096 rows)
+        n = ttnn.rms_norm(
+            a, epsilon=self.eps, weight=self.norm_w["post_attn_norm"], memory_config=L1, compute_kernel_config=self.norm_cfg
+        )
         ttnn.deallocate(a)
-        h = ttnn.add(h, n, dtype=h.dtype)
+        h = ttnn.add(h, n, dtype=h.dtype, memory_config=DRAM)
         ttnn.deallocate(n)
         m = self.moe(self._norm(h, "post_attention_layernorm"))
-        n = self._norm(m, "post_ffn_norm")
+        n = ttnn.rms_norm(
+            m, epsilon=self.eps, weight=self.norm_w["post_ffn_norm"], memory_config=L1, compute_kernel_config=self.norm_cfg
+        )
         ttnn.deallocate(m)
-        out = ttnn.add(h, n, dtype=h.dtype)
+        out = ttnn.add(h, n, dtype=h.dtype, memory_config=DRAM)
         ttnn.deallocate(n)
         ttnn.deallocate(h)
         return out
