@@ -43,10 +43,23 @@ PATTERNS = ("strided", "rot1", "rot3")
 _MASKS = {}
 
 
-def precise_config():
+def precise_config(fidelity=None):
     return ttnn.WormholeComputeKernelConfig(
-        math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False
+        math_fidelity=ttnn.MathFidelity.HiFi4 if fidelity is None else fidelity,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=False,
     )
+
+
+# optional math fidelity of linear's lo-limb product (lo ~ 2^-8 of x, so its own rounding is scaled down by
+# the same factor); None: HiFi4 like the hi product
+LO_FIDELITY = None
+
+
+# optional fn(hi, lo, w) -> hi @ w + lo @ w (float32) as one call, e.g. a fused kernel, or None when it does not
+# fit (the two stock matmuls then run); the bias is added after it
+LIMB_LINEAR_FN = None
 
 
 # optional replacement for the hi/lo split of a float32 tensor: a callable x32 -> (hi, lo), e.g. a fused
@@ -68,10 +81,18 @@ def linear(x, w, bias=None, compute_kernel_config=None, parts=None):
     (hi, lo) from split_bf16 when several projections share x (split once, not once per projection)."""
     cfg = precise_config()
     hi, lo = split_bf16(x) if parts is None else parts
+    y = LIMB_LINEAR_FN(hi, lo, w) if LIMB_LINEAR_FN is not None and LO_FIDELITY is None else None
+    if y is not None:
+        return (
+            y
+            if bias is None
+            else ttnn.add(y, bias if bias.dtype == ttnn.float32 else ttnn.typecast(bias, ttnn.float32))
+        )
     pc = LINEAR_PC_FN(hi, w) if LINEAR_PC_FN is not None else None
     kw = {} if pc is None else {"core_grid": pc} if isinstance(pc, ttnn.CoreGrid) else {"program_config": pc}
     y_hi = ttnn.linear(hi, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw)
-    y_lo = ttnn.linear(lo, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw)
+    cfg_lo = cfg if LO_FIDELITY is None else precise_config(LO_FIDELITY)
+    y_lo = ttnn.linear(lo, w, compute_kernel_config=cfg_lo, dtype=ttnn.float32, **kw)
     if LINEAR_SUM_BIAS_FN is not None and bias is not None and bias.dtype == ttnn.float32:
         n = int(y_hi.padded_shape[-1])
         one_row = math.prod(int(d) for d in list(bias.shape)[:-1]) == 1  # a bias row broadcast over the rows
