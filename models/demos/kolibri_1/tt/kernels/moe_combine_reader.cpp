@@ -1,0 +1,74 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+// Prefill routed experts, combine (reader). Token tile rows are dealt round-robin over the cores. For each row,
+// cnt_j = how many local experts token j routed to; planes 0 .. max_j cnt_j - 1 of the fp32 partial buffer are
+// read tile by tile, and in plane k the rows of tokens with cnt_j <= k (never written this call) are zeroed.
+// A row no token routed here still gets one all-zero plane, so compute always sums at least one. Every push
+// is KMAX tiles (the planes used first), so a reservation never wraps the circular buffer.
+#include <cstdint>
+
+#include "api/dataflow/dataflow_api.h"
+
+void kernel_main() {
+    constexpr uint32_t Kt = get_compile_time_arg_val(0);  // output tiles per row
+    constexpr uint32_t MT = get_compile_time_arg_val(1);  // token tile rows
+    constexpr uint32_t E = get_compile_time_arg_val(2);
+    constexpr uint32_t NC = get_compile_time_arg_val(3);  // cores
+    constexpr uint32_t wrow_bytes = get_compile_time_arg_val(4);
+    constexpr uint32_t KMAX = get_compile_time_arg_val(5);  // most routed local experts a token can have
+    constexpr auto w_args = TensorAccessorArgs<6>();
+    constexpr auto y_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
+    const auto wr = TensorAccessor(w_args, get_arg_val<uint32_t>(0));
+    const auto y = TensorAccessor(y_args, get_arg_val<uint32_t>(1));
+    const uint32_t core = get_arg_val<uint32_t>(2);
+
+    constexpr uint32_t cb_p = 0, cb_cnt = 4, cb_rows = 9;
+    constexpr uint32_t face = 1024, frow = 64, tile = 4096;
+
+    cb_reserve_back(cb_rows, 1);
+    const uint32_t rows_l1 = get_write_ptr(cb_rows);
+    uint32_t cnt[32];
+    for (uint32_t r = core; r < MT; r += NC) {
+        for (uint32_t j = 0; j < 32; ++j) {
+            noc_async_read_page(r * 32 + j, wr, rows_l1 + j * wrow_bytes);
+        }
+        noc_async_read_barrier();
+        uint32_t planes = 1;
+        for (uint32_t j = 0; j < 32; ++j) {
+            volatile tt_l1_ptr uint32_t* w = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(rows_l1 + j * wrow_bytes);
+            uint32_t c = 0;
+            for (uint32_t q = 0; q < E; ++q) {
+                c += (w[q] & 0x7fffffffu) != 0;
+            }
+            cnt[j] = c;
+            planes = c > planes ? c : planes;
+        }
+        cb_reserve_back(cb_cnt, 1);
+        *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_cnt)) = planes;
+        cb_push_back(cb_cnt, 1);
+
+        for (uint32_t nn = 0; nn < Kt; ++nn) {
+            cb_reserve_back(cb_p, KMAX);
+            const uint32_t l1 = get_write_ptr(cb_p);
+            for (uint32_t k = 0; k < planes; ++k) {
+                noc_async_read_page((k * MT + r) * Kt + nn, y, l1 + k * tile);
+            }
+            noc_async_read_barrier();
+            for (uint32_t k = 0; k < planes; ++k) {
+                for (uint32_t j = 0; j < 32; ++j) {
+                    if (cnt[j] > k) {
+                        continue;
+                    }
+                    volatile tt_l1_ptr uint32_t* p = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+                        l1 + k * tile + (j / 16) * 2 * face + (j % 16) * frow);
+                    for (uint32_t i = 0; i < frow / 4; ++i) {
+                        p[i] = 0;
+                        p[face / 4 + i] = 0;
+                    }
+                }
+            }
+            cb_push_back(cb_p, KMAX);
+        }
+    }
+}

@@ -364,6 +364,180 @@ class RoutedGateUp:
         return self.g_out, self.u_out
 
 
+class GroupedExperts:
+    """Prefill routed experts over the tokens each expert actually got (tt/kernels/moe_grouped_*.cpp, then
+    tt/kernels/moe_combine_*.cpp: two generic_ops).
+
+    The dense prefill path ran all of a chip's 96 experts on every token -- [M, 2560] x [2560, 96*1024] gate/up
+    and [M, 96*512] x [96*512, 2560] down -- while a token uses 6 of 384 experts, ~1.5 of a chip's 96. Here the
+    work is cut into units of 64 tokens routed to one expert, dealt round-robin over all cores (routing is
+    skewed: one expert can get half the tokens). A unit gathers its tokens' rows and runs gate/up (fp32 dest,
+    HiFi4), silu(gate) * up * the fp32 routing weight (all in fp32 dest) and the down projection on those rows
+    only, streaming the expert's weights once. Each output row lands in plane k of an fp32 [K, M, hidden]
+    buffer, k = the expert's rank among the token's routed local experts; the combine sums a token's planes in
+    fp32 and packs bf16 once. Nothing between x and the output is rounded to bf16 (the dense path rounded the
+    SwiGLU output, the scaled activation and the routing weight)."""
+
+    MAX_ROWS = 4096  # tokens per pass: bounds the fp32 plane buffer (top_k x MAX_ROWS x hidden)
+
+    def __init__(self, device, w_gu, w_down, n_experts: int, inter: int, top_k: int) -> None:
+        """w_gu: tile-pair-interleaved [hidden, 2 * n_experts * inter] gate/up (gate column c at 2c, up at 2c + 1);
+        w_down: [n_experts * inter, hidden]."""
+        self.device, self.w_gu, self.w_down = device, w_gu, w_down
+        g = device.compute_with_storage_grid_size()
+        self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(g.x - 1, g.y - 1))])
+        self.core_xy = [(x, y) for y in range(g.y) for x in range(g.x)]
+        self.n_experts, self.cpe = n_experts, inter // ttnn.TILE_SIZE
+        self.kt = w_down.shape[-1] // ttnn.TILE_SIZE  # hidden tiles
+        self.nt_gu = w_gu.shape[-1] // ttnn.TILE_SIZE
+        self.kmax = min(top_k, n_experts)
+        self.kb = next(b for b in (8, 5, 4, 2, 1) if self.kt % b == 0)
+        self.mm_cfg = ttnn.ComputeConfigDescriptor(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
+        )
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        modes[3] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the routing weights, multiplied in fp32 dest
+        self.mm_cfg.unpack_to_dest_mode = modes
+        self.sum_cfg = ttnn.ComputeConfigDescriptor(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
+        )
+        self.count_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
+        )
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        modes[0] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the fp32 partial planes, summed exactly
+        self.sum_cfg.unpack_to_dest_mode = modes
+
+    def __call__(self, x, w):
+        """x [1, 1, M, hidden] bf16 tile, w [1, 1, M, n_experts] fp32 tile (this chip's routing weights, 0 where
+        unrouted) -> this chip's routed-expert sum [1, 1, M, hidden] bf16."""
+        m, hidden = x.shape[-2], x.shape[-1]
+        if m > self.MAX_ROWS:
+            parts = []
+            for a in range(0, m, self.MAX_ROWS):
+                b = min(a + self.MAX_ROWS, m)
+                xs = ttnn.slice(x, [0, 0, a, 0], [1, 1, b, hidden])
+                ws = ttnn.slice(w, [0, 0, a, 0], [1, 1, b, w.shape[-1]])
+                parts.append(self(xs, ws))
+                ttnn.deallocate(xs)
+                ttnn.deallocate(ws)
+            out = ttnn.concat(parts, dim=2)
+            for p in parts:
+                ttnn.deallocate(p)
+            return out
+        x_rm = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+        wt = ttnn.transpose(w, 2, 3)
+        wt_rm = ttnn.to_layout(wt, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.deallocate(wt)
+        w_rm = ttnn.to_layout(w, ttnn.ROW_MAJOR_LAYOUT)
+        # Tokens routed to each expert (exact: 0/1 summed in fp32 on the SFPU path); the reader deals units by it.
+        n_e = ttnn.sum(ttnn.sign(w), dim=2, keepdim=True, compute_kernel_config=self.count_cfg)
+        counts = ttnn.to_layout(n_e, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.deallocate(n_e)
+        y = ttnn.empty(
+            [1, self.kmax, m, hidden],
+            dtype=ttnn.float32,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+            memory_config=DRAM,
+        )
+        self._experts(x_rm, wt_rm, w_rm, counts, y, m)
+        out = ttnn.empty(
+            [1, 1, m, hidden], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=DRAM
+        )
+        self._combine(y, w_rm, out, m)
+        for t in (x_rm, wt_rm, w_rm, counts, y):
+            ttnn.deallocate(t)
+        return out
+
+    @staticmethod
+    def _acc(*ts):
+        return [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+
+    def _kernel(self, name, ct, rt, config):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=self.cores,
+            compile_time_args=ct,
+            runtime_args=rt,
+            config=config,
+        )
+
+    def _experts(self, x_rm, wt_rm, w_rm, counts, y, m):
+        cb, c = RoutedGateUp._cb, self.cores
+        bf, w_tile, f32 = 2048, 1088, 4096
+        kt, cpe, kb = self.kt, self.cpe, self.kb
+        row_bytes, wrow = x_rm.shape[-1] * 2, w_rm.shape[-1] * 4
+        r32 = lambda n: -(-n // 32) * 32
+        nc = len(self.core_xy)
+        max_units = -(-(-(-m * self.kmax // 64) + self.n_experts) // nc)  # all units, worst case, dealt over nc
+        cbs = [
+            cb(0, ttnn.bfloat16, bf, kt, c),  # 32 gathered row-major x rows (tilize input)
+            cb(1, ttnn.bfloat8_b, w_tile, 2 * kb, c),  # gate weight tiles
+            cb(2, ttnn.bfloat8_b, w_tile, 2 * kb, c),  # up weight tiles
+            cb(3, ttnn.float32, f32, 2, c),  # routing-weight tiles (row j = token j's weight)
+            cb(4, ttnn.uint32, 16, 1, c),  # unit count -> compute
+            cb(5, ttnn.uint32, r32(4 * (2 + 64)), 3, c),  # unit count, then each unit's [e, n, tokens] -> writer
+            cb(6, ttnn.float32, r32(4 * max(m, self.n_experts)), 1, c),  # counts, then an expert's weight row
+            cb(7, ttnn.bfloat8_b, w_tile, 2 * cpe, c),  # down weight tiles
+            cb(8, ttnn.bfloat16, bf, 2 * kt, c),  # tilized x, two row blocks
+            cb(9, ttnn.float32, wrow * 64, 1, c),  # weight rows of a unit's tokens (writer: ranks)
+            cb(17, ttnn.float32, f32, 2 * cpe, c),  # act = silu(gate) * up * routing weight
+            cb(18, ttnn.float32, f32, 4, c),  # expert output tiles
+        ]
+        reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        addrs = [t.buffer_address() for t in (x_rm, self.w_gu, self.w_down, wt_rm, counts)]
+        for i, (cx, cy) in enumerate(self.core_xy):
+            reader_rt[cx][cy] = addrs + [i]
+            writer_rt[cx][cy] = [w_rm.buffer_address(), y.buffer_address()]
+        kernels = [
+            self._kernel(
+                "moe_grouped_reader.cpp",
+                [kt, self.nt_gu, cpe, m, kb, self.n_experts, w_tile, row_bytes, nc, max_units]
+                + self._acc(x_rm, self.w_gu, self.w_down, wt_rm, counts),
+                reader_rt,
+                ttnn.ReaderConfigDescriptor(),
+            ),
+            self._kernel(
+                "moe_grouped_writer.cpp", [kt, m, wrow] + self._acc(w_rm, y), writer_rt, ttnn.WriterConfigDescriptor()
+            ),
+            self._kernel("moe_grouped_compute.cpp", [kt, kb, cpe], [], self.mm_cfg),
+        ]
+        ttnn.generic_op(
+            [x_rm, self.w_gu, self.w_down, wt_rm, counts, w_rm, y],
+            ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs),
+        )
+
+    def _combine(self, y, w_rm, out, m):
+        cb, c = RoutedGateUp._cb, self.cores
+        kt, mt, nc, wrow = self.kt, m // ttnn.TILE_SIZE, len(self.core_xy), w_rm.shape[-1] * 4
+        cbs = [
+            cb(0, ttnn.float32, 4096, 2 * self.kmax, c),  # partial planes of one output tile
+            cb(4, ttnn.uint32, 16, 2, c),  # planes per tile row -> compute
+            cb(9, ttnn.float32, wrow * 32, 1, c),  # weight rows of the tile row's 32 tokens
+            cb(16, ttnn.bfloat16, 2048, 2, c),  # summed output tiles
+        ]
+        reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        for i, (cx, cy) in enumerate(self.core_xy):
+            reader_rt[cx][cy] = [w_rm.buffer_address(), y.buffer_address(), i]
+            compute_rt[cx][cy] = [i]
+            writer_rt[cx][cy] = [out.buffer_address(), i]
+        kernels = [
+            self._kernel(
+                "moe_combine_reader.cpp",
+                [kt, mt, self.n_experts, nc, wrow, self.kmax] + self._acc(w_rm, y),
+                reader_rt,
+                ttnn.ReaderConfigDescriptor(),
+            ),
+            self._kernel(
+                "moe_combine_writer.cpp", [kt, mt, nc] + self._acc(out), writer_rt, ttnn.WriterConfigDescriptor()
+            ),
+            self._kernel("moe_combine_compute.cpp", [kt, mt, nc, self.kmax], compute_rt, self.sum_cfg),
+        ]
+        ttnn.generic_op([y, w_rm, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+
+
 class MoE(TtKolibri1SparseMoeBlock):
     """The graduated sparse MoE block with its router logits from the graduated router stub and its
     ungated shared expert as the graduated m_l_p stub (the routed experts are the block's own)."""
@@ -414,6 +588,7 @@ class MoE(TtKolibri1SparseMoeBlock):
             mcast_in0=True,
         )
         self.routed_gate_up = RoutedGateUp(device, self.w_gu, self.w_gu, self.n_local, self.inter, interleaved=True)
+        self.grouped = GroupedExperts(device, self.w_gu, self.w_down, self.n_local, self.inter, self.top_k)
         self.grid = g
 
     def _upload(self, t, shard_dim, dtype):
@@ -490,39 +665,21 @@ class MoE(TtKolibri1SparseMoeBlock):
         x_in = ttnn.reshape(hidden_states, [1, 1, -1, shape[-1]])
         x = x_in if x_in.dtype == ttnn.bfloat16 else ttnn.typecast(x_in, ttnn.bfloat16)
         weights = self.routing_weights(x_in if self.router_fp32_input else x)
-        col_scale = ttnn.linear(weights, self.expand, dtype=ttnn.bfloat16, compute_kernel_config=self.hifi4)
-        decode = x.shape[-2] == ttnn.TILE_SIZE
-        if decode:  # only the routed experts' columns (persistent outputs, not freed)
+        if x.shape[-2] == ttnn.TILE_SIZE:  # decode: only the routed experts' columns (persistent outputs, not freed)
+            col_scale = ttnn.linear(weights, self.expand, dtype=ttnn.bfloat16, compute_kernel_config=self.hifi4)
             mask = self._routed_mask(weights)
             g, u = self.routed_gate_up(x, mask)
             ttnn.deallocate(mask)
-        ttnn.deallocate(weights)
-        if decode:
             act = ttnn.multiply(ttnn.multiply(ttnn.silu(g), u), col_scale)
-        else:  # gate and up in ONE matmul, SwiGLU fused into its pack: silu(x @ W_gate) * (x @ W_up)
-            (swi,) = ttnn.experimental.minimal_matmul_split(
-                x,
-                self.w_gu,
-                chunks=1,
-                fuse_swiglu=True,
-                dtype=ttnn.bfloat16,
-                compute_kernel_config=self.gate_up_prefill_cfg,
-                config=self._gate_up_prefill_mm(x.shape[-2] // ttnn.TILE_SIZE),
-            )
-            act = ttnn.multiply(swi, col_scale)
-            ttnn.deallocate(swi)
-        ttnn.deallocate(col_scale)
-        if decode:
+            ttnn.deallocate(col_scale)
             out = ttnn.linear(act, self.w_down, program_config=self.down_decode_pc, compute_kernel_config=self.hifi2)
-        else:
-            out = ttnn.experimental.minimal_matmul(
-                act,
-                self.w_down,
-                config=self._down_prefill_mm(act.shape[-2] // ttnn.TILE_SIZE),
-                compute_kernel_config=self.down_prefill_cfg,
-                dtype=ttnn.bfloat16,
-            )
-        ttnn.deallocate(act)
+            ttnn.deallocate(act)
+        else:  # prefill: each expert over the tokens routed to it
+            w = ttnn.mesh_partition(weights, dim=3, cluster_axis=self.tp_axis) if self.tp > 1 else weights
+            out = self.grouped(x, w)
+            if w is not weights:
+                ttnn.deallocate(w)
+        ttnn.deallocate(weights)
         if self.tp > 1:
             out = ttnn.all_reduce(out, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
         out = ttnn.add(out, self.shared(x))
@@ -606,14 +763,14 @@ class Sampler:
             device=device,
             mesh_mapper=mapper,
         )
-        # Prefix sums over the k candidates as matmuls against 0/1 triangles (inclusive: i <= j, exclusive:
-        # i < j). ttnn.cumsum runs this [B, k] scan on one core at ~150 us; see _scan for exactness.
-        tri = torch.ones(self.top_k, self.top_k)
-        self.tri_incl, self.tri_excl = (
-            ttnn.from_torch(
-                t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=mapper
-            )
-            for t in (torch.triu(tri), torch.triu(tri, diagonal=1))
+        # Inclusive prefix sums over the k candidates in token-id order as matmuls against a 0/1 triangle
+        # (ttnn.cumsum runs this [B, k] scan on one core at ~150 us); see _scan for its accuracy.
+        self.tri_incl = ttnn.from_torch(
+            torch.triu(torch.ones(self.top_k, self.top_k)),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            mesh_mapper=mapper,
         )
         self.scan_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
@@ -653,9 +810,11 @@ class Sampler:
         return ttnn.topk(x, k=self.top_k, dim=-1, largest=True, sorted=True, indices_tensor=labels)
 
     def _scan(self, x, tri):
-        """Prefix sums of x [1, 1, B, k] fp32 along k, to fp32 accuracy: x is split into three bf16 parts
-        (8 mantissa bits each, so h + m + l == x exactly), each part times a 0/1 triangle is a sum of exact
-        products (HiFi4), and the matmul accumulates in fp32."""
+        """Prefix sums of x [1, 1, B, k] fp32 along k: x split into three bf16 parts (h + m + l == x exactly),
+        each part times a 0/1 triangle (exact products, HiFi4). NOT fp32-exact: the FPU rounds a tile's running
+        dot product to ~12 bits relative to its magnitude, so a sum that has reached ~1 is off by up to ~2^-11
+        (measured: median 0, max 2.4e-4 of z on the token-order CDF; median 3.4e-4 on the descending-p
+        exclusive sums, which is why the top_p cut uses ttnn.cumsum)."""
         f32, bf16 = ttnn.float32, ttnn.bfloat16
         h = ttnn.typecast(x, bf16)
         r = ttnn.subtract(x, ttnn.typecast(h, f32))
@@ -672,7 +831,10 @@ class Sampler:
         vmax = ttnn.slice(vals, [0, 0, 0, 0], [1, 1, B, 1])
         e = ttnn.exp(ttnn.subtract(vals, vmax))
         p = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True))
-        excl = self._scan(p, self.tri_excl)
+        # The top_p cut from exact exclusive sums (ttnn.cumsum: sequential fp32 on the SFPU). The triangle-matmul
+        # scan was off by 3.4e-4 median / 8.6e-4 max here (descending p reaches ~1 in a few terms), enough to
+        # flip the 0.97 cut against the host rule (e2e: device sampler != host sampler at sample 4, step 100).
+        excl = ttnn.subtract(ttnn.cumsum(p, dim=-1), p)
         n_keep = ttnn.sum(ttnn.lt(excl, self.top_p), dim=-1, keepdim=True)
         last = ttnn.eq(self.ranks, ttnn.subtract(ttnn.maximum(n_keep, 1.0), 1.0))
         cut = ttnn.sum(ttnn.multiply(vals, last), dim=-1, keepdim=True)
