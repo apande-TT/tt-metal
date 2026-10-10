@@ -733,8 +733,23 @@ class DecoderLayer(TtKolibri1DecoderLayer):
         )
 
     def __call__(self, hidden_states, position_ids=None, attention_mask=None, past_key_value=None, **kwargs):
+        """The stub's sandwich-norm residual, except the two post-sublayer norms run on the sublayers' bf16
+        outputs and add into the fp32 residual (the stub cast each output to fp32 first: a typecast plus twice
+        the norm's traffic, for the same input values; only the norm's output is now bf16)."""
         INVOCATIONS["decoder_layer"] += 1
-        return super().__call__(hidden_states, position_ids, attention_mask, past_key_value)
+        h = hidden_states
+        a = self.attn(self._norm(h, "input_layernorm"), position_ids, attention_mask, past_key_value)
+        n = self._norm(a, "post_attn_norm")
+        ttnn.deallocate(a)
+        h = ttnn.add(h, n, dtype=h.dtype)
+        ttnn.deallocate(n)
+        m = self.moe(self._norm(h, "post_attention_layernorm"))
+        n = self._norm(m, "post_ffn_norm")
+        ttnn.deallocate(m)
+        out = ttnn.add(h, n, dtype=h.dtype)
+        ttnn.deallocate(n)
+        ttnn.deallocate(h)
+        return out
 
 
 # ----------------------------------------------------------------------------------------------- sampler
