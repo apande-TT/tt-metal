@@ -137,16 +137,38 @@ class Router(TtKolibri1Router):
 
 
 class SharedExpert(TtKolibri1MLP):
+    def __init__(self, device, torch_module) -> None:
+        """gate and up as ONE [hidden, 2 * inter / tp] weight per chip ([this chip's gate | its up]): one matmul
+        on twice the cores instead of two on 4 cores each (N = 4 tiles), sliced apart after."""
+        super().__init__(device, torch_module)
+        ttnn.deallocate(self.w_gate)
+        ttnn.deallocate(self.w_up)
+        gate = torch_module.gate_proj.dequantize(torch.float32).t()
+        up = torch_module.up_proj.dequantize(torch.float32).t()
+        k = gate.shape[0]
+        gu = torch.cat([gate.reshape(k, self.tp, -1), up.reshape(k, self.tp, -1)], dim=2).reshape(k, -1)
+        self.w_gu = self._upload(gu, -1)
+        self.w_gate = self.w_up = None
+
     def __call__(self, x, **kwargs):
-        INVOCATIONS["m_l_p"] += 1
-        return super().__call__(x, **kwargs)
+        shape = list(x.shape)
+        x = ttnn.reshape(x, [1, 1, -1, shape[-1]])
+        if x.dtype != ttnn.bfloat16:
+            x = ttnn.typecast(x, ttnn.bfloat16)
+        out = self.partial(x)
+        if self.tp > 1:
+            out = ttnn.all_reduce(out, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
+        return ttnn.reshape(out, shape)
 
     def partial(self, x):
         """The stub's forward without its all_reduce: x [1, 1, N, hidden] bf16 -> this chip's partial output, which
         the MoE block adds to its routed partial so ONE all_reduce sums both."""
         INVOCATIONS["m_l_p"] += 1
-        g = ttnn.linear(x, self.w_gate, compute_kernel_config=self.mm_cfg)
-        u = ttnn.linear(x, self.w_up, compute_kernel_config=self.mm_cfg)
+        gu = ttnn.linear(x, self.w_gu, compute_kernel_config=self.mm_cfg)
+        rows, n = gu.shape[-2], gu.shape[-1] // 2
+        g = ttnn.slice(gu, [0, 0, 0, 0], [1, 1, rows, n])
+        u = ttnn.slice(gu, [0, 0, 0, n], [1, 1, rows, 2 * n])
+        ttnn.deallocate(gu)
         act = ttnn.multiply(ttnn.silu(g), u)
         ttnn.deallocate(g)
         ttnn.deallocate(u)
