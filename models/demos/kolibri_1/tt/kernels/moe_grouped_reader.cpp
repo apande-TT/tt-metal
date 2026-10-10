@@ -150,8 +150,12 @@ void kernel_main() {
             }
         }
 
-        // Down rows of e ([CPE x Kt] tiles), one output column at a time.
-        for (uint32_t nn = 0; nn < Kt; ++nn) {
+        // Down rows of e ([CPE x Kt] tiles), one output column at a time. A down row is Kt tiles, a multiple of
+        // the DRAM banks, so a column's tiles (of every expert) share one bank: each unit starts at column
+        // (its global index) mod Kt, so the units in step spread over the banks (the writer walks the same order).
+        const uint32_t nn0 = (core + i * NC) % Kt;
+        for (uint32_t s = 0; s < Kt; ++s) {
+            const uint32_t nn = nn0 + s < Kt ? nn0 + s : nn0 + s - Kt;
             cb_reserve_back(cb_wd, CPE);
             const uint32_t l1 = get_write_ptr(cb_wd);
             for (uint32_t k = 0; k < CPE; ++k) {

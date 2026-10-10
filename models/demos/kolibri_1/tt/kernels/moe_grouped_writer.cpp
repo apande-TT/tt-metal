@@ -18,6 +18,8 @@ void kernel_main() {
     constexpr auto y_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
     const auto wr = TensorAccessor(w_args, get_arg_val<uint32_t>(0));
     const auto y = TensorAccessor(y_args, get_arg_val<uint32_t>(1));
+    const uint32_t core = get_arg_val<uint32_t>(2);
+    constexpr uint32_t NC = get_compile_time_arg_val(y_args.next_compile_time_args_offset());  // cores
 
     constexpr uint32_t cb_list = 5, cb_rows = 9, cb_y = 18;
     constexpr uint32_t MT = M / 32;
@@ -49,7 +51,10 @@ void kernel_main() {
             page_row[j] = (k * MT + t / 32) * Kt;
             dst_off[j] = (rt / 16) * 2 * face + (rt % 16) * frow;
         }
-        for (uint32_t nn = 0; nn < Kt; ++nn) {
+        // Output columns in the reader's order: from (this unit's global index) mod Kt, wrapping.
+        const uint32_t nn0 = (core + i * NC) % Kt;
+        for (uint32_t s = 0; s < Kt; ++s) {
+            const uint32_t nn = nn0 + s < Kt ? nn0 + s : nn0 + s - Kt;
             cb_wait_front(cb_y, RB);
             const uint32_t l1 = get_read_ptr(cb_y);
             for (uint32_t j = 0; j < n; ++j) {

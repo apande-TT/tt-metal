@@ -407,8 +407,8 @@ class GroupedExperts:
     MAX_ROWS = 4096  # tokens per pass: bounds the fp32 plane buffer (top_k x MAX_ROWS x hidden)
 
     def __init__(self, device, w_gu, w_down, n_experts: int, inter: int, top_k: int) -> None:
-        """w_gu: tile-pair-interleaved [hidden, 2 * n_experts * inter] gate/up (gate column c at 2c, up at 2c + 1);
-        w_down: [n_experts * inter, hidden]."""
+        """w_gu: tile-pair-interleaved [hidden, 2 * n_experts * inter + pad] gate/up (gate column c at 2c, up at
+        2c + 1; the row stride is the tensor's width); w_down: [n_experts * inter, hidden]."""
         self.device, self.w_gu, self.w_down = device, w_gu, w_down
         g = device.compute_with_storage_grid_size()
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(g.x - 1, g.y - 1))])
@@ -520,7 +520,7 @@ class GroupedExperts:
         addrs = [t.buffer_address() for t in (x_rm, self.w_gu, self.w_down, wt_rm, counts)]
         for i, (cx, cy) in enumerate(self.core_xy):
             reader_rt[cx][cy] = addrs + [i]
-            writer_rt[cx][cy] = [w_rm.buffer_address(), y.buffer_address()]
+            writer_rt[cx][cy] = [w_rm.buffer_address(), y.buffer_address(), i]
         kernels = [
             self._kernel(
                 "moe_grouped_reader.cpp",
@@ -530,7 +530,10 @@ class GroupedExperts:
                 ttnn.ReaderConfigDescriptor(),
             ),
             self._kernel(
-                "moe_grouped_writer.cpp", [kt, m, wrow, rb] + self._acc(w_rm, y), writer_rt, ttnn.WriterConfigDescriptor()
+                "moe_grouped_writer.cpp",
+                [kt, m, wrow, rb] + self._acc(w_rm, y) + [nc],
+                writer_rt,
+                ttnn.WriterConfigDescriptor(),
             ),
             self._kernel("moe_grouped_compute.cpp", [kt, kb, cpe, rb], [], self.mm_cfg),
         ]
@@ -578,24 +581,8 @@ class MoE(TtKolibri1SparseMoeBlock):
         super().__init__(device, moe)
         # The stub's _upload calls (see _upload below) left gate and up as ONE tile-pair-interleaved weight.
         self.w_gu, self.w_up = self.w_up, None
-        # Expert matmuls at HiFi4 (the stub uses HiFi2, which drops activation mantissa bits), except the
-        # compute-bound prefill gate/up (fused SwiGLU), at HiFi3.
-        self.gate_up_prefill_cfg = ttnn.init_device_compute_kernel_config(
-            device.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi3,
-            math_approx_mode=False,
-            fp32_dest_acc_en=True,
-            packer_l1_acc=True,
-        )
+        # Expert matmuls at HiFi4 (the stub uses HiFi2, which drops activation mantissa bits).
         self.hifi2 = self.hifi4
-        # Prefill down projection (compute-bound) at LoFi, fp32 dest kept.
-        self.down_prefill_cfg = ttnn.init_device_compute_kernel_config(
-            device.arch(),
-            math_fidelity=ttnn.MathFidelity.LoFi,
-            math_approx_mode=False,
-            fp32_dest_acc_en=True,
-            packer_l1_acc=True,
-        )
         self.router = Router(device, moe.gate)
         self.shared = SharedExpert(device, moe.shared_experts)
         for name in ("ws_gate", "ws_up", "ws_down", "w_router"):  # replaced by the two stubs above
@@ -620,7 +607,6 @@ class MoE(TtKolibri1SparseMoeBlock):
         )
         self.routed_gate_up = RoutedGateUp(device, self.w_gu, self.w_gu, self.n_local, self.inter, interleaved=True)
         self.grouped = GroupedExperts(device, self.w_gu, self.w_down, self.n_local, self.inter, self.top_k)
-        self.grid = g
 
     def _upload(self, t, shard_dim, dtype):
         """The stub uploads the routed gate, then up, each [hidden, n_exp * inter]. Hold the gate and upload
@@ -635,36 +621,13 @@ class MoE(TtKolibri1SparseMoeBlock):
         g, u, self._held_gate = self._held_gate, t, None
         k, n = g.shape
         gu = torch.stack([g.reshape(k, n // 32, 32), u.reshape(k, n // 32, 32)], dim=2).reshape(k, 2 * n)
+        # One zero tile column after each chip's shard. A shard row of 2 * n_local * inter / 32 tiles is a
+        # multiple of the 8 DRAM banks, so all K tiles of a weight column sat in one bank, and every core
+        # streaming the same column position (of any expert) queued on the same two banks; with the pad,
+        # consecutive K tiles of a column fall in consecutive banks. The kernels take the row stride from the
+        # tensor's width and never read the pad.
+        gu = torch.nn.functional.pad(gu.reshape(k, self.tp, -1), (0, ttnn.TILE_SIZE)).reshape(k, -1)
         return super()._upload(gu, shard_dim, dtype)
-
-    def _gate_up_prefill_mm(self, m_tiles):
-        """Fused gate/up on the full grid with the M tiles split evenly over the core rows in one round (ttnn's
-        default 8-tile M block leaves rows idle on the last round, e.g. 16 blocks over 10 rows)."""
-        g = self.grid
-        return ttnn.MinimalMatmulConfig(
-            M_block_size=-(-m_tiles // g.y),
-            K_block_size=8,
-            N_block_size=8,
-            subblock_h=1,
-            subblock_w=4,
-            compute_with_storage_grid_size=ttnn.CoreCoord(g.x, g.y),
-        )
-
-    def _down_prefill_mm(self, m_tiles):
-        """Prefill down projection on the full grid: minimal_matmul lays M along x when M > N (else along y);
-        each axis gets an even ceil(tiles / cores) block in one round (ttnn's default config left 10 of the
-        110 cores idle)."""
-        g, n_tiles = self.grid, self.w_down.shape[-1] // ttnn.TILE_SIZE
-        m_cores, n_cores = (g.x, g.y) if m_tiles > n_tiles else (g.y, g.x)
-        n_block = -(-n_tiles // n_cores)
-        return ttnn.MinimalMatmulConfig(
-            M_block_size=-(-m_tiles // m_cores),
-            K_block_size=8,
-            N_block_size=n_block,
-            subblock_h=1,
-            subblock_w=next(w for w in (4, 2, 1) if n_block % w == 0),
-            compute_with_storage_grid_size=ttnn.CoreCoord(g.x, g.y),
-        )
 
     def _routed_mask(self, weights):
         """[1, 1, 32, n_exp] routing weights (replicated) -> this chip's [1, 1, 1, n_local] row-major mask, non-zero
