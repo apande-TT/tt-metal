@@ -738,7 +738,12 @@ class DecoderLayer(TtKolibri1DecoderLayer):
         the norm's traffic, for the same input values; only the norm's output is now bf16)."""
         INVOCATIONS["decoder_layer"] += 1
         h = hidden_states
-        a = self.attn(self._norm(h, "input_layernorm"), position_ids, attention_mask, past_key_value)
+        # The attention reads its input as bf16: normalize a bf16 copy of the residual (typecast + bf16 norm, 105 MB
+        # at 4096 rows) instead of an fp32 norm whose output the attention then typecasts (147 MB).
+        hb = ttnn.typecast(h, ttnn.bfloat16)
+        x = self._norm(hb, "input_layernorm")
+        ttnn.deallocate(hb)
+        a = self.attn(x, position_ids, attention_mask, past_key_value)
         n = self._norm(a, "post_attn_norm")
         ttnn.deallocate(a)
         h = ttnn.add(h, n, dtype=h.dtype)
