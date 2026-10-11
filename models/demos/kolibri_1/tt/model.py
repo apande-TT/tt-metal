@@ -97,6 +97,39 @@ class Embedding(TtKolibri1Embedding):
         return super().__call__(input_ids, **kwargs)
 
 
+def wide_k_config(device, m_tiles: int, k_tiles: int, n_tiles: int):
+    """Program config for a small-M projection that streams its weight in wide K blocks. ttnn's default config for
+    these shapes walks K one or two tiles per multicast round (o_proj: 192 rounds, 136 us at 128 rows); blocks of 16
+    (one tile row of tokens: 1D, in0 multicast, one output column a core) or 8 (2D over the grid) K tiles stream
+    the same weight columns in a few rounds."""
+    g = device.compute_with_storage_grid_size()
+    kb = next(b for b in (16, 8, 4, 2, 1) if k_tiles % b == 0)
+    if m_tiles == 1:
+        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(g.x, g.y),
+            in0_block_w=kb,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            per_core_M=1,
+            per_core_N=1,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+        )
+    per_n = -(-n_tiles // g.x)
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=(g.x, g.y),
+        in0_block_w=max(1, kb // 2),
+        out_subblock_h=1,
+        out_subblock_w=next(w for w in (4, 2, 1) if per_n % w == 0),
+        per_core_M=-(-m_tiles // g.y),
+        per_core_N=per_n,
+        transpose_mcast=False,
+        fused_activation=None,
+        fuse_batch=True,
+    )
+
+
 class FP8Linear(TtKolibri1FP8Linear):
     def __call__(self, x, **kwargs):
         """The stub's column-parallel projection; at prefill sizes the matmul runs as a full-grid minimal_matmul
@@ -108,7 +141,8 @@ class FP8Linear(TtKolibri1FP8Linear):
             x = ttnn.typecast(x, ttnn.bfloat16)
         rows = x.shape[-2]
         if rows < 2048:
-            out = ttnn.linear(x, self.w, compute_kernel_config=self.mm_cfg)
+            pc = wide_k_config(self.device, rows // ttnn.TILE_SIZE, shape[-1] // ttnn.TILE_SIZE, self.w.shape[-1] // 32)
+            out = ttnn.linear(x, self.w, program_config=pc, compute_kernel_config=self.mm_cfg)
         else:
             g = self.device.compute_with_storage_grid_size()
             m_tiles, n_tiles = rows // ttnn.TILE_SIZE, self.w.shape[-1] // ttnn.TILE_SIZE
@@ -164,8 +198,10 @@ class SharedExpert(TtKolibri1MLP):
         """The stub's forward without its all_reduce: x [1, 1, N, hidden] bf16 -> this chip's partial output, which
         the MoE block adds to its routed partial so ONE all_reduce sums both."""
         INVOCATIONS["m_l_p"] += 1
-        gu = ttnn.linear(x, self.w_gu, compute_kernel_config=self.mm_cfg)
-        rows, n = gu.shape[-2], gu.shape[-1] // 2
+        rows = x.shape[-2]
+        pc = wide_k_config(self.device, rows // 32, x.shape[-1] // 32, self.w_gu.shape[-1] // 32) if rows < 2048 else None
+        gu = ttnn.linear(x, self.w_gu, program_config=pc, compute_kernel_config=self.mm_cfg)
+        n = gu.shape[-1] // 2
         g = ttnn.slice(gu, [0, 0, 0, 0], [1, 1, rows, n])
         u = ttnn.slice(gu, [0, 0, 0, n], [1, 1, rows, 2 * n])
         ttnn.deallocate(gu)
