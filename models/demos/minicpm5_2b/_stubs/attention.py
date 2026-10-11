@@ -159,9 +159,12 @@ class TtAttention:
             out = self._prefill_mm(attn, self.wo)
             return ttnn.reshape(out, (b, seq, out.shape[-1]))
         else:
-            q = ttnn.linear(x, self.wq, compute_kernel_config=self.compute_cfg)
-            k = ttnn.linear(x, self.wk, compute_kernel_config=self.compute_cfg)
-            v = ttnn.linear(x, self.wv, compute_kernel_config=self.compute_cfg)
+            # One fused-QKV projection for the B decode rows, sliced into q / k / v.
+            qkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.compute_cfg)
+            nq, nkv = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
+            q = ttnn.slice(qkv, (0, 0, 0), (1, b, nq))
+            k = ttnn.slice(qkv, (0, 0, nq), (1, b, nq + nkv))
+            v = ttnn.slice(qkv, (0, 0, nq + nkv), (1, b, nq + 2 * nkv))
             # One token per row: [B, 1, n*D] splits straight into the GQA layout [B, kv, groups, D]
             # (head h = g * groups + j), so the cache is attended per KV head with no repeat.
             q = ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups, self.head_dim))
