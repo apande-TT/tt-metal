@@ -306,7 +306,22 @@ class Attention(TtKolibri1Attention):
             )
             rotated = ttnn.reshape(rotated, shape)
         else:
-            rotated = ttnn.matmul(x, self.rot, compute_kernel_config=self.mm_cfg)
+            # Decode q / k [1, B, heads, D]: heads pad to a whole tile per user, so fusing the batch into M (over the
+            # padded rows) is one [B * 32, D] x [D, D] product over the grid (as B batched products: 4 cores, 60 us).
+            g = self.device.compute_with_storage_grid_size()
+            m_tiles = x.padded_shape[-2] * (x.volume() // (shape[-2] * d)) // ttnn.TILE_SIZE
+            pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                compute_with_storage_grid_size=(g.x, g.y),
+                in0_block_w=d // ttnn.TILE_SIZE,
+                out_subblock_h=1,
+                out_subblock_w=min(4, d // ttnn.TILE_SIZE),
+                per_core_M=-(-m_tiles // (g.x * g.y)),
+                per_core_N=d // ttnn.TILE_SIZE,
+                fuse_batch=True,
+                fused_activation=None,
+                mcast_in0=False,
+            )
+            rotated = ttnn.matmul(x, self.rot, program_config=pc, compute_kernel_config=self.mm_cfg)
         return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(rotated, sin))
 
     def _qk(self, q, k, st):
