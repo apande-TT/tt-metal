@@ -171,12 +171,14 @@ class Router(TtKolibri1Router):
         self.device = device
 
     def __call__(self, x, **kwargs):
-        """The stub's fp32 logits; one tile row of tokens (decode) streams the weight in wide K blocks (ttnn's default
-        1D config multicast the fp32 rows two K tiles a round: 40 rounds, 40 us on the 12 output-column cores)."""
+        """The stub's fp32 logits with the weight streamed in wide K blocks: ttnn's default configs multicast the fp32 rows
+        one or two K tiles a round (decode: 40 rounds, 40 us on the 12 output-column cores; the 128-token prefill: 80
+        rounds, 61 us on 24 cores)."""
         INVOCATIONS["router"] += 1
-        if x.shape[-2] != ttnn.TILE_SIZE:
+        rows = x.shape[-2]
+        if rows % ttnn.TILE_SIZE or rows > 1024:
             return super().__call__(x, **kwargs)
-        pc = wide_k_config(self.device, 1, x.shape[-1] // ttnn.TILE_SIZE, self.w.shape[-1] // ttnn.TILE_SIZE)
+        pc = wide_k_config(self.device, rows // ttnn.TILE_SIZE, x.shape[-1] // ttnn.TILE_SIZE, self.w.shape[-1] // ttnn.TILE_SIZE)
         return ttnn.linear(x, self.w, dtype=ttnn.float32, program_config=pc, compute_kernel_config=self.cfg)
 
 
@@ -203,6 +205,20 @@ class SharedExpert(TtKolibri1MLP):
         if self.tp > 1:
             out = ttnn.all_reduce(out, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
         return ttnn.reshape(out, shape)
+
+    def partial_from_gu(self, gu):
+        """This chip's [gate | up] pre-activations [1, 1, N, 2 * inter / tp] (fp32, from the decode router matmul that
+        also computes them) -> its partial output, bf16."""
+        INVOCATIONS["m_l_p"] += 1
+        rows, n = gu.shape[-2], gu.shape[-1] // 2
+        g = ttnn.slice(gu, [0, 0, 0, 0], [1, 1, rows, n])
+        u = ttnn.slice(gu, [0, 0, 0, n], [1, 1, rows, 2 * n])
+        act = ttnn.multiply(ttnn.silu(g), u)
+        ttnn.deallocate(g)
+        ttnn.deallocate(u)
+        out = ttnn.linear(act, self.w_down, dtype=ttnn.bfloat16, compute_kernel_config=self.mm_cfg)
+        ttnn.deallocate(act)
+        return out
 
     def partial(self, x):
         """The stub's forward without its all_reduce: x [1, 1, N, hidden] bf16 -> this chip's partial output, which
@@ -1138,6 +1154,16 @@ class MoE(TtKolibri1SparseMoeBlock):
         for name in ("ws_gate", "ws_up", "ws_down", "w_router"):  # replaced by the two stubs above
             ttnn.deallocate(getattr(self, name))
             setattr(self, name, None)
+        # Decode: the router logits and the shared expert's gate / up come from ONE matmul of the fp32 normed state
+        # against [router weight | this chip's shared gate | its up] (12 + 8 output tiles on 20 cores at the router's
+        # per-core cost; the shared gate/up was its own 9.4 us matmul on 8 cores).
+        r_w = moe.gate.weight.float().t()  # [hidden, n_exp], replicated
+        s_gate = moe.shared_experts.gate_proj.dequantize(torch.float32).t()  # [hidden, inter], TP-split by columns
+        s_up = moe.shared_experts.up_proj.dequantize(torch.float32).t()
+        tp, k = self.shared.tp, r_w.shape[0]
+        fused = torch.cat([r_w.unsqueeze(1).expand(k, tp, -1), s_gate.reshape(k, tp, -1), s_up.reshape(k, tp, -1)], dim=2)
+        self.n_router = r_w.shape[1]
+        self.w_rgu_dec = self.shared._upload(fused.reshape(k, -1), -1)
         self.routed_gate_up = RoutedGateUp(device, self.w_gu, self.w_gu, self.n_local, self.inter, interleaved=True)
         self.routed_down = RoutedDown(device, self.w_down, self.n_local, self.inter)
         self.grouped = GroupedExperts(device, self.w_gu, self.w_down, self.n_local, self.inter, self.top_k)
@@ -1197,8 +1223,9 @@ class MoE(TtKolibri1SparseMoeBlock):
         ttnn.generic_op([scores, out], ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
         return out
 
-    def routing_weights(self, x):
-        logits = self.router(x)
+    def routing_weights(self, x, logits=None):
+        if logits is None:
+            logits = self.router(x)
         scores = ttnn.add(logits, self.router_bias)
         chosen = self._chosen(scores)
         weights = ttnn.multiply(ttnn.sigmoid(logits), chosen)
@@ -1216,14 +1243,28 @@ class MoE(TtKolibri1SparseMoeBlock):
         shape = list(hidden_states.shape)
         x_in = ttnn.reshape(hidden_states, [1, 1, -1, shape[-1]])
         x = x_in if x_in.dtype == ttnn.bfloat16 else ttnn.typecast(x_in, ttnn.bfloat16)
-        weights = self.routing_weights(x_in if self.router_fp32_input else x)
+        decode = x.shape[-2] == ttnn.TILE_SIZE
+        if decode:  # router logits + the shared expert's gate / up in one matmul (see __init__)
+            INVOCATIONS["router"] += 1
+            nr, n_gu = self.n_router, self.w_rgu_dec.shape[-1]
+            pc = wide_k_config(self.device, 1, x_in.shape[-1] // ttnn.TILE_SIZE, n_gu // ttnn.TILE_SIZE)
+            fused = ttnn.linear(
+                x_in, self.w_rgu_dec, dtype=ttnn.float32, program_config=pc, compute_kernel_config=self.router.cfg
+            )
+            logits = ttnn.slice(fused, [0, 0, 0, 0], [1, 1, ttnn.TILE_SIZE, nr])
+            gu = ttnn.slice(fused, [0, 0, 0, nr], [1, 1, ttnn.TILE_SIZE, n_gu])
+            ttnn.deallocate(fused)
+            weights = self.routing_weights(None, logits)
+        else:
+            weights = self.routing_weights(x_in if self.router_fp32_input else x)
         w = ttnn.mesh_partition(weights, dim=3, cluster_axis=self.tp_axis) if self.tp > 1 else weights
         # The routed and the shared expert are both row-parallel over the chips: their partial sums are added here and
         # reduced once (the shared stub's own all_reduce made it two collectives per layer).
-        if x.shape[-2] == ttnn.TILE_SIZE:  # decode: only the routed experts' columns and rows
+        if decode:  # only the routed experts' columns and rows
             mask = self._routed_mask(w)
             act = self.routed_gate_up(x, mask, w)  # persistent, not freed
-            shared = self.shared.partial(x)
+            shared = self.shared.partial_from_gu(gu)
+            ttnn.deallocate(gu)
             total = self.routed_down(act, mask, shared)  # routed experts + shared expert, summed in fp32
             ttnn.deallocate(mask)
         else:  # prefill: each expert over the tokens routed to it
