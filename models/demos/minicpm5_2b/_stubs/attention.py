@@ -147,10 +147,19 @@ class TtAttention:
                 new_kv = ttnn.add(old, ttnn.subtract(new_kv, old))
                 new_kv = ttnn.to_memory_config(ttnn.reshape(new_kv, (1, b, self.n_kv_heads, self.head_dim)), shard)
                 ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
-            scores = ttnn.matmul(q, kv_cache.k, transpose_b=True, compute_kernel_config=self.compute_cfg)
+            d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
+            scores = ttnn.matmul(
+                q,
+                kv_cache.k,
+                transpose_b=True,
+                program_config=self._decode_bmm_cfg(d_t, c_t),
+                compute_kernel_config=self.compute_cfg,
+            )
             scores = ttnn.add(ttnn.multiply(scores, self.scale), ctx.mask)
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg)
-            attn = ttnn.matmul(probs, kv_cache.v, compute_kernel_config=self.compute_cfg)
+            attn = ttnn.matmul(
+                probs, kv_cache.v, program_config=self._decode_bmm_cfg(c_t, d_t), compute_kernel_config=self.compute_cfg
+            )
             attn = ttnn.reshape(attn, (1, b, self.n_heads * self.head_dim))
         return ttnn.linear(attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
@@ -181,6 +190,19 @@ class TtAttention:
             fuse_batch=True,
             fused_activation=None,
             mcast_in0=False,
+        )
+
+    def _decode_bmm_cfg(self, k_t, n_t):
+        """Decode attention bmm over the B * n_kv head groups (one tile row each, cache operand batched):
+        one tile row per core, in0_block_w spanning all of K so each tile is one uninterrupted accumulation."""
+        grid = self.device.compute_with_storage_grid_size()
+        return ttnn.MatmulMultiCoreReuseProgramConfig(
+            compute_with_storage_grid_size=(grid.x, grid.y),
+            in0_block_w=k_t,
+            out_subblock_h=1,
+            out_subblock_w=max(w for w in range(1, 5) if n_t % w == 0),
+            per_core_M=1,
+            per_core_N=n_t,
         )
 
     def _rope(self, x, cos, sin, program_config=None):
