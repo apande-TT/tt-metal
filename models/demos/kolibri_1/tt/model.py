@@ -1347,10 +1347,16 @@ class Sampler:
         last = ttnn.eq(self.ranks, ttnn.subtract(ttnn.maximum(n_keep, 1.0), 1.0))
         cut = ttnn.sum(ttnn.multiply(vals, last), dim=-1, keepdim=True)
         q = ttnn.multiply(e, ttnn.ge(vals, cut))
-        # The k candidates in token-id order: largest-first on -id is ascending id; q follows by gather.
-        neg_id, order = ttnn.topk(
-            ttnn.neg(ttnn.typecast(tok_ids, ttnn.float32)), k=self.top_k, dim=-1, largest=True, sorted=True
+        # The k candidates in token-id order: largest-first on -id is ascending id; q's bits ride along as the sort's
+        # uint32 labels (ttnn.gather of q by the sort's order ran on one core, 116 us).
+        neg_id, q_bits = ttnn.topk(
+            ttnn.neg(ttnn.typecast(tok_ids, ttnn.float32)),
+            k=self.top_k,
+            dim=-1,
+            largest=True,
+            sorted=True,
+            indices_tensor=ttnn.bitcast(q, ttnn.uint32),
         )
         # Positions whose CDF is <= u*z precede the sampled token (the CDF only rises at kept tokens).
-        at = self._at(ttnn.gather(q, -1, order), u)
+        at = self._at(ttnn.bitcast(q_bits, ttnn.float32), u)
         return ttnn.neg(ttnn.sum(ttnn.multiply(neg_id, ttnn.eq(self.ranks, at)), dim=-1, keepdim=True))
