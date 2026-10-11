@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Weight sender of the two-limb linear (limb_linear.cpp), on one core outside the compute rectangle. For every
-// work unit round it streams its column group's slice of the weight (Ntg columns from n0) once, column block (nb tiles) outer and K chunk (kc tiles) inner, each
-// chunk read from DRAM into one of the two cb 1 slots (tile kk * nb + c = w[k0 + kk, n0 + c]) and multicast to
-// the same L1 address on every compute core once all of them have freed that slot. The sender's own cb 1 is
+// work unit round it streams its column group's slice of the weight (Ntg columns from n0) once, column block
+// (nb tiles) outer and K chunk (kc tiles) inner, each chunk read from DRAM into one of the two cb 1 slots
+// (tile kk * nb + c = w[k0 + kk, n0 + c]) and multicast to the same L1 address on every compute core of its
+// group once all of them have freed that slot. The sender's own cb 1 is
 // only a staging ring (no consumer here): it alternates the two slots at the receivers' cb 1 addresses.
 
 #include "api/dataflow/dataflow_api.h"
