@@ -352,7 +352,8 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None):
     for i, mm in enumerate(mms):
         dn = mm(lead)
         # the trailing limbs' first two products go into the fused tail; any further ones are added after it
-        rest = [lambda p=part, mm=lo_mms[i] if k == 0 else mm: mm(p) for k, part in enumerate(parts[1:3])]
+        # (both at the trailing-limb fidelity: the third limb is ~2^-16 of x)
+        rest = [lambda p=part, mm=lo_mms[i]: mm(p) for part in parts[1:3]]
         y = _guarded(exs[i], dn, nn_mms[i](neg_lead), a_norm, b_norms[i], *rest)
         exs[i] = None
         acc = _LaneAcc()

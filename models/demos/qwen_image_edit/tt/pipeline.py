@@ -105,7 +105,7 @@ class TtQwenImageEditPipeline:
         self.fused_tail = guard_tail if precise else None
         # and their lead limb's 8 exact lanes formed in one pass
         self.lane_split = lanes_ttl.lanes8 if precise else None
-        # and their trailing (lo) limb's product -- and the guard's tie-break product -- at HiFi2
+        # and their trailing limbs' products -- and the guard's tie-break product -- at HiFi2
         self.lo_fidelity = ttnn.MathFidelity.HiFi2 if precise else ttnn.MathFidelity.HiFi4
         # and their TP all-reduce's sum of the gathered float32 partials in one pass (no slice copies)
         self.sum_parts = sum_parts if precise else None
