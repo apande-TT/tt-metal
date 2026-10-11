@@ -135,8 +135,9 @@ class TtAttention:
         else:
             # One token per row: [B, 1, n*D] splits straight into the GQA layout [B, kv, groups, D]
             # (head h = g * groups + j), so the cache is attended per KV head with no repeat.
-            q = self._rope(ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups, self.head_dim)), cos, sin)
-            k = self._rope(ttnn.reshape(k, (b, self.n_kv_heads, 1, self.head_dim)), cos, sin)
+            rope_cfg = self._decode_rope_cfg()
+            q = self._rope(ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups, self.head_dim)), cos, sin, rope_cfg)
+            k = self._rope(ttnn.reshape(k, (b, self.n_kv_heads, 1, self.head_dim)), cos, sin, rope_cfg)
             v = ttnn.reshape(v, (b, self.n_kv_heads, 1, self.head_dim))
             # Write only row b's slot pos[b] in place with old + (new - old): the value the one-hot blend
             # cache + onehot * (new - cache) leaves there, without touching the rest of the cache.
@@ -164,8 +165,26 @@ class TtAttention:
             use_height_and_width_as_shard_shape=True,
         )
 
-    def _rope(self, x, cos, sin):
-        x_rot = ttnn.matmul(x, self.rot, compute_kernel_config=self.compute_cfg)
+    def _decode_rope_cfg(self):
+        """Decode rotate-half with the B * n_kv head groups folded into M: one [<=32, D] @ [D, D] tile row per core.
+
+        in0_block_w spans all of K, so each tile is one uninterrupted accumulation."""
+        grid = self.device.compute_with_storage_grid_size()
+        d_t = self.head_dim // 32
+        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(grid.x, grid.y),
+            in0_block_w=d_t,
+            out_subblock_h=1,
+            out_subblock_w=d_t,
+            per_core_M=1,
+            per_core_N=d_t,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=False,
+        )
+
+    def _rope(self, x, cos, sin, program_config=None):
+        x_rot = ttnn.matmul(x, self.rot, program_config=program_config, compute_kernel_config=self.compute_cfg)
         return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(x_rot, sin))
 
     def _past_kv(self, past_key_values):
