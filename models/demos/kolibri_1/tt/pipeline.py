@@ -88,9 +88,6 @@ class KolibriPipeline:
                 tp_axis=self.head.tp_axis,
             )
         self.rope = self._share_rope_tables()
-        self.positions = self._up(
-            torch.arange(self.capacity, dtype=torch.float32).expand(1, 1, self.batch, -1).contiguous(), ttnn.float32
-        )
         self.prompt_len = None
         self._prefill_hn = None
         log(
@@ -156,10 +153,6 @@ class KolibriPipeline:
         sin = ttnn.embedding(pos_u32, self.rope.sin_table, layout=ttnn.TILE_LAYOUT)
         return ttnn.reshape(cos, shape), ttnn.reshape(sin, shape)
 
-    def _uniform(self, pos_col):
-        """Each user's uniform for the position it samples at: an exact one-hot select from the table."""
-        return ttnn.sum(ttnn.multiply(ttnn.eq(self.positions, pos_col), self.u_table), dim=-1, keepdim=True)
-
     def _commit(self, tok):
         """Sampled ids [1, 1, B, 1] -> the resident token buffer the next decode step embeds."""
         t = ttnn.typecast(tok, ttnn.uint32)
@@ -171,7 +164,7 @@ class KolibriPipeline:
         of the logits; the gathered logits are the step's output."""
         local = self.head.local(x)
         logits = self.head.gather(local)
-        tok = self.sampler(local if self.sampler.sharded else logits, self._uniform(pos_col))
+        tok = self.sampler(local if self.sampler.sharded else logits, self.u_table, pos_col)
         return logits, tok
 
     def _stack(self, h, st):
@@ -212,7 +205,7 @@ class KolibriPipeline:
     def decode_forward(self):
         """One token per user at its current position; advances the resident position counters."""
         B, H = self.batch, self.hidden
-        cos, sin = self._rope_rows(self.pos_u32, [1, B, 1, self.head_dim])
+        cos, sin = self._rope_rows(self.pos_u32, [1, 1, B, self.head_dim])  # one user per row (Attention._qk_prep)
         st = StepState("decode", cos, sin, self.cur_pos)
         h = ttnn.typecast(ttnn.reshape(self.embed(self.tok_u32), [1, 1, B, H]), ttnn.float32)
         logits, tok = self._head_sample(self.norm(self._stack(h, st)), self.pos_col)

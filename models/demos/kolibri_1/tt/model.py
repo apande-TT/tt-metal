@@ -333,6 +333,18 @@ class Attention(TtKolibri1Attention):
         self.sdpa_decode_cfg = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=self.grid, q_chunk_size=0, k_chunk_size=0, exp_approx_mode=False
         )
+        # Decode q/k prep (tt/kernels/qk_prep_*.cpp): the q / k norm weights as [32, D] tiles, every row the weight.
+        mapper = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
+        self.qk_w = [
+            ttnn.from_torch(
+                norm.weight.float().reshape(1, 1, 1, -1).expand(1, 1, ttnn.TILE_SIZE, -1).contiguous(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=mapper,
+            )
+            for norm in (torch_module.q_norm, torch_module.k_norm)
+        ]
         # fp32 accumulation in SDPA (the stub's prefill config accumulates in bf16): the reference
         # attention runs in fp32, and 50 layers of chaotic top-6 routing amplify every rounding.
         self.sdpa_cfg = ttnn.init_device_compute_kernel_config(
@@ -446,6 +458,61 @@ class Attention(TtKolibri1Attention):
             compute_with_storage_grid_size=ttnn.CoreCoord(g.x, g.y),
         )
 
+    def _qk_prep(self, xqkv, cos, sin):
+        """Decode xqkv [1, 1, B, (nq + 2 nkv) * D] (one user per row) -> the same with every q / k head RMS-normed
+        (its own weight) and, on sliding layers, rotated by the users' cos / sin rows [1, 1, B, D]; v unchanged.
+        One unit per (32-user tile row, head) on its own core (tt/kernels/qk_prep_*.cpp): in this layout the per-head
+        norm is a row reduction over the head's tile columns and rotate-half pairs tile t with t +- D / 64. Replaces
+        the split heads' interleaved round trip, two rms_norms and per tensor a rotate-half matmul, two multiplies
+        and an add over heads padded to 32 rows."""
+        B, n = xqkv.shape[-2], xqkv.shape[-1]
+        w, nt = self.head_dim // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        heads = self.n_local_heads + 2 * self.n_local_kv
+        out = ttnn.empty([1, 1, B, n], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=DRAM)
+        units = [(tr, h) for tr in range(B // ttnn.TILE_SIZE) for h in range(heads)]
+        g = self.device.compute_with_storage_grid_size()
+        xy = [(i % g.x, i // g.x) for i in range(len(units))]
+        cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in xy])
+        rope = 1 if self.is_sliding else 0
+        cs, sn = (cos, sin) if rope else (xqkv, xqkv)
+        reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        for (tr, h), (cx, cy) in zip(units, xy):
+            kind = 0 if h < self.n_local_heads + self.n_local_kv else 1
+            wt = self.qk_w[0 if h < self.n_local_heads else 1]
+            reader_rt[cx][cy] = [xqkv.buffer_address(), wt.buffer_address(), cs.buffer_address(), sn.buffer_address(), kind, tr, h * w]
+            compute_rt[cx][cy] = [kind]
+            writer_rt[cx][cy] = [out.buffer_address(), tr, h * w]
+        bf, f32 = 2048, 4096
+        cb = RoutedGateUp._cb
+        cbs = [cb(i, ttnn.bfloat16, bf, w, cores) for i in (0, 1, 2, 3, 8, 9, 10, 16)]
+        cbs += [cb(4, ttnn.bfloat16, bf, 1, cores), cb(5, ttnn.float32, f32, w, cores)]
+        cbs += [cb(6, ttnn.float32, f32, 1, cores), cb(7, ttnn.float32, f32, w, cores)]
+        scaler = struct.unpack("<I", struct.pack("<f", 1.0 / self.head_dim))[0] >> 16  # bf16 bits (exact: 2^-7)
+        eps = struct.unpack("<I", struct.pack("<f", self.eps))[0]
+        acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+
+        def kernel(name, ct, rt, config):
+            return ttnn.KernelDescriptor(
+                kernel_source=str(_KERNELS / name),
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=cores,
+                compile_time_args=ct,
+                runtime_args=rt,
+                config=config,
+            )
+
+        compute_cfg = ttnn.ComputeConfigDescriptor(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
+        )
+        kernels = [
+            kernel("qk_prep_reader.cpp", [w, nt, rope, scaler] + acc(xqkv, self.qk_w[0], cs, sn), reader_rt, ttnn.ReaderConfigDescriptor()),
+            kernel("qk_prep_compute.cpp", [w, rope, eps], compute_rt, compute_cfg),
+            kernel("qk_prep_writer.cpp", [w, nt] + acc(out), writer_rt, ttnn.WriterConfigDescriptor()),
+        ]
+        io = [xqkv] + self.qk_w + ([cos, sin] if rope else []) + [out]
+        ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+        return out
+
     def _head_tiles(self, mode, src, outs, B, rt, hkv):
         """tt/kernels/head_tiles.cpp: the prefill head split (mode 0: src [B, 1, T, (nq + 2 nkv) * D] -> outs q, k, v
         [B, heads, T, D]) or merge (mode 1: src [B, nq, T, D] -> outs [y [B, 1, T, nq * D]]) as whole-tile copies over
@@ -557,14 +624,13 @@ class Attention(TtKolibri1Attention):
         pc = wide_k_config(self.device, x.shape[-2] // ttnn.TILE_SIZE, x.shape[-1] // ttnn.TILE_SIZE, self.wqkv.shape[-1] // 32)
         xqkv = ttnn.linear(x, self.wqkv, program_config=pc, compute_kernel_config=self.mm_cfg)
         ttnn.deallocate(x)
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
-            xqkv, num_heads=self.n_local_heads, num_kv_heads=self.n_local_kv, memory_config=self.heads_mem
-        )
+        xp = self._qk_prep(xqkv, st.cos, st.sin)  # q / k normed (+ RoPE) before the head split
         ttnn.deallocate(xqkv)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
+            xp, num_heads=self.n_local_heads, num_kv_heads=self.n_local_kv, memory_config=self.heads_mem
+        )
+        ttnn.deallocate(xp)
         q = ttnn.to_memory_config(q, DRAM)
-        k = ttnn.to_memory_config(k, DRAM)
-        q, k = self._qk(q, k, st)
-        k = ttnn.to_memory_config(k, self.heads_mem)
         ttnn.experimental.paged_update_cache(self.k_cache, k, update_idxs_tensor=st.cur_pos)
         ttnn.experimental.paged_update_cache(self.v_cache, v, update_idxs_tensor=st.cur_pos)
         ttnn.deallocate(k)
@@ -1271,20 +1337,13 @@ class Sampler:
         self.top_k, self.top_p, self.temperature = int(top_k), float(top_p), float(temperature)
         self.k_pad = -(-self.top_k // 32) * 32
         mapper = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
-        self.ranks = ttnn.from_torch(
-            torch.arange(self.top_k, dtype=torch.float32).expand(1, 1, batch, -1).contiguous(),
-            dtype=ttnn.float32,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
-            mesh_mapper=mapper,
-        )
-        # top_p count kernel (tt/kernels/topp_count.cpp): one core per user row.
+        # The merge and tail kernels (tt/kernels/topk_merge.cpp, sample_tail.cpp): one core per user row.
         g = device.compute_with_storage_grid_size()
         self.count_xy = [(i % g.x, i // g.x) for i in range(batch)]
         self.count_cores = ttnn.CoreRangeSet(
             [ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in self.count_xy]
         )
-        self.top_p_bits = struct.unpack("<I", struct.pack("<f", self.top_p))[0]
+        self.top_p_q32 = min(round(self.top_p * 2**32), 2**32 - 1)
         grid = device.compute_with_storage_grid_size()
         # Vocab-sharded logits (tp chips, each its contiguous vocab / tp slice): each chip runs the tree over its own
         # slice, in groups of 10 tiles so its 1000 tiles spread over 100 cores, and the chips' top-k lists are
@@ -1376,76 +1435,40 @@ class Sampler:
             x, labels = ttnn.experimental.view(x, [1, 1, B, n]), ttnn.experimental.view(labels, [1, 1, B, n])
         return ttnn.topk(x, k=self.top_k, dim=-1, largest=True, sorted=True, indices_tensor=labels)
 
-    def _n_keep(self, p):
-        """p [1, 1, B, k] fp32 (descending) -> n_keep [1, 1, B, 1] fp32: how many leading candidates have an
-        exclusive cumulative probability below top_p, the sums taken one by one in fp32 (tt/kernels/topp_count.cpp)."""
-        B = p.shape[-2]
+    def _tail(self, vals, e, ids, u_table, col):
+        """vals / e = exp(vals - vals[:, :1]) / token ids [1, 1, B, k] (descending), u_table [1, 1, B, C], col [1, 1, B, 1]
+        (each user's position, fp32) -> token ids [1, 1, B, 1] fp32 (exact integers): top_p cut, the kept candidates
+        in token-id order and the inverse CDF at u_table[b, col[b]], one core per user row with exact integer sums
+        (tt/kernels/sample_tail.cpp). Replaces ~20 small ops, among them a sort on -id that carried the kept weights
+        as uint32 labels: ttnn.topk moves labels through a 19-bit path, which truncated them to 10 mantissa bits (the
+        token ids fit) and put u on the wrong side of a 1.5e-5 CDF edge."""
+        B, k = vals.shape[-2], vals.shape[-1]
         out = ttnn.empty([1, 1, B, 1], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
         rt = ttnn.RuntimeArgs()
+        args = (e, vals, ids, u_table, col, out)
         for i, (cx, cy) in enumerate(self.count_xy):
-            rt[cx][cy] = [p.buffer_address(), out.buffer_address(), i]
+            rt[cx][cy] = [t.buffer_address() for t in args] + [i]
         kernel = ttnn.KernelDescriptor(
-            kernel_source=str(_KERNELS / "topp_count.cpp"),
+            kernel_source=str(_KERNELS / "sample_tail.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=self.count_cores,
-            compile_time_args=[self.top_k // ttnn.TILE_SIZE, self.top_p_bits]
-            + [a for t in (p, out) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            compile_time_args=[k // ttnn.TILE_SIZE, u_table.shape[-1] // ttnn.TILE_SIZE, self.top_p_q32]
+            + [a for t in args for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
             runtime_args=rt,
             config=ttnn.ReaderConfigDescriptor(),
         )
-        cb = RoutedGateUp._cb(0, ttnn.float32, 64 + (self.top_k // ttnn.TILE_SIZE) * 128 + 64, 1, self.count_cores)
-        ttnn.generic_op([p, out], ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
+        scratch = 64 + 3 * k * 4 + 3 * 64 + k * 4 + 2 * k * 8
+        cb = RoutedGateUp._cb(0, ttnn.uint32, -(-scratch // 32) * 32, 1, self.count_cores)
+        ttnn.generic_op(list(args), ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
         return out
 
-    def _at(self, q, u):
-        """q [1, 1, B, k] fp32 (kept weights in token-id order), u [1, 1, B, 1] -> at [1, 1, B, 1] fp32: how many
-        positions have an inclusive cumulative sum <= u * z, z the total, the sums taken one by one in fp32
-        (tt/kernels/sample_at.cpp; host_sample's cumsum is fp64, and the triangle-matmul scan this replaces was off
-        by up to 2.4e-4, which put u on the wrong side of a CDF edge on some trajectories)."""
-        B = q.shape[-2]
-        out = ttnn.empty([1, 1, B, 1], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
-        rt = ttnn.RuntimeArgs()
-        for i, (cx, cy) in enumerate(self.count_xy):
-            rt[cx][cy] = [q.buffer_address(), u.buffer_address(), out.buffer_address(), i]
-        kernel = ttnn.KernelDescriptor(
-            kernel_source=str(_KERNELS / "sample_at.cpp"),
-            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
-            core_ranges=self.count_cores,
-            compile_time_args=[self.top_k // ttnn.TILE_SIZE]
-            + [a for t in (q, u, out) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
-            runtime_args=rt,
-            config=ttnn.ReaderConfigDescriptor(),
-        )
-        row_bytes = (self.top_k // ttnn.TILE_SIZE) * 128  # the row's two 64 B face rows per tile
-        cb = RoutedGateUp._cb(0, ttnn.float32, 64 + row_bytes + 64 + 64, 1, self.count_cores)
-        ttnn.generic_op([q, u, out], ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
-        return out
-
-    def __call__(self, logits, u):
-        """logits [1, 1, B, V] fp32 (this chip's [1, 1, B, V / tp] slice when sharded), u [1, 1, B, 1] fp32 -> token
-        ids [1, 1, B, 1] fp32 (exact integers), the same on every chip."""
+    def __call__(self, logits, u_table, col):
+        """logits [1, 1, B, V] fp32 (this chip's [1, 1, B, V / tp] slice when sharded), u_table [1, 1, B, C] fp32 (each
+        user's uniform per position), col [1, 1, B, 1] fp32 (the position each user samples at) -> token ids [1, 1, B, 1]
+        fp32 (exact integers), the same on every chip."""
         x = logits if self.temperature == 1.0 else ttnn.multiply(logits, 1.0 / self.temperature)
         vals, tok_ids = self._top_k(x)
         B = vals.shape[-2]
         vmax = ttnn.slice(vals, [0, 0, 0, 0], [1, 1, B, 1])
         e = ttnn.exp(ttnn.subtract(vals, vmax))
-        p = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True))
-        # The top_p cut from exact exclusive sums (the triangle-matmul scan was off by 3.4e-4 median / 8.6e-4 max here,
-        # enough to flip the 0.97 cut against the host rule: e2e device sampler != host sampler at sample 4, step 100).
-        n_keep = self._n_keep(p)
-        last = ttnn.eq(self.ranks, ttnn.subtract(ttnn.maximum(n_keep, 1.0), 1.0))
-        cut = ttnn.sum(ttnn.multiply(vals, last), dim=-1, keepdim=True)
-        q = ttnn.multiply(e, ttnn.ge(vals, cut))
-        # The k candidates in token-id order: largest-first on -id is ascending id; q's bits ride along as the sort's
-        # uint32 labels (ttnn.gather of q by the sort's order ran on one core, 116 us).
-        neg_id, q_bits = ttnn.topk(
-            ttnn.neg(ttnn.typecast(tok_ids, ttnn.float32)),
-            k=self.top_k,
-            dim=-1,
-            largest=True,
-            sorted=True,
-            indices_tensor=ttnn.bitcast(q, ttnn.uint32),
-        )
-        # Positions whose CDF is <= u*z precede the sampled token (the CDF only rises at kept tokens).
-        at = self._at(ttnn.bitcast(q_bits, ttnn.float32), u)
-        return ttnn.neg(ttnn.sum(ttnn.multiply(neg_id, ttnn.eq(self.ranks, at)), dim=-1, keepdim=True))
+        return self._tail(vals, e, tok_ids, u_table, col)
