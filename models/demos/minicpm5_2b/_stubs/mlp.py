@@ -41,6 +41,25 @@ class TtMlp:
         self.w_up = _w(torch_module.up_proj)
         self.w_down = _w(torch_module.down_proj)
 
+    def _mm(self, x, w):
+        """Many-row (prefill) gate/up projection on minimal_matmul's small CBs, which span the full grid under fp32
+        accumulation. K_block is all of K, so each tile is one uninterrupted K-order accumulation as in ttnn.linear."""
+        grid = self.device.compute_with_storage_grid_size()
+        return ttnn.experimental.minimal_matmul(
+            x,
+            w,
+            config=ttnn.MinimalMatmulConfig(
+                M_block_size=2,
+                K_block_size=w.shape[-2] // 32,
+                N_block_size=2,
+                subblock_h=2,
+                subblock_w=2,
+                compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
+            ),
+            memory_config=self.mem,
+            compute_kernel_config=self.compute_cfg,
+        )
+
     def __call__(self, x, *args, **kwargs):
         if not isinstance(x, ttnn.Tensor):
             x = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
@@ -51,14 +70,22 @@ class TtMlp:
             for d in in_shape[:-1]:
                 rows *= d
             x = ttnn.reshape(x, (1, 1, rows, in_shape[-1]))
-        gate = ttnn.linear(
-            x, self.w_gate, activation="silu", memory_config=self.mem, compute_kernel_config=self.compute_cfg
-        )
-        up = ttnn.linear(x, self.w_up, memory_config=self.mem, compute_kernel_config=self.compute_cfg)
-        h = ttnn.multiply(gate, up, memory_config=self.mem)
-        ttnn.deallocate(gate)
-        ttnn.deallocate(up)
-        out = ttnn.linear(h, self.w_down, memory_config=self.mem, compute_kernel_config=self.compute_cfg)
+        if x.shape[-2] > 32 and x.shape[0] == x.shape[1] == 1:
+            gate = ttnn.silu(self._mm(x, self.w_gate), memory_config=self.mem)
+            up = self._mm(x, self.w_up)
+            h = ttnn.multiply(gate, up, memory_config=self.mem)
+            ttnn.deallocate(gate)
+            ttnn.deallocate(up)
+            out = ttnn.linear(h, self.w_down, memory_config=self.mem, compute_kernel_config=self.compute_cfg)
+        else:
+            gate = ttnn.linear(
+                x, self.w_gate, activation="silu", memory_config=self.mem, compute_kernel_config=self.compute_cfg
+            )
+            up = ttnn.linear(x, self.w_up, memory_config=self.mem, compute_kernel_config=self.compute_cfg)
+            h = ttnn.multiply(gate, up, memory_config=self.mem)
+            ttnn.deallocate(gate)
+            ttnn.deallocate(up)
+            out = ttnn.linear(h, self.w_down, memory_config=self.mem, compute_kernel_config=self.compute_cfg)
         ttnn.deallocate(h)
         if len(in_shape) != 4:
             out = ttnn.reshape(out, in_shape[:-1] + (out.shape[-1],))
