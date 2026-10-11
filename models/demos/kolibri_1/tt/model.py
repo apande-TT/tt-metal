@@ -23,6 +23,7 @@ evidence that every graduated module runs inside the real forward path).
 from __future__ import annotations
 
 import contextlib
+import math
 import struct
 from collections import Counter
 from pathlib import Path
@@ -345,7 +346,9 @@ class Attention(TtKolibri1Attention):
             # Decode q / k [1, B, heads, D]: heads pad to a whole tile per user, so fusing the batch into M (over the
             # padded rows) is one [B * 32, D] x [D, D] product over the grid (as B batched products: 4 cores, 60 us).
             g = self.device.compute_with_storage_grid_size()
-            m_tiles = x.padded_shape[-2] * (x.volume() // (shape[-2] * d)) // ttnn.TILE_SIZE
+            # volume() counts the padded rows, so it is not used for the batch count (k's one head per user gave
+            # 1024 tiles, per_core_M = 10 and 4 cores for its 32)
+            m_tiles = x.padded_shape[-2] * math.prod(shape[:-2]) // ttnn.TILE_SIZE
             pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
                 compute_with_storage_grid_size=(g.x, g.y),
                 in0_block_w=d // ttnn.TILE_SIZE,
