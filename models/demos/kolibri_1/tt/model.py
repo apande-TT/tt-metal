@@ -314,6 +314,7 @@ class LMHead(TtKolibri1LMHead):
             device=device,
             mesh_mapper=mapper,
         )
+        self.stream = HeadStream(device, self.w) if HeadStream.supports(device, self.w) else None
 
     def __call__(self, x, **kwargs):
         return self.gather(self.local(x))
@@ -323,9 +324,17 @@ class LMHead(TtKolibri1LMHead):
         INVOCATIONS["decoder_head"] += 1
         shape = list(x.shape)
         x = ttnn.reshape(x, [1, 1, -1, shape[-1]])
-        if x.dtype != ttnn.bfloat16:
-            x = ttnn.typecast(x, ttnn.bfloat16)
-        out = ttnn.linear(x, self.w, dtype=ttnn.float32, compute_kernel_config=self.mm_cfg)
+        if self.stream is not None and x.shape[-2] == ttnn.TILE_SIZE:
+            own = x.dtype != ttnn.bfloat16
+            if own:  # into L1: the stream's x sender then reads it off the DRAM weight stream's path
+                x = ttnn.typecast(x, ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
+            out = self.stream(x)
+            if own:
+                ttnn.deallocate(x)
+        else:
+            if x.dtype != ttnn.bfloat16:
+                x = ttnn.typecast(x, ttnn.bfloat16)
+            out = ttnn.linear(x, self.w, dtype=ttnn.float32, compute_kernel_config=self.mm_cfg)
         return ttnn.reshape(out, shape[:-1] + [out.shape[-1]])
 
     def gather(self, local):
@@ -337,6 +346,116 @@ class LMHead(TtKolibri1LMHead):
             ttnn.reshape(local, [1, 1, -1, shape[-1]]), dim=3, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear
         )
         return ttnn.reshape(out, shape[:-1] + [out.shape[-1]])
+
+
+class HeadStream:
+    """The LM head over one tile row of tokens (tt/kernels/head_stream_*.cpp, one generic_op).
+
+    ttnn's 1D-multicast matmul gives 100 cores 10 vocab columns each and streams the 87 MB bf8 weight in 248 us.
+    Here 100 cores do the same per-core work and arithmetic (IB-tile K passes in fp32 dest, packer L1 accumulation,
+    an fp32 reload for the last pass, 1 x SW subblocks, HiFi4: bit-identical logits), but the weight streams from
+    the first block: a spare core reads the activation once and multicasts it while the compute cores' readers
+    start on the weight (their writers receive x), and the weight CB holds DEPTH pushes so the stream keeps going
+    until x lands. 233 us."""
+
+    NC, SW, IB, RB = 10, 2, 2, 2  # columns a core, subblock width, K tiles a dest pass, K rows a reader push
+    DEPTH = 8  # reader pushes the weight CB holds
+
+    @classmethod
+    def supports(cls, device, w) -> bool:
+        kt, nt = w.shape[-2] // ttnn.TILE_SIZE, w.shape[-1] // ttnn.TILE_SIZE
+        g = device.compute_with_storage_grid_size()
+        return (
+            w.dtype == ttnn.bfloat8_b
+            and nt % cls.NC == 0
+            and nt // cls.NC < g.x * g.y  # and a spare core for the sender
+            and kt % cls.RB == 0
+            and cls.RB % cls.IB == 0
+            and kt // cls.IB > 1
+        )
+
+    def __init__(self, device, w) -> None:
+        self.device, self.w = device, w
+        self.kt, self.nt = w.shape[-2] // ttnn.TILE_SIZE, w.shape[-1] // ttnn.TILE_SIZE
+        n = self.nt // self.NC
+        g = device.compute_with_storage_grid_size()
+        # The compute cores are the grid's first n, row-major (measured 10 us faster than a 10 x 10 block); the
+        # grid's last core is the sender.
+        self.core_xy = [(c % g.x, c // g.x) for c in range(n)]
+        full, rem = divmod(n, g.x)
+        rects = [(0, 0, g.x - 1, full - 1)] if full else []
+        if rem:
+            rects.append((0, full, rem - 1, full))
+        self.cores = ttnn.CoreRangeSet(
+            [ttnn.CoreRange(ttnn.CoreCoord(a, b), ttnn.CoreCoord(c, d)) for a, b, c, d in rects]
+        )
+        self.sender = ttnn.CoreCoord(g.x - 1, g.y - 1)
+        self.sender_cores = ttnn.CoreRangeSet([ttnn.CoreRange(self.sender, self.sender)])
+        self.all_cores = self.cores.merge(self.sender_cores)
+        snd = device.worker_core_from_logical_core(self.sender)
+        self.sender_xy = [snd.x, snd.y]
+        self.rects = [len(rects)]  # the sender's multicast targets: NOC 0 order corners and core count
+        for a, b, c, d in rects:
+            lo = device.worker_core_from_logical_core(ttnn.CoreCoord(a, b))
+            hi = device.worker_core_from_logical_core(ttnn.CoreCoord(c, d))
+            self.rects += [lo.x, lo.y, hi.x, hi.y, (c - a + 1) * (d - b + 1)]
+        self.cfg = ttnn.ComputeConfigDescriptor(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
+        )
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        modes[24] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the partials reload, exact as in ttnn's matmul
+        self.cfg.unpack_to_dest_mode = modes
+
+    def _kernel(self, name, ct, rt, config, cores=None):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores or self.cores,
+            compile_time_args=ct,
+            runtime_args=rt,
+            config=config,
+        )
+
+    def __call__(self, x):
+        """x [1, 1, 32, K] bf16 tile -> [1, 1, 32, N] fp32 logits (this chip's slice)."""
+        x_tile, w_tile, o_tile = 2048, 1088, 4096
+        cb, c, NC = RoutedGateUp._cb, self.all_cores, self.NC
+        out = ttnn.empty(
+            [1, 1, ttnn.TILE_SIZE, self.nt * ttnn.TILE_SIZE],
+            dtype=ttnn.float32,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+            memory_config=DRAM,
+        )
+        acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+        cbs = [
+            cb(0, ttnn.bfloat16, x_tile, self.kt, c),
+            cb(1, ttnn.bfloat8_b, w_tile, self.DEPTH * self.RB * NC, c),
+            cb(16, ttnn.float32, o_tile, NC, c),
+            cb(24, ttnn.float32, o_tile, NC, c),  # exactly NC: the L1-accumulated partials wrap onto themselves
+        ]
+        sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=c, initial_value=0) for i in (0, 1)]  # ready, valid
+        reader_rt, sender_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        for i, (cx, cy) in enumerate(self.core_xy):
+            reader_rt[cx][cy] = [x.buffer_address(), self.w.buffer_address(), i]
+            writer_rt[cx][cy] = [out.buffer_address(), i] + self.sender_xy
+        sender_rt[self.sender.x][self.sender.y] = [x.buffer_address(), self.w.buffer_address(), 0] + self.rects
+        reader_ct = [self.kt, self.nt, NC, self.RB, x_tile, w_tile, len(self.core_xy), 0, 1]
+        dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
+        dm0 = dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0)
+        kernels = [
+            self._kernel("head_stream_reader.cpp", reader_ct + [0] + acc(x, self.w), reader_rt, dm0),
+            self._kernel("head_stream_reader.cpp", reader_ct + [1] + acc(x, self.w), sender_rt, dm0, self.sender_cores),
+            self._kernel(
+                "head_stream_writer.cpp",
+                [NC, self.SW, o_tile, self.kt, 0, 1] + acc(out),
+                writer_rt,
+                dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1),
+            ),
+            self._kernel("head_stream_compute.cpp", [self.kt, NC, self.SW, self.IB], [], self.cfg),
+        ]
+        ttnn.generic_op([x, self.w, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs))
+        return out
 
 
 # ----------------------------------------------------------------------------------------------- attention
