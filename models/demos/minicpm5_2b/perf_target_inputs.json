@@ -1,0 +1,44 @@
+{
+  "weight_bytes": 5033557096,
+  "dominant_dtype": "bfloat16",
+  "source": "checkpoint bytes + HF config",
+  "total_params": 2249369600,
+  "params_basis": "read set for unit=unknown: lookup-only and tower-only tensors excluded",
+  "blocks": {
+    "model": {
+      "layers": 42,
+      "hidden_size": 2048,
+      "intermediate_size": 6144,
+      "kv_heads": 2,
+      "head_dim": 128,
+      "params": 2249369600,
+      "lookup_params": 267386880,
+      "matmul_params": 1981982720
+    }
+  },
+  "layers": 42,
+  "kv_heads": 2,
+  "head_dim": 128,
+  "hidden_size": 2048,
+  "intermediate_size": 6144,
+  "stage_roots": {
+    "prefill": "model",
+    "decode": "model"
+  },
+  "device_weight_bytes": 4498739200,
+  "device_census_complete": true,
+  "device_section_bytes": {
+    "stub": 4498739200,
+    "model": 3963965440,
+    "encoder_stack": 3963961344,
+    "layers": 3963961344,
+    "mlp": 3170893824,
+    "self_attn": 792723456,
+    "token_embed": 534773760,
+    "unmatched": 534773760,
+    "post_attention_layernorm": 172032,
+    "input_layernorm": 172032,
+    "final_norm": 4096
+  },
+  "bytes_per_param": 2.0
+}

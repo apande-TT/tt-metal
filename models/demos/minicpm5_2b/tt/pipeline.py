@@ -219,6 +219,8 @@ class MiniCPM5Pipeline:
         allowed = ttnn.ge(scores, threshold)
         perturbed = ttnn.add(scores, ttnn.typecast(self.noise_buf, ttnn.float32))
         perturbed = ttnn.add(perturbed, ttnn.multiply(ttnn.subtract(allowed, 1.0), -_NEG))
+        # TILE argmax runs single-core; the ROW_MAJOR last-dim path spreads the rows over the grid.
+        perturbed = ttnn.untilize(perturbed, use_multicore=True)
         return ttnn.argmax(perturbed, dim=-1)
 
     def _emit(self, logits):
