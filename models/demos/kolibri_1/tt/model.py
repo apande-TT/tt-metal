@@ -278,6 +278,27 @@ class LMHead(TtKolibri1LMHead):
     """The graduated head with fp32 logits: the reference computes the head in fp32 (head_dtype), and
     bf16 logits would quantise them by up to 0.125 at |logit| >= 16, which the sampler would see."""
 
+    def __init__(self, device, torch_module) -> None:
+        """The weight as bfloat8_b: the head streams its [hidden, V / tp] weight once per step and is DRAM-bound
+        (164 -> 87 MB a chip); the logits stay fp32."""
+        super().__init__(device, torch_module)
+        ttnn.deallocate(self.w)
+        mapper = None
+        if isinstance(device, ttnn.MeshDevice):
+            mesh_shape = list(device.shape)
+            mapper = (
+                ttnn.ShardTensor2dMesh(device, mesh_shape=mesh_shape, dims=(None, -1))
+                if self.tp > 1
+                else ttnn.ReplicateTensorToMesh(device)
+            )
+        self.w = ttnn.from_torch(
+            torch_module.weight.float().t().contiguous(),
+            dtype=ttnn.bfloat8_b,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            mesh_mapper=mapper,
+        )
+
     def __call__(self, x, **kwargs):
         return self.gather(self.local(x))
 
