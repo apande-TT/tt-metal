@@ -962,14 +962,37 @@ class MoE(TtKolibri1SparseMoeBlock):
         where any token routed to the expert."""
         return ttnn.to_layout(ttnn.max(w, dim=2, keepdim=True), ttnn.ROW_MAJOR_LAYOUT)
 
+    def _kth(self, scores):
+        """scores [1, 1, N, n_exp] fp32 -> [1, 1, N, 1] fp32: each row's top_k-th largest score (tt/kernels/router_kth.cpp,
+        one core per row). ttnn.topk ran this as a sort on one core per tile row (63 us at 128 rows) and its k-th
+        column took an untilize / slice / tilize to cut out; the threshold is the same value either way."""
+        n, e = scores.shape[-2], scores.shape[-1]
+        out = ttnn.empty([1, 1, n, 1], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=DRAM)
+        g = self.device.compute_with_storage_grid_size()
+        xy = [(i % g.x, i // g.x) for i in range(min(n, g.x * g.y))]
+        cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in xy])
+        rt = ttnn.RuntimeArgs()
+        for i, (cx, cy) in enumerate(xy):
+            rt[cx][cy] = [scores.buffer_address(), out.buffer_address(), i]
+        kernel = ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "router_kth.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[e // ttnn.TILE_SIZE, self.top_k, n, len(xy)]
+            + [a for t in (scores, out) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            runtime_args=rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        cb = RoutedGateUp._cb(0, ttnn.uint32, 64 + (e // ttnn.TILE_SIZE) * 128 + 64, 1, cores)
+        ttnn.generic_op([scores, out], ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
+        return out
+
     def routing_weights(self, x):
         logits = self.router(x)
         scores = ttnn.add(logits, self.router_bias)
-        top_vals, top_ids = ttnn.topk(scores, k=self.top_k, dim=-1, largest=True, sorted=True)
-        ttnn.deallocate(top_ids)
-        n = scores.shape[-2]
-        kth = ttnn.slice(top_vals, [0, 0, 0, self.top_k - 1], [1, 1, n, self.top_k])
+        kth = self._kth(scores)
         chosen = ttnn.ge(scores, kth)
+        ttnn.deallocate(kth)
         weights = ttnn.multiply(ttnn.sigmoid(logits), chosen)
         if self.norm_topk_prob:
             weights = ttnn.divide(weights, ttnn.add(ttnn.sum(weights, dim=-1, keepdim=True), 1e-20))
