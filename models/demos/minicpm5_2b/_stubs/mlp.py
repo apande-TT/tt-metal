@@ -41,7 +41,7 @@ class TtMlp:
         self.w_up = _w(torch_module.up_proj)
         self.w_down = _w(torch_module.down_proj)
 
-    def _mm(self, x, w):
+    def _mm(self, x, w, k_block=None):
         """Many-row (prefill) gate/up projection on minimal_matmul's small CBs, which span the full grid under fp32
         accumulation. K_block is all of K, so each tile is one uninterrupted K-order accumulation as in ttnn.linear."""
         grid = self.device.compute_with_storage_grid_size()
@@ -50,7 +50,7 @@ class TtMlp:
             w,
             config=ttnn.MinimalMatmulConfig(
                 M_block_size=2,
-                K_block_size=w.shape[-2] // 32,
+                K_block_size=k_block or w.shape[-2] // 32,
                 N_block_size=2,
                 subblock_h=2,
                 subblock_w=2,
@@ -76,7 +76,7 @@ class TtMlp:
             h = ttnn.multiply(gate, up, memory_config=self.mem)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-            out = ttnn.linear(h, self.w_down, memory_config=self.mem, compute_kernel_config=self.compute_cfg)
+            out = self._mm(h, self.w_down, k_block=64)  # K = 6144 does not fit one block: three K blocks
         else:
             gate = ttnn.linear(
                 x, self.w_gate, activation="silu", memory_config=self.mem, compute_kernel_config=self.compute_cfg
