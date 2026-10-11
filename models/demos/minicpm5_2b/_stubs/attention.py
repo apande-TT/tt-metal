@@ -109,9 +109,8 @@ class TtAttention:
         sin = ttnn.reshape(self._to_tt(sin), (cb, 1, seq, self.head_dim))
         return cos, sin
 
-    def _cached(self, x, cos, sin, kv_cache, ctx):
-        """Resident-cache attention (prefill or one decode step) for a [B, S, hidden] activation."""
-        b, seq = x.shape[0], x.shape[-2]
+    def _cached(self, x, cos, sin, kv_cache, ctx, b, seq):
+        """Resident-cache attention: prefill on [B, S, hidden], one decode step on [1, B, hidden]."""
         q = ttnn.linear(x, self.wq, compute_kernel_config=self.compute_cfg)
         k = ttnn.linear(x, self.wk, compute_kernel_config=self.compute_cfg)
         v = ttnn.linear(x, self.wv, compute_kernel_config=self.compute_cfg)
@@ -145,7 +144,7 @@ class TtAttention:
             scores = ttnn.add(ttnn.multiply(scores, self.scale), ctx.mask)
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg)
             attn = ttnn.matmul(probs, kv_cache.v, compute_kernel_config=self.compute_cfg)
-            attn = ttnn.reshape(attn, (b, seq, self.n_heads * self.head_dim))
+            attn = ttnn.reshape(attn, (1, b, self.n_heads * self.head_dim))
         return ttnn.linear(attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
     def _rope(self, x, cos, sin):
@@ -172,8 +171,11 @@ class TtAttention:
             x = ttnn.reshape(x, (x.shape[0] * x.shape[1], x.shape[-2], x.shape[-1]))
         b, seq = x.shape[0], x.shape[-2]
         if kv_cache is not None:
+            if attn_ctx.mode == "decode":
+                # Decode rows arrive as [1, B, hidden] so every linear sees B real rows, not B padded tiles.
+                b, seq = x.shape[-2], 1
             cos, sin = self._cos_sin(position_embeddings, b, seq)
-            return self._cached(x, cos, sin, kv_cache, attn_ctx), None
+            return self._cached(x, cos, sin, kv_cache, attn_ctx, b, seq), None
 
         q = ttnn.linear(x, self.wq, compute_kernel_config=self.compute_cfg)
         k = ttnn.linear(x, self.wk, compute_kernel_config=self.compute_cfg)

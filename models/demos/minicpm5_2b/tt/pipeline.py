@@ -237,6 +237,7 @@ class MiniCPM5Pipeline:
         h = self.encoder_stack(x, position_embeddings=cos_sin, kv_caches=self.kv_caches, attn_ctx=ctx)
         self.prefill_hidden = self.final_norm(h)  # [B, Sp, H]: the state prefill hands every decode step
         last = ttnn.slice(self.prefill_hidden, (0, self.real_len - 1, 0), (B, self.real_len, H))
+        last = ttnn.reshape(last, (1, B, H))  # B real rows in one tile row for the vocab matmul
         logits = self.decoder_head(last)
         self._emit(logits)
         return logits
@@ -244,7 +245,8 @@ class MiniCPM5Pipeline:
     def _decode_forward(self):
         """One token per row from the resident token/position: reads + writes the KV cache, emits the next."""
         B = self.batch
-        x = self.token_embed(self.tok_buf)
+        # [1, B, H]: the B single-token rows share one tile row instead of padding each to a tile.
+        x = ttnn.reshape(self.token_embed(self.tok_buf), (1, B, self.hidden))
         cos_sin = self.rotary_embedding(x, position_ids=self.pos_buf)
         pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1))
         write = ttnn.typecast(ttnn.eq(self.key_index_col, pos), ttnn.bfloat16)  # [B, 1, C, 1]
