@@ -453,14 +453,15 @@ _PLANES = {}  # (device, rows, hidden) -> the grouped experts' persistent fp32 p
 
 
 class RoutedGateUp:
-    """Decode gate/up over the ROUTED experts only (tt/kernels/routed_gate_up_*.cpp, one generic_op).
+    """Decode gate/up -> act over the ROUTED experts only (tt/kernels/routed_gate_up_*.cpp, one generic_op).
 
     One decode step routes its 32 tokens to ~40% of a chip's 96 experts, yet the dense [32, 2560] x
     [2560, 96*512] gate and up matmuls stream every expert's columns. The kernel reads a [1, 96] mask of the
     experts any token chose, deals their weight columns round-robin over all cores, and computes only
-    those, each column's K accumulated in fp32 dest at HiFi4 (the dense op's math). Outputs land in
-    persistent [32, 96*512] buffers shared by every layer: a column it skips keeps whatever finite value an
-    earlier call left, and its routing weight is exactly 0, so it contributes nothing downstream."""
+    those, each column's K accumulated in fp32 dest at HiFi4 (the dense op's math), then act = silu(gate) * up *
+    the token's fp32 routing weight for the column's expert, in fp32 dest, rounded to bf16 once. The output is a
+    persistent [32, 96*512] buffer shared by every layer; the columns of unrouted experts are written as zeros, so
+    the down projection reading every column sums exactly the routed experts' contributions."""
 
     def __init__(self, device, w_gate, w_up, n_experts: int, inter: int, interleaved: bool = False) -> None:
         """interleaved: w_gate is w_up, one tile-pair-interleaved [K, 2*N] weight (gate column c at 2c, up at
@@ -478,10 +479,14 @@ class RoutedGateUp:
         key = (id(device), self.nt)
         if key not in _ROUTED_OUT:
             shape = [1, 1, ttnn.TILE_SIZE, self.nt * ttnn.TILE_SIZE]
-            _ROUTED_OUT[key] = tuple(
-                ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device) for _ in range(2)
-            )
-        self.g_out, self.u_out = _ROUTED_OUT[key]
+            _ROUTED_OUT[key] = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.act = _ROUTED_OUT[key]
+        self.cfg = ttnn.ComputeConfigDescriptor(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
+        )
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        modes[7] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the routing-weight tiles, multiplied in fp32 dest
+        self.cfg.unpack_to_dest_mode = modes
 
     @staticmethod
     def _cb(index, fmt, page, pages, cores):
@@ -491,10 +496,12 @@ class RoutedGateUp:
             format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=fmt, page_size=page)],
         )
 
-    def __call__(self, x, mask):
-        """x [1, 1, 32, K] bf16 tile, mask [1, 1, 1, n_experts] fp32 row-major (non-zero = routed) ->
-        the persistent (gate, up) [1, 1, 32, N] bf16 outputs, routed columns written."""
+    def __call__(self, x, mask, weights):
+        """x [1, 1, 32, K] bf16 tile, mask [1, 1, 1, n_experts] fp32 row-major (non-zero = routed), weights
+        [1, 1, 32, n_experts] fp32 tile (this chip's routing weights, 0 where unrouted) -> the persistent act
+        [1, 1, 32, N] bf16."""
         x_tile, w_tile = 2048, 1088  # bf16 / bfp8_b tile bytes
+        et = weights.shape[-1] // ttnn.TILE_SIZE
         cores = self.cores
         cbs = [
             self._cb(0, ttnn.bfloat16, x_tile, self.kt, cores),
@@ -502,16 +509,18 @@ class RoutedGateUp:
             self._cb(2, ttnn.bfloat8_b, w_tile, 2 * self.kb, cores),
             self._cb(3, ttnn.float32, 512, 1, cores),
             self._cb(4, ttnn.uint32, 16, 1, cores),
-            self._cb(5, ttnn.uint32, 16 * (-(-4 * (1 + self.max_slots) // 16)), 1, cores),
+            self._cb(5, ttnn.uint32, 16 * (-(-4 * (2 + 2 * self.max_slots) // 16)), 1, cores),
+            self._cb(6, ttnn.float32, 4096 * et, 1, cores),
+            self._cb(7, ttnn.float32, 4096, 2, cores),
             self._cb(16, ttnn.bfloat16, x_tile, 2, cores),
-            self._cb(17, ttnn.bfloat16, x_tile, 2, cores),
+            self._cb(17, ttnn.bfloat16, x_tile, 1, cores),
         ]
         acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
-        addrs = [t.buffer_address() for t in (x, self.w_gate, self.w_up, mask)]
+        addrs = [t.buffer_address() for t in (x, self.w_gate, self.w_up, mask, weights)]
         for i, (cx, cy) in enumerate(self.core_xy):
             reader_rt[cx][cy] = addrs + [i]
-            writer_rt[cx][cy] = [self.g_out.buffer_address(), self.u_out.buffer_address()]
+            writer_rt[cx][cy] = [self.act.buffer_address()]
         file = ttnn.KernelDescriptor.SourceType.FILE_PATH
         kernels = [
             ttnn.KernelDescriptor(
@@ -530,8 +539,9 @@ class RoutedGateUp:
                     w_tile,
                     self.col_stride,
                     self.up_offset,
+                    et,
                 ]
-                + acc(x, self.w_gate, self.w_up, mask),
+                + acc(x, self.w_gate, self.w_up, mask, weights),
                 runtime_args=reader_rt,
                 config=ttnn.ReaderConfigDescriptor(),
             ),
@@ -539,7 +549,7 @@ class RoutedGateUp:
                 kernel_source=str(_KERNELS / "routed_gate_up_writer.cpp"),
                 source_type=file,
                 core_ranges=cores,
-                compile_time_args=acc(self.g_out, self.u_out),
+                compile_time_args=[x_tile] + acc(self.act),
                 runtime_args=writer_rt,
                 config=ttnn.WriterConfigDescriptor(),
             ),
@@ -549,16 +559,14 @@ class RoutedGateUp:
                 core_ranges=cores,
                 compile_time_args=[self.kt, self.kb],
                 runtime_args=[],
-                config=ttnn.ComputeConfigDescriptor(
-                    math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
-                ),
+                config=self.cfg,
             ),
         ]
         ttnn.generic_op(
-            [x, self.w_gate, self.w_up, mask, self.g_out, self.u_out],
+            [x, self.w_gate, self.w_up, mask, weights, self.act],
             ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs),
         )
-        return self.g_out, self.u_out
+        return self.act
 
 
 class GroupedExperts:
@@ -803,10 +811,9 @@ class MoE(TtKolibri1SparseMoeBlock):
         gu = torch.nn.functional.pad(gu.reshape(k, self.tp, -1), (0, ttnn.TILE_SIZE)).reshape(k, -1)
         return super()._upload(gu, shard_dim, dtype)
 
-    def _routed_mask(self, weights):
-        """[1, 1, 32, n_exp] routing weights (replicated) -> this chip's [1, 1, 1, n_local] row-major mask, non-zero
+    def _routed_mask(self, w):
+        """[1, 1, 32, n_local] routing weights (this chip's) -> its [1, 1, 1, n_local] row-major mask, non-zero
         where any token routed to the expert."""
-        w = ttnn.mesh_partition(weights, dim=3, cluster_axis=self.tp_axis) if self.tp > 1 else weights
         return ttnn.to_layout(ttnn.max(w, dim=2, keepdim=True), ttnn.ROW_MAJOR_LAYOUT)
 
     def routing_weights(self, x):
@@ -833,15 +840,14 @@ class MoE(TtKolibri1SparseMoeBlock):
         x_in = ttnn.reshape(hidden_states, [1, 1, -1, shape[-1]])
         x = x_in if x_in.dtype == ttnn.bfloat16 else ttnn.typecast(x_in, ttnn.bfloat16)
         weights = self.routing_weights(x_in if self.router_fp32_input else x)
-        if x.shape[-2] == ttnn.TILE_SIZE:  # decode: only the routed experts' columns (persistent outputs, not freed)
-            col_scale = ttnn.linear(weights, self.expand, dtype=ttnn.bfloat16, compute_kernel_config=self.hifi4)
-            mask = self._routed_mask(weights)
-            g, u = self.routed_gate_up(x, mask)
+        if x.shape[-2] == ttnn.TILE_SIZE:  # decode: only the routed experts' columns (persistent act, not freed)
+            w = ttnn.mesh_partition(weights, dim=3, cluster_axis=self.tp_axis) if self.tp > 1 else weights
+            mask = self._routed_mask(w)
+            act = self.routed_gate_up(x, mask, w)
             ttnn.deallocate(mask)
-            act = ttnn.multiply(ttnn.multiply(ttnn.silu(g), u), col_scale)
-            ttnn.deallocate(col_scale)
+            if w is not weights:
+                ttnn.deallocate(w)
             out = ttnn.linear(act, self.w_down, program_config=self.down_decode_pc, compute_kernel_config=self.hifi2)
-            ttnn.deallocate(act)
         else:  # prefill: each expert over the tokens routed to it
             w = ttnn.mesh_partition(weights, dim=3, cluster_axis=self.tp_axis) if self.tp > 1 else weights
             out = self.grouped(x, w)

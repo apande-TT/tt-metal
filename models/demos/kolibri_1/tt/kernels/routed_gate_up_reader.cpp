@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Decode gate/up over the ROUTED experts only (reader). The [1, E] mask says which local experts any of
+// Decode gate/up -> act over the ROUTED experts only (reader). The [1, E] mask says which local experts any of
 // the step's tokens routed to; their (expert, column) weight tiles are enumerated in expert order and dealt
 // round-robin over the cores, so every core streams an equal share of the weights that matter and none of
-// the rest. Hands the column list to the writer and the count to compute.
+// the rest. The other experts' columns are dealt the same way for the writer to zero. Per routed column it
+// also builds the routing-weight tile compute multiplies the activation by: every element of row j = token j's
+// fp32 weight for the column's expert. Hands the column lists to the writer and the count to compute.
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -16,29 +18,37 @@ void kernel_main() {
     constexpr uint32_t CPE = get_compile_time_arg_val(3);          // N tiles per expert
     constexpr uint32_t NC = get_compile_time_arg_val(4);           // cores
     constexpr uint32_t KB = get_compile_time_arg_val(5);           // K tiles per weight push
-    constexpr uint32_t MAX_SLOTS = get_compile_time_arg_val(6);    // max columns one core can own
+    constexpr uint32_t MAX_SLOTS = get_compile_time_arg_val(6);    // max columns of one kind one core can own
     constexpr uint32_t x_tile_bytes = get_compile_time_arg_val(7);
     constexpr uint32_t w_tile_bytes = get_compile_time_arg_val(8);
     // Gate column c is weight column c * STRIDE, up is UP pages after it: (1, 0) for separate gate/up tensors,
     // (2, 1) for one tile-pair-interleaved [g0 u0 g1 u1 ...] weight.
     constexpr uint32_t STRIDE = get_compile_time_arg_val(9);
     constexpr uint32_t UP = get_compile_time_arg_val(10);
-    constexpr auto x_args = TensorAccessorArgs<11>();
+    constexpr uint32_t ET = get_compile_time_arg_val(11);  // tiles of the [32, E] fp32 routing weights
+    constexpr auto x_args = TensorAccessorArgs<12>();
     constexpr auto wg_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
     constexpr auto wu_args = TensorAccessorArgs<wg_args.next_compile_time_args_offset()>();
     constexpr auto m_args = TensorAccessorArgs<wu_args.next_compile_time_args_offset()>();
+    constexpr auto r_args = TensorAccessorArgs<m_args.next_compile_time_args_offset()>();
 
     const auto x = TensorAccessor(x_args, get_arg_val<uint32_t>(0));
     const auto wg = TensorAccessor(wg_args, get_arg_val<uint32_t>(1));
     const auto wu = TensorAccessor(wu_args, get_arg_val<uint32_t>(2));
     const auto mask_acc = TensorAccessor(m_args, get_arg_val<uint32_t>(3));
-    const uint32_t core_id = get_arg_val<uint32_t>(4);
+    const auto rw = TensorAccessor(r_args, get_arg_val<uint32_t>(4));
+    const uint32_t core_id = get_arg_val<uint32_t>(5);
 
-    constexpr uint32_t cb_x = 0, cb_g = 1, cb_u = 2, cb_mask = 3, cb_count = 4, cb_list = 5;
+    constexpr uint32_t cb_x = 0, cb_g = 1, cb_u = 2, cb_mask = 3, cb_count = 4, cb_list = 5, cb_rw = 6, cb_scale = 7;
 
     cb_reserve_back(cb_mask, 1);
     const uint32_t mask_l1 = get_write_ptr(cb_mask);
     noc_async_read_page(0, mask_acc, mask_l1);
+    cb_reserve_back(cb_rw, 1);
+    const uint32_t rw_l1 = get_write_ptr(cb_rw);
+    for (uint32_t t = 0; t < ET; ++t) {
+        noc_async_read_page(t, rw, rw_l1 + t * 4096);
+    }
 
     cb_reserve_back(cb_x, Kt);
     const uint32_t x_l1 = get_write_ptr(cb_x);
@@ -50,18 +60,25 @@ void kernel_main() {
 
     // An expert is active when its mask word is non-zero (+-0.0 both count as inactive).
     volatile tt_l1_ptr uint32_t* mask = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(mask_l1);
-    uint32_t cols[MAX_SLOTS];
-    uint32_t n = 0, turn = 0;
+    uint32_t cols[MAX_SLOTS], zeros[MAX_SLOTS];
+    uint32_t n = 0, nz = 0, turn = 0, zturn = 0;
     for (uint32_t e = 0; e < E; ++e) {
-        if ((mask[e] & 0x7fffffffu) == 0) {
-            continue;
-        }
+        const bool active = (mask[e] & 0x7fffffffu) != 0;
         for (uint32_t j = 0; j < CPE; ++j) {
-            if (turn == core_id) {
-                cols[n++] = e * CPE + j;
-            }
-            if (++turn == NC) {
-                turn = 0;
+            if (active) {
+                if (turn == core_id) {
+                    cols[n++] = e * CPE + j;
+                }
+                if (++turn == NC) {
+                    turn = 0;
+                }
+            } else {
+                if (zturn == core_id) {
+                    zeros[nz++] = e * CPE + j;
+                }
+                if (++zturn == NC) {
+                    zturn = 0;
+                }
             }
         }
     }
@@ -69,16 +86,36 @@ void kernel_main() {
     cb_reserve_back(cb_list, 1);
     volatile tt_l1_ptr uint32_t* list = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_list));
     list[0] = n;
+    list[1] = nz;
     for (uint32_t s = 0; s < n; ++s) {
-        list[1 + s] = cols[s];
+        list[2 + s] = cols[s];
+    }
+    for (uint32_t s = 0; s < nz; ++s) {
+        list[2 + n + s] = zeros[s];
     }
     cb_push_back(cb_list, 1);
     cb_reserve_back(cb_count, 1);
     *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_count)) = n;
     cb_push_back(cb_count, 1);
 
+    // Routing weight (token j, local expert e) in the [32, E] fp32 tile tensor: tile e / 32, face (j / 16) * 2 +
+    // (e % 32) / 16, word (j % 16) * 16 + e % 16.
+    volatile tt_l1_ptr uint32_t* w = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(rw_l1);
     for (uint32_t s = 0; s < n; ++s) {
         const uint32_t col = cols[s];
+        const uint32_t e = col / CPE;
+        const uint32_t wbase = (e / 32) * 1024 + ((e % 32) / 16) * 256 + (e % 16);
+        cb_reserve_back(cb_scale, 1);
+        volatile tt_l1_ptr uint32_t* s32 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_scale));
+        for (uint32_t j = 0; j < 32; ++j) {
+            const uint32_t f = w[wbase + (j / 16) * 512 + (j % 16) * 16];
+            volatile tt_l1_ptr uint32_t* row = s32 + (j / 16) * 512 + (j % 16) * 16;
+            for (uint32_t q = 0; q < 16; ++q) {
+                row[q] = f;
+                row[256 + q] = f;
+            }
+        }
+        cb_push_back(cb_scale, 1);
         for (uint32_t kb = 0; kb < Kt; kb += KB) {
             cb_reserve_back(cb_g, KB);
             cb_reserve_back(cb_u, KB);
