@@ -206,10 +206,16 @@ class MiniCPM5Pipeline:
         top_k logits (ties kept), then drop the low tail whose ascending cumulative mass <= 1 - top_p.
         """
         B, V, k = self.batch, self.vocab, self.top_k
-        scores = ttnn.typecast(ttnn.reshape(logits, (1, 1, B, V)), ttnn.float32)
+        logits = ttnn.reshape(logits, (1, 1, B, V))
+        scores = ttnn.typecast(logits, ttnn.float32)
         if self.temperature != 1.0:
             scores = ttnn.multiply(scores, 1.0 / self.temperature)
-        top_vals, _ = ttnn.topk(scores, k=k, dim=-1)  # [1, 1, B, k], descending
+            top_vals, _ = ttnn.topk(scores, k=k, dim=-1)  # [1, 1, B, k], descending
+        else:
+            # bf16 -> fp32 is exact, so take the top k on the bf16 logits: that input routes to the
+            # multi-core topk (an fp32 input falls to the single-core factory at this width).
+            top_vals, _ = ttnn.topk(logits, k=k, dim=-1)
+            top_vals = ttnn.typecast(top_vals, ttnn.float32)
         probs = ttnn.softmax(top_vals, dim=-1)
         incl = ttnn.matmul(probs, self.cumsum_upper)  # mass of ranks <= j
         tail_mass = ttnn.add(ttnn.subtract(probs, incl), 1.0)  # mass of ranks >= j (HF's ascending cumsum)
