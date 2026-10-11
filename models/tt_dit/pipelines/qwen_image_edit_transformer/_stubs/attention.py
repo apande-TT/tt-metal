@@ -216,13 +216,27 @@ class TtQwenJointAttention:
                 s = _precise.matmul_bt(q, kh)
         else:
             s = self._qk(q, kh, kl)
-        if mask_add is not None:
-            s = ttnn.add(s, mask_add)
         # Explicit softmax: the fused ttnn.softmax loses ~0.2 abs on these ~1e4 logits when the key
         # length is not tile-aligned; max/exp/sum/divide on float32 stays within ~2e-3.
-        mx = ttnn.max(s, dim=-1, keepdim=True)
-        e = ttnn.exp(ttnn.subtract(s, mx))
-        p = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=self.hifi))
+        if SOFTMAX_L1:  # the same ops, the logits staged in L1 and the subtract / exp done in place there
+            l1 = ttnn.L1_MEMORY_CONFIG
+            s_in = s
+            s = ttnn.to_memory_config(s, l1) if mask_add is None else ttnn.add(s, mask_add, memory_config=l1)
+            ttnn.deallocate(s_in)
+            mx = ttnn.max(s, dim=-1, keepdim=True, memory_config=l1)
+            ttnn.subtract(s, mx, output_tensor=s)
+            ttnn.deallocate(mx)
+            ttnn.exp(s, output_tensor=s)
+            den = ttnn.sum(s, dim=-1, keepdim=True, compute_kernel_config=self.hifi, memory_config=l1)
+            p = ttnn.divide(s, den, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(den)
+            ttnn.deallocate(s)
+        else:
+            if mask_add is not None:
+                s = ttnn.add(s, mask_add)
+            mx = ttnn.max(s, dim=-1, keepdim=True)
+            e = ttnn.exp(ttnn.subtract(s, mx))
+            p = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=self.hifi))
         if _precise.ENABLED:
             o = _precise.matmul(p, v, b_parts=v_parts)  # float32 [B, Hl, Sq, D]
         else:
@@ -329,6 +343,8 @@ HEADS_BY_SLICES = False
 FUSED_QKV = False
 # the image and text queries attend as one joint query block (one QK^T / softmax / P @ V) instead of two
 JOINT_QUERIES = False
+# the attention softmax's float32 logits in L1 (subtract / exp in place), only the probabilities written to DRAM
+SOFTMAX_L1 = False
 
 
 def build(device, torch_module=None):
