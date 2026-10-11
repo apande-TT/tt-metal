@@ -4,14 +4,29 @@
 // Sampler top-k, final merge, one core per user row b. The first tree stage (ttnn.topk over G groups of the
 // vocabulary) leaves each group's top K sorted largest first, so the row's top K is a G-way merge of those lists:
 // K steps, each taking the largest list head. fp32 values are compared through an order-preserving integer key;
-// ties go to the earlier group, i.e. the smaller token ids. Reads the row's G * K values and labels as two 64 B
-// face rows per tile; writes the K winners, largest first, to the row's face rows of the [B, K] outputs.
+// ties go to the earlier group, i.e. the smaller token ids. Writes the K winners, largest first, to the row's face
+// rows of the [B, K] outputs.
+//
+// The heads sit in a winner tree over P >= G leaves (leaf g = list g): each internal node holds the leaf that wins
+// its subtree, and since a left subtree's lists all come before the right one's, a tie goes left -- the same winner
+// as a scan for the largest key with the earliest list on ties, found in log2(P) comparisons per step instead of G.
+// The lists are read a tile (32 entries: two 64 B face rows each of values and labels) at a time: one tile of every
+// list up front, the next one of a list only when its head reaches it (K winners rarely take more than a tile from
+// any list, so this reads ~1/KT of the rows' G * K entries).
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
 
 // fp32 bits -> unsigned key with the same order (negatives reversed below the positives).
 inline uint32_t order_key(uint32_t bits) { return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u); }
+
+constexpr uint32_t pow2_at_least(uint32_t n) {
+    uint32_t p = 1;
+    while (p < n) {
+        p <<= 1;
+    }
+    return p;
+}
 
 void kernel_main() {
     constexpr uint32_t G = get_compile_time_arg_val(0);  // sorted lists in the row
@@ -27,6 +42,7 @@ void kernel_main() {
     const uint32_t b = get_arg_val<uint32_t>(4);  // the user row this core owns
 
     constexpr uint32_t N = G * K, NT = N / 32, KT = K / 32;
+    constexpr uint32_t P = pow2_at_least(G);
     constexpr uint32_t face = 1024, frow = 64;  // 32-bit tile geometry
     constexpr uint32_t cb_scratch = 0;
 
@@ -37,15 +53,24 @@ void kernel_main() {
     const uint32_t ol_l1 = ov_l1 + K * 4;
     const uint32_t head_l1 = ol_l1 + K * 4;
     const uint32_t hkey_l1 = head_l1 + ((G * 4 + 63) & ~63u);
+    const uint32_t tree_l1 = hkey_l1 + P * 4;
 
     // Row r of tile row b / 32: two 64 B face rows per tile; column c of the row lands at index c.
     const uint32_t tile_row = b / 32, r = b % 32;
     const uint32_t off = (r / 16) * 2 * face + (r % 16) * frow;
-    for (uint32_t t = 0; t < NT; ++t) {
-        noc_async_read(vin.get_noc_addr(tile_row * NT + t, off), v_l1 + t * 2 * frow, frow);
-        noc_async_read(vin.get_noc_addr(tile_row * NT + t, off + face), v_l1 + t * 2 * frow + frow, frow);
-        noc_async_read(lin.get_noc_addr(tile_row * NT + t, off), l_l1 + t * 2 * frow, frow);
-        noc_async_read(lin.get_noc_addr(tile_row * NT + t, off + face), l_l1 + t * 2 * frow + frow, frow);
+    auto read_tile = [&](uint32_t t) {
+        const uint32_t src = tile_row * NT + t, dst = t * 2 * frow;
+        noc_async_read(vin.get_noc_addr(src, off), v_l1 + dst, frow);
+        noc_async_read(vin.get_noc_addr(src, off + face), v_l1 + dst + frow, frow);
+        noc_async_read(lin.get_noc_addr(src, off), l_l1 + dst, frow);
+        noc_async_read(lin.get_noc_addr(src, off + face), l_l1 + dst + frow, frow);
+    };
+    // A small merge (the chips' lists) reads every tile up front; a wide one the first tile of each list.
+    constexpr uint32_t PRE = NT <= 64 ? KT : 1;
+    for (uint32_t g = 0; g < G; ++g) {
+        for (uint32_t t = 0; t < PRE; ++t) {
+            read_tile(g * KT + t);
+        }
     }
     noc_async_read_barrier();
 
@@ -53,26 +78,41 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* l = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l_l1);
     volatile tt_l1_ptr uint32_t* ov = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ov_l1);
     volatile tt_l1_ptr uint32_t* ol = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ol_l1);
-    volatile tt_l1_ptr uint32_t* head = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head_l1);
-    volatile tt_l1_ptr uint32_t* hkey = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(hkey_l1);
-    for (uint32_t g = 0; g < G; ++g) {
+    // Only this core writes the heads, keys and tree: plain (cacheable) accesses.
+    uint32_t* head = reinterpret_cast<uint32_t*>(head_l1);
+    uint32_t* hkey = reinterpret_cast<uint32_t*>(hkey_l1);
+    uint32_t* tree = reinterpret_cast<uint32_t*>(tree_l1);
+    for (uint32_t g = 0; g < G; ++g) {  // head holds G entries only
         head[g] = 0;
-        hkey[g] = order_key(v[g * K]);
+    }
+    for (uint32_t g = 0; g < P; ++g) {
+        hkey[g] = g < G ? order_key(v[g * K]) : 0u;  // padding leaves never beat a list (ties go left)
+        tree[P + g] = g;
+    }
+    for (uint32_t n = P - 1; n >= 1; --n) {
+        const uint32_t a = tree[2 * n], c = tree[2 * n + 1];
+        tree[n] = hkey[c] > hkey[a] ? c : a;
     }
     for (uint32_t i = 0; i < K; ++i) {
-        uint32_t best = 0, best_key = hkey[0];
-        for (uint32_t g = 1; g < G; ++g) {
-            const uint32_t k = hkey[g];
-            if (k > best_key) {  // strict: ties keep the earlier list
-                best_key = k;
-                best = g;
-            }
-        }
+        const uint32_t best = tree[1];
         const uint32_t h = head[best];
         ov[i] = v[best * K + h];
         ol[i] = l[best * K + h];
-        head[best] = h + 1;
-        hkey[best] = h + 1 < K ? order_key(v[best * K + h + 1]) : 0u;  // an exhausted list never wins again
+        const uint32_t nh = h + 1;
+        head[best] = nh;
+        if (nh < K) {
+            if (nh % 32 == 0 && nh / 32 >= PRE) {  // the list's next tile
+                read_tile(best * KT + nh / 32);
+                noc_async_read_barrier();
+            }
+            hkey[best] = order_key(v[best * K + nh]);
+        } else {
+            hkey[best] = 0u;  // an exhausted list never wins again
+        }
+        for (uint32_t n = (P + best) >> 1; n >= 1; n >>= 1) {
+            const uint32_t a = tree[2 * n], c = tree[2 * n + 1];
+            tree[n] = hkey[c] > hkey[a] ? c : a;
+        }
     }
 
     // Winner i is column i: tile i / 32, face half (i % 32) / 16, so each 64 B run of the outputs is one face row.

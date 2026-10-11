@@ -1243,7 +1243,8 @@ class Sampler:
             runtime_args=rt,
             config=ttnn.ReaderConfigDescriptor(),
         )
-        scratch = 64 + 2 * groups * k * 4 + 2 * k * 4 + 2 * (-(-groups * 4 // 64) * 64)
+        leaves = 1 << (groups - 1).bit_length()  # the kernel's winner tree: P keys + 2P nodes
+        scratch = 64 + 2 * groups * k * 4 + 2 * k * 4 + (-(-groups * 4 // 64) * 64) + 3 * leaves * 4
         cb = RoutedGateUp._cb(0, ttnn.uint32, -(-scratch // 32) * 32, 1, self.count_cores)
         ttnn.generic_op([x, labels, vals, ids], ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
         return vals, ids
@@ -1257,12 +1258,14 @@ class Sampler:
         if self.k_pad == self.top_k:  # first stage on ttnn, then one merge of its sorted group lists
             g = self.plan[0]
             grouped = [1, 1, B * g, n // g]
+            # Group lists to L1: the merge reads them back one 64 B face row at a time.
             x, labels = ttnn.topk(
                 ttnn.experimental.view(x, grouped),
                 k=self.k_pad,
                 dim=-1,
                 largest=True,
                 sorted=True,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
                 indices_tensor=ttnn.experimental.view(labels, grouped),
             )
             flat = [1, 1, B, g * self.k_pad]
