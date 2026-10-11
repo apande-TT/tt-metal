@@ -59,6 +59,7 @@ GRADUATED_STUBS = (
 
 _TILE = 32
 _NEG = -1e9
+_NOISE_SEG_W = 1280  # 40 tiles: under gather's 60-tile single-row threshold; 130560 / 1280 = 102 segments
 
 
 def _round_up(n, m=_TILE):
@@ -174,7 +175,12 @@ class MiniCPM5Pipeline:
         self.ids_buf = self._tt(torch.full((B, Sp), self.pad_id, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         self.tok_buf = self._tt(torch.zeros(B, 1, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         self.pos_buf = self._tt(torch.zeros(B, 1), ttnn.float32)
-        self.noise_buf = self._tt(torch.zeros(1, 1, B, self.vocab), ttnn.bfloat16)
+        # Sampling noise lives as [1, S, B, V/S]: S vocab segments of _NOISE_SEG_W columns, so the per-step
+        # gather of the top-k candidates' noise reads one short segment row per core instead of one core
+        # streaming the whole vocab row.
+        S, W = self.vocab // _NOISE_SEG_W, _NOISE_SEG_W
+        self.noise_buf = self._tt(torch.zeros(1, S, B, W), ttnn.bfloat16)
+        self.noise_seg_base = self._tt(torch.arange(S, dtype=torch.float32).mul_(W).reshape(1, S, 1, 1), ttnn.float32)
         self.noise_steps = []
         self.real_len = self.prompt_len
 
@@ -193,8 +199,10 @@ class MiniCPM5Pipeline:
         self.real_len = S
         for t in self.noise_steps:
             ttnn.deallocate(t)
+        S, W = self.vocab // _NOISE_SEG_W, _NOISE_SEG_W
         self.noise_steps = [
-            self._tt(noise[t].reshape(1, 1, B, self.vocab), ttnn.bfloat16) for t in range(noise.shape[0])
+            self._tt(noise[t].reshape(B, S, W).transpose(0, 1).reshape(1, S, B, W).contiguous(), ttnn.bfloat16)
+            for t in range(noise.shape[0])
         ]
         ttnn.copy(self.noise_steps[0], self.noise_buf)
 
@@ -224,12 +232,25 @@ class MiniCPM5Pipeline:
         # Every allowed token is one of the top k, so the Gumbel-max runs over the k candidates only:
         # gather each candidate's noise, argmax over k, then map the winning rank back to its token id.
         allowed = ttnn.ge(top_vals, threshold)
-        noise = ttnn.typecast(ttnn.gather(self.noise_buf, -1, top_idx), ttnn.float32)
+        noise = self._candidate_noise(top_idx)
         perturbed = ttnn.add(ttnn.add(top_vals, noise), ttnn.multiply(ttnn.subtract(allowed, 1.0), -_NEG))
         rank = ttnn.argmax(ttnn.untilize(perturbed), dim=-1, keepdim=True)  # [1, 1, B, 1] uint32
         rank = ttnn.to_layout(rank, ttnn.TILE_LAYOUT)
         tok = ttnn.gather(top_idx, -1, ttnn.typecast(rank, top_idx.dtype) if rank.dtype != top_idx.dtype else rank)
         return ttnn.to_layout(ttnn.typecast(tok, ttnn.uint32) if tok.dtype != ttnn.uint32 else tok, ttnn.ROW_MAJOR_LAYOUT)
+
+    def _candidate_noise(self, top_idx):
+        """Noise of each top-k candidate, [1, 1, B, k] fp32, gathered from the segmented noise buffer.
+
+        Candidate token t sits in segment t // W at column t % W: every segment gathers at its local
+        column (clamped in range), and only the segment that holds t contributes to the sum over segments.
+        """
+        W = _NOISE_SEG_W
+        local = ttnn.subtract(ttnn.typecast(top_idx, ttnn.float32), self.noise_seg_base)  # [1, S, B, k]
+        inside = ttnn.multiply(ttnn.ge(local, 0.0), ttnn.lt(local, float(W)))
+        local = ttnn.typecast(ttnn.clamp(local, 0.0, float(W - 1)), ttnn.uint32)
+        seg_noise = ttnn.typecast(ttnn.gather(self.noise_buf, -1, local), ttnn.float32)
+        return ttnn.sum(ttnn.multiply(seg_noise, inside), dim=1, keepdim=True)
 
     def _emit(self, logits):
         tok = self._sample(logits)
