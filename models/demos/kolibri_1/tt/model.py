@@ -446,6 +446,57 @@ class Attention(TtKolibri1Attention):
             compute_with_storage_grid_size=ttnn.CoreCoord(g.x, g.y),
         )
 
+    def _head_tiles(self, mode, src, outs, B, rt, hkv):
+        """tt/kernels/head_tiles.cpp: the prefill head split (mode 0: src [B, 1, T, (nq + 2 nkv) * D] -> outs q, k, v
+        [B, heads, T, D]) or merge (mode 1: src [B, nq, T, D] -> outs [y [B, 1, T, nq * D]]) as whole-tile copies over
+        the grid; ttnn's nlp_create_qkv_heads / nlp_concat_heads ran one core per tile row (4 at the 128-token prefill,
+        18 / 21 us)."""
+        w = self.head_dim // ttnn.TILE_SIZE
+        total = sum(math.prod(list(o.shape)) for o in outs) // (ttnn.TILE_SIZE * ttnn.TILE_SIZE)
+        g = self.device.compute_with_storage_grid_size()
+        per = -(-total // (g.x * g.y))
+        n_cores = -(-total // per)
+        xy = [(i % g.x, i // g.x) for i in range(n_cores)]
+        cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in xy])
+        args = [src] + outs + [outs[0]] * (3 - len(outs))
+        rtargs = ttnn.RuntimeArgs()
+        for i, (cx, cy) in enumerate(xy):
+            rtargs[cx][cy] = [t.buffer_address() for t in args] + [i * per, min(total, (i + 1) * per)]
+        slots = min(per, 4)
+        tile = 2 * ttnn.TILE_SIZE * ttnn.TILE_SIZE  # bf16
+        kernel = ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "head_tiles.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[mode, B, rt, w, self.n_local_heads, hkv, tile, slots]
+            + [a for t in args for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            runtime_args=rtargs,
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        cb = RoutedGateUp._cb(0, ttnn.bfloat16, tile, slots, cores)
+        ttnn.generic_op([src] + outs, ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
+
+    def _split_heads(self, xqkv, B, T):
+        def empty(heads):
+            return ttnn.empty(
+                [B, heads, T, self.head_dim], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=DRAM
+            )
+
+        q, k, v = empty(self.n_local_heads), empty(self.n_local_kv), empty(self.n_local_kv)
+        self._head_tiles(0, xqkv, [q, k, v], B, T // ttnn.TILE_SIZE, self.n_local_kv)
+        return q, k, v
+
+    def _merge_heads(self, attn, B, T):
+        y = ttnn.empty(
+            [B, 1, T, self.n_local_heads * self.head_dim],
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+            memory_config=DRAM,
+        )
+        self._head_tiles(1, attn, [y], B, T // ttnn.TILE_SIZE, 0)
+        return y
+
     def _prefill(self, hidden_states, st):
         shape = list(hidden_states.shape)
         B, T, H = shape[0], shape[-2], shape[-1]
@@ -464,13 +515,7 @@ class Attention(TtKolibri1Attention):
         )
         ttnn.deallocate(x)  # the input norm's L1 output: free it before SDPA's circular buffers
         xqkv = ttnn.reshape(xqkv, [B, 1, T, n])
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            xqkv,
-            num_heads=self.n_local_heads,
-            num_kv_heads=self.n_local_kv,
-            transpose_k_heads=False,
-            memory_config=DRAM,
-        )
+        q, k, v = self._split_heads(xqkv, B, T)
         ttnn.deallocate(xqkv)
         q, k = self._qk(q, k, st)
         flat = [1, B * self.n_local_kv, T, self.head_dim]
@@ -499,8 +544,9 @@ class Attention(TtKolibri1Attention):
         ttnn.deallocate(q)
         ttnn.deallocate(k)
         ttnn.deallocate(v)
-        attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=DRAM)
-        return self._out(attn, shape)
+        merged = self._merge_heads(attn, B, T)
+        ttnn.deallocate(attn)
+        return self._out(merged, shape)
 
     def _decode(self, hidden_states, st):
         shape = list(hidden_states.shape)  # [1, 1, B, H]
