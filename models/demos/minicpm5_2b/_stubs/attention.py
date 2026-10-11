@@ -126,9 +126,7 @@ class TtAttention:
         if ctx.mode == "prefill":
             # Batch folded into the rows: one M = B*S fused-QKV matmul reading its weight once, then the
             # head split [B, 1, S, (n + 2 kv) * D] -> q [B, n, S, D], k/v [B, kv, S, D] in one op.
-            qkv = ttnn.linear(
-                ttnn.reshape(x, (1, b * seq, x.shape[-1])), self.wqkv, compute_kernel_config=self.compute_cfg
-            )
+            qkv = self._prefill_mm(ttnn.reshape(x, (1, b * seq, x.shape[-1])), self.wqkv)
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
                 ttnn.reshape(qkv, (b, 1, seq, qkv.shape[-1])),
                 num_heads=self.n_heads,
@@ -158,9 +156,7 @@ class TtAttention:
             )
             attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [B, 1, S, n*D]
             attn = ttnn.reshape(attn, (1, b * seq, self.n_heads * self.head_dim))
-            out = ttnn.linear(
-                attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
-            )
+            out = self._prefill_mm(attn, self.wo)
             return ttnn.reshape(out, (b, seq, out.shape[-1]))
         else:
             q = ttnn.linear(x, self.wq, compute_kernel_config=self.compute_cfg)
@@ -199,6 +195,25 @@ class TtAttention:
             )
             attn = ttnn.reshape(attn, (1, b, self.n_heads * self.head_dim))
         return ttnn.linear(attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    def _prefill_mm(self, x, w):
+        """Prefill projection on minimal_matmul's small streaming CBs, which span the full grid under fp32
+        accumulation. K_block is all of K, so each tile is one uninterrupted K-order accumulation as in ttnn.linear."""
+        grid = self.device.compute_with_storage_grid_size()
+        return ttnn.experimental.minimal_matmul(
+            x,
+            w,
+            config=ttnn.MinimalMatmulConfig(
+                M_block_size=2,
+                K_block_size=w.shape[-2] // 32,
+                N_block_size=2,
+                subblock_h=2,
+                subblock_w=2,
+                compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
+            ),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_cfg,
+        )
 
     def _decode_kv_shard(self, batch):
         """Height-shard spec for one token's K/V [1, B, n_kv, D]: one batch row (a padded tile row) per core."""
