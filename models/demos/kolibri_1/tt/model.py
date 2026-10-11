@@ -188,14 +188,26 @@ class LMHead(TtKolibri1LMHead):
     bf16 logits would quantise them by up to 0.125 at |logit| >= 16, which the sampler would see."""
 
     def __call__(self, x, **kwargs):
+        return self.gather(self.local(x))
+
+    def local(self, x):
+        """x [..., hidden] -> this chip's vocab slice of the fp32 logits [..., V / tp]."""
         INVOCATIONS["decoder_head"] += 1
         shape = list(x.shape)
         x = ttnn.reshape(x, [1, 1, -1, shape[-1]])
         if x.dtype != ttnn.bfloat16:
             x = ttnn.typecast(x, ttnn.bfloat16)
         out = ttnn.linear(x, self.w, dtype=ttnn.float32, compute_kernel_config=self.mm_cfg)
-        if self.tp > 1:
-            out = ttnn.all_gather(out, dim=3, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
+        return ttnn.reshape(out, shape[:-1] + [out.shape[-1]])
+
+    def gather(self, local):
+        """This chip's logits slice -> the full logits on every chip."""
+        if self.tp == 1:
+            return local
+        shape = list(local.shape)
+        out = ttnn.all_gather(
+            ttnn.reshape(local, [1, 1, -1, shape[-1]]), dim=3, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear
+        )
         return ttnn.reshape(out, shape[:-1] + [out.shape[-1]])
 
 
@@ -896,14 +908,14 @@ class DecoderLayer(TtKolibri1DecoderLayer):
 
 
 # ----------------------------------------------------------------------------------------------- sampler
-def _topk_tree(n_tiles: int, k_tiles: int, cores: int):
+def _topk_tree(n_tiles: int, k_tiles: int, cores: int, cap: int = 40):
     """Group counts, stage by stage, of a top-k tree over a row n_tiles tiles wide (None: no tree).
 
     ttnn's top-k for k > 64 sorts each tile row on one core, so one [B, V] row of logits is ~17 us per
-    tile on a single core (69 ms at V = 128000). Each stage splits the row into g groups of w tiles,
-    one tile row per group (g <= cores, so every group gets its own core); g * k_tiles tiles survive
-    into the next stage. A row of at most 20 tiles is left to one final top-k."""
-    plan, cap = [], 40
+    tile on a single core (69 ms at V = 128000). Each stage splits the row into g groups of w tiles
+    (w <= cap on the first stage), one tile row per group (g <= cores, so every group gets its own core);
+    g * k_tiles tiles survive into the next stage. A row of at most 20 tiles is left to one final top-k."""
+    plan = []
     while n_tiles > 20:
         w = next((w for w in range(min(cap, n_tiles - 1), 2 * k_tiles - 1, -1) if n_tiles % w == 0), None)
         if w is None or n_tiles // w > cores:
@@ -925,7 +937,9 @@ class Sampler:
     cumulated in that order, which is the full-vocabulary cumsum with its zero terms dropped (the same
     non-zero terms, added in the same order)."""
 
-    def __init__(self, device, batch: int, top_k: int, top_p: float, temperature: float, vocab: int = 0) -> None:
+    def __init__(
+        self, device, batch: int, top_k: int, top_p: float, temperature: float, vocab: int = 0, tp: int = 1, tp_axis=1
+    ) -> None:
         self.device = device
         self.top_k, self.top_p, self.temperature = int(top_k), float(top_p), float(temperature)
         self.k_pad = -(-self.top_k // 32) * 32
@@ -945,14 +959,30 @@ class Sampler:
         )
         self.top_p_bits = struct.unpack("<I", struct.pack("<f", self.top_p))[0]
         grid = device.compute_with_storage_grid_size()
-        tree_ok = vocab > 0 and batch % 32 == 0 and vocab % 32 == 0
-        self.plan = _topk_tree(vocab // 32, self.k_pad // 32, grid.x * grid.y) if tree_ok else None
+        # Vocab-sharded logits (tp chips, each its contiguous vocab / tp slice): each chip runs the tree over its own
+        # slice, in groups of 10 tiles so its 1000 tiles spread over 100 cores, and the chips' top-k lists are
+        # gathered and merged. The top k of the union of the slices' top k is the row's top k.
+        self.tp, self.tp_axis = (tp, tp_axis) if tp > 1 and vocab % (tp * 32) == 0 else (1, tp_axis)
+        local = vocab // self.tp
+        tree_ok = vocab > 0 and batch % 32 == 0 and local % 32 == 0
+        cap = 40 if self.tp == 1 else 10
+        self.plan = _topk_tree(local // 32, self.k_pad // 32, grid.x * grid.y, cap) if tree_ok else None
+        if self.plan is None or self.k_pad != self.top_k:
+            self.tp = 1  # the sharded path is the single-merge tree; anything else samples the gathered logits
+            self.plan = _topk_tree(vocab // 32, self.k_pad // 32, grid.x * grid.y) if tree_ok else None
         self.token_index = None
         if self.plan:
             vocab_index = torch.arange(vocab, dtype=torch.int32).expand(1, 1, batch, -1).contiguous()
+            if self.tp > 1:  # each chip's slice of the global ids
+                mapper = ttnn.ShardTensor2dMesh(device, mesh_shape=list(device.shape), dims=(None, -1))
             self.token_index = ttnn.from_torch(
                 vocab_index, dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=mapper
             )
+
+    @property
+    def sharded(self) -> bool:
+        """True: __call__ takes this chip's vocab slice of the logits, not the gathered row."""
+        return self.tp > 1
 
     def _merge(self, x, labels, groups):
         """x, labels [1, 1, B, groups * k] (each group's top k, largest first) -> the row's top k as a groups-way
@@ -995,7 +1025,13 @@ class Sampler:
                 indices_tensor=ttnn.experimental.view(labels, grouped),
             )
             flat = [1, 1, B, g * self.k_pad]
-            return self._merge(ttnn.experimental.view(x, flat), ttnn.experimental.view(labels, flat), g)
+            vals, ids = self._merge(ttnn.experimental.view(x, flat), ttnn.experimental.view(labels, flat), g)
+            if self.tp == 1:
+                return vals, ids
+            # Each chip's top k of its slice, in chip order (= ascending token ids, the merge's tie order).
+            vals = ttnn.all_gather(vals, dim=3, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
+            ids = ttnn.all_gather(ids, dim=3, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
+            return self._merge(vals, ids, self.tp)
         for g in self.plan:
             grouped = [1, 1, B * g, n // g]
             x, labels = ttnn.topk(
@@ -1056,7 +1092,8 @@ class Sampler:
         return out
 
     def __call__(self, logits, u):
-        """logits [1, 1, B, V] fp32, u [1, 1, B, 1] fp32 -> token ids [1, 1, B, 1] fp32 (exact integers)."""
+        """logits [1, 1, B, V] fp32 (this chip's [1, 1, B, V / tp] slice when sharded), u [1, 1, B, 1] fp32 -> token
+        ids [1, 1, B, 1] fp32 (exact integers), the same on every chip."""
         x = logits if self.temperature == 1.0 else ttnn.multiply(logits, 1.0 / self.temperature)
         vals, tok_ids = self._top_k(x)
         B = vals.shape[-2]

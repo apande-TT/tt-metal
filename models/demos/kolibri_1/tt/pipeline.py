@@ -84,6 +84,8 @@ class KolibriPipeline:
                 self.settings.top_p,
                 self.settings.temperature,
                 vocab=int(self.config.vocab_size),
+                tp=self.head.tp,
+                tp_axis=self.head.tp_axis,
             )
         self.rope = self._share_rope_tables()
         self.positions = self._up(
@@ -164,6 +166,14 @@ class KolibriPipeline:
         t = ttnn.reshape(ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT), [1, self.batch])
         ttnn.copy(t, self.tok_u32)
 
+    def _head_sample(self, x, pos_col):
+        """Final-norm state [1, 1, B, H] -> (full logits, sampled ids). A sharded sampler reads this chip's vocab slice
+        of the logits; the gathered logits are the step's output."""
+        local = self.head.local(x)
+        logits = self.head.gather(local)
+        tok = self.sampler(local if self.sampler.sharded else logits, self._uniform(pos_col))
+        return logits, tok
+
     def _stack(self, h, st):
         for layer in self.layers:
             h = layer(h, None, None, st)
@@ -189,8 +199,7 @@ class KolibriPipeline:
         ttnn.deallocate(block)
         last = ttnn.repeat(row, [1, 1, B, 1])
         ttnn.deallocate(row)
-        logits = self.head(last)
-        tok = self.sampler(logits, self._uniform(self.last_col))
+        logits, tok = self._head_sample(last, self.last_col)
         self._commit(tok)
         self._prefill_hn = hn
         return logits, tok
@@ -206,8 +215,7 @@ class KolibriPipeline:
         cos, sin = self._rope_rows(self.pos_u32, [1, B, 1, self.head_dim])
         st = StepState("decode", cos, sin, self.cur_pos)
         h = ttnn.typecast(ttnn.reshape(self.embed(self.tok_u32), [1, 1, B, H]), ttnn.float32)
-        logits = self.head(self.norm(self._stack(h, st)))
-        tok = self.sampler(logits, self._uniform(self.pos_col))
+        logits, tok = self._head_sample(self.norm(self._stack(h, st)), self.pos_col)
         self._commit(tok)
         ttnn.plus_one(self.cur_pos)
         ttnn.plus_one(self.pos_u32)
