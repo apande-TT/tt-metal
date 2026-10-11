@@ -207,14 +207,13 @@ class MiniCPM5Pipeline:
         """
         B, V, k = self.batch, self.vocab, self.top_k
         logits = ttnn.reshape(logits, (1, 1, B, V))
-        scores = ttnn.typecast(logits, ttnn.float32)
         if self.temperature != 1.0:
-            scores = ttnn.multiply(scores, 1.0 / self.temperature)
-            top_vals, _ = ttnn.topk(scores, k=k, dim=-1)  # [1, 1, B, k], descending
+            scores = ttnn.multiply(ttnn.typecast(logits, ttnn.float32), 1.0 / self.temperature)
+            top_vals, top_idx = ttnn.topk(scores, k=k, dim=-1)  # [1, 1, B, k], descending
         else:
             # bf16 -> fp32 is exact, so take the top k on the bf16 logits: that input routes to the
             # multi-core topk (an fp32 input falls to the single-core factory at this width).
-            top_vals, _ = ttnn.topk(logits, k=k, dim=-1)
+            top_vals, top_idx = ttnn.topk(logits, k=k, dim=-1)
             top_vals = ttnn.typecast(top_vals, ttnn.float32)
         probs = ttnn.softmax(top_vals, dim=-1)
         incl = ttnn.matmul(probs, self.cumsum_upper)  # mass of ranks <= j
@@ -222,12 +221,15 @@ class MiniCPM5Pipeline:
         keep = ttnn.gt(tail_mass, 1.0 - self.top_p)
         kept_vals = ttnn.add(top_vals, ttnn.multiply(ttnn.subtract(keep, 1.0), _NEG))  # dropped -> +1e9
         threshold = ttnn.min(kept_vals, dim=-1, keepdim=True)  # smallest kept logit, [1, 1, B, 1]
-        allowed = ttnn.ge(scores, threshold)
-        perturbed = ttnn.add(scores, ttnn.typecast(self.noise_buf, ttnn.float32))
-        perturbed = ttnn.add(perturbed, ttnn.multiply(ttnn.subtract(allowed, 1.0), -_NEG))
-        # TILE argmax runs single-core; the ROW_MAJOR last-dim path spreads the rows over the grid.
-        perturbed = ttnn.untilize(perturbed, use_multicore=True)
-        return ttnn.argmax(perturbed, dim=-1)
+        # Every allowed token is one of the top k, so the Gumbel-max runs over the k candidates only:
+        # gather each candidate's noise, argmax over k, then map the winning rank back to its token id.
+        allowed = ttnn.ge(top_vals, threshold)
+        noise = ttnn.typecast(ttnn.gather(self.noise_buf, -1, top_idx), ttnn.float32)
+        perturbed = ttnn.add(ttnn.add(top_vals, noise), ttnn.multiply(ttnn.subtract(allowed, 1.0), -_NEG))
+        rank = ttnn.argmax(ttnn.untilize(perturbed), dim=-1, keepdim=True)  # [1, 1, B, 1] uint32
+        rank = ttnn.to_layout(rank, ttnn.TILE_LAYOUT)
+        tok = ttnn.gather(top_idx, -1, ttnn.typecast(rank, top_idx.dtype) if rank.dtype != top_idx.dtype else rank)
+        return ttnn.to_layout(ttnn.typecast(tok, ttnn.uint32) if tok.dtype != ttnn.uint32 else tok, ttnn.ROW_MAJOR_LAYOUT)
 
     def _emit(self, logits):
         tok = self._sample(logits)
