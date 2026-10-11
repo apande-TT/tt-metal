@@ -112,7 +112,7 @@ class TtQwenImageEditPipeline:
         # and their exact-lane sums' products, and the trailing limb terms after the guard, added six at a time in
         # one pass (no add chain round trips)
         self.lane_sum = sum_list if precise else None
-        # and their inputs' two bf16 limbs in one pass (the vision attention's output projection column-parallel)
+        # and their inputs' two bf16 limbs in one pass (the vision and LM attention out-projections column-parallel)
         self.split_limbs = split_limbs if precise else None
         # and their batched attention products on the full core grid (the vision token permutations take two dense
         # limb products: a one-hot row selection is exact without lanes)

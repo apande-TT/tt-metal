@@ -88,6 +88,13 @@ def text_attention_mask(attention_mask, b, s, s_pad, rep):
     return np.tile(mask, (1, 1, rep, 1))
 
 
+def _gather_cols(t, tp):
+    """The TP chips' column blocks of t, concatenated in chip order (exact data movement)."""
+    if tp == 1:
+        return t
+    return ttnn.all_gather(t, dim=len(t.shape) - 1, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
+
+
 class TtTextAttention:
     def __init__(self, device, torch_module, pair=None):
         """pair: a second attention module placed on mesh row 1 (row-staged layers); same TP split."""
@@ -120,16 +127,18 @@ class TtTextAttention:
             w2, b2, wo2 = _fused(pair)
             self.wqkv = upload_rows(device, [w, w2], col_dim=-1)
             self.bqkv = upload_rows(device, [b, b2], col_dim=-1)
-            self.wo = upload_rows(device, [wo, wo2], col_dim=0)
+            self.wo = upload_rows(device, [wo, wo2], col_dim=-1)
         else:
             col = shard_mapper(device, -1)
             self.wqkv = upload(device, w, mapper=col)
             self.bqkv = upload(device, b, mapper=col)
-            self.wo = upload(device, wo, mapper=shard_mapper(device, 0))
+            self.wo = upload(device, wo, mapper=shard_mapper(device, -1))
         self.rot = upload(device, rotate_half_matrix(D), dtype=ttnn.float32)
         self.compute_cfg = hifi4_config()
         # precise: every matmul input carried as bf16 hi + lo (exact products), probs @ v in float32,
-        # o_proj out in float32 with an exact TP reduce
+        # o_proj out in float32. o_proj is column-parallel: each chip takes the gathered heads (exact data
+        # movement) and forms its output columns over the whole K, then the columns are gathered -- no float32
+        # partial sums cross the TP axis, and its products are 4x narrower than row-parallel full-width partials
         self.precise = False
 
     def rope_tables(self, position_embeddings, s_pad):
@@ -176,10 +185,8 @@ class TtTextAttention:
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.reshape(o, (b, 1, s_pad, hl * D))
 
-        out = ttnn.linear(o, self.wo, compute_kernel_config=self.compute_cfg)
-        if self.tp > 1:
-            out = ttnn.all_reduce(out, cluster_axis=1, topology=ttnn.Topology.Linear)
-        return out
+        out = ttnn.linear(_gather_cols(o, self.tp), self.wo, compute_kernel_config=self.compute_cfg)
+        return _gather_cols(out, self.tp)
 
     def _forward_precise(self, x, tt_cos, tt_sin, tt_mask):
         D, hl, kvl, G = self.head_dim, self.hl, self.kvl, self.group
@@ -211,10 +218,8 @@ class TtTextAttention:
         o = ttnn.reshape(o, (b, hl, s_pad, D))
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.reshape(o, (b, 1, s_pad, hl * D))
-        out = split_linear(o, self.wo, compute_kernel_config=cfg, exact=ex)
-        if self.tp > 1:
-            out = exact_all_reduce(out, self.device)
-        return out
+        out = split_linear(_gather_cols(o, self.tp), self.wo, compute_kernel_config=cfg, exact=ex)
+        return _gather_cols(out, self.tp)
 
 
 class TtTextMLP:
