@@ -224,11 +224,10 @@ class QwenImageEditTT:
         _tr_precise.LINEAR_PC_FN = _limb_linear_config
         # and their limb products' sum + float32 bias add as one C++ kernel pass (same adds, same order)
         _tr_precise.LINEAR_SUM_BIAS_FN = lambda a, b, bias_rows: fused_sum_bias(a, b, bias_rows, ttnn.DRAM_MEMORY_CONFIG)
-        # long-K limb linears (K >= N: the fused q/k/v) as one C++ program: both limbs' products accumulated in the
-        # float32 DEST from one multicast stream of the weight
-        _tr_precise.LIMB_LINEAR_FN = lambda hi, lo, w: (
-            fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG) if int(w.shape[-2]) >= int(w.shape[-1]) else None
-        )
+        # limb linears as one C++ program: both limbs' products accumulated in the float32 DEST from one multicast
+        # stream of the weight (long-K ones, K >= N: whole output rows per core; wide ones, K < N: each grid column
+        # its own slice of the output columns)
+        _tr_precise.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG)
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {

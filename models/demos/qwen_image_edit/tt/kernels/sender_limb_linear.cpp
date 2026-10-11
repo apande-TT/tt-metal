@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Weight sender of the two-limb linear (limb_linear.cpp), on one core outside the compute rectangle. For every
-// work unit round it streams the weight once, column block (nb tiles) outer and K chunk (kc tiles) inner, each
+// work unit round it streams its column group's slice of the weight (Ntg columns from n0) once, column block (nb tiles) outer and K chunk (kc tiles) inner, each
 // chunk read from DRAM into one of the two cb 1 slots (tile kk * nb + c = w[k0 + kk, n0 + c]) and multicast to
 // the same L1 address on every compute core once all of them have freed that slot. The sender's own cb 1 is
 // only a staging ring (no consumer here): it alternates the two slots at the receivers' cb 1 addresses.
@@ -23,14 +23,16 @@ void kernel_main() {
     const uint32_t y_start = get_arg_val<uint32_t>(2);
     const uint32_t x_end = get_arg_val<uint32_t>(3);
     const uint32_t y_end = get_arg_val<uint32_t>(4);
+    const uint32_t n0 = get_arg_val<uint32_t>(5);  // first output column tile of this sender's column group
 
     constexpr uint32_t Kt = get_compile_time_arg_val(0);
     constexpr uint32_t Nt = get_compile_time_arg_val(1);
-    constexpr uint32_t nb = get_compile_time_arg_val(2);
-    constexpr uint32_t kc = get_compile_time_arg_val(3);
-    constexpr uint32_t rounds = get_compile_time_arg_val(4);
-    constexpr uint32_t num_dests = get_compile_time_arg_val(5);
-    constexpr auto w_args = TensorAccessorArgs<6>();
+    constexpr uint32_t Ntg = get_compile_time_arg_val(2);  // column tiles of this column group
+    constexpr uint32_t nb = get_compile_time_arg_val(3);
+    constexpr uint32_t kc = get_compile_time_arg_val(4);
+    constexpr uint32_t rounds = get_compile_time_arg_val(5);
+    constexpr uint32_t num_dests = get_compile_time_arg_val(6);
+    constexpr auto w_args = TensorAccessorArgs<7>();
     constexpr uint32_t sender_sem_id = get_compile_time_arg_val(w_args.next_compile_time_args_offset());
     constexpr uint32_t receiver_sem_id = get_compile_time_arg_val(w_args.next_compile_time_args_offset() + 1);
 
@@ -49,13 +51,13 @@ void kernel_main() {
 
     uint32_t slot = 0;
     for (uint32_t round = 0; round < rounds; ++round) {
-        for (uint32_t nblk = 0; nblk < Nt / nb; ++nblk) {
+        for (uint32_t nblk = 0; nblk < Ntg / nb; ++nblk) {
             for (uint32_t kch = 0; kch < Kt / kc; ++kch) {
                 noc.async_write_barrier();  // the multicast that last used this slot has left L1
                 const uint32_t off = slot * chunk_bytes;
                 for (uint32_t kk = 0; kk < kc; ++kk) {
                     for (uint32_t c = 0; c < nb; ++c) {
-                        const uint32_t id = (kch * kc + kk) * Nt + nblk * nb + c;
+                        const uint32_t id = (kch * kc + kk) * Nt + n0 + nblk * nb + c;
                         noc.async_read(w, dw, page, {.page_id = id}, {.offset_bytes = off + (kk * nb + c) * page});
                     }
                 }

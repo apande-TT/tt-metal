@@ -6,8 +6,9 @@ The transformer's limb linears run one stock matmul per limb (each streaming the
 product) and then add the products. kernels/limb_linear.cpp keeps each work unit's rows of BOTH limbs (full K)
 resident in L1 and multiplies every K chunk of the weight by both limbs, each into its own float32 DEST tiles, then
 adds the two with the SFPU float32 add: the weight is streamed once for both limbs, the products' K reductions are
-the stock matmul's fp32 sums, and one float32 result is written. The weight reaches the compute cores by multicast from one sender core outside the
-compute rectangle (kernels/sender_limb_linear.cpp), read from DRAM once per round of work units.
+the stock matmul's fp32 sums, and one float32 result is written. The weight reaches the compute cores by multicast from a sender core outside the
+compute rectangle (kernels/sender_limb_linear.cpp), read from DRAM once per round of work units; a wide output
+(K < N) splits its columns over the grid columns, one sender per grid column streaming that column's slice.
 Plugged into the transformer's _precise.linear as its LIMB_LINEAR_FN.
 """
 from __future__ import annotations
@@ -41,28 +42,32 @@ def fused_limb_linear(hi, lo, w, mem):
     mb = 1
     if 2 * mb * k_t * 2048 > _ROWS_L1_BYTES:
         return None
-    nb = _largest_divisor(n_t, _DEST_TILES // (2 * mb))  # hi and lo accumulate in their own DEST tiles
-    kc = _largest_divisor(k_t, max(1, 32 // nb))  # 64 KB weight chunks (2 slots in cb 1)
     device = hi.device()
     grid = device.compute_with_storage_grid_size()
     cols = grid.x
-    # compute rectangle: whole grid rows (leaving one row for the sender), units dealt round-robin over it
-    rect_rows = max((r for r in range(1, grid.y) if (rows // mb) % (r * cols) == 0), default=0)
+    # column groups: a wide output (K < N) splits its columns over the grid columns, each grid column taking its
+    # own slice of the weight from its own sender, so a core's work (and the weight it is sent) shrinks with N;
+    # a long-K one (K >= N) is one group, every core taking whole output rows
+    groups = cols if k_t < n_t and n_t % cols == 0 else 1
+    gw, n_g = cols // groups, n_t // groups  # grid columns and output column tiles per group
+    nb = _largest_divisor(n_g, _DEST_TILES // (2 * mb))  # hi and lo accumulate in their own DEST tiles
+    kc = _largest_divisor(k_t, max(1, 32 // nb))  # 64 KB weight chunks (2 slots in cb 1)
+    # compute rectangle: whole grid rows (leaving one row for the senders), each group's units dealt round-robin
+    # over its gw x rect_rows cores
+    rect_rows = max((r for r in range(1, grid.y) if (rows // mb) % (r * gw) == 0), default=0)
     if rect_rows == 0:
         return None
-    n_cores = rect_rows * cols
+    n_cores = rect_rows * gw  # per group
     units = rows // mb // n_cores
 
     out = ttnn.allocate_tensor_on_device(
         ttnn.Shape(list(hi.shape)[:-1] + [int(w.shape[-1])]), ttnn.float32, ttnn.TILE_LAYOUT, device, mem
     )
     rect = ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rect_rows - 1))
-    sender = ttnn.CoreCoord(0, rect_rows)
+    senders = [ttnn.CoreCoord(g * gw, rect_rows) for g in range(groups)]
     compute_cores = ttnn.CoreRangeSet([rect])
-    sender_cores = ttnn.CoreRangeSet([ttnn.CoreRange(sender, sender)])
-    all_cores = ttnn.CoreRangeSet([rect, ttnn.CoreRange(sender, sender)])
-    start, end = device.worker_core_from_logical_core(rect.start), device.worker_core_from_logical_core(rect.end)
-    sender_phys = device.worker_core_from_logical_core(sender)
+    sender_cores = ttnn.CoreRangeSet([ttnn.CoreRange(senders[0], senders[-1])])
+    all_cores = ttnn.CoreRangeSet([rect, ttnn.CoreRange(senders[0], senders[-1])])
 
     def _cb(index, dtype, page, n):
         return ttnn.CBDescriptor(
@@ -78,21 +83,26 @@ def fused_limb_linear(hi, lo, w, mem):
     ]
     sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=all_cores, initial_value=0) for i in (0, 1)]
     rd_rt, wr_rt, sd_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
-    for y in range(rect_rows):
-        for x in range(cols):
-            first = y * cols + x
-            rd_rt[x][y] = [hi.buffer_address(), lo.buffer_address(), first, sender_phys.x, sender_phys.y]
-            wr_rt[x][y] = [out.buffer_address(), first]
-    sd_rt[sender.x][sender.y] = [w.buffer_address(), start.x, start.y, end.x, end.y]
+    for g, sender in enumerate(senders):
+        x0 = g * gw
+        sender_phys = device.worker_core_from_logical_core(sender)
+        for y in range(rect_rows):
+            for x in range(x0, x0 + gw):
+                first = y * gw + x - x0
+                rd_rt[x][y] = [hi.buffer_address(), lo.buffer_address(), first, sender_phys.x, sender_phys.y]
+                wr_rt[x][y] = [out.buffer_address(), first, g * n_g]
+        start = device.worker_core_from_logical_core(ttnn.CoreCoord(x0, 0))
+        end = device.worker_core_from_logical_core(ttnn.CoreCoord(x0 + gw - 1, rect_rows - 1))
+        sd_rt[sender.x][sender.y] = [w.buffer_address(), start.x, start.y, end.x, end.y, g * n_g]
 
     cfg = ttnn.ComputeConfigDescriptor()
     cfg.math_fidelity = ttnn.MathFidelity.HiFi4
     cfg.fp32_dest_acc_en = True
     cfg.math_approx_mode = False
-    rd_ct = [k_t, n_t, mb, nb, kc, units, n_cores]
+    rd_ct = [k_t, n_g, mb, nb, kc, units, n_cores]
     rd_ct += list(ttnn.TensorAccessorArgs(hi).get_compile_time_args())
     rd_ct += list(ttnn.TensorAccessorArgs(lo).get_compile_time_args())
-    sd_ct = [k_t, n_t, nb, kc, units, n_cores] + list(ttnn.TensorAccessorArgs(w).get_compile_time_args())
+    sd_ct = [k_t, n_t, n_g, nb, kc, units, n_cores] + list(ttnn.TensorAccessorArgs(w).get_compile_time_args())
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=os.path.join(_KERNELS, "reader_limb_linear.cpp"),
@@ -106,7 +116,7 @@ def fused_limb_linear(hi, lo, w, mem):
             kernel_source=os.path.join(_KERNELS, "writer_limb_linear.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=compute_cores,
-            compile_time_args=[n_t, mb, nb, units, n_cores]
+            compile_time_args=[n_t, n_g, mb, nb, units, n_cores]
             + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
             runtime_args=wr_rt,
             config=ttnn.WriterConfigDescriptor(),
@@ -124,7 +134,7 @@ def fused_limb_linear(hi, lo, w, mem):
             kernel_source=os.path.join(_KERNELS, "limb_linear.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=compute_cores,
-            compile_time_args=[k_t, n_t, mb, nb, kc, units],
+            compile_time_args=[k_t, n_g, mb, nb, kc, units],
             runtime_args=ttnn.RuntimeArgs(),
             config=cfg,
         ),

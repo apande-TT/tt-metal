@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Writer of the two-limb linear (limb_linear.cpp): each mb x nb float32 output block of cb 16 (tile r * nb + c)
-// to y[row0 + r, nblk * nb + c], per work unit in the compute kernel's order.
+// to y[row0 + r, n0 + nblk * nb + c], per work unit in the compute kernel's order.
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -13,13 +13,15 @@
 void kernel_main() {
     const uint32_t y_addr = get_arg_val<uint32_t>(0);
     const uint32_t first_unit = get_arg_val<uint32_t>(1);
+    const uint32_t n0 = get_arg_val<uint32_t>(2);  // first output column tile of this core's column group
 
     constexpr uint32_t Nt = get_compile_time_arg_val(0);
-    constexpr uint32_t mb = get_compile_time_arg_val(1);
-    constexpr uint32_t nb = get_compile_time_arg_val(2);
-    constexpr uint32_t units = get_compile_time_arg_val(3);
-    constexpr uint32_t unit_stride = get_compile_time_arg_val(4);
-    constexpr auto y_args = TensorAccessorArgs<5>();
+    constexpr uint32_t Ntg = get_compile_time_arg_val(1);  // column tiles of this column group
+    constexpr uint32_t mb = get_compile_time_arg_val(2);
+    constexpr uint32_t nb = get_compile_time_arg_val(3);
+    constexpr uint32_t units = get_compile_time_arg_val(4);
+    constexpr uint32_t unit_stride = get_compile_time_arg_val(5);
+    constexpr auto y_args = TensorAccessorArgs<6>();
 
     constexpr uint32_t cb_out = 16;
     const uint32_t page = get_local_cb_interface(cb_out).fifo_page_size;
@@ -29,11 +31,11 @@ void kernel_main() {
     DataflowBuffer dout(cb_out);
     for (uint32_t i = 0; i < units; ++i) {
         const uint32_t row0 = (first_unit + i * unit_stride) * mb;
-        for (uint32_t nblk = 0; nblk < Nt / nb; ++nblk) {
+        for (uint32_t nblk = 0; nblk < Ntg / nb; ++nblk) {
             dout.wait_front(mb * nb);
             for (uint32_t r = 0; r < mb; ++r) {
                 for (uint32_t c = 0; c < nb; ++c) {
-                    const uint32_t id = (row0 + r) * Nt + nblk * nb + c;
+                    const uint32_t id = (row0 + r) * Nt + n0 + nblk * nb + c;
                     noc.async_write(dout, y, page, {.offset_bytes = (r * nb + c) * page}, {.page_id = id});
                 }
             }
