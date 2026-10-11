@@ -212,8 +212,24 @@ def matmul(a, b, b_parts=None):
     cfg = precise_config()
     ah, al = split_bf16(a)
     bh, bl = split_bf16(b) if b_parts is None else b_parts
-    mm = lambda p, q: ttnn.matmul(p, q, compute_kernel_config=cfg, dtype=ttnn.float32)  # noqa: E731
-    return ttnn.add(ttnn.add(mm(ah, bh), mm(ah, bl)), mm(al, bh))
+    if not MATMUL_PRODUCTS_L1:
+        mm = lambda p, q: ttnn.matmul(p, q, compute_kernel_config=cfg, dtype=ttnn.float32)  # noqa: E731
+        return ttnn.add(ttnn.add(mm(ah, bh), mm(ah, bl)), mm(al, bh))
+    l1 = ttnn.L1_MEMORY_CONFIG
+    mm = lambda p, q: ttnn.matmul(p, q, compute_kernel_config=cfg, dtype=ttnn.float32, memory_config=l1)  # noqa: E731
+    hh, hl = mm(ah, bh), mm(ah, bl)
+    s = ttnn.add(hh, hl, memory_config=l1)
+    ttnn.deallocate(hh)
+    ttnn.deallocate(hl)
+    lh = mm(al, bh)
+    y = ttnn.add(s, lh, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    ttnn.deallocate(s)
+    ttnn.deallocate(lh)
+    return y
+
+
+# matmul's float32 limb products and their partial sum in L1 (consumed right away by the adds)
+MATMUL_PRODUCTS_L1 = False
 
 
 def matmul_bt(a, b):
