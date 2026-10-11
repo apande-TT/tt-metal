@@ -223,10 +223,55 @@ class SharedExpert(TtKolibri1MLP):
         return out
 
 
+NORM_SHARD_ROWS = 1024  # above this, the interleaved norm already spreads over 32+ tile rows
+
+
+def norm_shard_cfg(hidden: int, rows: int):
+    """(memory config, program config) of an RMSNorm over [rows, hidden] width-sharded over 8 x 5 cores."""
+    gx, gy = 8, 5
+    block_w = hidden // ttnn.TILE_SIZE // (gx * gy)
+    mem = ttnn.create_sharded_memory_config(
+        shape=(rows, hidden // (gx * gy)),
+        core_grid=ttnn.CoreGrid(y=gy, x=gx),
+        strategy=ttnn.ShardStrategy.WIDTH,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+    pc = ttnn.LayerNormShardedMultiCoreProgramConfig(
+        compute_with_storage_grid_size=[gx, gy],
+        subblock_w=next(w for w in (4, 3, 2, 1) if block_w % w == 0),
+        block_h=rows // ttnn.TILE_SIZE,
+        block_w=block_w,
+        inplace=False,
+    )
+    return mem, pc
+
+
 class FinalNorm(TtKolibri1RMSNorm):
+    """The stub's norm, width-sharded over 40 cores up to NORM_SHARD_ROWS rows (ttnn's interleaved norm ran one core
+    per tile row of tokens: 43 us on one core at decode, on 4 for the 128-token prefill)."""
+
+    def __init__(self, device, torch_module) -> None:
+        super().__init__(device, torch_module)
+        self.hidden = int(torch_module.weight.shape[-1])
+        self._shard = {}
+
     def __call__(self, x, **kwargs):
         INVOCATIONS["r_m_s_norm"] += 1
-        return super().__call__(x, **kwargs)
+        rows = x.shape[-2]
+        if rows > NORM_SHARD_ROWS or math.prod(list(x.shape)[:-1]) != rows:
+            return super().__call__(x, **kwargs)
+        if rows not in self._shard:
+            self._shard[rows] = norm_shard_cfg(self.hidden, rows)
+        smem, pc = self._shard[rows]
+        xs = ttnn.to_memory_config(x, smem)
+        n = ttnn.rms_norm(
+            xs, epsilon=self.eps, weight=self.weight, program_config=pc, memory_config=smem, compute_kernel_config=self.cfg
+        )
+        ttnn.deallocate(xs)
+        out = ttnn.to_memory_config(n, DRAM)
+        ttnn.deallocate(n)
+        return out
 
 
 class LMHead(TtKolibri1LMHead):
@@ -1083,27 +1128,11 @@ class DecoderLayer(TtKolibri1DecoderLayer):
         self.hidden = int(torch_module.input_layernorm.weight.shape[-1])
         self._shard = {}
 
-    SHARD_ROWS = 1024  # above this, the interleaved norm already spreads over 32+ tile rows
+    SHARD_ROWS = NORM_SHARD_ROWS
 
     def _shard_cfg(self, rows):
         if rows not in self._shard:
-            gx, gy = 8, 5
-            block_w = self.hidden // ttnn.TILE_SIZE // (gx * gy)
-            mem = ttnn.create_sharded_memory_config(
-                shape=(rows, self.hidden // (gx * gy)),
-                core_grid=ttnn.CoreGrid(y=gy, x=gx),
-                strategy=ttnn.ShardStrategy.WIDTH,
-                orientation=ttnn.ShardOrientation.ROW_MAJOR,
-                use_height_and_width_as_shard_shape=True,
-            )
-            pc = ttnn.LayerNormShardedMultiCoreProgramConfig(
-                compute_with_storage_grid_size=[gx, gy],
-                subblock_w=next(w for w in (4, 3, 2, 1) if block_w % w == 0),
-                block_h=rows // ttnn.TILE_SIZE,
-                block_w=block_w,
-                inplace=False,
-            )
-            self._shard[rows] = (mem, pc)
+            self._shard[rows] = norm_shard_cfg(self.hidden, rows)
         return self._shard[rows]
 
     def _rms(self, x, name, mem):
