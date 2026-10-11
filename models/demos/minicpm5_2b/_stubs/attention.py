@@ -50,7 +50,7 @@ class AttnContext:
 
     mode "prefill": `mask` is the additive causal mask [1, 1, S, S].
     mode "decode":  `mask` is the additive key mask [B, 1, 1, capacity] (keys past each row's position
-                    are -inf), `write` the one-hot [B, 1, capacity, 1] of each row's write slot and
+                    are -inf), `write` the one-hot [B, n_kv, 1, capacity] of each row's write slot and
                     `cur_pos` that slot as int32 [B], which paged_update_cache writes in place.
     """
 
@@ -176,12 +176,15 @@ class TtAttention:
             # Write only row b's slot pos[b] in place with old + (new - old): the value the one-hot blend
             # cache + onehot * (new - cache) leaves there, without touching the rest of the cache.
             shard = self._decode_kv_shard(b)
+            d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
             for new_kv, cache in ((k, kv_cache.k), (v, kv_cache.v)):
-                old = ttnn.sum(ttnn.multiply(ctx.write, cache), dim=2, keepdim=True)  # [B, kv, 1, D]
+                # onehot [B, kv, 1, C] @ cache: the slot's current value, exactly (one non-zero term).
+                old = ttnn.matmul(
+                    ctx.write, cache, program_config=self._bmm_cfg(1, c_t, d_t), compute_kernel_config=self.compute_cfg
+                )
                 new_kv = ttnn.add(old, ttnn.subtract(new_kv, old))
                 new_kv = ttnn.to_memory_config(ttnn.reshape(new_kv, (1, b, self.n_kv_heads, self.head_dim)), shard)
                 ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
-            d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
             scores = ttnn.matmul(
                 q,
                 kv_cache.k,

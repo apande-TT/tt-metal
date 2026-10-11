@@ -169,7 +169,8 @@ class MiniCPM5Pipeline:
         self.prefill_mask = self._tt(causal, ttnn.bfloat16)
         self.prefill_pos = self._tt(torch.arange(Sp, dtype=torch.float32).repeat(B, 1), ttnn.float32)
         self.key_index_row = self._tt(torch.arange(C, dtype=torch.float32).reshape(1, 1, 1, C), ttnn.float32)
-        self.key_index_col = self._tt(torch.arange(C, dtype=torch.float32).reshape(1, 1, C, 1), ttnn.float32)
+        kv = self.n_kv_heads
+        self.key_index_kv = self._tt(torch.arange(C, dtype=torch.float32).repeat(1, kv, 1, 1), ttnn.float32)
         k = self.top_k
         self.cumsum_upper = self._tt(torch.triu(torch.ones(k, k)), ttnn.float32)  # p @ U = inclusive cumsum
         self.ids_buf = self._tt(torch.full((B, Sp), self.pad_id, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
@@ -282,7 +283,7 @@ class MiniCPM5Pipeline:
         cos_sin = self.rotary_embedding(x, position_ids=self.pos_buf)
         cur_pos = ttnn.reshape(ttnn.to_layout(self.pos_i32, ttnn.ROW_MAJOR_LAYOUT), (B,))  # one contiguous page
         pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1))
-        write = ttnn.typecast(ttnn.eq(self.key_index_col, pos), ttnn.bfloat16)  # [B, 1, C, 1]
+        write = ttnn.typecast(ttnn.eq(self.key_index_kv, pos), ttnn.bfloat16)  # [B, kv, 1, C]
         mask = ttnn.typecast(ttnn.multiply(ttnn.gt(self.key_index_row, pos), _NEG), ttnn.bfloat16)  # [B, 1, 1, C]
         ctx = attention_stub.AttnContext("decode", mask, write, cur_pos)
         h = self.encoder_stack(x, position_embeddings=cos_sin, kv_caches=self.kv_caches, attn_ctx=ctx)
