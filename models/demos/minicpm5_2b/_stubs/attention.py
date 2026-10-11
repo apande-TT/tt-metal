@@ -126,7 +126,7 @@ class TtAttention:
             ttnn.copy(ttnn.pad(v, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0) if pad else v, kv_cache.v)
             k = ttnn.repeat_interleave(k, self.kv_groups, dim=1)
             v = ttnn.repeat_interleave(v, self.kv_groups, dim=1)
-            scores = ttnn.matmul(q, ttnn.transpose(k, -2, -1), compute_kernel_config=self.compute_cfg)
+            scores = ttnn.matmul(q, k, transpose_b=True, compute_kernel_config=self.compute_cfg)
             scores = ttnn.add(ttnn.multiply(scores, self.scale), ctx.mask)
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg)
             attn = ttnn.matmul(probs, v, compute_kernel_config=self.compute_cfg)
@@ -146,7 +146,7 @@ class TtAttention:
                 new_kv = ttnn.add(old, ttnn.subtract(new_kv, old))
                 new_kv = ttnn.to_memory_config(ttnn.reshape(new_kv, (1, b, self.n_kv_heads, self.head_dim)), shard)
                 ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
-            scores = ttnn.matmul(q, ttnn.transpose(kv_cache.k, -2, -1), compute_kernel_config=self.compute_cfg)
+            scores = ttnn.matmul(q, kv_cache.k, transpose_b=True, compute_kernel_config=self.compute_cfg)
             scores = ttnn.add(ttnn.multiply(scores, self.scale), ctx.mask)
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg)
             attn = ttnn.matmul(probs, kv_cache.v, compute_kernel_config=self.compute_cfg)
@@ -214,7 +214,7 @@ class TtAttention:
             v = ttnn.concat([past_v, v], dim=2)
         k = ttnn.repeat_interleave(k, self.kv_groups, dim=1)
         v = ttnn.repeat_interleave(v, self.kv_groups, dim=1)
-        scores = ttnn.matmul(q, ttnn.transpose(k, -2, -1), compute_kernel_config=self.compute_cfg)
+        scores = ttnn.matmul(q, k, transpose_b=True, compute_kernel_config=self.compute_cfg)
         scores = ttnn.multiply(scores, self.scale)
         if seq > 1:
             # Query i sits at absolute position past_len + i and sees keys 0..past_len + i.
