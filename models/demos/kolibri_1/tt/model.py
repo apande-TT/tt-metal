@@ -569,6 +569,132 @@ class RoutedGateUp:
         return self.act
 
 
+class RoutedDown:
+    """Decode down projection over the ROUTED experts only, plus the shared expert (two generic_ops:
+    tt/kernels/routed_down_*.cpp, then tt/kernels/routed_down_sum_*.cpp).
+
+    The dense [32, 96*512] x [96*512, 2560] down projection streams every local expert's rows (133 MB of bf8
+    weights a layer) although ~20-40% of the experts are routed and the rest have act exactly 0. Phase 1 cuts the
+    work into (routed expert, block of NB output columns) items dealt round-robin over all cores; an item multiplies
+    the expert's [32, 512] act by its [512, NB * 32] weight block, K accumulated in fp32 dest, and writes the fp32
+    partial to plane r (r = the expert's rank among the routed ones) of a persistent [1, 96, 32, hidden] buffer.
+    Phase 2 sums, per output tile, the shared expert's partial and planes 0 .. R-1 in fp32 dest and packs bf16
+    once (the dense path rounded the routed sum and the shared add separately)."""
+
+    NB = 8  # output column tiles per phase-1 item
+
+    def __init__(self, device, w_down, n_experts: int, inter: int) -> None:
+        self.device, self.w_down = device, w_down
+        g = device.compute_with_storage_grid_size()
+        self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(g.x - 1, g.y - 1))])
+        self.core_xy = [(x, y) for y in range(g.y) for x in range(g.x)]
+        self.n_experts, self.cpe = n_experts, inter // ttnn.TILE_SIZE
+        self.nt = w_down.shape[-1] // ttnn.TILE_SIZE  # output column tiles
+        assert self.nt % self.NB == 0
+        nc = len(self.core_xy)
+        self.max_items = -(-n_experts * (self.nt // self.NB) // nc)
+        key = (id(device), "routed_down", n_experts, self.nt)
+        if key not in _PLANES:
+            _PLANES[key] = ttnn.zeros(
+                [1, n_experts, ttnn.TILE_SIZE, self.nt * ttnn.TILE_SIZE],
+                dtype=ttnn.float32,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+            )
+        self.planes = _PLANES[key]
+        self.mm_cfg = ttnn.ComputeConfigDescriptor(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, dst_full_sync_en=True
+        )
+        self.sum_cfg = ttnn.ComputeConfigDescriptor(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
+        )
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        modes[0] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the fp32 partial planes, summed exactly
+        self.sum_cfg.unpack_to_dest_mode = modes
+
+    def _kernel(self, name, ct, rt, config):
+        return ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=self.cores,
+            compile_time_args=ct,
+            runtime_args=rt,
+            config=config,
+        )
+
+    def __call__(self, act, mask, shared):
+        """act [1, 1, 32, n_experts * inter] bf16 (unrouted experts' columns may hold anything), mask [1, 1, 1,
+        n_experts] fp32 row-major (non-zero = routed), shared [1, 1, 32, hidden] bf16 -> [1, 1, 32, hidden] bf16."""
+        cb, c, nc, NB = RoutedGateUp._cb, self.cores, len(self.core_xy), self.NB
+        a_tile, w_tile = 2048, 1088
+        acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+        cbs = [
+            cb(0, ttnn.bfloat16, a_tile, 2 * self.cpe, c),
+            cb(1, ttnn.bfloat8_b, w_tile, 2 * self.cpe * NB, c),
+            cb(3, ttnn.float32, 512, 1, c),
+            cb(4, ttnn.uint32, 16, 1, c),
+            cb(5, ttnn.uint32, 16 * (-(-4 * (1 + self.max_items) // 16)), 1, c),
+            cb(16, ttnn.float32, 4096, 2 * NB, c),
+        ]
+        reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        for i, (cx, cy) in enumerate(self.core_xy):
+            reader_rt[cx][cy] = [act.buffer_address(), self.w_down.buffer_address(), mask.buffer_address(), i]
+            writer_rt[cx][cy] = [self.planes.buffer_address()]
+        kernels = [
+            self._kernel(
+                "routed_down_reader.cpp",
+                [self.n_experts, self.cpe, self.nt, NB, nc, self.max_items, a_tile, w_tile]
+                + acc(act, self.w_down, mask),
+                reader_rt,
+                ttnn.ReaderConfigDescriptor(),
+            ),
+            self._kernel(
+                "routed_down_writer.cpp", [self.nt, NB] + acc(self.planes), writer_rt, ttnn.WriterConfigDescriptor()
+            ),
+            self._kernel("routed_down_compute.cpp", [self.cpe, NB], [], self.mm_cfg),
+        ]
+        ttnn.generic_op(
+            [act, self.w_down, mask, self.planes], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+        )
+
+        out = ttnn.empty(
+            [1, 1, ttnn.TILE_SIZE, self.nt * ttnn.TILE_SIZE],
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+            memory_config=DRAM,
+        )
+        B = 8
+        cbs = [
+            cb(0, ttnn.float32, 4096, 2 * B, c),
+            cb(1, ttnn.bfloat16, 2048, 2, c),
+            cb(3, ttnn.float32, 512, 1, c),
+            cb(4, ttnn.uint32, 16, 1, c),
+            cb(16, ttnn.bfloat16, 2048, 2, c),
+        ]
+        reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        for i, (cx, cy) in enumerate(self.core_xy):
+            reader_rt[cx][cy] = [self.planes.buffer_address(), shared.buffer_address(), mask.buffer_address(), i]
+            compute_rt[cx][cy] = [i]
+            writer_rt[cx][cy] = [out.buffer_address(), i]
+        kernels = [
+            self._kernel(
+                "routed_down_sum_reader.cpp",
+                [self.n_experts, self.nt, nc, B] + acc(self.planes, shared, mask),
+                reader_rt,
+                ttnn.ReaderConfigDescriptor(),
+            ),
+            self._kernel(
+                "routed_down_sum_writer.cpp", [self.nt, nc] + acc(out), writer_rt, ttnn.WriterConfigDescriptor()
+            ),
+            self._kernel("routed_down_sum_compute.cpp", [self.nt, nc, B], compute_rt, self.sum_cfg),
+        ]
+        ttnn.generic_op(
+            [self.planes, shared, mask, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+        )
+        return out
+
+
 class GroupedExperts:
     """Prefill routed experts over the tokens each expert actually got (tt/kernels/moe_grouped_*.cpp, then
     tt/kernels/moe_combine_*.cpp: two generic_ops).
@@ -770,24 +896,8 @@ class MoE(TtKolibri1SparseMoeBlock):
         for name in ("ws_gate", "ws_up", "ws_down", "w_router"):  # replaced by the two stubs above
             ttnn.deallocate(getattr(self, name))
             setattr(self, name, None)
-        # Down projection, decode: one tile row of tokens against [n_local*inter, hidden] is a pure weight
-        # stream split over N (80 tiles -> 80 cores, each streaming one weight column, which sits in a
-        # single DRAM bank). ttnn's default walks K in blocks of 2 tiles, so the time goes to 768
-        # multicast/sync rounds rather than to bytes; a wide K block streams the same column in few rounds.
-        g = device.compute_with_storage_grid_size()
-        k_tiles = self.w_down.shape[-2] // ttnn.TILE_SIZE
-        self.down_decode_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
-            compute_with_storage_grid_size=(g.x, g.y),
-            in0_block_w=next(w for w in (16, 8, 4, 2, 1) if k_tiles % w == 0),
-            out_subblock_h=1,
-            out_subblock_w=1,
-            per_core_M=1,
-            per_core_N=1,
-            fuse_batch=True,
-            fused_activation=None,
-            mcast_in0=True,
-        )
         self.routed_gate_up = RoutedGateUp(device, self.w_gu, self.w_gu, self.n_local, self.inter, interleaved=True)
+        self.routed_down = RoutedDown(device, self.w_down, self.n_local, self.inter)
         self.grouped = GroupedExperts(device, self.w_gu, self.w_down, self.n_local, self.inter, self.top_k)
 
     def _upload(self, t, shard_dim, dtype):
@@ -840,26 +950,24 @@ class MoE(TtKolibri1SparseMoeBlock):
         x_in = ttnn.reshape(hidden_states, [1, 1, -1, shape[-1]])
         x = x_in if x_in.dtype == ttnn.bfloat16 else ttnn.typecast(x_in, ttnn.bfloat16)
         weights = self.routing_weights(x_in if self.router_fp32_input else x)
-        if x.shape[-2] == ttnn.TILE_SIZE:  # decode: only the routed experts' columns (persistent act, not freed)
-            w = ttnn.mesh_partition(weights, dim=3, cluster_axis=self.tp_axis) if self.tp > 1 else weights
+        w = ttnn.mesh_partition(weights, dim=3, cluster_axis=self.tp_axis) if self.tp > 1 else weights
+        # The routed and the shared expert are both row-parallel over the chips: their partial sums are added here and
+        # reduced once (the shared stub's own all_reduce made it two collectives per layer).
+        if x.shape[-2] == ttnn.TILE_SIZE:  # decode: only the routed experts' columns and rows
             mask = self._routed_mask(w)
-            act = self.routed_gate_up(x, mask, w)
+            act = self.routed_gate_up(x, mask, w)  # persistent, not freed
+            shared = self.shared.partial(x)
+            total = self.routed_down(act, mask, shared)  # routed experts + shared expert, summed in fp32
             ttnn.deallocate(mask)
-            if w is not weights:
-                ttnn.deallocate(w)
-            out = ttnn.linear(act, self.w_down, program_config=self.down_decode_pc, compute_kernel_config=self.hifi2)
         else:  # prefill: each expert over the tokens routed to it
-            w = ttnn.mesh_partition(weights, dim=3, cluster_axis=self.tp_axis) if self.tp > 1 else weights
             out = self.grouped(x, w)
-            if w is not weights:
-                ttnn.deallocate(w)
-        ttnn.deallocate(weights)
-        # The routed and the shared expert are both row-parallel over the chips: add their partial sums here and
-        # reduce once (the shared stub's own all_reduce made it two collectives per layer).
-        shared = self.shared.partial(x)
-        total = ttnn.add(out, shared, dtype=ttnn.bfloat16)
-        ttnn.deallocate(out)
+            shared = self.shared.partial(x)
+            total = ttnn.add(out, shared, dtype=ttnn.bfloat16)
+            ttnn.deallocate(out)
         ttnn.deallocate(shared)
+        if w is not weights:
+            ttnn.deallocate(w)
+        ttnn.deallocate(weights)
         if self.tp > 1:
             total = ttnn.all_reduce(total, cluster_axis=self.tp_axis, topology=ttnn.Topology.Linear)
         return ttnn.reshape(total, shape)
