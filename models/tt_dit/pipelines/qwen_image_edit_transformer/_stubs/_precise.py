@@ -210,7 +210,8 @@ def matmul(a, b, b_parts=None):
     """float32 a @ float32 b -> float32 as the 3-term bf16 split (dense accumulation). b_parts: b's
     (hi, lo) when several products share b."""
     cfg = precise_config()
-    ah, al = split_bf16(a)
+    l1_limbs = MATMUL_A_L1 and SPLIT_FN is not None and a.dtype == ttnn.float32 and not a.is_sharded()
+    ah, al = SPLIT_FN(a, ttnn.L1_MEMORY_CONFIG) if l1_limbs else split_bf16(a)
     bh, bl = split_bf16(b) if b_parts is None else b_parts
     if not MATMUL_PRODUCTS_L1:
         mm = lambda p, q: ttnn.matmul(p, q, compute_kernel_config=cfg, dtype=ttnn.float32)  # noqa: E731
@@ -222,6 +223,9 @@ def matmul(a, b, b_parts=None):
     ttnn.deallocate(hh)
     ttnn.deallocate(hl)
     lh = mm(al, bh)
+    if l1_limbs:
+        ttnn.deallocate(ah)
+        ttnn.deallocate(al)
     y = ttnn.add(s, lh, memory_config=ttnn.DRAM_MEMORY_CONFIG)
     ttnn.deallocate(s)
     ttnn.deallocate(lh)
@@ -230,6 +234,8 @@ def matmul(a, b, b_parts=None):
 
 # matmul's float32 limb products and their partial sum in L1 (consumed right away by the adds)
 MATMUL_PRODUCTS_L1 = False
+# with MATMUL_PRODUCTS_L1 and SPLIT_FN(x, mem): a's bf16 limbs written to L1 by the split, read there by the products
+MATMUL_A_L1 = False
 
 
 def matmul_bt(a, b):
