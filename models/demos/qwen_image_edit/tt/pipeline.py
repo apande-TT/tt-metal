@@ -228,6 +228,7 @@ class QwenImageEditTT:
         # stream of the weight (long-K ones, K >= N: whole output rows per core; wide ones, K < N: each grid column
         # its own slice of the output columns)
         _tr_precise.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG)
+        _tr_precise.MATMUL_PRODUCTS_L1 = True  # the attention P @ V limb products and their partial sum in L1
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
