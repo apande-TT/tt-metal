@@ -99,8 +99,8 @@ class TtAttention:
         return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
 
     def _heads(self, x, n_heads, seq):
-        # [B, S, n*D] -> [B, n, S, D]
-        x = ttnn.reshape(x, (x.shape[0], seq, n_heads, self.head_dim))
+        # [B, S, n*D] (or the rows folded as [1, B*S, n*D]) -> [B, n, S, D]
+        x = ttnn.reshape(x, (x.shape[-2] * x.shape[0] // seq, seq, n_heads, self.head_dim))
         return ttnn.permute(x, (0, 2, 1, 3))
 
     def _cos_sin(self, position_embeddings, batch, seq):
@@ -114,6 +114,9 @@ class TtAttention:
 
     def _cached(self, x, cos, sin, kv_cache, ctx, b, seq):
         """Resident-cache attention: prefill on [B, S, hidden], one decode step on [1, B, hidden]."""
+        if ctx.mode == "prefill":
+            # Fold the batch into the rows so each projection is one M = B*S matmul reading its weight once.
+            x = ttnn.reshape(x, (1, b * seq, x.shape[-1]))
         q = ttnn.linear(x, self.wq, compute_kernel_config=self.compute_cfg)
         k = ttnn.linear(x, self.wk, compute_kernel_config=self.compute_cfg)
         v = ttnn.linear(x, self.wv, compute_kernel_config=self.compute_cfg)
@@ -142,7 +145,11 @@ class TtAttention:
                 probs, v, program_config=self._bmm_cfg(s_t, s_t, d_t), compute_kernel_config=self.compute_cfg
             )
             attn = ttnn.permute(attn, (0, 2, 1, 3))
-            attn = ttnn.reshape(attn, (b, seq, self.n_heads * self.head_dim))
+            attn = ttnn.reshape(attn, (1, b * seq, self.n_heads * self.head_dim))
+            out = ttnn.linear(
+                attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+            return ttnn.reshape(out, (b, seq, out.shape[-1]))
         else:
             # One token per row: [B, 1, n*D] splits straight into the GQA layout [B, kv, groups, D]
             # (head h = g * groups + j), so the cache is attended per KV head with no repeat.
