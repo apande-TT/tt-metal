@@ -42,6 +42,7 @@ from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
 from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16
+from models.demos.qwen_image_edit.tt.softmax_rows import fused_softmax_rows
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.tracker import InvocationTracker
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
@@ -206,6 +207,7 @@ class QwenImageEditTT:
         # the image and text queries as one joint query block: one exact QK^T / softmax / P @ V per attention
         _tr_attention.JOINT_QUERIES = True
         _tr_attention.SOFTMAX_L1 = True  # the softmax's float32 logits in L1, subtract / exp in place
+        _tr_attention.SOFTMAX_FN = fused_softmax_rows  # and the whole softmax as one bit-identical C++ kernel
         # the transformer's exact fp32 TP reduce gathers, slices and adds each token chunk in L1
         _tr_ccl.L1_GATHER_BYTES = 48 * 1024 * 1024
         _tr_ccl.L1_GATHER_INPUT = True  # and each chunk's own partial is staged in L1 for the gather
