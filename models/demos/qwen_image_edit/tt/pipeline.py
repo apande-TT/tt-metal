@@ -232,6 +232,7 @@ class QwenImageEditTT:
         # its own slice of the output columns)
         _tr_precise.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG)
         _tr_precise.MATMUL_PRODUCTS_L1 = True  # the attention P @ V limb products and their partial sum in L1
+        _tr_precise.MATMUL_A_L1 = True  # and P's bf16 limbs split straight into L1 for them
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {

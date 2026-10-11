@@ -19,9 +19,9 @@ _KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
 _TT_METAL = os.environ.get("TT_METAL_HOME", "")
 
 
-def fused_split_bf16(x):
-    """x float32 TILE (interleaved) -> (hi, lo) bf16 TILE in x's memory config."""
-    return _split(x, "split_bf16.cpp", gelu=False)
+def fused_split_bf16(x, mem=None):
+    """x float32 TILE (interleaved) -> (hi, lo) bf16 TILE in x's memory config (or `mem`)."""
+    return _split(x, "split_bf16.cpp", gelu=False, out_mem=mem)
 
 
 def fused_gelu_split_bf16(x):
@@ -30,11 +30,12 @@ def fused_gelu_split_bf16(x):
     return _split(x, "gelu_split_bf16.cpp", gelu=True)
 
 
-def _split(x, compute_kernel, gelu):
+def _split(x, compute_kernel, gelu, out_mem=None):
     device = x.device()
     mem = x.memory_config()
     if mem.buffer_type == ttnn.BufferType.L1:  # an L1 input still gets its limbs in DRAM (L1 limbs clash with matmuls)
         mem = ttnn.DRAM_MEMORY_CONFIG
+    mem = mem if out_mem is None else out_mem
     hi = ttnn.allocate_tensor_on_device(x.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, device, mem)
     lo = ttnn.allocate_tensor_on_device(x.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, device, mem)
     vol = 1
