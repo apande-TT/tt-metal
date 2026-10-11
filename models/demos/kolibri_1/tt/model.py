@@ -976,12 +976,16 @@ class MoE(TtKolibri1SparseMoeBlock):
         where any token routed to the expert."""
         return ttnn.to_layout(ttnn.max(w, dim=2, keepdim=True), ttnn.ROW_MAJOR_LAYOUT)
 
-    def _kth(self, scores):
-        """scores [1, 1, N, n_exp] fp32 -> [1, 1, N, 1] fp32: each row's top_k-th largest score (tt/kernels/router_kth.cpp,
-        one core per row). ttnn.topk ran this as a sort on one core per tile row (63 us at 128 rows) and its k-th
-        column took an untilize / slice / tilize to cut out; the threshold is the same value either way."""
+    def _chosen(self, scores):
+        """scores [1, 1, N, n_exp] fp32 -> [1, 1, N, n_exp] fp32: 1.0 where the score is >= its row's top_k-th largest,
+        else 0.0 (tt/kernels/router_kth.cpp, one core per row). ttnn.topk ran the threshold as a sort on one core per
+        tile row (63 us at 128 rows) and its k-th column took an untilize / slice / tilize to cut out; the kernel's
+        threshold is the same value, and comparing in the kernel drops the broadcast ttnn.ge (7 us)."""
         n, e = scores.shape[-2], scores.shape[-1]
-        out = ttnn.empty([1, 1, n, 1], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=DRAM)
+        # L1: every core writes its rows into the same few tiles, one 64 B face row at a time
+        out = ttnn.empty(
+            [1, 1, n, e], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=ttnn.L1_MEMORY_CONFIG
+        )
         g = self.device.compute_with_storage_grid_size()
         xy = [(i % g.x, i // g.x) for i in range(min(n, g.x * g.y))]
         cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in xy])
@@ -997,16 +1001,14 @@ class MoE(TtKolibri1SparseMoeBlock):
             runtime_args=rt,
             config=ttnn.ReaderConfigDescriptor(),
         )
-        cb = RoutedGateUp._cb(0, ttnn.uint32, 64 + (e // ttnn.TILE_SIZE) * 128 + 64, 1, cores)
+        cb = RoutedGateUp._cb(0, ttnn.uint32, 64 + 2 * (e // ttnn.TILE_SIZE) * 128, 1, cores)
         ttnn.generic_op([scores, out], ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
         return out
 
     def routing_weights(self, x):
         logits = self.router(x)
         scores = ttnn.add(logits, self.router_bias)
-        kth = self._kth(scores)
-        chosen = ttnn.ge(scores, kth)
-        ttnn.deallocate(kth)
+        chosen = self._chosen(scores)
         weights = ttnn.multiply(ttnn.sigmoid(logits), chosen)
         if self.norm_topk_prob:
             weights = ttnn.divide(weights, ttnn.add(ttnn.sum(weights, dim=-1, keepdim=True), 1e-20))
