@@ -888,6 +888,45 @@ class DecoderLayer(TtKolibri1DecoderLayer):
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
+        # Decode norms: a [32, hidden] row is ONE tile row, which ttnn's interleaved norm runs on one core (~40 us at
+        # hidden 2560); width-sharded over 40 cores (2 tiles each) the same norm is a sharded two-stage reduction.
+        hidden = int(torch_module.input_layernorm.weight.shape[-1])
+        gx, gy = 8, 5
+        block_w = hidden // ttnn.TILE_SIZE // (gx * gy)
+        self.dec_mem = ttnn.create_sharded_memory_config(
+            shape=(ttnn.TILE_SIZE, hidden // (gx * gy)),
+            core_grid=ttnn.CoreGrid(y=gy, x=gx),
+            strategy=ttnn.ShardStrategy.WIDTH,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        self.dec_pc = ttnn.LayerNormShardedMultiCoreProgramConfig(
+            compute_with_storage_grid_size=[gx, gy],
+            subblock_w=next(w for w in (4, 3, 2, 1) if block_w % w == 0),
+            block_h=1,
+            block_w=block_w,
+            inplace=False,
+        )
+
+    def _rms(self, x, name, mem, decode):
+        """rms_norm(x) into `mem`; at decode (one tile row) width-sharded over 40 cores instead of one."""
+        if not decode:
+            return ttnn.rms_norm(
+                x, epsilon=self.eps, weight=self.norm_w[name], memory_config=mem, compute_kernel_config=self.norm_cfg
+            )
+        xs = ttnn.to_memory_config(x, self.dec_mem)
+        n = ttnn.rms_norm(
+            xs,
+            epsilon=self.eps,
+            weight=self.norm_w[name],
+            program_config=self.dec_pc,
+            memory_config=self.dec_mem,
+            compute_kernel_config=self.norm_cfg,
+        )
+        ttnn.deallocate(xs)
+        out = ttnn.to_memory_config(n, mem)
+        ttnn.deallocate(n)
+        return out
 
     def __call__(self, hidden_states, position_ids=None, attention_mask=None, past_key_value=None, **kwargs):
         """The stub's sandwich-norm residual, except the two post-sublayer norms run on the sublayers' bf16
@@ -898,23 +937,18 @@ class DecoderLayer(TtKolibri1DecoderLayer):
         # The attention reads its input as bf16: normalize a bf16 copy of the residual (typecast + bf16 norm, 105 MB
         # at 4096 rows) instead of an fp32 norm whose output the attention then typecasts (147 MB).
         L1 = ttnn.L1_MEMORY_CONFIG  # the residual adds read their bf16 operand from L1 (~190 KB a core at 4096 rows)
+        dec = getattr(past_key_value, "mode", None) == "decode" and h.shape[-2] == ttnn.TILE_SIZE
         hb = ttnn.typecast(h, ttnn.bfloat16, memory_config=L1)  # the norm's bf16 input, too, only lives across it
-        x = ttnn.rms_norm(
-            hb, epsilon=self.eps, weight=self.norm_w["input_layernorm"], memory_config=L1, compute_kernel_config=self.norm_cfg
-        )
+        x = self._rms(hb, "input_layernorm", L1, dec)
         ttnn.deallocate(hb)
         # x (L1) feeds only the QKV projection, which frees it.
         a = self.attn(x, position_ids, attention_mask, past_key_value)
-        n = ttnn.rms_norm(
-            a, epsilon=self.eps, weight=self.norm_w["post_attn_norm"], memory_config=L1, compute_kernel_config=self.norm_cfg
-        )
+        n = self._rms(a, "post_attn_norm", L1, dec)
         ttnn.deallocate(a)
         h = ttnn.add(h, n, dtype=h.dtype, memory_config=DRAM)
         ttnn.deallocate(n)
-        m = self.moe(self._norm(h, "post_attention_layernorm"))
-        n = ttnn.rms_norm(
-            m, epsilon=self.eps, weight=self.norm_w["post_ffn_norm"], memory_config=L1, compute_kernel_config=self.norm_cfg
-        )
+        m = self.moe(self._rms(h, "post_attention_layernorm", DRAM, dec))
+        n = self._rms(m, "post_ffn_norm", L1, dec)
         ttnn.deallocate(m)
         out = ttnn.add(h, n, dtype=h.dtype, memory_config=DRAM)
         ttnn.deallocate(n)
