@@ -166,9 +166,18 @@ class FP8Linear(TtKolibri1FP8Linear):
 
 
 class Router(TtKolibri1Router):
+    def __init__(self, device, torch_module) -> None:
+        super().__init__(device, torch_module)
+        self.device = device
+
     def __call__(self, x, **kwargs):
+        """The stub's fp32 logits; one tile row of tokens (decode) streams the weight in wide K blocks (ttnn's default
+        1D config multicast the fp32 rows two K tiles a round: 40 rounds, 40 us on the 12 output-column cores)."""
         INVOCATIONS["router"] += 1
-        return super().__call__(x, **kwargs)
+        if x.shape[-2] != ttnn.TILE_SIZE:
+            return super().__call__(x, **kwargs)
+        pc = wide_k_config(self.device, 1, x.shape[-1] // ttnn.TILE_SIZE, self.w.shape[-1] // ttnn.TILE_SIZE)
+        return ttnn.linear(x, self.w, dtype=ttnn.float32, program_config=pc, compute_kernel_config=self.cfg)
 
 
 class SharedExpert(TtKolibri1MLP):
