@@ -450,7 +450,9 @@ class Attention(TtKolibri1Attention):
         x = hidden_states
         if x.dtype != ttnn.bfloat16:
             x = ttnn.typecast(x, ttnn.bfloat16)
-        xqkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.mm_cfg)
+        # wide K blocks (ttnn's default config for [B, 2560] x [2560, qkv] walked K in small multicast rounds, 44 us)
+        pc = wide_k_config(self.device, x.shape[-2] // ttnn.TILE_SIZE, x.shape[-1] // ttnn.TILE_SIZE, self.wqkv.shape[-1] // 32)
+        xqkv = ttnn.linear(x, self.wqkv, program_config=pc, compute_kernel_config=self.mm_cfg)
         ttnn.deallocate(x)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
             xqkv, num_heads=self.n_local_heads, num_kv_heads=self.n_local_kv, memory_config=self.heads_mem
