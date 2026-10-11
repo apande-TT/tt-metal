@@ -40,7 +40,8 @@ class DecoderHead:
         self.weights = [
             ttnn.from_torch(
                 chunk.contiguous(),
-                **_mesh_kw(device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG),
+                # bfloat8_b halves the ~535 MB vocab-projection read that bounds the decode LM head.
+                **_mesh_kw(device, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG),
             )
             for chunk in torch.split(w, _VOCAB_CHUNK, dim=-1)
         ]
