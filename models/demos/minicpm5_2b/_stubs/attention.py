@@ -19,6 +19,8 @@ path creates a tensor from host and both are trace-capturable.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 
 import ttnn
@@ -119,25 +121,35 @@ class TtAttention:
             q = self._heads(q, self.n_heads, seq)
             k = self._heads(k, self.n_kv_heads, seq)
             v = self._heads(v, self.n_kv_heads, seq)
-            q = self._rope(q, cos, sin)
-            k = self._rope(k, cos, sin)
+            q = self._rope(q, cos, sin, self._rope_cfg(q))
+            k = self._rope(k, cos, sin, self._rope_cfg(k))
             pad = kv_cache.capacity - seq
             ttnn.copy(ttnn.pad(k, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0) if pad else k, kv_cache.k)
             ttnn.copy(ttnn.pad(v, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0) if pad else v, kv_cache.v)
             k = ttnn.repeat_interleave(k, self.kv_groups, dim=1)
             v = ttnn.repeat_interleave(v, self.kv_groups, dim=1)
-            scores = ttnn.matmul(q, k, transpose_b=True, compute_kernel_config=self.compute_cfg)
+            s_t, d_t = seq // 32, self.head_dim // 32
+            scores = ttnn.matmul(
+                q,
+                k,
+                transpose_b=True,
+                program_config=self._bmm_cfg(s_t, d_t, s_t),
+                compute_kernel_config=self.compute_cfg,
+            )
             scores = ttnn.add(ttnn.multiply(scores, self.scale), ctx.mask)
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg)
-            attn = ttnn.matmul(probs, v, compute_kernel_config=self.compute_cfg)
+            attn = ttnn.matmul(
+                probs, v, program_config=self._bmm_cfg(s_t, s_t, d_t), compute_kernel_config=self.compute_cfg
+            )
             attn = ttnn.permute(attn, (0, 2, 1, 3))
             attn = ttnn.reshape(attn, (b, seq, self.n_heads * self.head_dim))
         else:
             # One token per row: [B, 1, n*D] splits straight into the GQA layout [B, kv, groups, D]
             # (head h = g * groups + j), so the cache is attended per KV head with no repeat.
-            rope_cfg = self._decode_rope_cfg()
-            q = self._rope(ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups, self.head_dim)), cos, sin, rope_cfg)
-            k = self._rope(ttnn.reshape(k, (b, self.n_kv_heads, 1, self.head_dim)), cos, sin, rope_cfg)
+            q = ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups, self.head_dim))
+            k = ttnn.reshape(k, (b, self.n_kv_heads, 1, self.head_dim))
+            q = self._rope(q, cos, sin, self._rope_cfg(q))
+            k = self._rope(k, cos, sin, self._rope_cfg(k))
             v = ttnn.reshape(v, (b, self.n_kv_heads, 1, self.head_dim))
             # Write only row b's slot pos[b] in place with old + (new - old): the value the one-hot blend
             # cache + onehot * (new - cache) leaves there, without touching the rest of the cache.
@@ -152,13 +164,13 @@ class TtAttention:
                 q,
                 kv_cache.k,
                 transpose_b=True,
-                program_config=self._decode_bmm_cfg(d_t, c_t),
+                program_config=self._bmm_cfg(1, d_t, c_t),
                 compute_kernel_config=self.compute_cfg,
             )
             scores = ttnn.add(ttnn.multiply(scores, self.scale), ctx.mask)
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg)
             attn = ttnn.matmul(
-                probs, kv_cache.v, program_config=self._decode_bmm_cfg(c_t, d_t), compute_kernel_config=self.compute_cfg
+                probs, kv_cache.v, program_config=self._bmm_cfg(1, c_t, d_t), compute_kernel_config=self.compute_cfg
             )
             attn = ttnn.reshape(attn, (1, b, self.n_heads * self.head_dim))
         return ttnn.linear(attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG)
@@ -174,34 +186,36 @@ class TtAttention:
             use_height_and_width_as_shard_shape=True,
         )
 
-    def _decode_rope_cfg(self):
-        """Decode rotate-half with the B * n_kv head groups folded into M: one [<=32, D] @ [D, D] tile row per core.
+    def _rope_cfg(self, x):
+        """Rotate-half x @ rot with x's batch/head dims folded into M, spread over the grid.
 
         in0_block_w spans all of K, so each tile is one uninterrupted accumulation."""
         grid = self.device.compute_with_storage_grid_size()
-        d_t = self.head_dim // 32
+        cores, d_t = grid.x * grid.y, self.head_dim // 32
+        m_t = math.prod(x.padded_shape) // (self.head_dim * 32)
+        per_core_m = next(d for d in range(1, m_t + 1) if m_t % d == 0 and m_t // d <= cores)
         return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
             compute_with_storage_grid_size=(grid.x, grid.y),
             in0_block_w=d_t,
             out_subblock_h=1,
             out_subblock_w=d_t,
-            per_core_M=1,
+            per_core_M=per_core_m,
             per_core_N=d_t,
             fuse_batch=True,
             fused_activation=None,
             mcast_in0=False,
         )
 
-    def _decode_bmm_cfg(self, k_t, n_t):
-        """Decode attention bmm over the B * n_kv head groups (one tile row each, cache operand batched):
-        one tile row per core, in0_block_w spanning all of K so each tile is one uninterrupted accumulation."""
+    def _bmm_cfg(self, m_t, k_t, n_t):
+        """Attention bmm with a batched second operand: one [m_t, n_t]-tile output block per (batch, head),
+        blocks spread over the grid, in0_block_w spanning all of K so each tile is one uninterrupted accumulation."""
         grid = self.device.compute_with_storage_grid_size()
         return ttnn.MatmulMultiCoreReuseProgramConfig(
             compute_with_storage_grid_size=(grid.x, grid.y),
             in0_block_w=k_t,
             out_subblock_h=1,
             out_subblock_w=max(w for w in range(1, 5) if n_t % w == 0),
-            per_core_M=1,
+            per_core_M=m_t,
             per_core_N=n_t,
         )
 
