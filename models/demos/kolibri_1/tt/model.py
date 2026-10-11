@@ -864,7 +864,7 @@ class GroupedExperts:
         self.nt_gu = w_gu.shape[-1] // ttnn.TILE_SIZE
         self.kmax = min(top_k, n_experts)
         self.kb = next(b for b in (8, 5, 4, 2, 1) if self.kt % b == 0)
-        self.rb = 4  # 32-token row blocks per unit: 128 tokens per pass over an expert's weights
+        self.rb_max = 4  # 32-token row blocks per unit: up to 128 tokens per pass over an expert's weights
         # 2 * rb fp32 dest tiles (gate, up per row block) need full-sync dest.
         self.mm_cfg = ttnn.ComputeConfigDescriptor(
             math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, dst_full_sync_en=True
@@ -940,6 +940,14 @@ class GroupedExperts:
             config=config,
         )
 
+    def _rb(self, m):
+        """Row blocks per unit. A unit runs on one core and streams its expert's weights once, so bigger units read
+        the weights fewer times but serialise a heavily routed expert's tokens on one core: at a short prefill
+        (m <= 256: ~100 32-token units, about one per core) a full 128-token unit was the critical path (HiFi4
+        gate/up/down over 4 row blocks, ~1.1 ms against ~0.3 ms for a one-block unit's weight stream). The math per
+        row is the same for every unit size."""
+        return 1 if m <= 256 else (2 if m <= 1024 else self.rb_max)
+
     def _experts(self, x_rm, wt_rm, w_rm, counts, y, m):
         cb, c = RoutedGateUp._cb, self.cores
         bf, w_tile, f32 = 2048, 1088, 4096
@@ -947,7 +955,8 @@ class GroupedExperts:
         row_bytes, wrow = x_rm.shape[-1] * 2, w_rm.shape[-1] * 4
         r32 = lambda n: -(-n // 32) * 32
         nc = len(self.core_xy)
-        rb, unit = self.rb, 32 * self.rb
+        rb = self._rb(m)
+        unit = 32 * rb
         max_units = -(-(-(-m * self.kmax // unit) + self.n_experts) // nc)  # all units, worst case, dealt over nc
         cbs = [
             cb(0, ttnn.bfloat16, bf, kt, c),  # 32 gathered row-major x rows (tilize input)
