@@ -993,9 +993,13 @@ class GroupedExperts:
         ttnn.deallocate(wt)
         w_rm = ttnn.to_layout(w, ttnn.ROW_MAJOR_LAYOUT)
         # Tokens routed to each expert (exact: 0/1 summed in fp32 on the SFPU path); the reader deals units by it.
-        n_e = ttnn.sum(ttnn.sign(w), dim=2, keepdim=True, compute_kernel_config=self.count_cfg)
+        routed = ttnn.sign(w)
+        n_e = ttnn.sum(routed, dim=2, keepdim=True, compute_kernel_config=self.count_cfg)
         counts = ttnn.to_layout(n_e, ttnn.ROW_MAJOR_LAYOUT)
         ttnn.deallocate(n_e)
+        # Each token's routed local experts (the combine's plane count per row), [1, 1, M, 1] fp32 tile.
+        n_t = ttnn.sum(routed, dim=3, keepdim=True, compute_kernel_config=self.count_cfg)
+        ttnn.deallocate(routed)
         # The fp32 partial planes persist across calls, zeroed once: a row a plane does not receive this call keeps
         # an earlier call's finite value, which the combine multiplies by its 0 mask.
         key = (id(self.device), m, hidden)
@@ -1008,7 +1012,8 @@ class GroupedExperts:
         out = ttnn.empty(
             [1, 1, m, hidden], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=DRAM
         )
-        self._combine(y, w_rm, out, m)
+        self._combine(y, n_t, out, m)
+        ttnn.deallocate(n_t)
         for t in (x_rm, wt_rm, w_rm, counts):
             ttnn.deallocate(t)
         return out
@@ -1086,26 +1091,26 @@ class GroupedExperts:
             ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs),
         )
 
-    def _combine(self, y, w_rm, out, m):
+    def _combine(self, y, n_t, out, m):
         cb, c = RoutedGateUp._cb, self.cores
-        kt, mt, nc, wrow = self.kt, m // ttnn.TILE_SIZE, len(self.core_xy), w_rm.shape[-1] * 4
+        kt, mt, nc = self.kt, m // ttnn.TILE_SIZE, len(self.core_xy)
         cw = next(w for w in (8, 5, 4, 2, 1) if kt % w == 0)  # output tiles per (row, column-chunk) unit
         cbs = [
             cb(0, ttnn.float32, 4096, 2 * self.kmax * cw, c),  # partial planes of a unit's cw output tiles
             cb(4, ttnn.uint32, 16, 2, c),  # planes and all-rows-valid bits per unit -> compute
             cb(5, ttnn.float32, 4096, 2 * self.kmax, c),  # a 0/1 row mask per plane
-            cb(9, ttnn.float32, wrow * 32, 1, c),  # weight rows of the tile row's 32 tokens
+            cb(9, ttnn.float32, 4096, 1, c),  # the tile row's 32 token counts (column 0 of one tile)
             cb(16, ttnn.bfloat16, 2048, 2 * cw, c),  # summed output tiles
         ]
         reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for i, (cx, cy) in enumerate(self.core_xy):
-            reader_rt[cx][cy] = [w_rm.buffer_address(), y.buffer_address(), i]
+            reader_rt[cx][cy] = [n_t.buffer_address(), y.buffer_address(), i]
             compute_rt[cx][cy] = [i]
             writer_rt[cx][cy] = [out.buffer_address(), i]
         kernels = [
             self._kernel(
                 "moe_combine_reader.cpp",
-                [kt, mt, self.n_experts, nc, wrow, self.kmax, cw] + self._acc(w_rm, y),
+                [kt, mt, nc, self.kmax, cw] + self._acc(n_t, y),
                 reader_rt,
                 ttnn.ReaderConfigDescriptor(),
             ),
@@ -1114,7 +1119,7 @@ class GroupedExperts:
             ),
             self._kernel("moe_combine_compute.cpp", [kt, mt, nc, self.kmax, cw], compute_rt, self.sum_cfg),
         ]
-        ttnn.generic_op([y, w_rm, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+        ttnn.generic_op([y, n_t, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
 
 
 class MoE(TtKolibri1SparseMoeBlock):
