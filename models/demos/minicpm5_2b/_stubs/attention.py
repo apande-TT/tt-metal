@@ -90,6 +90,15 @@ class TtAttention:
         self.wq = _w(torch_module.q_proj)
         self.wk = _w(torch_module.k_proj)
         self.wv = _w(torch_module.v_proj)
+        # [Wq | Wk | Wv] for the cached prefill: one projection whose output nlp_create_qkv_heads splits.
+        projs = (torch_module.q_proj, torch_module.k_proj, torch_module.v_proj)
+        self.wqkv = ttnn.from_torch(
+            torch.cat([m.weight.detach().to(torch.float32) for m in projs]).t().contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         self.wo = _w(torch_module.o_proj)
         self.rot = ttnn.from_torch(
             _rotate_half_matrix(self.head_dim), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
@@ -99,8 +108,8 @@ class TtAttention:
         return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
 
     def _heads(self, x, n_heads, seq):
-        # [B, S, n*D] (or the rows folded as [1, B*S, n*D]) -> [B, n, S, D]
-        x = ttnn.reshape(x, (x.shape[-2] * x.shape[0] // seq, seq, n_heads, self.head_dim))
+        # [B, S, n*D] -> [B, n, S, D]
+        x = ttnn.reshape(x, (x.shape[0], seq, n_heads, self.head_dim))
         return ttnn.permute(x, (0, 2, 1, 3))
 
     def _cos_sin(self, position_embeddings, batch, seq):
@@ -115,15 +124,18 @@ class TtAttention:
     def _cached(self, x, cos, sin, kv_cache, ctx, b, seq):
         """Resident-cache attention: prefill on [B, S, hidden], one decode step on [1, B, hidden]."""
         if ctx.mode == "prefill":
-            # Fold the batch into the rows so each projection is one M = B*S matmul reading its weight once.
-            x = ttnn.reshape(x, (1, b * seq, x.shape[-1]))
-        q = ttnn.linear(x, self.wq, compute_kernel_config=self.compute_cfg)
-        k = ttnn.linear(x, self.wk, compute_kernel_config=self.compute_cfg)
-        v = ttnn.linear(x, self.wv, compute_kernel_config=self.compute_cfg)
-        if ctx.mode == "prefill":
-            q = self._heads(q, self.n_heads, seq)
-            k = self._heads(k, self.n_kv_heads, seq)
-            v = self._heads(v, self.n_kv_heads, seq)
+            # Batch folded into the rows: one M = B*S fused-QKV matmul reading its weight once, then the
+            # head split [B, 1, S, (n + 2 kv) * D] -> q [B, n, S, D], k/v [B, kv, S, D] in one op.
+            qkv = ttnn.linear(
+                ttnn.reshape(x, (1, b * seq, x.shape[-1])), self.wqkv, compute_kernel_config=self.compute_cfg
+            )
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                ttnn.reshape(qkv, (b, 1, seq, qkv.shape[-1])),
+                num_heads=self.n_heads,
+                num_kv_heads=self.n_kv_heads,
+                transpose_k_heads=False,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
             q = self._rope(q, cos, sin, self._rope_cfg(q))
             k = self._rope(k, cos, sin, self._rope_cfg(k))
             pad = kv_cache.capacity - seq
@@ -144,13 +156,16 @@ class TtAttention:
             attn = ttnn.matmul(
                 probs, v, program_config=self._bmm_cfg(s_t, s_t, d_t), compute_kernel_config=self.compute_cfg
             )
-            attn = ttnn.permute(attn, (0, 2, 1, 3))
+            attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [B, 1, S, n*D]
             attn = ttnn.reshape(attn, (1, b * seq, self.n_heads * self.head_dim))
             out = ttnn.linear(
                 attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
             )
             return ttnn.reshape(out, (b, seq, out.shape[-1]))
         else:
+            q = ttnn.linear(x, self.wq, compute_kernel_config=self.compute_cfg)
+            k = ttnn.linear(x, self.wk, compute_kernel_config=self.compute_cfg)
+            v = ttnn.linear(x, self.wv, compute_kernel_config=self.compute_cfg)
             # One token per row: [B, 1, n*D] splits straight into the GQA layout [B, kv, groups, D]
             # (head h = g * groups + j), so the cache is attended per KV head with no repeat.
             q = ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups, self.head_dim))
