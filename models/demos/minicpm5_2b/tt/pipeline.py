@@ -175,6 +175,8 @@ class MiniCPM5Pipeline:
         self.ids_buf = self._tt(torch.full((B, Sp), self.pad_id, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         self.tok_buf = self._tt(torch.zeros(B, 1, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         self.pos_buf = self._tt(torch.zeros(B, 1), ttnn.float32)
+        # The same positions as int32 [1, B]: the in-place KV-cache write slot of each row.
+        self.pos_i32 = self._tt(torch.zeros(1, B, dtype=torch.int32), ttnn.int32)
         # Sampling noise lives as [1, S, B, V/S]: S vocab segments of _NOISE_SEG_W columns, so the per-step
         # gather of the top-k candidates' noise reads one short segment row per core instead of one core
         # streaming the whole vocab row.
@@ -196,6 +198,7 @@ class MiniCPM5Pipeline:
         ids[:, :S] = input_ids.to(torch.int32)
         ttnn.copy(self._tt(ids, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT), self.ids_buf)
         ttnn.copy(self._tt(torch.full((B, 1), float(S)), ttnn.float32), self.pos_buf)
+        ttnn.copy(self._tt(torch.full((1, B), S, dtype=torch.int32), ttnn.int32), self.pos_i32)
         self.real_len = S
         for t in self.noise_steps:
             ttnn.deallocate(t)
@@ -277,14 +280,16 @@ class MiniCPM5Pipeline:
         # [1, B, H]: the B single-token rows share one tile row instead of padding each to a tile.
         x = ttnn.reshape(self.token_embed(self.tok_buf), (1, B, self.hidden))
         cos_sin = self.rotary_embedding(x, position_ids=self.pos_buf)
+        cur_pos = ttnn.reshape(ttnn.to_layout(self.pos_i32, ttnn.ROW_MAJOR_LAYOUT), (B,))  # one contiguous page
         pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1))
         write = ttnn.typecast(ttnn.eq(self.key_index_col, pos), ttnn.bfloat16)  # [B, 1, C, 1]
         mask = ttnn.typecast(ttnn.multiply(ttnn.gt(self.key_index_row, pos), _NEG), ttnn.bfloat16)  # [B, 1, 1, C]
-        ctx = attention_stub.AttnContext("decode", mask, write)
+        ctx = attention_stub.AttnContext("decode", mask, write, cur_pos)
         h = self.encoder_stack(x, position_embeddings=cos_sin, kv_caches=self.kv_caches, attn_ctx=ctx)
         logits = self.decoder_head(self.final_norm(h))
         self._emit(logits)
         ttnn.add(self.pos_buf, 1.0, output_tensor=self.pos_buf)
+        ttnn.add(self.pos_i32, 1, output_tensor=self.pos_i32)
         return logits
 
     def prefill_step(self):

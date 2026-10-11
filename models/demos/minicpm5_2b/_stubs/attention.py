@@ -48,11 +48,12 @@ class AttnContext:
 
     mode "prefill": `mask` is the additive causal mask [1, 1, S, S].
     mode "decode":  `mask` is the additive key mask [B, 1, 1, capacity] (keys past each row's position
-                    are -inf) and `write` the one-hot [B, 1, capacity, 1] of each row's write slot.
+                    are -inf), `write` the one-hot [B, 1, capacity, 1] of each row's write slot and
+                    `cur_pos` that slot as int32 [B], which paged_update_cache writes in place.
     """
 
-    def __init__(self, mode, mask, write=None):
-        self.mode, self.mask, self.write = mode, mask, write
+    def __init__(self, mode, mask, write=None, cur_pos=None):
+        self.mode, self.mask, self.write, self.cur_pos = mode, mask, write, cur_pos
 
 
 class TtAttention:
@@ -137,15 +138,31 @@ class TtAttention:
             q = self._rope(ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups, self.head_dim)), cos, sin)
             k = self._rope(ttnn.reshape(k, (b, self.n_kv_heads, 1, self.head_dim)), cos, sin)
             v = ttnn.reshape(v, (b, self.n_kv_heads, 1, self.head_dim))
-            # cache <- cache + onehot(pos) * (new - cache): writes row b's slot pos[b] only.
-            ttnn.copy(ttnn.add(kv_cache.k, ttnn.multiply(ctx.write, ttnn.subtract(k, kv_cache.k))), kv_cache.k)
-            ttnn.copy(ttnn.add(kv_cache.v, ttnn.multiply(ctx.write, ttnn.subtract(v, kv_cache.v))), kv_cache.v)
+            # Write only row b's slot pos[b] in place with old + (new - old): the value the one-hot blend
+            # cache + onehot * (new - cache) leaves there, without touching the rest of the cache.
+            shard = self._decode_kv_shard(b)
+            for new_kv, cache in ((k, kv_cache.k), (v, kv_cache.v)):
+                old = ttnn.sum(ttnn.multiply(ctx.write, cache), dim=2, keepdim=True)  # [B, kv, 1, D]
+                new_kv = ttnn.add(old, ttnn.subtract(new_kv, old))
+                new_kv = ttnn.to_memory_config(ttnn.reshape(new_kv, (1, b, self.n_kv_heads, self.head_dim)), shard)
+                ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
             scores = ttnn.matmul(q, ttnn.transpose(kv_cache.k, -2, -1), compute_kernel_config=self.compute_cfg)
             scores = ttnn.add(ttnn.multiply(scores, self.scale), ctx.mask)
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg)
             attn = ttnn.matmul(probs, kv_cache.v, compute_kernel_config=self.compute_cfg)
             attn = ttnn.reshape(attn, (1, b, self.n_heads * self.head_dim))
         return ttnn.linear(attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    def _decode_kv_shard(self, batch):
+        """Height-shard spec for one token's K/V [1, B, n_kv, D]: one batch row (a padded tile row) per core."""
+        grid = self.device.compute_with_storage_grid_size()
+        return ttnn.create_sharded_memory_config(
+            shape=(32, self.head_dim),
+            core_grid=ttnn.num_cores_to_corerangeset(batch, grid, True),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
 
     def _rope(self, x, cos, sin):
         x_rot = ttnn.matmul(x, self.rot, compute_kernel_config=self.compute_cfg)
