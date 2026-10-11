@@ -656,6 +656,11 @@ class TtVisionAttention:
             device, torch_module.proj.weight.detach().float().t().contiguous(), mapper=shard_mapper(device, 0)
         )
         self.bproj = upload(device, torch_module.proj.bias.detach().float().reshape(1, 1, 1, -1))
+        # proj column-parallel too (precise path): every chip takes the gathered heads and forms its output
+        # columns over the whole K, so no float32 partial sums cross the TP axis
+        self.wproj_cols = upload(
+            device, torch_module.proj.weight.detach().float().t().contiguous(), mapper=shard_mapper(device, -1)
+        )
         # rotate_half(x) == x @ R
         half = D // 2
         r = np.zeros((D, D), dtype=np.float32)
@@ -743,9 +748,13 @@ class TtVisionAttention:
         o = split_matmul(probs, v, compute_kernel_config=cfg, limbs=L)
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.reshape(o, (n, 1, s_pad, loc))
-        out = split_linear(o, self.wproj, compute_kernel_config=cfg, limbs=L)
         if self.tp > 1:
-            out = exact_all_reduce(out, self.device)
+            # the heads gathered (exact data movement), this chip's output columns over the whole K, gathered back
+            o = ttnn.all_gather(o, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
+            out = split_linear(o, self.wproj_cols, compute_kernel_config=cfg, limbs=L)
+            out = ttnn.all_gather(out, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
+        else:
+            out = split_linear(o, self.wproj, compute_kernel_config=cfg, limbs=L)
         # float32 bias: adding a bf16 tensor to a float32 one rounds the SUM to bf16 (~4e-4 relative)
         return ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32))
 
