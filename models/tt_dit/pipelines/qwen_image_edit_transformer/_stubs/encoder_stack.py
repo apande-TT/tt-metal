@@ -60,6 +60,11 @@ def _as_tt(t, device, dtype=ttnn.float32):
     return _replicated(t.to(torch.float32), device, dtype=dtype)
 
 
+# skip the modulated activations' typecast when they already have the target dtype (precise: float32 ->
+# float32, a full copy)
+SKIP_SAME_CAST = False
+
+
 class _TtBlock:
     def __init__(self, device, block, hifi, tp):
         self.device = device
@@ -112,8 +117,9 @@ class _TtBlock:
         t_sh1, t_sc1, t_g1, t_sh2, t_sc2, t_g2 = self._mod_params(silu_temb, self.txt_mod)
 
         mdt = ttnn.float32 if _precise.ENABLED else ttnn.bfloat16
-        img_m = ttnn.typecast(self._modulate(img, i_sh1, i_sc1), mdt)
-        txt_m = ttnn.typecast(self._modulate(txt, t_sh1, t_sc1), mdt)
+        cast = lambda t: t if SKIP_SAME_CAST and t.dtype == mdt else ttnn.typecast(t, mdt)  # noqa: E731
+        img_m = cast(self._modulate(img, i_sh1, i_sc1))
+        txt_m = cast(self._modulate(txt, t_sh1, t_sc1))
         a_img, a_txt = self.attn(img_m, txt_m, attention_mask=mask, image_rotary_emb=rotary)
 
         img = ttnn.add(img, ttnn.multiply(i_g1, a_img))
