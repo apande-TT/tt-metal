@@ -213,6 +213,13 @@ def matmul(a, b, b_parts=None):
     l1_limbs = MATMUL_A_L1 and SPLIT_FN is not None and a.dtype == ttnn.float32 and not a.is_sharded()
     ah, al = SPLIT_FN(a, ttnn.L1_MEMORY_CONFIG) if l1_limbs else split_bf16(a)
     bh, bl = split_bf16(b) if b_parts is None else b_parts
+    if MATMUL_FN is not None:
+        y = MATMUL_FN(ah, al, bh, bl)
+        if y is not None:
+            if l1_limbs:
+                ttnn.deallocate(ah)
+                ttnn.deallocate(al)
+            return y
     if not MATMUL_PRODUCTS_L1:
         mm = lambda p, q: ttnn.matmul(p, q, compute_kernel_config=cfg, dtype=ttnn.float32)  # noqa: E731
         return ttnn.add(ttnn.add(mm(ah, bh), mm(ah, bl)), mm(al, bh))
@@ -236,6 +243,8 @@ def matmul(a, b, b_parts=None):
 MATMUL_PRODUCTS_L1 = False
 # with MATMUL_PRODUCTS_L1 and SPLIT_FN(x, mem): a's bf16 limbs written to L1 by the split, read there by the products
 MATMUL_A_L1 = False
+# fn(ah, al, bh, bl) -> matmul's (ah @ bh + ah @ bl) + al @ bh as one program, or None to run the ttnn ops
+MATMUL_FN = None
 
 
 def matmul_bt(a, b):
