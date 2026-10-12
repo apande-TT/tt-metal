@@ -237,6 +237,86 @@ def sum_list(ts):
     return y
 
 
+_WL_READER = f"{_DIR}/weight_lanes_reader.cpp"
+_WL_COMPUTE = f"{_DIR}/weight_lanes_compute.cpp"
+_EIGHT_OUT_WRITER = f"{_DIR}/eight_out_writer.cpp"
+_ROW_MASKS = {}
+
+
+def _row_masks(device):
+    """The 8 row-lane mask tiles ([8 x 32, 32] bf16; tile r keeps the rows i % 8 == r), built once per device
+    with ttnn.Tensor (no host op inside an observed forward)."""
+    if id(device) not in _ROW_MASKS:
+        vals = [1.0 if i % 8 == r else 0.0 for r in range(8) for i in range(TILE) for _ in range(TILE)]
+        m = ttnn.Tensor(vals, [8 * TILE, TILE], ttnn.float32, ttnn.TILE_LAYOUT, device)
+        _ROW_MASKS[id(device)] = ttnn.typecast(m, ttnn.bfloat16)
+    return _ROW_MASKS[id(device)]
+
+
+def weight_lanes(w):
+    """The 8 exact-lane copies of a bf16 weight [K, N] (copy r keeps the K rows k % 8 == r, the strided lanes of
+    models/demos/qwen_image_edit_text_encoder/_stubs/attention.py) in one pass that reads w once; or None for a
+    weight it does not take."""
+    s = list(w.shape)
+    if len(s) != 2 or s[0] % TILE or s[1] % TILE:
+        return None
+    if w.dtype != ttnn.bfloat16 or w.layout != ttnn.TILE_LAYOUT or w.is_sharded():
+        return None
+    masks = _row_masks(w.device())
+    n_tiles = (s[0] // TILE) * (s[1] // TILE)
+    outs = [ttnn.empty_like(w) for _ in range(8)]
+    grid = w.device().compute_with_storage_grid_size()
+    work = _cores(grid, n_tiles)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+    page = _FP32_TILE_BYTES // 2
+
+    def cb(index, pages):
+        return ttnn.CBDescriptor(
+            total_size=pages * page,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=ttnn.bfloat16, page_size=page)],
+        )
+
+    cbs = [cb(0, 2), cb(1, 8)] + [cb(_OUT_CB + r, 2) for r in range(8)]
+    reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    for c, start, count in work:
+        reader_rt[c.x][c.y] = [w.buffer_address(), masks.buffer_address(), count, start]
+        compute_rt[c.x][c.y] = [count]
+        writer_rt[c.x][c.y] = [t.buffer_address() for t in outs] + [count, start]
+    compute_cfg = ttnn.ComputeConfigDescriptor(
+        math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, dst_full_sync_en=True
+    )
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_WL_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(w).get_compile_time_args()
+            + ttnn.TensorAccessorArgs(masks).get_compile_time_args(),
+            runtime_args=reader_rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_WL_COMPUTE,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[],
+            runtime_args=compute_rt,
+            config=compute_cfg,
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_EIGHT_OUT_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[a for t in outs for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            runtime_args=writer_rt,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    ttnn.generic_op([w, masks] + outs, ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    return outs
+
+
 def split_limbs(x, limbs=2):
     """split_bf16's `limbs` (2 or 3) bf16 limbs of an interleaved float32 tile tensor in one pass -- hi = bf16(x),
     then the bf16 of each remainder -- with the same SFPU typecast / subtract; or None for a tensor it does

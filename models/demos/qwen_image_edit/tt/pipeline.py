@@ -26,7 +26,14 @@ import torch
 import ttnn
 from models.demos.qwen_image_edit.tt import inputs as I
 from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl
-from models.demos.qwen_image_edit.tt.guard_kernel import guard_tail, split_limbs, sum_list, sum_parts, vote_tail
+from models.demos.qwen_image_edit.tt.guard_kernel import (
+    guard_tail,
+    split_limbs,
+    sum_list,
+    sum_parts,
+    vote_tail,
+    weight_lanes,
+)
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
 from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
@@ -117,6 +124,8 @@ class TtQwenImageEditPipeline:
         self.split_limbs = split_limbs if precise else None
         # and their exact lanes masked onto the weights' rows where the weights are small beside the input
         self.weight_lanes = bool(precise)
+        # (the 8 masked weight copies from one read of the weight)
+        self.weight_lane_split = weight_lanes if precise else None
         # and their batched attention products on the full core grid (the vision token permutations take two dense
         # limb products: a one-hot row selection is exact without lanes)
         self.bmm_config = _te_attention.bmm_program_config if precise else None
@@ -191,6 +200,7 @@ class TtQwenImageEditPipeline:
             "SUM_PARTS": self.sum_parts,
             "LANE_SUM": self.lane_sum,
             "WEIGHT_LANES": self.weight_lanes,
+            "WEIGHT_LANE_SPLIT": self.weight_lane_split,
             "SPLIT_LIMBS": self.split_limbs,
             "BMM_CONFIG": self.bmm_config,
         }

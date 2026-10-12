@@ -336,6 +336,9 @@ def _lead_lanes(lead):
 # Taken when the weights sharing an input are small beside it (their N total <= half its rows): masking 8 copies
 # of the weights then moves far fewer bytes than 8 copies of the input.
 WEIGHT_LANES = False
+# Optional fused kernel for them: WEIGHT_LANE_SPLIT(w) -> the 8 masked copies of w (each equal to w * its row mask)
+# from one read of w, or None for a weight it does not take.
+WEIGHT_LANE_SPLIT = None
 _ROW_LANE_MASKS = {}
 
 
@@ -365,9 +368,12 @@ def _weight_lane_sums(lead, ws):
     if 2 * sum(w.shape[-1] for w in ws) > rows or any(len(w.shape) != 2 for w in ws):
         return None
     accs = [_LaneAcc() for _ in ws]
-    for m in _row_lane_masks(lead.device(), lead.shape[-1], ws[0].dtype):
+    split = None if WEIGHT_LANE_SPLIT is None else [WEIGHT_LANE_SPLIT(w) for w in ws]
+    if split is not None and any(lanes is None for lanes in split):
+        split = None
+    for r, m in enumerate(_row_lane_masks(lead.device(), lead.shape[-1], ws[0].dtype)):
         for i, w in enumerate(ws):
-            wr = ttnn.multiply(w, m)  # 0 / 1: exact
+            wr = ttnn.multiply(w, m) if split is None else split[i][r]  # 0 / 1: exact
             accs[i].push(_linear_mm(lead, wr)(lead))
             ttnn.deallocate(wr)
     return [acc.value() for acc in accs]
