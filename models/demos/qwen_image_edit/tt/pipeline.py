@@ -218,6 +218,8 @@ class TtQwenImageEditPipeline:
             return self.text_encoder.encode_text(up.te, image_embeds)
 
     def vae_encode(self, up):
+        # (its 1x1 shortcut linears run the text encoder's exact split_linear; their narrow 96 -> 192 products
+        # take linear_program_config's 1D full-grid config)
         with self._hook(_vae_resident, "VOTE_TAIL", self.vote_tail), self._hook(
             _vae_resident, "ROUND_BF16", self.round_bf16
         ):

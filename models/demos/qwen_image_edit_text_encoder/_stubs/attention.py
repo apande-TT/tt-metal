@@ -440,6 +440,34 @@ def _largest_divisor(n, cap, step=1):
     return step
 
 
+def _small_linear_config(mt, kt, nt, grid):
+    """1D config for a linear too narrow for the 2D blocks (the VAE's 96 -> 192 1x1 shortcut over 16384 voxels:
+    K = 3, N = 6 tiles): the weight multicast to every core, the M tiles split evenly over the whole grid, the whole
+    K in one step (the K order of each output tile unchanged). The auto pick ran it on 24 of the 64 cores. None
+    unless M splits evenly and the blocks fit ~1000 KB of L1."""
+    cores = grid.x * grid.y
+    if mt % cores or nt > 16:
+        return None
+    pcm = mt // cores
+    if 2 * (pcm * kt + kt * nt) * 2048 + pcm * nt * 4096 > 1000 * 1024:
+        return None
+    key = ("small", mt, kt, nt, grid.x, grid.y)
+    if key not in _LINEAR_CONFIGS:
+        sbw = _largest_divisor(nt, 4)
+        _LINEAR_CONFIGS[key] = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(grid.x, grid.y),
+            in0_block_w=kt,
+            out_subblock_h=_largest_divisor(pcm, max(1, 4 // sbw)),
+            out_subblock_w=sbw,
+            per_core_M=pcm,
+            per_core_N=nt,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=False,
+        )
+    return _LINEAR_CONFIGS[key]
+
+
 def linear_program_config(x, w):
     """2D-multicast config for a batched float32-output linear x [..., M, K] @ w [K, N], or None (auto).
 
@@ -459,7 +487,7 @@ def linear_program_config(x, w):
         rows *= d
     mt, kt, nt = rows // 32, xs[-1] // 32, ws[-1] // 32
     if mt < 8 or kt < 4 or nt < 8:
-        return None
+        return _small_linear_config(mt, kt, nt, w.device().compute_with_storage_grid_size())
     grid = w.device().compute_with_storage_grid_size()
     key = (mt, kt, nt, grid.x, grid.y)
     if key not in _LINEAR_CONFIGS:
