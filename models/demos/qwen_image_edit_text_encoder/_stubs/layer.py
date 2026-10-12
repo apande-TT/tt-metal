@@ -32,6 +32,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     pad_to_tile,
     rotate_half,
     shard_mapper,
+    split_bf16,
     split_linear,
     split_linears,
     split_matmul,
@@ -218,7 +219,10 @@ class TtTextAttention:
         o = ttnn.reshape(o, (b, hl, s_pad, D))
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.reshape(o, (b, 1, s_pad, hl * D))
-        out = split_linear(_gather_cols(o, self.tp), self.wo, compute_kernel_config=cfg, exact=ex)
+        # split into bf16 limbs on this chip, then gathered: the same bytes as the float32 heads, the split on a
+        # quarter of the data
+        parts = [_gather_cols(p, self.tp) for p in split_bf16(o, 2)]
+        out = split_linear(parts[0], self.wo, compute_kernel_config=cfg, exact=ex, parts=parts)
         return _gather_cols(out, self.tp)
 
 

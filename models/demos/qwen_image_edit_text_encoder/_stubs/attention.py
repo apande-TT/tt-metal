@@ -479,10 +479,11 @@ def split_linears(x, ws, biases=None, compute_kernel_config=None, exact=True, li
     return [_add_bias(y, b) for y, b in zip(ys, biases)]
 
 
-def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2):
+def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2, parts=None):
     """float32 x @ bf16 w (+ bias) -> float32. x is carried as `limbs` bf16 parts (exact products). With
-    exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part."""
-    parts = split_bf16(x, limbs)
+    exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part. parts: x's
+    limbs already split (x is then only its shape)."""
+    parts = split_bf16(x, limbs) if parts is None else tuple(parts)
     mm = _linear_mm(x, w)
     if exact and EXACT_MODE == "guarded":
         y = _guarded_sums(
