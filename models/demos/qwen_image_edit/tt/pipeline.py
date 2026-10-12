@@ -38,6 +38,7 @@ import torch
 import ttnn
 from models.demos.qwen_image_edit.mesh import DEVICE_PARAMS, MESH_SHAPE  # noqa: F401 (re-exported)
 from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_sum_bias
+from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
@@ -233,6 +234,8 @@ class QwenImageEditTT:
         _tr_precise.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG)
         _tr_precise.MATMUL_PRODUCTS_L1 = True  # the attention P @ V limb products and their partial sum in L1
         _tr_precise.MATMUL_A_L1 = True  # and P's bf16 limbs split straight into L1 for them
+        # and the three limb products + two adds as one kernel over the full grid (P's rows read once per row block)
+        _tr_precise.MATMUL_FN = lambda ah, al, bh, bl: fused_limb_bmm(ah, al, bh, bl, ttnn.DRAM_MEMORY_CONFIG)
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import encoder_stack as _tr_stack
 
         _tr_stack.SKIP_SAME_CAST = True  # no float32 -> float32 copy of the modulated activations
