@@ -233,6 +233,9 @@ class QwenImageEditTT:
         _tr_precise.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG)
         _tr_precise.MATMUL_PRODUCTS_L1 = True  # the attention P @ V limb products and their partial sum in L1
         _tr_precise.MATMUL_A_L1 = True  # and P's bf16 limbs split straight into L1 for them
+        from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import encoder_stack as _tr_stack
+
+        _tr_stack.SKIP_SAME_CAST = True  # no float32 -> float32 copy of the modulated activations
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
