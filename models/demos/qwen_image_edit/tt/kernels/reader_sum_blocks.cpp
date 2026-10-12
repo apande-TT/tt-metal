@@ -26,12 +26,13 @@ void kernel_main() {
 
     Noc noc;
     DataflowBuffer dfb(cb_id_in);
+    // the n source tiles of an output tile issued together, one barrier per output tile
     for (uint32_t t = start_tile; t < start_tile + num_tiles; ++t) {
+        dfb.reserve_back(n_blocks);
         for (uint32_t i = 0; i < n_blocks; ++i) {
-            dfb.reserve_back(1);
-            noc.async_read(s, dfb, page_bytes, {.page_id = i * block_tiles + t}, {.offset_bytes = 0});
-            noc.async_read_barrier();
-            dfb.push_back(1);
+            noc.async_read(s, dfb, page_bytes, {.page_id = i * block_tiles + t}, {.offset_bytes = i * page_bytes});
         }
+        noc.async_read_barrier();
+        dfb.push_back(n_blocks);
     }
 }
