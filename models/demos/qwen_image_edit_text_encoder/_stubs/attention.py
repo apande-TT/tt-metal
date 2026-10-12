@@ -331,21 +331,67 @@ def _lead_lanes(lead):
     return split
 
 
-def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None):
+# The exact lanes formed on the weights instead of the input: lane r of x @ w is x @ (w with only the K rows of
+# lane r kept), the same 4 nonzero terms per 32-group in every tile product, so the same exact tile results.
+# Taken when the weights sharing an input are small beside it (their N total <= half its rows): masking 8 copies
+# of the weights then moves far fewer bytes than 8 copies of the input.
+WEIGHT_LANES = False
+_ROW_LANE_MASKS = {}
+
+
+def _row_lane_masks(device, k, dtype):
+    """The strided lane masks as [K, 1] columns (row r of a weight kept by lane _lane_of(r))."""
+    key = (id(device), k, dtype)
+    if key not in _ROW_LANE_MASKS:
+        lane = [_lane_of(i, "strided") for i in range(k)]
+        masks = []
+        for r in range(EXACT_LANES):
+            m = ttnn.Tensor(
+                [1.0 if lane[i] == r else 0.0 for i in range(k)], [k, 1], ttnn.float32, ttnn.TILE_LAYOUT, device
+            )
+            masks.append(ttnn.typecast(m, dtype))
+        _ROW_LANE_MASKS[key] = masks
+    return _ROW_LANE_MASKS[key]
+
+
+def _weight_lane_sums(lead, ws):
+    """[sum_r lead @ (w masked to lane r's rows) for w in ws] (the exact-lane sums), or None when the weights
+    are not small beside the input."""
+    if not WEIGHT_LANES or ws is None:
+        return None
+    rows = 1
+    for d in list(lead.padded_shape)[:-1]:
+        rows *= d
+    if 2 * sum(w.shape[-1] for w in ws) > rows or any(len(w.shape) != 2 for w in ws):
+        return None
+    accs = [_LaneAcc() for _ in ws]
+    for m in _row_lane_masks(lead.device(), lead.shape[-1], ws[0].dtype):
+        for i, w in enumerate(ws):
+            wr = ttnn.multiply(w, m)  # 0 / 1: exact
+            accs[i].push(_linear_mm(lead, wr)(lead))
+            ttnn.deallocate(wr)
+    return [acc.value() for acc in accs]
+
+
+def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None):
     """EXACT_MODE "guarded" for linears of ONE input: mms[i](p) = p @ w_i; parts = the input's bf16 limbs.
     The input side (each lane, the negated lead limb, its row norms) is formed once for all the weights,
     one lane at a time; each weight's own sums run in the same order as alone, so every output is the one
-    a call for that weight alone would give. lo_mms: the matmuls for the trailing limb (default mms)."""
+    a call for that weight alone would give. lo_mms: the matmuls for the trailing limb (default mms). ws: the
+    weights themselves (for the weight-side lanes, WEIGHT_LANES)."""
     lo_mms = lo_mms or mms
     nn_mms = nn_mms or mms
     lead = parts[0]
-    accs = [_LaneAcc() for _ in mms]
-    lanes, neg_lead = _lead_lanes(lead)
-    for lane in lanes:
-        for i, mm in enumerate(mms):
-            accs[i].push(mm(lane))
-        ttnn.deallocate(lane)
-    exs = [acc.value() for acc in accs]
+    exs = _weight_lane_sums(lead, ws)
+    neg_lead = None
+    if exs is None:
+        accs = [_LaneAcc() for _ in mms]
+        lanes, neg_lead = _lead_lanes(lead)
+        for lane in lanes:
+            for i, mm in enumerate(mms):
+                accs[i].push(mm(lane))
+            ttnn.deallocate(lane)
+        exs = [acc.value() for acc in accs]
     neg_lead = ttnn.neg(lead) if neg_lead is None else neg_lead
     a_norm = _norm_last(lead)
     ys = []
@@ -475,7 +521,7 @@ def split_linears(x, ws, biases=None, compute_kernel_config=None, exact=True, li
     parts = split_bf16(x, limbs)
     lo_mms = [_linear_mm(x, w, LO_FIDELITY) for w in ws]
     nn_mms = [_linear_mm(x, w, NN_FIDELITY) for w in ws]
-    ys = _guarded_sums([_linear_mm(x, w) for w in ws], parts, [_col_norms(w) for w in ws], lo_mms, nn_mms)
+    ys = _guarded_sums([_linear_mm(x, w) for w in ws], parts, [_col_norms(w) for w in ws], lo_mms, nn_mms, ws=ws)
     return [_add_bias(y, b) for y, b in zip(ys, biases)]
 
 
@@ -487,7 +533,7 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     mm = _linear_mm(x, w)
     if exact and EXACT_MODE == "guarded":
         y = _guarded_sums(
-            [mm], parts, [_col_norms(w)], [_linear_mm(x, w, LO_FIDELITY)], [_linear_mm(x, w, NN_FIDELITY)]
+            [mm], parts, [_col_norms(w)], [_linear_mm(x, w, LO_FIDELITY)], [_linear_mm(x, w, NN_FIDELITY)], ws=[w]
         )[0]
     elif exact:
         y = _exact_sum(mm, parts)

@@ -115,6 +115,8 @@ class TtQwenImageEditPipeline:
         # and their inputs' two bf16 limbs in one pass (the vision and LM attention out-projections column-parallel,
         # the LM one split before its gather)
         self.split_limbs = split_limbs if precise else None
+        # and their exact lanes masked onto the weights' rows where the weights are small beside the input
+        self.weight_lanes = bool(precise)
         # and their batched attention products on the full core grid (the vision token permutations take two dense
         # limb products: a one-hot row selection is exact without lanes)
         self.bmm_config = _te_attention.bmm_program_config if precise else None
@@ -188,6 +190,7 @@ class TtQwenImageEditPipeline:
             "NN_FIDELITY": self.lo_fidelity,
             "SUM_PARTS": self.sum_parts,
             "LANE_SUM": self.lane_sum,
+            "WEIGHT_LANES": self.weight_lanes,
             "SPLIT_LIMBS": self.split_limbs,
             "BMM_CONFIG": self.bmm_config,
         }
