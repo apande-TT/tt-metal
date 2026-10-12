@@ -62,7 +62,13 @@ class KolibriPipeline:
         self.config = ck.config
         self.hf = ck.shell()  # full-depth reference skeleton (meta device): the model's section structure
         self.layer_ids = layer_indices(self.config, layers)
-        self.batch = int(batch or kin.batch_size())
+        # `users` is what the caller asked for; `batch` is what the device runs: whole tile rows of users, since
+        # every kernel (sharded norms, q/k prep, the sampler's per-row kernels and top-k tree) works on 32-row
+        # tiles. Rows past `users` are padding: they run the same prompt with a dummy seed and are never returned.
+        self.users = int(batch or kin.batch_size())
+        if self.users < 1:
+            raise ValueError(f"batch must be >= 1, got {self.users}")
+        self.batch = -(-self.users // ttnn.TILE_SIZE) * ttnn.TILE_SIZE
         self.capacity = min(int(capacity), int(self.config.max_position_embeddings))
         self.settings = kin.sampling_settings()
         self.hidden = int(self.config.hidden_size)
@@ -91,7 +97,8 @@ class KolibriPipeline:
         self.prompt_len = None
         self._prefill_hn = None
         log(
-            f"[build] {len(self.layers)} layers, batch {self.batch}, KV capacity {self.capacity} ({time.time() - t0:.0f}s)"
+            f"[build] {len(self.layers)} layers, {self.users} users on {self.batch} device rows, KV capacity "
+            f"{self.capacity} ({time.time() - t0:.0f}s)"
         )
 
     # ------------------------------------------------------------------------------------------ setup
@@ -126,8 +133,9 @@ class KolibriPipeline:
         """Input encoding -> resident device buffers: the padded prompt, its positions, the per-user
         sampling uniforms and the decode-state counters. Host work, done before any forward runs."""
         B, T = self.batch, len(prompt_ids)
-        if len(seeds) != B:
-            raise ValueError(f"need {B} seeds, got {len(seeds)}")
+        if len(seeds) != self.users:
+            raise ValueError(f"need {self.users} seeds (one per user), got {len(seeds)}")
+        seeds = list(seeds) + [0] * (B - self.users)  # padding rows: dummy seed, output discarded
         if T >= self.capacity:
             raise ValueError(f"prompt of {T} tokens exceeds the KV capacity {self.capacity}")
         Tp = max(32, -(-T // 32) * 32)
@@ -223,7 +231,7 @@ class KolibriPipeline:
             input_ids = self.default_prompt()
         ids = torch.as_tensor(input_ids)
         prompt = ids.reshape(-1, ids.shape[-1])[0].tolist()
-        self.load_request(prompt, list(seeds) if seeds is not None else list(range(self.batch)))
+        self.load_request(prompt, list(seeds) if seeds is not None else list(range(self.users)))
         logits, tok = self.prefill_forward()
         return {"logits": logits, "tokens": tok}
 
@@ -238,7 +246,7 @@ class KolibriPipeline:
         return kin.encode_prompt(kin.load_tokenizer())
 
     def _stage_inputs(self) -> dict:
-        return {"prompt_ids": self.default_prompt(), "seeds": list(range(self.batch))}
+        return {"prompt_ids": self.default_prompt(), "seeds": list(range(self.users))}
 
     def prefill_trace_inputs(self) -> dict:
         """The e2e test's / demo's inputs: the model-card prompt for every user, seed b on row b."""
@@ -275,8 +283,13 @@ class KolibriPipeline:
         return logits
 
     def decode_trace_items(self) -> int:
-        """One token per user per step."""
-        return self.batch
+        """One token per served user per step (padding rows are not served)."""
+        return self.users
+
+    @property
+    def batch_size(self) -> int:
+        """Users this pipeline serves -- what the perf adapter asks a pipeline for; `batch` is the device rows."""
+        return self.users
 
     def decode_trace_repeats(self) -> int:
         """Decode steps one request runs at most: every position left in the KV capacity after the prompt
@@ -304,17 +317,18 @@ class KolibriPipeline:
         t0 = time.time()
         state = self.decode_prefill([list(prompt_ids)], seeds)
         cap = self.max_new_tokens(max_new_tokens)
-        ids = [int(v) for v in read_host(state["tokens"]).reshape(-1)[: self.batch]]
+        U = self.users
+        ids = [int(v) for v in read_host(state["tokens"]).reshape(-1)[:U]]
         if on_step:
             on_step(0, state["logits"], ids)
         seqs = [[i] for i in ids]
         done = [i in stop for i in ids]
-        self.log(f"[prefill] {self.prompt_len} tokens x {self.batch} users: {time.time() - t0:.2f}s", flush=True)
+        self.log(f"[prefill] {self.prompt_len} tokens x {U} users: {time.time() - t0:.2f}s", flush=True)
         step = 1
         while not all(done) and step < cap:
             t1 = time.time()
             state = self.decode_step(state)
-            ids = [int(v) for v in read_host(state["tokens"]).reshape(-1)[: self.batch]]  # syncs the device
+            ids = [int(v) for v in read_host(state["tokens"]).reshape(-1)[:U]]  # syncs the device
             if on_step:
                 on_step(step, state["logits"], ids)
             for b, i in enumerate(ids):
@@ -322,9 +336,7 @@ class KolibriPipeline:
                     seqs[b].append(i)
                     done[b] = i in stop
             step += 1
-            self.log(
-                f"[decode] step {step}: {self.batch - sum(done)} users active ({time.time() - t1:.3f}s)", flush=True
-            )
+            self.log(f"[decode] step {step}: {U - sum(done)} users active ({time.time() - t1:.3f}s)", flush=True)
         return {"tokens": seqs, "ended_on_stop": done, "steps": step, "cap": cap}
 
 
