@@ -189,9 +189,10 @@ class TtQwenImageEditPipeline:
             setattr(module, name, prev)
 
     @contextlib.contextmanager
-    def _fused_tail(self):
+    def _fused_tail(self, exact_only=False):
         """The text encoder's precise-product hooks (fused kernels, the lo limb's fidelity, the batched products'
-        program configs) for the vision tower and the LM."""
+        program configs) for the vision tower and the LM. exact_only: just the bit-identical ones (the VAE's
+        shortcut linears run the same split_linear)."""
         hooks = {
             "GUARD_TAIL": self.fused_tail,
             "LANE_SPLIT": self.lane_split,
@@ -204,6 +205,9 @@ class TtQwenImageEditPipeline:
             "SPLIT_LIMBS": self.split_limbs,
             "BMM_CONFIG": self.bmm_config,
         }
+        if exact_only:
+            for name in ("LO_FIDELITY", "NN_FIDELITY", "SPLIT_LIMBS"):
+                del hooks[name]
         with contextlib.ExitStack() as stack:
             for name, fn in hooks.items():
                 stack.enter_context(self._hook(_te_attention, name, fn))
@@ -218,11 +222,11 @@ class TtQwenImageEditPipeline:
             return self.text_encoder.encode_text(up.te, image_embeds)
 
     def vae_encode(self, up):
-        # (its 1x1 shortcut linears run the text encoder's exact split_linear; their narrow 96 -> 192 products
-        # take linear_program_config's 1D full-grid config)
+        # (its 1x1 shortcut linears run the text encoder's exact split_linear: their narrow 96 -> 192 products
+        # take linear_program_config's 1D full-grid config, and the bit-identical fused hooks apply to them too)
         with self._hook(_vae_resident, "VOTE_TAIL", self.vote_tail), self._hook(
             _vae_resident, "ROUND_BF16", self.round_bf16
-        ):
+        ), self._fused_tail(exact_only=True):
             return self.vae.encode(up.vae_image)
 
     def denoise_setup_state(self, up, prompt_embeds, image_latents):
