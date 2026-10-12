@@ -1,0 +1,32 @@
+{
+  "component": "ministral3_m_l_p",
+  "submodule_path": "model.language_model.layers.0.mlp",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1,
+          5120
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      1,
+      5120
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

@@ -1,0 +1,440 @@
+{
+  "new_model_id": "mistralai/Devstral-Small-2-24B-Instruct-2512",
+  "new_model_type": "mistral3",
+  "sibling_hf_id": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+  "sibling_model_type": "mistral3",
+  "backend": {
+    "name": "Mistral-Small-3.1 (mistral3 VLM)",
+    "demo_path": "models/tt_transformers/demo/simple_text_demo.py"
+  },
+  "counts": {
+    "REUSE": 11,
+    "ADAPT": 4,
+    "NEW": 7
+  },
+  "common_reuse": [
+    {
+      "purpose": "LayerNorm / RMSNorm",
+      "path": "models/common/rmsnorm.py"
+    },
+    {
+      "purpose": "LightweightModule base",
+      "path": "models/common/lightweightmodule.py"
+    },
+    {
+      "purpose": "Tensor helpers",
+      "path": "models/common/tensor_utils.py"
+    },
+    {
+      "purpose": "Generic utility funcs",
+      "path": "models/common/utility_functions.py"
+    }
+  ],
+  "components": [
+    {
+      "name": "token_embed",
+      "kind": "token_embed",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 393216
+      },
+      "sibling_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 131072
+      },
+      "tt_reuse_target": "models/tt_transformers/tt/embedding.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: embedding -> models/tt_transformers/tt/embedding.py::ScaledEmbedding (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
+      "submodule_path": null,
+      "class_name": null
+    },
+    {
+      "name": "attention",
+      "kind": "attention",
+      "status": "REUSE",
+      "new_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 393216
+      },
+      "sibling_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 131072
+      },
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0.",
+      "submodule_path": null,
+      "class_name": null
+    },
+    {
+      "name": "mlp",
+      "kind": "mlp",
+      "status": "REUSE",
+      "new_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 393216
+      },
+      "sibling_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 131072
+      },
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh.",
+      "submodule_path": null,
+      "class_name": null
+    },
+    {
+      "name": "layer",
+      "kind": "layer",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 393216
+      },
+      "sibling_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 131072
+      },
+      "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_layernorm.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: llama_layernorm -> models/tt_transformers/tt/multimodal/llama_layernorm.py::TtLayerNorm (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
+      "submodule_path": null,
+      "class_name": null
+    },
+    {
+      "name": "encoder_stack",
+      "kind": "encoder_stack",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 393216
+      },
+      "sibling_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 131072
+      },
+      "tt_reuse_target": "models/tt_transformers/tt/multimodal/llama_vision_encoder.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: llama_vision_encoder -> models/tt_transformers/tt/multimodal/llama_vision_encoder.py::TtLlamaVisionEncoder (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
+      "submodule_path": null,
+      "class_name": null
+    },
+    {
+      "name": "decoder_head",
+      "kind": "decoder_head",
+      "status": "ADAPT",
+      "new_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 393216
+      },
+      "sibling_shape": {
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 32768,
+        "hidden_act": "silu",
+        "vocab_size": 131072,
+        "max_position_embeddings": 131072
+      },
+      "tt_reuse_target": "models/tt_transformers/tt/lm_head.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: lm_head -> models/tt_transformers/tt/lm_head.py::LMHead (ADAPT). auto-derived from upstream tree (fixes-plan Point 2a); ADAPT => wrapped + PCC-gated, not trusted.",
+      "submodule_path": null,
+      "class_name": null
+    },
+    {
+      "name": "ministral3_model",
+      "kind": "Ministral3Model",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/mistral3/modeling_mistral3.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=403 sample_paths=['language_model'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model",
+      "class_name": "Ministral3Model"
+    },
+    {
+      "name": "ministral3_decoder_layer",
+      "kind": "Ministral3DecoderLayer",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/mistral3/modeling_mistral3.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=40 leaves=400 sample_paths=['language_model.layers.0', 'language_model.layers.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model.layers.0",
+      "class_name": "Ministral3DecoderLayer"
+    },
+    {
+      "name": "pixtral_vision_model",
+      "kind": "PixtralVisionModel",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/mistral3/modeling_mistral3.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=243 sample_paths=['vision_tower'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "vision_tower",
+      "class_name": "PixtralVisionModel"
+    },
+    {
+      "name": "pixtral_attention_layer",
+      "kind": "PixtralAttentionLayer",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/mistral3/modeling_mistral3.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=24 leaves=240 sample_paths=['vision_tower.transformer.layers.0', 'vision_tower.transformer.layers.1'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "vision_tower.transformer.layers.0",
+      "class_name": "PixtralAttentionLayer"
+    },
+    {
+      "name": "pixtral_transformer",
+      "kind": "PixtralTransformer",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/mistral3/modeling_mistral3.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=240 sample_paths=['vision_tower.transformer'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "vision_tower.transformer",
+      "class_name": "PixtralTransformer"
+    },
+    {
+      "name": "ministral3_attention",
+      "kind": "Ministral3Attention",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=40 leaves=160 sample_paths=['language_model.layers.0.self_attn', 'language_model.layers.1.self_attn'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model.layers.0.self_attn",
+      "class_name": "Ministral3Attention",
+      "_added_by_decomposition_of": "ministral3_decoder_layer",
+      "_child_short_name": "ministral3_attention"
+    },
+    {
+      "name": "ministral3_m_l_p",
+      "kind": "Ministral3MLP",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | module-tree: occ=40 leaves=160 sample_paths=['language_model.layers.0.mlp', 'language_model.layers.1.mlp'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model.layers.0.mlp",
+      "class_name": "Ministral3MLP",
+      "_added_by_decomposition_of": "ministral3_decoder_layer",
+      "_child_short_name": "ministral3_m_l_p"
+    },
+    {
+      "name": "pixtral_attention",
+      "kind": "PixtralAttention",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=24 leaves=96 sample_paths=['vision_tower.transformer.layers.0.attention', 'vision_tower.transformer.layers.1.attention'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "vision_tower.transformer.layers.0.attention",
+      "class_name": "PixtralAttention",
+      "_added_by_decomposition_of": "pixtral_attention_layer",
+      "_child_short_name": "pixtral_attention"
+    },
+    {
+      "name": "pixtral_m_l_p",
+      "kind": "PixtralMLP",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | module-tree: occ=24 leaves=96 sample_paths=['vision_tower.transformer.layers.0.feed_forward', 'vision_tower.transformer.layers.1.feed_forward'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "vision_tower.transformer.layers.0.feed_forward",
+      "class_name": "PixtralMLP",
+      "_added_by_decomposition_of": "pixtral_attention_layer",
+      "_child_short_name": "pixtral_m_l_p"
+    },
+    {
+      "name": "ministral3_r_m_s_norm",
+      "kind": "Ministral3RMSNorm",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/common/rmsnorm.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: rmsnorm_text -> models/common/rmsnorm.py::RMSNorm (REUSE). derived from compatibility.py BUILDING_BLOCKS 'RMSNorm (text)'. ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip. | module-tree: occ=81 leaves=81 sample_paths=['language_model.layers.0.input_layernorm', 'language_model.layers.0.post_attention_layernorm'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model.layers.0.input_layernorm",
+      "class_name": "Ministral3RMSNorm",
+      "_added_by_decomposition_of": "ministral3_decoder_layer",
+      "_child_short_name": "ministral3_r_m_s_norm"
+    },
+    {
+      "name": "pixtral_r_m_s_norm",
+      "kind": "PixtralRMSNorm",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/common/rmsnorm.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: rmsnorm_text -> models/common/rmsnorm.py::RMSNorm (REUSE). derived from compatibility.py BUILDING_BLOCKS 'RMSNorm (text)'. ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip. | module-tree: occ=49 leaves=49 sample_paths=['vision_tower.ln_pre', 'vision_tower.transformer.layers.0.attention_norm'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "vision_tower.ln_pre",
+      "class_name": "PixtralRMSNorm"
+    },
+    {
+      "name": "mistral3_multi_modal_projector",
+      "kind": "Mistral3MultiModalProjector",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/mistral3/modeling_mistral3.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=5 sample_paths=['multi_modal_projector'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "multi_modal_projector",
+      "class_name": "Mistral3MultiModalProjector"
+    },
+    {
+      "name": "ministral3_rotary_embedding",
+      "kind": "Ministral3RotaryEmbedding",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/rope.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: standard_rope -> models/tt_transformers/tt/rope.py::RotaryEmbedding (REUSE). derived from compatibility.py BUILDING_BLOCKS 'Standard RoPE'. | module-tree: occ=1 leaves=1 sample_paths=['language_model.rotary_emb'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "language_model.rotary_emb",
+      "class_name": "Ministral3RotaryEmbedding"
+    },
+    {
+      "name": "mistral3_patch_merger",
+      "kind": "Mistral3PatchMerger",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/mistral3/modeling_mistral3.py",
+      "notes": "[supplemental module-tree pass] module-tree: occ=1 leaves=1 sample_paths=['multi_modal_projector.patch_merger'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "multi_modal_projector.patch_merger",
+      "class_name": "Mistral3PatchMerger"
+    },
+    {
+      "name": "mistral3_r_m_s_norm",
+      "kind": "Mistral3RMSNorm",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/common/rmsnorm.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: rmsnorm_text -> models/common/rmsnorm.py::RMSNorm (REUSE). derived from compatibility.py BUILDING_BLOCKS 'RMSNorm (text)'. ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip. | module-tree: occ=1 leaves=1 sample_paths=['multi_modal_projector.norm'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "multi_modal_projector.norm",
+      "class_name": "Mistral3RMSNorm"
+    },
+    {
+      "name": "pixtral_rotary_embedding",
+      "kind": "PixtralRotaryEmbedding",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/rope.py",
+      "hf_reference": null,
+      "notes": "[supplemental module-tree pass] reuse_registry: standard_rope -> models/tt_transformers/tt/rope.py::RotaryEmbedding (REUSE). derived from compatibility.py BUILDING_BLOCKS 'Standard RoPE'. | module-tree: occ=1 leaves=1 sample_paths=['vision_tower.patch_positional_embedding'] (primary extractor's template did not cover this class \u2014 falling back to module-tree discovery + op_classifier classification).",
+      "submodule_path": "vision_tower.patch_positional_embedding",
+      "class_name": "PixtralRotaryEmbedding"
+    }
+  ],
+  "notes": [
+    "Top sibling candidates (per-component reuse targets are pulled from whichever sibling provides them, not only the first): Mistral-Small-3.1 (mistral3 VLM) (score 100: exact model_type 'mistral3'); tt_transformers / simple_text_demo (multimodal) (score 40: category 'VLM' default (generic runner)); qwen25_vl (auto-upstream) (score 30: category 'VLM' default)"
+  ],
+  "ranked_siblings": [
+    {
+      "rank": 1,
+      "backend": "Mistral-Small-3.1 (mistral3 VLM)",
+      "score": 100,
+      "reason": "exact model_type 'mistral3'"
+    },
+    {
+      "rank": 2,
+      "backend": "tt_transformers / simple_text_demo (multimodal)",
+      "score": 40,
+      "reason": "category 'VLM' default (generic runner)"
+    },
+    {
+      "rank": 3,
+      "backend": "qwen25_vl (auto-upstream)",
+      "score": 30,
+      "reason": "category 'VLM' default"
+    }
+  ]
+}

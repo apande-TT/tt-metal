@@ -1,0 +1,37 @@
+[
+  {
+    "parent_name": "ministral3_decoder_layer",
+    "children": [
+      {
+        "name": "ministral3_attention",
+        "submodule_path": "language_model.layers.0.self_attn",
+        "class_name": "Ministral3Attention"
+      },
+      {
+        "name": "ministral3_m_l_p",
+        "submodule_path": "language_model.layers.0.mlp",
+        "class_name": "Ministral3MLP"
+      },
+      {
+        "name": "ministral3_r_m_s_norm",
+        "submodule_path": "language_model.layers.0.input_layernorm",
+        "class_name": "Ministral3RMSNorm"
+      }
+    ]
+  },
+  {
+    "parent_name": "pixtral_attention_layer",
+    "children": [
+      {
+        "name": "pixtral_attention",
+        "submodule_path": "vision_tower.transformer.layers.0.attention",
+        "class_name": "PixtralAttention"
+      },
+      {
+        "name": "pixtral_m_l_p",
+        "submodule_path": "vision_tower.transformer.layers.0.feed_forward",
+        "class_name": "PixtralMLP"
+      }
+    ]
+  }
+]

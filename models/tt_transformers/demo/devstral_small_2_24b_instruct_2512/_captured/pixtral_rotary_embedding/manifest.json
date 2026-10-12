@@ -1,0 +1,51 @@
+{
+  "component": "pixtral_rotary_embedding",
+  "submodule_path": "model.vision_tower.patch_positional_embedding",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          12100,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          12100
+        ],
+        "dtype": "torch.int64"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          12100,
+          64
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          12100,
+          64
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  }
+}

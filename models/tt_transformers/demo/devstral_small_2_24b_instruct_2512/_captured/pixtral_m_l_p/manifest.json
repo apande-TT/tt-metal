@@ -1,0 +1,32 @@
+{
+  "component": "pixtral_m_l_p",
+  "submodule_path": "model.vision_tower.transformer.layers.0.feed_forward",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          12100,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      12100,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

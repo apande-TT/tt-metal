@@ -1,0 +1,131 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native tensor-parallel TTNN port of `pixtral_vision_model` (PixtralVisionModel, `vision_tower`)
+of `mistralai/Devstral-Small-2-24B-Instruct-2512`.
+
+    per image i (cropped to image_sizes[i]):  tokens_i = patch_conv(pixels_i)   (14x14, stride 14)
+    x   = ln_pre(cat_i tokens_i)
+    out = transformer(x, block-diagonal mask, rope2d(patch ids))
+
+patch_conv has stride == kernel, so it is patchify + matmul: per image the (3, h*14, w*14) pixels are
+rearranged on device by reshape/permute into (h*w, 3*14*14) rows in (c, ky, kx) order — the conv
+weight's own flatten order — and multiplied by the flattened conv weight.
+
+The patch ids (h * max_side + w per image, as position_ids_in_meshgrid builds them) and the
+block-diagonal mask are pure functions of image_sizes, so they are built from that shape metadata.
+
+Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device):
+  * transformer  the TP port from `encoder_stack.py` (per layer q/k/v and gate/up column-parallel,
+                 o_proj and down row-parallel + all_reduce).
+  * patch_conv weight, ln_pre, rotary tables and mask are replicated (patch_conv is 0.6M params).
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.encoder_stack import TtEncoderStack
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_rotary_embedding import (
+    TtPixtralRotaryEmbedding,
+)
+
+
+class TtPixtralVisionModel:
+    def __init__(self, device, torch_module) -> None:
+        self.device = device
+        cfg = torch_module.config
+        self.patch_size = p = torch_module.patch_size
+        self.max_side = cfg.image_size // cfg.patch_size
+        self.hidden = hidden = cfg.hidden_size
+        self.eps = float(torch_module.ln_pre.variance_epsilon)
+        self.transformer = TtEncoderStack(device, torch_module.transformer)
+        self.rope = TtPixtralRotaryEmbedding(device, torch_module.patch_positional_embedding)
+        self.head_dim = self.transformer.head_dim
+        self._repl = repl = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
+
+        def _put(t):
+            return ttnn.from_torch(
+                t.detach().to(torch.bfloat16).contiguous(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=repl,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+
+        w = torch_module.patch_conv.weight  # (hidden, C, p, p)
+        self.in_ch = w.shape[1]
+        self.w_patch = _put(w.reshape(hidden, self.in_ch * p * p).T)
+        self.ln_pre_w = _put(torch_module.ln_pre.weight.reshape(1, 1, 1, hidden))
+        self.compute_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def _patchify(self, img, h, w):
+        """(1, C, h*p, w*p) row-major -> (1, 1, h*w, C*p*p) in (c, ky, kx) order."""
+        p, c = self.patch_size, self.in_ch
+        x = ttnn.reshape(img, (c * h, p, w, p))  # (c,i), ky, j, kx
+        x = ttnn.permute(x, (0, 2, 1, 3))  # (c,i), j, ky, kx
+        x = ttnn.reshape(x, (c, h, w, p * p))
+        x = ttnn.permute(x, (1, 2, 0, 3))  # i, j, c, (ky,kx)
+        return ttnn.reshape(x, (1, 1, h * w, c * p * p))
+
+    def __call__(self, pixel_values, image_sizes=None, **kwargs):
+        pv = pixel_values
+        b, _, hp, wp = pv.shape
+        sizes = image_sizes
+        if sizes is None:
+            sizes = [(hp, wp)] * b
+        elif isinstance(sizes, ttnn.Tensor):
+            sizes = ttnn.to_torch(sizes, mesh_composer=ttnn.ConcatMeshToTensor(self.device, dim=0))[: sizes.shape[0]]
+        if isinstance(sizes, torch.Tensor):
+            sizes = sizes.tolist()
+        p = self.patch_size
+        grids = [(int(hh) // p, int(ww) // p) for hh, ww in sizes]
+
+        pv = ttnn.to_layout(pv, ttnn.ROW_MAJOR_LAYOUT)
+        rows = []
+        for i, (h, w) in enumerate(grids):
+            img = ttnn.slice(pv, (i, 0, 0, 0), (i + 1, self.in_ch, h * p, w * p))
+            rows.append(self._patchify(img, h, w))
+        x = rows[0] if len(rows) == 1 else ttnn.concat(rows, dim=2)
+        x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        x = ttnn.linear(x, self.w_patch, compute_kernel_config=self.compute_cfg)
+        x = ttnn.rms_norm(x, epsilon=self.eps, weight=self.ln_pre_w, compute_kernel_config=self.compute_cfg)
+        s = x.shape[-2]
+
+        # Patch ids h * max_side + w and the block-diagonal mask, from image_sizes.
+        ids = []
+        for h, w in grids:
+            hh, ww = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+            ids.append((hh * self.max_side + ww).reshape(-1))
+        ids = torch.cat(ids)
+        cos, sin = self.rope(x, position_ids=ids)
+        cos = ttnn.reshape(cos, (1, 1, s, self.head_dim))
+        sin = ttnn.reshape(sin, (1, 1, s, self.head_dim))
+
+        mask = None
+        if len(grids) > 1:
+            mask = torch.full((s, s), torch.finfo(torch.bfloat16).min, dtype=torch.float32)
+            start = 0
+            for h, w in grids:
+                mask[start : start + h * w, start : start + h * w] = 0
+                start += h * w
+
+        return self.transformer(x, attention_mask=mask, position_embeddings=(cos, sin))
+
+
+def build(device, torch_module=None):
+    return TtPixtralVisionModel.build(device, torch_module)
+
+
+def pixtral_vision_model(device, torch_module=None):
+    return TtPixtralVisionModel.build(device, torch_module)

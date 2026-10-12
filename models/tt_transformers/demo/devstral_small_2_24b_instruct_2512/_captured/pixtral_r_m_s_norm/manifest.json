@@ -1,0 +1,32 @@
+{
+  "component": "pixtral_r_m_s_norm",
+  "submodule_path": "model.vision_tower.ln_pre",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          12100,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      12100,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

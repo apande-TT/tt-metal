@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native tensor-parallel TTNN port of `ministral3_m_l_p` (Ministral3MLP, `language_model.layers.0.mlp`)
+of `mistralai/Devstral-Small-2-24B-Instruct-2512`.
+
+    out = down(silu(gate(x)) * up(x))            (5120 -> 32768 -> 5120)
+
+Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device):
+  * gate/up    column-parallel on the intermediate dim (the SwiGLU product stays per-device).
+  * down_proj  row-parallel on the intermediate dim, then all_reduce.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+
+class TtMinistral3MLP:
+    def __init__(self, device, torch_module) -> None:
+        self.device = device
+        try:
+            self.tp = tp = int(device.get_num_devices())
+        except Exception:
+            self.tp = tp = 1
+        assert torch_module.intermediate_size % tp == 0, (
+            f"intermediate {torch_module.intermediate_size} not divisible by TP={tp}"
+        )
+        shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if tp > 1 else None
+
+        def _put(t, mapper):
+            return ttnn.from_torch(
+                t.detach().to(torch.bfloat16).contiguous(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=mapper,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+
+        self.w_gate = _put(torch_module.gate_proj.weight.T, shard(-1))
+        self.w_up = _put(torch_module.up_proj.weight.T, shard(-1))
+        self.w_down = _put(torch_module.down_proj.weight.T, shard(-2))
+        self.compute_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def __call__(self, x, *args, **kwargs):
+        shape = tuple(x.shape)
+        if len(shape) != 4:
+            x = ttnn.reshape(x, (1,) * (4 - len(shape)) + shape)
+        g = ttnn.linear(x, self.w_gate, compute_kernel_config=self.compute_cfg)
+        u = ttnn.linear(x, self.w_up, compute_kernel_config=self.compute_cfg)
+        m = ttnn.multiply(ttnn.silu(g), u)
+        out = ttnn.linear(m, self.w_down, compute_kernel_config=self.compute_cfg)
+        if self.tp > 1:
+            out = ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
+        return ttnn.reshape(out, shape)
+
+
+def build(device, torch_module=None):
+    return TtMinistral3MLP.build(device, torch_module)
+
+
+def ministral3_m_l_p(device, torch_module=None):
+    return TtMinistral3MLP.build(device, torch_module)

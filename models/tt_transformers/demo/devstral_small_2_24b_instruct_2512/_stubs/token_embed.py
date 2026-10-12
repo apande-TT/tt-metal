@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native TTNN port of `token_embed` (nn.Embedding, `language_model.embed_tokens`, 131072 x 5120)
+of `mistralai/Devstral-Small-2-24B-Instruct-2512`.
+
+    out = embed_tokens.weight[input_ids]
+
+A plain row gather with ttnn.embedding; Ministral3 applies no embedding scale. The table is replicated
+on a mesh (embeddings are a lookup, not a matmul — they are not tensor-parallel split).
+"""
+from __future__ import annotations
+
+import torch
+
+import ttnn
+
+
+class TtTokenEmbed:
+    def __init__(self, device, torch_module) -> None:
+        self.device = device
+        self._repl = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
+        self.weight = ttnn.from_torch(
+            torch_module.weight.detach()
+            .to(torch.bfloat16)
+            .clone(),  # an owned copy: from_torch crawls on a mmapped checkpoint view
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=device,
+            mesh_mapper=self._repl,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        self.dim = torch_module.embedding_dim
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def __call__(self, input_ids, *args, **kwargs):
+        tok = input_ids
+        if isinstance(tok, torch.Tensor):
+            tok = ttnn.from_torch(
+                tok.to(torch.int32),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device,
+                mesh_mapper=self._repl,
+            )
+        shape = tuple(tok.shape)
+        tok = ttnn.reshape(tok, (1, shape[-1]) if len(shape) == 1 else (-1, shape[-1]))
+        out = ttnn.embedding(tok, self.weight, layout=ttnn.TILE_LAYOUT)
+        return ttnn.reshape(out, shape + (self.dim,))
+
+
+def build(device, torch_module=None):
+    return TtTokenEmbed.build(device, torch_module)
+
+
+def token_embed(device, torch_module=None):
+    return TtTokenEmbed.build(device, torch_module)

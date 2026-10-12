@@ -1,0 +1,216 @@
+{
+  "model_id": "mistralai/Devstral-Small-2-24B-Instruct-2512",
+  "sources": {
+    "A_hf": {
+      "architecture": "Mistral3ForConditionalGeneration",
+      "auto_registry_task": "image-text-to-text (AutoModelForImageTextToText); text-only prompts are the same head with no pixel_values",
+      "processor": "PixtralProcessor (tokenizer + PixtralImageProcessorFast, patch 14, longest_edge 1540) with the checkpoint's chat template (default Mistral-Vibe system prompt)",
+      "text_config": "ministral3: 40 layers, hidden 5120, 32 q / 8 kv heads, head_dim 128, SwiGLU 32768, yarn RoPE (factor 48, theta 1e8) + llama-4 query scaling, vocab 131072",
+      "vision_config": "pixtral: 24 layers, hidden 1024, 16 heads, head_dim 64, SwiGLU 4096, 2D RoPE; projector = RMSNorm + 2x2 patch merger + linear/gelu/linear (1024 -> 5120)",
+      "generation_config": {
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "pad_token_id": 11,
+        "do_sample": true,
+        "temperature": 0.15,
+        "max_length": 262144
+      },
+      "checkpoint_note": "FP8 checkpoint; transformers dequantizes it to bf16 on CPU (no GPU), which is the golden the TT pipeline is compared against",
+      "golden": "model.generate() on the HF reference (CPU, bf16) with the SAME stop rule and the SAME seeded sampling rule as the TT pipeline"
+    },
+    "B_bringup": {
+      "bringup_dir": "models/tt_transformers/demo/devstral_small_2_24b_instruct_2512 (symlinked into this package as bringup_status.json, _stubs/, _captured/, tests/pcc/)",
+      "topology": "TP=4 x DP=1 (mesh 1x4), parallelism_manifest.json"
+    }
+  },
+  "graduation_audit": {
+    "rule": "GRADUATED = NEW with a _stubs/<name>.py.last_good_native or .py.last_good_sharded snapshot; the live _stubs/<name>.py is the graduated body",
+    "new_graduated": [
+      "ministral3_model",
+      "ministral3_decoder_layer",
+      "pixtral_vision_model",
+      "pixtral_attention_layer",
+      "pixtral_transformer",
+      "mistral3_multi_modal_projector",
+      "mistral3_patch_merger"
+    ],
+    "new_graduated_count": 7,
+    "reuse_adapt_with_live_graduated_stub": [
+      "token_embed",
+      "attention",
+      "mlp",
+      "layer",
+      "encoder_stack",
+      "decoder_head",
+      "ministral3_attention",
+      "ministral3_m_l_p",
+      "pixtral_attention",
+      "pixtral_m_l_p",
+      "ministral3_r_m_s_norm",
+      "pixtral_r_m_s_norm",
+      "mistral3_r_m_s_norm",
+      "ministral3_rotary_embedding",
+      "pixtral_rotary_embedding"
+    ],
+    "reuse_adapt_note": "In this bring-up every REUSE/ADAPT component ALSO has a live native-ttnn stub with a last_good snapshot and RUN_REPORT lists it ON_DEVICE / graduated. None of them is wasted: all 22 stubs are composed into the forward path below.",
+    "snapshot_kind": {
+      "last_good_sharded": [
+        "attention",
+        "decoder_head",
+        "encoder_stack",
+        "layer",
+        "ministral3_attention",
+        "ministral3_decoder_layer",
+        "ministral3_m_l_p",
+        "ministral3_model",
+        "mistral3_multi_modal_projector",
+        "mistral3_patch_merger",
+        "mlp",
+        "pixtral_attention",
+        "pixtral_attention_layer",
+        "pixtral_m_l_p",
+        "pixtral_transformer",
+        "pixtral_vision_model"
+      ],
+      "last_good_native": [
+        "ministral3_r_m_s_norm",
+        "ministral3_rotary_embedding",
+        "mistral3_r_m_s_norm",
+        "pixtral_r_m_s_norm",
+        "pixtral_rotary_embedding",
+        "token_embed"
+      ]
+    },
+    "total_stubs_routed": 22,
+    "duplicate_module_notes": {
+      "vision_tower.transformer.layers.N (PixtralAttentionLayer)": "three graduated stubs port it: pixtral_attention_layer, layer, attention (TtPixtralAttentionLayer and TtLayer subclass TtAttention). The 24 vision layers are held as ONE list of TtAttention-based elements, rotating the three classes so every one runs real layers.",
+      "vision_tower.transformer.layers.N.feed_forward (PixtralMLP)": "two graduated stubs port it: pixtral_m_l_p and mlp (both subclass TtMinistral3MLP); the vision layers alternate them.",
+      "vision_tower.transformer (PixtralTransformer)": "two graduated stubs port it: pixtral_transformer subclasses encoder_stack (TtEncoderStack); the vision model holds a TtPixtralTransformer whose forward IS encoder_stack's __call__ body."
+    }
+  },
+  "hardware": {
+    "box": "QB2 (4x Blackhole)",
+    "mesh": [
+      1,
+      4
+    ],
+    "tp": 4,
+    "dp": 1,
+    "fabric": "ttnn.FabricConfig.FABRIC_1D set before open_mesh_device",
+    "memory_budget": "registered figures: 32 GB DRAM/chip, 128 GB aggregate; usable 28.6 GB/chip with a CCL axis (TP=4). Planned resident set per chip (arithmetic from the registered 28.6 GB/chip CCL figure, not measured): text weights bf16 44.4 GB / 4 = 11.1 GB, token table 1.34 GB replicated, lm_head 0.34 GB, vision+projector < 0.3 GB, KV cache 40 layers x 2 x B32 x 2 local kv heads x C4096 x 128 x 2 B = 5.4 GB -> ~18.5 GB < 28.6 GB"
+  },
+  "pass_definition": "Per call: the TT pipeline consumes the HF processor's encoding of the input, runs the chained graduated stubs on the 1x4 mesh (vision encode -> projector -> prefill -> per-token decode with resident KV and on-device sampling), and produces generated text; for all B=32 samples the TT token stream equals the HF golden token stream (teacher-forced, near-tie tolerant), every row ends on EOS (not on the safety cap), and the final-output PCC (TT logits vs HF golden logits over the whole generated output) >= 0.99.",
+  "task_heads": [
+    {
+      "call": 1,
+      "task": "text_generation",
+      "io": "text -> text",
+      "hf_head": "Mistral3ForConditionalGeneration (no pixel_values)",
+      "input": "chat-templated user prompt, tokenized by the PixtralProcessor; TOOL-AUTHORED single content input (no published example discovered) reused for all 32 samples",
+      "output": "generated text (token ids decoded by the tokenizer)",
+      "stubs": [
+        "token_embed",
+        "ministral3_rotary_embedding",
+        "ministral3_model",
+        "ministral3_decoder_layer",
+        "ministral3_attention",
+        "ministral3_m_l_p",
+        "ministral3_r_m_s_norm",
+        "decoder_head"
+      ],
+      "chain": "input_ids -> token_embed -> ministral3_model[ministral3_rotary_embedding; 40 x ministral3_decoder_layer(ministral3_r_m_s_norm, ministral3_attention + KV cache, ministral3_r_m_s_norm, ministral3_m_l_p); final ministral3_r_m_s_norm] -> decoder_head -> on-device seeded sampling (ttnn.topk + gumbel + ttnn.argmax) -> next token fed back on device"
+    },
+    {
+      "call": 2,
+      "task": "image_text_to_text",
+      "io": "image + text -> text",
+      "hf_head": "Mistral3ForConditionalGeneration (pixel_values + image_sizes)",
+      "input": "chat-templated [image, text] message through the PixtralProcessor; TOOL-AUTHORED single synthetic image + question reused for all 32 samples",
+      "output": "generated text",
+      "stubs": [
+        "pixtral_vision_model",
+        "pixtral_r_m_s_norm",
+        "pixtral_rotary_embedding",
+        "pixtral_transformer",
+        "encoder_stack",
+        "pixtral_attention_layer",
+        "layer",
+        "attention",
+        "pixtral_attention",
+        "pixtral_m_l_p",
+        "mlp",
+        "mistral3_multi_modal_projector",
+        "mistral3_r_m_s_norm",
+        "mistral3_patch_merger",
+        "token_embed",
+        "ministral3_rotary_embedding",
+        "ministral3_model",
+        "ministral3_decoder_layer",
+        "ministral3_attention",
+        "ministral3_m_l_p",
+        "ministral3_r_m_s_norm",
+        "decoder_head"
+      ],
+      "chain": "pixel_values -> pixtral_vision_model[patchify+linear, pixtral_r_m_s_norm(ln_pre), pixtral_rotary_embedding, pixtral_transformer==encoder_stack over 24 layers rotating {pixtral_attention_layer, layer, attention}, each = pixtral_r_m_s_norm + pixtral_attention + pixtral_r_m_s_norm + {pixtral_m_l_p | mlp}] -> mistral3_multi_modal_projector[mistral3_r_m_s_norm, mistral3_patch_merger, linear_1/gelu/linear_2] -> on-device merge into token_embed(input_ids) at [IMG] positions -> same text chain as call 1"
+    }
+  ],
+  "shared_modules_agent_plan": "Both calls share the whole text chain (8 stubs), so per the orchestration rule ONE agent builds both calls on the ONE shared tt/pipeline.py.",
+  "sampling_and_batch": {
+    "batch": "B = $TT_PERF_BATCH (gate sets 32). Content identical across rows; only the sampling seed varies (seed = row index).",
+    "sampling_rule": "generation_config temperature (0.15) sampling via the Gumbel-max reparameterisation: token = argmax over the top-K (K=32) of logits/T + g, g ~ Gumbel(seed_row, step). Applied identically on TT (ttnn.topk/add/argmax on device, noise table resident) and on HF (LogitsProcessor inside model.generate, do_sample=False).",
+    "stop_rule": "eos_token_id=2 from generation_config; finished rows are padded with pad_token_id=11 exactly as generate() does; run ends when every row has emitted EOS",
+    "safety_cap": "KV capacity C=4096 positions (the model's max_length 262144 cannot be resident); assert no row ended on the cap unless TT_PERF_OSL_TOKENS is set"
+  },
+  "validation_metric": {
+    "gate_test": "tests/e2e/test_e2e_image_text_to_text.py::test_e2e_image_text_to_text (E2E_CORRECTNESS_GATE): the strictest test -- it runs all 22 stubs through encode, prefill and decode. TT decode is teacher-forced onto the INDEPENDENT HF golden trajectory (model.generate output); asserts per-step TT sampled token == golden token (a mismatch is allowed only where the golden's own top-2 noised score margin is a bf16-level near-tie), logits PCC >= 0.99 overall AND per row, prefill hidden-state and vision-feature PCC >= 0.995 (min over rows) with norm ratio within 0.5%, golden ended on EOS.",
+    "free_run_test": "TT free-runs its own sampled tokens to EOS; the HF reference is teacher-forced onto the TT trajectory; asserts exact token agreement (near-tie tolerant), termination on EOS, and 32 distinct outputs.",
+    "image_test": "tests/e2e/test_e2e_image_text_to_text.py: same two checks for the image call; vision features PCC vs HF vision tower + projector >= 0.99.",
+    "printed": "e2e PCC=<value> on its own line before the final assert; PERF_BATCH_STREAMS=<B>",
+    "text_test": "tests/e2e/test_e2e_text_generation.py::test_e2e_text_generation: the same golden-trajectory checks for call 1 (8 text stubs)."
+  },
+  "behavioral_proof": [
+    "decoded TT text for every row is printed and equals the HF golden text for the teacher-forced trajectory",
+    "32 distinct generations from one content input (seeds differ)",
+    "every row terminates on EOS",
+    "Gate 2 invocation counter: every one of the 22 stub classes is called inside run_text_generation / run_image_text_to_text (counted on the forward path, not a sweep) and the test asserts the set equals the graduated set"
+  ],
+  "self_validation_plan": [
+    "Gate 1: assert every routed stub module is the live _stubs file and contains no torch-compute call in its __call__ path (static scan) and the gate's G1 scans stay clean",
+    "Gate 2: INVOKED counter populated from the real forward; assert == all 22 graduated components",
+    "Gate 3: e2e PCC >= 0.99 per call vs HF golden, batch 32",
+    "trace: trace_capture_selftest captures encode / prefill / decode one at a time, replays and PCC-checks each",
+    "host-op: host_op_selftest runs encode+prefill+decode under observe_host_ops and must report zero host aten ops",
+    "pre-commit hooks run over every emitted file"
+  ],
+  "pipeline_stages": [
+    "encode",
+    "prefill",
+    "decode"
+  ],
+  "scheme_evaluation": {
+    "mesh": "1x4: cols = TP axis (4), rows = DP (1). Every sharded stub shards over the same device list (ShardTensorToMesh on the 1x4 mesh) and reduces with all_reduce / all_gather over that axis; batch is never sharded.",
+    "per_stub": {
+      "ministral3_attention": "TP by head: q/k/v column-parallel (32 q / 8 kv heads -> 8 q + 2 kv per chip), o_proj row-parallel + all_reduce. Valid: 4 <= num_key_value_heads=8, 8 % 4 == 0, 32 % 4 == 0.",
+      "ministral3_m_l_p": "TP column (gate/up on intermediate 32768 -> 8192/chip) + row (down) + all_reduce. Valid: 32768 % 4 == 0.",
+      "ministral3_decoder_layer": "composes ministral3_attention + ministral3_m_l_p (same axis/collectives); norms replicated.",
+      "ministral3_model": "40 x ministral3_decoder_layer; embed_tokens, final norm and rotary tables replicated; residual stream replicated between layers.",
+      "decoder_head": "lm_head column-parallel on vocab (131072 -> 32768/chip, ShardTensorToMesh dim=-1) + all_gather. Valid: 131072 % 4 == 0.",
+      "pixtral_attention": "TP by head: 16 heads -> 4/chip (Pixtral has no GQA: 16 kv heads), o_proj row-parallel + all_reduce. Valid: 16 % 4 == 0.",
+      "pixtral_m_l_p / mlp": "subclass ministral3_m_l_p's TP SwiGLU (intermediate 4096 -> 1024/chip) + all_reduce. Valid: 4096 % 4 == 0.",
+      "attention / layer / pixtral_attention_layer": "one PixtralAttentionLayer TP port (attention.py) and two subclasses; same axis and all_reduce.",
+      "encoder_stack / pixtral_transformer": "24 x the TP vision layer; pixtral_transformer subclasses encoder_stack.",
+      "pixtral_vision_model": "patch conv as linear (replicated) + ln_pre + pixtral_transformer (TP).",
+      "mistral3_patch_merger": "merging_layer (4096 -> 1024) column-parallel (ShardTensorToMesh dim=-1) + all_gather. Valid: 1024 % 4 == 0.",
+      "mistral3_multi_modal_projector": "linear_1 column / linear_2 row parallel + all_reduce (5120 % 4 == 0); norm + patch merger as above."
+    },
+    "verdict": "all 16 sharded schemes are compatible with TP=4 x DP=1 on this config; no expert- or sequence-parallel stage exists, so no EP/SP divisibility applies. No hole.",
+    "verified_by": "tests/pcc/*_sharded.py (gathered output vs single-device HF golden) and the e2e gate"
+  },
+  "numerics": {
+    "residual_streams": "fp32 in the text decoder and the vision encoder; attention o_proj / MLP down outputs + all_reduce in fp32; matmul inputs and weights bf16",
+    "rmsnorm": "canonical models/common/rmsnorm.py with a unit gamma; the checkpoint weight applied as a separate ttnn.multiply (the fused gamma biases the output ~0.06% low)",
+    "prefill_sdpa": "widest key chunk the padded prompt allows (<= 512); prompts right-padded to 512 positions (narrow key chunks bias attention's output level up, which the text decoder's image-token rows amplify)",
+    "why": "the image task's first-stage hidden state (>= 0.995 PCC, |tt|/|ref| within 0.5%) failed at 0.993 until these level biases were removed"
+  },
+  "hardware_note": "Physical chip 1 (PCI 02:00.0) miscomputes matmul columns when hot (thermal fault, reproduced by a sustained-matmul test). Gate results are only trusted from runs started cool (< ~63 C); identical batch rows diverging is the symptom."
+}

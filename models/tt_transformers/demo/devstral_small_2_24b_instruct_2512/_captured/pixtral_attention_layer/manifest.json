@@ -1,0 +1,77 @@
+{
+  "component": "pixtral_attention_layer",
+  "submodule_path": "model.vision_tower.transformer.layers.0",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          12100,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          1,
+          12100,
+          12100
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "position_embeddings": {
+        "kind": "tuple",
+        "items": [
+          {
+            "kind": "tensor",
+            "shape": [
+              12100,
+              64
+            ],
+            "dtype": "torch.bfloat16"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              12100,
+              64
+            ],
+            "dtype": "torch.bfloat16"
+          }
+        ]
+      },
+      "output_hidden_states": {
+        "kind": "scalar",
+        "type": "bool",
+        "repr": "True"
+      },
+      "position_ids": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          12100
+        ],
+        "dtype": "torch.int64"
+      }
+    }
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      12100,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "ttnn_dispatch": 45,
+  "torch_ops": 20,
+  "torch_op_names": [
+    "__dlpack__",
+    "contiguous",
+    "reshape",
+    "to"
+  ]
+}
