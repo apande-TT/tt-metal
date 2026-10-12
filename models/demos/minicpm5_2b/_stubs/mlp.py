@@ -60,6 +60,11 @@ class TtMlp:
             compute_kernel_config=self.compute_cfg,
         )
 
+    def _silu_mul(self, gate, up):
+        # silu(gate) * up in one op: the SiLU runs on the bf16 gate inside the multiply, as the separate
+        # unary did (ttnn.linear without a core grid applies its activation as a post-op on the bf16 output).
+        return ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=self.mem)
+
     def __call__(self, x, *args, **kwargs):
         if not isinstance(x, ttnn.Tensor):
             x = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
@@ -71,18 +76,16 @@ class TtMlp:
                 rows *= d
             x = ttnn.reshape(x, (1, 1, rows, in_shape[-1]))
         if x.shape[-2] > 32 and x.shape[0] == x.shape[1] == 1:
-            gate = ttnn.silu(self._mm(x, self.w_gate), memory_config=self.mem)
+            gate = self._mm(x, self.w_gate)
             up = self._mm(x, self.w_up)
-            h = ttnn.multiply(gate, up, memory_config=self.mem)
+            h = self._silu_mul(gate, up)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
             out = self._mm(h, self.w_down, k_block=64)  # K = 6144 does not fit one block: three K blocks
         else:
-            gate = ttnn.linear(
-                x, self.w_gate, activation="silu", memory_config=self.mem, compute_kernel_config=self.compute_cfg
-            )
+            gate = ttnn.linear(x, self.w_gate, memory_config=self.mem, compute_kernel_config=self.compute_cfg)
             up = ttnn.linear(x, self.w_up, memory_config=self.mem, compute_kernel_config=self.compute_cfg)
-            h = ttnn.multiply(gate, up, memory_config=self.mem)
+            h = self._silu_mul(gate, up)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
             out = ttnn.linear(h, self.w_down, memory_config=self.mem, compute_kernel_config=self.compute_cfg)

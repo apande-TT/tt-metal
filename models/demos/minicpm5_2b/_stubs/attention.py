@@ -20,10 +20,15 @@ path creates a tensor from host and both are trace-capturable.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
 import ttnn
+
+# Decode KV-cache write as one C++ kernel via ttnn.generic_op (else: slot-read matmuls + sub/add + paged_update_cache).
+_USE_KV_WRITE_KERNEL = True
+_KV_WRITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "kv_write")
 
 
 def _rotate_half_matrix(head_dim):
@@ -164,26 +169,35 @@ class TtAttention:
             nq, nkv = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
             q = ttnn.slice(qkv, (0, 0, 0), (1, b, nq))
             k = ttnn.slice(qkv, (0, 0, nq), (1, b, nq + nkv))
-            v = ttnn.slice(qkv, (0, 0, nq + nkv), (1, b, nq + 2 * nkv))
             # One token per row: [B, 1, n*D] splits straight into the GQA layout [B, kv, groups, D]
             # (head h = g * groups + j), so the cache is attended per KV head with no repeat.
             q = ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups, self.head_dim))
             k = ttnn.reshape(k, (b, self.n_kv_heads, 1, self.head_dim))
             q = self._rope(q, cos, sin, self._rope_cfg(q))
             k = self._rope(k, cos, sin, self._rope_cfg(k))
-            v = ttnn.reshape(v, (b, self.n_kv_heads, 1, self.head_dim))
-            # Write only row b's slot pos[b] in place with old + (new - old): the value the one-hot blend
-            # cache + onehot * (new - cache) leaves there, without touching the rest of the cache.
-            shard = self._decode_kv_shard(b)
             d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
-            for new_kv, cache in ((k, kv_cache.k), (v, kv_cache.v)):
-                # onehot [B, kv, 1, C] @ cache: the slot's current value, exactly (one non-zero term).
-                old = ttnn.matmul(
-                    ctx.write, cache, program_config=self._bmm_cfg(1, c_t, d_t), compute_kernel_config=self.compute_cfg
-                )
-                new_kv = ttnn.add(old, ttnn.subtract(new_kv, old))
-                new_kv = ttnn.to_memory_config(ttnn.reshape(new_kv, (1, b, self.n_kv_heads, self.head_dim)), shard)
-                ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
+            if _USE_KV_WRITE_KERNEL:
+                # One kernel writes slot pos[b] of both caches with old + (new - old), V read straight from qkv.
+                self._kv_write(k, qkv, kv_cache, ctx.cur_pos, b)
+            else:
+                v = ttnn.slice(qkv, (0, 0, nq + nkv), (1, b, nq + 2 * nkv))
+                v = ttnn.reshape(v, (b, self.n_kv_heads, 1, self.head_dim))
+                # Write only row b's slot pos[b] in place with old + (new - old): the value the one-hot blend
+                # cache + onehot * (new - cache) leaves there, without touching the rest of the cache.
+                shard = self._decode_kv_shard(b)
+                for new_kv, cache in ((k, kv_cache.k), (v, kv_cache.v)):
+                    # onehot [B, kv, 1, C] @ cache: the slot's current value, exactly (one non-zero term).
+                    old = ttnn.matmul(
+                        ctx.write,
+                        cache,
+                        program_config=self._bmm_cfg(1, c_t, d_t),
+                        compute_kernel_config=self.compute_cfg,
+                    )
+                    new_kv = ttnn.add(old, ttnn.subtract(new_kv, old))
+                    new_kv = ttnn.to_memory_config(
+                        ttnn.reshape(new_kv, (1, b, self.n_kv_heads, self.head_dim)), shard
+                    )
+                    ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
             scores = ttnn.matmul(
                 q,
                 kv_cache.k,
@@ -217,6 +231,87 @@ class TtAttention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             compute_kernel_config=self.compute_cfg,
         )
+
+    def _kv_write(self, k, qkv, kv_cache, cur_pos, batch):
+        """Decode KV-cache write as one generic_op: per (cache, b, kv head) unit, the slot row pos[b] of
+        cache[b, h] becomes old + (new - old) (binary_ng's default bf16 FPU sub/add), every other row untouched."""
+        grid = self.device.compute_with_storage_grid_size()
+        n_kv, d_t = self.n_kv_heads, self.head_dim // 32
+        units = 2 * batch * n_kv
+        n_cores = min(units, grid.x * grid.y)
+        base, extra = divmod(units, n_cores)
+        full_rows, rem = divmod(n_cores, grid.x)
+        ranges = []
+        if full_rows:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, full_rows - 1)))
+        if rem:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full_rows), ttnn.CoreCoord(rem - 1, full_rows)))
+        cores = ttnn.CoreRangeSet(ranges)
+
+        dm_rt, cmp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        start = 0
+        for i in range(n_cores):
+            count = base + (1 if i < extra else 0)
+            dm_rt[i % grid.x][i // grid.x] = [start, count]
+            cmp_rt[i % grid.x][i // grid.x] = [count]
+            start += count
+
+        tile = 2 * 32 * 32
+        cb_old, cb_new, cb_scr, cb_pos, cb_diff, cb_out, cb_wscr, cb_wpos = 0, 1, 2, 3, 4, 16, 17, 18
+
+        def cb(idx, n_tiles):
+            return ttnn.CBDescriptor(
+                total_size=n_tiles * tile,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(idx, ttnn.bfloat16, tile)],
+            )
+
+        cbs = [cb(cb_old, 2), cb(cb_new, 2), cb(cb_scr, 1), cb(cb_pos, 1), cb(cb_diff, 1)]
+        cbs += [cb(cb_out, 2), cb(cb_wscr, 1), cb(cb_wpos, 1)]
+        shape = (batch, n_kv, kv_cache.capacity // 32, d_t, qkv.padded_shape[-1] // 32)
+        cache_ct = list(ttnn.TensorAccessorArgs(kv_cache.k).get_compile_time_args())
+        pos_ct = list(ttnn.TensorAccessorArgs(cur_pos).get_compile_time_args())
+        addrs = [kv_cache.k, kv_cache.v, k, qkv, cur_pos]
+        common = [t.buffer_address() for t in addrs]
+        v_col0 = (self.n_heads + n_kv) * self.head_dim // 32
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_KV_WRITE_DIR, "reader_kv_write.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[*shape, v_col0, cb_old, cb_new, cb_scr, cb_pos]
+            + cache_ct
+            + list(ttnn.TensorAccessorArgs(k).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(qkv).get_compile_time_args())
+            + pos_ct,
+            runtime_args=dm_rt,
+            common_runtime_args=common,
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        writer = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_KV_WRITE_DIR, "writer_kv_write.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[*shape[:4], cb_out, cb_wscr, cb_wpos] + cache_ct + pos_ct,
+            runtime_args=dm_rt,
+            common_runtime_args=common,
+            config=ttnn.WriterConfigDescriptor(),
+        )
+        compute = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_KV_WRITE_DIR, "compute_kv_write.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[d_t, cb_old, cb_new, cb_out, cb_diff],
+            runtime_args=cmp_rt,
+            config=ttnn.ComputeConfigDescriptor(
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=False,
+                dst_full_sync_en=False,
+            ),
+        )
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
+        # The caches are updated in place; generic_op's last tensor is its (here: in-place) output.
+        ttnn.generic_op([k, qkv, cur_pos, kv_cache.k, kv_cache.v], program)
 
     def _decode_kv_shard(self, batch):
         """Height-shard spec for one token's K/V [1, B, n_kv, D]: one batch row (a padded tile row) per core."""
