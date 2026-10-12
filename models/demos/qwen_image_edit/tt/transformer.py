@@ -101,11 +101,17 @@ class TtQwenImageTransformer:
         """(img_freqs [S_img, 128], txt_freqs [txt_len, 128]) float32 [cos | sin] device tables."""
         return self.pos_embed([list(img_shapes)], max_txt_seq_len=int(txt_len))
 
-    def __call__(self, hidden_states, encoder_hidden_states, timestep, rotary, attention_mask=None):
-        """hidden_states [B, S_img, 64] fp32, encoder_hidden_states [B, L, 3584] fp32, timestep [B] (= t/1000),
-        rotary from rope(), attention_mask [B, 1, 1, L + S_img] (1 = attend) or None. -> [B, S_img, 64] fp32."""
+    def embed_txt(self, encoder_hidden_states):
+        """txt_in(txt_norm(prompt embeds)) -> [B, L, 3072] fp32: a function of the prompt alone, so a caller that
+        runs several scheduler steps on one prompt can compute it once and pass it with txt_embedded=True."""
+        return self.txt_in(self.txt_norm(encoder_hidden_states))
+
+    def __call__(self, hidden_states, encoder_hidden_states, timestep, rotary, attention_mask=None, txt_embedded=False):
+        """hidden_states [B, S_img, 64] fp32, encoder_hidden_states [B, L, 3584] fp32 (or embed_txt's output with
+        txt_embedded=True), timestep [B] (= t/1000), rotary from rope(), attention_mask [B, 1, 1, L + S_img]
+        (1 = attend) or None. -> [B, S_img, 64] fp32."""
         img = self.img_in(hidden_states)
-        txt = self.txt_in(self.txt_norm(encoder_hidden_states))
+        txt = encoder_hidden_states if txt_embedded else self.embed_txt(encoder_hidden_states)
         temb = self.time_text_embed(timestep, img)
         jak = {"attention_mask": attention_mask} if attention_mask is not None else None
         for blk in self.transformer_blocks:

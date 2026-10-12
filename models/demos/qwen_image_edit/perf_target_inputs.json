@@ -4,11 +4,11 @@
   "source": "checkpoint bytes + HF config",
   "total_params": 27627912755,
   "params_basis": "read set for unit=unknown: lookup-only and tower-only tensors excluded",
-  "device_weight_bytes": 7861132984,
+  "device_weight_bytes": 7858020024,
   "device_census_complete": false,
   "device_section_bytes": {
     "stacks": 7280472192,
-    "denoise": 5124484132,
+    "denoise": 5121371172,
     "stack": 5101547520,
     "blocks": 5101547520,
     "text_encode": 1670032896,
@@ -56,5 +56,5 @@
     "input_layernorm": 301056,
     "norm2": 267264
   },
-  "bytes_per_param": 2.0361
+  "bytes_per_param": 2.0357
 }
