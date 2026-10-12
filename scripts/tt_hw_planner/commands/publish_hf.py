@@ -149,6 +149,7 @@ def _write_tt_model_yaml(
     _batch = state.get("batch")
     serve_max = _batch or 32
     serve_maxlen = None
+    serve_hf_override = None
     try:
         _bm = Path(checkout) / extra_models_dir / slug / "vllm_metadata.json"
         if _bm.is_file():
@@ -159,9 +160,17 @@ def _write_tt_model_yaml(
             _ml = _md.get("max_model_len")
             if isinstance(_ml, int) and _ml > 0:
                 serve_maxlen = _ml
+            _ovr = _md.get("serve_hf_override_arch")
+            if isinstance(_ovr, str) and _ovr:
+                serve_hf_override = _ovr
     except Exception:
         pass
     arch = arch or a
+    # A novel-arch adapter is not a vLLM/Transformers built-in, so the engine must be told which
+    # registered TT class to use (there is no built-in to ride); stock arches omit this.
+    _serve_args = ["--trust-remote-code"]
+    if serve_hf_override:
+        _serve_args += ["--hf-overrides", json.dumps({"architectures": [serve_hf_override]})]
     hardware = hardware or hw
     mesh_device = mesh_device or mesh
     if not (arch and hardware and mesh_device):
@@ -185,7 +194,7 @@ def _write_tt_model_yaml(
         perf_bits.append(f"at batch {batch}")
     if hardware:
         perf_bits.append(f"on {hardware}")
-    perf = " ".join(perf_bits) or "measured with tt_hw_planner; see the dashboard."
+    perf = " ".join(perf_bits) or "measured on Tenstorrent; see the dashboard."
     lines = [
         'schema: "5.1"',
         f"repo: {repo_id}",
@@ -227,19 +236,19 @@ def _write_tt_model_yaml(
         f"  mesh_device: {mesh_device}",
         "  env:",
         f"    ARCH_NAME: {arch}",
-        "  args: [--trust-remote-code]",
+        f"  args: {json.dumps(_serve_args)}",
         "",
         "verify:",
         f'  - "import models.demos.{slug} as m; assert m"',
         "",
         "card:",
         f"  description: >",
-        f"    {slug}, brought up and optimized on {_hardware_phrase(state, hardware)} with tt_hw_planner",
+        f"    {slug}, brought up and optimized on {_hardware_phrase(state, hardware)}",
         f"    (kernel/lever autotuning against a PCC-gated end-to-end pipeline).",
         f"  performance: >",
         f"    {perf}.",
         f"  limitations: >",
-        f"    Community bring-up via tt_hw_planner; validated on {_hardware_phrase(state, hardware)}.",
+        f"    Validated on {_hardware_phrase(state, hardware)}.",
         f"  architecture: autoport ({slug})",
         f"  status: Experimental community bring-up",
         "  license:",
@@ -299,17 +308,50 @@ def _arch_name(state: dict) -> str:
     return a or "Tenstorrent"
 
 
+def _ensure_hw_env(state: dict, demo_dir=None, box: str | None = None) -> dict:
+    """Fill state.env with the real hardware when the run env didn't record it: device_count from the
+    run's parallelism manifest (chips, else mesh product), arch from the operator's --box. Best-effort
+    and idempotent, so every card the publish builds can name the chips automatically."""
+    env = dict(state.get("env") or {})
+    if not env.get("device_count") and demo_dir:
+        try:
+            import glob as _g
+
+            for f in _g.glob(str(Path(demo_dir) / "**" / "parallelism_manifest.json"), recursive=True):
+                d = json.loads(Path(f).read_text())
+                chips = d.get("chips")
+                if not chips and isinstance(d.get("mesh"), (list, tuple)) and len(d["mesh"]) == 2:
+                    chips = int(d["mesh"][0]) * int(d["mesh"][1])
+                if chips:
+                    env["device_count"] = int(chips)
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+    if not env.get("arch") and box:
+        tgt = _BOX_TARGET.get(box)
+        if tgt:
+            env["arch"] = tgt[0]
+    state = dict(state)
+    state["env"] = env
+    return state
+
+
 def _hardware_phrase(state: dict, hardware: str | None) -> str:
     """The hardware the run ACTUALLY used, in plain words. One chip reads as one chip — never the
     whole box — because the packaging ``hardware`` tag (e.g. ``p300x2``) names the box, not the number
     of chips the model opened. ``device_count`` comes from the run's own manifest env."""
     arch = _arch_name(state)
     dc = _device_count(state)
+    # Prefer the packaging label (e.g. "p300x2") when known -- it names the exact Tenstorrent box and
+    # is how the other model packages describe their hardware. Fall back to a chip count only when no
+    # package tag is available.
+    if hardware:
+        return f"Tenstorrent {hardware}"
     if dc == 1:
-        return f"a single Tenstorrent {arch} chip"
+        return "a single Tenstorrent chip" if arch == "Tenstorrent" else f"a single Tenstorrent {arch} chip"
     if dc > 1:
-        return f"{dc} Tenstorrent {arch} chips" + (f" ({hardware})" if hardware else "")
-    return f"Tenstorrent {hardware}" if hardware else f"Tenstorrent {arch}"
+        return f"{dc} Tenstorrent chips" if arch == "Tenstorrent" else f"{dc} Tenstorrent {arch} chips"
+    return "Tenstorrent" if arch == "Tenstorrent" else f"Tenstorrent {arch}"
 
 
 def _fetch_upstream_card(base_weights: str, token: str | None) -> str | None:
@@ -359,15 +401,180 @@ def _tt_validated_block(state: dict, hw_phrase: str, commit: str | None) -> str:
     table = "\n".join(["| Measured on Tenstorrent | Value |", "| --- | --- |", *rows])
     return (
         "## Validated on Tenstorrent\n\n"
-        f"Brought up and measured on {hw_phrase} with `tt_hw_planner` (PCC-gated end-to-end pipeline). "
+        f"Brought up and measured on {hw_phrase} through a PCC-gated end-to-end pipeline. "
         "Every figure in this section is measured on Tenstorrent hardware; the sections below are the "
         "upstream base-model card (measured by the base-model authors on GPU), reproduced for reference.\n\n"
         + table + "\n"
     )
 
 
+_GPU_TITLE_KEYS = (
+    "vllm", "sglang", "tensorrt", "trt-llm", "gpu", "cuda", "nvidia", "deploy", "deployment",
+    "quick start", "quickstart", "serving", "serve", "run with", "run on", "installation", "docker",
+)
+
+
+def _strip_gpu_sections(body: str) -> str:
+    """Drop GPU-specific deployment/usage/hardware sections from the upstream card body (keeps model
+    description, architecture, training, datasets, benchmarks). Conservative + best-effort: a section
+    is dropped only when its ## title is clearly a GPU/deployment one, or its body is dominated by GPU
+    serve commands (vllm serve / sglang / cuda / nvidia docker)."""
+    import re
+
+    parts = re.split(r"(?m)^(?=##\s)", body)
+    kept = []
+    for p in parts:
+        m = re.match(r"##\s+(.*)", p)
+        title = (m.group(1).strip().lower() if m else "")
+        low = p.lower()
+        gpu_title = bool(title) and any(k in title for k in _GPU_TITLE_KEYS)
+        gpu_body = (
+            "vllm serve" in low
+            or "sglang" in low
+            or ("docker run" in low and "nvidia" in low)
+            or ("--tensor-parallel" in low)
+        )
+        if gpu_title or gpu_body:
+            continue
+        kept.append(p)
+    out = "".join(kept).strip()
+    return out or body  # never return empty (fall back to the whole body)
+
+
+def _load_tt_eval(demo_dir) -> dict:
+    """On-device accuracy results written by a bounded TT eval, if any:
+    {"<task>": {"tt": <score>, "n": <sampled>}}. Empty when none have been run yet."""
+    from pathlib import Path
+
+    for name in ("tt_eval.json", "tt_accuracy.json"):
+        p = Path(demo_dir) / name
+        if p.is_file():
+            try:
+                d = json.load(open(p))
+                return d if isinstance(d, dict) else {}
+            except Exception:
+                return {}
+    return {}
+
+
+def _augment_benchmark_tables(body: str, base_weights: str, tt_results: dict) -> str:
+    """Add a Tenstorrent column to the upstream BENCHMARK tables — the ones whose header names the
+    model (base/other models compared). Each row's TT cell is the measured on-device score for that
+    task (from tt_results) or 'pending (TT)'. Dataset / hardware tables (header has no model name) are
+    left untouched. Best-effort: on any parse trouble, the table is returned unchanged."""
+    import re
+
+    model_tokens = [t for t in re.split(r"[^A-Za-z0-9]+", (base_weights or "").split("/")[-1].lower()) if len(t) > 2]
+
+    def _is_benchmark_header(header: str) -> bool:
+        h = header.lower()
+        if any(t in h for t in model_tokens):
+            return True
+        return any(k in h for k in ("benchmark", "task", "metric", "eval", "accuracy", "score"))
+
+    score_re = re.compile(r"^\**\s*~?\s*\d{1,3}(?:\.\d+)?\s*%?\s*\**$")
+
+    def _rows_mostly_numeric(rows):
+        data = [r for r in rows if "|" in r]
+        if not data:
+            return False
+        hits = 0
+        for r in data:
+            cells = [c.strip() for c in r.strip().strip("|").split("|")]
+            if any(score_re.match(c) for c in cells[1:]):
+                hits += 1
+        return hits >= 2 and hits >= 0.5 * len(data)
+
+    def repl(m):
+        tbl = m.group(0)
+        lines = [ln for ln in tbl.split("\n") if ln.strip()]
+        if len(lines) < 2 or not re.match(r"^\s*\|?[\s:|-]+\|?\s*$", lines[1]):
+            return tbl
+        if not (_is_benchmark_header(lines[0]) and _rows_mostly_numeric(lines[2:])):
+            return tbl
+        if "tenstorrent" in lines[0].lower():
+            return tbl
+        new = [lines[0].rstrip().rstrip("|") + " | Tenstorrent |", lines[1].rstrip().rstrip("|") + " | --- |"]
+        for ln in lines[2:]:
+            if "|" not in ln:
+                new.append(ln)
+                continue
+            task = ln.strip().strip("|").split("|")[0].strip().strip("*").strip()
+            res = (tt_results or {}).get(task)
+            if isinstance(res, dict) and res.get("tt") is not None:
+                cell = f"{res['tt']}" + (f" (n={res['n']})" if res.get("n") else "")
+            else:
+                cell = "pending (TT)"
+            new.append(ln.rstrip().rstrip("|") + f" | {cell} |")
+        return "\n".join(new) + "\n"
+
+    return re.sub(r"(?m)^(\|.*\|[ \t]*\n\|[\s:|-]+\|[ \t]*\n(?:\|.*\|[ \t]*\n?)+)", repl, body)
+
+
+_GPU_RUN_ROW_RE = __import__("re").compile(
+    r"\b(A100|H100|H200|B100|B200|B300|GB200|HGX|SXM|NVIDIA|CUDA|cuda|ROCm|vllm serve|sglang|TensorRT)\b"
+)
+
+
+def _scrub_gpu_run_rows(body: str) -> str:
+    """Drop lines that describe how to RUN on GPU — GPU hardware-requirement / compute / serve-command
+    rows (A100/H100/B200/NVIDIA/CUDA/vllm serve/sglang/...). Benchmark SCORE rows (no GPU-hardware
+    token) are kept, so the GPU numbers remain as the comparison column next to Tenstorrent. Prose
+    lines mentioning a GPU serve command are dropped too; plain prose is left alone."""
+    out = []
+    for ln in body.splitlines():
+        st = ln.strip()
+        is_table_row = st.startswith("|")
+        if _GPU_RUN_ROW_RE.search(ln) and (is_table_row or "vllm serve" in ln.lower() or "sglang" in ln.lower()):
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
+def _mirror_body_tt(body: str, base_weights: str, demo_dir, state: dict) -> str:
+    """Transform the upstream body for a TT card: strip GPU-specific sections and turn benchmark
+    tables into TT-vs-GPU comparisons. Fully best-effort — any error returns the body unchanged so
+    publishing never breaks."""
+    try:
+        tt_results = _load_tt_eval(demo_dir) if demo_dir else {}
+        b = _strip_gpu_sections(body)
+        b = _scrub_gpu_run_rows(b)
+        b = _augment_benchmark_tables(b, base_weights, tt_results)
+        return b
+    except Exception:  # noqa: BLE001
+        return body
+
+
+def _tt_run_section(repo_id: str | None, base_weights: str | None = None) -> str:
+    """How to actually serve this model on Tenstorrent: the `tt` CLI (Tenstorrent's packaged serving
+    flow) pulls the published package and serves it as an OpenAI-compatible API, then any OpenAI
+    client can query it. This is the same path the other Tenstorrent model packages use."""
+    rid = repo_id or "<your-published-repo>"
+    model = base_weights or rid
+    return (
+        "## Run on Tenstorrent\n\n"
+        "```bash\n"
+        "uv tool install tenstorrent          # once \u2014 the Tenstorrent CLI, `tt`\n"
+        f"tt model pull {rid}\n"
+        f"tt serve {rid}                       # OpenAI-compatible API on http://localhost:20000/v1\n"
+        "```\n\n"
+        "Then query it with any OpenAI client:\n\n"
+        "```python\n"
+        "from openai import OpenAI\n"
+        "client = OpenAI(base_url=\"http://localhost:20000/v1\", api_key=\"EMPTY\")\n"
+        "resp = client.chat.completions.create(\n"
+        f"    model=\"{model}\",\n"
+        "    messages=[{\"role\": \"user\", \"content\": \"What is the capital of Japan?\"}],\n"
+        "    max_tokens=256,\n"
+        ")\n"
+        "print(resp.choices[0].message.content)\n"
+        "```\n"
+    )
+
+
 def _compose_mirrored_card(
-    state: dict, slug: str, base_weights: str | None, commit: str | None, token: str | None
+    state: dict, slug: str, base_weights: str | None, commit: str | None, token: str | None, demo_dir=None,
+    repo_id: str | None = None,
 ) -> str | None:
     """A card that MIRRORS the upstream HF model card, with a TT-validated header whose numbers all
     come from this run and hardware named as the chips actually used. None -> caller falls back."""
@@ -376,6 +583,8 @@ def _compose_mirrored_card(
     body = _fetch_upstream_card(base_weights, token)
     if not body:
         return None
+    body = _mirror_body_tt(body, base_weights, demo_dir, state)  # strip GPU, TT-vs-GPU benchmarks
+    state = _ensure_hw_env(state, demo_dir)
     _, hw_tag, _ = _serve_target(None, state.get("env"))
     hw = _hardware_phrase(state, hw_tag)
     arch_tag = str((state.get("env") or {}).get("arch") or "").strip().lower()
@@ -387,23 +596,24 @@ def _compose_mirrored_card(
     fm.append("---")
     intro = (
         f"A Tenstorrent deployment of [`{base_weights}`](https://huggingface.co/{base_weights}) — the same "
-        f"weights, brought up on {hw} with `tt_hw_planner`. This card mirrors the upstream model card: the "
-        "**Validated on Tenstorrent** section holds figures measured on Tenstorrent hardware, and the rest "
-        "is the upstream base-model card reproduced for reference (its benchmarks were measured by the "
-        "base-model authors on GPU, not re-run here)."
+        f"weights, brought up on {hw}. This card mirrors the upstream model card: the "
+        "**Validated on Tenstorrent** section holds figures measured on Tenstorrent hardware. GPU-specific "
+        "deployment/usage has been removed; the base-model benchmark tables are shown with a Tenstorrent "
+        "column (the on-device score when a bounded TT eval has been run, else 'pending (TT)')."
     )
     return (
         "\n".join(fm)
         + f"\n\n# {base_weights} — on Tenstorrent\n\n{intro}\n\n"
         + _tt_validated_block(state, hw, commit)
+        + "\n" + _tt_run_section(repo_id, base_weights)
         + "\n## Base model (upstream) — reference\n\n"
         + body
         + "\n"
     )
 
 
-def _build_card(state: dict, slug: str, base_weights: str | None, commit: str | None, token: str | None = None) -> str:
-    mirrored = _compose_mirrored_card(state, slug, base_weights, commit, token)
+def _build_card(state: dict, slug: str, base_weights: str | None, commit: str | None, token: str | None = None, repo_id: str | None = None) -> str:
+    mirrored = _compose_mirrored_card(state, slug, base_weights, commit, token, repo_id=repo_id)
     if mirrored is not None:
         return mirrored
     cfg = state.get("config") or {}
@@ -435,8 +645,8 @@ def _build_card(state: dict, slug: str, base_weights: str | None, commit: str | 
         "",
         f"# {slug} — Tenstorrent-optimized",
         "",
-        "Optimized for Tenstorrent hardware with `tt_hw_planner` (kernel/lever autotuning "
-        "against a PCC-gated end-to-end pipeline).",
+        "Optimized for Tenstorrent hardware with kernel/lever autotuning "
+        "against a PCC-gated end-to-end pipeline.",
         "",
     ]
     if base_weights:
@@ -467,16 +677,7 @@ def _build_card(state: dict, slug: str, base_weights: str | None, commit: str | 
         L.append(f"| {m['name']} | {_fmt(m.get('current'), 1)} {m.get('unit', '')} |")
     L += [
         "",
-        "## Run on Tenstorrent",
-        "",
-        "```bash",
-        "# vLLM, OpenAI-compatible API via tt-inference-server, from an optimized tt-metal checkout:",
-        f"python3 run.py --model {slug} --tt-device <device> --workflow server \\",
-        "  --local-server --tt-metal-home <your tt-metal checkout>",
-        "```",
-        "",
-        "_Published with `tt_hw_planner publish-hf`. The optimized model implementation lives under "
-        "`models/`; weights are referenced from the base repo above (not stored here)._",
+        *_tt_run_section(repo_id, base_weights).rstrip("\n").split("\n"),
         "",
     ]
     return "\n".join(L)
@@ -723,6 +924,181 @@ def _pick_base_generator(arch: str, model_type: str | None) -> tuple[str, bool]:
     return ("HybridAttentionForCausalLM" if hybrid else "LlamaForCausalLM"), True
 
 
+_PIPELINE_ADAPTER_TMPL = '''# SPDX-License-Identifier: Apache-2.0
+"""vLLM generator for @SLUG@ (@ARCH@) on Tenstorrent.
+
+The tt-metal vLLM plugin registers this class as @TTARCH@ via vllm_metadata.json and drives it through
+the generator contract (initialize_vllm_model -> allocate_kv_cache_per_layer -> warmups ->
+prefill_forward / decode_forward). @ARCH@ is not a plugin built-in, so this wraps the demo's own
+resident pipeline (@PMOD@) rather than a stock generator.
+
+Starting serve profile (matches the validated demo): ONE sequence at a time (--max-num-seqs 1), prompt
+and generated tokens bounded by the pipeline KV capacity (--max-model-len @KV@), host-side sampling
+(logits are returned to vLLM). Concurrent users / long context / on-device sampling are model work; see
+the TODOs below.
+"""
+from __future__ import annotations
+
+import logging
+
+import torch
+
+try:
+    import ttnn  # noqa: F401
+    from @PMOD@ import build_pipeline as _build_pipeline, read_host as _read_host
+    try:
+        from @PMOD@ import KV_CAPACITY as _KV_CAPACITY
+    except Exception:  # noqa: BLE001
+        _KV_CAPACITY = @KV@
+except Exception:  # available only inside the serving image
+    _build_pipeline = None
+    _read_host = None
+    _KV_CAPACITY = @KV@
+
+log = logging.getLogger(__name__)
+
+
+class @TTARCH@:
+    """Generator contract over the demo resident pipeline (@PMOD@)."""
+
+    # Read by the plugin off the CLASS before the model exists.
+    model_capabilities = {"supports_sample_on_device": False}
+
+    def __init__(self, pipe, max_batch_size, max_seq_len):
+        self.pipe = pipe
+        self.max_batch_size = int(max_batch_size)
+        self.max_seq_len = int(max_seq_len)
+        self.vocab_size = int(getattr(pipe.config, "vocab_size", 0)) or None
+        self._state = None
+        self._active = False
+        self.already_warmed_up_prefill = False
+
+    @classmethod
+    def initialize_vllm_model(cls, hf_config, mesh_device, max_batch_size, max_seq_len=None, n_layers=None, **_ignored):
+        if int(max_batch_size) != 1:
+            raise ValueError(
+                "%s serves one sequence at a time; launch vLLM with --max-num-seqs 1 (got %s)."
+                % (cls.__name__, max_batch_size)
+            )
+        msl = int(max_seq_len or _KV_CAPACITY)
+        if msl > _KV_CAPACITY:
+            raise ValueError(
+                "%s: resident KV capacity is %d tokens; use --max-model-len %d or less (got %d)."
+                % (cls.__name__, _KV_CAPACITY, _KV_CAPACITY, msl)
+            )
+        if _build_pipeline is None:
+            raise RuntimeError("pipeline module @PMOD@ not importable; run inside the serving image")
+        pipe = _build_pipeline(mesh_device, layers=n_layers)
+        log.info("built @SLUG@ pipeline (device rows=%s, KV=%s)", getattr(pipe, "batch", "?"), _KV_CAPACITY)
+        return cls(pipe, max_batch_size, msl)
+
+    def allocate_kv_cache_per_layer(self, per_layer_specs):
+        return [None for _ in per_layer_specs]  # the pipeline owns its cache
+
+    def allocate_kv_cache(self, kv_cache_shape=None, dtype=None, num_layers=None):
+        return [None for _ in range(int(num_layers or 0))]
+
+    def _host_logits_row0(self, logits_dev):
+        host = _read_host(logits_dev).reshape(-1)
+        v = self.vocab_size or host.numel()
+        return host[:v].float().reshape(1, 1, v)
+
+    def prefill_forward(self, tokens, page_table=None, *, prompt_lens=None, start_pos=None, **_compat):
+        if tokens.shape[0] != 1:
+            raise ValueError("one sequence at a time: got a prefill batch of %d" % tokens.shape[0])
+        if start_pos is not None and int(torch.as_tensor(start_pos).max()) != 0:
+            raise ValueError("chunked / prefix-cached prefill is not supported by this generator")
+        T = int(prompt_lens[0]) if prompt_lens is not None else int(tokens.shape[1])
+        if T > self.max_seq_len:
+            raise ValueError("prompt of %d tokens exceeds max_model_len=%d" % (T, self.max_seq_len))
+        ids = tokens[0, :T].to(torch.int64).tolist()
+        self._state = self.pipe.decode_prefill([ids])  # seeds the resident caches for every device row
+        self._active = True
+        return self._host_logits_row0(self._state["logits"])
+
+    def decode_forward(self, tokens, start_pos=None, page_table=None, **_compat):
+        if not self._active:
+            raise RuntimeError("decode_forward before prefill_forward")
+        # Honor vLLM's host-sampled token: the demo pipeline commits its OWN device-sampled token, so
+        # overwrite its resident input-token buffer when it exposes one (the generated-pipeline
+        # convention: a uint32 ``tok_u32`` [1, batch] written in place via ``_write``). Greedy decode
+        # matches even without this; the writeback gives full host-sampler fidelity.
+        try:
+            _tok = int(torch.as_tensor(tokens).reshape(-1)[0])
+            if hasattr(self.pipe, "tok_u32") and hasattr(self.pipe, "_write"):
+                self.pipe._write(
+                    "tok_u32",
+                    torch.full((1, int(self.pipe.batch)), _tok, dtype=torch.int32),
+                    ttnn.uint32,
+                    ttnn.ROW_MAJOR_LAYOUT,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        self._state = self.pipe.decode_step(self._state)
+        return self._host_logits_row0(self._state["logits"])
+
+    def warmup_model_prefill(self, *, kv_cache=None, can_sample_on_device=False, enable_trace=False):
+        if enable_trace:
+            return  # eager generator; trace warmup is a no-op
+        bos = int(getattr(self.pipe.config, "bos_token_id", 1) or 1)
+        self.prefill_forward(torch.full((1, 8), bos, dtype=torch.int64), None, prompt_lens=[8])
+        self.already_warmed_up_prefill = True
+
+    def warmup_model_decode(self, *, kv_cache=None, max_batch_size=1, num_blocks=0, can_sample_on_device=False, enable_trace=False):
+        if enable_trace or not self._active:
+            return
+        self.decode_forward(torch.zeros((1, 1), dtype=torch.int64), None, None)
+        self._active = False  # warmup sequence done; next prefill reseeds
+
+    def cleanup(self):
+        pass
+'''
+
+
+def _demo_pipeline_module(checkout, slug):
+    """Dotted import path to the demo resident pipeline if it exposes build_pipeline, else None."""
+    pf = Path(checkout) / "models" / "demos" / slug / "tt" / "pipeline.py"
+    try:
+        if pf.is_file() and "def build_pipeline" in pf.read_text(errors="replace"):
+            return "models.demos.%s.tt.pipeline" % slug
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _pipeline_serve_profile(checkout, slug):
+    """(kv_capacity, mesh_str) for the serve note, from the demo pipeline + parallelism manifest."""
+    import re as _re
+
+    kv = 2048
+    try:
+        pf = Path(checkout) / "models" / "demos" / slug / "tt" / "pipeline.py"
+        m = _re.search(r"KV_CAPACITY\\s*=\\s*(\\d+)", pf.read_text(errors="replace"))
+        if m:
+            kv = int(m.group(1))
+    except Exception:  # noqa: BLE001
+        pass
+    mesh = None
+    try:
+        d = json.loads((Path(checkout) / "models" / "demos" / slug / "parallelism_manifest.json").read_text())
+        if isinstance(d.get("mesh"), (list, tuple)) and len(d["mesh"]) == 2:
+            mesh = "(%d, %d)" % (int(d["mesh"][0]), int(d["mesh"][1]))
+    except Exception:  # noqa: BLE001
+        pass
+    return kv, mesh
+
+
+def _pipeline_adapter_src(slug, arch, tt_arch, pipeline_mod, kv):
+    """Render the pipeline-wrapping adapter for a novel arch that has its own demo pipeline."""
+    return (
+        _PIPELINE_ADAPTER_TMPL.replace("@SLUG@", slug)
+        .replace("@TTARCH@", tt_arch)
+        .replace("@ARCH@", arch)
+        .replace("@PMOD@", pipeline_mod)
+        .replace("@KV@", str(kv))
+    )
+
+
 def _scaffold_vllm_bundle(
     checkout: Path, extra_models_dir: str, arch: str, model_type: str | None, weights: str | None, slug: str
 ) -> tuple[bool, bool, str]:
@@ -744,17 +1120,48 @@ def _scaffold_vllm_bundle(
     bundle = base_dir / slug
     meta = bundle / "vllm_metadata.json"
     base_cls, is_stub = _pick_base_generator(arch, model_type)
-    if meta.is_file():
-        return False, is_stub, str(bundle)
+    created = not meta.is_file()
     bundle.mkdir(parents=True, exist_ok=True)
     tt_arch = arch if arch.startswith("TT") else "TT" + arch
+
+    # Novel arch WITH its own resident demo pipeline -> ship a real pipeline-wrapping generator
+    # skeleton (the Nemotron-shaped serve contract) instead of a no-op stub, so publish-hf always
+    # produces a servable-shaped adapter and never leaves "no adapter" for the next run.
+    pipeline_mod = _demo_pipeline_module(checkout, slug) if is_stub else None
+    if pipeline_mod:
+        kv, mesh = _pipeline_serve_profile(checkout, slug)
+        note = (
+            "Single-sequence generator over the demo tt/pipeline.py; serve with "
+            "--max-num-seqs 1 --max-model-len %d" % kv
+        )
+        if mesh:
+            note += ' and MESH_DEVICE="%s"' % mesh
+        note += "."
+        meta.write_text(
+            json.dumps(
+                {
+                    "arch": arch,
+                    "main_class": "adapter:" + tt_arch,
+                    "weights": weights or "REPLACE/with-base-weights-repo",
+                    "note": note,
+                    "max_num_seqs": 1,
+                    "max_model_len": kv,
+                    "serve_hf_override_arch": tt_arch,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        (bundle / "adapter.py").write_text(_pipeline_adapter_src(slug, arch, tt_arch, pipeline_mod, kv))
+        return created, is_stub, str(bundle)
+
     meta.write_text(
         json.dumps(
             {
                 "arch": arch,
                 "main_class": "adapter:" + tt_arch,
                 "weights": weights or "REPLACE/with-base-weights-repo",
-                "note": "Generated by tt_hw_planner publish-hf.",
+                "note": "Auto-generated vLLM bundle for Tenstorrent.",
             },
             indent=2,
         )
@@ -780,7 +1187,7 @@ def _scaffold_vllm_bundle(
         f"class {tt_arch}(_Base):\n"
         f'    """TT generator for {arch} (base: {base_cls})."""\n\n' + todo
     )
-    return True, is_stub, str(bundle)
+    return created, is_stub, str(bundle)
 
 
 def _tidy_provenance_note(args) -> None:
@@ -1267,6 +1674,100 @@ def _ensure_tt_model_serving_fixes(tt_model_bin) -> None:
         )
 
 
+_TT_PLUGIN_NOVEL_ARCH_SNIPPET = '''
+
+# ---- Tenstorrent novel-architecture serving support (added by tt_hw_planner publish-hf) -----------
+def _tt_register_novel_configs() -> None:
+    """Register a permissive Transformers config for any EXTRA_MODELS_DIR bundle whose base weights
+    declare a model_type this Transformers build does not know (brand-new archs ship no remote code),
+    so vLLM can build its ModelConfig. The TT generator, not Transformers, builds the real model."""
+    import os, json, glob
+    try:
+        from transformers import AutoConfig, PretrainedConfig
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    except Exception:
+        return
+    emd = os.getenv("EXTRA_MODELS_DIR")
+    hf_home = os.getenv("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    if not emd:
+        return
+    for meta in glob.glob(os.path.join(emd, "*", "vllm_metadata.json")):
+        try:
+            w = (json.load(open(meta)) or {}).get("weights")
+            if not w or "/" not in w:
+                continue
+            folder = "models--" + w.replace("/", "--")
+            cfgs = glob.glob(os.path.join(hf_home, "hub", folder, "snapshots", "*", "config.json"))
+            if not cfgs:
+                continue
+            mt = (json.load(open(cfgs[0])) or {}).get("model_type")
+            if not mt or mt in CONFIG_MAPPING:
+                continue
+            cls = type("TTAutoConfig_" + mt, (PretrainedConfig,), {"model_type": mt})
+            AutoConfig.register(mt, cls, exist_ok=True)
+        except Exception:
+            continue
+
+
+def _tt_force_generate_capability() -> None:
+    """A TT-prefixed arch is a custom adapter driven through the TT generator contract, not vLLM's
+    native model __init__, so it never satisfies vLLM's structural is_vllm_model check (stock models
+    ride a built-in arch; a novel arch has none). Declare TT archs generative so ModelConfig accepts
+    them; the TT runner drives prefill/decode."""
+    try:
+        from vllm.model_executor.models.registry import ModelRegistry
+        RegClass = type(ModelRegistry)
+    except Exception:
+        return
+    if getattr(RegClass, "_tt_gen_patched", False):
+        return
+    _orig = RegClass.is_text_generation_model
+
+    def _wrap(self, architectures, *a, **k):
+        try:
+            archs = architectures if isinstance(architectures, (list, tuple)) else [architectures]
+            if any(isinstance(x, str) and x.startswith("TT") for x in archs):
+                return True
+        except Exception:
+            pass
+        return _orig(self, architectures, *a, **k)
+
+    RegClass.is_text_generation_model = _wrap
+    RegClass._tt_gen_patched = True
+# ---- end Tenstorrent novel-architecture serving support -------------------------------------------
+'''
+
+
+def _ensure_plugin_novel_arch_support(plugin_path) -> bool:
+    """Make the in-tree vLLM TT plugin serve a brand-new architecture out of the box, by adding two
+    small hooks to its platform.py and calling them during EXTRA_MODELS_DIR registration. Idempotent,
+    additive, and a no-op for stock archs (the hooks only fire on a novel EXTRA_MODELS_DIR bundle), so
+    the image built from this plugin needs no hand-fixing. Returns True when support is present."""
+    from pathlib import Path as _P
+
+    pf = _P(plugin_path) / "src" / "vllm_tt_plugin" / "platform.py"
+    try:
+        src = pf.read_text()
+    except Exception:
+        return False
+    if "_tt_register_novel_configs" in src:
+        return True
+    anchor = "def _register_models_from_extra_dir(ModelRegistry) -> int:\n"
+    if anchor not in src:
+        return False
+    calls = (
+        anchor
+        + "    try:\n        _tt_register_novel_configs()\n    except Exception:\n        pass\n"
+        + "    try:\n        _tt_force_generate_capability()\n    except Exception:\n        pass\n"
+    )
+    src = src.replace(anchor, _TT_PLUGIN_NOVEL_ARCH_SNIPPET + "\n\n" + calls, 1)
+    try:
+        pf.write_text(src)
+        return True
+    except Exception:
+        return False
+
+
 def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -> int:
     """Build + push a real v5.1 container bundle via tt-model (exactly like the published TT repos):
     generate tt-model.yaml, then `tt-model package --container` (2.5-4h OCI build) and `tt-model push`."""
@@ -1383,6 +1884,26 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
         )
         print(f"  [publish-hf] vLLM bundle {'created' if created else 'exists'}: {bpath}  ({state_note})")
 
+    # A novel-arch pipeline adapter must serve out of the box: build the image from the MATCHED
+    # local vLLM+plugin (no version skew) and give that plugin novel-arch support. Stock arches are
+    # unaffected (they ride a vLLM built-in; the hooks only fire on a novel EXTRA_MODELS_DIR bundle).
+    _is_pipeline_adapter = (not adapter_ready) and bool(_demo_pipeline_module(checkout, slug))
+    if getattr(args, "container", False) and _is_pipeline_adapter:
+        if not getattr(args, "vllm_path", None):
+            disc = _discover_serving_stack()
+            if disc:
+                vpath, ppath, vcommit, vremote = disc
+                args.vllm_path, args.plugin_path = vpath, ppath
+                args._discovered_vllm = (vcommit, vremote)
+                print(f"  [publish-hf] auto serving stack (novel arch): {vremote} @ {vcommit[:9]} -- {vpath}")
+                if not getattr(args, "lock", None):
+                    cf = _auto_constraint_file(checkout)
+                    if cf:
+                        args.lock = cf
+        if getattr(args, "plugin_path", None):
+            _ok = _ensure_plugin_novel_arch_support(args.plugin_path)
+            print(f"  [publish-hf] plugin novel-arch serving support: {'present' if _ok else 'could not inject'}")
+
     # Serve on the mesh the model was actually built/validated on (from the run), not a box guess.
     mesh_rc = _detect_mesh(Path(demo_dir))
     mesh_override = getattr(args, "mesh", None) or (f"({mesh_rc[0]}, {mesh_rc[1]})" if mesh_rc else None)
@@ -1496,7 +2017,7 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
                 repo_id=args.repo,
                 folder_path=str(staged),
                 repo_type="model",
-                commit_message=f"Publish {slug} container bundle (tt_hw_planner)",
+                commit_message=f"Publish {slug} container bundle",
             )
     except Exception as e:
         low = str(e).lower()
@@ -1657,7 +2178,7 @@ def _maybe_autocommit(args, demo_dir) -> None:
         print(f"  [publish-hf] auto-commit skipped: {exc}")
 
 
-def _maybe_mirror_container_card(args, slug, state, base_weights, commit) -> None:
+def _maybe_mirror_container_card(args, slug, state, base_weights, commit, demo_dir=None) -> None:
     """After a container publish, re-publish the README MIRRORING the upstream HF model card the port
     is based on — a TT-validated header (numbers measured in this run) + correct hardware + the upstream
     body for reference. Default on; --no-mirror-upstream to keep tt-model's card. Best-effort."""
@@ -1665,7 +2186,7 @@ def _maybe_mirror_container_card(args, slug, state, base_weights, commit) -> Non
         return
     try:
         tok = _hf_token(args)
-        card = _compose_mirrored_card(state, slug, base_weights, commit, tok)
+        card = _compose_mirrored_card(state, slug, base_weights, commit, tok, demo_dir, args.repo)
         if not card:
             print("  [publish-hf] upstream mirror: upstream card unavailable; kept tt-model card")
             return
@@ -1758,6 +2279,7 @@ def cmd_publish_hf(args) -> int:
         )
         return 2
 
+    state = _ensure_hw_env(state, demo_dir, getattr(args, "box", None))
     commit = _git_commit(state_root)
     # Auto-detect the base-weights HF id when the caller didn't pass one, so the card/manifest never
     # ship a placeholder. Also feeds the container path (it reads args.weights downstream).
@@ -1771,11 +2293,11 @@ def cmd_publish_hf(args) -> int:
     if getattr(args, "container", False):
         rc = _run_container(args, state, slug, demo_dir, commit)
         if rc == 0:
-            _maybe_mirror_container_card(args, slug, state, base_weights, commit)
+            _maybe_mirror_container_card(args, slug, state, base_weights, commit, demo_dir)
             _maybe_autocommit(args, demo_dir)
         return rc
 
-    card = _build_card(state, slug, base_weights, commit, _hf_token(args))
+    card = _build_card(state, slug, base_weights, commit, _hf_token(args), args.repo)
 
     stage = Path(tempfile.mkdtemp(prefix="tt_publish_"))
     (stage / "README.md").write_text(card)
@@ -1838,7 +2360,7 @@ def cmd_publish_hf(args) -> int:
             folder_path=str(stage),
             repo_type="model",
             token=token,
-            commit_message=f"Publish {slug} (tt_hw_planner; tt-metal {commit})",
+            commit_message=f"Publish {slug} (tt-metal {commit})",
         )
     except Exception as e:
         print(f"  [publish-hf] push failed: {e}")
