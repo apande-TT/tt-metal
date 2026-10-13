@@ -18,7 +18,10 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import tp_ccl_args
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import (
+    fold_input_scale,
+    tp_ccl_args,
+)
 
 # Prefill token rows (batch rows x sequence) one MLP chunk processes at a time. With gate/up fused into one
 # SwiGLU op the only intermediate is the (rows, intermediate/TP) product: 268 MB/chip for a full 32 x 512
@@ -36,7 +39,8 @@ class TtMinistral3MLP:
     # in fp32 and gathers the reduced shard in bf16 (half the bytes); its residual add takes the bf16 unrounded.
     GATHER_DTYPE = ttnn.bfloat16
 
-    def __init__(self, device, torch_module) -> None:
+    def __init__(self, device, torch_module, in_scale=None) -> None:
+        """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up."""
         self.device = device
         try:
             self.tp = tp = int(device.get_num_devices())
@@ -60,7 +64,8 @@ class TtMinistral3MLP:
         # Device d's slice of the folded weight holds its `inter` gate and `inter` up columns as alternating
         # 32-wide tiles [g_0, u_0, g_1, u_1, ...]: the layout minimal_matmul(fuse_swiglu=True) pairs up.
         self.inter = inter = torch_module.intermediate_size // tp
-        w_gate, w_up = torch_module.gate_proj.weight.T, torch_module.up_proj.weight.T
+        w_gate = fold_input_scale(torch_module.gate_proj.weight.T, in_scale)
+        w_up = fold_input_scale(torch_module.up_proj.weight.T, in_scale)
         k = w_gate.shape[0]
         chunks = []
         for d in range(tp):

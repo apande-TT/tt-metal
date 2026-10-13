@@ -44,6 +44,17 @@ def tp_ccl_args():
     return {"topology": ttnn.Topology.Linear}
 
 
+def fold_input_scale(w, in_scale):
+    """Weight w (in, out) with a per-input-feature scale folded in: (x * s) @ w == x @ (s[:, None] * w).
+
+    The decoder folds each RMSNorm's gamma into the projections that read the norm, so the norm's output feeds the
+    matmul directly instead of through an elementwise gamma multiply. The product is formed in fp32 and rounded to
+    the weight dtype once."""
+    if in_scale is None:
+        return w
+    return w.float() * in_scale.detach().float()[:, None]
+
+
 def _mesh_size(device):
     try:
         return int(device.get_num_devices())
@@ -57,7 +68,8 @@ class TtMinistral3Attention:
     # Widest SDPA key chunk prefill may use (see __call__).
     PREFILL_MAX_K_CHUNK = 512
 
-    def __init__(self, device, torch_module) -> None:
+    def __init__(self, device, torch_module, in_scale=None) -> None:
+        """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v."""
         self.device = device
         self.tp = tp = _mesh_size(device)
         cfg = torch_module.config
@@ -88,9 +100,9 @@ class TtMinistral3Attention:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
 
-        wq = torch_module.q_proj.weight.T  # (in, Hq*hd)
-        wk = torch_module.k_proj.weight.T  # (in, Hkv*hd)
-        wv = torch_module.v_proj.weight.T
+        wq = fold_input_scale(torch_module.q_proj.weight.T, in_scale)  # (in, Hq*hd)
+        wk = fold_input_scale(torch_module.k_proj.weight.T, in_scale)  # (in, Hkv*hd)
+        wv = fold_input_scale(torch_module.v_proj.weight.T, in_scale)
         chunks = []
         for d in range(tp):
             q_sl = slice(d * lh * hd, (d + 1) * lh * hd)

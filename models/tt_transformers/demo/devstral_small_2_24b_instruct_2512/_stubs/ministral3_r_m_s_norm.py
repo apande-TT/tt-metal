@@ -49,7 +49,9 @@ class TtMinistral3RMSNorm:
         self._decode_cfgs = {}
 
     @classmethod
-    def build(cls, device, torch_module):
+    def build(cls, device, torch_module, fold_gamma=False):
+        """fold_gamma: the caller folds the checkpoint weight into the projections that read this norm
+        (fold_input_scale), so the norm emits the unit-gamma result and applies no weight at all."""
         # Ministral3RMSNorm: weight * x * rsqrt(mean(x^2) + eps), weight replicated on a mesh.
         weight = torch_module.weight.detach().to(torch.bfloat16)
         # The kernel's fused gamma multiply biases the output ~0.06% low (measured on layer-8 residuals:
@@ -66,7 +68,7 @@ class TtMinistral3RMSNorm:
         canonical = RMSNorm(
             device=device,
             dim=weight.shape[0],
-            state_dict={"norm.weight": torch.ones_like(weight) if cls.SEPARATE_GAMMA else weight},
+            state_dict={"norm.weight": torch.ones_like(weight) if cls.SEPARATE_GAMMA or fold_gamma else weight},
             weight_key="norm",
             weight_dtype=ttnn.bfloat16,
             eps=float(torch_module.variance_epsilon),
@@ -81,7 +83,7 @@ class TtMinistral3RMSNorm:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
-        return cls(canonical, gamma if cls.SEPARATE_GAMMA else None)
+        return cls(canonical, gamma if cls.SEPARATE_GAMMA and not fold_gamma else None)
 
     def _decode_cfg(self, d):
         if d not in self._decode_cfgs:
@@ -119,10 +121,10 @@ class TtMinistral3RMSNorm:
             memory_config=mem,
             compute_kernel_config=self._impl.compute_kernel_config_hifi2,
         )
+        if self.gamma is None:
+            return ttnn.to_memory_config(n, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16)  # unshard + cast, one op
         n = ttnn.to_memory_config(n, ttnn.DRAM_MEMORY_CONFIG)
-        if self.gamma is not None:
-            return ttnn.multiply(n, self.gamma, dtype=ttnn.bfloat16)
-        return n if n.dtype == ttnn.bfloat16 else ttnn.typecast(n, ttnn.bfloat16)
+        return ttnn.multiply(n, self.gamma, dtype=ttnn.bfloat16)
 
     def __call__(self, x, *args, **kwargs):
         # Canonical RMSNorm takes the 4D [1, 1, S, H] prefill layout; restore the caller's rank.
