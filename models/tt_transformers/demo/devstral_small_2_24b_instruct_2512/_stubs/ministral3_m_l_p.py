@@ -47,6 +47,8 @@ class TtMinistral3MLP:
     PREFILL_REDUCE_DTYPE = ttnn.bfloat16
     # Math fidelity of the many-row (prefill) down projection (None: the HiFi4 compute_cfg decode uses too).
     PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi2
+    # dtype of the down weight the many-row (prefill) path multiplies with.
+    DOWN_DTYPE = ttnn.bfloat8_b
     # dtype of the fused gate/up weight the many-row (prefill) path multiplies with.
     GATE_UP_DTYPE = ttnn.bfloat8_b
 
@@ -91,14 +93,18 @@ class TtMinistral3MLP:
             self.w_gate = _put(w_gate, shard(-1), DECODE_WEIGHT_DTYPE)
             self.w_up = _put(w_up, shard(-1), DECODE_WEIGHT_DTYPE)
         del w_gate, w_up
-        self.w_down = _put(torch_module.down_proj.weight.T, shard(-2))
+        self.w_down = _put(torch_module.down_proj.weight.T, shard(-2), self.DOWN_DTYPE)
         if self.DECODE_WEIGHTS:
             # Decode down projection: 1D multicast matmul over the interleaved bf8 copy with DOWN_DECODE_K_BLOCK-tile K
             # blocks. The auto config's 2-tile blocks made 128 serialised activation multicasts (~1.3 us each, 168 us)
             # for only ~0.35 MB of weight per step; wider blocks put enough weight behind each step that the op
             # streams at the DRAM rate instead.
             n_out = torch_module.down_proj.weight.shape[0]
-            self.w_down_decode = _put(torch_module.down_proj.weight.T, shard(-2), DECODE_WEIGHT_DTYPE)
+            # (the prefill weight itself when it is already in that dtype)
+            if self.DOWN_DTYPE == DECODE_WEIGHT_DTYPE:
+                self.w_down_decode = self.w_down
+            else:
+                self.w_down_decode = _put(torch_module.down_proj.weight.T, shard(-2), DECODE_WEIGHT_DTYPE)
             grid = device.compute_with_storage_grid_size()
             n_per_core = -(-(n_out // 32) // (grid.x * grid.y))
             self.down_decode_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(

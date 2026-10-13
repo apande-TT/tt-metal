@@ -22,6 +22,7 @@ class TtMLP(TtMinistral3MLP):
     GATE_UP_DTYPE = ttnn.bfloat16
     PREFILL_REDUCE_DTYPE = None
     PREFILL_DOWN_FIDELITY = None
+    DOWN_DTYPE = ttnn.bfloat16
 
     def __init__(self, device, torch_module) -> None:
         act = type(torch_module.act_fn).__name__
