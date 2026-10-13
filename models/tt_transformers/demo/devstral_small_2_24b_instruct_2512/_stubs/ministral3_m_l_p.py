@@ -42,6 +42,8 @@ class TtMinistral3MLP:
     # dtype the reduced output is all_gathered in (None: plain fp32 all_reduce). The text decoder reduce-scatters
     # in fp32 and gathers the reduced shard in bf16 (half the bytes); its residual add takes the bf16 unrounded.
     GATHER_DTYPE = ttnn.bfloat16
+    # dtype of the fused gate/up weight the many-row (prefill) path multiplies with.
+    GATE_UP_DTYPE = ttnn.bfloat8_b
 
     def __init__(self, device, torch_module, in_scale=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up."""
@@ -76,7 +78,7 @@ class TtMinistral3MLP:
             g = w_gate[:, d * inter : (d + 1) * inter].reshape(k, inter // 32, 1, 32)
             u = w_up[:, d * inter : (d + 1) * inter].reshape(k, inter // 32, 1, 32)
             chunks.append(torch.concat([g, u], dim=2).reshape(k, 2 * inter))
-        self.w_gate_up = _put(torch.concat(chunks, dim=-1), shard(-1))
+        self.w_gate_up = _put(torch.concat(chunks, dim=-1), shard(-1), self.GATE_UP_DTYPE)
         del chunks
         if self.DECODE_WEIGHTS:
             # Decode streams every MLP weight once per token (DRAM-bound): it reads its own block-float8 copies, half
