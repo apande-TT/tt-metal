@@ -39,6 +39,10 @@ _ROPE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", 
 # Decode score scale + key mask as one kernel when the context carries the row-broadcast mask.
 _USE_SCALE_MASK_KERNEL = True
 _SCALE_MASK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "scale_mask")
+# Decode q.K^T and probs.V against the caches as a generic_op spreading output tiles over the whole grid
+# (the reuse bmm gives each (batch, KV head) row to one core: 64 of the cores).
+_USE_ATTN_BMM_KERNEL = True
+_ATTN_BMM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_bmm")
 
 
 def _rotate_half_matrix(head_dim):
@@ -289,26 +293,32 @@ class TtAttention:
                         ttnn.reshape(new_kv, (1, b, self.n_kv_heads, self.head_dim)), shard
                     )
                     ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
-            scores = ttnn.matmul(
-                qk,
-                kv_cache.k,
-                transpose_b=True,
-                program_config=self._bmm_cfg(1, d_t, c_t),
-                compute_kernel_config=self.compute_cfg,
-                memory_config=l1,
-            )
+            if _USE_ATTN_BMM_KERNEL:
+                scores = self._attn_bmm(qk, kv_cache.k, True, l1)
+            else:
+                scores = ttnn.matmul(
+                    qk,
+                    kv_cache.k,
+                    transpose_b=True,
+                    program_config=self._bmm_cfg(1, d_t, c_t),
+                    compute_kernel_config=self.compute_cfg,
+                    memory_config=l1,
+                )
             if _USE_SCALE_MASK_KERNEL and ctx.mask_full is not None:
                 scores = self._scale_mask_kernel(scores, ctx.mask_full, l1)
             else:
                 scores = ttnn.add(ttnn.multiply(scores, self.scale, memory_config=l1), ctx.mask, memory_config=l1)
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg, memory_config=l1)
-            attn = ttnn.matmul(
-                probs,
-                kv_cache.v,
-                program_config=self._bmm_cfg(1, c_t, d_t),
-                compute_kernel_config=self.compute_cfg,
-                memory_config=l1,
-            )
+            if _USE_ATTN_BMM_KERNEL:
+                attn = self._attn_bmm(probs, kv_cache.v, False, l1)
+            else:
+                attn = ttnn.matmul(
+                    probs,
+                    kv_cache.v,
+                    program_config=self._bmm_cfg(1, c_t, d_t),
+                    compute_kernel_config=self.compute_cfg,
+                    memory_config=l1,
+                )
             if _USE_HEAD_KERNELS and b == 32:
                 attn = self._heads_op("head_merge", attn, (1, b, self.n_heads * d), [g, d // 32, b], l1)
             else:
@@ -446,6 +456,62 @@ class TtAttention:
         )
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
         return ttnn.generic_op([scores, self.scale_tile, mask_full, out], program)
+
+    def _attn_bmm(self, x, cache, transpose_b, memory_config):
+        """Decode x [B, n_kv, rows, K] @ cache^T (transpose_b, cache [B, n_kv, C, D] -> [.., C]) or @ cache
+        (-> [.., D]) as one generic_op (kernels/attn_bmm), bit-identical to the reuse bmm with a full-K block."""
+        k_t = x.padded_shape[-1] // 32
+        n = cache.padded_shape[-2] if transpose_b else cache.padded_shape[-1]
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(list(x.shape)[:-1] + [n]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
+        )
+        n_t = n // 32
+        cores, rt = self._spread(math.prod(out.padded_shape) // (32 * 32))
+        tile = 2 * 32 * 32
+        cb_in0, cb_in1, cb_out = 0, 1, 16
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=size * tile,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(idx, ttnn.bfloat16, tile)],
+            )
+            for idx, size in ((cb_in0, 2 * k_t), (cb_in1, 2 * k_t), (cb_out, 2))
+        ]
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ATTN_BMM_DIR, "reader_attn_bmm.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[k_t, n_t, int(transpose_b), cb_in0, cb_in1]
+            + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(cache).get_compile_time_args()),
+            runtime_args=rt["dm"],
+            common_runtime_args=[x.buffer_address(), cache.buffer_address()],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        writer = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ROPE_DIR, "writer_rope.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[cb_out] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=rt["dm"],
+            common_runtime_args=[out.buffer_address()],
+            config=ttnn.WriterConfigDescriptor(),
+        )
+        compute = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ATTN_BMM_DIR, "compute_attn_bmm.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[k_t, int(transpose_b), cb_in0, cb_in1, cb_out],
+            runtime_args=rt["cmp"],
+            config=ttnn.ComputeConfigDescriptor(
+                math_fidelity=ttnn.MathFidelity.HiFi4,  # as self.compute_cfg
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                dst_full_sync_en=False,
+            ),
+        )
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
+        return ttnn.generic_op([x, cache, out], program)
 
     def _spread(self, n_tiles):
         """Row-major core set over the grid for n_tiles work items, with [start, count] / [count] runtime args."""
