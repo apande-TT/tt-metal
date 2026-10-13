@@ -111,6 +111,7 @@ PLANNED_TP = 4
 #   ministral3_m_l_p: gate/up folded into one tile-interleaved weight per device; minimal_matmul(fuse_swiglu)
 #                     emits silu(gate) * up in the same op (prefill/encode); decode keeps separate gate/up
 #                     with the silu fused into the multiply. Prefill MLP chunk 4096 -> 16384 rows (one call).
+#                     Prefill/encode down projection on minimal_matmul too (full grid).
 #   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk).
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
 #                     directly (no bf16 cast op, no single-core interleaved norm).
