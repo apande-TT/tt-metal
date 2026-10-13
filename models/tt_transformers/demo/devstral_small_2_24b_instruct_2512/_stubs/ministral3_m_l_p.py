@@ -19,8 +19,10 @@ import torch
 
 import ttnn
 
-# Prefill token rows (batch rows x sequence) one MLP chunk processes at a time.
-PREFILL_ROWS_PER_CHUNK = 4096
+# Prefill token rows (batch rows x sequence) one MLP chunk processes at a time. With gate/up fused into one
+# SwiGLU op the only intermediate is the (rows, intermediate/TP) product: 268 MB/chip for a full 32 x 512
+# prefill, so that whole batch runs as ONE call (one down matmul, one all_reduce, no slices / concat).
+PREFILL_ROWS_PER_CHUNK = 16384
 
 
 class TtMinistral3MLP:
