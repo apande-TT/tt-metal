@@ -106,13 +106,15 @@ class TtMinistral3Model:
         cos, sin = self.rotary_emb(x, position_ids=pos)  # (1, S, hd)
         cos = ttnn.reshape(cos, (1, 1, s, self.head_dim))
         sin = ttnn.reshape(sin, (1, 1, s, self.head_dim))
+        # q's rope tables with the llama-4 query scale folded in, built once and shared by every layer.
+        rope = (cos, sin) + self.layers[0].self_attn.query_rope_tables(cos, sin, pos, (1, 1, s, 1))
         for i, layer in enumerate(self.layers):
             # attention_mask=None -> causal SDPA, the mask HF builds for an unpadded prompt.
             x = layer(
                 x,
                 attention_mask=None,
                 position_ids=pos,
-                position_embeddings=(cos, sin),
+                position_embeddings=rope,
                 kv_cache=None if kv_caches is None else kv_caches[i],
                 mode="prefill",
             )
@@ -129,11 +131,12 @@ class TtMinistral3Model:
         cos, sin = self.rotary_emb(x, position_ids=position_ids)  # (B, 1, hd)
         cos = ttnn.reshape(cos, (1, b, 1, self.head_dim))
         sin = ttnn.reshape(sin, (1, b, 1, self.head_dim))
+        rope = (cos, sin) + self.layers[0].self_attn.query_rope_tables(cos, sin, position_ids, (1, b, 1, 1))
         for i, layer in enumerate(self.layers):
             x = layer(
                 x,
                 position_ids=position_ids,
-                position_embeddings=(cos, sin),
+                position_embeddings=rope,
                 kv_cache=kv_caches[i],
                 cur_pos=cur_pos,
                 mode="decode",

@@ -27,6 +27,7 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
 from __future__ import annotations
 
 import torch
+
 import ttnn
 
 
@@ -54,9 +55,9 @@ class TtMinistral3Attention:
         rope = getattr(cfg, "rope_parameters", None) or {}
         self.l4_beta = rope.get("llama_4_scaling_beta")
         self.l4_max = rope.get("original_max_position_embeddings")
-        assert self.num_heads % tp == 0 and self.num_kv_heads % tp == 0, (
-            f"heads {self.num_heads}/{self.num_kv_heads} not divisible by TP={tp}"
-        )
+        assert (
+            self.num_heads % tp == 0 and self.num_kv_heads % tp == 0
+        ), f"heads {self.num_heads}/{self.num_kv_heads} not divisible by TP={tp}"
         self.local_heads = lh = self.num_heads // tp
         self.local_kv_heads = lkv = self.num_kv_heads // tp
 
@@ -155,6 +156,17 @@ class TtMinistral3Attention:
         scale = ttnn.add(ttnn.multiply(t, float(self.l4_beta)), 1.0)
         return ttnn.typecast(ttnn.reshape(scale, shape), ttnn.bfloat16)
 
+    def query_rope_tables(self, cos, sin, position_ids, shape):
+        """(cos, sin) for q with the llama-4 query scale folded in: rope(q) * s == q * (cos * s) + rot(q) * (sin * s).
+
+        The scale depends only on the position, so the model builds these ONCE per forward and every layer shares
+        them, instead of each layer re-deriving the scale (floor/log/...) and multiplying its q by it. Below
+        original_max_position_embeddings the scale is exactly 1, so the shared tables are bit-identical."""
+        if self.l4_beta is None or not self.l4_max or position_ids is None:
+            return cos, sin
+        scale = self._llama4_scale(position_ids, shape)
+        return ttnn.multiply(cos, scale), ttnn.multiply(sin, scale)
+
     def _fill_cache(self, cache, kv):
         """Write prompt K or V (B, kv_heads, S, hd) into rows 0..S-1 of the resident (B, kv_heads, C, hd) cache."""
         s, cap = kv.shape[2], cache.shape[2]
@@ -182,7 +194,8 @@ class TtMinistral3Attention:
         b, _, s, _ = x.shape
         hd = self.head_dim
 
-        cos, sin = position_embeddings
+        cos, sin = position_embeddings[:2]
+        q_tables = tuple(position_embeddings[2:4]) if len(position_embeddings) == 4 else None
         if isinstance(cos, torch.Tensor):
             cos = self._to_tt(cos.to(torch.bfloat16).reshape(1, 1, s, hd))
         if isinstance(sin, torch.Tensor):
@@ -195,10 +208,13 @@ class TtMinistral3Attention:
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, transpose_k_heads=False
         )
-        q = self._rope(q, cos, sin)
         k = self._rope(k, cos, sin)
-        if self.l4_beta is not None and self.l4_max and position_ids is not None:
-            q = ttnn.multiply(q, self._llama4_scale(position_ids, (1, 1, s, 1)))
+        if q_tables is not None:
+            q = self._rope(q, *q_tables)  # llama-4 scale already folded into the shared q tables
+        else:
+            q = self._rope(q, cos, sin)
+            if self.l4_beta is not None and self.l4_max and position_ids is not None:
+                q = ttnn.multiply(q, self._llama4_scale(position_ids, (1, 1, s, 1)))
         if kv_cache is not None:
             self._fill_cache(kv_cache[0], k)
             self._fill_cache(kv_cache[1], v)
@@ -238,11 +254,14 @@ class TtMinistral3Attention:
         q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, memory_config=head_cfg
         )
-        cos, sin = position_embeddings
-        q = self._rope(ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG), cos, sin)
+        cos, sin = position_embeddings[:2]
         k = self._rope(ttnn.to_memory_config(k, ttnn.DRAM_MEMORY_CONFIG), cos, sin)
-        if self.l4_beta is not None and self.l4_max and position_ids is not None:
-            q = ttnn.multiply(q, self._llama4_scale(position_ids, (1, b, 1, 1)))
+        if len(position_embeddings) == 4:
+            q = self._rope(ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG), *position_embeddings[2:4])
+        else:
+            q = self._rope(ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG), cos, sin)
+            if self.l4_beta is not None and self.l4_max and position_ids is not None:
+                q = ttnn.multiply(q, self._llama4_scale(position_ids, (1, b, 1, 1)))
         k = ttnn.to_memory_config(k, head_cfg)
         k_cache, v_cache = kv_cache
         ttnn.experimental.paged_update_cache(k_cache, k, update_idxs_tensor=cur_pos)
