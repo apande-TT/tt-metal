@@ -106,6 +106,9 @@ DEFAULT_BATCH = 32
 # cache alone would need ~340 GB/chip. 4096 positions cost 40 layers x 2 x 32 x 2 local kv heads x 4096 x
 # 128 x 2 B = 5.4 GB/chip, inside the 28.6 GB/chip usable with a CCL axis (QB2 registered figure).
 DEFAULT_KV_CAPACITY = 4096
+# Resident KV cache dtype: decode attention re-reads every cached position of every layer each token, so block-float8
+# halves that traffic (and the cache's DRAM).
+KV_CACHE_DTYPE = ttnn.bfloat8_b
 PLANNED_TP = 4
 # Performance levers applied inside _stubs/ (a symlink out of this directory, so they are listed here too):
 #   ministral3_m_l_p: gate/up folded into one tile-interleaved weight per device; minimal_matmul(fuse_swiglu)
@@ -125,6 +128,7 @@ PLANNED_TP = 4
 #                     directly (no bf16 cast op, no single-core interleaved norm).
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
+#   KV cache in bfloat8_b (KV_CACHE_DTYPE): half the bytes decode SDPA re-reads every token.
 #   ministral3_attention: prefill QKV projection on minimal_matmul (full grid). Decode concatenates the SDPA heads
 #                     with nlp_concat_heads_decode on the head shards (no un-padding reshape through DRAM). Decode QKV
 #                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v].
@@ -397,8 +401,8 @@ class DevstralPipeline:
         self.kv_shape = [self.batch, attn0.local_kv_heads, self.kv_capacity, attn0.head_dim]
         self.kv_caches = [
             (
-                ttnn.zeros(self.kv_shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
-                ttnn.zeros(self.kv_shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                ttnn.zeros(self.kv_shape, dtype=KV_CACHE_DTYPE, layout=ttnn.TILE_LAYOUT, device=device),
+                ttnn.zeros(self.kv_shape, dtype=KV_CACHE_DTYPE, layout=ttnn.TILE_LAYOUT, device=device),
             )
             for _ in self.language_model.layers
         ]
