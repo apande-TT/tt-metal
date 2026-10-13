@@ -125,6 +125,8 @@ PLANNED_TP = 4
 #                     full-row logits all_gather (the sampler reads the shards; VocabShards joins them on host reads).
 #   sample(): the step's noise is looked up row-major and tilized as (B, NB); the bucket is a bitwise and; the draw is
 #                     one top-1 over the noisy scores labelled with the candidate ids (no argmax + index gather).
+#                     The per-device vocab-shard top-k is VocabTopK (generic_op, kernels/topk_mid.cpp): 64 local ->
+#                     8 middle -> 1 final core instead of ttnn.topk's 64 -> 1 serial merge, 16-bit shard positions.
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
 #                     directly (no bf16 cast op, no single-core interleaved norm).
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
@@ -163,6 +165,181 @@ TRACE_REGION_SIZE = 300_000_000
 # Prompts are right-padded only to a tile multiple: prefill attention pads its own q/k/v to whole 512-wide SDPA key
 # chunks (narrower key chunks bias attention's output level, see ministral3_attention.sdpa_len), so no other layer
 # computes pad rows. The padded rows come after every real row, so causal attention leaves rows 0..L-1 unchanged.
+
+_TOPK_KERNELS = "ttnn/cpp/ttnn/operations/reduction/topk/device/kernels"
+_TOPK_MID_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_mid.cpp")
+
+
+class VocabTopK:
+    """Top-k (largest, sorted) of each row of a (1, 1, B, W) bf16 vocab shard as ONE three-level program (generic_op).
+
+    ttnn.topk's multi-core program sorts W/64 columns on each of 64 local cores and sends all 64 candidate tiles to
+    a single final core, which merges them serially (63 tile merges: ~100 of its 156 us at 32 x 32768). Here the
+    64 local cores (columns 0..7 x rows 0..7, the stock local kernels) report in groups of 8 to 8 middle cores
+    (row 8, kernels/topk_mid.cpp), and the final core (0, 9) merges only the middle cores' 8 results (stock final
+    kernels): 7 + 7 serial merges. Each level alternates its cores' output order, as the stock op does across its
+    local cores, so every merge sees bitonic pairs.
+
+    Ids are the 16-bit column positions within the shard (W <= 65536): the sort runs in 16-bit DEST and no id
+    tensor is streamed in. The caller adds the shard's vocab offset (after the cross-device gather)."""
+
+    GROUPS = 8  # middle cores
+    LOCALS = 8  # local cores per middle core
+    VAL, IDX = ttnn.bfloat16, ttnn.uint16
+    TILE_BYTES = 2048  # bf16 and uint16 tiles
+
+    def __init__(self, device, k):
+        assert k == 32, "the stock kernels' K=32 layout (one candidate tile per core) is assumed"
+        grid = device.compute_with_storage_grid_size()
+        assert grid.x >= self.GROUPS and grid.y >= self.LOCALS + 2, f"grid {grid} too small for VocabTopK"
+        self.device, self.k, self.kt = device, k, 1
+        rng = lambda x0, y0, x1, y1: ttnn.CoreRange(ttnn.CoreCoord(x0, y0), ttnn.CoreCoord(x1, y1))
+        g, n = self.GROUPS, self.LOCALS
+        self.local_set = ttnn.CoreRangeSet([rng(0, 0, g - 1, n - 1)])
+        self.mid_set = ttnn.CoreRangeSet([rng(0, n, g - 1, n)])
+        self.final_core = (0, n + 1)
+        self.final_set = ttnn.CoreRangeSet([rng(0, n + 1, 0, n + 1)])
+        self.mid_final_set = self.mid_set.merge(self.final_set)
+        self.all_set = self.local_set.merge(self.mid_final_set)
+        self.phys = lambda x, y: device.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
+
+    def _cb(self, index, tiles, dtype, cores):
+        return ttnn.CBDescriptor(
+            total_size=tiles * self.TILE_BYTES,
+            core_ranges=cores,
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=self.TILE_BYTES)
+            ],
+        )
+
+    def __call__(self, x):
+        g, n, k, kt = self.GROUPS, self.LOCALS, self.k, self.kt
+        rows, width = int(x.shape[-2]), int(x.shape[-1])
+        ht, wt = rows // 32, width // 32
+        assert rows % 32 == 0 and width <= 65536 and wt % (g * n) == 0, f"VocabTopK shape {tuple(x.shape)}"
+        wt_local = wt // (g * n)
+        assert wt_local >= 2 and wt_local & (wt_local - 1) == 0
+        out_shape = ttnn.Shape((1, 1, rows, k))
+        vals = ttnn.allocate_tensor_on_device(out_shape, self.VAL, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG)
+        ids = ttnn.allocate_tensor_on_device(out_shape, self.IDX, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG)
+
+        # CB ids as in the stock factory. The gather buffers (c_4/c_5) are written remotely at the sender's own
+        # address of them, so they go first on every core (same L1 address everywhere). A middle core reads that
+        # address after its own gather wrapped the buffer, so the buffer holds exactly one gather (g == n).
+        assert g == n
+        IN, IN_IDX, LT_VAL, LT_IDX, G_VAL, G_IDX, M_VAL, M_IDX, OUT_VAL, OUT_IDX = range(10)
+        cbs = [
+            self._cb(G_VAL, n * kt, self.VAL, self.all_set),
+            self._cb(G_IDX, n * kt, self.IDX, self.all_set),
+            self._cb(OUT_VAL, 2, self.VAL, self.all_set),
+            self._cb(OUT_IDX, 2, self.IDX, self.all_set),
+            self._cb(IN, 4, self.VAL, self.local_set),
+            self._cb(IN_IDX, 4, self.IDX, self.local_set),
+            self._cb(LT_VAL, wt_local, self.VAL, self.local_set),
+            self._cb(LT_IDX, wt_local, self.IDX, self.local_set),
+            self._cb(M_VAL, g * kt, self.VAL, self.mid_final_set),
+            self._cb(M_IDX, g * kt, self.IDX, self.mid_final_set),
+        ]
+        # Semaphores 0/1: local -> middle hand-off; 2/3: middle -> final (a middle core runs both protocols).
+        sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=self.all_set, initial_value=0) for i in range(4)]
+
+        compute_cfg = ttnn.ComputeConfigDescriptor()
+        compute_cfg.fp32_dest_acc_en = False
+        logk = int(math.log2(k))
+        sort_ct = lambda width_tiles, a, b, c, d: [a, b, c, d, OUT_VAL, OUT_IDX, ht, width_tiles, k, kt, logk]
+        kern = lambda src, cores, ct, rt, cfg, **kw: ttnn.KernelDescriptor(
+            kernel_source=src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct,
+            runtime_args=rt,
+            config=cfg,
+            **kw,
+        )
+        locals_ = [(gx, ly) for gx in range(g) for ly in range(n)]  # global local index = gx * n + ly
+        kernels = [
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/reader_create_index_local_topk.cpp",
+                self.local_set,
+                [IN, IN_IDX, ht, wt_local, wt] + list(ttnn.TensorAccessorArgs(x).get_compile_time_args()),
+                [((cx, cy), [x.buffer_address(), 0, i * wt_local, 0]) for i, (cx, cy) in enumerate(locals_)],
+                ttnn.ReaderConfigDescriptor(),
+                defines=[("GENERATE_INDICES", "1")],
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/compute/topk_local.cpp",
+                self.local_set,
+                sort_ct(wt_local, IN, IN_IDX, LT_VAL, LT_IDX) + [int(math.log2(wt_local)), 1, 1, 0, 0],
+                [((cx, cy), [i % 2]) for i, (cx, cy) in enumerate(locals_)],
+                compute_cfg,
+            ),
+            kern(
+                _TOPK_MID_KERNEL,
+                self.mid_set,
+                sort_ct(n * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(n * kt)), 1],
+                [((gx, n), [gx % 2]) for gx in range(g)],
+                compute_cfg,
+                compiler_include_paths=[f"{_TOPK_KERNELS}/compute"],
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/writer_local_topk.cpp",
+                self.mid_set,
+                [2, 3, self.phys(*self.final_core).x, self.phys(*self.final_core).y, ht, k, kt]
+                + [OUT_VAL, OUT_IDX, G_VAL, G_IDX],
+                [((gx, n), [gx]) for gx in range(g)],
+                ttnn.WriterConfigDescriptor(),
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
+                self.final_set,
+                [2, 3, self.phys(0, n).x, self.phys(0, n).y, self.phys(g - 1, n).x, self.phys(g - 1, n).y]
+                + [ht, g * kt, g, G_VAL, G_IDX],
+                [],
+                ttnn.ReaderConfigDescriptor(),
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/compute/topk_final.cpp",
+                self.final_set,
+                sort_ct(g * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(g * kt)), 1, 1, 0, 0],
+                [],
+                compute_cfg,
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/writer_final_topk.cpp",
+                self.final_set,
+                [OUT_VAL, OUT_IDX, ht, kt]
+                + list(ttnn.TensorAccessorArgs(vals).get_compile_time_args())
+                + list(ttnn.TensorAccessorArgs(ids).get_compile_time_args()),
+                [(self.final_core, [vals.buffer_address(), ids.buffer_address()])],
+                ttnn.WriterConfigDescriptor(),
+            ),
+        ]
+        for gx in range(g):
+            column = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(gx, 0), ttnn.CoreCoord(gx, n - 1))])
+            mid, top, bottom = self.phys(gx, n), self.phys(gx, 0), self.phys(gx, n - 1)
+            # This group's local cores send their candidates to middle core (gx, n) ...
+            kernels.append(
+                kern(
+                    f"{_TOPK_KERNELS}/dataflow/writer_local_topk.cpp",
+                    column,
+                    [0, 1, mid.x, mid.y, ht, k, kt, OUT_VAL, OUT_IDX, G_VAL, G_IDX],
+                    [((gx, ly), [ly]) for ly in range(n)],
+                    ttnn.WriterConfigDescriptor(),
+                )
+            )
+            # ... which releases them (multicast over the column) and collects n * kt tiles.
+            kernels.append(
+                kern(
+                    f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
+                    ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(gx, n), ttnn.CoreCoord(gx, n))]),
+                    [0, 1, top.x, top.y, bottom.x, bottom.y, ht, n * kt, n, G_VAL, G_IDX],
+                    [],
+                    ttnn.ReaderConfigDescriptor(),
+                )
+            )
+        ttnn.generic_op([x, vals, ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
+        return vals, ids
+
 
 # Component name -> the stub class(es) that implement it. Every class here is invoked by the forward chain
 # below; Gate 2 reads INVOKED (filled by the probe installed at build) against this table.
@@ -411,20 +588,22 @@ class DevstralPipeline:
         ]
         self._stage = {}
         self._decode_repeats = None
-        # Global vocab id of every column of each device's lm_head shard, one row per batch row: the per-device
-        # top-k returns these labels directly (ttnn.topk indices_tensor), so the TP candidate lists merge with
-        # one more top-k and no index arithmetic.
-        self._vocab_ids = None
-        grid = device.compute_with_storage_grid_size()
-        self._full_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))})
-        if self._tp() > 1:
+        # TP > 1: each device top-k's its own lm_head vocab shard (VocabTopK, shard positions); the gathered
+        # (B, TP * K) candidate positions become vocab ids by adding their shard's first id (_shard_base), and one
+        # more top-k over the TP * K candidates picks the winners.
+        self._shard_base = None
+        tp = self._tp()
+        if tp > 1:
             vocab = int(tcfg.vocab_size)
-            self._vocab_ids = ttnn.from_torch(
-                torch.arange(vocab, dtype=torch.int32).reshape(1, 1, 1, vocab).expand(1, 1, self.batch, vocab).contiguous(),
+            self._shard_shape = (1, 1, self.batch, vocab // tp)
+            self._vocab_topk = VocabTopK(device, self.top_k)
+            base = (torch.arange(tp, dtype=torch.int32) * (vocab // tp)).repeat_interleave(self.top_k)
+            self._shard_base = ttnn.from_torch(
+                base.reshape(1, 1, 1, -1).expand(1, 1, self.batch, -1).contiguous(),
                 dtype=ttnn.uint32,
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
-                mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1),
+                mesh_mapper=self._repl,
             )
         log(f"pipeline resident in {time.time() - t0:.1f}s (KV cache {self.kv_shape} per layer, bf16)")
 
@@ -563,19 +742,14 @@ class DevstralPipeline:
         all_gathered and one top-k over TP*k candidates picks the winners."""
         k = self.top_k
         local = getattr(self.lm_head, "local", None)
-        if self._vocab_ids is None or local is None or tuple(local.shape) != tuple(self._vocab_ids.shape):
+        if self._shard_base is None or local is None or tuple(local.shape) != self._shard_shape:
             return ttnn.topk(logits, k=k, dim=-1, largest=True, sorted=True)
-        vals, ids = ttnn.topk(
-            local,
-            k=k,
-            dim=-1,
-            largest=True,
-            sorted=True,
-            indices_tensor=self._vocab_ids,
-            sub_core_grids=self._full_grid,
-        )
+        # Shard top-k (VocabTopK: 16-bit positions within the shard), gathered, then labelled with vocab ids: the
+        # gathered block of device d holds positions in vocab [d * W, (d + 1) * W).
+        vals, ids = self._vocab_topk(local)
         vals = ttnn.all_gather(vals, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         ids = ttnn.all_gather(ids, dim=3, num_links=1, topology=ttnn.Topology.Linear)
+        ids = ttnn.add(ttnn.typecast(ids, ttnn.uint32), self._shard_base)
         return ttnn.topk(vals, k=k, dim=-1, largest=True, sorted=True, indices_tensor=ids)
 
     def decode_prefill(self, request):
