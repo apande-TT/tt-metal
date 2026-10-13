@@ -131,7 +131,9 @@ PLANNED_TP = 4
 #                     directly (no bf16 cast op, no single-core interleaved norm).
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
-#   KV cache in bfloat8_b (KV_CACHE_DTYPE): half the bytes decode SDPA re-reads every token.
+#   KV cache in bfloat8_b (KV_CACHE_DTYPE): half the bytes decode SDPA re-reads every token. Prefill writes only the
+#                     cast prompt rows: one fill_cache over (batch x kv_heads) folded into heads, the prompt
+#                     height-sharded one (user, head) slab per core (no pad to the capacity, no full-capacity typecast).
 #   ministral3_attention: prefill QKV and o_proj projections on minimal_matmul (full grid). Decode concatenates the SDPA heads
 #                     with nlp_concat_heads_decode on the head shards (no un-padding reshape through DRAM). Decode QKV
 #                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v]; decode
