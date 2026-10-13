@@ -146,6 +146,7 @@ PLANNED_TP = 4
 #                     head_dim order, so decode's q and k RoPE each run as ONE fused rotary_embedding_llama on the
 #                     height-sharded heads (no rotate-half matmul / mul / add chain, no unshard + reshard of k); q
 #                     shares k's tables while the KV capacity is below the llama-4 scaling threshold (scale == 1).
+#                     Prefill's q / k RoPE are one fused rotary_embedding_llama each too (interleaved, all users at once).
 
 
 def kv_capacity_for(tp):
