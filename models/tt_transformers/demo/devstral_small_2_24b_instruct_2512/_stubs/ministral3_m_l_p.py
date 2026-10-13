@@ -115,9 +115,12 @@ class TtMinistral3MLP:
         return ttnn.reshape(self._forward(x), shape)
 
     def _forward_decode(self, x):
-        g = ttnn.linear(x, self.w_gate, compute_kernel_config=self.compute_cfg)
-        u = ttnn.linear(x, self.w_up, compute_kernel_config=self.compute_cfg)
-        m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])  # silu fused into the mul
+        # The single-row gate / up / product stay in L1 for the down matmul (no DRAM round trip of the 32 x inter
+        # intermediates); silu is fused into the multiply (ttnn.linear's activation= runs as a separate unary op).
+        l1 = ttnn.L1_MEMORY_CONFIG
+        g = ttnn.linear(x, self.w_gate, memory_config=l1, compute_kernel_config=self.compute_cfg)
+        u = ttnn.linear(x, self.w_up, memory_config=l1, compute_kernel_config=self.compute_cfg)
+        m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
         return self._reduce(ttnn.linear(m, self.w_down, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg))
 
     def _forward(self, x):
