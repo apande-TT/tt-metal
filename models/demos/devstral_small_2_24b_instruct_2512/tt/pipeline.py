@@ -123,7 +123,8 @@ PLANNED_TP = 4
 #                     directly (no bf16 cast op, no single-core interleaved norm).
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
-#   ministral3_attention: prefill QKV projection on minimal_matmul (full grid).
+#   ministral3_attention: prefill QKV projection on minimal_matmul (full grid). Decode concatenates the SDPA heads
+#                     with nlp_concat_heads_decode on the head shards (no un-padding reshape through DRAM).
 #   prompts pad to a tile multiple only; prefill attention pads q/k/v to whole SDPA key chunks itself.
 #   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard,
 #                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
