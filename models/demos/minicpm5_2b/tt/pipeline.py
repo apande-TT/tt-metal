@@ -171,6 +171,10 @@ class MiniCPM5Pipeline:
         self.key_index_row = self._tt(torch.arange(C, dtype=torch.float32).reshape(1, 1, 1, C), ttnn.float32)
         kv = self.n_kv_heads
         self.key_index_kv = self._tt(torch.arange(C, dtype=torch.float32).repeat(1, kv, 1, 1), ttnn.float32)
+        # rotate_half's sign over head_dim (-1 on the first half), folded into sin for the decode rope kernel.
+        d = self.head_dim
+        sign = torch.cat([-torch.ones(d // 2), torch.ones(d // 2)]).reshape(1, 1, 1, d)
+        self.rot_sign = self._tt(sign, ttnn.bfloat16)
         k = self.top_k
         self.cumsum_upper = self._tt(torch.triu(torch.ones(k, k)), ttnn.float32)  # p @ U = inclusive cumsum
         self.ids_buf = self._tt(torch.full((B, Sp), self.pad_id, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
@@ -288,7 +292,12 @@ class MiniCPM5Pipeline:
         pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1))
         write = ttnn.typecast(ttnn.eq(self.key_index_kv, pos), ttnn.bfloat16)  # [B, kv, 1, C]
         mask = ttnn.typecast(ttnn.multiply(ttnn.gt(self.key_index_row, pos), _NEG), ttnn.bfloat16)  # [B, 1, 1, C]
-        ctx = attention_stub.AttnContext("decode", mask, write, cur_pos)
+        # cos / signed sin broadcast over a tile's rows once per step, shared by every layer's rope kernel.
+        cos, sin = (ttnn.reshape(t, (B, 1, 1, self.head_dim)) for t in cos_sin)
+        l1 = ttnn.L1_MEMORY_CONFIG
+        cos_full = ttnn.repeat(cos, ttnn.Shape([1, 1, 32, 1]), memory_config=l1)
+        sin_signed = ttnn.multiply(ttnn.repeat(sin, ttnn.Shape([1, 1, 32, 1])), self.rot_sign, memory_config=l1)
+        ctx = attention_stub.AttnContext("decode", mask, write, cur_pos, rope=(cos_full, sin_signed))
         h = self.encoder_stack(x, position_embeddings=cos_sin, kv_caches=self.kv_caches, attn_ctx=ctx)
         # Decode logits (8 MB) stay in L1 for the sampler's topk.
         l1 = ttnn.L1_MEMORY_CONFIG

@@ -33,6 +33,9 @@ _KV_WRITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel
 # Decode head split/merge as one data-movement kernel each (else: slice + tiled reshape on both sides).
 _USE_HEAD_KERNELS = True
 _HEADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "heads")
+# Decode rope as one kernel (x * cos + rotate_half(x) * sin) when the context carries full-tile cos/signed sin.
+_USE_ROPE_KERNEL = True
+_ROPE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "rope")
 
 
 def _rotate_half_matrix(head_dim):
@@ -63,8 +66,11 @@ class AttnContext:
                     `cur_pos` that slot as int32 [B], which paged_update_cache writes in place.
     """
 
-    def __init__(self, mode, mask, write=None, cur_pos=None):
+    def __init__(self, mode, mask, write=None, cur_pos=None, rope=None):
         self.mode, self.mask, self.write, self.cur_pos = mode, mask, write, cur_pos
+        # decode: (cos, signed sin) [B, 1, 32, D] broadcast over the tile rows, sin negated on the first
+        # half of D (rotate_half's sign), for the one-kernel rope.
+        self.rope = rope
 
 
 class TtAttention:
@@ -208,7 +214,10 @@ class TtAttention:
             else:
                 qk = ttnn.slice(qkv, (0, 0, 0), (1, b, nq + nkv), memory_config=l1)
                 qk = ttnn.reshape(qk, (b, self.n_kv_heads, g + 1, d))
-            qk = self._rope(qk, cos, sin, self._rope_cfg(qk), memory_config=l1)
+            if _USE_ROPE_KERNEL and ctx.rope is not None:
+                qk = self._rope_kernel(qk, *ctx.rope, l1)
+            else:
+                qk = self._rope(qk, cos, sin, self._rope_cfg(qk), memory_config=l1)
             d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
             if _USE_KV_WRITE_KERNEL:
                 # One kernel writes slot pos[b] of both caches with old + (new - old), V read straight from qkv.
@@ -262,6 +271,83 @@ class TtAttention:
             memory_config=l1,
             program_config=self.cfg_o,
         )
+
+    def _rope_kernel(self, x, cos_full, sin_signed, memory_config):
+        """Decode rope on x [B, n_kv, rows, D] as one generic_op (kernels/rope), bit-identical to _rope."""
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(list(x.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
+        )
+        n_tiles = math.prod(x.padded_shape) // (32 * 32)
+        cores, rt = self._spread(n_tiles)
+        tile = 2 * 32 * 32
+        cb_x, cb_cos, cb_xr, cb_sin, cb_t1, cb_t2, cb_out = 0, 1, 2, 3, 4, 5, 16
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=2 * tile,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(idx, ttnn.bfloat16, tile)],
+            )
+            for idx in (cb_x, cb_cos, cb_xr, cb_sin, cb_t1, cb_t2, cb_out)
+        ]
+        compute_cfg = ttnn.ComputeConfigDescriptor(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=False
+        )
+        # As binary_ng sets for its SFPU multiply operands; the FPU add operands keep the default.
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        for idx in (cb_x, cb_cos, cb_xr, cb_sin):
+            modes[idx] = ttnn.UnpackToDestMode.UnpackToDestFp32
+        compute_cfg.unpack_to_dest_mode = modes
+        d_t = self.head_dim // 32
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ROPE_DIR, "reader_rope.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[self.n_kv_heads, d_t, cb_x, cb_cos, cb_xr, cb_sin]
+            + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(cos_full).get_compile_time_args()),
+            runtime_args=rt["dm"],
+            common_runtime_args=[x.buffer_address(), cos_full.buffer_address(), sin_signed.buffer_address()],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        writer = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ROPE_DIR, "writer_rope.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[cb_out] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=rt["dm"],
+            common_runtime_args=[out.buffer_address()],
+            config=ttnn.WriterConfigDescriptor(),
+        )
+        compute = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ROPE_DIR, "compute_rope.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[cb_x, cb_cos, cb_xr, cb_sin, cb_t1, cb_t2, cb_out],
+            runtime_args=rt["cmp"],
+            config=compute_cfg,
+        )
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
+        return ttnn.generic_op([x, cos_full, sin_signed, out], program)
+
+    def _spread(self, n_tiles):
+        """Row-major core set over the grid for n_tiles work items, with [start, count] / [count] runtime args."""
+        grid = self.device.compute_with_storage_grid_size()
+        n_cores = min(n_tiles, grid.x * grid.y)
+        base, extra = divmod(n_tiles, n_cores)
+        full_rows, rem = divmod(n_cores, grid.x)
+        ranges = []
+        if full_rows:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, full_rows - 1)))
+        if rem:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full_rows), ttnn.CoreCoord(rem - 1, full_rows)))
+        rt = {"dm": ttnn.RuntimeArgs(), "cmp": ttnn.RuntimeArgs()}
+        start = 0
+        for i in range(n_cores):
+            count = base + (1 if i < extra else 0)
+            rt["dm"][i % grid.x][i // grid.x] = [start, count]
+            rt["cmp"][i % grid.x][i // grid.x] = [count]
+            start += count
+        return ttnn.CoreRangeSet(ranges), rt
 
     def _heads_op(self, kernel, src, out_shape, args, memory_config):
         """Decode head split/merge (kernels/heads): a bf16 row-half gather into `out_shape` tiles, spread over
