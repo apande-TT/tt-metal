@@ -18,7 +18,6 @@ Layouts: prefill x (B, 1, S, D) [or (B, S, D)], decode x (1, 1, B, D). The outpu
 from __future__ import annotations
 
 import ttnn
-
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import (
     TtMinistral3Attention,
 )
@@ -80,11 +79,11 @@ class TtMinistral3DecoderLayer:
             mode=mode,
         )
         h = ttnn.add(x, self._as(a, x.dtype))
-        out = ttnn.add(h, self._as(self.mlp(self._bf16(self.post_attention_layernorm(self._bf16(h)))), h.dtype))
+        m = self.mlp(self._bf16(self.post_attention_layernorm(self._bf16(h))), mode=mode)
+        out = ttnn.add(h, self._as(m, h.dtype))
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
         return out
-
 
     @staticmethod
     def _as(t, dtype):
