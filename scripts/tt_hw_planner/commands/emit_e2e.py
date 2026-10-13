@@ -255,12 +255,15 @@ def _recover_board(error_text: str = "", fault_is_certain: bool = False) -> tupl
 
 class _StepResult:
     """One attempt of a device-running gate step: passed?, its output, and whether it had to be
-    stopped for making no progress (a hang, as opposed to a run that finished and failed)."""
+    stopped for making no progress (a hang, as opposed to a run that finished and failed). `earned` is
+    what tests that passed in EARLIER attempts of the same step printed (see _passed_segments): kept
+    apart from `output`, which stays this attempt's own, so a check of this attempt reads only it."""
 
-    __slots__ = ("ok", "output", "stalled", "detail")
+    __slots__ = ("ok", "output", "stalled", "detail", "earned")
 
-    def __init__(self, ok: bool, output: str = "", stalled: bool = False, detail=None):
+    def __init__(self, ok: bool, output: str = "", stalled: bool = False, detail=None, earned: str = ""):
         self.ok, self.output, self.stalled, self.detail = bool(ok), output or "", bool(stalled), detail
+        self.earned = earned or ""
 
 
 def _retry_after_wedge(label: str, run_once) -> tuple:
@@ -291,6 +294,53 @@ def _retry_after_wedge(label: str, run_once) -> tuple:
     if not second.ok:
         notes.append("%s: re-ran once on the recovered board and it failed again" % label)
     return second, notes
+
+
+def _thermal_step(label: str, run_once):
+    """Run a device-running gate step under optimize's thermal layers (e2e_thermal.device_step): hold at
+    the safety ceiling before it, cool after it, and re-run it from a cool board when the board reached
+    the abort limit while it ran. Returns whatever run_once returns."""
+    device_step = _thermal_api("device_step", "%s runs with NO thermal gating" % label)
+    if device_step is None:
+        return run_once()
+    return device_step(label, run_once)
+
+
+def _thermal_api(name: str, without_it: str):
+    """e2e_thermal.<name>, or None after a warning that says what runs `without_it` -- protection that
+    cannot load must not stop the work it protects."""
+    try:
+        from .. import e2e_thermal
+
+        return getattr(e2e_thermal, name)
+    except Exception as exc:  # noqa: BLE001
+        print("  [thermal-gate] WARNING: %s (%s)" % (without_it, exc), file=sys.stderr)
+        return None
+
+
+def _device_gate_step(label: str, run_once):
+    """A device-running gate step: re-run once on a wedged board (_retry_after_wedge), inside the thermal
+    layers (_thermal_step), and -- as optimize does with its readings -- a FAILURE taken on a board that
+    ran hot is discarded and re-run from a cooled board (e2e_thermal.rerun_failed_hot). One label names
+    all three, so they can never disagree about which step it is. Returns (final _StepResult, notes)."""
+
+    def _attempt():
+        return _thermal_step(label, lambda: _retry_after_wedge(label, run_once))
+
+    rerun_failed_hot = _thermal_api("rerun_failed_hot", "%s failures taken hot are NOT discarded" % label)
+    if rerun_failed_hot is None:
+        return _attempt()
+    (result, notes), hot_notes = rerun_failed_hot(label, _attempt, lambda r: None if r[0].ok else r[0].output)
+    return result, notes + hot_notes
+
+
+def _thermal_env(env: dict) -> dict:
+    """`env` carrying this run's thermal tag and pytest plugin (e2e_thermal.agent_env), or `env` unchanged
+    with a warning when that cannot load -- a child without protection still runs."""
+    agent_env = _thermal_api("agent_env", "child env carries NO thermal protection")
+    if agent_env is None:
+        return dict(env)
+    return agent_env(env)
 
 
 def _recover_if_wedged(text: str) -> Optional[str]:
@@ -1068,7 +1118,7 @@ def _block_stack_gate(demo_dir: Path, model_id: str, timeout_s: int):
         return _StepResult(found is not None, (proc.stderr or "") + "\n" + (proc.stdout or ""), detail=found)
 
     try:
-        probe, notes = _retry_after_wedge("G6 block stacks", _stack_probe_once)
+        probe, notes = _device_gate_step("G6 block stacks", _stack_probe_once)
     except Exception:  # noqa: BLE001 -- an unrunnable probe is not a model defect
         return None
     found = probe.detail
@@ -1516,6 +1566,8 @@ def _batch_gate_reason(requested: int, test_output: str) -> Optional[str]:
 _GATE_CACHE_FILE = ".e2e_correctness_pass.json"
 _GATE_CACHE_OFF_ENV = "E2E_GATE_NO_CACHE"
 _GATE_KEY_VERSION = 1
+# Beside the gate log: the node ids already passed in this gate call, for the mark plugin to leave out.
+_GATE_EARNED_FILE = "gate_earned_tests.txt"
 
 
 def _repo_root_of(demo_dir: Path) -> Optional[Path]:
@@ -1576,6 +1628,26 @@ def _import_closure(demo_dir: Path, seeds: Optional[list] = None) -> list:
                 if cand.is_file() and cand.resolve() not in seen:
                     work.append(cand)
     return out
+
+
+def _passed_segments(output: str) -> dict:
+    """{node id: the lines it printed, from its start mark to its passed mark} for every test the gate's
+    mark plugin (gate_pytest_plugins) saw PASS in `output`. A mark may share a line with pytest's own
+    progress text, so it is found anywhere in the line; the node id is the rest of that line."""
+    from ..gate_pytest_plugins.tt_hw_planner_gate_marks import PASSED_MARK, START_MARK
+
+    lines = (output or "").splitlines()
+    segs, cur, first = {}, None, None
+    for i, ln in enumerate(lines):
+        j = ln.find(START_MARK)
+        if j >= 0:
+            cur, first = ln[j + len(START_MARK) :].strip(), i
+            continue
+        j = ln.find(PASSED_MARK)
+        if j >= 0 and first is not None and ln[j + len(PASSED_MARK) :].strip() == cur:
+            segs[cur] = "\n".join(lines[first : i + 1])
+            cur, first = None, None
+    return segs
 
 
 def _gate_test_files(demo_dir: Path) -> list:
@@ -1702,12 +1774,42 @@ def _record_correctness_pass(demo_dir: Path, key: Optional[str], evidence: Optio
         pass
 
 
+def _ensure_package_markers(demo_dir: Path) -> list:
+    """Make the demo a package all the way down to every `__init__.py` the builder left under it: each
+    directory between the demo root and such a marker gets one, the root included. Returns the paths
+    written (empty when the layout already held). Idempotent.
+
+    WHY. The builder chooses its own layout each run: one put the golden under tests/e2e and made it a
+    package (tests/__init__.py, tests/e2e/__init__.py) with nothing at the demo root; another put it under
+    a reference/ package; every upstream demo that carries tests/__init__.py also carries the root marker.
+    A chain that stops short of the root is what pytest's prepend import mode (in force wherever the
+    tool clears addopts) turns into a top-level name -- `tests.e2e.<file>` here -- that the repo's own
+    `tests` package shadows. Completing the chain makes the name unambiguous under every import mode,
+    which is also how a reviewer expects a demo to import. Nothing here names a directory: whatever
+    marker exists, the chain above it is completed."""
+    from ..op_emitter import _SPDX_HEADER
+
+    root = Path(demo_dir)
+    written = []
+    for init in sorted(root.rglob("__init__.py")):
+        d = init.parent
+        while d != root:
+            d = d.parent
+            marker = d / "__init__.py"
+            if not marker.exists():
+                marker.write_text(_SPDX_HEADER)
+                written.append(marker)
+    return written
+
+
 def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: int = 1):
     """Model-agnostic gate runner: G1 native, G2/G3 (run tests/e2e), G4 demo/ structure. Returns (ok, reasons).
 
     batch > 1 is the emit-e2e `--batch` request: the tests are run with it and must report driving it
     (see _batch_gate_reason). The default 1 leaves the tests' own batch unchecked, as before."""
     reasons = []
+    for _marker in _ensure_package_markers(demo_dir):
+        print(f"  [gate] package marker written: {_marker.relative_to(demo_dir)}", flush=True)
     e2e_dir = demo_dir / "tests" / "e2e"
     test_files = sorted(e2e_dir.glob("test_*.py")) if e2e_dir.is_dir() else []
     if not test_files:
@@ -1790,13 +1892,16 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
             _pb3 = repo / "python_env" / "bin" / "python"
             _pbin3 = str(_pb3) if _pb3.exists() else sys.executable
             try:
-                pr3 = subprocess.run(
-                    [_pbin3, str(hop), str(demo_dir)],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_s,
-                    cwd=str(repo),
-                    env=penv3,
+                pr3 = _thermal_step(
+                    "host-op observer probe",
+                    lambda: subprocess.run(
+                        [_pbin3, str(hop), str(demo_dir)],
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_s,
+                        cwd=str(repo),
+                        env=penv3,
+                    ),
                 )
                 _res = None
                 for line in ((pr3.stdout or "") + "\n" + (pr3.stderr or "")).splitlines():
@@ -1867,12 +1972,39 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
     _gate_argv = [py, "-m", "pytest", *[str(f) for f in gate_tests], "-p", "no:cacheprovider"]
     _gate_argv += [*_pr.PYTEST_NO_TIMEOUT, "-rA", "-s"]
 
+    # A RE-RUN RUNS ONLY WHAT HAS NOT PASSED. Every retry of this step (a wedge, a thermal abort, a
+    # failure discarded as hot) re-ran the whole suite from its first test, and a session ended from
+    # outside leaves no summary to say what had passed. Measured 2026-10-12 on a 4-chip p300c:
+    # Devstral's four tests take ~12 min back to back, the board reached the 95C abort limit at ~11-12
+    # min even from 65C, and twelve retries in a row were ended near the end -- while the same four
+    # passed one at a time. The mark plugin says each pass as it happens; tests that passed in an
+    # earlier attempt of THIS call are left out of the next, and the verdict is the union. Scoped to
+    # this call, so a later call (after the code may have changed) re-earns everything.
+    from ..gate_pytest_plugins import tt_hw_planner_gate_marks as _marks
+
+    _earned = {}  # node id -> what it printed while passing, across this call's attempts
+    _earned_file = _gate_log.with_name(_GATE_EARNED_FILE)
+    _earned_file.unlink(missing_ok=True)
+    gate_env[_marks.EARNED_ENV] = str(_earned_file)
+    gate_env["PYTHONPATH"] += os.pathsep + str(Path(_marks.__file__).parent)  # holds only plugins
+    _gate_argv += ["-p", _marks.__name__.rsplit(".", 1)[-1]]
+
     def _e2e_once():
         # The run that already passed, on code that has not changed since, is still a pass; what the
         # checks below it read is replayed from the record rather than re-earned on the device.
         if _cached_pass is not None:
             return _StepResult(True, "\n".join(_cached_pass + ["1 passed"]), detail=0)
         _gate_log.unlink(missing_ok=True)  # each attempt is judged on its own output
+        prior = dict(_earned)
+        _earned_file.write_text("".join(n + "\n" for n in prior))
+        if prior:
+            print(
+                "  [gate] re-running only the test(s) not yet passed in this gate run; already passed: %s"
+                % ", ".join(prior),
+                file=sys.stderr,
+                flush=True,
+            )
+        carried = "\n".join(prior.values())
         try:
             rc = _pr._execute(
                 _gate_argv,
@@ -1882,12 +2014,18 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
                 _gate_log,
             )
             out = _gate_log.read_text(errors="ignore") if _gate_log.exists() else ""
-            return _StepResult(rc == 0, out, detail=rc)
+            _earned.update(_passed_segments(out))
+            # Nothing left to select is pytest's "no tests ran" -- here, every test already passed.
+            import pytest as _pytest
+
+            ok = rc == 0 or (rc == _pytest.ExitCode.NO_TESTS_COLLECTED and bool(prior))
+            return _StepResult(ok, out, detail=rc, earned=carried)
         except _pr.TracyHangError as _he:
             # NOW this really is a stall: no log growth and no CPU. The run was killed mid-flight, so
             # the board is suspect whatever its telemetry says (_retry_after_wedge resets it for sure).
             out = _gate_log.read_text(errors="ignore") if _gate_log.exists() else ""
-            return _StepResult(False, out + "\n" + str(_he), stalled=True, detail=_he)
+            _earned.update(_passed_segments(out))
+            return _StepResult(False, out + "\n" + str(_he), stalled=True, detail=_he, earned=carried)
 
     # KEEP THE LOG OF A STEP THAT FAILED. This deleted the gate's own output unconditionally, so the
     # only trace of a failure was the 15-line tail quoted into `reasons` -- and for a step killed
@@ -1902,7 +2040,7 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
     # where to look.
     _e2e, _e2e_notes = None, []
     try:
-        _e2e, _e2e_notes = _retry_after_wedge("G2/G3 tests/e2e", _e2e_once)
+        _e2e, _e2e_notes = _device_gate_step("G2/G3 tests/e2e", _e2e_once)
     finally:
         # Also cleaned when the step RAISED: there is no verdict to diagnose, and leaving temp dirs
         # behind on every exception is its own leak.
@@ -1910,7 +2048,8 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
             shutil.rmtree(_gate_log.parent, ignore_errors=True)
     if not _e2e.ok and _gate_log.exists():
         reasons.append(f"G2/G3: the failing run's full output is kept at {_gate_log}")
-    pytest_out = _e2e.output
+    # The verdict covers every test this call saw pass, so the checks below read all of what they printed.
+    pytest_out = "\n".join(x for x in (_e2e.earned, _e2e.output) if x)
     if _e2e.stalled:
         reasons.append(f"G2/G3: tests/e2e made no forward progress ({_e2e.detail})")
     else:
@@ -2099,7 +2238,7 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
                             tr = None
                 return _StepResult(bool(tr and tr.get("trace_ready")), out, detail=tr)
 
-            _trace, _trace_notes = _retry_after_wedge("G6 trace", _trace_probe_once)
+            _trace, _trace_notes = _device_gate_step("G6 trace", _trace_probe_once)
             if _trace.stalled:
                 reasons.append(
                     f"G6 trace: trace-capture probe hung >{g6_hang}s "
@@ -2130,9 +2269,13 @@ def _run_deterministic_gates(demo_dir: Path, pcc: float, timeout_s: int, batch: 
                 _proof = json.loads(_proof_raw)
             except Exception:  # noqa: BLE001
                 _proof = None
-        _tg = evaluate_trace_gate(demo_dir, allow_no_trace=_anno, overflow_proof=_proof)
+        # A stale capture is re-run on the device inside evaluate_trace_gate, and the overflow loop
+        # captures up to three more times -- both are device steps.
+        _tg = _thermal_step(
+            "trace gate", lambda: evaluate_trace_gate(demo_dir, allow_no_trace=_anno, overflow_proof=_proof)
+        )
         if _tg.get("verdict") == "FAIL" and _is_overflow_detail(_tg.get("capture_detail")):
-            _fix = overflow_fix_loop(demo_dir)
+            _fix = _thermal_step("trace-gate overflow fix-loop", lambda: overflow_fix_loop(demo_dir))
             print("[emit-e2e] trace-gate overflow fix-loop: %s" % _fix.get("detail"))
             if _fix.get("resolved"):
                 _tg = evaluate_trace_gate(demo_dir, trace_caps=_fix.get("caps"), allow_no_trace=_anno)
@@ -2387,6 +2530,7 @@ def _build_cc_fix_prompt(*, model_id, demo_dir, pcc) -> str:
         "captures) so trace can run. next_target may name a host op (residency / token-feed / KV / "
         "fixed-shape decode step) — fix it ON DEVICE the same way, WITHOUT regressing PCC (correctness is "
         "re-checked first every round, so a host-free edit that breaks PCC is rejected immediately).\n"
+        + _thermal_prompt_block()
         + _TT_ONLY_CONTRACT
     )
 
@@ -2405,6 +2549,12 @@ def cmd_emit_e2e(args) -> int:
             _rec[0].prepare_device_reset(box=str(getattr(args, "box", "") or ""))
         except Exception:  # noqa: BLE001 -- reset preparation must never stop the run
             pass
+    try:  # optimize's hold / cooldown / watch / abort, for everything this run and its agents start
+        from ..e2e_thermal import install as _thermal_install
+
+        _thermal_install(recover=_recover_board)
+    except Exception as exc:  # noqa: BLE001 -- protection that cannot start must not stop the run
+        print("  [thermal-gate] WARNING: emit-e2e thermal protection did not start (%s)" % exc, file=sys.stderr)
     return _emit_e2e_phase_a(args)
 
 
@@ -2445,12 +2595,24 @@ def _run_emit_e2e_cc(*, model_id, demo_dir, pcc, timeout_s, agent_bin, max_round
     # count its failures under a different run than this one (see device_recovery.stamp_run).
     if _os.environ.get("PERF_MCP_RUN_ID"):
         mcp_env["PERF_MCP_RUN_ID"] = _os.environ["PERF_MCP_RUN_ID"]
+    # The server's trace gate runs the replays, so an operator's --trace-replays must reach it too.
+    try:
+        from models.experimental.perf_automation.agent.trace_replay import REPLAY_ITERS_ENV
+
+        if _os.environ.get(REPLAY_ITERS_ENV):
+            mcp_env[REPLAY_ITERS_ENV] = _os.environ[REPLAY_ITERS_ENV]
+    except Exception as exc:  # noqa: BLE001 -- the gate still runs, at trace_replay's own count
+        print("  [emit-e2e] WARNING: the gate server will not see --trace-replays (%s)" % exc, file=sys.stderr)
+    # The server runs the device gates, and this env is built from scratch: carry the run's thermal tag
+    # and plugin explicitly rather than trusting the agent CLI to pass its own environment through.
+    mcp_env = _thermal_env(mcp_env)
     cfg = cc_harness.build_mcp_config(pybin, server_path, mcp_env, "e2e-mcp")
     cfg_path = thp_dir / f".e2e_mcp_config_{re.sub(r'[^A-Za-z0-9._-]', '_', model_id)}.json"
     cfg_path.write_text(_json.dumps(cfg, indent=2))
     env = dict(_os.environ)
     env["TT_METAL_HOME"] = str(repo_root)
     env["PYTHONPATH"] = str(repo_root)
+    env = _thermal_env(env)
 
     def gate_fn():
         # The gate's OWN budget is the floor: this call wraps the gate, so a tighter limit here
@@ -3592,6 +3754,29 @@ run is never killed for being slow -- but a SILENT one is killed for looking dea
 """
 
 
+def _thermal_prompt_block() -> str:
+    """What the agent sees when the board is protected, with the thresholds read off perf_mcp (the
+    owner) rather than retyped, so the agent is never told a number the gates do not use."""
+    try:
+        from models.experimental.perf_automation.agent import probes as _pr
+
+        pm = _pr._cc_optimize("perf_mcp")
+        ceiling, cool, abort = pm._SAFETY_CEILING_C, pm._COOL_BACK_TO_C, pm._ABORT_CEILING_C
+    except Exception:  # noqa: BLE001 - without the owner the gates are inert too; say nothing
+        return ""
+    from models.experimental.perf_automation.agent.thermal_pytest_plugin import ABORT_EXIT_CODE
+
+    return (
+        "\nTHERMAL PROTECTION (this board has lost chips running hot for hours): every pytest you run "
+        "waits before it starts, and between tests, while the board is at or above %.0fC, until it is "
+        "back to %.0fC. A device run is ENDED when the board reaches %.0fC: it prints `[thermal-abort]` "
+        "and exits with code %d, or dies with no traceback. That is the board being protected, NOT a "
+        "code failure -- re-run the same command; it waits for the board first. Do not work around it "
+        "(do not override PYTEST_PLUGINS or drop the repo root from PYTHONPATH).\n"
+        % (ceiling, cool, abort, ABORT_EXIT_CODE)
+    )
+
+
 def _progress_prompt_block() -> str:
     """The progress requirement, carrying the watchdog's OWN stall window.
 
@@ -3735,7 +3920,7 @@ run it launches by watching progress, and a limit typed into a test later kills 
 same test -- a profiled run of it takes several times longer than this one.
 Report a final summary: which calls are READY, the FINAL_PCC per call, and
 confirm all graduated modules were invoked.
-{hardware_note}{parallel_note}{trace_note}{batch_note}{_progress_prompt_block()}{_README_LAYOUT_BLOCK}
+{hardware_note}{parallel_note}{trace_note}{batch_note}{_progress_prompt_block()}{_thermal_prompt_block()}{_README_LAYOUT_BLOCK}
 {_TT_ONLY_CONTRACT}
 """
 

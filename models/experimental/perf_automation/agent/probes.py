@@ -509,6 +509,22 @@ def detect_marker_drop(log_text: str) -> str | None:
 # `timeout` mark, so a test carrying one still collects. Hangs stay bounded by _execute's watch.
 PYTEST_NO_TIMEOUT = ("-p", "no:timeout")
 
+
+def pytest_argv(*rest) -> list:
+    """The argv every site that clears pytest.ini's addopts starts from -- with the repo's import mode kept.
+
+    The repo's addopts carry `--import-mode=importlib` together with `-vvs ...`; the tool clears addopts
+    wherever it needs flat --collect-only output or its own plugins, and that silently dropped the import
+    mode too. pytest then named the test module from the __init__.py chain above it, so an emitted demo
+    with tests/__init__.py and no demo-root __init__.py became `tests.e2e.<file>` -- shadowed by tt-metal's
+    own top-level `tests` package: `ModuleNotFoundError: No module named 'tests.e2e'`, 0 collected in 0.08 s,
+    "perf test selects no cases" at optimize's final check (Kolibri-1, 2026-10-08), while every other
+    pytest call in the run kept the repo's options and ran the same file. ONE owner for the prefix, so the
+    four sites that clear addopts (collect_cases, preflight_collect, the pcc runner, the pcc gate) cannot
+    disagree on what they dropped. A list, fresh per call: callers append to it."""
+    return [sys.executable, "-m", "pytest", "-o", "addopts=", "--import-mode=importlib", *rest]
+
+
 # The generated perf test drains the device profiler every <this many> wrapped ttnn calls; the
 # profiling env carries it (measure._capacity_scaled_osl sets it), so a retry can change it.
 PERF_FLUSH_EVERY_ENV = "TT_PERF_FLUSH_EVERY"
@@ -763,12 +779,28 @@ def _pgroup_io_counters(pgid) -> tuple:
     """
     calls = 0
     total = 0
+    for c, b in _tree_io_counters(pgid).values():
+        calls += c
+        total += b
+    return calls, total
+
+
+def _tree_io_counters(pgid) -> dict:
+    """{pid: (syscalls, io_bytes)} for every member of the run -- its group and everything its leader
+    started (see _pgroup_io_counters, which sums this). {} when /proc cannot be read.
+
+    Per process, because the stall check needs to know WHICH processes are moving the counters: a
+    hung test's background threads keep ticking its syscall count while its main thread sits in one
+    call for hours, and only that process's stack can say so."""
     members = {pid for pid, fields in _proc_stat_fields() if len(fields) > 2 and fields[2] == str(pgid)}
     try:
         members.update(_descendant_pids(int(pgid)))
     except (TypeError, ValueError):
         pass
+    out = {}
     for pid in members:
+        calls = 0
+        total = 0
         try:
             with open("/proc/%d/io" % pid) as fh:
                 for line in fh:
@@ -779,31 +811,61 @@ def _pgroup_io_counters(pgid) -> tuple:
                         total += int(v)
         except (FileNotFoundError, ProcessLookupError, PermissionError, OSError, ValueError):
             continue
-    return calls, total
+        out[pid] = (calls, total)
+    return out
+
+
+def _py_spy_exe() -> str:
+    """py-spy on PATH, else the one installed beside the running interpreter, else "".
+
+    A supervisor started as `python_env/bin/python -m ...` without activating the venv has the venv's
+    bin off PATH, so a py-spy pip-installed into that venv was invisible and every stack read came
+    back empty -- the stack check silently never ran."""
+    import shutil as _shutil
+
+    exe = _shutil.which("py-spy")
+    if exe:
+        return exe
+    beside = Path(sys.executable).parent / "py-spy"
+    return str(beside) if beside.is_file() and os.access(beside, os.X_OK) else ""
 
 
 def _stack_fingerprint(pid) -> str:
-    """The top of the process's Python stack, or "" when it cannot be sampled.
+    """A digest of the process's Python stacks AND their local variables, or "" when it cannot be
+    sampled.
 
     THE ONE SIGNAL A KERNEL-SIDE LIVELOCK CANNOT FAKE. A poll loop asking the driver "ready yet?"
     moves the syscall counter forever, so the counters above call it alive; its STACK does not move.
     Sampled with py-spy when it is installed -- optional by design, because the counters already
     cover the common case and a missing profiler must not make the tool refuse to run.
+
+    LOCALS, because a healthy loop can sit on the same line every time it is sampled: a decode loop
+    that spends most of each step waiting in one read lands there sample after sample, and frames
+    alone would call it frozen. Its loop variable does not stay still; a hung call's locals do.
+    --nonblocking, because pausing a profiled run to look at it would show up in what it measures.
+    Digested whole rather than cut to a prefix: py-spy prints the innermost frame first, so a prefix
+    keeps the frame that never changes and drops the outer loop that does.
     """
-    import shutil as _shutil
+    import hashlib as _hashlib
     import subprocess as _sp
 
-    exe = _shutil.which("py-spy")
+    exe = _py_spy_exe()
     if not exe:
         return ""
     try:
-        r = _sp.run([exe, "dump", "--pid", str(int(pid))], capture_output=True, text=True, timeout=8)
+        r = _sp.run(
+            [exe, "dump", "--pid", str(int(pid)), "--locals", "--nonblocking"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
     except Exception:  # noqa: BLE001 -- an unsampleable process contributes nothing, never an error
         return ""
     if r.returncode != 0:
         return ""
     # The frames only -- not the thread header, which carries a state that flickers between samples.
-    return "\n".join(ln.strip() for ln in (r.stdout or "").splitlines() if ln.startswith("    "))[:2000]
+    frames = "\n".join(ln.strip() for ln in (r.stdout or "").splitlines() if ln.startswith("    "))
+    return _hashlib.sha1(frames.encode()).hexdigest() if frames else ""
 
 
 def progress_signature(pgid, log_path=None, pid=None) -> tuple:
@@ -839,9 +901,17 @@ class ProgressWatch:
     already diverging on the day it was written. So it lives here, once.
 
     Holds the last signature and the last time a stack was sampled; `moved()` folds a fresh sample
-    in and answers. The stack is the expensive field -- it costs a subprocess -- so it is only
-    sampled once the cheap counters have been still for half the stall window (and never more often
-    than _STACK_EVERY_S), and only when the caller offers a pid.
+    in and answers. The stack is the expensive field -- it costs a subprocess -- so it is never
+    sampled more often than _STACK_EVERY_S, and only when the caller offers a pid.
+
+    WHEN THE COUNTERS MOVE, THE STACKS OF WHOEVER MOVED THEM DECIDE. The counters were trusted on
+    their own, and the stack only consulted once they went quiet -- which a hung device run never
+    does. Measured 2026-10-12 on a MiniCPM5-2B profile: the test sat in one `to_torch` for three
+    hours, Python stack byte-identical across samples, while its background threads moved ~200
+    syscalls every 20 s. Every poll called that progress, so the stall clock never started and only
+    the 12 h ceiling stood behind it. Now counters that move only count while the processes moving
+    them also move their stacks (frames and locals). A process whose stack cannot be read -- a
+    compiler, the capture tool, a box without py-spy -- keeps the counters' word, exactly as before.
     """
 
     def __init__(self, pgid, log_path=None, stall_s=0.0):
@@ -851,6 +921,10 @@ class ProgressWatch:
         self._sig = progress_signature(pgid, log_path)
         self._last_stack_at = 0.0
         self._max_gap = 0.0
+        # pid -> (its io counters, its stack digest) as of the last busy-tree sample.
+        self._busy = {}
+        # True while every process moving the counters was last seen with an unchanged stack.
+        self._frozen = False
 
     # A WINDOW MAY NEVER BE TIGHTER THAN A GAP THIS RUN HAS ALREADY SURVIVED.
     #
@@ -883,7 +957,38 @@ class ProgressWatch:
         did = new[:3] != old[:3] or (bool(new[3]) and bool(old[3]) and new[3] != old[3])
         # Keep the last stack we managed to read, so a poll that skipped it does not look like a change.
         self._sig = new if (new[3] or not old[3]) else (new[0], new[1], new[2], old[3])
+        if new[0] != old[0]:
+            # The log grew. Nothing a hung process does writes its log, so this is never second-guessed.
+            self._frozen = False
+            return True
+        if pid is not None and new[1:3] != old[1:3]:
+            if now - self._last_stack_at >= _STACK_EVERY_S:
+                self._last_stack_at = now
+                self._frozen = self._busy_and_frozen()
+            return not self._frozen
+        if did:
+            self._frozen = False
         return did
+
+    def _busy_and_frozen(self) -> bool:
+        """Is every process that moved the counters since the last sample sitting on the stack it had
+        then? False whenever any of them cannot be read, is new, or moved -- the counters then decide.
+
+        Stops sampling at the first mover that is not frozen: one is enough to call the run alive,
+        and a compile can have dozens of short-lived movers that py-spy cannot read anyway. A mover
+        left unsampled is remembered with no stack, so it cannot read as frozen next time either.
+        """
+        io = _tree_io_counters(self._pgid)
+        movers = [p for p, v in io.items() if p not in self._busy or self._busy[p][0] != v]
+        stacks = {p: "" for p in movers}
+        frozen = bool(movers)
+        for p in movers:
+            stacks[p] = _stack_fingerprint(p)
+            if not (stacks[p] and p in self._busy and stacks[p] == self._busy[p][1]):
+                frozen = False
+                break
+        self._busy = {p: (v, stacks[p] if p in stacks else self._busy[p][1]) for p, v in io.items()}
+        return frozen
 
 
 def _pgroup_cpu_jiffies(pgid: int) -> int:
@@ -1320,10 +1425,145 @@ def thermal_yield(label: str = "") -> None:
         if now - _thermal_yield_last[0] < _THERMAL_YIELD_MIN_GAP_S:
             return
         _thermal_yield_last[0] = now
-        _cc_optimize("perf_mcp").cool_if_over_safety_ceiling(label or "next unit")
+        pm = _cc_optimize("perf_mcp")
+        # A PROCESS THAT HOLDS THE DEVICE CANNOT COOL IT BY WAITING. Measured on a 4-chip p300c,
+        # 2026-10-13, nothing else on the box: the mesh opened and left idle -- no op running -- took
+        # every chip from 20 W to 85-91 W and the board from 58C to 92.5C in fifteen minutes. Closed,
+        # the same chips idle at ~20 W, and the board fell from 95C to 65C in about twelve minutes,
+        # every time today's runs ended a holder. So the wait below, done with the device open, was
+        # not a cooldown: Devstral's perf test sat in it for forty-five minutes climbing 91.5C -> 94.7C
+        # until the abort limit ended it, and on 2026-10-11 the same wait went 87.6C -> 95.1C.
+        # Ending the process is what releases the device; whoever started it re-runs the step from a
+        # cool board, and the stages this step already measured are kept (stages_kept_across_retries).
+        try:
+            from .thermal_pytest_plugin import end_for_heat, holds_device
+        except Exception as exc:  # noqa: BLE001 -- without it, the wait below is still the old behaviour
+            _warn_thermal_inert("thermal_yield handoff", exc)
+            end_for_heat, holds_device = None, lambda: False
+        if holds_device():
+            hot, cur = pm.board_over_safety_ceiling()
+            if hot:
+                end_for_heat(
+                    "[thermal-handoff] %s: board at %.1fC, at or above the %.1fC safety ceiling, and this "
+                    "process holds the device -- which keeps the board heating, not cooling. Ending it so the "
+                    "device is released; the step re-runs from a cool board and keeps what it already measured."
+                    % (label or "next unit", cur, pm._SAFETY_CEILING_C),
+                    cur,
+                    "handoff",
+                )
+        pm.cool_if_over_safety_ceiling(label or "next unit")
     except Exception as exc:  # noqa: BLE001 -- a thermometer that cannot be read must never stop the work
         _warn_thermal_inert("thermal_yield", exc)
         return
+
+
+def ended_for_heat(rc) -> bool:
+    """Whether a child's exit status says it ended ITSELF to protect the board (end_for_heat) -- not a
+    failure, and not a measurement: the step is re-run from a cool board."""
+    from .thermal_pytest_plugin import ABORT_EXIT_CODE
+
+    return rc == ABORT_EXIT_CODE
+
+
+def run_watcher_owns_recovery() -> bool:
+    """See thermal_pytest_plugin.run_watcher_owns_recovery: a launcher in such a run leaves a child that
+    ended for heat to the run's watcher."""
+    from .thermal_pytest_plugin import run_watcher_owns_recovery as _owns
+
+    return _owns()
+
+
+def reset_after_ended_child(error_text: str = "", env=None) -> bool:
+    """Reset after a device process ended without closing the device -- killed, or ended for heat --
+    under the one rule for that (device_recovery.reset_is_mandatory_after_kill: a multi-chip run's
+    fabric may be left stuck whatever the telemetry says). Returns whether the device came back."""
+    from . import device_recovery as _dr
+
+    _kill = {"fault_is_certain": True} if _dr.reset_is_mandatory_after_kill(env=env) else {}
+    return _device_reset(error_text=error_text, **_kill)
+
+
+# A RETRIED STEP KEEPS THE STAGES IT ALREADY MEASURED. The owner of a retried device step names a file
+# here; trace_replay appends each stage it finishes and, on the next attempt of the SAME step, replays
+# that stage's lines instead of measuring it again. Without it every attempt after a heat stop starts
+# from the first stage, heats the board the same way and is stopped at the same place.
+STAGES_KEPT_ENV = "TT_TRACE_REPLAY_KEPT"
+
+
+class stages_kept_across_retries:
+    """Context manager for the owner of a retried device step: names a fresh record in STAGES_KEPT_ENV
+    for every child launched inside it, and removes it after. Nested owners share the outermost one's
+    record, so one step's stages are never split across two. `as` gives kept_stage_count."""
+
+    def __enter__(self):
+        self._path = None
+        if not os.environ.get(STAGES_KEPT_ENV):
+            import tempfile
+
+            fd, self._path = tempfile.mkstemp(prefix="trace_replay_kept_", suffix=".jsonl")
+            os.close(fd)
+            os.environ[STAGES_KEPT_ENV] = self._path
+        return kept_stage_count
+
+    def __exit__(self, *exc):
+        if self._path is not None:
+            if os.environ.get(STAGES_KEPT_ENV) == self._path:
+                os.environ.pop(STAGES_KEPT_ENV, None)
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
+        return False
+
+
+def _kept_records() -> list:
+    path = os.environ.get(STAGES_KEPT_ENV, "")
+    if not path:
+        return []
+    out = []
+    try:
+        with open(path) as fh:
+            for ln in fh:
+                try:
+                    rec = json.loads(ln)
+                except ValueError:
+                    continue  # a line cut short by an ended process is not a measurement
+                if isinstance(rec, dict) and {"node", "stage", "ms", "path", "lines"} <= set(rec):
+                    out.append(rec)
+    except OSError:
+        return []
+    return out
+
+
+def with_kept_stages(env: dict) -> dict:
+    """`env` carrying this step's kept-stage record when one is open -- for a launcher handed an env built
+    before the step began. The caller's dict is not changed."""
+    rec = os.environ.get(STAGES_KEPT_ENV, "")
+    if not rec or env.get(STAGES_KEPT_ENV):
+        return env
+    return {**env, STAGES_KEPT_ENV: rec}
+
+
+def kept_stage_count() -> int:
+    """How many stages this step has kept so far: an attempt that raised it made progress."""
+    return len(_kept_records())
+
+
+def kept_stages(node: str) -> dict:
+    """{stage: record} that an earlier attempt of this step measured for `node` (its pytest node id)."""
+    return {r["stage"]: r for r in _kept_records() if r["node"] == node}
+
+
+def keep_stage(node: str, stage: str, ms: float, path: str, lines: list) -> None:
+    """Record a finished stage for the next attempt of this step. Best-effort; one line per stage."""
+    rec_path = os.environ.get(STAGES_KEPT_ENV, "")
+    if not rec_path:
+        return
+    try:
+        with open(rec_path, "a") as fh:
+            fh.write(json.dumps({"node": node, "stage": stage, "ms": ms, "path": path, "lines": list(lines)}) + "\n")
+    except OSError:
+        pass
 
 
 def detect_overheat(log_text: str) -> str | None:
@@ -1627,6 +1867,7 @@ def _execute(
     progress is what let one hide for ten hours. `timeout_s` remains as a generous
     ABSOLUTE backstop (hard ceiling `timeout_s * _HARD_CEILING_MULT`)."""
     _therm_label = "generated-test run"
+    env = with_kept_stages(env)
     try:
         _run = _cc_optimize("run")
         _thermal_watch_new = _run._thermal_watch_new
@@ -1698,9 +1939,9 @@ def _execute(
             _stall_limit = _watch.limit()
             if stall_timeout_s and now - last_progress >= _stall_limit:
                 _kill_and_raise(
-                    f"{KILL_STALL} for {int(_stall_limit)}s -- no log growth, no syscalls, "
-                    f"no bytes and an unchanged stack. CPU alone is not progress; a livelock has "
-                    f"plenty of it. Process group killed"
+                    f"{KILL_STALL} for {int(_stall_limit)}s -- no log growth, and no syscalls or "
+                    f"bytes except from processes whose stack had not moved. CPU alone is not "
+                    f"progress; a livelock has plenty of it. Process group killed"
                 )
             # THE SAME RULE AS _run_device_proc: a clock does not get to call working code dead.
             #
@@ -1781,7 +2022,7 @@ def collect_cases(
     nor the sub-agent supplied one."""
     # -o addopts= : neutralize pytest.ini verbosity so collect prints FLAT
     # node ids (repo addopts include -v, which turns the listing into a tree).
-    cmd = [sys.executable, "-m", "pytest", "-o", "addopts=", perf_test, "--collect-only", "-q"]
+    cmd = pytest_argv(perf_test, "--collect-only", "-q")
     proc = runner(
         cmd, cwd=Path(tt_metal_root), env=env or dict(os.environ), capture_output=True, text=True, timeout=120
     )
@@ -1864,7 +2105,7 @@ def preflight_collect(
 
     Catches the zero-selection trap ('5 deselected, 0 selected') in seconds.
     Returns the number of selected tests."""
-    cmd = [sys.executable, "-m", "pytest", "-o", "addopts=", perf_test, "--collect-only", "-q"]
+    cmd = pytest_argv(perf_test, "--collect-only", "-q")
     if case:
         cmd += ["-k", case]
     proc = runner(
