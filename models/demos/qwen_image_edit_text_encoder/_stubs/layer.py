@@ -43,6 +43,9 @@ from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtRMS
 # the precise attention moves heads in and out of the fused projections by per-head slices + concat
 # instead of reshape + permute (which pads the head count to a tile in the permuted layout)
 HEADS_BY_SLICES = False
+# MLP gate / up's shared bf16 limbs split straight into L1 when together they take at most this many bytes
+# (the split hook's optional output memory config; freed after both products. 0: in x's memory)
+MLP_LIMBS_L1_BYTES = 0
 
 
 def _t(lin):
@@ -257,13 +260,27 @@ class TtTextMLP:
             self.w_down = upload(device, _t(torch_module.down_proj), mapper=shard_mapper(device, 0))
         self.compute_cfg = hifi4_config()
 
+    @staticmethod
+    def _limbs_l1(x):
+        """Whether gate / up's shared limbs of x go straight to L1 (MLP_LIMBS_L1_BYTES)."""
+        if not MLP_LIMBS_L1_BYTES or _attention.SPLIT_FN is None:
+            return False
+        if x.dtype != ttnn.float32 or x.layout != ttnn.TILE_LAYOUT or x.is_sharded():
+            return False
+        return 2 * 2 * math.prod(int(d) for d in x.padded_shape) <= MLP_LIMBS_L1_BYTES
+
     def __call__(self, x):
         if getattr(self, "precise", False):
             cfg = self.compute_cfg
             ex = getattr(self, "exact", True)
-            xp = split_bf16(x, 2) if _attention.SHARE_SPLIT else None  # gate and up share x's limbs
+            xp = split_bf16(x, 2) if _attention.SHARE_SPLIT and not self._limbs_l1(x) else None  # shared limbs
+            if _attention.SHARE_SPLIT and xp is None:
+                xp = tuple(_attention.SPLIT_FN(x, ttnn.L1_MEMORY_CONFIG))
             gate = split_linear(x, self.w_gate, compute_kernel_config=cfg, exact=ex, parts=xp)
             up = split_linear(x, self.w_up, compute_kernel_config=cfg, exact=ex, parts=xp)
+            if xp is not None and xp[0].memory_config().buffer_type == ttnn.BufferType.L1:
+                for p in xp:
+                    ttnn.deallocate(p)
             out = split_linear(ttnn.multiply(ttnn.silu(gate), up), self.w_down, compute_kernel_config=cfg, exact=ex)
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)
