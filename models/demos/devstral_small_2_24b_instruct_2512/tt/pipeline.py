@@ -142,6 +142,7 @@ PLANNED_TP = 4
 #                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
 #   prompts pad to a tile multiple only; prefill attention pads q/k/v to whole SDPA key chunks itself.
 #   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard,
+#                     prefill's (many-row) partials are produced and reduce-scattered in bf16 (half the bytes),
 #                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
 #   ministral3_decoder_layer: each RMSNorm's gamma is folded into the q/k/v and gate/up weights that read it
 #                     (no gamma multiply after the norm; the decode norm unshards + casts to bf16 in one op).
