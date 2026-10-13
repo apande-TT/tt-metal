@@ -25,14 +25,14 @@ class TtRMSNorm:
         w = torch_module.weight.detach().to(torch.float32).reshape(1, 1, -1)
         self.weight = ttnn.from_torch(w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
-    def __call__(self, x, *args, **kwargs):
+    def __call__(self, x, *args, memory_config=None, **kwargs):
         if not isinstance(x, ttnn.Tensor):
             x = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
         return ttnn.rms_norm(
             x,
             epsilon=self.eps,
             weight=self.weight,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=memory_config or ttnn.DRAM_MEMORY_CONFIG,
             compute_kernel_config=self.compute_cfg,
         )
 

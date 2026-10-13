@@ -235,7 +235,7 @@ class TtAttention:
             attn,
             self.wo,
             compute_kernel_config=self.compute_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=l1,
             program_config=self.cfg_o,
         )
 

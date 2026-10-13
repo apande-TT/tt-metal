@@ -102,7 +102,7 @@ class TtMlp:
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
             out = ttnn.linear(
-                h, self.w_down, memory_config=self.mem, compute_kernel_config=self.compute_cfg, program_config=cfg_down
+                h, self.w_down, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_down
             )
         ttnn.deallocate(h)
         if len(in_shape) != 4:

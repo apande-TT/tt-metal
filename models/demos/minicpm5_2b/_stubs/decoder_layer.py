@@ -37,8 +37,10 @@ class TtRMSNorm:
         w = torch_module.weight.detach().to(torch.float32).reshape(1, 1, -1)
         self.weight = ttnn.from_torch(w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
-    def __call__(self, x):
-        return ttnn.rms_norm(x, epsilon=self.eps, weight=self.weight, compute_kernel_config=self.compute_cfg)
+    def __call__(self, x, memory_config=None):
+        return ttnn.rms_norm(
+            x, epsilon=self.eps, weight=self.weight, compute_kernel_config=self.compute_cfg, memory_config=memory_config
+        )
 
 
 class TtMLP:
@@ -89,16 +91,18 @@ class TtDecoderLayer:
         if len(x.shape) == 4:
             x = ttnn.reshape(x, (x.shape[0] * x.shape[1], x.shape[-2], x.shape[-1]))
 
+        # A decode step's residual stream is one tile row: keep it in L1 (prefill's stays in DRAM).
+        mem = ttnn.L1_MEMORY_CONFIG if x.shape[0] == 1 and x.padded_shape[-2] == 32 else ttnn.DRAM_MEMORY_CONFIG
         attn_out, _ = self.self_attn(
-            self.input_layernorm(x),
+            self.input_layernorm(x, memory_config=mem),
             position_embeddings=position_embeddings,
             past_key_values=past_key_values,
             **kwargs,
         )
-        h = ttnn.add(x, attn_out)
+        h = ttnn.add(x, attn_out, memory_config=mem)
         ttnn.deallocate(attn_out)
-        mlp_out = self.mlp(self.post_attention_layernorm(h))
-        out = ttnn.add(h, mlp_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        mlp_out = self.mlp(self.post_attention_layernorm(h, memory_config=mem))
+        out = ttnn.add(h, mlp_out, memory_config=mem)
         ttnn.deallocate(mlp_out)
         ttnn.deallocate(h)
         return out
