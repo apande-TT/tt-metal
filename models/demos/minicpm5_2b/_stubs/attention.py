@@ -148,21 +148,28 @@ class TtAttention:
             pad = kv_cache.capacity - seq
             ttnn.copy(ttnn.pad(k, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0) if pad else k, kv_cache.k)
             ttnn.copy(ttnn.pad(v, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0) if pad else v, kv_cache.v)
-            k = ttnn.repeat_interleave(k, self.kv_groups, dim=1)
-            v = ttnn.repeat_interleave(v, self.kv_groups, dim=1)
+            # GQA without repeating K/V: head h = g * groups + j, so [B, n, S, D] viewed as [B, kv, groups * S, D]
+            # puts each KV head's query heads in its rows; every output tile is the same dot product as before.
             s_t, d_t = seq // 32, self.head_dim // 32
+            q = ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups * seq, self.head_dim))
             scores = ttnn.matmul(
                 q,
                 k,
                 transpose_b=True,
-                program_config=self._bmm_cfg(s_t, d_t, s_t),
+                program_config=self._bmm_cfg(self.kv_groups * s_t, d_t, s_t),
                 compute_kernel_config=self.compute_cfg,
             )
+            scores = ttnn.reshape(scores, (b, self.n_heads, seq, seq))
             scores = ttnn.add(ttnn.multiply(scores, self.scale), ctx.mask)
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg)
+            probs = ttnn.reshape(probs, (b, self.n_kv_heads, self.kv_groups * seq, seq))
             attn = ttnn.matmul(
-                probs, v, program_config=self._bmm_cfg(s_t, s_t, d_t), compute_kernel_config=self.compute_cfg
+                probs,
+                v,
+                program_config=self._bmm_cfg(self.kv_groups * s_t, s_t, d_t),
+                compute_kernel_config=self.compute_cfg,
             )
+            attn = ttnn.reshape(attn, (b, self.n_heads, seq, self.head_dim))
             attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [B, 1, S, n*D]
             attn = ttnn.reshape(attn, (1, b * seq, self.n_heads * self.head_dim))
             out = self._prefill_mm(attn, self.wo)
