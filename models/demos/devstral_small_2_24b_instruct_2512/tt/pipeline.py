@@ -119,7 +119,7 @@ PLANNED_TP = 4
 #                     made it multicast-latency-bound).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid).
-#                     Fused gate/up computes at HiFi2 (fp32 accumulation).
+#                     Fused gate/up computes at HiFi2 (fp32 accumulation), 8 x 8 x 12-tile blocks.
 #   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk);
 #                     lm_head weight in bfloat8_b (half the largest decode-step DRAM read). Decode skips the
 #                     full-row logits all_gather (the sampler reads the shards; VocabShards joins them on host reads).
