@@ -26,6 +26,8 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
 """
 from __future__ import annotations
 
+import math
+
 import torch
 
 import ttnn
@@ -172,6 +174,17 @@ class TtMinistral3Attention:
         scale = ttnn.add(ttnn.multiply(t, float(self.l4_beta)), 1.0)
         return ttnn.typecast(ttnn.reshape(scale, shape), ttnn.bfloat16)
 
+    @classmethod
+    def sdpa_len(cls, s):
+        """Rows prefill SDPA runs on for an s-row prompt: one power-of-two key chunk (32..PREFILL_MAX_K_CHUNK) that
+        holds it, else s rounded up to a multiple of PREFILL_MAX_K_CHUNK."""
+        if s > cls.PREFILL_MAX_K_CHUNK:
+            return int(math.ceil(s / cls.PREFILL_MAX_K_CHUNK) * cls.PREFILL_MAX_K_CHUNK)
+        n = 32
+        while n < s:
+            n *= 2
+        return n
+
     def query_rope_tables(self, cos, sin, position_ids, shape):
         """(cos, sin) for q with the llama-4 query scale folded in: rope(q) * s == q * (cos * s) + rot(q) * (sin * s).
 
@@ -245,9 +258,16 @@ class TtMinistral3Attention:
         # SDPA's online softmax rounds its running state once per KEY chunk, which biases the output level
         # upward (layer-8 Q/K/V of the image prompt: +0.23% at k_chunk 32, +0.10% at 128, +0.02% at 512).
         # Image-token rows amplify that bias over 40 layers (prefill hidden PCC 0.95 on those rows at k_chunk
-        # 32), so prefill uses the widest key chunk the sequence allows; the q chunk does not affect it.
-        k_chunk = next(c for c in (512, 256, 128, 64, 32) if s % c == 0 and c <= self.PREFILL_MAX_K_CHUNK)
-        q_chunk = 64 if s % 64 == 0 else 32
+        # 32), so prefill attends over the widest key chunk: q/k/v are padded HERE (and only here -- no other
+        # layer computes pad rows) to one chunk when the prompt fits in one, else to a multiple of the widest.
+        # The pad keys sit after every real row, so causal attention leaves the real rows unchanged; the q chunk
+        # does not affect the level.
+        s_attn = self.sdpa_len(s)
+        if s_attn != s:
+            pad = ((0, 0), (0, 0), (0, s_attn - s), (0, 0))
+            q, k, v = (ttnn.pad(t, padding=pad, value=0.0) for t in (q, k, v))
+        k_chunk = next(c for c in (512, 256, 128, 64, 32) if s_attn % c == 0 and c <= self.PREFILL_MAX_K_CHUNK)
+        q_chunk = 64 if s_attn % 64 == 0 else 32
         attn = ttnn.transformer.scaled_dot_product_attention(
             q,
             k,
@@ -263,6 +283,8 @@ class TtMinistral3Attention:
             ),
             compute_kernel_config=self.compute_cfg,
         )
+        if s_attn != s:
+            attn = ttnn.slice(attn, (0, 0, 0, 0), (b, self.local_heads, s, hd))
         attn = ttnn.experimental.nlp_concat_heads(attn)
         out = self._reduce(ttnn.linear(attn, self.wo, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg))
         if in_rank == 3:
