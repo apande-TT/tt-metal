@@ -27,6 +27,8 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.minis
 # SwiGLU op the only intermediate is the (rows, intermediate/TP) product: 268 MB/chip for a full 32 x 512
 # prefill, so that whole batch runs as ONE call (one down matmul, one all_reduce, no slices / concat).
 PREFILL_ROWS_PER_CHUNK = 16384
+# dtype of the decode-only gate / up / down weight copies.
+DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
 
 
 class TtMinistral3MLP:
@@ -51,10 +53,10 @@ class TtMinistral3MLP:
         ), f"intermediate {torch_module.intermediate_size} not divisible by TP={tp}"
         shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if tp > 1 else None
 
-        def _put(t, mapper):
+        def _put(t, mapper, dtype=ttnn.bfloat16):
             return ttnn.from_torch(
                 t.detach().to(torch.bfloat16).contiguous(),
-                dtype=ttnn.bfloat16,
+                dtype=dtype,
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
                 mesh_mapper=mapper,
@@ -75,10 +77,14 @@ class TtMinistral3MLP:
         self.w_gate_up = _put(torch.concat(chunks, dim=-1), shard(-1))
         del chunks
         if self.DECODE_WEIGHTS:
-            self.w_gate = _put(w_gate, shard(-1))
-            self.w_up = _put(w_up, shard(-1))
+            # Decode streams every MLP weight once per token (DRAM-bound): it reads its own block-float8 copies, half
+            # the bytes of the bf16 weights prefill multiplies with.
+            self.w_gate = _put(w_gate, shard(-1), DECODE_WEIGHT_DTYPE)
+            self.w_up = _put(w_up, shard(-1), DECODE_WEIGHT_DTYPE)
         del w_gate, w_up
         self.w_down = _put(torch_module.down_proj.weight.T, shard(-2))
+        if self.DECODE_WEIGHTS:
+            self.w_down_decode = _put(torch_module.down_proj.weight.T, shard(-2), DECODE_WEIGHT_DTYPE)
         self.compute_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -121,7 +127,9 @@ class TtMinistral3MLP:
         g = ttnn.linear(x, self.w_gate, memory_config=l1, compute_kernel_config=self.compute_cfg)
         u = ttnn.linear(x, self.w_up, memory_config=l1, compute_kernel_config=self.compute_cfg)
         m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
-        return self._reduce(ttnn.linear(m, self.w_down, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg))
+        return self._reduce(
+            ttnn.linear(m, self.w_down_decode, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg)
+        )
 
     def _forward(self, x):
         m = ttnn.experimental.minimal_matmul(
