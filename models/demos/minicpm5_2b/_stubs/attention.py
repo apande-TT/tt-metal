@@ -199,10 +199,14 @@ class TtAttention:
                 program_config=self._bmm_cfg(self.kv_groups * s_t, d_t, s_t),
                 compute_kernel_config=self.compute_cfg,
             )
-            scaled = ttnn.multiply(ttnn.reshape(scores, (b, self.n_heads, seq, seq)), self.scale, memory_config=l1)
-            ttnn.deallocate(scores)
-            masked = ttnn.add(scaled, ctx.mask, memory_config=l1)
-            ttnn.deallocate(scaled)
+            if _USE_SCALE_MASK_KERNEL:
+                masked = self._scale_mask_kernel(ttnn.reshape(scores, (b, self.n_heads, seq, seq)), ctx.mask, l1)
+                ttnn.deallocate(scores)
+            else:
+                scaled = ttnn.multiply(ttnn.reshape(scores, (b, self.n_heads, seq, seq)), self.scale, memory_config=l1)
+                ttnn.deallocate(scores)
+                masked = ttnn.add(scaled, ctx.mask, memory_config=l1)
+                ttnn.deallocate(scaled)
             probs = ttnn.softmax(
                 masked, dim=-1, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
             )
@@ -355,7 +359,8 @@ class TtAttention:
         return ttnn.generic_op([x, cos_full, sin_signed, out], program)
 
     def _scale_mask_kernel(self, scores, mask_full, memory_config):
-        """Decode scores * scale + mask as one generic_op (kernels/scale_mask), bit-identical to the two ops."""
+        """scores [B, H, S, C] * scale + mask as one generic_op (kernels/scale_mask), bit-identical to the two ops.
+        mask_full is [B, 1, S, C] (decode, row-broadcast key mask) or [1, 1, S, C] (prefill causal mask)."""
         out = ttnn.allocate_tensor_on_device(
             ttnn.Shape(list(scores.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
         )
@@ -384,7 +389,15 @@ class TtAttention:
             kernel_source=os.path.join(_SCALE_MASK_DIR, "reader_scale_mask.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[self.n_kv_heads, c_t, cb_s, cb_scale, cb_mask]
+            compile_time_args=[
+                scores.shape[1],
+                c_t,
+                scores.padded_shape[-2] // 32,
+                int(mask_full.shape[0] > 1),
+                cb_s,
+                cb_scale,
+                cb_mask,
+            ]
             + list(ttnn.TensorAccessorArgs(scores).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(self.scale_tile).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(mask_full).get_compile_time_args()),
