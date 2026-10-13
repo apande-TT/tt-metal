@@ -117,6 +117,7 @@ PLANNED_TP = 4
 #                     directly (no bf16 cast op, no single-core interleaved norm).
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
+#   ministral3_attention: prefill QKV projection on minimal_matmul (full grid).
 
 
 def kv_capacity_for(tp):
