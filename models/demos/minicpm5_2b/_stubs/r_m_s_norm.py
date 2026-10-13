@@ -6,9 +6,19 @@ HF semantics: x * rsqrt(mean(x^2) + eps) * weight over the 2048-wide hidden dim.
 """
 from __future__ import annotations
 
+import math
+import os
+import struct
+
 import torch
 
 import ttnn
+
+# Decode (one tile row) RMSNorm as a multi-core generic_op: every core recomputes ttnn.rms_norm's row statistic
+# with its exact arithmetic and normalizes its own slice of the row (the stock op runs one tile row on one core).
+_USE_KERNEL = True
+_KERNEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
+_TILES_PER_CORE = 4
 
 
 class TtRMSNorm:
@@ -25,9 +35,104 @@ class TtRMSNorm:
         w = torch_module.weight.detach().to(torch.float32).reshape(1, 1, -1)
         self.weight = ttnn.from_torch(w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
+    def _kernel_ok(self, x):
+        ps = list(x.padded_shape)
+        return (
+            _USE_KERNEL
+            and x.dtype == ttnn.bfloat16
+            and x.layout == ttnn.TILE_LAYOUT
+            and not x.memory_config().is_sharded()
+            and math.prod(ps[:-1]) == 32
+            and ps[-1] == x.shape[-1]
+            and (ps[-1] // 32) % _TILES_PER_CORE == 0
+        )
+
+    def _kernel(self, x, memory_config):
+        w_t = x.padded_shape[-1] // 32
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(list(x.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
+        )
+        grid = self.device.compute_with_storage_grid_size()
+        n_cores = w_t // _TILES_PER_CORE
+        full_rows, rem = divmod(n_cores, grid.x)
+        ranges = []
+        if full_rows:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, full_rows - 1)))
+        if rem:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full_rows), ttnn.CoreCoord(rem - 1, full_rows)))
+        cores = ttnn.CoreRangeSet(ranges)
+        rt = ttnn.RuntimeArgs()
+        for i in range(n_cores):
+            rt[i % grid.x][i // grid.x] = [i * _TILES_PER_CORE, _TILES_PER_CORE]
+        bf16_tile, f32_tile = 2 * 32 * 32, 4 * 32 * 32
+        cb_in, cb_scaler, cb_eps, cb_gamma, cb_out = 0, 1, 2, 3, 16
+        cb_x2, cb_ex2, cb_ex2pe, cb_fusion = 24, 25, 26, 27
+
+        def cb(idx, n, fmt, size):
+            return ttnn.CBDescriptor(
+                total_size=n * size,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(idx, fmt, size)],
+            )
+
+        bf, f32 = ttnn.bfloat16, ttnn.float32
+        cbs = [
+            cb(cb_in, w_t, bf, bf16_tile),
+            cb(cb_scaler, 1, bf, bf16_tile),
+            cb(cb_eps, 1, bf, bf16_tile),
+            cb(cb_gamma, _TILES_PER_CORE, bf, bf16_tile),
+            cb(cb_out, _TILES_PER_CORE, bf, bf16_tile),
+            cb(cb_x2, w_t, f32, f32_tile),
+            cb(cb_ex2, 1, f32, f32_tile),
+            cb(cb_ex2pe, 1, f32, f32_tile),
+            cb(cb_fusion, _TILES_PER_CORE, f32, f32_tile),
+        ]
+        eps_bits = struct.unpack("<I", struct.pack("<f", float(self.eps)))[0]
+        inv_w_bits = struct.unpack("<I", struct.pack("<f", 1.0 / x.shape[-1]))[0]
+        d = os.path.join(_KERNEL_DIR, "rms_norm")
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(d, "reader_rms_norm.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[w_t, cb_in, cb_scaler, cb_eps, cb_gamma, eps_bits]
+            + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(self.weight).get_compile_time_args()),
+            runtime_args=rt,
+            common_runtime_args=[x.buffer_address(), self.weight.buffer_address()],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        writer = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_KERNEL_DIR, "rope", "writer_rope.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[cb_out] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=rt,
+            common_runtime_args=[out.buffer_address()],
+            config=ttnn.WriterConfigDescriptor(),
+        )
+        compute = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(d, "compute_rms_norm.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[
+                w_t, inv_w_bits, cb_in, cb_scaler, cb_eps, cb_gamma, cb_x2, cb_ex2, cb_ex2pe, cb_fusion, cb_out
+            ],
+            runtime_args=rt,
+            config=ttnn.ComputeConfigDescriptor(  # as self.compute_cfg
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                dst_full_sync_en=False,
+            ),
+        )
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
+        return ttnn.generic_op([x, self.weight, out], program)
+
     def __call__(self, x, *args, memory_config=None, **kwargs):
         if not isinstance(x, ttnn.Tensor):
             x = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+        if self._kernel_ok(x):
+            return self._kernel(x, memory_config or ttnn.DRAM_MEMORY_CONFIG)
         return ttnn.rms_norm(
             x,
             epsilon=self.eps,

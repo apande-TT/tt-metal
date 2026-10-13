@@ -65,7 +65,7 @@ _USE_NOISE_KERNEL = True
 # Argmax over the candidates + token-id lookup written straight into tok_buf by one kernel (else: untilize,
 # argmax, tilize, gather, typecasts, reshape, copy).
 _USE_PICK_KERNEL = True
-_NOISE_KERNEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_stubs", "kernels", "sampler")
+_SAMPLER_KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_stubs", "kernels", "sampler")
 
 
 def _round_up(n, m=_TILE):
@@ -301,7 +301,7 @@ class MiniCPM5Pipeline:
             format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.bfloat16, tile)],
         )
         reader = ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_NOISE_KERNEL, "noise_gather.cpp"),
+            kernel_source=os.path.join(_SAMPLER_KERNELS, "noise_gather.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[k, k_tiles, _NOISE_SEG_W, 0]
@@ -330,7 +330,7 @@ class MiniCPM5Pipeline:
             format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.bfloat16, tile)],
         )
         reader = ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_NOISE_KERNEL, "pick_token.cpp"),
+            kernel_source=os.path.join(_SAMPLER_KERNELS, "pick_token.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=core,
             compile_time_args=[perturbed.shape[-1], k_tiles, self.batch, 0]
