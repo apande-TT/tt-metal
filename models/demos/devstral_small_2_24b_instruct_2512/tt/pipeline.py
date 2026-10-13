@@ -115,7 +115,8 @@ PLANNED_TP = 4
 #                     emits silu(gate) * up in the same op (prefill/encode); decode keeps separate gate/up
 #                     with the silu fused into the multiply and gate/up/product kept in L1 (no DRAM round trip);
 #                     decode gate / up / down read block-float8 copies (prefill keeps bf16); the decode down
-#                     projection is a DRAM-sharded matmul over a bank-sharded copy (16-tile blocks, 2 readers/bank).
+#                     projection runs a 1D multicast config with 8-tile K blocks (the auto config's 2-tile blocks
+#                     made it multicast-latency-bound).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid).
 #                     Fused gate/up computes at HiFi2 (fp32 accumulation).
