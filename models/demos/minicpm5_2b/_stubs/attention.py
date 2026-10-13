@@ -166,11 +166,14 @@ class TtAttention:
         if ctx.mode == "prefill":
             # Batch folded into the rows: one M = B*S fused-QKV matmul reading its weight once, then the
             # head split [B, 1, S, (n + 2 kv) * D] -> q [B, n, S, D], k/v [B, kv, S, D] in one op.
-            qkv = self._prefill_mm(ttnn.reshape(x, (1, b * seq, x.shape[-1])), self.wqkv)
-            if x.memory_config().buffer_type == ttnn.BufferType.L1:
-                ttnn.deallocate(x)  # an L1 norm output: free it before the score bmm's large static CBs
             dram, l1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG
             rope_kernel = _USE_ROPE_KERNEL and ctx.rope is not None
+            # With the rope kernel the fused-QKV output only feeds the head split: L1.
+            qkv = self._prefill_mm(
+                ttnn.reshape(x, (1, b * seq, x.shape[-1])), self.wqkv, memory_config=l1 if rope_kernel else dram
+            )
+            if x.memory_config().buffer_type == ttnn.BufferType.L1:
+                ttnn.deallocate(x)  # an L1 norm output: free it before the score bmm's large static CBs
             # With the rope kernel (small CBs) the head split lands in L1: q / k are freed once roped and v moves
             # to DRAM (it would otherwise sit below the freed q / k, inside the score bmm's static CB region).
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
@@ -180,6 +183,7 @@ class TtAttention:
                 transpose_k_heads=False,
                 memory_config=l1 if rope_kernel else dram,
             )
+            ttnn.deallocate(qkv)
             # The roped q / k feed the score bmm (large static CBs), so they stay in DRAM.
             if rope_kernel:
                 q_in, k_in = q, k
@@ -234,7 +238,7 @@ class TtAttention:
                 compute_kernel_config=self.compute_cfg,
             )
             attn = ttnn.reshape(attn, (b, self.n_heads, seq, self.head_dim))
-            # [B, 1, S, n*D] in L1: the o_proj input is the only 16 MB L1 tensor beside its static CBs.
+            # [B, 1, S, n*D] in L1: o_proj's input and output (two 16 MB L1 tensors) still fit beside its static CBs.
             attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.L1_MEMORY_CONFIG)
             attn = ttnn.reshape(attn, (1, b * seq, self.n_heads * self.head_dim))
             out = self._prefill_mm(attn, self.wo, memory_config=ttnn.L1_MEMORY_CONFIG)  # residual add input
