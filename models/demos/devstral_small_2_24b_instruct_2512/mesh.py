@@ -30,7 +30,7 @@ def open_mesh(trace_region_size=0, l1_small_size=24576, mesh_shape=None):
         print(f"[devstral] only {available} device(s) available; falling back to a 1x{tp} mesh (TP={tp})", flush=True)
         rows, cols = 1, tp
     if rows * cols > 1:
-        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+        _set_fabric(rows * cols)
     mesh = ttnn.open_mesh_device(
         ttnn.MeshShape(rows, cols),
         l1_small_size=l1_small_size,
@@ -39,6 +39,24 @@ def open_mesh(trace_region_size=0, l1_small_size=24576, mesh_shape=None):
     )
     print(f"[devstral] opened mesh {rows}x{cols} (TP={cols} x DP={rows})", flush=True)
     return mesh
+
+
+def _set_fabric(num_devices):
+    """QB2 (P300_X2): the four chips close a ring, so the TP collectives can run Ring over two links (the measured
+    QB2 TP4 setup, 8 KB router payload); anything else gets the plain 1D fabric. The stubs read the active
+    fabric (ttnn.get_fabric_config) to pick their CCL topology, so the two always agree."""
+    ring = False
+    if num_devices == 4:
+        try:
+            ring = ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.P300_X2
+        except Exception:  # noqa: BLE001 -- unknown cluster: stay on the 1D fabric
+            ring = False
+    if ring:
+        router = ttnn.FabricRouterConfig()
+        router.max_packet_payload_size_bytes = 8192
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D_RING, router_config=router)
+    else:
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
 
 
 def close_mesh(mesh):
