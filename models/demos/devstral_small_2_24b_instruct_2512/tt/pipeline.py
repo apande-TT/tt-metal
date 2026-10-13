@@ -110,7 +110,8 @@ PLANNED_TP = 4
 # Performance levers applied inside _stubs/ (a symlink out of this directory, so they are listed here too):
 #   ministral3_m_l_p: gate/up folded into one tile-interleaved weight per device; minimal_matmul(fuse_swiglu)
 #                     emits silu(gate) * up in the same op (prefill/encode); decode keeps separate gate/up
-#                     with the silu fused into the multiply and gate/up/product kept in L1 (no DRAM round trip).
+#                     with the silu fused into the multiply and gate/up/product kept in L1 (no DRAM round trip);
+#                     decode gate / up / down read block-float8 copies (prefill keeps bf16).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid).
 #                     Fused gate/up computes at HiFi2 (fp32 accumulation).
