@@ -110,7 +110,7 @@ class TtQwenImageEditPipeline:
         # the guarded tail (~9 float32 passes per precise product) as one fused kernel, bit-identical, while
         # the text encoder runs (see _fused_tail)
         self.fused_tail = guard_tail if precise else None
-        # and their lead limb's 8 exact lanes formed in one pass
+        # and their lead limb's 8 exact lanes formed in one pass (a ragged K zero-padded to take it)
         self.lane_split = lanes_ttl.lanes8 if precise else None
         # and their trailing limbs' products -- and the guard's tie-break product -- at HiFi2
         self.lo_fidelity = ttnn.MathFidelity.HiFi2 if precise else ttnn.MathFidelity.HiFi4

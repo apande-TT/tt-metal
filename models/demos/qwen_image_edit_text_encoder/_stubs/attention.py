@@ -691,6 +691,16 @@ def _guarded_terms(mm, terms, a, b, transpose_b):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
     (pa0, pb0), rest = terms[0], terms[1:]
+    k = pa0.shape[-1]
+    if LANE_SPLIT is not None and k % 32:
+        # a K that is not tile-aligned (the vision head dim, 80) is zero-padded on both lead limbs: zero terms add
+        # nothing (the matmul already took the tile padding as zeros) and the one-pass lane split then takes them
+        kp = -(-k // 32) * 32
+        pad_a = [(0, 0)] * (len(pa0.shape) - 1) + [(0, kp - k)]
+        pad_b = [(0, 0)] * (len(pb0.shape) - 1) + [(0, kp - k)] if transpose_b else None
+        if not transpose_b:
+            pad_b = [(0, 0)] * (len(pb0.shape) - 2) + [(0, kp - k), (0, 0)]
+        pa0, pb0 = ttnn.pad(pa0, pad_a, 0.0), ttnn.pad(pb0, pad_b, 0.0)
     # the lead b limb is read by all ten lane / dense / negated products: from an L1 copy when it is small and
     # the batch fills the grid (the vision attention's 32 images x 4 heads; the LM's 32 x 1 measured slower)
     shape = list(pb0.padded_shape)
