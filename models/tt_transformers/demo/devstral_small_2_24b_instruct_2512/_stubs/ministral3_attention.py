@@ -204,7 +204,14 @@ class TtMinistral3Attention:
         if isinstance(mask, torch.Tensor):
             mask = self._to_tt(mask.reshape(1, 1, s, s).to(torch.bfloat16))
 
-        qkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.compute_cfg)
+        # Prefill QKV on the full grid (ttnn.linear's auto config left this many-row projection on a partial one).
+        qkv = ttnn.experimental.minimal_matmul(
+            x,
+            self.wqkv,
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.bfloat16,
+        )
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, transpose_k_heads=False
         )
