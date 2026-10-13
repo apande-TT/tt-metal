@@ -118,6 +118,7 @@ PLANNED_TP = 4
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
 #   ministral3_attention: prefill QKV projection on minimal_matmul (full grid).
+#   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard.
 
 
 def kv_capacity_for(tp):
