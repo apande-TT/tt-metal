@@ -174,8 +174,11 @@ class TtAttention:
                 transpose_k_heads=False,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
-            q = self._rope(q, cos, sin, self._rope_cfg(q))
-            k = self._rope(k, cos, sin, self._rope_cfg(k))
+            # The rope products ([B, heads, S, D], 16 MB for q) feed only the add: L1. Its output feeds the score
+            # bmm (large static CBs), so it stays in DRAM.
+            dram, l1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG
+            q = self._rope(q, cos, sin, self._rope_cfg(q), memory_config=dram, products_memory_config=l1)
+            k = self._rope(k, cos, sin, self._rope_cfg(k), memory_config=dram, products_memory_config=l1)
             pad = kv_cache.capacity - seq
             ttnn.copy(ttnn.pad(k, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0) if pad else k, kv_cache.k)
             ttnn.copy(ttnn.pad(v, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0) if pad else v, kv_cache.v)
@@ -617,7 +620,8 @@ class TtAttention:
             per_core_N=n_t,
         )
 
-    def _rope(self, x, cos, sin, program_config=None, memory_config=None):
+    def _rope(self, x, cos, sin, program_config=None, memory_config=None, products_memory_config=None):
+        """x * cos + (x @ rot) * sin. The two products (consumed only by the add) may go to their own memory."""
         x_rot = ttnn.matmul(
             x,
             self.rot,
@@ -625,11 +629,14 @@ class TtAttention:
             compute_kernel_config=self.compute_cfg,
             memory_config=memory_config,
         )
-        return ttnn.add(
-            ttnn.multiply(x, cos, memory_config=memory_config),
-            ttnn.multiply(x_rot, sin, memory_config=memory_config),
-            memory_config=memory_config,
-        )
+        pmem = products_memory_config or memory_config
+        x_cos = ttnn.multiply(x, cos, memory_config=pmem)
+        rot_sin = ttnn.multiply(x_rot, sin, memory_config=pmem)
+        ttnn.deallocate(x_rot)
+        out = ttnn.add(x_cos, rot_sin, memory_config=memory_config)
+        ttnn.deallocate(x_cos)
+        ttnn.deallocate(rot_sin)
+        return out
 
     def _past_kv(self, past_key_values):
         if past_key_values is None:
