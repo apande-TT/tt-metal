@@ -408,7 +408,12 @@ class TtMinistral3Attention:
             compute_kernel_config=self.compute_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        attn = ttnn.reshape(attn, (1, 1, b, self.local_heads * self.head_dim))  # concat heads per row
+        # Concat heads per row with ttnn's fused decode op on the head shards (one batch row's tile-padded heads per
+        # core) instead of a reshape that un-pads the 8 heads out of their 32-row tiles through DRAM.
+        attn = ttnn.experimental.nlp_concat_heads_decode(
+            ttnn.to_memory_config(attn, head_cfg), num_heads=self.local_heads
+        )
+        attn = ttnn.sharded_to_interleaved(attn, ttnn.L1_MEMORY_CONFIG)  # (1, 1, B, heads * head_dim)
         return self._reduce(ttnn.linear(attn, self.wo, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg))
 
 
