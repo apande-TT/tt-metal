@@ -80,6 +80,14 @@ class TtMinistral3MLP:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,  # L1 accumulation made batched prefill matmuls non-repeatable
         )
+        # The many-row fused gate/up is compute-bound; it runs at HiFi2 (fp32 accumulation kept).
+        self.gate_up_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
 
     @classmethod
     def build(cls, device, torch_module):
@@ -110,7 +118,7 @@ class TtMinistral3MLP:
         m = ttnn.experimental.minimal_matmul(
             x,
             self.w_gate_up,
-            compute_kernel_config=self.compute_cfg,
+            compute_kernel_config=self.gate_up_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
             fuse_swiglu=True,
