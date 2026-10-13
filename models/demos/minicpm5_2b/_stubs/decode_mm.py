@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import ttnn
 
-_MAX_IN0_BLOCK_W = 16
+_MAX_IN0_BLOCK_W = 4  # decode sweep on BH (ms/token): 2 -> 26.86, 4 -> 23.46, 8 -> 23.55, 16 -> 24.00, 64 -> 24.85
 _MAX_SUBBLOCK_W = 4  # fp32 dest accumulation, half-sync DEST
 
 
