@@ -102,7 +102,9 @@ class TtDecoderLayer:
             past_key_values=past_key_values,
             **kwargs,
         )
-        h = ttnn.add(x, attn_out, memory_config=mem)
+        # The mid-layer residual lives in L1 in both stages: in prefill it sits beside at most one other 16 MB L1
+        # tensor during the MLP's minimal_matmuls, which still clears their static CBs.
+        h = ttnn.add(x, attn_out, memory_config=l1)
         ttnn.deallocate(attn_out)
         mlp_out = self.mlp(self.post_attention_layernorm(h, memory_config=l1))
         out = ttnn.add(h, mlp_out, memory_config=mem)
