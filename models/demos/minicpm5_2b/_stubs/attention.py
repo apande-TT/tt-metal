@@ -309,7 +309,10 @@ class TtAttention:
             else:
                 scores = ttnn.add(ttnn.multiply(scores, self.scale, memory_config=l1), ctx.mask, memory_config=l1)
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg, memory_config=l1)
-            if _USE_ATTN_BMM_KERNEL:
+            if _USE_ATTN_BMM_KERNEL and _USE_HEAD_KERNELS and b == 32:
+                # probs.V with the head merge in its writer: straight to the o_proj input [1, B, n * D].
+                attn = self._attn_bmm(probs, kv_cache.v, False, l1, merge_groups=g)
+            elif _USE_ATTN_BMM_KERNEL:
                 attn = self._attn_bmm(probs, kv_cache.v, False, l1)
             else:
                 attn = ttnn.matmul(
@@ -319,7 +322,9 @@ class TtAttention:
                     compute_kernel_config=self.compute_cfg,
                     memory_config=l1,
                 )
-            if _USE_HEAD_KERNELS and b == 32:
+            if _USE_ATTN_BMM_KERNEL and _USE_HEAD_KERNELS and b == 32:
+                pass  # already merged by the probs.V writer
+            elif _USE_HEAD_KERNELS and b == 32:
                 attn = self._heads_op("head_merge", attn, (1, b, self.n_heads * d), [g, d // 32, b], l1)
             else:
                 attn = ttnn.slice(attn, (0, 0, 0, 0), (b, self.n_kv_heads, g, d), memory_config=l1)
@@ -457,16 +462,22 @@ class TtAttention:
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
         return ttnn.generic_op([scores, self.scale_tile, mask_full, out], program)
 
-    def _attn_bmm(self, x, cache, transpose_b, memory_config):
+    def _attn_bmm(self, x, cache, transpose_b, memory_config, merge_groups=None):
         """Decode x [B, n_kv, rows, K] @ cache^T (transpose_b, cache [B, n_kv, C, D] -> [.., C]) or @ cache
-        (-> [.., D]) as one generic_op (kernels/attn_bmm), bit-identical to the reuse bmm with a full-K block."""
+        (-> [.., D]) as one generic_op (kernels/attn_bmm), bit-identical to the reuse bmm with a full-K block.
+        With merge_groups (probs.V only) the writer scatters rows 0..groups-1 straight into the merged
+        [1, B, n_kv * groups * D] (the head merge)."""
         k_t = x.padded_shape[-1] // 32
         n = cache.padded_shape[-2] if transpose_b else cache.padded_shape[-1]
+        if merge_groups is None:
+            out_shape = list(x.shape)[:-1] + [n]
+        else:
+            out_shape = [1, x.shape[0], x.shape[1] * merge_groups * n]
         out = ttnn.allocate_tensor_on_device(
-            ttnn.Shape(list(x.shape)[:-1] + [n]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
+            ttnn.Shape(out_shape), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
         )
         n_t = n // 32
-        cores, rt = self._spread(math.prod(out.padded_shape) // (32 * 32))
+        cores, rt = self._spread(math.prod(list(x.padded_shape)[:-1]) // 32 * n_t)
         tile = 2 * 32 * 32
         cb_in0, cb_in1, cb_out = 0, 1, 16
         cbs = [
@@ -488,11 +499,16 @@ class TtAttention:
             common_runtime_args=[x.buffer_address(), cache.buffer_address()],
             config=ttnn.ReaderConfigDescriptor(),
         )
+        if merge_groups is None:
+            writer_src, writer_ct = os.path.join(_ROPE_DIR, "writer_rope.cpp"), [cb_out]
+        else:
+            writer_src = os.path.join(_ATTN_BMM_DIR, "writer_attn_merge.cpp")
+            writer_ct = [cb_out, x.shape[1], merge_groups, n_t]
         writer = ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_ROPE_DIR, "writer_rope.cpp"),
+            kernel_source=writer_src,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[cb_out] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            compile_time_args=writer_ct + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
             runtime_args=rt["dm"],
             common_runtime_args=[out.buffer_address()],
             config=ttnn.WriterConfigDescriptor(),
