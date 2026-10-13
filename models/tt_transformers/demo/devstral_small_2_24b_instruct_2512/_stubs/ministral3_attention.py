@@ -330,13 +330,33 @@ class TtMinistral3Attention:
         return ttnn.multiply(cos, scale), ttnn.multiply(sin, scale)
 
     def _fill_cache(self, cache, kv):
-        """Write prompt K or V (B, kv_heads, S, hd) into rows 0..S-1 of the resident (B, kv_heads, C, hd) cache."""
-        s, cap = kv.shape[2], cache.shape[2]
-        if s < cap:
-            kv = ttnn.pad(kv, padding=((0, 0), (0, 0), (0, cap - s), (0, 0)), value=0.0)
+        """Write prompt K or V (B, kv_heads, S, hd) into rows 0..S-1 of the resident (B, kv_heads, C, hd) cache.
+
+        Only the S prompt rows are cast and written (rows past them are not read: decode SDPA is causal on
+        cur_pos, and decode writes each position before attending to it). fill_cache fills one batch row's heads,
+        so batch is folded into heads -- the same memory order in both tensors -- and one op writes every user. Its
+        interleaved path assumes no core's share of the work spans two heads, so the prompt goes in height-sharded
+        with one (user, kv head) slab of S rows per core."""
+        b, h, s, d = kv.shape
+        slots = b * h
+        grid = self.device.compute_with_storage_grid_size()
         if kv.dtype != cache.dtype:  # e.g. a block-float8 cache
             kv = ttnn.typecast(kv, cache.dtype)
-        ttnn.copy(kv, cache)
+        if slots > grid.x * grid.y:
+            s_cap = cache.shape[2]
+            if s < s_cap:
+                kv = ttnn.pad(kv, padding=((0, 0), (0, 0), (0, s_cap - s), (0, 0)), value=0.0)
+            ttnn.copy(kv, cache)
+            return
+        slab_cfg = ttnn.create_sharded_memory_config(
+            (s, d),
+            core_grid=ttnn.num_cores_to_corerangeset(slots, grid, row_wise=True),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        kv = ttnn.to_memory_config(ttnn.reshape(kv, (1, slots, s, d)), slab_cfg)
+        ttnn.fill_cache(ttnn.reshape(cache, (1, slots, cache.shape[2], d)), kv, 0)
 
     def __call__(
         self,
