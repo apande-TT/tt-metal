@@ -29,8 +29,8 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.minis
 PREFILL_ROWS_PER_CHUNK = 16384
 # dtype of the decode-only gate / up / down weight copies.
 DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
-# L1 cores the decode down projection's activation is width-sharded over: 32 divides K (256 tiles) and N (160 tiles).
-DOWN_DECODE_CORES = ttnn.CoreGrid(y=4, x=8)
+# K tiles per activation multicast block of the decode down projection (divides K = 256 tiles).
+DOWN_DECODE_K_BLOCK = 8
 
 
 class TtMinistral3MLP:
@@ -86,40 +86,24 @@ class TtMinistral3MLP:
         del w_gate, w_up
         self.w_down = _put(torch_module.down_proj.weight.T, shard(-2))
         if self.DECODE_WEIGHTS:
-            # The decode down projection is a DRAM-sharded matmul: its weight copy is width-sharded over the DRAM
-            # banks (each bank's reader streams only its columns) and the single-row activation is width-sharded over
-            # DOWN_DECODE_CORES (they divide K = inter/32 and N = 5120/32 tiles). The interleaved 1D matmul spent its
-            # time multicasting the 32 x inter activation block by block (168 us for 42 MB of bf8 weight).
+            # Decode down projection: 1D multicast matmul over the interleaved bf8 copy with DOWN_DECODE_K_BLOCK-tile K
+            # blocks. The auto config's 2-tile blocks made 128 serialised activation multicasts (~1.3 us each, 168 us)
+            # for only ~0.35 MB of weight per step; wider blocks put enough weight behind each step that the op
+            # streams at the DRAM rate instead.
             n_out = torch_module.down_proj.weight.shape[0]
-            banks, cores = device.dram_grid_size().x, DOWN_DECODE_CORES.num_cores
-            self.w_down_decode = _put(
-                torch_module.down_proj.weight.T,
-                shard(-2),
-                DECODE_WEIGHT_DTYPE,
-                ttnn.MemoryConfig(
-                    ttnn.TensorMemoryLayout.WIDTH_SHARDED,
-                    ttnn.BufferType.DRAM,
-                    ttnn.ShardSpec(
-                        ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))}),
-                        (inter, -(-n_out // (32 * banks)) * 32),
-                        ttnn.ShardOrientation.ROW_MAJOR,
-                    ),
-                ),
-            )
-            self.down_act_cfg = ttnn.create_sharded_memory_config(
-                (32, inter // cores),
-                core_grid=DOWN_DECODE_CORES,
-                strategy=ttnn.ShardStrategy.WIDTH,
-                orientation=ttnn.ShardOrientation.ROW_MAJOR,
-                use_height_and_width_as_shard_shape=True,
-            )
-            # 16-tile multicast blocks (two activation shards each, 16 hops) with two readers per DRAM bank, so each
-            # hop hides behind 16 x 10 weight tiles per reader (~520 KB of CBs); 4-tile blocks made 64 hops (312 us).
-            self.down_decode_pc = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
-                in0_block_w=16,
+            self.w_down_decode = _put(torch_module.down_proj.weight.T, shard(-2), DECODE_WEIGHT_DTYPE)
+            grid = device.compute_with_storage_grid_size()
+            n_per_core = -(-(n_out // 32) // (grid.x * grid.y))
+            self.down_decode_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                compute_with_storage_grid_size=(grid.x, grid.y),
+                in0_block_w=DOWN_DECODE_K_BLOCK,
+                out_subblock_h=1,
+                out_subblock_w=n_per_core,
                 per_core_M=1,
-                per_core_N=n_out // 32 // cores,
-                num_workers_per_dram_bank=2,
+                per_core_N=n_per_core,
+                fuse_batch=True,
+                fused_activation=None,
+                mcast_in0=True,
             )
         self.compute_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
@@ -164,14 +148,13 @@ class TtMinistral3MLP:
         u = ttnn.linear(x, self.w_up, memory_config=l1, compute_kernel_config=self.compute_cfg)
         m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
         out = ttnn.linear(
-            ttnn.to_memory_config(m, self.down_act_cfg),
+            m,
             self.w_down_decode,
             program_config=self.down_decode_pc,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             dtype=self.OUT_DTYPE,
             compute_kernel_config=self.compute_cfg,
         )
-        return self._reduce(ttnn.sharded_to_interleaved(out, ttnn.DRAM_MEMORY_CONFIG))
+        return self._reduce(out)
 
     def _forward(self, x):
         m = ttnn.experimental.minimal_matmul(
