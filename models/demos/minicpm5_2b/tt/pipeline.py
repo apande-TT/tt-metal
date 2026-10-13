@@ -280,8 +280,9 @@ class MiniCPM5Pipeline:
     def _decode_forward(self):
         """One token per row from the resident token/position: reads + writes the KV cache, emits the next."""
         B = self.batch
-        # [1, B, H]: the B single-token rows share one tile row instead of padding each to a tile.
-        x = ttnn.reshape(self.token_embed(self.tok_buf), (1, B, self.hidden))
+        # [1, B, H]: the B single-token rows share one tile row instead of padding each to a tile
+        # (the ids are looked up as one [1, B] row, so the embedding already lands in that layout).
+        x = self.token_embed(ttnn.reshape(self.tok_buf, (1, B)))
         cos_sin = self.rotary_embedding(x, position_ids=self.pos_buf)
         cur_pos = ttnn.reshape(ttnn.to_layout(self.pos_i32, ttnn.ROW_MAJOR_LAYOUT), (B,))  # one contiguous page
         pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1))
