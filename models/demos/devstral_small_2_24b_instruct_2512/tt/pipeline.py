@@ -124,6 +124,10 @@ PLANNED_TP = 4
 #                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
 #   ministral3_decoder_layer: each RMSNorm's gamma is folded into the q/k/v and gate/up weights that read it
 #                     (no gamma multiply after the norm; the decode norm unshards + casts to bf16 in one op).
+#   ministral3_attention meta_rope: q/k weight columns, the rotary tables and the prefill rotation use interleaved-pair
+#                     head_dim order, so decode's q and k RoPE each run as ONE fused rotary_embedding_llama on the
+#                     height-sharded heads (no rotate-half matmul / mul / add chain, no unshard + reshard of k); q
+#                     shares k's tables while the KV capacity is below the llama-4 scaling threshold (scale == 1).
 
 
 def kv_capacity_for(tp):
