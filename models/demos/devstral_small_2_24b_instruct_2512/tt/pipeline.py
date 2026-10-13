@@ -634,8 +634,10 @@ class DevstralPipeline:
             "positions": self._put(
                 torch.arange(s, dtype=torch.float32).reshape(1, 1, s, 1), ttnn.float32, ttnn.TILE_LAYOUT
             ),
+            # Cast on the host (exact: the table already holds bf16 values): an fp32 upload into a bf16 row-major
+            # tensor is converted on device as tilize + typecast + untilize of the whole (steps, B * NB) table, ~5 ms.
             "noise": self._put(
-                gumbel_table(req["seeds"], steps, NOISE_BUCKETS).reshape(steps, b * NOISE_BUCKETS),
+                gumbel_table(req["seeds"], steps, NOISE_BUCKETS).reshape(steps, b * NOISE_BUCKETS).to(torch.bfloat16),
                 ttnn.bfloat16,
                 ttnn.ROW_MAJOR_LAYOUT,
             ),
