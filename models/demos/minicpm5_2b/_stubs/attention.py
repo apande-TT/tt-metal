@@ -25,6 +25,7 @@ import os
 import torch
 
 import ttnn
+from models.demos.minicpm5_2b._stubs.decode_mm import decode_linear_config
 
 # Decode KV-cache write as one C++ kernel via ttnn.generic_op (else: slot-read matmuls + sub/add + paged_update_cache).
 _USE_KV_WRITE_KERNEL = True
@@ -105,6 +106,9 @@ class TtAttention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         self.wo = _w(torch_module.o_proj)
+        # Decode (one tile row) projections: 1-D multicast with a wide K block (bit-identical to the default).
+        self.cfg_qkv = decode_linear_config(device, self.wqkv.shape[-2], self.wqkv.shape[-1])
+        self.cfg_o = decode_linear_config(device, self.wo.shape[-2], self.wo.shape[-1])
         self.rot = ttnn.from_torch(
             _rotate_half_matrix(self.head_dim), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
@@ -165,7 +169,7 @@ class TtAttention:
             return ttnn.reshape(out, (b, seq, out.shape[-1]))
         else:
             # One fused-QKV projection for the B decode rows, sliced into q / k / v.
-            qkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.compute_cfg)
+            qkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.compute_cfg, program_config=self.cfg_qkv)
             nq, nkv = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
             q = ttnn.slice(qkv, (0, 0, 0), (1, b, nq))
             k = ttnn.slice(qkv, (0, 0, nq), (1, b, nq + nkv))
@@ -211,7 +215,13 @@ class TtAttention:
                 probs, kv_cache.v, program_config=self._bmm_cfg(1, c_t, d_t), compute_kernel_config=self.compute_cfg
             )
             attn = ttnn.reshape(attn, (1, b, self.n_heads * self.head_dim))
-        return ttnn.linear(attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        return ttnn.linear(
+            attn,
+            self.wo,
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            program_config=self.cfg_o,
+        )
 
     def _prefill_mm(self, x, w):
         """Prefill projection on minimal_matmul's small streaming CBs, which span the full grid under fp32

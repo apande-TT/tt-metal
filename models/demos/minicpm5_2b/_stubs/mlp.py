@@ -10,6 +10,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.demos.minicpm5_2b._stubs.decode_mm import decode_linear_config
 
 
 def _compute_cfg(device):
@@ -40,6 +41,9 @@ class TtMlp:
         self.w_gate = _w(torch_module.gate_proj)
         self.w_up = _w(torch_module.up_proj)
         self.w_down = _w(torch_module.down_proj)
+        h, f = self.w_gate.shape[-2], self.w_gate.shape[-1]
+        self.cfg_up = decode_linear_config(device, h, f)
+        self.cfg_down = decode_linear_config(device, f, h)
 
     def _mm(self, x, w, k_block=None):
         """Many-row (prefill) gate/up projection on minimal_matmul's small CBs, which span the full grid under fp32
@@ -83,12 +87,20 @@ class TtMlp:
             ttnn.deallocate(up)
             out = self._mm(h, self.w_down, k_block=64)  # K = 6144 does not fit one block: three K blocks
         else:
-            gate = ttnn.linear(x, self.w_gate, memory_config=self.mem, compute_kernel_config=self.compute_cfg)
-            up = ttnn.linear(x, self.w_up, memory_config=self.mem, compute_kernel_config=self.compute_cfg)
+            one_row = x.shape[0] == x.shape[1] == 1 and x.padded_shape[-2] == 32  # decode: one tile row
+            cfg_up, cfg_down = (self.cfg_up, self.cfg_down) if one_row else (None, None)
+            gate = ttnn.linear(
+                x, self.w_gate, memory_config=self.mem, compute_kernel_config=self.compute_cfg, program_config=cfg_up
+            )
+            up = ttnn.linear(
+                x, self.w_up, memory_config=self.mem, compute_kernel_config=self.compute_cfg, program_config=cfg_up
+            )
             h = self._silu_mul(gate, up)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-            out = ttnn.linear(h, self.w_down, memory_config=self.mem, compute_kernel_config=self.compute_cfg)
+            out = ttnn.linear(
+                h, self.w_down, memory_config=self.mem, compute_kernel_config=self.compute_cfg, program_config=cfg_down
+            )
         ttnn.deallocate(h)
         if len(in_shape) != 4:
             out = ttnn.reshape(out, in_shape[:-1] + (out.shape[-1],))
