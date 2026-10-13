@@ -46,8 +46,10 @@ class TtMinistral3Model:
         cfg = torch_module.config
         depth = cfg.num_hidden_layers if n_layers is None else max(1, min(int(n_layers), cfg.num_hidden_layers))
         self.embed_tokens = TtTokenEmbed(device, torch_module.embed_tokens)
-        self.rotary_emb = TtMinistral3RotaryEmbedding(device, torch_module.rotary_emb)
-        self.layers = [TtMinistral3DecoderLayer(device, layer) for layer in torch_module.layers[:depth]]
+        # q / k in interleaved-pair head_dim order with tables to match, so decode's RoPE runs fused on the head shards
+        # (TtMinistral3Attention meta_rope); attention itself is unchanged by the shared permutation.
+        self.rotary_emb = TtMinistral3RotaryEmbedding(device, torch_module.rotary_emb, interleaved=True)
+        self.layers = [TtMinistral3DecoderLayer(device, layer, meta_rope=True) for layer in torch_module.layers[:depth]]
         self.norm = TtMinistral3RMSNorm.build(device, torch_module.norm)
         self.tp = self.layers[0].tp
         self.head_dim = self.layers[0].self_attn.head_dim
@@ -131,7 +133,11 @@ class TtMinistral3Model:
         cos, sin = self.rotary_emb(x, position_ids=position_ids)  # (B, 1, hd)
         cos = ttnn.reshape(cos, (1, b, 1, self.head_dim))
         sin = ttnn.reshape(sin, (1, b, 1, self.head_dim))
-        rope = (cos, sin) + self.layers[0].self_attn.query_rope_tables(cos, sin, position_ids, (1, b, 1, 1))
+        attn0 = self.layers[0].self_attn
+        # Every decode position is below the resident KV capacity (dim 2 of the cache).
+        capacity = int(kv_caches[0][0].shape[2]) if kv_caches else None
+        rope = (cos, sin) + attn0.query_rope_tables(cos, sin, position_ids, (1, b, 1, 1), max_position=capacity)
+        rope = attn0.decode_rope_tables(rope, b)
         for i, layer in enumerate(self.layers):
             x = layer(
                 x,

@@ -67,10 +67,22 @@ class TtMinistral3Attention:
     OUT_DTYPE = ttnn.float32
     # Widest SDPA key chunk prefill may use (see __call__).
     PREFILL_MAX_K_CHUNK = 512
+    # Columns of the decode head grid (one batch row per core): 32 rows fill an 8 x 4 rectangle, the shape the fused
+    # decode RoPE needs (it runs on its input shard grid's bounding box).
+    HEAD_GRID_X = 8
+    # Batch rows the resident decode rotation tiles cover (the pipeline's maximum batch).
+    MAX_DECODE_BATCH = 32
 
-    def __init__(self, device, torch_module, in_scale=None) -> None:
-        """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v."""
+    def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
+        """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
+
+        meta_rope: q and k carry each head's dims in interleaved-pair order (2j, 2j+1 <- HF's j, j + head_dim/2): the
+        q/k weight columns are permuted per head, the rotary tables must come in the same order
+        (TtMinistral3RotaryEmbedding(interleaved=True)), and rotate_half becomes a pair swap inside every 32-wide tile,
+        so decode runs q's and k's RoPE as ONE fused rotary_embedding_llama each on the height-sharded heads. q . k is
+        unchanged by a permutation applied to both, and V is not permuted, so attention is the same math."""
         self.device = device
+        self.meta_rope = bool(meta_rope)
         self.tp = tp = _mesh_size(device)
         cfg = torch_module.config
         self.num_heads = cfg.num_attention_heads
@@ -103,6 +115,10 @@ class TtMinistral3Attention:
         wq = fold_input_scale(torch_module.q_proj.weight.T, in_scale)  # (in, Hq*hd)
         wk = fold_input_scale(torch_module.k_proj.weight.T, in_scale)  # (in, Hkv*hd)
         wv = fold_input_scale(torch_module.v_proj.weight.T, in_scale)
+        if self.meta_rope:
+            perm = torch.arange(hd).reshape(2, hd // 2).T.reshape(-1)  # [0, hd/2, 1, hd/2 + 1, ...]
+            per_head = lambda w: w.reshape(w.shape[0], -1, hd)[:, :, perm].reshape(w.shape[0], -1)
+            wq, wk = per_head(wq), per_head(wk)
         chunks = []
         for d in range(tp):
             q_sl = slice(d * lh * hd, (d + 1) * lh * hd)
@@ -111,11 +127,16 @@ class TtMinistral3Attention:
         self.wqkv = _put(torch.concat(chunks, dim=-1), shard(-1))
         self.wo = _put(torch_module.o_proj.weight.T, shard(-2))
 
-        # rotate_half(x) == x @ R  (HF convention: cat(-x2, x1)).
-        half = hd // 2
-        rot = torch.zeros(hd, hd)
-        rot[torch.arange(half) + half, torch.arange(half)] = -1.0
-        rot[torch.arange(half), torch.arange(half) + half] = 1.0
+        # rotate_half(x) == x @ R  (HF convention: cat(-x2, x1); meta_rope: each pair (x_2j, x_2j+1) -> (-x_2j+1, x_2j)).
+        if self.meta_rope:
+            rot = self._pair_swap(hd)
+            # Decode's fused RoPE reads one 32 x 32 pair-swap tile per batch row from its own core.
+            self.trans_mat = _put(self._pair_swap(ttnn.TILE_SIZE).repeat(1, 1, self.MAX_DECODE_BATCH, 1), repl)
+        else:
+            half = hd // 2
+            rot = torch.zeros(hd, hd)
+            rot[torch.arange(half) + half, torch.arange(half)] = -1.0
+            rot[torch.arange(half), torch.arange(half) + half] = 1.0
         self.rot = _put(rot.reshape(1, 1, hd, hd), repl)
 
         self.compute_cfg = ttnn.init_device_compute_kernel_config(
@@ -137,6 +158,14 @@ class TtMinistral3Attention:
     def build(cls, device, torch_module):
         return cls(device, torch_module)
 
+    @staticmethod
+    def _pair_swap(n):
+        """(n, n) R with x @ R = (-x_1, x_0, -x_3, x_2, ...): rotate_half in interleaved-pair order."""
+        rot = torch.zeros(n, n)
+        rot[torch.arange(0, n, 2), torch.arange(1, n, 2)] = 1.0
+        rot[torch.arange(1, n, 2), torch.arange(0, n, 2)] = -1.0
+        return rot
+
     def _to_tt(self, t, dtype=ttnn.bfloat16):
         return ttnn.from_torch(
             t.contiguous(),
@@ -149,16 +178,45 @@ class TtMinistral3Attention:
     def _head_cfg(self, batch):
         """HEIGHT-sharded L1 config holding one batch row's [heads (tile-padded), head_dim] per core."""
         if batch not in self._head_cfgs:
-            grid = self.device.compute_with_storage_grid_size()
-            cores = ttnn.num_cores_to_corerangeset(batch, grid, row_wise=True)
-            self._head_cfgs[batch] = ttnn.create_sharded_memory_config(
-                shape=(ttnn.TILE_SIZE, self.head_dim),
-                core_grid=cores,
-                strategy=ttnn.ShardStrategy.HEIGHT,
-                orientation=ttnn.ShardOrientation.ROW_MAJOR,
-                use_height_and_width_as_shard_shape=True,
-            )
+            self._head_cfgs[batch] = self._batch_shard_cfg(batch, self.head_dim)
         return self._head_cfgs[batch]
+
+    def _batch_cores(self, batch):
+        grid = self.device.compute_with_storage_grid_size()
+        return ttnn.num_cores_to_corerangeset(
+            batch, ttnn.CoreCoord(min(self.HEAD_GRID_X, grid.x), grid.y), row_wise=True
+        )
+
+    def _batch_shard_cfg(self, batch, width):
+        """HEIGHT-sharded L1 config with one (TILE_SIZE, width) shard per batch row on the decode head grid."""
+        return ttnn.create_sharded_memory_config(
+            shape=(ttnn.TILE_SIZE, width),
+            core_grid=self._batch_cores(batch),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+
+    def _fused_decode_rope(self, batch):
+        # The fused op runs on its input shard grid's bounding box, so the batch rows must fill a rectangle.
+        w = min(self.HEAD_GRID_X, self.device.compute_with_storage_grid_size().x)
+        return self.meta_rope and batch <= self.MAX_DECODE_BATCH and (batch <= w or batch % w == 0)
+
+    def decode_rope_tables(self, rope, batch):
+        """Decode rope tables (cos, sin, q_cos, q_sin), each (1, B, 1, head_dim), height-sharded onto the decode head
+        grid plus the pair-swap tiles, ONCE per forward for every layer: the fused RoPE reads them from the cores
+        that hold the q / k heads. Unchanged when the fused path does not apply."""
+        if not self._fused_decode_rope(batch):
+            return rope
+        cfg = self._head_cfg(batch)
+        trans = self.trans_mat
+        if batch < self.MAX_DECODE_BATCH:
+            trans = ttnn.slice(trans, (0, 0, 0, 0), (1, 1, batch * ttnn.TILE_SIZE, ttnn.TILE_SIZE))
+        trans = ttnn.to_memory_config(trans, self._batch_shard_cfg(batch, ttnn.TILE_SIZE))
+        cos, sin = (ttnn.to_memory_config(t, cfg) for t in rope[:2])
+        if len(rope) < 4 or (rope[2] is rope[0] and rope[3] is rope[1]):
+            return cos, sin, cos, sin, trans  # q shares k's tables
+        return (cos, sin) + tuple(ttnn.to_memory_config(t, cfg) for t in rope[2:4]) + (trans,)
 
     def _reduce(self, t):
         """all_reduce of o_proj's fp32 partials: reduce-scatter in fp32 (the sum is exact to fp32), round the reduced
@@ -197,13 +255,17 @@ class TtMinistral3Attention:
             n *= 2
         return n
 
-    def query_rope_tables(self, cos, sin, position_ids, shape):
+    def query_rope_tables(self, cos, sin, position_ids, shape, max_position=None):
         """(cos, sin) for q with the llama-4 query scale folded in: rope(q) * s == q * (cos * s) + rot(q) * (sin * s).
 
         The scale depends only on the position, so the model builds these ONCE per forward and every layer shares
         them, instead of each layer re-deriving the scale (floor/log/...) and multiplying its q by it. Below
-        original_max_position_embeddings the scale is exactly 1, so the shared tables are bit-identical."""
+        original_max_position_embeddings the scale is exactly 1, so the shared tables are bit-identical; when every
+        position is known to be below it (max_position: an exclusive bound, e.g. the KV capacity) q simply shares
+        k's tables."""
         if self.l4_beta is None or not self.l4_max or position_ids is None:
+            return cos, sin
+        if max_position is not None and int(max_position) <= int(self.l4_max):
             return cos, sin
         scale = self._llama4_scale(position_ids, shape)
         return ttnn.multiply(cos, scale), ttnn.multiply(sin, scale)
@@ -312,17 +374,30 @@ class TtMinistral3Attention:
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, memory_config=head_cfg
         )
         cos, sin = position_embeddings[:2]
-        k = self._rope(ttnn.to_memory_config(k, ttnn.DRAM_MEMORY_CONFIG), cos, sin)
-        if len(position_embeddings) == 4:
-            q = self._rope(ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG), *position_embeddings[2:4])
+        if len(position_embeddings) == 5:
+            # Sharded tables from decode_rope_tables: q's and k's RoPE run fused in place on the head shards.
+            q_cos, q_sin, trans = position_embeddings[2:5]
+            rope = lambda t, c, s: ttnn.experimental.rotary_embedding_llama(
+                t, c, s, trans, is_decode_mode=True, compute_kernel_config=self.compute_cfg
+            )
+            k, q = rope(k, cos, sin), rope(q, q_cos, q_sin)
+            # SDPA reads q from DRAM, as on the unfused path: its circular buffers fill nearly all of L1, so only the
+            # small shared tables may stay resident in L1 while it runs.
+            q = ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG)
         else:
-            q = self._rope(ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG), cos, sin)
-            if self.l4_beta is not None and self.l4_max and position_ids is not None:
-                q = ttnn.multiply(q, self._llama4_scale(position_ids, (1, b, 1, 1)))
-        k = ttnn.to_memory_config(k, head_cfg)
+            k = self._rope(ttnn.to_memory_config(k, ttnn.DRAM_MEMORY_CONFIG), cos, sin)
+            if len(position_embeddings) == 4:
+                q = self._rope(ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG), *position_embeddings[2:4])
+            else:
+                q = self._rope(ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG), cos, sin)
+                if self.l4_beta is not None and self.l4_max and position_ids is not None:
+                    q = ttnn.multiply(q, self._llama4_scale(position_ids, (1, b, 1, 1)))
+            k = ttnn.to_memory_config(k, head_cfg)
         k_cache, v_cache = kv_cache
         ttnn.experimental.paged_update_cache(k_cache, k, update_idxs_tensor=cur_pos)
         ttnn.experimental.paged_update_cache(v_cache, v, update_idxs_tensor=cur_pos)
+        ttnn.deallocate(k)  # free the L1 head shards before SDPA's circular buffers are placed
+        ttnn.deallocate(v)
         attn = ttnn.transformer.scaled_dot_product_attention_decode(
             q,
             k_cache,

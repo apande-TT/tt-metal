@@ -18,14 +18,18 @@ import ttnn
 
 
 class TtMinistral3RotaryEmbedding:
-    def __init__(self, device, torch_module) -> None:
+    def __init__(self, device, torch_module, interleaved=False) -> None:
+        """interleaved: emit the tables in interleaved-pair head_dim order (dims 2j and 2j+1 share frequency j, the
+        order ttnn's fused rotary_embedding_llama rotates) instead of HF's half-split order (j and j + head_dim/2).
+        The values are the same, only their column order differs (see TtMinistral3Attention meta_rope)."""
         self.device = device
         self.scaling = float(torch_module.attention_scaling)
         inv_freq = torch_module.inv_freq.detach().float()
         self.head_dim = 2 * inv_freq.shape[0]
         self._repl = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
+        freq = inv_freq.repeat_interleave(2) if interleaved else torch.concat((inv_freq, inv_freq))
         self.inv_freq = ttnn.from_torch(
-            torch.concat((inv_freq, inv_freq)).reshape(1, 1, 1, self.head_dim),
+            freq.reshape(1, 1, 1, self.head_dim),
             dtype=ttnn.float32,
             layout=ttnn.TILE_LAYOUT,
             device=device,

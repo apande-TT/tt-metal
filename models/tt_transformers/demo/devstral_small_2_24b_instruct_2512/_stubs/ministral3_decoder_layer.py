@@ -33,12 +33,15 @@ class TtMinistral3DecoderLayer:
     # image-token rows most. Norms read a bf16 copy; attention / MLP outputs arrive in fp32 (their OUT_DTYPE).
     RESIDUAL_DTYPE = ttnn.float32
 
-    def __init__(self, device, torch_module) -> None:
+    def __init__(self, device, torch_module, meta_rope=False) -> None:
+        """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order)."""
         self.device = device
         # Each norm's gamma is folded into the projections that read it (q/k/v; gate/up), so the norms apply no
         # weight and their outputs feed the matmuls without a separate gamma multiply.
         ln_in, ln_post = torch_module.input_layernorm, torch_module.post_attention_layernorm
-        self.self_attn = TtMinistral3Attention(device, torch_module.self_attn, in_scale=ln_in.weight)
+        self.self_attn = TtMinistral3Attention(
+            device, torch_module.self_attn, in_scale=ln_in.weight, meta_rope=meta_rope
+        )
         self.tp = self.self_attn.tp
         self.input_layernorm = TtMinistral3RMSNorm.build(device, ln_in, fold_gamma=True)
         self.post_attention_layernorm = TtMinistral3RMSNorm.build(device, ln_post, fold_gamma=True)
