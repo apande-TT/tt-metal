@@ -107,6 +107,10 @@ DEFAULT_BATCH = 32
 # 128 x 2 B = 5.4 GB/chip, inside the 28.6 GB/chip usable with a CCL axis (QB2 registered figure).
 DEFAULT_KV_CAPACITY = 4096
 PLANNED_TP = 4
+# Performance levers applied inside _stubs/ (a symlink out of this directory, so they are listed here too):
+#   ministral3_m_l_p: gate/up folded into one tile-interleaved weight per device; minimal_matmul(fuse_swiglu)
+#                     emits silu(gate) * up in the same op (prefill/encode); decode keeps separate gate/up
+#                     with the silu fused into the multiply.
 
 
 def kv_capacity_for(tp):

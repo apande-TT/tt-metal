@@ -1,0 +1,31 @@
+{
+  "weight_bytes": 51586095296,
+  "dominant_dtype": "bfloat16",
+  "source": "checkpoint bytes + HF config",
+  "total_params": 46509370368,
+  "params_basis": "read set for unit=unknown: lookup-only and tower-only tensors excluded",
+  "resolution": 1540,
+  "device_weight_bytes": 2261700608,
+  "device_census_complete": true,
+  "device_section_bytes": {
+    "unmatched": 2261700608,
+    "language_model": 1763266560,
+    "embed_tokens": 1342177280,
+    "layers": 572260352,
+    "self_attn": 419430400,
+    "lm_head": 335544320,
+    "vision_tower": 152399872,
+    "transformer": 151191552,
+    "feed_forward": 150994944,
+    "decode": 8388608,
+    "multi_modal_projector": 2101248,
+    "patch_merger": 2097152,
+    "post_attention_layernorm": 819200,
+    "input_layernorm": 819200,
+    "ffn_norm": 98304,
+    "attention_norm": 98304,
+    "norm": 24576,
+    "ln_pre": 4096
+  },
+  "bytes_per_param": 2.0
+}
