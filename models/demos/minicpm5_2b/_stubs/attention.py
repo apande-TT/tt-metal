@@ -182,20 +182,26 @@ class TtAttention:
             # GQA without repeating K/V: head h = g * groups + j, so [B, n, S, D] viewed as [B, kv, groups * S, D]
             # puts each KV head's query heads in its rows; every output tile is the same dot product as before.
             s_t, d_t = seq // 32, self.head_dim // 32
-            q = ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups * seq, self.head_dim))
+            # The scale and mask outputs ([B, n, S, S], 16 MB each at B=32, S=128) live in L1 between the two
+            # bmms; the bmms' outputs stay in DRAM, as their per-(batch, KV head) blocks fill most of L1 with CBs.
+            l1 = ttnn.L1_MEMORY_CONFIG
             scores = ttnn.matmul(
-                q,
+                ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups * seq, self.head_dim)),
                 k,
                 transpose_b=True,
                 program_config=self._bmm_cfg(self.kv_groups * s_t, d_t, s_t),
                 compute_kernel_config=self.compute_cfg,
             )
-            scores = ttnn.reshape(scores, (b, self.n_heads, seq, seq))
-            scores = ttnn.add(ttnn.multiply(scores, self.scale), ctx.mask)
-            probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg)
-            probs = ttnn.reshape(probs, (b, self.n_kv_heads, self.kv_groups * seq, seq))
+            scaled = ttnn.multiply(ttnn.reshape(scores, (b, self.n_heads, seq, seq)), self.scale, memory_config=l1)
+            ttnn.deallocate(scores)
+            masked = ttnn.add(scaled, ctx.mask, memory_config=l1)
+            ttnn.deallocate(scaled)
+            probs = ttnn.softmax(
+                masked, dim=-1, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+            ttnn.deallocate(masked)
             attn = ttnn.matmul(
-                probs,
+                ttnn.reshape(probs, (b, self.n_kv_heads, self.kv_groups * seq, seq)),
                 v,
                 program_config=self._bmm_cfg(self.kv_groups * s_t, s_t, d_t),
                 compute_kernel_config=self.compute_cfg,
