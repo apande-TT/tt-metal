@@ -419,7 +419,15 @@ class TtMinistral3Attention:
         if s_attn != s:
             attn = ttnn.slice(attn, (0, 0, 0, 0), (b, self.local_heads, s, hd))
         attn = ttnn.experimental.nlp_concat_heads(attn)
-        out = self._reduce(ttnn.linear(attn, self.wo, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg))
+        # Prefill o_proj on the full grid too (ttnn.linear's auto 1D config ran it on 80 cores at ~30 TFLOP/s).
+        out = ttnn.experimental.minimal_matmul(
+            attn,
+            self.wo,
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=self.OUT_DTYPE,
+        )
+        out = self._reduce(out)
         if in_rank == 3:
             return ttnn.reshape(out, (b, s, out.shape[-1]))
         return out
