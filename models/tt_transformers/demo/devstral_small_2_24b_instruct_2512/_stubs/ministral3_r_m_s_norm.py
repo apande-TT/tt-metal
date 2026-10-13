@@ -39,9 +39,14 @@ class TtMinistral3RMSNorm:
     # Apply the checkpoint weight as a separate multiply after a unit-gamma canonical norm (see build).
     SEPARATE_GAMMA = True
 
+    # Decode: the (1, 1, B, D) row is one tile row, which the interleaved norm runs on a single core. It is
+    # width-sharded over this many cores instead (D / cores columns each) and normed there.
+    DECODE_CORES = (8, 5)
+
     def __init__(self, canonical_instance, gamma=None) -> None:
         self._impl = canonical_instance
         self.gamma = gamma
+        self._decode_cfgs = {}
 
     @classmethod
     def build(cls, device, torch_module):
@@ -77,6 +82,47 @@ class TtMinistral3RMSNorm:
             packer_l1_acc=False,
         )
         return cls(canonical, gamma if cls.SEPARATE_GAMMA else None)
+
+    def _decode_cfg(self, d):
+        if d not in self._decode_cfgs:
+            gx, gy = self.DECODE_CORES
+            block_w = d // ttnn.TILE_SIZE // (gx * gy)
+            mem = ttnn.create_sharded_memory_config(
+                shape=(ttnn.TILE_SIZE, d // (gx * gy)),
+                core_grid=ttnn.CoreGrid(y=gy, x=gx),
+                strategy=ttnn.ShardStrategy.WIDTH,
+                orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                use_height_and_width_as_shard_shape=True,
+            )
+            prog = ttnn.LayerNormShardedMultiCoreProgramConfig(
+                compute_with_storage_grid_size=(gx, gy),
+                subblock_w=next(w for w in (4, 2, 1) if block_w % w == 0),
+                block_h=1,
+                block_w=block_w,
+                inplace=False,
+            )
+            self._decode_cfgs[d] = (mem, prog)
+        return self._decode_cfgs[d]
+
+    def decode(self, x):
+        """Decode-mode norm of the (1, 1, B, D) residual row (fp32 or bf16), returned bf16 interleaved.
+
+        The norm reads the residual in its own dtype -- an fp32 residual is not rounded to bf16 first, so the
+        cast the prefill path needs (its interleaved kernel cannot hold an fp32 row of D in L1) is folded into
+        the norm -- on a width-sharded row; the checkpoint gamma is applied after it, as in prefill."""
+        mem, prog = self._decode_cfg(int(x.shape[-1]))
+        n = ttnn.rms_norm(
+            ttnn.to_memory_config(x, mem),
+            epsilon=self._impl.eps,
+            weight=self._impl.weight,
+            program_config=prog,
+            memory_config=mem,
+            compute_kernel_config=self._impl.compute_kernel_config_hifi2,
+        )
+        n = ttnn.to_memory_config(n, ttnn.DRAM_MEMORY_CONFIG)
+        if self.gamma is not None:
+            return ttnn.multiply(n, self.gamma, dtype=ttnn.bfloat16)
+        return n if n.dtype == ttnn.bfloat16 else ttnn.typecast(n, ttnn.bfloat16)
 
     def __call__(self, x, *args, **kwargs):
         # Canonical RMSNorm takes the 4D [1, 1, S, H] prefill layout; restore the caller's rank.

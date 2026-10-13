@@ -68,7 +68,10 @@ class TtMinistral3DecoderLayer:
 
         if self.RESIDUAL_DTYPE is not None and x.dtype != self.RESIDUAL_DTYPE:
             x = ttnn.typecast(x, self.RESIDUAL_DTYPE)
-        n = self._bf16(self.input_layernorm(self._bf16(x)))  # rms_norm reads bf16 (fp32 input overflows L1 at 5120)
+        if mode == "decode":
+            n = self.input_layernorm.decode(x)  # sharded norm reads the fp32 residual directly
+        else:
+            n = self._bf16(self.input_layernorm(self._bf16(x)))  # rms_norm reads bf16 (fp32 input overflows L1 at 5120)
         a = self.self_attn(
             n,
             position_embeddings=position_embeddings,
@@ -79,7 +82,11 @@ class TtMinistral3DecoderLayer:
             mode=mode,
         )
         h = ttnn.add(x, self._as(a, x.dtype))
-        m = self.mlp(self._bf16(self.post_attention_layernorm(self._bf16(h))), mode=mode)
+        if mode == "decode":
+            n = self.post_attention_layernorm.decode(h)
+        else:
+            n = self._bf16(self.post_attention_layernorm(self._bf16(h)))
+        m = self.mlp(n, mode=mode)
         out = ttnn.add(h, self._as(m, h.dtype))
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)

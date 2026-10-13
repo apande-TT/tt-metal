@@ -26,8 +26,8 @@ all_reduce per block; embed_tokens, the final norm and the rotary tables are rep
 from __future__ import annotations
 
 import torch
-import ttnn
 
+import ttnn
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_decoder_layer import (
     TtMinistral3DecoderLayer,
 )
@@ -138,7 +138,7 @@ class TtMinistral3Model:
                 cur_pos=cur_pos,
                 mode="decode",
             )
-        return self._bf16(self.norm(self._bf16(x)))
+        return self.norm.decode(x)
 
     @staticmethod
     def _bf16(t):
