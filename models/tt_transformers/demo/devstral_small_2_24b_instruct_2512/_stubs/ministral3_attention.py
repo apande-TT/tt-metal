@@ -187,8 +187,10 @@ class TtMinistral3Attention:
         # rotate_half(x) == x @ R  (HF convention: cat(-x2, x1); meta_rope: each pair (x_2j, x_2j+1) -> (-x_2j+1, x_2j)).
         if self.meta_rope:
             rot = self._pair_swap(hd)
-            # Decode's fused RoPE reads one 32 x 32 pair-swap tile per batch row from its own core.
+            # Decode's fused RoPE reads one 32 x 32 pair-swap tile per batch row from its own core; prefill's reads
+            # the single tile from DRAM.
             self.trans_mat = _put(self._pair_swap(ttnn.TILE_SIZE).repeat(1, 1, self.MAX_DECODE_BATCH, 1), repl)
+            self.prefill_trans_mat = _put(self._pair_swap(ttnn.TILE_SIZE).reshape(1, 1, ttnn.TILE_SIZE, -1), repl)
         else:
             half = hd // 2
             rot = torch.zeros(hd, hd)
@@ -377,11 +379,18 @@ class TtMinistral3Attention:
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, transpose_k_heads=False
         )
-        k = self._rope(k, cos, sin)
+        rope = self._rope
+        if self.meta_rope:
+            # One fused RoPE per tensor over every user's heads (the prompt positions are shared by all rows): a
+            # 32 x 32 pair-swap per head-dim tile instead of a 128 x 128 rotate-half matmul plus mul / mul / add.
+            rope = lambda t, c, si: ttnn.experimental.rotary_embedding_llama(
+                t, c, si, self.prefill_trans_mat, is_decode_mode=False, compute_kernel_config=self.compute_cfg
+            )
+        k = rope(k, cos, sin)
         if q_tables is not None:
-            q = self._rope(q, *q_tables)  # llama-4 scale already folded into the shared q tables
+            q = rope(q, *q_tables)  # llama-4 scale already folded into the shared q tables
         else:
-            q = self._rope(q, cos, sin)
+            q = rope(q, cos, sin)
             if self.l4_beta is not None and self.l4_max and position_ids is not None:
                 q = ttnn.multiply(q, self._llama4_scale(position_ids, (1, 1, s, 1)))
         if kv_cache is not None:
