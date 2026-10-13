@@ -122,6 +122,8 @@ PLANNED_TP = 4
 #   prompts pad to a tile multiple only; prefill attention pads q/k/v to whole SDPA key chunks itself.
 #   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard,
 #                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
+#   ministral3_decoder_layer: each RMSNorm's gamma is folded into the q/k/v and gate/up weights that read it
+#                     (no gamma multiply after the norm; the decode norm unshards + casts to bf16 in one op).
 
 
 def kv_capacity_for(tp):
