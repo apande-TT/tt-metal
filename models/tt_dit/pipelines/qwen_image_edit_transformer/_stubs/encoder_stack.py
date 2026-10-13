@@ -60,6 +60,9 @@ def _as_tt(t, device, dtype=ttnn.float32):
     return _replicated(t.to(torch.float32), device, dtype=dtype)
 
 
+# the blocks of one forward share temb's SiLU and its bf16 limbs (split once into L1) for their modulation linears
+SHARE_TEMB_LIMBS = False
+_TEMB_CACHE = {}
 # skip the modulated activations' typecast when they already have the target dtype (precise: float32 ->
 # float32, a full copy)
 SKIP_SAME_CAST = False
@@ -91,11 +94,11 @@ class _TtBlock:
             y = _ccl.all_gather(y, self.device, dim=-1, axis=self.tp_axis)
         return y
 
-    def _mod_params(self, silu_temb, wb):
+    def _mod_params(self, silu_temb, wb, parts=None):
         """[B, 6*dim] float32 -> six [B, 1, dim] tensors (shift1, scale1, gate1, shift2, scale2, gate2)."""
         w, b = wb
         if _precise.ENABLED:
-            y = _precise.linear(silu_temb, w, bias=b)
+            y = _precise.linear(silu_temb, w, bias=b, parts=parts)
         else:
             y = ttnn.linear(silu_temb, w, bias=b, dtype=ttnn.float32, compute_kernel_config=self.hifi)
         y = self._gather(y)  # [B, 6*dim] (column shards concatenate in order)
@@ -112,9 +115,9 @@ class _TtBlock:
     def _modulate(self, x, shift, scale):
         return ttnn.add(ttnn.multiply(self._ln(x), ttnn.add(scale, 1.0)), shift)
 
-    def __call__(self, img, txt, silu_temb, rotary, mask):
-        i_sh1, i_sc1, i_g1, i_sh2, i_sc2, i_g2 = self._mod_params(silu_temb, self.img_mod)
-        t_sh1, t_sc1, t_g1, t_sh2, t_sc2, t_g2 = self._mod_params(silu_temb, self.txt_mod)
+    def __call__(self, img, txt, silu_temb, rotary, mask, temb_parts=None):
+        i_sh1, i_sc1, i_g1, i_sh2, i_sc2, i_g2 = self._mod_params(silu_temb, self.img_mod, temb_parts)
+        t_sh1, t_sc1, t_g1, t_sh2, t_sc2, t_g2 = self._mod_params(silu_temb, self.txt_mod, temb_parts)
 
         mdt = ttnn.float32 if _precise.ENABLED else ttnn.bfloat16
         cast = lambda t: t if SKIP_SAME_CAST and t.dtype == mdt else ttnn.typecast(t, mdt)  # noqa: E731
@@ -171,10 +174,21 @@ class TtQwenBlockStack:
         if txt.dtype != ttnn.float32:
             txt = ttnn.typecast(txt, ttnn.float32)
 
+        temb_arg = temb
         temb = _as_tt(temb, d)
         if temb.dtype != ttnn.float32:
             temb = ttnn.typecast(temb, ttnn.float32)
-        silu_temb = ttnn.silu(temb) if _precise.ENABLED else ttnn.typecast(ttnn.silu(temb), ttnn.bfloat16)
+        temb_parts = None
+        share = SHARE_TEMB_LIMBS and _precise.ENABLED and _precise.SPLIT_FN is not None
+        if share and isinstance(temb_arg, ttnn.Tensor):
+            # every block of a forward gets the same temb: its SiLU and bf16 limbs (in L1) once, not per block
+            if _TEMB_CACHE.get("temb") is not temb_arg:
+                _TEMB_CACHE.clear()
+                silu = ttnn.silu(temb)
+                _TEMB_CACHE.update(temb=temb_arg, silu=silu, parts=_precise.SPLIT_FN(silu, ttnn.L1_MEMORY_CONFIG))
+            silu_temb, temb_parts = _TEMB_CACHE["silu"], _TEMB_CACHE["parts"]
+        else:
+            silu_temb = ttnn.silu(temb) if _precise.ENABLED else ttnn.typecast(ttnn.silu(temb), ttnn.bfloat16)
 
         rotary = None
         if image_rotary_emb is not None:
@@ -192,7 +206,7 @@ class TtQwenBlockStack:
             mask = _as_tt(m, d)
 
         for blk in self.blocks:
-            img, txt = blk(img, txt, silu_temb, rotary, mask)
+            img, txt = blk(img, txt, silu_temb, rotary, mask, temb_parts)
         return img, txt
 
 
