@@ -169,6 +169,20 @@ class TtMinistral3Attention:
         self.wo = _put(torch_module.o_proj.weight.T, shard(-2))
         # Decode reads block-float8 copies of its projection weights (DRAM-bound single-row matmuls); prefill keeps bf16.
         self.wo_decode = _put(torch_module.o_proj.weight.T, shard(-2), dtype=DECODE_WEIGHT_DTYPE)
+        # Decode o_proj (K = 32 tiles, N = 160 tiles): 8-tile K multicast blocks (the auto config used 2), 2 N tiles
+        # per core.
+        grid = device.compute_with_storage_grid_size()
+        self.wo_decode_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(grid.x, grid.y),
+            in0_block_w=8,
+            out_subblock_h=1,
+            out_subblock_w=2,
+            per_core_M=1,
+            per_core_N=2,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+        )
 
         # rotate_half(x) == x @ R  (HF convention: cat(-x2, x1); meta_rope: each pair (x_2j, x_2j+1) -> (-x_2j+1, x_2j)).
         if self.meta_rope:
@@ -467,7 +481,13 @@ class TtMinistral3Attention:
         )
         attn = ttnn.sharded_to_interleaved(attn, ttnn.L1_MEMORY_CONFIG)  # (1, 1, B, heads * head_dim)
         return self._reduce(
-            ttnn.linear(attn, self.wo_decode, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg)
+            ttnn.linear(
+                attn,
+                self.wo_decode,
+                program_config=self.wo_decode_pc,
+                dtype=self.OUT_DTYPE,
+                compute_kernel_config=self.compute_cfg,
+            )
         )
 
 
