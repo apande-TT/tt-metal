@@ -194,8 +194,14 @@ class TtAttention:
                 q = self._rope(q, cos, sin, self._rope_cfg(q), memory_config=dram, products_memory_config=l1)
                 k = self._rope(k, cos, sin, self._rope_cfg(k), memory_config=dram, products_memory_config=l1)
             pad = kv_cache.capacity - seq
-            ttnn.copy(ttnn.pad(k, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0) if pad else k, kv_cache.k)
-            ttnn.copy(ttnn.pad(v, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0) if pad else v, kv_cache.v)
+            # The capacity-padded K / V feed only the copy into the cache: L1.
+            for new, cache in ((k, kv_cache.k), (v, kv_cache.v)):
+                if pad:
+                    padded = ttnn.pad(new, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0, memory_config=l1)
+                    ttnn.copy(padded, cache)
+                    ttnn.deallocate(padded)
+                else:
+                    ttnn.copy(new, cache)
             # GQA without repeating K/V: head h = g * groups + j, so [B, n, S, D] viewed as [B, kv, groups * S, D]
             # puts each KV head's query heads in its rows; every output tile is the same dot product as before.
             s_t, d_t = seq // 32, self.head_dim // 32
