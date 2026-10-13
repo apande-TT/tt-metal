@@ -62,6 +62,9 @@ _NEG = -1e9
 _NOISE_SEG_W = 1280  # 40 tiles: under gather's 60-tile single-row threshold; 130560 / 1280 = 102 segments
 # Candidate noise read straight from the segmented buffer by one data-movement kernel (else: per-segment gather).
 _USE_NOISE_KERNEL = True
+# Argmax over the candidates + token-id lookup written straight into tok_buf by one kernel (else: untilize,
+# argmax, tilize, gather, typecasts, reshape, copy).
+_USE_PICK_KERNEL = True
 _NOISE_KERNEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_stubs", "kernels", "sampler")
 
 
@@ -181,7 +184,8 @@ class MiniCPM5Pipeline:
         k = self.top_k
         self.cumsum_upper = self._tt(torch.triu(torch.ones(k, k)), ttnn.float32)  # p @ U = inclusive cumsum
         self.ids_buf = self._tt(torch.full((B, Sp), self.pad_id, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
-        self.tok_buf = self._tt(torch.zeros(B, 1, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+        # [1, B]: one row-major page, the sampler kernel's output and the decode embedding's input as is.
+        self.tok_buf = self._tt(torch.zeros(1, B, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         self.pos_buf = self._tt(torch.zeros(B, 1), ttnn.float32)
         # The same positions as int32 [1, B]: the in-place KV-cache write slot of each row.
         self.pos_i32 = self._tt(torch.zeros(1, B, dtype=torch.int32), ttnn.int32)
@@ -245,6 +249,9 @@ class MiniCPM5Pipeline:
         allowed = ttnn.ge(top_vals, threshold)
         noise = self._candidate_noise(top_idx)
         perturbed = ttnn.add(ttnn.add(top_vals, noise), ttnn.multiply(ttnn.subtract(allowed, 1.0), -_NEG))
+        if _USE_PICK_KERNEL and B == 32 and perturbed.dtype == ttnn.float32 and top_idx.dtype == ttnn.uint32:
+            self._pick_kernel(perturbed, top_idx)  # writes self.tok_buf
+            return None
         rank = ttnn.argmax(ttnn.untilize(perturbed), dim=-1, keepdim=True)  # [1, 1, B, 1] uint32
         rank = ttnn.to_layout(rank, ttnn.TILE_LAYOUT)
         tok = ttnn.gather(top_idx, -1, ttnn.typecast(rank, top_idx.dtype) if rank.dtype != top_idx.dtype else rank)
@@ -308,9 +315,39 @@ class MiniCPM5Pipeline:
         program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=[cb])
         return ttnn.generic_op([top_idx, self.noise_buf, out], program)
 
+    def _pick_kernel(self, perturbed, top_idx):
+        """Argmax over the k candidates (ttnn.argmax's comparison, first max wins) and that rank's token id,
+        written into tok_buf by one single-core generic_op (kernels/sampler/pick_token.cpp)."""
+        k_tiles = perturbed.padded_shape[-1] // 32
+        core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+        rt = ttnn.RuntimeArgs()
+        rt[0][0] = []
+        tile = 2 * 32 * 32
+        scratch = 2 * k_tiles * 4 * 32 * 32 + 4 * self.batch
+        cb = ttnn.CBDescriptor(
+            total_size=-(-scratch // tile) * tile,
+            core_ranges=core,
+            format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.bfloat16, tile)],
+        )
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_NOISE_KERNEL, "pick_token.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=core,
+            compile_time_args=[perturbed.shape[-1], k_tiles, self.batch, 0]
+            + list(ttnn.TensorAccessorArgs(perturbed).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(top_idx).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(self.tok_buf).get_compile_time_args()),
+            runtime_args=rt,
+            common_runtime_args=[perturbed.buffer_address(), top_idx.buffer_address(), self.tok_buf.buffer_address()],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=[cb])
+        ttnn.generic_op([perturbed, top_idx, self.tok_buf], program)
+
     def _emit(self, logits):
         tok = self._sample(logits)
-        ttnn.copy(ttnn.reshape(tok, (self.batch, 1)), self.tok_buf)
+        if tok is not None:  # else the sampler kernel already wrote tok_buf
+            ttnn.copy(ttnn.reshape(tok, (1, self.batch)), self.tok_buf)
 
     # ------------------------------------------------------------------ the chained forward
     def _prefill_forward(self):
@@ -334,7 +371,7 @@ class MiniCPM5Pipeline:
         B = self.batch
         # [1, B, H]: the B single-token rows share one tile row instead of padding each to a tile
         # (the ids are looked up as one [1, B] row, so the embedding already lands in that layout).
-        x = self.token_embed(ttnn.reshape(self.tok_buf, (1, B)))
+        x = self.token_embed(self.tok_buf)
         cos_sin = self.rotary_embedding(x, position_ids=self.pos_buf)
         cur_pos = ttnn.reshape(ttnn.to_layout(self.pos_i32, ttnn.ROW_MAJOR_LAYOUT), (B,))  # one contiguous page
         pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1))
