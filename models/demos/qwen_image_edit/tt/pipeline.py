@@ -204,7 +204,7 @@ class TtQwenImageEditPipeline:
             "WEIGHT_LANE_SPLIT": self.weight_lane_split,
             "SPLIT_LIMBS": self.split_limbs,
             "BMM_CONFIG": self.bmm_config,
-            # (the batched products' shared lead b limb read from L1)
+            # (the batched products' shared lead b limb read from L1; the LM's 32-entry batches M-split onto the grid)
             "B_LIMB_L1": bool(self.bmm_config),
         }
         if exact_only:

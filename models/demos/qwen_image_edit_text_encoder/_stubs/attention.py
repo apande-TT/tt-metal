@@ -610,19 +610,26 @@ def bmm_program_config(p, q, transpose_b=False):
     for d in ps[:-2]:
         batch *= d
     grid = q.device().compute_with_storage_grid_size()
-    # double-buffered bf16 operand blocks + the float32 output block within ~1 MB of L1
-    if batch < grid.x * grid.y or (2 * (mt * kt + kt * nt) * 2048 + mt * nt * 4096) > 1000 * 1024:
+    cores = grid.x * grid.y
+
+    def fits(m):  # double-buffered bf16 operand blocks + the float32 output block within ~1 MB of L1
+        return 2 * (m * kt + kt * nt) * 2048 + m * nt * 4096 <= 1000 * 1024
+
+    # one batch entry's whole M per work unit; with fewer entries than cores (the LM's 32 sequences x 1 kv head,
+    # M = 7 heads x 192 tokens) the widest M block that still gives every core a unit
+    pcm = mt if batch >= cores else next((d for d in range(mt, 0, -1) if mt % d == 0 and batch * (mt // d) >= cores), 0)
+    if not pcm or not fits(pcm):
         return None
-    key = (mt, kt, nt, grid.x, grid.y)
+    key = (mt, kt, nt, pcm, grid.x, grid.y)
     if key not in _BMM_CONFIGS:
         sbw = _largest_divisor(nt, 4)
-        sbh = _largest_divisor(mt, max(1, 4 // sbw))
+        sbh = _largest_divisor(pcm, max(1, 4 // sbw))
         _BMM_CONFIGS[key] = ttnn.MatmulMultiCoreReuseProgramConfig(
             compute_with_storage_grid_size=(grid.x, grid.y),
             in0_block_w=kt,
             out_subblock_h=sbh,
             out_subblock_w=sbw,
-            per_core_M=mt,
+            per_core_M=pcm,
             per_core_N=nt,
         )
     return _BMM_CONFIGS[key]
