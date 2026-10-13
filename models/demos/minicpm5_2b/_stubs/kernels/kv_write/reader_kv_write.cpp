@@ -64,6 +64,8 @@ void kernel_main() {
     noc_async_read_barrier();
     auto* pos = reinterpret_cast<volatile tt_l1_ptr int32_t*>(pos_l1);
 
+    // All Dt tiles of a unit are read under one barrier (the per-tile round trips dominated this kernel).
+    constexpr uint32_t tile_bytes = 32 * 32 * 2;
     const uint32_t scr = get_write_ptr(cb_scr);
     for (uint32_t u = unit_start; u < unit_start + num_units; ++u) {
         const uint32_t is_v = u / (B * n_kv);
@@ -73,24 +75,25 @@ void kernel_main() {
         const uint32_t p = static_cast<uint32_t>(pos[b]);
         const uint32_t r = p & 31;
         const uint32_t cache_page0 = (bh * Ct + (p >> 5)) * Dt;
+        cb_reserve_back(cb_old, Dt);
+        cb_reserve_back(cb_new, Dt);
+        const uint32_t old_l1 = get_write_ptr(cb_old);
+        const uint32_t new_l1 = get_write_ptr(cb_new);
         for (uint32_t wt = 0; wt < Dt; ++wt) {
-            cb_reserve_back(cb_old, 1);
-            cb_reserve_back(cb_new, 1);
-            const uint32_t old_l1 = get_write_ptr(cb_old);
-            uint32_t src_row;
             if (is_v) {
-                noc_async_read_page(cache_page0 + wt, cache_v, old_l1);
-                noc_async_read_page((b >> 5) * qkv_Nt + v_col0 + h * Dt + wt, qkv, scr);
-                src_row = b & 31;
+                noc_async_read_page(cache_page0 + wt, cache_v, old_l1 + wt * tile_bytes);
+                noc_async_read_page((b >> 5) * qkv_Nt + v_col0 + h * Dt + wt, qkv, scr + wt * tile_bytes);
             } else {
-                noc_async_read_page(cache_page0 + wt, cache_k, old_l1);
-                noc_async_read_page(bh * Dt + wt, k_new, scr);
-                src_row = k_row;
+                noc_async_read_page(cache_page0 + wt, cache_k, old_l1 + wt * tile_bytes);
+                noc_async_read_page(bh * Dt + wt, k_new, scr + wt * tile_bytes);
             }
-            noc_async_read_barrier();
-            copy_row(scr, src_row, get_write_ptr(cb_new), r);
-            cb_push_back(cb_old, 1);
-            cb_push_back(cb_new, 1);
         }
+        noc_async_read_barrier();
+        const uint32_t src_row = is_v ? (b & 31) : k_row;
+        for (uint32_t wt = 0; wt < Dt; ++wt) {
+            copy_row(scr + wt * tile_bytes, src_row, new_l1 + wt * tile_bytes, r);
+        }
+        cb_push_back(cb_old, Dt);
+        cb_push_back(cb_new, Dt);
     }
 }

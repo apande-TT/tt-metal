@@ -307,8 +307,9 @@ class TtAttention:
                 format_descriptors=[ttnn.CBFormatDescriptor(idx, ttnn.bfloat16, tile)],
             )
 
-        cbs = [cb(cb_old, 2), cb(cb_new, 2), cb(cb_scr, 1), cb(cb_pos, 1), cb(cb_diff, 1)]
-        cbs += [cb(cb_out, 2), cb(cb_wscr, 1), cb(cb_wpos, 1)]
+        # A unit's d_t tiles move as one batch: old/new double-buffered per unit, d_t-tile scratch on both movers.
+        cbs = [cb(cb_old, 2 * d_t), cb(cb_new, 2 * d_t), cb(cb_scr, d_t), cb(cb_pos, 1), cb(cb_diff, 1)]
+        cbs += [cb(cb_out, 2), cb(cb_wscr, d_t), cb(cb_wpos, 1)]
         shape = (batch, n_kv, kv_cache.capacity // 32, d_t, qkv.padded_shape[-1] // 32)
         cache_ct = list(ttnn.TensorAccessorArgs(kv_cache.k).get_compile_time_args())
         pos_ct = list(ttnn.TensorAccessorArgs(cur_pos).get_compile_time_args())

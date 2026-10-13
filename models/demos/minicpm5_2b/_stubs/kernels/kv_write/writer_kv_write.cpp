@@ -40,7 +40,9 @@ void kernel_main() {
     noc_async_read_barrier();
     auto* pos = reinterpret_cast<volatile tt_l1_ptr int32_t*>(pos_l1);
 
-    const uint32_t tile = get_write_ptr(cb_wscr);
+    // A unit's Dt cache tiles are read under one barrier and written back under one barrier.
+    constexpr uint32_t tile_bytes = 32 * 32 * 2;
+    const uint32_t tiles = get_write_ptr(cb_wscr);
     for (uint32_t u = unit_start; u < unit_start + num_units; ++u) {
         const uint32_t is_v = u / (B * n_kv);
         const uint32_t bh = u - is_v * (B * n_kv);
@@ -49,13 +51,12 @@ void kernel_main() {
         const uint32_t r = p & 31;
         const uint32_t cache_page0 = (bh * Ct + (p >> 5)) * Dt;
         for (uint32_t wt = 0; wt < Dt; ++wt) {
+            noc_async_read_page(cache_page0 + wt, is_v ? cache_v : cache_k, tiles + wt * tile_bytes);
+        }
+        noc_async_read_barrier();
+        for (uint32_t wt = 0; wt < Dt; ++wt) {
             const uint32_t page = cache_page0 + wt;
-            if (is_v) {
-                noc_async_read_page(page, cache_v, tile);
-            } else {
-                noc_async_read_page(page, cache_k, tile);
-            }
-            noc_async_read_barrier();
+            const uint32_t tile = tiles + wt * tile_bytes;
             cb_wait_front(cb_out, 1);
             const uint32_t out = get_read_ptr(cb_out);
             for (uint32_t half = 0; half < 2; ++half) {
@@ -67,12 +68,8 @@ void kernel_main() {
                 }
             }
             cb_pop_front(cb_out, 1);
-            if (is_v) {
-                noc_async_write_page(page, cache_v, tile);
-            } else {
-                noc_async_write_page(page, cache_k, tile);
-            }
-            noc_async_write_barrier();
+            noc_async_write_page(page, is_v ? cache_v : cache_k, tile);
         }
+        noc_async_write_barrier();  // the next unit reuses the scratch tiles
     }
 }
