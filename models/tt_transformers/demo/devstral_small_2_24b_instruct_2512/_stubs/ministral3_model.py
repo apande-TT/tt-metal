@@ -28,6 +28,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import tp_ccl_args
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_decoder_layer import (
     TtMinistral3DecoderLayer,
 )
@@ -110,6 +111,10 @@ class TtMinistral3Model:
         sin = ttnn.reshape(sin, (1, 1, s, self.head_dim))
         # q's rope tables with the llama-4 query scale folded in, built once and shared by every layer.
         rope = (cos, sin) + self.layers[0].self_attn.query_rope_tables(cos, sin, pos, (1, 1, s, 1))
+        shard = self.tp > 1 and TtMinistral3DecoderLayer.SHARD_PREFILL_RESIDUAL
+        if shard:
+            # The layers carry the prefill residual hidden-sharded (TtMinistral3DecoderLayer.SHARD_PREFILL_RESIDUAL).
+            x = ttnn.mesh_partition(x, dim=3)
         for i, layer in enumerate(self.layers):
             # attention_mask=None -> causal SDPA, the mask HF builds for an unpadded prompt.
             x = layer(
@@ -120,6 +125,8 @@ class TtMinistral3Model:
                 kv_cache=None if kv_caches is None else kv_caches[i],
                 mode="prefill",
             )
+        if shard:
+            x = ttnn.all_gather(self._bf16(x), dim=3, **tp_ccl_args())
         out = self._bf16(self.norm(self._bf16(x)))
         return ttnn.reshape(out, (b, s, d))
 

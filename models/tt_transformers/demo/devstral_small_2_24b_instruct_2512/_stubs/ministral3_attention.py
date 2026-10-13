@@ -75,6 +75,9 @@ class TtMinistral3Attention:
     # Prefill's many-row o_proj partials are produced and reduce-scattered in bf16 instead (half the reduce-scatter
     # bytes, no fp32 -> bf16 cast before the gather); decode keeps fp32 partials.
     PREFILL_REDUCE_DTYPE = ttnn.bfloat16
+    # False: prefill returns o_proj's reduce-scattered 1/TP hidden shard (the decoder keeps a hidden-sharded
+    # residual in prefill and gathers only the normed activation).
+    prefill_gather = True
     # Widest SDPA key chunk prefill may use (see __call__).
     PREFILL_MAX_K_CHUNK = 512
     # Columns of the decode head grid (one batch row per core): 32 rows fill an 8 x 4 rectangle, the shape the fused
@@ -280,14 +283,16 @@ class TtMinistral3Attention:
             return cos, sin, cos, sin, trans  # q shares k's tables
         return (cos, sin) + tuple(ttnn.to_memory_config(t, cfg) for t in rope[2:4]) + (trans,)
 
-    def _reduce(self, t):
+    def _reduce(self, t, gather=True):
         """all_reduce of o_proj's fp32 partials: reduce-scatter in fp32 (the sum is exact to fp32), round the reduced
         1/TP shard to bf16 once and all_gather that -- half the gather bytes. The decoder adds the bf16 result into
-        its fp32 residual unrounded (mixed-dtype ADD runs on the SFPU in fp32)."""
+        its fp32 residual unrounded (mixed-dtype ADD runs on the SFPU in fp32). gather=False: the reduced shard."""
         if self.tp == 1:
             return t
         ccl = tp_ccl_args()
         t = ttnn.reduce_scatter(t, dim=3, **ccl)
+        if not gather:
+            return t
         if t.dtype != ttnn.bfloat16:
             t = ttnn.typecast(t, ttnn.bfloat16)
         return ttnn.all_gather(t, dim=3, **ccl)
@@ -461,7 +466,7 @@ class TtMinistral3Attention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=self.PREFILL_REDUCE_DTYPE if self.tp > 1 else self.OUT_DTYPE,
         )
-        out = self._reduce(out)
+        out = self._reduce(out, gather=self.prefill_gather)
         if in_rank == 3:
             return ttnn.reshape(out, (b, s, out.shape[-1]))
         return out

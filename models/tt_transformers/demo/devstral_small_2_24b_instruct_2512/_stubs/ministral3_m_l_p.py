@@ -49,6 +49,8 @@ class TtMinistral3MLP:
     PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi2
     # dtype of the down weight the many-row (prefill) path multiplies with.
     DOWN_DTYPE = ttnn.bfloat8_b
+    # False: prefill returns the down projection's reduce-scattered 1/TP hidden shard (see the decoder layer).
+    prefill_gather = True
     # dtype of the fused gate/up weight the many-row (prefill) path multiplies with.
     GATE_UP_DTYPE = ttnn.bfloat8_b
 
@@ -160,8 +162,10 @@ class TtMinistral3MLP:
             # Prefill of a large batch: run the 32768-wide intermediate a few batch rows at a time so its
             # peak DRAM stays small (rows are independent, so the result is identical).
             parts = [self._forward(ttnn.slice(x, [i, 0, 0, 0], [min(i + step, b), 1, s, d])) for i in range(0, b, step)]
-            return ttnn.reshape(ttnn.concat(parts, dim=0), shape)
-        return ttnn.reshape(self._forward(x), shape)
+            out = ttnn.concat(parts, dim=0)
+            return ttnn.reshape(out, shape[:-1] + (out.shape[-1],))
+        out = self._forward(x)
+        return ttnn.reshape(out, shape[:-1] + (out.shape[-1],))
 
     def _forward_decode(self, x):
         # The single-row gate / up / product stay in L1 for the down matmul (no DRAM round trip of the 32 x inter
@@ -205,15 +209,17 @@ class TtMinistral3MLP:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=self.PREFILL_REDUCE_DTYPE if (self.PREFILL_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
         )
-        return self._reduce(out)
+        return self._reduce(out, gather=self.prefill_gather)
 
-    def _reduce(self, out):
+    def _reduce(self, out, gather=True):
         if self.tp == 1:
             return out
         if self.GATHER_DTYPE is None:
             return ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
         ccl = tp_ccl_args()
         out = ttnn.reduce_scatter(out, dim=3, **ccl)
+        if not gather:
+            return out
         if out.dtype != self.GATHER_DTYPE:
             out = ttnn.typecast(out, self.GATHER_DTYPE)
         return ttnn.all_gather(out, dim=3, **ccl)
