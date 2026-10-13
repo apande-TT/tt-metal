@@ -156,11 +156,12 @@ class TtMinistral3Attention:
             orientation=ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
-        # One activation shard per multicast block: 32 hops, each hidden behind 60 weight tiles per bank reader.
+        # One activation shard per multicast block, two readers per DRAM bank (3 weight columns each).
         self.qkv_decode_pc = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
             in0_block_w=k_in // ttnn.TILE_SIZE // cores,
             per_core_M=1,
             per_core_N=n_dev // ttnn.TILE_SIZE // cores,
+            num_workers_per_dram_bank=2,
         )
         self.wo = _put(torch_module.o_proj.weight.T, shard(-2))
 
