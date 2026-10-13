@@ -136,9 +136,13 @@ class TtMinistral3Attention:
         return self._head_cfgs[batch]
 
     def _reduce(self, t):
+        """all_reduce of o_proj's fp32 partials: reduce-scatter in fp32 (the sum is exact to fp32), round the reduced
+        1/TP shard to bf16 once and all_gather that -- half the gather bytes. The decoder adds the bf16 result into
+        its fp32 residual unrounded (mixed-dtype ADD runs on the SFPU in fp32)."""
         if self.tp == 1:
             return t
-        return ttnn.all_reduce(t, topology=ttnn.Topology.Linear)
+        t = ttnn.reduce_scatter(t, dim=3, topology=ttnn.Topology.Linear)
+        return ttnn.all_gather(ttnn.typecast(t, ttnn.bfloat16), dim=3, topology=ttnn.Topology.Linear)
 
     def _rope(self, x, cos, sin):
         return ttnn.add(

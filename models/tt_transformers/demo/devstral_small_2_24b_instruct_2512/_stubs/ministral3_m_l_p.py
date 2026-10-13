@@ -31,6 +31,9 @@ class TtMinistral3MLP:
     OUT_DTYPE = ttnn.float32
     # Separate gate / up weights for the single-token decode path (the vision MLP subclasses never decode).
     DECODE_WEIGHTS = True
+    # dtype the reduced output is all_gathered in (None: plain fp32 all_reduce). The text decoder reduce-scatters
+    # in fp32 and gathers the reduced shard in bf16 (half the bytes); its residual add takes the bf16 unrounded.
+    GATHER_DTYPE = ttnn.bfloat16
 
     def __init__(self, device, torch_module) -> None:
         self.device = device
@@ -123,9 +126,12 @@ class TtMinistral3MLP:
         return self._reduce(out)
 
     def _reduce(self, out):
-        if self.tp > 1:
-            out = ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
-        return out
+        if self.tp == 1:
+            return out
+        if self.GATHER_DTYPE is None:
+            return ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
+        out = ttnn.reduce_scatter(out, dim=3, topology=ttnn.Topology.Linear)
+        return ttnn.all_gather(ttnn.typecast(out, self.GATHER_DTYPE), dim=3, topology=ttnn.Topology.Linear)
 
 
 def build(device, torch_module=None):

@@ -81,16 +81,22 @@ class TtMinistral3DecoderLayer:
             cur_pos=cur_pos,
             mode=mode,
         )
-        h = ttnn.add(x, self._as(a, x.dtype))
+        h = self._residual_add(x, a)
         if mode == "decode":
             n = self.post_attention_layernorm.decode(h)
         else:
             n = self._bf16(self.post_attention_layernorm(self._bf16(h)))
         m = self.mlp(n, mode=mode)
-        out = ttnn.add(h, self._as(m, h.dtype))
+        out = self._residual_add(h, m)
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
         return out
+
+    @staticmethod
+    def _residual_add(x, delta):
+        # A bf16 attention / MLP output is added into the fp32 residual without a cast op: binary ADD runs on the
+        # SFPU in fp32 for mixed dtypes, so the bf16 operand is widened exactly.
+        return ttnn.add(x, delta) if delta.dtype == x.dtype else ttnn.add(x, delta, dtype=x.dtype)
 
     @staticmethod
     def _as(t, dtype):
