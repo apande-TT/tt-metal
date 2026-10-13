@@ -21,12 +21,15 @@ LLM_GAPs (op-NEW — still need synthesis):
 HF reference: (none)
 Op counts: total=1  op-REUSE=1  op-ADAPT=0  op-NEW=0"""
 from __future__ import annotations
+
 import torch
-import ttnn
 import transformers
 
-HF_MODEL_ID = 'mistralai/Devstral-Small-2-24B-Instruct-2512'
-_CANDIDATE_SUBMODULE_PATHS = ['mask_decoder', 'decoder', 'decode_head', 'classifier', 'lm_head']
+import ttnn
+
+HF_MODEL_ID = "mistralai/Devstral-Small-2-24B-Instruct-2512"
+_CANDIDATE_SUBMODULE_PATHS = ["mask_decoder", "decoder", "decode_head", "classifier", "lm_head"]
+
 
 def _mesh_kw(device, **kw):
     """Return ``ttnn.from_torch`` kwargs that are mesh-aware.
@@ -56,8 +59,12 @@ def _log_runtime_fallback(helper, kind, reason):
     before each pytest invocation and consumes it afterwards.
     """
     try:
-        import sys as _sys, json as _json, os as _os, time as _time
+        import json as _json
+        import os as _os
+        import sys as _sys
+        import time as _time
         from pathlib import Path as _Path
+
         _sys.stderr.write("[%s_CPU_FALLBACK] %s: %s\n" % (kind.upper(), helper, reason))
         log_env = _os.environ.get("TT_HW_PLANNER_RUNTIME_FALLBACK_LOG")
         if log_env:
@@ -79,8 +86,8 @@ def _log_runtime_fallback(helper, kind, reason):
         pass
 
 
-_LLM_GAPS = [
-]
+_LLM_GAPS = []
+
 
 def _resolve(obj, dotted):
     cur = obj
@@ -93,11 +100,14 @@ def _resolve(obj, dotted):
             cur = getattr(cur, tok)
     return cur
 
+
 def _coerce_to_torch(x):
     try:
         import ttnn as _ttnn
+
         if isinstance(x, _ttnn.Tensor):
             import torch as _torch
+
             t = _ttnn.to_torch(x)
             # Bug Y fix (2026-05-23 live-run sam2-hiera-tiny)
             if t.is_floating_point():
@@ -115,6 +125,7 @@ def _coerce_to_torch(x):
     if isinstance(x, dict):
         return {k: _coerce_to_torch(v) for k, v in x.items()}
     return x
+
 
 class DecoderHead:
     """lm_head (Linear 5120 -> 131072, no bias), tensor-parallel over the mesh.
@@ -157,19 +168,27 @@ class DecoderHead:
         if x.layout != ttnn.TILE_LAYOUT:
             x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
         out = self._apply__root_(x)
+        # The pre-gather (.., vocab/TP) shard stays reachable: the on-device sampler takes its top-k per device
+        # and merges the TP candidate lists instead of sorting the full gathered vocab row.
+        self.local = out
         if self.tp > 1:
             out = ttnn.all_gather(out, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         return ttnn.reshape(out, shape[:-1] + (out.shape[-1],))
 
+
 def build(device, torch_module):
     return DecoderHead(device, torch_module)
 
+
 _instance = None
+
 
 def decoder_head(*args, **kwargs):
     global _instance
     if _instance is None:
-        model = transformers.AutoModel.from_pretrained(HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True)
+        model = transformers.AutoModel.from_pretrained(
+            HF_MODEL_ID, trust_remote_code=True, torch_dtype="bfloat16", low_cpu_mem_usage=True
+        )
         model.eval()
         torch_sub = None
         for path in _CANDIDATE_SUBMODULE_PATHS:
@@ -179,6 +198,6 @@ def decoder_head(*args, **kwargs):
             except (AttributeError, IndexError, KeyError, TypeError):
                 continue
         if torch_sub is None:
-            raise RuntimeError('partial-stub: could not resolve `decoder_head`')
+            raise RuntimeError("partial-stub: could not resolve `decoder_head`")
         _instance = build(ttnn.open_device(device_id=0), torch_sub)
     return _instance(*args, **kwargs)
