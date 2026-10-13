@@ -45,6 +45,8 @@ class TtMinistral3MLP:
     # dtype of the many-row (prefill) down projection's partials and their reduce-scatter (None: OUT_DTYPE). The text
     # decoder reduce-scatters prefill's partials in bf16 (half the bytes, no cast before the gather); decode keeps fp32.
     PREFILL_REDUCE_DTYPE = ttnn.bfloat16
+    # Math fidelity of the many-row (prefill) down projection (None: the HiFi4 compute_cfg decode uses too).
+    PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi2
     # dtype of the fused gate/up weight the many-row (prefill) path multiplies with.
     GATE_UP_DTYPE = ttnn.bfloat8_b
 
@@ -117,6 +119,16 @@ class TtMinistral3MLP:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,  # L1 accumulation made batched prefill matmuls non-repeatable
         )
+        # The many-row down projection is compute-bound as well (fp32 accumulation kept).
+        self.down_cfg = self.compute_cfg
+        if self.PREFILL_DOWN_FIDELITY is not None:
+            self.down_cfg = ttnn.init_device_compute_kernel_config(
+                device.arch(),
+                math_fidelity=self.PREFILL_DOWN_FIDELITY,
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                packer_l1_acc=False,
+            )
         # The many-row fused gate/up is compute-bound; it runs at HiFi2 (fp32 accumulation kept).
         self.gate_up_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
@@ -183,7 +195,7 @@ class TtMinistral3MLP:
         out = ttnn.experimental.minimal_matmul(
             m,
             self.w_down,
-            compute_kernel_config=self.compute_cfg,
+            compute_kernel_config=self.down_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=self.PREFILL_REDUCE_DTYPE if (self.PREFILL_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
         )

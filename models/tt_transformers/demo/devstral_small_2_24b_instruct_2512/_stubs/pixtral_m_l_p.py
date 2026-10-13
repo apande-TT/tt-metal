@@ -21,6 +21,7 @@ class TtPixtralMLP(TtMinistral3MLP):
     GATHER_DTYPE = None  # the vision residual adds expect the fp32 all_reduce
     GATE_UP_DTYPE = ttnn.bfloat16
     PREFILL_REDUCE_DTYPE = None
+    PREFILL_DOWN_FIDELITY = None
 
     def __init__(self, device, torch_module) -> None:
         act = type(torch_module.act_fn).__name__
