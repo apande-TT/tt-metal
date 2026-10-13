@@ -122,7 +122,8 @@ class TtQwenImageEditPipeline:
         # and their inputs' two bf16 limbs in one pass (the vision and LM attention out-projections column-parallel,
         # the LM one split before its gather)
         self.split_limbs = split_limbs if precise else None
-        # and their exact lanes masked onto the weights' rows where the weights are small beside the input
+        # and their exact lanes masked onto the weights' rows where the weights are small beside the input (the
+        # vision merger's fc2 column-parallel)
         self.weight_lanes = bool(precise)
         # (the 8 masked weight copies from one read of the weight)
         self.weight_lane_split = weight_lanes if precise else None

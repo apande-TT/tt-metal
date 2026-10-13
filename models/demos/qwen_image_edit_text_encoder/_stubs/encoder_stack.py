@@ -179,6 +179,9 @@ class TtPatchMerger:
         self.w1 = upload(device, fc1.weight.detach().float().t().contiguous(), mapper=col)
         self.b1 = upload(device, fc1.bias.detach().float().reshape(1, 1, 1, -1), mapper=col)
         self.w2 = upload(device, fc2.weight.detach().float().t().contiguous(), mapper=shard_mapper(device, 0))
+        # fc2 column-parallel too (precise path): every chip takes the gathered hidden and forms its output columns
+        # over the whole K, so no float32 partial sums cross the TP axis
+        self.w2_cols = upload(device, fc2.weight.detach().float().t().contiguous(), mapper=shard_mapper(device, -1))
         self.b2 = upload(device, fc2.bias.detach().float().reshape(1, 1, 1, -1))
         self._device = device
         self.compute_cfg = hifi4_config()
@@ -194,9 +197,13 @@ class TtPatchMerger:
                 split_linear(x, self.w1, bias=self.b1, compute_kernel_config=cfg, limbs=L),
                 fast_and_approximate_mode=False,
             )
-            out = split_linear(h, self.w2, compute_kernel_config=cfg, limbs=L)
             if self.tp > 1:
-                out = exact_all_reduce(out, self._device)
+                # the hidden gathered (exact data movement), this chip's output columns over the whole K, gathered back
+                h = ttnn.all_gather(h, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
+                out = split_linear(h, self.w2_cols, compute_kernel_config=cfg, limbs=L)
+                out = ttnn.all_gather(out, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
+            else:
+                out = split_linear(h, self.w2, compute_kernel_config=cfg, limbs=L)
             return ttnn.add(out, ttnn.typecast(self.b2, ttnn.float32))
         h = ttnn.linear(x, self.w1, bias=self.b1, compute_kernel_config=self.compute_cfg)
         h = ttnn.gelu(h, fast_and_approximate_mode=False)
