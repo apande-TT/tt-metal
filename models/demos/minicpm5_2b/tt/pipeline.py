@@ -60,6 +60,9 @@ GRADUATED_STUBS = (
 _TILE = 32
 _NEG = -1e9
 _NOISE_SEG_W = 1280  # 40 tiles: under gather's 60-tile single-row threshold; 130560 / 1280 = 102 segments
+# Candidate noise read straight from the segmented buffer by one data-movement kernel (else: per-segment gather).
+_USE_NOISE_KERNEL = True
+_NOISE_KERNEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_stubs", "kernels", "sampler")
 
 
 def _round_up(n, m=_TILE):
@@ -253,6 +256,8 @@ class MiniCPM5Pipeline:
         Candidate token t sits in segment t // W at column t % W: every segment gathers at its local
         column (clamped in range), and only the segment that holds t contributes to the sum over segments.
         """
+        if _USE_NOISE_KERNEL and top_idx.dtype == ttnn.uint32 and self.batch == 32:
+            return self._noise_kernel(top_idx)
         W = _NOISE_SEG_W
         local = ttnn.subtract(ttnn.typecast(top_idx, ttnn.float32), self.noise_seg_base)  # [1, S, B, k]
         inside = ttnn.multiply(ttnn.ge(local, 0.0), ttnn.lt(local, float(W)))
@@ -261,6 +266,47 @@ class MiniCPM5Pipeline:
         seg_noise = ttnn.gather(self.noise_buf, -1, local, memory_config=local.memory_config())
         seg_noise = ttnn.typecast(seg_noise, ttnn.float32)
         return ttnn.sum(ttnn.multiply(seg_noise, inside), dim=1, keepdim=True)
+
+    def _noise_kernel(self, top_idx):
+        """_candidate_noise as one generic_op (kernels/sampler/noise_gather.cpp): each candidate's bf16 noise read
+        from its segment and widened to fp32 -- the value the masked segment sum produces."""
+        B, k = self.batch, top_idx.shape[-1]
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, 1, B, k]), ttnn.float32, ttnn.TILE_LAYOUT, self.device, ttnn.L1_MEMORY_CONFIG
+        )
+        k_tiles = top_idx.padded_shape[-1] // 32
+        grid = self.device.compute_with_storage_grid_size()
+        full_rows, rem = divmod(B, grid.x)
+        ranges = []
+        if full_rows:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, full_rows - 1)))
+        if rem:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full_rows), ttnn.CoreCoord(rem - 1, full_rows)))
+        cores = ttnn.CoreRangeSet(ranges)
+        rt = ttnn.RuntimeArgs()
+        for b in range(B):
+            rt[b % grid.x][b // grid.x] = [b, 1]
+        tile = 2 * 32 * 32
+        scratch = k_tiles * (2 * 64 + 32 * 64 + 2 * 64)
+        cb = ttnn.CBDescriptor(
+            total_size=-(-scratch // tile) * tile,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.bfloat16, tile)],
+        )
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_NOISE_KERNEL, "noise_gather.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[k, k_tiles, _NOISE_SEG_W, 0]
+            + list(ttnn.TensorAccessorArgs(top_idx).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(self.noise_buf).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=rt,
+            common_runtime_args=[top_idx.buffer_address(), self.noise_buf.buffer_address(), out.buffer_address()],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=[cb])
+        return ttnn.generic_op([top_idx, self.noise_buf, out], program)
 
     def _emit(self, logits):
         tok = self._sample(logits)
