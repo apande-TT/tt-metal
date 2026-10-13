@@ -239,6 +239,9 @@ class QwenImageEditTT:
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import encoder_stack as _tr_stack
 
         _tr_stack.SKIP_SAME_CAST = True  # no float32 -> float32 copy of the modulated activations
+        from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import timestep_embedding as _tr_temb
+
+        _tr_temb.LIMBS_L1 = True  # the timestep MLP's activation limbs in L1
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
