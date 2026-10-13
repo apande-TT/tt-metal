@@ -163,7 +163,8 @@ class DecoderHead:
     def _apply__root_(self, x):
         return ttnn.linear(x, self.w__root__weight, compute_kernel_config=self.compute_cfg)
 
-    def __call__(self, x, *args, **kwargs):
+    def __call__(self, x, *args, gather=True, **kwargs):
+        """gather=False returns each device's (.., vocab/TP) shard (the decode sampler only needs .local)."""
         shape = tuple(x.shape)
         if len(shape) != 4:
             x = ttnn.reshape(x, (1,) * (4 - len(shape)) + shape)
@@ -173,7 +174,7 @@ class DecoderHead:
         # The pre-gather (.., vocab/TP) shard stays reachable: the on-device sampler takes its top-k per device
         # and merges the TP candidate lists instead of sorting the full gathered vocab row.
         self.local = out
-        if self.tp > 1:
+        if self.tp > 1 and gather:
             out = ttnn.all_gather(out, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         return ttnn.reshape(out, shape[:-1] + (out.shape[-1],))
 
