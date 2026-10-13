@@ -65,6 +65,8 @@ def _mesh_size(device):
 # L1 cores the decode QKV activation is width-sharded over for its DRAM-sharded matmul: 16 divides both K (160 tiles)
 # and the per-device [q | k | v] N (48 tiles).
 QKV_DECODE_CORES = ttnn.CoreGrid(y=2, x=8)
+# dtype of the decode-only QKV / o_proj weight copies.
+DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
 
 
 class TtMinistral3Attention:
@@ -107,10 +109,10 @@ class TtMinistral3Attention:
         shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else None
         self._repl = repl = ttnn.ReplicateTensorToMesh(device) if is_mesh else None
 
-        def _put(t, mapper, memory_config=ttnn.DRAM_MEMORY_CONFIG):
+        def _put(t, mapper, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16):
             return ttnn.from_torch(
                 t.detach().to(torch.bfloat16).contiguous(),
-                dtype=ttnn.bfloat16,
+                dtype=dtype,
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
                 mesh_mapper=mapper,
@@ -139,7 +141,8 @@ class TtMinistral3Attention:
         self.wqkv_decode = _put(
             wqkv,
             shard(-1),
-            ttnn.MemoryConfig(
+            dtype=DECODE_WEIGHT_DTYPE,
+            memory_config=ttnn.MemoryConfig(
                 ttnn.TensorMemoryLayout.WIDTH_SHARDED,
                 ttnn.BufferType.DRAM,
                 ttnn.ShardSpec(
@@ -164,6 +167,8 @@ class TtMinistral3Attention:
             num_workers_per_dram_bank=2,
         )
         self.wo = _put(torch_module.o_proj.weight.T, shard(-2))
+        # Decode reads block-float8 copies of its projection weights (DRAM-bound single-row matmuls); prefill keeps bf16.
+        self.wo_decode = _put(torch_module.o_proj.weight.T, shard(-2), dtype=DECODE_WEIGHT_DTYPE)
 
         # rotate_half(x) == x @ R  (HF convention: cat(-x2, x1); meta_rope: each pair (x_2j, x_2j+1) -> (-x_2j+1, x_2j)).
         if self.meta_rope:
@@ -461,7 +466,9 @@ class TtMinistral3Attention:
             ttnn.to_memory_config(attn, head_cfg), num_heads=self.local_heads
         )
         attn = ttnn.sharded_to_interleaved(attn, ttnn.L1_MEMORY_CONFIG)  # (1, 1, B, heads * head_dim)
-        return self._reduce(ttnn.linear(attn, self.wo, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg))
+        return self._reduce(
+            ttnn.linear(attn, self.wo_decode, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg)
+        )
 
 
 def build(device, torch_module=None):
