@@ -91,17 +91,20 @@ class TtDecoderLayer:
         if len(x.shape) == 4:
             x = ttnn.reshape(x, (x.shape[0] * x.shape[1], x.shape[-2], x.shape[-1]))
 
-        # A decode step's residual stream is one tile row: keep it in L1 (prefill's stays in DRAM).
+        # A decode step's residual stream is one tile row: keep it in L1 (prefill's stays in DRAM). The norm
+        # outputs feed only the next projection, so they are L1 in both stages (one 16 MB prefill tensor still
+        # fits beside minimal_matmul's static CBs).
         mem = ttnn.L1_MEMORY_CONFIG if x.shape[0] == 1 and x.padded_shape[-2] == 32 else ttnn.DRAM_MEMORY_CONFIG
+        l1 = ttnn.L1_MEMORY_CONFIG
         attn_out, _ = self.self_attn(
-            self.input_layernorm(x, memory_config=mem),
+            self.input_layernorm(x, memory_config=l1),
             position_embeddings=position_embeddings,
             past_key_values=past_key_values,
             **kwargs,
         )
         h = ttnn.add(x, attn_out, memory_config=mem)
         ttnn.deallocate(attn_out)
-        mlp_out = self.mlp(self.post_attention_layernorm(h, memory_config=mem))
+        mlp_out = self.mlp(self.post_attention_layernorm(h, memory_config=l1))
         out = ttnn.add(h, mlp_out, memory_config=mem)
         ttnn.deallocate(mlp_out)
         ttnn.deallocate(h)

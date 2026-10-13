@@ -167,6 +167,8 @@ class TtAttention:
             # Batch folded into the rows: one M = B*S fused-QKV matmul reading its weight once, then the
             # head split [B, 1, S, (n + 2 kv) * D] -> q [B, n, S, D], k/v [B, kv, S, D] in one op.
             qkv = self._prefill_mm(ttnn.reshape(x, (1, b * seq, x.shape[-1])), self.wqkv)
+            if x.memory_config().buffer_type == ttnn.BufferType.L1:
+                ttnn.deallocate(x)  # an L1 norm output: free it before the score bmm's large static CBs
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
                 ttnn.reshape(qkv, (b, 1, seq, qkv.shape[-1])),
                 num_heads=self.n_heads,
