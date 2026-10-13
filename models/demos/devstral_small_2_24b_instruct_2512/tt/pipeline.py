@@ -115,7 +115,8 @@ PLANNED_TP = 4
 #                     Prefill/encode down projection on minimal_matmul too (full grid).
 #                     Fused gate/up computes at HiFi2 (fp32 accumulation).
 #   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk);
-#                     lm_head weight in bfloat8_b (half the largest decode-step DRAM read).
+#                     lm_head weight in bfloat8_b (half the largest decode-step DRAM read). Decode skips the
+#                     full-row logits all_gather (the sampler reads the shards; VocabShards joins them on host reads).
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
 #                     directly (no bf16 cast op, no single-core interleaved norm).
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
@@ -401,6 +402,8 @@ class DevstralPipeline:
         # top-k returns these labels directly (ttnn.topk indices_tensor), so the TP candidate lists merge with
         # one more top-k and no index arithmetic.
         self._vocab_ids = None
+        grid = device.compute_with_storage_grid_size()
+        self._full_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))})
         if self._tp() > 1:
             vocab = int(tcfg.vocab_size)
             self._vocab_ids = ttnn.from_torch(
@@ -547,7 +550,15 @@ class DevstralPipeline:
         local = getattr(self.lm_head, "local", None)
         if self._vocab_ids is None or local is None or tuple(local.shape) != tuple(self._vocab_ids.shape):
             return ttnn.topk(logits, k=k, dim=-1, largest=True, sorted=True)
-        vals, ids = ttnn.topk(local, k=k, dim=-1, largest=True, sorted=True, indices_tensor=self._vocab_ids)
+        vals, ids = ttnn.topk(
+            local,
+            k=k,
+            dim=-1,
+            largest=True,
+            sorted=True,
+            indices_tensor=self._vocab_ids,
+            sub_core_grids=self._full_grid,
+        )
         vals = ttnn.all_gather(vals, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         ids = ttnn.all_gather(ids, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         return ttnn.topk(vals, k=k, dim=-1, largest=True, sorted=True, indices_tensor=ids)
@@ -575,11 +586,13 @@ class DevstralPipeline:
             cur_pos=state["cur_pos"],
             mode="decode",
         )
-        logits = self.lm_head(hidden)
+        # The sampler reads each device's vocab shard (lm_head.local), so the token path skips the full-row
+        # all_gather; host readers join the shards on the vocab dim (VocabShards / host_read).
+        logits = self.lm_head(hidden, gather=False)
         ttnn.plus_one(state["cur_pos"])
         ttnn.add(state["pos"], 1.0, output_tensor=state["pos"])
         state["drawn"] = self.sample(logits, state)
-        state["logits"] = logits
+        state["logits"] = VocabShards(logits) if self._tp() > 1 else logits
         state["position"] = state["position"] + 1
         return state
 
@@ -687,7 +700,8 @@ class DevstralPipeline:
         self._stage["decode"] = self.decode_prefill(self._token_request(prompt))
 
     def decode_trace_step(self):
-        return self.decode_step(self._stage["decode"])["logits"]
+        logits = self.decode_step(self._stage["decode"])["logits"]
+        return logits.tensor if isinstance(logits, VocabShards) else logits
 
     def decode_trace_items(self):
         """One token for every batch row."""
@@ -740,8 +754,20 @@ def build_pipeline(
 # --------------------------------------------------------------------------------------- task heads (TT)
 
 
+class VocabShards:
+    """Decode logits kept as each device's (1, 1, B, vocab/TP) lm_head shard: the on-device sampler only needs
+    the shards, so no all_gather runs on the token path; host_read joins them on the vocab dim."""
+
+    __slots__ = ("tensor",)
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+
+
 def host_read(t, device):
-    """Device -> host read of a replicated tensor (the first replica)."""
+    """Device -> host read of a replicated tensor (the first replica), or the full vocab row of VocabShards."""
+    if isinstance(t, VocabShards):
+        return ttnn.to_torch(t.tensor, mesh_composer=ttnn.ConcatMeshToTensor(device, dim=-1))
     if isinstance(device, ttnn.MeshDevice):
         return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(device, dim=0))[: t.shape[0]]
     return ttnn.to_torch(t)
