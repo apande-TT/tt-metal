@@ -119,6 +119,7 @@ PLANNED_TP = 4
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
 #   ministral3_attention: prefill QKV projection on minimal_matmul (full grid).
+#   prompts pad to a tile multiple only; prefill attention pads q/k/v to whole SDPA key chunks itself.
 #   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard,
 #                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
 
@@ -137,10 +138,9 @@ SAMPLING_TOP_K = 32
 # logits that the two sides order differently still receive the same noise each.
 NOISE_BUCKETS = 1024
 TRACE_REGION_SIZE = 300_000_000
-# Prompts are right-padded to a multiple of this many positions (capped at the KV capacity) so prefill SDPA
-# can run 512-wide key chunks: narrower key chunks bias attention's output level (see ministral3_attention).
-# The padded rows come after every real row, so causal attention leaves rows 0..L-1 unchanged.
-PROMPT_PAD = 512
+# Prompts are right-padded only to a tile multiple: prefill attention pads its own q/k/v to whole 512-wide SDPA key
+# chunks (narrower key chunks bias attention's output level, see ministral3_attention.sdpa_len), so no other layer
+# computes pad rows. The padded rows come after every real row, so causal attention leaves rows 0..L-1 unchanged.
 
 # Component name -> the stub class(es) that implement it. Every class here is invoked by the forward chain
 # below; Gate 2 reads INVOKED (filled by the probe installed at build) against this table.
@@ -292,9 +292,8 @@ def encode_request(
 
 
 def padded_prompt_len(real_len, kv_capacity):
-    """Prefill length: real_len rounded up to PROMPT_PAD, never past the resident KV capacity (tile multiple)."""
-    padded = int(math.ceil(real_len / PROMPT_PAD) * PROMPT_PAD)
-    return padded if padded <= kv_capacity else int(math.ceil(real_len / 32) * 32)
+    """Prefill length: real_len rounded up to a tile multiple (<= the resident KV capacity, itself a tile multiple)."""
+    return int(math.ceil(real_len / 32) * 32)
 
 
 def gumbel_table(seeds, steps, buckets=NOISE_BUCKETS):
