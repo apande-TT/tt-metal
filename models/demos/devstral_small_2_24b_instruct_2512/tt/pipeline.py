@@ -118,7 +118,8 @@ PLANNED_TP = 4
 #                     projection runs a 1D multicast config with 8-tile K blocks (the auto config's 2-tile blocks
 #                     made it multicast-latency-bound).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
-#                     Prefill/encode down projection on minimal_matmul too (full grid).
+#                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
+#                     computes at HiFi2 (fp32 accumulation).
 #                     Fused gate/up computes at HiFi2 (fp32 accumulation), 8 x 8 x 12-tile blocks; the text
 #                     decoder's fused gate/up weight is bfloat8_b (the vision MLPs keep bf16).
 #   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk);
