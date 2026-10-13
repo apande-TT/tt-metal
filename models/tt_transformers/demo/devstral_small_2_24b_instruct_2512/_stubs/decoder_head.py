@@ -142,9 +142,11 @@ class DecoderHead:
             self.tp = 1
         w = torch_module.weight.detach().T.contiguous().to(torch.bfloat16)  # (in, vocab)
         assert w.shape[-1] % self.tp == 0, f"vocab {w.shape[-1]} not divisible by TP={self.tp}"
+        # bfloat8_b weight: the lm_head is the largest single DRAM read of a decode step (vocab/TP x 5120), so
+        # block-float halves it; accumulation stays fp32.
         self.w__root__weight = ttnn.from_torch(
             w,
-            dtype=ttnn.bfloat16,
+            dtype=ttnn.bfloat8_b,
             layout=ttnn.TILE_LAYOUT,
             device=device,
             mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1) if self.tp > 1 else None,
