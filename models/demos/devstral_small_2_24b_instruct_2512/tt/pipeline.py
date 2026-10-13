@@ -117,6 +117,8 @@ PLANNED_TP = 4
 #   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk);
 #                     lm_head weight in bfloat8_b (half the largest decode-step DRAM read). Decode skips the
 #                     full-row logits all_gather (the sampler reads the shards; VocabShards joins them on host reads).
+#   sample(): the step's noise is looked up row-major and tilized as (B, NB); the bucket is a bitwise and; the draw is
+#                     one top-1 over the noisy scores labelled with the candidate ids (no argmax + index gather).
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
 #                     directly (no bf16 cast op, no single-core interleaved norm).
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
@@ -521,13 +523,15 @@ class DevstralPipeline:
         b, k, nb = self.batch, self.top_k, NOISE_BUCKETS
         vals, idx = self._topk(logits)
         scores = ttnn.multiply(ttnn.typecast(vals, ttnn.float32), 1.0 / self.temperature)
-        noise = ttnn.embedding(state["step"], state["noise"], layout=ttnn.TILE_LAYOUT)  # (1, 1, B*NB) bf16
-        noise = ttnn.reshape(ttnn.typecast(noise, ttnn.float32), (1, 1, b, nb))
-        ids = ttnn.typecast(idx, ttnn.float32)  # exact: ids < 2^24
-        bucket = ttnn.subtract(ids, ttnn.multiply(ttnn.floor(ttnn.multiply(ids, 1.0 / nb)), float(nb)))
-        scores = ttnn.add(scores, ttnn.gather(noise, dim=-1, index=ttnn.typecast(bucket, ttnn.uint32)))
-        pick = ttnn.to_layout(ttnn.argmax(scores, dim=-1, keepdim=True), ttnn.TILE_LAYOUT)
-        drawn = ttnn.gather(idx, dim=-1, index=pick)  # (1, 1, B, 1) uint32
+        # The step's noise: one row-major lookup, a free row-major reshape to (B, NB), then a 32-row tilize (the
+        # tile-layout lookup tilized one 32768-wide row padded to a full tile and reshaped it after the cast).
+        noise = ttnn.embedding(state["step"], state["noise"], layout=ttnn.ROW_MAJOR_LAYOUT)  # (1, 1, B*NB) bf16
+        noise = ttnn.typecast(ttnn.to_layout(ttnn.reshape(noise, (1, 1, b, nb)), ttnn.TILE_LAYOUT), ttnn.float32)
+        bucket = ttnn.bitwise_and(idx, nb - 1)  # token v draws noise bucket v % NB (NB is a power of two)
+        scores = ttnn.add(scores, ttnn.gather(noise, dim=-1, index=bucket))
+        # The best score and its vocab id in one op: the top-1 carries the candidates' ids as labels (no argmax +
+        # index gather). Equal-score ties stay arbitrary, as the unstable candidate ordering already made them.
+        _, drawn = ttnn.topk(scores, k=1, dim=-1, largest=True, sorted=True, indices_tensor=idx)  # (1, 1, B, 1)
         # generate(): finished rows emit pad; a row finishes on the step it emits eos.
         unf = state["unfinished"]
         nxt = ttnn.add(
