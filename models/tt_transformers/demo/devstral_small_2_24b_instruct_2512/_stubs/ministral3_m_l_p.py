@@ -18,6 +18,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import tp_ccl_args
 
 # Prefill token rows (batch rows x sequence) one MLP chunk processes at a time. With gate/up fused into one
 # SwiGLU op the only intermediate is the (rows, intermediate/TP) product: 268 MB/chip for a full 32 x 512
@@ -138,8 +139,9 @@ class TtMinistral3MLP:
             return out
         if self.GATHER_DTYPE is None:
             return ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
-        out = ttnn.reduce_scatter(out, dim=3, topology=ttnn.Topology.Linear)
-        return ttnn.all_gather(ttnn.typecast(out, self.GATHER_DTYPE), dim=3, topology=ttnn.Topology.Linear)
+        ccl = tp_ccl_args()
+        out = ttnn.reduce_scatter(out, dim=3, **ccl)
+        return ttnn.all_gather(ttnn.typecast(out, self.GATHER_DTYPE), dim=3, **ccl)
 
 
 def build(device, torch_module=None):

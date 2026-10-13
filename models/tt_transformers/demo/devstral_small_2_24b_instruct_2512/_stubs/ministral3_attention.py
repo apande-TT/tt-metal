@@ -31,6 +31,17 @@ import torch
 import ttnn
 
 
+def tp_ccl_args():
+    """Topology / links for the text decoder's TP collectives: Ring over 2 links when the ring fabric is active
+    (QB2, see mesh.py), else Linear on the default link count."""
+    try:
+        if ttnn.get_fabric_config() == ttnn.FabricConfig.FABRIC_1D_RING:
+            return {"topology": ttnn.Topology.Ring, "num_links": 2}
+    except Exception:  # noqa: BLE001
+        pass
+    return {"topology": ttnn.Topology.Linear}
+
+
 def _mesh_size(device):
     try:
         return int(device.get_num_devices())
@@ -141,8 +152,9 @@ class TtMinistral3Attention:
         its fp32 residual unrounded (mixed-dtype ADD runs on the SFPU in fp32)."""
         if self.tp == 1:
             return t
-        t = ttnn.reduce_scatter(t, dim=3, topology=ttnn.Topology.Linear)
-        return ttnn.all_gather(ttnn.typecast(t, ttnn.bfloat16), dim=3, topology=ttnn.Topology.Linear)
+        ccl = tp_ccl_args()
+        t = ttnn.reduce_scatter(t, dim=3, **ccl)
+        return ttnn.all_gather(ttnn.typecast(t, ttnn.bfloat16), dim=3, **ccl)
 
     def _rope(self, x, cos, sin):
         return ttnn.add(
