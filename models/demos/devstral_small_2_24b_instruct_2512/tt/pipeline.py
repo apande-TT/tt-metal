@@ -125,7 +125,7 @@ PLANNED_TP = 4
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
 #   ministral3_attention: prefill QKV projection on minimal_matmul (full grid). Decode concatenates the SDPA heads
 #                     with nlp_concat_heads_decode on the head shards (no un-padding reshape through DRAM). Decode QKV
-#                     is a DRAM-sharded matmul over its own bank-sharded copy of the [q | k | v] weight.
+#                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v].
 #   prompts pad to a tile multiple only; prefill attention pads q/k/v to whole SDPA key chunks itself.
 #   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard,
 #                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
