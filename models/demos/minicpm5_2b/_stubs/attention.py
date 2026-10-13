@@ -30,6 +30,9 @@ from models.demos.minicpm5_2b._stubs.decode_mm import decode_linear_config
 # Decode KV-cache write as one C++ kernel via ttnn.generic_op (else: slot-read matmuls + sub/add + paged_update_cache).
 _USE_KV_WRITE_KERNEL = True
 _KV_WRITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "kv_write")
+# Decode head split/merge as one data-movement kernel each (else: slice + tiled reshape on both sides).
+_USE_HEAD_KERNELS = True
+_HEADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "heads")
 
 
 def _rotate_half_matrix(head_dim):
@@ -200,8 +203,11 @@ class TtAttention:
             # One token per row: the grouped columns split straight into [B, kv, groups + 1, D] (rows 0..groups-1
             # the query heads h = kv * groups + j, row `groups` that KV head's key), so q and k share one rope and
             # the cache is attended per KV head with no repeat. The key row's scores are computed and discarded.
-            qk = ttnn.slice(qkv, (0, 0, 0), (1, b, nq + nkv), memory_config=l1)
-            qk = ttnn.reshape(qk, (b, self.n_kv_heads, g + 1, d))
+            if _USE_HEAD_KERNELS and b == 32:
+                qk = self._heads_op("head_split", qkv, (b, self.n_kv_heads, g + 1, d), [g + 1], l1)
+            else:
+                qk = ttnn.slice(qkv, (0, 0, 0), (1, b, nq + nkv), memory_config=l1)
+                qk = ttnn.reshape(qk, (b, self.n_kv_heads, g + 1, d))
             qk = self._rope(qk, cos, sin, self._rope_cfg(qk), memory_config=l1)
             d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
             if _USE_KV_WRITE_KERNEL:
@@ -244,8 +250,11 @@ class TtAttention:
                 compute_kernel_config=self.compute_cfg,
                 memory_config=l1,
             )
-            attn = ttnn.slice(attn, (0, 0, 0, 0), (b, self.n_kv_heads, g, d), memory_config=l1)
-            attn = ttnn.reshape(attn, (1, b, self.n_heads * self.head_dim))
+            if _USE_HEAD_KERNELS and b == 32:
+                attn = self._heads_op("head_merge", attn, (1, b, self.n_heads * d), [g, d // 32, b], l1)
+            else:
+                attn = ttnn.slice(attn, (0, 0, 0, 0), (b, self.n_kv_heads, g, d), memory_config=l1)
+                attn = ttnn.reshape(attn, (1, b, self.n_heads * self.head_dim))
         return ttnn.linear(
             attn,
             self.wo,
@@ -253,6 +262,54 @@ class TtAttention:
             memory_config=l1,
             program_config=self.cfg_o,
         )
+
+    def _heads_op(self, kernel, src, out_shape, args, memory_config):
+        """Decode head split/merge (kernels/heads): a bf16 row-half gather into `out_shape` tiles, spread over
+        the grid. head_split args: [rows]; head_merge args: [groups, Dt, B]."""
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(list(out_shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
+        )
+        n_tiles = math.prod(out.padded_shape) // (32 * 32)
+        grid = self.device.compute_with_storage_grid_size()
+        n_cores = min(n_tiles, grid.x * grid.y)
+        base, extra = divmod(n_tiles, n_cores)
+        full_rows, rem = divmod(n_cores, grid.x)
+        ranges = []
+        if full_rows:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, full_rows - 1)))
+        if rem:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full_rows), ttnn.CoreCoord(rem - 1, full_rows)))
+        cores = ttnn.CoreRangeSet(ranges)
+        rt, start = ttnn.RuntimeArgs(), 0
+        for i in range(n_cores):
+            count = base + (1 if i < extra else 0)
+            rt[i % grid.x][i // grid.x] = [start, count]
+            start += count
+        tile, cb_tile = 2 * 32 * 32, 0
+        if kernel == "head_split":
+            ct = [self.n_kv_heads, args[0], self.head_dim // 32, cb_tile]
+        else:
+            ct = [self.n_kv_heads, *args, cb_tile]
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_HEADS_DIR, f"{kernel}.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct
+            + list(ttnn.TensorAccessorArgs(src).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=rt,
+            common_runtime_args=[src.buffer_address(), out.buffer_address()],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=tile,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(cb_tile, ttnn.bfloat16, tile)],
+            )
+        ]
+        program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=cbs)
+        return ttnn.generic_op([src, out], program)
 
     def _prefill_mm(self, x, w):
         """Prefill projection on minimal_matmul's small streaming CBs, which span the full grid under fp32
