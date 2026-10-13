@@ -180,7 +180,15 @@ def check_against_golden(task, run, pipe, hf_model, req):
 
     P.reset_invocations()
     res = run(pipe, req, teacher=gt, on_step=on_step)
-    assert res["steps"] == T and not res["hit_cap"], f"{task}: TT run ended after {res['steps']} of {T} golden steps"
+    if _osl_capped():
+        # The harness caps the horizon for profiling: compare the steps that ran, termination not asserted.
+        print(f"[{task}] {P.OSL_ENV} is set: compared {res['steps']} of {T} golden steps, termination not asserted")
+        T = res["steps"]
+        gt, alive, margins, step_err = gt[:, :T], alive[:, :T], margins[:, :T], step_err[:, :T]
+    else:
+        assert (
+            res["steps"] == T and not res["hit_cap"]
+        ), f"{task}: TT run ended after {res['steps']} of {T} golden steps"
 
     hidden = P.host_read(res["state"]["hidden"], pipe.device)[:, :L].float()
     h_pcc, h_ratio = hidden_state_check(hidden, golden["prefill_hidden"])

@@ -97,7 +97,6 @@ PIPELINE_STAGES = ["encode", "prefill", "decode"]
 TASKS = ("text_generation", "image_text_to_text")
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
-CAPTURED_DIR = PACKAGE_DIR / "_captured"
 
 BATCH_ENV = "TT_PERF_BATCH"
 LAYERS_ENV = "TT_PERF_LAYERS"
@@ -204,20 +203,19 @@ def _install_invocation_probe():
 
 @functools.lru_cache(maxsize=1)
 def load_hf_model():
-    """The HF reference (FP8 checkpoint dequantized to bf16 by transformers on a host without a GPU)."""
-    import transformers
+    """The HF reference: the FP8 checkpoint with weights bit-identical to transformers' bf16 dequantizing load,
+    its text linears held as FP8 + scale in host memory (reference/checkpoint.py: ~48 GB -> ~22 GB)."""
+    from models.demos.devstral_small_2_24b_instruct_2512.reference.checkpoint import load_reference_model
 
-    model = transformers.AutoModelForImageTextToText.from_pretrained(
-        MODEL_ID, dtype=torch.bfloat16, low_cpu_mem_usage=True
-    )
-    return model.eval()
+    return load_reference_model(MODEL_ID)
 
 
 @functools.lru_cache(maxsize=1)
 def load_processor():
     import transformers
 
-    return transformers.AutoProcessor.from_pretrained(MODEL_ID)
+    # transformers flags the checkpoint's pre-tokenizer regex as wrong and fixes it on request.
+    return transformers.AutoProcessor.from_pretrained(MODEL_ID, fix_mistral_regex=True)
 
 
 def requested_batch(default=DEFAULT_BATCH) -> int:
@@ -242,14 +240,17 @@ def chat_messages(prompt, image=None):
     return [{"role": "user", "content": content}]
 
 
-def encode_request(processor, prompt, image=None, batch=DEFAULT_BATCH, seeds=None, kv_capacity=DEFAULT_KV_CAPACITY):
+def encode_request(
+    processor, prompt, image=None, batch=DEFAULT_BATCH, seeds=None, kv_capacity=DEFAULT_KV_CAPACITY, model=None
+):
     # Pass the pipeline's own capacity (pipe.kv_capacity): the safety cap must be the one the device holds.
     """HOST encoding of one request for `batch` rows: chat template + tokenizer (+ image processor).
 
     Content is identical in every row; only the sampling seed differs (seed = row index by default). The prompt is
-    right-padded with pad_token_id to padded_prompt_len(); causal attention keeps rows 0..L-1 independent of it."""
-    cfg = load_hf_model().config
-    gen = load_hf_model().generation_config
+    right-padded with pad_token_id to padded_prompt_len(); causal attention keeps rows 0..L-1 independent of it.
+    `model` supplies the config (default: the cached reference)."""
+    model = model if model is not None else load_hf_model()
+    cfg, gen = model.config, model.generation_config
     enc = processor.apply_chat_template(
         chat_messages(prompt, image), add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
     )
@@ -552,16 +553,30 @@ class DevstralPipeline:
         }
 
     # ---------------------------------------------------------------- per-stage trace contract (perf engine)
+    #
+    # The stage inputs are the golden inputs the e2e tests and the demos run (demo/inputs.py through the HF
+    # processor), not the bring-up's _captured/*.pt: those tensors are gitignored and exist only on the box that
+    # ran the capture (this checkout has manifests only, and no token_embed capture at all), and the captured
+    # image was a 1540x1540 render the gated pipeline never sees.
+
+    def _trace_request(self, task):
+        """The encoded e2e / demo request of `task` for this pipeline's batch and KV capacity."""
+        from models.demos.devstral_small_2_24b_instruct_2512.demo.inputs import IMAGE_PROMPT, TEXT_PROMPT, load_image
+
+        image = load_image() if task == "image_text_to_text" else None
+        return encode_request(
+            load_processor(),
+            IMAGE_PROMPT if image is not None else TEXT_PROMPT,
+            image=image,
+            batch=self.batch,
+            kv_capacity=self.kv_capacity,
+            model=self.hf,
+        )
 
     def encode_trace_inputs(self):
-        """The captured vision-tower input (_captured/pixtral_vision_model), one image per batch row."""
-        pv = torch.load(CAPTURED_DIR / "pixtral_vision_model" / "args.pt", weights_only=False)[0]
-        sizes = torch.load(CAPTURED_DIR / "pixtral_vision_model" / "kwargs.pt", weights_only=False)["image_sizes"]
-        size = tuple(int(v) for v in sizes[0])
-        return {
-            "pixel_values": pv[:1].expand(self.batch, *pv.shape[1:]).contiguous(),
-            "image_sizes": [size] * self.batch,
-        }
+        """The image_text_to_text request's image, one per batch row."""
+        req = self._trace_request("image_text_to_text")
+        return {"pixel_values": req["pixel_values"], "image_sizes": req["image_sizes"]}
 
     def encode_trace_setup(self, inputs):
         pv, sizes = inputs["pixel_values"], [tuple(int(v) for v in s) for s in inputs["image_sizes"]]
@@ -586,14 +601,15 @@ class DevstralPipeline:
         """Patches the 24 vision layers process in one call: B images x (h/14 * w/14)."""
         st = self._stage.get("encode")
         if st is None:
-            st = {"patches": (self.config.vision_config.image_size // self.config.vision_config.patch_size) ** 2}
+            h, w = self.encode_trace_inputs()["image_sizes"][0]
+            p = self.config.vision_config.patch_size
+            st = {"patches": (h // p) * (w // p)}
         return self.batch * st["patches"]
 
     def prefill_trace_inputs(self):
-        """The captured prompt tokens (_captured/token_embed), replicated to every batch row."""
-        cap = torch.load(CAPTURED_DIR / "token_embed" / "golden_cache_s0.pt", weights_only=False)
-        prompt = cap["kwargs"]["input"].reshape(1, -1)
-        return {"input_ids": prompt.expand(self.batch, prompt.shape[1]).contiguous()}
+        """The text_generation request's prompt tokens (unpadded), one copy per batch row."""
+        req = self._trace_request("text_generation")
+        return {"input_ids": req["tokens"][:, : req["real_len"]].contiguous()}
 
     def prefill_trace_setup(self, inputs):
         """Pin the prompt to a tile-multiple capacity, pre-upload tokens / positions / noise / state."""
@@ -607,8 +623,12 @@ class DevstralPipeline:
         return logits
 
     def prefill_trace_items(self):
+        """Prompt rows the text layers process in one call: B x the padded prompt length."""
         dev = self._stage.get("prefill")
-        return self.batch * (dev["seq"] if dev is not None else 32)
+        if dev is None:
+            real_len = int(self.prefill_trace_inputs()["input_ids"].shape[1])
+            return self.batch * padded_prompt_len(real_len, self.kv_capacity)
+        return self.batch * dev["seq"]
 
     def decode_trace_inputs(self):
         return self.prefill_trace_inputs()

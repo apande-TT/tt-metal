@@ -86,7 +86,8 @@
       "vision_tower.transformer.layers.N (PixtralAttentionLayer)": "three graduated stubs port it: pixtral_attention_layer, layer, attention (TtPixtralAttentionLayer and TtLayer subclass TtAttention). The 24 vision layers are held as ONE list of TtAttention-based elements, rotating the three classes so every one runs real layers.",
       "vision_tower.transformer.layers.N.feed_forward (PixtralMLP)": "two graduated stubs port it: pixtral_m_l_p and mlp (both subclass TtMinistral3MLP); the vision layers alternate them.",
       "vision_tower.transformer (PixtralTransformer)": "two graduated stubs port it: pixtral_transformer subclasses encoder_stack (TtEncoderStack); the vision model holds a TtPixtralTransformer whose forward IS encoder_stack's __call__ body."
-    }
+    },
+    "verified_2026_10_12": "Re-verified on this box from bringup_status.json + _stubs/: 7 NEW (ministral3_model, ministral3_decoder_layer, pixtral_vision_model, pixtral_attention_layer, pixtral_transformer, mistral3_multi_modal_projector, mistral3_patch_merger) each have _stubs/<name>.py.last_good_sharded; the 15 REUSE/ADAPT components each have a live stub + last_good_native/_sharded snapshot and are ON_DEVICE in RUN_REPORT. Live stubs are byte-identical to their .last_good_sharded snapshots (the emit-e2e launch re-sources them). 22/22 routed, none wasted."
   },
   "hardware": {
     "box": "QB2 (4x Blackhole)",
@@ -180,7 +181,8 @@
     "Gate 3: e2e PCC >= 0.99 per call vs HF golden, batch 32",
     "trace: trace_capture_selftest captures encode / prefill / decode one at a time, replays and PCC-checks each",
     "host-op: host_op_selftest runs encode+prefill+decode under observe_host_ops and must report zero host aten ops",
-    "pre-commit hooks run over every emitted file"
+    "pre-commit hooks run over every emitted file",
+    "re-run on this box after the loader / trace-input changes: all 4 tests/e2e, trace_capture_selftest, host_op_selftest, the trace-replay perf test (README numbers are copied from it)"
   ],
   "pipeline_stages": [
     "encode",
@@ -212,5 +214,28 @@
     "prefill_sdpa": "widest key chunk the padded prompt allows (<= 512); prompts right-padded to 512 positions (narrow key chunks bias attention's output level up, which the text decoder's image-token rows amplify)",
     "why": "the image task's first-stage hidden state (>= 0.995 PCC, |tt|/|ref| within 0.5%) failed at 0.993 until these level biases were removed"
   },
-  "hardware_note": "Physical chip 1 (PCI 02:00.0) miscomputes matmul columns when hot (thermal fault, reproduced by a sustained-matmul test). Gate results are only trusted from runs started cool (< ~63 C); identical batch rows diverging is the symptom."
+  "hardware_note": "Physical chip 1 (PCI 02:00.0) miscomputes matmul columns when hot (thermal fault, reproduced by a sustained-matmul test). Gate results are only trusted from runs started cool (< ~63 C); identical batch rows diverging is the symptom.",
+  "environment_findings_2026_10_12": {
+    "captures_not_shipped": "The _captured/<name>/*.pt golden tensors are gitignored and were never on this box (bring-up ran elsewhere); only manifest.json files exist, and there is no _captured/token_embed at all. <stage>_trace_inputs() therefore must not torch.load captures: they assemble the stage's argument from the SAME encoded request the e2e tests and demos use (the tool-authored prompt / 224x224 image through the HF processor). This also replaces the bring-up capture's 1540x1540 image (12100 patches/image, a 37 GB encode trace) with the image the gate actually measures (256 patches/image).",
+    "host_memory": "QB2 host has 249 GB RAM but ~40 GB available to this run (about 180 GB is held outside every cgroup and process, not freeable without a reboot). transformers dequantizes the FP8 checkpoint to bf16 on a GPU-less host (~48 GB), which does not fit. The reference is loaded with the text-decoder linears kept as FP8 codes + per-tensor scale (~22 GB) and dequantized on access through a 256-entry table computed with transformers' own Fp8Dequantize arithmetic ((fp8.float() * scale).to(bf16)), so every weight element is bit-identical to the dequantizing load (asserted at load). Vision tower, projector, embeddings, norms and lm_head stay bf16 exactly as transformers loads them.",
+    "device_conflict": "An idle Kolibri-1 vLLM container (tt-model-kolibri_1-default, last request 21:55) held all 4 chips; it was stopped (not removed) so this run could open the 1x4 mesh. Restart with: docker start tt-model-kolibri_1-default",
+    "tokenizer": "load_processor passes fix_mistral_regex=True (transformers flags the checkpoint's pre-tokenizer regex as wrong); verified identical ids for both tool-authored prompts, so goldens are unaffected."
+  },
+  "verification_2026_10_13": {
+    "box": "QB2 4x p300c, mesh 1x4, TT_PERF_BATCH=32, after the loader / trace-input changes",
+    "text_generation": {
+      "test_e2e_text_generation": "PASSED (golden 127 steps, all rows EOS; tokens 2523/2527 exact + 4 near-tie; prefill hidden PCC 0.999458, |tt|/|ref| 0.99974; e2e PCC 0.9998245825768622)",
+      "test_e2e_text_generation_free_run": "PASSED (TT to EOS in 153 steps; HF teacher-forced: 2758/2765 exact + 7 near-tie; PCC 0.9997655754009245)"
+    },
+    "image_text_to_text": {
+      "test_e2e_image_text_to_text (E2E_CORRECTNESS_GATE)": "PASSED (golden 26 steps, all rows EOS; tokens 828/832 exact + 4 near-tie; prefill hidden PCC 0.996689 ratio 0.99997; encode PCC 0.999892 ratio 1.00110; e2e PCC 0.9998481075615955; Gate 1 22/22 native, Gate 2 22/22 invoked)",
+      "test_e2e_image_text_to_text_free_run": "PASSED (832/832 exact; PCC 0.9998542044629577)"
+    },
+    "trace_capture_selftest": "True (encode / prefill / decode captured + replayed, trace-vs-eager PCC 1.000000 each)",
+    "host_op_selftest": "on_device=True, 0 host aten ops (both tasks)",
+    "trace_replay": "test_text_generation_perf.py PASSED, all stages trace+1cq (README copies its output)",
+    "block_stack_gate": "None (passes)",
+    "demos": "demo_text_generation and demo_image_text_to_text ran to EOS on the mesh",
+    "reference_exactness": "text/image free-run and golden PCCs equal the earlier box's (transformers dequantizing load) to every printed digit"
+  }
 }

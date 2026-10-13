@@ -47,10 +47,9 @@ Only the declared correctness gate:
 TT_PERF_BATCH=32 ./python_env/bin/python -m pytest -p no:timeout models/demos/devstral_small_2_24b_instruct_2512/tests/e2e/test_e2e_image_text_to_text.py::test_e2e_image_text_to_text -s
 ```
 
-Trace replay (per-stage latency). The encode stage runs 32 images of 1540 px per replay, so the default 16
-replays heat this board past its thermal limit; one warmup and one replay keeps it inside:
+Trace replay (per-stage latency; each stage set up from its `<stage>_trace_inputs()`, captured and replayed):
 ```bash
-TT_PERF_BATCH=32 TT_TRACE_WARMUP_ITERS=1 TT_TRACE_REPLAY_ITERS=1 ./python_env/bin/python -m pytest -p no:timeout models/demos/devstral_small_2_24b_instruct_2512/tests/e2e/test_text_generation_perf.py -s
+TT_PERF_BATCH=32 TT_TRACE_REPLAY_ITERS=8 ./python_env/bin/python -m pytest -p no:timeout models/demos/devstral_small_2_24b_instruct_2512/tests/e2e/test_text_generation_perf.py -s
 ```
 
 Trace-capture and fully-on-device self-checks:
@@ -59,7 +58,8 @@ TT_PERF_BATCH=32 ./python_env/bin/python -c "from models.demos.devstral_small_2_
 TT_PERF_BATCH=32 ./python_env/bin/python -c "from models.demos.devstral_small_2_24b_instruct_2512.tt import pipeline as P; print(P.host_op_selftest())"
 ```
 
-Per-component PCC of the graduated stubs (TP=4):
+Per-component PCC of the graduated stubs (TP=4). These read the bring-up's captured HF tensors
+(`_captured/<component>/*.pt`), which are not committed: run them where the bring-up capture ran.
 ```bash
 ./python_env/bin/python -m pytest -p no:timeout models/demos/devstral_small_2_24b_instruct_2512/tests/pcc/test_ministral3_model_sharded.py -s
 ```
@@ -72,8 +72,12 @@ Per-component PCC of the graduated stubs (TP=4):
   decoder layers, attention, MLPs, norms, rotary embeddings, token embedding, lm_head). Each stub shards its own
   weights over the 4 chips and runs its own all_reduce / all_gather; embeddings, norms and rotary tables are
   replicated.
-- Weights and config are loaded from the HF hub checkpoint via `transformers` (`AutoModelForImageTextToText`);
-  the FP8 checkpoint is dequantized to bf16 by transformers on the host, then uploaded once.
+- Weights and config are loaded from the HF hub checkpoint via `transformers` (`AutoModelForImageTextToText`)
+  by `reference/checkpoint.py::load_reference_model`. On a host without a GPU, transformers would dequantize the
+  checkpoint's FP8 text-decoder linears to bf16 (~48 GB of host RAM); the loader keeps them as FP8 codes + their
+  per-tensor scale (~22 GB, file-backed) and rebuilds the bf16 weight on access with transformers' own dequant
+  arithmetic, so the weights the TT build uploads and the CPU reference computes with are bit-identical to
+  transformers' dequantized load (checked on load). Everything is uploaded to the mesh once.
 - Goldens are built against the same HF reference running `model.generate()` on CPU in bf16
   (`tests/e2e/hf_reference.py`), cached under `~/.cache/devstral_e2e_golden` (override with
   `DEVSTRAL_GOLDEN_CACHE`).
@@ -94,19 +98,21 @@ Per-component PCC of the graduated stubs (TP=4):
 The inputs are TOOL-AUTHORED (no published example was found for this checkpoint) and live in
 `demo/inputs.py`: one text prompt, and one 224x224 image of a two-line Python function with a question about it.
 Every batch row gets the same content; rows differ only in their sampling seed (row index + `--seed-offset`).
-Change them with `--prompt` / `--image` on the demos, or edit `demo/inputs.py` for the tests.
+Change them with `--prompt` / `--image` on the demos, or edit `demo/inputs.py` for the tests. The per-stage trace
+hooks (`<stage>_trace_inputs` in `tt/pipeline.py`) encode these same inputs: the image request for `encode`, the
+text request for `prefill` / `decode`.
 
 ### Trace replay
-From `tests/e2e/test_text_generation_perf.py` (batch 32, `PERF_ISL_TOKENS=128`, `TT_TRACE_WARMUP_ITERS=1`,
-`TT_TRACE_REPLAY_ITERS=1`), every stage replayed from a captured trace:
+From `tests/e2e/test_text_generation_perf.py` (`TT_PERF_BATCH=32`, `TT_TRACE_REPLAY_ITERS=8`; printed
+`TRACE_REPLAY_PATH=trace+1cq ... batch=32 warmup=3 iters=8`), every stage replayed from a captured trace:
 
-| Stage | `TRACE_STAGE_MS` | path |
-|---|---|---|
-| encode | 24065.2121 | `trace+1cq` |
-| prefill | 9356.6880 | `trace+1cq` |
-| decode | 84.7055 | `trace+1cq` |
+| Stage | `TRACE_STAGE_MS` | path | `TRACE_STAGE_ITEMS` |
+|---|---|---|---|
+| encode | 249.3803 | `trace+1cq` | 8192 |
+| prefill | 6064.1015 | `trace+1cq` | 16384 |
+| decode | 55.7033 | `trace+1cq` | 32 |
 
-`TRACE_PER_TOKEN_MS=84.7055`, `TRACE_HEADLINE_UNIT=token`.
+`TRACE_PER_TOKEN_MS=55.7033`, `TRACE_HEADLINE_UNIT=token` (`TRACE_STAGE_REPEATS[decode]=127`).
 
 ## Results
 See [RUN_REPORT.md](RUN_REPORT.md) for the measured gate results for this demo.
