@@ -101,7 +101,7 @@ class TtMinistral3MLP:
         g = ttnn.linear(x, self.w_gate, compute_kernel_config=self.compute_cfg)
         u = ttnn.linear(x, self.w_up, compute_kernel_config=self.compute_cfg)
         m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])  # silu fused into the mul
-        return self._down(m)
+        return self._reduce(ttnn.linear(m, self.w_down, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg))
 
     def _forward(self, x):
         m = ttnn.experimental.minimal_matmul(
@@ -112,10 +112,17 @@ class TtMinistral3MLP:
             dtype=ttnn.bfloat16,
             fuse_swiglu=True,
         )
-        return self._down(m)
+        # Many-row down projection on the full grid as well (ttnn.linear's auto config left it at ~45 TFLOP/s).
+        out = ttnn.experimental.minimal_matmul(
+            m,
+            self.w_down,
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=self.OUT_DTYPE,
+        )
+        return self._reduce(out)
 
-    def _down(self, m):
-        out = ttnn.linear(m, self.w_down, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg)
+    def _reduce(self, out):
         if self.tp > 1:
             out = ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
         return out
