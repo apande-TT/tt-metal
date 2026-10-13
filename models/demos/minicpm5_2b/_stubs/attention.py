@@ -237,7 +237,8 @@ class TtAttention:
             # [B, 1, S, n*D] in L1: the o_proj input is the only 16 MB L1 tensor beside its static CBs.
             attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.L1_MEMORY_CONFIG)
             attn = ttnn.reshape(attn, (1, b * seq, self.n_heads * self.head_dim))
-            out = self._prefill_mm(attn, self.wo)
+            out = self._prefill_mm(attn, self.wo, memory_config=ttnn.L1_MEMORY_CONFIG)  # residual add input
+            ttnn.deallocate(attn)
             return ttnn.reshape(out, (b, seq, out.shape[-1]))
         else:
             # One fused-QKV projection for the B decode rows, sliced into q / k / v. Every decode intermediate
@@ -510,7 +511,7 @@ class TtAttention:
         program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=cbs)
         return ttnn.generic_op([src, out], program)
 
-    def _prefill_mm(self, x, w):
+    def _prefill_mm(self, x, w, memory_config=ttnn.DRAM_MEMORY_CONFIG):
         """Prefill projection on minimal_matmul's small streaming CBs, which span the full grid under fp32
         accumulation. K_block is all of K, so each tile is one uninterrupted K-order accumulation as in ttnn.linear."""
         grid = self.device.compute_with_storage_grid_size()
@@ -525,7 +526,7 @@ class TtAttention:
                 subblock_w=2,
                 compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
             ),
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=memory_config,
             compute_kernel_config=self.compute_cfg,
         )
 
