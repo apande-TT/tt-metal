@@ -29,6 +29,8 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.minis
 PREFILL_ROWS_PER_CHUNK = 16384
 # dtype of the decode-only gate / up / down weight copies.
 DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
+# L1 cores the decode down projection's activation is width-sharded over: 32 divides K (256 tiles) and N (160 tiles).
+DOWN_DECODE_CORES = ttnn.CoreGrid(y=4, x=8)
 
 
 class TtMinistral3MLP:
@@ -53,14 +55,14 @@ class TtMinistral3MLP:
         ), f"intermediate {torch_module.intermediate_size} not divisible by TP={tp}"
         shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if tp > 1 else None
 
-        def _put(t, mapper, dtype=ttnn.bfloat16):
+        def _put(t, mapper, dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG):
             return ttnn.from_torch(
                 t.detach().to(torch.bfloat16).contiguous(),
                 dtype=dtype,
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
                 mesh_mapper=mapper,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                memory_config=memory_config,
             )
 
         # Device d's slice of the folded weight holds its `inter` gate and `inter` up columns as alternating
@@ -84,7 +86,41 @@ class TtMinistral3MLP:
         del w_gate, w_up
         self.w_down = _put(torch_module.down_proj.weight.T, shard(-2))
         if self.DECODE_WEIGHTS:
-            self.w_down_decode = _put(torch_module.down_proj.weight.T, shard(-2), DECODE_WEIGHT_DTYPE)
+            # The decode down projection is a DRAM-sharded matmul: its weight copy is width-sharded over the DRAM
+            # banks (each bank's reader streams only its columns) and the single-row activation is width-sharded over
+            # DOWN_DECODE_CORES (they divide K = inter/32 and N = 5120/32 tiles). The interleaved 1D matmul spent its
+            # time multicasting the 32 x inter activation block by block (168 us for 42 MB of bf8 weight).
+            n_out = torch_module.down_proj.weight.shape[0]
+            banks, cores = device.dram_grid_size().x, DOWN_DECODE_CORES.num_cores
+            self.w_down_decode = _put(
+                torch_module.down_proj.weight.T,
+                shard(-2),
+                DECODE_WEIGHT_DTYPE,
+                ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                    ttnn.BufferType.DRAM,
+                    ttnn.ShardSpec(
+                        ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))}),
+                        (inter, -(-n_out // (32 * banks)) * 32),
+                        ttnn.ShardOrientation.ROW_MAJOR,
+                    ),
+                ),
+            )
+            self.down_act_cfg = ttnn.create_sharded_memory_config(
+                (32, inter // cores),
+                core_grid=DOWN_DECODE_CORES,
+                strategy=ttnn.ShardStrategy.WIDTH,
+                orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                use_height_and_width_as_shard_shape=True,
+            )
+            # 16-tile multicast blocks (two activation shards each, 16 hops) with two readers per DRAM bank, so each
+            # hop hides behind 16 x 10 weight tiles per reader (~520 KB of CBs); 4-tile blocks made 64 hops (312 us).
+            self.down_decode_pc = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+                in0_block_w=16,
+                per_core_M=1,
+                per_core_N=n_out // 32 // cores,
+                num_workers_per_dram_bank=2,
+            )
         self.compute_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -127,9 +163,15 @@ class TtMinistral3MLP:
         g = ttnn.linear(x, self.w_gate, memory_config=l1, compute_kernel_config=self.compute_cfg)
         u = ttnn.linear(x, self.w_up, memory_config=l1, compute_kernel_config=self.compute_cfg)
         m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
-        return self._reduce(
-            ttnn.linear(m, self.w_down_decode, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg)
+        out = ttnn.linear(
+            ttnn.to_memory_config(m, self.down_act_cfg),
+            self.w_down_decode,
+            program_config=self.down_decode_pc,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            dtype=self.OUT_DTYPE,
+            compute_kernel_config=self.compute_cfg,
         )
+        return self._reduce(ttnn.sharded_to_interleaved(out, ttnn.DRAM_MEMORY_CONFIG))
 
     def _forward(self, x):
         m = ttnn.experimental.minimal_matmul(
