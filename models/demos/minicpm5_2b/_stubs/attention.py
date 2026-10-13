@@ -169,20 +169,28 @@ class TtAttention:
             qkv = self._prefill_mm(ttnn.reshape(x, (1, b * seq, x.shape[-1])), self.wqkv)
             if x.memory_config().buffer_type == ttnn.BufferType.L1:
                 ttnn.deallocate(x)  # an L1 norm output: free it before the score bmm's large static CBs
+            dram, l1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG
+            rope_kernel = _USE_ROPE_KERNEL and ctx.rope is not None
+            # With the rope kernel (small CBs) the head split lands in L1: q / k are freed once roped and v moves
+            # to DRAM (it would otherwise sit below the freed q / k, inside the score bmm's static CB region).
             q, k, v = ttnn.experimental.nlp_create_qkv_heads(
                 ttnn.reshape(qkv, (b, 1, seq, qkv.shape[-1])),
                 num_heads=self.n_heads,
                 num_kv_heads=self.n_kv_heads,
                 transpose_k_heads=False,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                memory_config=l1 if rope_kernel else dram,
             )
-            # The rope products ([B, heads, S, D], 16 MB for q) feed only the add: L1. Its output feeds the score
-            # bmm (large static CBs), so it stays in DRAM.
-            dram, l1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG
-            if _USE_ROPE_KERNEL and ctx.rope is not None:
-                q = self._rope_kernel(q, *ctx.rope, dram)
-                k = self._rope_kernel(k, *ctx.rope, dram)
+            # The roped q / k feed the score bmm (large static CBs), so they stay in DRAM.
+            if rope_kernel:
+                q_in, k_in = q, k
+                q = self._rope_kernel(q_in, *ctx.rope, dram)
+                k = self._rope_kernel(k_in, *ctx.rope, dram)
+                ttnn.deallocate(q_in)
+                ttnn.deallocate(k_in)
+                v_l1, v = v, ttnn.to_memory_config(v, dram)
+                ttnn.deallocate(v_l1)
             else:
+                # The rope products ([B, heads, S, D], 16 MB for q) feed only the add: L1.
                 q = self._rope(q, cos, sin, self._rope_cfg(q), memory_config=dram, products_memory_config=l1)
                 k = self._rope(k, cos, sin, self._rope_cfg(k), memory_config=dram, products_memory_config=l1)
             pad = kv_cache.capacity - seq
