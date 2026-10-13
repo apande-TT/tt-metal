@@ -7,7 +7,7 @@
 // For each of the Dt column tiles of that row:
 //   cb_old <- the cache tile holding the slot (row r = pos[b] % 32 is the slot's current value)
 //   cb_new <- a tile whose row r is the new K/V row (other rows are don't-care; only row r is written back)
-// New K comes from the roped k [B, kv, 1, D] (row 0 of tile (b, h)); new V straight from the fused-QKV
+// New K comes from the roped k [B, kv, rows, D] (row k_row of tile (b, h)); new V straight from the fused-QKV
 // output [1, B, (n + 2 kv) * D] (row b % 32 of its column tiles), so no reshape/reshard runs before it.
 
 #include <stdint.h>
@@ -44,7 +44,8 @@ void kernel_main() {
     constexpr uint32_t cb_new = get_compile_time_arg_val(7);
     constexpr uint32_t cb_scr = get_compile_time_arg_val(8);
     constexpr uint32_t cb_pos = get_compile_time_arg_val(9);
-    constexpr auto cache_args = TensorAccessorArgs<10>();
+    constexpr uint32_t k_row = get_compile_time_arg_val(10);
+    constexpr auto cache_args = TensorAccessorArgs<11>();
     constexpr auto k_args = TensorAccessorArgs<cache_args.next_compile_time_args_offset()>();
     constexpr auto qkv_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
     constexpr auto pos_args = TensorAccessorArgs<qkv_args.next_compile_time_args_offset()>();
@@ -84,7 +85,7 @@ void kernel_main() {
             } else {
                 noc_async_read_page(cache_page0 + wt, cache_k, old_l1);
                 noc_async_read_page(bh * Dt + wt, k_new, scr);
-                src_row = 0;
+                src_row = k_row;
             }
             noc_async_read_barrier();
             copy_row(scr, src_row, get_write_ptr(cb_new), r);

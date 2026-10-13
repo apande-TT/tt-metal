@@ -105,6 +105,20 @@ class TtAttention:
             device=device,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+        # Decode copy with the columns grouped per KV head, [q heads of group g | k head g] for each g, then V:
+        # q and k then split as one [B, kv, groups + 1, D] tensor and are roped together.
+        d, g = self.head_dim, self.kv_groups
+        wq, wk, wv = (m.weight.detach().to(torch.float32) for m in projs)
+        grouped = []
+        for h in range(self.n_kv_heads):
+            grouped += [wq[h * g * d : (h + 1) * g * d], wk[h * d : (h + 1) * d]]
+        self.wqkv_dec = ttnn.from_torch(
+            torch.cat(grouped + [wv]).t().contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         self.wo = _w(torch_module.o_proj)
         # Decode (one tile row) projections: 1-D multicast with a wide K block (bit-identical to the default).
         self.cfg_qkv = decode_linear_config(device, self.wqkv.shape[-2], self.wqkv.shape[-1])
@@ -179,22 +193,22 @@ class TtAttention:
             # is a few hundred tiles, so it lives in L1 instead of DRAM.
             l1 = ttnn.L1_MEMORY_CONFIG
             qkv = ttnn.linear(
-                x, self.wqkv, compute_kernel_config=self.compute_cfg, program_config=self.cfg_qkv, memory_config=l1
+                x, self.wqkv_dec, compute_kernel_config=self.compute_cfg, program_config=self.cfg_qkv, memory_config=l1
             )
             nq, nkv = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
-            q = ttnn.slice(qkv, (0, 0, 0), (1, b, nq), memory_config=l1)
-            k = ttnn.slice(qkv, (0, 0, nq), (1, b, nq + nkv), memory_config=l1)
-            # One token per row: [B, 1, n*D] splits straight into the GQA layout [B, kv, groups, D]
-            # (head h = g * groups + j), so the cache is attended per KV head with no repeat.
-            q = ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups, self.head_dim))
-            k = ttnn.reshape(k, (b, self.n_kv_heads, 1, self.head_dim))
-            q = self._rope(q, cos, sin, self._rope_cfg(q), memory_config=l1)
-            k = self._rope(k, cos, sin, self._rope_cfg(k), memory_config=l1)
+            g, d = self.kv_groups, self.head_dim
+            # One token per row: the grouped columns split straight into [B, kv, groups + 1, D] (rows 0..groups-1
+            # the query heads h = kv * groups + j, row `groups` that KV head's key), so q and k share one rope and
+            # the cache is attended per KV head with no repeat. The key row's scores are computed and discarded.
+            qk = ttnn.slice(qkv, (0, 0, 0), (1, b, nq + nkv), memory_config=l1)
+            qk = ttnn.reshape(qk, (b, self.n_kv_heads, g + 1, d))
+            qk = self._rope(qk, cos, sin, self._rope_cfg(qk), memory_config=l1)
             d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
             if _USE_KV_WRITE_KERNEL:
                 # One kernel writes slot pos[b] of both caches with old + (new - old), V read straight from qkv.
-                self._kv_write(k, qkv, kv_cache, ctx.cur_pos, b)
+                self._kv_write(qk, qkv, kv_cache, ctx.cur_pos, b, k_row=g)
             else:
+                k = ttnn.slice(qk, (0, 0, g, 0), (b, self.n_kv_heads, g + 1, d))
                 v = ttnn.slice(qkv, (0, 0, nq + nkv), (1, b, nq + 2 * nkv))
                 v = ttnn.reshape(v, (b, self.n_kv_heads, 1, self.head_dim))
                 # Write only row b's slot pos[b] in place with old + (new - old): the value the one-hot blend
@@ -214,7 +228,7 @@ class TtAttention:
                     )
                     ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
             scores = ttnn.matmul(
-                q,
+                qk,
                 kv_cache.k,
                 transpose_b=True,
                 program_config=self._bmm_cfg(1, d_t, c_t),
@@ -230,6 +244,7 @@ class TtAttention:
                 compute_kernel_config=self.compute_cfg,
                 memory_config=l1,
             )
+            attn = ttnn.slice(attn, (0, 0, 0, 0), (b, self.n_kv_heads, g, d), memory_config=l1)
             attn = ttnn.reshape(attn, (1, b, self.n_heads * self.head_dim))
         return ttnn.linear(
             attn,
@@ -258,7 +273,7 @@ class TtAttention:
             compute_kernel_config=self.compute_cfg,
         )
 
-    def _kv_write(self, k, qkv, kv_cache, cur_pos, batch):
+    def _kv_write(self, k, qkv, kv_cache, cur_pos, batch, k_row=0):
         """Decode KV-cache write as one generic_op: per (cache, b, kv head) unit, the slot row pos[b] of
         cache[b, h] becomes old + (new - old) (binary_ng's default bf16 FPU sub/add), every other row untouched."""
         grid = self.device.compute_with_storage_grid_size()
@@ -304,7 +319,7 @@ class TtAttention:
             kernel_source=os.path.join(_KV_WRITE_DIR, "reader_kv_write.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[*shape, v_col0, cb_old, cb_new, cb_scr, cb_pos]
+            compile_time_args=[*shape, v_col0, cb_old, cb_new, cb_scr, cb_pos, k_row]
             + cache_ct
             + list(ttnn.TensorAccessorArgs(k).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(qkv).get_compile_time_args())
