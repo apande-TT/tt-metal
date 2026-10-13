@@ -239,6 +239,7 @@ class QwenImageEditTT:
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import encoder_stack as _tr_stack
 
         _tr_stack.SKIP_SAME_CAST = True  # no float32 -> float32 copy of the modulated activations
+        _tr_stack.SHARE_TEMB_LIMBS = True  # temb's SiLU + L1 limbs once per forward, shared by every block
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import timestep_embedding as _tr_temb
 
         _tr_temb.LIMBS_L1 = True  # the timestep MLP's activation limbs in L1
