@@ -42,6 +42,9 @@ class TtMinistral3MLP:
     # dtype the reduced output is all_gathered in (None: plain fp32 all_reduce). The text decoder reduce-scatters
     # in fp32 and gathers the reduced shard in bf16 (half the bytes); its residual add takes the bf16 unrounded.
     GATHER_DTYPE = ttnn.bfloat16
+    # dtype of the many-row (prefill) down projection's partials and their reduce-scatter (None: OUT_DTYPE). The text
+    # decoder reduce-scatters prefill's partials in bf16 (half the bytes, no cast before the gather); decode keeps fp32.
+    PREFILL_REDUCE_DTYPE = ttnn.bfloat16
     # dtype of the fused gate/up weight the many-row (prefill) path multiplies with.
     GATE_UP_DTYPE = ttnn.bfloat8_b
 
@@ -182,7 +185,7 @@ class TtMinistral3MLP:
             self.w_down,
             compute_kernel_config=self.compute_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=self.OUT_DTYPE,
+            dtype=self.PREFILL_REDUCE_DTYPE if (self.PREFILL_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
         )
         return self._reduce(out)
 
@@ -193,7 +196,9 @@ class TtMinistral3MLP:
             return ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
         ccl = tp_ccl_args()
         out = ttnn.reduce_scatter(out, dim=3, **ccl)
-        return ttnn.all_gather(ttnn.typecast(out, self.GATHER_DTYPE), dim=3, **ccl)
+        if out.dtype != self.GATHER_DTYPE:
+            out = ttnn.typecast(out, self.GATHER_DTYPE)
+        return ttnn.all_gather(out, dim=3, **ccl)
 
 
 def build(device, torch_module=None):

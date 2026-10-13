@@ -20,6 +20,7 @@ class TtMLP(TtMinistral3MLP):
     DECODE_WEIGHTS = False  # the vision tower never decodes
     GATHER_DTYPE = None  # the vision residual adds expect the fp32 all_reduce
     GATE_UP_DTYPE = ttnn.bfloat16
+    PREFILL_REDUCE_DTYPE = None
 
     def __init__(self, device, torch_module) -> None:
         act = type(torch_module.act_fn).__name__

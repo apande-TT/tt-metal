@@ -72,6 +72,9 @@ DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
 class TtMinistral3Attention:
     # dtype of o_proj's output and its all_reduce: fp32, added unrounded into the decoder's fp32 residual stream.
     OUT_DTYPE = ttnn.float32
+    # Prefill's many-row o_proj partials are produced and reduce-scattered in bf16 instead (half the reduce-scatter
+    # bytes, no fp32 -> bf16 cast before the gather); decode keeps fp32 partials.
+    PREFILL_REDUCE_DTYPE = ttnn.bfloat16
     # Widest SDPA key chunk prefill may use (see __call__).
     PREFILL_MAX_K_CHUNK = 512
     # Columns of the decode head grid (one batch row per core): 32 rows fill an 8 x 4 rectangle, the shape the fused
@@ -285,7 +288,9 @@ class TtMinistral3Attention:
             return t
         ccl = tp_ccl_args()
         t = ttnn.reduce_scatter(t, dim=3, **ccl)
-        return ttnn.all_gather(ttnn.typecast(t, ttnn.bfloat16), dim=3, **ccl)
+        if t.dtype != ttnn.bfloat16:
+            t = ttnn.typecast(t, ttnn.bfloat16)
+        return ttnn.all_gather(t, dim=3, **ccl)
 
     def _rope(self, x, cos, sin):
         return ttnn.add(
@@ -454,7 +459,7 @@ class TtMinistral3Attention:
             self.wo,
             compute_kernel_config=self.compute_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=self.OUT_DTYPE,
+            dtype=self.PREFILL_REDUCE_DTYPE if self.tp > 1 else self.OUT_DTYPE,
         )
         out = self._reduce(out)
         if in_rank == 3:
