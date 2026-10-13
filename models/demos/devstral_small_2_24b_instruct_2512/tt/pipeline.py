@@ -110,7 +110,7 @@ PLANNED_TP = 4
 # Performance levers applied inside _stubs/ (a symlink out of this directory, so they are listed here too):
 #   ministral3_m_l_p: gate/up folded into one tile-interleaved weight per device; minimal_matmul(fuse_swiglu)
 #                     emits silu(gate) * up in the same op (prefill/encode); decode keeps separate gate/up
-#                     with the silu fused into the multiply.
+#                     with the silu fused into the multiply. Prefill MLP chunk 4096 -> 16384 rows (one call).
 
 
 def kv_capacity_for(tp):
