@@ -157,9 +157,18 @@ class TtMinistral3MLP:
         return self._reduce(out)
 
     def _forward(self, x):
+        grid = self.device.compute_with_storage_grid_size()
         m = ttnn.experimental.minimal_matmul(
             x,
             self.w_gate_up,
+            config=ttnn.MinimalMatmulConfig(
+                M_block_size=8,
+                K_block_size=8,
+                N_block_size=12,
+                subblock_h=2,
+                subblock_w=2,
+                compute_with_storage_grid_size=grid,
+            ),
             compute_kernel_config=self.gate_up_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
