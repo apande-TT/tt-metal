@@ -253,7 +253,9 @@ class MiniCPM5Pipeline:
         local = ttnn.subtract(ttnn.typecast(top_idx, ttnn.float32), self.noise_seg_base)  # [1, S, B, k]
         inside = ttnn.multiply(ttnn.ge(local, 0.0), ttnn.lt(local, float(W)))
         local = ttnn.typecast(ttnn.clamp(local, 0.0, float(W - 1)), ttnn.uint32)
-        seg_noise = ttnn.typecast(ttnn.gather(self.noise_buf, -1, local), ttnn.float32)
+        # The gathered noise follows the candidates (L1 in decode) rather than the resident DRAM noise buffer.
+        seg_noise = ttnn.gather(self.noise_buf, -1, local, memory_config=local.memory_config())
+        seg_noise = ttnn.typecast(seg_noise, ttnn.float32)
         return ttnn.sum(ttnn.multiply(seg_noise, inside), dim=1, keepdim=True)
 
     def _emit(self, logits):
@@ -287,7 +289,9 @@ class MiniCPM5Pipeline:
         mask = ttnn.typecast(ttnn.multiply(ttnn.gt(self.key_index_row, pos), _NEG), ttnn.bfloat16)  # [B, 1, 1, C]
         ctx = attention_stub.AttnContext("decode", mask, write, cur_pos)
         h = self.encoder_stack(x, position_embeddings=cos_sin, kv_caches=self.kv_caches, attn_ctx=ctx)
-        logits = self.decoder_head(self.final_norm(h))
+        # Decode logits (8 MB) stay in L1 for the sampler's topk.
+        l1 = ttnn.L1_MEMORY_CONFIG
+        logits = self.decoder_head(self.final_norm(h, memory_config=l1), memory_config=l1)
         self._emit(logits)
         ttnn.add(self.pos_buf, 1.0, output_tensor=self.pos_buf)
         ttnn.add(self.pos_i32, 1, output_tensor=self.pos_i32)
