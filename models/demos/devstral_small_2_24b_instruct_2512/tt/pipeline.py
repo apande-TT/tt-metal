@@ -111,6 +111,7 @@ PLANNED_TP = 4
 #   ministral3_m_l_p: gate/up folded into one tile-interleaved weight per device; minimal_matmul(fuse_swiglu)
 #                     emits silu(gate) * up in the same op (prefill/encode); decode keeps separate gate/up
 #                     with the silu fused into the multiply. Prefill MLP chunk 4096 -> 16384 rows (one call).
+#   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk).
 
 
 def kv_capacity_for(tp):
@@ -380,6 +381,19 @@ class DevstralPipeline:
         ]
         self._stage = {}
         self._decode_repeats = None
+        # Global vocab id of every column of each device's lm_head shard, one row per batch row: the per-device
+        # top-k returns these labels directly (ttnn.topk indices_tensor), so the TP candidate lists merge with
+        # one more top-k and no index arithmetic.
+        self._vocab_ids = None
+        if self._tp() > 1:
+            vocab = int(tcfg.vocab_size)
+            self._vocab_ids = ttnn.from_torch(
+                torch.arange(vocab, dtype=torch.int32).reshape(1, 1, 1, vocab).expand(1, 1, self.batch, vocab).contiguous(),
+                dtype=ttnn.uint32,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1),
+            )
         log(f"pipeline resident in {time.time() - t0:.1f}s (KV cache {self.kv_shape} per layer, bf16)")
 
     def _tp(self):
@@ -486,7 +500,7 @@ class DevstralPipeline:
         Writes the next input ids into state["tok"] and the finished mask into state["unfinished"] IN PLACE and
         returns the (1, 1, B, 1) uint32 ids the model itself drew (before pad substitution)."""
         b, k, nb = self.batch, self.top_k, NOISE_BUCKETS
-        vals, idx = ttnn.topk(logits, k=k, dim=-1, largest=True, sorted=True)
+        vals, idx = self._topk(logits)
         scores = ttnn.multiply(ttnn.typecast(vals, ttnn.float32), 1.0 / self.temperature)
         noise = ttnn.embedding(state["step"], state["noise"], layout=ttnn.TILE_LAYOUT)  # (1, 1, B*NB) bf16
         noise = ttnn.reshape(ttnn.typecast(noise, ttnn.float32), (1, 1, b, nb))
@@ -506,6 +520,21 @@ class DevstralPipeline:
         ttnn.copy(ids, state["tok"])
         ttnn.plus_one(state["step"])
         return drawn
+
+    def _topk(self, logits):
+        """Top-k of the full-vocab logits row, values sorted, uint32 vocab ids.
+
+        TP > 1: the top-k of the full row is the top-k of the union of each device's shard top-k, so each device
+        sorts only its vocab/TP columns of the lm_head output (labelled with global ids), the TP short lists are
+        all_gathered and one top-k over TP*k candidates picks the winners."""
+        k = self.top_k
+        local = getattr(self.lm_head, "local", None)
+        if self._vocab_ids is None or local is None or tuple(local.shape) != tuple(self._vocab_ids.shape):
+            return ttnn.topk(logits, k=k, dim=-1, largest=True, sorted=True)
+        vals, ids = ttnn.topk(local, k=k, dim=-1, largest=True, sorted=True, indices_tensor=self._vocab_ids)
+        vals = ttnn.all_gather(vals, dim=3, num_links=1, topology=ttnn.Topology.Linear)
+        ids = ttnn.all_gather(ids, dim=3, num_links=1, topology=ttnn.Topology.Linear)
+        return ttnn.topk(vals, k=k, dim=-1, largest=True, sorted=True, indices_tensor=ids)
 
     def decode_prefill(self, request):
         """Decode contract: prefill the prompt once, seed the resident KV and the decode state, sample token 0.
