@@ -677,20 +677,36 @@ def onehot_matmul(a, b, limbs=2):
     return acc.value()
 
 
+B_LIMB_L1 = False
+
+
 def _guarded_terms(mm, terms, a, b, transpose_b):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
     (pa0, pb0), rest = terms[0], terms[1:]
+    # the lead b limb is read by all ten lane / dense / negated products: from an L1 copy when it is small and
+    # the batch fills the grid (the vision attention's 32 images x 4 heads; the LM's 32 x 1 measured slower)
+    shape = list(pb0.padded_shape)
+    vol, batch = 2, 1
+    for d in shape:
+        vol *= d
+    for d in shape[:-2]:
+        batch *= d
+    small = vol <= 16 * 2**20 and batch >= 64
+    pb0_l1 = ttnn.to_memory_config(pb0, ttnn.L1_MEMORY_CONFIG) if B_LIMB_L1 and small else pb0
     acc = _LaneAcc()
     lanes, neg0 = _lead_lanes(pa0)
     for lane in lanes:
-        acc.push(mm(lane, pb0))
+        acc.push(mm(lane, pb0_l1))
         ttnn.deallocate(lane)
     ex = acc.value()
-    dn = mm(pa0, pb0)
+    dn = mm(pa0, pb0_l1)
     first = [lambda pa=pa, pb=pb: mm(pa, pb) for pa, pb in rest[:2]]
     neg0 = ttnn.neg(pa0) if neg0 is None else neg0
-    y = _guarded(ex, dn, mm(neg0, pb0), _norm_last(a), _col_norms(b, transpose_b, cache=False), *first)
+    nn = mm(neg0, pb0_l1)
+    if pb0_l1 is not pb0:
+        ttnn.deallocate(pb0_l1)
+    y = _guarded(ex, dn, nn, _norm_last(a), _col_norms(b, transpose_b, cache=False), *first)
     # the further terms (3 limbs: three more) summed after it, in order, through the lane-sum pass
     acc = _LaneAcc()
     acc.push(y)
