@@ -175,17 +175,21 @@ class TtAttention:
             out = self._prefill_mm(attn, self.wo)
             return ttnn.reshape(out, (b, seq, out.shape[-1]))
         else:
-            # One fused-QKV projection for the B decode rows, sliced into q / k / v.
-            qkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.compute_cfg, program_config=self.cfg_qkv)
+            # One fused-QKV projection for the B decode rows, sliced into q / k / v. Every decode intermediate
+            # is a few hundred tiles, so it lives in L1 instead of DRAM.
+            l1 = ttnn.L1_MEMORY_CONFIG
+            qkv = ttnn.linear(
+                x, self.wqkv, compute_kernel_config=self.compute_cfg, program_config=self.cfg_qkv, memory_config=l1
+            )
             nq, nkv = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
-            q = ttnn.slice(qkv, (0, 0, 0), (1, b, nq))
-            k = ttnn.slice(qkv, (0, 0, nq), (1, b, nq + nkv))
+            q = ttnn.slice(qkv, (0, 0, 0), (1, b, nq), memory_config=l1)
+            k = ttnn.slice(qkv, (0, 0, nq), (1, b, nq + nkv), memory_config=l1)
             # One token per row: [B, 1, n*D] splits straight into the GQA layout [B, kv, groups, D]
             # (head h = g * groups + j), so the cache is attended per KV head with no repeat.
             q = ttnn.reshape(q, (b, self.n_kv_heads, self.kv_groups, self.head_dim))
             k = ttnn.reshape(k, (b, self.n_kv_heads, 1, self.head_dim))
-            q = self._rope(q, cos, sin, self._rope_cfg(q))
-            k = self._rope(k, cos, sin, self._rope_cfg(k))
+            q = self._rope(q, cos, sin, self._rope_cfg(q), memory_config=l1)
+            k = self._rope(k, cos, sin, self._rope_cfg(k), memory_config=l1)
             d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
             if _USE_KV_WRITE_KERNEL:
                 # One kernel writes slot pos[b] of both caches with old + (new - old), V read straight from qkv.
@@ -215,11 +219,16 @@ class TtAttention:
                 transpose_b=True,
                 program_config=self._bmm_cfg(1, d_t, c_t),
                 compute_kernel_config=self.compute_cfg,
+                memory_config=l1,
             )
-            scores = ttnn.add(ttnn.multiply(scores, self.scale), ctx.mask)
-            probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg)
+            scores = ttnn.add(ttnn.multiply(scores, self.scale, memory_config=l1), ctx.mask, memory_config=l1)
+            probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg, memory_config=l1)
             attn = ttnn.matmul(
-                probs, kv_cache.v, program_config=self._bmm_cfg(1, c_t, d_t), compute_kernel_config=self.compute_cfg
+                probs,
+                kv_cache.v,
+                program_config=self._bmm_cfg(1, c_t, d_t),
+                compute_kernel_config=self.compute_cfg,
+                memory_config=l1,
             )
             attn = ttnn.reshape(attn, (1, b, self.n_heads * self.head_dim))
         return ttnn.linear(
@@ -374,9 +383,19 @@ class TtAttention:
             per_core_N=n_t,
         )
 
-    def _rope(self, x, cos, sin, program_config=None):
-        x_rot = ttnn.matmul(x, self.rot, program_config=program_config, compute_kernel_config=self.compute_cfg)
-        return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(x_rot, sin))
+    def _rope(self, x, cos, sin, program_config=None, memory_config=None):
+        x_rot = ttnn.matmul(
+            x,
+            self.rot,
+            program_config=program_config,
+            compute_kernel_config=self.compute_cfg,
+            memory_config=memory_config,
+        )
+        return ttnn.add(
+            ttnn.multiply(x, cos, memory_config=memory_config),
+            ttnn.multiply(x_rot, sin, memory_config=memory_config),
+            memory_config=memory_config,
+        )
 
     def _past_kv(self, past_key_values):
         if past_key_values is None:

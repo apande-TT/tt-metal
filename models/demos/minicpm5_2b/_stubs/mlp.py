@@ -64,10 +64,12 @@ class TtMlp:
             compute_kernel_config=self.compute_cfg,
         )
 
-    def _silu_mul(self, gate, up):
+    def _silu_mul(self, gate, up, memory_config=None):
         # silu(gate) * up in one op: the SiLU runs on the bf16 gate inside the multiply, as the separate
         # unary did (ttnn.linear without a core grid applies its activation as a post-op on the bf16 output).
-        return ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=self.mem)
+        return ttnn.multiply(
+            gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=memory_config or self.mem
+        )
 
     def __call__(self, x, *args, **kwargs):
         if not isinstance(x, ttnn.Tensor):
@@ -89,13 +91,14 @@ class TtMlp:
         else:
             one_row = x.shape[0] == x.shape[1] == 1 and x.padded_shape[-2] == 32  # decode: one tile row
             cfg_up, cfg_down = (self.cfg_up, self.cfg_down) if one_row else (None, None)
+            mid = ttnn.L1_MEMORY_CONFIG if one_row else self.mem  # decode intermediates fit in L1
             gate = ttnn.linear(
-                x, self.w_gate, memory_config=self.mem, compute_kernel_config=self.compute_cfg, program_config=cfg_up
+                x, self.w_gate, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_up
             )
             up = ttnn.linear(
-                x, self.w_up, memory_config=self.mem, compute_kernel_config=self.compute_cfg, program_config=cfg_up
+                x, self.w_up, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_up
             )
-            h = self._silu_mul(gate, up)
+            h = self._silu_mul(gate, up, memory_config=mid)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
             out = ttnn.linear(
