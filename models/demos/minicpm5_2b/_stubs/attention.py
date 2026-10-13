@@ -220,7 +220,8 @@ class TtAttention:
                 compute_kernel_config=self.compute_cfg,
             )
             attn = ttnn.reshape(attn, (b, self.n_heads, seq, self.head_dim))
-            attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # [B, 1, S, n*D]
+            # [B, 1, S, n*D] in L1: the o_proj input is the only 16 MB L1 tensor beside its static CBs.
+            attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.L1_MEMORY_CONFIG)
             attn = ttnn.reshape(attn, (1, b * seq, self.n_heads * self.head_dim))
             out = self._prefill_mm(attn, self.wo)
             return ttnn.reshape(out, (b, seq, out.shape[-1]))

@@ -45,7 +45,7 @@ class TtMlp:
         self.cfg_up = decode_linear_config(device, h, f)
         self.cfg_down = decode_linear_config(device, f, h)
 
-    def _mm(self, x, w, k_block=None):
+    def _mm(self, x, w, k_block=None, memory_config=None):
         """Many-row (prefill) gate/up projection on minimal_matmul's small CBs, which span the full grid under fp32
         accumulation. K_block is all of K, so each tile is one uninterrupted K-order accumulation as in ttnn.linear."""
         grid = self.device.compute_with_storage_grid_size()
@@ -60,7 +60,7 @@ class TtMlp:
                 subblock_w=2,
                 compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
             ),
-            memory_config=self.mem,
+            memory_config=memory_config or self.mem,
             compute_kernel_config=self.compute_cfg,
         )
 
@@ -84,10 +84,13 @@ class TtMlp:
         if x.shape[-2] > 32 and x.shape[0] == x.shape[1] == 1:
             gate = self._mm(x, self.w_gate)
             up = self._mm(x, self.w_up)
+            if x.memory_config().buffer_type == ttnn.BufferType.L1:
+                ttnn.deallocate(x)  # an L1 norm output: free it so the down output can take its place in L1
             h = self._silu_mul(gate, up)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-            out = self._mm(h, self.w_down, k_block=64)  # K = 6144 does not fit one block: three K blocks
+            # K = 6144 does not fit one block: three K blocks. Output in L1 for the residual add.
+            out = self._mm(h, self.w_down, k_block=64, memory_config=ttnn.L1_MEMORY_CONFIG)
         else:
             one_row = x.shape[0] == x.shape[1] == 1 and x.padded_shape[-2] == 32  # decode: one tile row
             cfg_up, cfg_down = (self.cfg_up, self.cfg_down) if one_row else (None, None)
