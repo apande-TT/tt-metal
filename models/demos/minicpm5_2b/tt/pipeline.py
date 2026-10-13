@@ -272,7 +272,9 @@ class MiniCPM5Pipeline:
         B, H = self.batch, self.hidden
         x = self.token_embed(self.ids_buf)
         cos_sin = self.rotary_embedding(x, position_ids=self.prefill_pos)
-        ctx = attention_stub.AttnContext("prefill", self.prefill_mask)
+        # cos / signed sin [B, 1, S, D] once per prefill for every layer's rope kernel (rows are positions).
+        cos, sin = (ttnn.reshape(t, (B, 1, t.shape[-2], self.head_dim)) for t in cos_sin)
+        ctx = attention_stub.AttnContext("prefill", self.prefill_mask, rope=(cos, ttnn.multiply(sin, self.rot_sign)))
         h = self.encoder_stack(x, position_embeddings=cos_sin, kv_caches=self.kv_caches, attn_ctx=ctx)
         self.prefill_hidden = self.final_norm(h)  # [B, Sp, H]: the state prefill hands every decode step
         last = ttnn.slice(self.prefill_hidden, (0, self.real_len - 1, 0), (B, self.real_len, H))

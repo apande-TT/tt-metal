@@ -177,8 +177,12 @@ class TtAttention:
             # The rope products ([B, heads, S, D], 16 MB for q) feed only the add: L1. Its output feeds the score
             # bmm (large static CBs), so it stays in DRAM.
             dram, l1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG
-            q = self._rope(q, cos, sin, self._rope_cfg(q), memory_config=dram, products_memory_config=l1)
-            k = self._rope(k, cos, sin, self._rope_cfg(k), memory_config=dram, products_memory_config=l1)
+            if _USE_ROPE_KERNEL and ctx.rope is not None:
+                q = self._rope_kernel(q, *ctx.rope, dram)
+                k = self._rope_kernel(k, *ctx.rope, dram)
+            else:
+                q = self._rope(q, cos, sin, self._rope_cfg(q), memory_config=dram, products_memory_config=l1)
+                k = self._rope(k, cos, sin, self._rope_cfg(k), memory_config=dram, products_memory_config=l1)
             pad = kv_cache.capacity - seq
             ttnn.copy(ttnn.pad(k, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0) if pad else k, kv_cache.k)
             ttnn.copy(ttnn.pad(v, ((0, 0), (0, 0), (0, pad), (0, 0)), 0.0) if pad else v, kv_cache.v)
@@ -293,7 +297,8 @@ class TtAttention:
         )
 
     def _rope_kernel(self, x, cos_full, sin_signed, memory_config):
-        """Decode rope on x [B, n_kv, rows, D] as one generic_op (kernels/rope), bit-identical to _rope."""
+        """Rope on x [B, H, S, D] as one generic_op (kernels/rope), bit-identical to _rope. cos_full / sin_signed
+        are [B, 1, S, D] (decode: S = one tile row broadcast from the step's position)."""
         out = ttnn.allocate_tensor_on_device(
             ttnn.Shape(list(x.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
         )
@@ -322,7 +327,7 @@ class TtAttention:
             kernel_source=os.path.join(_ROPE_DIR, "reader_rope.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[self.n_kv_heads, d_t, cb_x, cb_cos, cb_xr, cb_sin]
+            compile_time_args=[x.shape[1], d_t, x.padded_shape[-2] // 32, cb_x, cb_cos, cb_xr, cb_sin]
             + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(cos_full).get_compile_time_args()),
             runtime_args=rt["dm"],
