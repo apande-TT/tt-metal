@@ -33,6 +33,10 @@ def _act(name):
     raise NotImplementedError(f"activation {type(name).__name__} not ported")
 
 
+# precise path: the activation's bf16 limbs split straight into L1 for the limb products
+LIMBS_L1 = False
+
+
 class TtTimestepEmbedding:
     def __init__(self, device, torch_module):
         self.device = device
@@ -59,7 +63,13 @@ class TtTimestepEmbedding:
     def _lin(self, x, wb):
         w, b = wb
         if _precise.ENABLED:
-            return _precise.linear(x, w, bias=b)
+            parts = None
+            if LIMBS_L1 and _precise.SPLIT_FN is not None and x.dtype == ttnn.float32 and not x.is_sharded():
+                parts = _precise.SPLIT_FN(x, ttnn.L1_MEMORY_CONFIG)  # the activation's limbs split into L1
+            y = _precise.linear(x, w, bias=b, parts=parts)
+            for t in parts or ():
+                ttnn.deallocate(t)
+            return y
         if x.dtype != ttnn.bfloat16:
             x = ttnn.typecast(x, ttnn.bfloat16)
         y = ttnn.linear(x, w, dtype=ttnn.float32, compute_kernel_config=self.hifi)
