@@ -107,6 +107,27 @@ DEFAULT_BATCH = 32
 # 128 x 2 B = 5.4 GB/chip, inside the 28.6 GB/chip usable with a CCL axis (QB2 registered figure).
 DEFAULT_KV_CAPACITY = 4096
 PLANNED_TP = 4
+# Performance levers applied inside _stubs/ (a symlink out of this directory, so they are listed here too):
+#   ministral3_m_l_p: gate/up folded into one tile-interleaved weight per device; minimal_matmul(fuse_swiglu)
+#                     emits silu(gate) * up in the same op (prefill/encode); decode keeps separate gate/up
+#                     with the silu fused into the multiply. Prefill MLP chunk 4096 -> 16384 rows (one call).
+#                     Prefill/encode down projection on minimal_matmul too (full grid).
+#                     Fused gate/up computes at HiFi2 (fp32 accumulation).
+#   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk).
+#   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
+#                     directly (no bf16 cast op, no single-core interleaved norm).
+#   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
+#                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
+#   ministral3_attention: prefill QKV projection on minimal_matmul (full grid).
+#   prompts pad to a tile multiple only; prefill attention pads q/k/v to whole SDPA key chunks itself.
+#   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard,
+#                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
+#   ministral3_decoder_layer: each RMSNorm's gamma is folded into the q/k/v and gate/up weights that read it
+#                     (no gamma multiply after the norm; the decode norm unshards + casts to bf16 in one op).
+#   ministral3_attention meta_rope: q/k weight columns, the rotary tables and the prefill rotation use interleaved-pair
+#                     head_dim order, so decode's q and k RoPE each run as ONE fused rotary_embedding_llama on the
+#                     height-sharded heads (no rotate-half matmul / mul / add chain, no unshard + reshard of k); q
+#                     shares k's tables while the KV capacity is below the llama-4 scaling threshold (scale == 1).
 
 
 def kv_capacity_for(tp):
@@ -123,10 +144,9 @@ SAMPLING_TOP_K = 32
 # logits that the two sides order differently still receive the same noise each.
 NOISE_BUCKETS = 1024
 TRACE_REGION_SIZE = 300_000_000
-# Prompts are right-padded to a multiple of this many positions (capped at the KV capacity) so prefill SDPA
-# can run 512-wide key chunks: narrower key chunks bias attention's output level (see ministral3_attention).
-# The padded rows come after every real row, so causal attention leaves rows 0..L-1 unchanged.
-PROMPT_PAD = 512
+# Prompts are right-padded only to a tile multiple: prefill attention pads its own q/k/v to whole 512-wide SDPA key
+# chunks (narrower key chunks bias attention's output level, see ministral3_attention.sdpa_len), so no other layer
+# computes pad rows. The padded rows come after every real row, so causal attention leaves rows 0..L-1 unchanged.
 
 # Component name -> the stub class(es) that implement it. Every class here is invoked by the forward chain
 # below; Gate 2 reads INVOKED (filled by the probe installed at build) against this table.
@@ -278,9 +298,8 @@ def encode_request(
 
 
 def padded_prompt_len(real_len, kv_capacity):
-    """Prefill length: real_len rounded up to PROMPT_PAD, never past the resident KV capacity (tile multiple)."""
-    padded = int(math.ceil(real_len / PROMPT_PAD) * PROMPT_PAD)
-    return padded if padded <= kv_capacity else int(math.ceil(real_len / 32) * 32)
+    """Prefill length: real_len rounded up to a tile multiple (<= the resident KV capacity, itself a tile multiple)."""
+    return int(math.ceil(real_len / 32) * 32)
 
 
 def gumbel_table(seeds, steps, buckets=NOISE_BUCKETS):
@@ -376,6 +395,19 @@ class DevstralPipeline:
         ]
         self._stage = {}
         self._decode_repeats = None
+        # Global vocab id of every column of each device's lm_head shard, one row per batch row: the per-device
+        # top-k returns these labels directly (ttnn.topk indices_tensor), so the TP candidate lists merge with
+        # one more top-k and no index arithmetic.
+        self._vocab_ids = None
+        if self._tp() > 1:
+            vocab = int(tcfg.vocab_size)
+            self._vocab_ids = ttnn.from_torch(
+                torch.arange(vocab, dtype=torch.int32).reshape(1, 1, 1, vocab).expand(1, 1, self.batch, vocab).contiguous(),
+                dtype=ttnn.uint32,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1),
+            )
         log(f"pipeline resident in {time.time() - t0:.1f}s (KV cache {self.kv_shape} per layer, bf16)")
 
     def _tp(self):
@@ -482,7 +514,7 @@ class DevstralPipeline:
         Writes the next input ids into state["tok"] and the finished mask into state["unfinished"] IN PLACE and
         returns the (1, 1, B, 1) uint32 ids the model itself drew (before pad substitution)."""
         b, k, nb = self.batch, self.top_k, NOISE_BUCKETS
-        vals, idx = ttnn.topk(logits, k=k, dim=-1, largest=True, sorted=True)
+        vals, idx = self._topk(logits)
         scores = ttnn.multiply(ttnn.typecast(vals, ttnn.float32), 1.0 / self.temperature)
         noise = ttnn.embedding(state["step"], state["noise"], layout=ttnn.TILE_LAYOUT)  # (1, 1, B*NB) bf16
         noise = ttnn.reshape(ttnn.typecast(noise, ttnn.float32), (1, 1, b, nb))
@@ -502,6 +534,21 @@ class DevstralPipeline:
         ttnn.copy(ids, state["tok"])
         ttnn.plus_one(state["step"])
         return drawn
+
+    def _topk(self, logits):
+        """Top-k of the full-vocab logits row, values sorted, uint32 vocab ids.
+
+        TP > 1: the top-k of the full row is the top-k of the union of each device's shard top-k, so each device
+        sorts only its vocab/TP columns of the lm_head output (labelled with global ids), the TP short lists are
+        all_gathered and one top-k over TP*k candidates picks the winners."""
+        k = self.top_k
+        local = getattr(self.lm_head, "local", None)
+        if self._vocab_ids is None or local is None or tuple(local.shape) != tuple(self._vocab_ids.shape):
+            return ttnn.topk(logits, k=k, dim=-1, largest=True, sorted=True)
+        vals, ids = ttnn.topk(local, k=k, dim=-1, largest=True, sorted=True, indices_tensor=self._vocab_ids)
+        vals = ttnn.all_gather(vals, dim=3, num_links=1, topology=ttnn.Topology.Linear)
+        ids = ttnn.all_gather(ids, dim=3, num_links=1, topology=ttnn.Topology.Linear)
+        return ttnn.topk(vals, k=k, dim=-1, largest=True, sorted=True, indices_tensor=ids)
 
     def decode_prefill(self, request):
         """Decode contract: prefill the prompt once, seed the resident KV and the decode state, sample token 0.

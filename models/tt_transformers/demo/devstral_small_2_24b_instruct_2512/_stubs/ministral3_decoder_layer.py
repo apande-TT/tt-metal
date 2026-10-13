@@ -18,7 +18,6 @@ Layouts: prefill x (B, 1, S, D) [or (B, S, D)], decode x (1, 1, B, D). The outpu
 from __future__ import annotations
 
 import ttnn
-
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import (
     TtMinistral3Attention,
 )
@@ -34,13 +33,19 @@ class TtMinistral3DecoderLayer:
     # image-token rows most. Norms read a bf16 copy; attention / MLP outputs arrive in fp32 (their OUT_DTYPE).
     RESIDUAL_DTYPE = ttnn.float32
 
-    def __init__(self, device, torch_module) -> None:
+    def __init__(self, device, torch_module, meta_rope=False) -> None:
+        """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order)."""
         self.device = device
-        self.self_attn = TtMinistral3Attention(device, torch_module.self_attn)
+        # Each norm's gamma is folded into the projections that read it (q/k/v; gate/up), so the norms apply no
+        # weight and their outputs feed the matmuls without a separate gamma multiply.
+        ln_in, ln_post = torch_module.input_layernorm, torch_module.post_attention_layernorm
+        self.self_attn = TtMinistral3Attention(
+            device, torch_module.self_attn, in_scale=ln_in.weight, meta_rope=meta_rope
+        )
         self.tp = self.self_attn.tp
-        self.input_layernorm = TtMinistral3RMSNorm.build(device, torch_module.input_layernorm)
-        self.post_attention_layernorm = TtMinistral3RMSNorm.build(device, torch_module.post_attention_layernorm)
-        self.mlp = TtMinistral3MLP(device, torch_module.mlp)
+        self.input_layernorm = TtMinistral3RMSNorm.build(device, ln_in, fold_gamma=True)
+        self.post_attention_layernorm = TtMinistral3RMSNorm.build(device, ln_post, fold_gamma=True)
+        self.mlp = TtMinistral3MLP(device, torch_module.mlp, in_scale=ln_post.weight)
         self.compute_cfg = self.self_attn.compute_cfg
 
     @property
@@ -69,7 +74,10 @@ class TtMinistral3DecoderLayer:
 
         if self.RESIDUAL_DTYPE is not None and x.dtype != self.RESIDUAL_DTYPE:
             x = ttnn.typecast(x, self.RESIDUAL_DTYPE)
-        n = self._bf16(self.input_layernorm(self._bf16(x)))  # rms_norm reads bf16 (fp32 input overflows L1 at 5120)
+        if mode == "decode":
+            n = self.input_layernorm.decode(x)  # sharded norm reads the fp32 residual directly
+        else:
+            n = self._bf16(self.input_layernorm(self._bf16(x)))  # rms_norm reads bf16 (fp32 input overflows L1 at 5120)
         a = self.self_attn(
             n,
             position_embeddings=position_embeddings,
@@ -79,12 +87,22 @@ class TtMinistral3DecoderLayer:
             cur_pos=cur_pos,
             mode=mode,
         )
-        h = ttnn.add(x, self._as(a, x.dtype))
-        out = ttnn.add(h, self._as(self.mlp(self._bf16(self.post_attention_layernorm(self._bf16(h)))), h.dtype))
+        h = self._residual_add(x, a)
+        if mode == "decode":
+            n = self.post_attention_layernorm.decode(h)
+        else:
+            n = self._bf16(self.post_attention_layernorm(self._bf16(h)))
+        m = self.mlp(n, mode=mode)
+        out = self._residual_add(h, m)
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
         return out
 
+    @staticmethod
+    def _residual_add(x, delta):
+        # A bf16 attention / MLP output is added into the fp32 residual without a cast op: binary ADD runs on the
+        # SFPU in fp32 for mixed dtypes, so the bf16 operand is widened exactly.
+        return ttnn.add(x, delta) if delta.dtype == x.dtype else ttnn.add(x, delta, dtype=x.dtype)
 
     @staticmethod
     def _as(t, dtype):

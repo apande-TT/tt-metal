@@ -11,13 +11,14 @@ on the intermediate dim, down row-parallel then all_reduce.
 from __future__ import annotations
 
 import ttnn
-
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_m_l_p import TtMinistral3MLP
 
 
 class TtPixtralMLP(TtMinistral3MLP):
     # The vision residual stream is fp32 (see attention.py); its down projection lands there unrounded.
     OUT_DTYPE = ttnn.float32
+    DECODE_WEIGHTS = False  # the vision tower never decodes
+    GATHER_DTYPE = None  # the vision residual adds expect the fp32 all_reduce
 
     def __init__(self, device, torch_module) -> None:
         act = type(torch_module.act_fn).__name__

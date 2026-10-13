@@ -6,32 +6,49 @@ of `mistralai/Devstral-Small-2-24B-Instruct-2512`.
     out = down(silu(gate(x)) * up(x))            (5120 -> 32768 -> 5120)
 
 Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device):
-  * gate/up    column-parallel on the intermediate dim (the SwiGLU product stays per-device).
+  * gate/up    column-parallel on the intermediate dim (the SwiGLU product stays per-device), folded into
+               ONE weight per device whose column tiles alternate gate/up, so a single minimal_matmul with
+               fuse_swiglu emits silu(gate) * up directly (no separate gate/up outputs, slices, silu or mul).
+               That op splits M over one grid axis, so at decode's single tile row it would idle most of the
+               grid: decode (mode="decode") keeps separate gate / up weights on ttnn.linear instead.
   * down_proj  row-parallel on the intermediate dim, then all_reduce.
 """
 from __future__ import annotations
 
 import torch
-import ttnn
 
-# Prefill token rows (batch rows x sequence) one MLP chunk processes at a time.
-PREFILL_ROWS_PER_CHUNK = 4096
+import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import (
+    fold_input_scale,
+    tp_ccl_args,
+)
+
+# Prefill token rows (batch rows x sequence) one MLP chunk processes at a time. With gate/up fused into one
+# SwiGLU op the only intermediate is the (rows, intermediate/TP) product: 268 MB/chip for a full 32 x 512
+# prefill, so that whole batch runs as ONE call (one down matmul, one all_reduce, no slices / concat).
+PREFILL_ROWS_PER_CHUNK = 16384
 
 
 class TtMinistral3MLP:
     # dtype of the down projection's output and its all_reduce: fp32, added unrounded into the fp32 residual
     # stream of the text decoder (and of the vision layers, whose MLPs subclass this one).
     OUT_DTYPE = ttnn.float32
+    # Separate gate / up weights for the single-token decode path (the vision MLP subclasses never decode).
+    DECODE_WEIGHTS = True
+    # dtype the reduced output is all_gathered in (None: plain fp32 all_reduce). The text decoder reduce-scatters
+    # in fp32 and gathers the reduced shard in bf16 (half the bytes); its residual add takes the bf16 unrounded.
+    GATHER_DTYPE = ttnn.bfloat16
 
-    def __init__(self, device, torch_module) -> None:
+    def __init__(self, device, torch_module, in_scale=None) -> None:
+        """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up."""
         self.device = device
         try:
             self.tp = tp = int(device.get_num_devices())
         except Exception:
             self.tp = tp = 1
-        assert torch_module.intermediate_size % tp == 0, (
-            f"intermediate {torch_module.intermediate_size} not divisible by TP={tp}"
-        )
+        assert (
+            torch_module.intermediate_size % tp == 0
+        ), f"intermediate {torch_module.intermediate_size} not divisible by TP={tp}"
         shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if tp > 1 else None
 
         def _put(t, mapper):
@@ -44,8 +61,23 @@ class TtMinistral3MLP:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
 
-        self.w_gate = _put(torch_module.gate_proj.weight.T, shard(-1))
-        self.w_up = _put(torch_module.up_proj.weight.T, shard(-1))
+        # Device d's slice of the folded weight holds its `inter` gate and `inter` up columns as alternating
+        # 32-wide tiles [g_0, u_0, g_1, u_1, ...]: the layout minimal_matmul(fuse_swiglu=True) pairs up.
+        self.inter = inter = torch_module.intermediate_size // tp
+        w_gate = fold_input_scale(torch_module.gate_proj.weight.T, in_scale)
+        w_up = fold_input_scale(torch_module.up_proj.weight.T, in_scale)
+        k = w_gate.shape[0]
+        chunks = []
+        for d in range(tp):
+            g = w_gate[:, d * inter : (d + 1) * inter].reshape(k, inter // 32, 1, 32)
+            u = w_up[:, d * inter : (d + 1) * inter].reshape(k, inter // 32, 1, 32)
+            chunks.append(torch.concat([g, u], dim=2).reshape(k, 2 * inter))
+        self.w_gate_up = _put(torch.concat(chunks, dim=-1), shard(-1))
+        del chunks
+        if self.DECODE_WEIGHTS:
+            self.w_gate = _put(w_gate, shard(-1))
+            self.w_up = _put(w_up, shard(-1))
+        del w_gate, w_up
         self.w_down = _put(torch_module.down_proj.weight.T, shard(-2))
         self.compute_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
@@ -54,15 +86,25 @@ class TtMinistral3MLP:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,  # L1 accumulation made batched prefill matmuls non-repeatable
         )
+        # The many-row fused gate/up is compute-bound; it runs at HiFi2 (fp32 accumulation kept).
+        self.gate_up_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
 
     @classmethod
     def build(cls, device, torch_module):
         return cls(device, torch_module)
 
-    def __call__(self, x, *args, **kwargs):
+    def __call__(self, x, *args, mode="prefill", **kwargs):
         shape = tuple(x.shape)
         if len(shape) != 4:
             x = ttnn.reshape(x, (1,) * (4 - len(shape)) + shape)
+        if mode == "decode" and self.DECODE_WEIGHTS:
+            return ttnn.reshape(self._forward_decode(x), shape)
         b, _, s, d = x.shape
         step = max(1, PREFILL_ROWS_PER_CHUNK // max(1, s))
         if b > step:
@@ -72,14 +114,39 @@ class TtMinistral3MLP:
             return ttnn.reshape(ttnn.concat(parts, dim=0), shape)
         return ttnn.reshape(self._forward(x), shape)
 
-    def _forward(self, x):
+    def _forward_decode(self, x):
         g = ttnn.linear(x, self.w_gate, compute_kernel_config=self.compute_cfg)
         u = ttnn.linear(x, self.w_up, compute_kernel_config=self.compute_cfg)
-        m = ttnn.multiply(ttnn.silu(g), u)
-        out = ttnn.linear(m, self.w_down, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg)
-        if self.tp > 1:
-            out = ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
-        return out
+        m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])  # silu fused into the mul
+        return self._reduce(ttnn.linear(m, self.w_down, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg))
+
+    def _forward(self, x):
+        m = ttnn.experimental.minimal_matmul(
+            x,
+            self.w_gate_up,
+            compute_kernel_config=self.gate_up_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.bfloat16,
+            fuse_swiglu=True,
+        )
+        # Many-row down projection on the full grid as well (ttnn.linear's auto config left it at ~45 TFLOP/s).
+        out = ttnn.experimental.minimal_matmul(
+            m,
+            self.w_down,
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=self.OUT_DTYPE,
+        )
+        return self._reduce(out)
+
+    def _reduce(self, out):
+        if self.tp == 1:
+            return out
+        if self.GATHER_DTYPE is None:
+            return ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
+        ccl = tp_ccl_args()
+        out = ttnn.reduce_scatter(out, dim=3, **ccl)
+        return ttnn.all_gather(ttnn.typecast(out, self.GATHER_DTYPE), dim=3, **ccl)
 
 
 def build(device, torch_module=None):
