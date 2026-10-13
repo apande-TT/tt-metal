@@ -62,6 +62,11 @@ def _mesh_size(device):
         return 1
 
 
+# L1 cores the decode QKV activation is width-sharded over for its DRAM-sharded matmul: 16 divides both K (160 tiles)
+# and the per-device [q | k | v] N (48 tiles).
+QKV_DECODE_CORES = ttnn.CoreGrid(y=2, x=8)
+
+
 class TtMinistral3Attention:
     # dtype of o_proj's output and its all_reduce: fp32, added unrounded into the decoder's fp32 residual stream.
     OUT_DTYPE = ttnn.float32
@@ -102,14 +107,14 @@ class TtMinistral3Attention:
         shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else None
         self._repl = repl = ttnn.ReplicateTensorToMesh(device) if is_mesh else None
 
-        def _put(t, mapper):
+        def _put(t, mapper, memory_config=ttnn.DRAM_MEMORY_CONFIG):
             return ttnn.from_torch(
                 t.detach().to(torch.bfloat16).contiguous(),
                 dtype=ttnn.bfloat16,
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
                 mesh_mapper=mapper,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                memory_config=memory_config,
             )
 
         wq = fold_input_scale(torch_module.q_proj.weight.T, in_scale)  # (in, Hq*hd)
@@ -124,7 +129,39 @@ class TtMinistral3Attention:
             q_sl = slice(d * lh * hd, (d + 1) * lh * hd)
             kv_sl = slice(d * lkv * hd, (d + 1) * lkv * hd)
             chunks += [wq[:, q_sl], wk[:, kv_sl], wv[:, kv_sl]]
-        self.wqkv = _put(torch.concat(chunks, dim=-1), shard(-1))
+        wqkv = torch.concat(chunks, dim=-1)
+        self.wqkv = _put(wqkv, shard(-1))
+        # Decode reads its own copy of [q | k | v], DRAM width-sharded over the banks so each bank's reader streams
+        # only its column slice, with the single-row activation width-sharded over QKV_DECODE_CORES: the interleaved
+        # matmul has only N / 32 = 48 output tiles to spread, one per core, and streams the weight at ~190 GB/s.
+        k_in, n_dev = wqkv.shape[0], wqkv.shape[1] // tp
+        banks, cores = device.dram_grid_size().x, QKV_DECODE_CORES.num_cores
+        self.wqkv_decode = _put(
+            wqkv,
+            shard(-1),
+            ttnn.MemoryConfig(
+                ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                ttnn.BufferType.DRAM,
+                ttnn.ShardSpec(
+                    ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))}),
+                    (k_in, -(-n_dev // (ttnn.TILE_SIZE * banks)) * ttnn.TILE_SIZE),
+                    ttnn.ShardOrientation.ROW_MAJOR,
+                ),
+            ),
+        )
+        self.qkv_act_cfg = ttnn.create_sharded_memory_config(
+            (ttnn.TILE_SIZE, k_in // cores),
+            core_grid=QKV_DECODE_CORES,
+            strategy=ttnn.ShardStrategy.WIDTH,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        # One activation shard per multicast block: 32 hops, each hidden behind 60 weight tiles per bank reader.
+        self.qkv_decode_pc = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+            in0_block_w=k_in // ttnn.TILE_SIZE // cores,
+            per_core_M=1,
+            per_core_N=n_dev // ttnn.TILE_SIZE // cores,
+        )
         self.wo = _put(torch_module.o_proj.weight.T, shard(-2))
 
         # rotate_half(x) == x @ R  (HF convention: cat(-x2, x1); meta_rope: each pair (x_2j, x_2j+1) -> (-x_2j+1, x_2j)).
@@ -369,7 +406,14 @@ class TtMinistral3Attention:
         """x (1, 1, B, D) -> (1, 1, B, D); cos/sin (1, B, 1, hd); cur_pos int32 [B]; position_ids (B, 1, 1, 1) fp32."""
         b = x.shape[-2]
         head_cfg = self._head_cfg(b)
-        qkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.compute_cfg)
+        qkv = ttnn.linear(
+            ttnn.to_memory_config(x, self.qkv_act_cfg),
+            self.wqkv_decode,
+            program_config=self.qkv_decode_pc,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_cfg,
+        )
+        qkv = ttnn.sharded_to_interleaved(qkv, ttnn.L1_MEMORY_CONFIG)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, memory_config=head_cfg
         )
