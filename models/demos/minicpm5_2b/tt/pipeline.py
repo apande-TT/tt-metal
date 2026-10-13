@@ -297,7 +297,10 @@ class MiniCPM5Pipeline:
         l1 = ttnn.L1_MEMORY_CONFIG
         cos_full = ttnn.repeat(cos, ttnn.Shape([1, 1, 32, 1]), memory_config=l1)
         sin_signed = ttnn.multiply(ttnn.repeat(sin, ttnn.Shape([1, 1, 32, 1])), self.rot_sign, memory_config=l1)
-        ctx = attention_stub.AttnContext("decode", mask, write, cur_pos, rope=(cos_full, sin_signed))
+        mask_full = ttnn.repeat(mask, ttnn.Shape([1, 1, 32, 1]), memory_config=l1)
+        ctx = attention_stub.AttnContext(
+            "decode", mask, write, cur_pos, rope=(cos_full, sin_signed), mask_full=mask_full
+        )
         h = self.encoder_stack(x, position_embeddings=cos_sin, kv_caches=self.kv_caches, attn_ctx=ctx)
         # Decode logits (8 MB) stay in L1 for the sampler's topk.
         l1 = ttnn.L1_MEMORY_CONFIG

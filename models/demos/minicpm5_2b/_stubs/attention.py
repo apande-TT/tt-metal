@@ -36,6 +36,9 @@ _HEADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels",
 # Decode rope as one kernel (x * cos + rotate_half(x) * sin) when the context carries full-tile cos/signed sin.
 _USE_ROPE_KERNEL = True
 _ROPE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "rope")
+# Decode score scale + key mask as one kernel when the context carries the row-broadcast mask.
+_USE_SCALE_MASK_KERNEL = True
+_SCALE_MASK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "scale_mask")
 
 
 def _rotate_half_matrix(head_dim):
@@ -66,8 +69,10 @@ class AttnContext:
                     `cur_pos` that slot as int32 [B], which paged_update_cache writes in place.
     """
 
-    def __init__(self, mode, mask, write=None, cur_pos=None, rope=None):
+    def __init__(self, mode, mask, write=None, cur_pos=None, rope=None, mask_full=None):
         self.mode, self.mask, self.write, self.cur_pos = mode, mask, write, cur_pos
+        # decode: `mask` broadcast over the tile rows, [B, 1, 32, capacity], for the scale + mask kernel.
+        self.mask_full = mask_full
         # decode: (cos, signed sin) [B, 1, 32, D] broadcast over the tile rows, sin negated on the first
         # half of D (rotate_half's sign), for the one-kernel rope.
         self.rope = rope
@@ -135,6 +140,9 @@ class TtAttention:
         self.rot = ttnn.from_torch(
             _rotate_half_matrix(self.head_dim), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
+        # The score scale as ttnn.multiply(scores, scale) sees it: a bf16 tile, made by that same scalar multiply.
+        ones = ttnn.from_torch(torch.ones(1, 1, 32, 32), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.scale_tile = ttnn.multiply(ones, self.scale)
 
     def _to_tt(self, t):
         return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
@@ -250,7 +258,10 @@ class TtAttention:
                 compute_kernel_config=self.compute_cfg,
                 memory_config=l1,
             )
-            scores = ttnn.add(ttnn.multiply(scores, self.scale, memory_config=l1), ctx.mask, memory_config=l1)
+            if _USE_SCALE_MASK_KERNEL and ctx.mask_full is not None:
+                scores = self._scale_mask_kernel(scores, ctx.mask_full, l1)
+            else:
+                scores = ttnn.add(ttnn.multiply(scores, self.scale, memory_config=l1), ctx.mask, memory_config=l1)
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg, memory_config=l1)
             attn = ttnn.matmul(
                 probs,
@@ -328,6 +339,64 @@ class TtAttention:
         )
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
         return ttnn.generic_op([x, cos_full, sin_signed, out], program)
+
+    def _scale_mask_kernel(self, scores, mask_full, memory_config):
+        """Decode scores * scale + mask as one generic_op (kernels/scale_mask), bit-identical to the two ops."""
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(list(scores.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
+        )
+        n_tiles = math.prod(out.padded_shape) // (32 * 32)
+        cores, rt = self._spread(n_tiles)
+        tile = 2 * 32 * 32
+        cb_s, cb_scale, cb_mask, cb_t, cb_out = 0, 1, 2, 3, 16
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=2 * tile,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(idx, ttnn.bfloat16, tile)],
+            )
+            for idx in (cb_s, cb_scale, cb_mask, cb_t, cb_out)
+        ]
+        compute_cfg = ttnn.ComputeConfigDescriptor(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=False
+        )
+        # As binary_ng sets for its SFPU multiply operands; the FPU add operands keep the default.
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        for idx in (cb_s, cb_scale):
+            modes[idx] = ttnn.UnpackToDestMode.UnpackToDestFp32
+        compute_cfg.unpack_to_dest_mode = modes
+        c_t = scores.padded_shape[-1] // 32
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_SCALE_MASK_DIR, "reader_scale_mask.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[self.n_kv_heads, c_t, cb_s, cb_scale, cb_mask]
+            + list(ttnn.TensorAccessorArgs(scores).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(self.scale_tile).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(mask_full).get_compile_time_args()),
+            runtime_args=rt["dm"],
+            common_runtime_args=[scores.buffer_address(), self.scale_tile.buffer_address(), mask_full.buffer_address()],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        writer = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ROPE_DIR, "writer_rope.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[cb_out] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=rt["dm"],
+            common_runtime_args=[out.buffer_address()],
+            config=ttnn.WriterConfigDescriptor(),
+        )
+        compute = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_SCALE_MASK_DIR, "compute_scale_mask.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[cb_s, cb_scale, cb_mask, cb_t, cb_out],
+            runtime_args=rt["cmp"],
+            config=compute_cfg,
+        )
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
+        return ttnn.generic_op([scores, self.scale_tile, mask_full, out], program)
 
     def _spread(self, n_tiles):
         """Row-major core set over the grid for n_tiles work items, with [start, count] / [count] runtime args."""
