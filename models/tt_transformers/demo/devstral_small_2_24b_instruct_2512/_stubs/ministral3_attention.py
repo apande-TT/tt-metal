@@ -313,6 +313,8 @@ class TtMinistral3Attention:
         s, cap = kv.shape[2], cache.shape[2]
         if s < cap:
             kv = ttnn.pad(kv, padding=((0, 0), (0, 0), (0, cap - s), (0, 0)), value=0.0)
+        if kv.dtype != cache.dtype:  # e.g. a block-float8 cache
+            kv = ttnn.typecast(kv, cache.dtype)
         ttnn.copy(kv, cache)
 
     def __call__(
