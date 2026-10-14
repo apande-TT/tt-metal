@@ -514,6 +514,13 @@ class TracyHangError(TracyRunError):
     crash. Retriable: reset the device and re-profile."""
 
 
+class DiskFullError(TracyRunError):
+    """Watchdog killed a run because the disk its profile writes to fell below the free-space floor
+    (disk_floor_breached). NOT retriable as a hang: the space is still gone, so a retry would only
+    fill it again. Raised so the run fails with the reason instead of every process on the box
+    failing with ENOSPC."""
+
+
 _ERR_RE = re.compile(
     r"^[A-Za-z_][\w.]*(Error|Exception|Interrupt|Fault):"  # `ExceptionType: message` (not a `raise X(` line)
     r"|Segmentation fault|Aborted|core dumped|TT_FATAL|terminate called|Fatal Python error",
@@ -1550,10 +1557,145 @@ def thermal_yield(label: str = "") -> None:
         if now - _thermal_yield_last[0] < _THERMAL_YIELD_MIN_GAP_S:
             return
         _thermal_yield_last[0] = now
-        _cc_optimize("perf_mcp").cool_if_over_safety_ceiling(label or "next unit")
+        pm = _cc_optimize("perf_mcp")
+        # A PROCESS THAT HOLDS THE DEVICE CANNOT COOL IT BY WAITING. Measured on a 4-chip p300c,
+        # 2026-10-13, nothing else on the box: the mesh opened and left idle -- no op running -- took
+        # every chip from 20 W to 85-91 W and the board from 58C to 92.5C in fifteen minutes. Closed,
+        # the same chips idle at ~20 W, and the board fell from 95C to 65C in about twelve minutes,
+        # every time today's runs ended a holder. So the wait below, done with the device open, was
+        # not a cooldown: Devstral's perf test sat in it for forty-five minutes climbing 91.5C -> 94.7C
+        # until the abort limit ended it, and on 2026-10-11 the same wait went 87.6C -> 95.1C.
+        # Ending the process is what releases the device; whoever started it re-runs the step from a
+        # cool board, and the stages this step already measured are kept (stages_kept_across_retries).
+        try:
+            from .thermal_pytest_plugin import end_for_heat, holds_device
+        except Exception as exc:  # noqa: BLE001 -- without it, the wait below is still the old behaviour
+            _warn_thermal_inert("thermal_yield handoff", exc)
+            end_for_heat, holds_device = None, lambda: False
+        if holds_device():
+            hot, cur = pm.board_over_safety_ceiling()
+            if hot:
+                end_for_heat(
+                    "[thermal-handoff] %s: board at %.1fC, at or above the %.1fC safety ceiling, and this "
+                    "process holds the device -- which keeps the board heating, not cooling. Ending it so the "
+                    "device is released; the step re-runs from a cool board and keeps what it already measured."
+                    % (label or "next unit", cur, pm._SAFETY_CEILING_C),
+                    cur,
+                    "handoff",
+                )
+        pm.cool_if_over_safety_ceiling(label or "next unit")
     except Exception as exc:  # noqa: BLE001 -- a thermometer that cannot be read must never stop the work
         _warn_thermal_inert("thermal_yield", exc)
         return
+
+
+def ended_for_heat(rc) -> bool:
+    """Whether a child's exit status says it ended ITSELF to protect the board (end_for_heat) -- not a
+    failure, and not a measurement: the step is re-run from a cool board."""
+    from .thermal_pytest_plugin import ABORT_EXIT_CODE
+
+    return rc == ABORT_EXIT_CODE
+
+
+def run_watcher_owns_recovery() -> bool:
+    """See thermal_pytest_plugin.run_watcher_owns_recovery: a launcher in such a run leaves a child that
+    ended for heat to the run's watcher."""
+    from .thermal_pytest_plugin import run_watcher_owns_recovery as _owns
+
+    return _owns()
+
+
+def reset_after_ended_child(error_text: str = "", env=None) -> bool:
+    """Reset after a device process ended without closing the device -- killed, or ended for heat --
+    under the one rule for that (device_recovery.reset_is_mandatory_after_kill: a multi-chip run's
+    fabric may be left stuck whatever the telemetry says). Returns whether the device came back."""
+    from . import device_recovery as _dr
+
+    _kill = {"fault_is_certain": True} if _dr.reset_is_mandatory_after_kill(env=env) else {}
+    return _device_reset(error_text=error_text, **_kill)
+
+
+# A RETRIED STEP KEEPS THE STAGES IT ALREADY MEASURED. The owner of a retried device step names a file
+# here; trace_replay appends each stage it finishes and, on the next attempt of the SAME step, replays
+# that stage's lines instead of measuring it again. Without it every attempt after a heat stop starts
+# from the first stage, heats the board the same way and is stopped at the same place.
+STAGES_KEPT_ENV = "TT_TRACE_REPLAY_KEPT"
+
+
+class stages_kept_across_retries:
+    """Context manager for the owner of a retried device step: names a fresh record in STAGES_KEPT_ENV
+    for every child launched inside it, and removes it after. Nested owners share the outermost one's
+    record, so one step's stages are never split across two. `as` gives kept_stage_count."""
+
+    def __enter__(self):
+        self._path = None
+        if not os.environ.get(STAGES_KEPT_ENV):
+            import tempfile
+
+            fd, self._path = tempfile.mkstemp(prefix="trace_replay_kept_", suffix=".jsonl")
+            os.close(fd)
+            os.environ[STAGES_KEPT_ENV] = self._path
+        return kept_stage_count
+
+    def __exit__(self, *exc):
+        if self._path is not None:
+            if os.environ.get(STAGES_KEPT_ENV) == self._path:
+                os.environ.pop(STAGES_KEPT_ENV, None)
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
+        return False
+
+
+def _kept_records() -> list:
+    path = os.environ.get(STAGES_KEPT_ENV, "")
+    if not path:
+        return []
+    out = []
+    try:
+        with open(path) as fh:
+            for ln in fh:
+                try:
+                    rec = json.loads(ln)
+                except ValueError:
+                    continue  # a line cut short by an ended process is not a measurement
+                if isinstance(rec, dict) and {"node", "stage", "ms", "path", "lines"} <= set(rec):
+                    out.append(rec)
+    except OSError:
+        return []
+    return out
+
+
+def with_kept_stages(env: dict) -> dict:
+    """`env` carrying this step's kept-stage record when one is open -- for a launcher handed an env built
+    before the step began. The caller's dict is not changed."""
+    rec = os.environ.get(STAGES_KEPT_ENV, "")
+    if not rec or env.get(STAGES_KEPT_ENV):
+        return env
+    return {**env, STAGES_KEPT_ENV: rec}
+
+
+def kept_stage_count() -> int:
+    """How many stages this step has kept so far: an attempt that raised it made progress."""
+    return len(_kept_records())
+
+
+def kept_stages(node: str) -> dict:
+    """{stage: record} that an earlier attempt of this step measured for `node` (its pytest node id)."""
+    return {r["stage"]: r for r in _kept_records() if r["node"] == node}
+
+
+def keep_stage(node: str, stage: str, ms: float, path: str, lines: list) -> None:
+    """Record a finished stage for the next attempt of this step. Best-effort; one line per stage."""
+    rec_path = os.environ.get(STAGES_KEPT_ENV, "")
+    if not rec_path:
+        return
+    try:
+        with open(rec_path, "a") as fh:
+            fh.write(json.dumps({"node": node, "stage": stage, "ms": ms, "path": path, "lines": list(lines)}) + "\n")
+    except OSError:
+        pass
 
 
 def detect_overheat(log_text: str) -> str | None:
@@ -1857,6 +1999,7 @@ def _execute(
     progress is what let one hide for ten hours. `timeout_s` remains as a generous
     ABSOLUTE backstop (hard ceiling `timeout_s * _HARD_CEILING_MULT`)."""
     _therm_label = "generated-test run"
+    env = with_kept_stages(env)
     try:
         _run = _cc_optimize("run")
         _thermal_watch_new = _run._thermal_watch_new
@@ -1882,10 +2025,10 @@ def _execute(
             preexec_fn=preexec_fn,  # e.g. memory_cap_preexec_fn(); runs in the child after the new session
         )
 
-        def _kill_and_raise(reason: str):
+        def _kill_and_raise(reason: str, error=TracyHangError):
             _kill_tree(proc.pid)
             proc.wait()
-            raise TracyHangError(f"{label} {reason}; log: {log_path}") from None
+            raise error(f"{label} {reason}; log: {log_path}") from None
 
         pgid = proc.pid
         start = time.monotonic()
@@ -1898,6 +2041,8 @@ def _execute(
         poll = 5.0
         _therm = _thermal_watch_new()
         _mempress = memory_pressure_watch_new()
+        _disk_paths = (log_path.parent, cwd)
+        _disk_floor = disk_floor(_disk_paths)
         while True:
             try:
                 rc = proc.wait(timeout=poll)
@@ -1917,6 +2062,9 @@ def _execute(
                 pass
             _thermal_watch_sample(_therm, _therm_label)
             memory_pressure_watch_sample(_mempress, _therm_label)
+            _disk_low = disk_floor_breached(_disk_paths, _disk_floor)
+            if _disk_low:
+                _kill_and_raise(f"stopped before it filled the disk: {_disk_low}", DiskFullError)
             now = time.monotonic()
             try:
                 size = log_path.stat().st_size
@@ -2906,6 +3054,45 @@ def memory_cap_preexec_fn(margin_gb: float = None):
 
 _MEM_PRESSURE_WATCH_REPORT_S = 60.0
 _MEM_PRESSURE_WARN_PCT = float(os.environ.get("PERF_MCP_MEM_PRESSURE_WARN_PCT", "35") or "35")
+
+
+# THE DISK A PROFILE WRITES TO. A device log grows with every op of every core of every chip; a
+# decode that ignored its token window wrote a 97 GB profile_log_device.csv and filled the root disk
+# (Mistral-Small-4-119B-2603, 2026-10-14) -- the run died on ENOSPC, and so did every other process
+# writing to that disk. Below this many free GB the profiled run is stopped instead.
+_MIN_FREE_DISK_GB = float(os.environ.get("PERF_MCP_MIN_FREE_DISK_GB", "10") or "10")
+
+
+def _free_disk_gb(paths) -> dict:
+    """{path: free GB on its filesystem} for each path that can be measured."""
+    out = {}
+    for p in paths:
+        try:
+            out[p] = shutil.disk_usage(p).free / 1e9
+        except OSError:
+            continue
+    return out
+
+
+def disk_floor(paths) -> float:
+    """The free-space floor for a run about to write to `paths`: _MIN_FREE_DISK_GB, or half of what is
+    free at launch when that is less -- a disk that starts low is guarded against THIS run eating
+    what is left, rather than refused outright."""
+    free = _free_disk_gb(paths)
+    return min([_MIN_FREE_DISK_GB] + [f / 2 for f in free.values()])
+
+
+def disk_floor_breached(paths, floor_gb: float) -> str:
+    """'' while every measurable path's filesystem has at least floor_gb free; otherwise why not. A path
+    that cannot be measured is skipped: this guards a run, it never fails one by itself."""
+    for p, free_gb in _free_disk_gb(paths).items():
+        if free_gb < floor_gb:
+            return "%.1f GB free on the disk holding %s, under the %.1f GB floor (PERF_MCP_MIN_FREE_DISK_GB)" % (
+                free_gb,
+                p,
+                floor_gb,
+            )
+    return ""
 
 
 def memory_pressure_watch_new() -> dict:
