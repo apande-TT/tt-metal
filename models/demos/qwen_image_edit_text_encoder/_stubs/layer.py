@@ -46,6 +46,8 @@ HEADS_BY_SLICES = False
 # MLP gate / up's shared bf16 limbs split straight into L1 when together they take at most this many bytes
 # (the split hook's optional output memory config; freed after both products. 0: in x's memory)
 MLP_LIMBS_L1_BYTES = 0
+# the LM attention's logit scale applied as the mask add's input activation (one pass instead of multiply + add)
+FUSED_SCALE_MASK = False
 # the LM MLP's SiLU applied as the gate input's activation of the gate * up multiply (one op, no SiLU round trip)
 MLP_FUSED_SILU = False
 
@@ -227,7 +229,11 @@ class TtTextAttention:
                 k, v = ttnn.concat([kp, k], dim=2), ttnn.concat([vp, v], dim=2)
         q = ttnn.reshape(q, (b, kvl, G * s_pad, D))
         scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex)
-        scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask)
+        if FUSED_SCALE_MASK:
+            scale = [ttnn.UnaryWithParam(ttnn.UnaryOpType.MUL_UNARY_SFPU, self.scale)]
+            scores = ttnn.add(scores, tt_mask, input_tensor_a_activations=scale)
+        else:
+            scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask)
         mx = ttnn.max(scores, dim=-1, keepdim=True)
         e = ttnn.exp(ttnn.subtract(scores, mx))
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
