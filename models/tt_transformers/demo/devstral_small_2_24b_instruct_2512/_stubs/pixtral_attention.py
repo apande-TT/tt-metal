@@ -14,6 +14,7 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
 from __future__ import annotations
 
 import torch
+
 import ttnn
 
 
@@ -107,7 +108,11 @@ class TtPixtralAttention:
         if isinstance(mask, torch.Tensor):
             mask = self._to_tt(mask.reshape(1, 1, s, s).float())
 
-        qkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.compute_cfg)
+        # minimal_matmul folds the images into its rows over the full grid (ttnn.linear ran this batch of 32 x 256
+        # rows as a batched matmul on 64 cores: 816 us).
+        qkv = ttnn.experimental.minimal_matmul(
+            x, self.wqkv, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_heads, transpose_k_heads=False
         )
