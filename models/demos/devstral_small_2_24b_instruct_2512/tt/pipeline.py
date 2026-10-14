@@ -163,8 +163,9 @@ PLANNED_TP = 4
 #   pixtral_attention: the vision QKV, the RoPE rotate-half and o_proj (4-tile N blocks) run on minimal_matmul over the
 #                     full grid too; so does the projector linear_2.
 #   token_embed: a hidden-sharded copy of the table; the text prefill gathers each device's residual slice from it
-#                     (no full-width rows, no mesh_partition); the bf16 slice lands in L1 and is cast to the fp32
-#                     residual from there.
+#                     (no full-width rows, no mesh_partition). The slice stays bf16 into the first layer, whose input
+#                     norm gathers per-token sums of squares from a (vocab, 32) table (exact bf16 hi / mid / lo parts)
+#                     and whose fused residual add (tt/add_stats.py) widens it to fp32: no cast, no reduce of it.
 #   pixtral_vision_model: equal-size images are uploaded already patchified on the host (patchify_host; tile layout),
 #                     so the device skips the reshape / permute chain over 14-pixel row-major sticks.
 #   pixtral_m_l_p: the vision fused gate/up weight is block-float8.

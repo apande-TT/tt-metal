@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """C++ Metalium residual add fused with the next RMSNorm's statistics (generic_op, kernels/add_stats_*.cpp).
 
-For the decoder's fp32 hidden-sharded prefill residual x and an attention / MLP delta d it returns h = x + d (fp32,
-added on the SFPU exactly as binary_ng adds mixed dtypes) and, per row, sum(h^2) in column 0 of a one-tile-wide fp32
-stats tensor -- what ttnn.rms_norm_pre_all_gather computes from h, without reading h back from DRAM. Like that op's
-fp32 path, the other 31 stats columns hold reduce partials, so the gathered stats are masked before summing.
-Tile rows are split over the full compute grid."""
+For the decoder's fp32 (or, entering the first layer, bf16) hidden-sharded prefill residual x and an attention / MLP
+delta d it returns h = x + d (fp32, added on the SFPU exactly as binary_ng adds mixed dtypes) and, per row, sum(h^2)
+in column 0 of a one-tile-wide fp32 stats tensor -- what ttnn.rms_norm_pre_all_gather computes from h, without
+reading h back from DRAM. Like that op's fp32 path, the other 31 stats columns hold reduce partials, so the gathered
+stats are masked before summing. Tile rows are split over the full compute grid."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -48,7 +48,7 @@ def supports(x, d) -> bool:
         and d.layout == ttnn.TILE_LAYOUT
         and not x.is_sharded()
         and not d.is_sharded()
-        and x.dtype == ttnn.float32
+        and x.dtype in (ttnn.float32, ttnn.bfloat16)
         and d.dtype in (ttnn.float32, ttnn.bfloat16)
         and tuple(int(s) for s in d.shape) == shape
         and shape[-1] % (_TILE * BLK) == 0
@@ -57,8 +57,8 @@ def supports(x, d) -> bool:
 
 
 def apply(x, d):
-    """x: fp32 TILE interleaved [..., S, W]; d: same shape, bf16 or fp32. Returns (h = x + d fp32 [..., S, W],
-    stats fp32 [..., S, 32] with sum(h^2) of each row in column 0)."""
+    """x: fp32 (or bf16, widened exactly) TILE interleaved [..., S, W]; d: same shape, bf16 or fp32. Returns
+    (h = x + d fp32 [..., S, W], stats fp32 [..., S, 32] with sum(h^2) of each row in column 0)."""
     device = x.device()
     shape = [int(s) for s in x.shape]
     rows = 1
@@ -91,10 +91,11 @@ def apply(x, d):
     cfg.math_approx_mode = False
     cfg.dst_full_sync_en = False
     modes = [ttnn.UnpackToDestMode.Default] * 64
-    for cb in (CB_X, CB_H, CB_X2):  # fp32 operands of the SFPU add / copy / square / accurate reduce
+    for cb in (CB_H, CB_X2):  # fp32 operands of the SFPU copy / square / accurate reduce
         modes[cb] = ttnn.UnpackToDestMode.UnpackToDestFp32
-    if d.dtype == ttnn.float32:
-        modes[CB_D] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    for cb, t in ((CB_X, x), (CB_D, d)):  # the add's operands: fp32 straight to DEST, bf16 widened exactly
+        if t.dtype == ttnn.float32:
+            modes[cb] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
     kernels = [
         ttnn.KernelDescriptor(
@@ -123,7 +124,7 @@ def apply(x, d):
         ),
     ]
     cbs = [
-        _cb(cores, CB_X, ttnn.float32, 2 * BLK),
+        _cb(cores, CB_X, x.dtype, 2 * BLK),
         _cb(cores, CB_D, d.dtype, 2 * BLK),
         _cb(cores, CB_SCALER, ttnn.float32, 1),
         _cb(cores, CB_H, ttnn.float32, wt),
