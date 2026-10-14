@@ -101,8 +101,8 @@ class TtMinistral3Attention:
     # SDPA (none stays resident in L1 across the larger prefill ops, whose static buffers leave no room). 0 disables.
     PREFILL_HEADS_L1_BYTES = 512 * 1024
     # ... and the fused QKV output feeding that split lands in L1 too while it takes at most this many bytes per core
-    # (short prompts: 114 KB at 32 x 128 rows; at 32 x 416 rows its 372 KB would sit beside the matmul's own buffers).
-    PREFILL_QKV_L1_BYTES = 192 * 1024
+    # (114 KB at 32 x 128 rows, 372 KB at 32 x 416 rows beside the matmul's ~0.9 MB of static buffers).
+    PREFILL_QKV_L1_BYTES = 400 * 1024
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
