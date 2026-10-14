@@ -308,6 +308,8 @@ EXACT_BMM_L1_BYTES = 0
 # (None: ttnn picks its own; a core_grid alone gets in0_block_w=1, whose fp32 partial reloads break
 # the exact-lane sum: e2e PCC 0.9395)
 EXACT_CORE_GRID = None
+# split_matmul's plain (exact=False) limb products on this core grid (None: ttnn picks its own)
+BMM_CORE_GRID = None
 # core grid for split_linear's exact-lane products (None: ttnn.linear picks its own)
 EXACT_LINEAR_CORE_GRID = None
 # split_linear's exact-lane products stage the bf16 weight and the activation limbs in L1 once per call when
@@ -465,6 +467,8 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     pc = _bmm_full_k_config(pa_all[0], pb_all[0], transpose_b) if exact and EXACT_CORE_GRID is not None else None
 
     def mm(p, q, **kw):
+        if pc is None and not exact and BMM_CORE_GRID is not None:
+            kw["core_grid"] = BMM_CORE_GRID
         return ttnn.matmul(
             p, q, transpose_b=transpose_b, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc, **kw
         )
