@@ -24,10 +24,11 @@ class TtMLP(TtMinistral3MLP):
     PREFILL_DOWN_FIDELITY = None
     DOWN_DTYPE = ttnn.bfloat16
 
-    def __init__(self, device, torch_module) -> None:
+    def __init__(self, device, torch_module, in_scale=None) -> None:
+        """in_scale: the ffn_norm gamma, folded into gate/up (see TtAttention.FOLD_NORM_GAMMA)."""
         act = type(torch_module.act_fn).__name__
         assert act in ("SiLU", "SiLUActivation"), f"expected silu, got {act}"
-        super().__init__(device, torch_module)
+        super().__init__(device, torch_module, in_scale=in_scale)
 
 
 def build(device, torch_module=None):

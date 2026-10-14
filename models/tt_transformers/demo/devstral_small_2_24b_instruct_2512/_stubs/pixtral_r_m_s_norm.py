@@ -44,7 +44,9 @@ class TtPixtralRMSNorm:
         self.gamma = gamma
 
     @classmethod
-    def build(cls, device, torch_module):
+    def build(cls, device, torch_module, fold_gamma=False):
+        """fold_gamma: the caller folds the checkpoint weight into the projections that read this norm, so the
+        norm applies none (a unit-gamma canonical norm and no separate multiply)."""
         # PixtralRMSNorm: weight * x * rsqrt(mean(x^2) + eps), weight replicated on a mesh.
         weight = torch_module.weight.detach().to(torch.bfloat16)
         # The kernel's fused gamma multiply biases the output ~0.06% low (|tt| / |fp32| = 0.9994 fused, 1.0001
@@ -60,7 +62,7 @@ class TtPixtralRMSNorm:
         canonical = RMSNorm(
             device=device,
             dim=weight.shape[0],
-            state_dict={"norm.weight": torch.ones_like(weight) if cls.SEPARATE_GAMMA else weight},
+            state_dict={"norm.weight": torch.ones_like(weight) if (cls.SEPARATE_GAMMA or fold_gamma) else weight},
             weight_key="norm",
             weight_dtype=ttnn.bfloat16,
             eps=float(torch_module.variance_epsilon),
@@ -75,7 +77,7 @@ class TtPixtralRMSNorm:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
-        return cls(canonical, gamma if cls.SEPARATE_GAMMA else None)
+        return cls(canonical, gamma if (cls.SEPARATE_GAMMA and not fold_gamma) else None)
 
     def __call__(self, x, *args, **kwargs):
         # Canonical RMSNorm takes the 4D [1, 1, S, H] prefill layout; restore the caller's rank.

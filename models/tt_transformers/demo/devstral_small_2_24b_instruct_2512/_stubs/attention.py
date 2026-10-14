@@ -18,8 +18,8 @@ along S under a block-diagonal mask. The output keeps the input's rank.
 from __future__ import annotations
 
 import torch
-import ttnn
 
+import ttnn
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_attention import TtPixtralAttention
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_m_l_p import TtPixtralMLP
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_r_m_s_norm import TtPixtralRMSNorm
@@ -28,12 +28,20 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtr
 class TtAttention:
     # dtype the norm outputs enter the attention / MLP matmuls in (the residual itself is always fp32).
     MATMUL_INPUT_DTYPE = ttnn.bfloat16
+    # Each norm's gamma is folded into the projections that read it (q/k/v; gate/up), so the norms apply none: the
+    # separate fp32 x bf16 broadcast gamma multiply cost 456 us per norm on 32 images x 256 patches.
+    FOLD_NORM_GAMMA = True
+
     def __init__(self, device, torch_module, mlp_cls=None) -> None:
         self.device = device
-        self.attention_norm = TtPixtralRMSNorm.build(device, torch_module.attention_norm)
-        self.attention = TtPixtralAttention(device, torch_module.attention)
-        self.ffn_norm = TtPixtralRMSNorm.build(device, torch_module.ffn_norm)
-        self.feed_forward = (mlp_cls or TtPixtralMLP)(device, torch_module.feed_forward)
+        fold = self.FOLD_NORM_GAMMA
+        an, fn = torch_module.attention_norm, torch_module.ffn_norm
+        self.attention_norm = TtPixtralRMSNorm.build(device, an, fold_gamma=fold)
+        self.attention = TtPixtralAttention(device, torch_module.attention, in_scale=an.weight if fold else None)
+        self.ffn_norm = TtPixtralRMSNorm.build(device, fn, fold_gamma=fold)
+        self.feed_forward = (mlp_cls or TtPixtralMLP)(
+            device, torch_module.feed_forward, in_scale=fn.weight if fold else None
+        )
         self.tp = self.attention.tp
         self.head_dim = self.attention.head_dim
         self._repl = ttnn.ReplicateTensorToMesh(device) if self.tp > 1 else None

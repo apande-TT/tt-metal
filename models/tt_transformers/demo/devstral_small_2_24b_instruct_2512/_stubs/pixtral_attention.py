@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import fold_input_scale
 
 
 def _mesh_size(device):
@@ -26,7 +27,8 @@ def _mesh_size(device):
 
 
 class TtPixtralAttention:
-    def __init__(self, device, torch_module) -> None:
+    def __init__(self, device, torch_module, in_scale=None) -> None:
+        """in_scale: the attention_norm gamma, folded into q/k/v (see TtAttention.FOLD_NORM_GAMMA)."""
         self.device = device
         self.tp = tp = _mesh_size(device)
         self.num_heads = torch_module.num_heads
@@ -50,7 +52,10 @@ class TtPixtralAttention:
             )
 
         # Fused per-device [q_heads | k_heads | v_heads] so a dim=-1 shard hands each device its own heads.
-        wq, wk, wv = (torch_module.q_proj.weight.T, torch_module.k_proj.weight.T, torch_module.v_proj.weight.T)
+        wq, wk, wv = (
+            fold_input_scale(w.weight.T, in_scale)
+            for w in (torch_module.q_proj, torch_module.k_proj, torch_module.v_proj)
+        )
         chunks = []
         for d in range(tp):
             sl = slice(d * lh * hd, (d + 1) * lh * hd)
