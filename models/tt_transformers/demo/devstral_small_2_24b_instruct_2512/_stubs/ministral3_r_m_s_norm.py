@@ -106,6 +106,10 @@ class TtMinistral3RMSNorm:
             self._decode_cfgs[d] = (mem, prog)
         return self._decode_cfgs[d]
 
+    def decode_mem(self, d):
+        """The width-sharded L1 memory config decode norms of a D-wide row run in."""
+        return self._decode_cfg(d)[0]
+
     def decode(self, x, keep_sharded=False):
         """Decode-mode norm of the (1, 1, B, D) residual row (fp32 or bf16), returned bf16 interleaved.
 
