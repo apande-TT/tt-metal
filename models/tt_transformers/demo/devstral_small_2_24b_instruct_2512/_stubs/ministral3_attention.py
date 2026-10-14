@@ -222,8 +222,8 @@ class TtMinistral3Attention:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,  # L1 accumulation made batched prefill matmuls non-repeatable
         )
-        # The many-row prefill QKV projection is compute-bound: HiFi2 (fp32 accumulation kept).
-        self.prefill_qkv_cfg = ttnn.init_device_compute_kernel_config(
+        # The many-row prefill QKV and o_proj projections are compute-bound: HiFi2 (fp32 accumulation kept).
+        self.prefill_proj_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi2,
             math_approx_mode=False,
@@ -421,7 +421,7 @@ class TtMinistral3Attention:
         qkv = ttnn.experimental.minimal_matmul(
             x,
             self.wqkv,
-            compute_kernel_config=self.prefill_qkv_cfg,
+            compute_kernel_config=self.prefill_proj_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
         )
@@ -489,7 +489,7 @@ class TtMinistral3Attention:
         out = ttnn.experimental.minimal_matmul(
             attn,
             self.wo,
-            compute_kernel_config=self.compute_cfg,
+            compute_kernel_config=self.prefill_proj_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=self.PREFILL_REDUCE_DTYPE if self.tp > 1 else self.OUT_DTYPE,
         )
