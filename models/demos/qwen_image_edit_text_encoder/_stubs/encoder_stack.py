@@ -139,7 +139,10 @@ class TtVisionMLP:
                 x, self.w_gate, bias=self.b_gate, compute_kernel_config=cfg, exact=ex, limbs=L, parts=xp
             )
             up = split_linear(x, self.w_up, bias=self.b_up, compute_kernel_config=cfg, exact=ex, limbs=L, parts=xp)
-            h = ttnn.multiply(ttnn.silu(gate), up)
+            if VISION_MLP_FUSED_SILU:
+                h = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
+            else:
+                h = ttnn.multiply(ttnn.silu(gate), up)
             out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex, limbs=L)
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)
@@ -170,6 +173,10 @@ class TtVisionBlock:
         a = self.attn.forward_padded(cast(self.norm1(x)), tt_cos, tt_sin, tt_mask)
         x = ttnn.add(x, _fp32(a))
         return ttnn.add(x, _fp32(self.mlp(cast(self.norm2(x)))))
+
+
+# the vision MLP's SiLU applied as the gate input's activation of the gate * up multiply (precise path)
+VISION_MLP_FUSED_SILU = False
 
 
 class TtPatchMerger:
