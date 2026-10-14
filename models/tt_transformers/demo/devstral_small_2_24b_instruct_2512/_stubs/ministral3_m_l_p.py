@@ -53,6 +53,8 @@ class TtMinistral3MLP:
     prefill_gather = True
     # dtype of the fused gate/up weight the many-row (prefill) path multiplies with.
     GATE_UP_DTYPE = ttnn.bfloat8_b
+    # Math fidelity of the many-row fused gate/up.
+    GATE_UP_FIDELITY = ttnn.MathFidelity.HiFi2
     # The many-row SwiGLU product goes to the down projection through L1 (interleaved, freed right after) while it
     # takes at most this many bytes per core (the vision MLP's 8192 x 1024 bf16: 152 KB; the text MLP's is far larger).
     PREFILL_INTER_L1_BYTES = 192 * 1024
@@ -143,7 +145,7 @@ class TtMinistral3MLP:
         # The many-row fused gate/up is compute-bound; it runs at HiFi2 (fp32 accumulation kept).
         self.gate_up_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_fidelity=self.GATE_UP_FIDELITY,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=False,

@@ -20,6 +20,7 @@ class TtPixtralMLP(TtMinistral3MLP):
     DECODE_WEIGHTS = False  # the vision tower never decodes
     GATHER_DTYPE = None  # the vision residual adds expect the fp32 all_reduce
     GATE_UP_DTYPE = ttnn.bfloat8_b  # block-float8 fused gate/up weight (the many-row SwiGLU)
+    GATE_UP_FIDELITY = ttnn.MathFidelity.LoFi
     PREFILL_REDUCE_DTYPE = None
     PREFILL_DOWN_FIDELITY = None
     DOWN_DTYPE = ttnn.bfloat16
