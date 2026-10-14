@@ -178,8 +178,8 @@ PLANNED_TP = 4
 #   pixtral_m_l_p: the vision fused gate/up weight is block-float8; it runs at LoFi on the L1 ffn norm output cast
 #                  to bf16 in L1 (full 8-tile K blocks). The down projection runs at HiFi2.
 #   attention (vision layer): each RMSNorm gamma is folded into the q/k/v and gate/up weights that read it (no separate
-#                     fp32 gamma multiply); q/k/v read the fp32 norm output directly (no cast to bf16), the gate/up
-#                     reads the ffn norm output from L1 after an L1 cast to bf16 (its product fits in L1 too).
+#                     fp32 gamma multiply); the QKV and the gate/up read their norm outputs from L1 after an L1 cast
+#                     to bf16 (the gate/up's product fits in L1 too).
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
 #   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py);
