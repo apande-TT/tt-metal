@@ -91,24 +91,26 @@ class TtPixtralAttention:
             mesh_mapper=self._repl,
         )
 
-    def _o_proj_cfg(self, x):
-        """minimal_matmul config for o_proj whose N block is the per-core N range when that is under 8 tiles (M splits
-        along the grid's x axis and N along y when M > N); None (the default 8 x 8 blocks) otherwise."""
+    def _narrow_n_cfg(self, x, w):
+        """minimal_matmul config whose N block is the per-core N range when that is under 8 tiles (M splits along the
+        grid's x axis and N along y when M > N): the default 8-tile block would compute mostly padding (o_proj: 4 of
+        8 tiles valid, QKV: 3 of 8). None (the default 8 x 8 blocks) otherwise."""
         grid = self.device.compute_with_storage_grid_size()
         shape = tuple(int(d) for d in x.shape)
         mt = shape[-2] // ttnn.TILE_SIZE
         for d in shape[:-2]:
             mt *= d
-        nt = int(self.wo.shape[-1]) // ttnn.TILE_SIZE
+        nt = int(w.shape[-1]) // ttnn.TILE_SIZE
         n = -(-nt // (grid.y if mt > nt else grid.x))
-        if n >= 8 or n % 2:
+        if n >= 8 or (n % 2 and n > 4):
             return None
+        sh, sw = (2, 2) if n % 2 == 0 else (1, n)
         return ttnn.MinimalMatmulConfig(
             M_block_size=8,
             K_block_size=8,
             N_block_size=n,
-            subblock_h=2,
-            subblock_w=2,
+            subblock_h=sh,
+            subblock_w=sw,
             compute_with_storage_grid_size=grid,
         )
 
@@ -141,6 +143,7 @@ class TtPixtralAttention:
         qkv = ttnn.experimental.minimal_matmul(
             x,
             self.wqkv,
+            config=self._narrow_n_cfg(x, self.wqkv),
             compute_kernel_config=self.compute_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,  # q / k / v in bf16 also when x is the fp32 norm output
@@ -178,7 +181,7 @@ class TtPixtralAttention:
         out = ttnn.experimental.minimal_matmul(
             attn,
             self.wo,
-            config=self._o_proj_cfg(attn),
+            config=self._narrow_n_cfg(attn, self.wo),
             compute_kernel_config=self.compute_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.float32,
