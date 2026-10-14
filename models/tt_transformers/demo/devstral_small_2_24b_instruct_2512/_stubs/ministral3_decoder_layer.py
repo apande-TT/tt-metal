@@ -147,6 +147,8 @@ class TtMinistral3DecoderLayer:
                 mode="prefill",
             )
             h, h_sq = self._residual_add_stats(x, a)
+            if a.memory_config().buffer_type == ttnn.BufferType.L1:
+                ttnn.deallocate(a)  # attention's short-prompt L1 output (PREFILL_OPROJ_OUT_L1_BYTES)
             m = self.mlp(self._prefill_norm(self.post_attention_layernorm, h, sq=h_sq), mode="prefill")
         finally:
             self.self_attn.prefill_gather = self.mlp.prefill_gather = True

@@ -103,6 +103,9 @@ class TtMinistral3Attention:
     # ... and the fused QKV output feeding that split lands in L1 too while it takes at most this many bytes per core
     # (114 KB at 32 x 128 rows, 372 KB at 32 x 416 rows beside the matmul's ~0.9 MB of static buffers).
     PREFILL_QKV_L1_BYTES = 400 * 1024
+    # The o_proj's hidden-shard output (TP prefill, read once by the decoder's residual add) lands in L1 while it takes
+    # at most this many bytes per core (95 KB at 32 x 128 rows; the caller frees it right after the add).
+    PREFILL_OPROJ_OUT_L1_BYTES = 128 * 1024
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -652,12 +655,19 @@ class TtMinistral3Attention:
             if concat_l1:
                 ttnn.deallocate(concat)
         # Prefill o_proj on the full grid too (ttnn.linear's auto 1D config ran it on 80 cores at ~30 TFLOP/s).
+        # Its hidden shard (TP, no gather) goes to L1 for short prompts: the decoder's residual add reads it there and
+        # frees it (see PREFILL_OPROJ_OUT_L1_BYTES).
+        out_l1 = (
+            self.tp > 1
+            and not self.prefill_gather
+            and 2 * int(b) * int(s) * int(self.wo.shape[-1]) // (grid.x * grid.y) <= self.PREFILL_OPROJ_OUT_L1_BYTES
+        )
         out = ttnn.experimental.minimal_matmul(
             attn,
             self.wo,
             config=self._one_block_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wo.shape[-1]) // ttnn.TILE_SIZE),
             compute_kernel_config=self.prefill_proj_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=ttnn.L1_MEMORY_CONFIG if out_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=self.PREFILL_REDUCE_DTYPE if self.tp > 1 else self.OUT_DTYPE,
         )
         if self.tp > 1 and self.prefill_gather:
