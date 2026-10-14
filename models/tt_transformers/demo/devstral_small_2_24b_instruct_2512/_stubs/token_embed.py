@@ -50,11 +50,11 @@ class TtTokenEmbed:
     def __call__(self, input_ids, *args, **kwargs):
         return self._gather(input_ids, self.weight, self.dim)
 
-    def shard(self, input_ids):
+    def shard(self, input_ids, memory_config=None):
         """This device's hidden slice of the embeddings, (..., D / TP) (needs weight_shard)."""
-        return self._gather(input_ids, self.weight_shard, self.shard_dim)
+        return self._gather(input_ids, self.weight_shard, self.shard_dim, memory_config)
 
-    def _gather(self, input_ids, weight, dim):
+    def _gather(self, input_ids, weight, dim, memory_config=None):
         tok = input_ids
         if isinstance(tok, torch.Tensor):
             tok = ttnn.from_torch(
@@ -66,7 +66,7 @@ class TtTokenEmbed:
             )
         shape = tuple(tok.shape)
         tok = ttnn.reshape(tok, (1, shape[-1]) if len(shape) == 1 else (-1, shape[-1]))
-        out = ttnn.embedding(tok, weight, layout=ttnn.TILE_LAYOUT)
+        out = ttnn.embedding(tok, weight, layout=ttnn.TILE_LAYOUT, memory_config=memory_config)
         return ttnn.reshape(out, shape + (dim,))
 
 

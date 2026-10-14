@@ -105,7 +105,8 @@ class TtMinistral3Model:
         assert s <= self.max_seq_len and s % 32 == 0, f"seq {s} must be a tile multiple <= {self.max_seq_len}"
 
         pos = self._positions(position_ids, s)
-        cos, sin = self.rotary_emb(x, position_ids=pos)  # (1, S, hd)
+        # bf16 tables (rotary_emb casts them to its x's dtype; the prompt embeddings may already be the fp32 residual)
+        cos, sin = self.rotary_emb(None, position_ids=pos)  # (1, S, hd)
         cos = ttnn.reshape(cos, (1, 1, s, self.head_dim))
         sin = ttnn.reshape(sin, (1, 1, s, self.head_dim))
         # q's rope tables with the llama-4 query scale folded in, built once and shared by every layer.
@@ -130,16 +131,30 @@ class TtMinistral3Model:
         out = self._bf16(self.norm(self._bf16(x)))
         return ttnn.reshape(out, (b, s, d))
 
+    # The sharded gather's bf16 slice goes through L1 (interleaved, <= this many bytes per bank) on its way to the
+    # residual dtype: the typecast reads it there instead of from DRAM, and it is freed right after.
+    PREFILL_EMBED_L1_BYTES = 384 * 1024
+
     def prefill_embeds(self, input_ids):
         """(B, 1, S, D) prompt embeddings of input_ids (B, S), or, when the layers carry the prefill residual
-        hidden-sharded, this device's (B, 1, S, D / TP) slice gathered straight from the sharded table."""
+        hidden-sharded, this device's (B, 1, S, D / TP) slice gathered straight from the sharded table (already in
+        the residual dtype)."""
         shard = self.tp > 1 and TtMinistral3DecoderLayer.SHARD_PREFILL_RESIDUAL
-        if shard and self.embed_tokens.weight_shard is not None:
-            x = self.embed_tokens.shard(input_ids)
-        else:
+        if not (shard and self.embed_tokens.weight_shard is not None):
             x = self.embed_tokens(input_ids)
-        b, s, d = x.shape
-        return ttnn.reshape(x, (b, 1, s, d))
+            b, s, d = x.shape
+            return ttnn.reshape(x, (b, 1, s, d))
+        b, s = (int(v) for v in input_ids.shape)
+        grid = self.device.compute_with_storage_grid_size()
+        per_bank = b * s * self.embed_tokens.shard_dim * 2 / (grid.x * grid.y)
+        rd = TtMinistral3DecoderLayer.RESIDUAL_DTYPE
+        l1 = rd is not None and rd != ttnn.bfloat16 and per_bank <= self.PREFILL_EMBED_L1_BYTES
+        x = self.embed_tokens.shard(input_ids, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None)
+        if l1:
+            y = ttnn.typecast(x, rd, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(x)
+            x = y
+        return ttnn.reshape(x, (b, 1, s, x.shape[-1]))
 
     def _decode(self, input_ids, inputs_embeds, position_ids, kv_caches, cur_pos):
         if inputs_embeds is None:
