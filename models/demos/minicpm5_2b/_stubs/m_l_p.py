@@ -43,7 +43,7 @@ class TtMLP:
         self.w_down = _w(torch_module.down_proj)
         h, f = self.w_gate.shape[-2], self.w_gate.shape[-1]
         self.cfg_up = decode_linear_config(device, h, f)
-        self.cfg_down = decode_linear_config(device, f, h)
+        self.cfg_down = decode_linear_config(device, f, h, per_core_n=2)  # 64 tiles on 32 cores
 
     def _mm(self, x, w, k_block=None, memory_config=None):
         """Many-row (prefill) gate/up projection on minimal_matmul's small CBs, which span the full grid under fp32

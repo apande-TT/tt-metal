@@ -14,11 +14,11 @@ _MAX_IN0_BLOCK_W = 4  # decode sweep on BH (ms/token): 2 -> 26.86, 4 -> 23.46, 8
 _MAX_SUBBLOCK_W = 4  # fp32 dest accumulation, half-sync DEST
 
 
-def decode_linear_config(device, k, n):
+def decode_linear_config(device, k, n, per_core_n=None):
     grid = device.compute_with_storage_grid_size()
     k_t, n_t = k // 32, n // 32
     cores = grid.x * grid.y
-    per_core_n = -(-n_t // cores)
+    per_core_n = per_core_n or -(-n_t // cores)
     in0_block_w = max(d for d in range(1, min(_MAX_IN0_BLOCK_W, k_t) + 1) if k_t % d == 0)
     sub_w = max(d for d in range(1, min(_MAX_SUBBLOCK_W, per_core_n) + 1) if per_core_n % d == 0)
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
