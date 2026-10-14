@@ -158,8 +158,8 @@ PLANNED_TP = 4
 #                     The prefill RoPE computes at HiFi2. The concatenated SDPA heads reach the all_gather through L1;
 #                     short prompts hand the o_proj output to the residual add through L1.
 #   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
-#   pixtral_attention: the vision QKV and the RoPE rotate-half run on minimal_matmul over the full grid too; so does the
-#                     projector linear_2.
+#   pixtral_attention: the vision QKV, the RoPE rotate-half and o_proj (4-tile N blocks) run on minimal_matmul over the
+#                     full grid too; so does the projector linear_2.
 #   token_embed: a hidden-sharded copy of the table; the text prefill gathers each device's residual slice from it
 #                     (no full-width rows, no mesh_partition); the bf16 slice lands in L1 and is cast to the fp32
 #                     residual from there.
