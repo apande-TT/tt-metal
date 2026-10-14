@@ -96,6 +96,10 @@ class TtMinistral3Attention:
     # ... and reads cos / sin and the pair-swap tile from per-core L1 shards (prefill_rope_tables) when that moves
     # fewer DRAM bytes than its per-row reload of the interleaved tables.
     L1_PREFILL_ROPE = True
+    # Prefill q / k / v are split out of the fused QKV into L1 (interleaved over the grid) when they take at most this
+    # many bytes per core: the RoPEs read q / k from L1 and write DRAM, and v is copied to DRAM for the cache fill and
+    # SDPA (none stays resident in L1 across the larger prefill ops, whose static buffers leave no room). 0 disables.
+    PREFILL_HEADS_L1_BYTES = 512 * 1024
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -391,7 +395,13 @@ class TtMinistral3Attention:
         if g != shape[0]:
             t = ttnn.reshape(t, (g, shape[0] * shape[1] // g) + shape[2:])
         t = ttnn.experimental.rotary_embedding_llama(
-            t, cos, sin, trans, is_decode_mode=False, compute_kernel_config=self.compute_cfg
+            t,
+            cos,
+            sin,
+            trans,
+            is_decode_mode=False,
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         for x in l1:
             ttnn.deallocate(x)
@@ -533,9 +543,20 @@ class TtMinistral3Attention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
         )
+        grid = self.device.compute_with_storage_grid_size()
+        qkv_bytes = 2 * int(b) * int(s) * int(qkv.shape[-1])  # bf16
+        heads_l1 = self.meta_rope and 0 < qkv_bytes // (grid.x * grid.y) <= self.PREFILL_HEADS_L1_BYTES
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, transpose_k_heads=False
+            qkv,
+            num_heads=self.local_heads,
+            num_kv_heads=self.local_kv_heads,
+            transpose_k_heads=False,
+            memory_config=ttnn.L1_MEMORY_CONFIG if heads_l1 else None,
         )
+        if heads_l1:  # see PREFILL_HEADS_L1_BYTES; the RoPEs below write q / k to DRAM
+            heads_in = (q, k)
+            v_l1, v = v, ttnn.to_memory_config(v, ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(v_l1)
         rope_k = rope_q = self._rope
         if self.meta_rope:
             # One fused RoPE per tensor over every user's heads (the prompt positions are shared by all rows): a
@@ -551,6 +572,9 @@ class TtMinistral3Attention:
             q = rope_q(q, cos, sin)
             if self.l4_beta is not None and self.l4_max and position_ids is not None:
                 q = ttnn.multiply(q, self._llama4_scale(position_ids, (1, 1, s, 1)))
+        if heads_l1:
+            for t in heads_in:
+                ttnn.deallocate(t)
         if kv_cache is not None:
             self._fill_cache(kv_cache[0], k)
             self._fill_cache(kv_cache[1], v)
