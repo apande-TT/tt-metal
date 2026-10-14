@@ -17,6 +17,8 @@ Layouts: prefill x (B, 1, S, D) [or (B, S, D)], decode x (1, 1, B, D). The outpu
 """
 from __future__ import annotations
 
+import torch
+
 import ttnn
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import (
     TtMinistral3Attention,
@@ -34,13 +36,14 @@ class TtMinistral3DecoderLayer:
     # image-token rows most. Norms read a bf16 copy; attention / MLP outputs arrive in fp32 (their OUT_DTYPE).
     RESIDUAL_DTYPE = ttnn.float32
     # Prefill on a TP mesh carries the residual HIDDEN-SHARDED (each device its 1/TP slice of the hidden dim, the
-    # layout attention's and the MLP's reduce-scatter already produce): the fp32 residual adds and the residual's
-    # bf16 cast run on the shard, and the bf16 shard is all_gathered right before each norm (the same values the
-    # unsharded path gathers, so the result is bit-identical). ttnn's distributed RMSNorm (pre/post_all_gather) was
-    # measured here and lost accuracy (e2e PCC 0.9989 -> 0.9914, token mismatches), so the norm itself stays the
-    # unsharded HiFi4 one. The model partitions the embeddings into the shard and gathers the final residual. A
-    # full-width input takes the unsharded path.
+    # layout attention's and the MLP's reduce-scatter already produce): the fp32 residual adds and the RMS
+    # norms run on the shard (see _sharded_norm), so only each norm's bf16 output is all_gathered for the next
+    # projections. The model partitions the embeddings into the shard and gathers the final residual. A full-width
+    # input takes the unsharded path.
     SHARD_PREFILL_RESIDUAL = True
+    # False: cast the shard to bf16, all_gather it and run the unsharded HiFi4 norm (bit-identical to the unsharded
+    # path, but the norm then reads and writes the full-width activation on every device).
+    SHARDED_PREFILL_NORM = True
 
     def __init__(self, device, torch_module, meta_rope=False) -> None:
         """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order)."""
@@ -57,6 +60,18 @@ class TtMinistral3DecoderLayer:
         self.mlp = TtMinistral3MLP(device, torch_module.mlp, in_scale=ln_post.weight)
         self.compute_cfg = self.self_attn.compute_cfg
         self.hidden = int(ln_in.weight.shape[0])
+        self._stats_mask = None
+        if self.tp > 1 and self.SHARDED_PREFILL_NORM:
+            # Picks column 0 of each device's sum-of-squares tile out of the gathered (.., S, 32 * TP) stats.
+            mask = torch.zeros(1, 1, 1, ttnn.TILE_SIZE * self.tp)
+            mask[..., :: ttnn.TILE_SIZE] = 1.0
+            self._stats_mask = ttnn.from_torch(
+                mask,
+                dtype=ttnn.float32,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+            )
 
     @property
     def attn(self):
@@ -116,7 +131,7 @@ class TtMinistral3DecoderLayer:
         self.self_attn.prefill_gather = self.mlp.prefill_gather = False
         try:
             a = self.self_attn(
-                self._gathered_norm(self.input_layernorm, x),
+                self._prefill_norm(self.input_layernorm, x),
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -124,14 +139,34 @@ class TtMinistral3DecoderLayer:
                 mode="prefill",
             )
             h = self._residual_add(x, a)
-            m = self.mlp(self._gathered_norm(self.post_attention_layernorm, h), mode="prefill")
+            m = self.mlp(self._prefill_norm(self.post_attention_layernorm, h), mode="prefill")
         finally:
             self.self_attn.prefill_gather = self.mlp.prefill_gather = True
         return self._residual_add(h, m)
 
-    def _gathered_norm(self, norm, x):
-        """Norm of the hidden-sharded fp32 residual x: cast the shard to bf16, all_gather it, run the unsharded norm."""
+    def _prefill_norm(self, norm, x):
+        """Full-width bf16 norm output of the hidden-sharded fp32 residual x."""
+        if self.SHARDED_PREFILL_NORM:
+            return self._sharded_norm(norm, x)
         return self._bf16(norm(ttnn.all_gather(self._bf16(x), dim=3, **tp_ccl_args())))
+
+    def _sharded_norm(self, norm, x):
+        """Unit-gamma RMSNorm of the fp32 hidden shard x: each device's sum of squares, an all_gather of those sums,
+        the shard scaled by rsqrt(mean + eps) in fp32, and an all_gather of the bf16 result.
+
+        rms_norm_pre_all_gather's fp32 (SFPU) path puts the exact sum in column 0 of its stats tile but leaves
+        nonzero partials in columns 1..31 (measured: up to 15% of the sum), and rms_norm_post_all_gather reduces
+        all 32 columns (and, on bf16 input, scales by a 1/N truncated to bf16), which is why ttnn's distributed norm failed the e2e
+        test here. So the gathered stats are masked to each device's column 0 before they are summed, and 1/N,
+        eps and rsqrt are applied in fp32."""
+        assert norm.gamma is None, "the sharded prefill norm expects its gamma folded into the next projections"
+        ccl = tp_ccl_args()
+        cfg = norm._impl.compute_kernel_config_hifi2  # HiFi4 + fp32 dest, exact: the fp32 input takes the SFPU path
+        sq = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=cfg, dtype=ttnn.float32)  # sum(x^2) in column 0
+        sq = ttnn.multiply(ttnn.all_gather(sq, dim=3, **ccl), self._stats_mask)
+        sq = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg)
+        r = ttnn.rsqrt(ttnn.add(ttnn.multiply(sq, 1.0 / self.hidden), norm._impl.eps))
+        return ttnn.all_gather(ttnn.multiply(x, r, dtype=ttnn.bfloat16), dim=3, **ccl)
 
     @staticmethod
     def _residual_add(x, delta):
