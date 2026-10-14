@@ -159,6 +159,8 @@ PLANNED_TP = 4
 #   pixtral_attention: the vision QKV runs on minimal_matmul over the full grid too.
 #   pixtral_vision_model: equal-size images are uploaded already patchified on the host (patchify_host; tile layout),
 #                     so the device skips the reshape / permute chain over 14-pixel row-major sticks.
+#   attention (vision layer): each RMSNorm gamma is folded into the q/k/v and gate/up weights that read it (no separate
+#                     fp32 gamma multiply).
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
 #   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py).
