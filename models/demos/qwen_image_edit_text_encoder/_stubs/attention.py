@@ -310,6 +310,8 @@ EXACT_BMM_L1_BYTES = 0
 EXACT_CORE_GRID = None
 # split_matmul's plain (exact=False) limb products on this core grid (None: ttnn picks its own)
 BMM_CORE_GRID = None
+# the vision attention's logit scale applied as the mask add's input activation (False: multiply + add)
+VISION_FUSED_SCALE_MASK = False
 # core grid for split_linear's exact-lane products (None: ttnn.linear picks its own)
 EXACT_LINEAR_CORE_GRID = None
 # split_linear's exact-lane products stage the bf16 weight and the activation limbs in L1 once per call when
@@ -627,7 +629,11 @@ class TtVisionAttention:
         q, k = _rope(q), _rope(k)
         mask = tt_mask if tt_mask.dtype == ttnn.float32 else ttnn.typecast(tt_mask, ttnn.float32)
         scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex, limbs=L)
-        scores = ttnn.add(ttnn.multiply(scores, self.scale), mask)
+        if VISION_FUSED_SCALE_MASK:  # the logit scale as the mask add's input activation (one pass)
+            scale = [ttnn.UnaryWithParam(ttnn.UnaryOpType.MUL_UNARY_SFPU, self.scale)]
+            scores = ttnn.add(scores, mask, input_tensor_a_activations=scale)
+        else:
+            scores = ttnn.add(ttnn.multiply(scores, self.scale), mask)
         # explicit float32 softmax (the fused op mis-scales some masked window rows: one token of block
         # 12 measured 6.7% off with exact inputs)
         mx = ttnn.max(scores, dim=-1, keepdim=True)
