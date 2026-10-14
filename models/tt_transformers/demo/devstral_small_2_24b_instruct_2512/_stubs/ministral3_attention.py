@@ -222,6 +222,14 @@ class TtMinistral3Attention:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,  # L1 accumulation made batched prefill matmuls non-repeatable
         )
+        # Prefill SDPA is bound by its per-tile work (QK^T, softmax, PV per q chunk): HiFi2 matmuls, fp32 DEST kept.
+        self.prefill_sdpa_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
         # The many-row prefill QKV and o_proj projections are compute-bound: HiFi2 (fp32 accumulation kept).
         self.prefill_proj_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
@@ -480,7 +488,7 @@ class TtMinistral3Attention:
                 k_chunk_size=k_chunk,
                 exp_approx_mode=False,
             ),
-            compute_kernel_config=self.compute_cfg,
+            compute_kernel_config=self.prefill_sdpa_cfg,
         )
         attn = ttnn.experimental.nlp_concat_heads(attn)
         if self.tp > 1:
