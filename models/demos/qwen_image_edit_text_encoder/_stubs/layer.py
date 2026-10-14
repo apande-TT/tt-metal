@@ -46,6 +46,8 @@ HEADS_BY_SLICES = False
 # MLP gate / up's shared bf16 limbs split straight into L1 when together they take at most this many bytes
 # (the split hook's optional output memory config; freed after both products. 0: in x's memory)
 MLP_LIMBS_L1_BYTES = 0
+# the LM MLP's SiLU applied as the gate input's activation of the gate * up multiply (one op, no SiLU round trip)
+MLP_FUSED_SILU = False
 
 
 def _t(lin):
@@ -281,7 +283,11 @@ class TtTextMLP:
             if xp is not None and xp[0].memory_config().buffer_type == ttnn.BufferType.L1:
                 for p in xp:
                     ttnn.deallocate(p)
-            out = split_linear(ttnn.multiply(ttnn.silu(gate), up), self.w_down, compute_kernel_config=cfg, exact=ex)
+            if MLP_FUSED_SILU:
+                h = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
+            else:
+                h = ttnn.multiply(ttnn.silu(gate), up)
+            out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex)
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)
             return out
