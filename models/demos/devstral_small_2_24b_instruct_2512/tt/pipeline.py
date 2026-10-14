@@ -144,6 +144,7 @@ PLANNED_TP = 4
 #                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
 #   prompts pad to a tile multiple only; prefill SDPA pads to whole chunks internally. Prefill QKV and o_proj run HiFi2 on bf8 weights.
 #   ministral3_m_l_p short-prompt down projection: a grid of whole 16 x 16-tile output blocks per core.
+#   ministral3_attention short-prompt QKV: one output block per core (its whole M x N range, e.g. 12 x 5 tiles).
 #   ministral3_attention prefill SDPA: one key chunk of the prompt (even tiles), 160-row q chunks (7 even rounds), no pad,
 #                     HiFi2 matmuls.
 #   ministral3_attention prefill RoPE: runs on a (batch, heads) regrouping of the heads (an outer-dim view) that balances
