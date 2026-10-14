@@ -351,6 +351,25 @@ class TtMinistral3Attention:
             ttnn.multiply(ttnn.matmul(x, self.rot, compute_kernel_config=self.compute_cfg), sin),
         )
 
+    def _one_block_cfg(self, mt, nt):
+        """minimal_matmul config giving every core ONE output block -- its whole (M, N) tile range -- when that range
+        is small (short prompts): the default 8 x 8 blocks split e.g. the 128-row QKV's 12 x 5-tile range into an 8-
+        and a 4-row block, streaming the weight columns twice. None (the default config) otherwise."""
+        grid = self.device.compute_with_storage_grid_size()
+        gm, gn = (grid.x, grid.y) if mt > nt else (grid.y, grid.x)  # minimal_matmul puts M along x when M > N
+        m, n = -(-mt // gm), -(-nt // gn)
+        if m * n > 64 or m <= 8:
+            return None
+        sh, sw = (2, 2) if m % 2 == 0 and n % 2 == 0 else ((4, 1) if m % 4 == 0 else (2, 1) if m % 2 == 0 else (1, 1))
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=m,
+            K_block_size=8,
+            N_block_size=n,
+            subblock_h=sh,
+            subblock_w=sw,
+            compute_with_storage_grid_size=grid,
+        )
+
     def prefill_rope_tables(self, rope, s):
         """Prefill rope tables (cos, sin[, q_cos, q_sin]), each (1, 1, s, hd), extended ONCE per forward for every
         layer with their per-core layouts: (cos, sin, q_cos | None, q_sin | None, rows), rows = (cos, sin, q_cos,
@@ -539,6 +558,7 @@ class TtMinistral3Attention:
         qkv = ttnn.experimental.minimal_matmul(
             x,
             self.wqkv,
+            config=self._one_block_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE),
             compute_kernel_config=self.prefill_proj_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
