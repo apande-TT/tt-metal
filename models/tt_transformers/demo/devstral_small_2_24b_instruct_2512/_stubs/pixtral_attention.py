@@ -91,6 +91,27 @@ class TtPixtralAttention:
             mesh_mapper=self._repl,
         )
 
+    def _o_proj_cfg(self, x):
+        """minimal_matmul config for o_proj whose N block is the per-core N range when that is under 8 tiles (M splits
+        along the grid's x axis and N along y when M > N); None (the default 8 x 8 blocks) otherwise."""
+        grid = self.device.compute_with_storage_grid_size()
+        shape = tuple(int(d) for d in x.shape)
+        mt = shape[-2] // ttnn.TILE_SIZE
+        for d in shape[:-2]:
+            mt *= d
+        nt = int(self.wo.shape[-1]) // ttnn.TILE_SIZE
+        n = -(-nt // (grid.y if mt > nt else grid.x))
+        if n >= 8 or n % 2:
+            return None
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=8,
+            K_block_size=8,
+            N_block_size=n,
+            subblock_h=2,
+            subblock_w=2,
+            compute_with_storage_grid_size=grid,
+        )
+
     def _rope(self, x, cos, sin):
         # rotate_half as x @ R on minimal_matmul, which folds the (images, heads) batch into its rows over the full
         # grid (ttnn.matmul ran the 32 x 4 x 256-row batch on 16 cores: 252 us); R is a +-1 permutation, so exact.
@@ -147,8 +168,17 @@ class TtPixtralAttention:
             compute_kernel_config=self.compute_cfg,
         )
         attn = ttnn.experimental.nlp_concat_heads(attn)
-        # fp32 output: it is added straight into the vision layer's fp32 residual stream.
-        out = ttnn.linear(attn, self.wo, dtype=ttnn.float32, compute_kernel_config=self.compute_cfg)
+        # fp32 output: it is added straight into the vision layer's fp32 residual stream. minimal_matmul folds the
+        # images into its rows over the full grid (ttnn.linear ran the 32 x 256-row batch on 88 cores: 360 us), with
+        # N blocks no wider than each core's N range (the default 8-tile block would be half padding at 4 tiles).
+        out = ttnn.experimental.minimal_matmul(
+            attn,
+            self.wo,
+            config=self._o_proj_cfg(attn),
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.float32,
+        )
         if self.tp > 1:
             out = ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
         if len(in_shape) == 3:
