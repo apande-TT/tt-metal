@@ -144,6 +144,7 @@ PLANNED_TP = 4
 #                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
 #   prompts pad to a tile multiple only; prefill SDPA pads to whole chunks internally. Prefill QKV and o_proj run HiFi2 on bf8 weights.
 #   ministral3_m_l_p short-prompt down projection: a grid of whole 16 x 16-tile output blocks per core.
+#   prefill's last prompt rows: one embedding gather out of the untilized 32-row block (no re-tilize / reshape).
 #   ministral3_m_l_p fused gate/up N block: the per-core N range when it is under 12 tiles (vision MLP: 8 tiles).
 #   ministral3_attention short-prompt QKV and o_proj: one output block per core (its whole M x N range, e.g. 12 x 5 tiles).
 #   ministral3_attention prefill SDPA: one key chunk of the prompt (even tiles), 160-row q chunks (7 even rounds), no pad,
@@ -674,6 +675,13 @@ class DevstralPipeline:
             "positions": self._put(
                 torch.arange(s, dtype=torch.float32).reshape(1, 1, s, 1), ttnn.float32, ttnn.TILE_LAYOUT
             ),
+            # forward_prefill's gather index of each user's last prompt row in the untilized 32-row block holding it
+            "last_rows": self._put(
+                torch.arange(b, dtype=torch.int32).reshape(1, b) * ttnn.TILE_SIZE
+                + (req["real_len"] - 1) % ttnn.TILE_SIZE,
+                ttnn.uint32,
+                ttnn.ROW_MAJOR_LAYOUT,
+            ),
             # Cast on the host (exact: the table already holds bf16 values): an fp32 upload into a bf16 row-major
             # tensor is converted on device as tilize + typecast + untilize of the whole (steps, B * NB) table, ~5 ms.
             "noise": self._put(
@@ -752,7 +760,14 @@ class DevstralPipeline:
         r = dev["real_len"] - 1
         r0 = r // ttnn.TILE_SIZE * ttnn.TILE_SIZE
         block = ttnn.slice(hidden, (0, r0, 0), (b, r0 + ttnn.TILE_SIZE, d))
-        last = ttnn.slice(block, (0, r - r0, 0), (b, r - r0 + 1, d))
+        if "last_rows" in dev:
+            # The rows themselves by one gather out of the untilized block (row b * 32 + r % 32 per user), emitted
+            # tiled as the (B, D) LM-head input: the unaligned slice untilized, sliced, re-tilized padding each user's
+            # row to a full tile (90 us) and then reshaped the (B, 1, D) result to (1, 1, B, D) through DRAM (48 us).
+            rows = ttnn.reshape(ttnn.to_layout(block, ttnn.ROW_MAJOR_LAYOUT), (b * ttnn.TILE_SIZE, d))
+            last = ttnn.embedding(dev["last_rows"], rows, layout=ttnn.TILE_LAYOUT)  # (1, B, D)
+        else:
+            last = ttnn.slice(block, (0, r - r0, 0), (b, r - r0 + 1, d))
         logits = self.lm_head(ttnn.reshape(last, (1, 1, b, d)))
         return hidden, logits
 
