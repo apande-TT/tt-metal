@@ -153,6 +153,7 @@ PLANNED_TP = 4
 #                     core, laid out once per forward by ministral3_attention.prefill_rope_tables), so the op stops
 #                     re-reading them from DRAM per row (when that moves fewer bytes: 416 / 128 rows, q and k).
 #                     nlp_create_qkv_heads splits q / k / v into L1 (<= 512 KB per core); the RoPEs read q / k from L1.
+#                     Short prompts (<= 192 KB per core) also keep the fused QKV output in L1 for that split.
 #   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
