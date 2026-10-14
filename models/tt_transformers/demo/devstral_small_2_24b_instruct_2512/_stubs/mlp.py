@@ -11,6 +11,7 @@ on the intermediate dim, down row-parallel then all_reduce.
 from __future__ import annotations
 
 import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs import pixtral_attention
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_m_l_p import TtMinistral3MLP
 
 
@@ -24,6 +25,9 @@ class TtMLP(TtMinistral3MLP):
     PREFILL_REDUCE_DTYPE = None
     PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi2
     DOWN_DTYPE = ttnn.bfloat16
+
+    def _tp_degree(self, device, mesh):
+        return pixtral_attention.vision_tp(device)[0]
 
     def __init__(self, device, torch_module, in_scale=None) -> None:
         """in_scale: the ffn_norm gamma, folded into gate/up (see TtAttention.FOLD_NORM_GAMMA)."""

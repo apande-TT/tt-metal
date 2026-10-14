@@ -27,6 +27,7 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.mistr
     TtMistral3PatchMerger,
 )
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.mistral3_r_m_s_norm import TtMistral3RMSNorm
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_attention import vision_tp
 
 
 def _mesh_size(device):
@@ -39,7 +40,8 @@ def _mesh_size(device):
 class TtMistral3MultiModalProjector:
     def __init__(self, device, torch_module) -> None:
         self.device = device
-        self.tp = tp = _mesh_size(device)
+        self.tp, repl = vision_tp(device)
+        tp = self.tp
         self.norm = TtMistral3RMSNorm.build(device, torch_module.norm)
         self.patch_merger = TtMistral3PatchMerger(device, torch_module.patch_merger)
         self.d = torch_module.norm.weight.shape[0]
@@ -47,8 +49,8 @@ class TtMistral3MultiModalProjector:
         assert text_hidden % tp == 0, f"text hidden {text_hidden} not divisible by TP={tp}"
 
         is_mesh = tp > 1
-        shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else None
-        self._repl = repl = ttnn.ReplicateTensorToMesh(device) if is_mesh else None
+        shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else repl
+        self._repl = repl
 
         def _put(t, mapper):
             return ttnn.from_torch(

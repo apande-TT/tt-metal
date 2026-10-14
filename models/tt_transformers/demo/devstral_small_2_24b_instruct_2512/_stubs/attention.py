@@ -49,7 +49,7 @@ class TtAttention:
         )
         self.tp = self.attention.tp
         self.head_dim = self.attention.head_dim
-        self._repl = ttnn.ReplicateTensorToMesh(device) if self.tp > 1 else None
+        self._repl = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
 
     @classmethod
     def build(cls, device, torch_module):

@@ -21,15 +21,14 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_attention import vision_tp
 
 
 class TtMistral3PatchMerger:
     def __init__(self, device, torch_module) -> None:
         self.device = device
-        try:
-            self.tp = tp = int(device.get_num_devices())
-        except Exception:
-            self.tp = tp = 1
+        self.tp, repl = vision_tp(device)
+        tp = self.tp
         self.merge = k = torch_module.spatial_merge_size
         self.patch_size = torch_module.patch_size
         wm = torch_module.merging_layer.weight.detach()  # (d, d*k*k)
@@ -42,7 +41,7 @@ class TtMistral3PatchMerger:
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=device,
-            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1) if tp > 1 else None,
+            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1) if tp > 1 else repl,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         self.compute_cfg = ttnn.init_device_compute_kernel_config(

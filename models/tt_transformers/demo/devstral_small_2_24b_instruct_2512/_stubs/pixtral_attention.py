@@ -26,11 +26,24 @@ def _mesh_size(device):
         return 1
 
 
+# Vision data parallelism. True while the pipeline builds the vision tower and projector: those modules then keep
+# their FULL weights replicated on every device of the mesh and run without any collective, and the caller hands each
+# device its own slice of the image batch (and gathers the projector output). False: tensor-parallel over the mesh.
+DATA_PARALLEL = False
+
+
+def vision_tp(device):
+    """(tensor-parallel degree of a vision module built now, mapper for its replicated tensors)."""
+    mesh = _mesh_size(device)
+    return (1 if DATA_PARALLEL else mesh), (ttnn.ReplicateTensorToMesh(device) if mesh > 1 else None)
+
+
 class TtPixtralAttention:
     def __init__(self, device, torch_module, in_scale=None) -> None:
         """in_scale: the attention_norm gamma, folded into q/k/v (see TtAttention.FOLD_NORM_GAMMA)."""
         self.device = device
-        self.tp = tp = _mesh_size(device)
+        self.tp, repl = vision_tp(device)
+        tp = self.tp
         self.num_heads = torch_module.num_heads
         self.head_dim = hd = torch_module.head_dim
         self.scale = float(torch_module.scaling)
@@ -38,8 +51,8 @@ class TtPixtralAttention:
         self.local_heads = lh = self.num_heads // tp
 
         is_mesh = tp > 1
-        shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else None
-        self._repl = repl = ttnn.ReplicateTensorToMesh(device) if is_mesh else None
+        shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else repl
+        self._repl = repl
 
         def _put(t, mapper):
             return ttnn.from_torch(

@@ -63,13 +63,15 @@ class TtMinistral3MLP:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up."""
         self.device = device
         try:
-            self.tp = tp = int(device.get_num_devices())
+            mesh = int(device.get_num_devices())
         except Exception:
-            self.tp = tp = 1
+            mesh = 1
+        self.tp = tp = self._tp_degree(device, mesh)
         assert (
             torch_module.intermediate_size % tp == 0
         ), f"intermediate {torch_module.intermediate_size} not divisible by TP={tp}"
-        shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if tp > 1 else None
+        repl = ttnn.ReplicateTensorToMesh(device) if mesh > 1 else None
+        shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if tp > 1 else repl
 
         def _put(t, mapper, dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG):
             return ttnn.from_torch(
@@ -150,6 +152,11 @@ class TtMinistral3MLP:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
+
+    def _tp_degree(self, device, mesh):
+        """Tensor-parallel degree over a mesh of `mesh` devices (the vision MLPs follow the vision data-parallel
+        switch, see pixtral_attention.DATA_PARALLEL)."""
+        return mesh
 
     @classmethod
     def build(cls, device, torch_module):
