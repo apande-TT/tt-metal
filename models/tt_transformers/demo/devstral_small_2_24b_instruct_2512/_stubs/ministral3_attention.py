@@ -641,9 +641,16 @@ class TtMinistral3Attention:
             ),
             compute_kernel_config=self.prefill_sdpa_cfg,
         )
-        attn = ttnn.experimental.nlp_concat_heads(attn)
+        # With TP the concatenated heads only feed the all_gather: they go through L1 when they fit (the same budget
+        # as the head split), so the concat writes and the gather reads no DRAM for them.
+        concat_l1 = self.tp > 1 and 0 < (qkv_bytes * 2 // 3) // (grid.x * grid.y) <= self.PREFILL_HEADS_L1_BYTES
+        attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.L1_MEMORY_CONFIG if concat_l1 else None)
         if self.tp > 1:
-            attn = ttnn.all_gather(attn, dim=3, **tp_ccl_args())  # every head's output, for the column-parallel o_proj
+            # every head's output, for the column-parallel o_proj
+            concat = attn
+            attn = ttnn.all_gather(attn, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **tp_ccl_args())
+            if concat_l1:
+                ttnn.deallocate(concat)
         # Prefill o_proj on the full grid too (ttnn.linear's auto 1D config ran it on 80 cores at ~30 TFLOP/s).
         out = ttnn.experimental.minimal_matmul(
             attn,
