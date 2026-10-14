@@ -655,6 +655,7 @@ class TtMinistral3Attention:
         out = ttnn.experimental.minimal_matmul(
             attn,
             self.wo,
+            config=self._one_block_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wo.shape[-1]) // ttnn.TILE_SIZE),
             compute_kernel_config=self.prefill_proj_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=self.PREFILL_REDUCE_DTYPE if self.tp > 1 else self.OUT_DTYPE,
