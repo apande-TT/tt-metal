@@ -157,7 +157,8 @@ PLANNED_TP = 4
 #                     nlp_create_qkv_heads splits q / k / v into L1 (<= 512 KB per core); the RoPEs read q / k from L1.
 #                     The fused QKV output (<= 400 KB per core) also lands in L1 for that split.
 #                     The prefill RoPE computes at HiFi2. The concatenated SDPA heads reach the all_gather through L1;
-#                     short prompts hand the o_proj output to the residual add through L1.
+#                     short prompts hand the o_proj output to the residual add and SDPA's output to the concat
+#                     through L1 (416 rows too).
 #   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
 #   pixtral_attention: the vision QKV, the RoPE rotate-half and o_proj (4-tile N blocks) run on minimal_matmul over the
 #                     full grid too; so does the projector linear_2.
