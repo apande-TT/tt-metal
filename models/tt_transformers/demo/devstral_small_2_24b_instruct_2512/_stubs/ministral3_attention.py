@@ -422,7 +422,7 @@ class TtMinistral3Attention:
             sin,
             trans,
             is_decode_mode=False,
-            compute_kernel_config=self.compute_cfg,
+            compute_kernel_config=self.prefill_proj_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         for x in l1:
