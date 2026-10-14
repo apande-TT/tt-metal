@@ -78,6 +78,28 @@ class TtMistral3MultiModalProjector:
     def build(cls, device, torch_module):
         return cls(device, torch_module)
 
+    def _range_cfg(self, x, w):
+        """minimal_matmul config whose blocks are each core's whole M x N tile range (M splits along the grid's x axis
+        when M > N); None (the default 8 x 8 blocks) when a range is over 8 tiles or odd."""
+        grid = self.device.compute_with_storage_grid_size()
+        shape = tuple(int(d) for d in x.shape)
+        mt = shape[-2] // ttnn.TILE_SIZE
+        for d in shape[:-2]:
+            mt *= d
+        nt = int(w.shape[-1]) // ttnn.TILE_SIZE
+        gm, gn = (grid.x, grid.y) if mt > nt else (grid.y, grid.x)
+        m, n = -(-mt // gm), -(-nt // gn)
+        if m > 8 or n > 8 or m % 2 or n % 2:
+            return None
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=m,
+            K_block_size=8,
+            N_block_size=n,
+            subblock_h=2,
+            subblock_w=2,
+            compute_with_storage_grid_size=grid,
+        )
+
     def __call__(self, image_features, image_sizes=None, **kwargs):
         x = image_features
         side_by_side = x.shape[0] > 1 and len(x.shape) >= 3
@@ -87,7 +109,16 @@ class TtMistral3MultiModalProjector:
         if not side_by_side:
             x = ttnn.reshape(x, (1, 1, x.shape[-2], x.shape[-1]))
 
-        hdn = ttnn.linear(x, self.w1, bias=self.b1, compute_kernel_config=self.compute_cfg)
+        # linear_1 (+ its bias) on minimal_matmul over the full grid too (ttnn.linear ran the 32 x 64-row batch on 40
+        # cores: 571 us), with blocks of each core's whole M x N range (6 x 4 tiles on 11 x 10 cores).
+        hdn = ttnn.experimental.minimal_matmul(
+            x,
+            self.w1,
+            bias_tensor=self.b1,
+            config=self._range_cfg(x, self.w1),
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         hdn = ttnn.gelu(hdn, fast_and_approximate_mode=False)
         # minimal_matmul folds the images into its rows over the full grid (ttnn.linear ran the side-by-side batch
         # of 32 x 64 rows, K 1280, N 5120 as a batched matmul on 80 cores: 1.14 ms).
