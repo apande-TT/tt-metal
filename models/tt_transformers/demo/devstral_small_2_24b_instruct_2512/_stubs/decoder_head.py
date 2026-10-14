@@ -142,9 +142,11 @@ class DecoderHead:
             self.tp = 1
         w = torch_module.weight.detach().T.contiguous().to(torch.bfloat16)  # (in, vocab)
         assert w.shape[-1] % self.tp == 0, f"vocab {w.shape[-1]} not divisible by TP={self.tp}"
+        # bfloat8_b weight: the lm_head is the largest single DRAM read of a decode step (vocab/TP x 5120), so
+        # block-float halves it; accumulation stays fp32.
         self.w__root__weight = ttnn.from_torch(
             w,
-            dtype=ttnn.bfloat16,
+            dtype=ttnn.bfloat8_b,
             layout=ttnn.TILE_LAYOUT,
             device=device,
             mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1) if self.tp > 1 else None,
@@ -161,7 +163,8 @@ class DecoderHead:
     def _apply__root_(self, x):
         return ttnn.linear(x, self.w__root__weight, compute_kernel_config=self.compute_cfg)
 
-    def __call__(self, x, *args, **kwargs):
+    def __call__(self, x, *args, gather=True, **kwargs):
+        """gather=False returns each device's (.., vocab/TP) shard (the decode sampler only needs .local)."""
         shape = tuple(x.shape)
         if len(shape) != 4:
             x = ttnn.reshape(x, (1,) * (4 - len(shape)) + shape)
@@ -171,7 +174,7 @@ class DecoderHead:
         # The pre-gather (.., vocab/TP) shard stays reachable: the on-device sampler takes its top-k per device
         # and merges the TP candidate lists instead of sorting the full gathered vocab row.
         self.local = out
-        if self.tp > 1:
+        if self.tp > 1 and gather:
             out = ttnn.all_gather(out, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         return ttnn.reshape(out, shape[:-1] + (out.shape[-1],))
 

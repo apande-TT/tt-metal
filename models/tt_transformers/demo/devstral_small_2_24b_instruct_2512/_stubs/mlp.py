@@ -11,6 +11,7 @@ on the intermediate dim, down row-parallel then all_reduce.
 from __future__ import annotations
 
 import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs import pixtral_attention
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_m_l_p import TtMinistral3MLP
 
 
@@ -19,11 +20,22 @@ class TtMLP(TtMinistral3MLP):
     OUT_DTYPE = ttnn.float32
     DECODE_WEIGHTS = False  # the vision tower never decodes
     GATHER_DTYPE = None  # the vision residual adds expect the fp32 all_reduce
+    # Block-float8 fused gate/up weight (the many-row SwiGLU). Not bf4: a bf4 SwiGLU weight attenuated the hidden
+    # state around its massive activations in another model, and here it would save only 7.6 us a layer.
+    GATE_UP_DTYPE = ttnn.bfloat8_b
+    GATE_UP_FIDELITY = ttnn.MathFidelity.LoFi
+    PREFILL_REDUCE_DTYPE = None
+    PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi2
+    DOWN_DTYPE = ttnn.bfloat16
 
-    def __init__(self, device, torch_module) -> None:
+    def _tp_degree(self, device, mesh):
+        return pixtral_attention.vision_tp(device)[0]
+
+    def __init__(self, device, torch_module, in_scale=None) -> None:
+        """in_scale: the ffn_norm gamma, folded into gate/up (see TtAttention.FOLD_NORM_GAMMA)."""
         act = type(torch_module.act_fn).__name__
         assert act in ("SiLU", "SiLUActivation"), f"expected silu, got {act}"
-        super().__init__(device, torch_module)
+        super().__init__(device, torch_module, in_scale=in_scale)
 
 
 def build(device, torch_module=None):

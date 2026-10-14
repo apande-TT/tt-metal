@@ -19,16 +19,16 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
 from __future__ import annotations
 
 import torch
+
 import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_attention import vision_tp
 
 
 class TtMistral3PatchMerger:
     def __init__(self, device, torch_module) -> None:
         self.device = device
-        try:
-            self.tp = tp = int(device.get_num_devices())
-        except Exception:
-            self.tp = tp = 1
+        self.tp, repl = vision_tp(device)
+        tp = self.tp
         self.merge = k = torch_module.spatial_merge_size
         self.patch_size = torch_module.patch_size
         wm = torch_module.merging_layer.weight.detach()  # (d, d*k*k)
@@ -41,7 +41,7 @@ class TtMistral3PatchMerger:
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=device,
-            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1) if tp > 1 else None,
+            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1) if tp > 1 else repl,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         self.compute_cfg = ttnn.init_device_compute_kernel_config(
@@ -70,7 +70,11 @@ class TtMistral3PatchMerger:
         return ttnn.reshape(x, (b, 1, (h // k) * (w // k), k * k * d))
 
     def _merge(self, x):
-        out = ttnn.linear(x, self.w_merge, compute_kernel_config=self.compute_cfg)
+        # minimal_matmul folds the images into its rows and spreads them over the full grid; ttnn.linear's auto
+        # config ran the side-by-side batch (32 x 64 rows, K 4096, N 256) as a batched matmul on 16 cores (2.8 ms).
+        out = ttnn.experimental.minimal_matmul(
+            x, self.w_merge, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
         if self.tp > 1:
             out = ttnn.all_gather(out, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         return out

@@ -33,8 +33,8 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
 from __future__ import annotations
 
 import torch
-import ttnn
 
+import ttnn
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_r_m_s_norm import TtPixtralRMSNorm
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_rotary_embedding import (
     TtPixtralRotaryEmbedding,
@@ -105,16 +105,21 @@ class TtPixtralVisionModel:
             per_image.append((hh * self.max_side + ww).reshape(-1))
         return torch.concat(per_image)
 
-    def _patchify_batched(self, pv, h, w):
-        """(B, C, h*p, w*p) row-major -> (B, 1, h*w, C*p*p) in (c, ky, kx) order."""
-        p, c, b = self.patch_size, self.in_ch, pv.shape[0]
-        x = ttnn.reshape(pv, (b * c * h, p, w, p))  # (b,c,i), ky, j, kx
-        x = ttnn.permute(x, (0, 2, 1, 3))  # (b,c,i), j, ky, kx
-        x = ttnn.reshape(x, (b, c, h * w, p * p))
-        x = ttnn.permute(x, (0, 2, 1, 3))  # b, (i,j), c, (ky,kx)
-        return ttnn.reshape(x, (b, 1, h * w, c * p * p))
+    def patchify_host(self, pixel_values, image_sizes):
+        """Host (torch) patchify of equal-size images: (B, C, H, W) cropped to image_sizes -> (B, 1, h*w, C*p*p) rows
+        in (c, ky, kx) order -- exactly what _patchify_batched builds on device -- or None for mixed sizes. A caller
+        that uploads these rows (tile layout) and passes prepatched=True skips the device reshape / permute chain,
+        whose row-major sticks are 14 pixels wide (~3.6 ms for 32 images of 224 x 224)."""
+        grids = self.grids(image_sizes)
+        if len(set(grids)) != 1:
+            return None
+        (h, w), p, c = grids[0], self.patch_size, self.in_ch
+        pv = pixel_values[..., : h * p, : w * p]
+        b = pv.shape[0]
+        return pv.reshape(b, c, h, p, w, p).permute(0, 2, 4, 1, 3, 5).reshape(b, 1, h * w, c * p * p).contiguous()
 
-    def __call__(self, pixel_values, image_sizes=None, position_ids=None, **kwargs):
+    def _patchify(self, pixel_values, image_sizes):
+        """Device patchify: (B, C, H, W) pixels -> (patch rows, grids, batched)."""
         pv = pixel_values
         if isinstance(pv, torch.Tensor):
             pv = ttnn.from_torch(
@@ -134,15 +139,46 @@ class TtPixtralVisionModel:
             h, w = grids[0]
             if (h * p, w * p) != (hp, wp):
                 pv = ttnn.slice(pv, (0, 0, 0, 0), (b, self.in_ch, h * p, w * p))
-            x = self._patchify_batched(pv, h, w)
+            return self._patchify_batched(pv, h, w), grids, batched
+        rows = []
+        for i, (h, w) in enumerate(grids):
+            img = ttnn.slice(pv, (i, 0, 0, 0), (i + 1, self.in_ch, h * p, w * p))
+            rows.append(self._patchify_batched(img, h, w))
+        return ttnn.concat(rows, dim=2), grids, batched
+
+    def _patchify_batched(self, pv, h, w):
+        """(B, C, h*p, w*p) row-major -> (B, 1, h*w, C*p*p) in (c, ky, kx) order."""
+        p, c, b = self.patch_size, self.in_ch, pv.shape[0]
+        x = ttnn.reshape(pv, (b * c * h, p, w, p))  # (b,c,i), ky, j, kx
+        x = ttnn.permute(x, (0, 2, 1, 3))  # (b,c,i), j, ky, kx
+        x = ttnn.reshape(x, (b, c, h * w, p * p))
+        x = ttnn.permute(x, (0, 2, 1, 3))  # b, (i,j), c, (ky,kx)
+        return ttnn.reshape(x, (b, 1, h * w, c * p * p))
+
+    def __call__(self, pixel_values, image_sizes=None, position_ids=None, prepatched=False, **kwargs):
+        """prepatched: pixel_values is patchify_host's (B, 1, h*w, C*p*p) rows already on device (equal sizes)."""
+        if prepatched:
+            x, grids, batched = pixel_values, self.grids(image_sizes), True
         else:
-            rows = []
-            for i, (h, w) in enumerate(grids):
-                img = ttnn.slice(pv, (i, 0, 0, 0), (i + 1, self.in_ch, h * p, w * p))
-                rows.append(self._patchify_batched(img, h, w))
-            x = ttnn.concat(rows, dim=2)
+            x, grids, batched = self._patchify(pixel_values, image_sizes)
         x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
-        x = ttnn.linear(x, self.w_patch, compute_kernel_config=self.compute_cfg)
+        # The patch projection on minimal_matmul over the full grid (ttnn.linear ran the 32 x 256-row batch on 88
+        # cores: 552 us): one K block of the whole 588-wide patch (19 tiles; 8-tile blocks would pad it to 24) and
+        # 4 x 4-tile output blocks (each core's N range is 4 tiles).
+        x = ttnn.experimental.minimal_matmul(
+            x,
+            self.w_patch,
+            config=ttnn.MinimalMatmulConfig(
+                M_block_size=4,
+                K_block_size=-(-int(self.w_patch.shape[-2]) // ttnn.TILE_SIZE),
+                N_block_size=4,
+                subblock_h=2,
+                subblock_w=2,
+                compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
+            ),
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         x = self.ln_pre(x)
         s = x.shape[-2]
 

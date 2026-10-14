@@ -14,7 +14,9 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
 from __future__ import annotations
 
 import torch
+
 import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import fold_input_scale
 
 
 def _mesh_size(device):
@@ -24,10 +26,24 @@ def _mesh_size(device):
         return 1
 
 
+# Vision data parallelism. True while the pipeline builds the vision tower and projector: those modules then keep
+# their FULL weights replicated on every device of the mesh and run without any collective, and the caller hands each
+# device its own slice of the image batch (and gathers the projector output). False: tensor-parallel over the mesh.
+DATA_PARALLEL = False
+
+
+def vision_tp(device):
+    """(tensor-parallel degree of a vision module built now, mapper for its replicated tensors)."""
+    mesh = _mesh_size(device)
+    return (1 if DATA_PARALLEL else mesh), (ttnn.ReplicateTensorToMesh(device) if mesh > 1 else None)
+
+
 class TtPixtralAttention:
-    def __init__(self, device, torch_module) -> None:
+    def __init__(self, device, torch_module, in_scale=None) -> None:
+        """in_scale: the attention_norm gamma, folded into q/k/v (see TtAttention.FOLD_NORM_GAMMA)."""
         self.device = device
-        self.tp = tp = _mesh_size(device)
+        self.tp, repl = vision_tp(device)
+        tp = self.tp
         self.num_heads = torch_module.num_heads
         self.head_dim = hd = torch_module.head_dim
         self.scale = float(torch_module.scaling)
@@ -35,8 +51,8 @@ class TtPixtralAttention:
         self.local_heads = lh = self.num_heads // tp
 
         is_mesh = tp > 1
-        shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else None
-        self._repl = repl = ttnn.ReplicateTensorToMesh(device) if is_mesh else None
+        shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else repl
+        self._repl = repl
 
         def _put(t, mapper):
             return ttnn.from_torch(
@@ -49,7 +65,10 @@ class TtPixtralAttention:
             )
 
         # Fused per-device [q_heads | k_heads | v_heads] so a dim=-1 shard hands each device its own heads.
-        wq, wk, wv = (torch_module.q_proj.weight.T, torch_module.k_proj.weight.T, torch_module.v_proj.weight.T)
+        wq, wk, wv = (
+            fold_input_scale(w.weight.T, in_scale)
+            for w in (torch_module.q_proj, torch_module.k_proj, torch_module.v_proj)
+        )
         chunks = []
         for d in range(tp):
             sl = slice(d * lh * hd, (d + 1) * lh * hd)
@@ -85,11 +104,64 @@ class TtPixtralAttention:
             mesh_mapper=self._repl,
         )
 
-    def _rope(self, x, cos, sin):
-        return ttnn.add(
-            ttnn.multiply(x, cos),
-            ttnn.multiply(ttnn.matmul(x, self.rot, compute_kernel_config=self.compute_cfg), sin),
+    def _narrow_n_cfg(self, x, w):
+        """minimal_matmul config whose blocks are the per-core M / N ranges where those are under 8 tiles (M splits
+        along the grid's x axis and N along y when M > N, else the other way round): the default 8-tile blocks would
+        compute mostly padding (TP o_proj: 4 of 8 N tiles valid, TP QKV: 3 of 8; the data-parallel QKV's 7 x 9-tile
+        range ran 8 x 16). None (the default 8 x 8 blocks) otherwise."""
+        grid = self.device.compute_with_storage_grid_size()
+        shape = tuple(int(d) for d in x.shape)
+        mt = shape[-2] // ttnn.TILE_SIZE
+        for d in shape[:-2]:
+            mt *= d
+        nt = int(w.shape[-1]) // ttnn.TILE_SIZE
+        m = min(8, -(-mt // (grid.x if mt > nt else grid.y)))
+        n = -(-nt // (grid.y if mt > nt else grid.x))
+        if (n >= 8 and m == 8) or n > 12 or (n % 2 and n > 4 and n % 3):
+            return None
+        if m % 2 == 0 and n % 2 == 0:
+            sh, sw = 2, 2
+        else:
+            sh, sw = 1, next(c for c in (4, 3, 2, 1) if n % c == 0)
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=m,
+            K_block_size=8,
+            N_block_size=n,
+            subblock_h=sh,
+            subblock_w=sw,
+            compute_with_storage_grid_size=grid,
         )
+
+    def _rope(self, x, cos, sin):
+        # rotate_half as x @ R (R is a +-1 permutation, so exact), height-parallel: a 1D multicast matmul hands every
+        # core of the full grid its own run of the (images x heads x patches) row tiles against the multicast 2 x 2-tile
+        # R. (minimal_matmul splits a 2-tile N over the grid's 10 rows, leaving 8 of them idle: 102 us; ttnn.matmul's
+        # auto config ran the batch on 16 cores: 252 us.)
+        grid = self.device.compute_with_storage_grid_size()
+        shape = tuple(int(d) for d in x.shape)
+        rows = 1
+        for d in shape[:-1]:
+            rows *= d
+        nt = shape[-1] // ttnn.TILE_SIZE
+        pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(grid.x, grid.y),
+            in0_block_w=nt,
+            out_subblock_h=1,
+            out_subblock_w=nt,
+            per_core_M=-(-(rows // ttnn.TILE_SIZE) // (grid.x * grid.y)),
+            per_core_N=nt,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=False,
+        )
+        rot = ttnn.matmul(
+            x,
+            self.rot,
+            program_config=pc,
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(rot, sin))
 
     def __call__(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
         x = hidden_states
@@ -107,7 +179,18 @@ class TtPixtralAttention:
         if isinstance(mask, torch.Tensor):
             mask = self._to_tt(mask.reshape(1, 1, s, s).float())
 
-        qkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.compute_cfg)
+        # minimal_matmul folds the images into its rows over the full grid (ttnn.linear ran this batch of 32 x 256
+        # rows as a batched matmul on 64 cores: 816 us).
+        qkv = ttnn.experimental.minimal_matmul(
+            x,
+            self.wqkv,
+            config=self._narrow_n_cfg(x, self.wqkv),
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.bfloat16,  # q / k / v in bf16 also when x is the fp32 norm output
+        )
+        if len(in_shape) == 4 and x.memory_config().buffer_type == ttnn.BufferType.L1:
+            ttnn.deallocate(x)  # the caller's L1 norm output, read only here (see TtAttention)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_heads, transpose_k_heads=False
         )
@@ -135,8 +218,17 @@ class TtPixtralAttention:
             compute_kernel_config=self.compute_cfg,
         )
         attn = ttnn.experimental.nlp_concat_heads(attn)
-        # fp32 output: it is added straight into the vision layer's fp32 residual stream.
-        out = ttnn.linear(attn, self.wo, dtype=ttnn.float32, compute_kernel_config=self.compute_cfg)
+        # fp32 output: it is added straight into the vision layer's fp32 residual stream. minimal_matmul folds the
+        # images into its rows over the full grid (ttnn.linear ran the 32 x 256-row batch on 88 cores: 360 us), with
+        # N blocks no wider than each core's N range (the default 8-tile block would be half padding at 4 tiles).
+        out = ttnn.experimental.minimal_matmul(
+            attn,
+            self.wo,
+            config=self._narrow_n_cfg(attn, self.wo),
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.float32,
+        )
         if self.tp > 1:
             out = ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
         if len(in_shape) == 3:

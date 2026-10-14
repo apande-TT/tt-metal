@@ -21,7 +21,8 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
   * q/k/v  column-parallel by HEAD: device d holds q heads [d*Hq/TP, (d+1)*Hq/TP) and the kv heads
            those q heads attend with ([d*Hkv/TP, (d+1)*Hkv/TP)), so every GQA group stays local.
            Fused per device as [q | k | v] into one wqkv.
-  * o_proj row-parallel (input features = that device's q heads), then all_reduce.
+  * o_proj: decode row-parallel (input features = that device's q heads), then all_reduce; prefill
+           column-parallel over the all_gathered heads (see self.wo).
   * rotary tables, the mask and the llama-4 scale are replicated; the KV cache holds the local heads.
 """
 from __future__ import annotations
@@ -62,16 +63,53 @@ def _mesh_size(device):
         return 1
 
 
+# L1 cores the decode QKV activation is width-sharded over for its DRAM-sharded matmul: 16 divides both K (160 tiles)
+# and the per-device [q | k | v] N (48 tiles).
+QKV_DECODE_CORES = ttnn.CoreGrid(y=2, x=8)
+# dtype of the decode-only QKV / o_proj weight copies.
+DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
+
+
 class TtMinistral3Attention:
     # dtype of o_proj's output and its all_reduce: fp32, added unrounded into the decoder's fp32 residual stream.
     OUT_DTYPE = ttnn.float32
+    # Prefill's many-row o_proj partials are produced and reduce-scattered in bf16 instead (half the reduce-scatter
+    # bytes, no fp32 -> bf16 cast before the gather); decode keeps fp32 partials.
+    PREFILL_REDUCE_DTYPE = ttnn.bfloat16
+    # False: prefill returns o_proj's reduce-scattered 1/TP hidden shard (the decoder keeps a hidden-sharded
+    # residual in prefill and gathers only the normed activation).
+    prefill_gather = True
     # Widest SDPA key chunk prefill may use (see __call__).
     PREFILL_MAX_K_CHUNK = 512
+    # Prefill SDPA query chunk beside a 512-row key chunk: every q chunk streams the whole key/value range from DRAM
+    # again (64-row chunks re-read ~540 MB of K/V per layer and device), and 128 is the widest whose score block fits
+    # L1 there. Beside a 257..448-row key chunk the queries take PREFILL_WIDE_Q_CHUNK rows (see __call__).
+    PREFILL_Q_CHUNK = 128
+    PREFILL_WIDE_Q_CHUNK = 160
     # Columns of the decode head grid (one batch row per core): 32 rows fill an 8 x 4 rectangle, the shape the fused
     # decode RoPE needs (it runs on its input shard grid's bounding box).
     HEAD_GRID_X = 8
     # Batch rows the resident decode rotation tiles cover (the pipeline's maximum batch).
     MAX_DECODE_BATCH = 32
+    # Prefill RoPE runs on a (batch, heads) regrouping of the heads that balances its grid split (see _rope_regroup).
+    REGROUP_PREFILL_ROPE = True
+    # ... and reads cos / sin and the pair-swap tile from per-core L1 shards (prefill_rope_tables) when that moves
+    # fewer DRAM bytes than its per-row reload of the interleaved tables.
+    L1_PREFILL_ROPE = True
+    # Prefill q / k / v are split out of the fused QKV into L1 (interleaved over the grid) when they take at most this
+    # many bytes per core: the RoPEs read q / k from L1 and write DRAM, and v is copied to DRAM for the cache fill and
+    # SDPA (none stays resident in L1 across the larger prefill ops, whose static buffers leave no room). 0 disables.
+    PREFILL_HEADS_L1_BYTES = 512 * 1024
+    # ... and the fused QKV output feeding that split lands in L1 too while it takes at most this many bytes per core
+    # (114 KB at 32 x 128 rows, 372 KB at 32 x 416 rows beside the matmul's ~0.9 MB of static buffers).
+    PREFILL_QKV_L1_BYTES = 400 * 1024
+    # The o_proj's hidden-shard output (TP prefill, read once by the decoder's residual add) lands in L1 while it takes
+    # at most this many bytes per core (95 KB at 32 x 128 rows; the caller frees it right after the add).
+    PREFILL_OPROJ_OUT_L1_BYTES = 128 * 1024
+    # With TP, SDPA's output (read once by nlp_concat_heads, which writes L1 for the all_gather) lands in L1 too while
+    # it takes at most this many bytes per core (76 KB at 32 x 128 rows; 248 KB at 416 rows does not fit beside SDPA's
+    # static buffers).
+    PREFILL_SDPA_OUT_L1_BYTES = 256 * 1024
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -102,14 +140,14 @@ class TtMinistral3Attention:
         shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else None
         self._repl = repl = ttnn.ReplicateTensorToMesh(device) if is_mesh else None
 
-        def _put(t, mapper):
+        def _put(t, mapper, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16):
             return ttnn.from_torch(
                 t.detach().to(torch.bfloat16).contiguous(),
-                dtype=ttnn.bfloat16,
+                dtype=dtype,
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
                 mesh_mapper=mapper,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                memory_config=memory_config,
             )
 
         wq = fold_input_scale(torch_module.q_proj.weight.T, in_scale)  # (in, Hq*hd)
@@ -124,14 +162,83 @@ class TtMinistral3Attention:
             q_sl = slice(d * lh * hd, (d + 1) * lh * hd)
             kv_sl = slice(d * lkv * hd, (d + 1) * lkv * hd)
             chunks += [wq[:, q_sl], wk[:, kv_sl], wv[:, kv_sl]]
-        self.wqkv = _put(torch.concat(chunks, dim=-1), shard(-1))
-        self.wo = _put(torch_module.o_proj.weight.T, shard(-2))
+        wqkv = torch.concat(chunks, dim=-1)
+        # The prefill QKV multiplies a block-float8 copy (half the weight bytes; HiFi2, fp32 accumulation).
+        self.wqkv = _put(wqkv, shard(-1), dtype=ttnn.bfloat8_b)
+        # Decode reads its own copy of [q | k | v], DRAM width-sharded over the banks so each bank's reader streams
+        # only its column slice, with the single-row activation width-sharded over QKV_DECODE_CORES: the interleaved
+        # matmul has only N / 32 = 48 output tiles to spread, one per core, and streams the weight at ~190 GB/s.
+        k_in, n_dev = wqkv.shape[0], wqkv.shape[1] // tp
+        banks, cores = device.dram_grid_size().x, QKV_DECODE_CORES.num_cores
+        self.wqkv_decode = _put(
+            wqkv,
+            shard(-1),
+            dtype=DECODE_WEIGHT_DTYPE,
+            memory_config=ttnn.MemoryConfig(
+                ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                ttnn.BufferType.DRAM,
+                ttnn.ShardSpec(
+                    ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))}),
+                    (k_in, -(-n_dev // (ttnn.TILE_SIZE * banks)) * ttnn.TILE_SIZE),
+                    ttnn.ShardOrientation.ROW_MAJOR,
+                ),
+            ),
+        )
+        self.qkv_act_cfg = ttnn.create_sharded_memory_config(
+            (ttnn.TILE_SIZE, k_in // cores),
+            core_grid=QKV_DECODE_CORES,
+            strategy=ttnn.ShardStrategy.WIDTH,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        # One activation shard per multicast block, two readers per DRAM bank (3 weight columns each).
+        self.qkv_decode_pc = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+            in0_block_w=k_in // ttnn.TILE_SIZE // cores,
+            per_core_M=1,
+            per_core_N=n_dev // ttnn.TILE_SIZE // cores,
+            num_workers_per_dram_bank=2,
+        )
+        # Prefill o_proj is COLUMN-parallel: the heads' outputs are all_gathered (13312 x 1024 -> 4096 per device) and
+        # each device multiplies them by its 1/TP column slice of W_o, which yields exactly its 1/TP hidden slice -- the
+        # shard the decoder's sharded prefill residual adds -- with no reduce-scatter of 5120-wide partials. Device d's
+        # heads are the contiguous block d of the 4096 inputs, so the gather restores W_o's input order.
+        # The prefill o_proj weight is block-float8, like the prefill QKV weight (HiFi2 matmuls).
+        self.wo = _put(torch_module.o_proj.weight.T, shard(-1), dtype=ttnn.bfloat8_b)
+        # Decode reads block-float8 copies of its projection weights (DRAM-bound single-row matmuls).
+        self.wo_decode = _put(torch_module.o_proj.weight.T, shard(-2), dtype=DECODE_WEIGHT_DTYPE)
+        # Decode o_proj (K = 32 tiles, N = 160 tiles): 8-tile K multicast blocks (the auto config used 2), 2 N tiles
+        # per core.
+        grid = device.compute_with_storage_grid_size()
+        self.wo_decode_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(grid.x, grid.y),
+            in0_block_w=8,
+            out_subblock_h=1,
+            out_subblock_w=2,
+            per_core_M=1,
+            per_core_N=2,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+        )
 
         # rotate_half(x) == x @ R  (HF convention: cat(-x2, x1); meta_rope: each pair (x_2j, x_2j+1) -> (-x_2j+1, x_2j)).
         if self.meta_rope:
             rot = self._pair_swap(hd)
-            # Decode's fused RoPE reads one 32 x 32 pair-swap tile per batch row from its own core.
+            # Decode's fused RoPE reads one 32 x 32 pair-swap tile per batch row from its own core; prefill's reads
+            # the single tile from DRAM.
             self.trans_mat = _put(self._pair_swap(ttnn.TILE_SIZE).repeat(1, 1, self.MAX_DECODE_BATCH, 1), repl)
+            self.prefill_trans_mat = _put(self._pair_swap(ttnn.TILE_SIZE).reshape(1, 1, ttnn.TILE_SIZE, -1), repl)
+            # One pair-swap tile per core, height-sharded into L1 around each prefill RoPE (see _prefill_rope).
+            n_cores = grid.x * grid.y
+            self.prefill_trans_rows = _put(self._pair_swap(ttnn.TILE_SIZE).repeat(1, 1, n_cores, 1), repl)
+            core_shard = lambda w: ttnn.create_sharded_memory_config(
+                (ttnn.TILE_SIZE, w),
+                core_grid=ttnn.CoreGrid(y=grid.y, x=grid.x),
+                strategy=ttnn.ShardStrategy.HEIGHT,
+                orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                use_height_and_width_as_shard_shape=True,
+            )
+            self.prefill_rope_l1_cfg, self.prefill_trans_l1_cfg = core_shard(hd), core_shard(ttnn.TILE_SIZE)
         else:
             half = hd // 2
             rot = torch.zeros(hd, hd)
@@ -145,6 +252,22 @@ class TtMinistral3Attention:
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=False,  # L1 accumulation made batched prefill matmuls non-repeatable
+        )
+        # Prefill SDPA is bound by its per-tile work (QK^T, softmax, PV per q chunk): HiFi2 matmuls, fp32 DEST kept.
+        self.prefill_sdpa_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
+        # The many-row prefill QKV and o_proj projections are compute-bound: HiFi2 (fp32 accumulation kept).
+        self.prefill_proj_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
         )
         self.sdpa_decode_cfg = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=device.compute_with_storage_grid_size(),
@@ -218,21 +341,130 @@ class TtMinistral3Attention:
             return cos, sin, cos, sin, trans  # q shares k's tables
         return (cos, sin) + tuple(ttnn.to_memory_config(t, cfg) for t in rope[2:4]) + (trans,)
 
-    def _reduce(self, t):
+    def _reduce(self, t, gather=True):
         """all_reduce of o_proj's fp32 partials: reduce-scatter in fp32 (the sum is exact to fp32), round the reduced
         1/TP shard to bf16 once and all_gather that -- half the gather bytes. The decoder adds the bf16 result into
-        its fp32 residual unrounded (mixed-dtype ADD runs on the SFPU in fp32)."""
+        its fp32 residual unrounded (mixed-dtype ADD runs on the SFPU in fp32). gather=False: the reduced shard."""
         if self.tp == 1:
             return t
         ccl = tp_ccl_args()
         t = ttnn.reduce_scatter(t, dim=3, **ccl)
-        return ttnn.all_gather(ttnn.typecast(t, ttnn.bfloat16), dim=3, **ccl)
+        if not gather:
+            return t
+        if t.dtype != ttnn.bfloat16:
+            t = ttnn.typecast(t, ttnn.bfloat16)
+        return ttnn.all_gather(t, dim=3, **ccl)
 
     def _rope(self, x, cos, sin):
         return ttnn.add(
             ttnn.multiply(x, cos),
             ttnn.multiply(ttnn.matmul(x, self.rot, compute_kernel_config=self.compute_cfg), sin),
         )
+
+    def _one_block_cfg(self, mt, nt):
+        """minimal_matmul config giving every core ONE output block -- its whole (M, N) tile range -- when that range
+        is small (short prompts): the default 8 x 8 blocks split e.g. the 128-row QKV's 12 x 5-tile range into an 8-
+        and a 4-row block, streaming the weight columns twice. None (the default config) otherwise."""
+        grid = self.device.compute_with_storage_grid_size()
+        gm, gn = (grid.x, grid.y) if mt > nt else (grid.y, grid.x)  # minimal_matmul puts M along x when M > N
+        m, n = -(-mt // gm), -(-nt // gn)
+        if m * n > 64 or m <= 8:
+            return None
+        sh, sw = (2, 2) if m % 2 == 0 and n % 2 == 0 else ((4, 1) if m % 4 == 0 else (2, 1) if m % 2 == 0 else (1, 1))
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=m,
+            K_block_size=8,
+            N_block_size=n,
+            subblock_h=sh,
+            subblock_w=sw,
+            compute_with_storage_grid_size=grid,
+        )
+
+    def prefill_rope_tables(self, rope, s):
+        """Prefill rope tables (cos, sin[, q_cos, q_sin]), each (1, 1, s, hd), extended ONCE per forward for every
+        layer with their per-core layouts: (cos, sin, q_cos | None, q_sin | None, rows), rows = (cos, sin, q_cos,
+        q_sin) as (1, 1, cores * 32, hd) DRAM tables whose tile i is sequence tile i % S_t -- the tile the prefill
+        split hands core i when every core takes one sequence tile. _prefill_rope height-shards them into L1 around
+        the op (one tile per core), which then reads them in place instead of from DRAM for every row; they stay out
+        of L1 between layers (forward-lifetime L1 tables clash with the static buffers of the larger prefill ops).
+        Unchanged when the fused RoPE does not apply."""
+        grid = self.device.compute_with_storage_grid_size()
+        cores, st = grid.x * grid.y, -(-int(s) // ttnn.TILE_SIZE)
+        if not (self.meta_rope and self.L1_PREFILL_ROPE) or st > cores:
+            return rope
+        reps = -(-cores // st)
+
+        def per_core(t):
+            if reps > 1:
+                t = ttnn.repeat(t, ttnn.Shape([1, 1, reps, 1]))
+            if reps * st != cores:
+                t = ttnn.slice(t, (0, 0, 0, 0), (1, 1, cores * ttnn.TILE_SIZE, self.head_dim))
+            return t
+
+        q = tuple(rope[2:4]) if len(rope) >= 4 else (None, None)
+        cos, sin = per_core(rope[0]), per_core(rope[1])
+        shared = q[0] is None or (q[0] is rope[0] and q[1] is rope[1])
+        q_cos, q_sin = (cos, sin) if shared else (per_core(q[0]), per_core(q[1]))
+        return tuple(rope[:2]) + q + ((cos, sin, q_cos, q_sin),)
+
+    def _prefill_rope(self, t, cos, sin, rows=None):
+        """Fused prefill RoPE of the (B, H, S, hd) heads t (meta_rope pair order), run on _rope_regroup's view.
+        rows: (cos, sin) per-core tables from prefill_rope_tables, moved into L1 for the op when _rope_regroup
+        picks them (with the pair-swap tile) and freed after it."""
+        shape = tuple(int(d) for d in t.shape)
+        g, use_l1 = self._rope_regroup(shape, rows is not None)
+        trans, l1 = self.prefill_trans_mat, ()
+        if use_l1:
+            l1 = (
+                ttnn.to_memory_config(rows[0], self.prefill_rope_l1_cfg),
+                ttnn.to_memory_config(rows[1], self.prefill_rope_l1_cfg),
+                ttnn.to_memory_config(self.prefill_trans_rows, self.prefill_trans_l1_cfg),
+            )
+            cos, sin, trans = l1
+        if g != shape[0]:
+            t = ttnn.reshape(t, (g, shape[0] * shape[1] // g) + shape[2:])
+        t = ttnn.experimental.rotary_embedding_llama(
+            t,
+            cos,
+            sin,
+            trans,
+            is_decode_mode=False,
+            compute_kernel_config=self.prefill_proj_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        for x in l1:
+            ttnn.deallocate(x)
+        return t if g == shape[0] else ttnn.reshape(t, shape)
+
+    def _rope_regroup(self, shape, l1=False):
+        """(B', use_l1): the (B', B * H / B') regrouping of (B, H, S, hd) heads for rotary_embedding_llama, and whether
+        it reads prefill_rope_tables' L1 copies. Its prefill split gives min(B', cores) batch slices the remaining
+        cores over sequence tiles, each core every head of its slice. With DRAM tables the regrouping leaves the
+        busiest core the least work: 32 users x 8 q heads x 13 sequence tiles leaves 96 cores with 5/5/3 tiles of 8
+        heads (160 head tiles on the busiest), while 8 x 32 puts one sequence tile of 32 heads on each of 104 cores
+        (128). The op reads cos and sin from DRAM again for every (sequence tile, head) row above 8 rows per core
+        (four tile transfers per head tile instead of two), else once per batch slice. The L1 tables need one
+        sequence tile per core (at most cores // S_t batch slices) and cost two transfers per head tile; they are
+        used when that is less DRAM traffic on the busiest core (416 rows: q 8 x 32 at 64 transfers vs 128).
+        The rows' positions (and so cos/sin) are unchanged, and the outer-dim reshape is a view."""
+        b, h, s = shape[:3]
+        grid = self.device.compute_with_storage_grid_size()
+        cores, st, n = grid.x * grid.y, -(-s // ttnn.TILE_SIZE), b * h
+        divisors = [g for g in range(1, n + 1) if n % g == 0]
+
+        def split(g):  # (head tiles, DRAM tile transfers) on the busiest core with DRAM tables
+            bp = min(g, cores)
+            sp = min(cores // bp, st)
+            seq = -(-st // sp)
+            rows, slices = seq * (n // g), -(-g // bp)
+            return slices * rows, slices * (4 * rows if rows > 8 else 2 * (rows + seq))
+
+        g = min(divisors, key=lambda g: (split(g)[0], g != b)) if self.REGROUP_PREFILL_ROPE else b
+        if l1 and st <= cores:
+            g_l1 = max(d for d in divisors if d <= cores // st)
+            if 2 * (n // g_l1) <= split(g)[1]:
+                return g_l1, True
+        return g, False
 
     def _llama4_scale(self, position_ids, shape):
         """Per-position query scale 1 + beta * log(1 + floor(pos / orig_max)), on device, in `shape`."""
@@ -271,11 +503,33 @@ class TtMinistral3Attention:
         return ttnn.multiply(cos, scale), ttnn.multiply(sin, scale)
 
     def _fill_cache(self, cache, kv):
-        """Write prompt K or V (B, kv_heads, S, hd) into rows 0..S-1 of the resident (B, kv_heads, C, hd) cache."""
-        s, cap = kv.shape[2], cache.shape[2]
-        if s < cap:
-            kv = ttnn.pad(kv, padding=((0, 0), (0, 0), (0, cap - s), (0, 0)), value=0.0)
-        ttnn.copy(kv, cache)
+        """Write prompt K or V (B, kv_heads, S, hd) into rows 0..S-1 of the resident (B, kv_heads, C, hd) cache.
+
+        Only the S prompt rows are cast and written (rows past them are not read: decode SDPA is causal on
+        cur_pos, and decode writes each position before attending to it). fill_cache fills one batch row's heads,
+        so batch is folded into heads -- the same memory order in both tensors -- and one op writes every user. Its
+        interleaved path assumes no core's share of the work spans two heads, so the prompt goes in height-sharded
+        with one (user, kv head) slab of S rows per core."""
+        b, h, s, d = kv.shape
+        slots = b * h
+        grid = self.device.compute_with_storage_grid_size()
+        if kv.dtype != cache.dtype:  # e.g. a block-float8 cache
+            kv = ttnn.typecast(kv, cache.dtype)
+        if slots > grid.x * grid.y:
+            s_cap = cache.shape[2]
+            if s < s_cap:
+                kv = ttnn.pad(kv, padding=((0, 0), (0, 0), (0, s_cap - s), (0, 0)), value=0.0)
+            ttnn.copy(kv, cache)
+            return
+        slab_cfg = ttnn.create_sharded_memory_config(
+            (s, d),
+            core_grid=ttnn.num_cores_to_corerangeset(slots, grid, row_wise=True),
+            strategy=ttnn.ShardStrategy.HEIGHT,
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
+        kv = ttnn.to_memory_config(ttnn.reshape(kv, (1, slots, s, d)), slab_cfg)
+        ttnn.fill_cache(ttnn.reshape(cache, (1, slots, cache.shape[2], d)), kv, 0)
 
     def __call__(
         self,
@@ -298,7 +552,10 @@ class TtMinistral3Attention:
         hd = self.head_dim
 
         cos, sin = position_embeddings[:2]
-        q_tables = tuple(position_embeddings[2:4]) if len(position_embeddings) == 4 else None
+        q_tables = None
+        if len(position_embeddings) >= 4 and position_embeddings[2] is not None:
+            q_tables = tuple(position_embeddings[2:4])
+        rows = position_embeddings[4] if len(position_embeddings) > 4 else None  # prefill_rope_tables' per-core tables
         if isinstance(cos, torch.Tensor):
             cos = self._to_tt(cos.to(torch.bfloat16).reshape(1, 1, s, hd))
         if isinstance(sin, torch.Tensor):
@@ -307,24 +564,50 @@ class TtMinistral3Attention:
         if isinstance(mask, torch.Tensor):
             mask = self._to_tt(mask.reshape(1, 1, s, s).to(torch.bfloat16))
 
+        grid = self.device.compute_with_storage_grid_size()
+        qkv_bytes = 2 * int(b) * int(s) * int(self.wqkv.shape[-1])  # bf16
+        heads_l1 = self.meta_rope and 0 < qkv_bytes // (grid.x * grid.y) <= self.PREFILL_HEADS_L1_BYTES
+        qkv_l1 = heads_l1 and qkv_bytes // (grid.x * grid.y) <= self.PREFILL_QKV_L1_BYTES
         # Prefill QKV on the full grid (ttnn.linear's auto config left this many-row projection on a partial one).
         qkv = ttnn.experimental.minimal_matmul(
             x,
             self.wqkv,
-            compute_kernel_config=self.compute_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            config=self._one_block_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE),
+            compute_kernel_config=self.prefill_proj_cfg,
+            memory_config=ttnn.L1_MEMORY_CONFIG if qkv_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
         )
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, transpose_k_heads=False
+            qkv,
+            num_heads=self.local_heads,
+            num_kv_heads=self.local_kv_heads,
+            transpose_k_heads=False,
+            memory_config=ttnn.L1_MEMORY_CONFIG if heads_l1 else None,
         )
-        k = self._rope(k, cos, sin)
+        if qkv_l1:
+            ttnn.deallocate(qkv)
+        if heads_l1:  # see PREFILL_HEADS_L1_BYTES; the RoPEs below write q / k to DRAM
+            heads_in = (q, k)
+            v_l1, v = v, ttnn.to_memory_config(v, ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(v_l1)
+        rope_k = rope_q = self._rope
+        if self.meta_rope:
+            # One fused RoPE per tensor over every user's heads (the prompt positions are shared by all rows): a
+            # 32 x 32 pair-swap per head-dim tile instead of a 128 x 128 rotate-half matmul plus mul / mul / add.
+            k_rows = None if rows is None else rows[:2]
+            q_rows = None if rows is None else rows[2:4]
+            rope_k = lambda t, c, si: self._prefill_rope(t, c, si, k_rows)
+            rope_q = lambda t, c, si: self._prefill_rope(t, c, si, q_rows)
+        k = rope_k(k, cos, sin)
         if q_tables is not None:
-            q = self._rope(q, *q_tables)  # llama-4 scale already folded into the shared q tables
+            q = rope_q(q, *q_tables)  # llama-4 scale already folded into the shared q tables
         else:
-            q = self._rope(q, cos, sin)
+            q = rope_q(q, cos, sin)
             if self.l4_beta is not None and self.l4_max and position_ids is not None:
                 q = ttnn.multiply(q, self._llama4_scale(position_ids, (1, 1, s, 1)))
+        if heads_l1:
+            for t in heads_in:
+                ttnn.deallocate(t)
         if kv_cache is not None:
             self._fill_cache(kv_cache[0], k)
             self._fill_cache(kv_cache[1], v)
@@ -332,16 +615,29 @@ class TtMinistral3Attention:
         # SDPA's online softmax rounds its running state once per KEY chunk, which biases the output level
         # upward (layer-8 Q/K/V of the image prompt: +0.23% at k_chunk 32, +0.10% at 128, +0.02% at 512).
         # Image-token rows amplify that bias over 40 layers (prefill hidden PCC 0.95 on those rows at k_chunk
-        # 32), so prefill attends over the widest key chunk: q/k/v are padded HERE (and only here -- no other
-        # layer computes pad rows) to one chunk when the prompt fits in one, else to a multiple of the widest.
-        # The pad keys sit after every real row, so causal attention leaves the real rows unchanged; the q chunk
-        # does not affect the level.
-        s_attn = self.sdpa_len(s)
-        if s_attn != s:
-            pad = ((0, 0), (0, 0), (0, s_attn - s), (0, 0))
-            q, k, v = (ttnn.pad(t, padding=pad, value=0.0) for t in (q, k, v))
-        k_chunk = next(c for c in (512, 256, 128, 64, 32) if s_attn % c == 0 and c <= self.PREFILL_MAX_K_CHUNK)
-        q_chunk = 64 if s_attn % 64 == 0 else 32
+        # 32), so prefill attends over the widest key chunk: one chunk when the prompt fits in one, else chunks of
+        # the widest. SDPA pads the sequence to whole chunks itself (no pad / slice ops); the pad keys sit after
+        # every real row, so causal attention leaves the real rows unchanged. The q chunk does not affect the level.
+        if s <= self.PREFILL_MAX_K_CHUNK:
+            # One key chunk of s rounded up to an even tile count. Up to 256 rows the queries are one chunk too
+            # (K/V stream once per head). Longer prompts take 160-row q chunks: the time follows (rounds of work
+            # units over the grid) x (q tiles per unit), and 416 rows x 32 users x 8 heads in 3 q chunks is 768 units
+            # = 7 even rounds on 110 cores (q224: 1041 us, q160: 881 us, q128: 1003 us). A 512-row key chunk keeps
+            # 128-row q chunks (a 256 x 512 score block overflows L1).
+            k_chunk = -(-s // 64) * 64
+            if k_chunk <= 256:
+                q_chunk = k_chunk
+            elif k_chunk <= 448:
+                q_chunk = self.PREFILL_WIDE_Q_CHUNK
+            else:
+                q_chunk = self.PREFILL_Q_CHUNK
+        else:
+            k_chunk, q_chunk = self.PREFILL_MAX_K_CHUNK, self.PREFILL_Q_CHUNK
+        # With TP the concatenated heads only feed the all_gather: they go through L1 when they fit (the same budget
+        # as the head split), so the concat writes and the gather reads no DRAM for them.
+        attn_core_bytes = (qkv_bytes * 2 // 3) // (grid.x * grid.y)
+        concat_l1 = self.tp > 1 and 0 < attn_core_bytes <= self.PREFILL_HEADS_L1_BYTES
+        sdpa_l1 = concat_l1 and attn_core_bytes <= self.PREFILL_SDPA_OUT_L1_BYTES
         attn = ttnn.transformer.scaled_dot_product_attention(
             q,
             k,
@@ -355,12 +651,37 @@ class TtMinistral3Attention:
                 k_chunk_size=k_chunk,
                 exp_approx_mode=False,
             ),
-            compute_kernel_config=self.compute_cfg,
+            compute_kernel_config=self.prefill_sdpa_cfg,
+            memory_config=ttnn.L1_MEMORY_CONFIG if sdpa_l1 else ttnn.DRAM_MEMORY_CONFIG,
         )
-        if s_attn != s:
-            attn = ttnn.slice(attn, (0, 0, 0, 0), (b, self.local_heads, s, hd))
-        attn = ttnn.experimental.nlp_concat_heads(attn)
-        out = self._reduce(ttnn.linear(attn, self.wo, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg))
+        heads = attn
+        attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.L1_MEMORY_CONFIG if concat_l1 else None)
+        if sdpa_l1:
+            ttnn.deallocate(heads)
+        if self.tp > 1:
+            # every head's output, for the column-parallel o_proj
+            concat = attn
+            attn = ttnn.all_gather(attn, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **tp_ccl_args())
+            if concat_l1:
+                ttnn.deallocate(concat)
+        # Prefill o_proj on the full grid too (ttnn.linear's auto 1D config ran it on 80 cores at ~30 TFLOP/s).
+        # Its hidden shard (TP, no gather) goes to L1 for short prompts: the decoder's residual add reads it there and
+        # frees it (see PREFILL_OPROJ_OUT_L1_BYTES).
+        out_l1 = (
+            self.tp > 1
+            and not self.prefill_gather
+            and 2 * int(b) * int(s) * int(self.wo.shape[-1]) // (grid.x * grid.y) <= self.PREFILL_OPROJ_OUT_L1_BYTES
+        )
+        out = ttnn.experimental.minimal_matmul(
+            attn,
+            self.wo,
+            config=self._one_block_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wo.shape[-1]) // ttnn.TILE_SIZE),
+            compute_kernel_config=self.prefill_proj_cfg,
+            memory_config=ttnn.L1_MEMORY_CONFIG if out_l1 else ttnn.DRAM_MEMORY_CONFIG,
+            dtype=self.PREFILL_REDUCE_DTYPE if self.tp > 1 else self.OUT_DTYPE,
+        )
+        if self.tp > 1 and self.prefill_gather:
+            out = ttnn.all_gather(out, dim=3, **tp_ccl_args())  # the full-width output of the unsharded path
         if in_rank == 3:
             return ttnn.reshape(out, (b, s, out.shape[-1]))
         return out
@@ -369,7 +690,14 @@ class TtMinistral3Attention:
         """x (1, 1, B, D) -> (1, 1, B, D); cos/sin (1, B, 1, hd); cur_pos int32 [B]; position_ids (B, 1, 1, 1) fp32."""
         b = x.shape[-2]
         head_cfg = self._head_cfg(b)
-        qkv = ttnn.linear(x, self.wqkv, compute_kernel_config=self.compute_cfg)
+        qkv = ttnn.linear(
+            ttnn.to_memory_config(x, self.qkv_act_cfg),
+            self.wqkv_decode,
+            program_config=self.qkv_decode_pc,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_cfg,
+        )
+        qkv = ttnn.sharded_to_interleaved(qkv, ttnn.L1_MEMORY_CONFIG)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, memory_config=head_cfg
         )
@@ -408,8 +736,21 @@ class TtMinistral3Attention:
             compute_kernel_config=self.compute_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        attn = ttnn.reshape(attn, (1, 1, b, self.local_heads * self.head_dim))  # concat heads per row
-        return self._reduce(ttnn.linear(attn, self.wo, dtype=self.OUT_DTYPE, compute_kernel_config=self.compute_cfg))
+        # Concat heads per row with ttnn's fused decode op on the head shards (one batch row's tile-padded heads per
+        # core) instead of a reshape that un-pads the 8 heads out of their 32-row tiles through DRAM.
+        attn = ttnn.experimental.nlp_concat_heads_decode(
+            ttnn.to_memory_config(attn, head_cfg), num_heads=self.local_heads
+        )
+        attn = ttnn.sharded_to_interleaved(attn, ttnn.L1_MEMORY_CONFIG)  # (1, 1, B, heads * head_dim)
+        return self._reduce(
+            ttnn.linear(
+                attn,
+                self.wo_decode,
+                program_config=self.wo_decode_pc,
+                dtype=self.OUT_DTYPE,
+                compute_kernel_config=self.compute_cfg,
+            )
+        )
 
 
 def build(device, torch_module=None):

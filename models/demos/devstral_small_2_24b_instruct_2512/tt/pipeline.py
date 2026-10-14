@@ -106,21 +106,86 @@ DEFAULT_BATCH = 32
 # cache alone would need ~340 GB/chip. 4096 positions cost 40 layers x 2 x 32 x 2 local kv heads x 4096 x
 # 128 x 2 B = 5.4 GB/chip, inside the 28.6 GB/chip usable with a CCL axis (QB2 registered figure).
 DEFAULT_KV_CAPACITY = 4096
+# Resident KV cache dtype: decode attention re-reads every cached position of every layer each token, so block-float8
+# halves that traffic (and the cache's DRAM).
+KV_CACHE_DTYPE = ttnn.bfloat8_b
 PLANNED_TP = 4
 # Performance levers applied inside _stubs/ (a symlink out of this directory, so they are listed here too):
 #   ministral3_m_l_p: gate/up folded into one tile-interleaved weight per device; minimal_matmul(fuse_swiglu)
 #                     emits silu(gate) * up in the same op (prefill/encode); decode keeps separate gate/up
-#                     with the silu fused into the multiply. Prefill MLP chunk 4096 -> 16384 rows (one call).
-#                     Prefill/encode down projection on minimal_matmul too (full grid).
-#                     Fused gate/up computes at HiFi2 (fp32 accumulation).
-#   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk).
+#                     with the silu fused into the multiply and gate/up/product kept in L1 (no DRAM round trip);
+#                     decode gate / up / down read block-float8 copies (prefill keeps bf16); the decode down
+#                     projection runs a 1D multicast config with 8-tile K blocks (the auto config's 2-tile blocks
+#                     made it multicast-latency-bound).
+#                     Prefill MLP chunk 4096 -> 16384 rows (one call).
+#                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
+#                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
+#                     Fused gate/up computes at HiFi2 (fp32 accumulation), 8 x 8 x 12-tile blocks; the text
+#                     decoder's fused gate/up weight is bfloat8_b (the vision MLPs keep bf16).
+#   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk);
+#                     lm_head weight in bfloat8_b (half the largest decode-step DRAM read). Decode skips the
+#                     full-row logits all_gather (the sampler reads the shards; VocabShards joins them on host reads).
+#   sample(): the step's noise is looked up row-major and tilized as (B, NB); the bucket is a bitwise and; the draw is
+#                     one top-1 over the noisy scores labelled with the candidate ids (no argmax + index gather).
+#                     The per-device vocab-shard top-k is VocabTopK (generic_op, kernels/topk_mid.cpp): 64 local ->
+#                     8 middle -> 1 final core instead of ttnn.topk's 64 -> 1 serial merge, 16-bit shard positions.
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
 #                     directly (no bf16 cast op, no single-core interleaved norm).
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
-#   ministral3_attention: prefill QKV projection on minimal_matmul (full grid).
-#   prompts pad to a tile multiple only; prefill attention pads q/k/v to whole SDPA key chunks itself.
+#   KV cache in bfloat8_b (KV_CACHE_DTYPE): half the bytes decode SDPA re-reads every token. Prefill writes only the
+#                     cast prompt rows: one fill_cache over (batch x kv_heads) folded into heads, the prompt
+#                     height-sharded one (user, head) slab per core (no pad to the capacity, no full-capacity typecast).
+#   ministral3_attention: prefill QKV (HiFi2, bf8 weight) and o_proj projections on minimal_matmul (full grid); prefill o_proj is
+#                     column-parallel over the all_gathered heads, emitting the residual's hidden slice (no reduce-scatter). Decode concatenates the SDPA heads
+#                     with nlp_concat_heads_decode on the head shards (no un-padding reshape through DRAM). Decode QKV
+#                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v]; decode
+#                     QKV and o_proj read block-float8 copies (prefill keeps bf16). Decode o_proj runs a hand-written
+#                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
+#   prompts pad to a tile multiple only; prefill SDPA pads to whole chunks internally. Prefill QKV and o_proj run HiFi2 on bf8 weights.
+#   ministral3_m_l_p short-prompt down projection: a grid of whole 16 x 16-tile output blocks per core.
+#   prefill's last prompt rows: one embedding gather out of the untilized 32-row block (no re-tilize / reshape).
+#   ministral3_m_l_p fused gate/up N block: the per-core N range when it is under 12 tiles; M blocks no taller than the
+#                     per-core M range (data-parallel vision MLP: 7 tiles); the
+#                     vision MLP's SwiGLU product reaches the down projection through L1, which runs 4-tile N blocks.
+#   ministral3_attention short-prompt QKV and o_proj: one output block per core (its whole M x N range, e.g. 12 x 5 tiles).
+#   ministral3_attention prefill SDPA: one key chunk of the prompt (even tiles), 160-row q chunks (7 even rounds), no pad,
+#                     HiFi2 matmuls.
+#   ministral3_attention prefill RoPE: runs on a (batch, heads) regrouping of the heads (an outer-dim view) that balances
+#                     rotary_embedding_llama's batch x sequence split over the grid (416 rows: 8 x 32, 128 rows: 256 x 1);
+#                     cos / sin / the pair-swap tile are height-sharded into L1 around each op (one sequence tile per
+#                     core, laid out once per forward by ministral3_attention.prefill_rope_tables), so the op stops
+#                     re-reading them from DRAM per row (when that moves fewer bytes: 416 / 128 rows, q and k).
+#                     nlp_create_qkv_heads splits q / k / v into L1 (<= 512 KB per core); the RoPEs read q / k from L1.
+#                     The fused QKV output (<= 400 KB per core) also lands in L1 for that split.
+#                     The prefill RoPE computes at HiFi2. The concatenated SDPA heads reach the all_gather through L1;
+#                     short prompts hand the o_proj output to the residual add and SDPA's output to the concat
+#                     through L1 (416 rows too).
+#   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
+#   pixtral_attention: the vision QKV and o_proj run on minimal_matmul over the full grid too, with blocks of each
+#                     core's M / N range (data-parallel QKV 7 x 9, o_proj 6 x 4 tiles); so do the projector linear_1
+#                     (with its bias; 6 x 4-tile blocks) and linear_2. The RoPE rotate-half is a height-parallel 1D
+#                     matmul (every core a run of row tiles).
+#   token_embed: a hidden-sharded copy of the table; the text prefill gathers each device's residual slice from it
+#                     (no full-width rows, no mesh_partition). The slice stays bf16 into the first layer, whose input
+#                     norm gathers per-token sums of squares from a (vocab, 32) table (exact bf16 hi / mid / lo parts)
+#                     and whose fused residual add (tt/add_stats.py) widens it to fp32: no cast, no reduce of it.
+#   vision tower + projector: data-parallel over the mesh (full weights per device, each device its own images, one
+#                     batch all_gather of the projector output) -- no per-layer all_reduces.
+#   pixtral_vision_model: equal-size images are uploaded already patchified on the host (patchify_host; tile layout),
+#                     so the device skips the reshape / permute chain over 14-pixel row-major sticks; the patch
+#                     projection runs on minimal_matmul (one 19-tile K block).
+#   pixtral_m_l_p: the vision fused gate/up weight is block-float8; it runs at LoFi on the L1 ffn norm output cast
+#                  to bf16 in L1 (full 8-tile K blocks). The down projection runs at HiFi2.
+#   attention (vision layer): each RMSNorm gamma is folded into the q/k/v and gate/up weights that read it (no separate
+#                     fp32 gamma multiply); the QKV and the gate/up read their norm outputs from L1 after an L1 cast
+#                     to bf16 (the gate/up's product fits in L1 too).
+#   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
+#                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
+#   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py);
+#                     the last layer's final add emits the bf16 residual for the gather directly (no fp32 copy + cast).
 #   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard,
+#                     prefill's (many-row) partials are produced and reduce-scattered in bf16 (half the bytes),
 #                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
 #   ministral3_decoder_layer: each RMSNorm's gamma is folded into the q/k/v and gate/up weights that read it
 #                     (no gamma multiply after the norm; the decode norm unshards + casts to bf16 in one op).
@@ -128,6 +193,7 @@ PLANNED_TP = 4
 #                     head_dim order, so decode's q and k RoPE each run as ONE fused rotary_embedding_llama on the
 #                     height-sharded heads (no rotate-half matmul / mul / add chain, no unshard + reshard of k); q
 #                     shares k's tables while the KV capacity is below the llama-4 scaling threshold (scale == 1).
+#                     Prefill's q / k RoPE are one fused rotary_embedding_llama each too (interleaved, all users at once).
 
 
 def kv_capacity_for(tp):
@@ -147,6 +213,181 @@ TRACE_REGION_SIZE = 300_000_000
 # Prompts are right-padded only to a tile multiple: prefill attention pads its own q/k/v to whole 512-wide SDPA key
 # chunks (narrower key chunks bias attention's output level, see ministral3_attention.sdpa_len), so no other layer
 # computes pad rows. The padded rows come after every real row, so causal attention leaves rows 0..L-1 unchanged.
+
+_TOPK_KERNELS = "ttnn/cpp/ttnn/operations/reduction/topk/device/kernels"
+_TOPK_MID_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_mid.cpp")
+
+
+class VocabTopK:
+    """Top-k (largest, sorted) of each row of a (1, 1, B, W) bf16 vocab shard as ONE three-level program (generic_op).
+
+    ttnn.topk's multi-core program sorts W/64 columns on each of 64 local cores and sends all 64 candidate tiles to
+    a single final core, which merges them serially (63 tile merges: ~100 of its 156 us at 32 x 32768). Here the
+    64 local cores (columns 0..7 x rows 0..7, the stock local kernels) report in groups of 8 to 8 middle cores
+    (row 8, kernels/topk_mid.cpp), and the final core (0, 9) merges only the middle cores' 8 results (stock final
+    kernels): 7 + 7 serial merges. Each level alternates its cores' output order, as the stock op does across its
+    local cores, so every merge sees bitonic pairs.
+
+    Ids are the 16-bit column positions within the shard (W <= 65536): the sort runs in 16-bit DEST and no id
+    tensor is streamed in. The caller adds the shard's vocab offset (after the cross-device gather)."""
+
+    GROUPS = 8  # middle cores
+    LOCALS = 8  # local cores per middle core
+    VAL, IDX = ttnn.bfloat16, ttnn.uint16
+    TILE_BYTES = 2048  # bf16 and uint16 tiles
+
+    def __init__(self, device, k):
+        assert k == 32, "the stock kernels' K=32 layout (one candidate tile per core) is assumed"
+        grid = device.compute_with_storage_grid_size()
+        assert grid.x >= self.GROUPS and grid.y >= self.LOCALS + 2, f"grid {grid} too small for VocabTopK"
+        self.device, self.k, self.kt = device, k, 1
+        rng = lambda x0, y0, x1, y1: ttnn.CoreRange(ttnn.CoreCoord(x0, y0), ttnn.CoreCoord(x1, y1))
+        g, n = self.GROUPS, self.LOCALS
+        self.local_set = ttnn.CoreRangeSet([rng(0, 0, g - 1, n - 1)])
+        self.mid_set = ttnn.CoreRangeSet([rng(0, n, g - 1, n)])
+        self.final_core = (0, n + 1)
+        self.final_set = ttnn.CoreRangeSet([rng(0, n + 1, 0, n + 1)])
+        self.mid_final_set = self.mid_set.merge(self.final_set)
+        self.all_set = self.local_set.merge(self.mid_final_set)
+        self.phys = lambda x, y: device.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
+
+    def _cb(self, index, tiles, dtype, cores):
+        return ttnn.CBDescriptor(
+            total_size=tiles * self.TILE_BYTES,
+            core_ranges=cores,
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=self.TILE_BYTES)
+            ],
+        )
+
+    def __call__(self, x):
+        g, n, k, kt = self.GROUPS, self.LOCALS, self.k, self.kt
+        rows, width = int(x.shape[-2]), int(x.shape[-1])
+        ht, wt = rows // 32, width // 32
+        assert rows % 32 == 0 and width <= 65536 and wt % (g * n) == 0, f"VocabTopK shape {tuple(x.shape)}"
+        wt_local = wt // (g * n)
+        assert wt_local >= 2 and wt_local & (wt_local - 1) == 0
+        out_shape = ttnn.Shape((1, 1, rows, k))
+        vals = ttnn.allocate_tensor_on_device(out_shape, self.VAL, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG)
+        ids = ttnn.allocate_tensor_on_device(out_shape, self.IDX, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG)
+
+        # CB ids as in the stock factory. The gather buffers (c_4/c_5) are written remotely at the sender's own
+        # address of them, so they go first on every core (same L1 address everywhere). A middle core reads that
+        # address after its own gather wrapped the buffer, so the buffer holds exactly one gather (g == n).
+        assert g == n
+        IN, IN_IDX, LT_VAL, LT_IDX, G_VAL, G_IDX, M_VAL, M_IDX, OUT_VAL, OUT_IDX = range(10)
+        cbs = [
+            self._cb(G_VAL, n * kt, self.VAL, self.all_set),
+            self._cb(G_IDX, n * kt, self.IDX, self.all_set),
+            self._cb(OUT_VAL, 2, self.VAL, self.all_set),
+            self._cb(OUT_IDX, 2, self.IDX, self.all_set),
+            self._cb(IN, 4, self.VAL, self.local_set),
+            self._cb(IN_IDX, 4, self.IDX, self.local_set),
+            self._cb(LT_VAL, wt_local, self.VAL, self.local_set),
+            self._cb(LT_IDX, wt_local, self.IDX, self.local_set),
+            self._cb(M_VAL, g * kt, self.VAL, self.mid_final_set),
+            self._cb(M_IDX, g * kt, self.IDX, self.mid_final_set),
+        ]
+        # Semaphores 0/1: local -> middle hand-off; 2/3: middle -> final (a middle core runs both protocols).
+        sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=self.all_set, initial_value=0) for i in range(4)]
+
+        compute_cfg = ttnn.ComputeConfigDescriptor()
+        compute_cfg.fp32_dest_acc_en = False
+        logk = int(math.log2(k))
+        sort_ct = lambda width_tiles, a, b, c, d: [a, b, c, d, OUT_VAL, OUT_IDX, ht, width_tiles, k, kt, logk]
+        kern = lambda src, cores, ct, rt, cfg, **kw: ttnn.KernelDescriptor(
+            kernel_source=src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct,
+            runtime_args=rt,
+            config=cfg,
+            **kw,
+        )
+        locals_ = [(gx, ly) for gx in range(g) for ly in range(n)]  # global local index = gx * n + ly
+        kernels = [
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/reader_create_index_local_topk.cpp",
+                self.local_set,
+                [IN, IN_IDX, ht, wt_local, wt] + list(ttnn.TensorAccessorArgs(x).get_compile_time_args()),
+                [((cx, cy), [x.buffer_address(), 0, i * wt_local, 0]) for i, (cx, cy) in enumerate(locals_)],
+                ttnn.ReaderConfigDescriptor(),
+                defines=[("GENERATE_INDICES", "1")],
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/compute/topk_local.cpp",
+                self.local_set,
+                sort_ct(wt_local, IN, IN_IDX, LT_VAL, LT_IDX) + [int(math.log2(wt_local)), 1, 1, 0, 0],
+                [((cx, cy), [i % 2]) for i, (cx, cy) in enumerate(locals_)],
+                compute_cfg,
+            ),
+            kern(
+                _TOPK_MID_KERNEL,
+                self.mid_set,
+                sort_ct(n * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(n * kt)), 1],
+                [((gx, n), [gx % 2]) for gx in range(g)],
+                compute_cfg,
+                compiler_include_paths=[f"{_TOPK_KERNELS}/compute"],
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/writer_local_topk.cpp",
+                self.mid_set,
+                [2, 3, self.phys(*self.final_core).x, self.phys(*self.final_core).y, ht, k, kt]
+                + [OUT_VAL, OUT_IDX, G_VAL, G_IDX],
+                [((gx, n), [gx]) for gx in range(g)],
+                ttnn.WriterConfigDescriptor(),
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
+                self.final_set,
+                [2, 3, self.phys(0, n).x, self.phys(0, n).y, self.phys(g - 1, n).x, self.phys(g - 1, n).y]
+                + [ht, g * kt, g, G_VAL, G_IDX],
+                [],
+                ttnn.ReaderConfigDescriptor(),
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/compute/topk_final.cpp",
+                self.final_set,
+                sort_ct(g * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(g * kt)), 1, 1, 0, 0],
+                [],
+                compute_cfg,
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/writer_final_topk.cpp",
+                self.final_set,
+                [OUT_VAL, OUT_IDX, ht, kt]
+                + list(ttnn.TensorAccessorArgs(vals).get_compile_time_args())
+                + list(ttnn.TensorAccessorArgs(ids).get_compile_time_args()),
+                [(self.final_core, [vals.buffer_address(), ids.buffer_address()])],
+                ttnn.WriterConfigDescriptor(),
+            ),
+        ]
+        for gx in range(g):
+            column = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(gx, 0), ttnn.CoreCoord(gx, n - 1))])
+            mid, top, bottom = self.phys(gx, n), self.phys(gx, 0), self.phys(gx, n - 1)
+            # This group's local cores send their candidates to middle core (gx, n) ...
+            kernels.append(
+                kern(
+                    f"{_TOPK_KERNELS}/dataflow/writer_local_topk.cpp",
+                    column,
+                    [0, 1, mid.x, mid.y, ht, k, kt, OUT_VAL, OUT_IDX, G_VAL, G_IDX],
+                    [((gx, ly), [ly]) for ly in range(n)],
+                    ttnn.WriterConfigDescriptor(),
+                )
+            )
+            # ... which releases them (multicast over the column) and collects n * kt tiles.
+            kernels.append(
+                kern(
+                    f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
+                    ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(gx, n), ttnn.CoreCoord(gx, n))]),
+                    [0, 1, top.x, top.y, bottom.x, bottom.y, ht, n * kt, n, G_VAL, G_IDX],
+                    [],
+                    ttnn.ReaderConfigDescriptor(),
+                )
+            )
+        ttnn.generic_op([x, vals, ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
+        return vals, ids
+
 
 # Component name -> the stub class(es) that implement it. Every class here is invoked by the forward chain
 # below; Gate 2 reads INVOKED (filled by the probe installed at build) against this table.
@@ -335,6 +576,9 @@ class DevstralPipeline:
     """Resident TT pipeline: every weight is built once on the mesh, the KV cache is allocated once."""
 
     PIPELINE_STAGES = PIPELINE_STAGES
+    # The vision tower and projector run data-parallel over the mesh (full weights on every device, each device its own
+    # images, one all_gather of the projector output) instead of tensor-parallel (two fp32 all_reduces per layer).
+    VISION_DATA_PARALLEL = True
 
     def __init__(
         self,
@@ -377,8 +621,15 @@ class DevstralPipeline:
         t0 = time.time()
         m = hf_model.model
         log(f"building vision tower ({self.vision_layers} layers) + projector")
-        self.vision_tower = _st_vision_model.TtPixtralVisionModel(device, m.vision_tower, n_layers=self.vision_layers)
-        self.multi_modal_projector = _st_projector.TtMistral3MultiModalProjector(device, m.multi_modal_projector)
+        self.vision_dp = self.VISION_DATA_PARALLEL and self._tp() > 1
+        _st_pixtral_attention.DATA_PARALLEL = self.vision_dp
+        try:
+            self.vision_tower = _st_vision_model.TtPixtralVisionModel(
+                device, m.vision_tower, n_layers=self.vision_layers
+            )
+            self.multi_modal_projector = _st_projector.TtMistral3MultiModalProjector(device, m.multi_modal_projector)
+        finally:
+            _st_pixtral_attention.DATA_PARALLEL = False
         log(f"building language model ({self.text_layers} layers, TP={self._tp()})")
         self.language_model = _st_ministral3_model.TtMinistral3Model(
             device, m.language_model, n_layers=self.text_layers
@@ -388,25 +639,29 @@ class DevstralPipeline:
         self.kv_shape = [self.batch, attn0.local_kv_heads, self.kv_capacity, attn0.head_dim]
         self.kv_caches = [
             (
-                ttnn.zeros(self.kv_shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
-                ttnn.zeros(self.kv_shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device),
+                ttnn.zeros(self.kv_shape, dtype=KV_CACHE_DTYPE, layout=ttnn.TILE_LAYOUT, device=device),
+                ttnn.zeros(self.kv_shape, dtype=KV_CACHE_DTYPE, layout=ttnn.TILE_LAYOUT, device=device),
             )
             for _ in self.language_model.layers
         ]
         self._stage = {}
         self._decode_repeats = None
-        # Global vocab id of every column of each device's lm_head shard, one row per batch row: the per-device
-        # top-k returns these labels directly (ttnn.topk indices_tensor), so the TP candidate lists merge with
-        # one more top-k and no index arithmetic.
-        self._vocab_ids = None
-        if self._tp() > 1:
+        # TP > 1: each device top-k's its own lm_head vocab shard (VocabTopK, shard positions); the gathered
+        # (B, TP * K) candidate positions become vocab ids by adding their shard's first id (_shard_base), and one
+        # more top-k over the TP * K candidates picks the winners.
+        self._shard_base = None
+        tp = self._tp()
+        if tp > 1:
             vocab = int(tcfg.vocab_size)
-            self._vocab_ids = ttnn.from_torch(
-                torch.arange(vocab, dtype=torch.int32).reshape(1, 1, 1, vocab).expand(1, 1, self.batch, vocab).contiguous(),
+            self._shard_shape = (1, 1, self.batch, vocab // tp)
+            self._vocab_topk = VocabTopK(device, self.top_k)
+            base = (torch.arange(tp, dtype=torch.int32) * (vocab // tp)).repeat_interleave(self.top_k)
+            self._shard_base = ttnn.from_torch(
+                base.reshape(1, 1, 1, -1).expand(1, 1, self.batch, -1).contiguous(),
                 dtype=ttnn.uint32,
                 layout=ttnn.TILE_LAYOUT,
                 device=device,
-                mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1),
+                mesh_mapper=self._repl,
             )
         log(f"pipeline resident in {time.time() - t0:.1f}s (KV cache {self.kv_shape} per layer, bf16)")
 
@@ -421,6 +676,27 @@ class DevstralPipeline:
     def _put(self, t, dtype, layout):
         return ttnn.from_torch(t.contiguous(), dtype=dtype, layout=layout, device=self.device, mesh_mapper=self._repl)
 
+    def _put_pixels(self, pixel_values, sizes):
+        """Upload an image batch: equal-size images go up already patchified on the host (the vision tower's own
+        (c, ky, kx) row order, tile layout), so the device skips its reshape / permute chain over 14-pixel row-major
+        sticks; mixed sizes upload the raw pixels for the device patchify."""
+        patches = self.vision_tower.patchify_host(pixel_values, sizes)
+        if patches is None:
+            return {"pixel_values": self._put(pixel_values.to(torch.bfloat16), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)}
+        tp = self._tp()
+        if self.vision_dp and patches.shape[0] % tp == 0 and patches.shape[0] // tp > 1:
+            # data-parallel vision: each device its own run of images (VISION_DATA_PARALLEL); with replicated
+            # pixels instead, every device computes every image (same result, no gather needed)
+            pv = ttnn.from_torch(
+                patches.to(torch.bfloat16).contiguous(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.device,
+                mesh_mapper=ttnn.ShardTensorToMesh(self.device, dim=0),
+            )
+            return {"pixel_values": pv, "prepatched": True, "vision_split": True}
+        return {"pixel_values": self._put(patches.to(torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT), "prepatched": True}
+
     def upload(self, req):
         """Move one encoded request onto the device: prompt, positions, image, merge index, noise table, state."""
         b, s = req["tokens"].shape
@@ -434,8 +710,17 @@ class DevstralPipeline:
             "positions": self._put(
                 torch.arange(s, dtype=torch.float32).reshape(1, 1, s, 1), ttnn.float32, ttnn.TILE_LAYOUT
             ),
+            # forward_prefill's gather index of each user's last prompt row in the untilized 32-row block holding it
+            "last_rows": self._put(
+                torch.arange(b, dtype=torch.int32).reshape(1, b) * ttnn.TILE_SIZE
+                + (req["real_len"] - 1) % ttnn.TILE_SIZE,
+                ttnn.uint32,
+                ttnn.ROW_MAJOR_LAYOUT,
+            ),
+            # Cast on the host (exact: the table already holds bf16 values): an fp32 upload into a bf16 row-major
+            # tensor is converted on device as tilize + typecast + untilize of the whole (steps, B * NB) table, ~5 ms.
             "noise": self._put(
-                gumbel_table(req["seeds"], steps, NOISE_BUCKETS).reshape(steps, b * NOISE_BUCKETS),
+                gumbel_table(req["seeds"], steps, NOISE_BUCKETS).reshape(steps, b * NOISE_BUCKETS).to(torch.bfloat16),
                 ttnn.bfloat16,
                 ttnn.ROW_MAJOR_LAYOUT,
             ),
@@ -443,9 +728,7 @@ class DevstralPipeline:
         if "pixel_values" in req:
             sizes = req["image_sizes"]
             dev["image_sizes"] = sizes
-            dev["pixel_values"] = self._put(
-                req["pixel_values"].to(torch.bfloat16), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT
-            )
+            dev.update(self._put_pixels(req["pixel_values"], sizes))
             dev["patch_positions"] = self._put(
                 self.vision_tower.patch_position_ids(sizes).reshape(1, -1).to(torch.int32),
                 ttnn.uint32,
@@ -479,18 +762,23 @@ class DevstralPipeline:
     def forward_encode(self, dev):
         """pixel_values -> vision tower -> projector: (B, 1, M, hidden) image embeddings."""
         feats = self.vision_tower(
-            dev["pixel_values"], image_sizes=dev["image_sizes"], position_ids=dev["patch_positions"]
+            dev["pixel_values"],
+            image_sizes=dev["image_sizes"],
+            position_ids=dev["patch_positions"],
+            prepatched=dev.get("prepatched", False),
         )
         out = self.multi_modal_projector(feats, image_sizes=dev["image_sizes"])
+        if dev.get("vision_split"):  # each device encoded its own images: gather them in device (= image) order
+            out = ttnn.all_gather(out, dim=0, num_links=1, topology=ttnn.Topology.Linear)
         b, d = self.batch, out.shape[-1]
         return ttnn.reshape(out, (b, 1, dev["tokens_per_image"], d))
 
     def embed_prompt(self, dev, image_embeds=None):
         """(B, 1, S, hidden) prompt embeddings; image features land on the [IMG] rows through an on-device gather."""
+        if image_embeds is None:
+            return self.language_model.prefill_embeds(dev["tokens"])  # (B, 1, S, D) or its hidden shard
         x = self.language_model.embed_tokens(dev["tokens"])  # (B, S, D)
         b, s, d = x.shape
-        if image_embeds is None:
-            return ttnn.reshape(x, (b, 1, s, d))
         m = image_embeds.shape[-2]
         text_rows = ttnn.to_layout(ttnn.reshape(x, (1, 1, b * s, d)), ttnn.ROW_MAJOR_LAYOUT)
         img_rows = ttnn.to_layout(ttnn.reshape(image_embeds, (1, 1, b * m, d)), ttnn.ROW_MAJOR_LAYOUT)
@@ -504,7 +792,19 @@ class DevstralPipeline:
             inputs_embeds=embeds, position_ids=dev["positions"], kv_caches=self.kv_caches, mode="prefill"
         )
         b, _, d = hidden.shape
-        last = ttnn.slice(hidden, (0, dev["real_len"] - 1, 0), (b, dev["real_len"], d))
+        # The last prompt row in two slices: first the tile-aligned 32-row block that holds it (a tiled slice), then
+        # the row itself -- a direct unaligned slice untilized the whole (B, S, D) hidden state first.
+        r = dev["real_len"] - 1
+        r0 = r // ttnn.TILE_SIZE * ttnn.TILE_SIZE
+        block = ttnn.slice(hidden, (0, r0, 0), (b, r0 + ttnn.TILE_SIZE, d))
+        if "last_rows" in dev:
+            # The rows themselves by one gather out of the untilized block (row b * 32 + r % 32 per user), emitted
+            # tiled as the (B, D) LM-head input: the unaligned slice untilized, sliced, re-tilized padding each user's
+            # row to a full tile (90 us) and then reshaped the (B, 1, D) result to (1, 1, B, D) through DRAM (48 us).
+            rows = ttnn.reshape(ttnn.to_layout(block, ttnn.ROW_MAJOR_LAYOUT), (b * ttnn.TILE_SIZE, d))
+            last = ttnn.embedding(dev["last_rows"], rows, layout=ttnn.TILE_LAYOUT)  # (1, B, D)
+        else:
+            last = ttnn.slice(block, (0, r - r0, 0), (b, r - r0 + 1, d))
         logits = self.lm_head(ttnn.reshape(last, (1, 1, b, d)))
         return hidden, logits
 
@@ -516,13 +816,15 @@ class DevstralPipeline:
         b, k, nb = self.batch, self.top_k, NOISE_BUCKETS
         vals, idx = self._topk(logits)
         scores = ttnn.multiply(ttnn.typecast(vals, ttnn.float32), 1.0 / self.temperature)
-        noise = ttnn.embedding(state["step"], state["noise"], layout=ttnn.TILE_LAYOUT)  # (1, 1, B*NB) bf16
-        noise = ttnn.reshape(ttnn.typecast(noise, ttnn.float32), (1, 1, b, nb))
-        ids = ttnn.typecast(idx, ttnn.float32)  # exact: ids < 2^24
-        bucket = ttnn.subtract(ids, ttnn.multiply(ttnn.floor(ttnn.multiply(ids, 1.0 / nb)), float(nb)))
-        scores = ttnn.add(scores, ttnn.gather(noise, dim=-1, index=ttnn.typecast(bucket, ttnn.uint32)))
-        pick = ttnn.to_layout(ttnn.argmax(scores, dim=-1, keepdim=True), ttnn.TILE_LAYOUT)
-        drawn = ttnn.gather(idx, dim=-1, index=pick)  # (1, 1, B, 1) uint32
+        # The step's noise: one row-major lookup, a free row-major reshape to (B, NB), then a 32-row tilize (the
+        # tile-layout lookup tilized one 32768-wide row padded to a full tile and reshaped it after the cast).
+        noise = ttnn.embedding(state["step"], state["noise"], layout=ttnn.ROW_MAJOR_LAYOUT)  # (1, 1, B*NB) bf16
+        noise = ttnn.typecast(ttnn.to_layout(ttnn.reshape(noise, (1, 1, b, nb)), ttnn.TILE_LAYOUT), ttnn.float32)
+        bucket = ttnn.bitwise_and(idx, nb - 1)  # token v draws noise bucket v % NB (NB is a power of two)
+        scores = ttnn.add(scores, ttnn.gather(noise, dim=-1, index=bucket))
+        # The best score and its vocab id in one op: the top-1 carries the candidates' ids as labels (no argmax +
+        # index gather). Equal-score ties stay arbitrary, as the unstable candidate ordering already made them.
+        _, drawn = ttnn.topk(scores, k=1, dim=-1, largest=True, sorted=True, indices_tensor=idx)  # (1, 1, B, 1)
         # generate(): finished rows emit pad; a row finishes on the step it emits eos.
         unf = state["unfinished"]
         nxt = ttnn.add(
@@ -543,11 +845,14 @@ class DevstralPipeline:
         all_gathered and one top-k over TP*k candidates picks the winners."""
         k = self.top_k
         local = getattr(self.lm_head, "local", None)
-        if self._vocab_ids is None or local is None or tuple(local.shape) != tuple(self._vocab_ids.shape):
+        if self._shard_base is None or local is None or tuple(local.shape) != self._shard_shape:
             return ttnn.topk(logits, k=k, dim=-1, largest=True, sorted=True)
-        vals, ids = ttnn.topk(local, k=k, dim=-1, largest=True, sorted=True, indices_tensor=self._vocab_ids)
+        # Shard top-k (VocabTopK: 16-bit positions within the shard), gathered, then labelled with vocab ids: the
+        # gathered block of device d holds positions in vocab [d * W, (d + 1) * W).
+        vals, ids = self._vocab_topk(local)
         vals = ttnn.all_gather(vals, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         ids = ttnn.all_gather(ids, dim=3, num_links=1, topology=ttnn.Topology.Linear)
+        ids = ttnn.add(ttnn.typecast(ids, ttnn.uint32), self._shard_base)
         return ttnn.topk(vals, k=k, dim=-1, largest=True, sorted=True, indices_tensor=ids)
 
     def decode_prefill(self, request):
@@ -573,11 +878,13 @@ class DevstralPipeline:
             cur_pos=state["cur_pos"],
             mode="decode",
         )
-        logits = self.lm_head(hidden)
+        # The sampler reads each device's vocab shard (lm_head.local), so the token path skips the full-row
+        # all_gather; host readers join the shards on the vocab dim (VocabShards / host_read).
+        logits = self.lm_head(hidden, gather=False)
         ttnn.plus_one(state["cur_pos"])
         ttnn.add(state["pos"], 1.0, output_tensor=state["pos"])
         state["drawn"] = self.sample(logits, state)
-        state["logits"] = logits
+        state["logits"] = VocabShards(logits) if self._tp() > 1 else logits
         state["position"] = state["position"] + 1
         return state
 
@@ -630,7 +937,7 @@ class DevstralPipeline:
         h, w = sizes[0]
         pv = pv[..., :h, :w].contiguous()  # the processor's padding is cropped off before patchify (as HF does)
         self._stage["encode"] = {
-            "pixel_values": self._put(pv.to(torch.bfloat16), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT),
+            **self._put_pixels(pv, sizes),
             "image_sizes": sizes,
             "patch_positions": self._put(
                 self.vision_tower.patch_position_ids(sizes).reshape(1, -1).to(torch.int32),
@@ -685,7 +992,8 @@ class DevstralPipeline:
         self._stage["decode"] = self.decode_prefill(self._token_request(prompt))
 
     def decode_trace_step(self):
-        return self.decode_step(self._stage["decode"])["logits"]
+        logits = self.decode_step(self._stage["decode"])["logits"]
+        return logits.tensor if isinstance(logits, VocabShards) else logits
 
     def decode_trace_items(self):
         """One token for every batch row."""
@@ -738,8 +1046,20 @@ def build_pipeline(
 # --------------------------------------------------------------------------------------- task heads (TT)
 
 
+class VocabShards:
+    """Decode logits kept as each device's (1, 1, B, vocab/TP) lm_head shard: the on-device sampler only needs
+    the shards, so no all_gather runs on the token path; host_read joins them on the vocab dim."""
+
+    __slots__ = ("tensor",)
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+
+
 def host_read(t, device):
-    """Device -> host read of a replicated tensor (the first replica)."""
+    """Device -> host read of a replicated tensor (the first replica), or the full vocab row of VocabShards."""
+    if isinstance(t, VocabShards):
+        return ttnn.to_torch(t.tensor, mesh_composer=ttnn.ConcatMeshToTensor(device, dim=-1))
     if isinstance(device, ttnn.MeshDevice):
         return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(device, dim=0))[: t.shape[0]]
     return ttnn.to_torch(t)

@@ -18,25 +18,44 @@ along S under a block-diagonal mask. The output keeps the input's rank.
 from __future__ import annotations
 
 import torch
-import ttnn
 
+import ttnn
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_attention import TtPixtralAttention
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_m_l_p import TtPixtralMLP
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_r_m_s_norm import TtPixtralRMSNorm
 
 
 class TtAttention:
-    # dtype the norm outputs enter the attention / MLP matmuls in (the residual itself is always fp32).
-    MATMUL_INPUT_DTYPE = ttnn.bfloat16
+    # dtype the norm outputs enter the attention / MLP matmuls in (the residual itself is always fp32). fp32: the
+    # QKV and gate/up minimal_matmuls read the fp32 norm output themselves (and emit bf16), so no separate cast of
+    # each norm output to bf16 (113 us per norm on 32 images x 256 patches).
+    MATMUL_INPUT_DTYPE = ttnn.float32
+    # Each norm's gamma is folded into the projections that read it (q/k/v; gate/up), so the norms apply none: the
+    # separate fp32 x bf16 broadcast gamma multiply cost 456 us per norm on 32 images x 256 patches.
+    FOLD_NORM_GAMMA = True
+    # The ffn (and attention) norm's output (read once, by the gate/up or the QKV, which frees it) lands in L1 while it
+    # takes at most this many bytes per core (fp32 32 x 256 x 1024: 298 KB).
+    FFN_NORM_L1_BYTES = 320 * 1024
+    # dtype the L1 ffn norm output enters the fused gate/up in (cast in L1): bf16 halves the activation blocks the
+    # LoFi gate/up unpacks and multicasts, and leaves room for full-depth K blocks.
+    GATE_UP_INPUT_DTYPE = ttnn.bfloat16
+    # dtype the attention norm output enters the QKV in when it fits in L1 (norm output to L1, cast there, freed by
+    # the QKV): bf16 halves the activation blocks the HiFi4 QKV unpacks. None: the fp32 norm output from DRAM.
+    QKV_INPUT_DTYPE = ttnn.bfloat16
+
     def __init__(self, device, torch_module, mlp_cls=None) -> None:
         self.device = device
-        self.attention_norm = TtPixtralRMSNorm.build(device, torch_module.attention_norm)
-        self.attention = TtPixtralAttention(device, torch_module.attention)
-        self.ffn_norm = TtPixtralRMSNorm.build(device, torch_module.ffn_norm)
-        self.feed_forward = (mlp_cls or TtPixtralMLP)(device, torch_module.feed_forward)
+        fold = self.FOLD_NORM_GAMMA
+        an, fn = torch_module.attention_norm, torch_module.ffn_norm
+        self.attention_norm = TtPixtralRMSNorm.build(device, an, fold_gamma=fold)
+        self.attention = TtPixtralAttention(device, torch_module.attention, in_scale=an.weight if fold else None)
+        self.ffn_norm = TtPixtralRMSNorm.build(device, fn, fold_gamma=fold)
+        self.feed_forward = (mlp_cls or TtPixtralMLP)(
+            device, torch_module.feed_forward, in_scale=fn.weight if fold else None
+        )
         self.tp = self.attention.tp
         self.head_dim = self.attention.head_dim
-        self._repl = ttnn.ReplicateTensorToMesh(device) if self.tp > 1 else None
+        self._repl = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
 
     @classmethod
     def build(cls, device, torch_module):
@@ -68,12 +87,26 @@ class TtAttention:
         # The residual stream is carried in fp32. The vision encoder grows a few massive activations
         # (row norms ~1e4) around layer 13, and whether a patch row crosses that onset depends on low bits a
         # bf16 residual drops: a bf16 stream (TT's or the CPU reference's alike) moves rows away from the
-        # fp32 result there. Norm outputs go to the matmuls in bf16; the sub-blocks return fp32.
+        # fp32 result there. Norm outputs go to the matmuls in MATMUL_INPUT_DTYPE; the sub-blocks return fp32.
         if x.dtype != ttnn.float32:
             x = ttnn.typecast(x, ttnn.float32)
-        n = self._mm_in(self.attention_norm(x))
+        grid = self.device.compute_with_storage_grid_size()
+        n_bytes = 4 * int(x.shape[0]) * int(x.shape[-2]) * int(x.shape[-1]) // (grid.x * grid.y)
+        l1 = self.FOLD_NORM_GAMMA and self.MATMUL_INPUT_DTYPE == ttnn.float32 and n_bytes <= self.FFN_NORM_L1_BYTES
+        if l1 and self.QKV_INPUT_DTYPE not in (None, ttnn.float32):
+            n32 = self.attention_norm(x, memory_config=ttnn.L1_MEMORY_CONFIG)
+            n = ttnn.typecast(n32, self.QKV_INPUT_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG)
+            ttnn.deallocate(n32)
+        else:
+            n = self._mm_in(self.attention_norm(x))
         h = ttnn.add(x, self.attention(n, attention_mask=mask, position_embeddings=(cos, sin)))
-        out = ttnn.add(h, self.feed_forward(self._mm_in(self.ffn_norm(h))))
+        n = self.ffn_norm(h, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None)
+        if l1 and self.GATE_UP_INPUT_DTYPE not in (None, n.dtype):
+            n32, n = n, ttnn.typecast(n, self.GATE_UP_INPUT_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG)
+            ttnn.deallocate(n32)
+            out = ttnn.add(h, self.feed_forward(n))
+        else:
+            out = ttnn.add(h, self.feed_forward(self._mm_in(n)))
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
         return out

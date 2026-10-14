@@ -8,7 +8,7 @@ of `mistralai/Devstral-Small-2-24B-Instruct-2512`.
     out = norm(h)
 
 Composed from the graduated child ports:
-  * embed_tokens  `token_embed.py` (replicated table, ttnn.embedding)
+  * embed_tokens  `token_embed.py` (replicated table, ttnn.embedding; prefill gathers from its hidden-sharded copy)
   * rotary_emb    `ministral3_rotary_embedding.py` (yarn cos/sin evaluated on device from positions)
   * layers        `ministral3_decoder_layer.py` (the TP decoder layer; a plain list of one type)
   * norm          `ministral3_r_m_s_norm.py`
@@ -28,6 +28,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import tp_ccl_args
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_decoder_layer import (
     TtMinistral3DecoderLayer,
 )
@@ -52,6 +53,8 @@ class TtMinistral3Model:
         self.layers = [TtMinistral3DecoderLayer(device, layer, meta_rope=True) for layer in torch_module.layers[:depth]]
         self.norm = TtMinistral3RMSNorm.build(device, torch_module.norm)
         self.tp = self.layers[0].tp
+        # the last layer's prefill output only feeds the bf16 all_gather below (see bf16_prefill_out)
+        self.layers[-1].bf16_prefill_out = True
         self.head_dim = self.layers[0].self_attn.head_dim
         self.max_seq_len = max_seq_len
         self._repl = ttnn.ReplicateTensorToMesh(device) if self.tp > 1 else None
@@ -94,22 +97,27 @@ class TtMinistral3Model:
             return self._decode(input_ids, inputs_embeds, position_ids, kv_caches, cur_pos)
 
         if inputs_embeds is None:
-            x = self.embed_tokens(input_ids)  # (B, S, D)
-            b, s, d = x.shape
-            x = ttnn.reshape(x, (b, 1, s, d))
+            x = self.prefill_embeds(input_ids)
         else:
             x = inputs_embeds
             if len(x.shape) == 3:
                 x = ttnn.reshape(x, (x.shape[0], 1, x.shape[1], x.shape[2]))
-            b, _, s, d = x.shape
+        b, _, s, _ = x.shape
+        d = self.layers[0].hidden
         assert s <= self.max_seq_len and s % 32 == 0, f"seq {s} must be a tile multiple <= {self.max_seq_len}"
 
         pos = self._positions(position_ids, s)
-        cos, sin = self.rotary_emb(x, position_ids=pos)  # (1, S, hd)
+        # bf16 tables (rotary_emb casts them to its x's dtype; the prompt embeddings may already be the fp32 residual)
+        cos, sin = self.rotary_emb(None, position_ids=pos)  # (1, S, hd)
         cos = ttnn.reshape(cos, (1, 1, s, self.head_dim))
         sin = ttnn.reshape(sin, (1, 1, s, self.head_dim))
         # q's rope tables with the llama-4 query scale folded in, built once and shared by every layer.
         rope = (cos, sin) + self.layers[0].self_attn.query_rope_tables(cos, sin, pos, (1, 1, s, 1))
+        rope = self.layers[0].self_attn.prefill_rope_tables(rope, s)  # + per-core L1 copies for the fused RoPE
+        shard = self.tp > 1 and TtMinistral3DecoderLayer.SHARD_PREFILL_RESIDUAL
+        if shard and int(x.shape[-1]) == d:
+            # The layers carry the prefill residual hidden-sharded (TtMinistral3DecoderLayer.SHARD_PREFILL_RESIDUAL).
+            x = ttnn.mesh_partition(x, dim=3)
         for i, layer in enumerate(self.layers):
             # attention_mask=None -> causal SDPA, the mask HF builds for an unpadded prompt.
             x = layer(
@@ -120,8 +128,42 @@ class TtMinistral3Model:
                 kv_cache=None if kv_caches is None else kv_caches[i],
                 mode="prefill",
             )
+        if shard:
+            x = ttnn.all_gather(self._bf16(x), dim=3, **tp_ccl_args())
         out = self._bf16(self.norm(self._bf16(x)))
         return ttnn.reshape(out, (b, s, d))
+
+    # The sharded gather's bf16 slice goes through L1 (interleaved, <= this many bytes per bank) on its way to the
+    # residual dtype: the typecast reads it there instead of from DRAM, and it is freed right after.
+    PREFILL_EMBED_L1_BYTES = 384 * 1024
+
+    def prefill_embeds(self, input_ids):
+        """(B, 1, S, D) prompt embeddings of input_ids (B, S), or, when the layers carry the prefill residual
+        hidden-sharded, this device's (B, 1, S, D / TP) slice gathered straight from the sharded table (in the
+        residual dtype, or kept bf16 with its per-token norm statistics handed to the first layer)."""
+        shard = self.tp > 1 and TtMinistral3DecoderLayer.SHARD_PREFILL_RESIDUAL
+        if not (shard and self.embed_tokens.weight_shard is not None):
+            x = self.embed_tokens(input_ids)
+            b, s, d = x.shape
+            return ttnn.reshape(x, (b, 1, s, d))
+        b, s = (int(v) for v in input_ids.shape)
+        if self.embed_tokens.sq_table is not None and TtMinistral3DecoderLayer.accepts_bf16_input():
+            # The bf16 slice is the first layer's residual as is (its fused residual add widens it to fp32) and its
+            # input norm reads the gathered per-token sums of squares, so nothing casts or reduces the embeddings.
+            x = ttnn.reshape(self.embed_tokens.shard(input_ids), (b, 1, s, self.embed_tokens.shard_dim))
+            sq = ttnn.reshape(self.embed_tokens.shard_sq(input_ids), (b, 1, s, ttnn.TILE_SIZE))
+            TtMinistral3DecoderLayer.carry_input_stats(x, sq)
+            return x
+        grid = self.device.compute_with_storage_grid_size()
+        per_bank = b * s * self.embed_tokens.shard_dim * 2 / (grid.x * grid.y)
+        rd = TtMinistral3DecoderLayer.RESIDUAL_DTYPE
+        l1 = rd is not None and rd != ttnn.bfloat16 and per_bank <= self.PREFILL_EMBED_L1_BYTES
+        x = self.embed_tokens.shard(input_ids, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None)
+        if l1:
+            y = ttnn.typecast(x, rd, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(x)
+            x = y
+        return ttnn.reshape(x, (b, 1, s, x.shape[-1]))
 
     def _decode(self, input_ids, inputs_embeds, position_ids, kv_caches, cur_pos):
         if inputs_embeds is None:
