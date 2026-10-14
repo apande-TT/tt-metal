@@ -53,6 +53,8 @@ class TtMinistral3Model:
         self.layers = [TtMinistral3DecoderLayer(device, layer, meta_rope=True) for layer in torch_module.layers[:depth]]
         self.norm = TtMinistral3RMSNorm.build(device, torch_module.norm)
         self.tp = self.layers[0].tp
+        # the last layer's prefill output only feeds the bf16 all_gather below (see bf16_prefill_out)
+        self.layers[-1].bf16_prefill_out = True
         self.head_dim = self.layers[0].self_attn.head_dim
         self.max_seq_len = max_seq_len
         self._repl = ttnn.ReplicateTensorToMesh(device) if self.tp > 1 else None

@@ -52,6 +52,10 @@ class TtMinistral3DecoderLayer:
     # (residual tensor, its sum-of-squares stats, whether those are whole-row totals): set by the last layer's fused
     # add (per-device partial stats) or by the model for its bf16 prompt embeddings (carry_input_stats).
     _CARRY = None
+    # Set by the model on its last layer: that layer's final sharded-prefill residual add emits bf16 (C++ add + the
+    # SFPU round ttnn.typecast runs, tt/add_stats.apply_bf16) for the model's bf16 all_gather, instead of an fp32
+    # residual and its stats that only a cast would read.
+    bf16_prefill_out = False
 
     def __init__(self, device, torch_module, meta_rope=False) -> None:
         """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order)."""
@@ -172,6 +176,11 @@ class TtMinistral3DecoderLayer:
             m = self.mlp(self._prefill_norm(self.post_attention_layernorm, h, sq=h_sq), mode="prefill")
         finally:
             self.self_attn.prefill_gather = self.mlp.prefill_gather = True
+        if self.bf16_prefill_out and self.FUSED_ADD_STATS:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import add_stats
+
+            if add_stats.supports(h, m):
+                return add_stats.apply_bf16(h, m)
         out, out_sq = self._residual_add_stats(h, m)
         if out_sq is not None:
             TtMinistral3DecoderLayer._CARRY = (out, out_sq, False)
