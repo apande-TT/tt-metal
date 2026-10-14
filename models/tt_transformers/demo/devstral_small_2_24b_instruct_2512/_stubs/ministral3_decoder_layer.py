@@ -133,7 +133,8 @@ class TtMinistral3DecoderLayer:
             out = self._prefill_sharded(x, attention_mask, position_ids, position_embeddings, kv_cache)
             return ttnn.reshape(out, in_shape) if len(in_shape) == 3 else out
         if mode == "decode":
-            n = self.input_layernorm.decode(x)  # sharded norm reads the fp32 residual directly
+            # sharded norm reads the fp32 residual directly; the decode QKV reads its width shards as they are
+            n = self.input_layernorm.decode(x, keep_sharded=self.self_attn.DECODE_SHARDED_INPUT)
         else:
             n = self._bf16(self.input_layernorm(self._bf16(x)))  # rms_norm reads bf16 (fp32 input overflows L1 at 5120)
         a = self.self_attn(
