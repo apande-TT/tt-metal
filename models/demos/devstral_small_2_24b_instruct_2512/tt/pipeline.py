@@ -167,6 +167,7 @@ PLANNED_TP = 4
 #                     residual from there.
 #   pixtral_vision_model: equal-size images are uploaded already patchified on the host (patchify_host; tile layout),
 #                     so the device skips the reshape / permute chain over 14-pixel row-major sticks.
+#   pixtral_m_l_p: the vision fused gate/up weight is block-float8.
 #   attention (vision layer): each RMSNorm gamma is folded into the q/k/v and gate/up weights that read it (no separate
 #                     fp32 gamma multiply).
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
