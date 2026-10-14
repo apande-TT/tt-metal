@@ -140,6 +140,7 @@ class TtQwenTextEncoder:
         _te_layer.MLP_LIMBS_L1_BYTES = 16 * 1024 * 1024
         _te_layer.MLP_FUSED_SILU = True  # and its SiLU fused into the gate * up multiply
         _te_layer.FUSED_SCALE_MASK = True  # the LM attention's logit scale fused into its mask add
+        _te_attention.VISION_FUSED_SCALE_MASK = True  # and the vision attention's
         from models.demos.qwen_image_edit_text_encoder._stubs import encoder_stack as _te_stack
 
         _te_stack.VISION_MLP_FUSED_SILU = True  # the vision MLP's SiLU likewise
