@@ -139,7 +139,8 @@ class TtMinistral3Attention:
             kv_sl = slice(d * lkv * hd, (d + 1) * lkv * hd)
             chunks += [wq[:, q_sl], wk[:, kv_sl], wv[:, kv_sl]]
         wqkv = torch.concat(chunks, dim=-1)
-        self.wqkv = _put(wqkv, shard(-1))
+        # The prefill QKV multiplies a block-float8 copy (half the weight bytes; HiFi2, fp32 accumulation).
+        self.wqkv = _put(wqkv, shard(-1), dtype=ttnn.bfloat8_b)
         # Decode reads its own copy of [q | k | v], DRAM width-sharded over the banks so each bank's reader streams
         # only its column slice, with the single-row activation width-sharded over QKV_DECODE_CORES: the interleaved
         # matmul has only N / 32 = 48 output tiles to spread, one per core, and streams the weight at ~190 GB/s.
