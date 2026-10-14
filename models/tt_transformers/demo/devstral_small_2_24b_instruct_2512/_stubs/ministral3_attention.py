@@ -91,6 +91,8 @@ class TtMinistral3Attention:
     HEAD_GRID_X = 8
     # Batch rows the resident decode rotation tiles cover (the pipeline's maximum batch).
     MAX_DECODE_BATCH = 32
+    # Prefill RoPE runs on a (batch, heads) regrouping of the heads that balances its grid split (see _rope_regroup).
+    REGROUP_PREFILL_ROPE = True
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -331,6 +333,35 @@ class TtMinistral3Attention:
             ttnn.multiply(ttnn.matmul(x, self.rot, compute_kernel_config=self.compute_cfg), sin),
         )
 
+    def _prefill_rope(self, t, cos, sin):
+        """Fused prefill RoPE of the (B, H, S, hd) heads t (meta_rope pair order), run on _rope_regroup's view."""
+        shape = tuple(int(d) for d in t.shape)
+        g = self._rope_regroup(shape) if self.REGROUP_PREFILL_ROPE else shape[0]
+        if g != shape[0]:
+            t = ttnn.reshape(t, (g, shape[0] * shape[1] // g) + shape[2:])
+        t = ttnn.experimental.rotary_embedding_llama(
+            t, cos, sin, self.prefill_trans_mat, is_decode_mode=False, compute_kernel_config=self.compute_cfg
+        )
+        return t if g == shape[0] else ttnn.reshape(t, shape)
+
+    def _rope_regroup(self, shape):
+        """Batch size of the (B', B * H / B') regrouping of (B, H, S, hd) heads that leaves rotary_embedding_llama's
+        busiest core the least work. Its prefill split gives min(B', cores) batch slices the remaining cores over
+        sequence tiles, each core every head of its slice: 32 users x 8 q heads x 13 sequence tiles leaves 96 cores
+        with 5/5/3 tiles of 8 heads (160 head tiles on the busiest), while 8 x 32 puts one sequence tile of 32 heads
+        on each of 104 cores (128); at 4 sequence tiles 256 x 1 (48) beats 32 x 8 (64). The rows' positions (and so
+        cos/sin) are unchanged, and the outer-dim reshape is a view."""
+        b, h, s = shape[:3]
+        grid = self.device.compute_with_storage_grid_size()
+        cores, st, n = grid.x * grid.y, -(-s // ttnn.TILE_SIZE), b * h
+
+        def busiest(g):
+            bp = min(g, cores)
+            sp = min(cores // bp, st)
+            return -(-g // bp) * -(-st // sp) * (n // g)
+
+        return min((g for g in range(1, n + 1) if n % g == 0), key=lambda g: (busiest(g), g != b))
+
     def _llama4_scale(self, position_ids, shape):
         """Per-position query scale 1 + beta * log(1 + floor(pos / orig_max)), on device, in `shape`."""
         pos = position_ids
@@ -441,9 +472,7 @@ class TtMinistral3Attention:
         if self.meta_rope:
             # One fused RoPE per tensor over every user's heads (the prompt positions are shared by all rows): a
             # 32 x 32 pair-swap per head-dim tile instead of a 128 x 128 rotate-half matmul plus mul / mul / add.
-            rope = lambda t, c, si: ttnn.experimental.rotary_embedding_llama(
-                t, c, si, self.prefill_trans_mat, is_decode_mode=False, compute_kernel_config=self.compute_cfg
-            )
+            rope = self._prefill_rope
         k = rope(k, cos, sin)
         if q_tables is not None:
             q = rope(q, *q_tables)  # llama-4 scale already folded into the shared q tables
