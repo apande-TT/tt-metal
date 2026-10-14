@@ -92,10 +92,12 @@ class TtPixtralAttention:
         )
 
     def _rope(self, x, cos, sin):
-        return ttnn.add(
-            ttnn.multiply(x, cos),
-            ttnn.multiply(ttnn.matmul(x, self.rot, compute_kernel_config=self.compute_cfg), sin),
+        # rotate_half as x @ R on minimal_matmul, which folds the (images, heads) batch into its rows over the full
+        # grid (ttnn.matmul ran the 32 x 4 x 256-row batch on 16 cores: 252 us); R is a +-1 permutation, so exact.
+        rot = ttnn.experimental.minimal_matmul(
+            x, self.rot, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
         )
+        return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(rot, sin))
 
     def __call__(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
         x = hidden_states
