@@ -161,9 +161,9 @@ PLANNED_TP = 4
 #                     short prompts hand the o_proj output to the residual add and SDPA's output to the concat
 #                     through L1 (416 rows too).
 #   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
-#   pixtral_attention: the vision QKV (3-tile N blocks), the RoPE rotate-half and o_proj (4-tile N blocks) run on
-#                     minimal_matmul over the full grid too; so do the projector linear_1 (with its bias; 6 x 4-tile
-#                     blocks) and linear_2.
+#   pixtral_attention: the vision QKV (3-tile N blocks) and o_proj (4-tile N blocks) run on minimal_matmul over the
+#                     full grid too; so do the projector linear_1 (with its bias; 6 x 4-tile blocks) and linear_2. The
+#                     RoPE rotate-half is a height-parallel 1D matmul (every core a run of row tiles).
 #   token_embed: a hidden-sharded copy of the table; the text prefill gathers each device's residual slice from it
 #                     (no full-width rows, no mesh_partition). The slice stays bf16 into the first layer, whose input
 #                     norm gathers per-token sums of squares from a (vocab, 32) table (exact bf16 hi / mid / lo parts)
