@@ -53,6 +53,9 @@ class TtMinistral3MLP:
     prefill_gather = True
     # dtype of the fused gate/up weight the many-row (prefill) path multiplies with.
     GATE_UP_DTYPE = ttnn.bfloat8_b
+    # The many-row SwiGLU product goes to the down projection through L1 (interleaved, freed right after) while it
+    # takes at most this many bytes per core (the vision MLP's 8192 x 1024 bf16: 152 KB; the text MLP's is far larger).
+    PREFILL_INTER_L1_BYTES = 192 * 1024
 
     def __init__(self, device, torch_module, in_scale=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up."""
@@ -198,6 +201,10 @@ class TtMinistral3MLP:
 
     def _forward(self, x):
         grid = self.device.compute_with_storage_grid_size()
+        rows = 1
+        for d in tuple(int(v) for v in x.shape)[:-1]:
+            rows *= d
+        inter_l1 = 0 < 2 * rows * self.inter // (grid.x * grid.y) <= self.PREFILL_INTER_L1_BYTES
         m = ttnn.experimental.minimal_matmul(
             x,
             self.w_gate_up,
@@ -210,7 +217,7 @@ class TtMinistral3MLP:
                 compute_with_storage_grid_size=grid,
             ),
             compute_kernel_config=self.gate_up_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=ttnn.L1_MEMORY_CONFIG if inter_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
             fuse_swiglu=True,
         )
@@ -232,6 +239,17 @@ class TtMinistral3MLP:
                 subblock_w=2,
                 compute_with_storage_grid_size=ttnn.CoreCoord(nt // 16, mt // 16),
             )
+        elif -(-nt // (grid.y if mt > nt else grid.x)) in (2, 4, 6):
+            # A narrow per-core N range (the vision MLP's 32 output tiles over 10 cores: 4) runs N blocks of exactly
+            # that width; the default 8-tile block would be half padding.
+            down_cfg = ttnn.MinimalMatmulConfig(
+                M_block_size=8,
+                K_block_size=8,
+                N_block_size=-(-nt // (grid.y if mt > nt else grid.x)),
+                subblock_h=2,
+                subblock_w=2,
+                compute_with_storage_grid_size=grid,
+            )
         out = ttnn.experimental.minimal_matmul(
             m,
             self.w_down,
@@ -240,6 +258,8 @@ class TtMinistral3MLP:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=self.PREFILL_REDUCE_DTYPE if (self.PREFILL_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
         )
+        if inter_l1:
+            ttnn.deallocate(m)
         return self._reduce(out, gather=self.prefill_gather)
 
     def _reduce(self, out, gather=True):
