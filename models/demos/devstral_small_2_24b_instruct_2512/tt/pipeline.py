@@ -715,7 +715,12 @@ class DevstralPipeline:
             inputs_embeds=embeds, position_ids=dev["positions"], kv_caches=self.kv_caches, mode="prefill"
         )
         b, _, d = hidden.shape
-        last = ttnn.slice(hidden, (0, dev["real_len"] - 1, 0), (b, dev["real_len"], d))
+        # The last prompt row in two slices: first the tile-aligned 32-row block that holds it (a tiled slice), then
+        # the row itself -- a direct unaligned slice untilized the whole (B, S, D) hidden state first.
+        r = dev["real_len"] - 1
+        r0 = r // ttnn.TILE_SIZE * ttnn.TILE_SIZE
+        block = ttnn.slice(hidden, (0, r0, 0), (b, r0 + ttnn.TILE_SIZE, d))
+        last = ttnn.slice(block, (0, r - r0, 0), (b, r - r0 + 1, d))
         logits = self.lm_head(ttnn.reshape(last, (1, 1, b, d)))
         return hidden, logits
 
