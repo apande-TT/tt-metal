@@ -157,6 +157,8 @@ PLANNED_TP = 4
 #                     The prefill RoPE computes at HiFi2. The concatenated SDPA heads reach the all_gather through L1.
 #   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
 #   pixtral_attention: the vision QKV runs on minimal_matmul over the full grid too.
+#   pixtral_vision_model: equal-size images are uploaded already patchified on the host (patchify_host; tile layout),
+#                     so the device skips the reshape / permute chain over 14-pixel row-major sticks.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
 #   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py).
@@ -642,6 +644,15 @@ class DevstralPipeline:
     def _put(self, t, dtype, layout):
         return ttnn.from_torch(t.contiguous(), dtype=dtype, layout=layout, device=self.device, mesh_mapper=self._repl)
 
+    def _put_pixels(self, pixel_values, sizes):
+        """Upload an image batch: equal-size images go up already patchified on the host (the vision tower's own
+        (c, ky, kx) row order, tile layout), so the device skips its reshape / permute chain over 14-pixel row-major
+        sticks; mixed sizes upload the raw pixels for the device patchify."""
+        patches = self.vision_tower.patchify_host(pixel_values, sizes)
+        if patches is None:
+            return {"pixel_values": self._put(pixel_values.to(torch.bfloat16), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)}
+        return {"pixel_values": self._put(patches.to(torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT), "prepatched": True}
+
     def upload(self, req):
         """Move one encoded request onto the device: prompt, positions, image, merge index, noise table, state."""
         b, s = req["tokens"].shape
@@ -666,9 +677,7 @@ class DevstralPipeline:
         if "pixel_values" in req:
             sizes = req["image_sizes"]
             dev["image_sizes"] = sizes
-            dev["pixel_values"] = self._put(
-                req["pixel_values"].to(torch.bfloat16), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT
-            )
+            dev.update(self._put_pixels(req["pixel_values"], sizes))
             dev["patch_positions"] = self._put(
                 self.vision_tower.patch_position_ids(sizes).reshape(1, -1).to(torch.int32),
                 ttnn.uint32,
@@ -702,7 +711,10 @@ class DevstralPipeline:
     def forward_encode(self, dev):
         """pixel_values -> vision tower -> projector: (B, 1, M, hidden) image embeddings."""
         feats = self.vision_tower(
-            dev["pixel_values"], image_sizes=dev["image_sizes"], position_ids=dev["patch_positions"]
+            dev["pixel_values"],
+            image_sizes=dev["image_sizes"],
+            position_ids=dev["patch_positions"],
+            prepatched=dev.get("prepatched", False),
         )
         out = self.multi_modal_projector(feats, image_sizes=dev["image_sizes"])
         b, d = self.batch, out.shape[-1]
@@ -865,7 +877,7 @@ class DevstralPipeline:
         h, w = sizes[0]
         pv = pv[..., :h, :w].contiguous()  # the processor's padding is cropped off before patchify (as HF does)
         self._stage["encode"] = {
-            "pixel_values": self._put(pv.to(torch.bfloat16), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT),
+            **self._put_pixels(pv, sizes),
             "image_sizes": sizes,
             "patch_positions": self._put(
                 self.vision_tower.patch_position_ids(sizes).reshape(1, -1).to(torch.int32),
