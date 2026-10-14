@@ -26,6 +26,9 @@ from models.demos.qwen_image_edit_text_encoder._stubs import (
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import pad_to_tile
 from models.demos.qwen_image_edit_text_encoder._stubs.layer import text_attention_mask
 
+# micro-batches of the row-staged LM's 2-stage pipeline (TtTextModel._pipelined; 1 = the plain two passes)
+TEXT_MICRO = 2
+
 
 def replicated(device, t, dtype, layout=ttnn.TILE_LAYOUT):
     kw = {"mesh_mapper": ttnn.ReplicateTensorToMesh(device)} if isinstance(device, ttnn.MeshDevice) else {}
@@ -206,7 +209,7 @@ class TtQwenTextEncoder:
         )
         x = ttnn.reshape(x, (B, 1, s_pad, C))
         cos3, sin3 = self.rotary(None, p.positions, dtype=ttnn.float32)
-        h = self.text_model.forward_padded(x, self._mrope(cos3), self._mrope(sin3), p.mask)
+        h = self.text_model.forward_padded(x, self._mrope(cos3), self._mrope(sin3), p.mask, micro=TEXT_MICRO)
         L, drop = p.out_len, PROMPT_TEMPLATE_DROP
         h = ttnn.reshape(ttnn.slice(h, [0, 0, drop, 0], [B, 1, drop + L, C]), (B, L, C))
         return h if p.keep is None else ttnn.multiply(h, p.keep)

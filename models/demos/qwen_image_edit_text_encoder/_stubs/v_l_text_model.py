@@ -20,7 +20,7 @@ import numpy as np
 
 import ttnn
 from models.demos.qwen_image_edit_text_encoder._stubs import language_model_layers_0_mlp, v_l_decoder_layer
-from models.demos.qwen_image_edit_text_encoder._stubs.attention import mesh_shape, pad_to_tile
+from models.demos.qwen_image_edit_text_encoder._stubs.attention import mesh_shape, pad_to_tile, upload_rows
 from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtRMSNorm, _fp32
 from models.demos.qwen_image_edit_text_encoder._stubs.token_embed import TtTokenEmbed
 
@@ -59,6 +59,14 @@ class TtTextModel:
                 mlp = language_model_layers_0_mlp.build(device, lyr.mlp)
                 self.layers.append(v_l_decoder_layer.build(device, lyr, mlp=mlp))
         self.norm = TtRMSNorm(device, torch_module.norm)
+        # the row selectors of the pipelined row stages: 1 on its row, 0 on the other (exact 0 / 1 multiplies)
+        self._row_sel = None
+        if self.row_stages:
+            one, zero = np.ones((1, 1, 1, 1), np.float32), np.zeros((1, 1, 1, 1), np.float32)
+            self._row_sel = (
+                upload_rows(device, [one, zero], dtype=ttnn.float32),
+                upload_rows(device, [zero, one], dtype=ttnn.float32),
+            )
         rot = torch_module.rotary_emb
         self.inv_freq = rot.inv_freq.detach().float().numpy()
         self.rope_scale = float(getattr(rot, "attention_scaling", 1.0))
@@ -86,9 +94,47 @@ class TtTextModel:
         end = [(row + 1) * b] + list(x.shape)[1:]
         return ttnn.slice(g, start, end)
 
-    def forward_padded(self, x, tt_cos, tt_sin, tt_mask):
+    @staticmethod
+    def _batch_slice(t, i, mb):
+        shape = list(t.shape)
+        return ttnn.slice(t, [i * mb] + [0] * (len(shape) - 1), [(i + 1) * mb] + shape[1:])
+
+    def _rows(self, a, b):
+        """a on mesh row 0, b on row 1 (exact: 0 / 1 multiplies of finite values)."""
+        r0, r1 = self._row_sel
+        return ttnn.add(ttnn.multiply(a, r0), ttnn.multiply(b, r1))
+
+    def _pipelined(self, x, tt_cos, tt_sin, tt_mask, m):
+        """The row stages as a 2-stage pipeline over m micro-batches: at step t row 0 runs micro-batch t through
+        layers [0, n/2) while row 1 runs micro-batch t - 1 (row 0's previous output) through [n/2, n). m + 1 steps
+        of B / m sequences instead of 2 passes of all B (each row's other half was discarded work). Each step's
+        masks are its rows' micro-batches of tt_mask (a step's idle row takes a valid one), formed per step."""
+        mb = x.shape[0] // m
+        outs, prev = [], None
+        for t in range(m + 1):
+            if t == 0:
+                xin, mask = self._batch_slice(x, 0, mb), self._batch_slice(tt_mask, 0, mb)
+            elif t == m:
+                xin, mask = self._take_row(prev, 0), self._batch_slice(tt_mask, m - 1, mb)
+            else:  # row 0: the next micro-batch; row 1: row 0's output of the last step
+                xin = self._rows(self._batch_slice(x, t, mb), self._take_row(prev, 0))
+                mask = self._rows(self._batch_slice(tt_mask, t, mb), self._batch_slice(tt_mask, t - 1, mb))
+            y = xin
+            for lyr in self.layers:
+                y = lyr.forward_padded(y, tt_cos, tt_sin, mask)
+            if 0 < t < m:  # the row-selected mask is this step's own; a plain batch slice may be a view of tt_mask
+                ttnn.deallocate(mask)
+            if t >= 1:
+                outs.append(self._take_row(y, 1))  # micro-batch t - 1, finished on row 1
+            prev = y
+        return ttnn.concat(outs, dim=0)
+
+    def forward_padded(self, x, tt_cos, tt_sin, tt_mask, micro=1):
         """Device path: x [B, 1, s_pad, C] fp32 -> norm(layers(x)) [B, 1, s_pad, C], replicated. Rotary
-        tables ([B|1, 1, s_pad, D]) and the additive causal/padding mask are prepared outside."""
+        tables ([B|1, 1, s_pad, D]) and the additive causal/padding mask are prepared outside. micro > 1: the row
+        stages pipelined over that many micro-batches (see _pipelined)."""
+        if self.row_stages and micro > 1 and x.shape[0] % micro == 0:
+            return self.norm(self._pipelined(x, tt_cos, tt_sin, tt_mask, micro))
         for lyr in self.layers:
             x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask)
         if self.row_stages:

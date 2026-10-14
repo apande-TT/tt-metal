@@ -616,8 +616,14 @@ def bmm_program_config(p, q, transpose_b=False):
         return 2 * (m * kt + kt * nt) * 2048 + m * nt * 4096 <= 1000 * 1024
 
     # one batch entry's whole M per work unit; with fewer entries than cores (the LM's 32 sequences x 1 kv head,
-    # M = 7 heads x 192 tokens) the widest M block that still gives every core a unit
-    pcm = mt if batch >= cores else next((d for d in range(mt, 0, -1) if mt % d == 0 and batch * (mt // d) >= cores), 0)
+    # M = 7 heads x 192 tokens) the widest M block that still gives every core a unit. The M-split units must be a
+    # whole number of waves over the cores: 16 entries x 6 blocks = 96 units on 64 cores computed the first wave's
+    # entries wrong, and 16 x 3 = 48 units computed every entry wrong, so other batches keep the auto config.
+    pcm = (
+        mt
+        if batch >= cores
+        else next((d for d in range(mt, 0, -1) if mt % d == 0 and batch * (mt // d) % cores == 0), 0)
+    )
     if not pcm or not fits(pcm):
         return None
     key = (mt, kt, nt, pcm, grid.x, grid.y)
