@@ -18,6 +18,8 @@ _DIR = Path(__file__).resolve().parent / "kernels"
 _READER = str(_DIR / "add_stats_reader.cpp")
 _WRITER = str(_DIR / "add_stats_writer.cpp")
 _COMPUTE = str(_DIR / "add_stats_compute.cpp")
+_CAST_WRITER = str(_DIR / "add_cast_writer.cpp")
+_CAST_COMPUTE = str(_DIR / "add_cast_compute.cpp")
 
 _TILE = 32
 _TILE_BYTES = {ttnn.bfloat16: 2048, ttnn.float32: 4096}
@@ -59,6 +61,17 @@ def supports(x, d) -> bool:
 def apply(x, d):
     """x: fp32 (or bf16, widened exactly) TILE interleaved [..., S, W]; d: same shape, bf16 or fp32. Returns
     (h = x + d fp32 [..., S, W], stats fp32 [..., S, 32] with sum(h^2) of each row in column 0)."""
+    return _run(x, d, cast=False)
+
+
+def apply_bf16(x, d):
+    """bf16(x + d) [..., S, W] for the same inputs: the fp32 sum rounded by the SFPU typecast ttnn.typecast runs
+    (bit-identical to apply()'s h followed by ttnn.typecast to bf16), with no fp32 h and no stats written. For the
+    last residual add, whose sum only feeds a bf16 all_gather."""
+    return _run(x, d, cast=True)
+
+
+def _run(x, d, cast):
     device = x.device()
     shape = [int(s) for s in x.shape]
     rows = 1
@@ -68,13 +81,14 @@ def apply(x, d):
     grid = device.compute_with_storage_grid_size()
     gx, ncores = int(grid.x), min(int(grid.x) * int(grid.y), rt)
     cores = ttnn.num_cores_to_corerangeset(ncores, grid, row_wise=True)
-    h = ttnn.allocate_tensor_on_device(
-        ttnn.Shape(shape), ttnn.float32, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG
-    )
-    stats = ttnn.allocate_tensor_on_device(
-        ttnn.Shape(shape[:-1] + [_TILE]), ttnn.float32, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG
-    )
-    xa, da, ha, sa = x.buffer_address(), d.buffer_address(), h.buffer_address(), stats.buffer_address()
+    out_dtype = ttnn.bfloat16 if cast else ttnn.float32
+    h = ttnn.allocate_tensor_on_device(ttnn.Shape(shape), out_dtype, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG)
+    stats = None
+    if not cast:
+        stats = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(shape[:-1] + [_TILE]), ttnn.float32, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG
+        )
+    xa, da, ha = x.buffer_address(), d.buffer_address(), h.buffer_address()
     base, extra = divmod(rt, ncores)
     rr, rw, rc = [], [], []
     r0 = 0
@@ -82,7 +96,7 @@ def apply(x, d):
         nr = base + (1 if c < extra else 0)
         cy, cx = divmod(c, gx)
         rr.append(((cx, cy), [xa, da, r0, nr]))
-        rw.append(((cx, cy), [ha, sa, r0, nr]))
+        rw.append(((cx, cy), [ha, r0, nr] if cast else [ha, stats.buffer_address(), r0, nr]))
         rc.append(((cx, cy), [nr]))
         r0 += nr
     cfg = ttnn.ComputeConfigDescriptor()
@@ -107,15 +121,15 @@ def apply(x, d):
             config=ttnn.ReaderConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
-            kernel_source=_WRITER,
+            kernel_source=_CAST_WRITER if cast else _WRITER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[wt, BLK] + _accessor_args(h) + _accessor_args(stats),
+            compile_time_args=[wt, BLK] + _accessor_args(h) + ([] if cast else _accessor_args(stats)),
             runtime_args=rw,
             config=ttnn.WriterConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
-            kernel_source=_COMPUTE,
+            kernel_source=_CAST_COMPUTE if cast else _COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[wt, BLK],
@@ -127,6 +141,12 @@ def apply(x, d):
         _cb(cores, CB_X, x.dtype, 2 * BLK),
         _cb(cores, CB_D, d.dtype, 2 * BLK),
         _cb(cores, CB_SCALER, ttnn.float32, 1),
+    ]
+    if cast:
+        cbs.append(_cb(cores, CB_OUT, out_dtype, 2 * BLK))
+        ttnn.generic_op([x, d, h], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+        return h
+    cbs += [
         _cb(cores, CB_H, ttnn.float32, wt),
         _cb(cores, CB_X2, ttnn.float32, wt),
         _cb(cores, CB_OUT, ttnn.float32, 2 * BLK),
