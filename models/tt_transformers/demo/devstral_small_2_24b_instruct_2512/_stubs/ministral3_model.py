@@ -111,6 +111,7 @@ class TtMinistral3Model:
         sin = ttnn.reshape(sin, (1, 1, s, self.head_dim))
         # q's rope tables with the llama-4 query scale folded in, built once and shared by every layer.
         rope = (cos, sin) + self.layers[0].self_attn.query_rope_tables(cos, sin, pos, (1, 1, s, 1))
+        rope = self.layers[0].self_attn.prefill_rope_tables(rope, s)  # + per-core L1 copies for the fused RoPE
         shard = self.tp > 1 and TtMinistral3DecoderLayer.SHARD_PREFILL_RESIDUAL
         if shard:
             # The layers carry the prefill residual hidden-sharded (TtMinistral3DecoderLayer.SHARD_PREFILL_RESIDUAL).

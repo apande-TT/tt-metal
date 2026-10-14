@@ -93,6 +93,9 @@ class TtMinistral3Attention:
     MAX_DECODE_BATCH = 32
     # Prefill RoPE runs on a (batch, heads) regrouping of the heads that balances its grid split (see _rope_regroup).
     REGROUP_PREFILL_ROPE = True
+    # ... and reads cos / sin and the pair-swap tile from per-core L1 shards (prefill_rope_tables) when that moves
+    # fewer DRAM bytes than its per-row reload of the interleaved tables.
+    L1_PREFILL_ROPE = True
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -211,6 +214,17 @@ class TtMinistral3Attention:
             # the single tile from DRAM.
             self.trans_mat = _put(self._pair_swap(ttnn.TILE_SIZE).repeat(1, 1, self.MAX_DECODE_BATCH, 1), repl)
             self.prefill_trans_mat = _put(self._pair_swap(ttnn.TILE_SIZE).reshape(1, 1, ttnn.TILE_SIZE, -1), repl)
+            # One pair-swap tile per core, height-sharded into L1 around each prefill RoPE (see _prefill_rope).
+            n_cores = grid.x * grid.y
+            self.prefill_trans_rows = _put(self._pair_swap(ttnn.TILE_SIZE).repeat(1, 1, n_cores, 1), repl)
+            core_shard = lambda w: ttnn.create_sharded_memory_config(
+                (ttnn.TILE_SIZE, w),
+                core_grid=ttnn.CoreGrid(y=grid.y, x=grid.x),
+                strategy=ttnn.ShardStrategy.HEIGHT,
+                orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                use_height_and_width_as_shard_shape=True,
+            )
+            self.prefill_rope_l1_cfg, self.prefill_trans_l1_cfg = core_shard(hd), core_shard(ttnn.TILE_SIZE)
         else:
             half = hd // 2
             rot = torch.zeros(hd, hd)
@@ -333,34 +347,85 @@ class TtMinistral3Attention:
             ttnn.multiply(ttnn.matmul(x, self.rot, compute_kernel_config=self.compute_cfg), sin),
         )
 
-    def _prefill_rope(self, t, cos, sin):
-        """Fused prefill RoPE of the (B, H, S, hd) heads t (meta_rope pair order), run on _rope_regroup's view."""
+    def prefill_rope_tables(self, rope, s):
+        """Prefill rope tables (cos, sin[, q_cos, q_sin]), each (1, 1, s, hd), extended ONCE per forward for every
+        layer with their per-core layouts: (cos, sin, q_cos | None, q_sin | None, rows), rows = (cos, sin, q_cos,
+        q_sin) as (1, 1, cores * 32, hd) DRAM tables whose tile i is sequence tile i % S_t -- the tile the prefill
+        split hands core i when every core takes one sequence tile. _prefill_rope height-shards them into L1 around
+        the op (one tile per core), which then reads them in place instead of from DRAM for every row; they stay out
+        of L1 between layers (forward-lifetime L1 tables clash with the static buffers of the larger prefill ops).
+        Unchanged when the fused RoPE does not apply."""
+        grid = self.device.compute_with_storage_grid_size()
+        cores, st = grid.x * grid.y, -(-int(s) // ttnn.TILE_SIZE)
+        if not (self.meta_rope and self.L1_PREFILL_ROPE) or st > cores:
+            return rope
+        reps = -(-cores // st)
+
+        def per_core(t):
+            if reps > 1:
+                t = ttnn.repeat(t, ttnn.Shape([1, 1, reps, 1]))
+            if reps * st != cores:
+                t = ttnn.slice(t, (0, 0, 0, 0), (1, 1, cores * ttnn.TILE_SIZE, self.head_dim))
+            return t
+
+        q = tuple(rope[2:4]) if len(rope) >= 4 else (None, None)
+        cos, sin = per_core(rope[0]), per_core(rope[1])
+        shared = q[0] is None or (q[0] is rope[0] and q[1] is rope[1])
+        q_cos, q_sin = (cos, sin) if shared else (per_core(q[0]), per_core(q[1]))
+        return tuple(rope[:2]) + q + ((cos, sin, q_cos, q_sin),)
+
+    def _prefill_rope(self, t, cos, sin, rows=None):
+        """Fused prefill RoPE of the (B, H, S, hd) heads t (meta_rope pair order), run on _rope_regroup's view.
+        rows: (cos, sin) per-core tables from prefill_rope_tables, moved into L1 for the op when _rope_regroup
+        picks them (with the pair-swap tile) and freed after it."""
         shape = tuple(int(d) for d in t.shape)
-        g = self._rope_regroup(shape) if self.REGROUP_PREFILL_ROPE else shape[0]
+        g, use_l1 = self._rope_regroup(shape, rows is not None)
+        trans, l1 = self.prefill_trans_mat, ()
+        if use_l1:
+            l1 = (
+                ttnn.to_memory_config(rows[0], self.prefill_rope_l1_cfg),
+                ttnn.to_memory_config(rows[1], self.prefill_rope_l1_cfg),
+                ttnn.to_memory_config(self.prefill_trans_rows, self.prefill_trans_l1_cfg),
+            )
+            cos, sin, trans = l1
         if g != shape[0]:
             t = ttnn.reshape(t, (g, shape[0] * shape[1] // g) + shape[2:])
         t = ttnn.experimental.rotary_embedding_llama(
-            t, cos, sin, self.prefill_trans_mat, is_decode_mode=False, compute_kernel_config=self.compute_cfg
+            t, cos, sin, trans, is_decode_mode=False, compute_kernel_config=self.compute_cfg
         )
+        for x in l1:
+            ttnn.deallocate(x)
         return t if g == shape[0] else ttnn.reshape(t, shape)
 
-    def _rope_regroup(self, shape):
-        """Batch size of the (B', B * H / B') regrouping of (B, H, S, hd) heads that leaves rotary_embedding_llama's
-        busiest core the least work. Its prefill split gives min(B', cores) batch slices the remaining cores over
-        sequence tiles, each core every head of its slice: 32 users x 8 q heads x 13 sequence tiles leaves 96 cores
-        with 5/5/3 tiles of 8 heads (160 head tiles on the busiest), while 8 x 32 puts one sequence tile of 32 heads
-        on each of 104 cores (128); at 4 sequence tiles 256 x 1 (48) beats 32 x 8 (64). The rows' positions (and so
-        cos/sin) are unchanged, and the outer-dim reshape is a view."""
+    def _rope_regroup(self, shape, l1=False):
+        """(B', use_l1): the (B', B * H / B') regrouping of (B, H, S, hd) heads for rotary_embedding_llama, and whether
+        it reads prefill_rope_tables' L1 copies. Its prefill split gives min(B', cores) batch slices the remaining
+        cores over sequence tiles, each core every head of its slice. With DRAM tables the regrouping leaves the
+        busiest core the least work: 32 users x 8 q heads x 13 sequence tiles leaves 96 cores with 5/5/3 tiles of 8
+        heads (160 head tiles on the busiest), while 8 x 32 puts one sequence tile of 32 heads on each of 104 cores
+        (128). The op reads cos and sin from DRAM again for every (sequence tile, head) row above 8 rows per core
+        (four tile transfers per head tile instead of two), else once per batch slice. The L1 tables need one
+        sequence tile per core (at most cores // S_t batch slices) and cost two transfers per head tile; they are
+        used when that is less DRAM traffic on the busiest core (416 rows: q 8 x 32 at 64 transfers vs 128).
+        The rows' positions (and so cos/sin) are unchanged, and the outer-dim reshape is a view."""
         b, h, s = shape[:3]
         grid = self.device.compute_with_storage_grid_size()
         cores, st, n = grid.x * grid.y, -(-s // ttnn.TILE_SIZE), b * h
+        divisors = [g for g in range(1, n + 1) if n % g == 0]
 
-        def busiest(g):
+        def split(g):  # (head tiles, DRAM tile transfers) on the busiest core with DRAM tables
             bp = min(g, cores)
             sp = min(cores // bp, st)
-            return -(-g // bp) * -(-st // sp) * (n // g)
+            seq = -(-st // sp)
+            rows, slices = seq * (n // g), -(-g // bp)
+            return slices * rows, slices * (4 * rows if rows > 8 else 2 * (rows + seq))
 
-        return min((g for g in range(1, n + 1) if n % g == 0), key=lambda g: (busiest(g), g != b))
+        g = min(divisors, key=lambda g: (split(g)[0], g != b)) if self.REGROUP_PREFILL_ROPE else b
+        if l1 and st <= cores:
+            g_l1 = max(d for d in divisors if d <= cores // st)
+            if 2 * (n // g_l1) <= split(g)[1]:
+                return g_l1, True
+        return g, False
 
     def _llama4_scale(self, position_ids, shape):
         """Per-position query scale 1 + beta * log(1 + floor(pos / orig_max)), on device, in `shape`."""
@@ -448,7 +513,10 @@ class TtMinistral3Attention:
         hd = self.head_dim
 
         cos, sin = position_embeddings[:2]
-        q_tables = tuple(position_embeddings[2:4]) if len(position_embeddings) == 4 else None
+        q_tables = None
+        if len(position_embeddings) >= 4 and position_embeddings[2] is not None:
+            q_tables = tuple(position_embeddings[2:4])
+        rows = position_embeddings[4] if len(position_embeddings) > 4 else None  # prefill_rope_tables' per-core tables
         if isinstance(cos, torch.Tensor):
             cos = self._to_tt(cos.to(torch.bfloat16).reshape(1, 1, s, hd))
         if isinstance(sin, torch.Tensor):
@@ -468,16 +536,19 @@ class TtMinistral3Attention:
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, transpose_k_heads=False
         )
-        rope = self._rope
+        rope_k = rope_q = self._rope
         if self.meta_rope:
             # One fused RoPE per tensor over every user's heads (the prompt positions are shared by all rows): a
             # 32 x 32 pair-swap per head-dim tile instead of a 128 x 128 rotate-half matmul plus mul / mul / add.
-            rope = self._prefill_rope
-        k = rope(k, cos, sin)
+            k_rows = None if rows is None else rows[:2]
+            q_rows = None if rows is None else rows[2:4]
+            rope_k = lambda t, c, si: self._prefill_rope(t, c, si, k_rows)
+            rope_q = lambda t, c, si: self._prefill_rope(t, c, si, q_rows)
+        k = rope_k(k, cos, sin)
         if q_tables is not None:
-            q = rope(q, *q_tables)  # llama-4 scale already folded into the shared q tables
+            q = rope_q(q, *q_tables)  # llama-4 scale already folded into the shared q tables
         else:
-            q = rope(q, cos, sin)
+            q = rope_q(q, cos, sin)
             if self.l4_beta is not None and self.l4_max and position_ids is not None:
                 q = ttnn.multiply(q, self._llama4_scale(position_ids, (1, 1, s, 1)))
         if kv_cache is not None:
