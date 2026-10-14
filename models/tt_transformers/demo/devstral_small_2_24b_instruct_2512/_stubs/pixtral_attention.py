@@ -105,21 +105,26 @@ class TtPixtralAttention:
         )
 
     def _narrow_n_cfg(self, x, w):
-        """minimal_matmul config whose N block is the per-core N range when that is under 8 tiles (M splits along the
-        grid's x axis and N along y when M > N): the default 8-tile block would compute mostly padding (o_proj: 4 of
-        8 tiles valid, QKV: 3 of 8). None (the default 8 x 8 blocks) otherwise."""
+        """minimal_matmul config whose blocks are the per-core M / N ranges where those are under 8 tiles (M splits
+        along the grid's x axis and N along y when M > N, else the other way round): the default 8-tile blocks would
+        compute mostly padding (TP o_proj: 4 of 8 N tiles valid, TP QKV: 3 of 8; the data-parallel QKV's 7 x 9-tile
+        range ran 8 x 16). None (the default 8 x 8 blocks) otherwise."""
         grid = self.device.compute_with_storage_grid_size()
         shape = tuple(int(d) for d in x.shape)
         mt = shape[-2] // ttnn.TILE_SIZE
         for d in shape[:-2]:
             mt *= d
         nt = int(w.shape[-1]) // ttnn.TILE_SIZE
+        m = min(8, -(-mt // (grid.x if mt > nt else grid.y)))
         n = -(-nt // (grid.y if mt > nt else grid.x))
-        if n >= 8 or (n % 2 and n > 4):
+        if (n >= 8 and m == 8) or n > 12 or (n % 2 and n > 4 and n % 3):
             return None
-        sh, sw = (2, 2) if n % 2 == 0 else (1, n)
+        if m % 2 == 0 and n % 2 == 0:
+            sh, sw = 2, 2
+        else:
+            sh, sw = 1, next(c for c in (4, 3, 2, 1) if n % c == 0)
         return ttnn.MinimalMatmulConfig(
-            M_block_size=8,
+            M_block_size=m,
             K_block_size=8,
             N_block_size=n,
             subblock_h=sh,
