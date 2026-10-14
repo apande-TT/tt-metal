@@ -136,7 +136,7 @@ PLANNED_TP = 4
 #   KV cache in bfloat8_b (KV_CACHE_DTYPE): half the bytes decode SDPA re-reads every token. Prefill writes only the
 #                     cast prompt rows: one fill_cache over (batch x kv_heads) folded into heads, the prompt
 #                     height-sharded one (user, head) slab per core (no pad to the capacity, no full-capacity typecast).
-#   ministral3_attention: prefill QKV (HiFi2) and o_proj projections on minimal_matmul (full grid); prefill o_proj is
+#   ministral3_attention: prefill QKV (HiFi2, bf8 weight) and o_proj projections on minimal_matmul (full grid); prefill o_proj is
 #                     column-parallel over the all_gathered heads, emitting the residual's hidden slice (no reduce-scatter). Decode concatenates the SDPA heads
 #                     with nlp_concat_heads_decode on the head shards (no un-padding reshape through DRAM). Decode QKV
 #                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v]; decode
