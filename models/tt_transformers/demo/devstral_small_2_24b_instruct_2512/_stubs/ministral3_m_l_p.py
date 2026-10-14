@@ -43,8 +43,10 @@ class TtMinistral3MLP:
     # in fp32 and gathers the reduced shard in bf16 (half the bytes); its residual add takes the bf16 unrounded.
     GATHER_DTYPE = ttnn.bfloat16
     # dtype of the many-row (prefill) down projection's partials and their reduce-scatter (None: OUT_DTYPE). The text
-    # decoder reduce-scatters prefill's partials in bf16 (half the bytes, no cast before the gather); decode keeps fp32.
+    # decoder reduce-scatters prefill's partials in bf16 (half the bytes, no cast before the gather).
     PREFILL_REDUCE_DTYPE = ttnn.bfloat16
+    # dtype of the single-row (decode) down projection's partials and their reduce-scatter (None: OUT_DTYPE).
+    DECODE_REDUCE_DTYPE = ttnn.bfloat16
     # Math fidelity of the many-row (prefill) down projection (None: the HiFi4 compute_cfg decode uses too).
     PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi2
     # dtype of the down weight the many-row (prefill) path multiplies with.
@@ -190,7 +192,7 @@ class TtMinistral3MLP:
             m,
             self.w_down_decode,
             program_config=self.down_decode_pc,
-            dtype=self.OUT_DTYPE,
+            dtype=self.DECODE_REDUCE_DTYPE if (self.DECODE_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
             compute_kernel_config=self.compute_cfg,
         )
         return self._reduce(out)

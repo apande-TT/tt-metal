@@ -74,8 +74,14 @@ class TtMinistral3Attention:
     # dtype of o_proj's output and its all_reduce: fp32, added unrounded into the decoder's fp32 residual stream.
     OUT_DTYPE = ttnn.float32
     # Prefill's many-row o_proj partials are produced and reduce-scattered in bf16 instead (half the reduce-scatter
-    # bytes, no fp32 -> bf16 cast before the gather); decode keeps fp32 partials.
+    # bytes, no fp32 -> bf16 cast before the gather).
     PREFILL_REDUCE_DTYPE = ttnn.bfloat16
+    # Decode's single-row o_proj partials likewise (None: fp32 partials, cast to bf16 after the reduce-scatter).
+    DECODE_REDUCE_DTYPE = ttnn.bfloat16
+    # The decode QKV takes the input norm's width-sharded fp32 output as it is (no unshard + cast, no reshard onto
+    # QKV_DECODE_CORES), in K blocks of DECODE_SHARDED_K_BLOCK tiles (whole shards).
+    DECODE_SHARDED_INPUT = True
+    DECODE_SHARDED_K_BLOCK = 20
     # False: prefill returns o_proj's reduce-scattered 1/TP hidden shard (the decoder keeps a hidden-sharded
     # residual in prefill and gathers only the normed activation).
     prefill_gather = True
@@ -192,10 +198,11 @@ class TtMinistral3Attention:
             use_height_and_width_as_shard_shape=True,
         )
         # One activation shard per multicast block, two readers per DRAM bank (3 weight columns each).
+        self.qkv_per_core_n = n_dev // ttnn.TILE_SIZE // cores
         self.qkv_decode_pc = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
             in0_block_w=k_in // ttnn.TILE_SIZE // cores,
             per_core_M=1,
-            per_core_N=n_dev // ttnn.TILE_SIZE // cores,
+            per_core_N=self.qkv_per_core_n,
             num_workers_per_dram_bank=2,
         )
         # Prefill o_proj is COLUMN-parallel: the heads' outputs are all_gathered (13312 x 1024 -> 4096 per device) and
@@ -340,6 +347,16 @@ class TtMinistral3Attention:
         if len(rope) < 4 or (rope[2] is rope[0] and rope[3] is rope[1]):
             return cos, sin, cos, sin, trans  # q shares k's tables
         return (cos, sin) + tuple(ttnn.to_memory_config(t, cfg) for t in rope[2:4]) + (trans,)
+
+    def _sharded_qkv_pc(self):
+        if getattr(self, "_sharded_qkv_pc_cache", None) is None:
+            self._sharded_qkv_pc_cache = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+                in0_block_w=self.DECODE_SHARDED_K_BLOCK,
+                per_core_M=1,
+                per_core_N=self.qkv_per_core_n,
+                num_workers_per_dram_bank=2,
+            )
+        return self._sharded_qkv_pc_cache
 
     def _reduce(self, t, gather=True):
         """all_reduce of o_proj's fp32 partials: reduce-scatter in fp32 (the sum is exact to fp32), round the reduced
@@ -690,13 +707,24 @@ class TtMinistral3Attention:
         """x (1, 1, B, D) -> (1, 1, B, D); cos/sin (1, B, 1, hd); cur_pos int32 [B]; position_ids (B, 1, 1, 1) fp32."""
         b = x.shape[-2]
         head_cfg = self._head_cfg(b)
-        qkv = ttnn.linear(
-            ttnn.to_memory_config(x, self.qkv_act_cfg),
-            self.wqkv_decode,
-            program_config=self.qkv_decode_pc,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            compute_kernel_config=self.compute_cfg,
-        )
+        if x.is_sharded():  # the input norm's own width shards (DECODE_SHARDED_INPUT)
+            qkv = ttnn.linear(
+                x,
+                self.wqkv_decode,
+                program_config=self._sharded_qkv_pc(),
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                dtype=ttnn.bfloat16,
+                compute_kernel_config=self.compute_cfg,
+            )
+            ttnn.deallocate(x)
+        else:
+            qkv = ttnn.linear(
+                ttnn.to_memory_config(x, self.qkv_act_cfg),
+                self.wqkv_decode,
+                program_config=self.qkv_decode_pc,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                compute_kernel_config=self.compute_cfg,
+            )
         qkv = ttnn.sharded_to_interleaved(qkv, ttnn.L1_MEMORY_CONFIG)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, memory_config=head_cfg
@@ -747,7 +775,7 @@ class TtMinistral3Attention:
                 attn,
                 self.wo_decode,
                 program_config=self.wo_decode_pc,
-                dtype=self.OUT_DTYPE,
+                dtype=self.DECODE_REDUCE_DTYPE if (self.DECODE_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
                 compute_kernel_config=self.compute_cfg,
             )
         )

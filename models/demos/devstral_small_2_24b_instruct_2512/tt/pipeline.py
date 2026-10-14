@@ -130,7 +130,9 @@ PLANNED_TP = 4
 #                     The per-device vocab-shard top-k is VocabTopK (generic_op, kernels/topk_mid.cpp): 64 local ->
 #                     8 middle -> 1 final core instead of ttnn.topk's 64 -> 1 serial merge, 16-bit shard positions.
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
-#                     directly (no bf16 cast op, no single-core interleaved norm).
+#                     directly (no bf16 cast op, no single-core interleaved norm); the decode QKV reads the input
+#                     norm's fp32 width shards as they are (20-tile K blocks of 5 shards; no unshard, cast, reshard);
+#                     decode residual adds write straight into the norms' sharded layout (no re-shard per norm).
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
 #   KV cache in bfloat8_b (KV_CACHE_DTYPE): half the bytes decode SDPA re-reads every token. Prefill writes only the
@@ -162,8 +164,9 @@ PLANNED_TP = 4
 #                     short prompts hand the o_proj output to the residual add and SDPA's output to the concat
 #                     through L1 (416 rows too).
 #   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
-#   pixtral_attention: the vision QKV and o_proj run on minimal_matmul over the full grid too, with blocks of each
-#                     core's M / N range (data-parallel QKV 7 x 9, o_proj 6 x 4 tiles); so do the projector linear_1
+#   pixtral_attention: the vision QKV (output to L1 for the head split) and o_proj run on minimal_matmul over the full
+#                     grid too, with blocks of each core's M / N range (data-parallel QKV 7 x 9, o_proj 6 x 4 tiles); so
+#                     do the projector linear_1
 #                     (with its bias; 6 x 4-tile blocks) and linear_2. The RoPE rotate-half is a height-parallel 1D
 #                     matmul (every core a run of row tiles).
 #   token_embed: a hidden-sharded copy of the table; the text prefill gathers each device's residual slice from it
@@ -184,8 +187,8 @@ PLANNED_TP = 4
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
 #   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py);
 #                     the last layer's final add emits the bf16 residual for the gather directly (no fp32 copy + cast).
-#   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard,
-#                     prefill's (many-row) partials are produced and reduce-scattered in bf16 (half the bytes),
+#   text decoder all_reduces (o_proj, MLP down): reduce-scatter + bf16 all_gather of the reduced shard; prefill's
+#                     and decode's partials are produced and reduce-scattered in bf16 (half the bytes, no cast),
 #                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
 #   ministral3_decoder_layer: each RMSNorm's gamma is folded into the q/k/v and gate/up weights that read it
 #                     (no gamma multiply after the norm; the decode norm unshards + casts to bf16 in one op).

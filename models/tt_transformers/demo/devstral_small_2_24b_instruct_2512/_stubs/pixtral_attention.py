@@ -39,6 +39,10 @@ def vision_tp(device):
 
 
 class TtPixtralAttention:
+    # The fused q/k/v output (read once, by the head split, which frees it) lands in L1 while it takes at most this many
+    # bytes per core (the data-parallel 8 x 256-row batch: 114 KB).
+    QKV_OUT_L1_BYTES = 128 * 1024
+
     def __init__(self, device, torch_module, in_scale=None) -> None:
         """in_scale: the attention_norm gamma, folded into q/k/v (see TtAttention.FOLD_NORM_GAMMA)."""
         self.device = device
@@ -181,19 +185,27 @@ class TtPixtralAttention:
 
         # minimal_matmul folds the images into its rows over the full grid (ttnn.linear ran this batch of 32 x 256
         # rows as a batched matmul on 64 cores: 816 us).
+        grid = self.device.compute_with_storage_grid_size()
+        qkv_l1 = 2 * int(b) * int(s) * int(self.wqkv.shape[-1]) // (grid.x * grid.y) <= self.QKV_OUT_L1_BYTES
         qkv = ttnn.experimental.minimal_matmul(
             x,
             self.wqkv,
             config=self._narrow_n_cfg(x, self.wqkv),
             compute_kernel_config=self.compute_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=ttnn.L1_MEMORY_CONFIG if qkv_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,  # q / k / v in bf16 also when x is the fp32 norm output
         )
         if len(in_shape) == 4 and x.memory_config().buffer_type == ttnn.BufferType.L1:
             ttnn.deallocate(x)  # the caller's L1 norm output, read only here (see TtAttention)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv, num_heads=self.local_heads, num_kv_heads=self.local_heads, transpose_k_heads=False
+            qkv,
+            num_heads=self.local_heads,
+            num_kv_heads=self.local_heads,
+            transpose_k_heads=False,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+        if qkv_l1:
+            ttnn.deallocate(qkv)
         q = self._rope(q, cos, sin)
         k = self._rope(k, cos, sin)
         if q.dtype != ttnn.bfloat16:  # fp32 activations upstream; SDPA reads bf16
