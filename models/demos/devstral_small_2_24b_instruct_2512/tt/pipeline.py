@@ -159,6 +159,8 @@ PLANNED_TP = 4
 #   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
 #   pixtral_attention: the vision QKV and the RoPE rotate-half run on minimal_matmul over the full grid too; so does the
 #                     projector linear_2.
+#   token_embed: a hidden-sharded copy of the table; the text prefill gathers each device's residual slice from it
+#                     (no full-width rows, no mesh_partition).
 #   pixtral_vision_model: equal-size images are uploaded already patchified on the host (patchify_host; tile layout),
 #                     so the device skips the reshape / permute chain over 14-pixel row-major sticks.
 #   attention (vision layer): each RMSNorm gamma is folded into the q/k/v and gate/up weights that read it (no separate
@@ -726,10 +728,10 @@ class DevstralPipeline:
 
     def embed_prompt(self, dev, image_embeds=None):
         """(B, 1, S, hidden) prompt embeddings; image features land on the [IMG] rows through an on-device gather."""
+        if image_embeds is None:
+            return self.language_model.prefill_embeds(dev["tokens"])  # (B, 1, S, D) or its hidden shard
         x = self.language_model.embed_tokens(dev["tokens"])  # (B, S, D)
         b, s, d = x.shape
-        if image_embeds is None:
-            return ttnn.reshape(x, (b, 1, s, d))
         m = image_embeds.shape[-2]
         text_rows = ttnn.to_layout(ttnn.reshape(x, (1, 1, b * s, d)), ttnn.ROW_MAJOR_LAYOUT)
         img_rows = ttnn.to_layout(ttnn.reshape(image_embeds, (1, 1, b * m, d)), ttnn.ROW_MAJOR_LAYOUT)
