@@ -44,6 +44,12 @@ class TtMinistral3DecoderLayer:
     # False: cast the shard to bf16, all_gather it and run the unsharded HiFi4 norm (bit-identical to the unsharded
     # path, but the norm then reads and writes the full-width activation on every device).
     SHARDED_PREFILL_NORM = True
+    # With the sharded norm: each prefill residual add also produces the next norm's per-row sum of squares (one C++
+    # pass over x and the delta, tt/add_stats.py), so the norm does not read the new residual back from DRAM. The MLP
+    # residual's sums are handed to the next layer's input norm through _CARRY (only when that layer receives the
+    # very same tensor object; anything else recomputes them).
+    FUSED_ADD_STATS = True
+    _CARRY = None  # (residual tensor, its sum-of-squares stats) from the last layer's fused add
 
     def __init__(self, device, torch_module, meta_rope=False) -> None:
         """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order)."""
@@ -128,29 +134,34 @@ class TtMinistral3DecoderLayer:
 
     def _prefill_sharded(self, x, attention_mask, position_ids, position_embeddings, kv_cache):
         """Prefill with the residual x as this device's (B, 1, S, D/TP) hidden shard (see SHARD_PREFILL_RESIDUAL)."""
+        carry, TtMinistral3DecoderLayer._CARRY = TtMinistral3DecoderLayer._CARRY, None
+        x_sq = carry[1] if carry is not None and carry[0] is x else None
         self.self_attn.prefill_gather = self.mlp.prefill_gather = False
         try:
             a = self.self_attn(
-                self._prefill_norm(self.input_layernorm, x),
+                self._prefill_norm(self.input_layernorm, x, sq=x_sq),
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 kv_cache=kv_cache,
                 mode="prefill",
             )
-            h = self._residual_add(x, a)
-            m = self.mlp(self._prefill_norm(self.post_attention_layernorm, h), mode="prefill")
+            h, h_sq = self._residual_add_stats(x, a)
+            m = self.mlp(self._prefill_norm(self.post_attention_layernorm, h, sq=h_sq), mode="prefill")
         finally:
             self.self_attn.prefill_gather = self.mlp.prefill_gather = True
-        return self._residual_add(h, m)
+        out, out_sq = self._residual_add_stats(h, m)
+        if out_sq is not None:
+            TtMinistral3DecoderLayer._CARRY = (out, out_sq)
+        return out
 
-    def _prefill_norm(self, norm, x):
-        """Full-width bf16 norm output of the hidden-sharded fp32 residual x."""
+    def _prefill_norm(self, norm, x, sq=None):
+        """Full-width bf16 norm output of the hidden-sharded fp32 residual x (sq: its sum-of-squares stats, if known)."""
         if self.SHARDED_PREFILL_NORM:
-            return self._sharded_norm(norm, x)
+            return self._sharded_norm(norm, x, sq)
         return self._bf16(norm(ttnn.all_gather(self._bf16(x), dim=3, **tp_ccl_args())))
 
-    def _sharded_norm(self, norm, x):
+    def _sharded_norm(self, norm, x, sq=None):
         """Unit-gamma RMSNorm of the fp32 hidden shard x: each device's sum of squares, an all_gather of those sums,
         the shard scaled by rsqrt(mean + eps) in fp32, and an all_gather of the bf16 result.
 
@@ -162,11 +173,21 @@ class TtMinistral3DecoderLayer:
         assert norm.gamma is None, "the sharded prefill norm expects its gamma folded into the next projections"
         ccl = tp_ccl_args()
         cfg = norm._impl.compute_kernel_config_hifi2  # HiFi4 + fp32 dest, exact: the fp32 input takes the SFPU path
-        sq = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=cfg, dtype=ttnn.float32)  # sum(x^2) in column 0
+        if sq is None:
+            sq = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=cfg, dtype=ttnn.float32)  # sum(x^2) in column 0
         sq = ttnn.multiply(ttnn.all_gather(sq, dim=3, **ccl), self._stats_mask)
         sq = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg)
         r = ttnn.rsqrt(ttnn.add(ttnn.multiply(sq, 1.0 / self.hidden), norm._impl.eps))
         return ttnn.all_gather(ttnn.multiply(x, r, dtype=ttnn.bfloat16), dim=3, **ccl)
+
+    def _residual_add_stats(self, x, delta):
+        """(x + delta, the sum-of-squares stats of the sum or None) for the prefill residual (see FUSED_ADD_STATS)."""
+        if self.FUSED_ADD_STATS and self.SHARDED_PREFILL_NORM:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import add_stats
+
+            if add_stats.supports(x, delta):
+                return add_stats.apply(x, delta)
+        return self._residual_add(x, delta), None
 
     @staticmethod
     def _residual_add(x, delta):
