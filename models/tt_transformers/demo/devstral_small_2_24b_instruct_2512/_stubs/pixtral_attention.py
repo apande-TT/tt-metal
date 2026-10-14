@@ -115,10 +115,33 @@ class TtPixtralAttention:
         )
 
     def _rope(self, x, cos, sin):
-        # rotate_half as x @ R on minimal_matmul, which folds the (images, heads) batch into its rows over the full
-        # grid (ttnn.matmul ran the 32 x 4 x 256-row batch on 16 cores: 252 us); R is a +-1 permutation, so exact.
-        rot = ttnn.experimental.minimal_matmul(
-            x, self.rot, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        # rotate_half as x @ R (R is a +-1 permutation, so exact), height-parallel: a 1D multicast matmul hands every
+        # core of the full grid its own run of the (images x heads x patches) row tiles against the multicast 2 x 2-tile
+        # R. (minimal_matmul splits a 2-tile N over the grid's 10 rows, leaving 8 of them idle: 102 us; ttnn.matmul's
+        # auto config ran the batch on 16 cores: 252 us.)
+        grid = self.device.compute_with_storage_grid_size()
+        shape = tuple(int(d) for d in x.shape)
+        rows = 1
+        for d in shape[:-1]:
+            rows *= d
+        nt = shape[-1] // ttnn.TILE_SIZE
+        pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=(grid.x, grid.y),
+            in0_block_w=nt,
+            out_subblock_h=1,
+            out_subblock_w=nt,
+            per_core_M=-(-(rows // ttnn.TILE_SIZE) // (grid.x * grid.y)),
+            per_core_N=nt,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=False,
+        )
+        rot = ttnn.matmul(
+            x,
+            self.rot,
+            program_config=pc,
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         return ttnn.add(ttnn.multiply(x, cos), ttnn.multiply(rot, sin))
 
