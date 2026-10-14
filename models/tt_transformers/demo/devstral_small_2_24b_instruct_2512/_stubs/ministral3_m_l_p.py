@@ -201,10 +201,28 @@ class TtMinistral3MLP:
             dtype=ttnn.bfloat16,
             fuse_swiglu=True,
         )
-        # Many-row down projection on the full grid as well (ttnn.linear's auto config left it at ~45 TFLOP/s).
+        # Many-row down projection on the full grid as well (ttnn.linear's auto config left it at ~45 TFLOP/s). A short
+        # prompt (<= 128 tile rows) runs on the grid that gives every core whole 16 x 16-tile output blocks: on the
+        # full 11 x 10 grid its 128 x 160 output tiles split 13 x 15 per core, padded to 16 x 16 by the 8-tile blocks.
+        m_shape = tuple(int(d) for d in m.shape)
+        mt = m_shape[-2] // ttnn.TILE_SIZE
+        for d in m_shape[:-2]:
+            mt *= d
+        nt = int(self.w_down.shape[-1]) // ttnn.TILE_SIZE
+        down_cfg = None
+        if mt <= 128 and mt % 16 == 0 and nt % 16 == 0 and mt // 16 <= grid.y and grid.x - 1 <= nt // 16 <= grid.x:
+            down_cfg = ttnn.MinimalMatmulConfig(
+                M_block_size=8,
+                K_block_size=8,
+                N_block_size=8,
+                subblock_h=2,
+                subblock_w=2,
+                compute_with_storage_grid_size=ttnn.CoreCoord(nt // 16, mt // 16),
+            )
         out = ttnn.experimental.minimal_matmul(
             m,
             self.w_down,
+            config=down_cfg,
             compute_kernel_config=self.down_cfg,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=self.PREFILL_REDUCE_DTYPE if (self.PREFILL_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
