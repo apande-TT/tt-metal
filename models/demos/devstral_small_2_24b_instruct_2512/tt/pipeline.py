@@ -162,7 +162,7 @@ PLANNED_TP = 4
 #                     through L1 (416 rows too).
 #   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
 #   pixtral_attention: the vision QKV, the RoPE rotate-half and o_proj (4-tile N blocks) run on minimal_matmul over the
-#                     full grid too; so does the projector linear_2.
+#                     full grid too; so do the projector linear_1 (with its bias; 6 x 4-tile blocks) and linear_2.
 #   token_embed: a hidden-sharded copy of the table; the text prefill gathers each device's residual slice from it
 #                     (no full-width rows, no mesh_partition). The slice stays bf16 into the first layer, whose input
 #                     norm gathers per-token sums of squares from a (vocab, 32) table (exact bf16 hi / mid / lo parts)
