@@ -168,6 +168,8 @@ PLANNED_TP = 4
 #                     (no full-width rows, no mesh_partition). The slice stays bf16 into the first layer, whose input
 #                     norm gathers per-token sums of squares from a (vocab, 32) table (exact bf16 hi / mid / lo parts)
 #                     and whose fused residual add (tt/add_stats.py) widens it to fp32: no cast, no reduce of it.
+#   vision tower + projector: data-parallel over the mesh (full weights per device, each device its own images, one
+#                     batch all_gather of the projector output) -- no per-layer all_reduces.
 #   pixtral_vision_model: equal-size images are uploaded already patchified on the host (patchify_host; tile layout),
 #                     so the device skips the reshape / permute chain over 14-pixel row-major sticks; the patch
 #                     projection runs on minimal_matmul (one 19-tile K block).
@@ -571,6 +573,9 @@ class DevstralPipeline:
     """Resident TT pipeline: every weight is built once on the mesh, the KV cache is allocated once."""
 
     PIPELINE_STAGES = PIPELINE_STAGES
+    # The vision tower and projector run data-parallel over the mesh (full weights on every device, each device its own
+    # images, one all_gather of the projector output) instead of tensor-parallel (two fp32 all_reduces per layer).
+    VISION_DATA_PARALLEL = True
 
     def __init__(
         self,
@@ -613,8 +618,15 @@ class DevstralPipeline:
         t0 = time.time()
         m = hf_model.model
         log(f"building vision tower ({self.vision_layers} layers) + projector")
-        self.vision_tower = _st_vision_model.TtPixtralVisionModel(device, m.vision_tower, n_layers=self.vision_layers)
-        self.multi_modal_projector = _st_projector.TtMistral3MultiModalProjector(device, m.multi_modal_projector)
+        self.vision_dp = self.VISION_DATA_PARALLEL and self._tp() > 1
+        _st_pixtral_attention.DATA_PARALLEL = self.vision_dp
+        try:
+            self.vision_tower = _st_vision_model.TtPixtralVisionModel(
+                device, m.vision_tower, n_layers=self.vision_layers
+            )
+            self.multi_modal_projector = _st_projector.TtMistral3MultiModalProjector(device, m.multi_modal_projector)
+        finally:
+            _st_pixtral_attention.DATA_PARALLEL = False
         log(f"building language model ({self.text_layers} layers, TP={self._tp()})")
         self.language_model = _st_ministral3_model.TtMinistral3Model(
             device, m.language_model, n_layers=self.text_layers
@@ -668,6 +680,18 @@ class DevstralPipeline:
         patches = self.vision_tower.patchify_host(pixel_values, sizes)
         if patches is None:
             return {"pixel_values": self._put(pixel_values.to(torch.bfloat16), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)}
+        tp = self._tp()
+        if self.vision_dp and patches.shape[0] % tp == 0 and patches.shape[0] // tp > 1:
+            # data-parallel vision: each device its own run of images (VISION_DATA_PARALLEL); with replicated
+            # pixels instead, every device computes every image (same result, no gather needed)
+            pv = ttnn.from_torch(
+                patches.to(torch.bfloat16).contiguous(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.device,
+                mesh_mapper=ttnn.ShardTensorToMesh(self.device, dim=0),
+            )
+            return {"pixel_values": pv, "prepatched": True, "vision_split": True}
         return {"pixel_values": self._put(patches.to(torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT), "prepatched": True}
 
     def upload(self, req):
@@ -741,6 +765,8 @@ class DevstralPipeline:
             prepatched=dev.get("prepatched", False),
         )
         out = self.multi_modal_projector(feats, image_sizes=dev["image_sizes"])
+        if dev.get("vision_split"):  # each device encoded its own images: gather them in device (= image) order
+            out = ttnn.all_gather(out, dim=0, num_links=1, topology=ttnn.Topology.Linear)
         b, d = self.batch, out.shape[-1]
         return ttnn.reshape(out, (b, 1, dev["tokens_per_image"], d))
 
