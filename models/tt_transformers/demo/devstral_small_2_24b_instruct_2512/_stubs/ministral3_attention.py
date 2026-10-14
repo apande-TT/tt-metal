@@ -74,8 +74,10 @@ class TtMinistral3Attention:
     # dtype of o_proj's output and its all_reduce: fp32, added unrounded into the decoder's fp32 residual stream.
     OUT_DTYPE = ttnn.float32
     # Prefill's many-row o_proj partials are produced and reduce-scattered in bf16 instead (half the reduce-scatter
-    # bytes, no fp32 -> bf16 cast before the gather); decode keeps fp32 partials.
+    # bytes, no fp32 -> bf16 cast before the gather).
     PREFILL_REDUCE_DTYPE = ttnn.bfloat16
+    # Decode's single-row o_proj partials likewise (None: fp32 partials, cast to bf16 after the reduce-scatter).
+    DECODE_REDUCE_DTYPE = ttnn.bfloat16
     # False: prefill returns o_proj's reduce-scattered 1/TP hidden shard (the decoder keeps a hidden-sharded
     # residual in prefill and gathers only the normed activation).
     prefill_gather = True
@@ -747,7 +749,7 @@ class TtMinistral3Attention:
                 attn,
                 self.wo_decode,
                 program_config=self.wo_decode_pc,
-                dtype=self.OUT_DTYPE,
+                dtype=self.DECODE_REDUCE_DTYPE if (self.DECODE_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
                 compute_kernel_config=self.compute_cfg,
             )
         )
