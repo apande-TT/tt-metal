@@ -20,7 +20,9 @@ class TtPixtralMLP(TtMinistral3MLP):
     OUT_DTYPE = ttnn.float32
     DECODE_WEIGHTS = False  # the vision tower never decodes
     GATHER_DTYPE = None  # the vision residual adds expect the fp32 all_reduce
-    GATE_UP_DTYPE = ttnn.bfloat4_b  # block-float4 fused gate/up weight (the many-row SwiGLU)
+    # Block-float8 fused gate/up weight (the many-row SwiGLU). Not bf4: a bf4 SwiGLU weight attenuated the hidden
+    # state around its massive activations in another model, and here it would save only 7.6 us a layer.
+    GATE_UP_DTYPE = ttnn.bfloat8_b
     GATE_UP_FIDELITY = ttnn.MathFidelity.LoFi
     PREFILL_REDUCE_DTYPE = None
     PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi2
