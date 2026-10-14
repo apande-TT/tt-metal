@@ -204,13 +204,15 @@ class TtMinistral3MLP:
         rows = 1
         for d in tuple(int(v) for v in x.shape)[:-1]:
             rows *= d
+        x_l1 = x.memory_config().buffer_type == ttnn.BufferType.L1
         inter_l1 = 0 < 2 * rows * self.inter // (grid.x * grid.y) <= self.PREFILL_INTER_L1_BYTES
         m = ttnn.experimental.minimal_matmul(
             x,
             self.w_gate_up,
             config=ttnn.MinimalMatmulConfig(
                 M_block_size=8,
-                K_block_size=8,
+                # (an L1 fp32 input + the L1 product leave room only for half-depth activation blocks)
+                K_block_size=4 if x_l1 and inter_l1 and x.dtype == ttnn.float32 else 8,
                 N_block_size=self._gate_up_n_block(x, grid),
                 subblock_h=2,
                 subblock_w=2,
@@ -221,6 +223,8 @@ class TtMinistral3MLP:
             dtype=ttnn.bfloat16,
             fuse_swiglu=True,
         )
+        if x_l1:  # the caller's norm output, read only here (see TtAttention)
+            ttnn.deallocate(x)
         # Many-row down projection on the full grid as well (ttnn.linear's auto config left it at ~45 TFLOP/s). A short
         # prompt (<= 128 tile rows) runs on the grid that gives every core whole 16 x 16-tile output blocks: on the
         # full 11 x 10 grid its 128 x 160 output tiles split 13 x 15 per core, padded to 16 x 16 by the 8-tile blocks.

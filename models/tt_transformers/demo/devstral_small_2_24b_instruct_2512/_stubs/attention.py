@@ -33,6 +33,9 @@ class TtAttention:
     # Each norm's gamma is folded into the projections that read it (q/k/v; gate/up), so the norms apply none: the
     # separate fp32 x bf16 broadcast gamma multiply cost 456 us per norm on 32 images x 256 patches.
     FOLD_NORM_GAMMA = True
+    # The ffn norm's output (read once, by the MLP's gate/up, which frees it) lands in L1 while it takes at most this
+    # many bytes per core (fp32 32 x 256 x 1024: 298 KB).
+    FFN_NORM_L1_BYTES = 320 * 1024
 
     def __init__(self, device, torch_module, mlp_cls=None) -> None:
         self.device = device
@@ -83,7 +86,11 @@ class TtAttention:
             x = ttnn.typecast(x, ttnn.float32)
         n = self._mm_in(self.attention_norm(x))
         h = ttnn.add(x, self.attention(n, attention_mask=mask, position_embeddings=(cos, sin)))
-        out = ttnn.add(h, self.feed_forward(self._mm_in(self.ffn_norm(h))))
+        grid = self.device.compute_with_storage_grid_size()
+        n_bytes = 4 * int(h.shape[0]) * int(h.shape[-2]) * int(h.shape[-1]) // (grid.x * grid.y)
+        l1 = self.FOLD_NORM_GAMMA and self.MATMUL_INPUT_DTYPE == ttnn.float32 and n_bytes <= self.FFN_NORM_L1_BYTES
+        n = self.ffn_norm(h, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None)
+        out = ttnn.add(h, self.feed_forward(self._mm_in(n)))
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
         return out

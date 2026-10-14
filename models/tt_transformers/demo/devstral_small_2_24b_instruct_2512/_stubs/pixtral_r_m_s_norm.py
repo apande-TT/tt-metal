@@ -79,11 +79,23 @@ class TtPixtralRMSNorm:
         )
         return cls(canonical, gamma if (cls.SEPARATE_GAMMA and not fold_gamma) else None)
 
-    def __call__(self, x, *args, **kwargs):
+    def __call__(self, x, *args, memory_config=None, **kwargs):
+        """memory_config: where the (unit-gamma) output goes, e.g. L1 for a consumer that reads it once; the
+        canonical call places it in DRAM. Same op, weight, eps and compute config either way."""
         # Canonical RMSNorm takes the 4D [1, 1, S, H] prefill layout; restore the caller's rank.
         shape = tuple(x.shape)
         if len(shape) != 4:
             x = ttnn.reshape(x, (1,) * (4 - len(shape)) + shape)
+        if memory_config is not None and self.gamma is None:
+            impl = self._impl
+            out = ttnn.rms_norm(
+                x,
+                epsilon=impl.eps,
+                weight=impl.weight,
+                memory_config=memory_config,
+                compute_kernel_config=impl.compute_kernel_config_hifi2,
+            )
+            return ttnn.reshape(out, shape)
         out = self._impl(x, mode="prefill")
         if self.gamma is not None:
             out = ttnn.multiply(out, self.gamma)
