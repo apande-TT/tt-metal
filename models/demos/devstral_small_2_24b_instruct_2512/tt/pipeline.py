@@ -160,7 +160,8 @@ PLANNED_TP = 4
 #   pixtral_attention: the vision QKV and the RoPE rotate-half run on minimal_matmul over the full grid too; so does the
 #                     projector linear_2.
 #   token_embed: a hidden-sharded copy of the table; the text prefill gathers each device's residual slice from it
-#                     (no full-width rows, no mesh_partition).
+#                     (no full-width rows, no mesh_partition); the bf16 slice lands in L1 and is cast to the fp32
+#                     residual from there.
 #   pixtral_vision_model: equal-size images are uploaded already patchified on the host (patchify_host; tile layout),
 #                     so the device skips the reshape / permute chain over 14-pixel row-major sticks.
 #   attention (vision layer): each RMSNorm gamma is folded into the q/k/v and gate/up weights that read it (no separate
