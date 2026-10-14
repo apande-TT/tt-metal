@@ -143,8 +143,8 @@ PLANNED_TP = 4
 #                     QKV and o_proj read block-float8 copies (prefill keeps bf16). Decode o_proj runs a hand-written
 #                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
 #   prompts pad to a tile multiple only; prefill attention pads q/k/v to whole SDPA key chunks itself.
-#   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the bf16 cast
-#                     run on the reduce-scatter shard and the bf16 shard is all_gathered right before each norm.
+#   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
+#                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
 #   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard,
 #                     prefill's (many-row) partials are produced and reduce-scattered in bf16 (half the bytes),
 #                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
