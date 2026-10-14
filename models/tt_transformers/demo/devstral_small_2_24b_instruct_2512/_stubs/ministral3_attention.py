@@ -183,8 +183,9 @@ class TtMinistral3Attention:
         # each device multiplies them by its 1/TP column slice of W_o, which yields exactly its 1/TP hidden slice -- the
         # shard the decoder's sharded prefill residual adds -- with no reduce-scatter of 5120-wide partials. Device d's
         # heads are the contiguous block d of the 4096 inputs, so the gather restores W_o's input order.
-        self.wo = _put(torch_module.o_proj.weight.T, shard(-1))
-        # Decode reads block-float8 copies of its projection weights (DRAM-bound single-row matmuls); prefill keeps bf16.
+        # The prefill o_proj weight is block-float8, like the prefill QKV weight (HiFi2 matmuls).
+        self.wo = _put(torch_module.o_proj.weight.T, shard(-1), dtype=ttnn.bfloat8_b)
+        # Decode reads block-float8 copies of its projection weights (DRAM-bound single-row matmuls).
         self.wo_decode = _put(torch_module.o_proj.weight.T, shard(-2), dtype=DECODE_WEIGHT_DTYPE)
         # Decode o_proj (K = 32 tiles, N = 160 tiles): 8-tile K multicast blocks (the auto config used 2), 2 N tiles
         # per core.
