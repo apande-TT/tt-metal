@@ -151,6 +151,7 @@ PLANNED_TP = 4
 #                     cos / sin / the pair-swap tile are height-sharded into L1 around each op (one sequence tile per
 #                     core, laid out once per forward by ministral3_attention.prefill_rope_tables), so the op stops
 #                     re-reading them from DRAM per row (when that moves fewer bytes: 416 / 128 rows, q and k).
+#   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
 #   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py).
