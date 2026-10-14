@@ -21,7 +21,8 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
   * q/k/v  column-parallel by HEAD: device d holds q heads [d*Hq/TP, (d+1)*Hq/TP) and the kv heads
            those q heads attend with ([d*Hkv/TP, (d+1)*Hkv/TP)), so every GQA group stays local.
            Fused per device as [q | k | v] into one wqkv.
-  * o_proj row-parallel (input features = that device's q heads), then all_reduce.
+  * o_proj: decode row-parallel (input features = that device's q heads), then all_reduce; prefill
+           column-parallel over the all_gathered heads (see self.wo).
   * rotary tables, the mask and the llama-4 scale are replicated; the KV cache holds the local heads.
 """
 from __future__ import annotations
@@ -172,7 +173,11 @@ class TtMinistral3Attention:
             per_core_N=n_dev // ttnn.TILE_SIZE // cores,
             num_workers_per_dram_bank=2,
         )
-        self.wo = _put(torch_module.o_proj.weight.T, shard(-2))
+        # Prefill o_proj is COLUMN-parallel: the heads' outputs are all_gathered (13312 x 1024 -> 4096 per device) and
+        # each device multiplies them by its 1/TP column slice of W_o, which yields exactly its 1/TP hidden slice -- the
+        # shard the decoder's sharded prefill residual adds -- with no reduce-scatter of 5120-wide partials. Device d's
+        # heads are the contiguous block d of the 4096 inputs, so the gather restores W_o's input order.
+        self.wo = _put(torch_module.o_proj.weight.T, shard(-1))
         # Decode reads block-float8 copies of its projection weights (DRAM-bound single-row matmuls); prefill keeps bf16.
         self.wo_decode = _put(torch_module.o_proj.weight.T, shard(-2), dtype=DECODE_WEIGHT_DTYPE)
         # Decode o_proj (K = 32 tiles, N = 160 tiles): 8-tile K multicast blocks (the auto config used 2), 2 N tiles
@@ -458,6 +463,8 @@ class TtMinistral3Attention:
         if s_attn != s:
             attn = ttnn.slice(attn, (0, 0, 0, 0), (b, self.local_heads, s, hd))
         attn = ttnn.experimental.nlp_concat_heads(attn)
+        if self.tp > 1:
+            attn = ttnn.all_gather(attn, dim=3, **tp_ccl_args())  # every head's output, for the column-parallel o_proj
         # Prefill o_proj on the full grid too (ttnn.linear's auto 1D config ran it on 80 cores at ~30 TFLOP/s).
         out = ttnn.experimental.minimal_matmul(
             attn,
@@ -466,7 +473,8 @@ class TtMinistral3Attention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=self.PREFILL_REDUCE_DTYPE if self.tp > 1 else self.OUT_DTYPE,
         )
-        out = self._reduce(out, gather=self.prefill_gather)
+        if self.tp > 1 and self.prefill_gather:
+            out = ttnn.all_gather(out, dim=3, **tp_ccl_args())  # the full-width output of the unsharded path
         if in_rank == 3:
             return ttnn.reshape(out, (b, s, out.shape[-1]))
         return out
