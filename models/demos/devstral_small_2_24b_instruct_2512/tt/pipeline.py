@@ -145,7 +145,8 @@ PLANNED_TP = 4
 #   prompts pad to a tile multiple only; prefill SDPA pads to whole chunks internally. Prefill QKV and o_proj run HiFi2 on bf8 weights.
 #   ministral3_m_l_p short-prompt down projection: a grid of whole 16 x 16-tile output blocks per core.
 #   prefill's last prompt rows: one embedding gather out of the untilized 32-row block (no re-tilize / reshape).
-#   ministral3_m_l_p fused gate/up N block: the per-core N range when it is under 12 tiles (vision MLP: 8 tiles).
+#   ministral3_m_l_p fused gate/up N block: the per-core N range when it is under 12 tiles (vision MLP: 8 tiles); the
+#                     vision MLP's SwiGLU product reaches the down projection through L1, which runs 4-tile N blocks.
 #   ministral3_attention short-prompt QKV and o_proj: one output block per core (its whole M x N range, e.g. 12 x 5 tiles).
 #   ministral3_attention prefill SDPA: one key chunk of the prompt (even tiles), 160-row q chunks (7 even rounds), no pad,
 #                     HiFi2 matmuls.
