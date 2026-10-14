@@ -208,6 +208,11 @@ class TtMinistral3MLP:
         n_core = 2 * -(-(nt // 2) // n_cores)
         return n_core if n_core < 12 else 12
 
+    @staticmethod
+    def _m_range(mt, nt, grid):
+        """Each core's M tile range in minimal_matmul (M splits along the grid's x axis when M > N, else along y)."""
+        return -(-mt // (grid.x if mt > nt else grid.y))
+
     def _forward(self, x):
         grid = self.device.compute_with_storage_grid_size()
         rows = 1
@@ -215,16 +220,20 @@ class TtMinistral3MLP:
             rows *= d
         x_l1 = x.memory_config().buffer_type == ttnn.BufferType.L1
         inter_l1 = 0 < 2 * rows * self.inter // (grid.x * grid.y) <= self.PREFILL_INTER_L1_BYTES
+        # M blocks no taller than each core's M range (the data-parallel vision MLP's 2048 rows give 7 tiles a core;
+        # an 8-tile block would compute a padded row of tiles)
+        nt_gu = int(self.w_gate_up.shape[-1]) // ttnn.TILE_SIZE
+        m_gu = min(8, self._m_range(rows // ttnn.TILE_SIZE, nt_gu, grid))
         m = ttnn.experimental.minimal_matmul(
             x,
             self.w_gate_up,
             config=ttnn.MinimalMatmulConfig(
-                M_block_size=8,
+                M_block_size=m_gu,
                 # (an L1 fp32 input + the L1 product leave room only for half-depth activation blocks)
                 K_block_size=4 if x_l1 and inter_l1 and x.dtype == ttnn.float32 else 8,
                 N_block_size=self._gate_up_n_block(x, grid),
-                subblock_h=2,
-                subblock_w=2,
+                subblock_h=2 if m_gu % 2 == 0 else 1,
+                subblock_w=2 if m_gu % 2 == 0 else 4 if self._gate_up_n_block(x, grid) % 4 == 0 else 2,
                 compute_with_storage_grid_size=grid,
             ),
             compute_kernel_config=self.gate_up_cfg,
@@ -255,8 +264,9 @@ class TtMinistral3MLP:
         elif -(-nt // (grid.y if mt > nt else grid.x)) in (2, 4, 6):
             # A narrow per-core N range (the vision MLP's 32 output tiles over 10 cores: 4) runs N blocks of exactly
             # that width; the default 8-tile block would be half padding.
+            m_dn = min(8, self._m_range(mt, nt, grid))
             down_cfg = ttnn.MinimalMatmulConfig(
-                M_block_size=8,
+                M_block_size=m_dn if m_dn % 2 == 0 else 8,
                 K_block_size=8,
                 N_block_size=-(-nt // (grid.y if mt > nt else grid.x)),
                 subblock_h=2,
