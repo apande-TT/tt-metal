@@ -137,14 +137,21 @@ class TtMinistral3Model:
 
     def prefill_embeds(self, input_ids):
         """(B, 1, S, D) prompt embeddings of input_ids (B, S), or, when the layers carry the prefill residual
-        hidden-sharded, this device's (B, 1, S, D / TP) slice gathered straight from the sharded table (already in
-        the residual dtype)."""
+        hidden-sharded, this device's (B, 1, S, D / TP) slice gathered straight from the sharded table (in the
+        residual dtype, or kept bf16 with its per-token norm statistics handed to the first layer)."""
         shard = self.tp > 1 and TtMinistral3DecoderLayer.SHARD_PREFILL_RESIDUAL
         if not (shard and self.embed_tokens.weight_shard is not None):
             x = self.embed_tokens(input_ids)
             b, s, d = x.shape
             return ttnn.reshape(x, (b, 1, s, d))
         b, s = (int(v) for v in input_ids.shape)
+        if self.embed_tokens.sq_table is not None and TtMinistral3DecoderLayer.accepts_bf16_input():
+            # The bf16 slice is the first layer's residual as is (its fused residual add widens it to fp32) and its
+            # input norm reads the gathered per-token sums of squares, so nothing casts or reduces the embeddings.
+            x = ttnn.reshape(self.embed_tokens.shard(input_ids), (b, 1, s, self.embed_tokens.shard_dim))
+            sq = ttnn.reshape(self.embed_tokens.shard_sq(input_ids), (b, 1, s, ttnn.TILE_SIZE))
+            TtMinistral3DecoderLayer.carry_input_stats(x, sq)
+            return x
         grid = self.device.compute_with_storage_grid_size()
         per_bank = b * s * self.embed_tokens.shard_dim * 2 / (grid.x * grid.y)
         rd = TtMinistral3DecoderLayer.RESIDUAL_DTYPE

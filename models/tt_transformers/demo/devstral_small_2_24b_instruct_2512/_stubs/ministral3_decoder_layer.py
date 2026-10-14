@@ -49,7 +49,9 @@ class TtMinistral3DecoderLayer:
     # residual's sums are handed to the next layer's input norm through _CARRY (only when that layer receives the
     # very same tensor object; anything else recomputes them).
     FUSED_ADD_STATS = True
-    _CARRY = None  # (residual tensor, its sum-of-squares stats) from the last layer's fused add
+    # (residual tensor, its sum-of-squares stats, whether those are whole-row totals): set by the last layer's fused
+    # add (per-device partial stats) or by the model for its bf16 prompt embeddings (carry_input_stats).
+    _CARRY = None
 
     def __init__(self, device, torch_module, meta_rope=False) -> None:
         """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order)."""
@@ -84,6 +86,23 @@ class TtMinistral3DecoderLayer:
         return self.self_attn
 
     @classmethod
+    def accepts_bf16_input(cls):
+        """Whether the sharded prefill can take a bf16 residual shard together with its per-token statistics
+        (carry_input_stats): its first fused residual add widens the residual to fp32."""
+        return cls.SHARDED_PREFILL_NORM and cls.FUSED_ADD_STATS and cls.RESIDUAL_DTYPE == ttnn.float32
+
+    @classmethod
+    def carry_input_stats(cls, x, sq):
+        """Hand the next layer the bf16 residual shard x (B, 1, S, D / TP) with sq (B, 1, S, 32) bf16, whose columns
+        sum in fp32 to each row's sum of squares over the whole hidden dim: that layer's input norm reads these
+        instead of reducing x, and x stays bf16 until its residual add."""
+        cls._CARRY = (x, sq, True)
+
+    def _carried(self, x):
+        carry = TtMinistral3DecoderLayer._CARRY
+        return carry is not None and carry[0] is x
+
+    @classmethod
     def build(cls, device, torch_module):
         return cls(device, torch_module)
 
@@ -103,7 +122,8 @@ class TtMinistral3DecoderLayer:
         if len(in_shape) == 3:
             x = ttnn.reshape(x, (in_shape[0], 1, in_shape[1], in_shape[2]))
 
-        if self.RESIDUAL_DTYPE is not None and x.dtype != self.RESIDUAL_DTYPE:
+        carried_bf16 = self._carried(x) and TtMinistral3DecoderLayer._CARRY[2]  # see carry_input_stats
+        if self.RESIDUAL_DTYPE is not None and x.dtype != self.RESIDUAL_DTYPE and not carried_bf16:
             x = ttnn.typecast(x, self.RESIDUAL_DTYPE)
         if mode != "decode" and self.tp > 1 and int(x.shape[-1]) * self.tp == self.hidden:
             out = self._prefill_sharded(x, attention_mask, position_ids, position_embeddings, kv_cache)
@@ -135,11 +155,11 @@ class TtMinistral3DecoderLayer:
     def _prefill_sharded(self, x, attention_mask, position_ids, position_embeddings, kv_cache):
         """Prefill with the residual x as this device's (B, 1, S, D/TP) hidden shard (see SHARD_PREFILL_RESIDUAL)."""
         carry, TtMinistral3DecoderLayer._CARRY = TtMinistral3DecoderLayer._CARRY, None
-        x_sq = carry[1] if carry is not None and carry[0] is x else None
+        x_sq, x_total = (carry[1], carry[2]) if carry is not None and carry[0] is x else (None, False)
         self.self_attn.prefill_gather = self.mlp.prefill_gather = False
         try:
             a = self.self_attn(
-                self._prefill_norm(self.input_layernorm, x, sq=x_sq),
+                self._prefill_norm(self.input_layernorm, x, sq=x_sq, total=x_total),
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -154,16 +174,17 @@ class TtMinistral3DecoderLayer:
             self.self_attn.prefill_gather = self.mlp.prefill_gather = True
         out, out_sq = self._residual_add_stats(h, m)
         if out_sq is not None:
-            TtMinistral3DecoderLayer._CARRY = (out, out_sq)
+            TtMinistral3DecoderLayer._CARRY = (out, out_sq, False)
         return out
 
-    def _prefill_norm(self, norm, x, sq=None):
-        """Full-width bf16 norm output of the hidden-sharded fp32 residual x (sq: its sum-of-squares stats, if known)."""
+    def _prefill_norm(self, norm, x, sq=None, total=False):
+        """Full-width bf16 norm output of the hidden-sharded fp32 residual x (sq: its sum-of-squares stats, if known;
+        total: sq holds whole-row totals as carry_input_stats describes, not this device's partial sums)."""
         if self.SHARDED_PREFILL_NORM:
-            return self._sharded_norm(norm, x, sq)
+            return self._sharded_norm(norm, x, sq, total)
         return self._bf16(norm(ttnn.all_gather(self._bf16(x), dim=3, **tp_ccl_args())))
 
-    def _sharded_norm(self, norm, x, sq=None):
+    def _sharded_norm(self, norm, x, sq=None, total=False):
         """Unit-gamma RMSNorm of the fp32 hidden shard x: each device's sum of squares, an all_gather of those sums,
         the shard scaled by rsqrt(mean + eps) in fp32, and an all_gather of the bf16 result.
 
@@ -175,10 +196,13 @@ class TtMinistral3DecoderLayer:
         assert norm.gamma is None, "the sharded prefill norm expects its gamma folded into the next projections"
         ccl = tp_ccl_args()
         cfg = norm._impl.compute_kernel_config_hifi2  # HiFi4 + fp32 dest, exact: the fp32 input takes the SFPU path
-        if sq is None:
-            sq = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=cfg, dtype=ttnn.float32)  # sum(x^2) in column 0
-        sq = ttnn.multiply(ttnn.all_gather(sq, dim=3, **ccl), self._stats_mask)
-        sq = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg)
+        if total:  # bf16 parts of each row's whole-hidden sum, added back in fp32 (exact); no gather needed
+            sq = ttnn.sum(ttnn.typecast(sq, ttnn.float32), dim=-1, keepdim=True, compute_kernel_config=cfg)
+        else:
+            if sq is None:  # sum(x^2) in column 0
+                sq = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=cfg, dtype=ttnn.float32)
+            sq = ttnn.multiply(ttnn.all_gather(sq, dim=3, **ccl), self._stats_mask)
+            sq = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg)
         r = ttnn.rsqrt(ttnn.add(ttnn.multiply(sq, 1.0 / self.hidden), norm._impl.eps))
         return ttnn.all_gather(ttnn.multiply(x, r, dtype=ttnn.bfloat16), dim=3, **ccl)
 
@@ -189,6 +213,8 @@ class TtMinistral3DecoderLayer:
 
             if add_stats.supports(x, delta):
                 return add_stats.apply(x, delta)
+        if self.RESIDUAL_DTYPE is not None and x.dtype != self.RESIDUAL_DTYPE:  # a bf16 first-layer input
+            x = ttnn.typecast(x, self.RESIDUAL_DTYPE)
         return self._residual_add(x, delta), None
 
     @staticmethod
