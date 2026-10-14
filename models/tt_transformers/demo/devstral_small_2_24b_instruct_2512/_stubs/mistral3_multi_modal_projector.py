@@ -21,14 +21,12 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
 from __future__ import annotations
 
 import torch
-import ttnn
 
+import ttnn
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.mistral3_patch_merger import (
     TtMistral3PatchMerger,
 )
-from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.mistral3_r_m_s_norm import (
-    TtMistral3RMSNorm,
-)
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.mistral3_r_m_s_norm import TtMistral3RMSNorm
 
 
 def _mesh_size(device):
@@ -91,7 +89,11 @@ class TtMistral3MultiModalProjector:
 
         hdn = ttnn.linear(x, self.w1, bias=self.b1, compute_kernel_config=self.compute_cfg)
         hdn = ttnn.gelu(hdn, fast_and_approximate_mode=False)
-        out = ttnn.linear(hdn, self.w2, compute_kernel_config=self.compute_cfg)
+        # minimal_matmul folds the images into its rows over the full grid (ttnn.linear ran the side-by-side batch
+        # of 32 x 64 rows, K 1280, N 5120 as a batched matmul on 80 cores: 1.14 ms).
+        out = ttnn.experimental.minimal_matmul(
+            hdn, self.w2, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
         if self.tp > 1:
             out = ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
         if self.b2 is not None:
