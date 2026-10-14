@@ -139,7 +139,11 @@ class TtPixtralAttention:
         # minimal_matmul folds the images into its rows over the full grid (ttnn.linear ran this batch of 32 x 256
         # rows as a batched matmul on 64 cores: 816 us).
         qkv = ttnn.experimental.minimal_matmul(
-            x, self.wqkv, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            x,
+            self.wqkv,
+            compute_kernel_config=self.compute_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            dtype=ttnn.bfloat16,  # q / k / v in bf16 also when x is the fp32 norm output
         )
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_heads, transpose_k_heads=False

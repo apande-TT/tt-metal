@@ -26,8 +26,10 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtr
 
 
 class TtAttention:
-    # dtype the norm outputs enter the attention / MLP matmuls in (the residual itself is always fp32).
-    MATMUL_INPUT_DTYPE = ttnn.bfloat16
+    # dtype the norm outputs enter the attention / MLP matmuls in (the residual itself is always fp32). fp32: the
+    # QKV and gate/up minimal_matmuls read the fp32 norm output themselves (and emit bf16), so no separate cast of
+    # each norm output to bf16 (113 us per norm on 32 images x 256 patches).
+    MATMUL_INPUT_DTYPE = ttnn.float32
     # Each norm's gamma is folded into the projections that read it (q/k/v; gate/up), so the norms apply none: the
     # separate fp32 x bf16 broadcast gamma multiply cost 456 us per norm on 32 images x 256 patches.
     FOLD_NORM_GAMMA = True
@@ -76,7 +78,7 @@ class TtAttention:
         # The residual stream is carried in fp32. The vision encoder grows a few massive activations
         # (row norms ~1e4) around layer 13, and whether a patch row crosses that onset depends on low bits a
         # bf16 residual drops: a bf16 stream (TT's or the CPU reference's alike) moves rows away from the
-        # fp32 result there. Norm outputs go to the matmuls in bf16; the sub-blocks return fp32.
+        # fp32 result there. Norm outputs go to the matmuls in MATMUL_INPUT_DTYPE; the sub-blocks return fp32.
         if x.dtype != ttnn.float32:
             x = ttnn.typecast(x, ttnn.float32)
         n = self._mm_in(self.attention_norm(x))
