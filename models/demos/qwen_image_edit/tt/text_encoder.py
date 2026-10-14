@@ -111,6 +111,8 @@ class TtQwenTextEncoder:
         v_l_text_model.SPLIT_HANDOFF = True
         # the vision attention's exact-lane products: one batch-parallel full-K block per core on the grid
         _te_attention.EXACT_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
+        # and the LM attention's plain limb products (QK^T, P @ V; ttnn's own pick: 42 cores) on it too
+        _te_attention.BMM_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         # and its exact-lane linears on the full core grid (ttnn's own pick: 30-48 cores)
         _te_attention.EXACT_LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         # with their weight and activation limbs (vision qkv / proj / MLP: <= 4 MB per chip) staged in L1 once
