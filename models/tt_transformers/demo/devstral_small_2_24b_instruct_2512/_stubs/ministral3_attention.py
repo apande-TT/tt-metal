@@ -81,6 +81,10 @@ class TtMinistral3Attention:
     prefill_gather = True
     # Widest SDPA key chunk prefill may use (see __call__).
     PREFILL_MAX_K_CHUNK = 512
+    # Prefill SDPA query chunk when the keys span several chunks: every q chunk streams the whole key/value range
+    # from DRAM again (64-row chunks re-read ~540 MB of K/V per layer and device and bound the op on DRAM). 128 is
+    # the widest whose score block fits L1 beside a 512-row key chunk.
+    PREFILL_Q_CHUNK = 128
     # Columns of the decode head grid (one batch row per core): 32 rows fill an 8 x 4 rectangle, the shape the fused
     # decode RoPE needs (it runs on its input shard grid's bounding box).
     HEAD_GRID_X = 8
@@ -444,16 +448,23 @@ class TtMinistral3Attention:
         # SDPA's online softmax rounds its running state once per KEY chunk, which biases the output level
         # upward (layer-8 Q/K/V of the image prompt: +0.23% at k_chunk 32, +0.10% at 128, +0.02% at 512).
         # Image-token rows amplify that bias over 40 layers (prefill hidden PCC 0.95 on those rows at k_chunk
-        # 32), so prefill attends over the widest key chunk: q/k/v are padded HERE (and only here -- no other
-        # layer computes pad rows) to one chunk when the prompt fits in one, else to a multiple of the widest.
-        # The pad keys sit after every real row, so causal attention leaves the real rows unchanged; the q chunk
-        # does not affect the level.
-        s_attn = self.sdpa_len(s)
-        if s_attn != s:
-            pad = ((0, 0), (0, 0), (0, s_attn - s), (0, 0))
-            q, k, v = (ttnn.pad(t, padding=pad, value=0.0) for t in (q, k, v))
-        k_chunk = next(c for c in (512, 256, 128, 64, 32) if s_attn % c == 0 and c <= self.PREFILL_MAX_K_CHUNK)
-        q_chunk = 64 if s_attn % 64 == 0 else 32
+        # 32), so prefill attends over the widest key chunk: one chunk when the prompt fits in one, else chunks of
+        # the widest. SDPA pads the sequence to whole chunks itself (no pad / slice ops); the pad keys sit after
+        # every real row, so causal attention leaves the real rows unchanged. The q chunk does not affect the level.
+        if s <= self.PREFILL_MAX_K_CHUNK:
+            # One key chunk of s rounded up to an even tile count, and the queries in as few chunks as fit L1 beside
+            # it, so K/V stream from DRAM once or twice per head: one q chunk up to 256 rows, two up to 448 (416
+            # rows: a 448-row key chunk, two 224-row q chunks), else 128-row q chunks (a 256 x 512 score block
+            # overflows L1).
+            k_chunk = -(-s // 64) * 64
+            if k_chunk <= 256:
+                q_chunk = k_chunk
+            elif k_chunk <= 448:
+                q_chunk = k_chunk // 2
+            else:
+                q_chunk = self.PREFILL_Q_CHUNK
+        else:
+            k_chunk, q_chunk = self.PREFILL_MAX_K_CHUNK, self.PREFILL_Q_CHUNK
         attn = ttnn.transformer.scaled_dot_product_attention(
             q,
             k,
@@ -469,8 +480,6 @@ class TtMinistral3Attention:
             ),
             compute_kernel_config=self.compute_cfg,
         )
-        if s_attn != s:
-            attn = ttnn.slice(attn, (0, 0, 0, 0), (b, self.local_heads, s, hd))
         attn = ttnn.experimental.nlp_concat_heads(attn)
         if self.tp > 1:
             attn = ttnn.all_gather(attn, dim=3, **tp_ccl_args())  # every head's output, for the column-parallel o_proj
