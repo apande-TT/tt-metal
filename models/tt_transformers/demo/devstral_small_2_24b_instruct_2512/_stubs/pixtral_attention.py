@@ -189,6 +189,8 @@ class TtPixtralAttention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,  # q / k / v in bf16 also when x is the fp32 norm output
         )
+        if len(in_shape) == 4 and x.memory_config().buffer_type == ttnn.BufferType.L1:
+            ttnn.deallocate(x)  # the caller's L1 norm output, read only here (see TtAttention)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_heads, transpose_k_heads=False
         )
