@@ -106,6 +106,10 @@ class TtMinistral3Attention:
     # The o_proj's hidden-shard output (TP prefill, read once by the decoder's residual add) lands in L1 while it takes
     # at most this many bytes per core (95 KB at 32 x 128 rows; the caller frees it right after the add).
     PREFILL_OPROJ_OUT_L1_BYTES = 128 * 1024
+    # With TP, SDPA's output (read once by nlp_concat_heads, which writes L1 for the all_gather) lands in L1 too while
+    # it takes at most this many bytes per core (76 KB at 32 x 128 rows; 248 KB at 416 rows does not fit beside SDPA's
+    # static buffers).
+    PREFILL_SDPA_OUT_L1_BYTES = 256 * 1024
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -629,6 +633,11 @@ class TtMinistral3Attention:
                 q_chunk = self.PREFILL_Q_CHUNK
         else:
             k_chunk, q_chunk = self.PREFILL_MAX_K_CHUNK, self.PREFILL_Q_CHUNK
+        # With TP the concatenated heads only feed the all_gather: they go through L1 when they fit (the same budget
+        # as the head split), so the concat writes and the gather reads no DRAM for them.
+        attn_core_bytes = (qkv_bytes * 2 // 3) // (grid.x * grid.y)
+        concat_l1 = self.tp > 1 and 0 < attn_core_bytes <= self.PREFILL_HEADS_L1_BYTES
+        sdpa_l1 = concat_l1 and attn_core_bytes <= self.PREFILL_SDPA_OUT_L1_BYTES
         attn = ttnn.transformer.scaled_dot_product_attention(
             q,
             k,
@@ -643,11 +652,12 @@ class TtMinistral3Attention:
                 exp_approx_mode=False,
             ),
             compute_kernel_config=self.prefill_sdpa_cfg,
+            memory_config=ttnn.L1_MEMORY_CONFIG if sdpa_l1 else ttnn.DRAM_MEMORY_CONFIG,
         )
-        # With TP the concatenated heads only feed the all_gather: they go through L1 when they fit (the same budget
-        # as the head split), so the concat writes and the gather reads no DRAM for them.
-        concat_l1 = self.tp > 1 and 0 < (qkv_bytes * 2 // 3) // (grid.x * grid.y) <= self.PREFILL_HEADS_L1_BYTES
+        heads = attn
         attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.L1_MEMORY_CONFIG if concat_l1 else None)
+        if sdpa_l1:
+            ttnn.deallocate(heads)
         if self.tp > 1:
             # every head's output, for the column-parallel o_proj
             concat = attn
