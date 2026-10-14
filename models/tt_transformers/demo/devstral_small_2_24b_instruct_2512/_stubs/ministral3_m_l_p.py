@@ -183,6 +183,19 @@ class TtMinistral3MLP:
         )
         return self._reduce(out)
 
+    def _gate_up_n_block(self, x, grid):
+        """N block of the fused gate/up: 12 tiles, or the whole per-core N range when that is smaller. minimal_matmul
+        hands each core 2 * ceil(pairs / cores) weight tiles along N (the grid's y axis when M > N), and a block wider
+        than that range is computed padded: the vision MLP's 8-tile range ran 12-tile blocks (half of them padding)."""
+        shape = tuple(int(d) for d in x.shape)
+        mt = shape[-2] // ttnn.TILE_SIZE
+        for d in shape[:-2]:
+            mt *= d
+        nt = int(self.w_gate_up.shape[-1]) // ttnn.TILE_SIZE
+        n_cores = grid.y if mt > nt else grid.x
+        n_core = 2 * -(-(nt // 2) // n_cores)
+        return n_core if n_core < 12 else 12
+
     def _forward(self, x):
         grid = self.device.compute_with_storage_grid_size()
         m = ttnn.experimental.minimal_matmul(
@@ -191,7 +204,7 @@ class TtMinistral3MLP:
             config=ttnn.MinimalMatmulConfig(
                 M_block_size=8,
                 K_block_size=8,
-                N_block_size=12,
+                N_block_size=self._gate_up_n_block(x, grid),
                 subblock_h=2,
                 subblock_w=2,
                 compute_with_storage_grid_size=grid,
