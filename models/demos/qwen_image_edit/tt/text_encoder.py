@@ -131,11 +131,21 @@ class TtQwenTextEncoder:
 
         p = TextEncoderInputs()
         p.B = B
-        vc = self.visual.consts(grids[0], B)
+        # the vision tower is data-parallel over the mesh rows: each row encodes B / rows of the images (its weights
+        # are replicated over the rows anyway; every row used to encode all B), and encode_vision gathers them
+        rows, cols = tuple(d.shape) if isinstance(d, ttnn.MeshDevice) else (1, 1)
+        p.vision_rows = rows if rows > 1 and B % rows == 0 else 1
+        vc = self.visual.consts(grids[0], B // p.vision_rows)
         pix = vl["pixel_values"].to(torch.float32).reshape(B, 1, vc.s, -1)
         pix = torch.nn.functional.pad(pix, (0, 0, 0, vc.s_pad - vc.s))
         p.vision_consts = vc
-        p.pixels = replicated(d, pix, ttnn.float32)
+        if p.vision_rows > 1:
+            mapper = ttnn.ShardTensor2dMesh(d, mesh_shape=(rows, cols), dims=(0, None))
+            p.pixels = ttnn.from_torch(
+                pix.contiguous(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=d, mesh_mapper=mapper
+            )
+        else:
+            p.pixels = replicated(d, pix, ttnn.float32)
 
         s_pad = pad_to_tile(S)
         ids_p = torch.full((B, s_pad), self.pad_token_id, dtype=torch.int64)
@@ -176,6 +186,8 @@ class TtQwenTextEncoder:
     def encode_vision(self, p):
         """Vision tower over the B condition images -> image embeddings [B, m, 3584]."""
         _, img = self.visual.forward_batched(p.pixels, p.vision_consts)
+        if getattr(p, "vision_rows", 1) > 1:  # each row's images -> every chip, in image order (exact data movement)
+            img = ttnn.all_gather(img, dim=0, cluster_axis=0, num_links=1, topology=ttnn.Topology.Linear)
         return img
 
     def encode_text(self, p, img):
