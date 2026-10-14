@@ -189,6 +189,14 @@ class TtTextAttention:
         out = ttnn.linear(_gather_cols(o, self.tp), self.wo, compute_kernel_config=self.compute_cfg)
         return _gather_cols(out, self.tp)
 
+    @staticmethod
+    def _repeat_heads(t, G):
+        """[B, kvl, S, D] -> [B * kvl * G, 1, S, D]: each kv head once per q head of its group, in q head order."""
+        b, kvl, s, d = t.shape
+        return ttnn.reshape(
+            ttnn.repeat(ttnn.reshape(t, (b * kvl, 1, s, d)), ttnn.Shape([1, G, 1, 1])), (b * kvl * G, 1, s, d)
+        )
+
     def _forward_precise(self, x, tt_cos, tt_sin, tt_mask):
         D, hl, kvl, G = self.head_dim, self.hl, self.kvl, self.group
         b, s_pad = x.shape[0], x.shape[-2]
@@ -210,11 +218,24 @@ class TtTextAttention:
 
         q, k = _rope(q), _rope(k)
         q = ttnn.reshape(q, (b, kvl, G * s_pad, D))
+        # with fewer sequences x kv heads than cores (the pipelined LM's 16-sequence micro-batches), one batch entry
+        # per q head (its kv head repeated) so the batched products fill the grid with whole-entry work units: an
+        # M-split of the packed heads is only correct at one unit per core
+        cores = x.device().compute_with_storage_grid_size()
+        per_head = G > 1 and b * kvl < cores.x * cores.y
+        if per_head:
+            q = ttnn.reshape(q, (b * kvl * G, 1, s_pad, D))
+            k = self._repeat_heads(k, G)
         scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex)
+        if per_head:
+            scores = ttnn.reshape(scores, (b, kvl, G * s_pad, s_pad))
         scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask)
         mx = ttnn.max(scores, dim=-1, keepdim=True)
         e = ttnn.exp(ttnn.subtract(scores, mx))
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
+        if per_head:
+            probs = ttnn.reshape(probs, (b * kvl * G, 1, s_pad, s_pad))
+            v = self._repeat_heads(v, G)
         o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex)  # [B, kvl, G*S, D]
         o = ttnn.reshape(o, (b, hl, s_pad, D))
         o = ttnn.permute(o, (0, 2, 1, 3))
