@@ -138,6 +138,7 @@ class TtQwenTextEncoder:
         _te_layer.HEADS_BY_SLICES = True
         # the LM MLP's gate / up limbs of a short batch (the negatives' tail: 14.7 MB) split straight into L1
         _te_layer.MLP_LIMBS_L1_BYTES = 16 * 1024 * 1024
+        _te_layer.MLP_FUSED_SILU = True  # and its SiLU fused into the gate * up multiply
         self.set_precise(True)
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
