@@ -175,7 +175,7 @@ PLANNED_TP = 4
 #   pixtral_vision_model: equal-size images are uploaded already patchified on the host (patchify_host; tile layout),
 #                     so the device skips the reshape / permute chain over 14-pixel row-major sticks; the patch
 #                     projection runs on minimal_matmul (one 19-tile K block).
-#   pixtral_m_l_p: the vision fused gate/up weight is block-float4; it runs at LoFi on the L1 ffn norm output cast
+#   pixtral_m_l_p: the vision fused gate/up weight is block-float8; it runs at LoFi on the L1 ffn norm output cast
 #                  to bf16 in L1 (full 8-tile K blocks). The down projection runs at HiFi2.
 #   attention (vision layer): each RMSNorm gamma is folded into the q/k/v and gate/up weights that read it (no separate
 #                     fp32 gamma multiply); q/k/v read the fp32 norm output directly (no cast to bf16), the gate/up
