@@ -100,6 +100,9 @@ class TtMinistral3Attention:
     # many bytes per core: the RoPEs read q / k from L1 and write DRAM, and v is copied to DRAM for the cache fill and
     # SDPA (none stays resident in L1 across the larger prefill ops, whose static buffers leave no room). 0 disables.
     PREFILL_HEADS_L1_BYTES = 512 * 1024
+    # ... and the fused QKV output feeding that split lands in L1 too while it takes at most this many bytes per core
+    # (short prompts: 114 KB at 32 x 128 rows; at 32 x 416 rows its 372 KB would sit beside the matmul's own buffers).
+    PREFILL_QKV_L1_BYTES = 192 * 1024
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -554,18 +557,19 @@ class TtMinistral3Attention:
         if isinstance(mask, torch.Tensor):
             mask = self._to_tt(mask.reshape(1, 1, s, s).to(torch.bfloat16))
 
+        grid = self.device.compute_with_storage_grid_size()
+        qkv_bytes = 2 * int(b) * int(s) * int(self.wqkv.shape[-1])  # bf16
+        heads_l1 = self.meta_rope and 0 < qkv_bytes // (grid.x * grid.y) <= self.PREFILL_HEADS_L1_BYTES
+        qkv_l1 = heads_l1 and qkv_bytes // (grid.x * grid.y) <= self.PREFILL_QKV_L1_BYTES
         # Prefill QKV on the full grid (ttnn.linear's auto config left this many-row projection on a partial one).
         qkv = ttnn.experimental.minimal_matmul(
             x,
             self.wqkv,
             config=self._one_block_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE),
             compute_kernel_config=self.prefill_proj_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=ttnn.L1_MEMORY_CONFIG if qkv_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
         )
-        grid = self.device.compute_with_storage_grid_size()
-        qkv_bytes = 2 * int(b) * int(s) * int(qkv.shape[-1])  # bf16
-        heads_l1 = self.meta_rope and 0 < qkv_bytes // (grid.x * grid.y) <= self.PREFILL_HEADS_L1_BYTES
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv,
             num_heads=self.local_heads,
@@ -573,6 +577,8 @@ class TtMinistral3Attention:
             transpose_k_heads=False,
             memory_config=ttnn.L1_MEMORY_CONFIG if heads_l1 else None,
         )
+        if qkv_l1:
+            ttnn.deallocate(qkv)
         if heads_l1:  # see PREFILL_HEADS_L1_BYTES; the RoPEs below write q / k to DRAM
             heads_in = (q, k)
             v_l1, v = v, ttnn.to_memory_config(v, ttnn.DRAM_MEMORY_CONFIG)
