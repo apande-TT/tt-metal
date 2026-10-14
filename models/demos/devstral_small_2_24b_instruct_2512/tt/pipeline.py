@@ -154,7 +154,7 @@ PLANNED_TP = 4
 #                     re-reading them from DRAM per row (when that moves fewer bytes: 416 / 128 rows, q and k).
 #                     nlp_create_qkv_heads splits q / k / v into L1 (<= 512 KB per core); the RoPEs read q / k from L1.
 #                     Short prompts (<= 192 KB per core) also keep the fused QKV output in L1 for that split.
-#                     (HiFi2 RoPE trial.)
+#                     The prefill RoPE computes at HiFi2. The concatenated SDPA heads reach the all_gather through L1.
 #   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
 #   pixtral_attention: the vision QKV runs on minimal_matmul over the full grid too.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
