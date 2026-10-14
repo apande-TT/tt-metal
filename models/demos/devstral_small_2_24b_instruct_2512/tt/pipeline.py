@@ -147,6 +147,7 @@ PLANNED_TP = 4
 #                     HiFi2 matmuls.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
+#   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py).
 #   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard,
 #                     prefill's (many-row) partials are produced and reduce-scattered in bf16 (half the bytes),
 #                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
