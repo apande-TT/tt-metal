@@ -22,7 +22,7 @@ class TtMLP(TtMinistral3MLP):
     GATE_UP_DTYPE = ttnn.bfloat8_b  # block-float8 fused gate/up weight (the many-row SwiGLU)
     GATE_UP_FIDELITY = ttnn.MathFidelity.LoFi
     PREFILL_REDUCE_DTYPE = None
-    PREFILL_DOWN_FIDELITY = None
+    PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi2
     DOWN_DTYPE = ttnn.bfloat16
 
     def __init__(self, device, torch_module, in_scale=None) -> None:
