@@ -185,8 +185,8 @@ PLANNED_TP = 4
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
 #   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py);
 #                     the last layer's final add emits the bf16 residual for the gather directly (no fp32 copy + cast).
-#   text decoder all_reduces (o_proj, MLP down): fp32 reduce-scatter + bf16 all_gather of the reduced shard,
-#                     prefill's (many-row) partials are produced and reduce-scattered in bf16 (half the bytes),
+#   text decoder all_reduces (o_proj, MLP down): reduce-scatter + bf16 all_gather of the reduced shard; prefill's
+#                     and decode's partials are produced and reduce-scattered in bf16 (half the bytes, no cast),
 #                     Ring over 2 links on QB2's ring fabric (mesh.py opens FABRIC_1D_RING there).
 #   ministral3_decoder_layer: each RMSNorm's gamma is folded into the q/k/v and gate/up weights that read it
 #                     (no gamma multiply after the norm; the decode norm unshards + casts to bf16 in one op).
