@@ -40,6 +40,7 @@ from agent import integrity as _integrity  # noqa: E402
 from agent.probes import PYTEST_NO_TIMEOUT  # noqa: E402
 from agent.probes import tt_smi_bin as _tt_smi_bin  # noqa: E402
 from agent.layer_depth import set_depth as _set_depth  # noqa: E402
+from agent.stage_seams import parse_unmeasured as _parse_unmeasured  # noqa: E402
 
 _DEPTH_GUARD = "models.experimental.perf_automation.agent.depth_guard_plugin"
 from agent.handlers import remeasure as _rm  # noqa: E402
@@ -686,6 +687,144 @@ _KNOB_REASON = {
     "shard": lambda g, f, w: "shard this op's weights/activations into L1 (height/width shard) to cut DRAM "
     "reads; record_kernel_attempt(...,'shard',...) to mark it tried (even on a no-gain)",
 }
+# A KNOB THAT FAILED PCC ON THE WHOLE STACK WAS NEVER TRIED ON PART OF IT. A repeated block is one
+# shared definition, so a fidelity or dtype edit on it lowers every instance at once -- and the
+# image-edit port on the 32-chip mesh (2026-10-13) recorded 19 such tries, every one reverted at PCC
+# 0.9443-0.9470 against a 0.95 bar, none of them on fewer layers. A miss that small says the error
+# budget is spent by SOME of the instances, not that none can carry the lower setting. So a knob
+# whose whole-stack try came back pcc_low is offered again on a subset of the instances, bounded,
+# with every earlier subset and its PCC handed back so each try narrows or widens the last one.
+_MAX_PARTIAL_TRIES = int(os.environ.get("PERF_MCP_MAX_PARTIAL_TRIES", "3"))
+# How a subset try's reason opens. The handed-out target keeps its reason, so a try that wedges or
+# diverges before the agent could state its blocks is still known to be one (_partial_marker).
+_PARTIAL_LEAD = "PCC-BOUNDED PARTIAL"
+# applied_blocks for such a try: a subset was tried, which instances is not known.
+_BLOCKS_UNSTATED = "unstated"
+
+
+def _parse_blocks(spec) -> list | None:
+    """Block indices from '0-11,14,20-23' or a JSON list -> sorted unique ints; [] for empty, None if
+    unparseable (a subset the caller cannot state is not one the tools can check)."""
+    if spec is None or spec == "" or spec == []:
+        return []
+    try:
+        if isinstance(spec, str) and spec.strip().startswith("["):
+            spec = json.loads(spec)
+        if isinstance(spec, (list, tuple)):
+            vals = [int(x) for x in spec]
+        else:
+            vals = []
+            for part in str(spec).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                lo, _, hi = part.partition("-")
+                vals += list(range(int(lo), int(hi) + 1)) if hi else [int(lo)]
+    except (TypeError, ValueError):
+        return None
+    return sorted(set(vals)) if all(v >= 0 for v in vals) else None
+
+
+def _is_partial(a: dict) -> bool:
+    return bool(a.get("applied_blocks"))
+
+
+def _partial_marker(target: dict) -> dict:
+    """The applied_blocks field for a row minted from the handed-out target alone (a wedge or a
+    diverged reading): {} unless that target was a subset try."""
+    return (
+        {"applied_blocks": _BLOCKS_UNSTATED}
+        if str((target or {}).get("reason") or "").startswith(_PARTIAL_LEAD)
+        else {}
+    )
+
+
+# The knobs that change the ARITHMETIC. A grid or shard edit that fails PCC broke the program, not
+# the precision budget, so a subset of instances is no answer to it.
+_PRECISION_KNOBS = frozenset({"fidelity", "dtype"})
+
+
+def _partial_knob_state(op_code: str, knob: str, attempts: list, count=None) -> dict | None:
+    """The subset retries this (op, knob) is owed, or None when it is owed none.
+
+    Owed only after a WHOLE-stack try of a precision knob on this op came back pcc_low: a knob that
+    was slower, or never reached the accuracy gate, has said nothing about which instances carry the
+    error. Subset tries count wherever they ended -- measured, wedged or diverged -- so the walk is
+    bounded by _MAX_PARTIAL_TRIES however each one went.
+
+    SIZED BY THE HEADROOM, NOT BY HALVES. The tree's last passing PCC (p_ok) minus the bar is what a
+    subset may spend; p_ok minus the whole-stack reading is what lowering every instance cost. Small
+    independent errors add, so about headroom/loss of the instances fit -- an estimate the walk then
+    corrects. With no headroom, or so little that not one of the op's `count` instances fits, the
+    walk is not owed: the image-edit port above sits at 0.9501 against 0.95, and a whole-stack miss
+    of 0.004 leaves room for ~2.5% of the instances."""
+    if knob not in _PRECISION_KNOBS:
+        return None
+    rows = [
+        a
+        for a in attempts
+        if _op_match(op_code, a)
+        and _normalise_rung(a.get("kernel_kind")) == knob
+        and not a.get("measurement_failed")
+        and not a.get("commit_record")
+    ]
+    failed = [a for a in rows if not _is_partial(a) and a.get("pcc_status") == "pcc_low"]
+    if not failed:
+        return None
+    f = failed[-1]
+    _ok = [a["pcc"] for a in attempts if a.get("pcc_status") == "ok" and isinstance(a.get("pcc"), (int, float))]
+    fraction = None
+    if _ok and isinstance(f.get("pcc"), (int, float)) and isinstance(f.get("pcc_threshold"), (int, float)):
+        headroom, loss = _ok[-1] - f["pcc_threshold"], _ok[-1] - f["pcc"]
+        if headroom <= 0 or loss <= 0:
+            return None
+        fraction = min(1.0, headroom / loss)
+        if count and fraction * int(count) < 1:
+            return None
+    return {
+        "failed": f,
+        "partials": [a for a in rows if _is_partial(a)],
+        "allowed": _MAX_PARTIAL_TRIES,
+        "fraction": fraction,
+    }
+
+
+def _partial_reason(knob: str, st: dict) -> str:
+    f = st["failed"]
+    tried = "; ".join(
+        "blocks %s -> %s%s"
+        % (
+            a.get("applied_blocks"),
+            a.get("pcc_status") or ("wedged" if a.get("wedged") else "diverged" if a.get("diverged") else "no pcc"),
+            " %.4f" % a["pcc"] if isinstance(a.get("pcc"), (int, float)) else "",
+        )
+        for a in st["partials"]
+    )
+    return (
+        _PARTIAL_LEAD + " (%d of %d): the whole-stack %s try on this op failed accuracy (pcc %s < %s), "
+        "so apply the SAME lowered setting to a SUBSET of the repeated stack's instances (the stack this "
+        "op's shared definition is instantiated in -- the pipeline's own `stacks`) and keep the rest at the "
+        "current setting. Earlier subsets: %s. With none, lower %s of the instances; after a pass widen the "
+        "subset, after a fail narrow it. record_kernel_attempt(...,'%s',..., applied_blocks='<the instance "
+        "indices you lowered, e.g. 0-29>'), and for a signature-visible lever "
+        "check_lever_coverage(..., intended_blocks=<same>) must say as_intended"
+        % (
+            len(st["partials"]) + 1,
+            st["allowed"],
+            knob,
+            f.get("pcc", "?"),
+            f.get("pcc_threshold", "?"),
+            tried or "none",
+            (
+                "about %.1f%% (the PCC headroom over the whole-stack loss, an estimate)" % (100 * st["fraction"])
+                if st.get("fraction") is not None
+                else "half"
+            ),
+            knob,
+        )
+    )
+
+
 _MAX_KERNEL_WEDGES = int(os.environ.get("PERF_MCP_MAX_KERNEL_WEDGES", "3"))
 
 
@@ -1154,6 +1293,7 @@ def _autorecord_wedge(reason: str, killed_by_watchdog: bool = False) -> None:
         "needs_device_recovery": kind == FAULT_KIND_WEDGED,
         "evidence": {},
         "diff": "",
+        **_partial_marker(t),
     }
     try:
         _append_attempt(rec)
@@ -1161,7 +1301,7 @@ def _autorecord_wedge(reason: str, killed_by_watchdog: bool = False) -> None:
         pass
 
 
-def _autorecord_diverged(op_signature: str, kernel_kind: str, note: str, fp: dict) -> None:
+def _autorecord_diverged(op_signature: str, kernel_kind: str, note: str, fp: dict, blocks=None) -> None:
     """Give a diverged attempt a ledger row, so the rung it was tried on can eventually close.
 
     record_kernel_attempt refuses to bank a diverged reading as a win or a loss -- correctly, since
@@ -1213,6 +1353,7 @@ def _autorecord_diverged(op_signature: str, kernel_kind: str, note: str, fp: dic
         "needs_device_recovery": False,
         "evidence": {},
         "diff": "",
+        **({"applied_blocks": blocks} if blocks else _partial_marker(_load_target())),
     }
     try:
         _append_attempt(rec)
@@ -1641,10 +1782,12 @@ def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool
     # Counted straight off _KNOBS, so a rung added to the ladder cannot be left uncounted here -- the
     # four hand-written sums this replaces were one copy per knob, and a fifth would have been a knob
     # that is offered forever because its tries never saturate.
+    # Subset tries of a knob are counted by _partial_knob_state, against their own allowance, so they
+    # neither spend the whole-stack retries nor close the rung on the whole stack.
     _rung_tries = collections.Counter(
         _normalise_rung(a.get("kernel_kind"))
         for a in matches
-        if not a.get("measurement_failed") and not a.get("commit_record")
+        if not a.get("measurement_failed") and not a.get("commit_record") and not _is_partial(a)
     )
     # A RUNG THAT CANNOT SUCCEED MUST STOP BEING OFFERED, the same rule host_overhead already applies
     # a few lines below ("an attempt that wedged the device may never have got far enough to have
@@ -1660,7 +1803,7 @@ def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool
     # the lever, and it deserves another go) or absent (two pre-existing records predate this field;
     # treating an unknown as non-retryable would exclude them on a missing value, not a judgement).
     for _a in _load_attempts_all():
-        if _a.get("wedged") and _a.get("retryable") is False and _op_match(op_code, _a):
+        if _a.get("wedged") and _a.get("retryable") is False and _op_match(op_code, _a) and not _is_partial(_a):
             _rung_tries[_normalise_rung(_a.get("kernel_kind"))] += 1
     # SAME BLIND SPOT, SAME FIX, for a diverged reading instead of a wedge: record_kernel_attempt
     # refuses to bank a >8% full-pipeline blowup as a win or a loss, so _rung_tries above cannot see
@@ -1668,7 +1811,7 @@ def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool
     # truthy for the same reason as _rung_allowance: a hot board making a reading look bad is not the
     # rung being genuinely tried.
     for _a in _load_attempts_all():
-        if _a.get("diverged") and not _a.get("board_clamped") and _op_match(op_code, _a):
+        if _a.get("diverged") and not _a.get("board_clamped") and _op_match(op_code, _a) and not _is_partial(_a):
             _rung_tries[_normalise_rung(_a.get("kernel_kind"))] += 1
     grid = (open_op.get("grid") or "").lower()
     wdtype = (open_op.get("weight_dtype") or "").lower()
@@ -1802,6 +1945,17 @@ def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool
                 continue
             lead = "" if want_preferred else "LOW-PRIORITY SWEEP (bound_by=%s): " % (bound or "unknown")
             return (False, "knob:" + knob, lead + _KNOB_REASON[knob](grid, fidelity, wdtype))
+    # Only an op the profile saw more than once has instances to take a subset of.
+    if int(open_op.get("count") or 0) > 1:
+        # Subset rows from the FULL log: one that wedged or diverged is absent from the caller's
+        # `attempts` (see above) and must still count against the bound.
+        _partial_pool = [a for a in attempts if not _is_partial(a)] + [
+            a for a in _load_attempts_all() if _is_partial(a)
+        ]
+        for knob in order:
+            st = applicable[knob] and _partial_knob_state(op_code, knob, _partial_pool, open_op.get("count"))
+            if st and len(st["partials"]) < st["allowed"]:
+                return (False, "knob:" + knob, _partial_reason(knob, st))
 
     if _tp_candidate(open_op, op_code) and "tp-fracture" not in kinds:
         return (
@@ -2625,6 +2779,20 @@ def _adaptive_run(cmd, cwd, env, label="device run", stall_s=None, backstop=None
                 proc.communicate(timeout=30)
             except Exception:  # noqa: BLE001
                 pass
+            # THE KILL IS RECOVERED HERE, ONCE, FOR EVERY CALLER. This is the one place this module
+            # SIGKILLs a device run, and it used to leave the board exactly as the kill found it: the
+            # full-pipeline gate reset only inside its trace-region grow, which stops once the region
+            # is at its ceiling, and the op-sig probe never reset at all. Run 1791980272 (2026-10-14,
+            # minicpm5_2b, --devices 0) then spent 4 back-to-back 662 s attempts stuck in
+            # fetch_queue_reserve_back on the board the previous kill left behind. The reset goes
+            # through the one rule every other killing path uses (probes.reset_after_ended_child),
+            # so a single-chip run still meets the veto and its work probe exactly as before.
+            try:
+                from agent.probes import reset_after_ended_child
+
+                reset_after_ended_child(error_text="".join(buf)[-4000:], env=env)
+            except Exception:  # noqa: BLE001 -- the next run's own device open says if it is still needed
+                pass
             raise _sp.TimeoutExpired(cmd, limit if now - last_progress >= limit else backstop)
     rc = proc.returncode
     pt.join(timeout=30)
@@ -3321,6 +3489,8 @@ def _run_full_pipeline_ms():
     # The marker is printed BEFORE the raise for exactly that reason: it survives the swallow, and
     # this is what reads it.
     decode_stuck = ""
+    # {stage: why} the run stated it could not time (stage_seams.UNMEASURED_MARK).
+    unmeasured = {}
     stage_ms = {}
     # EVERY SAMPLE, NOT THE LAST ONE. The headline is the median of _FULLPIPE_SAMPLES readings
     # (`dec` below) precisely because one reading is noise; the per-stage split was a plain
@@ -3366,10 +3536,11 @@ def _run_full_pipeline_ms():
     for _ in range(_FULLPIPE_SAMPLES):
         # A stall with NO trace is the silent-overflow signature: a too-small region can HANG the mesh,
         # and _adaptive_run then SIGKILLs it and RAISES -- so it never reaches the grow below. Handle it
-        # HERE: reset the wedged device, double the region up to the DRAM ceiling, and retry the SAME
-        # sample (without spending the measurement budget), so a hang that printed nothing self-corrects
-        # instead of just burning samples. Only a timeout-type stall triggers this; a clean crash still
-        # returns and takes the message-based grow path below.
+        # HERE: double the region up to the DRAM ceiling and retry the SAME sample (without spending
+        # the measurement budget), so a hang that printed nothing self-corrects instead of just burning
+        # samples. _adaptive_run has already reset the board it killed, at the ceiling too. Only a
+        # timeout-type stall triggers this; a clean crash still returns and takes the message-based
+        # grow path below.
         r = None
         for _stall_try in range(int(_STALL_GROW_ROUNDS) + 1):
             try:
@@ -3382,15 +3553,9 @@ def _run_full_pipeline_ms():
                     break
                 env["TT_PERF_TRACE_REGION"] = str(min(cur * 2, _TRACE_REGION_MAX))
                 sys.stderr.write(
-                    "[full-pipeline-gate] run stalled with no trace (silent overflow); resetting device "
-                    "and growing trace region to %s B, retrying\n" % env["TT_PERF_TRACE_REGION"]
+                    "[full-pipeline-gate] run stalled with no trace (silent overflow); growing trace "
+                    "region to %s B, retrying\n" % env["TT_PERF_TRACE_REGION"]
                 )
-                try:
-                    from agent.probes import _device_reset
-
-                    _device_reset(error_text=str(exc))
-                except Exception:  # noqa: BLE001
-                    pass
         if r is None:
             continue
         # ENDED ITSELF FOR HEAT (agent.probes.thermal_yield): no reading, and no reason to take the next
@@ -3589,6 +3754,9 @@ def _run_full_pipeline_ms():
             # Printed by trace_replay._check_advance; keep the name verbatim on both sides.
             if _DECODE_STUCK_MARKER in line:
                 decode_stuck = line.strip()
+            _um = _parse_unmeasured(line)
+            if _um:
+                unmeasured[_um[0]] = _um[1]
             if "TRACE_PER_TOKEN_MS=" in line:
                 try:
                     per_tokens.append(float(line.split("TRACE_PER_TOKEN_MS=", 1)[1].split()[0]))
@@ -3643,6 +3811,22 @@ def _run_full_pipeline_ms():
         # that genuinely stalls -- so ask the recovery, which knows the difference.
         _recover_if_board_is_dead(decode_stuck, _BASELINE_WHERE)
         return None, None, "decode did not advance between iterations: %s" % decode_stuck, None
+    # A READING MISSING A STAGE THE COMMITTED BEST MEASURED IS NOT A FULL-PIPELINE READING. The run
+    # gives an untimed stage no row (stage_seams.UNMEASURED_MARK), so its headline covers only what
+    # ran; differenced against a bar that covered every stage, a crash reads as a win. Like with like:
+    # a stage the bar never had (a model that has never timed it) does not refuse the reading.
+    _lost = sorted(set(unmeasured) & set(_bar_stages()))
+    if _lost:
+        _why = "; ".join("%s: %s" % (s, unmeasured[s]) for s in _lost)
+        _recover_if_board_is_dead(_why, _BASELINE_WHERE)
+        return (
+            None,
+            None,
+            "stage(s) %s ran in the committed best but were NOT measured in this run (%s). The headline "
+            "would cover only the stages that ran, so this is no full-pipeline reading: fix or revert "
+            "the edit." % (", ".join(_lost), _why),
+            None,
+        )
     dec = statistics.median(per_tokens) if per_tokens else None
     pf = statistics.median(prefills) if prefills else None
     if dec is not None or pf is not None:
@@ -3734,6 +3918,28 @@ def _run_full_pipeline_ms():
                             source=_src,
                             model=_MODEL_ROOT.name if _MODEL_ROOT else "",
                         )
+        except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost a measurement
+            pass
+        # PER-STAGE BASELINE, write-once: pin each declared stage's end-to-end ms the FIRST time
+        # the gate measures it. A stage the whole-model BEFORE bookend could not time -- e.g. a
+        # prefill trace_replay reports as n/a on the first reading -- would otherwise never get a
+        # baseline, so the dashboard showed a current bar with no baseline for it. The value is the
+        # correct-scale trace_replay per-stage ms (the tracy profile's per-stage sum is a capped
+        # capture, not a full reading), stage names come from the measured split (not literals),
+        # and write-once keeps it the STARTING value (a resumed run never refiles it). The
+        # whole-model BEFORE is pinned separately, and run.py still pins the bookend split too;
+        # this only fills stages that reading missed, via the same shared anchor.
+        try:
+            for _sn, _sv in (stage_ms or {}).items():
+                if _sn and isinstance(_sv, (int, float)) and _sv > 0:
+                    _ledger().anchor(
+                        _ledger().KIND_STAGE_E2E,
+                        float(_sv),
+                        depth=str(_sn).strip().lower(),
+                        mode=(stage_paths or {}).get(_sn) or "trace+1cq",
+                        source="trace_replay per-stage e2e (first measured)",
+                        model=_MODEL_ROOT.name if _MODEL_ROOT else "",
+                    )
         except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost a measurement
             pass
         _pin_stage_params_and_tp(stage_modules, tp)
@@ -4881,6 +5087,11 @@ def _stage_deltas(now: dict, bar: dict, spread: dict | None = None) -> dict:
     """
     out = {}
     _tol_by_stage = spread or {}
+    # WHAT A STEP'S DELTA IS WORTH TO ONE REQUEST. A stage the pipeline states a request repeats
+    # (stage_repeats_per_request) gets `repeats` and `delta_per_request_ms` beside its per-step
+    # delta, so a 0.02 ms step win on a 127-step stage reads as the ~2.5 ms it is. Additive: the win
+    # rule and the bars still judge the per-step number against the stage's own spread.
+    _reps = stage_repeats_per_request(list(now)) if now else {}
     for name, ms in sorted(now.items()):
         prev = bar.get(name)
         row = {"ms": round(ms, 4), "best": (round(prev, 4) if prev else None)}
@@ -4897,6 +5108,9 @@ def _stage_deltas(now: dict, bar: dict, spread: dict | None = None) -> dict:
             row["tol_ms"] = round(prev * tol, 4)
             row["improved"] = ms < prev * (1.0 - tol)
             row["regressed"] = ms > prev * (1.0 + tol)
+            if _reps.get(name):
+                row["repeats"] = int(_reps[name])
+                row["delta_per_request_ms"] = round((ms - prev) * int(_reps[name]), 4)
         else:
             row["delta_pct"] = None
             row["delta_ms"] = None
@@ -5207,7 +5421,7 @@ def _block_of(pos: int, starts: list) -> int:
 
 
 def compute_lever_coverage(
-    counts: dict, sequence: list, op_match: str, stale_dtype: str = "", new_dtype: str = ""
+    counts: dict, sequence: list, op_match: str, stale_dtype: str = "", new_dtype: str = "", intended_blocks=None
 ) -> dict:
     matching = {s: n for s, n in (counts or {}).items() if op_match and op_match in s}
     if not matching:
@@ -5228,7 +5442,21 @@ def compute_lever_coverage(
                     seen.add(b)
                     missed_blocks.append(b)
     fully = (stale == 0 and fresh > 0) if (stale_dtype and new_dtype) else None
-    if fully:
+    # A SUBSET TRY IS JUDGED AGAINST THE SUBSET IT MEANT. Partial is the goal there, so fully_applied
+    # cannot be its bar; the bar is that exactly the intended instances carry the new signature.
+    as_intended, fresh_blocks = None, []
+    if intended_blocks and stale_dtype and new_dtype:
+        fresh_sigs = {s for s in matching if new_dtype in s}
+        fresh_blocks = sorted({_block_of(i, starts) for i, s in enumerate(sequence or []) if s in fresh_sigs} - {-1})
+        as_intended = fresh_blocks == sorted(set(intended_blocks)) and not (set(missed_blocks) & set(intended_blocks))
+    if as_intended is not None:
+        note = (
+            "subset applied AS INTENDED: blocks %s carry the new signature, the rest the old" % fresh_blocks
+            if as_intended
+            else "subset NOT as intended: new signature on blocks %s, intended %s"
+            % (fresh_blocks, sorted(set(intended_blocks)))
+        )
+    elif fully:
         note = "lever reached ALL %d instances of this op" % total
     elif fully is False:
         note = (
@@ -5248,6 +5476,7 @@ def compute_lever_coverage(
         "n_blocks": n_blocks,
         "block_source": block_source,
         "missed_blocks": sorted(missed_blocks),
+        **({"as_intended": as_intended, "applied_blocks": fresh_blocks} if as_intended is not None else {}),
         "note": note,
     }
 
@@ -5289,7 +5518,7 @@ def _full_depth_op_probe():
 
 
 @mcp.tool()
-def check_lever_coverage(op_match: str, stale_dtype: str = "", new_dtype: str = "") -> dict:
+def check_lever_coverage(op_match: str, stale_dtype: str = "", new_dtype: str = "", intended_blocks: str = "") -> dict:
     """After applying a lever (dtype knob / kernel swap) to an op, VERIFY it reached EVERY layer instance,
     not just the profiled representative slice. Runs an ALL-LAYERS op-signature probe (TT_PERF_LAYERS=0,
     NO tracy -> no marker buffer -> overflow-safe) and checks whether the op still appears with its OLD
@@ -5298,7 +5527,17 @@ def check_lever_coverage(op_match: str, stale_dtype: str = "", new_dtype: str = 
     supply both for a dtype lever so coverage is exact. Returns fully_applied + missed_blocks: if PARTIAL,
     the edit is on an instance-specific path (e.g. layers[0]) — move it to the SHARED block definition and
     reapply so all N layers change. A repeated block is ONE class instantiated N times, so a lever on the
-    shared definition propagates to every instance; this catches the case where it did not."""
+    shared definition propagates to every instance; this catches the case where it did not.
+    intended_blocks: for a PCC-BOUNDED PARTIAL try only -- the instance indices meant to carry the lever
+    (same form as record_kernel_attempt's applied_blocks); the answer is then as_intended, not
+    fully_applied."""
+    _intended = _parse_blocks(intended_blocks)
+    if _intended is None:
+        return {
+            "status": "error",
+            "fully_applied": None,
+            "note": "intended_blocks %r is not a list of indices" % (intended_blocks,),
+        }
     counts, seq = _full_depth_op_probe()
     if not counts:
         return {
@@ -5309,7 +5548,7 @@ def check_lever_coverage(op_match: str, stale_dtype: str = "", new_dtype: str = 
                 "counts (%s). This is NOT a pass: do not treat the lever as fully applied." % (seq or "no output")
             ),
         }
-    return compute_lever_coverage(counts, seq, op_match, stale_dtype, new_dtype)
+    return compute_lever_coverage(counts, seq, op_match, stale_dtype, new_dtype, _intended)
 
 
 def _tokens_env() -> str:
@@ -5354,6 +5593,11 @@ def _check_full_pipeline_latency_body() -> dict:
     cq = 1
     ms, method, err, path = _measure_full_pipeline_guarded()
     if ms is None:
+        # THE SAME CRASH POLICY AS EVERY OTHER DEVICE TOOL. measure_candidate and check_pcc feed
+        # note_crash (a dead-board signature resets at once, an ambiguous crash counts toward the
+        # two-strike reset); this gate fed it nothing, so its crashes never reached recovery at all.
+        if not _is_measurement_failure(err or ""):
+            _note_device_crash("check_full_pipeline_latency", err or "")
         return _emit_fullpipe({"status": "crash", "error": err, "cq": cq})
     # A HEADLINE OF ZERO IS A RUN THAT MEASURED NOTHING, and it used to be reported as `ok`. The
     # perf test prints TRACE_PER_TOKEN_MS=0.0000 and exits PASSED when every stage's timing hook
@@ -5382,6 +5626,7 @@ def _check_full_pipeline_latency_body() -> dict:
                 ),
             }
         )
+    _note_device_ok()  # a positive reading: the device ran the whole pipeline, so the crash streak ends
     metric = "trace_per_token_ms" if method == "trace" else "eager_full_pipeline_ms"
     mode = _fullpipe_mode(method, path)
     base_path = _FULLPIPE_BASELINE_1CQ_PATH
@@ -6071,16 +6316,21 @@ def _gate_rung_allowance(rung: str) -> int | None:
     return None
 
 
-def _rung_allowance(op_signature: str, kernel_kind: str, attempts: list) -> tuple[int, int]:
+def _rung_allowance(op_signature: str, kernel_kind: str, attempts: list, partial: bool = False) -> tuple[int, int]:
     """(attempts already made, how many are permitted) for this (op, rung).
 
     Mirrors the policy _op_ladder_status already applies when handing rungs out, so the two cannot
     drift: knob rungs get _MAX_KNOB_RETRIES, deep rungs get one, and a knob is capped to one once the
     op has gone deep (perf_mcp.py:1338 -- a second knob search is not worth it after a structural or
     kernel rung exists). Failed measurements do not count against the allowance; nothing was learned.
+    partial: a subset try (applied_blocks given), counted against _partial_knob_state's allowance --
+    none at all until a whole-stack try of the knob came back pcc_low.
     """
     rung = _normalise_rung(kernel_kind)
-    matches = [a for a in attempts if _op_match(op_signature, a)]
+    if partial:
+        st = _partial_knob_state(op_signature, rung, attempts)
+        return (len(st["partials"]), st["allowed"]) if st else (0, 0)
+    matches = [a for a in attempts if _op_match(op_signature, a) and not _is_partial(a)]
     tries = sum(
         1
         for a in matches
@@ -6145,7 +6395,13 @@ _KNOB_RUNG_NAMES = frozenset(_KNOBS)
 
 @mcp.tool()
 def record_kernel_attempt(
-    op_signature: str, kernel_kind: str, measured_ms: float, beat_baseline: bool, note: str = "", stages_json: str = ""
+    op_signature: str,
+    kernel_kind: str,
+    measured_ms: float,
+    beat_baseline: bool,
+    note: str = "",
+    stages_json: str = "",
+    applied_blocks: str = "",
 ) -> dict:
     """Record that you AUTHORED and MEASURED a real custom kernel for an open op (tt-lang or C++).
 
@@ -6160,7 +6416,9 @@ def record_kernel_attempt(
     kernel actually exists in the model source — a record with no kernel present is flagged and will
     NOT clear the op. stages_json: OPTIONAL per-stage trace timings for this lever (the same
     JSON list of {"name","ms","dominant?"} you would pass hitl_gate) — rendered as the block-level
-    timing table in RUN_REPORT.md so BOTH hitl and non-hitl runs surface where device time went."""
+    timing table in RUN_REPORT.md so BOTH hitl and non-hitl runs surface where device time went.
+    applied_blocks: ONLY for a PCC-BOUNDED PARTIAL knob try (the ladder says so in its reason) -- the
+    repeated-stack instance indices the lowered setting was applied to, e.g. '0-29' or '[0, 2, 4]'."""
     # CONFIG/STRUCTURAL kinds — changes with NO custom-kernel source marker: program-config knobs
     # (grid/dtype), trace/2-CQ host-loop transforms, and dataflow restructures (gather/fusion/cache).
     # Accepted as detected; the re-profile + PCC verify the real effect. Only true kernel kinds
@@ -6227,9 +6485,16 @@ def record_kernel_attempt(
     # and the trace replay it had already paid minutes for was gone -- the next, legitimate kind on
     # the same op then refused too, for "owns no end-to-end measurement". Order matters because one
     # of these two refusals is free to retry and the other is not.
+    _blocks = _parse_blocks(applied_blocks)
+    if _blocks is None:
+        return {
+            "recorded": False,
+            "refused": "applied_blocks %r is not a list of instance indices (e.g. '0-29' or '[0, 2]')"
+            % (applied_blocks,),
+        }
     if os.environ.get("PERF_MCP_ALLOW_RETRIED_RUNG") != "1":
         _all = [a for a in _load_attempts_all() if not a.get("measurement_failed")]
-        _tries, _allowed = _rung_allowance(op_signature, kernel_kind, _all)
+        _tries, _allowed = _rung_allowance(op_signature, kernel_kind, _all, partial=bool(_blocks))
         if _tries >= _allowed:
             _done_kinds = sorted(
                 {
@@ -6244,6 +6509,11 @@ def record_kernel_attempt(
                 "refused": (
                     "rung %r on %r is CLOSED: %d of %d permitted attempt(s) already recorded"
                     % (_normalise_rung(kernel_kind), op_signature, _tries, _allowed)
+                    + (
+                        " (subset tries; they are owed only after a whole-stack try of this knob failed PCC)"
+                        if _blocks
+                        else ""
+                    )
                 ),
                 "already_tried": _done_kinds,
                 "rungs_still_open": _left,
@@ -6279,7 +6549,7 @@ def record_kernel_attempt(
         # it. See _autorecord_diverged.
         _fp_now = gate_verdicts().get("full_pipeline") or {}
         if str(_fp_now.get("status")) == "diverged":
-            _autorecord_diverged(op_signature, kernel_kind, note, _fp_now)
+            _autorecord_diverged(op_signature, kernel_kind, note, _fp_now, _blocks)
         return {
             "recorded": False,
             "refused": (
@@ -6340,6 +6610,7 @@ def record_kernel_attempt(
         "fullpipe_measured_here": _fpv["own"],
         "note": note,
         "stages": stages,
+        **({"applied_blocks": _blocks} if _blocks else {}),
         "kernel_detected_in_source": detected,
         # WHICH LIBRARY GRADED THIS. A hand-written kernel only ever beat the stock op of its day, and
         # without the version of that day there is no way to notice when ttnn has moved past it --
@@ -6947,8 +7218,10 @@ def _fold_gate(prof: dict, attempts: list) -> dict | None:
     if not cands:
         return None  # (1) not applicable: nothing recurs within a layer
     gap = sum(float(o.get("gap_ms") or 0.0) for o in cands)
-    if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
+    _req = _per_request_reader(prof)
+    if not _req.material_sum(cands):
         return None
+
     # THE LADDER IS PER GROUP. It was read off every attempt the model ever recorded, so one fold win on
     # one group answered the ladder for all of them: an image-edit port's early folds of its vision
     # reduction and its VAE convs closed it, and no repeated group of its 50-step denoise was ever
@@ -6957,16 +7230,10 @@ def _fold_gate(prof: dict, attempts: list) -> dict | None:
     # Ranked by what the group costs ONE REQUEST -- its gap times its stage's cost weight, the weight
     # the blocking ranking uses -- so a group in a stage a request repeats is not queued behind groups
     # in stages it runs once. Only the first _FUSION_GROUPS_ENV groups are held to the ladder.
-    # A stage is read off the op_code only when that code names ONE group: several open groups under one
-    # bare class name cannot be placed by name, and such a group keeps weight 1 rather than borrow the
-    # stage where its class costs most (which boosted a vision elementwise group 130x as "denoise").
-    _w = stage_cost_weights(prof)
-    _codes = [str(o.get("op_code") or "") for o in ops]
-
+    # Placed by fingerprint, and by the bare op_code only when that code names ONE group -- see
+    # _open_op_stage, the placement rule this gate and the blocking ranking share.
     def _per_request(o):
-        code = str(o.get("op_code") or "")
-        stage = stage_of_op(code, prof) if _codes.count(code) == 1 else ""
-        return float(o.get("gap_ms") or 0.0) * float(_w.get(stage or "", 1.0))
+        return _req.gap(o, o.get("gap_ms"))
 
     _held = int(os.environ.get(_FUSION_GROUPS_ENV, _FUSION_GROUPS_DEFAULT) or _FUSION_GROUPS_DEFAULT)
     lever = worst = None
@@ -7058,7 +7325,7 @@ def _order_gate(prof: dict, attempts: list) -> dict | None:
     if not cands:
         return None  # (1) not applicable: no projection is adjacent to a slice/gather
     gap = sum(float(o.get("gap_ms") or 0.0) for o in cands)
-    if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
+    if not _per_request_reader(prof).material_sum(cands):
         return None
     if _gate_retired(_ORDER_LEVER, attempts):
         return None  # (2) measured win, or (3) capped
@@ -7117,7 +7384,7 @@ def _conv_gate(prof: dict, attempts: list) -> dict | None:
     if not convs:
         return None  # (1) not applicable: this model has no convolution at all
     gap = sum(float(o.get("gap_ms") or 0.0) for o in convs)
-    if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
+    if not _per_request_reader(prof).material_sum(convs):
         return None
     if _gate_retired(_CONV_LEVER, attempts):
         return None  # (2) measured win, or (3) capped
@@ -7183,7 +7450,7 @@ def _split_gate(prof: dict, attempts: list) -> dict | None:
     if not cands:
         return None  # (1) not applicable: nothing fused has open gap here
     gap = sum(float(o.get("gap_ms") or 0.0) for o in cands)
-    if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
+    if not _per_request_reader(prof).material_sum(cands):
         return None
     if _gate_retired(_SPLIT_LEVER, attempts):
         return None  # (2) measured win, or (3) capped
@@ -8115,6 +8382,99 @@ def _blocking_order_key(b: dict, short_names) -> tuple:
     return (done, -float(gap) * float(b.get("cost_weight") or 1.0))
 
 
+def _open_op_stage(o: dict, profile, codes) -> str:
+    """Which stage one OPEN OP lives in, or "". An open op is a fingerprint (op_code + shape).
+
+    BY THE FINGERPRINT FIRST. The bare op_code names a class that runs in every stage -- a matmul runs
+    in all of them -- so placing by it put every recurring-step matmul in whichever stage matmuls cost
+    the most, and weighed it as that stage. The shape is what tells a one-row step projection from a
+    prompt-length one.
+
+    By the bare code only when it names ONE open fingerprint (`codes`: every open op's code): several
+    groups under one class name cannot be placed by name, and such a group keeps no stage rather than
+    borrow the one where its class costs most -- which once boosted a vision elementwise group 130x as
+    the denoise stage."""
+    code = str((o or {}).get("op_code") or "").strip()
+    if not code:
+        return ""
+    shape = str((o or {}).get("shape") or "").strip()
+    if shape:
+        placed = stage_of_op("%s %s" % (code, shape), profile)
+        if placed:
+            return placed
+    if list(codes or ()).count(code) != 1:
+        return ""
+    return stage_of_op(code, profile)
+
+
+def _per_request_reader(profile):
+    """How much closing an open op's gap saves ONE REQUEST, and whether that is material -- read once.
+
+    THE CUTOFF USED TO RUN BEFORE THE WEIGHT. termination_check dropped every op whose PROFILED gap was
+    under _material_gap_ms, and only the survivors were weighed by stage_cost_weights. The profile runs
+    a recurring step once, so a stage a request repeats 127 times showed every op under the cutoff:
+    all of them were dropped before the x127 could apply, the queue held only once-per-request stages,
+    and the stage the band check named as still short was never offered an op. The same raw-gap test
+    sat in every structural gate, so none of them could see that stage either.
+
+    Membership is the OLD test OR the new one, so it only ever widens: an op that was material is still
+    material, and an op is also material when its gap times its stage's weight clears the cutoff
+    restated per request (the profile's device_ms with each marked stage's share scaled by its weight,
+    never below 1, so the cutoff can only rise to meet the larger units).
+
+    A GAP ITS STAGE CANNOT RESOLVE IS NOT MULTIPLIED. Multiplying a gap multiplies its error with it,
+    so the weight is withheld from an op whose gap is inside its stage's measured run-to-run wobble
+    (read_stage_spread x the op's own device_ms). With no spread on file nothing is withheld; the
+    roofline has already left any gap within its absolute noise floor at_floor, and the per-op launch
+    cost is already inside every op's floor.
+
+    Fields: weights ({stage: weight}, stage_cost_weights), stage(o), gap(o, raw) -> per-request ms,
+    material(o, raw) -> bool, material_sum(ops) -> bool (a gate's summed gap_ms). Stage names are
+    whatever the capture and the pipeline report."""
+    import types as _types
+
+    profile = profile or {}
+    weights = stage_cost_weights(profile)
+    spread = _measured_spread() if weights else {}
+    codes = [str(o.get("op_code") or "").strip() for o in profile.get("open_ops") or [] if isinstance(o, dict)]
+    dev = float(profile.get("device_ms") or 0.0)
+    cutoff_raw = _material_gap_ms(dev)
+    req_dev = dev
+    for st, buckets in (profile.get("stage_buckets") or {}).items():
+        st_ms = sum(float(b.get("device_ms") or 0.0) for b in (buckets or []) if isinstance(b, dict))
+        req_dev += st_ms * (max(1.0, float(weights.get(st, 1.0))) - 1.0)
+    cutoff_req = _material_gap_ms(req_dev)
+
+    placed = {}  # one lookup per fingerprint: the cutoff and the entry both ask
+
+    def stage(o):
+        if not weights:
+            return ""
+        key = (str((o or {}).get("op_code") or ""), str((o or {}).get("shape") or ""))
+        if key not in placed:
+            placed[key] = _open_op_stage(o, profile, codes)
+        return placed[key]
+
+    def gap(o, raw):
+        raw = float(raw or 0.0)
+        st = stage(o)
+        w = float(weights.get(st or "", 1.0))
+        if w > 1.0 and spread.get(st) and raw <= float(o.get("device_ms") or 0.0) * float(spread[st]):
+            w = 1.0
+        return raw * w
+
+    def material(o, raw):
+        return float(raw or 0.0) >= cutoff_raw or gap(o, raw) >= cutoff_req
+
+    def material_sum(ops):
+        # A structural gate's applicability test, over the summed gap_ms of its candidates.
+        ops = [o for o in ops or [] if isinstance(o, dict)]
+        raw = sum(float(o.get("gap_ms") or 0.0) for o in ops)
+        return raw >= cutoff_raw or sum(gap(o, o.get("gap_ms")) for o in ops) >= cutoff_req
+
+    return _types.SimpleNamespace(weights=weights, stage=stage, gap=gap, material=material, material_sum=material_sum)
+
+
 def stage_of_op(op, profile) -> str:
     """Which stage this op costs the most in, read from the capture, or "" when it cannot say.
 
@@ -8428,13 +8788,17 @@ def termination_check() -> dict:
     attempts = [a for a in _load_attempts_all() if _attempt_counts_for_the_ladder(a)]
     blocking, cleared = [], []
     material = _material_gap_ms(dev)
+    # The gates read this view too (see _gate_prof below); built first so the cutoff is judged per
+    # request -- an op's gap times its stage's weight -- not per profiled pass (_per_request_reader).
+    _gate_prof = {**prof, "open_ops": rep.get("open_ops") or []}
+    _req = _per_request_reader(_gate_prof)
     for o in rep.get("open_ops") or []:
         gap = o.get("gap_ms") or 0.0
         # eff_gap is precision-aware for matmuls, == gap otherwise; keep the op if EITHER is material.
         eff_gap = o.get("eff_gap_ms")
         if eff_gap is None:
             eff_gap = gap
-        if max(gap, eff_gap) < material:
+        if not _req.material(o, max(gap, eff_gap)):
             continue
         op_code = o.get("op_code") or o.get("bucket") or ""
         entry = {
@@ -8475,7 +8839,9 @@ def termination_check() -> dict:
         # WHERE THIS OP LIVES, resolved once here rather than again for whichever entry wins: the
         # ordering below needs it for every candidate, and next_target used to recompute it for the
         # one it picked.
-        entry["stage"] = stage_of_op(op_code, prof)
+        # By fingerprint when the weights are in force (_open_op_stage): the bare code put every
+        # recurring-step matmul in whichever stage matmuls cost most. Unweighted, exactly as before.
+        entry["stage"] = _req.stage(o) if _req.weights else stage_of_op(op_code, prof)
         done, rung, reason = _op_ladder_status(o, op_code, attempts)
         if done:
             cleared.append({**entry, "verdict": reason})
@@ -8493,11 +8859,11 @@ def termination_check() -> dict:
     # the shape this caller had, so the gate logic was pinned while the wiring between the two was
     # never exercised at all.
     #
-    # A merged view rather than a mutation: `prof` is the cached profile object, and the roofline's
-    # work queue is a derived reading of it, not a property of the capture. Handed to every gate,
+    # A merged view rather than a mutation (built above the per-op loop, which reads it too): `prof`
+    # is the cached profile object, and the roofline's work queue is a derived reading of it, not a
+    # property of the capture. Handed to every gate,
     # including the two that read other fields today, so the next gate to read open_ops cannot
     # inherit this by being wired the older way.
-    _gate_prof = {**prof, "open_ops": rep.get("open_ops") or []}
     host_block = _host_gate(_gate_prof, blocking, attempts)
     if host_block:
         blocking.append(host_block)
@@ -8539,7 +8905,7 @@ def termination_check() -> dict:
     # WEIGHED BY WHAT THE STAGE REALLY COSTS (stage_cost_weights): the gap is read off a capped
     # profile that samples the stages unequally. The gap itself is reported unchanged; only the
     # order uses the weight, and with no weights every op's is 1 and the order is the old one.
-    _weights = stage_cost_weights(prof)
+    _weights = _req.weights
     for b in blocking:
         b["cost_weight"] = round(float(_weights.get(b.get("stage") or "", 1.0)), 4)
     blocking.sort(key=lambda b: _blocking_order_key(b, _short_names))

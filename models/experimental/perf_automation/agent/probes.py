@@ -213,6 +213,131 @@ def device_is_responsive(timeout_s: float = 20.0) -> bool:
         return False
 
 
+# How long the work probe below may sit with nothing being built before its silence is read as a hung
+# device. A healthy chip opens, runs and closes in 2-5 s (measured, warm and cold cache alike; build
+# time is not counted -- see _work_probe_once), so this is a wide margin, not an estimate.
+# 0 switches the probe off (device_runs_work answers None, and every caller keeps its old behaviour).
+WORK_PROBE_TIMEOUT_S = float(os.environ.get("PERF_MCP_WORK_PROBE_S", "60") or "0")
+# How many failures in a row it takes to call the device unable to run work (see device_runs_work).
+_WORK_PROBE_ATTEMPTS = int(os.environ.get("PERF_MCP_WORK_PROBE_ATTEMPTS", "3") or "1")
+# The build that may precede the op is bounded by this multiple of the timeout, and how often the
+# probe's process group is looked at for a running build.
+_WORK_PROBE_CEILING_MULT = 5
+_WORK_PROBE_POLL_S = 2.0
+_WORK_PROBE_READY = "PERF_WORK_PROBE_READY"
+_WORK_PROBE_OK = "PERF_WORK_PROBE_OK"
+# Every chip this process may see -- the run's own scope, inherited through TT_VISIBLE_DEVICES and its
+# descriptor -- is opened in turn and asked to add a tile to itself. ttnn's own TILE_SIZE, no shape of
+# ours. READY is printed once ttnn imported, so "could not run the probe" never reads as "device hung".
+_WORK_PROBE_CODE = """
+import torch, ttnn
+print(%(ready)r, flush=True)
+x = torch.ones(ttnn.TILE_SIZE, ttnn.TILE_SIZE, dtype=torch.bfloat16)
+for i in ttnn.get_device_ids():
+    d = ttnn.open_device(device_id=i)
+    try:
+        t = ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=d)
+        assert torch.equal(ttnn.to_torch(ttnn.add(t, t)).to(x.dtype), x + x), "chip %%s added wrong" %% i
+    finally:
+        ttnn.close_device(d)
+print(%(ok)r, flush=True)
+""" % {
+    "ready": _WORK_PROBE_READY,
+    "ok": _WORK_PROBE_OK,
+}
+
+
+def device_runs_work(timeout_s: float = None, attempts: int = None):
+    """Can the device RUN anything? True, False, or None when the question could not be put.
+
+    THE OTHER LIVENESS SIGNALS READ THE ARC. device_is_responsive asks tt-smi and board_telemetry reads
+    the die temperature; both come from the board-management firmware, which keeps answering while the
+    Tensix cores are hung. Measured 2026-10-13/14 on a QB2 (MiniCPM5-2B on chip 3): after the first
+    hang every device run on that chip hung -- the profiler, and the trace run without it -- for
+    fifteen hours across four rounds, while each recovery printed "no reset issued" because tt-smi
+    answered and every chip reported a die temperature. A manual `tt-smi -r` of that board cleared it.
+
+    So this asks the question a run actually needs answered: open each visible chip, add a tile to
+    itself, check the sum, close. Each attempt runs in its own session and is bounded, so a hung chip
+    costs the timeout per attempt and the probe's process group is killed, never left holding the device.
+
+    True:  every visible chip ran the op and returned the right answer.
+    False: ttnn imported, then a chip failed, answered wrong, or did not finish in time -- a device that
+           cannot run work, whatever its ARC says.
+    None:  the probe is switched off, or ttnn itself could not be imported -- no evidence either way,
+           so a caller must decide exactly as it did before this probe existed.
+
+    ONE FAILURE IS NOT A VERDICT. Measured 2026-10-14 on an idle, healthy p300c chip with `tt-smi -s`
+    running in a loop beside it (the dashboard and the run's own telemetry poll it): one probe in three
+    hung until it was killed, and the probes either side of it passed in 2.5 s. A probe that resets on
+    one failure would reset healthy boards on a busy host. A hung chip fails EVERY attempt; contention
+    does not. So False needs `attempts` failures in a row, and any pass is a pass.
+
+    Never call it while this process holds the device: it opens the device itself.
+    """
+    timeout_s = WORK_PROBE_TIMEOUT_S if timeout_s is None else float(timeout_s)
+    if timeout_s <= 0:
+        return None
+    attempts = max(1, int(_WORK_PROBE_ATTEMPTS if attempts is None else attempts))
+    answers = []
+    for n in range(attempts):
+        if n:
+            time.sleep(_WORK_PROBE_POLL_S)
+        answers.append(_work_probe_once(timeout_s))
+        if answers[-1] is True:
+            return True
+    return False if all(a is False for a in answers) else None
+
+
+def _work_probe_once(timeout_s: float):
+    """One bounded run of the work probe: True, False or None, as device_runs_work describes."""
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _WORK_PROBE_CODE],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    except Exception:  # noqa: BLE001 -- no interpreter to run it with: no evidence
+        return None
+    # THE CLOCK RUNS ONLY WHILE NOTHING IS BEING BUILT. A cold JIT cache compiles the firmware and the
+    # op's kernels first, in compiler subprocesses of the probe. Measured 2026-10-14 on an idle,
+    # healthy p300c chip with the host loaded: the cold probe was still compiling at 180 s, while the
+    # same probe warm finished in under a second (21/21 cache hits). Counting that build against the
+    # timeout would call a healthy chip hung and reset it -- the 2026-08-17 failure. A device wait
+    # spawns no process, so "no member of the probe's group but the probe itself" is the hang clock,
+    # and the build is bounded separately by the ceiling.
+    started = quiet_since = time.monotonic()
+    ceiling = timeout_s * _WORK_PROBE_CEILING_MULT
+    building = False
+    while True:
+        try:
+            out, _ = proc.communicate(timeout=_WORK_PROBE_POLL_S)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.monotonic()
+        building = any(p != proc.pid for p in _pgroup_members(proc.pid))
+        if building:
+            quiet_since = now
+        if now - quiet_since >= timeout_s or now - started >= ceiling:
+            _reap_process_group(proc.pid)
+            try:
+                out, _ = proc.communicate(timeout=30)
+            except Exception:  # noqa: BLE001
+                out = ""
+            # Silent before ttnn even imported is a slow host, and a build still running at the
+            # ceiling is a slow build: neither is an answer from the device.
+            if _WORK_PROBE_READY not in (out or "") or building:
+                return None
+            return False
+    out = out or ""
+    if _WORK_PROBE_READY not in out:
+        return None
+    return proc.returncode == 0 and _WORK_PROBE_OK in out
+
+
 # WHERE tt-smi IS, ASKED ONCE. Nine sites resolved this independently -- eight spelled
 # `tt_smi_bin()` and the ninth, tt_smi_probe,
 # ran the bare name and trusted PATH. That one fails from any launch that does not inherit an
@@ -387,6 +512,13 @@ class TracyHangError(TracyRunError):
     """Watchdog killed a run that made no forward progress (stalled/deadlocked,
     e.g. an intermittent multi-chip CCL deadlock) — distinct from an edit-induced
     crash. Retriable: reset the device and re-profile."""
+
+
+class DiskFullError(TracyRunError):
+    """Watchdog killed a run because the disk its profile writes to fell below the free-space floor
+    (disk_floor_breached). NOT retriable as a hang: the space is still gone, so a retry would only
+    fill it again. Raised so the run fails with the reason instead of every process on the box
+    failing with ENOSPC."""
 
 
 _ERR_RE = re.compile(
@@ -1893,10 +2025,10 @@ def _execute(
             preexec_fn=preexec_fn,  # e.g. memory_cap_preexec_fn(); runs in the child after the new session
         )
 
-        def _kill_and_raise(reason: str):
+        def _kill_and_raise(reason: str, error=TracyHangError):
             _kill_tree(proc.pid)
             proc.wait()
-            raise TracyHangError(f"{label} {reason}; log: {log_path}") from None
+            raise error(f"{label} {reason}; log: {log_path}") from None
 
         pgid = proc.pid
         start = time.monotonic()
@@ -1909,6 +2041,8 @@ def _execute(
         poll = 5.0
         _therm = _thermal_watch_new()
         _mempress = memory_pressure_watch_new()
+        _disk_paths = (log_path.parent, cwd)
+        _disk_floor = disk_floor(_disk_paths)
         while True:
             try:
                 rc = proc.wait(timeout=poll)
@@ -1928,6 +2062,9 @@ def _execute(
                 pass
             _thermal_watch_sample(_therm, _therm_label)
             memory_pressure_watch_sample(_mempress, _therm_label)
+            _disk_low = disk_floor_breached(_disk_paths, _disk_floor)
+            if _disk_low:
+                _kill_and_raise(f"stopped before it filled the disk: {_disk_low}", DiskFullError)
             now = time.monotonic()
             try:
                 size = log_path.stat().st_size
@@ -2917,6 +3054,45 @@ def memory_cap_preexec_fn(margin_gb: float = None):
 
 _MEM_PRESSURE_WATCH_REPORT_S = 60.0
 _MEM_PRESSURE_WARN_PCT = float(os.environ.get("PERF_MCP_MEM_PRESSURE_WARN_PCT", "35") or "35")
+
+
+# THE DISK A PROFILE WRITES TO. A device log grows with every op of every core of every chip; a
+# decode that ignored its token window wrote a 97 GB profile_log_device.csv and filled the root disk
+# (Mistral-Small-4-119B-2603, 2026-10-14) -- the run died on ENOSPC, and so did every other process
+# writing to that disk. Below this many free GB the profiled run is stopped instead.
+_MIN_FREE_DISK_GB = float(os.environ.get("PERF_MCP_MIN_FREE_DISK_GB", "10") or "10")
+
+
+def _free_disk_gb(paths) -> dict:
+    """{path: free GB on its filesystem} for each path that can be measured."""
+    out = {}
+    for p in paths:
+        try:
+            out[p] = shutil.disk_usage(p).free / 1e9
+        except OSError:
+            continue
+    return out
+
+
+def disk_floor(paths) -> float:
+    """The free-space floor for a run about to write to `paths`: _MIN_FREE_DISK_GB, or half of what is
+    free at launch when that is less -- a disk that starts low is guarded against THIS run eating
+    what is left, rather than refused outright."""
+    free = _free_disk_gb(paths)
+    return min([_MIN_FREE_DISK_GB] + [f / 2 for f in free.values()])
+
+
+def disk_floor_breached(paths, floor_gb: float) -> str:
+    """'' while every measurable path's filesystem has at least floor_gb free; otherwise why not. A path
+    that cannot be measured is skipped: this guards a run, it never fails one by itself."""
+    for p, free_gb in _free_disk_gb(paths).items():
+        if free_gb < floor_gb:
+            return "%.1f GB free on the disk holding %s, under the %.1f GB floor (PERF_MCP_MIN_FREE_DISK_GB)" % (
+                free_gb,
+                p,
+                floor_gb,
+            )
+    return ""
 
 
 def memory_pressure_watch_new() -> dict:
