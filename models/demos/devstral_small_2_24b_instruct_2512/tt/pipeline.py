@@ -156,7 +156,7 @@ PLANNED_TP = 4
 #                     Short prompts (<= 192 KB per core) also keep the fused QKV output in L1 for that split.
 #                     The prefill RoPE computes at HiFi2. The concatenated SDPA heads reach the all_gather through L1.
 #   mistral3_patch_merger: the merging layer runs on minimal_matmul over the full grid (images folded into rows).
-#   pixtral_attention: the vision QKV runs on minimal_matmul over the full grid too.
+#   pixtral_attention: the vision QKV runs on minimal_matmul over the full grid too; so does the projector linear_2.
 #   pixtral_vision_model: equal-size images are uploaded already patchified on the host (patchify_host; tile layout),
 #                     so the device skips the reshape / permute chain over 14-pixel row-major sticks.
 #   attention (vision layer): each RMSNorm gamma is folded into the q/k/v and gate/up weights that read it (no separate
