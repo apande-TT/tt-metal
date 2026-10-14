@@ -140,7 +140,7 @@ class TtAttention:
         self.wo = _w(torch_module.o_proj)
         # Decode (one tile row) projections: 1-D multicast with a wide K block (bit-identical to the default).
         self.cfg_qkv = decode_linear_config(device, self.wqkv.shape[-2], self.wqkv.shape[-1])
-        self.cfg_o = decode_linear_config(device, self.wo.shape[-2], self.wo.shape[-1])
+        self.cfg_o = decode_linear_config(device, self.wo.shape[-2], self.wo.shape[-1], per_core_n=2)  # 64 tiles on 32 cores
         self.rot = ttnn.from_torch(
             _rotate_half_matrix(self.head_dim), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
