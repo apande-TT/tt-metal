@@ -36,6 +36,9 @@ class TtAttention:
     # The ffn norm's output (read once, by the MLP's gate/up, which frees it) lands in L1 while it takes at most this
     # many bytes per core (fp32 32 x 256 x 1024: 298 KB).
     FFN_NORM_L1_BYTES = 320 * 1024
+    # dtype the L1 ffn norm output enters the fused gate/up in (cast in L1): bf16 halves the activation blocks the
+    # LoFi gate/up unpacks and multicasts, and leaves room for full-depth K blocks.
+    GATE_UP_INPUT_DTYPE = ttnn.bfloat16
 
     def __init__(self, device, torch_module, mlp_cls=None) -> None:
         self.device = device
@@ -90,7 +93,12 @@ class TtAttention:
         n_bytes = 4 * int(h.shape[0]) * int(h.shape[-2]) * int(h.shape[-1]) // (grid.x * grid.y)
         l1 = self.FOLD_NORM_GAMMA and self.MATMUL_INPUT_DTYPE == ttnn.float32 and n_bytes <= self.FFN_NORM_L1_BYTES
         n = self.ffn_norm(h, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None)
-        out = ttnn.add(h, self.feed_forward(self._mm_in(n)))
+        if l1 and self.GATE_UP_INPUT_DTYPE not in (None, n.dtype):
+            n32, n = n, ttnn.typecast(n, self.GATE_UP_INPUT_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG)
+            ttnn.deallocate(n32)
+            out = ttnn.add(h, self.feed_forward(n))
+        else:
+            out = ttnn.add(h, self.feed_forward(self._mm_in(n)))
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
         return out
