@@ -171,7 +171,8 @@ PLANNED_TP = 4
 #                     so the device skips the reshape / permute chain over 14-pixel row-major sticks.
 #   pixtral_m_l_p: the vision fused gate/up weight is block-float8.
 #   attention (vision layer): each RMSNorm gamma is folded into the q/k/v and gate/up weights that read it (no separate
-#                     fp32 gamma multiply); those matmuls read the fp32 norm output directly (no cast to bf16).
+#                     fp32 gamma multiply); those matmuls read the fp32 norm output directly (no cast to bf16), the
+#                     gate/up from L1 (with 4-tile K blocks, so its product fits in L1 too).
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
 #   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py);
