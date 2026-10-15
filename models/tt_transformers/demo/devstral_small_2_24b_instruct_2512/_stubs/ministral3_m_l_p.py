@@ -35,6 +35,8 @@ DECODE_GATE_UP_BF4_DTYPE = ttnn.bfloat4_b
 DECODE_GATE_UP_BF4_LAYERS = frozenset(range(5, 36))
 # K tiles per activation multicast block of the bf4 decode gate / up projections (divides K = 160 tiles).
 DECODE_GATE_UP_K_BLOCK = 8
+# Math fidelity of the bf4 decode gate / up (HiFi3 == HiFi4 bit for bit on a block-float4 weight, see __init__).
+DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi3
 # K tiles per activation multicast block of the decode down projection (divides K = 256 tiles).
 DOWN_DECODE_K_BLOCK = 8
 
@@ -132,6 +134,18 @@ class TtMinistral3MLP:
                     fused_activation=None,
                     mcast_in0=True,
                 )
+            # bf4 layers multiply at DECODE_GATE_UP_BF4_FIDELITY. Matmul feeds the weight (in1) to SrcA, and a block-float4
+            # value has at most 3 significant mantissa bits, so every fidelity phase over SrcA's low bits multiplies
+            # zeros: HiFi3 accumulates exactly what HiFi4 does with one pass fewer.
+            self.gate_up_decode_cfg = None
+            if lowp:
+                self.gate_up_decode_cfg = ttnn.init_device_compute_kernel_config(
+                    device.arch(),
+                    math_fidelity=DECODE_GATE_UP_BF4_FIDELITY,
+                    math_approx_mode=False,
+                    fp32_dest_acc_en=True,
+                    packer_l1_acc=False,
+                )
         del w_gate, w_up
         self.w_down = _put(torch_module.down_proj.weight.T, shard(-2), self.DOWN_DTYPE)
         if self.DECODE_WEIGHTS:
@@ -215,8 +229,9 @@ class TtMinistral3MLP:
         # intermediates); silu is fused into the multiply (ttnn.linear's activation= runs as a separate unary op).
         l1 = ttnn.L1_MEMORY_CONFIG
         pc = self.gate_up_decode_pc
-        g = ttnn.linear(x, self.w_gate, program_config=pc, memory_config=l1, compute_kernel_config=self.compute_cfg)
-        u = ttnn.linear(x, self.w_up, program_config=pc, memory_config=l1, compute_kernel_config=self.compute_cfg)
+        cfg = self.compute_cfg if self.gate_up_decode_cfg is None else self.gate_up_decode_cfg
+        g = ttnn.linear(x, self.w_gate, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
+        u = ttnn.linear(x, self.w_up, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
         m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
         out = ttnn.linear(
             m,
