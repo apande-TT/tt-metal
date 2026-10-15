@@ -68,7 +68,7 @@ _USE_PICK_KERNEL = True
 # The LM head writes its logits as [1, S, B, V / S] (the same tile pages as [1, B, V]) so the sampler's top-k runs in
 # two stages: ttnn.topk's top-_SEG_K of each segment (S * B rows over the grid: its large-indices route splits by
 # rows, so one [B, V] row set kept 32 cores busy) and a k-way merge of the S sorted lists (kernels/sampler).
-_LOGIT_SEGMENTS = 34
+_LOGIT_SEGMENTS = 17
 _SEG_K = 128
 _SAMPLER_KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_stubs", "kernels", "sampler")
 
