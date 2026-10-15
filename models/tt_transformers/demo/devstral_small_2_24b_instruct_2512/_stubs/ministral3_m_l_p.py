@@ -116,8 +116,19 @@ class TtMinistral3MLP:
             # block-float4 gate / up copies (the whole stack in bf4 costs more accuracy than the gate allows).
             lowp = layer_idx is not None and layer_idx in DECODE_GATE_UP_BF4_LAYERS
             gu_dtype = DECODE_GATE_UP_BF4_DTYPE if lowp else DECODE_WEIGHT_DTYPE
-            self.w_gate = _put(w_gate, shard(-1), gu_dtype)
-            self.w_up = _put(w_up, shard(-1), gu_dtype)
+            # DECODE_GATE_UP_FUSED: gate, up and silu * up as one C++ program; the activation multicast once and both
+            # data-movement RISCs streaming the weights independently of it, from bank-major copies the program owns
+            # (tt/gate_up_decode.py). Otherwise two ttnn.linear calls on interleaved copies and the silu-multiply.
+            if DECODE_GATE_UP_FUSED:
+                from models.demos.devstral_small_2_24b_instruct_2512.tt.gate_up_decode import FusedGateUpDecode
+
+                if FusedGateUpDecode.supports(device, k, inter, gu_dtype):
+                    fid = DECODE_GATE_UP_BF4_FIDELITY if lowp else ttnn.MathFidelity.HiFi4
+                    put = lambda t, dtype: _put(t, shard(-1), dtype)
+                    self.fused_gate_up = FusedGateUpDecode(device, w_gate, w_up, gu_dtype, fid, put, tp)
+            if self.fused_gate_up is None:
+                self.w_gate = _put(w_gate, shard(-1), gu_dtype)
+                self.w_up = _put(w_up, shard(-1), gu_dtype)
             # bf4 layers: 1D multicast config with DECODE_GATE_UP_K_BLOCK-tile activation blocks. Each step costs
             # ~1.3 us of multicast latency, so the auto config's 2-tile blocks (80 steps over K = 160 tiles) are
             # latency-bound once the block-float4 weight halves the DRAM bytes behind each step (bf8 keeps the auto
@@ -149,14 +160,6 @@ class TtMinistral3MLP:
                     fp32_dest_acc_en=True,
                     packer_l1_acc=False,
                 )
-            # DECODE_GATE_UP_FUSED: gate, up and silu * up as one C++ program; the activation multicast once and both
-            # data-movement RISCs streaming the weights independently of it (tt/gate_up_decode.py)
-            if DECODE_GATE_UP_FUSED:
-                from models.demos.devstral_small_2_24b_instruct_2512.tt.gate_up_decode import FusedGateUpDecode
-
-                if FusedGateUpDecode.supports(device, self.w_gate, self.w_up):
-                    fid = DECODE_GATE_UP_BF4_FIDELITY if lowp else ttnn.MathFidelity.HiFi4
-                    self.fused_gate_up = FusedGateUpDecode(device, self.w_gate, self.w_up, fid)
         del w_gate, w_up
         self.w_down = _put(torch_module.down_proj.weight.T, shard(-2), self.DOWN_DTYPE)
         if self.DECODE_WEIGHTS:
@@ -239,14 +242,7 @@ class TtMinistral3MLP:
         # The single-row gate / up / product stay in L1 for the down matmul (no DRAM round trip of the 32 x inter
         # intermediates); silu is fused into the multiply (ttnn.linear's activation= runs as a separate unary op).
         l1 = ttnn.L1_MEMORY_CONFIG
-        fused = (
-            self.fused_gate_up is not None
-            and tuple(int(d) for d in x.shape)[:-1] == (1, 1, ttnn.TILE_SIZE)
-            and x.dtype == ttnn.bfloat16
-            and x.layout == ttnn.TILE_LAYOUT
-            and not x.is_sharded()
-        )
-        if fused:  # one program: both projections + silu * up (tt/gate_up_decode.py)
+        if self.fused_gate_up is not None:  # one program: both projections + silu * up (tt/gate_up_decode.py)
             m = self.fused_gate_up(x)
         else:
             pc = self.gate_up_decode_pc
