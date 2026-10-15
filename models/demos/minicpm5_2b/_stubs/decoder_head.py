@@ -156,10 +156,13 @@ class DecoderHead:
         ps = list(x.padded_shape)
         return ps[-1] == self.k_dim and math.prod(ps[:-1]) == _TILE  # exactly one tile row
 
-    def _run_kernel(self, x, memory_config=None):
+    def _run_kernel(self, x, memory_config=None, segments=None):
         k = self._kernel
+        # With `segments` S the logits are allocated as [1, S, 32, V / S]: one tile row per segment, so its tile
+        # pages are exactly those of [.., 32, V] in the same order and the kernel writes them unchanged.
+        shape = list(x.shape)[:-1] + [self.vocab] if segments is None else [1, segments, 32, self.vocab // segments]
         out = ttnn.allocate_tensor_on_device(
-            ttnn.Shape(list(x.shape)[:-1] + [self.vocab]),
+            ttnn.Shape(shape),
             ttnn.bfloat16,
             ttnn.TILE_LAYOUT,
             self.device,
@@ -187,13 +190,15 @@ class DecoderHead:
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, k["compute"]], semaphores=[], cbs=k["cbs"])
         return ttnn.generic_op([x, *self.weights, out], program)
 
-    def __call__(self, x, *args, memory_config=None, **kwargs):
+    def __call__(self, x, *args, memory_config=None, segments=None, **kwargs):
         if not isinstance(x, ttnn.Tensor):
             x = ttnn.from_torch(x, **_mesh_kw(self.device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT))
         elif x.layout != ttnn.TILE_LAYOUT:
             x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
         if self._kernel_ok(x):
-            return self._run_kernel(x, memory_config)
+            if segments is not None and (self.vocab // 32) % segments:
+                segments = None
+            return self._run_kernel(x, memory_config, segments)
         outs = [
             ttnn.linear(x, w, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             for w in self.weights

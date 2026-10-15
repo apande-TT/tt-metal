@@ -65,6 +65,11 @@ _USE_NOISE_KERNEL = True
 # Argmax over the candidates + token-id lookup written straight into tok_buf by one kernel (else: untilize,
 # argmax, tilize, gather, typecasts, reshape, copy).
 _USE_PICK_KERNEL = True
+# The LM head writes its logits as [1, S, B, V / S] (the same tile pages as [1, B, V]) so the sampler's top-k runs in
+# two stages: ttnn.topk's top-_SEG_K of each segment (S * B rows over the grid: its large-indices route splits by
+# rows, so one [B, V] row set kept 32 cores busy) and a k-way merge of the S sorted lists (kernels/sampler).
+_LOGIT_SEGMENTS = 34
+_SEG_K = 128
 _SAMPLER_KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_stubs", "kernels", "sampler")
 
 
@@ -229,11 +234,15 @@ class MiniCPM5Pipeline:
         top_k logits (ties kept), then drop the low tail whose ascending cumulative mass <= 1 - top_p.
         """
         B, V, k = self.batch, self.vocab, self.top_k
-        logits = ttnn.reshape(logits, (1, 1, B, V))
-        if self.temperature != 1.0:
+        if len(logits.shape) == 4 and logits.shape[1] > 1:
+            # Segmented logits [1, S, B, V / S] (temperature 1.0 only): the two-stage top-k.
+            top_vals, top_idx = self._topk_segmented(logits, k)  # fp32 values, uint32 ids
+        elif self.temperature != 1.0:
+            logits = ttnn.reshape(logits, (1, 1, B, V))
             scores = ttnn.multiply(ttnn.typecast(logits, ttnn.float32), 1.0 / self.temperature)
             top_vals, top_idx = ttnn.topk(scores, k=k, dim=-1)  # [1, 1, B, k], descending
         else:
+            logits = ttnn.reshape(logits, (1, 1, B, V))
             # bf16 -> fp32 is exact, so take the top k on the bf16 logits: that input routes to the
             # multi-core topk (an fp32 input falls to the single-core factory at this width).
             top_vals, top_idx = ttnn.topk(logits, k=k, dim=-1)
@@ -256,6 +265,65 @@ class MiniCPM5Pipeline:
         rank = ttnn.to_layout(rank, ttnn.TILE_LAYOUT)
         tok = ttnn.gather(top_idx, -1, ttnn.typecast(rank, top_idx.dtype) if rank.dtype != top_idx.dtype else rank)
         return ttnn.to_layout(ttnn.typecast(tok, ttnn.uint32) if tok.dtype != ttnn.uint32 else tok, ttnn.ROW_MAJOR_LAYOUT)
+
+    def _topk_segmented(self, logits, k):
+        """top-k over segmented logits [1, S, B, W]: each segment's top-_SEG_K by ttnn.topk (k <= _SEG_K, so every
+        global top-k token survives in its segment), then the k-way merge of the S sorted lists as one generic_op
+        (kernels/sampler/topk_merge.cpp, one core per batch row). Returns fp32 values and uint32 global ids,
+        [1, 1, B, k]."""
+        S, B, W = logits.shape[1], logits.shape[2], logits.shape[3]
+        vals, ids = ttnn.topk(logits, k=_SEG_K, dim=-1)  # [1, S, B, _SEG_K], descending, in-segment ids
+        l1 = ttnn.L1_MEMORY_CONFIG
+        top_vals = ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, B, k]), ttnn.float32, ttnn.TILE_LAYOUT, self.device, l1)
+        top_idx = ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, B, k]), ttnn.uint32, ttnn.TILE_LAYOUT, self.device, l1)
+        k_tiles = top_vals.padded_shape[-1] // 32
+        grid = self.device.compute_with_storage_grid_size()
+        full_rows, rem = divmod(B, grid.x)
+        ranges = []
+        if full_rows:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, full_rows - 1)))
+        if rem:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full_rows), ttnn.CoreCoord(rem - 1, full_rows)))
+        cores = ttnn.CoreRangeSet(ranges)
+        rt = ttnn.RuntimeArgs()
+        for row in range(B):
+            rt[row % grid.x][row // grid.x] = [row]
+        ks_tiles = vals.padded_shape[-1] // 32
+        tile = 2 * 32 * 32
+        scratch = 2 * S * ks_tiles * 2 * 64 + 2 * k_tiles * 2 * 64
+        cb = ttnn.CBDescriptor(
+            total_size=-(-scratch // tile) * tile,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.bfloat16, tile)],
+        )
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_SAMPLER_KERNELS, "topk_merge.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[k, k_tiles, S, W, ks_tiles, 0]
+            + list(ttnn.TensorAccessorArgs(vals).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(ids).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(top_vals).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(top_idx).get_compile_time_args()),
+            runtime_args=rt,
+            common_runtime_args=[
+                vals.buffer_address(),
+                ids.buffer_address(),
+                top_vals.buffer_address(),
+                top_idx.buffer_address(),
+            ],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=[cb])
+        ttnn.generic_op([vals, ids, top_vals, top_idx], program)
+        return top_vals, top_idx
+
+    def logits_to_torch(self, logits):
+        """Host [B, V] float logits from either layout ([1, B, V] or segmented [1, S, B, V / S])."""
+        t = ttnn.to_torch(logits)
+        if t.dim() == 4 and t.shape[1] > 1:
+            t = t.permute(0, 2, 1, 3)
+        return t.reshape(self.batch, self.vocab).float()
 
     def _candidate_noise(self, top_idx):
         """Noise of each top-k candidate, [1, 1, B, k] fp32, gathered from the segmented noise buffer.
@@ -362,7 +430,7 @@ class MiniCPM5Pipeline:
         self.prefill_hidden = self.final_norm(h)  # [B, Sp, H]: the state prefill hands every decode step
         last = ttnn.slice(self.prefill_hidden, (0, self.real_len - 1, 0), (B, self.real_len, H))
         last = ttnn.reshape(last, (1, B, H))  # B real rows in one tile row for the vocab matmul
-        logits = self.decoder_head(last)
+        logits = self.decoder_head(last, segments=self._logit_segments())
         self._emit(logits)
         return logits
 
@@ -392,11 +460,15 @@ class MiniCPM5Pipeline:
         h = self.encoder_stack(x, position_embeddings=cos_sin, kv_caches=self.kv_caches, attn_ctx=ctx)
         # Decode logits (8 MB) stay in L1 for the sampler's topk.
         l1 = ttnn.L1_MEMORY_CONFIG
-        logits = self.decoder_head(self.final_norm(h, memory_config=l1), memory_config=l1)
+        logits = self.decoder_head(self.final_norm(h, memory_config=l1), memory_config=l1, segments=self._logit_segments())
         self._emit(logits)
         ttnn.add(self.pos_buf, 1.0, output_tensor=self.pos_buf)
         ttnn.add(self.pos_i32, 1, output_tensor=self.pos_i32)
         return logits
+
+    def _logit_segments(self):
+        ok = self.vocab % (_LOGIT_SEGMENTS * _TILE) == 0 and self.temperature == 1.0 and self.top_k <= _SEG_K
+        return _LOGIT_SEGMENTS if ok and self.batch == 32 else None
 
     def prefill_step(self):
         return self._prefill_forward()
@@ -436,7 +508,7 @@ class MiniCPM5Pipeline:
             ttnn.synchronize_device(self.device)
             tok = self.read_tokens()
             if collect_logits:
-                step_logits.append(ttnn.to_torch(logits).reshape(B, self.vocab).float())
+                step_logits.append(self.logits_to_torch(logits))
             tok = torch.where(finished, torch.full_like(tok, self.pad_id), tok)
             out_tokens.append(tok)
             newly = (~finished) & torch.isin(tok, torch.tensor(self.eos_ids))
@@ -608,7 +680,7 @@ def _trace_capture_selftest(device, pipe, pcc_min):
             print(f"TRACE_CAPTURE_FAILED[{stage}]: {exc}; capacity C={pipe.capacity} cannot be traced")
             return False
         ttnn.execute_trace(device, tid, cq_id=0, blocking=True)
-        got = ttnn.to_torch(out).reshape(pipe.batch, pipe.vocab).float()
+        got = pipe.logits_to_torch(out)
         ttnn.release_trace(device, tid)
         ref = _stage_reference(pipe, stage, inputs, fed)
         worst = min(_pcc(got[b], ref[b]) for b in range(pipe.batch))
