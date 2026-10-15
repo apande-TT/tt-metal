@@ -174,9 +174,13 @@ class TtMinistral3MLP:
             else:
                 self.w_down_decode = _put(torch_module.down_proj.weight.T, shard(-2), DECODE_WEIGHT_DTYPE)
             grid = device.compute_with_storage_grid_size()
+            # On exactly the cores the N split occupies (160 tiles / 2 = 80: an 8 x 10 rectangle), so the activation
+            # multicast spans no idle columns of the full grid.
             n_per_core = -(-(n_out // 32) // (grid.x * grid.y))
+            n_cores = -(-(n_out // 32) // n_per_core)
+            down_grid = (8, n_cores // 8) if n_cores % 8 == 0 and n_cores // 8 <= grid.y else (grid.x, grid.y)
             self.down_decode_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
-                compute_with_storage_grid_size=(grid.x, grid.y),
+                compute_with_storage_grid_size=down_grid,
                 in0_block_w=DOWN_DECODE_K_BLOCK,
                 out_subblock_h=1,
                 out_subblock_w=n_per_core,
