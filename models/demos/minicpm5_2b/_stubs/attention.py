@@ -253,12 +253,23 @@ class TtAttention:
             attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.L1_MEMORY_CONFIG)
             attn = ttnn.reshape(attn, (1, b * seq, self.n_heads * self.head_dim))
             grid = self.device.compute_with_storage_grid_size()
+            m_t, n_t = attn.padded_shape[-2] // 32, self.wo.padded_shape[-1] // 32
             out = ttnn.linear(  # residual add input
                 attn,
                 self.wo,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
                 compute_kernel_config=self.compute_cfg,
-                core_grid=ttnn.CoreGrid(y=grid.y, x=grid.x),
+                # Full-grid 2-D multicast with 8-tile K blocks (8 K steps instead of the auto config's).
+                program_config=ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+                    compute_with_storage_grid_size=(grid.x, grid.y),
+                    in0_block_w=8,
+                    out_subblock_h=1,
+                    out_subblock_w=3,
+                    per_core_M=-(-m_t // grid.y),
+                    per_core_N=-(-n_t // grid.x),
+                    transpose_mcast=False,
+                    fused_activation=None,
+                ),
             )
             ttnn.deallocate(attn)
             return ttnn.reshape(out, (b, seq, out.shape[-1]))
