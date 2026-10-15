@@ -40,7 +40,7 @@ DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi3
 # K tiles per activation multicast block of the decode down projection (divides K = 256 tiles).
 DOWN_DECODE_K_BLOCK = 8
 # Decoder layers whose decode-only down copy is block-float4 (the others read the bf8 prefill weight).
-DECODE_DOWN_BF4_LAYERS = frozenset(range(16, 24))
+DECODE_DOWN_BF4_LAYERS = frozenset(range(15, 25))
 # Decode gate / up / silu-multiply as one C++ program (tt/gate_up_decode.py).
 DECODE_GATE_UP_FUSED = True
 
