@@ -39,6 +39,8 @@ DECODE_GATE_UP_K_BLOCK = 8
 DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi3
 # K tiles per activation multicast block of the decode down projection (divides K = 256 tiles).
 DOWN_DECODE_K_BLOCK = 8
+# Decoder layers whose decode-only down copy is block-float4 (the others read the bf8 prefill weight).
+DECODE_DOWN_BF4_LAYERS = frozenset(range(16, 24))
 # Decode gate / up / silu-multiply as one C++ program (tt/gate_up_decode.py).
 DECODE_GATE_UP_FUSED = True
 
@@ -168,8 +170,19 @@ class TtMinistral3MLP:
             # for only ~0.35 MB of weight per step; wider blocks put enough weight behind each step that the op
             # streams at the DRAM rate instead.
             n_out = torch_module.down_proj.weight.shape[0]
-            # (the prefill weight itself when it is already in that dtype)
-            if self.DOWN_DTYPE == DECODE_WEIGHT_DTYPE:
+            # (the prefill weight itself when it is already in that dtype). Layers in DECODE_DOWN_BF4_LAYERS read a
+            # block-float4 copy at DECODE_GATE_UP_BF4_FIDELITY (exact on a bf4 weight, see the gate / up above).
+            self.down_decode_cfg = None
+            if layer_idx is not None and layer_idx in DECODE_DOWN_BF4_LAYERS:
+                self.w_down_decode = _put(torch_module.down_proj.weight.T, shard(-2), DECODE_GATE_UP_BF4_DTYPE)
+                self.down_decode_cfg = ttnn.init_device_compute_kernel_config(
+                    device.arch(),
+                    math_fidelity=DECODE_GATE_UP_BF4_FIDELITY,
+                    math_approx_mode=False,
+                    fp32_dest_acc_en=True,
+                    packer_l1_acc=False,
+                )
+            elif self.DOWN_DTYPE == DECODE_WEIGHT_DTYPE:
                 self.w_down_decode = self.w_down
             else:
                 self.w_down_decode = _put(torch_module.down_proj.weight.T, shard(-2), DECODE_WEIGHT_DTYPE)
@@ -259,7 +272,7 @@ class TtMinistral3MLP:
             self.w_down_decode,
             program_config=self.down_decode_pc,
             dtype=self.DECODE_REDUCE_DTYPE if (self.DECODE_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
-            compute_kernel_config=self.compute_cfg,
+            compute_kernel_config=self.compute_cfg if self.down_decode_cfg is None else self.down_decode_cfg,
         )
         return self._reduce(out)
 
