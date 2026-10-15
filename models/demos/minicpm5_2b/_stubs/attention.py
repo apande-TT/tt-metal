@@ -149,6 +149,10 @@ class TtAttention:
         # The score scale as ttnn.multiply(scores, scale) sees it: a bf16 tile, made by that same scalar multiply.
         ones = ttnn.from_torch(torch.ones(1, 1, 32, 32), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
         self.scale_tile = ttnn.multiply(ones, self.scale)
+        # Stand-in for cache tiles past a row's position tile in the decode attention bmms (see _attn_bmm).
+        self.zero_tile = ttnn.from_torch(
+            torch.zeros(1, 1, 32, 32), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+        )
 
     def _to_tt(self, t):
         return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
@@ -320,7 +324,9 @@ class TtAttention:
                     ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
             fused_mask = _USE_ATTN_BMM_KERNEL and _FUSE_SCALE_MASK and ctx.mask_full is not None
             if _USE_ATTN_BMM_KERNEL:
-                scores = self._attn_bmm(qk, kv_cache.k, True, l1, mask_full=ctx.mask_full if fused_mask else None)
+                scores = self._attn_bmm(
+                    qk, kv_cache.k, True, l1, mask_full=ctx.mask_full if fused_mask else None, cur_pos=ctx.cur_pos
+                )
             else:
                 scores = ttnn.matmul(
                     qk,
@@ -339,9 +345,9 @@ class TtAttention:
             probs = ttnn.softmax(scores, dim=-1, compute_kernel_config=self.compute_cfg, memory_config=l1)
             if _USE_ATTN_BMM_KERNEL and _USE_HEAD_KERNELS and b == 32:
                 # probs.V with the head merge in its writer: straight to the o_proj input [1, B, n * D].
-                attn = self._attn_bmm(probs, kv_cache.v, False, l1, merge_groups=g)
+                attn = self._attn_bmm(probs, kv_cache.v, False, l1, merge_groups=g, cur_pos=ctx.cur_pos)
             elif _USE_ATTN_BMM_KERNEL:
-                attn = self._attn_bmm(probs, kv_cache.v, False, l1)
+                attn = self._attn_bmm(probs, kv_cache.v, False, l1, cur_pos=ctx.cur_pos)
             else:
                 attn = ttnn.matmul(
                     probs,
@@ -490,13 +496,17 @@ class TtAttention:
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
         return ttnn.generic_op([scores, self.scale_tile, mask_full, out], program)
 
-    def _attn_bmm(self, x, cache, transpose_b, memory_config, merge_groups=None, mask_full=None):
+    def _attn_bmm(self, x, cache, transpose_b, memory_config, merge_groups=None, mask_full=None, cur_pos=None):
         """Decode x [B, n_kv, rows, K] @ cache^T (transpose_b, cache [B, n_kv, C, D] -> [.., C]) or @ cache
         (-> [.., D]) as one generic_op (kernels/attn_bmm), bit-identical to the reuse bmm with a full-K block.
         With merge_groups (probs.V only) the writer scatters rows 0..groups-1 straight into the merged
         [1, B, n_kv * groups * D] (the head merge). With mask_full (scores only, [B, 1, 32, C]) the kernel also
-        applies _scale_mask_kernel's scale + mask to each packed score tile on the same core."""
+        applies _scale_mask_kernel's scale + mask to each packed score tile on the same core.
+        With cur_pos (int32 [B], one page) the reader stands a resident zero tile in for every cache tile past row b's
+        position tile instead of reading it from DRAM: those keys are masked (score -> the mask value, prob 0), and
+        unwritten slots are zero anyway, so the compute sees the inputs that leave its output unchanged."""
         fuse = mask_full is not None
+        skip = cur_pos is not None
         k_t = x.padded_shape[-1] // 32
         n = cache.padded_shape[-2] if transpose_b else cache.padded_shape[-1]
         if merge_groups is None:
@@ -509,10 +519,12 @@ class TtAttention:
         n_t = n // 32
         cores, rt = self._spread(math.prod(list(x.padded_shape)[:-1]) // 32 * n_t)
         tile = 2 * 32 * 32
-        cb_in0, cb_in1, cb_scale, cb_mask, cb_t, cb_t2, cb_out = 0, 1, 2, 3, 4, 5, 16
+        cb_in0, cb_in1, cb_scale, cb_mask, cb_t, cb_t2, cb_pos, cb_zero, cb_out = 0, 1, 2, 3, 4, 5, 6, 7, 16
         sizes = [(cb_in0, 2 * k_t), (cb_in1, 2 * k_t), (cb_out, 2)]
         if fuse:
             sizes += [(cb_scale, 1), (cb_mask, 2), (cb_t, 2), (cb_t2, 2)]
+        if skip:
+            sizes += [(cb_pos, 1), (cb_zero, 1)]
         cbs = [
             ttnn.CBDescriptor(
                 total_size=size * tile,
@@ -522,21 +534,27 @@ class TtAttention:
             for idx, size in sizes
         ]
         scale_t, mask_t = (self.scale_tile, mask_full) if fuse else (cache, cache)  # unused when not fused
+        pos_t, zero_t = (cur_pos, self.zero_tile) if skip else (cache, cache)  # unused without cur_pos
         reader = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_ATTN_BMM_DIR, "reader_attn_bmm.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[k_t, n_t, int(transpose_b), cb_in0, cb_in1, int(fuse), x.shape[1], cb_scale, cb_mask]
+            + [int(skip), cb_pos, cb_zero]
             + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(cache).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(scale_t).get_compile_time_args())
-            + list(ttnn.TensorAccessorArgs(mask_t).get_compile_time_args()),
+            + list(ttnn.TensorAccessorArgs(mask_t).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(pos_t).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(zero_t).get_compile_time_args()),
             runtime_args=rt["dm"],
             common_runtime_args=[
                 x.buffer_address(),
                 cache.buffer_address(),
                 scale_t.buffer_address(),
                 mask_t.buffer_address(),
+                pos_t.buffer_address(),
+                zero_t.buffer_address(),
             ],
             config=ttnn.ReaderConfigDescriptor(),
         )
@@ -575,7 +593,8 @@ class TtAttention:
             config=compute_cfg,
         )
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
-        return ttnn.generic_op([x, cache, mask_full, out] if fuse else [x, cache, out], program)
+        io = [x, cache] + ([mask_full] if fuse else []) + ([cur_pos, self.zero_tile] if skip else [])
+        return ttnn.generic_op(io + [out], program)
 
     def _spread(self, n_tiles):
         """Row-major core set over the grid for n_tiles work items, with [start, count] / [count] runtime args."""
