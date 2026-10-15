@@ -39,6 +39,8 @@ DECODE_GATE_UP_K_BLOCK = 8
 DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi3
 # K tiles per activation multicast block of the decode down projection (divides K = 256 tiles).
 DOWN_DECODE_K_BLOCK = 8
+# Decode gate / up / silu-multiply as one C++ program (tt/gate_up_decode.py).
+DECODE_GATE_UP_FUSED = True
 
 
 class TtMinistral3MLP:
@@ -47,6 +49,7 @@ class TtMinistral3MLP:
     OUT_DTYPE = ttnn.float32
     # Separate gate / up weights for the single-token decode path (the vision MLP subclasses never decode).
     DECODE_WEIGHTS = True
+    fused_gate_up = None
     # dtype the reduced output is all_gathered in (None: plain fp32 all_reduce). The text decoder reduce-scatters
     # in fp32 and gathers the reduced shard in bf16 (half the bytes); its residual add takes the bf16 unrounded.
     GATHER_DTYPE = ttnn.bfloat16
@@ -146,6 +149,14 @@ class TtMinistral3MLP:
                     fp32_dest_acc_en=True,
                     packer_l1_acc=False,
                 )
+            # DECODE_GATE_UP_FUSED: gate, up and silu * up as one C++ program; the activation multicast once and both
+            # data-movement RISCs streaming the weights independently of it (tt/gate_up_decode.py)
+            if DECODE_GATE_UP_FUSED:
+                from models.demos.devstral_small_2_24b_instruct_2512.tt.gate_up_decode import FusedGateUpDecode
+
+                if FusedGateUpDecode.supports(device, self.w_gate, self.w_up):
+                    fid = DECODE_GATE_UP_BF4_FIDELITY if lowp else ttnn.MathFidelity.HiFi4
+                    self.fused_gate_up = FusedGateUpDecode(device, self.w_gate, self.w_up, fid)
         del w_gate, w_up
         self.w_down = _put(torch_module.down_proj.weight.T, shard(-2), self.DOWN_DTYPE)
         if self.DECODE_WEIGHTS:
@@ -228,11 +239,21 @@ class TtMinistral3MLP:
         # The single-row gate / up / product stay in L1 for the down matmul (no DRAM round trip of the 32 x inter
         # intermediates); silu is fused into the multiply (ttnn.linear's activation= runs as a separate unary op).
         l1 = ttnn.L1_MEMORY_CONFIG
-        pc = self.gate_up_decode_pc
-        cfg = self.compute_cfg if self.gate_up_decode_cfg is None else self.gate_up_decode_cfg
-        g = ttnn.linear(x, self.w_gate, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
-        u = ttnn.linear(x, self.w_up, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
-        m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
+        fused = (
+            self.fused_gate_up is not None
+            and tuple(int(d) for d in x.shape)[:-1] == (1, 1, ttnn.TILE_SIZE)
+            and x.dtype == ttnn.bfloat16
+            and x.layout == ttnn.TILE_LAYOUT
+            and not x.is_sharded()
+        )
+        if fused:  # one program: both projections + silu * up (tt/gate_up_decode.py)
+            m = self.fused_gate_up(x)
+        else:
+            pc = self.gate_up_decode_pc
+            cfg = self.compute_cfg if self.gate_up_decode_cfg is None else self.gate_up_decode_cfg
+            g = ttnn.linear(x, self.w_gate, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
+            u = ttnn.linear(x, self.w_up, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
+            m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
         out = ttnn.linear(
             m,
             self.w_down_decode,

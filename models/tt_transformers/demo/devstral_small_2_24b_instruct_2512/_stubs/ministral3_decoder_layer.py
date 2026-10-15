@@ -155,7 +155,7 @@ class TtMinistral3DecoderLayer:
             res_mem = self.post_attention_layernorm.decode_mem(int(x.shape[-1]))
         h = self._residual_add(x, a, res_mem)
         if mode == "decode":
-            # unsharded into L1: the gate / up multicast this row once per K block straight from there
+            # unsharded into L1: the fused gate / up's sender core reads this row once from there and multicasts it
             n = self.post_attention_layernorm.decode(h, l1=True)
         else:
             n = self._bf16(self.post_attention_layernorm(self._bf16(h)))
