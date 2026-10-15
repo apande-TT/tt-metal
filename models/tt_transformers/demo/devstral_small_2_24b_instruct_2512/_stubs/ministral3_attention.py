@@ -117,6 +117,9 @@ class TtMinistral3Attention:
     # it takes at most this many bytes per core (76 KB at 32 x 128 rows; 248 KB at 416 rows does not fit beside SDPA's
     # static buffers).
     PREFILL_SDPA_OUT_L1_BYTES = 256 * 1024
+    # ... and the L1 heads are concatenated by one C++ program (tt/concat_heads.py: every core pushes the tiles of its
+    # own L1 bank to their slots) instead of nlp_concat_heads.
+    CPP_PREFILL_CONCAT = True
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -142,6 +145,11 @@ class TtMinistral3Attention:
         ), f"heads {self.num_heads}/{self.num_kv_heads} not divisible by TP={tp}"
         self.local_heads = lh = self.num_heads // tp
         self.local_kv_heads = lkv = self.num_kv_heads // tp
+        self.concat_heads = None
+        if self.CPP_PREFILL_CONCAT:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt.concat_heads import ConcatHeads
+
+            self.concat_heads = ConcatHeads(device)
 
         is_mesh = tp > 1
         shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else None
@@ -688,7 +696,11 @@ class TtMinistral3Attention:
             memory_config=ttnn.L1_MEMORY_CONFIG if sdpa_l1 else ttnn.DRAM_MEMORY_CONFIG,
         )
         heads = attn
-        attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.L1_MEMORY_CONFIG if concat_l1 else None)
+        concat_mem = ttnn.L1_MEMORY_CONFIG if concat_l1 else None
+        if self.concat_heads is not None and self.concat_heads.supports(attn):
+            attn = self.concat_heads(attn, concat_mem or ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=concat_mem)
         if sdpa_l1:
             ttnn.deallocate(heads)
         if self.tp > 1:
