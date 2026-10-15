@@ -39,6 +39,8 @@ DECODE_GATE_UP_K_BLOCK = 8
 DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi3
 # K tiles per activation multicast block of the decode down projection (divides K = 256 tiles).
 DOWN_DECODE_K_BLOCK = 8
+# Decode down projection as one C++ program streaming a bank-major weight copy (tt/down_decode.py).
+DOWN_DECODE_STREAM = True
 # Decoder layers whose decode-only down copy is block-float4 (the others read the bf8 prefill weight).
 DECODE_DOWN_BF4_LAYERS = frozenset(range(15, 25))
 # Decode gate / up / silu-multiply as one C++ program (tt/gate_up_decode.py).
@@ -173,7 +175,21 @@ class TtMinistral3MLP:
             # (the prefill weight itself when it is already in that dtype). Layers in DECODE_DOWN_BF4_LAYERS read a
             # block-float4 copy at DECODE_GATE_UP_BF4_FIDELITY (exact on a bf4 weight, see the gate / up above).
             self.down_decode_cfg = None
-            if layer_idx is not None and layer_idx in DECODE_DOWN_BF4_LAYERS:
+            lowp_down = layer_idx is not None and layer_idx in DECODE_DOWN_BF4_LAYERS
+            # DOWN_DECODE_STREAM: the decode down as one C++ program streaming its own bank-major weight copy
+            # (tt/down_decode.py: bit-identical to the 1D-multicast matmul); then no interleaved decode copy is made.
+            self.stream_down = None
+            if DOWN_DECODE_STREAM:
+                from models.demos.devstral_small_2_24b_instruct_2512.tt.down_decode import StreamDownDecode
+
+                wdt = DECODE_GATE_UP_BF4_DTYPE if lowp_down else DECODE_WEIGHT_DTYPE
+                if StreamDownDecode.supports(device, self.inter, n_out, wdt):
+                    fid = DECODE_GATE_UP_BF4_FIDELITY if lowp_down else ttnn.MathFidelity.HiFi4
+                    put = lambda t, dtype: _put(t, shard(-2), dtype)
+                    self.stream_down = StreamDownDecode(device, torch_module.down_proj.weight.T, wdt, fid, put, tp)
+            if self.stream_down is not None:
+                self.w_down_decode = None
+            elif lowp_down:
                 self.w_down_decode = _put(torch_module.down_proj.weight.T, shard(-2), DECODE_GATE_UP_BF4_DTYPE)
                 self.down_decode_cfg = ttnn.init_device_compute_kernel_config(
                     device.arch(),
@@ -267,6 +283,8 @@ class TtMinistral3MLP:
             g = ttnn.linear(x, self.w_gate, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
             u = ttnn.linear(x, self.w_up, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
             m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
+        if self.stream_down is not None:  # one program streaming the bank-major down copy (tt/down_decode.py)
+            return self._reduce(self.stream_down(m))
         out = ttnn.linear(
             m,
             self.w_down_decode,
