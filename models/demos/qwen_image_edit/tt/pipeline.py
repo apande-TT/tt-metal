@@ -28,6 +28,7 @@ from models.demos.qwen_image_edit.tt import inputs as I
 from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import (
     guard_tail,
+    small_weight_linear,
     split_limbs,
     sum_list,
     sum_parts,
@@ -112,6 +113,8 @@ class TtQwenImageEditPipeline:
         self.fused_tail = guard_tail if precise else None
         # and their lead limb's 8 exact lanes formed in one pass (a ragged K zero-padded to take it)
         self.lane_split = lanes_ttl.lanes8 if precise else None
+        # (the VAE shortcuts' small-weight products: the whole weight in every core's L1, M over the whole grid)
+        self.linear_kernel = small_weight_linear if precise else None
         # and their trailing limbs' products -- and the guard's tie-break product -- at HiFi2
         self.lo_fidelity = ttnn.MathFidelity.HiFi2 if precise else ttnn.MathFidelity.HiFi4
         # and their TP all-reduce's sum of the gathered float32 partials in one pass (no slice copies)
@@ -229,7 +232,7 @@ class TtQwenImageEditPipeline:
         # take linear_program_config's 1D full-grid config, and the bit-identical fused hooks apply to them too)
         with self._hook(_vae_resident, "VOTE_TAIL", self.vote_tail), self._hook(
             _vae_resident, "ROUND_BF16", self.round_bf16
-        ), self._fused_tail(exact_only=True):
+        ), self._hook(_te_attention, "LINEAR_KERNEL", self.linear_kernel), self._fused_tail(exact_only=True):
             return self.vae.encode(up.vae_image)
 
     def denoise_setup_state(self, up, prompt_embeds, image_latents):

@@ -342,3 +342,83 @@ def split_limbs(x, limbs=2):
     ]
     ttnn.generic_op([x] + outs, _program([x], outs, pages, compute=_SPLIT_COMPUTE, compute_args=[limbs]))
     return tuple(outs)
+
+
+_SW_READER = f"{_DIR}/small_w_mm_reader.cpp"
+_SW_COMPUTE = f"{_DIR}/small_w_mm_compute.cpp"
+_SW_MAX_W_TILES = 96  # the whole weight in each core's L1: 96 bf16 tiles (192 KB) beside the row and output blocks
+
+
+def small_weight_linear(p, w, fidelity=ttnn.MathFidelity.HiFi4):
+    """p [..., M, K] bf16 @ w [K, N] bf16 -> float32 [..., M, N] for a SMALL weight (the VAE's 1x1 conv shortcuts,
+    192 -> 384): every core reads the whole weight into L1 once and streams its own tile rows of p, each row's K
+    reduction in the float32 DST (k ascending) -- the M tile rows split over the whole grid, where the stock 2D
+    config spreads the narrow N over 6 of the 8 grid columns. None for a product it does not take."""
+    s, ws = list(p.shape), list(w.shape)
+    if len(ws) != 2 or len(s) < 2 or s[-1] != ws[0] or s[-1] % TILE or ws[1] % TILE or s[-2] % TILE:
+        return None
+    kt, nt = ws[0] // TILE, ws[1] // TILE
+    if kt * nt > _SW_MAX_W_TILES:
+        return None
+    for t in (p, w):
+        if t.dtype != ttnn.bfloat16 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded():
+            return None
+    rows = 1
+    for d in s[:-1]:
+        rows *= d
+    rt = rows // TILE
+    chunk = max(d for d in range(1, 9) if nt % d == 0)  # output tiles per DST pass (8 float32 tiles, full sync)
+    y = ttnn.empty((rows, ws[1]), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=p.device())
+    grid = p.device().compute_with_storage_grid_size()
+    work = _cores(grid, rt)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+    bf_page = _FP32_TILE_BYTES // 2
+
+    def cb(index, pages, dtype, page):
+        return ttnn.CBDescriptor(
+            total_size=pages * page,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=page)],
+        )
+
+    cbs = [
+        cb(0, 2 * kt, ttnn.bfloat16, bf_page),
+        cb(1, kt * nt, ttnn.bfloat16, bf_page),
+        cb(_OUT_CB, 2 * chunk, ttnn.float32, _FP32_TILE_BYTES),
+    ]
+    reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    for c, start, count in work:
+        reader_rt[c.x][c.y] = [p.buffer_address(), w.buffer_address(), start, count]
+        compute_rt[c.x][c.y] = [count]
+        writer_rt[c.x][c.y] = [y.buffer_address(), count * nt, start * nt]
+    compute_cfg = ttnn.ComputeConfigDescriptor(math_fidelity=fidelity, fp32_dest_acc_en=True, dst_full_sync_en=True)
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_SW_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(p).get_compile_time_args()
+            + ttnn.TensorAccessorArgs(w).get_compile_time_args()
+            + [kt, nt],
+            runtime_args=reader_rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_SW_COMPUTE,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[kt, nt, chunk],
+            runtime_args=compute_rt,
+            config=compute_cfg,
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[_OUT_CB] + ttnn.TensorAccessorArgs(y).get_compile_time_args(),
+            runtime_args=writer_rt,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    ttnn.generic_op([p, w, y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    return ttnn.view(y, s[:-1] + [ws[1]])

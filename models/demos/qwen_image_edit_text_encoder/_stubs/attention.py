@@ -530,6 +530,11 @@ def linear_program_config(x, w):
     return _LINEAR_CONFIGS[key]
 
 
+# Optional kernel for the precise linears' products: LINEAR_KERNEL(p, w, fidelity) -> p @ w in float32, or None for
+# a product it does not take.
+LINEAR_KERNEL = None
+
+
 def _linear_mm(x, w, fidelity=ttnn.MathFidelity.HiFi4):
     """p -> p @ w in float32 for the bf16 parts p of x (the precise linears' matmul)."""
     cfg = precise_config(fidelity)
@@ -538,7 +543,14 @@ def _linear_mm(x, w, fidelity=ttnn.MathFidelity.HiFi4):
         cfg = ttnn.WormholeComputeKernelConfig(
             math_fidelity=fidelity, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
         )
-    return lambda p: ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc)
+
+    def mm(p):
+        y = None if LINEAR_KERNEL is None else LINEAR_KERNEL(p, w, fidelity)
+        return (
+            y if y is not None else ttnn.linear(p, w, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc)
+        )
+
+    return mm
 
 
 def _add_bias(y, bias):
