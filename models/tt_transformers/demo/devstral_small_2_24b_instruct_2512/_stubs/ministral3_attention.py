@@ -768,7 +768,8 @@ class TtMinistral3Attention:
             scale=self.scale,
             program_config=self.sdpa_decode_cfg,
             compute_kernel_config=self.compute_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            # L1-interleaved: GQA allows no sharded SDPA output, and the head-shard reshard below reads it on-chip
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         # Concat heads per row with ttnn's fused decode op on the head shards (one batch row's tile-padded heads per
         # core) instead of a reshape that un-pads the 8 heads out of their 32-row tiles through DRAM.
