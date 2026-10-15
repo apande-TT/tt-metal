@@ -116,7 +116,8 @@ PLANNED_TP = 4
 #                     with the silu fused into the multiply and gate/up/product kept in L1 (no DRAM round trip);
 #                     decode gate / up / down read block-float8 copies (prefill keeps bf16); the decode down
 #                     projection runs a 1D multicast config with 8-tile K blocks (the auto config's 2-tile blocks
-#                     made it multicast-latency-bound).
+#                     made it multicast-latency-bound); layers 10-30 read block-float4 decode gate / up copies with
+#                     8-tile K blocks (bf4 on every layer: PCC 0.9921 < 0.995).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
 #                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
@@ -125,8 +126,9 @@ PLANNED_TP = 4
 #   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk);
 #                     lm_head weight in bfloat8_b (half the largest decode-step DRAM read). Decode skips the
 #                     full-row logits all_gather (the sampler reads the shards; VocabShards joins them on host reads).
-#   sample(): the step's noise is looked up row-major and tilized as (B, NB); the bucket is a bitwise and; the draw is
-#                     one top-1 over the noisy scores labelled with the candidate ids (no argmax + index gather).
+#   sample(): the candidates' noise is ONE data-movement program (NoiseLookup, kernels/noise_lookup.cpp) reading the
+#                     step's row of the resident table directly (no embedding / tilize / typecast / bitwise and / gather);
+#                     the draw is one top-1 over the noisy scores labelled with the candidate ids (no argmax + index gather).
 #                     The per-device vocab-shard top-k is VocabTopK (generic_op, kernels/topk_mid.cpp): 64 local ->
 #                     8 middle -> 1 final core instead of ttnn.topk's 64 -> 1 serial merge, 16-bit shard positions.
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
