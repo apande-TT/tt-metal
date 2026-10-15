@@ -119,6 +119,9 @@ PLANNED_TP = 4
 #                     made it multicast-latency-bound); layers 5-35 read block-float4 decode gate / up copies with
 #                     8-tile K blocks at HiFi3 (exact on a bf4 weight; bf4 on every layer: PCC 0.9921 < 0.995). The post-attention decode norm
 #                     unshards its bf16 output into L1, so gate / up fetch each K block of the row from L1, not DRAM.
+#                     Decode gate / up / silu-multiply run as ONE C++ program (tt/gate_up_decode.py: the activation
+#                     multicast once by a spare core, gate and up streamed by the two data-movement RISCs, fp32
+#                     silu * up, one rounding).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
 #                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
