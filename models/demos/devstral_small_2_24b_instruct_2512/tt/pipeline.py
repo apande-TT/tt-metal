@@ -122,7 +122,7 @@ PLANNED_TP = 4
 #                     Decode gate / up / silu-multiply run as ONE C++ program (tt/gate_up_decode.py: the activation
 #                     multicast once by a spare core, gate and up streamed by the two data-movement RISCs, fp32
 #                     silu * up, one rounding). The decode down projection's 1D multicast runs on exactly the 8 x 10
-#                     cores its N split occupies (not the 11 x 10 grid with idle columns); layers 16-23 read a
+#                     cores its N split occupies (not the 11 x 10 grid with idle columns); layers 15-24 read a
 #                     block-float4 down copy at HiFi3 (bf4 down on every layer: PCC 0.989 < 0.995).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
