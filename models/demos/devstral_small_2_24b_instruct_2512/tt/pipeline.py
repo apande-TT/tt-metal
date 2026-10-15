@@ -146,7 +146,8 @@ PLANNED_TP = 4
 #                     cast prompt rows: one fill_cache over (batch x kv_heads) folded into heads, the prompt
 #                     height-sharded one (user, head) slab per core (no pad to the capacity, no full-capacity typecast).
 #                     Decode SDPA reads q straight from its post-RoPE head shards (no copy to DRAM): its grid is the
-#                     8-wide head grid, so each batch row's output core is the core holding that row's q.
+#                     8-wide head grid, so each batch row's output core is the core holding that row's q. Its output
+#                     goes L1-interleaved (GQA allows no sharded output) for the reshard into the concat's head shards.
 #   ministral3_attention: prefill QKV (HiFi2, bf8 weight) and o_proj projections on minimal_matmul (full grid); prefill o_proj is
 #                     column-parallel over the all_gathered heads, emitting the residual's hidden slice (no reduce-scatter). Decode concatenates the SDPA heads
 #                     with nlp_concat_heads_decode on the head shards (no un-padding reshape through DRAM). Decode QKV
