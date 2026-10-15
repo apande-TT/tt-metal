@@ -44,12 +44,12 @@ void kernel_main() {
 
     compute_kernel_hw_startup(cb_in, cb_in, cb_x2);
     cb_wait_front(cb_eps, 1);
-    cb_wait_front(cb_in, Wt);
 
     // x^2
     reconfig_data_format(cb_in, cb_in);
     pack_reconfig_data_format(cb_x2);
     for (uint32_t b0 = 0; b0 < Wt; b0 += blk) {
+        cb_wait_front(cb_in, b0 + blk);  // the reader pushes the row in chunks: square each block as it lands
         mul_init(cb_in, cb_in, false);
         cb_reserve_back(cb_x2, blk);
         tile_regs_acquire();

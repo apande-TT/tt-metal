@@ -36,18 +36,23 @@ void kernel_main() {
     cb_push_back(cb_scaler, 1);
     cb_push_back(cb_eps, 1);
 
-    // The whole input row, and gamma for this core's slice.
-    cb_reserve_back(cb_in, Wt);
-    const uint32_t in_l1 = get_write_ptr(cb_in);
-    for (uint32_t t = 0; t < Wt; ++t) {
-        noc_async_read_page(t, x, in_l1 + t * tile_bytes);
-    }
+    // Gamma for this core's slice, then the whole input row pushed in chunks so compute squares a chunk while the
+    // next is in flight.
+    constexpr uint32_t chunk = 8;
     cb_reserve_back(cb_gamma, num_tiles);
     const uint32_t g_l1 = get_write_ptr(cb_gamma);
     for (uint32_t i = 0; i < num_tiles; ++i) {
         noc_async_read_page(t_start + i, gamma, g_l1 + i * tile_bytes);
     }
-    noc_async_read_barrier();
-    cb_push_back(cb_in, Wt);
+    cb_reserve_back(cb_in, Wt);
+    const uint32_t in_l1 = get_write_ptr(cb_in);
+    for (uint32_t t0 = 0; t0 < Wt; t0 += chunk) {
+        const uint32_t n = (Wt - t0) < chunk ? (Wt - t0) : chunk;
+        for (uint32_t t = t0; t < t0 + n; ++t) {
+            noc_async_read_page(t, x, in_l1 + t * tile_bytes);
+        }
+        noc_async_read_barrier();
+        cb_push_back(cb_in, n);
+    }
     cb_push_back(cb_gamma, num_tiles);
 }
