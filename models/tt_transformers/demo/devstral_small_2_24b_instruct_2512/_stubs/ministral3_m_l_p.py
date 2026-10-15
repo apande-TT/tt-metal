@@ -57,6 +57,8 @@ class TtMinistral3MLP:
     # dtype the reduced output is all_gathered in (None: plain fp32 all_reduce). The text decoder reduce-scatters
     # in fp32 and gathers the reduced shard in bf16 (half the bytes); its residual add takes the bf16 unrounded.
     GATHER_DTYPE = ttnn.bfloat16
+    # Set by the decoder layer: the decode all_gather writes straight into its residual add's width shards.
+    decode_gather_mem = None
     # dtype of the many-row (prefill) down projection's partials and their reduce-scatter (None: OUT_DTYPE). The text
     # decoder reduce-scatters prefill's partials in bf16 (half the bytes, no cast before the gather).
     PREFILL_REDUCE_DTYPE = ttnn.bfloat16
@@ -395,6 +397,8 @@ class TtMinistral3MLP:
             return out
         if out.dtype != self.GATHER_DTYPE:
             out = ttnn.typecast(out, self.GATHER_DTYPE)
+        if self.decode_gather_mem is not None and int(out.shape[-2]) == ttnn.TILE_SIZE:
+            return ttnn.all_gather(out, dim=3, memory_config=self.decode_gather_mem, **ccl)
         return ttnn.all_gather(out, dim=3, **ccl)
 
 

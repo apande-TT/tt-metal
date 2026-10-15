@@ -120,6 +120,9 @@ class TtMinistral3Attention:
     # ... and the L1 heads are concatenated by one C++ program (tt/concat_heads.py: every core pushes the tiles of its
     # own L1 bank to their slots) instead of nlp_concat_heads.
     CPP_PREFILL_CONCAT = True
+    # Set by the decoder layer: the width-sharded layout its decode residual add runs in. The decode all_gather of
+    # the reduced o_proj shard writes straight into it, so the add reads two shards (no interleaved row).
+    decode_gather_mem = None
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -394,6 +397,8 @@ class TtMinistral3Attention:
             return t
         if t.dtype != ttnn.bfloat16:
             t = ttnn.typecast(t, ttnn.bfloat16)
+        if self.decode_gather_mem is not None and int(t.shape[-2]) == ttnn.TILE_SIZE:
+            return ttnn.all_gather(t, dim=3, memory_config=self.decode_gather_mem, **ccl)
         return ttnn.all_gather(t, dim=3, **ccl)
 
     def _rope(self, x, cos, sin):
