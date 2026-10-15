@@ -280,6 +280,14 @@ class TtMinistral3Attention:
         # SDPA decode reads q straight from its head shards (batch row b on core (b % HEAD_GRID_X, b // HEAD_GRID_X)):
         # with sharded q, batch b's output core is core b of SDPA's grid in row-major order, so that grid is
         # HEAD_GRID_X wide (8 x 10: 2 cores per batch row = 1 per kv head, as on the full grid).
+        # Decode SDPA multiplies q by the block-float8 K / V cache at HiFi2 (fp32 accumulation kept): 42-44 -> 40 us.
+        self.sdpa_decode_compute_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
         grid = device.compute_with_storage_grid_size()
         self.sdpa_decode_cfg = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(min(self.HEAD_GRID_X, grid.x), grid.y),
@@ -767,7 +775,7 @@ class TtMinistral3Attention:
             cur_pos_tensor=cur_pos,
             scale=self.scale,
             program_config=self.sdpa_decode_cfg,
-            compute_kernel_config=self.compute_cfg,
+            compute_kernel_config=self.sdpa_decode_compute_cfg,
             # L1-interleaved: GQA allows no sharded SDPA output, and the head-shard reshard below reads it on-chip
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
