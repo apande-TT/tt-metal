@@ -50,7 +50,10 @@ class TtMinistral3Model:
         # q / k in interleaved-pair head_dim order with tables to match, so decode's RoPE runs fused on the head shards
         # (TtMinistral3Attention meta_rope); attention itself is unchanged by the shared permutation.
         self.rotary_emb = TtMinistral3RotaryEmbedding(device, torch_module.rotary_emb, interleaved=True)
-        self.layers = [TtMinistral3DecoderLayer(device, layer, meta_rope=True) for layer in torch_module.layers[:depth]]
+        self.layers = [
+            TtMinistral3DecoderLayer(device, layer, meta_rope=True, layer_idx=i)
+            for i, layer in enumerate(torch_module.layers[:depth])
+        ]
         self.norm = TtMinistral3RMSNorm.build(device, torch_module.norm)
         self.tp = self.layers[0].tp
         # the last layer's prefill output only feeds the bf16 all_gather below (see bf16_prefill_out)

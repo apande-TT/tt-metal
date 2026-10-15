@@ -60,8 +60,9 @@ class TtMinistral3DecoderLayer:
     # residual stream between layers), so neither norm has to re-shard its input first.
     SHARDED_DECODE_RESIDUAL = True
 
-    def __init__(self, device, torch_module, meta_rope=False) -> None:
-        """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order)."""
+    def __init__(self, device, torch_module, meta_rope=False, layer_idx=None) -> None:
+        """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order).
+        layer_idx: this layer's index in the stack (per-layer decode weight precision, see TtMinistral3MLP)."""
         self.device = device
         # Each norm's gamma is folded into the projections that read it (q/k/v; gate/up), so the norms apply no
         # weight and their outputs feed the matmuls without a separate gamma multiply.
@@ -72,7 +73,7 @@ class TtMinistral3DecoderLayer:
         self.tp = self.self_attn.tp
         self.input_layernorm = TtMinistral3RMSNorm.build(device, ln_in, fold_gamma=True)
         self.post_attention_layernorm = TtMinistral3RMSNorm.build(device, ln_post, fold_gamma=True)
-        self.mlp = TtMinistral3MLP(device, torch_module.mlp, in_scale=ln_post.weight)
+        self.mlp = TtMinistral3MLP(device, torch_module.mlp, in_scale=ln_post.weight, layer_idx=layer_idx)
         self.compute_cfg = self.self_attn.compute_cfg
         self.hidden = int(ln_in.weight.shape[0])
         self._stats_mask = None
