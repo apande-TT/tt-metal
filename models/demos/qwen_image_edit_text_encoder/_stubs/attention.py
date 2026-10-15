@@ -494,7 +494,9 @@ def linear_program_config(x, w):
         gx, gy = grid.x, grid.y
         pcm = -(-mt // gy)
         pcn = -(-nt // gx)
-        pcn += pcn % 2 if pcn > 1 else 0  # an even width admits 2-wide subblocks
+        even = pcn + (pcn % 2 if pcn > 1 else 0)  # an even width admits 2-wide subblocks
+        # ... unless rounding it up leaves grid columns idle (the VAE's 384 -> 1152: 36 tiles on 6 of 8 columns)
+        pcn = even if -(-nt // even) >= -(-nt // pcn) else pcn
         obw = _largest_divisor(pcn, 24)
         sbw = 2 if obw % 2 == 0 else 1
         # output block <= 120 float32 tiles (480 KB), height a multiple of the subblock height
