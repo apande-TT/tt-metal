@@ -252,7 +252,14 @@ class TtAttention:
             # [B, 1, S, n*D] in L1: o_proj's input and output (two 16 MB L1 tensors) still fit beside its static CBs.
             attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.L1_MEMORY_CONFIG)
             attn = ttnn.reshape(attn, (1, b * seq, self.n_heads * self.head_dim))
-            out = self._prefill_mm(attn, self.wo, memory_config=ttnn.L1_MEMORY_CONFIG)  # residual add input
+            grid = self.device.compute_with_storage_grid_size()
+            out = ttnn.linear(  # residual add input
+                attn,
+                self.wo,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+                compute_kernel_config=self.compute_cfg,
+                core_grid=ttnn.CoreGrid(y=grid.y, x=grid.x),
+            )
             ttnn.deallocate(attn)
             return ttnn.reshape(out, (b, seq, out.shape[-1]))
         else:
