@@ -375,7 +375,10 @@ class MiniCPM5Pipeline:
         cos_sin = self.rotary_embedding(x, position_ids=self.pos_buf)
         cur_pos = ttnn.reshape(ttnn.to_layout(self.pos_i32, ttnn.ROW_MAJOR_LAYOUT), (B,))  # one contiguous page
         pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1))
-        write = ttnn.typecast(ttnn.eq(self.key_index_kv, pos), ttnn.bfloat16)  # [B, kv, 1, C]
+        # The one-hot cache-slot selector is read only by the non-kernel KV write.
+        write = None
+        if not attention_stub._USE_KV_WRITE_KERNEL:
+            write = ttnn.typecast(ttnn.eq(self.key_index_kv, pos), ttnn.bfloat16)  # [B, kv, 1, C]
         mask = ttnn.typecast(ttnn.multiply(ttnn.gt(self.key_index_row, pos), _NEG), ttnn.bfloat16)  # [B, 1, 1, C]
         # cos / signed sin broadcast over a tile's rows once per step, shared by every layer's rope kernel.
         cos, sin = (ttnn.reshape(t, (B, 1, 1, self.head_dim)) for t in cos_sin)

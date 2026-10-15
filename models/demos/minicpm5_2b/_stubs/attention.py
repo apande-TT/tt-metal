@@ -783,7 +783,11 @@ class TtAttention:
             if attn_ctx.mode == "decode":
                 # Decode rows arrive as [1, B, hidden] so every linear sees B real rows, not B padded tiles.
                 b, seq = x.shape[-2], 1
-            cos, sin = self._cos_sin(position_embeddings, b, seq)
+            if attn_ctx.mode == "decode" and _USE_ROPE_KERNEL and attn_ctx.rope is not None:
+                # The rope kernel reads the step's shared cos / signed sin (ctx.rope): skip the per-layer reshape.
+                cos = sin = None
+            else:
+                cos, sin = self._cos_sin(position_embeddings, b, seq)
             return self._cached(x, cos, sin, kv_cache, attn_ctx, b, seq), None
 
         q = ttnn.linear(x, self.wq, compute_kernel_config=self.compute_cfg)
