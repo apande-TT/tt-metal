@@ -29,6 +29,14 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.minis
 PREFILL_ROWS_PER_CHUNK = 16384
 # dtype of the decode-only gate / up / down weight copies.
 DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
+# Decoder layers whose decode-only gate / up copies are block-float4 (a quarter of the bf16 bytes the single-token
+# step streams); the other layers keep DECODE_WEIGHT_DTYPE.
+DECODE_GATE_UP_BF4_DTYPE = ttnn.bfloat4_b
+DECODE_GATE_UP_BF4_LAYERS = frozenset(range(5, 36))
+# K tiles per activation multicast block of the bf4 decode gate / up projections (divides K = 160 tiles).
+DECODE_GATE_UP_K_BLOCK = 8
+# Math fidelity of the bf4 decode gate / up (HiFi3 == HiFi4 bit for bit on a block-float4 weight, see __init__).
+DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi3
 # K tiles per activation multicast block of the decode down projection (divides K = 256 tiles).
 DOWN_DECODE_K_BLOCK = 8
 
@@ -61,8 +69,9 @@ class TtMinistral3MLP:
     # takes at most this many bytes per core (the vision MLP's 8192 x 1024 bf16: 152 KB; the text MLP's is far larger).
     PREFILL_INTER_L1_BYTES = 192 * 1024
 
-    def __init__(self, device, torch_module, in_scale=None) -> None:
-        """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up."""
+    def __init__(self, device, torch_module, in_scale=None, layer_idx=None) -> None:
+        """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up.
+        layer_idx: the decoder layer's index (selects the decode gate / up precision, DECODE_GATE_UP_BF4_LAYERS)."""
         self.device = device
         try:
             mesh = int(device.get_num_devices())
@@ -100,9 +109,43 @@ class TtMinistral3MLP:
         del chunks
         if self.DECODE_WEIGHTS:
             # Decode streams every MLP weight once per token (DRAM-bound): it reads its own block-float8 copies, half
-            # the bytes of the bf16 weights prefill multiplies with.
-            self.w_gate = _put(w_gate, shard(-1), DECODE_WEIGHT_DTYPE)
-            self.w_up = _put(w_up, shard(-1), DECODE_WEIGHT_DTYPE)
+            # the bytes of the bf16 weights prefill multiplies with; the layers in DECODE_GATE_UP_BF4_LAYERS read
+            # block-float4 gate / up copies (the whole stack in bf4 costs more accuracy than the gate allows).
+            lowp = layer_idx is not None and layer_idx in DECODE_GATE_UP_BF4_LAYERS
+            gu_dtype = DECODE_GATE_UP_BF4_DTYPE if lowp else DECODE_WEIGHT_DTYPE
+            self.w_gate = _put(w_gate, shard(-1), gu_dtype)
+            self.w_up = _put(w_up, shard(-1), gu_dtype)
+            # bf4 layers: 1D multicast config with DECODE_GATE_UP_K_BLOCK-tile activation blocks. Each step costs
+            # ~1.3 us of multicast latency, so the auto config's 2-tile blocks (80 steps over K = 160 tiles) are
+            # latency-bound once the block-float4 weight halves the DRAM bytes behind each step (bf8 keeps the auto
+            # config: wider blocks are DRAM-bound there, 4-tile 116 us vs 112).
+            self.gate_up_decode_pc = None
+            if lowp:
+                grid = device.compute_with_storage_grid_size()
+                n_gu = -(-(inter // 32) // (grid.x * grid.y))
+                self.gate_up_decode_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                    compute_with_storage_grid_size=(grid.x, grid.y),
+                    in0_block_w=DECODE_GATE_UP_K_BLOCK,
+                    out_subblock_h=1,
+                    out_subblock_w=max(w for w in (1, 2, 3, 4) if n_gu % w == 0),
+                    per_core_M=1,
+                    per_core_N=n_gu,
+                    fuse_batch=True,
+                    fused_activation=None,
+                    mcast_in0=True,
+                )
+            # bf4 layers multiply at DECODE_GATE_UP_BF4_FIDELITY. Matmul feeds the weight (in1) to SrcA, and a block-float4
+            # value has at most 3 significant mantissa bits, so every fidelity phase over SrcA's low bits multiplies
+            # zeros: HiFi3 accumulates exactly what HiFi4 does with one pass fewer.
+            self.gate_up_decode_cfg = None
+            if lowp:
+                self.gate_up_decode_cfg = ttnn.init_device_compute_kernel_config(
+                    device.arch(),
+                    math_fidelity=DECODE_GATE_UP_BF4_FIDELITY,
+                    math_approx_mode=False,
+                    fp32_dest_acc_en=True,
+                    packer_l1_acc=False,
+                )
         del w_gate, w_up
         self.w_down = _put(torch_module.down_proj.weight.T, shard(-2), self.DOWN_DTYPE)
         if self.DECODE_WEIGHTS:
@@ -185,8 +228,10 @@ class TtMinistral3MLP:
         # The single-row gate / up / product stay in L1 for the down matmul (no DRAM round trip of the 32 x inter
         # intermediates); silu is fused into the multiply (ttnn.linear's activation= runs as a separate unary op).
         l1 = ttnn.L1_MEMORY_CONFIG
-        g = ttnn.linear(x, self.w_gate, memory_config=l1, compute_kernel_config=self.compute_cfg)
-        u = ttnn.linear(x, self.w_up, memory_config=l1, compute_kernel_config=self.compute_cfg)
+        pc = self.gate_up_decode_pc
+        cfg = self.compute_cfg if self.gate_up_decode_cfg is None else self.gate_up_decode_cfg
+        g = ttnn.linear(x, self.w_gate, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
+        u = ttnn.linear(x, self.w_up, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
         m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
         out = ttnn.linear(
             m,

@@ -110,14 +110,16 @@ class TtMinistral3RMSNorm:
         """The width-sharded L1 memory config decode norms of a D-wide row run in."""
         return self._decode_cfg(d)[0]
 
-    def decode(self, x, keep_sharded=False):
+    def decode(self, x, keep_sharded=False, l1=False):
         """Decode-mode norm of the (1, 1, B, D) residual row (fp32 or bf16), returned bf16 interleaved.
 
         The norm reads the residual in its own dtype -- an fp32 residual is not rounded to bf16 first, so the
         cast the prefill path needs (its interleaved kernel cannot hold an fp32 row of D in L1) is folded into
         the norm -- on a width-sharded row; the checkpoint gamma is applied after it, as in prefill.
         keep_sharded (unit gamma only): return the norm's own width-sharded output, in the residual's dtype, for a
-        consumer that reads those shards directly (the decode QKV)."""
+        consumer that reads those shards directly (the decode QKV).
+        l1 (unit gamma only): unshard into L1 instead of DRAM (the decode gate / up multicast the row from there
+        once per K block, so each block's activation fetch skips a DRAM round trip)."""
         mem, prog = self._decode_cfg(int(x.shape[-1]))
         n = ttnn.rms_norm(
             ttnn.to_memory_config(x, mem),
@@ -130,7 +132,8 @@ class TtMinistral3RMSNorm:
         if self.gamma is None:
             if keep_sharded:
                 return n
-            return ttnn.to_memory_config(n, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16)  # unshard + cast, one op
+            out_mem = ttnn.L1_MEMORY_CONFIG if l1 else ttnn.DRAM_MEMORY_CONFIG
+            return ttnn.to_memory_config(n, out_mem, dtype=ttnn.bfloat16)  # unshard + cast, one op
         n = ttnn.to_memory_config(n, ttnn.DRAM_MEMORY_CONFIG)
         return ttnn.multiply(n, self.gamma, dtype=ttnn.bfloat16)
 

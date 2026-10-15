@@ -116,7 +116,9 @@ PLANNED_TP = 4
 #                     with the silu fused into the multiply and gate/up/product kept in L1 (no DRAM round trip);
 #                     decode gate / up / down read block-float8 copies (prefill keeps bf16); the decode down
 #                     projection runs a 1D multicast config with 8-tile K blocks (the auto config's 2-tile blocks
-#                     made it multicast-latency-bound).
+#                     made it multicast-latency-bound); layers 5-35 read block-float4 decode gate / up copies with
+#                     8-tile K blocks at HiFi3 (exact on a bf4 weight; bf4 on every layer: PCC 0.9921 < 0.995). The post-attention decode norm
+#                     unshards its bf16 output into L1, so gate / up fetch each K block of the row from L1, not DRAM.
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
 #                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
@@ -125,13 +127,15 @@ PLANNED_TP = 4
 #   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk);
 #                     lm_head weight in bfloat8_b (half the largest decode-step DRAM read). Decode skips the
 #                     full-row logits all_gather (the sampler reads the shards; VocabShards joins them on host reads).
-#   sample(): the step's noise is looked up row-major and tilized as (B, NB); the bucket is a bitwise and; the draw is
-#                     one top-1 over the noisy scores labelled with the candidate ids (no argmax + index gather).
+#   sample(): the candidates' noise is ONE data-movement program (NoiseLookup, kernels/noise_lookup.cpp) reading the
+#                     step's row of the resident table directly (no embedding / tilize / typecast / bitwise and / gather);
+#                     the draw is one top-1 over the noisy scores labelled with the candidate ids (no argmax + index gather).
 #                     The per-device vocab-shard top-k is VocabTopK (generic_op, kernels/topk_mid.cpp): 64 local ->
 #                     8 middle -> 1 final core instead of ttnn.topk's 64 -> 1 serial merge, 16-bit shard positions.
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
 #                     directly (no bf16 cast op, no single-core interleaved norm); the decode QKV reads the input
-#                     norm's fp32 width shards as they are (20-tile K blocks of 5 shards; no unshard, cast, reshard);
+#                     norm's fp32 width shards as they are (20-tile K blocks of 5 shards; no unshard, cast, reshard;
+#                     3 readers per DRAM bank);
 #                     decode residual adds write straight into the norms' sharded layout (no re-shard per norm).
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
@@ -219,6 +223,61 @@ TRACE_REGION_SIZE = 300_000_000
 
 _TOPK_KERNELS = "ttnn/cpp/ttnn/operations/reduction/topk/device/kernels"
 _TOPK_MID_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_mid.cpp")
+_NOISE_LOOKUP_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "noise_lookup.cpp")
+
+
+class NoiseLookup:
+    """The sampler's per-candidate Gumbel noise as ONE data-movement program (generic_op, kernels/noise_lookup.cpp):
+    out[b, j] = noise_table[step, b * NB + ids[b, j] % NB] as a (1, 1, 32, 32) fp32 tile.
+
+    Replaces the step-row embedding, its reshape / tilize / typecast to fp32, the bucket bitwise_and and the
+    one-core ttnn.gather (~70 us of six ops): each RISC of CORES cores reads the step counter, then its ROWS rows
+    of that step's bf16 noise row straight from the resident table, and looks its rows' candidates up with integer
+    ops (bf16 -> fp32 is a 16-bit shift, so the values are bit-identical to the typecast + gather path)."""
+
+    CORES = 4
+    ROWS = 4  # rows per RISC: 32 rows = CORES x 2 RISCs x ROWS
+
+    def __init__(self, device, batch, k, buckets):
+        assert batch == 32 and k == 32 and buckets & (buckets - 1) == 0, (batch, k, buckets)
+        assert self.CORES * 2 * self.ROWS == 32 and 16 % self.ROWS == 0
+        self.device, self.buckets = device, buckets
+        self.core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(self.CORES - 1, 0))])
+
+    def _cb(self, index, size):
+        fmt = ttnn.CBFormatDescriptor(buffer_index=index, data_format=ttnn.uint32, page_size=size)
+        return ttnn.CBDescriptor(total_size=size, core_ranges=self.core, format_descriptors=[fmt])
+
+    def __call__(self, step, table, ids):
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape((1, 1, 32, 32)), ttnn.float32, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        io = [step, table, ids, out]
+        ct = [self.buckets, self.ROWS]
+        for t in io:
+            ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        addrs = [t.buffer_address() for t in io]
+        kernels = [
+            ttnn.KernelDescriptor(
+                kernel_source=_NOISE_LOOKUP_KERNEL,
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=self.core,
+                compile_time_args=ct,
+                runtime_args=[((c, 0), addrs + [(2 * c + h) * self.ROWS, h]) for c in range(self.CORES)],
+                config=cfg,
+            )
+            for h, cfg in ((0, ttnn.ReaderConfigDescriptor()), (1, ttnn.WriterConfigDescriptor()))
+        ]
+        # per RISC: 64 B step scratch, ROWS noise rows, ROWS rows of ids and of the output (two face runs each)
+        run = self.ROWS * 16 * 4
+        cbs = [
+            self._cb(0, 128),
+            self._cb(1, 2 * self.ROWS * self.buckets * 2),
+            self._cb(2, 2 * 2 * run),
+            self._cb(3, 2 * 2 * run),
+        ]
+        ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
+        return out
 
 
 class VocabTopK:
@@ -653,6 +712,8 @@ class DevstralPipeline:
         # (B, TP * K) candidate positions become vocab ids by adding their shard's first id (_shard_base), and one
         # more top-k over the TP * K candidates picks the winners.
         self._shard_base = None
+        full = self.batch == 32 and self.top_k == 32
+        self._noise_lookup = NoiseLookup(device, self.batch, self.top_k, NOISE_BUCKETS) if full else None
         tp = self._tp()
         if tp > 1:
             vocab = int(tcfg.vocab_size)
@@ -819,12 +880,15 @@ class DevstralPipeline:
         b, k, nb = self.batch, self.top_k, NOISE_BUCKETS
         vals, idx = self._topk(logits)
         scores = ttnn.multiply(ttnn.typecast(vals, ttnn.float32), 1.0 / self.temperature)
-        # The step's noise: one row-major lookup, a free row-major reshape to (B, NB), then a 32-row tilize (the
-        # tile-layout lookup tilized one 32768-wide row padded to a full tile and reshaped it after the cast).
-        noise = ttnn.embedding(state["step"], state["noise"], layout=ttnn.ROW_MAJOR_LAYOUT)  # (1, 1, B*NB) bf16
-        noise = ttnn.typecast(ttnn.to_layout(ttnn.reshape(noise, (1, 1, b, nb)), ttnn.TILE_LAYOUT), ttnn.float32)
-        bucket = ttnn.bitwise_and(idx, nb - 1)  # token v draws noise bucket v % NB (NB is a power of two)
-        scores = ttnn.add(scores, ttnn.gather(noise, dim=-1, index=bucket))
+        if self._noise_lookup is not None:  # the candidates' noise in one program, straight from the table
+            scores = ttnn.add(scores, self._noise_lookup(state["step"], state["noise"], idx))
+        else:
+            # The step's noise: one row-major lookup, a free row-major reshape to (B, NB), then a 32-row tilize
+            # (the tile-layout lookup tilized one 32768-wide row padded to a full tile and reshaped it after the cast).
+            noise = ttnn.embedding(state["step"], state["noise"], layout=ttnn.ROW_MAJOR_LAYOUT)  # (1, 1, B*NB) bf16
+            noise = ttnn.typecast(ttnn.to_layout(ttnn.reshape(noise, (1, 1, b, nb)), ttnn.TILE_LAYOUT), ttnn.float32)
+            bucket = ttnn.bitwise_and(idx, nb - 1)  # token v draws noise bucket v % NB (NB is a power of two)
+            scores = ttnn.add(scores, ttnn.gather(noise, dim=-1, index=bucket))
         # The best score and its vocab id in one op: the top-1 carries the candidates' ids as labels (no argmax +
         # index gather). Equal-score ties stay arbitrary, as the unstable candidate ordering already made them.
         _, drawn = ttnn.topk(scores, k=1, dim=-1, largest=True, sorted=True, indices_tensor=idx)  # (1, 1, B, 1)
