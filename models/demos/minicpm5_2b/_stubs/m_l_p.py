@@ -89,14 +89,25 @@ class TtMLP:
             h = self._silu_mul(gate, up)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-            # ttnn.linear's 2-D multicast over the full grid. Output in L1 for the residual add.
+            # ttnn.linear's 2-D multicast over the full grid with 8-tile K blocks (24 K steps). Output in L1 for the
+            # residual add.
             grid = self.device.compute_with_storage_grid_size()
+            m_t, n_t = h.padded_shape[-2] // 32, self.w_down.padded_shape[-1] // 32
             out = ttnn.linear(
                 h,
                 self.w_down,
                 memory_config=ttnn.L1_MEMORY_CONFIG,
                 compute_kernel_config=self.compute_cfg,
-                core_grid=ttnn.CoreGrid(y=grid.y, x=grid.x),
+                program_config=ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+                    compute_with_storage_grid_size=(grid.x, grid.y),
+                    in0_block_w=8,
+                    out_subblock_h=1,
+                    out_subblock_w=3,
+                    per_core_M=-(-m_t // grid.y),
+                    per_core_N=-(-n_t // grid.x),
+                    transpose_mcast=False,
+                    fused_activation=None,
+                ),
             )
         else:
             one_row = x.shape[0] == x.shape[1] == 1 and x.padded_shape[-2] == 32  # decode: one tile row
