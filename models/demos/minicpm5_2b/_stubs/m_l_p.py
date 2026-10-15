@@ -89,8 +89,15 @@ class TtMLP:
             h = self._silu_mul(gate, up)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-            # K = 6144 does not fit one block: three K blocks. Output in L1 for the residual add.
-            out = self._mm(h, self.w_down, k_block=64, memory_config=ttnn.L1_MEMORY_CONFIG)
+            # ttnn.linear's 2-D multicast over the full grid. Output in L1 for the residual add.
+            grid = self.device.compute_with_storage_grid_size()
+            out = ttnn.linear(
+                h,
+                self.w_down,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+                compute_kernel_config=self.compute_cfg,
+                core_grid=ttnn.CoreGrid(y=grid.y, x=grid.x),
+            )
         else:
             one_row = x.shape[0] == x.shape[1] == 1 and x.padded_shape[-2] == 32  # decode: one tile row
             cfg_up, cfg_down = (self.cfg_up, self.cfg_down) if one_row else (None, None)
