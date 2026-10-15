@@ -32,7 +32,7 @@ DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
 # Decoder layers whose decode-only gate / up copies are block-float4 (a quarter of the bf16 bytes the single-token
 # step streams); the other layers keep DECODE_WEIGHT_DTYPE.
 DECODE_GATE_UP_BF4_DTYPE = ttnn.bfloat4_b
-DECODE_GATE_UP_BF4_LAYERS = frozenset(range(10, 31))
+DECODE_GATE_UP_BF4_LAYERS = frozenset(range(7, 34))
 # K tiles per activation multicast block of the bf4 decode gate / up projections (divides K = 160 tiles).
 DECODE_GATE_UP_K_BLOCK = 8
 # K tiles per activation multicast block of the decode down projection (divides K = 256 tiles).
