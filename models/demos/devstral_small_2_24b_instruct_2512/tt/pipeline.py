@@ -116,7 +116,7 @@ PLANNED_TP = 4
 #                     with the silu fused into the multiply and gate/up/product kept in L1 (no DRAM round trip);
 #                     decode gate / up / down read block-float8 copies (prefill keeps bf16); the decode down
 #                     projection runs a 1D multicast config with 8-tile K blocks (the auto config's 2-tile blocks
-#                     made it multicast-latency-bound); layers 7-33 read block-float4 decode gate / up copies with
+#                     made it multicast-latency-bound); layers 5-35 read block-float4 decode gate / up copies with
 #                     8-tile K blocks (bf4 on every layer: PCC 0.9921 < 0.995).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
