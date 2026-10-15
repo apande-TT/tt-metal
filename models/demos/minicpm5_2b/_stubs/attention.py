@@ -175,8 +175,13 @@ class TtAttention:
             dram, l1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG
             rope_kernel = _USE_ROPE_KERNEL and ctx.rope is not None
             # With the rope kernel the fused-QKV output only feeds the head split: L1.
-            qkv = self._prefill_mm(
-                ttnn.reshape(x, (1, b * seq, x.shape[-1])), self.wqkv, memory_config=l1 if rope_kernel else dram
+            grid = self.device.compute_with_storage_grid_size()
+            qkv = ttnn.linear(
+                ttnn.reshape(x, (1, b * seq, x.shape[-1])),
+                self.wqkv,
+                memory_config=l1 if rope_kernel else dram,
+                compute_kernel_config=self.compute_cfg,
+                core_grid=ttnn.CoreGrid(y=grid.y, x=grid.x),
             )
             if x.memory_config().buffer_type == ttnn.BufferType.L1:
                 ttnn.deallocate(x)  # an L1 norm output: free it before the score bmm's large static CBs
