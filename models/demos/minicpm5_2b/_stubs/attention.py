@@ -45,6 +45,10 @@ _USE_ATTN_BMM_KERNEL = True
 # Decode: the score kernel applies the scale + key mask itself (no separate scale_mask op).
 _FUSE_SCALE_MASK = True
 _ATTN_BMM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_bmm")
+# Decode q.K^T (+ scale + mask), softmax and probs.V (+ head merge) as ONE generic_op, one (batch, KV head) row
+# block per core, bit-identical to the three ops (kernels/attn_fused).
+_USE_FUSED_DECODE_ATTN = True
+_ATTN_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_fused")
 
 
 def _rotate_half_matrix(head_dim):
@@ -153,6 +157,12 @@ class TtAttention:
         self.zero_tile = ttnn.from_torch(
             torch.zeros(1, 1, 32, 32), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
+        # ttnn softmax's reduce scalers as its reader builds them: 1.0 in row 0 of every face (tile rows 0 and 16),
+        # bf16 for the max (the input's format) and fp32 for the sum (the fp32 intermediates' format).
+        scaler = torch.zeros(1, 1, 32, 32)
+        scaler[..., [0, 16], :] = 1.0
+        self.max_scaler = ttnn.from_torch(scaler, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.sum_scaler = ttnn.from_torch(scaler, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
 
     def _to_tt(self, t):
         return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
@@ -322,6 +332,11 @@ class TtAttention:
                         ttnn.reshape(new_kv, (1, b, self.n_kv_heads, self.head_dim)), shard
                     )
                     ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
+            if _USE_FUSED_DECODE_ATTN and _USE_HEAD_KERNELS and b == 32 and ctx.mask_full is not None:
+                attn = self._attn_fused(qk, kv_cache, ctx, l1)
+                return ttnn.linear(
+                    attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=l1, program_config=self.cfg_o
+                )
             fused_mask = _USE_ATTN_BMM_KERNEL and _FUSE_SCALE_MASK and ctx.mask_full is not None
             if _USE_ATTN_BMM_KERNEL:
                 scores = self._attn_bmm(
@@ -595,6 +610,119 @@ class TtAttention:
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
         io = [x, cache] + ([mask_full] if fuse else []) + ([cur_pos, self.zero_tile] if skip else [])
         return ttnn.generic_op(io + [out], program)
+
+    def _attn_fused(self, qk, kv_cache, ctx, memory_config):
+        """Decode attention for qk [B, n_kv, rows, D] against the caches as one generic_op (kernels/attn_fused): per
+        (batch, KV head) row block, the score kernel's q.K^T + scale + mask, ttnn.softmax's arithmetic and probs.V,
+        the writer scattering the query rows straight into the merged [1, B, n_kv * groups * D] o_proj input."""
+        b, n_kv, g = qk.shape[0], qk.shape[1], self.kv_groups
+        d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, b, n_kv * g * self.head_dim]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
+        )
+        grid = self.device.compute_with_storage_grid_size()
+        n_rows = b * n_kv
+        assert n_rows <= grid.x * grid.y
+        full_rows, rem = divmod(n_rows, grid.x)
+        ranges = []
+        if full_rows:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, full_rows - 1)))
+        if rem:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full_rows), ttnn.CoreCoord(rem - 1, full_rows)))
+        cores = ttnn.CoreRangeSet(ranges)
+        rd_rt, wr_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        for i in range(n_rows):
+            rd_rt[i % grid.x][i // grid.x] = [i]
+            wr_rt[i % grid.x][i // grid.x] = [i * d_t, d_t]
+        bf, f32 = ttnn.bfloat16, ttnn.float32
+        tile, f32_tile = 2 * 32 * 32, 4 * 32 * 32
+        (cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_pos, cb_zero, cb_sm_in, cb_mx, cb_sm, cb_v, cb_probs) = range(13)
+        cb_out, cb_max, cb_exps, cb_recip = 16, 24, 25, 26
+        spec = [
+            (cb_q, d_t, bf),
+            (cb_k, 2 * d_t, bf),
+            (cb_scale, 1, bf),
+            (cb_mask, 2, bf),
+            (cb_t, 2, bf),
+            (cb_t2, 2, bf),
+            (cb_pos, 1, bf),
+            (cb_zero, 1, bf),
+            (cb_sm_in, c_t, bf),
+            (cb_mx, 1, bf),
+            (cb_sm, 1, f32),
+            (cb_v, 2 * c_t, bf),
+            (cb_probs, c_t, bf),
+            (cb_out, 2, bf),
+            (cb_max, 1, f32),
+            (cb_exps, c_t, f32),
+            (cb_recip, 1, f32),
+        ]
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=n * (f32_tile if fmt == f32 else tile),
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(idx, fmt, f32_tile if fmt == f32 else tile)],
+            )
+            for idx, n, fmt in spec
+        ]
+        tensors = [
+            qk,
+            kv_cache.k,
+            kv_cache.v,
+            self.scale_tile,
+            ctx.mask_full,
+            ctx.cur_pos,
+            self.zero_tile,
+            self.max_scaler,
+            self.sum_scaler,
+        ]
+        accessor_ct = []
+        for t in tensors:
+            accessor_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ATTN_FUSED_DIR, "reader_attn_fused.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[d_t, c_t, n_kv, cb_q, cb_k, cb_scale, cb_mask, cb_pos, cb_zero, cb_mx, cb_sm, cb_v]
+            + accessor_ct,
+            runtime_args=rd_rt,
+            common_runtime_args=[t.buffer_address() for t in tensors],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        writer = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ATTN_BMM_DIR, "writer_attn_merge.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[cb_out, n_kv, g, d_t] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=wr_rt,
+            common_runtime_args=[out.buffer_address()],
+            config=ttnn.WriterConfigDescriptor(),
+        )
+        compute_cfg = ttnn.ComputeConfigDescriptor(
+            math_fidelity=ttnn.MathFidelity.HiFi4,  # as self.compute_cfg (scores, softmax and probs.V)
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            dst_full_sync_en=False,
+        )
+        # As _attn_bmm sets for the score scale's SFPU multiply operands; softmax's fp32 intermediates keep the
+        # default (unpacked to SrcA/SrcB, as ttnn's softmax factory leaves them).
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        for idx in (cb_t, cb_scale):
+            modes[idx] = ttnn.UnpackToDestMode.UnpackToDestFp32
+        compute_cfg.unpack_to_dest_mode = modes
+        compute = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ATTN_FUSED_DIR, "compute_attn_fused.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[
+                d_t, c_t, cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_sm_in, cb_mx, cb_sm, cb_max, cb_exps, cb_recip,
+                cb_probs, cb_v, cb_out,
+            ],
+            runtime_args=ttnn.RuntimeArgs(),
+            config=compute_cfg,
+        )
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
+        return ttnn.generic_op(tensors + [out], program)
 
     def _spread(self, n_tiles):
         """Row-major core set over the grid for n_tiles work items, with [start, count] / [count] runtime args."""
