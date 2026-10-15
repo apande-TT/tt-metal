@@ -51,9 +51,10 @@ class FusedGateUpDecode:
 
     @classmethod
     def bank_major(cls, w: torch.Tensor, nb: int) -> torch.Tensor:
-        """One device's [K, N] weight -> a [32, Kt * Nt * 32] row of tiles whose interleaved pages (tile columns) put
-        each core's pushes in consecutive slots of bank core % nb: core c = q * nb + b, push p, tile t (row r = t // NC,
-        column j = t % NC, i.e. weight tile (p * RB + r, c * NC + j)) sits at page ((q * P + p) * T + t) * nb + b."""
+        """One device's [K, N] weight -> the same [K, N] shape with its tiles permuted so that the interleaved pages
+        (row-major tile order) put each core's pushes in consecutive slots of bank core % nb: core c = q * nb + b, push
+        p, tile t (row r = t // NC, column j = t % NC, i.e. weight tile (p * RB + r, c * NC + j)) sits at page
+        ((q * P + p) * T + t) * nb + b."""
         k, n = w.shape
         kt, nt, nc, rb = k // 32, n // 32, cls.NC, cls.RB
         n_cores, pushes, t_push = nt // nc, kt // rb, rb * nc
@@ -65,7 +66,7 @@ class FusedGateUpDecode:
         order = torch.empty(kt * nt, dtype=torch.long)
         order[page.flatten()] = tile.flatten()
         tiles = w.reshape(kt, 32, nt, 32).permute(0, 2, 1, 3).reshape(kt * nt, 32, 32)
-        return tiles[order].permute(1, 0, 2).reshape(32, kt * nt * 32)
+        return tiles[order].reshape(kt, nt, 32, 32).permute(0, 2, 1, 3).reshape(k, n)
 
     def __init__(self, device, w_gate, w_up, dtype, math_fidelity, put, tp=1):
         """w_gate, w_up: [K, tp * N] torch weights (device d multiplies columns d * N .. (d + 1) * N); put(t, dtype)
