@@ -27,7 +27,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs.attention import pad_to_ti
 from models.demos.qwen_image_edit_text_encoder._stubs.layer import text_attention_mask
 
 # micro-batches of the row-staged LM's 2-stage pipeline (TtTextModel._pipelined; 1 = the plain two passes)
-TEXT_MICRO = 2
+TEXT_MICRO = 4
 
 
 def replicated(device, t, dtype, layout=ttnn.TILE_LAYOUT):
