@@ -155,10 +155,13 @@ class TtMinistral3DecoderLayer:
             res_mem = self.post_attention_layernorm.decode_mem(int(x.shape[-1]))
         h = self._residual_add(x, a, res_mem)
         if mode == "decode":
-            n = self.post_attention_layernorm.decode(h)
+            # unsharded into L1: the gate / up multicast this row once per K block straight from there
+            n = self.post_attention_layernorm.decode(h, l1=True)
         else:
             n = self._bf16(self.post_attention_layernorm(self._bf16(h)))
         m = self.mlp(n, mode=mode)
+        if mode == "decode":
+            ttnn.deallocate(n)
         out = self._residual_add(h, m, res_mem)
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
