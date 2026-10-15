@@ -222,10 +222,13 @@ class TtTextAttention:
         # per q head (its kv head repeated) so the batched products fill the grid with whole-entry work units: an
         # M-split of the packed heads is only correct at one unit per core
         cores = x.device().compute_with_storage_grid_size()
-        per_head = G > 1 and b * kvl < cores.x * cores.y
+        n_cores = cores.x * cores.y
+        per_head = G > 1 and b * kvl < n_cores
+        # still short of the grid per head: each head's rows split r ways too (whole-entry units of s_pad / r rows)
+        r = next((r for r in range(1, s_pad // 32 + 1) if (s_pad // 32) % r == 0 and b * kvl * G * r >= n_cores), 1)
         if per_head:
-            q = ttnn.reshape(q, (b * kvl * G, 1, s_pad, D))
-            k = self._repeat_heads(k, G)
+            q = ttnn.reshape(q, (b * kvl * G * r, 1, s_pad // r, D))
+            k = self._repeat_heads(k, G * r)
         scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex)
         if per_head:
             scores = ttnn.reshape(scores, (b, kvl, G * s_pad, s_pad))
@@ -234,8 +237,8 @@ class TtTextAttention:
         e = ttnn.exp(ttnn.subtract(scores, mx))
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
         if per_head:
-            probs = ttnn.reshape(probs, (b * kvl * G, 1, s_pad, s_pad))
-            v = self._repeat_heads(v, G)
+            probs = ttnn.reshape(probs, (b * kvl * G * r, 1, s_pad // r, s_pad))
+            v = self._repeat_heads(v, G * r)
         o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex)  # [B, kvl, G*S, D]
         o = ttnn.reshape(o, (b, hl, s_pad, D))
         o = ttnn.permute(o, (0, 2, 1, 3))
