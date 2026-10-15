@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // MiniCPM5-2B decode RMSNorm reader (one tile row of x, Wt tiles). Every core reads the whole row (each core
-// recomputes the row statistic) plus the gamma tiles of its own output slice, and builds the two constant tiles
-// as ttnn's layernorm reader does: the reduce scaler (1.0 bf16 in row 0 of each face, zeros elsewhere) and eps
-// (fp32 eps truncated to bf16, in column 0 of every row of faces 0 and 2).
+// recomputes the row statistic) plus the gamma tiles of its own output slice, and the two constant tiles of ttnn's
+// layernorm reader, built once on the host: the reduce scaler (1.0 bf16 in row 0 of each face, zeros elsewhere)
+// and eps (fp32 eps truncated to bf16, in column 0 of every row of faces 0 and 2).
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -16,36 +16,23 @@ void kernel_main() {
     constexpr uint32_t cb_scaler = get_compile_time_arg_val(2);
     constexpr uint32_t cb_eps = get_compile_time_arg_val(3);
     constexpr uint32_t cb_gamma = get_compile_time_arg_val(4);
-    constexpr uint32_t eps_bits = get_compile_time_arg_val(5);
-    constexpr auto x_args = TensorAccessorArgs<6>();
+    constexpr auto x_args = TensorAccessorArgs<5>();
     constexpr auto g_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
+    constexpr auto c_args = TensorAccessorArgs<g_args.next_compile_time_args_offset()>();
     constexpr uint32_t tile_bytes = 32 * 32 * 2;
 
     const uint32_t t_start = get_arg_val<uint32_t>(0);
     const uint32_t num_tiles = get_arg_val<uint32_t>(1);
     const auto x = TensorAccessor(x_args, get_common_arg_val<uint32_t>(0));
     const auto gamma = TensorAccessor(g_args, get_common_arg_val<uint32_t>(1));
+    const auto consts = TensorAccessor(c_args, get_common_arg_val<uint32_t>(2));
 
-    // Constant tiles.
+    // Constant tiles, host-built pages 0..1 of the [32, 64] constants tensor: the reduce scaler and eps.
     cb_reserve_back(cb_scaler, 1);
     cb_reserve_back(cb_eps, 1);
-    auto* scaler = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(get_write_ptr(cb_scaler));
-    auto* eps = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(get_write_ptr(cb_eps));
-    for (uint32_t i = 0; i < tile_bytes / 2; ++i) {
-        scaler[i] = 0;
-        eps[i] = 0;
-    }
-    for (uint32_t face = 0; face < 4; ++face) {
-        for (uint32_t c = 0; c < 16; ++c) {
-            scaler[face * 256 + c] = 0x3F80;  // 1.0
-        }
-    }
-    const uint16_t eps_bf16 = static_cast<uint16_t>(eps_bits >> 16);
-    for (uint32_t face = 0; face < 4; face += 2) {
-        for (uint32_t r = 0; r < 16; ++r) {
-            eps[face * 256 + r * 16] = eps_bf16;
-        }
-    }
+    noc_async_read_page(0, consts, get_write_ptr(cb_scaler));
+    noc_async_read_page(1, consts, get_write_ptr(cb_eps));
+    noc_async_read_barrier();
     cb_push_back(cb_scaler, 1);
     cb_push_back(cb_eps, 1);
 

@@ -34,6 +34,17 @@ class TtRMSNorm:
         )
         w = torch_module.weight.detach().to(torch.float32).reshape(1, 1, -1)
         self.weight = ttnn.from_torch(w, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.consts = None
+        if _USE_KERNEL:
+            # The decode kernel's constant tiles [scaler | eps], built here once instead of by the reader (whose
+            # element-wise L1 stores were most of its time): ttnn layernorm's reduce scaler (1.0 in rows 0 and 16)
+            # and eps truncated (not rounded) to bf16 in column 0.
+            eps_bf16 = torch.tensor([float(self.eps)], dtype=torch.float32).view(torch.int32)
+            eps_bf16 = (eps_bf16 & ~0xFFFF).view(torch.float32)
+            c = torch.zeros(32, 64)
+            c[[0, 16], 0:32] = 1.0
+            c[:, 32] = eps_bf16
+            self.consts = ttnn.from_torch(c, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
     def _kernel_ok(self, x):
         ps = list(x.padded_shape)
@@ -87,18 +98,18 @@ class TtRMSNorm:
             cb(cb_ex2pe, 1, f32, f32_tile),
             cb(cb_fusion, _TILES_PER_CORE, f32, f32_tile),
         ]
-        eps_bits = struct.unpack("<I", struct.pack("<f", float(self.eps)))[0]
         inv_w_bits = struct.unpack("<I", struct.pack("<f", 1.0 / x.shape[-1]))[0]
         d = os.path.join(_KERNEL_DIR, "rms_norm")
         reader = ttnn.KernelDescriptor(
             kernel_source=os.path.join(d, "reader_rms_norm.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[w_t, cb_in, cb_scaler, cb_eps, cb_gamma, eps_bits]
+            compile_time_args=[w_t, cb_in, cb_scaler, cb_eps, cb_gamma]
             + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
-            + list(ttnn.TensorAccessorArgs(self.weight).get_compile_time_args()),
+            + list(ttnn.TensorAccessorArgs(self.weight).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(self.consts).get_compile_time_args()),
             runtime_args=rt,
-            common_runtime_args=[x.buffer_address(), self.weight.buffer_address()],
+            common_runtime_args=[x.buffer_address(), self.weight.buffer_address(), self.consts.buffer_address()],
             config=ttnn.ReaderConfigDescriptor(),
         )
         writer = ttnn.KernelDescriptor(
@@ -126,7 +137,7 @@ class TtRMSNorm:
             ),
         )
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
-        return ttnn.generic_op([x, self.weight, out], program)
+        return ttnn.generic_op([x, self.weight, self.consts, out], program)
 
     def __call__(self, x, *args, memory_config=None, **kwargs):
         if not isinstance(x, ttnn.Tensor):
