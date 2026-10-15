@@ -134,7 +134,8 @@ PLANNED_TP = 4
 #                     8 middle -> 1 final core instead of ttnn.topk's 64 -> 1 serial merge, 16-bit shard positions.
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
 #                     directly (no bf16 cast op, no single-core interleaved norm); the decode QKV reads the input
-#                     norm's fp32 width shards as they are (20-tile K blocks of 5 shards; no unshard, cast, reshard);
+#                     norm's fp32 width shards as they are (20-tile K blocks of 5 shards; no unshard, cast, reshard;
+#                     3 readers per DRAM bank);
 #                     decode residual adds write straight into the norms' sharded layout (no re-shard per norm).
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
