@@ -29,6 +29,30 @@ _KDIR = Path(__file__).resolve().parent / "kernels"
 _TILE_BYTES = {ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
 
 
+def bank_major(w: torch.Tensor, nb: int, nc: int, rb: int) -> torch.Tensor:
+    """One device's [K, N] weight -> the same [K, N] shape with its tiles permuted so that the interleaved pages
+    (row-major tile order) put each stream's pushes in consecutive slots of bank stream % nb: stream s = q * nb + b
+    (the stream reading columns s * nc .. s * nc + nc - 1), push p, tile t (row r = t // nc, column j = t % nc, i.e.
+    weight tile (p * rb + r, s * nc + j)) sits at page ((q * P + p) * T + t) * nb + b, T = rb * nc tiles a push."""
+    k, n = w.shape
+    kt, nt = k // 32, n // 32
+    n_streams, pushes, t_push = nt // nc, kt // rb, rb * nc
+    c = torch.arange(n_streams).view(-1, 1, 1)
+    p = torch.arange(pushes).view(1, -1, 1)
+    t = torch.arange(t_push).view(1, 1, -1)
+    page = ((c // nb * pushes + p) * t_push + t) * nb + c % nb
+    tile = (p * rb + t // nc) * nt + c * nc + t % nc
+    order = torch.empty(kt * nt, dtype=torch.long)
+    order[page.flatten()] = tile.flatten()
+    tiles = w.reshape(kt, 32, nt, 32).permute(0, 2, 1, 3).reshape(kt * nt, 32, 32)
+    return tiles[order].reshape(kt, nt, 32, 32).permute(0, 2, 1, 3).reshape(k, n)
+
+
+def bank_major_page0(stream: int, kt: int, nb: int, nc: int, rb: int) -> int:
+    """First page of a stream's first push in bank_major's layout (each next push starts rb * nc * nb pages later)."""
+    return (stream // nb) * (kt // rb) * rb * nc * nb + stream % nb
+
+
 class FusedGateUpDecode:
     NC = 4  # output columns a compute core (gate and up each): 2 * NC tiles fill the full-sync fp32 DEST
     RB = 8  # K rows a weight push
@@ -51,22 +75,7 @@ class FusedGateUpDecode:
 
     @classmethod
     def bank_major(cls, w: torch.Tensor, nb: int) -> torch.Tensor:
-        """One device's [K, N] weight -> the same [K, N] shape with its tiles permuted so that the interleaved pages
-        (row-major tile order) put each core's pushes in consecutive slots of bank core % nb: core c = q * nb + b, push
-        p, tile t (row r = t // NC, column j = t % NC, i.e. weight tile (p * RB + r, c * NC + j)) sits at page
-        ((q * P + p) * T + t) * nb + b."""
-        k, n = w.shape
-        kt, nt, nc, rb = k // 32, n // 32, cls.NC, cls.RB
-        n_cores, pushes, t_push = nt // nc, kt // rb, rb * nc
-        c = torch.arange(n_cores).view(-1, 1, 1)
-        p = torch.arange(pushes).view(1, -1, 1)
-        t = torch.arange(t_push).view(1, 1, -1)
-        page = ((c // nb * pushes + p) * t_push + t) * nb + c % nb
-        tile = (p * rb + t // nc) * nt + c * nc + t % nc
-        order = torch.empty(kt * nt, dtype=torch.long)
-        order[page.flatten()] = tile.flatten()
-        tiles = w.reshape(kt, 32, nt, 32).permute(0, 2, 1, 3).reshape(kt * nt, 32, 32)
-        return tiles[order].reshape(kt, nt, 32, 32).permute(0, 2, 1, 3).reshape(k, n)
+        return bank_major(w, nb, cls.NC, cls.RB)
 
     def __init__(self, device, w_gate, w_up, dtype, math_fidelity, put, tp=1):
         """w_gate, w_up: [K, tp * N] torch weights (device d multiplies columns d * N .. (d + 1) * N); put(t, dtype)
@@ -150,11 +159,21 @@ class FusedGateUpDecode:
         dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
         dm0 = dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0)
         dm1 = dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1)
-        stream_ct = lambda cb, owner, w: [kt, nb, nc, rb, w_tile, cb, depth, owner, SEM_READY, SEM_VALID, o_tile] + acc(
-            w, out
-        )
-        # first page of core c's first push (see bank_major)
-        page0 = lambda c: (c // nb) * (kt // rb) * rb * nc * nb + c % nb
+        stream_ct = lambda cb, owner, w: [
+            kt,
+            nb,
+            nc,
+            rb,
+            w_tile,
+            cb,
+            depth,
+            owner,
+            SEM_READY,
+            SEM_VALID,
+            o_tile,
+            nc,
+        ] + acc(w, out)
+        page0 = lambda c: bank_major_page0(c, kt, nb, nc, rb)
         rt = lambda w: [
             ((cx, cy), [w.buffer_address(), c * nc, out.buffer_address()] + self.sender_xy + [page0(c)])
             for c, (cx, cy) in enumerate(self.core_xy)

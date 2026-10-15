@@ -9,7 +9,8 @@
 // page, and the next push starts RB * NC * NB pages later. The OWNER instance (RISCV_1) also takes the activation the
 // sender multicasts -- it tells the sender this core's x CB is reserved, then hands x to compute as soon as the
 // valid semaphore is up, checked between pushes so its weight stream never waits on x until its CB is full -- and
-// finally writes the core's NC finished silu(gate) * up tiles.
+// finally writes the core's OUT_NC finished output tiles (silu(gate) * up for tt/gate_up_decode.py, the down projection
+// for tt/down_decode.py, whose RISCs stream one column each).
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -26,7 +27,8 @@ void kernel_main() {
     constexpr uint32_t sem_ready = get_compile_time_arg_val(8);
     constexpr uint32_t sem_valid = get_compile_time_arg_val(9);
     constexpr uint32_t out_tile = get_compile_time_arg_val(10);
-    constexpr auto w_args = TensorAccessorArgs<11>();
+    constexpr uint32_t OUT_NC = get_compile_time_arg_val(11);  // output tiles the OWNER writes
+    constexpr auto w_args = TensorAccessorArgs<12>();
     constexpr auto o_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
     static_assert(Kt % RB == 0, "gate_up blocking");
 
@@ -68,12 +70,12 @@ void kernel_main() {
             cb_push_back(cb_x, Kt);
         }
         const auto out = TensorAccessor(o_args, get_arg_val<uint32_t>(2));
-        cb_wait_front(cb_out, NC);
+        cb_wait_front(cb_out, OUT_NC);
         const uint32_t l1 = get_read_ptr(cb_out);
-        for (uint32_t c = 0; c < NC; ++c) {
+        for (uint32_t c = 0; c < OUT_NC; ++c) {
             noc_async_write_page(n0 + c, out, l1 + c * out_tile);
         }
         noc_async_write_barrier();
-        cb_pop_front(cb_out, NC);
+        cb_pop_front(cb_out, OUT_NC);
     }
 }
