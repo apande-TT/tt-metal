@@ -82,6 +82,7 @@ class TtMinistral3Attention:
     # QKV_DECODE_CORES), in K blocks of DECODE_SHARDED_K_BLOCK tiles (whole shards).
     DECODE_SHARDED_INPUT = True
     DECODE_SHARDED_K_BLOCK = 20
+    DECODE_SHARDED_READERS_PER_BANK = 3  # (the op allows 1-3)
     # False: prefill returns o_proj's reduce-scattered 1/TP hidden shard (the decoder keeps a hidden-sharded
     # residual in prefill and gathers only the normed activation).
     prefill_gather = True
@@ -350,11 +351,14 @@ class TtMinistral3Attention:
 
     def _sharded_qkv_pc(self):
         if getattr(self, "_sharded_qkv_pc_cache", None) is None:
+            # DECODE_SHARDED_READERS_PER_BANK readers per DRAM bank, each streaming 6 / readers of its bank's 6 columns
+            readers = self.DECODE_SHARDED_READERS_PER_BANK
+            banks = self.device.dram_grid_size().x
             self._sharded_qkv_pc_cache = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
                 in0_block_w=self.DECODE_SHARDED_K_BLOCK,
                 per_core_M=1,
-                per_core_N=self.qkv_per_core_n,
-                num_workers_per_dram_bank=2,
+                per_core_N=self.qkv_per_core_n * QKV_DECODE_CORES.num_cores // (readers * banks),
+                num_workers_per_dram_bank=readers,
             )
         return self._sharded_qkv_pc_cache
 
