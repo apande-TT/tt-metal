@@ -10,11 +10,18 @@ Here a spare core reads the [32, K] activation once and multicasts it whole, and
 data-movement RISCs stream the weights independently of it -- gate on RISCV_0 (NOC 0), up on RISCV_1 (NOC 1, which
 also receives x and writes the output) -- each into a CB DEPTH pushes deep. Each core owns NC gate and NC up columns
 and accumulates both over the whole K in fp32 DEST (full-sync DEST: 2 * NC tiles), applies silu(gate) * up on the
-SFPU in fp32 and rounds once to bf16 (ttnn's chain rounds gate and up to bf16 first)."""
+SFPU in fp32 and rounds once to bf16 (ttnn's chain rounds gate and up to bf16 first).
+
+The weights are BANK-MAJOR copies (bank_major): an interleaved DRAM buffer puts page p in bank p % NB at slot p // NB,
+so the tiles are ordered such that each push of a core (RB K rows x its NC columns, row-major) occupies consecutive
+slots of one bank, and the push is ONE contiguous read instead of RB * NC tile reads (per-tile reads of the 576-byte
+block-float4 tiles left the stream at ~350 GB/s). Core c reads bank c % NB, so every bank serves n_cores / NB cores."""
 
 from __future__ import annotations
 
 from pathlib import Path
+
+import torch
 
 import ttnn
 
@@ -28,26 +35,52 @@ class FusedGateUpDecode:
     CB_BYTES = 112 * 1024  # per weight CB (DEPTH = pushes that fit)
 
     @classmethod
-    def supports(cls, device, w_gate, w_up) -> bool:
-        kt, nt = int(w_gate.shape[-2]) // ttnn.TILE_SIZE, int(w_gate.shape[-1]) // ttnn.TILE_SIZE
+    def supports(cls, device, k, n, dtype) -> bool:
+        """k x n: one device's gate (= up) weight."""
+        kt, nt = k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
         g = device.compute_with_storage_grid_size()
+        n_cores = nt // cls.NC
         return (
-            tuple(w_gate.shape) == tuple(w_up.shape)
-            and w_gate.dtype == w_up.dtype
-            and w_gate.dtype in _TILE_BYTES
+            dtype in _TILE_BYTES
+            and k % ttnn.TILE_SIZE == 0
             and nt % cls.NC == 0
-            and nt // cls.NC < g.x * g.y  # and a spare core for the sender
+            and n_cores < g.x * g.y  # and a spare core for the sender
+            and n_cores % device.dram_grid_size().x == 0
             and kt % cls.RB == 0
         )
 
-    def __init__(self, device, w_gate, w_up, math_fidelity):
-        self.device, self.wg, self.wu = device, w_gate, w_up
-        self.kt, self.nt = int(w_gate.shape[-2]) // ttnn.TILE_SIZE, int(w_gate.shape[-1]) // ttnn.TILE_SIZE
-        n = self.nt // self.NC
+    @classmethod
+    def bank_major(cls, w: torch.Tensor, nb: int) -> torch.Tensor:
+        """One device's [K, N] weight -> a [32, Kt * Nt * 32] row of tiles whose interleaved pages (tile columns) put
+        each core's pushes in consecutive slots of bank core % nb: core c = q * nb + b, push p, tile t (row r = t // NC,
+        column j = t % NC, i.e. weight tile (p * RB + r, c * NC + j)) sits at page ((q * P + p) * T + t) * nb + b."""
+        k, n = w.shape
+        kt, nt, nc, rb = k // 32, n // 32, cls.NC, cls.RB
+        n_cores, pushes, t_push = nt // nc, kt // rb, rb * nc
+        c = torch.arange(n_cores).view(-1, 1, 1)
+        p = torch.arange(pushes).view(1, -1, 1)
+        t = torch.arange(t_push).view(1, 1, -1)
+        page = ((c // nb * pushes + p) * t_push + t) * nb + c % nb
+        tile = (p * rb + t // nc) * nt + c * nc + t % nc
+        order = torch.empty(kt * nt, dtype=torch.long)
+        order[page.flatten()] = tile.flatten()
+        tiles = w.reshape(kt, 32, nt, 32).permute(0, 2, 1, 3).reshape(kt * nt, 32, 32)
+        return tiles[order].permute(1, 0, 2).reshape(32, kt * nt * 32)
+
+    def __init__(self, device, w_gate, w_up, dtype, math_fidelity, put, tp=1):
+        """w_gate, w_up: [K, tp * N] torch weights (device d multiplies columns d * N .. (d + 1) * N); put(t, dtype)
+        uploads a torch tensor sharded over the mesh on its last dim."""
+        self.device = device
+        k, n = int(w_gate.shape[0]), int(w_gate.shape[1]) // tp
+        self.kt, self.nt = k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        self.nb = nb = device.dram_grid_size().x
+        bm = lambda w: torch.cat([self.bank_major(w[:, d * n : (d + 1) * n], nb) for d in range(tp)], dim=-1)
+        self.wg, self.wu = put(bm(w_gate), dtype), put(bm(w_up), dtype)
+        n_cores = self.nt // self.NC
         g = device.compute_with_storage_grid_size()
-        # Compute cores: the grid's first n, row-major; the sender: the grid's last core.
-        self.core_xy = [(c % g.x, c // g.x) for c in range(n)]
-        full, rem = divmod(n, g.x)
+        # Compute cores: the grid's first n_cores, row-major; the sender: the grid's last core.
+        self.core_xy = [(c % g.x, c // g.x) for c in range(n_cores)]
+        full, rem = divmod(n_cores, g.x)
         rects = [(0, 0, g.x - 1, full - 1)] if full else []
         if rem:
             rects.append((0, full, rem - 1, full))
@@ -64,7 +97,7 @@ class FusedGateUpDecode:
             lo = device.worker_core_from_logical_core(ttnn.CoreCoord(a, b))
             hi = device.worker_core_from_logical_core(ttnn.CoreCoord(c, d))
             self.rects += [lo.x, lo.y, hi.x, hi.y, (c - a + 1) * (d - b + 1)]
-        self.w_tile = _TILE_BYTES[w_gate.dtype]
+        self.w_tile = _TILE_BYTES[dtype]
         self.depth = max(2, self.CB_BYTES // (self.RB * self.NC * self.w_tile))
         cfg = ttnn.ComputeConfigDescriptor()
         cfg.math_fidelity = math_fidelity
@@ -89,7 +122,10 @@ class FusedGateUpDecode:
 
     def __call__(self, x):
         """x: (1, 1, 32, K) bf16 tiles (interleaved); returns silu(x W_gate) * (x W_up), (1, 1, 32, N) bf16 in L1."""
-        kt, nt, nc, rb, w_tile, depth = self.kt, self.nt, self.NC, self.RB, self.w_tile, self.depth
+        shape = tuple(int(d) for d in x.shape)
+        if shape[:-1] != (1, 1, ttnn.TILE_SIZE) or x.dtype != ttnn.bfloat16 or x.is_sharded():
+            raise ValueError(f"FusedGateUpDecode takes one interleaved bf16 tile row, got {shape} {x.dtype}")
+        kt, nt, nc, rb, w_tile, depth, nb = self.kt, self.nt, self.NC, self.RB, self.w_tile, self.depth, self.nb
         x_tile, o_tile = 2048, 2048
         out = ttnn.allocate_tensor_on_device(
             ttnn.Shape((1, 1, ttnn.TILE_SIZE, nt * ttnn.TILE_SIZE)),
@@ -113,12 +149,14 @@ class FusedGateUpDecode:
         dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
         dm0 = dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0)
         dm1 = dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1)
-        stream_ct = lambda cb, owner, w: [kt, nt, nc, rb, w_tile, cb, depth, owner, SEM_READY, SEM_VALID, o_tile] + acc(
+        stream_ct = lambda cb, owner, w: [kt, nb, nc, rb, w_tile, cb, depth, owner, SEM_READY, SEM_VALID, o_tile] + acc(
             w, out
         )
+        # first page of core c's first push (see bank_major)
+        page0 = lambda c: (c // nb) * (kt // rb) * rb * nc * nb + c % nb
         rt = lambda w: [
-            ((cx, cy), [w.buffer_address(), i * nc, out.buffer_address()] + self.sender_xy)
-            for i, (cx, cy) in enumerate(self.core_xy)
+            ((cx, cy), [w.buffer_address(), c * nc, out.buffer_address()] + self.sender_xy + [page0(c)])
+            for c, (cx, cy) in enumerate(self.core_xy)
         ]
         kernels = [
             self._kernel(

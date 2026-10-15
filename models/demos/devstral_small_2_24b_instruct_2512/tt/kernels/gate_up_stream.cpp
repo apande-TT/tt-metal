@@ -4,7 +4,9 @@
 
 // Weight stream of tt/gate_up_decode.py (compute cores; one instance per data-movement RISC): streams this core's
 // NC columns of one weight (gate on RISCV_0, up on RISCV_1), RB K rows a push, into its CB; a push is RB rows of NC
-// tiles, row-major (the compute kernel's in1 block). The OWNER instance (RISCV_1) also takes the activation the
+// tiles, row-major (the compute kernel's in1 block). The weight is bank-major (FusedGateUpDecode.bank_major): a push
+// is RB * NC consecutive slots of one DRAM bank, so it is ONE read of RB * NC tiles from the address of its first
+// page, and the next push starts RB * NC * NB pages later. The OWNER instance (RISCV_1) also takes the activation the
 // sender multicasts -- it tells the sender this core's x CB is reserved, then hands x to compute as soon as the
 // valid semaphore is up, checked between pushes so its weight stream never waits on x until its CB is full -- and
 // finally writes the core's NC finished silu(gate) * up tiles.
@@ -14,7 +16,7 @@
 
 void kernel_main() {
     constexpr uint32_t Kt = get_compile_time_arg_val(0);  // K tiles
-    constexpr uint32_t Nt = get_compile_time_arg_val(1);  // weight column tiles
+    constexpr uint32_t NB = get_compile_time_arg_val(1);  // DRAM banks the weight is interleaved over
     constexpr uint32_t NC = get_compile_time_arg_val(2);  // columns a core
     constexpr uint32_t RB = get_compile_time_arg_val(3);  // K rows a push
     constexpr uint32_t w_tile = get_compile_time_arg_val(4);
@@ -29,7 +31,9 @@ void kernel_main() {
     static_assert(Kt % RB == 0, "gate_up blocking");
 
     const auto w = TensorAccessor(w_args, get_arg_val<uint32_t>(0));
-    const uint32_t n0 = get_arg_val<uint32_t>(1);
+    const uint32_t n0 = get_arg_val<uint32_t>(1);  // this core's first output column
+    uint32_t page = get_arg_val<uint32_t>(5);      // first page of this core's first push
+    constexpr uint32_t T = RB * NC;                // tiles a push
     constexpr uint32_t cb_x = 0, cb_out = 16;
     volatile tt_l1_ptr uint32_t* valid = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_valid));
 
@@ -51,17 +55,11 @@ void kernel_main() {
                 have_x = true;
             }
         }
-        cb_reserve_back(cb_w, RB * NC);
-        uint32_t l1 = get_write_ptr(cb_w);
-        for (uint32_t r = 0; r < RB; ++r) {
-            const uint32_t row = (k0 + r) * Nt + n0;
-            for (uint32_t c = 0; c < NC; ++c) {
-                noc_async_read_page(row + c, w, l1);
-                l1 += w_tile;
-            }
-        }
+        cb_reserve_back(cb_w, T);
+        noc_async_read(w.get_noc_addr(page), get_write_ptr(cb_w), T * w_tile);
+        page += T * NB;
         noc_async_read_barrier();
-        cb_push_back(cb_w, RB * NC);
+        cb_push_back(cb_w, T);
     }
 
     if constexpr (OWNER) {
