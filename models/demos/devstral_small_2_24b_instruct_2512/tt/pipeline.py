@@ -43,6 +43,7 @@ from pathlib import Path
 import torch
 
 import ttnn
+from models.demos.devstral_small_2_24b_instruct_2512.tt.last_row import LastRow
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs import attention as _st_attention
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs import decoder_head as _st_decoder_head
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs import encoder_stack as _st_encoder_stack
@@ -161,7 +162,8 @@ PLANNED_TP = 4
 #                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
 #   prompts pad to a tile multiple only; prefill SDPA pads to whole chunks internally. Prefill QKV and o_proj run HiFi2 on bf8 weights.
 #   ministral3_m_l_p short-prompt down projection: a grid of whole 16 x 16-tile output blocks per core.
-#   prefill's last prompt rows: one embedding gather out of the untilized 32-row block (no re-tilize / reshape).
+#   prefill's last prompt rows: ONE data-movement program (tt/last_row.py) reads every user's row straight out of its
+#                     tiles into the tiled LM-head input (no block slice, untilize or embedding gather).
 #   ministral3_m_l_p fused gate/up N block: the per-core N range when it is under 12 tiles; M blocks no taller than the
 #                     per-core M range (data-parallel vision MLP: 7 tiles); the
 #                     vision MLP's SwiGLU product reaches the down projection through L1, which runs 4-tile N blocks.
@@ -725,6 +727,7 @@ class DevstralPipeline:
         self._shard_base = None
         full = self.batch == 32 and self.top_k == 32
         self._noise_lookup = NoiseLookup(device, self.batch, self.top_k, NOISE_BUCKETS) if full else None
+        self._last_row = LastRow(device) if self.batch == ttnn.TILE_SIZE else None
         tp = self._tp()
         if tp > 1:
             vocab = int(tcfg.vocab_size)
@@ -870,6 +873,9 @@ class DevstralPipeline:
         # The last prompt row in two slices: first the tile-aligned 32-row block that holds it (a tiled slice), then
         # the row itself -- a direct unaligned slice untilized the whole (B, S, D) hidden state first.
         r = dev["real_len"] - 1
+        if self._last_row is not None and LastRow.supports(hidden):
+            # every user's row R straight out of its tiles into the tiled LM-head input (tt/last_row.py)
+            return hidden, self.lm_head(self._last_row(hidden, r))
         r0 = r // ttnn.TILE_SIZE * ttnn.TILE_SIZE
         block = ttnn.slice(hidden, (0, r0, 0), (b, r0 + ttnn.TILE_SIZE, d))
         if "last_rows" in dev:
