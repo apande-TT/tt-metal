@@ -277,8 +277,12 @@ class TtMinistral3Attention:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
+        # SDPA decode reads q straight from its head shards (batch row b on core (b % HEAD_GRID_X, b // HEAD_GRID_X)):
+        # with sharded q, batch b's output core is core b of SDPA's grid in row-major order, so that grid is
+        # HEAD_GRID_X wide (8 x 10: 2 cores per batch row = 1 per kv head, as on the full grid).
+        grid = device.compute_with_storage_grid_size()
         self.sdpa_decode_cfg = ttnn.SDPAProgramConfig(
-            compute_with_storage_grid_size=device.compute_with_storage_grid_size(),
+            compute_with_storage_grid_size=ttnn.CoreCoord(min(self.HEAD_GRID_X, grid.x), grid.y),
             q_chunk_size=0,
             k_chunk_size=0,
             exp_approx_mode=False,
@@ -741,9 +745,7 @@ class TtMinistral3Attention:
                 t, c, s, trans, is_decode_mode=True, compute_kernel_config=self.compute_cfg
             )
             k, q = rope(k, cos, sin), rope(q, q_cos, q_sin)
-            # SDPA reads q from DRAM, as on the unfused path: its circular buffers fill nearly all of L1, so only the
-            # small shared tables may stay resident in L1 while it runs.
-            q = ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG)
+            # SDPA reads q from these head shards (one (heads, head_dim) tile row per core, see sdpa_decode_cfg).
         else:
             k = self._rope(ttnn.to_memory_config(k, ttnn.DRAM_MEMORY_CONFIG), cos, sin)
             if len(position_embeddings) == 4:
