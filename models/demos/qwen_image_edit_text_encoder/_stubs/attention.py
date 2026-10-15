@@ -604,6 +604,8 @@ def rotate_half(t):
 # Optional program-config hook for split_matmul's batched products: BMM_CONFIG(p, q, transpose_b) -> a program
 # config for p @ q (q transposed when transpose_b), or None (auto).
 BMM_CONFIG = None
+# Optional kernel for split_matmul's batched products: BMM_KERNEL(p, q, transpose_b) -> p @ q in float32, or None.
+BMM_KERNEL = None
 _BMM_CONFIGS = {}
 
 
@@ -661,14 +663,20 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     pa_all = split_bf16(a, limbs)
     pb_all = split_bf16(b, limbs)
     terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
-    mm = lambda p, q: ttnn.matmul(  # noqa: E731
-        p,
-        q,
-        transpose_b=transpose_b,
-        compute_kernel_config=cfg,
-        dtype=ttnn.float32,
-        program_config=None if BMM_CONFIG is None else BMM_CONFIG(p, q, transpose_b),
-    )
+
+    def mm(p, q):
+        y = None if BMM_KERNEL is None else BMM_KERNEL(p, q, transpose_b)
+        if y is not None:
+            return y
+        return ttnn.matmul(
+            p,
+            q,
+            transpose_b=transpose_b,
+            compute_kernel_config=cfg,
+            dtype=ttnn.float32,
+            program_config=None if BMM_CONFIG is None else BMM_CONFIG(p, q, transpose_b),
+        )
+
     if not exact:
         y = None
         for pa, pb in terms:

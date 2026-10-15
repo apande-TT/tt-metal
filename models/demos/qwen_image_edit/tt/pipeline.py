@@ -27,6 +27,7 @@ import ttnn
 from models.demos.qwen_image_edit.tt import inputs as I
 from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import (
+    batched_matmul,
     guard_tail,
     small_weight_linear,
     split_limbs,
@@ -113,6 +114,7 @@ class TtQwenImageEditPipeline:
         self.fused_tail = guard_tail if precise else None
         # and their lead limb's 8 exact lanes formed in one pass (a ragged K zero-padded to take it)
         self.lane_split = lanes_ttl.lanes8 if precise else None
+        self.bmm_kernel = batched_matmul if precise else None
         # (the VAE shortcuts' small-weight products: the whole weight in every core's L1, M over the whole grid)
         self.linear_kernel = small_weight_linear if precise else None
         # and their trailing limbs' products -- and the guard's tie-break product -- at HiFi2
@@ -224,7 +226,8 @@ class TtQwenImageEditPipeline:
             return self.text_encoder.encode_vision(up.te)
 
     def text_encode(self, up, image_embeds):
-        with self._fused_tail():
+        # (the LM's per-head attention products: each entry's block in L1, all entries' rows over the whole grid)
+        with self._hook(_te_attention, "BMM_KERNEL", self.bmm_kernel), self._fused_tail():
             return self.text_encoder.encode_text(up.te, image_embeds)
 
     def vae_encode(self, up):

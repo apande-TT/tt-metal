@@ -2,10 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// The small-weight linear's reader: the whole bf16 weight [K, N] (kt x nt tiles, row-major pages) into c_1 once,
-// held for the whole run, then this core's rows of the bf16 input, one row of kt tiles at a time, into c_0.
-// Compile-time: the input's accessor args, the weight's, then kt, nt. Runtime: input addr, weight addr, the first
-// row (in tile rows) and the row count.
+// The small-weight linear's reader: this core's tile rows of the bf16 input, one row of kt tiles at a time, into
+// c_0; before the first row of each batch entry, that entry's whole bf16 weight block (kt x nt tiles, its pages
+// in order) into c_1, held until the entry's rows are done (a weight shared by every row is one entry).
+// Compile-time: the input's accessor args, the weight's, then kt, nt, the tile rows per entry and the weight
+// pages per entry (0: one weight for all entries). Runtime: input addr, weight addr, first row, row count.
 
 #include <cstdint>
 
@@ -22,22 +23,29 @@ void kernel_main() {
 
     constexpr auto a_args = TensorAccessorArgs<0>();
     constexpr auto w_args = TensorAccessorArgs<a_args.next_compile_time_args_offset()>();
-    constexpr uint32_t kt = get_compile_time_arg_val(w_args.next_compile_time_args_offset());
-    constexpr uint32_t nt = get_compile_time_arg_val(w_args.next_compile_time_args_offset() + 1);
+    constexpr uint32_t base = w_args.next_compile_time_args_offset();
+    constexpr uint32_t kt = get_compile_time_arg_val(base);
+    constexpr uint32_t nt = get_compile_time_arg_val(base + 1);
+    constexpr uint32_t rows_per_entry = get_compile_time_arg_val(base + 2);
+    constexpr uint32_t w_entry_pages = get_compile_time_arg_val(base + 3);
     const auto a = TensorAccessor(a_args, a_addr);
     const auto w = TensorAccessor(w_args, w_addr);
     const uint32_t bytes = get_local_cb_interface(0).fifo_page_size;
 
     Noc noc;
     CircularBuffer cb_a(0), cb_w(1);
-    cb_w.reserve_back(kt * nt);
-    for (uint32_t t = 0; t < kt * nt; ++t) {
-        noc.async_read(w, cb_w, bytes, {.page_id = t}, {.offset_bytes = t * bytes});
-    }
-    noc.async_read_barrier();
-    cb_w.push_back(kt * nt);
-
+    uint32_t cur = 0xFFFFFFFF;
     for (uint32_t r = row_start; r < row_start + row_count; ++r) {
+        const uint32_t e = r / rows_per_entry;
+        if (e != cur) {
+            cb_w.reserve_back(kt * nt);  // (free once the compute has released the previous entry's block)
+            for (uint32_t t = 0; t < kt * nt; ++t) {
+                noc.async_read(w, cb_w, bytes, {.page_id = e * w_entry_pages + t}, {.offset_bytes = t * bytes});
+            }
+            noc.async_read_barrier();
+            cb_w.push_back(kt * nt);
+            cur = e;
+        }
         cb_a.reserve_back(kt);
         for (uint32_t k = 0; k < kt; ++k) {
             noc.async_read(a, cb_a, bytes, {.page_id = r * kt + k}, {.offset_bytes = k * bytes});
