@@ -143,6 +143,7 @@ PLANNED_TP = 4
 #                     norm's fp32 width shards as they are (20-tile K blocks of 5 shards; no unshard, cast, reshard;
 #                     3 readers per DRAM bank);
 #                     decode residual adds write straight into the norms' sharded layout (no re-shard per norm).
+#                     The decode all_gathers of the reduced o_proj / down shards write into that layout too.
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
 #   KV cache in bfloat8_b (KV_CACHE_DTYPE): half the bytes decode SDPA re-reads every token. Prefill writes only the
