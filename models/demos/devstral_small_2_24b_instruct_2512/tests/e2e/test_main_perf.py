@@ -149,12 +149,15 @@ def _run(device):
         # a generated test simply omitted this, which is why five earlier attempts measured nothing.
         try:
             from models.experimental.perf_automation.agent import stage_marks as _tt_sm
-            from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter as _TtPSA
         except Exception:  # noqa: BLE001
             _tt_sm = None
         if _tt_sm is not None:
             _tt_sm.signpost("start")
-        _eager_forward()
+        try:
+            _eager_forward()
+        except Exception as _tt_e:  # noqa: BLE001
+            if _tt_sm is None or not _tt_sm.window_reached(_tt_e):
+                raise
         if _tt_sm is not None:
             _tt_sm.signpost("stop")
         if _PERF_TRACE:
