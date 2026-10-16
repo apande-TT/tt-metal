@@ -4,7 +4,7 @@
   "source": "checkpoint bytes + HF config",
   "total_params": 27627912755,
   "params_basis": "read set for unit=unknown: lookup-only and tower-only tensors excluded",
-  "device_weight_bytes": 7858020024,
+  "device_weight_bytes": 7858059256,
   "device_census_complete": false,
   "device_section_bytes": {
     "stacks": 7280472192,

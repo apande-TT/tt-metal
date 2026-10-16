@@ -109,6 +109,9 @@ def normalize_mesh(device):
 # Empty on the 8x4 Galaxy: every stage ran all 32 samples in one program (2026-09-25, B=32 demo +
 # full-depth trace test); the T3K ceilings (vae_decode 16, text 2 x 32) did not reproduce here.
 STAGE_MAX_BATCH = {}
+# true CFG as ONE transformer pass over [cond; uncond] (the shorter text zero-padded to the longer and masked
+# out) instead of a cond pass and an uncond pass per step: half the per-block programs and TP reduces
+CFG_BATCH = True
 
 
 def _replicated(device, t, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
@@ -293,6 +296,20 @@ class QwenImageEditTT:
 
         p.joint_mask_cond = joint_mask(p.te.mask_cond)
         p.joint_mask_uncond = joint_mask(p.te.mask_uncond)
+        if CFG_BATCH and p.do_cfg:
+            # [cond; uncond] rows of each DP column's samples, every text padded to L = the longer text (0 = masked)
+            lc, lu = p.te.len_cond, p.te.len_uncond
+            L = max(lc, lu)
+
+            def padded(m, n):
+                m = torch.ones(p.B, n) if m is None else m.to(torch.float32)
+                return torch.cat([m, torch.zeros(p.B, L - n), torch.ones(p.B, 2 * p.S_lat)], dim=1)
+
+            mc, mu = padded(p.te.mask_cond, lc), padded(p.te.mask_uncond, lu)
+            bl = p.B // self.dp
+            rows = [t for c in range(self.dp) for t in (mc[c * bl : (c + 1) * bl], mu[c * bl : (c + 1) * bl])]
+            p.cfg_len = L
+            p.joint_mask_cfg = _dp_sharded(d, torch.cat(rows, dim=0).reshape(2 * p.B, 1, 1, -1))
         return p
 
     # ------------------------------------------------------------------ stages (device only)
@@ -329,16 +346,46 @@ class QwenImageEditTT:
         dt = p.dts[i] if dt is None else dt
         x = ttnn.concat([latents, image_latents], dim=1)
         B, S = latents.shape[0], p.S_lat
-        eps = self.transformer(x, pe, t, rope_c, p.joint_mask_cond, txt_embedded=self.hoist_txt)
-        eps = ttnn.slice(eps, [0, 0, 0], [B, S, eps.shape[-1]])
+        if p.do_cfg and CFG_BATCH:
+            txt2, rope2 = self._cfg_inputs(p, pe, neg_pe)
+            both = self.transformer(
+                ttnn.concat([x, x], dim=0), txt2, ttnn.concat([t, t], dim=0), rope2, p.joint_mask_cfg,
+                txt_embedded=self.hoist_txt,
+            )
+            eps = ttnn.slice(both, [0, 0, 0], [B, S, both.shape[-1]])
+            neg = ttnn.slice(both, [B, 0, 0], [2 * B, S, both.shape[-1]])
+            ttnn.deallocate(both)
+        else:
+            eps = self.transformer(x, pe, t, rope_c, p.joint_mask_cond, txt_embedded=self.hoist_txt)
+            eps = ttnn.slice(eps, [0, 0, 0], [B, S, eps.shape[-1]])
         if p.do_cfg:
-            neg = self.transformer(x, neg_pe, t, rope_u, p.joint_mask_uncond, txt_embedded=self.hoist_txt)
-            neg = ttnn.slice(neg, [0, 0, 0], [B, S, neg.shape[-1]])
+            if not CFG_BATCH:
+                neg = self.transformer(x, neg_pe, t, rope_u, p.joint_mask_uncond, txt_embedded=self.hoist_txt)
+                neg = ttnn.slice(neg, [0, 0, 0], [B, S, neg.shape[-1]])
             comb = ttnn.add(neg, ttnn.multiply(ttnn.subtract(eps, neg), p.cfg_scale))
             cond_norm = ttnn.sqrt(ttnn.sum(ttnn.multiply(eps, eps), dim=-1, keepdim=True))
             comb_norm = ttnn.sqrt(ttnn.sum(ttnn.multiply(comb, comb), dim=-1, keepdim=True))
             eps = ttnn.multiply(comb, ttnn.divide(cond_norm, comb_norm))
         return ttnn.add(latents, ttnn.multiply(eps, dt))
+
+    def _cfg_inputs(self, p, pe, neg_pe):
+        """CFG_BATCH's step constants, built once per (pe, neg_pe): [pe; neg_pe] each zero-padded to p.cfg_len
+        text rows (DP-split like them), and the RoPE tables for that length."""
+        key = (id(pe), id(neg_pe))
+        if getattr(p, "_cfg_key", None) != key:
+            L = p.cfg_len
+
+            def pad(t):
+                n = int(t.shape[1])
+                if n == L:
+                    return t
+                z = ttnn.zeros((t.shape[0], L - n, t.shape[2]), dtype=t.dtype, layout=t.layout, device=self.device)
+                return ttnn.concat([t, z], dim=1)
+
+            p._cfg_txt = ttnn.concat([pad(pe), pad(neg_pe)], dim=0)
+            p._cfg_rope = self.rope(p, L)
+            p._cfg_key = key
+        return p._cfg_txt, p._cfg_rope
 
     def _denoise_loop(self, p, n, latents, image_latents, pe, neg_pe, rope_c, rope_u, on_step=None):
         """The scheduler loop. Step 0 runs eagerly (it compiles every program the step uses); the step is
