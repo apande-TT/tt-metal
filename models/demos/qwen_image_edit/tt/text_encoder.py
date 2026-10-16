@@ -23,7 +23,7 @@ import torch
 
 import ttnn
 from models.demos.qwen_image_edit.tt.inputs import PROMPT_TEMPLATE_DROP
-from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm
+from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_linear
 from models.demos.qwen_image_edit_text_encoder._stubs import (
     language_model_layers_0_mlp,
     v_l_decoder_layer,
@@ -65,11 +65,6 @@ VISION_DP_AXIS = 0
 
 class TextEncoderInputs:
     """Device-resident encoded inputs for one batched call (uploaded once, outside the forward)."""
-
-
-def _non_transposed_lane_bmm(pa, pb, lanes, transpose_b, mem):
-    """fused_lane_bmm for a @ b products only (None -> the stock exact-lane ops for a @ b^T)."""
-    return None if transpose_b else fused_lane_bmm(pa, pb, lanes, transpose_b, mem)
 
 
 class TtQwenTextEncoder:
@@ -123,10 +118,10 @@ class TtQwenTextEncoder:
         # and the attention's exact-lane products (QK^T ~7.9 MB, PV ~2.2 MB) likewise
         _te_attention.EXACT_BMM_L1_BYTES = 8 * 1024 * 1024
         _te_attention.VISION_PV_PATTERNS = ("strided",)  # vision P @ V: one lane pattern, no median of three
-        # P @ V's lane pattern as one C++ kernel (lane copies, products and adds in one program). QK^T stays on
-        # the stock ops: with it on the kernel too the text_encode trace replay picks up the fixed +1.25 s
-        # replay offset (eager text time unchanged), costing more than the vision saving
-        _te_attention.EXACT_BMM_FN = _non_transposed_lane_bmm
+        # each lane pattern of P @ V and QK^T as one C++ kernel (lane copies, products and adds in one program)
+        _te_attention.EXACT_BMM_FN = fused_lane_bmm
+        # the exact-lane linears (vision tower) likewise: a lane pattern's limb x lane products + adds as one kernel
+        _te_attention.EXACT_LINEAR_FN = fused_lane_linear
         # the vision token permutations as one bf16 matmul per limb (one-hot rows: each output is a single
         # 1 * v product, already exact without the exact-lane decomposition)
         vision_transformer_pretrained_model.ONEHOT_PERMUTE = True

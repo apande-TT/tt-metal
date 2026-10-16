@@ -9,8 +9,8 @@
   "device_section_bytes": {
     "stacks": 7280472192,
     "denoise": 5121371172,
-    "stack": 5101547520,
     "blocks": 5101547520,
+    "stack": 5101547520,
     "text_encode": 1670032896,
     "mlp": 1638330368,
     "attn": 1240023040,

@@ -7,6 +7,8 @@ The ports' split_matmul spells each pattern as 8 lanes x 3 terms of multiply (la
 72 small programs; kernels/lane_bmm.cpp does the lane copies (as exact matmuls with diagonal 0/1 tiles),
 the full-K lane products in the float32 DEST and their float32 adds in one program. Plugged into
 split_matmul as its EXACT_BMM_FN.
+fused_lane_linear does the same for split_linear's exact-lane products against one bf16 weight
+(kernels/lane_linear.cpp, EXACT_LINEAR_FN).
 """
 from __future__ import annotations
 
@@ -151,4 +153,153 @@ def lane_program(pa, pb, transpose_b, mem, diag_fn, n_diag, n_copies, compute_ke
         ),
     ]
     ttnn.generic_op([pa[0], pa[1], pb[0], pb[1], diag, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    return out
+
+
+# the 8 diagonal lane tiles diag(col % 8 == q) per device
+_DIAG8 = {}
+
+
+def _diag8_tiles(device):
+    """[8 * 32, 32] bf16 TILE: tile q is diag(col % 8 == q) (the lane copy a @ E_q keeps a's columns c % 8 == q)."""
+    if id(device) not in _DIAG8:
+        vals = [
+            1.0 if col == row and col % _LANES == q else 0.0
+            for q in range(_LANES)
+            for row in range(_TILE)
+            for col in range(_TILE)
+        ]
+        d = ttnn.Tensor(vals, [_LANES * _TILE, _TILE], ttnn.float32, ttnn.TILE_LAYOUT, device)
+        _DIAG8[id(device)] = ttnn.typecast(d, ttnn.bfloat16)
+    return _DIAG8[id(device)]
+
+
+def _lane_shift(lanes):
+    """s with lanes[k] == (k % 8 + s * (k // 32)) % 8 for every k (the 8-spaced rotated patterns), else None."""
+    for s in range(_LANES):
+        if all(v == (k % _LANES + s * (k // _TILE)) % _LANES for k, v in enumerate(lanes)):
+            return s
+    return None
+
+
+def fused_lane_linear(parts, w, lanes, mem):
+    """One lane pattern of split_linear's exact-lane product: sum over the bf16 limbs (parts, [..., M, K], 1-3)
+    and the 8 lanes of (part * mask_r) @ w (w: bf16 [K, N] TILE, any interleaved buffer); lanes: lane id of each
+    K entry. -> float32 [..., M, N] in `mem` (kernels/lane_linear.cpp), or None when the operands do not fit
+    the kernel (the caller then runs the stock ops)."""
+    if not 1 <= len(parts) <= 3 or len(w.shape) != 2 or w.dtype != ttnn.bfloat16:
+        return None
+    if any(p.dtype != ttnn.bfloat16 or p.layout != ttnn.TILE_LAYOUT or p.is_sharded() for p in parts):
+        return None
+    if w.layout != ttnn.TILE_LAYOUT or w.is_sharded():
+        return None
+    a_s, w_s = [int(v) for v in parts[0].padded_shape], [int(v) for v in w.padded_shape]
+    k = int(parts[0].shape[-1])
+    shift = _lane_shift(lanes)
+    # whole K tiles only (no padded K entries for the lane masks to cover), K matching the weight
+    if shift is None or len(lanes) != k or k % _TILE or a_s[-1] != k or w_s[0] != k or int(w.shape[0]) != k:
+        return None
+    if any([int(v) for v in p.padded_shape] != a_s for p in parts[1:]):
+        return None
+    k_t, n_t = k // _TILE, w_s[1] // _TILE
+    rows = math.prod(a_s[:-2]) * (a_s[-2] // _TILE)
+    device = parts[0].device()
+    grid = device.compute_with_storage_grid_size()
+    cores_n = grid.x * grid.y
+    # work unit = (row block, csize output columns) with the weight's column block resident in L1; cb bytes per
+    # core: a limb (double-buffered), the weight block, the 8 lane tiles, one lane copy, the running sums and
+    # the output (float32). Pick the column split with the least work on the busiest core (lane copies cost
+    # about two columns' products)
+    best = None
+    for c in range(1, n_t + 1):
+        csize = -(-n_t // c)
+        chunks = -(-n_t // csize)
+        if (2 * k_t + _LANES + k_t + csize * k_t) * 2048 + (csize + 4) * 4096 > 900 * 1024:
+            continue
+        cost = -(-rows * chunks // cores_n) * (csize + 2)
+        if best is None or cost < best[0]:
+            best = (cost, chunks, csize)
+    if best is None:
+        return None
+    _, chunks, csize = best
+    units = rows * chunks
+    out_shape = list(parts[0].shape)[:-1] + [int(w.shape[-1])]
+    out = ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), ttnn.float32, ttnn.TILE_LAYOUT, device, mem)
+    diag = _diag8_tiles(device)
+
+    all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
+    _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, units)
+
+    def _cb(index, dtype, page, n):
+        return ttnn.CBDescriptor(
+            total_size=n * page,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=page)],
+        )
+
+    cbs = [
+        _cb(0, ttnn.bfloat16, 2048, 2 * k_t),
+        _cb(1, ttnn.bfloat16, 2048, csize * k_t),
+        _cb(2, ttnn.bfloat16, 2048, _LANES),
+        _cb(3, ttnn.bfloat16, 2048, k_t),
+        _cb(4, ttnn.float32, 4096, csize),
+        _cb(16, ttnn.float32, 4096, 4),
+    ]
+    a_list = list(parts) + [parts[0]] * (3 - len(parts))  # unused limb slots read nothing
+    addrs = [p.buffer_address() for p in a_list] + [w.buffer_address(), diag.buffer_address()]
+    rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    start = 0
+    for group, per in ((group1, per1), (group2, per2)):
+        for r in group.ranges():
+            for cx in range(r.start.x, r.end.x + 1):
+                for cy in range(r.start.y, r.end.y + 1):
+                    # this core's units cover output tiles [first, last) contiguously (row-major (row, nt))
+                    first, last = _tile_of(start, chunks, csize, n_t), _tile_of(start + per, chunks, csize, n_t)
+                    rd_rt[cx][cy] = addrs + [start, per]
+                    wr_rt[cx][cy] = [out.buffer_address(), last - first, first]
+                    cp_rt[cx][cy] = [start, per]
+                    start += per
+    ct = [k_t, n_t, chunks, csize, len(parts), shift]
+    # as the stock linear's precise_config: HiFi4, float32 DEST; the running sums reload exactly (UnpackToDestFp32)
+    cfg = ttnn.ComputeConfigDescriptor()
+    cfg.math_fidelity = ttnn.MathFidelity.HiFi4
+    cfg.fp32_dest_acc_en = True
+    cfg.math_approx_mode = False
+    modes = [ttnn.UnpackToDestMode.Default] * 32
+    modes[4] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    cfg.unpack_to_dest_mode = modes
+    acc = []
+    for t in a_list + [w, diag]:
+        acc += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_KERNELS, "reader_lane_linear.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct + acc,
+            runtime_args=rd_rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=os.path.join(
+                _TT_METAL,
+                "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp",
+            ),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[16] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=wr_rt,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_KERNELS, "lane_linear.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct,
+            runtime_args=cp_rt,
+            config=cfg,
+        ),
+    ]
+    prog = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+    ttnn.generic_op(list(parts) + [w, diag, out], prog)
     return out
