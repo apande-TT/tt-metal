@@ -322,6 +322,9 @@ EXACT_OPERANDS_L1_BYTES = 0
 # (sum over limb terms and lanes; lanes = lane id of each K entry), or None to run the stock ops
 # (None: ttnn multiply + matmul + add per lane)
 EXACT_BMM_FN = None
+# fn(limbs, w, lanes, memory_config) -> one lane pattern's exact-lane linear (sum over limbs and lanes of
+# (limb * mask_r) @ w), or None to run the stock ops (None: ttnn multiply + linear + add per lane)
+EXACT_LINEAR_FN = None
 # lane patterns of the vision attention's P @ V exact-lane product (None: the attention's own `exact`,
 # i.e. the median of all LANE_PATTERNS; e.g. ("strided",): one pattern, no vote)
 VISION_PV_PATTERNS = None
@@ -386,6 +389,24 @@ def _block_config(x, w):
     )
 
 
+def _exact_linear_fn(parts, w, patterns, out_bytes):
+    """_exact_sum of split_linear's products through EXACT_LINEAR_FN (one call per lane pattern; L1 / DRAM as
+    _exact_sum places them), or None when it declines a pattern."""
+    l1 = bool(EXACT_SUM_L1_BYTES) and 0 < out_bytes <= EXACT_SUM_L1_BYTES
+    mem = ttnn.L1_MEMORY_CONFIG if l1 else ttnn.DRAM_MEMORY_CONFIG
+    k = int(parts[0].shape[-1])
+    ests = []
+    for pattern in patterns:
+        y = EXACT_LINEAR_FN(parts, w, [_lane_of(i, pattern) for i in range(k)], mem)
+        if y is None:
+            for t in ests:
+                ttnn.deallocate(t)
+            return None
+        ests.append(y)
+    out = _vote(ests)
+    return ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out
+
+
 def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2, parts=None):
     """float32 x @ bf16 w (+ bias) -> float32. x is carried as `limbs` bf16 parts (exact products). With
     exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part.
@@ -394,7 +415,8 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     parts = split_bf16(x, limbs) if parts is None else parts
 
     staged = []
-    if exact and EXACT_OPERANDS_L1_BYTES:  # every lane product re-reads the weight and a limb: stage them in L1
+    # every stock lane product re-reads the weight and a limb: stage them in L1 (EXACT_LINEAR_FN reads them once)
+    if exact and EXACT_OPERANDS_L1_BYTES and EXACT_LINEAR_FN is None:
         w_bytes = 2 * math.prod([int(d) for d in w.padded_shape])
         p_bytes = 2 * math.prod([int(d) for d in parts[0].padded_shape])
         if w.dtype == ttnn.bfloat16 and w_bytes + len(parts) * p_bytes <= EXACT_OPERANDS_L1_BYTES:
@@ -408,7 +430,9 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
 
     if exact:
         out_bytes = 4 * math.prod([int(d) for d in x.padded_shape][:-1]) * int(w.padded_shape[-1])
-        y = _exact_sum(mm, parts, _patterns(exact), out_bytes=out_bytes)
+        y = _exact_linear_fn(parts, w, _patterns(exact), out_bytes) if EXACT_LINEAR_FN is not None else None
+        if y is None:
+            y = _exact_sum(mm, parts, _patterns(exact), out_bytes=out_bytes)
         for t in staged:
             ttnn.deallocate(t)
     else:
