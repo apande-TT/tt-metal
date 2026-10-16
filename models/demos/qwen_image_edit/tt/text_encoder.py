@@ -24,6 +24,7 @@ import torch
 import ttnn
 from models.demos.qwen_image_edit.tt.inputs import PROMPT_TEMPLATE_DROP
 from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_linear
+from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit_text_encoder._stubs import (
     language_model_layers_0_mlp,
     v_l_decoder_layer,
@@ -127,6 +128,9 @@ class TtQwenTextEncoder:
         vision_transformer_pretrained_model.ONEHOT_PERMUTE = True
         # MLP gate / up share their input's bf16 limb split (LM and vision tower)
         _te_attention.SHARE_SPLIT = True
+        # the LM's two-limb linears as one C++ program each (limb_linear.cpp: the weight streamed once for both limbs,
+        # the same fp32 products and RNE add)
+        _te_attention.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG)
         # the LM attention moves heads by per-head slices + concat, not a padded reshape + permute
         from models.demos.qwen_image_edit_text_encoder._stubs import layer as _te_layer
 

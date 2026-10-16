@@ -22,8 +22,8 @@ _KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
 _TILE = 32
 # float32 DEST tiles per output block (fp32 accumulation, half-sync DEST)
 _DEST_TILES = 4
-# L1 bytes per core for the resident rows of both limbs
-_ROWS_L1_BYTES = 400 * 1024
+# L1 bytes per core for the resident rows of both limbs (460 KB: K up to 3680, the text encoder's 3584)
+_ROWS_L1_BYTES = 460 * 1024
 
 
 def _largest_divisor(n, cap):
