@@ -46,6 +46,10 @@ class VisionConsts:
         self.mask_full, self.mask_win = mask_full, mask_win
         self.perm, self.unperm = perm, unperm  # [N, 1, s_pad, s_pad] / [N, 1, m_pad, m_pad] one-hot
         self.s, self.s_pad, self.m, self.m_pad = s, s_pad, m, m_pad
+        # the window-major token order (the perm's rows); a caller that uploads its pixel rows in this order sets
+        # pixels_in_window_order and the forward skips the perm product (the patch embed is row-wise)
+        self.window_rows = None
+        self.pixels_in_window_order = False
 
 
 class TtVisionTransformer:
@@ -91,7 +95,7 @@ class TtVisionTransformer:
         m_pad = pad_to_tile(s_pad // self.unit)
         perm = np.repeat(_one_hot(rows, s_pad), n_images, axis=0)
         unperm = np.repeat(_one_hot(np.argsort(window_index), m_pad), n_images, axis=0)
-        return VisionConsts(
+        c = VisionConsts(
             cos,
             sin,
             mask_full,
@@ -104,6 +108,8 @@ class TtVisionTransformer:
             m,
             m_pad,
         )
+        c.window_rows = rows
+        return c
 
     # ---- device forward ---------------------------------------------------------------------------
     def forward_batched(self, pixels, c: VisionConsts):
@@ -113,10 +119,12 @@ class TtVisionTransformer:
         cfg = self.compute_cfg
         if self.precise:
             x = self.patch_embed(pixels, dtype=ttnn.float32, precise=True)
-            x = onehot_matmul(c.perm, x, limbs=getattr(self, "limbs", 2))
+            if not c.pixels_in_window_order:
+                x = onehot_matmul(c.perm, x, limbs=getattr(self, "limbs", 2))
         else:
             x = self.patch_embed(pixels, dtype=ttnn.float32)
-            x = ttnn.matmul(c.perm, x, compute_kernel_config=cfg, dtype=ttnn.float32)
+            if not c.pixels_in_window_order:
+                x = ttnn.matmul(c.perm, x, compute_kernel_config=cfg, dtype=ttnn.float32)
         for i, blk in enumerate(self.blocks):
             x = blk.forward_padded(x, c.cos, c.sin, c.mask_full if i in self.fullatt else c.mask_win)
 

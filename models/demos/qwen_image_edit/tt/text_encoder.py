@@ -140,6 +140,10 @@ class TtQwenTextEncoder:
         p.vision_rows = rows if rows > 1 and B % rows == 0 else 1
         vc = self.visual.consts(grids[0], B // p.vision_rows)
         pix = vl["pixel_values"].to(torch.float32).reshape(B, 1, vc.s, -1)
+        # the patch rows uploaded in the tower's window-major order (an index permutation of the input, from the
+        # grid metadata): the forward then skips its one-hot reorder product after the row-wise patch embed
+        pix = pix[:, :, torch.from_numpy(np.ascontiguousarray(vc.window_rows))]
+        vc.pixels_in_window_order = True
         pix = torch.nn.functional.pad(pix, (0, 0, 0, vc.s_pad - vc.s))
         p.vision_consts = vc
         if p.vision_rows > 1:
