@@ -407,6 +407,11 @@ def _exact_linear_fn(parts, w, patterns, out_bytes):
     return ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out
 
 
+# fn(hi, lo, w) -> hi @ w + lo @ w as float32 (one call: the weight streamed once for both limbs, the same fp32
+# products and add) or None to run the stock ops; used by split_linear's non-exact two-limb products
+LIMB_LINEAR_FN = None
+
+
 def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2, parts=None):
     """float32 x @ bf16 w (+ bias) -> float32. x is carried as `limbs` bf16 parts (exact products). With
     exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part.
@@ -436,10 +441,10 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
         for t in staged:
             ttnn.deallocate(t)
     else:
-        pc = _block_config(x, w) if LINEAR_BLOCK and LINEAR_CORE_GRID is not None else None
+        y = LIMB_LINEAR_FN(parts[0], parts[1], w) if LIMB_LINEAR_FN is not None and len(parts) == 2 else None
+        pc = _block_config(x, w) if y is None and LINEAR_BLOCK and LINEAR_CORE_GRID is not None else None
         kw = dict(program_config=pc) if pc is not None else dict(core_grid=LINEAR_CORE_GRID)
-        y = None
-        for part in parts:
+        for part in parts if y is None else ():
             t = ttnn.linear(part, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw)
             y = t if y is None else ttnn.add(y, t)
     # bias added separately in float32 (the fused bias add of ttnn.linear rounds: 3.1e-4 -> 5.1e-4)
