@@ -297,9 +297,10 @@ class QwenImageEditTT:
         p.joint_mask_cond = joint_mask(p.te.mask_cond)
         p.joint_mask_uncond = joint_mask(p.te.mask_uncond)
         if CFG_BATCH and p.do_cfg:
-            # [cond; uncond] rows of each DP column's samples, every text padded to L = the longer text (0 = masked)
+            # [cond; uncond] rows of each DP column's samples, every text padded to L = the longer text rounded up to
+            # whole tiles (0 = masked): the blocks' [txt, img] concats and splits then fall on tile boundaries
             lc, lu = p.te.len_cond, p.te.len_uncond
-            L = max(lc, lu)
+            L = -(-max(lc, lu) // 32) * 32
 
             def padded(m, n):
                 m = torch.ones(p.B, n) if m is None else m.to(torch.float32)
