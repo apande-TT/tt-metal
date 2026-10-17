@@ -603,6 +603,17 @@ def rotate_half(t):
     return ttnn.concat([ttnn.neg(x2), x1], dim=-1)
 
 
+def rotate_half_padded(t, d):
+    """rotate_half over the first d columns of t (the rest zero, kept zero): cat(-x[d/2:d], x[:d/2], x[d:])."""
+    shape = list(t.shape)
+    half = d // 2
+    z = [0] * len(shape)
+    x1 = ttnn.slice(t, z, shape[:-1] + [half])
+    x2 = ttnn.slice(t, z[:-1] + [half], shape[:-1] + [d])
+    x3 = ttnn.slice(t, z[:-1] + [d], shape)
+    return ttnn.concat([ttnn.neg(x2), x1, x3], dim=-1)
+
+
 # Optional program-config hook for split_matmul's batched products: BMM_CONFIG(p, q, transpose_b) -> a program
 # config for p @ q (q transposed when transpose_b), or None (auto).
 BMM_CONFIG = None
@@ -793,6 +804,27 @@ class TtVisionAttention:
         bqkv = torch.cat(b_blocks, dim=0).reshape(1, 1, 1, -1)
         self.wqkv = upload(device, wqkv_t, mapper=shard_mapper(device, -1))
         self.bqkv = upload(device, bqkv, mapper=shard_mapper(device, -1))
+        # precise: every head's D columns (q, k, v) and proj rows zero-padded to a tile multiple Dp, so the head
+        # split / merge are the tile-aligned head kernels (the ragged D = 80 took a ~2.3 ms re-tiling reshape per
+        # q / k / v / output per layer) and the P @ V products take the fused guard tail; the zero columns add
+        # nothing to any product
+        Dp = -(-D // 32) * 32
+        self.head_dim_pad = Dp
+
+        def _pad_heads(t, axis):  # t's `axis` = (..., heads, D) groups -> (..., heads, Dp), zeros (host numpy)
+            sh = list(t.shape)
+            n = sh[axis] // D
+            a = t.numpy().reshape(sh[:axis] + [n, D] + sh[axis + 1 :])
+            widths = [(0, 0)] * (axis + 1) + [(0, Dp - D)] + [(0, 0)] * (len(sh) - axis - 1)
+            return torch.from_numpy(np.pad(a, widths).reshape(sh[:axis] + [n * Dp] + sh[axis + 1 :]).copy())
+
+        self.wqkv_p = upload(device, _pad_heads(wqkv_t, 1), mapper=shard_mapper(device, -1))
+        self.bqkv_p = upload(device, _pad_heads(bqkv, 3), mapper=shard_mapper(device, -1))
+        wproj_t = torch_module.proj.weight.detach().float().t().contiguous()  # [H*D, C] rows head-major
+        self.wproj_p = upload(device, _pad_heads(wproj_t, 0), mapper=shard_mapper(device, 0))
+        self.wproj_cols_p = upload(device, _pad_heads(wproj_t, 0), mapper=shard_mapper(device, -1))
+        self._tables_p = {}
+        self.head_pad = True
         # proj: row-parallel -- input rows are head-major, so chip d's rows match its local heads.
         self.wproj = upload(
             device, torch_module.proj.weight.detach().float().t().contiguous(), mapper=shard_mapper(device, 0)
@@ -858,7 +890,51 @@ class TtVisionAttention:
             out = ttnn.all_reduce(out, cluster_axis=1, topology=ttnn.Topology.Linear)
         return ttnn.add(out, self.bproj)
 
+    def _padded_tables(self, tt_cos, tt_sin):
+        """The rotary tables zero-padded to Dp columns (float32), cached per table pair."""
+        key = (id(tt_cos), id(tt_sin))
+        if key not in self._tables_p:
+            Dp, D = self.head_dim_pad, self.head_dim
+            out = []
+            for t in (tt_cos, tt_sin):
+                t = t if t.dtype == ttnn.float32 else ttnn.typecast(t, ttnn.float32)
+                out.append(ttnn.pad(t, [(0, 0)] * (len(t.shape) - 1) + [(0, Dp - D)], 0.0))
+            self._tables_p[key] = (tt_cos, tt_sin, out[0], out[1])  # (the sources kept: their ids stay unique)
+        return self._tables_p[key][2:]
+
+    def _forward_precise_padded(self, x, tt_cos, tt_sin, tt_mask):
+        """_forward_precise with every head's columns zero-padded to Dp (see __init__)."""
+        D, Dp, hp = self.head_dim, self.head_dim_pad, self.local_heads
+        cfg = self.compute_cfg
+        L = getattr(self, "limbs", 2)
+        qkv = split_linear(x, self.wqkv_p, bias=self.bqkv_p, compute_kernel_config=cfg, limbs=L)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(qkv, num_heads=hp, num_kv_heads=hp, transpose_k_heads=False)
+        ttnn.deallocate(qkv)
+        cos, sin = self._padded_tables(tt_cos, tt_sin)
+
+        def _rope(t):
+            return ttnn.add(ttnn.multiply(t, cos), ttnn.multiply(rotate_half_padded(t, D), sin))
+
+        q, k = _rope(q), _rope(k)
+        mask = tt_mask if tt_mask.dtype == ttnn.float32 else ttnn.typecast(tt_mask, ttnn.float32)
+        scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, limbs=L)
+        scores = ttnn.add(ttnn.multiply(scores, self.scale), mask)
+        mx = ttnn.max(scores, dim=-1, keepdim=True)
+        e = ttnn.exp(ttnn.subtract(scores, mx))
+        probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
+        o = split_matmul(probs, v, compute_kernel_config=cfg, limbs=L)  # [N, hp, S, Dp]
+        o = ttnn.experimental.nlp_concat_heads(o)  # [N, 1, S, hp * Dp]
+        if self.tp > 1:
+            o = ttnn.all_gather(o, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
+            out = split_linear(o, self.wproj_cols_p, compute_kernel_config=cfg, limbs=L)
+            out = ttnn.all_gather(out, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
+        else:
+            out = split_linear(o, self.wproj_p, compute_kernel_config=cfg, limbs=L)
+        return ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32))
+
     def _forward_precise(self, x, tt_cos, tt_sin, tt_mask):
+        if self.head_pad and self.head_dim % 32:
+            return self._forward_precise_padded(x, tt_cos, tt_sin, tt_mask)
         D, hp = self.head_dim, self.local_heads
         n, s_pad = x.shape[0], x.shape[-2]
         loc = hp * D
