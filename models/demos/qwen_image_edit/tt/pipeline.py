@@ -42,7 +42,6 @@ from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
-from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm
 from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16
 from models.demos.qwen_image_edit.tt.softmax_rows import fused_softmax_rows
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
@@ -119,13 +118,6 @@ def _replicated(device, t, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
     return ttnn.from_torch(
         t.contiguous(), dtype=dtype, layout=layout, device=device, mesh_mapper=ttnn.ReplicateTensorToMesh(device)
     )
-
-
-def _exact_qk(pa, pb, lanes_per_pattern):
-    """The transformer's exact-lane QK^T: three patterns + median as fused_exact_qk, one pattern as fused_lane_bmm."""
-    if len(lanes_per_pattern) == 1:
-        return fused_lane_bmm(pa, pb, lanes_per_pattern[0], True, ttnn.DRAM_MEMORY_CONFIG)
-    return fused_exact_qk(pa, pb, lanes_per_pattern)
 
 
 def _dp_sharded(device, t, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
@@ -207,9 +199,7 @@ class QwenImageEditTT:
         _tr_precise.FOLD_LANES = True
         # and its three lane patterns + median as one C++ kernel (lane copies made per row block, each pattern
         # accumulated in DEST in the folded K order): no folded query operand, masks or [Sq, Sk] estimates
-        _tr_precise.EXACT_QK_FN = _exact_qk
-        # one lane pattern (no median of three): the median only outvotes a rare power-of-two glitch
-        _tr_precise.PATTERNS = ("strided",)
+        _tr_precise.EXACT_QK_FN = fused_exact_qk
         # projections of one activation (q/k/v, ada-norm scale/shift) share its hi/lo split, and the image and
         # text queries share the joint K's folded operand and V's limbs
         _tr_precise.SHARE_SPLIT = True
