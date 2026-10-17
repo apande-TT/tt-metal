@@ -222,7 +222,8 @@ class TtQwenImageEditPipeline:
             yield
 
     def vision_encode(self, up):
-        with self._fused_tail():
+        # (the attention P @ V products' exact lanes on V's rows: the C++ weight-lane split of the smaller operand)
+        with self._hook(_te_attention, "B_LANE_SPLIT", self.weight_lane_split), self._fused_tail():
             return self.text_encoder.encode_vision(up.te)
 
     def text_encode(self, up, image_embeds):

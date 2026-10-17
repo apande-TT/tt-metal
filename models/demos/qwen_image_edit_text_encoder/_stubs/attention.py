@@ -734,6 +734,26 @@ def onehot_matmul(a, b, limbs=2):
 B_LIMB_L1 = False
 
 
+# Optional fused kernel for the weight-side lane split: B_LANE_SPLIT(w2d) -> the 8 strided-lane row-masked copies of a
+# bf16 [K, N] tile tensor (guard_kernel.weight_lanes), or None.
+B_LANE_SPLIT = None
+
+
+def _b_side_lanes(pa, pb, transpose_b):
+    """The 8 exact lanes of a batched product formed on b's K rows instead of a's K columns, when b is the smaller
+    operand (a [..., M, K] @ b [..., K, N] with N < M); None otherwise."""
+    if B_LANE_SPLIT is None or transpose_b:
+        return None
+    sa, sb = list(pa.padded_shape), list(pb.padded_shape)
+    if len(sb) < 3 or sb[-1] >= sa[-2] or sb[-2] % 32 or list(pb.shape) != sb:
+        return None
+    rows = 1
+    for d in sb[:-1]:
+        rows *= d
+    lanes = B_LANE_SPLIT(ttnn.view(pb, (rows, sb[-1])))  # K % 32 == 0: row r's lane is r % 8 in every entry
+    return None if lanes is None else [ttnn.view(t, sb) for t in lanes]
+
+
 def _guarded_terms(mm, terms, a, b, transpose_b):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
@@ -759,10 +779,19 @@ def _guarded_terms(mm, terms, a, b, transpose_b):
     small = vol <= 16 * 2**20 and batch >= 64
     pb0_l1 = ttnn.to_memory_config(pb0, ttnn.L1_MEMORY_CONFIG) if B_LIMB_L1 and small else pb0
     acc = _LaneAcc()
-    lanes, neg0 = _lead_lanes(pa0)
-    for lane in lanes:
-        acc.push(mm(lane, pb0_l1))
-        ttnn.deallocate(lane)
+    b_lanes = _b_side_lanes(pa0, pb0, transpose_b)
+    if b_lanes is not None:
+        # the exact lanes on the smaller operand's K rows (the vision P @ V: V is 3.7x smaller than the probs):
+        # lane r = a @ (b with only lane r's K rows) -- the same nonzero terms in every tile product
+        for lane in b_lanes:
+            acc.push(mm(pa0, lane))
+            ttnn.deallocate(lane)
+        neg0 = None
+    else:
+        lanes, neg0 = _lead_lanes(pa0)
+        for lane in lanes:
+            acc.push(mm(lane, pb0_l1))
+            ttnn.deallocate(lane)
     ex = acc.value()
     dn = mm(pa0, pb0_l1)
     first = [lambda pa=pa, pb=pb: mm(pa, pb) for pa, pb in rest[:2]]
