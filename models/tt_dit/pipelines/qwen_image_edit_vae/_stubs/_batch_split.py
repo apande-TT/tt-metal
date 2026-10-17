@@ -52,13 +52,89 @@ class BatchSplit:
         pad_b = -x.shape[0] % self.factor
         if pad_b:
             x = ttnn.pad(x, [(0, pad_b), (0, 0), (0, 0), (0, 0), (0, 0)], value=0.0)
-        for a in self.axes:
+        part = self._batch_part(x) if self.axes else None
+        if part is not None:
+            x = part
+        for a in self.axes if part is None else ():
             x = ttnn.mesh_partition(x, dim=0, cluster_axis=a)
         if pc.height_parallel.factor > 1:
             x = ttnn.mesh_partition(x, dim=2, cluster_axis=pc.height_parallel.mesh_axis)
         if pc.width_parallel.factor > 1:
             x = ttnn.mesh_partition(x, dim=3, cluster_axis=pc.width_parallel.mesh_axis)
         return x, pad_b
+
+    _COPY_READER = "models/demos/qwen_image_edit/tt/kernels/chunk_copy_reader.cpp"
+    _COPY_WRITER = "models/demos/qwen_image_edit/tt/kernels/chunk_copy_writer.cpp"
+    _CHUNK = 64
+
+    def _batch_part(self, x):
+        """The batch partitions over self.axes in ONE device copy: each chip copies its own images' pages of the
+        replicated row-major x (exact data movement; one program per chip, its page offset a runtime arg).
+        None when x is not a plain interleaved row-major tensor on a mesh."""
+        device = x.device()
+        if not isinstance(device, ttnn.MeshDevice) or x.layout != ttnn.ROW_MAJOR_LAYOUT or x.is_sharded():
+            return None
+        shape = mesh_shape(device)
+        B = x.shape[0]
+        b = B // self.factor
+        per_item = 1
+        for d in list(x.shape)[1:-1]:
+            per_item *= d
+        pages = b * per_item
+        y = ttnn.empty([b] + list(x.shape)[1:], dtype=x.dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+        page_bytes = x.shape[-1] * (4 if x.dtype == ttnn.float32 else 2)
+        grid = device.compute_with_storage_grid_size()
+        n_cores = min(grid.x * grid.y, pages)
+        per, extra = divmod(pages, n_cores)
+        work, start = [], 0
+        for i in range(n_cores):
+            cnt = per + (1 if i < extra else 0)
+            work.append((ttnn.CoreCoord(i % grid.x, i // grid.x), start, cnt))
+            start += cnt
+        cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=2 * self._CHUNK * page_bytes,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=0, data_format=x.dtype, page_size=page_bytes)],
+            )
+        ]
+        mesh_pd = ttnn.MeshProgramDescriptor()
+        for r in range(shape[0]):
+            for c in range(shape[1]):
+                idx = (r, c)
+                chunk = 0
+                for a in self.axes:  # mesh_partition order: the first axis splits the batch, the next its parts
+                    chunk = chunk * shape[a] + idx[a]
+                src0 = chunk * pages
+                rd, wr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+                for core, st, cnt in work:
+                    rd[core.x][core.y] = [x.buffer_address(), src0 + st, cnt]
+                    wr[core.x][core.y] = [y.buffer_address(), st, cnt]
+                kernels = [
+                    ttnn.KernelDescriptor(
+                        kernel_source=self._COPY_READER,
+                        source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                        core_ranges=cores,
+                        compile_time_args=ttnn.TensorAccessorArgs(x).get_compile_time_args() + [self._CHUNK],
+                        runtime_args=rd,
+                        config=ttnn.ReaderConfigDescriptor(),
+                    ),
+                    ttnn.KernelDescriptor(
+                        kernel_source=self._COPY_WRITER,
+                        source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                        core_ranges=cores,
+                        compile_time_args=ttnn.TensorAccessorArgs(y).get_compile_time_args() + [self._CHUNK],
+                        runtime_args=wr,
+                        config=ttnn.WriterConfigDescriptor(),
+                    ),
+                ]
+                coord = ttnn.MeshCoordinate(r, c)
+                mesh_pd[ttnn.MeshCoordinateRange(coord, coord)] = ttnn.ProgramDescriptor(
+                    kernels=kernels, semaphores=[], cbs=cbs
+                )
+        ttnn.generic_op([x, y], mesh_pd)
+        return y
 
     def gather(self, out, ccl_manager, B, pad_b):
         """This chip's BTHWC part -> the replicated [B, ...] whole."""
