@@ -325,6 +325,9 @@ EXACT_BMM_FN = None
 # fn(limbs, w, lanes, memory_config) -> one lane pattern's exact-lane linear (sum over limbs and lanes of
 # (limb * mask_r) @ w), or None to run the stock ops (None: ttnn multiply + linear + add per lane)
 EXACT_LINEAR_FN = None
+# fn(limbs, w, [lanes per pattern], memory_config) -> every lane pattern's exact-lane linear and their vote in one
+# call, or None (then EXACT_LINEAR_FN per pattern / the stock ops)
+EXACT_LINEAR_PATTERNS_FN = None
 # lane patterns of the vision attention's P @ V exact-lane product (None: the attention's own `exact`,
 # i.e. the median of all LANE_PATTERNS; e.g. ("strided",): one pattern, no vote)
 VISION_PV_PATTERNS = None
@@ -395,6 +398,10 @@ def _exact_linear_fn(parts, w, patterns, out_bytes):
     l1 = bool(EXACT_SUM_L1_BYTES) and 0 < out_bytes <= EXACT_SUM_L1_BYTES
     mem = ttnn.L1_MEMORY_CONFIG if l1 else ttnn.DRAM_MEMORY_CONFIG
     k = int(parts[0].shape[-1])
+    if EXACT_LINEAR_PATTERNS_FN is not None:
+        out = EXACT_LINEAR_PATTERNS_FN(parts, w, [[_lane_of(i, pt) for i in range(k)] for pt in patterns], mem)
+        if out is not None:
+            return ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out
     ests = []
     for pattern in patterns:
         y = EXACT_LINEAR_FN(parts, w, [_lane_of(i, pattern) for i in range(k)], mem)
