@@ -371,11 +371,18 @@ def _weight_lane_sums(lead, ws):
     split = None if WEIGHT_LANE_SPLIT is None else [WEIGHT_LANE_SPLIT(w) for w in ws]
     if split is not None and any(lanes is None for lanes in split):
         split = None
+    # the lead limb, read by every lane product, staged in L1 once when it is small (the vision qkv: 14.4 MB/chip)
+    vol = 2
+    for d in lead.padded_shape:
+        vol *= d
+    src = ttnn.to_memory_config(lead, ttnn.L1_MEMORY_CONFIG) if vol <= 16 * 2**20 else lead
     for r, m in enumerate(_row_lane_masks(lead.device(), lead.shape[-1], ws[0].dtype)):
         for i, w in enumerate(ws):
             wr = ttnn.multiply(w, m) if split is None else split[i][r]  # 0 / 1: exact
-            accs[i].push(_linear_mm(lead, wr)(lead))
+            accs[i].push(_linear_mm(src, wr)(src))
             ttnn.deallocate(wr)
+    if src is not lead:
+        ttnn.deallocate(src)
     return [acc.value() for acc in accs]
 
 
