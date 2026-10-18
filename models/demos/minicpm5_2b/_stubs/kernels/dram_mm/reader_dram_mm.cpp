@@ -16,14 +16,14 @@
 
 void kernel_main() {
     constexpr uint32_t cb_in1 = get_compile_time_arg_val(0);
-    constexpr uint32_t num_blocks = get_compile_time_arg_val(1);
-    constexpr uint32_t block_tiles = get_compile_time_arg_val(2);
-    constexpr uint32_t txns_per_block = get_compile_time_arg_val(3);
-    constexpr uint32_t txn_bytes = get_compile_time_arg_val(4);
+    constexpr uint32_t block_tiles = get_compile_time_arg_val(1);
+    constexpr uint32_t txns_per_block = get_compile_time_arg_val(2);
+    constexpr uint32_t txn_bytes = get_compile_time_arg_val(3);
 
     const uint32_t bank_id = get_arg_val<uint32_t>(0);
     const uint32_t vchannel = get_arg_val<uint32_t>(1);
     uint32_t w_offset = get_common_arg_val<uint32_t>(0) + get_arg_val<uint32_t>(3);  // this worker's part
+    const uint32_t num_blocks = get_arg_val<uint32_t>(5);
 
     const uint64_t dram_noc_addr = get_noc_addr_from_bank_id<true>(bank_id, 0);
     const uint32_t cb_base = get_write_ptr(cb_in1);

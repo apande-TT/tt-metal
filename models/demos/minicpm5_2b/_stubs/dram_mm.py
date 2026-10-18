@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Decode (one tile row) projection as a DRAM-bank-local generic_op (kernels/dram_mm).
 
-One core per DRAM bank, on that bank's optimal worker, streams only tiles held by its own bank in large contiguous
-reads (the access pattern of ttnn's DRAM-sharded matmul), while the arithmetic stays that of the 1-D multicast
+A few cores per DRAM bank (its optimal worker and the nearest free cores in that row) stream only tiles held by that
+bank, each its own contiguous part, in large reads (the access pattern of ttnn's DRAM-sharded matmul), while the arithmetic stays that of the 1-D multicast
 matmul it replaces: every output tile is one uninterrupted fp32 DEST accumulation over K in order (that factory
 reloads its partials straight into DEST between K blocks), packed to bf16.
 
 The weight is stored DRAM interleaved with its tiles permuted so that bank b's pages, in address order, are exactly
-the tiles bank b's core consumes: interleaved page p lives in bank p % banks at offset (p // banks) * page, so page
+the tiles bank b's workers consume: interleaved page p lives in bank p % banks at offset (p // banks) * page, so page
 banks * q + b is tile q of bank b's sequence (output-column groups of group_w tiles, K-major inside a group).
 """
 from __future__ import annotations
@@ -60,8 +60,10 @@ class DramMatmul:
         if not self.ok:
             return
         bank_groups = cols // group_w
-        wpb = max(w for w in range(1, _WORKERS_PER_BANK + 1) if bank_groups % w == 0)
-        num_groups = bank_groups // wpb  # per worker
+        wpb = min(_WORKERS_PER_BANK, bank_groups)
+        # Groups per worker of a bank (the first ones take one more when they do not divide evenly).
+        base, extra = divmod(bank_groups, wpb)
+        worker_groups = [base + (1 if i < extra else 0) for i in range(wpb)]
 
         # [k_t, n_t, 32, 32] tiles -> per bank, per group, K-major rows of group_w tiles.
         tiles = w.reshape(k_t, _TILE, n_t, _TILE).permute(0, 2, 1, 3)
@@ -96,8 +98,9 @@ class DramMatmul:
         self.cores = cores
         rt = ttnn.RuntimeArgs()
         vchannels = {}
-        part_bytes = num_groups * k_t * group_w * _TILE_BYTES
+        group_bytes = k_t * group_w * _TILE_BYTES
         for b, mine in enumerate(bank_cores):
+            g0 = 0
             for w_i, c in enumerate(mine):
                 # Different virtual channels for workers sharing a row (deepseek matmul_wo's assignment).
                 vc = (b * wpb + w_i) & 0x3
@@ -107,9 +110,10 @@ class DramMatmul:
                         break
                     vc = (vc + 1) & 0x3
                 vchannels[(c.x, c.y)] = vc
-                rt[c.x][c.y] = [b, vc, b * cols + w_i * num_groups * group_w, w_i * part_bytes]
+                ng = worker_groups[w_i]
+                rt[c.x][c.y] = [b, vc, b * cols + g0 * group_w, g0 * group_bytes, ng, ng * (k_t // k_block)]
+                g0 += ng
         self.rt = rt
-        num_blocks = num_groups * (k_t // k_block)
         self.cbs = [
             ttnn.CBDescriptor(
                 total_size=k_t * _TILE_BYTES,
@@ -127,13 +131,13 @@ class DramMatmul:
                 format_descriptors=[ttnn.CBFormatDescriptor(_CB_OUT, ttnn.bfloat16, _TILE_BYTES)],
             ),
         ]
-        self.reader_ct = [_CB_IN1, num_blocks, _BLOCK_TILES, _BLOCK_TILES // _TXN_TILES, _TXN_TILES * _TILE_BYTES]
-        self.writer_ct = [k_t, group_w, num_groups, _IN0_CHUNK, _CB_IN0, _CB_OUT]
+        self.reader_ct = [_CB_IN1, _BLOCK_TILES, _BLOCK_TILES // _TXN_TILES, _TXN_TILES * _TILE_BYTES]
+        self.writer_ct = [k_t, group_w, _IN0_CHUNK, _CB_IN0, _CB_OUT]
         self.compute = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_KERNEL_DIR, "compute_dram_mm.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[k_t, group_w, num_groups, k_block, _CB_IN0, _CB_IN1, _CB_OUT],
+            compile_time_args=[k_t, group_w, k_block, _CB_IN0, _CB_IN1, _CB_OUT],
             runtime_args=rt,
             config=ttnn.ComputeConfigDescriptor(
                 math_fidelity=math_fidelity,

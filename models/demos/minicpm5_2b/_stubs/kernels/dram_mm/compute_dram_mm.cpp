@@ -19,12 +19,13 @@ using std::uint32_t;
 void kernel_main() {
     constexpr uint32_t Kt = get_compile_time_arg_val(0);
     constexpr uint32_t group_w = get_compile_time_arg_val(1);
-    constexpr uint32_t num_groups = get_compile_time_arg_val(2);
-    constexpr uint32_t k_block = get_compile_time_arg_val(3);
-    constexpr uint32_t cb_in0 = get_compile_time_arg_val(4);
-    constexpr uint32_t cb_in1 = get_compile_time_arg_val(5);
-    constexpr uint32_t cb_out = get_compile_time_arg_val(6);
+    constexpr uint32_t k_block = get_compile_time_arg_val(2);
+    constexpr uint32_t cb_in0 = get_compile_time_arg_val(3);
+    constexpr uint32_t cb_in1 = get_compile_time_arg_val(4);
+    constexpr uint32_t cb_out = get_compile_time_arg_val(5);
     constexpr uint32_t block_tiles = k_block * group_w;
+
+    const uint32_t num_groups = get_arg_val<uint32_t>(4);
 
     compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in0, cb_in1, cb_out);
     matmul_block_init(cb_in0, cb_in1, 0, group_w, 1, k_block);

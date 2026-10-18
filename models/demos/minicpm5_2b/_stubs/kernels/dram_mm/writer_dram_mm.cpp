@@ -12,15 +12,15 @@
 void kernel_main() {
     constexpr uint32_t Kt = get_compile_time_arg_val(0);
     constexpr uint32_t group_w = get_compile_time_arg_val(1);
-    constexpr uint32_t num_groups = get_compile_time_arg_val(2);
-    constexpr uint32_t in0_chunk = get_compile_time_arg_val(3);
-    constexpr uint32_t cb_in0 = get_compile_time_arg_val(4);
-    constexpr uint32_t cb_out = get_compile_time_arg_val(5);
-    constexpr auto x_args = TensorAccessorArgs<6>();
+    constexpr uint32_t in0_chunk = get_compile_time_arg_val(2);
+    constexpr uint32_t cb_in0 = get_compile_time_arg_val(3);
+    constexpr uint32_t cb_out = get_compile_time_arg_val(4);
+    constexpr auto x_args = TensorAccessorArgs<5>();
     constexpr auto out_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
     constexpr uint32_t tile_bytes = 32 * 32 * 2;
 
     const uint32_t n_start = get_arg_val<uint32_t>(2);
+    const uint32_t num_groups = get_arg_val<uint32_t>(4);
     const auto x = TensorAccessor(x_args, get_common_arg_val<uint32_t>(1));
     const auto out = TensorAccessor(out_args, get_common_arg_val<uint32_t>(2));
 

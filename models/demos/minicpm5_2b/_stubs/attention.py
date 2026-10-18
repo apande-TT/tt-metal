@@ -26,6 +26,7 @@ import torch
 
 import ttnn
 from models.demos.minicpm5_2b._stubs.decode_mm import decode_linear_config
+from models.demos.minicpm5_2b._stubs.dram_mm import DramMatmul
 
 # Decode KV-cache write as one C++ kernel via ttnn.generic_op (else: slot-read matmuls + sub/add + paged_update_cache).
 _USE_KV_WRITE_KERNEL = True
@@ -48,6 +49,8 @@ _ATTN_BMM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel
 # Decode q.K^T (+ scale + mask), softmax and probs.V (+ head merge) as ONE generic_op, one (batch, KV head) row
 # block per core, bit-identical to the three ops (kernels/attn_fused).
 _USE_FUSED_DECODE_ATTN = True
+# Decode QKV / o_proj on the DRAM-bank-local generic_op (_stubs/dram_mm.py).
+_USE_DRAM_MM = True
 _ATTN_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_fused")
 
 
@@ -147,6 +150,13 @@ class TtAttention:
         # Decode (one tile row) projections: 1-D multicast with a wide K block (bit-identical to the default).
         self.cfg_qkv = decode_linear_config(device, self.wqkv.shape[-2], self.wqkv.shape[-1], per_core_n=2)  # 80 tiles on 40 cores
         self.cfg_o = decode_linear_config(device, self.wo.shape[-2], self.wo.shape[-1], per_core_n=2)  # 64 tiles on 32 cores
+        # The same decode projections on the DRAM-bank-local generic_op (same arithmetic as the 1-D multicast).
+        self.dmm_qkv = self.dmm_o = None
+        if _USE_DRAM_MM:
+            fid = ttnn.MathFidelity.HiFi4  # as self.compute_cfg
+            self.dmm_qkv = DramMatmul(device, torch.cat(grouped + [wv]).t().contiguous(), fid)
+            wo_t = torch_module.o_proj.weight.detach().to(torch.float32).t().contiguous()
+            self.dmm_o = DramMatmul(device, wo_t, fid)
         self.rot = ttnn.from_torch(
             _rotate_half_matrix(self.head_dim), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
@@ -291,9 +301,12 @@ class TtAttention:
             # One fused-QKV projection for the B decode rows, sliced into q / k / v. Every decode intermediate
             # is a few hundred tiles, so it lives in L1 instead of DRAM.
             l1 = ttnn.L1_MEMORY_CONFIG
-            qkv = ttnn.linear(
-                x, self.wqkv_dec, compute_kernel_config=self.compute_cfg, program_config=self.cfg_qkv, memory_config=l1
-            )
+            if self.dmm_qkv is not None and self.dmm_qkv.accepts(x):
+                qkv = self.dmm_qkv(x, l1)
+            else:
+                qkv = ttnn.linear(
+                    x, self.wqkv_dec, compute_kernel_config=self.compute_cfg, program_config=self.cfg_qkv, memory_config=l1
+                )
             nq, nkv = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
             g, d = self.kv_groups, self.head_dim
             # One token per row: the grouped columns split straight into [B, kv, groups + 1, D] (rows 0..groups-1
@@ -313,9 +326,7 @@ class TtAttention:
             if fused_attn and _USE_KV_WRITE_KERNEL:
                 # The KV write runs inside the fused attention program, on the cores attention leaves idle.
                 attn = self._attn_fused(qk, kv_cache, ctx, l1, kv_write=(qkv, g))
-                return ttnn.linear(
-                    attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=l1, program_config=self.cfg_o
-                )
+                return self._decode_o_proj(attn, l1)
             if _USE_KV_WRITE_KERNEL:
                 # One kernel writes slot pos[b] of both caches with old + (new - old), V read straight from qkv.
                 self._kv_write(qk, qkv, kv_cache, ctx.cur_pos, b, k_row=g)
@@ -341,9 +352,7 @@ class TtAttention:
                     ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
             if fused_attn:
                 attn = self._attn_fused(qk, kv_cache, ctx, l1)
-                return ttnn.linear(
-                    attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=l1, program_config=self.cfg_o
-                )
+                return self._decode_o_proj(attn, l1)
             fused_mask = _USE_ATTN_BMM_KERNEL and _FUSE_SCALE_MASK and ctx.mask_full is not None
             if _USE_ATTN_BMM_KERNEL:
                 scores = self._attn_bmm(
@@ -617,6 +626,13 @@ class TtAttention:
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
         io = [x, cache] + ([mask_full] if fuse else []) + ([cur_pos, self.zero_tile] if skip else [])
         return ttnn.generic_op(io + [out], program)
+
+    def _decode_o_proj(self, attn, l1):
+        if self.dmm_o is not None and self.dmm_o.accepts(attn):
+            return self.dmm_o(attn, l1)
+        return ttnn.linear(
+            attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=l1, program_config=self.cfg_o
+        )
 
     def _attn_fused(self, qk, kv_cache, ctx, memory_config, kv_write=None):
         """Decode attention for qk [B, n_kv, rows, D] against the caches as one generic_op (kernels/attn_fused): per
