@@ -19,6 +19,9 @@ import ttnn
 _USE_KERNEL = True
 _KERNEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
 _TILES_PER_CORE = 4
+# Row statistic once on a reducer core and broadcast (kernels/rms_norm_shared) instead of recomputed on every core.
+_SHARED_STAT = True
+_SHARED_COLS = 8  # the cores form a _SHARED_COLS-wide rectangle
 
 
 class TtRMSNorm:
@@ -58,7 +61,101 @@ class TtRMSNorm:
             and (ps[-1] // 32) % _TILES_PER_CORE == 0
         )
 
+    def _kernel_shared(self, x, memory_config):
+        """The row statistic computed once instead of on every core: each core squares its own slice, the reducer
+        (core 0) row-reduces all Wt x^2 tiles in order and broadcasts the rstd tile, each core normalizes its
+        slice. Same per-tile arithmetic and reduction order as the per-core-statistic kernel."""
+        w_t = x.padded_shape[-1] // 32
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(list(x.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
+        )
+        n_cores = w_t // _TILES_PER_CORE
+        cols = _SHARED_COLS if n_cores % _SHARED_COLS == 0 else n_cores
+        rows = n_cores // cols
+        cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+        rt = ttnn.RuntimeArgs()
+        noc_xy = []
+        for i in range(n_cores):
+            rt[i % cols][i // cols] = [i * _TILES_PER_CORE, _TILES_PER_CORE, 1 if i == 0 else 0]
+            c = self.device.worker_core_from_logical_core(ttnn.CoreCoord(i % cols, i // cols))
+            noc_xy += [c.x, c.y]
+        bf16_tile, f32_tile = 2 * 32 * 32, 4 * 32 * 32
+        cb_in, cb_scaler, cb_eps, cb_gamma, cb_out = 0, 1, 2, 3, 16
+        cb_x2, cb_ex2, cb_ex2pe, cb_fusion, cb_x2all, cb_ex2pe_send = 24, 25, 26, 27, 28, 29
+        sem_gather, sem_bcast = 0, 1
+
+        def cb(idx, n, fmt, size):
+            return ttnn.CBDescriptor(
+                total_size=n * size,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(idx, fmt, size)],
+            )
+
+        bf, f32 = ttnn.bfloat16, ttnn.float32
+        cbs = [
+            cb(cb_in, _TILES_PER_CORE, bf, bf16_tile),
+            cb(cb_scaler, 1, bf, bf16_tile),
+            cb(cb_eps, 1, bf, bf16_tile),
+            cb(cb_gamma, _TILES_PER_CORE, bf, bf16_tile),
+            cb(cb_out, _TILES_PER_CORE, bf, bf16_tile),
+            cb(cb_x2, _TILES_PER_CORE, f32, f32_tile),
+            cb(cb_ex2, 1, f32, f32_tile),
+            cb(cb_ex2pe, 1, f32, f32_tile),
+            cb(cb_fusion, _TILES_PER_CORE, f32, f32_tile),
+            cb(cb_x2all, w_t, f32, f32_tile),
+            cb(cb_ex2pe_send, 1, f32, f32_tile),
+        ]
+        inv_w_bits = struct.unpack("<I", struct.pack("<f", 1.0 / x.shape[-1]))[0]
+        d = os.path.join(_KERNEL_DIR, "rms_norm_shared")
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(d, "reader_rms_norm_shared.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[w_t, cb_in, cb_scaler, cb_eps, cb_gamma, cb_x2all, cb_ex2pe, sem_gather, sem_bcast]
+            + [n_cores]
+            + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(self.weight).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(self.consts).get_compile_time_args()),
+            runtime_args=rt,
+            common_runtime_args=[x.buffer_address(), self.weight.buffer_address(), self.consts.buffer_address()],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        writer = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(d, "writer_rms_norm_shared.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[cb_x2, cb_x2all, cb_ex2pe, cb_ex2pe_send, cb_out, sem_gather, sem_bcast, n_cores]
+            + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=rt,
+            common_runtime_args=[out.buffer_address(), noc_xy[0], noc_xy[1]] + noc_xy,
+            config=ttnn.WriterConfigDescriptor(),
+        )
+        compute = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(d, "compute_rms_norm_shared.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[
+                w_t, inv_w_bits, cb_in, cb_scaler, cb_eps, cb_gamma, cb_x2, cb_ex2, cb_ex2pe, cb_fusion, cb_out,
+                cb_x2all, cb_ex2pe_send,
+            ],
+            runtime_args=rt,
+            config=ttnn.ComputeConfigDescriptor(  # as self.compute_cfg
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                dst_full_sync_en=False,
+            ),
+        )
+        semaphores = [
+            ttnn.SemaphoreDescriptor(id=sem_gather, core_ranges=cores, initial_value=0),
+            ttnn.SemaphoreDescriptor(id=sem_bcast, core_ranges=cores, initial_value=0),
+        ]
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=semaphores, cbs=cbs)
+        return ttnn.generic_op([x, self.weight, self.consts, out], program)
+
     def _kernel(self, x, memory_config):
+        if _SHARED_STAT:
+            return self._kernel_shared(x, memory_config)
         w_t = x.padded_shape[-1] // 32
         out = ttnn.allocate_tensor_on_device(
             ttnn.Shape(list(x.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
