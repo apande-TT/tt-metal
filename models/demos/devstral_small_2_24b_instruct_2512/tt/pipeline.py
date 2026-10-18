@@ -158,7 +158,9 @@ PLANNED_TP = 4
 #                     column-parallel over the all_gathered heads, emitting the residual's hidden slice (no reduce-scatter). Decode concatenates the SDPA heads
 #                     with ONE C++ copy program (tt/concat_heads.py ConcatHeadsDecode: each core gathers one o_proj input
 #                     tile's rows out of SDPA's L1-interleaved tiles; no reshard, nlp_concat_heads_decode, unshard).
-#                     nlp_create_qkv_heads_decode reads the decode QKV's width shards in place (no unshard). Decode QKV
+#                     nlp_create_qkv_heads_decode reads the decode QKV's width shards in place (no unshard) and puts k
+#                     on its own cores (overlap_qk_coregrid=False), so q / k RoPE is ONE rotary_embedding_llama_fused_qk
+#                     (64-row cos / sin tables, q's rows then k's) and K / V are ONE paged_fused_update_cache. Decode QKV
 #                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v]; decode
 #                     QKV and o_proj read block-float8 copies (prefill keeps bf16). Decode o_proj runs a hand-written
 #                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
