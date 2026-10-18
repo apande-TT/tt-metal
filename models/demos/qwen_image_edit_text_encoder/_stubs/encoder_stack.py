@@ -96,8 +96,18 @@ class TtRMSNorm:
     def __call__(self, x):
         if self.precise:
             x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
-            ms = ttnn.mean(ttnn.multiply(x32, x32), dim=-1, keepdim=True, compute_kernel_config=self.compute_cfg)
-            return ttnn.multiply(ttnn.multiply(x32, ttnn.rsqrt(ttnn.add(ms, self.eps))), self._ensure_w32())
+            # the full-size intermediates (x * x, x * rsqrt) in L1 when they fit (the LM's micro-batches: 22 MB)
+            vol = 4
+            for d in x32.padded_shape:
+                vol *= d
+            mem = ttnn.L1_MEMORY_CONFIG if vol <= 24 * 2**20 else None
+            sq = ttnn.multiply(x32, x32, memory_config=mem)
+            ms = ttnn.mean(sq, dim=-1, keepdim=True, compute_kernel_config=self.compute_cfg)
+            ttnn.deallocate(sq)
+            xr = ttnn.multiply(x32, ttnn.rsqrt(ttnn.add(ms, self.eps)), memory_config=mem)
+            out = ttnn.multiply(xr, self._ensure_w32(), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(xr)
+            return out
         return ttnn.rms_norm(x, epsilon=self.eps, weight=self.weight, compute_kernel_config=self.compute_cfg)
 
 
