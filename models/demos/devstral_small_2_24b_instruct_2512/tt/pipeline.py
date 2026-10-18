@@ -125,7 +125,7 @@ PLANNED_TP = 4
 #                     silu * up, one rounding). The decode down projection is ONE C++ program too
 #                     (tt/down_decode.py: the product multicast once, a bank-major weight copy streamed one column per
 #                     data-movement RISC on 8 x 10 cores, fp32 DEST over all K -- bit-identical to the 1D-multicast
-#                     matmul); layers 16-23 read a block-float4 down copy at HiFi3 (bf4 down everywhere: PCC 0.989).
+#                     matmul); layers 16-24 read a block-float4 down copy at HiFi3 (bf4 down everywhere: PCC 0.989).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
 #                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
