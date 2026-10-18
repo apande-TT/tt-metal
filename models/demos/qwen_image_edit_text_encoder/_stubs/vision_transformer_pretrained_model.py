@@ -38,6 +38,11 @@ from models.demos.qwen_image_edit_text_encoder._stubs.v_l_vision_block import Tt
 from models.demos.qwen_image_edit_text_encoder._stubs.vision_patch_embed import TtVisionPatchEmbed
 
 
+# Optional exact row-gather kernel for the merged rows' unpermutation: ROW_GATHER(x, perm) -> y with y[..., j, :] =
+# x[..., perm[j], :] for j < len(perm) (later rows unset), or None (the one-hot product runs).
+ROW_GATHER = None
+
+
 class VisionConsts:
     """Per-grid device constants shared by every image of that grid."""
 
@@ -109,6 +114,7 @@ class TtVisionTransformer:
             m_pad,
         )
         c.window_rows = rows
+        c.unperm_rows = np.argsort(window_index).tolist()  # merged row j <- window-order row unperm_rows[j]
         return c
 
     # ---- device forward ---------------------------------------------------------------------------
@@ -133,7 +139,8 @@ class TtVisionTransformer:
         if c.m_pad != m_rows:
             merged = ttnn.pad(merged, [(0, 0), (0, 0), (0, c.m_pad - m_rows), (0, 0)], 0.0)
         if self.precise:
-            merged = onehot_matmul(c.unperm, merged, limbs=getattr(self, "limbs", 2))
+            gathered = None if ROW_GATHER is None else ROW_GATHER(merged, c.unperm_rows)
+            merged = gathered if gathered is not None else onehot_matmul(c.unperm, merged, limbs=getattr(self, "limbs", 2))
         else:
             merged = ttnn.matmul(c.unperm, merged, compute_kernel_config=cfg)
         out = merged.shape[-1]

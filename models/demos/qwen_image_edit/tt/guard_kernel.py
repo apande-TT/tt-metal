@@ -452,3 +452,60 @@ def batched_matmul(a, b, transpose_b=False):
         entries *= d
     y = _rows_mm(a, b, entries * mt, kt, nt, mt, kt * nt, transpose_b, ttnn.MathFidelity.HiFi4)
     return ttnn.view(y, sa[:-1] + [n])
+
+
+_RG_READER = f"{_DIR}/row_gather_reader.cpp"
+_RG_WRITER = f"{_DIR}/row_gather_writer.cpp"
+
+
+def row_gather(x, perm):
+    """y [..., j, :] = x [..., perm[j], :] for j < len(perm) within every leading entry of a float32 tile tensor
+    (the rows past len(perm) are left unset: the caller drops them) -- an exact row permutation, each row moved as
+    its two 64-byte face rows straight between tiles. None for a tensor it does not take."""
+    s = list(x.padded_shape)
+    if x.dtype != ttnn.float32 or x.layout != ttnn.TILE_LAYOUT or x.is_sharded() or len(s) < 2:
+        return None
+    if s[-2] % TILE or s[-1] % TILE or len(perm) > s[-2]:
+        return None
+    entries = 1
+    for d in s[:-2]:
+        entries *= d
+    mt, nt = s[-2] // TILE, s[-1] // TILE
+    y = ttnn.empty_like(x)
+    grid = x.device().compute_with_storage_grid_size()
+    work = _cores(grid, entries * nt)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+    cbs = [
+        ttnn.CBDescriptor(
+            total_size=2 * mt * _FP32_TILE_BYTES,
+            core_ranges=cores,
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=0, data_format=ttnn.float32, page_size=_FP32_TILE_BYTES)
+            ],
+        )
+    ]
+    rd, wr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    perm = [int(p) for p in perm]
+    for c, start, count in work:
+        rd[c.x][c.y] = [x.buffer_address(), start, count] + perm
+        wr[c.x][c.y] = [y.buffer_address(), start, count]
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_RG_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(x).get_compile_time_args() + [mt, nt, len(perm)],
+            runtime_args=rd,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_RG_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(y).get_compile_time_args() + [mt, nt],
+            runtime_args=wr,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    ttnn.generic_op([x, y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    return y

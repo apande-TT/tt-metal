@@ -29,6 +29,7 @@ from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import (
     batched_matmul,
     guard_tail,
+    row_gather,
     small_weight_linear,
     split_limbs,
     sum_list,
@@ -40,6 +41,7 @@ from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
 from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
 from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
+from models.demos.qwen_image_edit_text_encoder._stubs import vision_transformer_pretrained_model as _vision_tower
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import _resident as _vae_resident
 
 # Stages from the HF reference (model_index.json): the Qwen2.5-VL text_encoder is a vision tower + an
@@ -223,7 +225,10 @@ class TtQwenImageEditPipeline:
 
     def vision_encode(self, up):
         # (the attention P @ V products' exact lanes on V's rows: the C++ weight-lane split of the smaller operand)
-        with self._hook(_te_attention, "B_LANE_SPLIT", self.weight_lane_split), self._fused_tail():
+        # (and the merged rows' unpermutation as an exact row gather, not one-hot products)
+        with self._hook(_te_attention, "B_LANE_SPLIT", self.weight_lane_split), self._hook(
+            _vision_tower, "ROW_GATHER", row_gather if self.linear_kernel else None
+        ), self._fused_tail():
             return self.text_encoder.encode_vision(up.te)
 
     def text_encode(self, up, image_embeds):
