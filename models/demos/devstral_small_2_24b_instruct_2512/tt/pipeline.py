@@ -125,7 +125,7 @@ PLANNED_TP = 4
 #                     silu * up, one rounding). The decode down projection is ONE C++ program too
 #                     (tt/down_decode.py: the product multicast once, a bank-major weight copy streamed one column per
 #                     data-movement RISC on 8 x 10 cores, fp32 DEST over all K -- bit-identical to the 1D-multicast
-#                     matmul); layers 15-24 read a block-float4 down copy at HiFi3 (bf4 down everywhere: PCC 0.989).
+#                     matmul); layers 16-23 read a block-float4 down copy at HiFi3 (bf4 down everywhere: PCC 0.989).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
 #                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
@@ -162,7 +162,7 @@ PLANNED_TP = 4
 #                     Decode SDPA reads q straight from its post-RoPE head shards (no copy to DRAM): its grid is the
 #                     8-wide head grid, so each batch row's output core is the core holding that row's q. Its output
 #                     goes L1-interleaved (GQA allows no sharded output) for the reshard into the concat's head shards;
-#                     it computes at HiFi2 (fp32 accumulation) on the bf8 cache.
+#                     it computes at HiFi2 (fp32 accumulation) on the bf8 cache, in fixed 4-tile key chunks.
 #   ministral3_attention: prefill QKV (HiFi2, bf8 weight) and o_proj projections on minimal_matmul (full grid); prefill o_proj is
 #                     column-parallel over the all_gathered heads, emitting the residual's hidden slice (no reduce-scatter). Decode concatenates the SDPA heads
 #                     with ONE C++ copy program (tt/concat_heads.py ConcatHeadsDecode: each core gathers one o_proj input
