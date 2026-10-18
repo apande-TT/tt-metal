@@ -164,6 +164,8 @@ class MiniCPM5Pipeline:
         self.encoder_stack = counted("encoder_stack", encoder_stack_stub.build(device, hf.layers, blocks=blocks))
         self.final_norm = counted("r_m_s_norm", r_m_s_norm_stub.build(device, hf.norm))
         self.decoder_head = counted("decoder_head", decoder_head_stub.build(device, hf_model.lm_head))
+        bind = getattr(self.decoder_head, "bind_prenorm", None)
+        self._head_prenorm = bool(bind and bind(self.final_norm))
 
         self.kv_caches = [
             attention_stub.KVCache(device, self.batch, self.n_kv_heads, self.capacity, self.head_dim)
@@ -511,7 +513,13 @@ class MiniCPM5Pipeline:
         h = self.encoder_stack(x, position_embeddings=position_embeddings, kv_caches=self.kv_caches, attn_ctx=ctx)
         # Decode logits (8 MB) stay in L1 for the sampler's topk.
         l1 = ttnn.L1_MEMORY_CONFIG
-        logits = self.decoder_head(self.final_norm(h, memory_config=l1), memory_config=l1, segments=self._logit_segments())
+        if self._head_prenorm:
+            # The LM head applies the final norm itself (as the prologue of its program).
+            logits = self.decoder_head(h, memory_config=l1, segments=self._logit_segments(), prenorm=self.final_norm)
+        else:
+            logits = self.decoder_head(
+                self.final_norm(h, memory_config=l1), memory_config=l1, segments=self._logit_segments()
+            )
         self._emit(logits)
         ttnn.add(self.pos_buf, 1.0, output_tensor=self.pos_buf)
         ttnn.add(self.pos_i32, 1, output_tensor=self.pos_i32)

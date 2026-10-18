@@ -28,6 +28,8 @@ _CB_IN0, _CB_IN1, _CB_OUT = 0, 1, 16
 # Decode LM head on the DRAM-bank-local generic_op (_stubs/dram_mm.py), same arithmetic as the kernel below.
 _USE_DRAM_MM = True
 _DRAM_MM_WORKERS_PER_BANK = 6  # HiFi4 bf8: compute-bound on fewer cores
+# The final RMSNorm as a prologue of the decode LM head program (bind_prenorm).
+_USE_NORM_PROLOGUE = True
 
 
 def _mesh_kw(device, **kw):
@@ -205,7 +207,39 @@ class DecoderHead:
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, k["compute"]], semaphores=[], cbs=k["cbs"])
         return ttnn.generic_op([x, *self.weights, out], program)
 
-    def __call__(self, x, *args, memory_config=None, segments=None, **kwargs):
+    def bind_prenorm(self, norm):
+        """Run `norm` (the final RMSNorm) as a prologue of the decode LM head program (DramMatmul norm_prologue)."""
+        self.dmm_norm = None
+        if _USE_NORM_PROLOGUE and self.dmm is not None and self.dmm.ok and hasattr(norm, "consts"):
+            dmm = DramMatmul(
+                self.device,
+                None,
+                ttnn.MathFidelity.HiFi4,
+                dtype=ttnn.bfloat8_b,
+                workers_per_bank=_DRAM_MM_WORKERS_PER_BANK,
+                prebuilt=self.dmm,
+                norm_prologue=norm,
+            )
+            self.dmm_norm = dmm if dmm.ok else None
+        return self.dmm_norm is not None
+
+    def __call__(self, x, *args, memory_config=None, segments=None, prenorm=None, **kwargs):
+        """prenorm: the RMSNorm still to be applied to x (inside the decode LM head program when bound)."""
+        dmm = getattr(self, "dmm_norm", None)
+        if prenorm is not None:
+            if dmm is not None and dmm.norm_pro is prenorm and self._kernel_ok(x) and prenorm._kernel_ok(x):
+                if segments is not None and (self.vocab // 32) % segments:
+                    segments = None
+                shape = (
+                    list(x.shape)[:-1] + [self.vocab] if segments is None else [1, segments, 32, self.vocab // segments]
+                )
+                mem = memory_config or ttnn.DRAM_MEMORY_CONFIG
+
+                def fused(xx, _mem):
+                    return dmm(xx, mem, out_shape=shape)
+
+                return prenorm(x, memory_config=mem, fused=fused)  # final RMSNorm + LM head in one program
+            x = prenorm(x, memory_config=ttnn.L1_MEMORY_CONFIG)
         if not isinstance(x, ttnn.Tensor):
             x = ttnn.from_torch(x, **_mesh_kw(self.device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT))
         elif x.layout != ttnn.TILE_LAYOUT:
