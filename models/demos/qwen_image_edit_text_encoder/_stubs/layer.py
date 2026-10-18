@@ -203,13 +203,10 @@ class TtTextAttention:
         cfg = self.compute_cfg
         ex = getattr(self, "exact", True)
         qkv = split_linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=cfg, exact=ex)
-
-        def _heads(lo, n):
-            t = ttnn.slice(qkv, [0, 0, 0, lo * D], [b, 1, s_pad, (lo + n) * D])
-            t = ttnn.reshape(t, (b, s_pad, n, D))
-            return ttnn.permute(t, (0, 2, 1, 3))
-
-        q, k, v = _heads(0, hl), _heads(hl, kvl), _heads(hl + kvl, kvl)
+        # the q / k / v heads ([q heads | k heads | v heads] per chip) split by the tile-aligned head kernel (exact
+        # data movement; the slice + reshape + permute re-tiled every head)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(qkv, num_heads=hl, num_kv_heads=kvl, transpose_k_heads=False)
+        ttnn.deallocate(qkv)
         cos = tt_cos if tt_cos.dtype == ttnn.float32 else ttnn.typecast(tt_cos, ttnn.float32)
         sin = tt_sin if tt_sin.dtype == ttnn.float32 else ttnn.typecast(tt_sin, ttnn.float32)
 
@@ -240,9 +237,7 @@ class TtTextAttention:
             probs = ttnn.reshape(probs, (b * kvl * G * r, 1, s_pad // r, s_pad))
             v = self._repeat_heads(v, G * r)
         o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex)  # [B, kvl, G*S, D]
-        o = ttnn.reshape(o, (b, hl, s_pad, D))
-        o = ttnn.permute(o, (0, 2, 1, 3))
-        o = ttnn.reshape(o, (b, 1, s_pad, hl * D))
+        o = ttnn.experimental.nlp_concat_heads(ttnn.reshape(o, (b, hl, s_pad, D)))  # [B, 1, S, hl * D]
         # split into bf16 limbs on this chip, then gathered: the same bytes as the float32 heads, the split on a
         # quarter of the data
         parts = [_gather_cols(p, self.tp) for p in split_bf16(o, 2)]
