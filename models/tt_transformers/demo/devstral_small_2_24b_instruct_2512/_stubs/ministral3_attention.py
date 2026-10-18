@@ -96,6 +96,8 @@ class TtMinistral3Attention:
     DECODE_OPROJ_STREAM = True
     # K rows a push of that o_proj stream (its K is only 32 tiles: 8 pushes a column)
     DECODE_OPROJ_PUSH_ROWS = 4
+    # Decode SDPA key chunk (0: sized per step by the kernel)
+    DECODE_SDPA_K_CHUNK = 128
     # False: prefill returns o_proj's reduce-scattered 1/TP hidden shard (the decoder keeps a hidden-sharded
     # residual in prefill and gathers only the normed activation).
     prefill_gather = True
@@ -341,10 +343,14 @@ class TtMinistral3Attention:
             packer_l1_acc=False,
         )
         grid = device.compute_with_storage_grid_size()
+        # A fixed 4-tile key chunk: the chunk the kernel's dynamic sizing picks at every position >= 64 anyway (the
+        # next power of two of the cached tiles, capped at fp32 DEST's 4), with compile-time subblocks (40 -> 21-34 us).
+        # Its last chunk takes the causal mask as a separate add over the packed scores (the dynamic path adds it in
+        # DEST): -0.00018 gate PCC, paid for by two fewer block-float4 down layers (ministral3_m_l_p).
         self.sdpa_decode_cfg = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(min(self.HEAD_GRID_X, grid.x), grid.y),
             q_chunk_size=0,
-            k_chunk_size=0,
+            k_chunk_size=self.DECODE_SDPA_K_CHUNK,
             exp_approx_mode=False,
         )
         self._head_cfgs = {}

@@ -41,8 +41,10 @@ DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi3
 DOWN_DECODE_K_BLOCK = 8
 # Decode down projection as one C++ program streaming a bank-major weight copy (tt/down_decode.py).
 DOWN_DECODE_STREAM = True
-# Decoder layers whose decode-only down copy is block-float4 (the others read the bf8 prefill weight).
-DECODE_DOWN_BF4_LAYERS = frozenset(range(15, 25))
+# Decoder layers whose decode-only down copy is block-float4 (the others read the bf8 prefill weight). 16-23: layers
+# 15 and 24 went back to bf8 (gate PCC 0.995034 -> ~0.9954 measured for 16-23), headroom the fixed-chunk decode SDPA
+# (ministral3_attention DECODE_SDPA_K_CHUNK, -0.22 ms for -0.00018 PCC) spends.
+DECODE_DOWN_BF4_LAYERS = frozenset(range(16, 24))
 # Decode gate / up / silu-multiply as one C++ program (tt/gate_up_decode.py).
 DECODE_GATE_UP_FUSED = True
 
