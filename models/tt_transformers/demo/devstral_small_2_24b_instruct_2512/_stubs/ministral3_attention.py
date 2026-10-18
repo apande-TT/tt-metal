@@ -83,6 +83,9 @@ class TtMinistral3Attention:
     DECODE_SHARDED_INPUT = True
     DECODE_SHARDED_K_BLOCK = 20
     DECODE_SHARDED_READERS_PER_BANK = 3  # (the op allows 1-3)
+    # nlp_create_qkv_heads_decode reads the QKV's width shards in place (its sharded-input path) instead of an
+    # unsharded copy of the row.
+    DECODE_SHARDED_HEADS = True
     # False: prefill returns o_proj's reduce-scattered 1/TP hidden shard (the decoder keeps a hidden-sharded
     # residual in prefill and gathers only the normed activation).
     prefill_gather = True
@@ -767,7 +770,8 @@ class TtMinistral3Attention:
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 compute_kernel_config=self.compute_cfg,
             )
-        qkv = ttnn.sharded_to_interleaved(qkv, ttnn.L1_MEMORY_CONFIG)
+        if not self.DECODE_SHARDED_HEADS:
+            qkv = ttnn.sharded_to_interleaved(qkv, ttnn.L1_MEMORY_CONFIG)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
             qkv, num_heads=self.local_heads, num_kv_heads=self.local_kv_heads, memory_config=head_cfg
         )
