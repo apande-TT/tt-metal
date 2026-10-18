@@ -22,7 +22,10 @@ void kernel_main() {
     constexpr uint32_t ep_sem = get_compile_time_arg_val(7);
     constexpr uint32_t ep_tpc = get_compile_time_arg_val(8);  // output tiles per helper core
     constexpr uint32_t ep_off = get_compile_time_arg_val(9);
-    constexpr auto x_args = TensorAccessorArgs<10>();
+    // Prologue on helper cores (x is their output): wait for pro_count bumps of pro_sem before reading x.
+    constexpr uint32_t pro_sem = get_compile_time_arg_val(10);  // ~0u: none
+    constexpr uint32_t pro_count = get_compile_time_arg_val(11);
+    constexpr auto x_args = TensorAccessorArgs<12>();
     constexpr auto out_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
     constexpr uint32_t tile_bytes = 32 * 32 * 2;
 
@@ -32,6 +35,11 @@ void kernel_main() {
     const auto out = TensorAccessor(out_args, get_common_arg_val<uint32_t>(2));
     const auto out_hi = TensorAccessor(out_args, get_common_arg_val<uint32_t>(3));  // same spec, other buffer
 
+    if constexpr (pro_sem != 0xFFFFFFFF) {
+        auto* sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(pro_sem));
+        noc_semaphore_wait(sem, pro_count);
+        noc_semaphore_set(sem, 0);
+    }
     cb_reserve_back(cb_in0, Kt);
     uint32_t l1 = get_write_ptr(cb_in0);
     for (uint32_t k0 = 0; k0 < Kt; k0 += in0_chunk) {

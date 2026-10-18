@@ -40,7 +40,7 @@ void kernel_main() {
     constexpr uint32_t sem_bcast = get_compile_time_arg_val(16);
     constexpr uint32_t sem_all = get_compile_time_arg_val(17);
     constexpr uint32_t n_cores = get_compile_time_arg_val(18);
-    constexpr uint32_t n_norm = get_compile_time_arg_val(19);  // cores 0..n_norm-1 do the norm, all receive its row
+    constexpr uint32_t n_norm = get_compile_time_arg_val(19);     // cores 0..n_norm-1 do the norm, all receive its row
     constexpr uint32_t sem_start = get_compile_time_arg_val(20);  // releases this core's weight stream
     // Epilogue (residual add on helper cores): signal each stored output tile's helper (common args from ep_off).
     constexpr uint32_t ep_on = get_compile_time_arg_val(21);

@@ -18,6 +18,8 @@ _USE_DRAM_MM = True
 # ... with the post-attention RMSNorm fused into the gate/up program (bind_prenorm): its latency hides under the
 # weight stream.
 _USE_DRAM_MM_NORM = True
+# silu(gate) * up as a prologue of the down + residual program (helper cores; DramMatmul silu_prologue).
+_USE_SILU_PROLOGUE = True
 
 
 def _compute_cfg(device):
@@ -51,7 +53,7 @@ class TtMlp:
         h, f = self.w_gate.shape[-2], self.w_gate.shape[-1]
         self.cfg_up = decode_linear_config(device, h, f)
         self.cfg_down = decode_linear_config(device, f, h, per_core_n=2)  # 64 tiles on 32 cores
-        self.dram_mm = self.down_res = None
+        self.dram_mm = self.down_res = self.down_res_silu = None
         if _USE_DRAM_MM:
 
             def _t(linear):
@@ -67,6 +69,12 @@ class TtMlp:
             # down + the layer's residual add in one program (ttnn.add's arithmetic on helper cores).
             dmm = DramMatmul(device, None, fid, prebuilt=self.dram_mm[1], residual_add=True)
             self.down_res = dmm if dmm.ok else None
+            # ... and also silu(gate) * up computed in that program by the same helper cores, ahead of the stream
+            # (a deep weight CB keeps the stream going meanwhile).
+            dmm = DramMatmul(
+                device, None, fid, prebuilt=self.dram_mm[1], residual_add=True, silu_prologue=True, cb_blocks=10
+            )
+            self.down_res_silu = dmm if (dmm.ok and dmm.silu_pro and _USE_SILU_PROLOGUE) else None
 
     def _mm(self, x, w, k_block=None, memory_config=None):
         """Many-row (prefill) gate/up projection on minimal_matmul's small CBs, which span the full grid under fp32
@@ -169,12 +177,30 @@ class TtMlp:
                 up = ttnn.linear(
                     x, self.w_up, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_up
                 )
+            res = None
+            if residual is not None and self.down_res is not None and one_row:
+                res = ttnn.reshape(residual, tuple(gate.shape)[:-1] + (residual.shape[-1],))
+            pro_ok = (
+                res is not None
+                and self.down_res_silu is not None
+                and self.down_res_silu.accepts(gate)
+                and list(up.padded_shape) == list(gate.padded_shape)
+                and list(res.padded_shape) == list(gate.padded_shape)[:-1] + [res.padded_shape[-1]]
+                and res.dtype == ttnn.bfloat16
+                and not res.memory_config().is_sharded()
+            )
+            if pro_ok:
+                # silu(gate) * up, down and the residual add as one program.
+                out = self.down_res_silu(None, mid, residual=res, pro=(gate, up))
+                ttnn.deallocate(gate)
+                ttnn.deallocate(up)
+                self.last_residual_added = True
+                if len(in_shape) != 4:
+                    out = ttnn.reshape(out, in_shape[:-1] + (out.shape[-1],))
+                return out
             h = self._silu_mul(gate, up, memory_config=mid)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-            res = None
-            if residual is not None and self.down_res is not None and one_row:
-                res = ttnn.reshape(residual, tuple(h.shape)[:-1] + (residual.shape[-1],))
             if (
                 res is not None
                 and self.down_res.accepts(h)

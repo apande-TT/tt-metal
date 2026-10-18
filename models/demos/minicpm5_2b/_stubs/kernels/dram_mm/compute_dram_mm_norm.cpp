@@ -39,8 +39,14 @@ ALWI void mm_block_init_fid(uint32_t in0, uint32_t in1, uint32_t ct_dim, uint32_
 
 template <MathFidelity FID>
 ALWI void mm_block_fid(
-    uint32_t in0, uint32_t in1, uint32_t in0_index, uint32_t in1_index, uint32_t idst, uint32_t ct_dim,
-    uint32_t rt_dim, uint32_t kt_dim) {
+    uint32_t in0,
+    uint32_t in1,
+    uint32_t in0_index,
+    uint32_t in1_index,
+    uint32_t idst,
+    uint32_t ct_dim,
+    uint32_t rt_dim,
+    uint32_t kt_dim) {
     state_configure(in1, in0, __builtin_LINE());
     UNPACK((llk_unpack_AB_matmul(in0, in1, in0_index, in1_index, ct_dim, rt_dim, kt_dim)));
 #ifdef TRISC_MATH
