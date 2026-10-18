@@ -8,6 +8,8 @@
 // the scores) and the batch's key-mask tile, then per output column tile dt the value-cache tiles.
 // Only the nt = position tile + 1 key tiles are streamed (nt handed to compute through cb_cnt): the tiles past it
 // are fully masked, so their scores add exact zeros to the softmax sum and to probs.V.
+// With `wait_kv` set, this step's KV-cache write runs in the same program on other cores (kernels/kv_write); the
+// position tile of K (resp. the V tiles) is streamed only after that write signalled the K (resp. V) semaphore.
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -36,6 +38,9 @@ void kernel_main() {
     constexpr auto zero_args = TensorAccessorArgs<pos_args.next_compile_time_args_offset()>();
     constexpr auto mx_args = TensorAccessorArgs<zero_args.next_compile_time_args_offset()>();
     constexpr auto sm_args = TensorAccessorArgs<mx_args.next_compile_time_args_offset()>();
+    constexpr uint32_t wait_kv = get_compile_time_arg_val(sm_args.next_compile_time_args_offset());
+    constexpr uint32_t sem_k_id = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 1);
+    constexpr uint32_t sem_v_id = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 2);
 
     const uint32_t bg = get_arg_val<uint32_t>(0);
     const auto q = TensorAccessor(q_args, get_common_arg_val<uint32_t>(0));
@@ -84,6 +89,13 @@ void kernel_main() {
 
     // Scores: per key tile n, cache tiles (n, k) and the mask tile.
     for (uint32_t n = 0; n < nt; ++n) {
+        if constexpr (wait_kv) {
+            if (n == last_key_tile) {
+                auto* sem_k = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_k_id));
+                noc_semaphore_wait(sem_k, 1);
+                noc_semaphore_set(sem_k, 0);
+            }
+        }
         cb_reserve_back(cb_k, Kt);
         uint32_t l1 = get_write_ptr(cb_k);
         for (uint32_t k = 0; k < Kt; ++k) {
@@ -100,6 +112,11 @@ void kernel_main() {
 
     // probs @ V: per output column tile dt, cache tiles (k, dt) for k = 0..nt-1, in a full Ct-tile slot (the rest
     // unwritten and unread) so every push stays aligned to the 2 * Ct ring and a block never runs past its end.
+    if constexpr (wait_kv) {
+        auto* sem_v = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_v_id));
+        noc_semaphore_wait(sem_v, 1);
+        noc_semaphore_set(sem_v, 0);
+    }
     for (uint32_t dt = 0; dt < Kt; ++dt) {
         cb_reserve_back(cb_v, Ct);
         uint32_t l1 = get_write_ptr(cb_v);

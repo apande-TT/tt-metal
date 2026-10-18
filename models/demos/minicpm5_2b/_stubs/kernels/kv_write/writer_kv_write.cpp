@@ -5,6 +5,9 @@
 // MiniCPM5-2B decode KV-cache write, writer: for each (cache, b, h) unit and column tile, re-read the cache
 // tile holding slot pos[b], replace only row pos[b] % 32 with the computed row, and write the tile back in
 // place. Each cache tile belongs to exactly one unit, so no other core touches it.
+// With `signal` set (the write fused into the decode attention program), once a unit's tiles are written the unit's
+// attention core (row block b * n_kv + h, NoC coordinates in the common args from index 5) gets its K or V
+// semaphore bumped, so it streams the slot's tile only after the write landed.
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -28,6 +31,9 @@ void kernel_main() {
     constexpr uint32_t cb_wpos = get_compile_time_arg_val(6);
     constexpr auto cache_args = TensorAccessorArgs<7>();
     constexpr auto pos_args = TensorAccessorArgs<cache_args.next_compile_time_args_offset()>();
+    constexpr uint32_t signal = get_compile_time_arg_val(pos_args.next_compile_time_args_offset());
+    constexpr uint32_t sem_k_id = get_compile_time_arg_val(pos_args.next_compile_time_args_offset() + 1);
+    constexpr uint32_t sem_v_id = get_compile_time_arg_val(pos_args.next_compile_time_args_offset() + 2);
 
     const uint32_t unit_start = get_arg_val<uint32_t>(0);
     const uint32_t num_units = get_arg_val<uint32_t>(1);
@@ -71,5 +77,13 @@ void kernel_main() {
             noc_async_write_page(page, is_v ? cache_v : cache_k, tile);
         }
         noc_async_write_barrier();  // the next unit reuses the scratch tiles
+        if constexpr (signal) {
+            const uint32_t x = get_common_arg_val<uint32_t>(5 + 2 * bh);
+            const uint32_t y = get_common_arg_val<uint32_t>(6 + 2 * bh);
+            noc_semaphore_inc(get_noc_addr(x, y, get_semaphore(is_v ? sem_v_id : sem_k_id)), 1);
+        }
+    }
+    if constexpr (signal) {
+        noc_async_atomic_barrier();
     }
 }

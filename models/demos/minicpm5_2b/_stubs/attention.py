@@ -309,6 +309,13 @@ class TtAttention:
             else:
                 qk = self._rope(qk, cos, sin, self._rope_cfg(qk), memory_config=l1)
             d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
+            fused_attn = _USE_FUSED_DECODE_ATTN and _USE_HEAD_KERNELS and b == 32 and ctx.mask_full is not None
+            if fused_attn and _USE_KV_WRITE_KERNEL:
+                # The KV write runs inside the fused attention program, on the cores attention leaves idle.
+                attn = self._attn_fused(qk, kv_cache, ctx, l1, kv_write=(qkv, g))
+                return ttnn.linear(
+                    attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=l1, program_config=self.cfg_o
+                )
             if _USE_KV_WRITE_KERNEL:
                 # One kernel writes slot pos[b] of both caches with old + (new - old), V read straight from qkv.
                 self._kv_write(qk, qkv, kv_cache, ctx.cur_pos, b, k_row=g)
@@ -332,7 +339,7 @@ class TtAttention:
                         ttnn.reshape(new_kv, (1, b, self.n_kv_heads, self.head_dim)), shard
                     )
                     ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
-            if _USE_FUSED_DECODE_ATTN and _USE_HEAD_KERNELS and b == 32 and ctx.mask_full is not None:
+            if fused_attn:
                 attn = self._attn_fused(qk, kv_cache, ctx, l1)
                 return ttnn.linear(
                     attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=l1, program_config=self.cfg_o
@@ -611,10 +618,14 @@ class TtAttention:
         io = [x, cache] + ([mask_full] if fuse else []) + ([cur_pos, self.zero_tile] if skip else [])
         return ttnn.generic_op(io + [out], program)
 
-    def _attn_fused(self, qk, kv_cache, ctx, memory_config):
+    def _attn_fused(self, qk, kv_cache, ctx, memory_config, kv_write=None):
         """Decode attention for qk [B, n_kv, rows, D] against the caches as one generic_op (kernels/attn_fused): per
         (batch, KV head) row block, the score kernel's q.K^T + scale + mask, ttnn.softmax's arithmetic and probs.V,
-        the writer scattering the query rows straight into the merged [1, B, n_kv * groups * D] o_proj input."""
+        the writer scattering the query rows straight into the merged [1, B, n_kv * groups * D] o_proj input.
+
+        kv_write=(qkv, k_row): this step's KV-cache write (the _kv_write kernels, unchanged, bf16 DEST) joins the same
+        program on the cores the row blocks leave idle; each unit bumps its row block's K or V semaphore once written,
+        and the attention reader waits on it before streaming the slot's tile."""
         b, n_kv, g = qk.shape[0], qk.shape[1], self.kv_groups
         d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
         out = ttnn.allocate_tensor_on_device(
@@ -630,6 +641,18 @@ class TtAttention:
         if rem:
             ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full_rows), ttnn.CoreCoord(rem - 1, full_rows)))
         cores = ttnn.CoreRangeSet(ranges)
+        sem_k, sem_v = 0, 1
+        kv_kernels, kv_cbs, kv_tensors = [], [], []
+        if kv_write is not None:
+            qkv, k_row = kv_write
+            idle = [ttnn.CoreCoord(i % grid.x, i // grid.x) for i in range(n_rows, grid.x * grid.y)]
+            coords = []
+            for i in range(n_rows):
+                c = self.device.worker_core_from_logical_core(ttnn.CoreCoord(i % grid.x, i // grid.x))
+                coords += [c.x, c.y]
+            kv_kernels, kv_cbs, kv_tensors = self._kv_write_parts(
+                qk, qkv, kv_cache, ctx.cur_pos, b, k_row, idle, signal=(sem_k, sem_v, coords)
+            )
         rd_rt, wr_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for i in range(n_rows):
             rd_rt[i % grid.x][i // grid.x] = [i]
@@ -690,7 +713,8 @@ class TtAttention:
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[d_t, c_t, n_kv, cb_q, cb_k, cb_scale, cb_mask, cb_pos, cb_zero, cb_mx, cb_sm, cb_v, cb_cnt]
-            + accessor_ct,
+            + accessor_ct
+            + [int(kv_write is not None), sem_k, sem_v],
             runtime_args=rd_rt,
             common_runtime_args=[t.buffer_address() for t in tensors],
             config=ttnn.ReaderConfigDescriptor(),
@@ -727,8 +751,19 @@ class TtAttention:
             runtime_args=ttnn.RuntimeArgs(),
             config=compute_cfg,
         )
-        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
-        return ttnn.generic_op(tensors + [out], program)
+        semaphores = []
+        if kv_write is not None:
+            everywhere = ttnn.CoreRangeSet(
+                [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))]
+            )
+            semaphores = [
+                ttnn.SemaphoreDescriptor(id=sem_k, core_ranges=everywhere, initial_value=0),
+                ttnn.SemaphoreDescriptor(id=sem_v, core_ranges=everywhere, initial_value=0),
+            ]
+        program = ttnn.ProgramDescriptor(
+            kernels=[reader, writer, compute] + kv_kernels, semaphores=semaphores, cbs=cbs + kv_cbs
+        )
+        return ttnn.generic_op(tensors + [t for t in kv_tensors if all(t is not u for u in tensors)] + [out], program)
 
     def _spread(self, n_tiles):
         """Row-major core set over the grid for n_tiles work items, with [start, count] / [count] runtime args."""
@@ -821,24 +856,29 @@ class TtAttention:
         """Decode KV-cache write as one generic_op: per (cache, b, kv head) unit, the slot row pos[b] of
         cache[b, h] becomes old + (new - old) (binary_ng's default bf16 FPU sub/add), every other row untouched."""
         grid = self.device.compute_with_storage_grid_size()
+        all_cores = [ttnn.CoreCoord(i % grid.x, i // grid.x) for i in range(grid.x * grid.y)]
+        kernels, cbs, _ = self._kv_write_parts(k, qkv, kv_cache, cur_pos, batch, k_row, all_cores)
+        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+        # The caches are updated in place; generic_op's last tensor is its (here: in-place) output.
+        ttnn.generic_op([k, qkv, cur_pos, kv_cache.k, kv_cache.v], program)
+
+    def _kv_write_parts(self, k, qkv, kv_cache, cur_pos, batch, k_row, core_list, signal=None):
+        """The KV-write kernels and CBs on the first units-many cores of core_list (logical, in order; K units
+        first). signal=(sem_k, sem_v, coords): after each unit the writer bumps that semaphore on row block
+        b * n_kv + h, whose NoC coordinates are coords[2 * bh], coords[2 * bh + 1]."""
         n_kv, d_t = self.n_kv_heads, self.head_dim // 32
         units = 2 * batch * n_kv
-        n_cores = min(units, grid.x * grid.y)
+        n_cores = min(units, len(core_list))
         base, extra = divmod(units, n_cores)
-        full_rows, rem = divmod(n_cores, grid.x)
-        ranges = []
-        if full_rows:
-            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, full_rows - 1)))
-        if rem:
-            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full_rows), ttnn.CoreCoord(rem - 1, full_rows)))
-        cores = ttnn.CoreRangeSet(ranges)
+        used = core_list[:n_cores]
+        cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in used])
 
         dm_rt, cmp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         start = 0
-        for i in range(n_cores):
+        for i, c in enumerate(used):
             count = base + (1 if i < extra else 0)
-            dm_rt[i % grid.x][i // grid.x] = [start, count]
-            cmp_rt[i % grid.x][i // grid.x] = [count]
+            dm_rt[c.x][c.y] = [start, count]
+            cmp_rt[c.x][c.y] = [count]
             start += count
 
         tile = 2 * 32 * 32
@@ -859,6 +899,7 @@ class TtAttention:
         pos_ct = list(ttnn.TensorAccessorArgs(cur_pos).get_compile_time_args())
         addrs = [kv_cache.k, kv_cache.v, k, qkv, cur_pos]
         common = [t.buffer_address() for t in addrs]
+        sem_k, sem_v, coords = signal if signal is not None else (0, 0, [])
         v_col0 = (self.n_heads + n_kv) * self.head_dim // 32
         reader = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_KV_WRITE_DIR, "reader_kv_write.cpp"),
@@ -877,9 +918,12 @@ class TtAttention:
             kernel_source=os.path.join(_KV_WRITE_DIR, "writer_kv_write.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[*shape[:4], cb_out, cb_wscr, cb_wpos] + cache_ct + pos_ct,
+            compile_time_args=[*shape[:4], cb_out, cb_wscr, cb_wpos]
+            + cache_ct
+            + pos_ct
+            + [int(signal is not None), sem_k, sem_v],
             runtime_args=dm_rt,
-            common_runtime_args=common,
+            common_runtime_args=common + list(coords),
             config=ttnn.WriterConfigDescriptor(),
         )
         compute = ttnn.KernelDescriptor(
@@ -895,9 +939,7 @@ class TtAttention:
                 dst_full_sync_en=False,
             ),
         )
-        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
-        # The caches are updated in place; generic_op's last tensor is its (here: in-place) output.
-        ttnn.generic_op([k, qkv, cur_pos, kv_cache.k, kv_cache.v], program)
+        return [reader, writer, compute], cbs, [k, qkv, cur_pos, kv_cache.k, kv_cache.v]
 
     def _decode_kv_shard(self, batch):
         """Height-shard spec for one token's K/V [1, B, n_kv, D]: one batch row (a padded tile row) per core."""
