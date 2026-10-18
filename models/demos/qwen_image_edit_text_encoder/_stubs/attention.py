@@ -960,14 +960,19 @@ class TtVisionAttention:
         cfg = self.compute_cfg
         L = getattr(self, "limbs", 2)
         qkv = split_linear(x, self.wqkv_p, bias=self.bqkv_p, compute_kernel_config=cfg, limbs=L)
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(qkv, num_heads=hp, num_kv_heads=hp, transpose_k_heads=False)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            qkv, num_heads=hp, num_kv_heads=hp, transpose_k_heads=False, memory_config=ttnn.L1_MEMORY_CONFIG
+        )  # (the heads into L1: the rope reads them there)
         ttnn.deallocate(qkv)
         cos, sin = self._padded_tables(tt_cos, tt_sin)
 
         def _rope(t):
-            return ttnn.add(ttnn.multiply(t, cos), ttnn.multiply(rotate_half_padded(t, D), sin))
+            return ttnn.add(
+                ttnn.multiply(t, cos), ttnn.multiply(rotate_half_padded(t, D), sin), memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
 
         q, k = _rope(q), _rope(k)
+        v = ttnn.to_memory_config(v, ttnn.DRAM_MEMORY_CONFIG)
         mask = tt_mask if tt_mask.dtype == ttnn.float32 else ttnn.typecast(tt_mask, ttnn.float32)
         scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, limbs=L)
         scores = ttnn.add(ttnn.multiply(scores, self.scale), mask)
