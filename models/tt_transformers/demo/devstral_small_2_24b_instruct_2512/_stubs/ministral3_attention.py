@@ -388,6 +388,27 @@ class TtMinistral3Attention:
             and 2 * batch <= w * self.device.compute_with_storage_grid_size().y
         )
 
+    def head_grid_x(self):
+        return min(self.HEAD_GRID_X, self.device.compute_with_storage_grid_size().x)
+
+    def query_shares_rope(self, max_position):
+        """Whether q uses k's rotary tables at every position below max_position (query_rope_tables: the llama-4
+        query scale is exactly 1 there)."""
+        if self.l4_beta is None or not self.l4_max:
+            return True
+        return max_position is not None and int(max_position) <= int(self.l4_max)
+
+    def decode_rope_gathered(self, gather, cur_pos, cos_tab, sin_tab):
+        """decode_rope_tables' DECODE_FUSED_QK result (cos, sin, trans) with the step's cos / sin rows gathered from
+        the resident tables of every position (tt/rope_gather.py) instead of derived, concatenated and resharded."""
+        batch = gather.batch
+        cfg = self._batch_shard_cfg(2 * batch, self.head_dim)
+        cos, sin = gather(cur_pos, cos_tab, sin_tab, cfg)
+        trans = self.trans_mat_qk
+        if batch < self.MAX_DECODE_BATCH:
+            trans = ttnn.slice(trans, (0, 0, 0, 0), (1, 1, 2 * batch * ttnn.TILE_SIZE, ttnn.TILE_SIZE))
+        return cos, sin, ttnn.to_memory_config(trans, self._batch_shard_cfg(2 * batch, ttnn.TILE_SIZE))
+
     def decode_rope_tables(self, rope, batch):
         """Decode rope tables (cos, sin, q_cos, q_sin), each (1, B, 1, head_dim), height-sharded onto the decode head
         grid plus the pair-swap tiles, ONCE per forward for every layer: the fused RoPE reads them from the cores

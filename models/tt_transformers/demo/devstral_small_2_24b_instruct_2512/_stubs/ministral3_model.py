@@ -62,10 +62,28 @@ class TtMinistral3Model:
         self.max_seq_len = max_seq_len
         self._repl = ttnn.ReplicateTensorToMesh(device) if self.tp > 1 else None
         self.compute_cfg = self.layers[0].compute_cfg
+        # (cos, sin) tables of every decode position and the program that gathers a step's rows (prepare_decode_rope)
+        self._decode_rope = None
+        self._rope_gather = None
+
+    # Decode reads its RoPE rows from tables of every position below the KV capacity, built once (rope_gather.py),
+    # instead of deriving them on device each step.
+    DECODE_ROPE_TABLES = True
 
     @classmethod
     def build(cls, device, torch_module):
         return cls(device, torch_module)
+
+    def prepare_decode_rope(self, capacity, batch):
+        """Build the decode RoPE tables for positions 0 .. capacity - 1 (the KV capacity bounds every decode position)
+        when decode runs the fused q / k RoPE with q sharing k's tables; otherwise decode derives them per step."""
+        attn0 = self.layers[0].self_attn
+        if not (self.DECODE_ROPE_TABLES and attn0._fused_qk_rope(batch) and attn0.query_shares_rope(capacity)):
+            return
+        from models.demos.devstral_small_2_24b_instruct_2512.tt.rope_gather import RopeGather
+
+        self._decode_rope = self.rotary_emb.table(int(capacity))
+        self._rope_gather = RopeGather(self.device, batch, self.head_dim, attn0.head_grid_x())
 
     def _positions(self, position_ids, s):
         """(1, 1, S, 1) fp32 prefill positions on device (a device tensor is used as given)."""
@@ -175,14 +193,18 @@ class TtMinistral3Model:
         else:
             x = inputs_embeds
         b = x.shape[-2]
-        cos, sin = self.rotary_emb(x, position_ids=position_ids)  # (B, 1, hd)
-        cos = ttnn.reshape(cos, (1, b, 1, self.head_dim))
-        sin = ttnn.reshape(sin, (1, b, 1, self.head_dim))
         attn0 = self.layers[0].self_attn
-        # Every decode position is below the resident KV capacity (dim 2 of the cache).
-        capacity = int(kv_caches[0][0].shape[2]) if kv_caches else None
-        rope = (cos, sin) + attn0.query_rope_tables(cos, sin, position_ids, (1, b, 1, 1), max_position=capacity)
-        rope = attn0.decode_rope_tables(rope, b)
+        if self._rope_gather is not None and self._rope_gather.batch == b and cur_pos is not None:
+            # this step's rows of the resident tables, straight into the fused RoPE's shards (prepare_decode_rope)
+            rope = attn0.decode_rope_gathered(self._rope_gather, cur_pos, *self._decode_rope)
+        else:
+            cos, sin = self.rotary_emb(x, position_ids=position_ids)  # (B, 1, hd)
+            cos = ttnn.reshape(cos, (1, b, 1, self.head_dim))
+            sin = ttnn.reshape(sin, (1, b, 1, self.head_dim))
+            # Every decode position is below the resident KV capacity (dim 2 of the cache).
+            capacity = int(kv_caches[0][0].shape[2]) if kv_caches else None
+            rope = (cos, sin) + attn0.query_rope_tables(cos, sin, position_ids, (1, b, 1, 1), max_position=capacity)
+            rope = attn0.decode_rope_tables(rope, b)
         for i, layer in enumerate(self.layers):
             x = layer(
                 x,
