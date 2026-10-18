@@ -13,6 +13,7 @@ import os
 import torch
 
 import ttnn
+from models.demos.minicpm5_2b._stubs.dram_mm import DramMatmul
 
 _VOCAB_CHUNK = 16320  # 510 tiles; 130560 = 8 chunks
 _TILE = 32
@@ -24,6 +25,9 @@ _MAX_GROUP_W = 4  # output tiles held in DEST per accumulation (fp32 dest, half-
 _BLOCK_TILES = 32  # target weight tiles per reader block (k_block * group_w)
 _IN1_BUFFERS = 3  # weight CB depth in blocks
 _CB_IN0, _CB_IN1, _CB_OUT = 0, 1, 16
+# Decode LM head on the DRAM-bank-local generic_op (_stubs/dram_mm.py), same arithmetic as the kernel below.
+_USE_DRAM_MM = True
+_DRAM_MM_WORKERS_PER_BANK = 6  # HiFi4 bf8: compute-bound on fewer cores
 
 
 def _mesh_kw(device, **kw):
@@ -60,6 +64,15 @@ class DecoderHead:
         self.k_dim = w.shape[0]
         self.vocab = w.shape[1]
         self._kernel = self._build_kernel() if _USE_CPP_KERNEL else None
+        self.dmm = None
+        if _USE_DRAM_MM:
+            self.dmm = DramMatmul(
+                device,
+                w,
+                ttnn.MathFidelity.HiFi4,
+                dtype=ttnn.bfloat8_b,
+                workers_per_bank=_DRAM_MM_WORKERS_PER_BANK,
+            )
 
     def _build_kernel(self):
         """Static part of the generic_op program: one program covers all vocab chunks."""
@@ -161,6 +174,8 @@ class DecoderHead:
         # With `segments` S the logits are allocated as [1, S, 32, V / S]: one tile row per segment, so its tile
         # pages are exactly those of [.., 32, V] in the same order and the kernel writes them unchanged.
         shape = list(x.shape)[:-1] + [self.vocab] if segments is None else [1, segments, 32, self.vocab // segments]
+        if self.dmm is not None and self.dmm.accepts(x):
+            return self.dmm(x, memory_config or ttnn.DRAM_MEMORY_CONFIG, out_shape=shape)
         out = ttnn.allocate_tensor_on_device(
             ttnn.Shape(shape),
             ttnn.bfloat16,

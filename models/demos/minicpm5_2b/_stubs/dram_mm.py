@@ -22,7 +22,7 @@ import ttnn
 _KERNEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "dram_mm")
 _TILE = 32
 _TILE_BYTES = 2 * _TILE * _TILE  # bf16
-_TXN_TILES = 8  # 16 KB: one NoC packet on Blackhole
+_TXN_TILES = 8  # 16 KB of bf16 (one NoC packet on Blackhole)
 _BLOCK_TILES = 16  # weight tiles per reader block (two transactions)
 _SLOTS = 3
 _IN0_CHUNK = 8
@@ -43,7 +43,7 @@ def _mesh_kw(device, **kw):
 class DramMatmul:
     """y[1, 32, N] = x[.., 32, K] @ w[K, N] for a bf16 one-tile-row x (None-able: check `ok`)."""
 
-    def __init__(self, device, w, math_fidelity, split_n=None):
+    def __init__(self, device, w, math_fidelity, split_n=None, dtype=ttnn.bfloat16, workers_per_bank=None):
         """split_n: write output columns [0, split_n) and [split_n, N) as two tensors (two projections sharing
         one activation row run as one program)."""
         self.device = device
@@ -63,7 +63,7 @@ class DramMatmul:
         if not self.ok:
             return
         bank_groups = cols // group_w
-        wpb = min(_WORKERS_PER_BANK, bank_groups)
+        wpb = min(workers_per_bank or _WORKERS_PER_BANK, bank_groups)
         # Groups per worker of a bank (the first ones take one more when they do not divide evenly).
         base, extra = divmod(bank_groups, wpb)
         worker_groups = [base + (1 if i < extra else 0) for i in range(wpb)]
@@ -76,32 +76,39 @@ class DramMatmul:
             .reshape(banks, -1, _TILE, _TILE)
         )
         pages = seq.permute(1, 0, 2, 3).reshape(-1, _TILE)  # page banks * q + b = seq[b, q]
+        # Whole tiles are permuted, so a block-float dtype quantizes every tile exactly as in the unpermuted weight.
         self.weight = ttnn.from_torch(
             pages.contiguous(),
-            **_mesh_kw(device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG),
+            **_mesh_kw(device, dtype=dtype, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG),
         )
+        w_tile_bytes = self.weight.tile.get_tile_size(dtype)
 
-        # Extra workers of a bank: the nearest free cores in its optimal worker's row.
+        # Extra workers of a bank: the nearest free cores to its optimal worker (same row first), taken round-robin
+        # over the banks so neighbouring banks share their surroundings.
         grid = device.compute_with_storage_grid_size()
         used = {(c.x, c.y) for c in workers}
-        bank_cores = []
-        for c in workers:
-            mine = [c]
-            for d in range(1, grid.x):
-                for x in (c.x + d, c.x - d):
-                    if len(mine) < wpb and 0 <= x < grid.x and (x, c.y) not in used:
-                        used.add((x, c.y))
-                        mine.append(ttnn.CoreCoord(x, c.y))
-            self.ok = self.ok and len(mine) == wpb
-            bank_cores.append(mine)
-        if not self.ok:
-            return
+        bank_cores = [[c] for c in workers]
+        for _ in range(wpb - 1):
+            for mine in bank_cores:
+                c = mine[0]
+                free = [  # nearest first; same row, then the +x side (measured faster than -x for 2 per bank)
+                    (abs(x - c.x) + abs(y - c.y), abs(y - c.y), 0 if x > c.x else 1, x, y)
+                    for x in range(grid.x)
+                    for y in range(grid.y)
+                    if (x, y) not in used
+                ]
+                if not free:
+                    self.ok = False
+                    return
+                *_, x, y = min(free)
+                used.add((x, y))
+                mine.append(ttnn.CoreCoord(x, y))
         all_cores = [c for mine in bank_cores for c in mine]
         cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in all_cores])
         self.cores = cores
         rt = ttnn.RuntimeArgs()
         vchannels = {}
-        group_bytes = k_t * group_w * _TILE_BYTES
+        group_bytes = k_t * group_w * w_tile_bytes
         for b, mine in enumerate(bank_cores):
             g0 = 0
             for w_i, c in enumerate(mine):
@@ -124,9 +131,9 @@ class DramMatmul:
                 format_descriptors=[ttnn.CBFormatDescriptor(_CB_IN0, ttnn.bfloat16, _TILE_BYTES)],
             ),
             ttnn.CBDescriptor(
-                total_size=_SLOTS * _BLOCK_TILES * _TILE_BYTES,
+                total_size=_SLOTS * _BLOCK_TILES * w_tile_bytes,
                 core_ranges=cores,
-                format_descriptors=[ttnn.CBFormatDescriptor(_CB_IN1, ttnn.bfloat16, _TILE_BYTES)],
+                format_descriptors=[ttnn.CBFormatDescriptor(_CB_IN1, dtype, w_tile_bytes)],
             ),
             ttnn.CBDescriptor(
                 total_size=2 * group_w * _TILE_BYTES,
@@ -134,7 +141,7 @@ class DramMatmul:
                 format_descriptors=[ttnn.CBFormatDescriptor(_CB_OUT, ttnn.bfloat16, _TILE_BYTES)],
             ),
         ]
-        self.reader_ct = [_CB_IN1, _BLOCK_TILES, _BLOCK_TILES // _TXN_TILES, _TXN_TILES * _TILE_BYTES]
+        self.reader_ct = [_CB_IN1, _BLOCK_TILES, _BLOCK_TILES // _TXN_TILES, _TXN_TILES * w_tile_bytes]
         self.writer_ct = [k_t, group_w, _IN0_CHUNK, _CB_IN0, _CB_OUT, self.split_n // _TILE]
         self.compute = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_KERNEL_DIR, "compute_dram_mm.cpp"),
@@ -159,13 +166,13 @@ class DramMatmul:
             rows *= d
         return ps[-1] == self.k and rows == _TILE and x.shape[-1] == self.k
 
-    def __call__(self, x, memory_config):
+    def __call__(self, x, memory_config, out_shape=None):
+        """out_shape: the (single) output's shape when it is not [.., 32, N] but has the same tile pages in order."""
         widths = [self.split_n] + ([self.n - self.split_n] if self.split_n < self.n else [])
+        shapes = [out_shape] if out_shape is not None else [list(x.shape)[:-1] + [n] for n in widths]
         outs = [
-            ttnn.allocate_tensor_on_device(
-                ttnn.Shape(list(x.shape)[:-1] + [n]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
-            )
-            for n in widths
+            ttnn.allocate_tensor_on_device(ttnn.Shape(sh), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config)
+            for sh in shapes
         ]
         out = outs[0]
         common = [self.weight.buffer_address(), x.buffer_address(), out.buffer_address(), outs[-1].buffer_address()]
