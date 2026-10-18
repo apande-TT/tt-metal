@@ -41,6 +41,10 @@ void kernel_main() {
     constexpr uint32_t wait_kv = get_compile_time_arg_val(sm_args.next_compile_time_args_offset());
     constexpr uint32_t sem_k_id = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 1);
     constexpr uint32_t sem_v_id = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 2);
+    // q_rows: q is the roped QKV-layout [1, B, H * G * D] (row b = batch b, G = groups + 1 heads per KV head):
+    // the row block's G head rows are gathered into rows 0..G-1 of its Kt q tiles (the head-split layout).
+    constexpr uint32_t q_rows = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 3);
+    constexpr uint32_t G = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 4);
 
     const uint32_t bg = get_arg_val<uint32_t>(0);
     const auto q = TensorAccessor(q_args, get_common_arg_val<uint32_t>(0));
@@ -77,7 +81,24 @@ void kernel_main() {
 
     // q (with the discarded key row) of bg.
     cb_reserve_back(cb_q, Kt);
-    {
+    if constexpr (q_rows) {
+        constexpr uint32_t face_bytes = 16 * 16 * 2, face_row_bytes = 16 * 2;
+        auto face_row_offset = [](uint32_t row, uint32_t half) {
+            return (((row >> 4) << 1) + half) * face_bytes + (row & 15) * face_row_bytes;
+        };
+        const uint32_t h = bg - b * H;
+        const uint32_t l1 = get_write_ptr(cb_q);
+        for (uint32_t j = 0; j < G; ++j) {
+            for (uint32_t k = 0; k < Kt; ++k) {
+                for (uint32_t half = 0; half < 2; ++half) {
+                    noc_async_read(
+                        q.get_noc_addr((h * G + j) * Kt + k, face_row_offset(b & 31, half)),
+                        l1 + k * tile_bytes + face_row_offset(j, half),
+                        face_row_bytes);
+                }
+            }
+        }
+    } else {
         uint32_t l1 = get_write_ptr(cb_q);
         for (uint32_t k = 0; k < Kt; ++k) {
             noc_async_read_page(bg * Kt + k, q, l1);

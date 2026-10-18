@@ -482,8 +482,12 @@ class MiniCPM5Pipeline:
         cos_full = ttnn.repeat(cos, ttnn.Shape([1, 1, 32, 1]), memory_config=l1)
         sin_signed = ttnn.multiply(ttnn.repeat(sin, ttnn.Shape([1, 1, 32, 1])), self.rot_sign, memory_config=l1)
         mask_full = ttnn.repeat(mask, ttnn.Shape([1, 1, 32, 1]), memory_config=l1)
+        # The same cos / signed sin as one tile row (row b = batch b) for the rope on the QKV layout.
+        cos_rows = ttnn.to_memory_config(ttnn.reshape(cos, (1, 1, B, self.head_dim)), l1)
+        sin_rows = ttnn.multiply(ttnn.reshape(sin, (1, 1, B, self.head_dim)), self.rot_sign, memory_config=l1)
         ctx = attention_stub.AttnContext(
-            "decode", mask, write, cur_pos, rope=(cos_full, sin_signed), mask_full=mask_full
+            "decode", mask, write, cur_pos, rope=(cos_full, sin_signed), mask_full=mask_full,
+            rope_rows=(cos_rows, sin_rows),
         )
         h = self.encoder_stack(x, position_embeddings=cos_sin, kv_caches=self.kv_caches, attn_ctx=ctx)
         # Decode logits (8 MB) stay in L1 for the sampler's topk.

@@ -45,7 +45,10 @@ void kernel_main() {
     constexpr uint32_t cb_scr = get_compile_time_arg_val(8);
     constexpr uint32_t cb_pos = get_compile_time_arg_val(9);
     constexpr uint32_t k_row = get_compile_time_arg_val(10);
-    constexpr auto cache_args = TensorAccessorArgs<11>();
+    // k_from_rows: k_new is the roped QKV-layout [1, B, n_kv * (k_row + 1) * D] (the key of KV head h is head
+    // h * (k_row + 1) + k_row, row b = batch b) instead of the head-split [B, n_kv, rows, D].
+    constexpr uint32_t k_from_rows = get_compile_time_arg_val(11);
+    constexpr auto cache_args = TensorAccessorArgs<12>();
     constexpr auto k_args = TensorAccessorArgs<cache_args.next_compile_time_args_offset()>();
     constexpr auto qkv_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
     constexpr auto pos_args = TensorAccessorArgs<qkv_args.next_compile_time_args_offset()>();
@@ -85,11 +88,12 @@ void kernel_main() {
                 noc_async_read_page((b >> 5) * qkv_Nt + v_col0 + h * Dt + wt, qkv, scr + wt * tile_bytes);
             } else {
                 noc_async_read_page(cache_page0 + wt, cache_k, old_l1 + wt * tile_bytes);
-                noc_async_read_page(bh * Dt + wt, k_new, scr + wt * tile_bytes);
+                const uint32_t k_page = k_from_rows ? (h * (k_row + 1) + k_row) * Dt + wt : bh * Dt + wt;
+                noc_async_read_page(k_page, k_new, scr + wt * tile_bytes);
             }
         }
         noc_async_read_barrier();
-        const uint32_t src_row = is_v ? (b & 31) : k_row;
+        const uint32_t src_row = (is_v || k_from_rows) ? (b & 31) : k_row;
         for (uint32_t wt = 0; wt < Dt; ++wt) {
             copy_row(scr + wt * tile_bytes, src_row, new_l1 + wt * tile_bytes, r);
         }

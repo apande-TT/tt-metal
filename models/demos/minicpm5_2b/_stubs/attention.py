@@ -51,6 +51,9 @@ _ATTN_BMM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel
 _USE_FUSED_DECODE_ATTN = True
 # Decode QKV / o_proj on the DRAM-bank-local generic_op (_stubs/dram_mm.py).
 _USE_DRAM_MM = True
+# Decode rope on the QKV projection's own layout (72 real tiles, no head split): the fused attention gathers its
+# head rows from it and the KV write takes its key rows from it.
+_USE_QKV_ROPE = True
 # ... with the layer's input RMSNorm fused into the QKV program (bind_prenorm). Off: QKV is stream-bound at ~26 us
 # on 16 or 40 cores and does not hide the norm (16 cores: 39.7 us; 40 cores: 38.3 us, its all-gather of the
 # normalized row to 40 cores alone takes ~18 us; vs 11.7 + 25.7 us unfused).
@@ -89,8 +92,10 @@ class AttnContext:
                     `cur_pos` that slot as int32 [B], which paged_update_cache writes in place.
     """
 
-    def __init__(self, mode, mask, write=None, cur_pos=None, rope=None, mask_full=None):
+    def __init__(self, mode, mask, write=None, cur_pos=None, rope=None, mask_full=None, rope_rows=None):
         self.mode, self.mask, self.write, self.cur_pos = mode, mask, write, cur_pos
+        # decode: (cos, signed sin) [1, 1, B, D] (row b = batch b's position), for the rope on the QKV layout.
+        self.rope_rows = rope_rows
         # decode: `mask` broadcast over the tile rows, [B, 1, 32, capacity], for the scale + mask kernel.
         self.mask_full = mask_full
         # decode: (cos, signed sin) [B, 1, 32, D] broadcast over the tile rows, sin negated on the first
@@ -327,6 +332,13 @@ class TtAttention:
             # One token per row: the grouped columns split straight into [B, kv, groups + 1, D] (rows 0..groups-1
             # the query heads h = kv * groups + j, row `groups` that KV head's key), so q and k share one rope and
             # the cache is attended per KV head with no repeat. The key row's scores are computed and discarded.
+            fused_attn = _USE_FUSED_DECODE_ATTN and _USE_HEAD_KERNELS and b == 32 and ctx.mask_full is not None
+            if _USE_QKV_ROPE and fused_attn and _USE_KV_WRITE_KERNEL and ctx.rope_rows is not None:
+                # Rope on the QKV layout; attention and the KV write read head rows straight from it.
+                qkr = self._rope_qkv(qkv, *ctx.rope_rows, (g + 1) * self.n_kv_heads * self.head_dim, l1)
+                attn = self._attn_fused(qkr, kv_cache, ctx, l1, kv_write=(qkv, g), q_rows=(b, g + 1))
+                ttnn.deallocate(qkr)
+                return self._decode_o_proj(attn, l1)
             if _USE_HEAD_KERNELS and b == 32:
                 qk = self._heads_op("head_split", qkv, (b, self.n_kv_heads, g + 1, d), [g + 1], l1)
             else:
@@ -416,6 +428,63 @@ class TtAttention:
             memory_config=l1,
             program_config=self.cfg_o,
         )
+
+    def _rope_qkv(self, qkv, cos_rows, sin_rows, width, memory_config):
+        """Rope on the first `width` columns (the grouped q / k heads) of the one-tile-row QKV output [1, B, N],
+        as _rope_kernel's program with reader_rope_qkv.cpp: tile c (head c / Dt, column tile c % Dt) with the
+        step's cos / signed sin tile c % Dt ([1, 1, B, D], row b = batch b) and its rotate-half partner tile."""
+        b = qkv.shape[-2]
+        out = ttnn.allocate_tensor_on_device(ttnn.Shape([1, b, width]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config)
+        n_tiles = width // 32
+        cores, rt = self._spread(n_tiles)
+        tile = 2 * 32 * 32
+        cb_x, cb_cos, cb_xr, cb_sin, cb_t1, cb_t2, cb_out = 0, 1, 2, 3, 4, 5, 16
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=2 * tile,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(idx, ttnn.bfloat16, tile)],
+            )
+            for idx in (cb_x, cb_cos, cb_xr, cb_sin, cb_t1, cb_t2, cb_out)
+        ]
+        compute_cfg = ttnn.ComputeConfigDescriptor(  # as _rope_kernel
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=False
+        )
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        for idx in (cb_x, cb_cos, cb_xr, cb_sin):
+            modes[idx] = ttnn.UnpackToDestMode.UnpackToDestFp32
+        compute_cfg.unpack_to_dest_mode = modes
+        d_t = self.head_dim // 32
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ROPE_DIR, "reader_rope_qkv.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[d_t, cb_x, cb_cos, cb_xr, cb_sin]
+            + list(ttnn.TensorAccessorArgs(qkv).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(cos_rows).get_compile_time_args()),
+            runtime_args=rt["dm"],
+            common_runtime_args=[qkv.buffer_address(), cos_rows.buffer_address(), sin_rows.buffer_address()],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        writer = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ROPE_DIR, "writer_rope.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[cb_out] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=rt["dm"],
+            common_runtime_args=[out.buffer_address()],
+            config=ttnn.WriterConfigDescriptor(),
+        )
+        compute = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ROPE_DIR, "compute_rope.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[cb_x, cb_cos, cb_xr, cb_sin, cb_t1, cb_t2, cb_out],
+            runtime_args=rt["cmp"],
+            config=compute_cfg,
+        )
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
+        return ttnn.generic_op([qkv, cos_rows, sin_rows, out], program)
 
     def _rope_kernel(self, x, cos_full, sin_signed, memory_config):
         """Rope on x [B, H, S, D] as one generic_op (kernels/rope), bit-identical to _rope. cos_full / sin_signed
@@ -667,7 +736,7 @@ class TtAttention:
             attn, self.wo, compute_kernel_config=self.compute_cfg, memory_config=l1, program_config=self.cfg_o
         )
 
-    def _attn_fused(self, qk, kv_cache, ctx, memory_config, kv_write=None):
+    def _attn_fused(self, qk, kv_cache, ctx, memory_config, kv_write=None, q_rows=None):
         """Decode attention for qk [B, n_kv, rows, D] against the caches as one generic_op (kernels/attn_fused): per
         (batch, KV head) row block, the score kernel's q.K^T + scale + mask, ttnn.softmax's arithmetic and probs.V,
         the writer scattering the query rows straight into the merged [1, B, n_kv * groups * D] o_proj input.
@@ -675,7 +744,11 @@ class TtAttention:
         kv_write=(qkv, k_row): this step's KV-cache write (the _kv_write kernels, unchanged, bf16 DEST) joins the same
         program on the cores the row blocks leave idle; each unit bumps its row block's K or V semaphore once written,
         and the attention reader waits on it before streaming the slot's tile."""
-        b, n_kv, g = qk.shape[0], qk.shape[1], self.kv_groups
+        # q_rows=(B, G): qk is the roped QKV layout [1, B, n_kv * G * D] (the reader gathers the head rows).
+        if q_rows is not None:
+            b, n_kv, g = q_rows[0], self.n_kv_heads, self.kv_groups
+        else:
+            b, n_kv, g = qk.shape[0], qk.shape[1], self.kv_groups
         d_t, c_t = self.head_dim // 32, kv_cache.capacity // 32
         out = ttnn.allocate_tensor_on_device(
             ttnn.Shape([1, b, n_kv * g * self.head_dim]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
@@ -700,7 +773,8 @@ class TtAttention:
                 c = self.device.worker_core_from_logical_core(ttnn.CoreCoord(i % grid.x, i // grid.x))
                 coords += [c.x, c.y]
             kv_kernels, kv_cbs, kv_tensors = self._kv_write_parts(
-                qk, qkv, kv_cache, ctx.cur_pos, b, k_row, idle, signal=(sem_k, sem_v, coords)
+                qk, qkv, kv_cache, ctx.cur_pos, b, k_row, idle, signal=(sem_k, sem_v, coords),
+                k_from_rows=q_rows is not None,
             )
         rd_rt, wr_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for i in range(n_rows):
@@ -763,7 +837,7 @@ class TtAttention:
             core_ranges=cores,
             compile_time_args=[d_t, c_t, n_kv, cb_q, cb_k, cb_scale, cb_mask, cb_pos, cb_zero, cb_mx, cb_sm, cb_v, cb_cnt]
             + accessor_ct
-            + [int(kv_write is not None), sem_k, sem_v],
+            + [int(kv_write is not None), sem_k, sem_v, int(q_rows is not None), g + 1],
             runtime_args=rd_rt,
             common_runtime_args=[t.buffer_address() for t in tensors],
             config=ttnn.ReaderConfigDescriptor(),
@@ -911,7 +985,7 @@ class TtAttention:
         # The caches are updated in place; generic_op's last tensor is its (here: in-place) output.
         ttnn.generic_op([k, qkv, cur_pos, kv_cache.k, kv_cache.v], program)
 
-    def _kv_write_parts(self, k, qkv, kv_cache, cur_pos, batch, k_row, core_list, signal=None):
+    def _kv_write_parts(self, k, qkv, kv_cache, cur_pos, batch, k_row, core_list, signal=None, k_from_rows=False):
         """The KV-write kernels and CBs on the first units-many cores of core_list (logical, in order; K units
         first). signal=(sem_k, sem_v, coords): after each unit the writer bumps that semaphore on row block
         b * n_kv + h, whose NoC coordinates are coords[2 * bh], coords[2 * bh + 1]."""
@@ -954,7 +1028,7 @@ class TtAttention:
             kernel_source=os.path.join(_KV_WRITE_DIR, "reader_kv_write.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[*shape, v_col0, cb_old, cb_new, cb_scr, cb_pos, k_row]
+            compile_time_args=[*shape, v_col0, cb_old, cb_new, cb_scr, cb_pos, k_row, int(k_from_rows)]
             + cache_ct
             + list(ttnn.TensorAccessorArgs(k).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(qkv).get_compile_time_args())
