@@ -468,7 +468,9 @@ class MiniCPM5Pipeline:
         # [1, B, H]: the B single-token rows share one tile row instead of padding each to a tile
         # (the ids are looked up as one [1, B] row, so the embedding already lands in that layout).
         x = self.token_embed(self.tok_buf)
-        cos_sin = self.rotary_embedding(x, position_ids=self.pos_buf)
+        rows = attention_stub._USE_QKV_ROPE and B == 32
+        # rows: cos / sin as one tile row (row b = batch b) for the rope on the QKV layout, the only rope decode runs.
+        cos_sin = self.rotary_embedding(x, position_ids=self.pos_buf, rows=rows)
         cur_pos = ttnn.reshape(ttnn.to_layout(self.pos_i32, ttnn.ROW_MAJOR_LAYOUT), (B,))  # one contiguous page
         pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1))
         # The one-hot cache-slot selector is read only by the non-kernel KV write.
@@ -476,20 +478,25 @@ class MiniCPM5Pipeline:
         if not attention_stub._USE_KV_WRITE_KERNEL:
             write = ttnn.typecast(ttnn.eq(self.key_index_kv, pos), ttnn.bfloat16)  # [B, kv, 1, C]
         mask = ttnn.typecast(ttnn.multiply(ttnn.gt(self.key_index_row, pos), _NEG), ttnn.bfloat16)  # [B, 1, 1, C]
-        # cos / signed sin broadcast over a tile's rows once per step, shared by every layer's rope kernel.
-        cos, sin = (ttnn.reshape(t, (B, 1, 1, self.head_dim)) for t in cos_sin)
         l1 = ttnn.L1_MEMORY_CONFIG
-        cos_full = ttnn.repeat(cos, ttnn.Shape([1, 1, 32, 1]), memory_config=l1)
-        sin_signed = ttnn.multiply(ttnn.repeat(sin, ttnn.Shape([1, 1, 32, 1])), self.rot_sign, memory_config=l1)
         mask_full = ttnn.repeat(mask, ttnn.Shape([1, 1, 32, 1]), memory_config=l1)
-        # The same cos / signed sin as one tile row (row b = batch b) for the rope on the QKV layout.
-        cos_rows = ttnn.to_memory_config(ttnn.reshape(cos, (1, 1, B, self.head_dim)), l1)
-        sin_rows = ttnn.multiply(ttnn.reshape(sin, (1, 1, B, self.head_dim)), self.rot_sign, memory_config=l1)
-        ctx = attention_stub.AttnContext(
-            "decode", mask, write, cur_pos, rope=(cos_full, sin_signed), mask_full=mask_full,
-            rope_rows=(cos_rows, sin_rows),
-        )
-        h = self.encoder_stack(x, position_embeddings=cos_sin, kv_caches=self.kv_caches, attn_ctx=ctx)
+        if rows:
+            cos_rows = ttnn.to_memory_config(cos_sin[0], l1)
+            sin_rows = ttnn.multiply(cos_sin[1], self.rot_sign, memory_config=l1)  # rotate_half's sign folded in
+            ctx = attention_stub.AttnContext(
+                "decode", mask, write, cur_pos, mask_full=mask_full, rope_rows=(cos_rows, sin_rows)
+            )
+            position_embeddings = None
+        else:
+            # cos / signed sin broadcast over a tile's rows once per step, shared by every layer's rope kernel.
+            cos, sin = (ttnn.reshape(t, (B, 1, 1, self.head_dim)) for t in cos_sin)
+            cos_full = ttnn.repeat(cos, ttnn.Shape([1, 1, 32, 1]), memory_config=l1)
+            sin_signed = ttnn.multiply(ttnn.repeat(sin, ttnn.Shape([1, 1, 32, 1])), self.rot_sign, memory_config=l1)
+            ctx = attention_stub.AttnContext(
+                "decode", mask, write, cur_pos, rope=(cos_full, sin_signed), mask_full=mask_full
+            )
+            position_embeddings = cos_sin
+        h = self.encoder_stack(x, position_embeddings=position_embeddings, kv_caches=self.kv_caches, attn_ctx=ctx)
         # Decode logits (8 MB) stay in L1 for the sampler's topk.
         l1 = ttnn.L1_MEMORY_CONFIG
         logits = self.decoder_head(self.final_norm(h, memory_config=l1), memory_config=l1, segments=self._logit_segments())

@@ -1172,7 +1172,8 @@ class TtAttention:
             if attn_ctx.mode == "decode":
                 # Decode rows arrive as [1, B, hidden] so every linear sees B real rows, not B padded tiles.
                 b, seq = x.shape[-2], 1
-            if attn_ctx.mode == "decode" and _USE_ROPE_KERNEL and attn_ctx.rope is not None:
+            rope_given = attn_ctx.rope is not None or attn_ctx.rope_rows is not None
+            if attn_ctx.mode == "decode" and _USE_ROPE_KERNEL and rope_given:
                 # The rope kernel reads the step's shared cos / signed sin (ctx.rope): skip the per-layer reshape.
                 cos = sin = None
             else:

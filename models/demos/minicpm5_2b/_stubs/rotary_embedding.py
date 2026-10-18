@@ -22,13 +22,25 @@ class TtRotaryEmbedding:
         self.head_dim = inv_freq.shape[-1]
         self.inv_freq = ttnn.from_torch(inv_freq, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
 
-    def __call__(self, x, position_ids=None, *args, **kwargs):
+    def __call__(self, x, position_ids=None, *args, rows=False, **kwargs):
+        """rows: one position per batch row (s = 1), returned as [1, 1, B, head_dim] (row b = batch b, one tile
+        row) instead of [B, 1, head_dim]; the same elementwise arithmetic on the same values."""
         if position_ids is None:
             raise ValueError("TtRotaryEmbedding requires position_ids")
         if not isinstance(position_ids, ttnn.Tensor):
             raise TypeError("TtRotaryEmbedding reads position_ids from device; upload them before the call")
         pos = position_ids if position_ids.dtype == ttnn.float32 else ttnn.typecast(position_ids, ttnn.float32)
         b, s = pos.shape[0], pos.shape[-1]
+        if rows:
+            assert s == 1
+            pos = ttnn.to_layout(ttnn.reshape(pos, (1, 1, b, 1)), ttnn.TILE_LAYOUT)
+            emb = ttnn.multiply(pos, self.inv_freq)
+            cos, sin = ttnn.cos(emb), ttnn.sin(emb)
+            ttnn.deallocate(emb)
+            if self.scaling != 1.0:
+                cos = ttnn.multiply(cos, self.scaling)
+                sin = ttnn.multiply(sin, self.scaling)
+            return ttnn.typecast(cos, ttnn.bfloat16), ttnn.typecast(sin, ttnn.bfloat16)
         pos = ttnn.reshape(pos, (1, b, s, 1))
         pos = ttnn.to_layout(pos, ttnn.TILE_LAYOUT)
         emb = ttnn.multiply(pos, self.inv_freq)
