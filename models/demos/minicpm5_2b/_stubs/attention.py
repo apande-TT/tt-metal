@@ -26,7 +26,7 @@ import torch
 
 import ttnn
 from models.demos.minicpm5_2b._stubs.decode_mm import decode_linear_config
-from models.demos.minicpm5_2b._stubs.dram_mm import DramMatmul
+from models.demos.minicpm5_2b._stubs.dram_mm import DramMatmul, _core_rects
 
 # Decode KV-cache write as one C++ kernel via ttnn.generic_op (else: slot-read matmuls + sub/add + paged_update_cache).
 _USE_KV_WRITE_KERNEL = True
@@ -994,7 +994,7 @@ class TtAttention:
         n_cores = min(units, len(core_list))
         base, extra = divmod(units, n_cores)
         used = core_list[:n_cores]
-        cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in used])
+        cores = _core_rects(used)  # rectangles, not one range per core
 
         dm_rt, cmp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         start = 0

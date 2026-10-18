@@ -47,6 +47,35 @@ def _mesh_kw(device, **kw):
     return kw
 
 
+def _core_rects(cores):
+    """The logical cores as few rectangles as possible (x-runs per row, stacked when rows repeat): a program's
+    kernels go to each CoreRange of its set, so rectangles beat a list of single cores."""
+    rows = {}
+    for c in cores:
+        rows.setdefault(c.y, []).append(c.x)
+    runs = []  # (x0, x1, y)
+    for y in sorted(rows):
+        xs = sorted(rows[y])
+        x0 = prev = xs[0]
+        for x in xs[1:]:
+            if x != prev + 1:
+                runs.append((x0, prev, y))
+                x0 = x
+            prev = x
+        runs.append((x0, prev, y))
+    rects = []  # [x0, x1, y0, y1]
+    for x0, x1, y in runs:
+        for r in rects:
+            if r[0] == x0 and r[1] == x1 and r[3] == y - 1:
+                r[3] = y
+                break
+        else:
+            rects.append([x0, x1, y, y])
+    return ttnn.CoreRangeSet(
+        [ttnn.CoreRange(ttnn.CoreCoord(x0, y0), ttnn.CoreCoord(x1, y1)) for x0, x1, y0, y1 in rects]
+    )
+
+
 class DramMatmul:
     """y[1, 32, N] = x[.., 32, K] @ w[K, N] for a bf16 one-tile-row x (None-able: check `ok`)."""
 
@@ -140,7 +169,7 @@ class DramMatmul:
                 used.add((x, y))
                 mine.append(ttnn.CoreCoord(x, y))
         all_cores = [c for mine in bank_cores for c in mine]
-        cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in all_cores])
+        cores = _core_rects(all_cores)
         self.cores = cores
         rt = ttnn.RuntimeArgs()
         vchannels = {}
@@ -173,7 +202,7 @@ class DramMatmul:
                 ep_rt[c.x][c.y] = [i * ep_tpc, min(ep_tpc, n_t - i * ep_tpc)]
                 p = device.worker_core_from_logical_core(c)
                 ep_xy += [p.x, p.y]
-            ep_cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in helpers])
+            ep_cores = _core_rects(helpers)
             self.ep = dict(tpc=ep_tpc, cores=ep_cores, rt=ep_rt, xy=ep_xy)
         if norm is not None:
             n_cores = len(all_cores)
