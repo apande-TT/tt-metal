@@ -90,6 +90,10 @@ class TtMinistral3Attention:
     # cores, k on the next B), so q's and k's RoPE run as ONE rotary_embedding_llama_fused_qk and K / V are appended
     # by ONE paged_fused_update_cache (each needs its two inputs on disjoint cores).
     DECODE_FUSED_QK = True
+    # Decode o_proj as the MLP down's C++ streaming program (tt/down_decode.py: the concatenated heads multicast once,
+    # a bank-major copy streamed one column per data-movement RISC, ~9 KB pushes, fp32 DEST over all K), its bf16
+    # partials left in L1 for the reduce-scatter.
+    DECODE_OPROJ_STREAM = True
     # False: prefill returns o_proj's reduce-scattered 1/TP hidden shard (the decoder keeps a hidden-sharded
     # residual in prefill and gathers only the normed activation).
     prefill_gather = True
@@ -240,7 +244,19 @@ class TtMinistral3Attention:
         # The prefill o_proj weight is block-float8, like the prefill QKV weight (HiFi2 matmuls).
         self.wo = _put(torch_module.o_proj.weight.T, shard(-1), dtype=ttnn.bfloat8_b)
         # Decode reads block-float8 copies of its projection weights (DRAM-bound single-row matmuls).
-        self.wo_decode = _put(torch_module.o_proj.weight.T, shard(-2), dtype=DECODE_WEIGHT_DTYPE)
+        # DECODE_OPROJ_STREAM: the decode o_proj is the MLP down's C++ streaming program over its own bank-major copy
+        # (tt/down_decode.py, bit-identical to the 1D-multicast matmul); then no interleaved decode copy is made.
+        self.stream_o = None
+        if self.DECODE_OPROJ_STREAM and tp > 1 and self.DECODE_REDUCE_DTYPE == ttnn.bfloat16:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt.down_decode import StreamDownDecode
+
+            w_o = torch_module.o_proj.weight.T  # (Hq * hd, D): device d multiplies the rows of its own heads
+            if StreamDownDecode.supports(device, int(w_o.shape[0]) // tp, int(w_o.shape[1]), DECODE_WEIGHT_DTYPE):
+                put = lambda t, dtype: _put(t, shard(-2), dtype=dtype)
+                self.stream_o = StreamDownDecode(device, w_o, DECODE_WEIGHT_DTYPE, ttnn.MathFidelity.HiFi4, put, tp)
+        self.wo_decode = None
+        if self.stream_o is None:
+            self.wo_decode = _put(torch_module.o_proj.weight.T, shard(-2), dtype=DECODE_WEIGHT_DTYPE)
         # Decode o_proj (K = 32 tiles, N = 160 tiles): 8-tile K multicast blocks (the auto config used 2), 2 N tiles
         # per core.
         grid = device.compute_with_storage_grid_size()
@@ -895,6 +911,8 @@ class TtMinistral3Attention:
                 ttnn.to_memory_config(attn, head_cfg), num_heads=self.local_heads
             )
             attn = ttnn.sharded_to_interleaved(attn, ttnn.L1_MEMORY_CONFIG)  # (1, 1, B, heads * head_dim)
+        if self.stream_o is not None:  # one program streaming the bank-major o_proj copy (tt/down_decode.py)
+            return self._reduce(self.stream_o(attn))
         return self._reduce(
             ttnn.linear(
                 attn,
