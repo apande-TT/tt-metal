@@ -56,6 +56,13 @@ constexpr uint32_t cb_probs = get_compile_time_arg_val(14);
 constexpr uint32_t cb_v = get_compile_time_arg_val(15);
 constexpr uint32_t cb_out = get_compile_time_arg_val(16);
 constexpr uint32_t cb_cnt = get_compile_time_arg_val(17);
+// inline_kv: first this step's KV-cache write arithmetic for the reader (kernels/kv_write/compute_kv_write.cpp's
+// calls: d = new - old packed bf16, out = old + d packed bf16), K then V, Kt tiles each.
+constexpr uint32_t inline_kv = get_compile_time_arg_val(18);
+constexpr uint32_t cb_kv_old = get_compile_time_arg_val(19);
+constexpr uint32_t cb_kv_new = get_compile_time_arg_val(20);
+constexpr uint32_t cb_kv_diff = get_compile_time_arg_val(21);
+constexpr uint32_t cb_kv_out = get_compile_time_arg_val(22);
 constexpr uint32_t ndst = 4;  // softmax block size under fp32 DEST
 
 // softmax.cpp's calc_numeric_stable (exp precise: EXP_APPROX 0).
@@ -83,13 +90,52 @@ void calc_numeric_stable(std::uint32_t Wt, std::uint32_t nd) {
             ckl::input(dfb_max, ckl::BroadcastDim::Col, ckl::WaitPolicy::Upfront, ckl::PopPolicy::AtEnd)>{},
         ckl::Exp<static_cast<ckl::Approx>(0), ckl::Dst::D0>{},
         ckl::PackTile<ckl::output(
-            dfb_out, ckl::ReservePolicy::PerBlockSize, ckl::PushPolicy::PerBlockSize, ckl::DataFormatReconfig::Disabled)>{});
+            dfb_out,
+            ckl::ReservePolicy::PerBlockSize,
+            ckl::PushPolicy::PerBlockSize,
+            ckl::DataFormatReconfig::Disabled)>{});
     dfb_out_obj.wait_front(static_cast<uint16_t>(Wt));
 }
 
 void kernel_main() {
     // ---- 1. scores * scale + mask -> cb_sm_in (bf16), as kernels/attn_bmm ----
     compute_kernel_hw_startup<SrcOrder::Reverse>(cb_q, cb_k, cb_t);
+    if constexpr (inline_kv) {
+        reconfig_data_format(cb_kv_new, cb_kv_old);
+        for (uint32_t t = 0; t < 2 * Kt; ++t) {
+            cb_wait_front(cb_kv_new, 1);
+            cb_wait_front(cb_kv_old, 1);
+
+            // d = new - old
+            cb_reserve_back(cb_kv_diff, 1);
+            pack_reconfig_data_format(cb_kv_diff);
+            binary_tiles_init<true, EltwiseBinaryType::ELWSUB>(cb_kv_new, cb_kv_old);
+            tile_regs_acquire();
+            sub_tiles(cb_kv_new, cb_kv_old, 0, 0, 0);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile(0, cb_kv_diff);
+            tile_regs_release();
+            cb_push_back(cb_kv_diff, 1);
+            cb_pop_front(cb_kv_new, 1);
+
+            // out = old + d
+            cb_wait_front(cb_kv_diff, 1);
+            cb_reserve_back(cb_kv_out, 1);
+            binary_tiles_init<true, EltwiseBinaryType::ELWADD>(cb_kv_old, cb_kv_diff);
+            tile_regs_acquire();
+            add_tiles(cb_kv_old, cb_kv_diff, 0, 0, 0);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile(0, cb_kv_out);
+            tile_regs_release();
+            cb_push_back(cb_kv_out, 1);
+            cb_pop_front(cb_kv_diff, 1);
+            cb_pop_front(cb_kv_old, 1);
+        }
+        reconfig_data_format(cb_k, cb_q);
+        pack_reconfig_data_format(cb_t);
+    }
     cb_wait_front(cb_cnt, 1);
     const uint32_t nt = read_tile_value(cb_cnt, 0, 0);
     matmul_init(cb_q, cb_k, true);

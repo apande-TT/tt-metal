@@ -45,6 +45,33 @@ void kernel_main() {
     // the row block's G head rows are gathered into rows 0..G-1 of its Kt q tiles (the head-split layout).
     constexpr uint32_t q_rows = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 3);
     constexpr uint32_t G = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 4);
+    // inline_kv: this step's KV-cache write is done here instead of by separate cores: the old position tiles and
+    // the new rows (K from q = the roped QKV layout, V from qkv) go to compute, which forms
+    // old + bf16(new - old) with kernels/kv_write's arithmetic; its row r is spliced into the position tile read
+    // for the scores (resp. the values), which is written back to the cache before compute gets it.
+    constexpr uint32_t inline_kv = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 5);
+    constexpr uint32_t cb_kv_old = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 6);
+    constexpr uint32_t cb_kv_new = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 7);
+    constexpr uint32_t cb_kv_scr = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 8);
+    constexpr uint32_t cb_kv_out = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 9);
+    constexpr uint32_t v_col0 = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 10);
+    constexpr uint32_t qkv_Nt = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 11);
+    // kv_flag: semaphore set once both staged position tiles hold this step's row (the writer stores them).
+    constexpr uint32_t kv_flag = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 12);
+    constexpr auto qkv_args = TensorAccessorArgs<sm_args.next_compile_time_args_offset() + 13>();
+    constexpr uint32_t face_bytes_ = 16 * 16 * 2, face_row_bytes_ = 16 * 2;
+    auto face_row_off = [](uint32_t row, uint32_t half) {
+        return (((row >> 4) << 1) + half) * face_bytes_ + (row & 15) * face_row_bytes_;
+    };
+    auto copy_row = [&](uint32_t src_tile, uint32_t src_row, uint32_t dst_tile, uint32_t dst_row) {
+        for (uint32_t half = 0; half < 2; ++half) {
+            auto* src = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(src_tile + face_row_off(src_row, half));
+            auto* dst = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dst_tile + face_row_off(dst_row, half));
+            for (uint32_t i = 0; i < face_row_bytes_ / 4; ++i) {
+                dst[i] = src[i];
+            }
+        }
+    };
 
     const uint32_t bg = get_arg_val<uint32_t>(0);
     const auto q = TensorAccessor(q_args, get_common_arg_val<uint32_t>(0));
@@ -56,6 +83,7 @@ void kernel_main() {
     const auto max_scaler = TensorAccessor(mx_args, get_common_arg_val<uint32_t>(7));
     const auto sum_scaler = TensorAccessor(sm_args, get_common_arg_val<uint32_t>(8));
     const uint32_t b = bg / H;
+    const auto qkv = TensorAccessor(qkv_args, get_common_arg_val<uint32_t>(9));
 
     // Position (the zero-tile accessor is unused: no tile past the position tile is streamed).
     const uint32_t pos_l1 = get_write_ptr(cb_pos);
@@ -78,6 +106,38 @@ void kernel_main() {
     cb_push_back(cb_scale, 1);
     cb_push_back(cb_max_scaler, 1);
     cb_push_back(cb_sum_scaler, 1);
+
+    const uint32_t r = static_cast<uint32_t>(reinterpret_cast<volatile tt_l1_ptr int32_t*>(pos_l1)[b]) & 31;
+    const uint32_t hh = bg - b * H;
+    uint32_t kv_old_base = 0;
+    if constexpr (inline_kv) {
+        // The KV write's operands for compute: per unit (K, then V) the Kt old position tiles and Kt tiles whose
+        // row r is the new row (the rest of those tiles is not used: only row r of the result is kept).
+        const uint32_t scr = get_write_ptr(cb_kv_scr);
+        kv_old_base = get_write_ptr(cb_kv_old);  // K's Kt staged tiles, then V's (the CB is filled once)
+        for (uint32_t unit = 0; unit < 2; ++unit) {
+            cb_reserve_back(cb_kv_old, Kt);
+            cb_reserve_back(cb_kv_new, Kt);
+            const uint32_t old_l1 = get_write_ptr(cb_kv_old);
+            const uint32_t new_l1 = get_write_ptr(cb_kv_new);
+            for (uint32_t dt = 0; dt < Kt; ++dt) {
+                const uint32_t page = (bg * Ct + last_key_tile) * Kt + dt;
+                if (unit == 0) {
+                    noc_async_read_page(page, kc, old_l1 + dt * tile_bytes);
+                    noc_async_read_page((hh * G + G - 1) * Kt + dt, q, scr + dt * tile_bytes);
+                } else {
+                    noc_async_read_page(page, vc, old_l1 + dt * tile_bytes);
+                    noc_async_read_page((b >> 5) * qkv_Nt + v_col0 + hh * Kt + dt, qkv, scr + dt * tile_bytes);
+                }
+            }
+            noc_async_read_barrier();
+            for (uint32_t dt = 0; dt < Kt; ++dt) {
+                copy_row(scr + dt * tile_bytes, b & 31, new_l1 + dt * tile_bytes, r);
+            }
+            cb_push_back(cb_kv_old, Kt);
+            cb_push_back(cb_kv_new, Kt);
+        }
+    }
 
     // q (with the discarded key row) of bg.
     cb_reserve_back(cb_q, Kt);
@@ -119,11 +179,24 @@ void kernel_main() {
         }
         cb_reserve_back(cb_k, Kt);
         uint32_t l1 = get_write_ptr(cb_k);
-        for (uint32_t k = 0; k < Kt; ++k) {
-            noc_async_read_page((bg * Ct + n) * Kt + k, kc, l1);
-            l1 += tile_bytes;
+        if (inline_kv && n == last_key_tile) {
+            // The position tiles: this step's key row spliced into the staged old tiles (which the writer stores),
+            // copied in locally.
+            cb_wait_front(cb_kv_out, Kt);
+            const uint32_t upd = get_read_ptr(cb_kv_out);
+            for (uint32_t k = 0; k < Kt; ++k) {
+                copy_row(upd + k * tile_bytes, r, kv_old_base + k * tile_bytes, r);
+                noc_async_read(get_noc_addr(kv_old_base + k * tile_bytes), l1 + k * tile_bytes, tile_bytes);
+            }
+            noc_async_read_barrier();
+            cb_pop_front(cb_kv_out, Kt);
+        } else {
+            for (uint32_t k = 0; k < Kt; ++k) {
+                noc_async_read_page((bg * Ct + n) * Kt + k, kc, l1);
+                l1 += tile_bytes;
+            }
+            noc_async_read_barrier();
         }
-        noc_async_read_barrier();
         cb_push_back(cb_k, Kt);
         cb_reserve_back(cb_mask, 1);
         noc_async_read_page(b * Ct + n, mask, get_write_ptr(cb_mask));
@@ -133,6 +206,16 @@ void kernel_main() {
 
     // probs @ V: per output column tile dt, cache tiles (k, dt) for k = 0..nt-1, in a full Ct-tile slot (the rest
     // unwritten and unread) so every push stays aligned to the 2 * Ct ring and a block never runs past its end.
+    if constexpr (inline_kv) {
+        // This step's value row into the staged old V tiles; then both staged units are complete for the writer.
+        cb_wait_front(cb_kv_out, Kt);
+        const uint32_t upd = get_read_ptr(cb_kv_out);
+        for (uint32_t dt = 0; dt < Kt; ++dt) {
+            copy_row(upd + dt * tile_bytes, r, kv_old_base + (Kt + dt) * tile_bytes, r);
+        }
+        cb_pop_front(cb_kv_out, Kt);
+        *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(kv_flag)) = 1;
+    }
     if constexpr (wait_kv) {
         auto* sem_v = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_v_id));
         noc_semaphore_wait(sem_v, 1);
@@ -142,7 +225,11 @@ void kernel_main() {
         cb_reserve_back(cb_v, Ct);
         uint32_t l1 = get_write_ptr(cb_v);
         for (uint32_t k = 0; k < nt; ++k) {
-            noc_async_read_page((bg * Ct + k) * Kt + dt, vc, l1);
+            if (inline_kv && k == last_key_tile) {
+                noc_async_read(get_noc_addr(kv_old_base + (Kt + dt) * tile_bytes), l1, tile_bytes);
+            } else {
+                noc_async_read_page((bg * Ct + k) * Kt + dt, vc, l1);
+            }
             l1 += tile_bytes;
         }
         noc_async_read_barrier();
