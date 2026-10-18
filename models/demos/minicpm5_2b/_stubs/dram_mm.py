@@ -95,6 +95,7 @@ class DramMatmul:
         group_w=None,
         residual_add=False,
         silu_prologue=False,
+        norm_prologue=None,
     ):
         """split_n: write output columns [0, split_n) and [split_n, N) as two tensors (two projections sharing
         one activation row run as one program). norm: an r_m_s_norm.TtRMSNorm applied to x inside the program
@@ -106,12 +107,16 @@ class DramMatmul:
         its writer has stored it); __call__ then needs residual= and returns the sum. silu_prologue (with
         residual_add, plain programs): the same helper cores first compute the input x = silu(gate) * up
         (ttnn.multiply's binary_ng SFPU arithmetic) while the weight stream starts; __call__ then takes
-        pro=(gate, up) instead of x."""
+        pro=(gate, up) instead of x. norm_prologue: an r_m_s_norm.TtRMSNorm whose shared-statistic kernels run on
+        helper cores into an L1 tensor the projection then reads (the weight stream starts at once into a deep CB)
+        -- x is the norm's input."""
         self.device = device
         self.norm = norm
+        self.norm_pro = norm_prologue if norm is None else None
         if prebuilt is not None:
             w = torch.empty(prebuilt.k, prebuilt.n, device="meta")
-        cb_blocks = cb_blocks or (_NORM_CB_BLOCKS if norm is not None else _SLOTS)
+        deep = norm is not None or self.norm_pro is not None
+        cb_blocks = cb_blocks or (_NORM_CB_BLOCKS if deep else _SLOTS)
         self.k, self.n = w.shape
         self.split_n = split_n or self.n
         # The weight reader runs on NCRISC (ReaderConfigDescriptor: RISCV_1, its default NoC).
@@ -197,7 +202,20 @@ class DramMatmul:
         self.rt = rt
         self.semaphores = []
         self.residual_add = residual_add and self.split_n == self.n
-        self.silu_pro = silu_prologue and self.residual_add and norm is None
+        self.silu_pro = silu_prologue and self.residual_add and norm is None and self.norm_pro is None
+        if self.norm_pro is not None:
+            # The norm's cores: the first Wt / 4 free cores (the reducer first).
+            n_norm = k_t // 4
+            free = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x) if (x, y) not in used]
+            self.ok = self.ok and len(free) >= n_norm and getattr(self.norm_pro, "consts", None) is not None
+            if not self.ok:
+                return
+            self.norm_cores = free[:n_norm]
+            used |= {(c.x, c.y) for c in self.norm_cores}
+            self.mm_xy = []
+            for c in all_cores:
+                q = device.worker_core_from_logical_core(c)
+                self.mm_xy += [q.x, q.y]
         self.ep = None
         if self.residual_add:
             free = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x) if (x, y) not in used]
@@ -266,6 +284,8 @@ class DramMatmul:
             self.writer_ct = [k_t, group_w, _IN0_CHUNK, _CB_IN0, _CB_OUT, self.split_n // _TILE]
             ep_off = 4
             pro_ct = [_SEM_PRO, self.ep["n_helpers"]] if self.silu_pro else [0xFFFFFFFF, 0]
+            if self.norm_pro is not None:
+                pro_ct = [_SEM_PRO, len(self.norm_cores)]
             compute_src = "compute_dram_mm.cpp"
             compute_ct = [k_t, group_w, k_block, _CB_IN0, _CB_IN1, _CB_OUT]
         else:
@@ -304,6 +324,9 @@ class DramMatmul:
         self.writer_ct += [1, _SEM_EP, self.ep["tpc"], ep_off] if self.ep else [0, 0, 1, 0]
         if norm is None:
             self.writer_ct += pro_ct
+        if self.norm_pro is not None:
+            everywhere = cores.merge(_core_rects(self.norm_cores))
+            self.semaphores.append(ttnn.SemaphoreDescriptor(id=_SEM_PRO, core_ranges=everywhere, initial_value=0))
         if self.silu_pro:
             everywhere = cores.merge(self.ep["cores"])
             self.semaphores += [
@@ -388,6 +411,13 @@ class DramMatmul:
             x = ttnn.allocate_tensor_on_device(
                 ttnn.Shape(list(gate.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
             )
+        pro_parts = None
+        if self.norm_pro is not None:
+            x_in = x  # the norm's input; the projection reads its output
+            x = ttnn.allocate_tensor_on_device(
+                ttnn.Shape(list(x_in.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, ttnn.L1_MEMORY_CONFIG
+            )
+            pro_parts = self.norm_pro.shared_parts(x_in, x, self.norm_cores, pro=(_SEM_PRO, self.mm_xy))
         widths = [self.split_n] + ([self.n - self.split_n] if self.split_n < self.n else [])
         shapes = [out_shape] if out_shape is not None else [list(x.shape)[:-1] + [n] for n in widths]
         outs = [
@@ -493,8 +523,13 @@ class DramMatmul:
             common_runtime_args=common,
             config=ttnn.WriterConfigDescriptor(),
         )
+        cbs, semaphores = self.cbs, self.semaphores
+        if pro_parts is not None:
+            kernels = kernels + pro_parts[0]
+            cbs, semaphores = cbs + pro_parts[1], semaphores + pro_parts[2]
+            inputs = [x_in, self.norm_pro.weight, self.norm_pro.consts] + inputs
         program = ttnn.ProgramDescriptor(
-            kernels=[reader, writer, self.compute] + kernels, semaphores=self.semaphores, cbs=self.cbs
+            kernels=[reader, writer, self.compute] + kernels, semaphores=semaphores, cbs=cbs
         )
         if final is not None:
             ttnn.generic_op([*inputs, out, final] + ([x] if self.silu_pro else []), program)
@@ -503,4 +538,6 @@ class DramMatmul:
                 ttnn.deallocate(x)  # h, read only by this program
             return final
         ttnn.generic_op([*inputs, *outs], program)
+        if pro_parts is not None:
+            ttnn.deallocate(x)  # the normalized row, read only by this program
         return outs[0] if len(outs) == 1 else tuple(outs)

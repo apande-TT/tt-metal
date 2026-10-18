@@ -18,6 +18,7 @@ _USE_DRAM_MM = True
 # ... with the post-attention RMSNorm fused into the gate/up program (bind_prenorm): its latency hides under the
 # weight stream.
 _USE_DRAM_MM_NORM = True
+_NORM_AS_PROLOGUE = True
 # silu(gate) * up as a prologue of the down + residual program (helper cores; DramMatmul silu_prologue).
 _USE_SILU_PROLOGUE = True
 
@@ -107,7 +108,9 @@ class TtMLP:
         self.dmm_gu_norm = None
         if _USE_DRAM_MM_NORM and self.dram_mm and self.dram_mm[0].ok and hasattr(norm, "consts"):
             gu = self.dram_mm[0]
-            dmm = DramMatmul(self.device, None, ttnn.MathFidelity.HiFi2, split_n=gu.split_n, norm=norm, prebuilt=gu)
+            # The norm on helper cores ahead of the projection (prologue), or on its own cores with an all-gather.
+            how = dict(norm_prologue=norm) if _NORM_AS_PROLOGUE else dict(norm=norm)
+            dmm = DramMatmul(self.device, None, ttnn.MathFidelity.HiFi2, split_n=gu.split_n, prebuilt=gu, **how)
             self.dmm_gu_norm = dmm if dmm.ok else None
         return self.dmm_gu_norm is not None
 
@@ -121,7 +124,8 @@ class TtMLP:
         fused_norm = None
         if prenorm is not None:
             dmm = getattr(self, "dmm_gu_norm", None)
-            if dmm is not None and dmm.norm is prenorm and dmm.accepts(x) and prenorm._kernel_ok(x):
+            bound = dmm is not None and (dmm.norm or dmm.norm_pro) is prenorm
+            if bound and dmm.accepts(x) and prenorm._kernel_ok(x):
                 fused_norm = dmm
             else:
                 x = prenorm(x, memory_config=ttnn.L1_MEMORY_CONFIG)

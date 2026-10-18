@@ -24,7 +24,10 @@ void kernel_main() {
     constexpr uint32_t sem_gather = get_compile_time_arg_val(5);
     constexpr uint32_t sem_bcast = get_compile_time_arg_val(6);
     constexpr uint32_t n_cores = get_compile_time_arg_val(7);
-    constexpr auto out_args = TensorAccessorArgs<8>();
+    // As the prologue of a projection program: once this core's output slice is stored, bump pro_sem on each of
+    // the projection's cores (common args after the norm cores' coordinates: [n_mm, x_0, y_0, ...]).
+    constexpr uint32_t pro_sem = get_compile_time_arg_val(8);  // ~0u: stand-alone
+    constexpr auto out_args = TensorAccessorArgs<9>();
     constexpr uint32_t f32_tile_bytes = 32 * 32 * 4;
 
     const uint32_t t_start = get_arg_val<uint32_t>(0);
@@ -74,4 +77,15 @@ void kernel_main() {
         cb_pop_front(cb_out, 1);
     }
     noc_async_write_barrier();
+    if constexpr (pro_sem != 0xFFFFFFFF) {
+        const uint32_t base = 3 + 2 * n_cores;
+        const uint32_t n_mm = get_common_arg_val<uint32_t>(base);
+        const uint32_t sem_l1 = get_semaphore(pro_sem);
+        for (uint32_t c = 0; c < n_mm; ++c) {
+            const uint32_t cx = get_common_arg_val<uint32_t>(base + 1 + 2 * c);
+            const uint32_t cy = get_common_arg_val<uint32_t>(base + 2 + 2 * c);
+            noc_semaphore_inc(get_noc_addr(cx, cy, sem_l1), 1);
+        }
+        noc_async_atomic_barrier();
+    }
 }

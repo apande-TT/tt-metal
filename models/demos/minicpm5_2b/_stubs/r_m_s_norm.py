@@ -65,20 +65,32 @@ class TtRMSNorm:
         """The row statistic computed once instead of on every core: each core squares its own slice, the reducer
         (core 0) row-reduces all Wt x^2 tiles in order and broadcasts the rstd tile, each core normalizes its
         slice. Same per-tile arithmetic and reduction order as the per-core-statistic kernel."""
-        w_t = x.padded_shape[-1] // 32
         out = ttnn.allocate_tensor_on_device(
             ttnn.Shape(list(x.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
         )
-        n_cores = w_t // _TILES_PER_CORE
+        n_cores = x.padded_shape[-1] // 32 // _TILES_PER_CORE
         cols = _SHARED_COLS if n_cores % _SHARED_COLS == 0 else n_cores
-        rows = n_cores // cols
-        cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rows - 1))])
+        core_list = [ttnn.CoreCoord(i % cols, i // cols) for i in range(n_cores)]
+        kernels, cbs, semaphores = self.shared_parts(x, out, core_list)
+        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=semaphores, cbs=cbs)
+        return ttnn.generic_op([x, self.weight, self.consts, out], program)
+
+    def shared_parts(self, x, out, core_list, pro=None):
+        """Kernels, CBs and semaphores of the shared-statistic norm of x into out on core_list (logical cores, the
+        first the reducer; Wt / _TILES_PER_CORE of them). pro=(sem_id, noc_xy): as the prologue of another
+        program, each core then bumps semaphore sem_id on every core of noc_xy once its output slice is stored."""
+        w_t = x.padded_shape[-1] // 32
+        n_cores = w_t // _TILES_PER_CORE
+        assert len(core_list) == n_cores
+        from models.demos.minicpm5_2b._stubs.dram_mm import _core_rects
+
+        cores = _core_rects(core_list)
         rt = ttnn.RuntimeArgs()
         noc_xy = []
-        for i in range(n_cores):
-            rt[i % cols][i // cols] = [i * _TILES_PER_CORE, _TILES_PER_CORE, 1 if i == 0 else 0]
-            c = self.device.worker_core_from_logical_core(ttnn.CoreCoord(i % cols, i // cols))
-            noc_xy += [c.x, c.y]
+        for i, c in enumerate(core_list):
+            rt[c.x][c.y] = [i * _TILES_PER_CORE, _TILES_PER_CORE, 1 if i == 0 else 0]
+            q = self.device.worker_core_from_logical_core(c)
+            noc_xy += [q.x, q.y]
         bf16_tile, f32_tile = 2 * 32 * 32, 4 * 32 * 32
         cb_in, cb_scaler, cb_eps, cb_gamma, cb_out = 0, 1, 2, 3, 16
         cb_x2, cb_ex2, cb_ex2pe, cb_fusion, cb_x2all, cb_ex2pe_send = 24, 25, 26, 27, 28, 29
@@ -120,14 +132,18 @@ class TtRMSNorm:
             common_runtime_args=[x.buffer_address(), self.weight.buffer_address(), self.consts.buffer_address()],
             config=ttnn.ReaderConfigDescriptor(),
         )
+        pro_sem, pro_xy = pro if pro is not None else (0xFFFFFFFF, [])
         writer = ttnn.KernelDescriptor(
             kernel_source=os.path.join(d, "writer_rms_norm_shared.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[cb_x2, cb_x2all, cb_ex2pe, cb_ex2pe_send, cb_out, sem_gather, sem_bcast, n_cores]
+            + [pro_sem]
             + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
             runtime_args=rt,
-            common_runtime_args=[out.buffer_address(), noc_xy[0], noc_xy[1]] + noc_xy,
+            common_runtime_args=[out.buffer_address(), noc_xy[0], noc_xy[1]]
+            + noc_xy
+            + ([len(pro_xy) // 2] + list(pro_xy) if pro is not None else []),
             config=ttnn.WriterConfigDescriptor(),
         )
         compute = ttnn.KernelDescriptor(
@@ -150,8 +166,7 @@ class TtRMSNorm:
             ttnn.SemaphoreDescriptor(id=sem_gather, core_ranges=cores, initial_value=0),
             ttnn.SemaphoreDescriptor(id=sem_bcast, core_ranges=cores, initial_value=0),
         ]
-        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=semaphores, cbs=cbs)
-        return ttnn.generic_op([x, self.weight, self.consts, out], program)
+        return [reader, writer, compute], cbs, semaphores
 
     def _kernel(self, x, memory_config):
         if _SHARED_STAT:
