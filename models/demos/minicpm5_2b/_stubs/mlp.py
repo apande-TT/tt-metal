@@ -11,6 +11,10 @@ import torch
 
 import ttnn
 from models.demos.minicpm5_2b._stubs.decode_mm import decode_linear_config
+from models.demos.minicpm5_2b._stubs.dram_mm import DramMatmul
+
+# Decode projections on the DRAM-bank-local generic_op (same arithmetic as the 1-D multicast matmul).
+_USE_DRAM_MM = True
 
 
 def _compute_cfg(device):
@@ -44,6 +48,17 @@ class TtMlp:
         h, f = self.w_gate.shape[-2], self.w_gate.shape[-1]
         self.cfg_up = decode_linear_config(device, h, f)
         self.cfg_down = decode_linear_config(device, f, h, per_core_n=2)  # 64 tiles on 32 cores
+        self.dram_mm = None
+        if _USE_DRAM_MM:
+
+            def _t(linear):
+                return linear.weight.detach().to(torch.float32).t().contiguous()
+
+            fid = ttnn.MathFidelity.HiFi2  # as self.compute_cfg
+            self.dram_mm = tuple(
+                DramMatmul(device, _t(m), fid)
+                for m in (torch_module.gate_proj, torch_module.up_proj, torch_module.down_proj)
+            )
 
     def _mm(self, x, w, k_block=None, memory_config=None):
         """Many-row (prefill) gate/up projection on minimal_matmul's small CBs, which span the full grid under fp32
@@ -113,18 +128,25 @@ class TtMlp:
             one_row = x.shape[0] == x.shape[1] == 1 and x.padded_shape[-2] == 32  # decode: one tile row
             cfg_up, cfg_down = (self.cfg_up, self.cfg_down) if one_row else (None, None)
             mid = ttnn.L1_MEMORY_CONFIG if one_row else self.mem  # decode intermediates fit in L1
-            gate = ttnn.linear(
-                x, self.w_gate, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_up
-            )
-            up = ttnn.linear(
-                x, self.w_up, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_up
-            )
+            dmm = self.dram_mm if one_row and self.dram_mm and all(m.ok for m in self.dram_mm) else None
+            if dmm and dmm[0].accepts(x):
+                gate, up = dmm[0](x, mid), dmm[1](x, mid)
+            else:
+                gate = ttnn.linear(
+                    x, self.w_gate, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_up
+                )
+                up = ttnn.linear(
+                    x, self.w_up, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_up
+                )
             h = self._silu_mul(gate, up, memory_config=mid)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-            out = ttnn.linear(
-                h, self.w_down, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_down
-            )
+            if dmm and dmm[2].accepts(h):
+                out = dmm[2](h, mid)
+            else:
+                out = ttnn.linear(
+                    h, self.w_down, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_down
+                )
         ttnn.deallocate(h)
         if len(in_shape) != 4:
             out = ttnn.reshape(out, in_shape[:-1] + (out.shape[-1],))
