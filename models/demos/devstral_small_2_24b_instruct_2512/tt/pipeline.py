@@ -156,7 +156,8 @@ PLANNED_TP = 4
 #                     it computes at HiFi2 (fp32 accumulation) on the bf8 cache.
 #   ministral3_attention: prefill QKV (HiFi2, bf8 weight) and o_proj projections on minimal_matmul (full grid); prefill o_proj is
 #                     column-parallel over the all_gathered heads, emitting the residual's hidden slice (no reduce-scatter). Decode concatenates the SDPA heads
-#                     with nlp_concat_heads_decode on the head shards (no un-padding reshape through DRAM). Decode QKV
+#                     with ONE C++ copy program (tt/concat_heads.py ConcatHeadsDecode: each core gathers one o_proj input
+#                     tile's rows out of SDPA's L1-interleaved tiles; no reshard, nlp_concat_heads_decode, unshard). Decode QKV
 #                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v]; decode
 #                     QKV and o_proj read block-float8 copies (prefill keeps bf16). Decode o_proj runs a hand-written
 #                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
