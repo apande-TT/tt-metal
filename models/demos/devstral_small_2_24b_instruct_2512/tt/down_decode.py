@@ -49,15 +49,16 @@ class StreamDownDecode:
             and kt % cls.rb_for(dtype) == 0
         )
 
-    def __init__(self, device, w_down, dtype, math_fidelity, put, tp=1):
+    def __init__(self, device, w_down, dtype, math_fidelity, put, tp=1, rb=None):
         """w_down: [tp * K, N] torch weight (device d multiplies rows d * K .. (d + 1) * K); put(t, dtype) uploads a
-        torch tensor sharded over the mesh on its second-to-last dim."""
+        torch tensor sharded over the mesh on its second-to-last dim. rb: K rows a push (default: rb_for(dtype)); a
+        short K takes fewer rows a push, so each column still streams as several pushes."""
         import torch
 
         self.device = device
-        self.RB = self.rb_for(dtype)
         k, n = int(w_down.shape[0]) // tp, int(w_down.shape[1])
         self.kt, self.nt = k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        self.RB = int(rb) if rb and self.kt % int(rb) == 0 else self.rb_for(dtype)
         self.nb = nb = device.dram_grid_size().x
         # one stream a column (nc = 1): stream s reads column s
         self.w = put(

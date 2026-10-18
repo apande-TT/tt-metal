@@ -144,7 +144,8 @@ PLANNED_TP = 4
 #                     8 middle -> 1 final core instead of ttnn.topk's 64 -> 1 serial merge, 16-bit shard positions.
 #                     The draw's pad select, eos update and next-token row are ONE data-movement program
 #                     (SampleTail, kernels/sample_tail.cpp: integer select on the id / mask tiles; no fp32 chain,
-#                     untilize or reshape).
+#                     untilize or reshape); with 32 rows of 32 candidates the top-1 itself joins it (DrawTail,
+#                     kernels/draw_tail.cpp: integer-keyed argmax per row; no 64-column pads, no ttnn.topk).
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
 #                     directly (no bf16 cast op, no single-core interleaved norm); the decode QKV reads the input
 #                     norm's fp32 width shards as they are (20-tile K blocks of 5 shards; no unshard, cast, reshard;
@@ -349,6 +350,64 @@ class SampleTail:
             )
         ]
         ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
+
+
+_DRAW_TAIL_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "draw_tail.cpp")
+
+
+class DrawTail:
+    """The sampler's draw and end as ONE data-movement program (generic_op, kernels/draw_tail.cpp), one RISC per
+    16 rows: the top-1 of the (1, 1, 32, K = 32) fp32 noisy scores labelled with its uint32 candidate id (what
+    ttnn.topk(k=1, indices_tensor=ids) draws, after padding both tiles to 64 columns), then SampleTail's pad select,
+    eos update and next-token row. Replaces the two pads, the top-1 and SampleTail (~16 us of 4 ops). Returns the
+    (1, 1, B, 1) uint32 draw."""
+
+    CB = 0
+
+    def __init__(self, device, batch, pad_token_id, eos_token_id):
+        assert batch == ttnn.TILE_SIZE, batch
+        self.device, self.batch = device, batch
+        self.pad, self.eos = int(pad_token_id), int(eos_token_id)
+        self.core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+
+    @staticmethod
+    def supports(scores, ids):
+        tile = (1, 1, ttnn.TILE_SIZE, ttnn.TILE_SIZE)
+        return (
+            tuple(int(d) for d in scores.shape) == tile
+            and tuple(int(d) for d in ids.shape) == tile
+            and scores.dtype == ttnn.float32
+            and ids.dtype == ttnn.uint32
+            and scores.layout == ttnn.TILE_LAYOUT
+            and ids.layout == ttnn.TILE_LAYOUT
+            and not scores.is_sharded()
+            and not ids.is_sharded()
+        )
+
+    def __call__(self, scores, ids, unfinished, tok):
+        drawn = ttnn.allocate_tensor_on_device(
+            ttnn.Shape((1, 1, self.batch, 1)), ttnn.uint32, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        io = [scores, ids, unfinished, tok, drawn]
+        acc = []
+        for t in io:
+            acc += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        size = 12 * 1024 + 128  # per RISC: scores / ids face pairs, the unfinished and drawn faces; the id row
+        fmt = ttnn.CBFormatDescriptor(buffer_index=self.CB, data_format=ttnn.uint32, page_size=size)
+        cbs = [ttnn.CBDescriptor(total_size=size, core_ranges=self.core, format_descriptors=[fmt])]
+        kernels = [
+            ttnn.KernelDescriptor(
+                kernel_source=_DRAW_TAIL_KERNEL,
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=self.core,
+                compile_time_args=[half, self.pad, self.eos, self.CB] + acc,
+                runtime_args=[((0, 0), [t.buffer_address() for t in io])],
+                config=cfg,
+            )
+            for half, cfg in ((0, ttnn.ReaderConfigDescriptor()), (1, ttnn.WriterConfigDescriptor()))
+        ]
+        ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
+        return drawn
 
 
 class VocabTopK:
@@ -790,6 +849,7 @@ class DevstralPipeline:
         full = self.batch == 32 and self.top_k == 32
         self._noise_lookup = NoiseLookup(device, self.batch, self.top_k, NOISE_BUCKETS) if full else None
         self._sample_tail = SampleTail(device, self.batch, self.pad_token_id, self.eos_token_id)
+        self._draw_tail = DrawTail(device, self.batch, self.pad_token_id, self.eos_token_id) if full else None
         self._last_row = LastRow(device) if self.batch == ttnn.TILE_SIZE else None
         tp = self._tp()
         if tp > 1:
@@ -969,6 +1029,11 @@ class DevstralPipeline:
             noise = ttnn.typecast(ttnn.to_layout(ttnn.reshape(noise, (1, 1, b, nb)), ttnn.TILE_LAYOUT), ttnn.float32)
             bucket = ttnn.bitwise_and(idx, nb - 1)  # token v draws noise bucket v % NB (NB is a power of two)
             scores = ttnn.add(scores, ttnn.gather(noise, dim=-1, index=bucket))
+        if self._draw_tail is not None and DrawTail.supports(scores, idx):
+            # the top-1, the select, the eos update and the next-token row in one program (DrawTail)
+            drawn = self._draw_tail(scores, idx, state["unfinished"], state["tok"])
+            ttnn.plus_one(state["step"])
+            return drawn
         # The best score and its vocab id in one op: the top-1 carries the candidates' ids as labels (no argmax +
         # index gather). Equal-score ties stay arbitrary, as the unstable candidate ordering already made them.
         _, drawn = ttnn.topk(scores, k=1, dim=-1, largest=True, sorted=True, indices_tensor=idx)  # (1, 1, B, 1)
