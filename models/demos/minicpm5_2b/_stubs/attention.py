@@ -70,6 +70,8 @@ _ATTN_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kern
 # Prefill score bmm + scale/mask + softmax + probs.V + head merge as ONE generic_op (kernels/attn_prefill): the
 # attn_fused arithmetic per query tile row, the (batch, KV head) block's K / V resident in L1 across its rows.
 _USE_FUSED_PREFILL_ATTN = True
+# Prefill Q and K|V as two full-grid 2-D multicast matmuls (Q on the o_proj config) instead of one 100-core fused QKV.
+_SPLIT_PREFILL_QKV = True
 _ATTN_PREFILL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_prefill")
 
 
@@ -168,6 +170,14 @@ class TtAttention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         self.wo = _w(torch_module.o_proj)
+        # [Wk | Wv] for the split prefill projection (q on wq, k / v on this; nlp_create_qkv_heads' input_kv).
+        self.wkv = ttnn.from_torch(
+            torch.cat([m.weight.detach().to(torch.float32) for m in projs[1:]]).t().contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         # Decode (one tile row) projections: 1-D multicast with a wide K block (bit-identical to the default).
         self.cfg_qkv = decode_linear_config(device, self.wqkv.shape[-2], self.wqkv.shape[-1], per_core_n=2)  # 80 tiles on 40 cores
         self.cfg_o = decode_linear_config(device, self.wo.shape[-2], self.wo.shape[-1], per_core_n=2)  # 64 tiles on 32 cores
@@ -226,25 +236,50 @@ class TtAttention:
             rope_kernel = _USE_ROPE_KERNEL and ctx.rope is not None
             # With the rope kernel the fused-QKV output only feeds the head split: L1.
             grid = self.device.compute_with_storage_grid_size()
-            qkv = ttnn.linear(
-                ttnn.reshape(x, (1, b * seq, x.shape[-1])),
-                self.wqkv,
-                memory_config=l1 if rope_kernel else dram,
-                compute_kernel_config=self.compute_cfg,
-                core_grid=ttnn.CoreGrid(y=grid.y, x=grid.x),
-            )
+            x2 = ttnn.reshape(x, (1, b * seq, x.shape[-1]))
+            if _SPLIT_PREFILL_QKV:
+                # Q on o_proj's full-grid 2-D multicast config (same shape), K | V as a narrow second matmul: every
+                # output tile is the same full-K accumulation as in the fused-QKV matmul, on all 110 cores.
+                q_lin = ttnn.linear(
+                    x2, self.wq, memory_config=l1 if rope_kernel else dram, compute_kernel_config=self.compute_cfg,
+                    program_config=self._prefill_2d_cfg(x2, self.wq, 8, 3),
+                )
+                kv_lin = ttnn.linear(
+                    x2, self.wkv, memory_config=l1 if rope_kernel else dram, compute_kernel_config=self.compute_cfg,
+                    program_config=self._prefill_2d_cfg(x2, self.wkv, 8, 2),
+                )
+            else:
+                qkv = ttnn.linear(
+                    x2,
+                    self.wqkv,
+                    memory_config=l1 if rope_kernel else dram,
+                    compute_kernel_config=self.compute_cfg,
+                    core_grid=ttnn.CoreGrid(y=grid.y, x=grid.x),
+                )
             if x.memory_config().buffer_type == ttnn.BufferType.L1:
                 ttnn.deallocate(x)  # an L1 norm output: free it before the score bmm's large static CBs
             # With the rope kernel (small CBs) the head split lands in L1: q / k are freed once roped and v moves
             # to DRAM (it would otherwise sit below the freed q / k, inside the score bmm's static CB region).
-            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-                ttnn.reshape(qkv, (b, 1, seq, qkv.shape[-1])),
-                num_heads=self.n_heads,
-                num_kv_heads=self.n_kv_heads,
-                transpose_k_heads=False,
-                memory_config=l1 if rope_kernel else dram,
-            )
-            ttnn.deallocate(qkv)
+            if _SPLIT_PREFILL_QKV:
+                q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                    ttnn.reshape(q_lin, (b, 1, seq, q_lin.shape[-1])),
+                    input_kv=ttnn.reshape(kv_lin, (b, 1, seq, kv_lin.shape[-1])),
+                    num_heads=self.n_heads,
+                    num_kv_heads=self.n_kv_heads,
+                    transpose_k_heads=False,
+                    memory_config=l1 if rope_kernel else dram,
+                )
+                ttnn.deallocate(q_lin)
+                ttnn.deallocate(kv_lin)
+            else:
+                q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                    ttnn.reshape(qkv, (b, 1, seq, qkv.shape[-1])),
+                    num_heads=self.n_heads,
+                    num_kv_heads=self.n_kv_heads,
+                    transpose_k_heads=False,
+                    memory_config=l1 if rope_kernel else dram,
+                )
+                ttnn.deallocate(qkv)
             fused = _USE_FUSED_PREFILL_ATTN and _USE_SCALE_MASK_KERNEL and seq % 32 == 0 and ctx.mask.shape[-1] == seq
             fused = fused and kv_cache.capacity % 32 == 0 and kv_cache.capacity >= seq
             # The roped q / k feed the score bmm (large static CBs), so they stay in DRAM.
@@ -927,6 +962,21 @@ class TtAttention:
         extra_t = [qkv_t] if inline_kv and all(qkv_t is not u for u in tensors) else []
         return ttnn.generic_op(
             tensors + [t for t in kv_tensors if all(t is not u for u in tensors)] + extra_t + [out], program
+        )
+
+    def _prefill_2d_cfg(self, x, w, in0_block_w, subblock_w):
+        """Full-grid 2-D multicast config for a prefill projection x [.., M, K] @ w [K, N]."""
+        grid = self.device.compute_with_storage_grid_size()
+        m_t, n_t = x.padded_shape[-2] // 32, w.padded_shape[-1] // 32
+        return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+            compute_with_storage_grid_size=(grid.x, grid.y),
+            in0_block_w=in0_block_w,
+            out_subblock_h=1,
+            out_subblock_w=subblock_w,
+            per_core_M=-(-m_t // grid.y),
+            per_core_N=-(-n_t // grid.x),
+            transpose_mcast=False,
+            fused_activation=None,
         )
 
     def _prefill_o_proj(self, attn, b, seq):
