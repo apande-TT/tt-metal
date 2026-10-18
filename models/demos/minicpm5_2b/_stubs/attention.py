@@ -245,6 +245,8 @@ class TtAttention:
                 memory_config=l1 if rope_kernel else dram,
             )
             ttnn.deallocate(qkv)
+            fused = _USE_FUSED_PREFILL_ATTN and _USE_SCALE_MASK_KERNEL and seq % 32 == 0 and ctx.mask.shape[-1] == seq
+            fused = fused and kv_cache.capacity % 32 == 0 and kv_cache.capacity >= seq
             # The roped q / k feed the score bmm (large static CBs), so they stay in DRAM.
             if rope_kernel:
                 q_in, k_in = q, k
@@ -252,12 +254,20 @@ class TtAttention:
                 k = self._rope_kernel(k_in, *ctx.rope, dram)
                 ttnn.deallocate(q_in)
                 ttnn.deallocate(k_in)
-                v_l1, v = v, ttnn.to_memory_config(v, dram)
-                ttnn.deallocate(v_l1)
+                if not fused:  # the fused attention (small CBs) reads v from L1
+                    v_l1, v = v, ttnn.to_memory_config(v, dram)
+                    ttnn.deallocate(v_l1)
             else:
                 # The rope products ([B, heads, S, D], 16 MB for q) feed only the add: L1.
                 q = self._rope(q, cos, sin, self._rope_cfg(q), memory_config=dram, products_memory_config=l1)
                 k = self._rope(k, cos, sin, self._rope_cfg(k), memory_config=dram, products_memory_config=l1)
+            if fused:
+                # The fused attention also stores K / V (zero-padded to capacity) into the caches, and returns
+                # [1, B * S, n * D] in L1, already head-merged: o_proj's input.
+                attn = self._attn_prefill_fused(q, k, v, ctx.mask, b, seq, ttnn.L1_MEMORY_CONFIG, kv_cache=kv_cache)
+                for t in (q, k, v):
+                    ttnn.deallocate(t)
+                return self._prefill_o_proj(attn, b, seq)
             pad = kv_cache.capacity - seq
             # The capacity-padded K / V feed only the copy into the cache: L1.
             for new, cache in ((k, kv_cache.k), (v, kv_cache.v)):
@@ -270,11 +280,6 @@ class TtAttention:
             # GQA without repeating K/V: head h = g * groups + j, so [B, n, S, D] viewed as [B, kv, groups * S, D]
             # puts each KV head's query heads in its rows; every output tile is the same dot product as before.
             s_t, d_t = seq // 32, self.head_dim // 32
-            if _USE_FUSED_PREFILL_ATTN and _USE_SCALE_MASK_KERNEL and seq % 32 == 0 and ctx.mask.shape[-1] == seq:
-                # [1, B * S, n * D] in L1, already head-merged: o_proj's input.
-                attn = self._attn_prefill_fused(q, k, v, ctx.mask, b, seq, ttnn.L1_MEMORY_CONFIG)
-                ttnn.deallocate(q)
-                return self._prefill_o_proj(attn, b, seq)
             # The scale and mask outputs ([B, n, S, S], 16 MB each at B=32, S=128) live in L1 between the two
             # bmms; the bmms' outputs stay in DRAM, as their per-(batch, KV head) blocks fill most of L1 with CBs.
             l1 = ttnn.L1_MEMORY_CONFIG
@@ -948,11 +953,12 @@ class TtAttention:
         ttnn.deallocate(attn)
         return ttnn.reshape(out, (b, seq, out.shape[-1]))
 
-    def _attn_prefill_fused(self, q, k, v, mask, b, seq, memory_config):
+    def _attn_prefill_fused(self, q, k, v, mask, b, seq, memory_config, kv_cache):
         """Prefill attention for roped q [B, n, S, D], k / v [B, n_kv, S, D] and the causal mask [1, 1, S, S] as one
         generic_op (kernels/attn_prefill), output head-merged [1, B * S, n * D]. A unit is one query tile row of a
         (batch, KV head) block (q viewed as [B, n_kv, G * S, D]); each core takes a contiguous unit range, keeping
-        the block's K / V tiles resident. Per unit: the attn_fused arithmetic over all S / 32 key tiles."""
+        the block's K / V tiles resident. Per unit: the attn_fused arithmetic over all S / 32 key tiles. The core
+        holding a block's first row also stores its K / V into kv_cache (key tiles past S: the zero tile)."""
         n_kv, g = self.n_kv_heads, self.kv_groups
         d_t, s_t = self.head_dim // 32, seq // 32
         r_t = g * s_t
@@ -964,8 +970,9 @@ class TtAttention:
         bf, f32 = ttnn.bfloat16, ttnn.float32
         tile, f32_tile = 2 * 32 * 32, 4 * 32 * 32
         (cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_sm_in, cb_mx, cb_sm, cb_v, cb_probs) = range(11)
-        cb_out, cb_max, cb_exps, cb_recip = 16, 24, 25, 26
+        cb_out, cb_zero, cb_max, cb_exps, cb_recip = 16, 17, 24, 25, 26
         spec = [
+            (cb_zero, 1, bf),
             (cb_q, 2 * d_t, bf),
             (cb_k, s_t * d_t, bf),
             (cb_scale, 1, bf),
@@ -998,9 +1005,14 @@ class TtAttention:
             kernel_source=os.path.join(_ATTN_PREFILL_DIR, "reader_attn_prefill.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[d_t, s_t, r_t, cb_q, cb_k, cb_scale, cb_mask, cb_mx, cb_sm, cb_v] + accessor_ct,
+            compile_time_args=[d_t, s_t, r_t, cb_q, cb_k, cb_scale, cb_mask, cb_mx, cb_sm, cb_v]
+            + accessor_ct
+            + [1, kv_cache.capacity // 32, cb_zero]
+            + list(ttnn.TensorAccessorArgs(kv_cache.k).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(self.zero_tile).get_compile_time_args()),
             runtime_args=rt["dm"],
-            common_runtime_args=[t.buffer_address() for t in tensors],
+            common_runtime_args=[t.buffer_address() for t in tensors]
+            + [kv_cache.k.buffer_address(), kv_cache.v.buffer_address(), self.zero_tile.buffer_address()],
             config=ttnn.ReaderConfigDescriptor(),
         )
         writer = ttnn.KernelDescriptor(
@@ -1035,7 +1047,7 @@ class TtAttention:
             config=compute_cfg,
         )
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
-        return ttnn.generic_op(tensors + [out], program)
+        return ttnn.generic_op(tensors + [kv_cache.k, kv_cache.v, self.zero_tile, out], program)
 
     def _spread(self, n_tiles):
         """Row-major core set over the grid for n_tiles work items, with [start, count] / [count] runtime args."""

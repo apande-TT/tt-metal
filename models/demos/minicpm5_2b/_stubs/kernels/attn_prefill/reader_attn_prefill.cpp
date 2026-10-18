@@ -31,6 +31,13 @@ void kernel_main() {
     constexpr auto mask_args = TensorAccessorArgs<scale_args.next_compile_time_args_offset()>();
     constexpr auto mx_args = TensorAccessorArgs<mask_args.next_compile_time_args_offset()>();
     constexpr auto sm_args = TensorAccessorArgs<mx_args.next_compile_time_args_offset()>();
+    // kv_store: the core holding a block's first unit also stores its K / V tiles into the caches (capacity Cc
+    // tiles; key tiles Ct..Cc-1 get the zero tile: the zero-padded copy the multi-op path made).
+    constexpr uint32_t kv_store = get_compile_time_arg_val(sm_args.next_compile_time_args_offset());
+    constexpr uint32_t Cc = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 1);
+    constexpr uint32_t cb_zero = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 2);
+    constexpr auto cache_args = TensorAccessorArgs<sm_args.next_compile_time_args_offset() + 3>();
+    constexpr auto zero_args = TensorAccessorArgs<cache_args.next_compile_time_args_offset()>();
 
     const uint32_t u_start = get_arg_val<uint32_t>(0);
     const uint32_t u_count = get_arg_val<uint32_t>(1);
@@ -53,6 +60,15 @@ void kernel_main() {
     cb_push_back(cb_max_scaler, 1);
     cb_push_back(cb_sum_scaler, 1);
 
+    uint32_t zero_l1 = 0;
+    if constexpr (kv_store) {
+        zero_l1 = get_write_ptr(cb_zero);
+        noc_async_read_page(0, TensorAccessor(zero_args, get_common_arg_val<uint32_t>(9)), zero_l1);
+        noc_async_read_barrier();
+    }
+    const auto kc = TensorAccessor(cache_args, get_common_arg_val<uint32_t>(7));
+    const auto vc = TensorAccessor(cache_args, get_common_arg_val<uint32_t>(8));
+
     uint32_t cur_bg = 0xFFFFFFFF;
     for (uint32_t u = u_start; u < u_start + u_count; ++u) {
         const uint32_t bg = u / Rt;
@@ -74,6 +90,17 @@ void kernel_main() {
                 }
             }
             noc_async_read_barrier();
+            if (kv_store && t == 0) {
+                const uint32_t k_l1 = get_write_ptr(cb_k), v_l1 = get_write_ptr(cb_v);
+                for (uint32_t n = 0; n < Cc; ++n) {
+                    for (uint32_t d = 0; d < Kt; ++d) {
+                        const uint32_t page = (bg * Cc + n) * Kt + d;
+                        noc_async_write_page(page, kc, n < Ct ? k_l1 + (n * Kt + d) * tile_bytes : zero_l1);
+                        noc_async_write_page(page, vc, n < Ct ? v_l1 + (d * Ct + n) * tile_bytes : zero_l1);
+                    }
+                }
+                noc_async_write_barrier();
+            }
             cb_push_back(cb_k, Ct * Kt);
             cb_push_back(cb_v, Ct * Kt);
         }
