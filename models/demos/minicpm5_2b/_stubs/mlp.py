@@ -55,9 +55,11 @@ class TtMlp:
                 return linear.weight.detach().to(torch.float32).t().contiguous()
 
             fid = ttnn.MathFidelity.HiFi2  # as self.compute_cfg
-            self.dram_mm = tuple(
-                DramMatmul(device, _t(m), fid)
-                for m in (torch_module.gate_proj, torch_module.up_proj, torch_module.down_proj)
+            # gate and up as one program over [W_gate | W_up] (one activation read), written as two tensors.
+            w_gu = torch.cat([_t(torch_module.gate_proj), _t(torch_module.up_proj)], dim=-1)
+            self.dram_mm = (
+                DramMatmul(device, w_gu, fid, split_n=f),
+                DramMatmul(device, _t(torch_module.down_proj), fid),
             )
 
     def _mm(self, x, w, k_block=None, memory_config=None):
@@ -130,7 +132,7 @@ class TtMlp:
             mid = ttnn.L1_MEMORY_CONFIG if one_row else self.mem  # decode intermediates fit in L1
             dmm = self.dram_mm if one_row and self.dram_mm and all(m.ok for m in self.dram_mm) else None
             if dmm and dmm[0].accepts(x):
-                gate, up = dmm[0](x, mid), dmm[1](x, mid)
+                gate, up = dmm[0](x, mid)
             else:
                 gate = ttnn.linear(
                     x, self.w_gate, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_up
@@ -141,8 +143,8 @@ class TtMlp:
             h = self._silu_mul(gate, up, memory_config=mid)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-            if dmm and dmm[2].accepts(h):
-                out = dmm[2](h, mid)
+            if dmm and dmm[1].accepts(h):
+                out = dmm[1](h, mid)
             else:
                 out = ttnn.linear(
                     h, self.w_down, memory_config=mid, compute_kernel_config=self.compute_cfg, program_config=cfg_down

@@ -43,14 +43,17 @@ def _mesh_kw(device, **kw):
 class DramMatmul:
     """y[1, 32, N] = x[.., 32, K] @ w[K, N] for a bf16 one-tile-row x (None-able: check `ok`)."""
 
-    def __init__(self, device, w, math_fidelity):
+    def __init__(self, device, w, math_fidelity, split_n=None):
+        """split_n: write output columns [0, split_n) and [split_n, N) as two tensors (two projections sharing
+        one activation row run as one program)."""
         self.device = device
         self.k, self.n = w.shape
+        self.split_n = split_n or self.n
         # The weight reader runs on NCRISC (ReaderConfigDescriptor: RISCV_1, its default NoC).
         workers = ttnn.device.get_optimal_dram_bank_to_logical_worker_assignment(device, ttnn.NOC.RISCV_1_default)
         banks = len(workers)
         k_t, n_t = self.k // _TILE, self.n // _TILE
-        self.ok = self.k % _TILE == 0 and self.n % _TILE == 0 and n_t % banks == 0
+        self.ok = self.k % _TILE == 0 and self.n % _TILE == 0 and n_t % banks == 0 and self.split_n % _TILE == 0
         if not self.ok:
             return
         cols = n_t // banks
@@ -132,7 +135,7 @@ class DramMatmul:
             ),
         ]
         self.reader_ct = [_CB_IN1, _BLOCK_TILES, _BLOCK_TILES // _TXN_TILES, _TXN_TILES * _TILE_BYTES]
-        self.writer_ct = [k_t, group_w, _IN0_CHUNK, _CB_IN0, _CB_OUT]
+        self.writer_ct = [k_t, group_w, _IN0_CHUNK, _CB_IN0, _CB_OUT, self.split_n // _TILE]
         self.compute = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_KERNEL_DIR, "compute_dram_mm.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -157,10 +160,15 @@ class DramMatmul:
         return ps[-1] == self.k and rows == _TILE and x.shape[-1] == self.k
 
     def __call__(self, x, memory_config):
-        out = ttnn.allocate_tensor_on_device(
-            ttnn.Shape(list(x.shape)[:-1] + [self.n]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
-        )
-        common = [self.weight.buffer_address(), x.buffer_address(), out.buffer_address()]
+        widths = [self.split_n] + ([self.n - self.split_n] if self.split_n < self.n else [])
+        outs = [
+            ttnn.allocate_tensor_on_device(
+                ttnn.Shape(list(x.shape)[:-1] + [n]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
+            )
+            for n in widths
+        ]
+        out = outs[0]
+        common = [self.weight.buffer_address(), x.buffer_address(), out.buffer_address(), outs[-1].buffer_address()]
         reader = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_KERNEL_DIR, "reader_dram_mm.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -182,4 +190,5 @@ class DramMatmul:
             config=ttnn.WriterConfigDescriptor(),
         )
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, self.compute], semaphores=[], cbs=self.cbs)
-        return ttnn.generic_op([x, self.weight, out], program)
+        ttnn.generic_op([x, self.weight, *outs], program)
+        return outs[0] if len(outs) == 1 else tuple(outs)

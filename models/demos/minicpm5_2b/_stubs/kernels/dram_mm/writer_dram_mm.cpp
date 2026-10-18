@@ -4,7 +4,8 @@
 
 // MiniCPM5-2B decode projection, activation reader + output writer (BRISC). Reads the whole activation row
 // x[0, 0..Kt) into cb_in0 (kept resident by compute), pushed in chunks so compute starts on the first K rows, then
-// writes this core's output tiles [n_start, n_start + num_groups * group_w) of the one-tile-row output.
+// writes this core's output tiles [n_start, n_start + num_groups * group_w) of the one-tile-row output (columns
+// from split_t on into the second output tensor, when the program computes two projections side by side).
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -15,7 +16,8 @@ void kernel_main() {
     constexpr uint32_t in0_chunk = get_compile_time_arg_val(2);
     constexpr uint32_t cb_in0 = get_compile_time_arg_val(3);
     constexpr uint32_t cb_out = get_compile_time_arg_val(4);
-    constexpr auto x_args = TensorAccessorArgs<5>();
+    constexpr uint32_t split_t = get_compile_time_arg_val(5);  // columns >= split_t go to the second output
+    constexpr auto x_args = TensorAccessorArgs<6>();
     constexpr auto out_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
     constexpr uint32_t tile_bytes = 32 * 32 * 2;
 
@@ -23,6 +25,7 @@ void kernel_main() {
     const uint32_t num_groups = get_arg_val<uint32_t>(4);
     const auto x = TensorAccessor(x_args, get_common_arg_val<uint32_t>(1));
     const auto out = TensorAccessor(out_args, get_common_arg_val<uint32_t>(2));
+    const auto out_hi = TensorAccessor(out_args, get_common_arg_val<uint32_t>(3));  // same spec, other buffer
 
     cb_reserve_back(cb_in0, Kt);
     uint32_t l1 = get_write_ptr(cb_in0);
@@ -40,7 +43,11 @@ void kernel_main() {
         cb_wait_front(cb_out, group_w);
         uint32_t src = get_read_ptr(cb_out);
         for (uint32_t j = 0; j < group_w; ++j) {
-            noc_async_write_page(n + j, out, src);
+            if (n + j < split_t) {
+                noc_async_write_page(n + j, out, src);
+            } else {
+                noc_async_write_page(n + j - split_t, out_hi, src);
+            }
             src += tile_bytes;
         }
         noc_async_writes_flushed();
