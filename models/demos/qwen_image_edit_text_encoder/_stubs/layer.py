@@ -205,15 +205,20 @@ class TtTextAttention:
         qkv = split_linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=cfg, exact=ex)
         # the q / k / v heads ([q heads | k heads | v heads] per chip) split by the tile-aligned head kernel (exact
         # data movement; the slice + reshape + permute re-tiled every head)
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(qkv, num_heads=hl, num_kv_heads=kvl, transpose_k_heads=False)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+            qkv, num_heads=hl, num_kv_heads=kvl, transpose_k_heads=False, memory_config=ttnn.L1_MEMORY_CONFIG
+        )  # (the heads into L1: the rotary passes read them there)
         ttnn.deallocate(qkv)
         cos = tt_cos if tt_cos.dtype == ttnn.float32 else ttnn.typecast(tt_cos, ttnn.float32)
         sin = tt_sin if tt_sin.dtype == ttnn.float32 else ttnn.typecast(tt_sin, ttnn.float32)
 
         def _rope(t):
-            return ttnn.add(ttnn.multiply(t, cos), ttnn.multiply(rotate_half(t), sin))
+            return ttnn.add(
+                ttnn.multiply(t, cos), ttnn.multiply(rotate_half(t), sin), memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
 
         q, k = _rope(q), _rope(k)
+        v = ttnn.to_memory_config(v, ttnn.DRAM_MEMORY_CONFIG)
         q = ttnn.reshape(q, (b, kvl, G * s_pad, D))
         # with fewer sequences x kv heads than cores (the pipelined LM's 16-sequence micro-batches), one batch entry
         # per q head (its kv head repeated) so the batched products fill the grid with whole-entry work units: an
