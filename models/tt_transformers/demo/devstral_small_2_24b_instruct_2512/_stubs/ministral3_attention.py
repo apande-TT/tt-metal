@@ -120,6 +120,10 @@ class TtMinistral3Attention:
     # ... and the L1 heads are concatenated by one C++ program (tt/concat_heads.py: every core pushes the tiles of its
     # own L1 bank to their slots) instead of nlp_concat_heads.
     CPP_PREFILL_CONCAT = True
+    # Decode's SDPA output is concatenated by one C++ program too (tt/concat_heads.py ConcatHeadsDecode: each core
+    # gathers one output tile's rows straight out of the L1-interleaved SDPA tiles) instead of a reshard onto the head
+    # shards, nlp_concat_heads_decode and an unshard.
+    CPP_DECODE_CONCAT = True
     # Set by the decoder layer: the width-sharded layout its decode residual add runs in. The decode all_gather of
     # the reduced o_proj shard writes straight into it, so the add reads two shards (no interleaved row).
     decode_gather_mem = None
@@ -153,6 +157,11 @@ class TtMinistral3Attention:
             from models.demos.devstral_small_2_24b_instruct_2512.tt.concat_heads import ConcatHeads
 
             self.concat_heads = ConcatHeads(device)
+        self.concat_heads_decode = None
+        if self.CPP_DECODE_CONCAT:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt.concat_heads import ConcatHeadsDecode
+
+            self.concat_heads_decode = ConcatHeadsDecode(device)
 
         is_mesh = tp > 1
         shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else None
@@ -796,12 +805,17 @@ class TtMinistral3Attention:
             # L1-interleaved: GQA allows no sharded SDPA output, and the head-shard reshard below reads it on-chip
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
-        # Concat heads per row with ttnn's fused decode op on the head shards (one batch row's tile-padded heads per
-        # core) instead of a reshape that un-pads the 8 heads out of their 32-row tiles through DRAM.
-        attn = ttnn.experimental.nlp_concat_heads_decode(
-            ttnn.to_memory_config(attn, head_cfg), num_heads=self.local_heads
-        )
-        attn = ttnn.sharded_to_interleaved(attn, ttnn.L1_MEMORY_CONFIG)  # (1, 1, B, heads * head_dim)
+        if self.concat_heads_decode is not None and self.concat_heads_decode.supports(attn):
+            # (1, 1, B, heads * head_dim) L1-interleaved in one copy program, read straight out of SDPA's tiles
+            heads, attn = attn, self.concat_heads_decode(attn)
+            ttnn.deallocate(heads)
+        else:
+            # Concat heads per row with ttnn's fused decode op on the head shards (one batch row's tile-padded heads
+            # per core) instead of a reshape that un-pads the 8 heads out of their 32-row tiles through DRAM.
+            attn = ttnn.experimental.nlp_concat_heads_decode(
+                ttnn.to_memory_config(attn, head_cfg), num_heads=self.local_heads
+            )
+            attn = ttnn.sharded_to_interleaved(attn, ttnn.L1_MEMORY_CONFIG)  # (1, 1, B, heads * head_dim)
         return self._reduce(
             ttnn.linear(
                 attn,
