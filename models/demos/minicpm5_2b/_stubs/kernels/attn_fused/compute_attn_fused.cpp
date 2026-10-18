@@ -9,8 +9,11 @@
 //      bf16).
 //   2. ttnn.softmax(dim=-1, numeric_stable) on that bf16 row: the calls of ttnn's attention softmax.cpp (no fused
 //      mask, no padding), through the same kernel_lib helpers, fp32 intermediates.
-//   3. probs @ V (kernels/attn_bmm): per output column tile, one uninterrupted fp32 DEST accumulation over the Ct
+//   3. probs @ V (kernels/attn_bmm): per output column tile, one uninterrupted fp32 DEST accumulation over the
 //      key tiles in order, packed bf16.
+// All three run over the nt = position tile + 1 key tiles the reader streams (cb_cnt), not all Ct: the tiles past
+// the position tile are fully masked (exp -> exactly 0), so dropping them leaves the max, the fp32 sum and the
+// probs.V accumulation unchanged.
 
 #include <cstdint>
 
@@ -52,6 +55,7 @@ constexpr uint32_t cb_recip = get_compile_time_arg_val(13);
 constexpr uint32_t cb_probs = get_compile_time_arg_val(14);
 constexpr uint32_t cb_v = get_compile_time_arg_val(15);
 constexpr uint32_t cb_out = get_compile_time_arg_val(16);
+constexpr uint32_t cb_cnt = get_compile_time_arg_val(17);
 constexpr uint32_t ndst = 4;  // softmax block size under fp32 DEST
 
 // softmax.cpp's calc_numeric_stable (exp precise: EXP_APPROX 0).
@@ -86,10 +90,12 @@ void calc_numeric_stable(std::uint32_t Wt, std::uint32_t nd) {
 void kernel_main() {
     // ---- 1. scores * scale + mask -> cb_sm_in (bf16), as kernels/attn_bmm ----
     compute_kernel_hw_startup<SrcOrder::Reverse>(cb_q, cb_k, cb_t);
+    cb_wait_front(cb_cnt, 1);
+    const uint32_t nt = read_tile_value(cb_cnt, 0, 0);
     matmul_init(cb_q, cb_k, true);
     cb_wait_front(cb_scale, 1);
     cb_wait_front(cb_q, Kt);
-    for (uint32_t n = 0; n < Ct; ++n) {
+    for (uint32_t n = 0; n < nt; ++n) {
         matmul_init(cb_q, cb_k, true);
         cb_wait_front(cb_k, Kt);
         tile_regs_acquire();
@@ -139,13 +145,13 @@ void kernel_main() {
     cb_pop_front(cb_q, Kt);
     cb_pop_front(cb_scale, 1);
 
-    // ---- 2. softmax over the Ct masked score tiles -> cb_probs (bf16), as ttnn softmax.cpp ----
+    // ---- 2. softmax over the nt masked score tiles -> cb_probs (bf16), as ttnn softmax.cpp ----
     DataflowBuffer(static_cast<uint16_t>(cb_max_scaler)).wait_front(1);
     DataflowBuffer(static_cast<uint16_t>(cb_sum_scaler)).wait_front(1);
     reconfig_data_format(cb_sm_in, cb_sm_in);
     pack_reconfig_data_format(cb_exps);
     copy_init(cb_sm_in);
-    calc_numeric_stable<cb_sm_in, cb_max_scaler, cb_max, cb_exps>(Ct, ndst);
+    calc_numeric_stable<cb_sm_in, cb_max_scaler, cb_max, cb_exps>(nt, ndst);
     compute_kernel_lib::reduce<
         PoolType::SUM,
         ReduceDim::REDUCE_ROW,
@@ -153,7 +159,7 @@ void kernel_main() {
         cb_sum_scaler,
         cb_recip,
         compute_kernel_lib::ReduceInputPolicy::WaitUpfrontNoPop>(
-        compute_kernel_lib::ReduceInputBlockShape::row(Ct),
+        compute_kernel_lib::ReduceInputBlockShape::row(nt),
         compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
         compute_kernel_lib::NoAccumulation{},
         [](std::uint32_t) {
@@ -169,7 +175,7 @@ void kernel_main() {
         ckl::input(cb_exps, ckl::WaitPolicy::Upfront, ckl::PopPolicy::AtEnd, ckl::InputTileMapping::Block),
         ckl::input(cb_recip, ckl::BroadcastDim::Col, ckl::WaitPolicy::Upfront, ckl::PopPolicy::AtEnd),
         ckl::output(cb_probs, ckl::ReservePolicy::PerBlockSize, ckl::PushPolicy::PerBlockSize)>(
-        ckl::IterationShape::tiles(Ct).block_size(ndst));
+        ckl::IterationShape::tiles(nt).block_size(ndst));
     DataflowBuffer(static_cast<uint16_t>(cb_max_scaler)).pop_front(1);
     DataflowBuffer(static_cast<uint16_t>(cb_sum_scaler)).pop_front(1);
 
@@ -177,11 +183,11 @@ void kernel_main() {
     reconfig_data_format(cb_v, cb_probs);
     pack_reconfig_data_format(cb_out);
     matmul_init(cb_probs, cb_v, false);
-    cb_wait_front(cb_probs, Ct);
+    cb_wait_front(cb_probs, nt);
     for (uint32_t dt = 0; dt < Kt; ++dt) {
-        cb_wait_front(cb_v, Ct);
+        cb_wait_front(cb_v, Ct);  // a full Ct-tile slot, of which the first nt are live
         tile_regs_acquire();
-        for (uint32_t k = 0; k < Ct; ++k) {
+        for (uint32_t k = 0; k < nt; ++k) {
             matmul_tiles(cb_probs, cb_v, k, k, 0);
         }
         tile_regs_commit();
@@ -192,5 +198,6 @@ void kernel_main() {
         tile_regs_release();
         cb_push_back(cb_out, 1);
     }
-    cb_pop_front(cb_probs, Ct);
+    cb_pop_front(cb_probs, nt);
+    cb_pop_front(cb_cnt, 1);
 }

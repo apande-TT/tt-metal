@@ -5,8 +5,9 @@
 // MiniCPM5-2B fused decode attention reader: one (batch, KV head) row block bg per core. Pushes, in the order the
 // compute consumes them: the bf16 score-scale tile, the softmax reduce scalers (host-built tiles, the values
 // ttnn's softmax reader generates), the Kt query/key rows of bg, then per key tile n its Kt cache tiles (cache^T for
-// the scores) and the batch's key-mask tile, then per output column tile dt the Ct value-cache tiles. As in
-// kernels/attn_bmm, every cache tile past the batch's position tile is a local copy of a resident zero tile.
+// the scores) and the batch's key-mask tile, then per output column tile dt the value-cache tiles.
+// Only the nt = position tile + 1 key tiles are streamed (nt handed to compute through cb_cnt): the tiles past it
+// are fully masked, so their scores add exact zeros to the softmax sum and to probs.V.
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -20,12 +21,13 @@ void kernel_main() {
     constexpr uint32_t cb_scale = get_compile_time_arg_val(5);
     constexpr uint32_t cb_mask = get_compile_time_arg_val(6);
     constexpr uint32_t cb_pos = get_compile_time_arg_val(7);
-    constexpr uint32_t cb_zero = get_compile_time_arg_val(8);
+    [[maybe_unused]] constexpr uint32_t cb_zero = get_compile_time_arg_val(8);
     constexpr uint32_t cb_max_scaler = get_compile_time_arg_val(9);
     constexpr uint32_t cb_sum_scaler = get_compile_time_arg_val(10);
     constexpr uint32_t cb_v = get_compile_time_arg_val(11);
+    constexpr uint32_t cb_cnt = get_compile_time_arg_val(12);
     constexpr uint32_t tile_bytes = 32 * 32 * 2;
-    constexpr auto q_args = TensorAccessorArgs<12>();
+    constexpr auto q_args = TensorAccessorArgs<13>();
     constexpr auto k_args = TensorAccessorArgs<q_args.next_compile_time_args_offset()>();
     constexpr auto v_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
     constexpr auto scale_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
@@ -42,19 +44,19 @@ void kernel_main() {
     const auto scale = TensorAccessor(scale_args, get_common_arg_val<uint32_t>(3));
     const auto mask = TensorAccessor(mask_args, get_common_arg_val<uint32_t>(4));
     const auto cur_pos = TensorAccessor(pos_args, get_common_arg_val<uint32_t>(5));
-    const auto zero = TensorAccessor(zero_args, get_common_arg_val<uint32_t>(6));
     const auto max_scaler = TensorAccessor(mx_args, get_common_arg_val<uint32_t>(7));
     const auto sum_scaler = TensorAccessor(sm_args, get_common_arg_val<uint32_t>(8));
     const uint32_t b = bg / H;
 
-    // Position and the resident zero tile.
+    // Position (the zero-tile accessor is unused: no tile past the position tile is streamed).
     const uint32_t pos_l1 = get_write_ptr(cb_pos);
-    const uint32_t zero_l1 = get_write_ptr(cb_zero);
     noc_async_read_page(0, cur_pos, pos_l1);
-    noc_async_read_page(0, zero, zero_l1);
     noc_async_read_barrier();
     const uint32_t last_key_tile = static_cast<uint32_t>(reinterpret_cast<volatile tt_l1_ptr int32_t*>(pos_l1)[b]) >> 5;
-    const uint64_t zero_noc = get_noc_addr(zero_l1);
+    const uint32_t nt = last_key_tile + 1 < Ct ? last_key_tile + 1 : Ct;
+    cb_reserve_back(cb_cnt, 1);
+    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_cnt))[0] = nt;
+    cb_push_back(cb_cnt, 1);
 
     // Scale and softmax scalers.
     cb_reserve_back(cb_scale, 1);
@@ -81,15 +83,11 @@ void kernel_main() {
     cb_push_back(cb_q, Kt);
 
     // Scores: per key tile n, cache tiles (n, k) and the mask tile.
-    for (uint32_t n = 0; n < Ct; ++n) {
+    for (uint32_t n = 0; n < nt; ++n) {
         cb_reserve_back(cb_k, Kt);
         uint32_t l1 = get_write_ptr(cb_k);
         for (uint32_t k = 0; k < Kt; ++k) {
-            if (n > last_key_tile) {
-                noc_async_read(zero_noc, l1, tile_bytes);
-            } else {
-                noc_async_read_page((bg * Ct + n) * Kt + k, kc, l1);
-            }
+            noc_async_read_page((bg * Ct + n) * Kt + k, kc, l1);
             l1 += tile_bytes;
         }
         noc_async_read_barrier();
@@ -100,16 +98,13 @@ void kernel_main() {
         cb_push_back(cb_mask, 1);
     }
 
-    // probs @ V: per output column tile dt, cache tiles (k, dt) for k = 0..Ct-1.
+    // probs @ V: per output column tile dt, cache tiles (k, dt) for k = 0..nt-1, in a full Ct-tile slot (the rest
+    // unwritten and unread) so every push stays aligned to the 2 * Ct ring and a block never runs past its end.
     for (uint32_t dt = 0; dt < Kt; ++dt) {
         cb_reserve_back(cb_v, Ct);
         uint32_t l1 = get_write_ptr(cb_v);
-        for (uint32_t k = 0; k < Ct; ++k) {
-            if (k > last_key_tile) {
-                noc_async_read(zero_noc, l1, tile_bytes);
-            } else {
-                noc_async_read_page((bg * Ct + k) * Kt + dt, vc, l1);
-            }
+        for (uint32_t k = 0; k < nt; ++k) {
+            noc_async_read_page((bg * Ct + k) * Kt + dt, vc, l1);
             l1 += tile_bytes;
         }
         noc_async_read_barrier();

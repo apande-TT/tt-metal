@@ -637,6 +637,7 @@ class TtAttention:
         bf, f32 = ttnn.bfloat16, ttnn.float32
         tile, f32_tile = 2 * 32 * 32, 4 * 32 * 32
         (cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_pos, cb_zero, cb_sm_in, cb_mx, cb_sm, cb_v, cb_probs) = range(13)
+        cb_cnt = 13  # the row's live key-tile count, reader -> compute
         cb_out, cb_max, cb_exps, cb_recip = 16, 24, 25, 26
         spec = [
             (cb_q, d_t, bf),
@@ -665,6 +666,11 @@ class TtAttention:
             )
             for idx, n, fmt in spec
         ]
+        cbs.append(
+            ttnn.CBDescriptor(
+                total_size=64, core_ranges=cores, format_descriptors=[ttnn.CBFormatDescriptor(cb_cnt, ttnn.uint32, 64)]
+            )
+        )
         tensors = [
             qk,
             kv_cache.k,
@@ -683,7 +689,7 @@ class TtAttention:
             kernel_source=os.path.join(_ATTN_FUSED_DIR, "reader_attn_fused.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[d_t, c_t, n_kv, cb_q, cb_k, cb_scale, cb_mask, cb_pos, cb_zero, cb_mx, cb_sm, cb_v]
+            compile_time_args=[d_t, c_t, n_kv, cb_q, cb_k, cb_scale, cb_mask, cb_pos, cb_zero, cb_mx, cb_sm, cb_v, cb_cnt]
             + accessor_ct,
             runtime_args=rd_rt,
             common_runtime_args=[t.buffer_address() for t in tensors],
@@ -716,7 +722,7 @@ class TtAttention:
             core_ranges=cores,
             compile_time_args=[
                 d_t, c_t, cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_sm_in, cb_mx, cb_sm, cb_max, cb_exps, cb_recip,
-                cb_probs, cb_v, cb_out,
+                cb_probs, cb_v, cb_out, cb_cnt,
             ],
             runtime_args=ttnn.RuntimeArgs(),
             config=compute_cfg,
