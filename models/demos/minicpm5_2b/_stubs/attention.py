@@ -67,6 +67,10 @@ _INLINE_KV_WRITE = True
 # Decode o_proj with the layer's residual add on helper cores of the same program (DramMatmul residual_add).
 _USE_DRAM_MM_RES = True
 _ATTN_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_fused")
+# Prefill score bmm + scale/mask + softmax + probs.V + head merge as ONE generic_op (kernels/attn_prefill): the
+# attn_fused arithmetic per query tile row, the (batch, KV head) block's K / V resident in L1 across its rows.
+_USE_FUSED_PREFILL_ATTN = True
+_ATTN_PREFILL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_prefill")
 
 
 def _rotate_half_matrix(head_dim):
@@ -266,6 +270,11 @@ class TtAttention:
             # GQA without repeating K/V: head h = g * groups + j, so [B, n, S, D] viewed as [B, kv, groups * S, D]
             # puts each KV head's query heads in its rows; every output tile is the same dot product as before.
             s_t, d_t = seq // 32, self.head_dim // 32
+            if _USE_FUSED_PREFILL_ATTN and _USE_SCALE_MASK_KERNEL and seq % 32 == 0 and ctx.mask.shape[-1] == seq:
+                # [1, B * S, n * D] in L1, already head-merged: o_proj's input.
+                attn = self._attn_prefill_fused(q, k, v, ctx.mask, b, seq, ttnn.L1_MEMORY_CONFIG)
+                ttnn.deallocate(q)
+                return self._prefill_o_proj(attn, b, seq)
             # The scale and mask outputs ([B, n, S, S], 16 MB each at B=32, S=128) live in L1 between the two
             # bmms; the bmms' outputs stay in DRAM, as their per-(batch, KV head) blocks fill most of L1 with CBs.
             l1 = ttnn.L1_MEMORY_CONFIG
@@ -298,27 +307,7 @@ class TtAttention:
             # [B, 1, S, n*D] in L1: o_proj's input and output (two 16 MB L1 tensors) still fit beside its static CBs.
             attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.L1_MEMORY_CONFIG)
             attn = ttnn.reshape(attn, (1, b * seq, self.n_heads * self.head_dim))
-            grid = self.device.compute_with_storage_grid_size()
-            m_t, n_t = attn.padded_shape[-2] // 32, self.wo.padded_shape[-1] // 32
-            out = ttnn.linear(  # residual add input
-                attn,
-                self.wo,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
-                compute_kernel_config=self.compute_cfg,
-                # Full-grid 2-D multicast with 8-tile K blocks (8 K steps instead of the auto config's).
-                program_config=ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-                    compute_with_storage_grid_size=(grid.x, grid.y),
-                    in0_block_w=8,
-                    out_subblock_h=1,
-                    out_subblock_w=3,
-                    per_core_M=-(-m_t // grid.y),
-                    per_core_N=-(-n_t // grid.x),
-                    transpose_mcast=False,
-                    fused_activation=None,
-                ),
-            )
-            ttnn.deallocate(attn)
-            return ttnn.reshape(out, (b, seq, out.shape[-1]))
+            return self._prefill_o_proj(attn, b, seq)
         else:
             # One fused-QKV projection for the B decode rows, sliced into q / k / v. Every decode intermediate
             # is a few hundred tiles, so it lives in L1 instead of DRAM.
@@ -934,6 +923,119 @@ class TtAttention:
         return ttnn.generic_op(
             tensors + [t for t in kv_tensors if all(t is not u for u in tensors)] + extra_t + [out], program
         )
+
+    def _prefill_o_proj(self, attn, b, seq):
+        """Prefill o_proj on the merged heads [1, B * S, n * D] -> [B, S, hidden] in L1 (the residual add input)."""
+        grid = self.device.compute_with_storage_grid_size()
+        m_t, n_t = attn.padded_shape[-2] // 32, self.wo.padded_shape[-1] // 32
+        out = ttnn.linear(
+            attn,
+            self.wo,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_cfg,
+            # Full-grid 2-D multicast with 8-tile K blocks (8 K steps instead of the auto config's).
+            program_config=ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+                compute_with_storage_grid_size=(grid.x, grid.y),
+                in0_block_w=8,
+                out_subblock_h=1,
+                out_subblock_w=3,
+                per_core_M=-(-m_t // grid.y),
+                per_core_N=-(-n_t // grid.x),
+                transpose_mcast=False,
+                fused_activation=None,
+            ),
+        )
+        ttnn.deallocate(attn)
+        return ttnn.reshape(out, (b, seq, out.shape[-1]))
+
+    def _attn_prefill_fused(self, q, k, v, mask, b, seq, memory_config):
+        """Prefill attention for roped q [B, n, S, D], k / v [B, n_kv, S, D] and the causal mask [1, 1, S, S] as one
+        generic_op (kernels/attn_prefill), output head-merged [1, B * S, n * D]. A unit is one query tile row of a
+        (batch, KV head) block (q viewed as [B, n_kv, G * S, D]); each core takes a contiguous unit range, keeping
+        the block's K / V tiles resident. Per unit: the attn_fused arithmetic over all S / 32 key tiles."""
+        n_kv, g = self.n_kv_heads, self.kv_groups
+        d_t, s_t = self.head_dim // 32, seq // 32
+        r_t = g * s_t
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, b * seq, self.n_heads * self.head_dim]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device,
+            memory_config,
+        )
+        cores, rt = self._spread(b * n_kv * r_t)
+        bf, f32 = ttnn.bfloat16, ttnn.float32
+        tile, f32_tile = 2 * 32 * 32, 4 * 32 * 32
+        (cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_sm_in, cb_mx, cb_sm, cb_v, cb_probs) = range(11)
+        cb_out, cb_max, cb_exps, cb_recip = 16, 24, 25, 26
+        spec = [
+            (cb_q, 2 * d_t, bf),
+            (cb_k, s_t * d_t, bf),
+            (cb_scale, 1, bf),
+            (cb_mask, 2, bf),
+            (cb_t, 2, bf),
+            (cb_t2, 2, bf),
+            (cb_sm_in, s_t, bf),
+            (cb_mx, 1, bf),
+            (cb_sm, 1, f32),
+            (cb_v, s_t * d_t, bf),
+            (cb_probs, s_t, bf),
+            (cb_out, 2 * d_t, bf),
+            (cb_max, 1, f32),
+            (cb_exps, s_t, f32),
+            (cb_recip, 1, f32),
+        ]
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=n * (f32_tile if fmt == f32 else tile),
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(idx, fmt, f32_tile if fmt == f32 else tile)],
+            )
+            for idx, n, fmt in spec
+        ]
+        tensors = [q, k, v, self.scale_tile, mask, self.max_scaler, self.sum_scaler]
+        accessor_ct = []
+        for t in tensors:
+            accessor_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ATTN_PREFILL_DIR, "reader_attn_prefill.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[d_t, s_t, r_t, cb_q, cb_k, cb_scale, cb_mask, cb_mx, cb_sm, cb_v] + accessor_ct,
+            runtime_args=rt["dm"],
+            common_runtime_args=[t.buffer_address() for t in tensors],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        writer = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ATTN_PREFILL_DIR, "writer_attn_prefill.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[cb_out, d_t, s_t, r_t, n_kv, g] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=rt["dm"],
+            common_runtime_args=[out.buffer_address()],
+            config=ttnn.WriterConfigDescriptor(),
+        )
+        compute_cfg = ttnn.ComputeConfigDescriptor(
+            math_fidelity=ttnn.MathFidelity.HiFi4,  # as self.compute_cfg (scores, softmax and probs.V)
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            dst_full_sync_en=False,
+        )
+        # As _attn_fused: the score scale's SFPU multiply operands unpack to DEST as fp32.
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        for idx in (cb_t, cb_scale):
+            modes[idx] = ttnn.UnpackToDestMode.UnpackToDestFp32
+        compute_cfg.unpack_to_dest_mode = modes
+        compute = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_ATTN_PREFILL_DIR, "compute_attn_prefill.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[
+                d_t, s_t, r_t, cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_sm_in, cb_mx, cb_sm, cb_max, cb_exps,
+                cb_recip, cb_probs, cb_v, cb_out,
+            ],
+            runtime_args=rt["dm"],
+            config=compute_cfg,
+        )
+        program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
+        return ttnn.generic_op(tensors + [out], program)
 
     def _spread(self, n_tiles):
         """Row-major core set over the grid for n_tiles work items, with [start, count] / [count] runtime args."""
