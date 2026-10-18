@@ -676,19 +676,31 @@ def bmm_program_config(p, q, transpose_b=False):
     return _BMM_CONFIGS[key]
 
 
-def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2):
+def _repeat_entries(t, rep):
+    """[E, 1, R, C] -> [E * rep, 1, R, C]: each entry rep times in a row (entry e of the result is entry e // rep)."""
+    e, _, r, c = t.shape
+    return ttnn.reshape(ttnn.repeat(ttnn.reshape(t, (e, 1, r, c)), ttnn.Shape([1, rep, 1, 1])), (e * rep, 1, r, c))
+
+
+def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2, b_rep=1):
     """float32 a @ float32 b over bf16 limbs of both operands, keeping the limb products whose order
     (i + j) is below `limbs` (2 limbs: ah.bh + ah.bl + al.bh; 3 limbs: six terms, ~float32). With
-    exact=True each term's K reduction is the exact lane sum (the lanes mask a's last dim)."""
+    exact=True each term's K reduction is the exact lane sum (the lanes mask a's last dim). b_rep: b holds one
+    entry per b_rep consecutive entries of a (a's entry e uses b's entry e // b_rep) -- never materialised when the
+    batched kernel takes it."""
     cfg = precise_config()
     pa_all = split_bf16(a, limbs)
     pb_all = split_bf16(b, limbs)
     terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
 
     def mm(p, q):
-        y = None if BMM_KERNEL is None else BMM_KERNEL(p, q, transpose_b)
+        y = None
+        if BMM_KERNEL is not None:
+            y = BMM_KERNEL(p, q, transpose_b) if b_rep == 1 else BMM_KERNEL(p, q, transpose_b, b_rep=b_rep)
         if y is not None:
             return y
+        if b_rep > 1:
+            q = _repeat_entries(q, b_rep)
         return ttnn.matmul(
             p,
             q,
@@ -705,7 +717,7 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
             y = t if y is None else ttnn.add(y, t)
         return y
     if EXACT_MODE == "guarded":
-        return _guarded_terms(mm, terms, a, b, transpose_b)
+        return _guarded_terms(mm, terms, a, b, transpose_b, b_rep=b_rep)
     ests = []
     for pattern in LANE_PATTERNS:
         y = None
@@ -754,7 +766,7 @@ def _b_side_lanes(pa, pb, transpose_b):
     return None if lanes is None else [ttnn.view(t, sb) for t in lanes]
 
 
-def _guarded_terms(mm, terms, a, b, transpose_b):
+def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
     (pa0, pb0), rest = terms[0], terms[1:]
@@ -799,7 +811,10 @@ def _guarded_terms(mm, terms, a, b, transpose_b):
     nn = mm(neg0, pb0_l1)
     if pb0_l1 is not pb0:
         ttnn.deallocate(pb0_l1)
-    y = _guarded(ex, dn, nn, _norm_last(a), _col_norms(b, transpose_b, cache=False), *first)
+    b_norm = _col_norms(b, transpose_b, cache=False)
+    if b_rep > 1:  # b's per-entry norms to a's entries (small)
+        b_norm = _repeat_entries(b_norm, b_rep)
+    y = _guarded(ex, dn, nn, _norm_last(a), b_norm, *first)
     # the further terms (3 limbs: three more) summed after it, in order, through the lane-sum pass
     acc = _LaneAcc()
     acc.push(y)

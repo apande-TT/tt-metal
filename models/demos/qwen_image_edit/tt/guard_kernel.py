@@ -349,7 +349,7 @@ _SW_COMPUTE = f"{_DIR}/small_w_mm_compute.cpp"
 _SW_MAX_W_TILES = 96  # the whole weight in each core's L1: 96 bf16 tiles (192 KB) beside the row and output blocks
 
 
-def _rows_mm(a, w, rows, kt, nt, rows_per_entry, w_entry_pages, transpose_b, fidelity):
+def _rows_mm(a, w, rows, kt, nt, rows_per_entry, w_entry_pages, transpose_b, fidelity, w_rep=1):
     """y [rows * 32, nt * 32] float32 = each tile row of a (kt tiles, bf16) @ its entry's weight block (bf16) in w:
     the tile rows split over the whole grid, each entry's block read into L1 once per core."""
     chunk = max(d for d in range(1, 9) if nt % d == 0)  # output tiles per DST pass (8 float32 tiles, full sync)
@@ -385,7 +385,7 @@ def _rows_mm(a, w, rows, kt, nt, rows_per_entry, w_entry_pages, transpose_b, fid
             core_ranges=cores,
             compile_time_args=ttnn.TensorAccessorArgs(a).get_compile_time_args()
             + ttnn.TensorAccessorArgs(w).get_compile_time_args()
-            + [kt, nt, rows_per_entry, w_entry_pages],
+            + [kt, nt, rows_per_entry, w_entry_pages, w_rep],
             runtime_args=reader_rt,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -433,14 +433,21 @@ def small_weight_linear(p, w, fidelity=ttnn.MathFidelity.HiFi4):
     return ttnn.view(y, s[:-1] + [ws[1]])
 
 
-def batched_matmul(a, b, transpose_b=False):
+def batched_matmul(a, b, transpose_b=False, b_rep=1):
     """a [..., M, K] @ b [..., K, N] (b [..., N, K] when transpose_b), bf16 -> float32, one weight block per batch
     entry (the LM's per-head attention products: 112 entries of 96 x 128 @ 128 x 192 / 96 x 192 @ 192 x 128). The
     tile rows of all entries split over the whole grid; each core reads an entry's block into L1 once. None for a
     product it does not take."""
     sa, sb = list(a.shape), list(b.shape)
     kb, n = (sb[-1], sb[-2]) if transpose_b else (sb[-2], sb[-1])
-    if len(sa) < 3 or sa[:-2] != sb[:-2] or sa[-1] != kb or any(d % TILE for d in (sa[-2], sa[-1], n)):
+    if len(sa) < 3 or len(sb) != len(sa) or sa[-1] != kb or any(d % TILE for d in (sa[-2], sa[-1], n)):
+        return None
+    ea, eb = 1, 1
+    for d in sa[:-2]:
+        ea *= d
+    for d in sb[:-2]:
+        eb *= d
+    if ea != eb * b_rep or (b_rep == 1 and sa[:-2] != sb[:-2]):  # b_rep: each b entry serves b_rep a entries
         return None
     if list(a.padded_shape)[-2] != sa[-2] or list(b.padded_shape)[-2] != sb[-2] or not _plain_bf16(a, b):
         return None
@@ -450,7 +457,7 @@ def batched_matmul(a, b, transpose_b=False):
     entries = 1
     for d in sa[:-2]:
         entries *= d
-    y = _rows_mm(a, b, entries * mt, kt, nt, mt, kt * nt, transpose_b, ttnn.MathFidelity.HiFi4)
+    y = _rows_mm(a, b, entries * mt, kt, nt, mt, kt * nt, transpose_b, ttnn.MathFidelity.HiFi4, w_rep=b_rep)
     return ttnn.view(y, sa[:-1] + [n])
 
 

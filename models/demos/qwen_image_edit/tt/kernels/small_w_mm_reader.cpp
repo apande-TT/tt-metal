@@ -6,7 +6,8 @@
 // c_0; before the first row of each batch entry, that entry's whole bf16 weight block (kt x nt tiles, its pages
 // in order) into c_1, held until the entry's rows are done (a weight shared by every row is one entry).
 // Compile-time: the input's accessor args, the weight's, then kt, nt, the tile rows per entry and the weight
-// pages per entry (0: one weight for all entries). Runtime: input addr, weight addr, first row, row count.
+// pages per entry (0: one weight for all entries), and the entries per weight block (w_rep: entry e reads block
+// e / w_rep). Runtime: input addr, weight addr, first row, row count.
 
 #include <cstdint>
 
@@ -28,6 +29,7 @@ void kernel_main() {
     constexpr uint32_t nt = get_compile_time_arg_val(base + 1);
     constexpr uint32_t rows_per_entry = get_compile_time_arg_val(base + 2);
     constexpr uint32_t w_entry_pages = get_compile_time_arg_val(base + 3);
+    constexpr uint32_t w_rep = get_compile_time_arg_val(base + 4);  // entries sharing one weight block
     const auto a = TensorAccessor(a_args, a_addr);
     const auto w = TensorAccessor(w_args, w_addr);
     const uint32_t bytes = get_local_cb_interface(0).fifo_page_size;
@@ -40,7 +42,7 @@ void kernel_main() {
         if (e != cur) {
             cb_w.reserve_back(kt * nt);  // (free once the compute has released the previous entry's block)
             for (uint32_t t = 0; t < kt * nt; ++t) {
-                noc.async_read(w, cb_w, bytes, {.page_id = e * w_entry_pages + t}, {.offset_bytes = t * bytes});
+                noc.async_read(w, cb_w, bytes, {.page_id = (e / w_rep) * w_entry_pages + t}, {.offset_bytes = t * bytes});
             }
             noc.async_read_barrier();
             cb_w.push_back(kt * nt);

@@ -223,10 +223,13 @@ class TtTextAttention:
         per_head = G > 1 and b * kvl < n_cores
         # still short of the grid per head: each head's rows split r ways too (whole-entry units of s_pad / r rows)
         r = next((r for r in range(1, s_pad // 32 + 1) if (s_pad // 32) % r == 0 and b * kvl * G * r >= n_cores), 1)
+        rep = 1
         if per_head:
+            # each q entry's kv head is read from its shared block by the batched kernel (no repeated copies)
             q = ttnn.reshape(q, (b * kvl * G * r, 1, s_pad // r, D))
-            k = self._repeat_heads(k, G * r)
-        scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex)
+            k = ttnn.reshape(k, (b * kvl, 1, s_pad, D))
+            rep = G * r
+        scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex, b_rep=rep)
         if per_head:
             scores = ttnn.reshape(scores, (b, kvl, G * s_pad, s_pad))
         scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask)
@@ -235,8 +238,8 @@ class TtTextAttention:
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
         if per_head:
             probs = ttnn.reshape(probs, (b * kvl * G * r, 1, s_pad // r, s_pad))
-            v = self._repeat_heads(v, G * r)
-        o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex)  # [B, kvl, G*S, D]
+            v = ttnn.reshape(v, (b * kvl, 1, s_pad, D))
+        o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex, b_rep=rep)  # [B, kvl, G*S, D]
         o = ttnn.experimental.nlp_concat_heads(ttnn.reshape(o, (b, hl, s_pad, D)))  # [B, 1, S, hl * D]
         # split into bf16 limbs on this chip, then gathered: the same bytes as the float32 heads, the split on a
         # quarter of the data
