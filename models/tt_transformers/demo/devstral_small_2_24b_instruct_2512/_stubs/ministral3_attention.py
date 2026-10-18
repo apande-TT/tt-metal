@@ -86,6 +86,10 @@ class TtMinistral3Attention:
     # nlp_create_qkv_heads_decode reads the QKV's width shards in place (its sharded-input path) instead of an
     # unsharded copy of the row.
     DECODE_SHARDED_HEADS = True
+    # Decode splits the heads with k on its own cores (overlap_qk_coregrid=False: q and v on the head grid's first B
+    # cores, k on the next B), so q's and k's RoPE run as ONE rotary_embedding_llama_fused_qk and K / V are appended
+    # by ONE paged_fused_update_cache (each needs its two inputs on disjoint cores).
+    DECODE_FUSED_QK = True
     # False: prefill returns o_proj's reduce-scattered 1/TP hidden shard (the decoder keeps a hidden-sharded
     # residual in prefill and gathers only the normed activation).
     prefill_gather = True
@@ -258,6 +262,11 @@ class TtMinistral3Attention:
             # Decode's fused RoPE reads one 32 x 32 pair-swap tile per batch row from its own core; prefill's reads
             # the single tile from DRAM.
             self.trans_mat = _put(self._pair_swap(ttnn.TILE_SIZE).repeat(1, 1, self.MAX_DECODE_BATCH, 1), repl)
+            # ... and with DECODE_FUSED_QK one per q core and one per k core (q's and k's heads on disjoint cores)
+            self.trans_mat_qk = None
+            if self.DECODE_FUSED_QK:
+                pair = self._pair_swap(ttnn.TILE_SIZE).repeat(1, 1, 2 * self.MAX_DECODE_BATCH, 1)
+                self.trans_mat_qk = _put(pair, repl)
             self.prefill_trans_mat = _put(self._pair_swap(ttnn.TILE_SIZE).reshape(1, 1, ttnn.TILE_SIZE, -1), repl)
             # One pair-swap tile per core, height-sharded into L1 around each prefill RoPE (see _prefill_rope).
             n_cores = grid.x * grid.y
@@ -368,10 +377,33 @@ class TtMinistral3Attention:
         w = min(self.HEAD_GRID_X, self.device.compute_with_storage_grid_size().x)
         return self.meta_rope and batch <= self.MAX_DECODE_BATCH and (batch <= w or batch % w == 0)
 
+    def _fused_qk_rope(self, batch):
+        # q on the head grid's first `batch` cores and k on the next `batch`: 2 * batch whole rows of the 8-wide grid
+        w = min(self.HEAD_GRID_X, self.device.compute_with_storage_grid_size().x)
+        return (
+            self.DECODE_FUSED_QK
+            and self.trans_mat_qk is not None
+            and self._fused_decode_rope(batch)
+            and (2 * batch) % w == 0
+            and 2 * batch <= w * self.device.compute_with_storage_grid_size().y
+        )
+
     def decode_rope_tables(self, rope, batch):
         """Decode rope tables (cos, sin, q_cos, q_sin), each (1, B, 1, head_dim), height-sharded onto the decode head
         grid plus the pair-swap tiles, ONCE per forward for every layer: the fused RoPE reads them from the cores
-        that hold the q / k heads. Unchanged when the fused path does not apply."""
+        that hold the q / k heads. Unchanged when the fused path does not apply.
+
+        With DECODE_FUSED_QK: (cos, sin, trans), each table (1, 2B, 1, head_dim) = q's rows then k's, height-sharded
+        one row per core over the 2B cores the q and k heads occupy, for rotary_embedding_llama_fused_qk."""
+        if self._fused_qk_rope(batch):
+            q_cos, q_sin = rope[2:4] if len(rope) >= 4 else rope[:2]
+            cfg = self._batch_shard_cfg(2 * batch, self.head_dim)
+            both = lambda q_t, k_t: ttnn.to_memory_config(ttnn.concat([q_t, k_t], dim=1), cfg)
+            trans = self.trans_mat_qk
+            if batch < self.MAX_DECODE_BATCH:
+                trans = ttnn.slice(trans, (0, 0, 0, 0), (1, 1, 2 * batch * ttnn.TILE_SIZE, ttnn.TILE_SIZE))
+            trans = ttnn.to_memory_config(trans, self._batch_shard_cfg(2 * batch, ttnn.TILE_SIZE))
+            return both(q_cos, rope[0]), both(q_sin, rope[1]), trans
         if not self._fused_decode_rope(batch):
             return rope
         cfg = self._head_cfg(batch)
@@ -770,6 +802,25 @@ class TtMinistral3Attention:
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 compute_kernel_config=self.compute_cfg,
             )
+        k_cache, v_cache = kv_cache
+        if len(position_embeddings) == 3 and self.DECODE_SHARDED_HEADS:
+            # DECODE_FUSED_QK (tables from decode_rope_tables): k's heads on the B cores after q's, so one fused RoPE
+            # rotates both and one fused cache update appends K (k's cores) and V (q's cores).
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
+                qkv,
+                num_heads=self.local_heads,
+                num_kv_heads=self.local_kv_heads,
+                overlap_qk_coregrid=False,
+                memory_config=self._batch_shard_cfg(2 * b, self.head_dim),
+            )
+            cos, sin, trans = position_embeddings
+            q, k = ttnn.experimental.rotary_embedding_llama_fused_qk(
+                q, k, cos, sin, trans, compute_kernel_config=self.compute_cfg
+            )
+            ttnn.experimental.paged_fused_update_cache(k_cache, k, v_cache, v, update_idxs_tensor=cur_pos)
+            ttnn.deallocate(k)  # free the L1 head shards before SDPA's circular buffers are placed
+            ttnn.deallocate(v)
+            return self._decode_attend(q, k_cache, v_cache, cur_pos, head_cfg)
         if not self.DECODE_SHARDED_HEADS:
             qkv = ttnn.sharded_to_interleaved(qkv, ttnn.L1_MEMORY_CONFIG)
         q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
@@ -793,11 +844,14 @@ class TtMinistral3Attention:
                 if self.l4_beta is not None and self.l4_max and position_ids is not None:
                     q = ttnn.multiply(q, self._llama4_scale(position_ids, (1, b, 1, 1)))
             k = ttnn.to_memory_config(k, head_cfg)
-        k_cache, v_cache = kv_cache
         ttnn.experimental.paged_update_cache(k_cache, k, update_idxs_tensor=cur_pos)
         ttnn.experimental.paged_update_cache(v_cache, v, update_idxs_tensor=cur_pos)
         ttnn.deallocate(k)  # free the L1 head shards before SDPA's circular buffers are placed
         ttnn.deallocate(v)
+        return self._decode_attend(q, k_cache, v_cache, cur_pos, head_cfg)
+
+    def _decode_attend(self, q, k_cache, v_cache, cur_pos, head_cfg):
+        """SDPA-decode of the post-RoPE q head shards over the resident cache, head concat, o_proj and its reduce."""
         attn = ttnn.transformer.scaled_dot_product_attention_decode(
             q,
             k_cache,
