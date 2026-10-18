@@ -117,6 +117,12 @@ class TtMinistral3Attention:
     # it takes at most this many bytes per core (76 KB at 32 x 128 rows; 248 KB at 416 rows does not fit beside SDPA's
     # static buffers).
     PREFILL_SDPA_OUT_L1_BYTES = 256 * 1024
+    # ... and the L1 heads are concatenated by one C++ program (tt/concat_heads.py: every core pushes the tiles of its
+    # own L1 bank to their slots) instead of nlp_concat_heads.
+    CPP_PREFILL_CONCAT = True
+    # Set by the decoder layer: the width-sharded layout its decode residual add runs in. The decode all_gather of
+    # the reduced o_proj shard writes straight into it, so the add reads two shards (no interleaved row).
+    decode_gather_mem = None
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -142,6 +148,11 @@ class TtMinistral3Attention:
         ), f"heads {self.num_heads}/{self.num_kv_heads} not divisible by TP={tp}"
         self.local_heads = lh = self.num_heads // tp
         self.local_kv_heads = lkv = self.num_kv_heads // tp
+        self.concat_heads = None
+        if self.CPP_PREFILL_CONCAT:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt.concat_heads import ConcatHeads
+
+            self.concat_heads = ConcatHeads(device)
 
         is_mesh = tp > 1
         shard = lambda dim: ttnn.ShardTensorToMesh(device, dim=dim) if is_mesh else None
@@ -277,8 +288,20 @@ class TtMinistral3Attention:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
+        # SDPA decode reads q straight from its head shards (batch row b on core (b % HEAD_GRID_X, b // HEAD_GRID_X)):
+        # with sharded q, batch b's output core is core b of SDPA's grid in row-major order, so that grid is
+        # HEAD_GRID_X wide (8 x 10: 2 cores per batch row = 1 per kv head, as on the full grid).
+        # Decode SDPA multiplies q by the block-float8 K / V cache at HiFi2 (fp32 accumulation kept): 42-44 -> 40 us.
+        self.sdpa_decode_compute_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
+        grid = device.compute_with_storage_grid_size()
         self.sdpa_decode_cfg = ttnn.SDPAProgramConfig(
-            compute_with_storage_grid_size=device.compute_with_storage_grid_size(),
+            compute_with_storage_grid_size=ttnn.CoreCoord(min(self.HEAD_GRID_X, grid.x), grid.y),
             q_chunk_size=0,
             k_chunk_size=0,
             exp_approx_mode=False,
@@ -374,6 +397,8 @@ class TtMinistral3Attention:
             return t
         if t.dtype != ttnn.bfloat16:
             t = ttnn.typecast(t, ttnn.bfloat16)
+        if self.decode_gather_mem is not None and int(t.shape[-2]) == ttnn.TILE_SIZE:
+            return ttnn.all_gather(t, dim=3, memory_config=self.decode_gather_mem, **ccl)
         return ttnn.all_gather(t, dim=3, **ccl)
 
     def _rope(self, x, cos, sin):
@@ -676,7 +701,11 @@ class TtMinistral3Attention:
             memory_config=ttnn.L1_MEMORY_CONFIG if sdpa_l1 else ttnn.DRAM_MEMORY_CONFIG,
         )
         heads = attn
-        attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.L1_MEMORY_CONFIG if concat_l1 else None)
+        concat_mem = ttnn.L1_MEMORY_CONFIG if concat_l1 else None
+        if self.concat_heads is not None and self.concat_heads.supports(attn):
+            attn = self.concat_heads(attn, concat_mem or ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=concat_mem)
         if sdpa_l1:
             ttnn.deallocate(heads)
         if self.tp > 1:
@@ -741,9 +770,7 @@ class TtMinistral3Attention:
                 t, c, s, trans, is_decode_mode=True, compute_kernel_config=self.compute_cfg
             )
             k, q = rope(k, cos, sin), rope(q, q_cos, q_sin)
-            # SDPA reads q from DRAM, as on the unfused path: its circular buffers fill nearly all of L1, so only the
-            # small shared tables may stay resident in L1 while it runs.
-            q = ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG)
+            # SDPA reads q from these head shards (one (heads, head_dim) tile row per core, see sdpa_decode_cfg).
         else:
             k = self._rope(ttnn.to_memory_config(k, ttnn.DRAM_MEMORY_CONFIG), cos, sin)
             if len(position_embeddings) == 4:
@@ -765,8 +792,9 @@ class TtMinistral3Attention:
             cur_pos_tensor=cur_pos,
             scale=self.scale,
             program_config=self.sdpa_decode_cfg,
-            compute_kernel_config=self.compute_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.sdpa_decode_compute_cfg,
+            # L1-interleaved: GQA allows no sharded SDPA output, and the head-shard reshard below reads it on-chip
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         # Concat heads per row with ttnn's fused decode op on the head shards (one batch row's tile-padded heads per
         # core) instead of a reshape that un-pads the 8 heads out of their 32-row tiles through DRAM.

@@ -76,6 +76,10 @@ class TtMinistral3DecoderLayer:
         self.mlp = TtMinistral3MLP(device, torch_module.mlp, in_scale=ln_post.weight, layer_idx=layer_idx)
         self.compute_cfg = self.self_attn.compute_cfg
         self.hidden = int(ln_in.weight.shape[0])
+        if self.tp > 1 and self.SHARDED_DECODE_RESIDUAL:  # the decode all_gathers land in the residual's shards
+            self.self_attn.decode_gather_mem = self.mlp.decode_gather_mem = self.post_attention_layernorm.decode_mem(
+                self.hidden
+            )
         self._stats_mask = None
         if self.tp > 1 and self.SHARDED_PREFILL_NORM:
             # Picks column 0 of each device's sum-of-squares tile out of the gathered (.., S, 32 * TP) stats.
@@ -155,7 +159,7 @@ class TtMinistral3DecoderLayer:
             res_mem = self.post_attention_layernorm.decode_mem(int(x.shape[-1]))
         h = self._residual_add(x, a, res_mem)
         if mode == "decode":
-            # unsharded into L1: the gate / up multicast this row once per K block straight from there
+            # unsharded into L1: the fused gate / up's sender core reads this row once from there and multicasts it
             n = self.post_attention_layernorm.decode(h, l1=True)
         else:
             n = self._bf16(self.post_attention_layernorm(self._bf16(h)))

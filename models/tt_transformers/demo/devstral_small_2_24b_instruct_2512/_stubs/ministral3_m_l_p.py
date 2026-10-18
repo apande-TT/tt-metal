@@ -39,6 +39,12 @@ DECODE_GATE_UP_K_BLOCK = 8
 DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi3
 # K tiles per activation multicast block of the decode down projection (divides K = 256 tiles).
 DOWN_DECODE_K_BLOCK = 8
+# Decode down projection as one C++ program streaming a bank-major weight copy (tt/down_decode.py).
+DOWN_DECODE_STREAM = True
+# Decoder layers whose decode-only down copy is block-float4 (the others read the bf8 prefill weight).
+DECODE_DOWN_BF4_LAYERS = frozenset(range(15, 25))
+# Decode gate / up / silu-multiply as one C++ program (tt/gate_up_decode.py).
+DECODE_GATE_UP_FUSED = True
 
 
 class TtMinistral3MLP:
@@ -47,9 +53,12 @@ class TtMinistral3MLP:
     OUT_DTYPE = ttnn.float32
     # Separate gate / up weights for the single-token decode path (the vision MLP subclasses never decode).
     DECODE_WEIGHTS = True
+    fused_gate_up = None
     # dtype the reduced output is all_gathered in (None: plain fp32 all_reduce). The text decoder reduce-scatters
     # in fp32 and gathers the reduced shard in bf16 (half the bytes); its residual add takes the bf16 unrounded.
     GATHER_DTYPE = ttnn.bfloat16
+    # Set by the decoder layer: the decode all_gather writes straight into its residual add's width shards.
+    decode_gather_mem = None
     # dtype of the many-row (prefill) down projection's partials and their reduce-scatter (None: OUT_DTYPE). The text
     # decoder reduce-scatters prefill's partials in bf16 (half the bytes, no cast before the gather).
     PREFILL_REDUCE_DTYPE = ttnn.bfloat16
@@ -113,8 +122,19 @@ class TtMinistral3MLP:
             # block-float4 gate / up copies (the whole stack in bf4 costs more accuracy than the gate allows).
             lowp = layer_idx is not None and layer_idx in DECODE_GATE_UP_BF4_LAYERS
             gu_dtype = DECODE_GATE_UP_BF4_DTYPE if lowp else DECODE_WEIGHT_DTYPE
-            self.w_gate = _put(w_gate, shard(-1), gu_dtype)
-            self.w_up = _put(w_up, shard(-1), gu_dtype)
+            # DECODE_GATE_UP_FUSED: gate, up and silu * up as one C++ program; the activation multicast once and both
+            # data-movement RISCs streaming the weights independently of it, from bank-major copies the program owns
+            # (tt/gate_up_decode.py). Otherwise two ttnn.linear calls on interleaved copies and the silu-multiply.
+            if DECODE_GATE_UP_FUSED:
+                from models.demos.devstral_small_2_24b_instruct_2512.tt.gate_up_decode import FusedGateUpDecode
+
+                if FusedGateUpDecode.supports(device, k, inter, gu_dtype):
+                    fid = DECODE_GATE_UP_BF4_FIDELITY if lowp else ttnn.MathFidelity.HiFi4
+                    put = lambda t, dtype: _put(t, shard(-1), dtype)
+                    self.fused_gate_up = FusedGateUpDecode(device, w_gate, w_up, gu_dtype, fid, put, tp)
+            if self.fused_gate_up is None:
+                self.w_gate = _put(w_gate, shard(-1), gu_dtype)
+                self.w_up = _put(w_up, shard(-1), gu_dtype)
             # bf4 layers: 1D multicast config with DECODE_GATE_UP_K_BLOCK-tile activation blocks. Each step costs
             # ~1.3 us of multicast latency, so the auto config's 2-tile blocks (80 steps over K = 160 tiles) are
             # latency-bound once the block-float4 weight halves the DRAM bytes behind each step (bf8 keeps the auto
@@ -154,15 +174,44 @@ class TtMinistral3MLP:
             # for only ~0.35 MB of weight per step; wider blocks put enough weight behind each step that the op
             # streams at the DRAM rate instead.
             n_out = torch_module.down_proj.weight.shape[0]
-            # (the prefill weight itself when it is already in that dtype)
-            if self.DOWN_DTYPE == DECODE_WEIGHT_DTYPE:
+            # (the prefill weight itself when it is already in that dtype). Layers in DECODE_DOWN_BF4_LAYERS read a
+            # block-float4 copy at DECODE_GATE_UP_BF4_FIDELITY (exact on a bf4 weight, see the gate / up above).
+            self.down_decode_cfg = None
+            lowp_down = layer_idx is not None and layer_idx in DECODE_DOWN_BF4_LAYERS
+            # DOWN_DECODE_STREAM: the decode down as one C++ program streaming its own bank-major weight copy
+            # (tt/down_decode.py: bit-identical to the 1D-multicast matmul); then no interleaved decode copy is made.
+            self.stream_down = None
+            if DOWN_DECODE_STREAM:
+                from models.demos.devstral_small_2_24b_instruct_2512.tt.down_decode import StreamDownDecode
+
+                wdt = DECODE_GATE_UP_BF4_DTYPE if lowp_down else DECODE_WEIGHT_DTYPE
+                if StreamDownDecode.supports(device, self.inter, n_out, wdt):
+                    fid = DECODE_GATE_UP_BF4_FIDELITY if lowp_down else ttnn.MathFidelity.HiFi4
+                    put = lambda t, dtype: _put(t, shard(-2), dtype)
+                    self.stream_down = StreamDownDecode(device, torch_module.down_proj.weight.T, wdt, fid, put, tp)
+            if self.stream_down is not None:
+                self.w_down_decode = None
+            elif lowp_down:
+                self.w_down_decode = _put(torch_module.down_proj.weight.T, shard(-2), DECODE_GATE_UP_BF4_DTYPE)
+                self.down_decode_cfg = ttnn.init_device_compute_kernel_config(
+                    device.arch(),
+                    math_fidelity=DECODE_GATE_UP_BF4_FIDELITY,
+                    math_approx_mode=False,
+                    fp32_dest_acc_en=True,
+                    packer_l1_acc=False,
+                )
+            elif self.DOWN_DTYPE == DECODE_WEIGHT_DTYPE:
                 self.w_down_decode = self.w_down
             else:
                 self.w_down_decode = _put(torch_module.down_proj.weight.T, shard(-2), DECODE_WEIGHT_DTYPE)
             grid = device.compute_with_storage_grid_size()
+            # On exactly the cores the N split occupies (160 tiles / 2 = 80: an 8 x 10 rectangle), so the activation
+            # multicast spans no idle columns of the full grid.
             n_per_core = -(-(n_out // 32) // (grid.x * grid.y))
+            n_cores = -(-(n_out // 32) // n_per_core)
+            down_grid = (8, n_cores // 8) if n_cores % 8 == 0 and n_cores // 8 <= grid.y else (grid.x, grid.y)
             self.down_decode_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
-                compute_with_storage_grid_size=(grid.x, grid.y),
+                compute_with_storage_grid_size=down_grid,
                 in0_block_w=DOWN_DECODE_K_BLOCK,
                 out_subblock_h=1,
                 out_subblock_w=n_per_core,
@@ -228,17 +277,22 @@ class TtMinistral3MLP:
         # The single-row gate / up / product stay in L1 for the down matmul (no DRAM round trip of the 32 x inter
         # intermediates); silu is fused into the multiply (ttnn.linear's activation= runs as a separate unary op).
         l1 = ttnn.L1_MEMORY_CONFIG
-        pc = self.gate_up_decode_pc
-        cfg = self.compute_cfg if self.gate_up_decode_cfg is None else self.gate_up_decode_cfg
-        g = ttnn.linear(x, self.w_gate, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
-        u = ttnn.linear(x, self.w_up, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
-        m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
+        if self.fused_gate_up is not None:  # one program: both projections + silu * up (tt/gate_up_decode.py)
+            m = self.fused_gate_up(x)
+        else:
+            pc = self.gate_up_decode_pc
+            cfg = self.compute_cfg if self.gate_up_decode_cfg is None else self.gate_up_decode_cfg
+            g = ttnn.linear(x, self.w_gate, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
+            u = ttnn.linear(x, self.w_up, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
+            m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
+        if self.stream_down is not None:  # one program streaming the bank-major down copy (tt/down_decode.py)
+            return self._reduce(self.stream_down(m))
         out = ttnn.linear(
             m,
             self.w_down_decode,
             program_config=self.down_decode_pc,
             dtype=self.DECODE_REDUCE_DTYPE if (self.DECODE_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
-            compute_kernel_config=self.compute_cfg,
+            compute_kernel_config=self.compute_cfg if self.down_decode_cfg is None else self.down_decode_cfg,
         )
         return self._reduce(out)
 
@@ -343,6 +397,8 @@ class TtMinistral3MLP:
             return out
         if out.dtype != self.GATHER_DTYPE:
             out = ttnn.typecast(out, self.GATHER_DTYPE)
+        if self.decode_gather_mem is not None and int(out.shape[-2]) == ttnn.TILE_SIZE:
+            return ttnn.all_gather(out, dim=3, memory_config=self.decode_gather_mem, **ccl)
         return ttnn.all_gather(out, dim=3, **ccl)
 
 

@@ -43,6 +43,7 @@ from pathlib import Path
 import torch
 
 import ttnn
+from models.demos.devstral_small_2_24b_instruct_2512.tt.last_row import LastRow
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs import attention as _st_attention
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs import decoder_head as _st_decoder_head
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs import encoder_stack as _st_encoder_stack
@@ -119,6 +120,12 @@ PLANNED_TP = 4
 #                     made it multicast-latency-bound); layers 5-35 read block-float4 decode gate / up copies with
 #                     8-tile K blocks at HiFi3 (exact on a bf4 weight; bf4 on every layer: PCC 0.9921 < 0.995). The post-attention decode norm
 #                     unshards its bf16 output into L1, so gate / up fetch each K block of the row from L1, not DRAM.
+#                     Decode gate / up / silu-multiply run as ONE C++ program (tt/gate_up_decode.py: the activation
+#                     multicast once by a spare core, gate and up streamed by the two data-movement RISCs, fp32
+#                     silu * up, one rounding). The decode down projection is ONE C++ program too
+#                     (tt/down_decode.py: the product multicast once, a bank-major weight copy streamed one column per
+#                     data-movement RISC on 8 x 10 cores, fp32 DEST over all K -- bit-identical to the 1D-multicast
+#                     matmul); layers 15-24 read a block-float4 down copy at HiFi3 (bf4 down everywhere: PCC 0.989).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
 #                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
@@ -137,11 +144,16 @@ PLANNED_TP = 4
 #                     norm's fp32 width shards as they are (20-tile K blocks of 5 shards; no unshard, cast, reshard;
 #                     3 readers per DRAM bank);
 #                     decode residual adds write straight into the norms' sharded layout (no re-shard per norm).
+#                     The decode all_gathers of the reduced o_proj / down shards write into that layout too.
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
 #   KV cache in bfloat8_b (KV_CACHE_DTYPE): half the bytes decode SDPA re-reads every token. Prefill writes only the
 #                     cast prompt rows: one fill_cache over (batch x kv_heads) folded into heads, the prompt
 #                     height-sharded one (user, head) slab per core (no pad to the capacity, no full-capacity typecast).
+#                     Decode SDPA reads q straight from its post-RoPE head shards (no copy to DRAM): its grid is the
+#                     8-wide head grid, so each batch row's output core is the core holding that row's q. Its output
+#                     goes L1-interleaved (GQA allows no sharded output) for the reshard into the concat's head shards;
+#                     it computes at HiFi2 (fp32 accumulation) on the bf8 cache.
 #   ministral3_attention: prefill QKV (HiFi2, bf8 weight) and o_proj projections on minimal_matmul (full grid); prefill o_proj is
 #                     column-parallel over the all_gathered heads, emitting the residual's hidden slice (no reduce-scatter). Decode concatenates the SDPA heads
 #                     with nlp_concat_heads_decode on the head shards (no un-padding reshape through DRAM). Decode QKV
@@ -150,7 +162,8 @@ PLANNED_TP = 4
 #                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
 #   prompts pad to a tile multiple only; prefill SDPA pads to whole chunks internally. Prefill QKV and o_proj run HiFi2 on bf8 weights.
 #   ministral3_m_l_p short-prompt down projection: a grid of whole 16 x 16-tile output blocks per core.
-#   prefill's last prompt rows: one embedding gather out of the untilized 32-row block (no re-tilize / reshape).
+#   prefill's last prompt rows: ONE data-movement program (tt/last_row.py) reads every user's row straight out of its
+#                     tiles into the tiled LM-head input (no block slice, untilize or embedding gather).
 #   ministral3_m_l_p fused gate/up N block: the per-core N range when it is under 12 tiles; M blocks no taller than the
 #                     per-core M range (data-parallel vision MLP: 7 tiles); the
 #                     vision MLP's SwiGLU product reaches the down projection through L1, which runs 4-tile N blocks.
@@ -714,6 +727,7 @@ class DevstralPipeline:
         self._shard_base = None
         full = self.batch == 32 and self.top_k == 32
         self._noise_lookup = NoiseLookup(device, self.batch, self.top_k, NOISE_BUCKETS) if full else None
+        self._last_row = LastRow(device) if self.batch == ttnn.TILE_SIZE else None
         tp = self._tp()
         if tp > 1:
             vocab = int(tcfg.vocab_size)
@@ -859,6 +873,9 @@ class DevstralPipeline:
         # The last prompt row in two slices: first the tile-aligned 32-row block that holds it (a tiled slice), then
         # the row itself -- a direct unaligned slice untilized the whole (B, S, D) hidden state first.
         r = dev["real_len"] - 1
+        if self._last_row is not None and LastRow.supports(hidden):
+            # every user's row R straight out of its tiles into the tiled LM-head input (tt/last_row.py)
+            return hidden, self.lm_head(self._last_row(hidden, r))
         r0 = r // ttnn.TILE_SIZE * ttnn.TILE_SIZE
         block = ttnn.slice(hidden, (0, r0, 0), (b, r0 + ttnn.TILE_SIZE, d))
         if "last_rows" in dev:
