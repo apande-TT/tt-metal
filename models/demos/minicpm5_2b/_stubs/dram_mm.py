@@ -14,6 +14,7 @@ banks * q + b is tile q of bank b's sequence (output-column groups of group_w ti
 from __future__ import annotations
 
 import os
+import struct
 
 import torch
 
@@ -28,6 +29,11 @@ _SLOTS = 3
 _IN0_CHUNK = 8
 _CB_IN0, _CB_IN1, _CB_OUT = 0, 1, 16
 _WORKERS_PER_BANK = 2  # cores streaming disjoint contiguous parts of one bank (at most; must divide its groups)
+_NORM_CB_BLOCKS = 10  # with a fused norm: weight CB the stream can run ahead into (20 measured slower)
+_CB_XIN, _CB_SCALER, _CB_EPS, _CB_GAMMA, _CB_NORMOUT = 2, 3, 4, 5, 17
+_CB_X2, _CB_EX2, _CB_EX2PE, _CB_FUSION, _CB_X2ALL, _CB_EX2PE_SEND = 24, 25, 26, 27, 28, 29
+_SEM_GATHER, _SEM_BCAST, _SEM_ALL, _SEM_START = 0, 1, 2, 3
+_NO_SEM = 0xFFFFFFFF
 
 
 def _mesh_kw(device, **kw):
@@ -43,10 +49,30 @@ def _mesh_kw(device, **kw):
 class DramMatmul:
     """y[1, 32, N] = x[.., 32, K] @ w[K, N] for a bf16 one-tile-row x (None-able: check `ok`)."""
 
-    def __init__(self, device, w, math_fidelity, split_n=None, dtype=ttnn.bfloat16, workers_per_bank=None):
+    def __init__(
+        self,
+        device,
+        w,
+        math_fidelity,
+        split_n=None,
+        dtype=ttnn.bfloat16,
+        workers_per_bank=None,
+        norm=None,
+        cb_blocks=None,
+        prebuilt=None,
+        group_w=None,
+    ):
         """split_n: write output columns [0, split_n) and [split_n, N) as two tensors (two projections sharing
-        one activation row run as one program)."""
+        one activation row run as one program). norm: an r_m_s_norm.TtRMSNorm applied to x inside the program
+        (its shared-statistic kernel's arithmetic, then an all-gather of the normalized row) -- only for a norm and
+        projection of the same math fidelity. cb_blocks: weight CB depth in reader blocks. prebuilt: a DramMatmul
+        of the same weight (and group_w) whose device copy is reused (w is then ignored). group_w: output tiles per
+        DEST accumulation (default the largest of 4, 2, 1 dividing a bank's columns)."""
         self.device = device
+        self.norm = norm
+        if prebuilt is not None:
+            w = torch.empty(prebuilt.k, prebuilt.n, device="meta")
+        cb_blocks = cb_blocks or (_NORM_CB_BLOCKS if norm is not None else _SLOTS)
         self.k, self.n = w.shape
         self.split_n = split_n or self.n
         # The weight reader runs on NCRISC (ReaderConfigDescriptor: RISCV_1, its default NoC).
@@ -57,7 +83,10 @@ class DramMatmul:
         if not self.ok:
             return
         cols = n_t // banks
-        group_w = max(g for g in (4, 2, 1) if cols % g == 0)
+        group_w = group_w or max(g for g in (4, 2, 1) if cols % g == 0)
+        self.ok = cols % group_w == 0
+        if not self.ok:
+            return
         k_block = _BLOCK_TILES // group_w
         self.ok = k_t % k_block == 0 and (k_t % _IN0_CHUNK == 0)
         if not self.ok:
@@ -76,11 +105,14 @@ class DramMatmul:
             .reshape(banks, -1, _TILE, _TILE)
         )
         pages = seq.permute(1, 0, 2, 3).reshape(-1, _TILE)  # page banks * q + b = seq[b, q]
-        # Whole tiles are permuted, so a block-float dtype quantizes every tile exactly as in the unpermuted weight.
-        self.weight = ttnn.from_torch(
-            pages.contiguous(),
-            **_mesh_kw(device, dtype=dtype, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG),
-        )
+        if prebuilt is not None:
+            self.weight = prebuilt.weight
+        else:
+            # Whole tiles are permuted, so a block-float dtype quantizes every tile as in the unpermuted weight.
+            self.weight = ttnn.from_torch(
+                pages.contiguous(),
+                **_mesh_kw(device, dtype=dtype, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG),
+            )
         w_tile_bytes = self.weight.tile.get_tile_size(dtype)
 
         # Extra workers of a bank: the nearest free cores to its optimal worker (same row first), taken round-robin
@@ -124,6 +156,25 @@ class DramMatmul:
                 rt[c.x][c.y] = [b, vc, b * cols + g0 * group_w, g0 * group_bytes, ng, ng * (k_t // k_block)]
                 g0 += ng
         self.rt = rt
+        self.semaphores = []
+        if norm is not None:
+            n_cores = len(all_cores)
+            self.ok = norm.consts is not None
+            if not self.ok:
+                return
+            # The norm runs on the first n_norm cores (the most that split its Kt tiles evenly), all receive its row.
+            n_norm = max(d for d in range(1, n_cores + 1) if k_t % d == 0)
+            tpc = k_t // n_norm
+            self.noc_xy = []
+            for i, c in enumerate(all_cores):  # all_cores[0] is the reducer
+                args = list(rt[c.x][c.y]) + [i * tpc, 1 if i == 0 else 0, 1 if i < n_norm else 0]
+                rt[c.x][c.y] = args
+                p = device.worker_core_from_logical_core(c)
+                self.noc_xy += [p.x, p.y]
+            self.semaphores = [
+                ttnn.SemaphoreDescriptor(id=i, core_ranges=cores, initial_value=0)
+                for i in (_SEM_GATHER, _SEM_BCAST, _SEM_ALL, _SEM_START)
+            ]
         self.cbs = [
             ttnn.CBDescriptor(
                 total_size=k_t * _TILE_BYTES,
@@ -131,7 +182,7 @@ class DramMatmul:
                 format_descriptors=[ttnn.CBFormatDescriptor(_CB_IN0, ttnn.bfloat16, _TILE_BYTES)],
             ),
             ttnn.CBDescriptor(
-                total_size=_SLOTS * _BLOCK_TILES * w_tile_bytes,
+                total_size=cb_blocks * _BLOCK_TILES * w_tile_bytes,
                 core_ranges=cores,
                 format_descriptors=[ttnn.CBFormatDescriptor(_CB_IN1, dtype, w_tile_bytes)],
             ),
@@ -141,13 +192,50 @@ class DramMatmul:
                 format_descriptors=[ttnn.CBFormatDescriptor(_CB_OUT, ttnn.bfloat16, _TILE_BYTES)],
             ),
         ]
-        self.reader_ct = [_CB_IN1, _BLOCK_TILES, _BLOCK_TILES // _TXN_TILES, _TXN_TILES * w_tile_bytes]
-        self.writer_ct = [k_t, group_w, _IN0_CHUNK, _CB_IN0, _CB_OUT, self.split_n // _TILE]
+        self.reader_ct = [_CB_IN1, _BLOCK_TILES, _BLOCK_TILES // _TXN_TILES, _TXN_TILES * w_tile_bytes, cb_blocks]
+        self.reader_ct += [_SEM_START if norm is not None else _NO_SEM]
+        if norm is None:
+            self.writer_src = "writer_dram_mm.cpp"
+            self.writer_ct = [k_t, group_w, _IN0_CHUNK, _CB_IN0, _CB_OUT, self.split_n // _TILE]
+            compute_src = "compute_dram_mm.cpp"
+            compute_ct = [k_t, group_w, k_block, _CB_IN0, _CB_IN1, _CB_OUT]
+        else:
+            f32_tile = 4 * _TILE * _TILE
+
+            def cb(idx, n, fmt, size):
+                return ttnn.CBDescriptor(
+                    total_size=n * size, core_ranges=cores, format_descriptors=[ttnn.CBFormatDescriptor(idx, fmt, size)]
+                )
+
+            bf, f32 = ttnn.bfloat16, ttnn.float32
+            self.cbs += [
+                cb(_CB_XIN, tpc, bf, _TILE_BYTES),
+                cb(_CB_SCALER, 1, bf, _TILE_BYTES),
+                cb(_CB_EPS, 1, bf, _TILE_BYTES),
+                cb(_CB_GAMMA, tpc, bf, _TILE_BYTES),
+                cb(_CB_NORMOUT, tpc, bf, _TILE_BYTES),
+                cb(_CB_X2, tpc, f32, f32_tile),
+                cb(_CB_EX2, 1, f32, f32_tile),
+                cb(_CB_EX2PE, 1, f32, f32_tile),
+                cb(_CB_FUSION, tpc, f32, f32_tile),
+                cb(_CB_X2ALL, k_t, f32, f32_tile),
+                cb(_CB_EX2PE_SEND, 1, f32, f32_tile),
+            ]
+            self.writer_src = "writer_dram_mm_norm.cpp"
+            self.writer_ct = [k_t, group_w, _CB_IN0, _CB_OUT, self.split_n // _TILE, tpc]
+            self.writer_ct += [_CB_XIN, _CB_SCALER, _CB_EPS, _CB_GAMMA, _CB_X2, _CB_X2ALL, _CB_EX2PE, _CB_EX2PE_SEND]
+            self.writer_ct += [_CB_NORMOUT, _SEM_GATHER, _SEM_BCAST, _SEM_ALL, n_cores, n_norm, _SEM_START]
+            inv_w_bits = struct.unpack("<I", struct.pack("<f", 1.0 / self.k))[0]
+            compute_src = "compute_dram_mm_norm.cpp"
+            compute_ct = [k_t, group_w, k_block, _CB_IN0, _CB_IN1, _CB_OUT, inv_w_bits, tpc]
+            compute_ct += [_CB_XIN, _CB_SCALER, _CB_EPS, _CB_GAMMA, _CB_X2, _CB_EX2, _CB_EX2PE, _CB_FUSION]
+            compute_ct += [_CB_X2ALL, _CB_EX2PE_SEND, _CB_NORMOUT, math_fidelity.value]
+            math_fidelity = ttnn.MathFidelity.HiFi4  # the norm's (as r_m_s_norm's kernel); the matmul keeps its own
         self.compute = ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_KERNEL_DIR, "compute_dram_mm.cpp"),
+            kernel_source=os.path.join(_KERNEL_DIR, compute_src),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[k_t, group_w, k_block, _CB_IN0, _CB_IN1, _CB_OUT],
+            compile_time_args=compute_ct,
             runtime_args=rt,
             config=ttnn.ComputeConfigDescriptor(
                 math_fidelity=math_fidelity,
@@ -176,6 +264,15 @@ class DramMatmul:
         ]
         out = outs[0]
         common = [self.weight.buffer_address(), x.buffer_address(), out.buffer_address(), outs[-1].buffer_address()]
+        writer_ct = self.writer_ct + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
+        writer_ct += list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
+        inputs = [x, self.weight]
+        if self.norm is not None:
+            g, c = self.norm.weight, self.norm.consts
+            common += [g.buffer_address(), c.buffer_address()] + self.noc_xy[:2] + self.noc_xy
+            writer_ct += list(ttnn.TensorAccessorArgs(g).get_compile_time_args())
+            writer_ct += list(ttnn.TensorAccessorArgs(c).get_compile_time_args())
+            inputs += [g, c]
         reader = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_KERNEL_DIR, "reader_dram_mm.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -186,16 +283,16 @@ class DramMatmul:
             config=ttnn.ReaderConfigDescriptor(),
         )
         writer = ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_KERNEL_DIR, "writer_dram_mm.cpp"),
+            kernel_source=os.path.join(_KERNEL_DIR, self.writer_src),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=self.cores,
-            compile_time_args=self.writer_ct
-            + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
-            + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            compile_time_args=writer_ct,
             runtime_args=self.rt,
             common_runtime_args=common,
             config=ttnn.WriterConfigDescriptor(),
         )
-        program = ttnn.ProgramDescriptor(kernels=[reader, writer, self.compute], semaphores=[], cbs=self.cbs)
-        ttnn.generic_op([x, self.weight, *outs], program)
+        program = ttnn.ProgramDescriptor(
+            kernels=[reader, writer, self.compute], semaphores=self.semaphores, cbs=self.cbs
+        )
+        ttnn.generic_op([*inputs, *outs], program)
         return outs[0] if len(outs) == 1 else tuple(outs)

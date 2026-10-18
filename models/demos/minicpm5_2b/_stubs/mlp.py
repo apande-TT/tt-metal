@@ -15,6 +15,9 @@ from models.demos.minicpm5_2b._stubs.dram_mm import DramMatmul
 
 # Decode projections on the DRAM-bank-local generic_op (same arithmetic as the 1-D multicast matmul).
 _USE_DRAM_MM = True
+# ... with the post-attention RMSNorm fused into the gate/up program (bind_prenorm): its latency hides under the
+# weight stream.
+_USE_DRAM_MM_NORM = True
 
 
 def _compute_cfg(device):
@@ -88,9 +91,26 @@ class TtMlp:
             gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=memory_config or self.mem
         )
 
-    def __call__(self, x, *args, **kwargs):
+    def bind_prenorm(self, norm):
+        """Fuse `norm` (the post-attention RMSNorm) into the decode gate/up program."""
+        self.dmm_gu_norm = None
+        if _USE_DRAM_MM_NORM and self.dram_mm and self.dram_mm[0].ok and hasattr(norm, "consts"):
+            gu = self.dram_mm[0]
+            dmm = DramMatmul(self.device, None, ttnn.MathFidelity.HiFi2, split_n=gu.split_n, norm=norm, prebuilt=gu)
+            self.dmm_gu_norm = dmm if dmm.ok else None
+        return self.dmm_gu_norm is not None
+
+    def __call__(self, x, *args, prenorm=None, **kwargs):
+        """prenorm: the RMSNorm still to be applied to x (inside the decode gate/up program when bound)."""
         if not isinstance(x, ttnn.Tensor):
             x = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+        fused_norm = None
+        if prenorm is not None:
+            dmm = getattr(self, "dmm_gu_norm", None)
+            if dmm is not None and dmm.norm is prenorm and dmm.accepts(x) and prenorm._kernel_ok(x):
+                fused_norm = dmm
+            else:
+                x = prenorm(x, memory_config=ttnn.L1_MEMORY_CONFIG)
         in_shape = tuple(x.shape)
         if len(in_shape) != 4:
             # Fold every leading dim (batch included) into the matmul's M rows.
@@ -131,7 +151,10 @@ class TtMlp:
             cfg_up, cfg_down = (self.cfg_up, self.cfg_down) if one_row else (None, None)
             mid = ttnn.L1_MEMORY_CONFIG if one_row else self.mem  # decode intermediates fit in L1
             dmm = self.dram_mm if one_row and self.dram_mm and all(m.ok for m in self.dram_mm) else None
-            if dmm and dmm[0].accepts(x):
+            if fused_norm is not None and one_row:
+                # Post-attention RMSNorm + gate/up in one program, run through the norm's own call.
+                gate, up = prenorm(x, memory_config=mid, fused=fused_norm)
+            elif dmm and dmm[0].accepts(x):
                 gate, up = dmm[0](x, mid)
             else:
                 gate = ttnn.linear(

@@ -236,7 +236,11 @@ class TtRMSNorm:
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
         return ttnn.generic_op([x, self.weight, self.consts, out], program)
 
-    def __call__(self, x, *args, memory_config=None, **kwargs):
+    def __call__(self, x, *args, memory_config=None, fused=None, **kwargs):
+        """fused: a program computing this norm together with the op that consumes it (e.g. a dram_mm.DramMatmul
+        bound to this norm); its result is returned instead of the normalized x."""
+        if fused is not None:
+            return fused(x, memory_config or ttnn.DRAM_MEMORY_CONFIG)
         if not isinstance(x, ttnn.Tensor):
             x = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
         if self._kernel_ok(x):

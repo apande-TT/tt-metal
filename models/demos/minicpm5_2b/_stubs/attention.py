@@ -51,6 +51,11 @@ _ATTN_BMM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel
 _USE_FUSED_DECODE_ATTN = True
 # Decode QKV / o_proj on the DRAM-bank-local generic_op (_stubs/dram_mm.py).
 _USE_DRAM_MM = True
+# ... with the layer's input RMSNorm fused into the QKV program (bind_prenorm). Off: QKV is stream-bound at ~26 us
+# on 16 or 40 cores and does not hide the norm (16 cores: 39.7 us; 40 cores: 38.3 us, its all-gather of the
+# normalized row to 40 cores alone takes ~18 us; vs 11.7 + 25.7 us unfused).
+_USE_DRAM_MM_NORM = False
+_QKV_DMM = dict()
 _ATTN_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_fused")
 
 
@@ -154,9 +159,10 @@ class TtAttention:
         self.dmm_qkv = self.dmm_o = None
         if _USE_DRAM_MM:
             fid = ttnn.MathFidelity.HiFi4  # as self.compute_cfg
-            self.dmm_qkv = DramMatmul(device, torch.cat(grouped + [wv]).t().contiguous(), fid)
+            self.dmm_qkv = DramMatmul(device, torch.cat(grouped + [wv]).t().contiguous(), fid, **_QKV_DMM)
             wo_t = torch_module.o_proj.weight.detach().to(torch.float32).t().contiguous()
             self.dmm_o = DramMatmul(device, wo_t, fid)
+        self.dmm_qkv_norm = None  # bind_prenorm: the input norm fused into the QKV program
         self.rot = ttnn.from_torch(
             _rotate_half_matrix(self.head_dim), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
@@ -301,7 +307,10 @@ class TtAttention:
             # One fused-QKV projection for the B decode rows, sliced into q / k / v. Every decode intermediate
             # is a few hundred tiles, so it lives in L1 instead of DRAM.
             l1 = ttnn.L1_MEMORY_CONFIG
-            if self.dmm_qkv is not None and self.dmm_qkv.accepts(x):
+            if self._fused_prenorm:
+                # Input RMSNorm + QKV in one program, run through the norm's own call.
+                qkv = self._prenorm(x, memory_config=l1, fused=self.dmm_qkv_norm)
+            elif self.dmm_qkv is not None and self.dmm_qkv.accepts(x):
                 qkv = self.dmm_qkv(x, l1)
             else:
                 qkv = ttnn.linear(
@@ -626,6 +635,13 @@ class TtAttention:
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
         io = [x, cache] + ([mask_full] if fuse else []) + ([cur_pos, self.zero_tile] if skip else [])
         return ttnn.generic_op(io + [out], program)
+
+    def bind_prenorm(self, norm):
+        """Fuse `norm` (the layer's input RMSNorm, HiFi4 like the QKV projection) into the decode QKV program."""
+        if _USE_DRAM_MM_NORM and self.dmm_qkv is not None and self.dmm_qkv.ok and hasattr(norm, "consts"):
+            dmm = DramMatmul(self.device, None, ttnn.MathFidelity.HiFi4, norm=norm, prebuilt=self.dmm_qkv, **_QKV_DMM)
+            self.dmm_qkv_norm = dmm if dmm.ok else None
+        return self.dmm_qkv_norm is not None
 
     def _decode_o_proj(self, attn, l1):
         if self.dmm_o is not None and self.dmm_o.accepts(attn):
@@ -1032,9 +1048,25 @@ class TtAttention:
         return self._to_tt(keys), self._to_tt(values), keys.shape[2]
 
     def __call__(
-        self, hidden_states, position_embeddings=None, past_key_values=None, kv_cache=None, attn_ctx=None, **kwargs
+        self,
+        hidden_states,
+        position_embeddings=None,
+        past_key_values=None,
+        kv_cache=None,
+        attn_ctx=None,
+        prenorm=None,
+        **kwargs,
     ):
+        """prenorm: the input norm, still to be applied to hidden_states (in the QKV program when bound)."""
         x = hidden_states
+        self._fused_prenorm = False
+        self._prenorm = prenorm
+        if prenorm is not None:
+            decode = kv_cache is not None and attn_ctx.mode == "decode"
+            if decode and self.dmm_qkv_norm is not None and self.dmm_qkv_norm.norm is prenorm:
+                self._fused_prenorm = self.dmm_qkv_norm.accepts(x) and prenorm._kernel_ok(x)
+            if not self._fused_prenorm:
+                x = prenorm(x, memory_config=ttnn.L1_MEMORY_CONFIG)
         if len(x.shape) == 4:
             x = ttnn.reshape(x, (x.shape[0] * x.shape[1], x.shape[-2], x.shape[-1]))
         b, seq = x.shape[0], x.shape[-2]
