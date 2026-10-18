@@ -131,6 +131,9 @@ PLANNED_TP = 4
 #                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
 #                     Fused gate/up computes at HiFi2 (fp32 accumulation), 8 x 8 x 12-tile blocks; the text
 #                     decoder's fused gate/up weight is bfloat8_b (the vision MLPs keep bf16).
+#   ministral3_model decode embedding: ONE program (tt/embed_decode.py) gathers each core's column slice of the token
+#                     rows, tilizes them to fp32 and writes the first layer's width-sharded residual directly (no
+#                     one-core tiled ttnn.embedding, typecast or reshard).
 #   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk);
 #                     lm_head weight in bfloat8_b (half the largest decode-step DRAM read). Decode skips the
 #                     full-row logits all_gather (the sampler reads the shards; VocabShards joins them on host reads).
@@ -168,7 +171,7 @@ PLANNED_TP = 4
 #                     (64-row cos / sin tables, q's rows then k's) and K / V are ONE paged_fused_update_cache. Those
 #                     tables are gathered each step by ONE program (tt/rope_gather.py) from cos / sin tables of every
 #                     position below the KV capacity, built once by the same device ops (no per-step cos / sin math,
-#                     concat or reshard). Decode QKV
+#                     concat or reshard; the fp32 position column is then no longer advanced). Decode QKV
 #                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v]; decode
 #                     QKV and o_proj read block-float8 copies (prefill keeps bf16). Decode o_proj runs a hand-written
 #                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
@@ -1029,7 +1032,8 @@ class DevstralPipeline:
         # all_gather; host readers join the shards on the vocab dim (VocabShards / host_read).
         logits = self.lm_head(hidden, gather=False)
         ttnn.plus_one(state["cur_pos"])
-        ttnn.add(state["pos"], 1.0, output_tensor=state["pos"])
+        if getattr(self.language_model, "_rope_gather", None) is None:  # the gathered RoPE rows index by cur_pos
+            ttnn.add(state["pos"], 1.0, output_tensor=state["pos"])
         state["drawn"] = self.sample(logits, state)
         state["logits"] = VocabShards(logits) if self._tp() > 1 else logits
         state["position"] = state["position"] + 1
