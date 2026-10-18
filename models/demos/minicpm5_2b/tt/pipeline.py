@@ -181,6 +181,8 @@ class MiniCPM5Pipeline:
         self.prefill_mask = self._tt(causal, ttnn.bfloat16)
         self.prefill_pos = self._tt(torch.arange(Sp, dtype=torch.float32).repeat(B, 1), ttnn.float32)
         self.key_index_row = self._tt(torch.arange(C, dtype=torch.float32).reshape(1, 1, 1, C), ttnn.float32)
+        # The key index broadcast over a tile's 32 rows: the decode key mask is built at its [B, 1, 32, C] size.
+        self.key_index_full = self._tt(torch.arange(C, dtype=torch.float32).repeat(1, 1, 32, 1), ttnn.float32)
         kv = self.n_kv_heads
         self.key_index_kv = self._tt(torch.arange(C, dtype=torch.float32).repeat(1, kv, 1, 1), ttnn.float32)
         # rotate_half's sign over head_dim (-1 on the first half), folded into sin for the decode rope kernel.
@@ -477,9 +479,19 @@ class MiniCPM5Pipeline:
         write = None
         if not attention_stub._USE_KV_WRITE_KERNEL:
             write = ttnn.typecast(ttnn.eq(self.key_index_kv, pos), ttnn.bfloat16)  # [B, kv, 1, C]
-        mask = ttnn.typecast(ttnn.multiply(ttnn.gt(self.key_index_row, pos), _NEG), ttnn.bfloat16)  # [B, 1, 1, C]
+        if rows:
+            # The fused attention reads only the row-broadcast mask: the same gt / * NEG / typecast per element at
+            # [B, 1, 32, C] directly, instead of [B, 1, 1, C] untilized, repeated and re-tilized.
+            mask = None
+        else:
+            mask = ttnn.typecast(ttnn.multiply(ttnn.gt(self.key_index_row, pos), _NEG), ttnn.bfloat16)  # [B, 1, 1, C]
         l1 = ttnn.L1_MEMORY_CONFIG
-        mask_full = ttnn.repeat(mask, ttnn.Shape([1, 1, 32, 1]), memory_config=l1)
+        if rows:
+            mask_full = ttnn.typecast(
+                ttnn.multiply(ttnn.gt(self.key_index_full, pos), _NEG), ttnn.bfloat16, memory_config=l1
+            )
+        else:
+            mask_full = ttnn.repeat(mask, ttnn.Shape([1, 1, 32, 1]), memory_config=l1)
         if rows:
             cos_rows = ttnn.to_memory_config(cos_sin[0], l1)
             sin_rows = ttnn.multiply(cos_sin[1], self.rot_sign, memory_config=l1)  # rotate_half's sign folded in
