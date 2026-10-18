@@ -55,8 +55,15 @@ def bank_major_page0(stream: int, kt: int, nb: int, nc: int, rb: int) -> int:
 
 class FusedGateUpDecode:
     NC = 4  # output columns a compute core (gate and up each): 2 * NC tiles fill the full-sync fp32 DEST
-    RB = 8  # K rows a weight push
+    RB = 8  # K rows a weight push (bf16)
+    # K rows a push by weight dtype: ~9 KB pushes (8 block-float8 / 16 block-float4 tiles), many in flight per CB,
+    # stream faster than few large ones (bf8 gate / up, measured: 35 KB pushes 225 us, 17 KB 220 us, 9 KB 218 us)
+    RB_BY_DTYPE = {ttnn.bfloat8_b: 2, ttnn.bfloat4_b: 4}
     CB_BYTES = 112 * 1024  # per weight CB (DEPTH = pushes that fit)
+
+    @classmethod
+    def rb_for(cls, dtype) -> int:
+        return cls.RB_BY_DTYPE.get(dtype, cls.RB)
 
     @classmethod
     def supports(cls, device, k, n, dtype) -> bool:
@@ -70,21 +77,20 @@ class FusedGateUpDecode:
             and nt % cls.NC == 0
             and n_cores < g.x * g.y  # and a spare core for the sender
             and n_cores % device.dram_grid_size().x == 0
-            and kt % cls.RB == 0
+            and kt % cls.rb_for(dtype) == 0
         )
-
-    @classmethod
-    def bank_major(cls, w: torch.Tensor, nb: int) -> torch.Tensor:
-        return bank_major(w, nb, cls.NC, cls.RB)
 
     def __init__(self, device, w_gate, w_up, dtype, math_fidelity, put, tp=1):
         """w_gate, w_up: [K, tp * N] torch weights (device d multiplies columns d * N .. (d + 1) * N); put(t, dtype)
         uploads a torch tensor sharded over the mesh on its last dim."""
         self.device = device
+        self.RB = self.rb_for(dtype)
         k, n = int(w_gate.shape[0]), int(w_gate.shape[1]) // tp
         self.kt, self.nt = k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
         self.nb = nb = device.dram_grid_size().x
-        bm = lambda w: torch.cat([self.bank_major(w[:, d * n : (d + 1) * n], nb) for d in range(tp)], dim=-1)
+        bm = lambda w: torch.cat(
+            [bank_major(w[:, d * n : (d + 1) * n], nb, self.NC, self.RB) for d in range(tp)], dim=-1
+        )
         self.wg, self.wu = put(bm(w_gate), dtype), put(bm(w_up), dtype)
         n_cores = self.nt // self.NC
         g = device.compute_with_storage_grid_size()

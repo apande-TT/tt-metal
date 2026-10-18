@@ -21,9 +21,16 @@ _KDIR = Path(__file__).resolve().parent / "kernels"
 
 class StreamDownDecode:
     NC = 2  # output columns a compute core (one a data-movement RISC)
-    RB = 16  # K rows a weight push
+    RB = 16  # K rows a weight push (bf16)
+    # K rows a push by weight dtype: ~9 KB pushes (8 block-float8 / 16 block-float4 tiles) stream fastest (bf8 down,
+    # measured: 35 KB pushes 120 us, 17 KB 117 us, 9 KB 110.5 us, 4 KB 111 us)
+    RB_BY_DTYPE = {ttnn.bfloat8_b: 8, ttnn.bfloat4_b: 16}
     CB_BYTES = 112 * 1024  # per weight CB (DEPTH = pushes that fit)
     GRID_X = 8  # compute cores: an 8-wide rectangle (as the 1D down's 8 x 10)
+
+    @classmethod
+    def rb_for(cls, dtype) -> int:
+        return cls.RB_BY_DTYPE.get(dtype, cls.RB)
 
     @classmethod
     def supports(cls, device, k, n, dtype) -> bool:
@@ -39,7 +46,7 @@ class StreamDownDecode:
             and cls.GRID_X < g.x
             and n_cores // cls.GRID_X <= g.y
             and nt % device.dram_grid_size().x == 0
-            and kt % cls.RB == 0
+            and kt % cls.rb_for(dtype) == 0
         )
 
     def __init__(self, device, w_down, dtype, math_fidelity, put, tp=1):
@@ -48,6 +55,7 @@ class StreamDownDecode:
         import torch
 
         self.device = device
+        self.RB = self.rb_for(dtype)
         k, n = int(w_down.shape[0]) // tp, int(w_down.shape[1])
         self.kt, self.nt = k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
         self.nb = nb = device.dram_grid_size().x
