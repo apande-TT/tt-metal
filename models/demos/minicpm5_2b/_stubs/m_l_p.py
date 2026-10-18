@@ -12,6 +12,7 @@ import torch
 import ttnn
 from models.demos.minicpm5_2b._stubs.decode_mm import decode_linear_config
 from models.demos.minicpm5_2b._stubs.dram_mm import DramMatmul
+from models.demos.minicpm5_2b._stubs.mm_swiglu import interleave_gate_up, mm_swiglu, mm_swiglu_supported
 
 # Decode projections on the DRAM-bank-local generic_op (same arithmetic as the 1-D multicast matmul).
 _USE_DRAM_MM = True
@@ -21,6 +22,9 @@ _USE_DRAM_MM_NORM = True
 _NORM_AS_PROLOGUE = True
 # silu(gate) * up as a prologue of the down + residual program (helper cores; DramMatmul silu_prologue).
 _USE_SILU_PROLOGUE = True
+# Prefill gate/up + silu * up as one program (kernels/mm_swiglu: minimal_matmul over the tile-pair interleaved
+# [W_gate | W_up] with a SwiGLU epilogue bit-identical to the two minimal_matmuls + ttnn.multiply).
+_PREFILL_MM_SWIGLU = True
 
 
 def _compute_cfg(device):
@@ -51,6 +55,21 @@ class TtMLP:
         self.w_gate = _w(torch_module.gate_proj)
         self.w_up = _w(torch_module.up_proj)
         self.w_down = _w(torch_module.down_proj)
+        # Prefill only: [W_gate | W_up] tile-pair interleaved along N (tile 2p = gate tile p, 2p+1 = up tile p) for
+        # mm_swiglu. The same fp32 values as w_gate / w_up, permuted by whole tiles, so the bf16 tiles are identical.
+        self.w_gu_il = None
+        if _PREFILL_MM_SWIGLU:
+            w_il = interleave_gate_up(
+                torch_module.gate_proj.weight.detach().to(torch.float32).t().contiguous(),
+                torch_module.up_proj.weight.detach().to(torch.float32).t().contiguous(),
+            )
+            self.w_gu_il = ttnn.from_torch(
+                w_il.contiguous().unsqueeze(0).unsqueeze(0),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
         h, f = self.w_gate.shape[-2], self.w_gate.shape[-1]
         self.cfg_up = decode_linear_config(device, h, f)
         self.cfg_down = decode_linear_config(device, f, h, per_core_n=2)  # 64 tiles on 32 cores
@@ -137,13 +156,26 @@ class TtMLP:
                 rows *= d
             x = ttnn.reshape(x, (1, 1, rows, in_shape[-1]))
         if x.shape[-2] > 32 and x.shape[0] == x.shape[1] == 1:
-            gate = self._mm(x, self.w_gate)
-            up = self._mm(x, self.w_up)
-            if x.memory_config().buffer_type == ttnn.BufferType.L1:
-                ttnn.deallocate(x)  # an L1 norm output: free it so the down output can take its place in L1
-            h = self._silu_mul(gate, up)
-            ttnn.deallocate(gate)
-            ttnn.deallocate(up)
+            grid = self.device.compute_with_storage_grid_size()
+            if (
+                _PREFILL_MM_SWIGLU
+                and self.w_gu_il is not None
+                and mm_swiglu_supported(x, self.w_gu_il, grid)
+            ):
+                # silu(x @ W_gate) * (x @ W_up) in one program (bit-identical to the path below).
+                h = mm_swiglu(
+                    self.device, x, self.w_gu_il, compute_fidelity=ttnn.MathFidelity.HiFi2, memory_config=self.mem
+                )
+                if x.memory_config().buffer_type == ttnn.BufferType.L1:
+                    ttnn.deallocate(x)  # an L1 norm output: free it so the down output can take its place in L1
+            else:
+                gate = self._mm(x, self.w_gate)
+                up = self._mm(x, self.w_up)
+                if x.memory_config().buffer_type == ttnn.BufferType.L1:
+                    ttnn.deallocate(x)  # an L1 norm output: free it so the down output can take its place in L1
+                h = self._silu_mul(gate, up)
+                ttnn.deallocate(gate)
+                ttnn.deallocate(up)
             # ttnn.linear's 2-D multicast over the full grid with 8-tile K blocks (24 K steps). Output in L1 for the
             # residual add.
             grid = self.device.compute_with_storage_grid_size()
