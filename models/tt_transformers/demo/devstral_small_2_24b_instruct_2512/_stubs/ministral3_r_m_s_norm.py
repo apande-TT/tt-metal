@@ -42,10 +42,15 @@ class TtMinistral3RMSNorm:
     # Decode: the (1, 1, B, D) row is one tile row, which the interleaved norm runs on a single core. It is
     # width-sharded over this many cores instead (D / cores columns each) and normed there.
     DECODE_CORES = (8, 5)
+    # Decode with a separate gamma (the final norm): gamma is multiplied in as a full 32-row tile row (the same value
+    # down each column, so the same products) straight from the norm's width shards into the DRAM row the LM head
+    # reads -- no row broadcast, no fp32 unshard through DRAM first.
+    DECODE_GAMMA_ROWS = True
 
-    def __init__(self, canonical_instance, gamma=None) -> None:
+    def __init__(self, canonical_instance, gamma=None, gamma_rows=None) -> None:
         self._impl = canonical_instance
         self.gamma = gamma
+        self.gamma_rows = gamma_rows
         self._decode_cfgs = {}
 
     @classmethod
@@ -83,7 +88,17 @@ class TtMinistral3RMSNorm:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
-        return cls(canonical, gamma if cls.SEPARATE_GAMMA and not fold_gamma else None)
+        separate = cls.SEPARATE_GAMMA and not fold_gamma
+        gamma_rows = None
+        if separate and cls.DECODE_GAMMA_ROWS:
+            gamma_rows = ttnn.from_torch(
+                weight.reshape(1, 1, 1, -1).expand(1, 1, ttnn.TILE_SIZE, -1).contiguous(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None,
+            )
+        return cls(canonical, gamma if separate else None, gamma_rows)
 
     def _decode_cfg(self, d):
         if d not in self._decode_cfgs:
@@ -134,6 +149,8 @@ class TtMinistral3RMSNorm:
                 return n
             out_mem = ttnn.L1_MEMORY_CONFIG if l1 else ttnn.DRAM_MEMORY_CONFIG
             return ttnn.to_memory_config(n, out_mem, dtype=ttnn.bfloat16)  # unshard + cast, one op
+        if self.gamma_rows is not None and int(x.shape[-2]) == ttnn.TILE_SIZE:
+            return ttnn.multiply(n, self.gamma_rows, dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         n = ttnn.to_memory_config(n, ttnn.DRAM_MEMORY_CONFIG)
         return ttnn.multiply(n, self.gamma, dtype=ttnn.bfloat16)
 
