@@ -170,7 +170,8 @@ PLANNED_TP = 4
 #                     on its own cores (overlap_qk_coregrid=False), so q / k RoPE is ONE rotary_embedding_llama_fused_qk
 #                     (64-row cos / sin tables, q's rows then k's) and K / V are ONE paged_fused_update_cache. Those
 #                     tables are gathered each step by ONE program (tt/rope_gather.py) from cos / sin tables of every
-#                     position below the KV capacity, built once by the same device ops (no per-step cos / sin math,
+#                     position below the KV capacity, built once by the same device ops on one dense position column
+#                     (32 positions a tile; ~0.1 ms at load instead of 2.65 ms) (no per-step cos / sin math,
 #                     concat or reshard; the fp32 position column is then no longer advanced). Decode QKV
 #                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v]; decode
 #                     QKV and o_proj read block-float8 copies (prefill keeps bf16). Decode o_proj runs a hand-written
