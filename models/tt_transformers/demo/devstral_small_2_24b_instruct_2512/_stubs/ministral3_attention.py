@@ -94,6 +94,8 @@ class TtMinistral3Attention:
     # a bank-major copy streamed one column per data-movement RISC, ~9 KB pushes, fp32 DEST over all K), its bf16
     # partials left in L1 for the reduce-scatter.
     DECODE_OPROJ_STREAM = True
+    # K rows a push of that o_proj stream (its K is only 32 tiles: 8 pushes a column)
+    DECODE_OPROJ_PUSH_ROWS = 4
     # False: prefill returns o_proj's reduce-scattered 1/TP hidden shard (the decoder keeps a hidden-sharded
     # residual in prefill and gathers only the normed activation).
     prefill_gather = True
@@ -253,7 +255,9 @@ class TtMinistral3Attention:
             w_o = torch_module.o_proj.weight.T  # (Hq * hd, D): device d multiplies the rows of its own heads
             if StreamDownDecode.supports(device, int(w_o.shape[0]) // tp, int(w_o.shape[1]), DECODE_WEIGHT_DTYPE):
                 put = lambda t, dtype: _put(t, shard(-2), dtype=dtype)
-                self.stream_o = StreamDownDecode(device, w_o, DECODE_WEIGHT_DTYPE, ttnn.MathFidelity.HiFi4, put, tp)
+                self.stream_o = StreamDownDecode(
+                    device, w_o, DECODE_WEIGHT_DTYPE, ttnn.MathFidelity.HiFi4, put, tp, rb=self.DECODE_OPROJ_PUSH_ROWS
+                )
         self.wo_decode = None
         if self.stream_o is None:
             self.wo_decode = _put(torch_module.o_proj.weight.T, shard(-2), dtype=DECODE_WEIGHT_DTYPE)
