@@ -165,7 +165,10 @@ PLANNED_TP = 4
 #                     tile's rows out of SDPA's L1-interleaved tiles; no reshard, nlp_concat_heads_decode, unshard).
 #                     nlp_create_qkv_heads_decode reads the decode QKV's width shards in place (no unshard) and puts k
 #                     on its own cores (overlap_qk_coregrid=False), so q / k RoPE is ONE rotary_embedding_llama_fused_qk
-#                     (64-row cos / sin tables, q's rows then k's) and K / V are ONE paged_fused_update_cache. Decode QKV
+#                     (64-row cos / sin tables, q's rows then k's) and K / V are ONE paged_fused_update_cache. Those
+#                     tables are gathered each step by ONE program (tt/rope_gather.py) from cos / sin tables of every
+#                     position below the KV capacity, built once by the same device ops (no per-step cos / sin math,
+#                     concat or reshard). Decode QKV
 #                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v]; decode
 #                     QKV and o_proj read block-float8 copies (prefill keeps bf16). Decode o_proj runs a hand-written
 #                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
@@ -769,6 +772,10 @@ class DevstralPipeline:
             )
             for _ in self.language_model.layers
         ]
+        # decode RoPE rows come from tables of every position below the KV capacity (built here, once)
+        prepare_rope = getattr(self.language_model, "prepare_decode_rope", None)
+        if prepare_rope is not None:
+            prepare_rope(self.kv_capacity, self.batch)
         self._stage = {}
         self._decode_repeats = None
         # TP > 1: each device top-k's its own lm_head vocab shard (VocabTopK, shard positions); the gathered
