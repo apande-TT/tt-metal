@@ -32,7 +32,8 @@ _WORKERS_PER_BANK = 2  # cores streaming disjoint contiguous parts of one bank (
 _NORM_CB_BLOCKS = 10  # with a fused norm: weight CB the stream can run ahead into (20 measured slower)
 _CB_XIN, _CB_SCALER, _CB_EPS, _CB_GAMMA, _CB_NORMOUT = 2, 3, 4, 5, 17
 _CB_X2, _CB_EX2, _CB_EX2PE, _CB_FUSION, _CB_X2ALL, _CB_EX2PE_SEND = 24, 25, 26, 27, 28, 29
-_SEM_GATHER, _SEM_BCAST, _SEM_ALL, _SEM_START = 0, 1, 2, 3
+_SEM_GATHER, _SEM_BCAST, _SEM_ALL, _SEM_START, _SEM_EP = 0, 1, 2, 3, 4
+_CB_EP_LHS, _CB_EP_RHS, _CB_EP_OUT = 0, 1, 16  # on the epilogue helper cores only
 _NO_SEM = 0xFFFFFFFF
 
 
@@ -61,13 +62,16 @@ class DramMatmul:
         cb_blocks=None,
         prebuilt=None,
         group_w=None,
+        residual_add=False,
     ):
         """split_n: write output columns [0, split_n) and [split_n, N) as two tensors (two projections sharing
         one activation row run as one program). norm: an r_m_s_norm.TtRMSNorm applied to x inside the program
         (its shared-statistic kernel's arithmetic, then an all-gather of the normalized row) -- only for a norm and
         projection of the same math fidelity. cb_blocks: weight CB depth in reader blocks. prebuilt: a DramMatmul
         of the same weight (and group_w) whose device copy is reused (w is then ignored). group_w: output tiles per
-        DEST accumulation (default the largest of 4, 2, 1 dividing a bank's columns)."""
+        DEST accumulation (default the largest of 4, 2, 1 dividing a bank's columns). residual_add: the program also
+        returns residual + projection (ttnn.add's arithmetic, on helper cores that take each output tile as soon as
+        its writer has stored it); __call__ then needs residual= and returns the sum."""
         self.device = device
         self.norm = norm
         if prebuilt is not None:
@@ -157,6 +161,20 @@ class DramMatmul:
                 g0 += ng
         self.rt = rt
         self.semaphores = []
+        self.residual_add = residual_add and self.split_n == self.n
+        self.ep = None
+        if self.residual_add:
+            free = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x) if (x, y) not in used]
+            ep_tpc = -(-n_t // len(free))
+            helpers = free[: -(-n_t // ep_tpc)]
+            ep_rt = ttnn.RuntimeArgs()
+            ep_xy = []
+            for i, c in enumerate(helpers):
+                ep_rt[c.x][c.y] = [i * ep_tpc, min(ep_tpc, n_t - i * ep_tpc)]
+                p = device.worker_core_from_logical_core(c)
+                ep_xy += [p.x, p.y]
+            ep_cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in helpers])
+            self.ep = dict(tpc=ep_tpc, cores=ep_cores, rt=ep_rt, xy=ep_xy)
         if norm is not None:
             n_cores = len(all_cores)
             self.ok = norm.consts is not None
@@ -197,6 +215,7 @@ class DramMatmul:
         if norm is None:
             self.writer_src = "writer_dram_mm.cpp"
             self.writer_ct = [k_t, group_w, _IN0_CHUNK, _CB_IN0, _CB_OUT, self.split_n // _TILE]
+            ep_off = 4
             compute_src = "compute_dram_mm.cpp"
             compute_ct = [k_t, group_w, k_block, _CB_IN0, _CB_IN1, _CB_OUT]
         else:
@@ -225,12 +244,38 @@ class DramMatmul:
             self.writer_ct = [k_t, group_w, _CB_IN0, _CB_OUT, self.split_n // _TILE, tpc]
             self.writer_ct += [_CB_XIN, _CB_SCALER, _CB_EPS, _CB_GAMMA, _CB_X2, _CB_X2ALL, _CB_EX2PE, _CB_EX2PE_SEND]
             self.writer_ct += [_CB_NORMOUT, _SEM_GATHER, _SEM_BCAST, _SEM_ALL, n_cores, n_norm, _SEM_START]
+            ep_off = 8 + 2 * n_cores
             inv_w_bits = struct.unpack("<I", struct.pack("<f", 1.0 / self.k))[0]
             compute_src = "compute_dram_mm_norm.cpp"
             compute_ct = [k_t, group_w, k_block, _CB_IN0, _CB_IN1, _CB_OUT, inv_w_bits, tpc]
             compute_ct += [_CB_XIN, _CB_SCALER, _CB_EPS, _CB_GAMMA, _CB_X2, _CB_EX2, _CB_EX2PE, _CB_FUSION]
             compute_ct += [_CB_X2ALL, _CB_EX2PE_SEND, _CB_NORMOUT, math_fidelity.value]
             math_fidelity = ttnn.MathFidelity.HiFi4  # the norm's (as r_m_s_norm's kernel); the matmul keeps its own
+        self.writer_ct += [1, _SEM_EP, self.ep["tpc"], ep_off] if self.ep else [0, 0, 1, 0]
+        if self.ep:
+            everywhere = cores.merge(self.ep["cores"])
+            self.semaphores.append(ttnn.SemaphoreDescriptor(id=_SEM_EP, core_ranges=everywhere, initial_value=0))
+            self.cbs += [
+                ttnn.CBDescriptor(
+                    total_size=self.ep["tpc"] * _TILE_BYTES,
+                    core_ranges=self.ep["cores"],
+                    format_descriptors=[ttnn.CBFormatDescriptor(idx, ttnn.bfloat16, _TILE_BYTES)],
+                )
+                for idx in (_CB_EP_LHS, _CB_EP_RHS, _CB_EP_OUT)
+            ]
+            self.ep["compute"] = ttnn.KernelDescriptor(
+                kernel_source=os.path.join(_KERNEL_DIR, "compute_ep_add.cpp"),
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=self.ep["cores"],
+                compile_time_args=[_CB_EP_LHS, _CB_EP_RHS, _CB_EP_OUT],
+                runtime_args=self.ep["rt"],
+                config=ttnn.ComputeConfigDescriptor(  # ttnn.add's (binary_ng) for bf16 operands
+                    math_fidelity=ttnn.MathFidelity.HiFi4,
+                    math_approx_mode=False,
+                    fp32_dest_acc_en=False,
+                    dst_full_sync_en=False,
+                ),
+            )
         self.compute = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_KERNEL_DIR, compute_src),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -254,7 +299,7 @@ class DramMatmul:
             rows *= d
         return ps[-1] == self.k and rows == _TILE and x.shape[-1] == self.k
 
-    def __call__(self, x, memory_config, out_shape=None):
+    def __call__(self, x, memory_config, out_shape=None, residual=None):
         """out_shape: the (single) output's shape when it is not [.., 32, N] but has the same tile pages in order."""
         widths = [self.split_n] + ([self.n - self.split_n] if self.split_n < self.n else [])
         shapes = [out_shape] if out_shape is not None else [list(x.shape)[:-1] + [n] for n in widths]
@@ -273,6 +318,39 @@ class DramMatmul:
             writer_ct += list(ttnn.TensorAccessorArgs(g).get_compile_time_args())
             writer_ct += list(ttnn.TensorAccessorArgs(c).get_compile_time_args())
             inputs += [g, c]
+        kernels = []
+        final = None
+        if self.ep is not None:
+            assert residual is not None and list(residual.padded_shape) == list(out.padded_shape)
+            final = ttnn.allocate_tensor_on_device(
+                ttnn.Shape(list(out.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
+            )
+            common += self.ep["xy"]
+            ep_common = [residual.buffer_address(), out.buffer_address(), final.buffer_address()]
+            kernels = [
+                ttnn.KernelDescriptor(
+                    kernel_source=os.path.join(_KERNEL_DIR, "reader_ep_add.cpp"),
+                    source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                    core_ranges=self.ep["cores"],
+                    compile_time_args=[_CB_EP_LHS, _CB_EP_RHS, _SEM_EP]
+                    + list(ttnn.TensorAccessorArgs(residual).get_compile_time_args())
+                    + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+                    runtime_args=self.ep["rt"],
+                    common_runtime_args=ep_common,
+                    config=ttnn.ReaderConfigDescriptor(),
+                ),
+                ttnn.KernelDescriptor(
+                    kernel_source=os.path.join(_KERNEL_DIR, "writer_ep_add.cpp"),
+                    source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                    core_ranges=self.ep["cores"],
+                    compile_time_args=[_CB_EP_OUT] + list(ttnn.TensorAccessorArgs(final).get_compile_time_args()),
+                    runtime_args=self.ep["rt"],
+                    common_runtime_args=ep_common,
+                    config=ttnn.WriterConfigDescriptor(),
+                ),
+                self.ep["compute"],
+            ]
+            inputs += [residual]
         reader = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_KERNEL_DIR, "reader_dram_mm.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -292,7 +370,11 @@ class DramMatmul:
             config=ttnn.WriterConfigDescriptor(),
         )
         program = ttnn.ProgramDescriptor(
-            kernels=[reader, writer, self.compute], semaphores=self.semaphores, cbs=self.cbs
+            kernels=[reader, writer, self.compute] + kernels, semaphores=self.semaphores, cbs=self.cbs
         )
+        if final is not None:
+            ttnn.generic_op([*inputs, out, final], program)
+            ttnn.deallocate(out)  # the projection alone, read only by the helpers
+            return final
         ttnn.generic_op([*inputs, *outs], program)
         return outs[0] if len(outs) == 1 else tuple(outs)

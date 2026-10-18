@@ -51,7 +51,7 @@ class TtMlp:
         h, f = self.w_gate.shape[-2], self.w_gate.shape[-1]
         self.cfg_up = decode_linear_config(device, h, f)
         self.cfg_down = decode_linear_config(device, f, h, per_core_n=2)  # 64 tiles on 32 cores
-        self.dram_mm = None
+        self.dram_mm = self.down_res = None
         if _USE_DRAM_MM:
 
             def _t(linear):
@@ -64,6 +64,9 @@ class TtMlp:
                 DramMatmul(device, w_gu, fid, split_n=f),
                 DramMatmul(device, _t(torch_module.down_proj), fid),
             )
+            # down + the layer's residual add in one program (ttnn.add's arithmetic on helper cores).
+            dmm = DramMatmul(device, None, fid, prebuilt=self.dram_mm[1], residual_add=True)
+            self.down_res = dmm if dmm.ok else None
 
     def _mm(self, x, w, k_block=None, memory_config=None):
         """Many-row (prefill) gate/up projection on minimal_matmul's small CBs, which span the full grid under fp32
@@ -100,8 +103,11 @@ class TtMlp:
             self.dmm_gu_norm = dmm if dmm.ok else None
         return self.dmm_gu_norm is not None
 
-    def __call__(self, x, *args, prenorm=None, **kwargs):
-        """prenorm: the RMSNorm still to be applied to x (inside the decode gate/up program when bound)."""
+    def __call__(self, x, *args, prenorm=None, residual=None, **kwargs):
+        """prenorm: the RMSNorm still to be applied to x (inside the decode gate/up program when bound).
+        residual: the layer's residual stream; when the decode down program adds it itself it returns
+        residual + MLP and sets last_residual_added."""
+        self.last_residual_added = False
         if not isinstance(x, ttnn.Tensor):
             x = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
         fused_norm = None
@@ -166,7 +172,19 @@ class TtMlp:
             h = self._silu_mul(gate, up, memory_config=mid)
             ttnn.deallocate(gate)
             ttnn.deallocate(up)
-            if dmm and dmm[1].accepts(h):
+            res = None
+            if residual is not None and self.down_res is not None and one_row:
+                res = ttnn.reshape(residual, tuple(h.shape)[:-1] + (residual.shape[-1],))
+            if (
+                res is not None
+                and self.down_res.accepts(h)
+                and list(res.padded_shape) == list(h.padded_shape)[:-1] + [res.padded_shape[-1]]
+                and res.dtype == ttnn.bfloat16
+                and not res.memory_config().is_sharded()
+            ):
+                out = self.down_res(h, mid, residual=res)
+                self.last_residual_added = True
+            elif dmm and dmm[1].accepts(h):
                 out = dmm[1](h, mid)
             else:
                 out = ttnn.linear(

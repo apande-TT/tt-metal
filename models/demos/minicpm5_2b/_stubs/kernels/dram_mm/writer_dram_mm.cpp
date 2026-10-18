@@ -17,7 +17,12 @@ void kernel_main() {
     constexpr uint32_t cb_in0 = get_compile_time_arg_val(3);
     constexpr uint32_t cb_out = get_compile_time_arg_val(4);
     constexpr uint32_t split_t = get_compile_time_arg_val(5);  // columns >= split_t go to the second output
-    constexpr auto x_args = TensorAccessorArgs<6>();
+    // Epilogue (residual add on helper cores): signal each stored output tile's helper (common args from ep_off).
+    constexpr uint32_t ep_on = get_compile_time_arg_val(6);
+    constexpr uint32_t ep_sem = get_compile_time_arg_val(7);
+    constexpr uint32_t ep_tpc = get_compile_time_arg_val(8);  // output tiles per helper core
+    constexpr uint32_t ep_off = get_compile_time_arg_val(9);
+    constexpr auto x_args = TensorAccessorArgs<10>();
     constexpr auto out_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
     constexpr uint32_t tile_bytes = 32 * 32 * 2;
 
@@ -51,8 +56,22 @@ void kernel_main() {
             src += tile_bytes;
         }
         noc_async_writes_flushed();
+        if constexpr (ep_on) {
+            // The tiles are stored: hand each to its epilogue core.
+            noc_async_write_barrier();
+            const uint32_t sem_l1 = get_semaphore(ep_sem);
+            for (uint32_t j = 0; j < group_w; ++j) {
+                const uint32_t h = (n + j) / ep_tpc;
+                const uint32_t hx = get_common_arg_val<uint32_t>(ep_off + 2 * h);
+                const uint32_t hy = get_common_arg_val<uint32_t>(ep_off + 2 * h + 1);
+                noc_semaphore_inc(get_noc_addr(hx, hy, sem_l1), 1);
+            }
+        }
         cb_pop_front(cb_out, group_w);
         n += group_w;
     }
     noc_async_write_barrier();
+    if constexpr (ep_on) {
+        noc_async_atomic_barrier();
+    }
 }

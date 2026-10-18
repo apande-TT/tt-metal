@@ -56,6 +56,8 @@ _USE_DRAM_MM = True
 # normalized row to 40 cores alone takes ~18 us; vs 11.7 + 25.7 us unfused).
 _USE_DRAM_MM_NORM = False
 _QKV_DMM = dict()
+# Decode o_proj with the layer's residual add on helper cores of the same program (DramMatmul residual_add).
+_USE_DRAM_MM_RES = True
 _ATTN_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_fused")
 
 
@@ -156,12 +158,16 @@ class TtAttention:
         self.cfg_qkv = decode_linear_config(device, self.wqkv.shape[-2], self.wqkv.shape[-1], per_core_n=2)  # 80 tiles on 40 cores
         self.cfg_o = decode_linear_config(device, self.wo.shape[-2], self.wo.shape[-1], per_core_n=2)  # 64 tiles on 32 cores
         # The same decode projections on the DRAM-bank-local generic_op (same arithmetic as the 1-D multicast).
-        self.dmm_qkv = self.dmm_o = None
+        self.dmm_qkv = self.dmm_o = self.dmm_o_res = None
         if _USE_DRAM_MM:
             fid = ttnn.MathFidelity.HiFi4  # as self.compute_cfg
             self.dmm_qkv = DramMatmul(device, torch.cat(grouped + [wv]).t().contiguous(), fid, **_QKV_DMM)
             wo_t = torch_module.o_proj.weight.detach().to(torch.float32).t().contiguous()
             self.dmm_o = DramMatmul(device, wo_t, fid)
+            # ... and o_proj + the layer's residual add in one program (ttnn.add's arithmetic on helper cores).
+            if _USE_DRAM_MM_RES and self.dmm_o.ok:
+                dmm = DramMatmul(device, None, fid, prebuilt=self.dmm_o, residual_add=True)
+                self.dmm_o_res = dmm if dmm.ok else None
         self.dmm_qkv_norm = None  # bind_prenorm: the input norm fused into the QKV program
         self.rot = ttnn.from_torch(
             _rotate_half_matrix(self.head_dim), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
@@ -644,6 +650,17 @@ class TtAttention:
         return self.dmm_qkv_norm is not None
 
     def _decode_o_proj(self, attn, l1):
+        r = self._residual
+        if (
+            r is not None
+            and self.dmm_o_res is not None
+            and self.dmm_o_res.accepts(attn)
+            and list(r.padded_shape) == list(attn.padded_shape)
+            and r.dtype == ttnn.bfloat16
+            and not r.memory_config().is_sharded()
+        ):
+            self._residual_added = True
+            return self.dmm_o_res(attn, l1, residual=r)
         if self.dmm_o is not None and self.dmm_o.accepts(attn):
             return self.dmm_o(attn, l1)
         return ttnn.linear(
@@ -1055,12 +1072,17 @@ class TtAttention:
         kv_cache=None,
         attn_ctx=None,
         prenorm=None,
+        residual=None,
         **kwargs,
     ):
-        """prenorm: the input norm, still to be applied to hidden_states (in the QKV program when bound)."""
+        """prenorm: the input norm, still to be applied to hidden_states (in the QKV program when bound).
+        residual: the layer's residual stream; when the decode o_proj program adds it itself, the second return
+        value is "residual_added" and the first is residual + attention."""
         x = hidden_states
         self._fused_prenorm = False
         self._prenorm = prenorm
+        self._residual = residual
+        self._residual_added = False
         if prenorm is not None:
             decode = kv_cache is not None and attn_ctx.mode == "decode"
             if decode and self.dmm_qkv_norm is not None and self.dmm_qkv_norm.norm is prenorm:
@@ -1079,7 +1101,8 @@ class TtAttention:
                 cos = sin = None
             else:
                 cos, sin = self._cos_sin(position_embeddings, b, seq)
-            return self._cached(x, cos, sin, kv_cache, attn_ctx, b, seq), None
+            out = self._cached(x, cos, sin, kv_cache, attn_ctx, b, seq)
+            return out, ("residual_added" if self._residual_added else None)
 
         q = ttnn.linear(x, self.wq, compute_kernel_config=self.compute_cfg)
         k = ttnn.linear(x, self.wk, compute_kernel_config=self.compute_cfg)

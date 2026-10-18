@@ -87,6 +87,9 @@ class TtDecoderLayer:
         self._attn_prenorm = bool(bind and bind(self.input_layernorm))
         bind = getattr(self.mlp, "bind_prenorm", None)
         self._mlp_prenorm = bool(bind and bind(self.post_attention_layernorm))
+        self._residual_fusion = (
+            getattr(self.self_attn, "dmm_o_res", None) is not None and getattr(self.mlp, "down_res", None) is not None
+        )
 
     def __call__(self, hidden_states, position_embeddings=None, past_key_values=None, **kwargs):
         x = hidden_states
@@ -100,33 +103,44 @@ class TtDecoderLayer:
         # fits beside minimal_matmul's static CBs).
         mem = ttnn.L1_MEMORY_CONFIG if x.shape[0] == 1 and x.padded_shape[-2] == 32 else ttnn.DRAM_MEMORY_CONFIG
         l1 = ttnn.L1_MEMORY_CONFIG
+        # The decode o_proj / down programs add the residual themselves when they can (residual=).
+        res_kw = dict(residual=x) if self._residual_fusion else {}
         if self._attn_prenorm:
             # The attention applies the input norm itself (inside its decode QKV program when it can).
-            attn_out, _ = self.self_attn(
+            attn_out, added = self.self_attn(
                 x,
                 position_embeddings=position_embeddings,
                 past_key_values=past_key_values,
                 prenorm=self.input_layernorm,
+                **res_kw,
                 **kwargs,
             )
         else:
-            attn_out, _ = self.self_attn(
+            attn_out, added = self.self_attn(
                 self.input_layernorm(x, memory_config=l1),
                 position_embeddings=position_embeddings,
                 past_key_values=past_key_values,
+                **res_kw,
                 **kwargs,
             )
         # The mid-layer residual lives in L1 in both stages: in prefill it sits beside at most one other 16 MB L1
         # tensor during the MLP's minimal_matmuls, which still clears their static CBs.
-        h = ttnn.add(x, attn_out, memory_config=l1)
-        ttnn.deallocate(attn_out)
+        if added == "residual_added":
+            h = attn_out
+        else:
+            h = ttnn.add(x, attn_out, memory_config=l1)
+            ttnn.deallocate(attn_out)
+        res_kw = dict(residual=h) if self._residual_fusion else {}
         if self._mlp_prenorm:
             # The MLP applies the post-attention norm itself (inside its decode gate/up program when it can).
-            mlp_out = self.mlp(h, prenorm=self.post_attention_layernorm)
+            mlp_out = self.mlp(h, prenorm=self.post_attention_layernorm, **res_kw)
         else:
-            mlp_out = self.mlp(self.post_attention_layernorm(h, memory_config=l1))
-        out = ttnn.add(h, mlp_out, memory_config=mem)
-        ttnn.deallocate(mlp_out)
+            mlp_out = self.mlp(self.post_attention_layernorm(h, memory_config=l1), **res_kw)
+        if getattr(self.mlp, "last_residual_added", False):
+            out = mlp_out
+        else:
+            out = ttnn.add(h, mlp_out, memory_config=mem)
+            ttnn.deallocate(mlp_out)
         ttnn.deallocate(h)
         return out
 
