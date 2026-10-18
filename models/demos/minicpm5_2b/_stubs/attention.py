@@ -54,10 +54,10 @@ _USE_DRAM_MM = True
 # Decode rope on the QKV projection's own layout (72 real tiles, no head split): the fused attention gathers its
 # head rows from it and the KV write takes its key rows from it.
 _USE_QKV_ROPE = True
-# ... with the layer's input RMSNorm fused into the QKV program (bind_prenorm). Off: QKV is stream-bound at ~26 us
-# on 16 or 40 cores and does not hide the norm (16 cores: 39.7 us; 40 cores: 38.3 us, its all-gather of the
-# normalized row to 40 cores alone takes ~18 us; vs 11.7 + 25.7 us unfused).
-_USE_DRAM_MM_NORM = False
+# ... with the layer's input RMSNorm fused into the QKV program (bind_prenorm) as a prologue on helper cores
+# (DramMatmul norm_prologue). On the QKV cores with an all-gather it did not pay (16 cores: 39.7 us; 40 cores:
+# 38.3 us, the all-gather to 40 cores alone ~18 us; vs 11.7 + 25.7 us unfused).
+_USE_DRAM_MM_NORM = True
 _QKV_DMM = dict()
 # Decode o_proj with the layer's residual add on helper cores of the same program (DramMatmul residual_add).
 _USE_DRAM_MM_RES = True
@@ -714,7 +714,9 @@ class TtAttention:
     def bind_prenorm(self, norm):
         """Fuse `norm` (the layer's input RMSNorm, HiFi4 like the QKV projection) into the decode QKV program."""
         if _USE_DRAM_MM_NORM and self.dmm_qkv is not None and self.dmm_qkv.ok and hasattr(norm, "consts"):
-            dmm = DramMatmul(self.device, None, ttnn.MathFidelity.HiFi4, norm=norm, prebuilt=self.dmm_qkv, **_QKV_DMM)
+            dmm = DramMatmul(
+                self.device, None, ttnn.MathFidelity.HiFi4, norm_prologue=norm, prebuilt=self.dmm_qkv, **_QKV_DMM
+            )
             self.dmm_qkv_norm = dmm if dmm.ok else None
         return self.dmm_qkv_norm is not None
 
@@ -1159,7 +1161,7 @@ class TtAttention:
         self._residual_added = False
         if prenorm is not None:
             decode = kv_cache is not None and attn_ctx.mode == "decode"
-            if decode and self.dmm_qkv_norm is not None and self.dmm_qkv_norm.norm is prenorm:
+            if decode and self.dmm_qkv_norm is not None and self.dmm_qkv_norm.norm_pro is prenorm:
                 self._fused_prenorm = self.dmm_qkv_norm.accepts(x) and prenorm._kernel_ok(x)
             if not self._fused_prenorm:
                 x = prenorm(x, memory_config=ttnn.L1_MEMORY_CONFIG)
