@@ -237,10 +237,19 @@ class TtTextAttention:
         scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex, b_rep=rep)
         if per_head:
             scores = ttnn.reshape(scores, (b, kvl, G * s_pad, s_pad))
-        scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask)
+        # the softmax passes over the scores in L1 when they fit (~8 MB per micro-batch), the probs back to DRAM
+        vol = 4
+        for d in scores.padded_shape:
+            vol *= d
+        mem = ttnn.L1_MEMORY_CONFIG if vol <= 12 * 2**20 else None
+        scores = ttnn.add(ttnn.multiply(scores, self.scale, memory_config=mem), tt_mask, memory_config=mem)
         mx = ttnn.max(scores, dim=-1, keepdim=True)
-        e = ttnn.exp(ttnn.subtract(scores, mx))
-        probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
+        e = ttnn.exp(ttnn.subtract(scores, mx, memory_config=mem), memory_config=mem)
+        ttnn.deallocate(scores)
+        probs = ttnn.divide(
+            e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg), memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        ttnn.deallocate(e)
         if per_head:
             probs = ttnn.reshape(probs, (b * kvl * G * r, 1, s_pad // r, s_pad))
             v = ttnn.reshape(v, (b * kvl, 1, s_pad, D))
