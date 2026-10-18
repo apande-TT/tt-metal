@@ -56,9 +56,10 @@ def bank_major_page0(stream: int, kt: int, nb: int, nc: int, rb: int) -> int:
 class FusedGateUpDecode:
     NC = 4  # output columns a compute core (gate and up each): 2 * NC tiles fill the full-sync fp32 DEST
     RB = 8  # K rows a weight push (bf16)
-    # K rows a push by weight dtype: ~9 KB pushes (8 block-float8 / 16 block-float4 tiles), many in flight per CB,
-    # stream faster than few large ones (bf8 gate / up, measured: 35 KB pushes 225 us, 17 KB 220 us, 9 KB 218 us)
-    RB_BY_DTYPE = {ttnn.bfloat8_b: 2, ttnn.bfloat4_b: 4}
+    # K rows a push by weight dtype: ~4.5 KB pushes (one K row of the NC columns: 4 block-float8 / 8 block-float4
+    # tiles), many in flight per CB, stream faster than few large ones (bf8 gate / up, measured: 35 KB pushes 225 us,
+    # 17 KB 220 us, 9 KB 218 us, 4.4 KB 216 us; the bf4 layers gained on the decode trace too)
+    RB_BY_DTYPE = {ttnn.bfloat8_b: 1, ttnn.bfloat4_b: 2}
     CB_BYTES = 112 * 1024  # per weight CB (DEPTH = pushes that fit)
 
     @classmethod

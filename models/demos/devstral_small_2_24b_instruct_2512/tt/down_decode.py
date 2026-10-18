@@ -22,9 +22,9 @@ _KDIR = Path(__file__).resolve().parent / "kernels"
 class StreamDownDecode:
     NC = 2  # output columns a compute core (one a data-movement RISC)
     RB = 16  # K rows a weight push (bf16)
-    # K rows a push by weight dtype: ~9 KB pushes (8 block-float8 / 16 block-float4 tiles) stream fastest (bf8 down,
-    # measured: 35 KB pushes 120 us, 17 KB 117 us, 9 KB 110.5 us, 4 KB 111 us)
-    RB_BY_DTYPE = {ttnn.bfloat8_b: 8, ttnn.bfloat4_b: 16}
+    # K rows a push by weight dtype: 8 tiles (~9 KB block-float8, ~4.6 KB block-float4) stream fastest (bf8 down,
+    # measured: 35 KB pushes 120 us, 17 KB 117 us, 9 KB 110.5 us, 4 KB 111 us; bf4 at 8 rows gained on the trace)
+    RB_BY_DTYPE = {ttnn.bfloat8_b: 8, ttnn.bfloat4_b: 8}
     CB_BYTES = 112 * 1024  # per weight CB (DEPTH = pushes that fit)
     GRID_X = 8  # compute cores: an 8-wide rectangle (as the 1D down's 8 x 10)
 
