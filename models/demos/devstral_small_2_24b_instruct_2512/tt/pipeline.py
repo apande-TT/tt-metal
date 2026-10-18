@@ -139,6 +139,9 @@ PLANNED_TP = 4
 #                     the draw is one top-1 over the noisy scores labelled with the candidate ids (no argmax + index gather).
 #                     The per-device vocab-shard top-k is VocabTopK (generic_op, kernels/topk_mid.cpp): 64 local ->
 #                     8 middle -> 1 final core instead of ttnn.topk's 64 -> 1 serial merge, 16-bit shard positions.
+#                     The draw's pad select, eos update and next-token row are ONE data-movement program
+#                     (SampleTail, kernels/sample_tail.cpp: integer select on the id / mask tiles; no fp32 chain,
+#                     untilize or reshape).
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
 #                     directly (no bf16 cast op, no single-core interleaved norm); the decode QKV reads the input
 #                     norm's fp32 width shards as they are (20-tile K blocks of 5 shards; no unshard, cast, reshard;
@@ -297,6 +300,47 @@ class NoiseLookup:
         ]
         ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
         return out
+
+
+_SAMPLE_TAIL_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "sample_tail.cpp")
+
+
+class SampleTail:
+    """The sampler's end as ONE data-movement program (generic_op, kernels/sample_tail.cpp) on one RISC: from the
+    (1, 1, B, 1) uint32 draw and the fp32 0 / 1 unfinished mask, nxt = unfinished ? drawn : pad, the mask drops rows
+    that emit eos (in place), and nxt lands in the (1, B) row-major uint32 next-token buffer (in place).
+
+    Replaces the fp32 select chain (typecast, subtract, multiply, add), the eos update (ne, multiply, copy) and the
+    id row's typecast / untilize / reshape / copy (~43 us of 11 ops): the ids are exact integers below 2^24, so the
+    integer select gives the same values the fp32 chain did."""
+
+    CB = 0
+
+    def __init__(self, device, batch, pad_token_id, eos_token_id):
+        assert 1 <= batch <= 32, batch
+        self.device, self.batch = device, batch
+        self.pad, self.eos = int(pad_token_id), int(eos_token_id)
+        self.core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+
+    def __call__(self, drawn, unfinished, tok):
+        io = [drawn, unfinished, tok]
+        ct = [self.batch, self.pad, self.eos, self.CB]
+        for t in io:
+            ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        size = 4 * 1024 + 128  # two faces of each tile and the id row
+        fmt = ttnn.CBFormatDescriptor(buffer_index=self.CB, data_format=ttnn.uint32, page_size=size)
+        cbs = [ttnn.CBDescriptor(total_size=size, core_ranges=self.core, format_descriptors=[fmt])]
+        kernels = [
+            ttnn.KernelDescriptor(
+                kernel_source=_SAMPLE_TAIL_KERNEL,
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=self.core,
+                compile_time_args=ct,
+                runtime_args=[((0, 0), [t.buffer_address() for t in io])],
+                config=ttnn.ReaderConfigDescriptor(),
+            )
+        ]
+        ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
 
 
 class VocabTopK:
@@ -733,6 +777,7 @@ class DevstralPipeline:
         self._shard_base = None
         full = self.batch == 32 and self.top_k == 32
         self._noise_lookup = NoiseLookup(device, self.batch, self.top_k, NOISE_BUCKETS) if full else None
+        self._sample_tail = SampleTail(device, self.batch, self.pad_token_id, self.eos_token_id)
         self._last_row = LastRow(device) if self.batch == ttnn.TILE_SIZE else None
         tp = self._tp()
         if tp > 1:
@@ -916,6 +961,11 @@ class DevstralPipeline:
         # index gather). Equal-score ties stay arbitrary, as the unstable candidate ordering already made them.
         _, drawn = ttnn.topk(scores, k=1, dim=-1, largest=True, sorted=True, indices_tensor=idx)  # (1, 1, B, 1)
         # generate(): finished rows emit pad; a row finishes on the step it emits eos.
+        if self._sample_tail is not None and drawn.dtype == ttnn.uint32 and drawn.layout == ttnn.TILE_LAYOUT:
+            # the select, the eos update and the next-token row in one program (SampleTail)
+            self._sample_tail(drawn, state["unfinished"], state["tok"])
+            ttnn.plus_one(state["step"])
+            return drawn
         unf = state["unfinished"]
         nxt = ttnn.add(
             ttnn.multiply(ttnn.subtract(ttnn.typecast(drawn, ttnn.float32), float(self.pad_token_id)), unf),
