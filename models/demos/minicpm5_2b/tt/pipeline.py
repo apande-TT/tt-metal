@@ -18,6 +18,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import os
+import struct
 import sys
 import time
 
@@ -250,6 +251,12 @@ class MiniCPM5Pipeline:
         probs = ttnn.softmax(top_vals, dim=-1)
         incl = ttnn.matmul(probs, self.cumsum_upper)  # mass of ranks <= j
         tail_mass = ttnn.add(ttnn.subtract(probs, incl), 1.0)  # mass of ranks >= j (HF's ascending cumsum)
+        if _USE_PICK_KERNEL and B == 32 and top_vals.dtype == ttnn.float32 and top_idx.dtype == ttnn.uint32:
+            # keep / threshold / allowed / argmax are compares and selects only: the pick kernel does them on the
+            # fp32 bits; the one rounding add (top_vals + noise) stays the same ttnn op as below.
+            scored = ttnn.add(top_vals, self._candidate_noise(top_idx))
+            self._pick_kernel(tail_mass, top_vals, scored, top_idx)  # writes self.tok_buf
+            return None
         keep = ttnn.gt(tail_mass, 1.0 - self.top_p)
         kept_vals = ttnn.add(top_vals, ttnn.multiply(ttnn.subtract(keep, 1.0), _NEG))  # dropped -> +1e9
         threshold = ttnn.min(kept_vals, dim=-1, keepdim=True)  # smallest kept logit, [1, 1, B, 1]
@@ -258,9 +265,6 @@ class MiniCPM5Pipeline:
         allowed = ttnn.ge(top_vals, threshold)
         noise = self._candidate_noise(top_idx)
         perturbed = ttnn.add(ttnn.add(top_vals, noise), ttnn.multiply(ttnn.subtract(allowed, 1.0), -_NEG))
-        if _USE_PICK_KERNEL and B == 32 and perturbed.dtype == ttnn.float32 and top_idx.dtype == ttnn.uint32:
-            self._pick_kernel(perturbed, top_idx)  # writes self.tok_buf
-            return None
         rank = ttnn.argmax(ttnn.untilize(perturbed), dim=-1, keepdim=True)  # [1, 1, B, 1] uint32
         rank = ttnn.to_layout(rank, ttnn.TILE_LAYOUT)
         tok = ttnn.gather(top_idx, -1, ttnn.typecast(rank, top_idx.dtype) if rank.dtype != top_idx.dtype else rank)
@@ -383,34 +387,58 @@ class MiniCPM5Pipeline:
         program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=[cb])
         return ttnn.generic_op([top_idx, self.noise_buf, out], program)
 
-    def _pick_kernel(self, perturbed, top_idx):
-        """Argmax over the k candidates (ttnn.argmax's comparison, first max wins) and that rank's token id,
-        written into tok_buf by one single-core generic_op (kernels/sampler/pick_token.cpp)."""
-        k_tiles = perturbed.padded_shape[-1] // 32
-        core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+    def _pick_kernel(self, tail_mass, top_vals, scored, top_idx):
+        """The top-p filter (keep, smallest kept logit, allowed) and the argmax of scored = top_vals + noise over the
+        allowed candidates (ttnn.argmax's comparison, first max wins), then that rank's token id, written into
+        tok_buf by one generic_op (kernels/sampler/pick_token_mc.cpp): one core per batch row, the B ids gathered
+        into core (0, 0)'s L1 behind a semaphore and written from there."""
+        B = self.batch
+        k_tiles = scored.padded_shape[-1] // 32
+        keep_above_bits = struct.unpack("<I", struct.pack("<f", 1.0 - self.top_p))[0]
+        grid = self.device.compute_with_storage_grid_size()
+        full_rows, rem = divmod(B, grid.x)
+        ranges = []
+        if full_rows:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, full_rows - 1)))
+        if rem:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, full_rows), ttnn.CoreCoord(rem - 1, full_rows)))
+        cores = ttnn.CoreRangeSet(ranges)
         rt = ttnn.RuntimeArgs()
-        rt[0][0] = []
+        for b in range(B):
+            rt[b % grid.x][b // grid.x] = [b]
+        leader = self.device.worker_core_from_logical_core(ttnn.CoreCoord(0, 0))
         tile = 2 * 32 * 32
-        scratch = 2 * k_tiles * 4 * 32 * 32 + 4 * self.batch
+        scratch = 4 * k_tiles * 32 * 4 + 16 * B + 4 * B
         cb = ttnn.CBDescriptor(
             total_size=-(-scratch // tile) * tile,
-            core_ranges=core,
+            core_ranges=cores,
             format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.bfloat16, tile)],
         )
         reader = ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_SAMPLER_KERNELS, "pick_token.cpp"),
+            kernel_source=os.path.join(_SAMPLER_KERNELS, "pick_token_mc.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
-            core_ranges=core,
-            compile_time_args=[perturbed.shape[-1], k_tiles, self.batch, 0]
-            + list(ttnn.TensorAccessorArgs(perturbed).get_compile_time_args())
+            core_ranges=cores,
+            compile_time_args=[scored.shape[-1], k_tiles, B, 0, 0, keep_above_bits]
+            + list(ttnn.TensorAccessorArgs(tail_mass).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(top_vals).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(scored).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(top_idx).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(self.tok_buf).get_compile_time_args()),
             runtime_args=rt,
-            common_runtime_args=[perturbed.buffer_address(), top_idx.buffer_address(), self.tok_buf.buffer_address()],
+            common_runtime_args=[
+                tail_mass.buffer_address(),
+                top_vals.buffer_address(),
+                scored.buffer_address(),
+                top_idx.buffer_address(),
+                self.tok_buf.buffer_address(),
+                leader.x,
+                leader.y,
+            ],
             config=ttnn.ReaderConfigDescriptor(),
         )
-        program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=[cb])
-        ttnn.generic_op([perturbed, top_idx, self.tok_buf], program)
+        sem = ttnn.SemaphoreDescriptor(id=0, core_ranges=cores, initial_value=0)
+        program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[sem], cbs=[cb])
+        ttnn.generic_op([tail_mass, top_vals, scored, top_idx, self.tok_buf], program)
 
     def _emit(self, logits):
         tok = self._sample(logits)
