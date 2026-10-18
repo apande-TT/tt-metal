@@ -58,7 +58,9 @@ _USE_QKV_ROPE = True
 # (DramMatmul norm_prologue). On the QKV cores with an all-gather it did not pay (16 cores: 39.7 us; 40 cores:
 # 38.3 us, the all-gather to 40 cores alone ~18 us; vs 11.7 + 25.7 us unfused).
 _USE_DRAM_MM_NORM = True
-_QKV_DMM = dict()
+# QKV is compute-bound (HiFi4) once its norm prologue is done: 3 workers per bank (24 cores) beat 2 (+ the norm
+# prologue gives the stream a head start), 4 and 5 lose to bank contention.
+_QKV_DMM = dict(workers_per_bank=3)
 # Decode o_proj with the layer's residual add on helper cores of the same program (DramMatmul residual_add).
 _USE_DRAM_MM_RES = True
 _ATTN_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_fused")
