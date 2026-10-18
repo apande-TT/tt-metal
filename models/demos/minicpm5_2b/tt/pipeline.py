@@ -70,7 +70,7 @@ _USE_PICK_KERNEL = True
 # two stages: ttnn.topk's top-_SEG_K of each segment (S * B rows over the grid: its large-indices route splits by
 # rows, so one [B, V] row set kept 32 cores busy) and a k-way merge of the S sorted lists (kernels/sampler).
 _LOGIT_SEGMENTS = 17
-_SEG_K = 128
+_SEG_K = 64  # >= top_k (50); half the per-segment sort and merge of 128
 _SAMPLER_KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_stubs", "kernels", "sampler")
 
 
