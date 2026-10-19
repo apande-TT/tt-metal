@@ -34,8 +34,9 @@ DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
 DECODE_GATE_UP_BF4_DTYPE = ttnn.bfloat4_b
 DECODE_GATE_UP_BF4_LAYERS = frozenset(range(5, 36))
 # Layers whose many-row (prefill) fused gate/up computes at LoFi instead of GATE_UP_FIDELITY (LoFi on every layer:
-# prefill 1173 -> 1006 ms but PCC 0.99334 < 0.995; layers 18-22: 1153 ms, PCC 0.995137).
-PREFILL_GATE_UP_LOFI_LAYERS = frozenset(range(16, 25))
+# prefill 1173 -> 1006 ms but PCC 0.99334 < 0.995; layers 18-22: 1153 ms, PCC 0.995137; 16-24: 1134 ms, 0.995147;
+# 8-31: 1073 ms, PCC 0.99509 and 12-27: 1107 ms, PCC 0.995806 fail test_e2e_text_generation's token agreement).
+PREFILL_GATE_UP_LOFI_LAYERS = frozenset(range(14, 26))
 # K tiles per activation multicast block of the bf4 decode gate / up projections (divides K = 160 tiles).
 DECODE_GATE_UP_K_BLOCK = 8
 # Math fidelity of the bf4 decode gate / up (HiFi3 == HiFi4 bit for bit on a block-float4 weight, see __init__).
