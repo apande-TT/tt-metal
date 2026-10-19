@@ -315,6 +315,14 @@ class TtMinistral3Attention:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,  # L1 accumulation made batched prefill matmuls non-repeatable
         )
+        # The decode QKV (fp32 norm shards x block-float8 weight, 320 tile products a core on 24 cores) at HiFi2.
+        self.qkv_decode_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
         # Prefill SDPA is bound by its per-tile work (QK^T, softmax, PV per q chunk): HiFi2 matmuls, fp32 DEST kept.
         self.prefill_sdpa_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
@@ -838,7 +846,7 @@ class TtMinistral3Attention:
                 program_config=self._sharded_qkv_pc(),
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 dtype=ttnn.bfloat16,
-                compute_kernel_config=self.compute_cfg,
+                compute_kernel_config=self.qkv_decode_cfg,
             )
             ttnn.deallocate(x)
         else:
