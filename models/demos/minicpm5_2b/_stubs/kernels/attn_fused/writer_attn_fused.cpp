@@ -30,6 +30,11 @@ void kernel_main() {
     constexpr auto out_args = TensorAccessorArgs<8>();
     constexpr auto cache_args = TensorAccessorArgs<out_args.next_compile_time_args_offset()>();
     constexpr auto pos_args = TensorAccessorArgs<cache_args.next_compile_time_args_offset()>();
+    // The row block's G = groups + 1 head rows of the roped QKV layout q [1, B, H * G * D] (row b = batch b),
+    // gathered into rows 0..G-1 of its Dt q tiles for compute (the reader's q_rows gather, moved to this RISC so it
+    // runs on the other NoC while the reader fetches the KV-write operands).
+    constexpr uint32_t cb_q = get_compile_time_arg_val(pos_args.next_compile_time_args_offset());
+    constexpr auto q_args = TensorAccessorArgs<pos_args.next_compile_time_args_offset() + 1>();
     constexpr uint32_t tile_bytes = 32 * 32 * 2;
 
     const uint32_t t_start = get_arg_val<uint32_t>(0);
@@ -40,6 +45,26 @@ void kernel_main() {
     const auto cur_pos = TensorAccessor(pos_args, get_common_arg_val<uint32_t>(3));
     const uint32_t bg = t_start / Dt;
     const uint32_t b = bg / n_kv;
+
+    {
+        constexpr uint32_t G = groups + 1;
+        const auto q = TensorAccessor(q_args, get_common_arg_val<uint32_t>(4));
+        const uint32_t h = bg - b * n_kv;
+        cb_reserve_back(cb_q, Dt);
+        const uint32_t l1 = get_write_ptr(cb_q);
+        for (uint32_t j = 0; j < G; ++j) {
+            for (uint32_t k = 0; k < Dt; ++k) {
+                for (uint32_t half = 0; half < 2; ++half) {
+                    noc_async_read(
+                        q.get_noc_addr((h * G + j) * Dt + k, face_row_offset(b & 31, half)),
+                        l1 + k * tile_bytes + face_row_offset(j, half),
+                        kFaceRowBytes);
+                }
+            }
+        }
+        noc_async_read_barrier();
+        cb_push_back(cb_q, Dt);
+    }
 
     const uint32_t pos_l1 = get_write_ptr(cb_wpos);
     noc_async_read_page(0, cur_pos, pos_l1);

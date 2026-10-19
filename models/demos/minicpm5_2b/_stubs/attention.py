@@ -895,13 +895,16 @@ class TtAttention:
                 compile_time_args=[cb_out, n_kv, g, d_t, c_t, cb_kv_old, cb_wpos, kv_flag]
                 + list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
                 + list(ttnn.TensorAccessorArgs(kv_cache.k).get_compile_time_args())
-                + list(ttnn.TensorAccessorArgs(ctx.cur_pos).get_compile_time_args()),
+                + list(ttnn.TensorAccessorArgs(ctx.cur_pos).get_compile_time_args())
+                + [cb_q]
+                + list(ttnn.TensorAccessorArgs(qk).get_compile_time_args()),
                 runtime_args=wr_rt,
                 common_runtime_args=[
                     out.buffer_address(),
                     kv_cache.k.buffer_address(),
                     kv_cache.v.buffer_address(),
                     ctx.cur_pos.buffer_address(),
+                    qk.buffer_address(),
                 ],
                 config=ttnn.WriterConfigDescriptor(),
             )

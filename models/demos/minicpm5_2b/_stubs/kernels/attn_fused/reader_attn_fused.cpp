@@ -139,9 +139,15 @@ void kernel_main() {
         }
     }
 
-    // q (with the discarded key row) of bg.
-    cb_reserve_back(cb_q, Kt);
-    if constexpr (q_rows) {
+    // q (with the discarded key row) of bg. With q_rows and inline_kv the writer gathers it (on the other NoC, in
+    // parallel with the KV-write operand reads above).
+    constexpr bool q_by_writer = q_rows && inline_kv;
+    if constexpr (!q_by_writer) {
+        cb_reserve_back(cb_q, Kt);
+    }
+    if constexpr (q_by_writer) {
+        // (the writer pushes cb_q)
+    } else if constexpr (q_rows) {
         constexpr uint32_t face_bytes = 16 * 16 * 2, face_row_bytes = 16 * 2;
         auto face_row_offset = [](uint32_t row, uint32_t half) {
             return (((row >> 4) << 1) + half) * face_bytes + (row & 15) * face_row_bytes;
@@ -165,8 +171,10 @@ void kernel_main() {
             l1 += tile_bytes;
         }
     }
-    noc_async_read_barrier();
-    cb_push_back(cb_q, Kt);
+    if constexpr (!q_by_writer) {
+        noc_async_read_barrier();
+        cb_push_back(cb_q, Kt);
+    }
 
     // Scores: per key tile n, cache tiles (n, k) and the mask tile.
     for (uint32_t n = 0; n < nt; ++n) {
