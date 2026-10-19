@@ -59,6 +59,8 @@ void kernel_main() {
     // kv_flag: semaphore set once both staged position tiles hold this step's row (the writer stores them).
     constexpr uint32_t kv_flag = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 12);
     constexpr auto qkv_args = TensorAccessorArgs<sm_args.next_compile_time_args_offset() + 13>();
+    // mask_table: `mask` is the 32-tile table (tile r: the position at column r, tile 31: unmasked), not [B, 1, 32, C].
+    constexpr uint32_t mask_table = get_compile_time_arg_val(qkv_args.next_compile_time_args_offset());
     constexpr uint32_t face_bytes_ = 16 * 16 * 2, face_row_bytes_ = 16 * 2;
     auto face_row_off = [](uint32_t row, uint32_t half) {
         return (((row >> 4) << 1) + half) * face_bytes_ + (row & 15) * face_row_bytes_;
@@ -207,7 +209,8 @@ void kernel_main() {
         }
         cb_push_back(cb_k, Kt);
         cb_reserve_back(cb_mask, 1);
-        noc_async_read_page(b * Ct + n, mask, get_write_ptr(cb_mask));
+        const uint32_t mask_page = mask_table ? (n == last_key_tile ? r : 31) : b * Ct + n;
+        noc_async_read_page(mask_page, mask, get_write_ptr(cb_mask));
         noc_async_read_barrier();
         cb_push_back(cb_mask, 1);
     }

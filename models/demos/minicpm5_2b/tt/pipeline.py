@@ -60,6 +60,9 @@ GRADUATED_STUBS = (
 
 _TILE = 32
 _NEG = -1e9
+# Decode: the fused attention picks its key-mask tiles from a fixed 32-tile table (mask_table) instead of the
+# [B, 1, 32, C] mask built every step (three ops).
+_MASK_TABLE = True
 _NOISE_SEG_W = 1280  # 40 tiles: under gather's 60-tile single-row threshold; 130560 / 1280 = 102 segments
 # Candidate noise read straight from the segmented buffer by one data-movement kernel (else: per-segment gather).
 _USE_NOISE_KERNEL = True
@@ -185,6 +188,12 @@ class MiniCPM5Pipeline:
         self.key_index_row = self._tt(torch.arange(C, dtype=torch.float32).reshape(1, 1, 1, C), ttnn.float32)
         # The key index broadcast over a tile's 32 rows: the decode key mask is built at its [B, 1, 32, C] size.
         self.key_index_full = self._tt(torch.arange(C, dtype=torch.float32).repeat(1, 1, 32, 1), ttnn.float32)
+        # The decode key mask's only distinct tiles, made once by the per-step mask's own ops: tile r is a key tile
+        # holding the position at column r (columns c > r masked); tile 31 the all-unmasked tile (0 * NEG = -0).
+        # The fused attention reads tile pos % 32 for the position tile and tile 31 before it (none after it).
+        col = self._tt(torch.arange(32, dtype=torch.float32).repeat(1, 1, 32, 1), ttnn.float32)
+        at = self._tt(torch.arange(32, dtype=torch.float32).reshape(32, 1, 1, 1), ttnn.float32)
+        self.mask_table = ttnn.typecast(ttnn.multiply(ttnn.gt(col, at), _NEG), ttnn.bfloat16)  # [32, 1, 32, 32]
         kv = self.n_kv_heads
         self.key_index_kv = self._tt(torch.arange(C, dtype=torch.float32).repeat(1, kv, 1, 1), ttnn.float32)
         # rotate_half's sign over head_dim (-1 on the first half), folded into sin for the decode rope kernel.
@@ -488,7 +497,9 @@ class MiniCPM5Pipeline:
         else:
             mask = ttnn.typecast(ttnn.multiply(ttnn.gt(self.key_index_row, pos), _NEG), ttnn.bfloat16)  # [B, 1, 1, C]
         l1 = ttnn.L1_MEMORY_CONFIG
-        if rows:
+        if rows and _MASK_TABLE:
+            mask_full = ttnn.to_memory_config(self.mask_table, l1)  # read on the attention's critical path: L1
+        elif rows:
             mask_full = ttnn.typecast(
                 ttnn.multiply(ttnn.gt(self.key_index_full, pos), _NEG), ttnn.bfloat16, memory_config=l1
             )
@@ -500,6 +511,7 @@ class MiniCPM5Pipeline:
             ctx = attention_stub.AttnContext(
                 "decode", mask, write, cur_pos, mask_full=mask_full, rope_rows=(cos_rows, sin_rows)
             )
+            ctx.mask_table = _MASK_TABLE
             # The attention constants copied to L1 for this step (persistent L1 copies clash with prefill's CBs).
             att = self.encoder_stack.layers[0].self_attn
             ctx.consts = tuple(

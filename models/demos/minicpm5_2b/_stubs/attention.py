@@ -114,6 +114,8 @@ class AttnContext:
         self.rope = rope
         # decode: per-step L1 copies of the attention constants (scale, zero, max / sum scalers), shared by every layer.
         self.consts = None
+        # decode: mask_full is the 32-tile mask table (tile r: position at column r; tile 31: unmasked).
+        self.mask_table = False
 
 
 class TtAttention:
@@ -880,7 +882,8 @@ class TtAttention:
             + [int(kv_write is not None and not inline_kv), sem_k, sem_v, int(q_rows is not None), g + 1]
             + [int(inline_kv), cb_kv_old, cb_kv_new, cb_kv_scr, cb_kv_out]
             + [(self.n_heads + self.n_kv_heads) * d_t, (qkv_t.padded_shape[-1] // 32) if inline_kv else 0, kv_flag]
-            + list(ttnn.TensorAccessorArgs(qkv_t if inline_kv else qk).get_compile_time_args()),
+            + list(ttnn.TensorAccessorArgs(qkv_t if inline_kv else qk).get_compile_time_args())
+            + [int(ctx.mask_table)],
             runtime_args=rd_rt,
             common_runtime_args=[t.buffer_address() for t in tensors]
             + [(qkv_t if inline_kv else qk).buffer_address()],
