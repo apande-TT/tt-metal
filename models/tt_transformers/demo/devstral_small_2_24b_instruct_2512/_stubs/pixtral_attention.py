@@ -16,10 +16,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import (
-    TtMinistral3Attention,
-    fold_input_scale,
-)
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.ministral3_attention import fold_input_scale
 
 
 def _mesh_size(device):
@@ -34,12 +31,10 @@ def _mesh_size(device):
 # device its own slice of the image batch (and gathers the projector output). False: tensor-parallel over the mesh.
 DATA_PARALLEL = False
 
-# Vision q/k in interleaved-pair head_dim order (2j, 2j+1 <- HF's j, j + head_dim/2). True while the vision model builds
-# its transformer, whose rotary tables then come in the same order (TtPixtralRotaryEmbedding(interleaved=True)): the
-# q/k weight columns are permuted per head and rotate_half becomes a pair swap inside every 32-wide tile, so q's and
-# k's RoPE each run as ONE fused rotary_embedding_llama instead of the rotate-half matmul + multiply / multiply / add.
-# q . k is unchanged by a permutation applied to both, and V is not permuted.
-META_ROPE = False
+# The head split and the q/k RoPE as ONE C++ program (tt/heads_rope.py). True while the vision model builds its
+# transformer, whose rotary tables then hold the SIGNED sin (first half negated: TtPixtralRotaryEmbedding(
+# signed_sin=True)) that carries rotate_half's negation. Host-supplied tables are converted here.
+CPP_HEADS_ROPE = False
 
 
 def vision_tp(device):
@@ -56,7 +51,7 @@ class TtPixtralAttention:
     def __init__(self, device, torch_module, in_scale=None) -> None:
         """in_scale: the attention_norm gamma, folded into q/k/v (see TtAttention.FOLD_NORM_GAMMA)."""
         self.device = device
-        self.meta_rope = META_ROPE
+        self.cpp_rope = CPP_HEADS_ROPE
         self.tp, repl = vision_tp(device)
         tp = self.tp
         self.num_heads = torch_module.num_heads
@@ -84,10 +79,6 @@ class TtPixtralAttention:
             fold_input_scale(w.weight.T, in_scale)
             for w in (torch_module.q_proj, torch_module.k_proj, torch_module.v_proj)
         )
-        self._perm = torch.arange(hd).reshape(2, hd // 2).T.reshape(-1)  # [0, hd/2, 1, hd/2 + 1, ...]
-        if self.meta_rope:
-            per_head = lambda w: w.reshape(w.shape[0], -1, hd)[:, :, self._perm].reshape(w.shape[0], -1)
-            wq, wk = per_head(wq), per_head(wk)
         chunks = []
         for d in range(tp):
             sl = slice(d * lh * hd, (d + 1) * lh * hd)
@@ -95,27 +86,13 @@ class TtPixtralAttention:
         self.wqkv = _put(torch.hstack(chunks), shard(-1))  # 2-D slices: hstack == concat on dim -1
         self.wo = _put(torch_module.o_proj.weight.T, shard(-2))
 
-        # rotate_half(x) == x @ R  (HF convention: cat(-x2, x1)).
+        # rotate_half(x) == x @ R  (HF convention: cat(-x2, x1)). cpp_rope: the tables hold the signed sin, so R only
+        # swaps the halves (its fallback rotate-half chain then multiplies the same magnitudes with the same signs).
         half = hd // 2
         rot = torch.zeros(hd, hd)
-        rot[torch.arange(half) + half, torch.arange(half)] = -1.0
+        rot[torch.arange(half) + half, torch.arange(half)] = 1.0 if self.cpp_rope else -1.0
         rot[torch.arange(half), torch.arange(half) + half] = 1.0
         self.rot = _put(rot.reshape(1, 1, hd, hd), repl)
-        # meta_rope: the 32 x 32 pair-swap tile the fused RoPE applies to every tile of a head.
-        self.trans_mat = (
-            _put(TtMinistral3Attention._pair_swap(ttnn.TILE_SIZE).reshape(1, 1, ttnn.TILE_SIZE, -1), repl)
-            if self.meta_rope
-            else None
-        )
-        # The fused RoPE replays the rotate-half chain's arithmetic: the pair swap is exact, and x * cos, rot * sin and
-        # their sum are bf16 FPU products / sum at HiFi4 in a 16-bit DEST (the setting BinaryNg runs for bf16 operands).
-        self.rope_cfg = ttnn.init_device_compute_kernel_config(
-            device.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi4,
-            math_approx_mode=False,
-            fp32_dest_acc_en=False,
-            packer_l1_acc=False,
-        )
 
         self.compute_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
@@ -166,38 +143,7 @@ class TtPixtralAttention:
             compute_with_storage_grid_size=grid,
         )
 
-    def _rope_groups(self, shape):
-        """B' of the (B', B * H / B') view of the (B, H, S, hd) heads the fused RoPE runs on. Its prefill split gives
-        min(B', cores) batch slices and the remaining cores sequence tiles, each core every head of its slice, so take
-        the view leaving the busiest core the fewest head rows (8 images x 16 heads of 8 sequence tiles: 32 x 4, 12
-        rows). The outer-dim reshape is a view and leaves every row's position (its cos / sin) unchanged."""
-        b, h, s = shape[:3]
-        grid = self.device.compute_with_storage_grid_size()
-        cores, st, n = grid.x * grid.y, -(-s // ttnn.TILE_SIZE), b * h
-
-        def rows(g):
-            bp = min(g, cores)
-            sp = min(cores // bp, st)
-            return -(-g // bp) * -(-st // sp) * (n // g)
-
-        return min((g for g in range(1, n + 1) if n % g == 0), key=lambda g: (rows(g), g != b))
-
     def _rope(self, x, cos, sin):
-        if self.meta_rope:
-            shape = tuple(int(d) for d in x.shape)
-            g = self._rope_groups(shape)
-            if g != shape[0]:
-                x = ttnn.reshape(x, (g, shape[0] * shape[1] // g) + shape[2:])
-            x = ttnn.experimental.rotary_embedding_llama(
-                x,
-                cos,
-                sin,
-                self.trans_mat,
-                is_decode_mode=False,
-                compute_kernel_config=self.rope_cfg,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
-            return x if g == shape[0] else ttnn.reshape(x, shape)
         # rotate_half as x @ R (R is a +-1 permutation, so exact), height-parallel: a 1D multicast matmul hands every
         # core of the full grid its own run of the (images x heads x patches) row tiles against the multicast 2 x 2-tile
         # R. (minimal_matmul splits a 2-tile N over the grid's 10 rows, leaving 8 of them idle: 102 us; ttnn.matmul's
@@ -238,9 +184,8 @@ class TtPixtralAttention:
         hd = self.head_dim
 
         cos, sin = position_embeddings
-        if self.meta_rope:  # host tables come in HF order; device tables already in the interleaved one
-            cos = cos[..., self._perm] if isinstance(cos, torch.Tensor) else cos
-            sin = sin[..., self._perm] if isinstance(sin, torch.Tensor) else sin
+        if self.cpp_rope and isinstance(sin, torch.Tensor):  # host tables come plain; device tables already signed
+            sin = torch.cat((-sin[..., : hd // 2], sin[..., hd // 2 :]), dim=-1)
         cos = self._to_tt(cos.reshape(1, 1, s, hd)) if isinstance(cos, torch.Tensor) else cos
         sin = self._to_tt(sin.reshape(1, 1, s, hd)) if isinstance(sin, torch.Tensor) else sin
         mask = attention_mask
@@ -261,17 +206,25 @@ class TtPixtralAttention:
         )
         if len(in_shape) == 4 and x.memory_config().buffer_type == ttnn.BufferType.L1:
             ttnn.deallocate(x)  # the caller's L1 norm output, read only here (see TtAttention)
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv,
-            num_heads=self.local_heads,
-            num_kv_heads=self.local_heads,
-            transpose_k_heads=False,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        if qkv_l1:
-            ttnn.deallocate(qkv)
-        q = self._rope(q, cos, sin)
-        k = self._rope(k, cos, sin)
+        if self.cpp_rope:
+            # (imported here: a module held on the instance would be walked by the perf harness's weight census)
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import heads_rope
+        if self.cpp_rope and heads_rope.supports(qkv, cos, sin, self.local_heads):
+            q, k, v = heads_rope.apply(qkv, cos, sin, self.local_heads)
+            if qkv_l1:
+                ttnn.deallocate(qkv)
+        else:
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                qkv,
+                num_heads=self.local_heads,
+                num_kv_heads=self.local_heads,
+                transpose_k_heads=False,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            if qkv_l1:
+                ttnn.deallocate(qkv)
+            q = self._rope(q, cos, sin)
+            k = self._rope(k, cos, sin)
         if q.dtype != ttnn.bfloat16:  # fp32 activations upstream; SDPA reads bf16
             q, k, v = (ttnn.typecast(t, ttnn.bfloat16) for t in (q, k, v))
         # Widest key chunk the sequence allows: SDPA's per-key-chunk rescale rounding biases its output level
