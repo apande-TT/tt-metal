@@ -888,8 +888,15 @@ class DevstralPipeline:
 
     # ------------------------------------------------------------------ host -> device (outside any forward)
 
+    # Tile-layout uploads up to this many elements are tilized on the host: the per-request positions / pos /
+    # unfinished columns otherwise each cost a device TilizeWithValPadding launch (one of them on a single core).
+    HOST_TILIZE_MAX = 1 << 16
+
     def _put(self, t, dtype, layout):
-        return ttnn.from_torch(t.contiguous(), dtype=dtype, layout=layout, device=self.device, mesh_mapper=self._repl)
+        t = t.contiguous()
+        if layout == ttnn.TILE_LAYOUT and t.numel() <= self.HOST_TILIZE_MAX:
+            return ttnn.to_device(ttnn.from_torch(t, dtype=dtype, layout=layout, mesh_mapper=self._repl), self.device)
+        return ttnn.from_torch(t, dtype=dtype, layout=layout, device=self.device, mesh_mapper=self._repl)
 
     def _put_pixels(self, pixel_values, sizes):
         """Upload an image batch: equal-size images go up already patchified on the host (the vision tower's own
