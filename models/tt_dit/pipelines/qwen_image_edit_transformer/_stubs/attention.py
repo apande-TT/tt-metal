@@ -330,12 +330,19 @@ class TtQwenJointAttention:
             yi = self._proj(hs, self.img_qkv, parts=hp)
             yt = self._proj(ehs, self.txt_qkv, parts=ep)
             L, S_img = yt.shape[1], yi.shape[1]
-            y = ttnn.concat([yt, yi], dim=1)
+            hd, H = self.head_dim, self.local_heads
+            qkv = None
+            if JOINT_HEADS_FN is not None:  # each of q / k / v straight from the two projections, no join
+                qkv = [JOINT_HEADS_FN(yt, yi, o, H, hd, ttnn.DRAM_MEMORY_CONFIG) for o in (0, n, 2 * n)]
+                qkv = None if any(t is None for t in qkv) else qkv
+            y = None if qkv is not None else ttnn.concat([yt, yi], dim=1)
             ttnn.deallocate(yi)
             ttnn.deallocate(yt)
             wq, wk = self._joint_norm_w(L, S_img)
             fj = _joint_freqs(txt_f, img_f)
-            if NLP_SPLIT:  # q/k/v heads in one tile-copy op ([q | k | v] column blocks per chip)
+            if qkv is not None:
+                q, k, v = qkv
+            elif NLP_SPLIT:  # q/k/v heads in one tile-copy op ([q | k | v] column blocks per chip)
                 B, Sj = y.shape[0], y.shape[1]
                 q, k, v = ttnn.experimental.nlp_create_qkv_heads(
                     ttnn.reshape(y, (B, 1, Sj, 3 * n)),
@@ -350,7 +357,8 @@ class TtQwenJointAttention:
             k = self._rope(self._rms(k, wk), fj)
             if vdt != ttnn.float32:
                 v = ttnn.typecast(v, vdt)
-            ttnn.deallocate(y)
+            if y is not None:
+                ttnn.deallocate(y)
             joint = q
         elif self.fused_qkv:  # one projection per stream; q/k/v are column blocks of its float32 output
             n = self.local_heads * self.head_dim
@@ -436,6 +444,9 @@ def _joint_freqs(txt_f, img_f):
 # heads split (JOINT_HEADS path only) by ttnn.experimental.nlp_create_qkv_heads, merged by nlp_concat_heads (plain
 # tile copies) instead of per-head slices + concat
 NLP_SPLIT = False
+# JOINT_HEADS's q / k / v as fn(txt, img, col_off, heads, head_dim, mem) -> [B, heads, L + S, head_dim] (or None:
+# the join + split above), each read straight from the two streams' projections
+JOINT_HEADS_FN = None
 NLP_MERGE = False
 # RoPE as x * [cos | cos] + [x2 | x1] * [-sin | sin] on tables built once per rotary tensor (bit-identical: a - b is
 # a + (-b), and the second half's sum is the same two products in the other order)
