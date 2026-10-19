@@ -494,6 +494,40 @@ def _bmm_full_k_config(a, b, transpose_b):
     )
 
 
+def _bmm_split_m_config(a, b, transpose_b):
+    """Full-grid config for a plain batched limb product on BMM_CORE_GRID: the whole K in one in0 block (each output
+    tile formed in the fp32 dest in one pass) and M split into the fewest row blocks per batch that still give every
+    core at most one block. None when the shapes are not tile aligned or a block overflows L1."""
+    a_s, b_s = [int(d) for d in a.padded_shape], [int(d) for d in b.padded_shape]
+    k, n = (b_s[-1], b_s[-2]) if transpose_b else (b_s[-2], b_s[-1])
+    m = a_s[-2]
+    if m % TILE or k % TILE or n % TILE:
+        return None
+    m_t, k_t, n_t = m // TILE, k // TILE, n // TILE
+    batches = math.prod(a_s[:-2])
+    cores = BMM_CORE_GRID.x * BMM_CORE_GRID.y
+    fits = [d for d in range(1, m_t + 1) if m_t % d == 0 and batches * (m_t // d) <= cores]
+    if not fits:
+        return None
+    per_m = min(fits)
+    if (2 * per_m * k_t + 2 * k_t * n_t) * 2048 + per_m * n_t * 4096 > 1024 * 1024:
+        return None
+    sub_w = max(d for d in range(1, min(n_t, 4) + 1) if n_t % d == 0)
+    sub_h = max(d for d in range(1, min(per_m, 4 // sub_w) + 1) if per_m % d == 0)
+    return ttnn.MatmulMultiCoreReuseProgramConfig(
+        compute_with_storage_grid_size=(BMM_CORE_GRID.x, BMM_CORE_GRID.y),
+        in0_block_w=k_t,
+        out_subblock_h=sub_h,
+        out_subblock_w=sub_w,
+        per_core_M=per_m,
+        per_core_N=n_t,
+    )
+
+
+# split_matmul's plain products on _bmm_split_m_config (M split over the grid) instead of BMM_CORE_GRID alone
+BMM_SPLIT_M = False
+
+
 def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2):
     """float32 a @ float32 b over bf16 limbs of both operands, keeping the limb products whose order
     (i + j) is below `limbs` (2 limbs: ah.bh + ah.bl + al.bh; 3 limbs: six terms, ~float32). With
@@ -503,6 +537,8 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     pb_all = split_bf16(b, limbs)
     terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
     pc = _bmm_full_k_config(pa_all[0], pb_all[0], transpose_b) if exact and EXACT_CORE_GRID is not None else None
+    if pc is None and not exact and BMM_SPLIT_M and BMM_CORE_GRID is not None:
+        pc = _bmm_split_m_config(pa_all[0], pb_all[0], transpose_b)
 
     def mm(p, q, **kw):
         if pc is None and not exact and BMM_CORE_GRID is not None:
