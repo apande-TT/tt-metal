@@ -6,6 +6,8 @@
 // [32, K] decode activation once and multicasts it into every compute core's x CB (the same L1 address on every
 // core), then raises their valid semaphore. It first waits for every compute core to report its x CB reserved
 // (ready semaphore). Both semaphores start from 0 on every launch of the program.
+// X_GATHER (NormGateUpDecode): the activation is not read from a tensor; X_GATHER norm cores write its slices straight
+// into this core's x CB, each counting itself on the gather semaphore (compile-time arg 5).
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -16,17 +18,21 @@ void kernel_main() {
     constexpr uint32_t n_cores = get_compile_time_arg_val(2);  // compute cores
     constexpr uint32_t sem_ready = get_compile_time_arg_val(3);
     constexpr uint32_t sem_valid = get_compile_time_arg_val(4);
-    constexpr auto x_args = TensorAccessorArgs<5>();
-
-    const auto x = TensorAccessor(x_args, get_arg_val<uint32_t>(0));
     constexpr uint32_t cb_x = 0;
 
     cb_reserve_back(cb_x, Kt);
     const uint32_t x_l1 = get_write_ptr(cb_x);
+#ifdef X_GATHER
+    constexpr uint32_t sem_gather = get_compile_time_arg_val(5);
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_gather)), X_GATHER);
+#else
+    constexpr auto x_args = TensorAccessorArgs<5>();
+    const auto x = TensorAccessor(x_args, get_arg_val<uint32_t>(0));
     for (uint32_t k = 0; k < Kt; ++k) {
         noc_async_read_page(k, x, x_l1 + k * x_tile);
     }
     noc_async_read_barrier();
+#endif
     noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_ready)), n_cores);
     const uint32_t valid_l1 = get_semaphore(sem_valid);
     *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(valid_l1) = 1;

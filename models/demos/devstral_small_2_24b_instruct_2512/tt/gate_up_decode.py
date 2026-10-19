@@ -199,3 +199,182 @@ class FusedGateUpDecode:
         ]
         ttnn.generic_op([x, self.wg, self.wu, out], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
         return out
+
+
+
+class NormGateUpDecode(FusedGateUpDecode):
+    """FusedGateUpDecode with the post-attention RMSNorm folded into its prologue: it takes the decode residual h itself
+    (fp32, width-sharded, WT tiles a shard) instead of the normed bf16 row, so the weight streams start while the row
+    is still being normed (a separate rms_norm + unshard ran ~8.6 us first).
+
+    NP norm cores on rows the program leaves free (NORM_ORIGIN, NORM_SHAPE; kernels/norm_shard_*.cpp) each read one
+    residual shard, square and row-sum it in fp32, swap those row sums with the other norm cores, add all of them in
+    fp32, scale by 1 / hidden, add eps, take rsqrt and multiply their shard by it (FPU column broadcast, as rms_norm's
+    sharded kernel does), then write the bf16 result into their K slot of the activation sender's x CB and count it
+    there; the sender (gate_up_sender.cpp, X_GATHER) waits for all NP slices and multicasts the row exactly as it
+    multicasts a row it read itself. Stream cores, weights and compute are FusedGateUpDecode's, unchanged."""
+
+    NORM_ORIGIN = (0, 6)
+    NORM_SHAPE = (10, 4)  # NP = 40 cores, 4 K tiles each at K = 160
+
+    @classmethod
+    def supports_norm(cls, device, k, n, dtype) -> bool:
+        if not cls.supports(device, k, n, dtype):
+            return False
+        g = device.compute_with_storage_grid_size()
+        (ox, oy), (nx, ny) = cls.NORM_ORIGIN, cls.NORM_SHAPE
+        n_cores = (n // ttnn.TILE_SIZE) // cls.NC
+        used_rows = -(-n_cores // g.x)  # the stream cores fill rows 0.. row-major; the sender is the last core
+        return (
+            k % (nx * ny * ttnn.TILE_SIZE) == 0
+            and oy >= used_rows
+            and ox + nx <= g.x
+            and oy + ny <= g.y
+            and (ox + nx < g.x or oy + ny < g.y)  # not the sender (g.x - 1, g.y - 1)
+        )
+
+    def __init__(self, device, w_gate, w_up, dtype, math_fidelity, put, tp, eps, hidden):
+        super().__init__(device, w_gate, w_up, dtype, math_fidelity, put, tp)
+        import struct
+
+        (ox, oy), (nx, ny) = self.NORM_ORIGIN, self.NORM_SHAPE
+        self.np = nx * ny
+        self.wt = self.kt // self.np  # tiles of a residual shard
+        self.norm_xy_logical = [(ox + i % nx, oy + i // nx) for i in range(self.np)]
+        rng = lambda a, b, c, d: ttnn.CoreRange(ttnn.CoreCoord(a, b), ttnn.CoreCoord(c, d))
+        self.norm_set = ttnn.CoreRangeSet([rng(ox, oy, ox + nx - 1, oy + ny - 1)])
+        self.n_all = self.all.merge(self.norm_set)
+        phys = lambda x, y: device.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
+        # the gather core (norm core 0, the origin corner) and the other norm cores as rectangles it multicasts to
+        gc = phys(ox, oy)
+        self.gather_xy = [gc.x, gc.y]
+        others = [(ox + 1, oy, ox + nx - 1, oy), (ox, oy + 1, ox + nx - 1, oy + ny - 1)]
+        self.others = [len(others)]
+        for a, b, c, d in others:
+            lo, hi = phys(a, b), phys(c, d)
+            self.others += [lo.x, lo.y, hi.x, hi.y, (c - a + 1) * (d - b + 1)]
+        bits = lambda f: struct.unpack("<I", struct.pack("<f", f))[0]
+        self.inv_n_bits, self.eps_bits = bits(1.0 / hidden), bits(float(eps))
+        ncfg = ttnn.ComputeConfigDescriptor()
+        ncfg.math_fidelity = ttnn.MathFidelity.HiFi4
+        ncfg.fp32_dest_acc_en = True
+        ncfg.math_approx_mode = False
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        modes[4] = ttnn.UnpackToDestMode.UnpackToDestFp32  # cb_h: fp32 straight to DEST for the SFPU square
+        ncfg.unpack_to_dest_mode = modes
+        self.ncfg = ncfg
+
+    def accepts(self, h) -> bool:
+        """h: the (1, 1, 32, K) fp32 decode residual, width-sharded into self.np shards of self.wt tiles."""
+        if tuple(int(d) for d in h.shape) != (1, 1, ttnn.TILE_SIZE, self.kt * ttnn.TILE_SIZE):
+            return False
+        if h.dtype != ttnn.float32 or not h.is_sharded():
+            return False
+        mem = h.memory_config()
+        spec = mem.shard_spec
+        return (
+            mem.memory_layout == ttnn.TensorMemoryLayout.WIDTH_SHARDED
+            and spec is not None
+            and tuple(spec.shape) == (ttnn.TILE_SIZE, self.wt * ttnn.TILE_SIZE)
+        )
+
+    def _ncb(self, index, tiles, page, dtype, cores):
+        fmt = ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=page)
+        return ttnn.CBDescriptor(total_size=tiles * page, core_ranges=cores, format_descriptors=[fmt])
+
+    def norm_call(self, h):
+        """h: the decode residual as accepts() requires; returns silu(norm(h) W_gate) * (norm(h) W_up), (1, 1, 32, N)
+        bf16 in L1 (unit-gamma RMSNorm: its gamma is folded into the weights)."""
+        kt, nt, nc, rb, w_tile, depth, nb = self.kt, self.nt, self.NC, self.RB, self.w_tile, self.depth, self.nb
+        x_tile, o_tile, f32_tile = 2048, 2048, 4096
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape((1, 1, ttnn.TILE_SIZE, nt * ttnn.TILE_SIZE)),
+            ttnn.bfloat16,
+            ttnn.TILE_LAYOUT,
+            self.device,
+            ttnn.L1_MEMORY_CONFIG,
+        )
+        acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+        wdt = self.wg.dtype
+        norm, everyone = self.norm_set, self.n_all
+        # x first, on every core (the norm cores write into the sender's at their own address of it)
+        cbs = [
+            self._ncb(0, kt, x_tile, ttnn.bfloat16, everyone),
+            self._ncb(3, self.np, f32_tile, ttnn.float32, norm),
+            self._ncb(1, depth * rb * nc, w_tile, wdt, self.all),
+            self._ncb(2, depth * rb * nc, w_tile, wdt, self.all),
+            self._ncb(16, nc, o_tile, ttnn.bfloat16, self.all),
+            self._ncb(4, self.wt, f32_tile, ttnn.float32, norm),
+            self._ncb(5, self.wt, f32_tile, ttnn.float32, norm),
+            self._ncb(6, self.wt, f32_tile, ttnn.float32, norm),
+            self._ncb(7, 1, f32_tile, ttnn.float32, norm),
+            self._ncb(8, 1, f32_tile, ttnn.float32, norm),
+            self._ncb(9, 1, f32_tile, ttnn.float32, norm),
+            self._ncb(10, self.wt, x_tile, ttnn.bfloat16, norm),
+        ]
+        SEM_READY, SEM_VALID, SEM_PART, SEM_GATHER, SEM_R = 0, 1, 2, 3, 4
+        sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=everyone, initial_value=0) for i in range(5)]
+        dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
+        dm0 = dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0)
+        dm1 = dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1)
+        stream_ct = lambda cb, owner, w: [
+            kt,
+            nb,
+            nc,
+            rb,
+            w_tile,
+            cb,
+            depth,
+            owner,
+            SEM_READY,
+            SEM_VALID,
+            o_tile,
+            nc,
+        ] + acc(w, out)
+        page0 = lambda c: bank_major_page0(c, kt, nb, nc, rb)
+        rt = lambda w: [
+            ((cx, cy), [w.buffer_address(), c * nc, out.buffer_address()] + self.sender_xy + [page0(c)])
+            for c, (cx, cy) in enumerate(self.core_xy)
+        ]
+        norm_rt = [
+            (xy, [i, h.buffer_address()] + self.sender_xy + self.gather_xy + self.others)
+            for i, xy in enumerate(self.norm_xy_logical)
+        ]
+        kern = lambda name, cores, ct, rt_, cfg, defines=(): ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct,
+            runtime_args=rt_,
+            config=cfg,
+            defines=list(defines),
+        )
+        kernels = [
+            kern(
+                "gate_up_sender.cpp",
+                self.sender_set,
+                [kt, x_tile, len(self.core_xy), SEM_READY, SEM_VALID, SEM_GATHER],
+                [(self.sender, [0] + self.rects)],
+                dm0,
+                [("X_GATHER", str(self.np))],
+            ),
+            kern("gate_up_stream.cpp", self.cores, stream_ct(1, 0, self.wg), rt(self.wg), dm0),
+            kern("gate_up_stream.cpp", self.cores, stream_ct(2, 1, self.wu), rt(self.wu), dm1),
+            kern("gate_up_compute.cpp", self.cores, [kt, nc, rb], [], self.cfg),
+            kern(
+                "norm_shard_dm.cpp",
+                norm,
+                [self.wt, self.np, x_tile, f32_tile, SEM_PART, SEM_GATHER, SEM_R] + acc(h),
+                norm_rt,
+                dm0,
+            ),
+            kern(
+                "norm_shard_compute.cpp",
+                norm,
+                [self.wt, self.np, self.inv_n_bits, self.eps_bits],
+                [(xy, [int(i == 0)]) for i, xy in enumerate(self.norm_xy_logical)],
+                self.ncfg,
+            ),
+        ]
+        ttnn.generic_op([h, self.wg, self.wu, out], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
+        return out
