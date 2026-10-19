@@ -194,6 +194,10 @@ class MiniCPM5Pipeline:
         col = self._tt(torch.arange(32, dtype=torch.float32).repeat(1, 1, 32, 1), ttnn.float32)
         at = self._tt(torch.arange(32, dtype=torch.float32).reshape(32, 1, 1, 1), ttnn.float32)
         self.mask_table = ttnn.typecast(ttnn.multiply(ttnn.gt(col, at), _NEG), ttnn.bfloat16)  # [32, 1, 32, 32]
+        # ... followed by the attention's bf16 constant tiles (scale, zero, max scaler: tiles 32-34), so one per-step
+        # L1 copy brings the mask and those constants.
+        att = self.encoder_stack.layers[0].self_attn
+        self.mask_table = ttnn.concat([self.mask_table, att.scale_tile, att.zero_tile, att.max_scaler], dim=0)
         kv = self.n_kv_heads
         self.key_index_kv = self._tt(torch.arange(C, dtype=torch.float32).repeat(1, kv, 1, 1), ttnn.float32)
         # rotate_half's sign over head_dim (-1 on the first half), folded into sin for the decode rope kernel.
@@ -514,9 +518,13 @@ class MiniCPM5Pipeline:
             ctx.mask_table = _MASK_TABLE
             # The attention constants copied to L1 for this step (persistent L1 copies clash with prefill's CBs).
             att = self.encoder_stack.layers[0].self_attn
-            ctx.consts = tuple(
-                ttnn.to_memory_config(t, l1) for t in (att.scale_tile, att.zero_tile, att.max_scaler, att.sum_scaler)
-            )
+            if _MASK_TABLE:
+                ctx.consts = (mask_full, mask_full, mask_full, ttnn.to_memory_config(att.sum_scaler, l1))
+            else:
+                ctx.consts = tuple(
+                    ttnn.to_memory_config(t, l1)
+                    for t in (att.scale_tile, att.zero_tile, att.max_scaler, att.sum_scaler)
+                )
             position_embeddings = None
         else:
             # cos / signed sin broadcast over a tile's rows once per step, shared by every layer's rope kernel.

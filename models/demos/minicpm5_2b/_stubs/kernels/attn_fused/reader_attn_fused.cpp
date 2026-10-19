@@ -101,8 +101,9 @@ void kernel_main() {
     cb_reserve_back(cb_scale, 1);
     cb_reserve_back(cb_max_scaler, 1);
     cb_reserve_back(cb_sum_scaler, 1);
-    noc_async_read_page(0, scale, get_write_ptr(cb_scale));
-    noc_async_read_page(0, max_scaler, get_write_ptr(cb_max_scaler));
+    // (with mask_table, the score scale and the max scaler are tiles 32 and 34 of the table tensor)
+    noc_async_read_page(mask_table ? 32 : 0, scale, get_write_ptr(cb_scale));
+    noc_async_read_page(mask_table ? 34 : 0, max_scaler, get_write_ptr(cb_max_scaler));
     noc_async_read_page(0, sum_scaler, get_write_ptr(cb_sum_scaler));
     noc_async_read_barrier();
     cb_push_back(cb_scale, 1);

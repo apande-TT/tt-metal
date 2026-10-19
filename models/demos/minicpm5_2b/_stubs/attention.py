@@ -114,7 +114,8 @@ class AttnContext:
         self.rope = rope
         # decode: per-step L1 copies of the attention constants (scale, zero, max / sum scalers), shared by every layer.
         self.consts = None
-        # decode: mask_full is the 32-tile mask table (tile r: position at column r; tile 31: unmasked).
+        # decode: mask_full is the mask table (tile r: position at column r; tile 31: unmasked; tiles 32-34: the
+        # score scale, zero and max-scaler tiles, passed in consts too).
         self.mask_table = False
 
 
@@ -960,7 +961,11 @@ class TtAttention:
         )
         extra_t = [qkv_t] if inline_kv and all(qkv_t is not u for u in tensors) else []
         return ttnn.generic_op(
-            tensors + [t for t in kv_tensors if all(t is not u for u in tensors)] + extra_t + [out], program
+            [t for i, t in enumerate(tensors) if all(t is not u for u in tensors[:i])]
+            + [t for t in kv_tensors if all(t is not u for u in tensors)]
+            + extra_t
+            + [out],
+            program,
         )
 
     def _prefill_2d_cfg(self, x, w, in0_block_w, subblock_w):
