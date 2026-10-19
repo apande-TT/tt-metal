@@ -62,6 +62,8 @@ VISION_ATTN_LIMBS = 2
 PREFIX_SHARE = True
 # mesh axis the vision batch is split over (the tower's TP=4 runs on the other axis)
 VISION_DP_AXIS = 0
+# LM stack slots whose MLP down projection takes its lower-limb product at LoFi (the rest: LO_FIDELITY)
+LM_DOWN_LOFI_SLOTS = range(7, 14)
 
 
 class TextEncoderInputs:
@@ -135,6 +137,11 @@ class TtQwenTextEncoder:
         _te_attention.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG)
         # the two-limb linears it declines (LM MLP down: K = 4736) take their lower-limb product at HiFi3
         _te_attention.LO_FIDELITY = ttnn.MathFidelity.HiFi3
+        # and at LoFi on the LM stack slots LM_DOWN_LOFI_SLOTS (slot j = layers j and n/2 + j on the two row stages):
+        # LoFi on every layer fails PCC, so only part of the stack takes it
+        for j, lyr in enumerate(self.text_model.layers):
+            if j in LM_DOWN_LOFI_SLOTS:
+                lyr.mlp.lo_fidelity = ttnn.MathFidelity.LoFi
         # the LM attention moves heads by per-head slices + concat, not a padded reshape + permute
         from models.demos.qwen_image_edit_text_encoder._stubs import layer as _te_layer
 
