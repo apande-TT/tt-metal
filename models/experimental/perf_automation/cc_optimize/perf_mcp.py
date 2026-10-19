@@ -3182,7 +3182,7 @@ def _persist_stage_ms(
                     # PER-REQUEST counts, from the legacy marker. "isl" above holds TOTALS a stage
                     # stated for one call; these must be multiplied by the batch and those must not.
                     "isl_per_request": stage_isl_per_request or {},
-                    # THE READ SET, MEASURED. Distinct device tensors each stage's ops touched, from
+                    # THE READ SET, MEASURED. Distinct device tensors each stage's ops streamed, from
                     # trace_replay's dispatch hook. The roofline's memory floor divides by this;
                     # every other source for it is an inference from the checkpoint plus a naming
                     # convention, and the one that matters most -- what a TOKEN reads -- had no
@@ -3246,8 +3246,10 @@ def read_stage_spread(state_dir_path=None, model="", task="") -> dict:
 def read_stage_bytes(state_dir_path=None, model="", task="") -> dict:
     """The measured per-stage read set in BYTES, or {}. Read by the report renderer.
 
-    The distinct device tensors each stage's ops touched, observed by trace_replay's dispatch hook
-    while the stage ran in isolation. This is the roofline's memory-floor divisor, MEASURED -- the
+    The distinct device tensors each stage's ops STREAMED -- handed and never written, a gathered
+    table at the rows that came out of it -- observed by trace_replay's dispatch hook while the stage
+    ran in isolation. What the step writes (its KV rows, its activations) is priced by summary's
+    per-item term on top. This is the roofline's memory-floor divisor, MEASURED -- the
     alternative sources are the checkpoint's total (which counts towers a token never reads), a name
     list (`audio_tower|vision_tower|...`, which a model can spell differently), and a stage_roots
     section map (which drops lm_head on any untied model).
@@ -3604,10 +3606,11 @@ def _run_full_pipeline_ms():
             # Decode ms and prefill ms are not the same currency (decode recurs per token, prefill
             # once per request), so a phase split guessed from free text can put time in the wrong
             # pool and be acted on. Measured, it cannot.
-            # THE BYTES A STAGE ACTUALLY READ. Parsed here beside its time because they are one
+            # THE BYTES A STAGE ACTUALLY STREAMED. Parsed here beside its time because they are one
             # measurement of one stage: trace_replay observes the distinct device tensors the stage's
-            # ops touched, which is the quantity the roofline has always had to infer from the
-            # checkpoint and a tower name list.
+            # ops read without writing, which is the quantity the roofline has always had to infer
+            # from the checkpoint and a tower name list. The integer up to the first space; the
+            # breakdown trace_replay prints behind it (in_step=, gathered_saved=) is for a reader.
             if "TRACE_STAGE_BYTES[" in line:
                 try:
                     _bn = line.split("TRACE_STAGE_BYTES[", 1)[1].split("]", 1)[0].strip()
@@ -3978,7 +3981,7 @@ def _run_full_pipeline_ms():
                     _med / 1e6,
                     depth=str(_st).strip().lower(),
                     mode="bytes_mb",
-                    source="trace_replay observed read set (%d agreeing samples)" % len(_svals),
+                    source="trace_replay observed streamed read set (%d agreeing samples)" % len(_svals),
                     model=_MODEL_ROOT.name if _MODEL_ROOT else "",
                 )
         except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost a measurement
@@ -8643,6 +8646,7 @@ def finish_round() -> dict:
     # still ends -- the agent exits on its own and no tool can prevent that -- but it ends recorded
     # as REFUSED, and the run stops on its round budget. The budget becoming the visible stopping
     # point is the honest outcome: it says the work was not finished instead of claiming it was.
+    _rep: dict = {}
     try:
         # THE GATE'S OWN ANSWER, not a second one. termination_check already builds the blocking list
         # and already names what has no attempt yet; asking it here means finish_round and the target
@@ -8675,11 +8679,29 @@ def finish_round() -> dict:
         )
     if _left:
         _owed.append("%d material op(s) have no attempt on the rung they are next owed" % len(_left))
-    _verdict["why"] = (
-        "NOT FINISHED. %s. Go back to the top of the LOOP: call termination_check, take the next "
-        "target -- prefer ops in the stacks named here -- and work its rung. Banking wins and writing "
-        "a summary is not an ending while either half is outstanding." % ", and ".join(_owed)
-    )
+    # A REFUSAL IS NOT ALWAYS AN ORDER TO GO BACK. "Go back to the top of the LOOP and take the next
+    # target" presumes there is one. When the gate itself answered with no target -- every material
+    # op's rungs tried, and nothing it could hand over -- the loop it sends the agent back to says the
+    # same thing, and the gate's own directive for that state is "call finish_round". The two tools
+    # then contradicted each other (Devstral run 4, 2026-10-18: the gate said call finish_round, this
+    # said call termination_check, and the agent went looking through the tool's source for a way
+    # out). The verdict is still REFUSED -- a band that cannot be reached is not waived, and the run
+    # ends on its round budget as designed -- but what the agent is told to do is to exit.
+    # ONE REFUSAL EXIT, two wordings: the verdict below is recorded and returned once either way.
+    if _short and not _left and _rep and _rep.get("next_target") is None:
+        _verdict["nothing_reachable"] = True
+        _verdict["why"] = (
+            "NOT FINISHED, AND NOTHING LEFT TO WORK. %s, yet the gate has no target: every material op "
+            "has its rungs tried. The round ends REFUSED on the record -- exit now rather than looping "
+            "back to termination_check, which will say the same. The run goes on by its round budget; a "
+            "later capture may open a new op." % ", and ".join(_owed)
+        )
+    else:
+        _verdict["why"] = (
+            "NOT FINISHED. %s. Go back to the top of the LOOP: call termination_check, take the next "
+            "target -- prefer ops in the stacks named here -- and work its rung. Banking wins and writing "
+            "a summary is not an ending while either half is outstanding." % ", and ".join(_owed)
+        )
     _record_round_finish(_verdict)
     return _verdict
 
@@ -8952,8 +8974,13 @@ def termination_check() -> dict:
     # actually happened last time (a crash message, a wedge, a PCC miss) from the log and appends it,
     # so a fresh round starting on a target someone already tried is not starting blind on WHY it
     # failed -- it still has to prove a fix by measuring, same as ever, but it knows what broke.
-    _target_reason = blocking[0]["reason"]
-    _prior_note = _last_recorded_note(blocking[0]["op"])
+    # NOTHING BLOCKING IS A VERDICT, NOT A CRASH. `next_target` below already yields None for an empty
+    # list, but these two reads ran first and raised IndexError the moment the last material op cleared
+    # its checklist -- the very moment can_stop had just been set. The harness treats a raised gate as
+    # "not done" and launches another round, so a finished run relaunched empty rounds until its round
+    # budget was spent (Devstral run 3, 2026-10-15: rounds 4-10 of 10 did nothing).
+    _target_reason = blocking[0]["reason"] if blocking else ""
+    _prior_note = _last_recorded_note(blocking[0]["op"]) if blocking else ""
     if _prior_note and _prior_note not in _target_reason:
         _target_reason = _target_reason.rstrip() + " | Last recorded attempt on this target: " + _prior_note
     next_target = (
@@ -9003,6 +9030,39 @@ def termination_check() -> dict:
         else ""
     )
     _persist_target(next_target)
+    if can_stop:
+        _directive = (
+            "DONE — every material-gap op has its full checklist ticked (grid + dtype knobs + tt-lang "
+            "+ C++). No reachable rung remains."
+        )
+    elif next_target is None:
+        # A STACK STILL OWES ITS BAND BUT NO OP IS LEFT TO HAND OVER. Before, this case could not be
+        # reached (see the IndexError note above); once it is, telling the agent to "work next_target"
+        # sends it after a target that is null. Say what is true and what to do.
+        _directive = (
+            "NOT DONE — %s still above the achievable band, yet no material op has a rung left to try: "
+            "nothing to work this round. Call finish_round (it records the round as REFUSED, there being "
+            "nothing reachable) and exit; the run goes on by its round budget, and a later capture may "
+            "open a new op." % ", ".join(str(r.get("stage") or "?") for r in _short)
+        )
+    else:
+        _directive = (
+            "NOT DONE — work next_target (the largest-gap blocking op) at its rung, IN THE STAGE "
+            "next_target.stage names: the ranking already accounts for where the time is, and the "
+            "metric in your instructions describes only the recurring stage, so following the metric "
+            "instead of the target spends effort where little is left. " + _stage_time_note + "REUSE-FIRST: "
+            "BEFORE editing, call recall_knobs(next_target.op_class, next_target.grid, "
+            "next_target.bound_by) and APPLY/ADAPT any matching "
+            "catalogued knob (heed its negative knowledge); improvise from scratch ONLY if nothing "
+            "matches — a recalled knob still requires check_pcc + measure + record_kernel_attempt (it "
+            "never skips a rung). Ladder ORDER: "
+            "knob:grid -> knob:fidelity -> knob:dtype -> knob:shard -> tt-lang -> cpp. record_kernel_attempt for EACH rung (knobs too: "
+            "kind='grid'/'fidelity'/'dtype'/'shard'; kernels: 'tt-lang'/'cpp'). A later rung does NOT clear an op while an "
+            "earlier rung is untried. WRITE-BACK: after you COMMIT a win you IMPROVISED (recall_knobs "
+            "had no match), call distill_knob to persist it for reuse; if the win re-used a provisional "
+            "lever from another model, pass its id to distill_knob to graduate it. Re-run "
+            "termination_check after each rung."
+        )
     return {
         "can_stop": can_stop,
         # WHICH STACKS STILL OWE THE BAND, and by how much. A veto the caller cannot see reads as
@@ -9020,26 +9080,7 @@ def termination_check() -> dict:
         "next_target": next_target,
         "blocking_ops": blocking,
         "cleared_ops": cleared,
-        "directive": (
-            "DONE — every material-gap op has its full checklist ticked (grid + dtype knobs + tt-lang "
-            "+ C++). No reachable rung remains."
-            if can_stop
-            else "NOT DONE — work next_target (the largest-gap blocking op) at its rung, IN THE STAGE "
-            "next_target.stage names: the ranking already accounts for where the time is, and the "
-            "metric in your instructions describes only the recurring stage, so following the metric "
-            "instead of the target spends effort where little is left. " + _stage_time_note + "REUSE-FIRST: "
-            "BEFORE editing, call recall_knobs(next_target.op_class, next_target.grid, "
-            "next_target.bound_by) and APPLY/ADAPT any matching "
-            "catalogued knob (heed its negative knowledge); improvise from scratch ONLY if nothing "
-            "matches — a recalled knob still requires check_pcc + measure + record_kernel_attempt (it "
-            "never skips a rung). Ladder ORDER: "
-            "knob:grid -> knob:fidelity -> knob:dtype -> knob:shard -> tt-lang -> cpp. record_kernel_attempt for EACH rung (knobs too: "
-            "kind='grid'/'fidelity'/'dtype'/'shard'; kernels: 'tt-lang'/'cpp'). A later rung does NOT clear an op while an "
-            "earlier rung is untried. WRITE-BACK: after you COMMIT a win you IMPROVISED (recall_knobs "
-            "had no match), call distill_knob to persist it for reuse; if the win re-used a provisional "
-            "lever from another model, pass its id to distill_knob to graduate it. Re-run "
-            "termination_check after each rung."
-        ),
+        "directive": _directive,
     }
 
 
