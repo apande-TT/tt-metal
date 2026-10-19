@@ -220,6 +220,11 @@ class QwenImageEditTT:
         _tr_attention.HEADS_BY_SLICES = True  # heads in/out by per-head slices, not a padded permute
         # the image and text queries as one joint query block: one exact QK^T / softmax / P @ V per attention
         _tr_attention.JOINT_QUERIES = True
+        # with the two streams' fused q/k/v outputs joined as [txt; img] rows first: one head split, norm and rope
+        # over the joint rows instead of per stream + the q/k/v joins
+        _tr_attention.JOINT_HEADS = True
+        _tr_attention.ROPE_SWAP = True  # rope as x * [cos | cos] + swap(x) * [-sin | sin] on cached tables
+        _tr_attention.NLP_SPLIT = True  # the joint q/k/v heads split by one nlp_create_qkv_heads tile copy
         _tr_attention.SOFTMAX_L1 = True  # the softmax's float32 logits in L1, subtract / exp in place
         _tr_attention.SOFTMAX_FN = fused_softmax_rows  # and the whole softmax as one bit-identical C++ kernel
         # the transformer's exact fp32 TP reduce gathers, slices and adds each token chunk in L1
@@ -320,6 +325,10 @@ class QwenImageEditTT:
             bl = p.B // self.dp
             rows = [t for c in range(self.dp) for t in (mc[c * bl : (c + 1) * bl], mu[c * bl : (c + 1) * bl])]
             p.cfg_len = L
+            from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import attention as _tr_attention
+
+            if _tr_attention.JOINT_HEADS:  # the blocks' joint-row norm tables for this [txt; img] length
+                self.transformer.joint_norm_tables(L, 2 * p.S_lat)
             p.joint_mask_cfg = _dp_sharded(d, torch.cat(rows, dim=0).reshape(2 * p.B, 1, 1, -1))
         return p
 

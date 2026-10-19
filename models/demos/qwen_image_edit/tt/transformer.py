@@ -101,6 +101,12 @@ class TtQwenImageTransformer:
         """(img_freqs [S_img, 128], txt_freqs [txt_len, 128]) float32 [cos | sin] device tables."""
         return self.pos_embed([list(img_shapes)], max_txt_seq_len=int(txt_len))
 
+    def joint_norm_tables(self, txt_len, img_len):
+        """Build every block's joint-row attention norm tables for this (text, image) length pair (attention
+        JOINT_HEADS) on host, before the forward."""
+        for blk in self.transformer_blocks:
+            blk.stack.blocks[0].attn.joint_norm_tables(int(txt_len), int(img_len))
+
     def embed_txt(self, encoder_hidden_states):
         """txt_in(txt_norm(prompt embeds)) -> [B, L, 3072] fp32: a function of the prompt alone, so a caller that
         runs several scheduler steps on one prompt can compute it once and pass it with txt_embedded=True."""
