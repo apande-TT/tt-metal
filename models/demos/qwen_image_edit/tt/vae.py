@@ -73,7 +73,7 @@ class PointwiseConv32:
         return ttnn.permute(ttnn.reshape(y, (B, H, W, self.cout)), (0, 3, 1, 2))
 
 
-def _block_fp32_convs(stack, h_block=8, w_block=4):
+def _block_fp32_convs(stack, h_block=8, w_block=8):
     """Give a float32 Wan stack's conv3d layers a real output blocking.
 
     get_conv3d_config has no float32 entry for the VAE's shapes, so every float32 conv falls back to
