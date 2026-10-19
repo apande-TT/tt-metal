@@ -27,6 +27,19 @@ def mesh_shape(device):
     return shape if len(shape) == 2 else (1, 1)
 
 
+def _wide_rows(t, min_width=32):
+    """(b, 1, rows, w): t's per-entry elements in row-major pages w wide, for a row-major t whose own rows are
+    narrower than min_width; None when that does not apply."""
+    s = list(t.shape)
+    if t.layout != ttnn.ROW_MAJOR_LAYOUT or len(s) < 2 or s[-1] >= min_width:
+        return None
+    per = 1
+    for d in s[1:]:
+        per *= d
+    w = next((w for w in (1024, 512, 256, 128, 64, 32) if per % w == 0), None)
+    return None if w is None else [s[0], 1, per // w, w]
+
+
 class BatchSplit:
     def __init__(self, device, batch_parallel=False):
         shape = mesh_shape(device)
@@ -143,8 +156,17 @@ class BatchSplit:
             out = ccl_manager.all_gather(out, dim=3, mesh_axis=pc.width_parallel.mesh_axis, use_hyperparams=False)
         if pc.height_parallel.factor > 1:
             out = ccl_manager.all_gather(out, dim=2, mesh_axis=pc.height_parallel.mesh_axis, use_hyperparams=False)
-        for a in reversed(self.axes):
-            out = ccl_manager.all_gather(out, dim=0, mesh_axis=a, use_hyperparams=False)
+        if self.axes:
+            # a narrow row-major output (the decoder's 3-channel image: 12-byte pages) is gathered as wide pages
+            # of the same per-image elements, then viewed back: a pure relayout, far fewer CCL pages
+            shape = list(out.shape)
+            wide = _wide_rows(out)
+            if wide is not None:
+                out = ttnn.reshape(out, wide)
+            for a in reversed(self.axes):
+                out = ccl_manager.all_gather(out, dim=0, mesh_axis=a, use_hyperparams=False)
+            if wide is not None:
+                out = ttnn.reshape(out, [out.shape[0]] + shape[1:])
         if pad_b:
             out = ttnn.slice(out, (0, 0, 0, 0, 0), (B,) + tuple(out.shape)[1:])
         return out
