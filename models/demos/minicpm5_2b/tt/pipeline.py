@@ -500,6 +500,11 @@ class MiniCPM5Pipeline:
             ctx = attention_stub.AttnContext(
                 "decode", mask, write, cur_pos, mask_full=mask_full, rope_rows=(cos_rows, sin_rows)
             )
+            # The attention constants copied to L1 for this step (persistent L1 copies clash with prefill's CBs).
+            att = self.encoder_stack.layers[0].self_attn
+            ctx.consts = tuple(
+                ttnn.to_memory_config(t, l1) for t in (att.scale_tile, att.zero_tile, att.max_scaler, att.sum_scaler)
+            )
             position_embeddings = None
         else:
             # cos / signed sin broadcast over a tile's rows once per step, shared by every layer's rope kernel.

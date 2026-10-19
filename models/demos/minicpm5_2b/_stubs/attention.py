@@ -112,6 +112,8 @@ class AttnContext:
         # decode: (cos, signed sin) [B, 1, 32, D] broadcast over the tile rows, sin negated on the first
         # half of D (rotate_half's sign), for the one-kernel rope.
         self.rope = rope
+        # decode: per-step L1 copies of the attention constants (scale, zero, max / sum scalers), shared by every layer.
+        self.consts = None
 
 
 class TtAttention:
@@ -864,17 +866,8 @@ class TtAttention:
                 total_size=64, core_ranges=cores, format_descriptors=[ttnn.CBFormatDescriptor(cb_cnt, ttnn.uint32, 64)]
             )
         )
-        tensors = [
-            qk,
-            kv_cache.k,
-            kv_cache.v,
-            self.scale_tile,
-            ctx.mask_full,
-            ctx.cur_pos,
-            self.zero_tile,
-            self.max_scaler,
-            self.sum_scaler,
-        ]
+        scale_t, zero_t, max_s, sum_s = ctx.consts or (self.scale_tile, self.zero_tile, self.max_scaler, self.sum_scaler)
+        tensors = [qk, kv_cache.k, kv_cache.v, scale_t, ctx.mask_full, ctx.cur_pos, zero_t, max_s, sum_s]
         accessor_ct = []
         for t in tensors:
             accessor_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
