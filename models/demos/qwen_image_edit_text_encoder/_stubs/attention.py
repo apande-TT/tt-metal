@@ -136,18 +136,18 @@ def exact_all_reduce(y, device, cluster_axis=1):
 SPLIT_LIMBS = None
 
 
-def split_bf16(x, limbs=2):
+def split_bf16(x, limbs=2, memory_config=None):
     """float32 -> `limbs` bf16 parts summing to x (2 limbs ~16 mantissa bits, 3 limbs ~24 = float32).
     A matmul consumes its inputs as bf16; the limbs keep every product exact against bf16 weights."""
     x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
     if SPLIT_LIMBS is not None:
-        parts = SPLIT_LIMBS(x32, limbs)
+        parts = SPLIT_LIMBS(x32, limbs) if memory_config is None else SPLIT_LIMBS(x32, limbs, memory_config)
         if parts is not None:
             return parts
     parts = []
     rest = x32
     for i in range(limbs):
-        p = ttnn.typecast(rest, ttnn.bfloat16)
+        p = ttnn.typecast(rest, ttnn.bfloat16, memory_config=memory_config)
         parts.append(p)
         if i + 1 < limbs:
             rest = ttnn.subtract(rest, ttnn.typecast(p, ttnn.float32))
@@ -682,15 +682,15 @@ def _repeat_entries(t, rep):
     return ttnn.reshape(ttnn.repeat(ttnn.reshape(t, (e, 1, r, c)), ttnn.Shape([1, rep, 1, 1])), (e * rep, 1, r, c))
 
 
-def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2, b_rep=1):
+def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2, b_rep=1, b_pre=None):
     """float32 a @ float32 b over bf16 limbs of both operands, keeping the limb products whose order
     (i + j) is below `limbs` (2 limbs: ah.bh + ah.bl + al.bh; 3 limbs: six terms, ~float32). With
     exact=True each term's K reduction is the exact lane sum (the lanes mask a's last dim). b_rep: b holds one
     entry per b_rep consecutive entries of a (a's entry e uses b's entry e // b_rep) -- never materialised when the
-    batched kernel takes it."""
+    batched kernel takes it. b_pre: (b's limbs, b's column norms) formed earlier (b itself then unused: None)."""
     cfg = precise_config()
     pa_all = split_bf16(a, limbs)
-    pb_all = split_bf16(b, limbs)
+    pb_all = split_bf16(b, limbs) if b_pre is None else b_pre[0]
     terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
 
     def mm(p, q):
@@ -717,7 +717,7 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
             y = t if y is None else ttnn.add(y, t)
         return y
     if EXACT_MODE == "guarded":
-        return _guarded_terms(mm, terms, a, b, transpose_b, b_rep=b_rep)
+        return _guarded_terms(mm, terms, a, b, transpose_b, b_rep=b_rep, b_norm=None if b_pre is None else b_pre[1])
     ests = []
     for pattern in LANE_PATTERNS:
         y = None
@@ -766,7 +766,7 @@ def _b_side_lanes(pa, pb, transpose_b):
     return None if lanes is None else [ttnn.view(t, sb) for t in lanes]
 
 
-def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1):
+def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
     (pa0, pb0), rest = terms[0], terms[1:]
@@ -811,7 +811,8 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1):
     nn = mm(neg0, pb0_l1)
     if pb0_l1 is not pb0:
         ttnn.deallocate(pb0_l1)
-    b_norm = _col_norms(b, transpose_b, cache=False)
+    if b_norm is None:
+        b_norm = _col_norms(b, transpose_b, cache=False)
     if b_rep > 1:  # b's per-entry norms to a's entries (small)
         b_norm = _repeat_entries(b_norm, b_rep)
     y = _guarded(ex, dn, nn, _norm_last(a), b_norm, *first)
@@ -972,14 +973,19 @@ class TtVisionAttention:
             )
 
         q, k = _rope(q), _rope(k)
-        v = ttnn.to_memory_config(v, ttnn.DRAM_MEMORY_CONFIG)
+        # v's limbs and column norms (all P @ V takes of it) formed from L1 straight into DRAM: no copy of v
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        vt = ttnn.transpose(v, -2, -1, memory_config=dram)
+        v_pre = (split_bf16(v, L, memory_config=dram), ttnn.transpose(_norm_last(vt), -2, -1))
+        ttnn.deallocate(vt)
+        ttnn.deallocate(v)
         mask = tt_mask if tt_mask.dtype == ttnn.float32 else ttnn.typecast(tt_mask, ttnn.float32)
         scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, limbs=L)
         scores = ttnn.add(ttnn.multiply(scores, self.scale), mask)
         mx = ttnn.max(scores, dim=-1, keepdim=True)
         e = ttnn.exp(ttnn.subtract(scores, mx))
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
-        o = split_matmul(probs, v, compute_kernel_config=cfg, limbs=L)  # [N, hp, S, Dp]
+        o = split_matmul(probs, None, compute_kernel_config=cfg, limbs=L, b_pre=v_pre)  # [N, hp, S, Dp]
         o = ttnn.experimental.nlp_concat_heads(o)  # [N, 1, S, hp * Dp]
         if self.tp > 1:
             o = ttnn.all_gather(o, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)

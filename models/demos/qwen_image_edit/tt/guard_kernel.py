@@ -317,7 +317,7 @@ def weight_lanes(w):
     return outs
 
 
-def split_limbs(x, limbs=2):
+def split_limbs(x, limbs=2, memory_config=None):
     """split_bf16's `limbs` (2 or 3) bf16 limbs of an interleaved float32 tile tensor in one pass -- hi = bf16(x),
     then the bf16 of each remainder -- with the same SFPU typecast / subtract; or None for a tensor it does
     not take."""
@@ -336,7 +336,7 @@ def split_limbs(x, limbs=2):
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=x.device(),
-            memory_config=x.memory_config(),
+            memory_config=x.memory_config() if memory_config is None else memory_config,
         )
         for _ in range(limbs)
     ]
