@@ -19,11 +19,16 @@ import ttnn
 
 
 class TtPixtralRotaryEmbedding:
-    def __init__(self, device, torch_module) -> None:
+    def __init__(self, device, torch_module, interleaved=False) -> None:
+        """interleaved: emit the tables in interleaved-pair head_dim order (dims 2j and 2j+1 <- HF's j and
+        j + head_dim/2, which share a frequency), the order of a TtPixtralAttention built with META_ROPE. The values
+        are the same, only their column order differs."""
         self.device = device
         self._repl = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
         inv_freq = torch_module.inv_freq.detach().float()  # (positions, head_dim)
-        self.head_dim = inv_freq.shape[-1]
+        self.head_dim = hd = inv_freq.shape[-1]
+        if interleaved:
+            inv_freq = inv_freq[:, torch.arange(hd).reshape(2, hd // 2).T.reshape(-1)]
 
         def _table(t):
             return ttnn.from_torch(

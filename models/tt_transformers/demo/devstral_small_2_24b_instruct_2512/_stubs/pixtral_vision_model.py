@@ -35,6 +35,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs import pixtral_attention
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_r_m_s_norm import TtPixtralRMSNorm
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_rotary_embedding import (
     TtPixtralRotaryEmbedding,
@@ -45,15 +46,25 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtr
 
 
 class TtPixtralVisionModel:
+    # The transformer's q/k and the rotary tables in interleaved-pair head_dim order (pixtral_attention.META_ROPE):
+    # every layer's q / k RoPE is one fused rotary_embedding_llama.
+    META_ROPE = True
+
     def __init__(self, device, torch_module, n_layers=None) -> None:
         self.device = device
         cfg = torch_module.config
         self.patch_size = p = torch_module.patch_size
         self.max_side = cfg.image_size // cfg.patch_size
         self.hidden = hidden = cfg.hidden_size
-        self.transformer = TtPixtralTransformer(device, torch_module.transformer, n_layers=n_layers)
+        pixtral_attention.META_ROPE = self.META_ROPE
+        try:
+            self.transformer = TtPixtralTransformer(device, torch_module.transformer, n_layers=n_layers)
+        finally:
+            pixtral_attention.META_ROPE = False
         self.ln_pre = TtPixtralRMSNorm.build(device, torch_module.ln_pre)
-        self.patch_positional_embedding = TtPixtralRotaryEmbedding(device, torch_module.patch_positional_embedding)
+        self.patch_positional_embedding = TtPixtralRotaryEmbedding(
+            device, torch_module.patch_positional_embedding, interleaved=self.META_ROPE
+        )
         self.head_dim = self.transformer.head_dim
         self._repl = repl = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
 
