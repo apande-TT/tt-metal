@@ -133,6 +133,8 @@ class TtQwenTextEncoder:
         # the LM's two-limb linears as one C++ program each (limb_linear.cpp: the weight streamed once for both limbs,
         # the same fp32 products and RNE add)
         _te_attention.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG)
+        # the two-limb linears it declines (LM MLP down: K = 4736) take their lower-limb product at HiFi3
+        _te_attention.LO_FIDELITY = ttnn.MathFidelity.HiFi3
         # the LM attention moves heads by per-head slices + concat, not a padded reshape + permute
         from models.demos.qwen_image_edit_text_encoder._stubs import layer as _te_layer
 
