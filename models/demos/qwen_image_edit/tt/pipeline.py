@@ -42,6 +42,7 @@ from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
 from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
 from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
 from models.demos.qwen_image_edit_text_encoder._stubs import vision_transformer_pretrained_model as _vision_tower
+from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl as _dit_ccl
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import _resident as _vae_resident
 
 # Stages from the HF reference (model_index.json): the Qwen2.5-VL text_encoder is a vision tower + an
@@ -264,7 +265,9 @@ class TtQwenImageEditPipeline:
         t = ttnn.repeat(ttnn.slice(st.sched, [0, 0], [1, 1]), (B, 1))  # [B, 1] = timestep / 1000
         dt = ttnn.reshape(ttnn.slice(st.sched, [0, 1], [1, 2]), (1, 1, 1))
         x_in = ttnn.concat([st.lat, st.image_latents], dim=1)
-        v = self.transformer(x_in, t, st.prompt, st.rotary)
+        # (the exact all-reduces' gathered partials summed in one fused pass, bit-identical to the slice + add chain)
+        with self._hook(_dit_ccl, "SUM_PARTS", self.sum_parts):
+            v = self.transformer(x_in, t, st.prompt, st.rotary)
         v = ttnn.slice(v, [0, 0, 0], [B, S, C])  # noise_pred[:, : latents.size(1)]
         ttnn.copy(ttnn.add(st.lat, ttnn.multiply(v, dt)), st.lat)
         n, w = st.n, _SCHED_COLS

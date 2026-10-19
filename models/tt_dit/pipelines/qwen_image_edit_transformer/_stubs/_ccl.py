@@ -20,6 +20,9 @@ from __future__ import annotations
 import ttnn
 
 _CHUNK_BYTES = 48 * 1024 * 1024  # per-partial bytes gathered at once
+# Optional fused kernel for the gathered partials' sum: SUM_PARTS(g, n) -> the left-to-right float32 sum of the n
+# slabs of g = [n, ...] (bit-identical to the slice + add chain below), or None for a g it does not take.
+SUM_PARTS = None
 
 
 def mesh_axes(device):
@@ -37,7 +40,10 @@ def _gather_sum_once(y, ax, n):
     g = ttnn.all_gather(
         ttnn.reshape(y, [1] + shape), dim=0, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear
     )
-    out = None
+    out = None if SUM_PARTS is None else SUM_PARTS(g, n)
+    if out is not None:
+        ttnn.deallocate(g)
+        return ttnn.reshape(out, shape)
     for i in range(n):
         part = ttnn.slice(g, [i] + [0] * len(shape), [i + 1] + shape)
         out = part if out is None else ttnn.add(out, part)
