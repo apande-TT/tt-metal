@@ -41,6 +41,7 @@ from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_sum
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
+from models.demos.qwen_image_edit.tt.joint_heads import fused_joint_heads
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
 from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm
 from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16
@@ -225,6 +226,9 @@ class QwenImageEditTT:
         _tr_attention.JOINT_HEADS = True
         _tr_attention.ROPE_SWAP = True  # rope as x * [cos | cos] + swap(x) * [-sin | sin] on cached tables
         _tr_attention.NLP_SPLIT = True  # the joint q/k/v heads split by one nlp_create_qkv_heads tile copy
+        # and q / k / v each written head-major straight from the two streams' projections by one C++ copy program
+        # (joint_heads.fused_joint_heads), with no [txt; img] join
+        _tr_attention.JOINT_HEADS_FN = fused_joint_heads
         _tr_attention.SOFTMAX_L1 = True  # the softmax's float32 logits in L1, subtract / exp in place
         _tr_attention.SOFTMAX_FN = fused_softmax_rows  # and the whole softmax as one bit-identical C++ kernel
         # the transformer's exact fp32 TP reduce gathers, slices and adds each token chunk in L1
