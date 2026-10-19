@@ -100,7 +100,7 @@ class TtRMSNorm:
             vol = 4
             for d in x32.padded_shape:
                 vol *= d
-            mem = ttnn.L1_MEMORY_CONFIG if vol <= 24 * 2**20 else None
+            mem = ttnn.L1_MEMORY_CONFIG if vol <= 30 * 2**20 else None
             sq = ttnn.multiply(x32, x32, memory_config=mem)
             ms = ttnn.mean(sq, dim=-1, keepdim=True, compute_kernel_config=self.compute_cfg)
             ttnn.deallocate(sq)
