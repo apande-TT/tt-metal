@@ -423,17 +423,18 @@ LIMB_LINEAR_FN = None
 LO_FIDELITY = None
 
 
-def _lo_config():
-    """precise_config() at LO_FIDELITY."""
+def _lo_config(fidelity=None):
+    """precise_config() at `fidelity` (None: LO_FIDELITY)."""
     return ttnn.WormholeComputeKernelConfig(
-        math_fidelity=LO_FIDELITY, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False
+        math_fidelity=fidelity or LO_FIDELITY, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False
     )
 
 
-def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2, parts=None):
+def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2, parts=None, lo_fidelity=None):
     """float32 x @ bf16 w (+ bias) -> float32. x is carried as `limbs` bf16 parts (exact products). With
     exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part.
-    parts: split_bf16(x, limbs) when several projections share x (split once, not once per projection)."""
+    parts: split_bf16(x, limbs) when several projections share x (split once, not once per projection).
+    lo_fidelity: this call's lower-limb fidelity on the stock non-exact path (None: LO_FIDELITY)."""
     cfg = precise_config()
     parts = split_bf16(x, limbs) if parts is None else parts
 
@@ -463,7 +464,7 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
         pc = _block_config(x, w) if y is None and LINEAR_BLOCK and LINEAR_CORE_GRID is not None else None
         kw = dict(program_config=pc) if pc is not None else dict(core_grid=LINEAR_CORE_GRID)
         for i, part in enumerate(parts if y is None else ()):
-            c = cfg if i == 0 or LO_FIDELITY is None else _lo_config()
+            c = cfg if i == 0 or (lo_fidelity or LO_FIDELITY) is None else _lo_config(lo_fidelity)
             t = ttnn.linear(part, w, compute_kernel_config=c, dtype=ttnn.float32, **kw)
             y = t if y is None else ttnn.add(y, t)
     # bias added separately in float32 (the fused bias add of ttnn.linear rounds: 3.1e-4 -> 5.1e-4)

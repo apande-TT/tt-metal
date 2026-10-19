@@ -293,7 +293,9 @@ class TtTextMLP:
                 h = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
             else:
                 h = ttnn.multiply(ttnn.silu(gate), up)
-            out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex)
+            # lo_fidelity: this MLP's own lower-limb fidelity for the down projection (None: the module default)
+            lo = getattr(self, "lo_fidelity", None)
+            out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex, lo_fidelity=lo)
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)
             return out
