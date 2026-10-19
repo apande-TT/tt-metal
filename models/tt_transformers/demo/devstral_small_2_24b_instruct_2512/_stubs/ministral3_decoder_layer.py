@@ -73,7 +73,13 @@ class TtMinistral3DecoderLayer:
         self.tp = self.self_attn.tp
         self.input_layernorm = TtMinistral3RMSNorm.build(device, ln_in, fold_gamma=True)
         self.post_attention_layernorm = TtMinistral3RMSNorm.build(device, ln_post, fold_gamma=True)
-        self.mlp = TtMinistral3MLP(device, torch_module.mlp, in_scale=ln_post.weight, layer_idx=layer_idx)
+        self.mlp = TtMinistral3MLP(
+            device,
+            torch_module.mlp,
+            in_scale=ln_post.weight,
+            layer_idx=layer_idx,
+            norm_eps=float(ln_post.variance_epsilon) if self.SHARDED_DECODE_RESIDUAL else None,
+        )
         self.compute_cfg = self.self_attn.compute_cfg
         self.hidden = int(ln_in.weight.shape[0])
         if self.tp > 1 and self.SHARDED_DECODE_RESIDUAL:  # the decode all_gathers land in the residual's shards
@@ -158,14 +164,16 @@ class TtMinistral3DecoderLayer:
         if mode == "decode" and self.SHARDED_DECODE_RESIDUAL:
             res_mem = self.post_attention_layernorm.decode_mem(int(x.shape[-1]))
         h = self._residual_add(x, a, res_mem)
-        if mode == "decode":
+        if mode == "decode" and self.mlp.decode_norms(h):
+            # the gate / up program norms the residual's own width shards itself (its weight streams start meanwhile)
+            m = self.mlp(h, mode=mode, residual_norm=True)
+        elif mode == "decode":
             # unsharded into L1: the fused gate / up's sender core reads this row once from there and multicasts it
             n = self.post_attention_layernorm.decode(h, l1=True)
-        else:
-            n = self._bf16(self.post_attention_layernorm(self._bf16(h)))
-        m = self.mlp(n, mode=mode)
-        if mode == "decode":
+            m = self.mlp(n, mode=mode)
             ttnn.deallocate(n)
+        else:
+            m = self.mlp(self._bf16(self.post_attention_layernorm(self._bf16(h))), mode=mode)
         out = self._residual_add(h, m, res_mem)
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
