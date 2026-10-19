@@ -174,7 +174,7 @@ PLANNED_TP = 4
 #                     position below the KV capacity, built once by the same device ops on one dense position column
 #                     (32 positions a tile; ~0.1 ms at load instead of 2.65 ms) (no per-step cos / sin math,
 #                     concat or reshard; the fp32 position column is then no longer advanced). Decode QKV
-#                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v]; decode
+#                     is a DRAM-sharded matmul (3 readers per bank, HiFi2) over its own bank-sharded copy of [q | k | v]; decode
 #                     QKV and o_proj read block-float8 copies (prefill keeps bf16). Decode o_proj is the MLP down's
 #                     C++ streaming program (tt/down_decode.py: bank-major bf8 copy, 8 x 10 cores, ~9 KB pushes,
 #                     bit-identical to the 1D-multicast matmul), its bf16 partials in L1 for the reduce-scatter.
