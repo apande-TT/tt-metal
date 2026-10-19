@@ -232,9 +232,10 @@ PLANNED_TP = 4
 #                     height-sharded heads (no rotate-half matmul / mul / add chain, no unshard + reshard of k); q
 #                     shares k's tables while the KV capacity is below the llama-4 scaling threshold (scale == 1).
 #                     Prefill's q / k RoPE are one fused rotary_embedding_llama each too (interleaved, all users at once).
-#   pixtral_attention META_ROPE: the vision tower's q/k weight columns and rotary tables use the same interleaved-pair
-#                     order, so each vision layer's q / k RoPE is one fused rotary_embedding_llama (HiFi4, 16-bit DEST:
-#                     the rotate-half chain's own arithmetic) instead of a rotate-half matmul + multiply / multiply / add.
+#   pixtral_attention CPP_HEADS_ROPE: each vision layer's head split and q / k RoPE run as ONE C++ program
+#                     (tt/heads_rope.py: per tile, x * cos + partner * signed sin, replaying ttnn.multiply's SFPU and
+#                     ttnn.add's FPU bf16 ops -- bit-identical to the rotate-half chain, no matmul) instead of
+#                     nlp_create_qkv_heads + a rotate-half matmul / multiply / multiply / add per tensor.
 
 
 def kv_capacity_for(tp):
