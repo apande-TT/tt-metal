@@ -460,8 +460,12 @@ class VocabTopK:
         wt_local = wt // (g * n)
         assert wt_local >= 2 and wt_local & (wt_local - 1) == 0
         out_shape = ttnn.Shape((1, 1, rows, k))
-        vals = ttnn.allocate_tensor_on_device(out_shape, self.VAL, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG)
-        ids = ttnn.allocate_tensor_on_device(out_shape, self.IDX, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG)
+        vals = ttnn.allocate_tensor_on_device(
+            out_shape, self.VAL, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        ids = ttnn.allocate_tensor_on_device(
+            out_shape, self.IDX, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
 
         # CB ids as in the stock factory. The gather buffers (c_4/c_5) are written remotely at the sender's own
         # address of them, so they go first on every core (same L1 address everywhere). A middle core reads that
@@ -866,6 +870,16 @@ class DevstralPipeline:
             )
         log(f"pipeline resident in {time.time() - t0:.1f}s (KV cache {self.kv_shape} per layer, bf16)")
 
+    def gathered_tables(self):
+        """The tables a step reads BY INDEX (perf_automation's stage_seams.GATHERED_TABLES_ATTR): the token
+        embedding's replicated table (decode's one-program gather, tt/embed_decode.py), its hidden-sharded copy and
+        its per-row squared-sum table (prefill's per-device gathers), and the vision tower's rotary cos / sin tables
+        (gathered by patch position). A unit of work reads rows of these, never the table, so the perf harness
+        charges each at the rows that came out of it instead of at its whole size."""
+        te = self.language_model.embed_tokens
+        rope = self.vision_tower.patch_positional_embedding
+        return [t for t in (te.weight, te.weight_shard, te.sq_table, rope.cos_table, rope.sin_table) if t is not None]
+
     def _tp(self):
         try:
             return int(self.device.get_num_devices())
@@ -896,7 +910,10 @@ class DevstralPipeline:
                 mesh_mapper=ttnn.ShardTensorToMesh(self.device, dim=0),
             )
             return {"pixel_values": pv, "prepatched": True, "vision_split": True}
-        return {"pixel_values": self._put(patches.to(torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT), "prepatched": True}
+        return {
+            "pixel_values": self._put(patches.to(torch.bfloat16), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+            "prepatched": True,
+        }
 
     def upload(self, req):
         """Move one encoded request onto the device: prompt, positions, image, merge index, noise table, state."""
