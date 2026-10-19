@@ -417,6 +417,17 @@ def _exact_linear_fn(parts, w, patterns, out_bytes):
 # fn(hi, lo, w) -> hi @ w + lo @ w as float32 (one call: the weight streamed once for both limbs, the same fp32
 # products and add) or None to run the stock ops; used by split_linear's non-exact two-limb products
 LIMB_LINEAR_FN = None
+# math fidelity of the lower-limb products of split_linear's stock non-exact two-limb path (the linears LIMB_LINEAR_FN
+# declines; the lower limb is ~2^-8 of the value, so a lower fidelity's error on it sits below the leading product's
+# rounding); None: HiFi4 for every term
+LO_FIDELITY = None
+
+
+def _lo_config():
+    """precise_config() at LO_FIDELITY."""
+    return ttnn.WormholeComputeKernelConfig(
+        math_fidelity=LO_FIDELITY, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=False
+    )
 
 
 def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2, parts=None):
@@ -451,8 +462,9 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
         y = LIMB_LINEAR_FN(parts[0], parts[1], w) if LIMB_LINEAR_FN is not None and len(parts) == 2 else None
         pc = _block_config(x, w) if y is None and LINEAR_BLOCK and LINEAR_CORE_GRID is not None else None
         kw = dict(program_config=pc) if pc is not None else dict(core_grid=LINEAR_CORE_GRID)
-        for part in parts if y is None else ():
-            t = ttnn.linear(part, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw)
+        for i, part in enumerate(parts if y is None else ()):
+            c = cfg if i == 0 or LO_FIDELITY is None else _lo_config()
+            t = ttnn.linear(part, w, compute_kernel_config=c, dtype=ttnn.float32, **kw)
             y = t if y is None else ttnn.add(y, t)
     # bias added separately in float32 (the fused bias add of ttnn.linear rounds: 3.1e-4 -> 5.1e-4)
     return ttnn.add(y, ttnn.typecast(bias, ttnn.float32)) if bias is not None else y
