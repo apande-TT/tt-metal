@@ -136,13 +136,18 @@ class TtQwenJointAttention:
             else:
                 w = norm.weight.detach().to(torch.float32) if norm.weight is not None else torch.ones(hd)
             w = w[in_head] * q_scale  # softmax scale folded into the query norm weight
+            self._nw_host.append(w)
             return _replicated(w.reshape(1, 1, 1, hd), device)
 
         self.eps = float(getattr(m.norm_q, "eps", 1e-6) or 1e-6)
+        self._nw_host = []  # img q, img k, txt q, txt k: host copies for joint_norm_tables
         self.nw_img_q = norm_w(m.norm_q, scale)
         self.nw_img_k = norm_w(m.norm_k, 1.0)
         self.nw_txt_q = norm_w(m.norm_added_q, scale)
         self.nw_txt_k = norm_w(m.norm_added_k, 1.0)
+        # (L, S) -> the joint-row (q, k) norm weights of JOINT_HEADS: on device, and built on host awaiting upload
+        self._nw_joint = {}
+        self._nw_joint_host = {}
 
         self.hifi = ttnn.init_device_compute_kernel_config(
             device.arch(),
@@ -183,6 +188,13 @@ class TtQwenJointAttention:
     def _rope(self, x, freqs):  # x [B, Hl, S, D] half-split; freqs [S, D] = [cos | sin]
         if freqs is None:
             return x
+        if ROPE_SWAP:  # x * [cos | cos] + [x2 | x1] * [-sin | sin]: the same fp32 products and sums
+            cc, ss = _rope_tables(freqs, self.half)
+            B, H, S = x.shape[0], x.shape[1], x.shape[2]
+            x1 = ttnn.slice(x, (0, 0, 0, 0), (B, H, S, self.half))
+            x2 = ttnn.slice(x, (0, 0, 0, self.half), (B, H, S, 2 * self.half))
+            sw = ttnn.concat([x2, x1], dim=-1)
+            return ttnn.add(ttnn.multiply(x, cc), ttnn.multiply(sw, ss))
         S = freqs.shape[0]
         f = ttnn.reshape(freqs, (1, 1, S, 2 * self.half))
         cos = ttnn.slice(f, (0, 0, 0, 0), (1, 1, S, self.half))
@@ -193,6 +205,31 @@ class TtQwenJointAttention:
         o1 = ttnn.subtract(ttnn.multiply(x1, cos), ttnn.multiply(x2, sin))
         o2 = ttnn.add(ttnn.multiply(x1, sin), ttnn.multiply(x2, cos))
         return ttnn.concat([o1, o2], dim=-1)
+
+    def joint_norm_tables(self, L, S):
+        """Build (on host) JOINT_HEADS's (q, k) RMSNorm weights per joint row [1, 1, L + S, D] -- the text weight on
+        the first L rows, the image weight on the rest -- for a (text, image) length pair known before the forward;
+        the forward uploads them on first use."""
+        if (L, S) not in self._nw_joint and (L, S) not in self._nw_joint_host:
+            iq, ik, tq, tk = self._nw_host
+            rows = lambda t, i: torch.cat([t.expand(L, -1), i.expand(S, -1)]).reshape(1, 1, L + S, -1).contiguous()
+            self._nw_joint_host[(L, S)] = (rows(tq, iq), rows(tk, ik))
+
+    def _joint_norm_w(self, L, S):
+        """(q, k) RMSNorm weights per joint row, once per (L, S): joint_norm_tables' host tables uploaded, else built
+        here on device (exact copies: 1.0 * w)."""
+        key = (L, S)
+        if key not in self._nw_joint and key in self._nw_joint_host:
+            self._nw_joint[key] = tuple(_replicated(t, self.device) for t in self._nw_joint_host.pop(key))
+        if key not in self._nw_joint:
+            d, hd = self.device, self.head_dim
+            ones = lambda n: ttnn.full((1, 1, n, hd), 1.0, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=d)
+            o_txt, o_img = ones(L), ones(S)
+            self._nw_joint[key] = tuple(
+                ttnn.concat([ttnn.multiply(o_txt, t), ttnn.multiply(o_img, i)], dim=2)
+                for t, i in ((self.nw_txt_q, self.nw_img_q), (self.nw_txt_k, self.nw_img_k))
+            )
+        return self._nw_joint[key]
 
     @staticmethod
     def _split(x):  # float32 -> (hi, lo) bf16 with x ~= hi + lo
@@ -247,6 +284,9 @@ class TtQwenJointAttention:
                 ttnn.typecast(p, ttnn.bfloat16), v, dtype=ttnn.bfloat16, compute_kernel_config=self.hifi
             )  # [B, Hl, Sq, D]
         B, Sq = o.shape[0], o.shape[2]
+        if NLP_MERGE:  # heads side by side along the width in one tile-copy op
+            o = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            return ttnn.reshape(o, (B, Sq, self.local_heads * self.head_dim))
         if HEADS_BY_SLICES:  # heads side by side along the width by slices + concat (no padded permute)
             D = self.head_dim
             parts = [ttnn.slice(o, (0, h, 0, 0), (B, h + 1, Sq, D)) for h in range(self.local_heads)]
@@ -284,7 +324,35 @@ class TtQwenJointAttention:
         share = _precise.ENABLED and _precise.SHARE_SPLIT
         hp = _precise.split_bf16(hs) if share else None  # q/k/v of one stream share its hi/lo split
         ep = _precise.split_bf16(ehs) if share else None
-        if self.fused_qkv:  # one projection per stream; q/k/v are column blocks of its float32 output
+        joint = None
+        if self.fused_qkv and JOINT_HEADS and JOINT_QUERIES:  # one [txt; img] row block, heads / norm / rope once
+            n = self.local_heads * self.head_dim
+            yi = self._proj(hs, self.img_qkv, parts=hp)
+            yt = self._proj(ehs, self.txt_qkv, parts=ep)
+            L, S_img = yt.shape[1], yi.shape[1]
+            y = ttnn.concat([yt, yi], dim=1)
+            ttnn.deallocate(yi)
+            ttnn.deallocate(yt)
+            wq, wk = self._joint_norm_w(L, S_img)
+            fj = _joint_freqs(txt_f, img_f)
+            if NLP_SPLIT:  # q/k/v heads in one tile-copy op ([q | k | v] column blocks per chip)
+                B, Sj = y.shape[0], y.shape[1]
+                q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                    ttnn.reshape(y, (B, 1, Sj, 3 * n)),
+                    num_heads=self.local_heads,
+                    num_kv_heads=self.local_heads,
+                    transpose_k_heads=False,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+            else:
+                q, k, v = self._heads(y), self._heads(y, n), self._heads(y, 2 * n)
+            q = self._rope(self._rms(q, wq), fj)
+            k = self._rope(self._rms(k, wk), fj)
+            if vdt != ttnn.float32:
+                v = ttnn.typecast(v, vdt)
+            ttnn.deallocate(y)
+            joint = q
+        elif self.fused_qkv:  # one projection per stream; q/k/v are column blocks of its float32 output
             n = self.local_heads * self.head_dim
             yi = self._proj(hs, self.img_qkv, parts=hp)
             yt = self._proj(ehs, self.txt_qkv, parts=ep)
@@ -307,8 +375,9 @@ class TtQwenJointAttention:
             vt = self._heads(self._proj(ehs, self.txt_v, vdt, parts=ep))
 
         # Joint sequence order is [text, image].
-        k = ttnn.concat([kt, ki], dim=2)
-        v = ttnn.concat([vt, vi], dim=2)
+        if joint is None:
+            k = ttnn.concat([kt, ki], dim=2)
+            v = ttnn.concat([vt, vi], dim=2)
         kh, kl = (k, None) if _precise.ENABLED else self._split(k)
 
         mask_add = None
@@ -322,8 +391,10 @@ class TtQwenJointAttention:
             k_rep = _precise.fold_b(kh) if fold else None
             shared = (k_rep, _precise.split_bf16(v))
         if JOINT_QUERIES:  # one attention over the joint [text, image] queries; rows split after P @ V
-            L = qt.shape[2]
-            o = self._attend(ttnn.concat([qt, qi], dim=2), kh, kl, v, mask_add, shared)
+            if joint is None:
+                L = qt.shape[2]
+                joint = ttnn.concat([qt, qi], dim=2)
+            o = self._attend(joint, kh, kl, v, mask_add, shared)
             B, S, W = o.shape[0], o.shape[1], o.shape[2]
             o_txt = ttnn.slice(o, (0, 0, 0), (B, L, W))
             o_img = ttnn.slice(o, (0, L, 0), (B, S, W))
@@ -346,6 +417,47 @@ HEADS_BY_SLICES = False
 FUSED_QKV = False
 # the image and text queries attend as one joint query block (one QK^T / softmax / P @ V) instead of two
 JOINT_QUERIES = False
+# with FUSED_QKV + JOINT_QUERIES: the two streams' q/k/v outputs joined as [txt; img] rows once, then one head split,
+# RMSNorm (per-row weights) and RoPE (joint tables) over the joint rows instead of per stream + three joins
+JOINT_HEADS = False
+# the joint [txt | img] rotary table of the last (img_f, txt_f) pair (the pair held so its ids stay valid)
+_FREQS_JOINT = [None, None, None]
+
+
+def _joint_freqs(txt_f, img_f):
+    if txt_f is None or img_f is None:
+        return None
+    c = _FREQS_JOINT
+    if c[0] is not txt_f or c[1] is not img_f:
+        c[:] = [txt_f, img_f, ttnn.concat([txt_f, img_f], dim=0)]
+    return c[2]
+
+
+# heads split (JOINT_HEADS path only) by ttnn.experimental.nlp_create_qkv_heads, merged by nlp_concat_heads (plain
+# tile copies) instead of per-head slices + concat
+NLP_SPLIT = False
+NLP_MERGE = False
+# RoPE as x * [cos | cos] + [x2 | x1] * [-sin | sin] on tables built once per rotary tensor (bit-identical: a - b is
+# a + (-b), and the second half's sum is the same two products in the other order)
+ROPE_SWAP = False
+# rotary tensor id -> (the tensor, held so its id stays valid; [cos | cos]; [-sin | sin])
+_ROPE_TABLES = {}
+
+
+def _rope_tables(freqs, half):
+    hit = _ROPE_TABLES.get(id(freqs))
+    if hit is None or hit[0] is not freqs:
+        if len(_ROPE_TABLES) >= 8:
+            _ROPE_TABLES.clear()
+        S = freqs.shape[0]
+        f = ttnn.reshape(freqs, (1, 1, S, 2 * half))
+        cos = ttnn.slice(f, (0, 0, 0, 0), (1, 1, S, half))
+        sin = ttnn.slice(f, (0, 0, 0, half), (1, 1, S, 2 * half))
+        hit = (freqs, ttnn.concat([cos, cos], dim=-1), ttnn.concat([ttnn.neg(sin), sin], dim=-1))
+        _ROPE_TABLES[id(freqs)] = hit
+    return hit[1], hit[2]
+
+
 # the attention softmax's float32 logits in L1 (subtract / exp in place), only the probabilities written to DRAM
 SOFTMAX_L1 = False
 # the attention softmax (mask add .. divide) as one bit-identical kernel: f(s, mask_add or None, mem) -> p
