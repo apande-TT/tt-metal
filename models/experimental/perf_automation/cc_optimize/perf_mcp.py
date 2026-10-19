@@ -3006,13 +3006,14 @@ def _read_stage_doc(state_dir_path=None, model="", task="") -> dict:
 
 
 def _parse_gathered_weights(out: str) -> dict:
-    """{subtree: resident bytes read PER ITEM} from the pipeline's marker, or {} when it printed none.
+    """{subtree: bytes of the pipeline's declared lookup tables} from the census marker, or {} for none.
 
     Resident is not the same as streamed. The ceiling assumes one unit of work reads every weight in
     its subtree once, which is true of a matmul weight and false of a lookup table -- voxtral's
     embed_tokens is 805 MB and a decode step reads one 6 KB row of it. Nothing in the checkpoint
     separates the two: embed_tokens and lm_head are both [131072, 3072], same size, same section.
-    The pipeline holds them and says which is which.
+    The pipeline holds them and declares its tables once (stage_seams.GATHERED_TABLES_ATTR); the
+    census credits their bytes per subtree and trace_replay prints that (weight_census.gathered_marker).
     """
     out_map: dict = {}
     try:
@@ -8431,7 +8432,8 @@ def _per_request_reader(profile):
     A GAP ITS STAGE CANNOT RESOLVE IS NOT MULTIPLIED. Multiplying a gap multiplies its error with it,
     so the weight is withheld from an op whose gap is inside its stage's measured run-to-run wobble
     (read_stage_spread x the op's own device_ms). With no spread on file nothing is withheld; the
-    roofline has already left any gap within its absolute noise floor at_floor, and the per-op launch
+    roofline leaves at_floor only a gap within a tenth of the op's own floor -- it has no absolute
+    cutoff, since one judged on the profiled pass would run before this weight -- and the per-op launch
     cost is already inside every op's floor.
 
     Fields: weights ({stage: weight}, stage_cost_weights), stage(o), gap(o, raw) -> per-request ms,
@@ -8825,7 +8827,14 @@ def termination_check() -> dict:
             eff_gap = gap
         if not _req.material(o, max(gap, eff_gap)):
             continue
-        op_code = o.get("op_code") or o.get("bucket") or ""
+        # NAMED BY OP AND SHAPE (_group_name), as the fold gate names its groups. A matmul's op_code
+        # carries its dims; a shapeless class (GenericOp, BinaryNg, LayerNorm) does not, so every
+        # instance of it shared one name -- and _op_match matches a shapeless name on class alone, so
+        # one attempt on any of them answered the ladder for all of them. A model's custom kernels
+        # all profile as GenericOpDeviceOperation: one cpp try on a small attention kernel closed the
+        # largest kernel in its prefill (a fused gate/up matmul, a third of the stage) unexamined.
+        # The target carries this name, so the agent records against it and its ladder is its own.
+        op_code = _group_name(o) or o.get("bucket") or ""
         entry = {
             "op": op_code,
             "op_class": o.get("bucket"),
