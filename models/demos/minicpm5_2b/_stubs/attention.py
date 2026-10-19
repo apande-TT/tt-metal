@@ -116,7 +116,7 @@ class AttnContext:
         self.consts = None
         # decode: mask_full is the mask table (tile r: position at column r; tile 31: unmasked; tiles 32-34: the
         # score scale, zero and max-scaler tiles, passed in consts too).
-        self.mask_table = False
+        self.mask_table = 0
 
 
 class TtAttention:
@@ -884,7 +884,7 @@ class TtAttention:
             + [int(inline_kv), cb_kv_old, cb_kv_new, cb_kv_scr, cb_kv_out]
             + [(self.n_heads + self.n_kv_heads) * d_t, (qkv_t.padded_shape[-1] // 32) if inline_kv else 0, kv_flag]
             + list(ttnn.TensorAccessorArgs(qkv_t if inline_kv else qk).get_compile_time_args())
-            + [int(ctx.mask_table)],
+            + [int(ctx.mask_table)],  # R: the table's per-core replicas (0: no table)
             runtime_args=rd_rt,
             common_runtime_args=[t.buffer_address() for t in tensors]
             + [(qkv_t if inline_kv else qk).buffer_address()],

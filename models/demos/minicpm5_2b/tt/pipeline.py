@@ -194,10 +194,18 @@ class MiniCPM5Pipeline:
         col = self._tt(torch.arange(32, dtype=torch.float32).repeat(1, 1, 32, 1), ttnn.float32)
         at = self._tt(torch.arange(32, dtype=torch.float32).reshape(32, 1, 1, 1), ttnn.float32)
         self.mask_table = ttnn.typecast(ttnn.multiply(ttnn.gt(col, at), _NEG), ttnn.bfloat16)  # [32, 1, 32, 32]
-        # ... followed by the attention's bf16 constant tiles (scale, zero, max scaler: tiles 32-34), so one per-step
-        # L1 copy brings the mask and those constants.
+        # ... followed by one copy per attention core (R = B * n_kv row blocks) of the tiles every core reads -- the
+        # unmasked tile, the score scale, the max scaler -- so no single L1 page is read by all R cores at once; the
+        # fp32 sum scaler likewise as R tiles. One per-step L1 copy of each brings them in.
         att = self.encoder_stack.layers[0].self_attn
-        self.mask_table = ttnn.concat([self.mask_table, att.scale_tile, att.zero_tile, att.max_scaler], dim=0)
+        R = B * self.n_kv_heads
+        reps = ttnn.Shape([R, 1, 1, 1])
+        unmasked = ttnn.slice(self.mask_table, (31, 0, 0, 0), (32, 1, 32, 32))
+        self.mask_table = ttnn.concat(
+            [self.mask_table] + [ttnn.repeat(t, reps) for t in (unmasked, att.scale_tile, att.max_scaler)], dim=0
+        )  # [32 + 3R, 1, 32, 32]
+        self.sum_scalers = ttnn.repeat(att.sum_scaler, reps)  # [R, 1, 32, 32] fp32
+        self.mask_replicas = R
         kv = self.n_kv_heads
         self.key_index_kv = self._tt(torch.arange(C, dtype=torch.float32).repeat(1, kv, 1, 1), ttnn.float32)
         # rotate_half's sign over head_dim (-1 on the first half), folded into sin for the decode rope kernel.
@@ -515,11 +523,11 @@ class MiniCPM5Pipeline:
             ctx = attention_stub.AttnContext(
                 "decode", mask, write, cur_pos, mask_full=mask_full, rope_rows=(cos_rows, sin_rows)
             )
-            ctx.mask_table = _MASK_TABLE
+            ctx.mask_table = self.mask_replicas if _MASK_TABLE else 0
             # The attention constants copied to L1 for this step (persistent L1 copies clash with prefill's CBs).
             att = self.encoder_stack.layers[0].self_attn
             if _MASK_TABLE:
-                ctx.consts = (mask_full, mask_full, mask_full, ttnn.to_memory_config(att.sum_scaler, l1))
+                ctx.consts = (mask_full, mask_full, mask_full, ttnn.to_memory_config(self.sum_scalers, l1))
             else:
                 ctx.consts = tuple(
                     ttnn.to_memory_config(t, l1)

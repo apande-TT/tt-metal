@@ -59,8 +59,11 @@ void kernel_main() {
     // kv_flag: semaphore set once both staged position tiles hold this step's row (the writer stores them).
     constexpr uint32_t kv_flag = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 12);
     constexpr auto qkv_args = TensorAccessorArgs<sm_args.next_compile_time_args_offset() + 13>();
-    // mask_table: `mask` is the 32-tile table (tile r: the position at column r, tile 31: unmasked), not [B, 1, 32, C].
+    // mask_table = R (0: off): `mask` is the table [tiles r = the position at column r, r < 32 | R unmasked tiles |
+    // R score-scale tiles | R max-scaler tiles] (one copy per row block, read by row block bg only) and the sum
+    // scaler holds R tiles, instead of the [B, 1, 32, C] mask and single-tile scalers.
     constexpr uint32_t mask_table = get_compile_time_arg_val(qkv_args.next_compile_time_args_offset());
+    constexpr uint32_t R = mask_table;
     constexpr uint32_t face_bytes_ = 16 * 16 * 2, face_row_bytes_ = 16 * 2;
     auto face_row_off = [](uint32_t row, uint32_t half) {
         return (((row >> 4) << 1) + half) * face_bytes_ + (row & 15) * face_row_bytes_;
@@ -101,10 +104,9 @@ void kernel_main() {
     cb_reserve_back(cb_scale, 1);
     cb_reserve_back(cb_max_scaler, 1);
     cb_reserve_back(cb_sum_scaler, 1);
-    // (with mask_table, the score scale and the max scaler are tiles 32 and 34 of the table tensor)
-    noc_async_read_page(mask_table ? 32 : 0, scale, get_write_ptr(cb_scale));
-    noc_async_read_page(mask_table ? 34 : 0, max_scaler, get_write_ptr(cb_max_scaler));
-    noc_async_read_page(0, sum_scaler, get_write_ptr(cb_sum_scaler));
+    noc_async_read_page(R ? 32 + R + bg : 0, scale, get_write_ptr(cb_scale));
+    noc_async_read_page(R ? 32 + 2 * R + bg : 0, max_scaler, get_write_ptr(cb_max_scaler));
+    noc_async_read_page(R ? bg : 0, sum_scaler, get_write_ptr(cb_sum_scaler));
     noc_async_read_barrier();
     cb_push_back(cb_scale, 1);
     cb_push_back(cb_max_scaler, 1);
@@ -210,7 +212,7 @@ void kernel_main() {
         }
         cb_push_back(cb_k, Kt);
         cb_reserve_back(cb_mask, 1);
-        const uint32_t mask_page = mask_table ? (n == last_key_tile ? r : 31) : b * Ct + n;
+        const uint32_t mask_page = R ? (n == last_key_tile ? r : 32 + bg) : b * Ct + n;
         noc_async_read_page(mask_page, mask, get_write_ptr(cb_mask));
         noc_async_read_barrier();
         cb_push_back(cb_mask, 1);
