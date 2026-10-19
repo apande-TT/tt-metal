@@ -22,6 +22,7 @@ void kernel_main() {
     constexpr uint32_t txn_bytes = get_compile_time_arg_val(3);
     constexpr uint32_t cb_blocks = get_compile_time_arg_val(4);  // blocks the weight CB holds (>= NUM_SLOTS)
     constexpr uint32_t start_sem = get_compile_time_arg_val(5);  // local semaphore to wait on first, or ~0u
+    constexpr uint32_t start_count = get_compile_time_arg_val(6);  // ... until it reaches this
 
     const uint32_t bank_id = get_arg_val<uint32_t>(0);
     const uint32_t vchannel = get_arg_val<uint32_t>(1);
@@ -32,7 +33,7 @@ void kernel_main() {
     if constexpr (start_sem != 0xFFFFFFFF) {
         // A fused prologue's small DRAM reads go first: queued behind this stream they would stall it.
         auto* start = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(start_sem));
-        noc_semaphore_wait(start, 1);
+        noc_semaphore_wait(start, start_count);
         noc_semaphore_set(start, 0);
     }
     const uint32_t cb_base = get_write_ptr(cb_in1);

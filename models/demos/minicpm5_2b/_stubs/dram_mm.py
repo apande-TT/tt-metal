@@ -37,6 +37,9 @@ _SEM_GATHER, _SEM_BCAST, _SEM_ALL, _SEM_START, _SEM_EP, _SEM_PRO = 0, 1, 2, 3, 4
 _CB_P_GATE, _CB_P_UP, _CB_P_POST, _CB_P_H, _CB_P_RES, _CB_P_MM, _CB_P_SUM = 0, 1, 3, 16, 4, 5, 17
 _CB_EP_LHS, _CB_EP_RHS, _CB_EP_OUT = 0, 1, 16  # on the epilogue helper cores only
 _NO_SEM = 0xFFFFFFFF
+# With a norm prologue: the weight streams start once every norm core's few DRAM reads (gamma, constants) have
+# landed, so those reads are not queued behind the streams at the banks.
+_NORM_PRO_READS_FIRST = True
 
 
 def _mesh_kw(device, **kw):
@@ -278,7 +281,12 @@ class DramMatmul:
             ),
         ]
         self.reader_ct = [_CB_IN1, _BLOCK_TILES, _BLOCK_TILES // _TXN_TILES, _TXN_TILES * w_tile_bytes, cb_blocks]
-        self.reader_ct += [_SEM_START if norm is not None else _NO_SEM]
+        if norm is not None:
+            self.reader_ct += [_SEM_START, 1]
+        elif self.norm_pro is not None and _NORM_PRO_READS_FIRST:
+            self.reader_ct += [_SEM_START, len(self.norm_cores)]
+        else:
+            self.reader_ct += [_NO_SEM, 0]
         if norm is None:
             self.writer_src = "writer_dram_mm.cpp"
             self.writer_ct = [k_t, group_w, _IN0_CHUNK, _CB_IN0, _CB_OUT, self.split_n // _TILE]
@@ -327,6 +335,10 @@ class DramMatmul:
         if self.norm_pro is not None:
             everywhere = cores.merge(_core_rects(self.norm_cores))
             self.semaphores.append(ttnn.SemaphoreDescriptor(id=_SEM_PRO, core_ranges=everywhere, initial_value=0))
+            if _NORM_PRO_READS_FIRST:
+                self.semaphores.append(
+                    ttnn.SemaphoreDescriptor(id=_SEM_START, core_ranges=everywhere, initial_value=0)
+                )
         if self.silu_pro:
             everywhere = cores.merge(self.ep["cores"])
             self.semaphores += [
@@ -417,7 +429,7 @@ class DramMatmul:
             x = ttnn.allocate_tensor_on_device(
                 ttnn.Shape(list(x_in.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, ttnn.L1_MEMORY_CONFIG
             )
-            pro_parts = self.norm_pro.shared_parts(x_in, x, self.norm_cores, pro=(_SEM_PRO, self.mm_xy))
+            pro_parts = self.norm_pro.shared_parts(x_in, x, self.norm_cores, pro=(_SEM_PRO, self.mm_xy) + ((_SEM_START,) if _NORM_PRO_READS_FIRST else ()))
         widths = [self.split_n] + ([self.n - self.split_n] if self.split_n < self.n else [])
         shapes = [out_shape] if out_shape is not None else [list(x.shape)[:-1] + [n] for n in widths]
         outs = [

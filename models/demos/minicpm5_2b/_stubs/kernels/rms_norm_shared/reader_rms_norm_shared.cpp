@@ -22,7 +22,11 @@ void kernel_main() {
     constexpr uint32_t sem_gather = get_compile_time_arg_val(7);
     constexpr uint32_t sem_bcast = get_compile_time_arg_val(8);
     constexpr uint32_t n_cores = get_compile_time_arg_val(9);
-    constexpr auto x_args = TensorAccessorArgs<10>();
+    // As the prologue of a projection program: once this core's DRAM reads have landed, bump start_sem on each
+    // projection core (common args from 3: count, then x / y pairs) -- their weight streams wait for every norm
+    // core, so these few small reads are not queued behind the stream at the DRAM banks.
+    constexpr uint32_t start_sem = get_compile_time_arg_val(10);  // ~0u: none
+    constexpr auto x_args = TensorAccessorArgs<11>();
     constexpr auto g_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
     constexpr auto c_args = TensorAccessorArgs<g_args.next_compile_time_args_offset()>();
     constexpr uint32_t tile_bytes = 32 * 32 * 2;
@@ -51,6 +55,15 @@ void kernel_main() {
         noc_async_read_page(1, consts, get_write_ptr(cb_eps));
     }
     noc_async_read_barrier();
+    if constexpr (start_sem != 0xFFFFFFFF) {
+        const uint32_t n_mm = get_common_arg_val<uint32_t>(3);
+        const uint32_t sem_l1 = get_semaphore(start_sem);
+        for (uint32_t i = 0; i < n_mm; ++i) {
+            const uint32_t cx = get_common_arg_val<uint32_t>(4 + 2 * i);
+            const uint32_t cy = get_common_arg_val<uint32_t>(5 + 2 * i);
+            noc_semaphore_inc(get_noc_addr(cx, cy, sem_l1), 1);
+        }
+    }
     cb_push_back(cb_in, num_tiles);
     if (is_reducer) {
         cb_push_back(cb_scaler, 1);
@@ -73,4 +86,7 @@ void kernel_main() {
     }
     cb_push_back(cb_ex2pe, 1);
     cb_push_back(cb_gamma, num_tiles);
+    if constexpr (start_sem != 0xFFFFFFFF) {
+        noc_async_atomic_barrier();
+    }
 }

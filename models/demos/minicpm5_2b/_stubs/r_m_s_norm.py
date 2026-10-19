@@ -118,21 +118,25 @@ class TtRMSNorm:
             cb(cb_ex2pe_send, 1, f32, f32_tile),
         ]
         inv_w_bits = struct.unpack("<I", struct.pack("<f", 1.0 / x.shape[-1]))[0]
+        pro_sem, pro_xy = pro[:2] if pro is not None else (0xFFFFFFFF, [])
+        # pro[2] (optional): the projection's start semaphore, bumped once this core's DRAM reads have landed.
+        start_sem = pro[2] if pro is not None and len(pro) > 2 else 0xFFFFFFFF
+        start_args = [len(pro_xy) // 2] + list(pro_xy) if start_sem != 0xFFFFFFFF else []
         d = os.path.join(_KERNEL_DIR, "rms_norm_shared")
         reader = ttnn.KernelDescriptor(
             kernel_source=os.path.join(d, "reader_rms_norm_shared.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[w_t, cb_in, cb_scaler, cb_eps, cb_gamma, cb_x2all, cb_ex2pe, sem_gather, sem_bcast]
-            + [n_cores]
+            + [n_cores, start_sem]
             + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(self.weight).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(self.consts).get_compile_time_args()),
             runtime_args=rt,
-            common_runtime_args=[x.buffer_address(), self.weight.buffer_address(), self.consts.buffer_address()],
+            common_runtime_args=[x.buffer_address(), self.weight.buffer_address(), self.consts.buffer_address()]
+            + start_args,
             config=ttnn.ReaderConfigDescriptor(),
         )
-        pro_sem, pro_xy = pro if pro is not None else (0xFFFFFFFF, [])
         writer = ttnn.KernelDescriptor(
             kernel_source=os.path.join(d, "writer_rms_norm_shared.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
