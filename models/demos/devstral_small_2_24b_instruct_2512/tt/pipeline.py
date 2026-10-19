@@ -129,7 +129,7 @@ PLANNED_TP = 4
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
 #                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
-#                     Fused gate/up computes at HiFi2 (LoFi on layers 16-24) (fp32 accumulation), 8 x 8 x 12-tile blocks; the text
+#                     Fused gate/up computes at HiFi2 (LoFi on layers 14-25) (fp32 accumulation), 8 x 8 x 12-tile blocks; the text
 #                     decoder's fused gate/up weight is bfloat8_b (the vision MLPs keep bf16).
 #   ministral3_model decode embedding: ONE program (tt/embed_decode.py) gathers each core's column slice of the token
 #                     rows, tilizes them to fp32 and writes the first layer's width-sharded residual directly (no
