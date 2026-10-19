@@ -61,7 +61,11 @@ class TtTokenEmbed:
     def build(cls, device, torch_module):
         return cls(device, torch_module)
 
-    def __call__(self, input_ids, *args, **kwargs):
+    def __call__(self, input_ids, *args, decode_program=None, **kwargs):
+        """decode_program: the decode step's embedding program (tt/embed_decode.py EmbedDecode), which gathers the
+        rows of the (1, B) id row straight into the decoder's fp32 width-sharded residual layout."""
+        if decode_program is not None:
+            return decode_program(input_ids, self.weight)
         return self._gather(input_ids, self.weight, self.dim)
 
     def shard(self, input_ids, memory_config=None):

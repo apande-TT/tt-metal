@@ -41,10 +41,15 @@ DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi3
 DOWN_DECODE_K_BLOCK = 8
 # Decode down projection as one C++ program streaming a bank-major weight copy (tt/down_decode.py).
 DOWN_DECODE_STREAM = True
-# Decoder layers whose decode-only down copy is block-float4 (the others read the bf8 prefill weight).
-DECODE_DOWN_BF4_LAYERS = frozenset(range(15, 25))
+# Decoder layers whose decode-only down copy is block-float4 (the others read the bf8 prefill weight). 16-24: layer
+# 15 went back to bf8 (gate PCC 0.995034 at 15-24, 0.995374 at 16-23), headroom the fixed-chunk decode SDPA
+# (ministral3_attention DECODE_SDPA_K_CHUNK, -0.22 ms for -0.00018 PCC) spends.
+DECODE_DOWN_BF4_LAYERS = frozenset(range(16, 25))
 # Decode gate / up / silu-multiply as one C++ program (tt/gate_up_decode.py).
 DECODE_GATE_UP_FUSED = True
+# ... with the post-attention RMSNorm folded into that program's prologue (tt/gate_up_decode.py NormGateUpDecode): it
+# takes the decode residual's own width shards, so its weight streams start while the row is normed.
+DECODE_GATE_UP_NORM = True
 
 
 class TtMinistral3MLP:
@@ -78,9 +83,11 @@ class TtMinistral3MLP:
     # takes at most this many bytes per core (the vision MLP's 8192 x 1024 bf16: 152 KB; the text MLP's is far larger).
     PREFILL_INTER_L1_BYTES = 192 * 1024
 
-    def __init__(self, device, torch_module, in_scale=None, layer_idx=None) -> None:
+    def __init__(self, device, torch_module, in_scale=None, layer_idx=None, norm_eps=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up.
-        layer_idx: the decoder layer's index (selects the decode gate / up precision, DECODE_GATE_UP_BF4_LAYERS)."""
+        layer_idx: the decoder layer's index (selects the decode gate / up precision, DECODE_GATE_UP_BF4_LAYERS).
+        norm_eps: the eps of the unit-gamma RMSNorm feeding gate / up (its gamma is in_scale), when the decode gate / up
+        may norm the residual itself (DECODE_GATE_UP_NORM)."""
         self.device = device
         try:
             mesh = int(device.get_num_devices())
@@ -126,11 +133,20 @@ class TtMinistral3MLP:
             # data-movement RISCs streaming the weights independently of it, from bank-major copies the program owns
             # (tt/gate_up_decode.py). Otherwise two ttnn.linear calls on interleaved copies and the silu-multiply.
             if DECODE_GATE_UP_FUSED:
-                from models.demos.devstral_small_2_24b_instruct_2512.tt.gate_up_decode import FusedGateUpDecode
+                from models.demos.devstral_small_2_24b_instruct_2512.tt.gate_up_decode import (
+                    FusedGateUpDecode,
+                    NormGateUpDecode,
+                )
 
-                if FusedGateUpDecode.supports(device, k, inter, gu_dtype):
-                    fid = DECODE_GATE_UP_BF4_FIDELITY if lowp else ttnn.MathFidelity.HiFi4
-                    put = lambda t, dtype: _put(t, shard(-1), dtype)
+                fid = DECODE_GATE_UP_BF4_FIDELITY if lowp else ttnn.MathFidelity.HiFi4
+                put = lambda t, dtype: _put(t, shard(-1), dtype)
+                if (
+                    DECODE_GATE_UP_NORM
+                    and norm_eps is not None
+                    and NormGateUpDecode.supports_norm(device, k, inter, gu_dtype)
+                ):
+                    self.fused_gate_up = NormGateUpDecode(device, w_gate, w_up, gu_dtype, fid, put, tp, norm_eps, k)
+                elif FusedGateUpDecode.supports(device, k, inter, gu_dtype):
                     self.fused_gate_up = FusedGateUpDecode(device, w_gate, w_up, gu_dtype, fid, put, tp)
             if self.fused_gate_up is None:
                 self.w_gate = _put(w_gate, shard(-1), gu_dtype)
@@ -256,12 +272,17 @@ class TtMinistral3MLP:
     def build(cls, device, torch_module):
         return cls(device, torch_module)
 
-    def __call__(self, x, *args, mode="prefill", **kwargs):
+    def decode_norms(self, h) -> bool:
+        """Whether the decode gate / up can take the residual h itself and norm it (NormGateUpDecode)."""
+        return getattr(self.fused_gate_up, "accepts", None) is not None and self.fused_gate_up.accepts(h)
+
+    def __call__(self, x, *args, mode="prefill", residual_norm=False, **kwargs):
+        """residual_norm (decode, decode_norms(x)): x is the residual, normed here by the gate / up program."""
         shape = tuple(x.shape)
         if len(shape) != 4:
             x = ttnn.reshape(x, (1,) * (4 - len(shape)) + shape)
         if mode == "decode" and self.DECODE_WEIGHTS:
-            return ttnn.reshape(self._forward_decode(x), shape)
+            return ttnn.reshape(self._forward_decode(x, residual_norm), shape)
         b, _, s, d = x.shape
         step = max(1, PREFILL_ROWS_PER_CHUNK // max(1, s))
         if b > step:
@@ -273,11 +294,13 @@ class TtMinistral3MLP:
         out = self._forward(x)
         return ttnn.reshape(out, shape[:-1] + (out.shape[-1],))
 
-    def _forward_decode(self, x):
+    def _forward_decode(self, x, residual_norm=False):
         # The single-row gate / up / product stay in L1 for the down matmul (no DRAM round trip of the 32 x inter
         # intermediates); silu is fused into the multiply (ttnn.linear's activation= runs as a separate unary op).
         l1 = ttnn.L1_MEMORY_CONFIG
-        if self.fused_gate_up is not None:  # one program: both projections + silu * up (tt/gate_up_decode.py)
+        if residual_norm:  # one program: the norm of the residual x, both projections, silu * up
+            m = self.fused_gate_up.norm_call(x)
+        elif self.fused_gate_up is not None:  # one program: both projections + silu * up (tt/gate_up_decode.py)
             m = self.fused_gate_up(x)
         else:
             pc = self.gate_up_decode_pc

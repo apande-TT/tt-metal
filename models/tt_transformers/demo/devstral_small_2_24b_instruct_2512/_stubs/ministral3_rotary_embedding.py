@@ -60,6 +60,33 @@ class TtMinistral3RotaryEmbedding:
         sin = ttnn.reshape(ttnn.typecast(sin, out_dtype), (b, s, self.head_dim))
         return cos, sin
 
+    def table(self, positions, dtype=ttnn.bfloat16):
+        """(cos, sin) of every position 0 .. positions - 1 as (1, 1, positions, head_dim) row-major tables, one row a
+        position. Computed by the very ops __call__ runs on a decode step's position column -- the same fp32
+        position x inv_freq product, cos / sin, scale and cast, element by element -- so row p is bit-identical to the
+        row a decode step at position p derives. The positions run down one dense (1, 1, positions, 1) column (32
+        positions a tile), not one tile row each as a step's (B, 1, 1, 1) column holds them: 32x fewer tiles to build."""
+        pos = ttnn.from_torch(
+            torch.arange(positions, dtype=torch.float32).reshape(1, 1, positions, 1),
+            dtype=ttnn.float32,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+            mesh_mapper=self._repl,
+        )
+        freqs = ttnn.multiply(pos, self.inv_freq)
+        ttnn.deallocate(pos)
+        out = []
+        for fn in (ttnn.cos, ttnn.sin):
+            t = fn(freqs)
+            v = ttnn.multiply(t, self.scaling)
+            ttnn.deallocate(t)
+            c = ttnn.typecast(v, dtype)
+            ttnn.deallocate(v)
+            out.append(ttnn.to_layout(c, ttnn.ROW_MAJOR_LAYOUT))
+            ttnn.deallocate(c)
+        ttnn.deallocate(freqs)
+        return tuple(out)
+
 
 def build(device, torch_module=None):
     return TtMinistral3RotaryEmbedding.build(device, torch_module)

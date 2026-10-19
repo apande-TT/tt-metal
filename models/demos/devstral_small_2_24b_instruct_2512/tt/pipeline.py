@@ -125,12 +125,15 @@ PLANNED_TP = 4
 #                     silu * up, one rounding). The decode down projection is ONE C++ program too
 #                     (tt/down_decode.py: the product multicast once, a bank-major weight copy streamed one column per
 #                     data-movement RISC on 8 x 10 cores, fp32 DEST over all K -- bit-identical to the 1D-multicast
-#                     matmul); layers 15-24 read a block-float4 down copy at HiFi3 (bf4 down everywhere: PCC 0.989).
+#                     matmul); layers 16-24 read a block-float4 down copy at HiFi3 (bf4 down everywhere: PCC 0.989).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
 #                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
 #                     Fused gate/up computes at HiFi2 (fp32 accumulation), 8 x 8 x 12-tile blocks; the text
 #                     decoder's fused gate/up weight is bfloat8_b (the vision MLPs keep bf16).
+#   ministral3_model decode embedding: ONE program (tt/embed_decode.py) gathers each core's column slice of the token
+#                     rows, tilizes them to fp32 and writes the first layer's width-sharded residual directly (no
+#                     one-core tiled ttnn.embedding, typecast or reshard).
 #   decoder_head: keeps its pre-gather vocab shard (.local) for the per-device sampler top-k (DevstralPipeline._topk);
 #                     lm_head weight in bfloat8_b (half the largest decode-step DRAM read). Decode skips the
 #                     full-row logits all_gather (the sampler reads the shards; VocabShards joins them on host reads).
@@ -139,12 +142,18 @@ PLANNED_TP = 4
 #                     the draw is one top-1 over the noisy scores labelled with the candidate ids (no argmax + index gather).
 #                     The per-device vocab-shard top-k is VocabTopK (generic_op, kernels/topk_mid.cpp): 64 local ->
 #                     8 middle -> 1 final core instead of ttnn.topk's 64 -> 1 serial merge, 16-bit shard positions.
+#                     The draw's pad select, eos update and next-token row are ONE data-movement program
+#                     (SampleTail, kernels/sample_tail.cpp: integer select on the id / mask tiles; no fp32 chain,
+#                     untilize or reshape); with 32 rows of 32 candidates the top-1 itself joins it (DrawTail,
+#                     kernels/draw_tail.cpp: integer-keyed argmax per row; no 64-column pads, no ttnn.topk).
 #   ministral3_r_m_s_norm.decode: decode norms run width-sharded over 40 cores and read the fp32 residual
 #                     directly (no bf16 cast op, no single-core interleaved norm); the decode QKV reads the input
 #                     norm's fp32 width shards as they are (20-tile K blocks of 5 shards; no unshard, cast, reshard;
 #                     3 readers per DRAM bank);
 #                     decode residual adds write straight into the norms' sharded layout (no re-shard per norm).
 #                     The decode all_gathers of the reduced o_proj / down shards write into that layout too.
+#                     The final decode norm's gamma multiplies its fp32 width shards as a full 32-row tile row (no row
+#                     broadcast, no fp32 unshard through DRAM) into the DRAM bf16 row the LM head reads.
 #   ministral3_attention.query_rope_tables: the llama-4 query scale is folded into q's cos/sin ONCE per forward
 #                     (ministral3_model) and shared by all layers, not re-derived and multiplied in each layer.
 #   KV cache in bfloat8_b (KV_CACHE_DTYPE): half the bytes decode SDPA re-reads every token. Prefill writes only the
@@ -153,13 +162,22 @@ PLANNED_TP = 4
 #                     Decode SDPA reads q straight from its post-RoPE head shards (no copy to DRAM): its grid is the
 #                     8-wide head grid, so each batch row's output core is the core holding that row's q. Its output
 #                     goes L1-interleaved (GQA allows no sharded output) for the reshard into the concat's head shards;
-#                     it computes at HiFi2 (fp32 accumulation) on the bf8 cache.
+#                     it computes at HiFi2 (fp32 accumulation) on the bf8 cache, in fixed 4-tile key chunks.
 #   ministral3_attention: prefill QKV (HiFi2, bf8 weight) and o_proj projections on minimal_matmul (full grid); prefill o_proj is
 #                     column-parallel over the all_gathered heads, emitting the residual's hidden slice (no reduce-scatter). Decode concatenates the SDPA heads
-#                     with nlp_concat_heads_decode on the head shards (no un-padding reshape through DRAM). Decode QKV
+#                     with ONE C++ copy program (tt/concat_heads.py ConcatHeadsDecode: each core gathers one o_proj input
+#                     tile's rows out of SDPA's L1-interleaved tiles; no reshard, nlp_concat_heads_decode, unshard).
+#                     nlp_create_qkv_heads_decode reads the decode QKV's width shards in place (no unshard) and puts k
+#                     on its own cores (overlap_qk_coregrid=False), so q / k RoPE is ONE rotary_embedding_llama_fused_qk
+#                     (64-row cos / sin tables, q's rows then k's) and K / V are ONE paged_fused_update_cache. Those
+#                     tables are gathered each step by ONE program (tt/rope_gather.py) from cos / sin tables of every
+#                     position below the KV capacity, built once by the same device ops on one dense position column
+#                     (32 positions a tile; ~0.1 ms at load instead of 2.65 ms) (no per-step cos / sin math,
+#                     concat or reshard; the fp32 position column is then no longer advanced). Decode QKV
 #                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v]; decode
-#                     QKV and o_proj read block-float8 copies (prefill keeps bf16). Decode o_proj runs a hand-written
-#                     1D config with 8-tile K multicast blocks (4 steps over K = 32 tiles; the auto config used 2).
+#                     QKV and o_proj read block-float8 copies (prefill keeps bf16). Decode o_proj is the MLP down's
+#                     C++ streaming program (tt/down_decode.py: bank-major bf8 copy, 8 x 10 cores, ~9 KB pushes,
+#                     bit-identical to the 1D-multicast matmul), its bf16 partials in L1 for the reduce-scatter.
 #   prompts pad to a tile multiple only; prefill SDPA pads to whole chunks internally. Prefill QKV and o_proj run HiFi2 on bf8 weights.
 #   ministral3_m_l_p short-prompt down projection: a grid of whole 16 x 16-tile output blocks per core.
 #   prefill's last prompt rows: ONE data-movement program (tt/last_row.py) reads every user's row straight out of its
@@ -291,6 +309,105 @@ class NoiseLookup:
         ]
         ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
         return out
+
+
+_SAMPLE_TAIL_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "sample_tail.cpp")
+
+
+class SampleTail:
+    """The sampler's end as ONE data-movement program (generic_op, kernels/sample_tail.cpp) on one RISC: from the
+    (1, 1, B, 1) uint32 draw and the fp32 0 / 1 unfinished mask, nxt = unfinished ? drawn : pad, the mask drops rows
+    that emit eos (in place), and nxt lands in the (1, B) row-major uint32 next-token buffer (in place).
+
+    Replaces the fp32 select chain (typecast, subtract, multiply, add), the eos update (ne, multiply, copy) and the
+    id row's typecast / untilize / reshape / copy (~43 us of 11 ops): the ids are exact integers below 2^24, so the
+    integer select gives the same values the fp32 chain did."""
+
+    CB = 0
+
+    def __init__(self, device, batch, pad_token_id, eos_token_id):
+        assert 1 <= batch <= 32, batch
+        self.device, self.batch = device, batch
+        self.pad, self.eos = int(pad_token_id), int(eos_token_id)
+        self.core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+
+    def __call__(self, drawn, unfinished, tok):
+        io = [drawn, unfinished, tok]
+        ct = [self.batch, self.pad, self.eos, self.CB]
+        for t in io:
+            ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        size = 4 * 1024 + 128  # two faces of each tile and the id row
+        fmt = ttnn.CBFormatDescriptor(buffer_index=self.CB, data_format=ttnn.uint32, page_size=size)
+        cbs = [ttnn.CBDescriptor(total_size=size, core_ranges=self.core, format_descriptors=[fmt])]
+        kernels = [
+            ttnn.KernelDescriptor(
+                kernel_source=_SAMPLE_TAIL_KERNEL,
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=self.core,
+                compile_time_args=ct,
+                runtime_args=[((0, 0), [t.buffer_address() for t in io])],
+                config=ttnn.ReaderConfigDescriptor(),
+            )
+        ]
+        ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
+
+
+_DRAW_TAIL_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "draw_tail.cpp")
+
+
+class DrawTail:
+    """The sampler's draw and end as ONE data-movement program (generic_op, kernels/draw_tail.cpp), one RISC per
+    16 rows: the top-1 of the (1, 1, 32, K = 32) fp32 noisy scores labelled with its uint32 candidate id (what
+    ttnn.topk(k=1, indices_tensor=ids) draws, after padding both tiles to 64 columns), then SampleTail's pad select,
+    eos update and next-token row. Replaces the two pads, the top-1 and SampleTail (~16 us of 4 ops). Returns the
+    (1, 1, B, 1) uint32 draw."""
+
+    CB = 0
+
+    def __init__(self, device, batch, pad_token_id, eos_token_id):
+        assert batch == ttnn.TILE_SIZE, batch
+        self.device, self.batch = device, batch
+        self.pad, self.eos = int(pad_token_id), int(eos_token_id)
+        self.core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+
+    @staticmethod
+    def supports(scores, ids):
+        tile = (1, 1, ttnn.TILE_SIZE, ttnn.TILE_SIZE)
+        return (
+            tuple(int(d) for d in scores.shape) == tile
+            and tuple(int(d) for d in ids.shape) == tile
+            and scores.dtype == ttnn.float32
+            and ids.dtype == ttnn.uint32
+            and scores.layout == ttnn.TILE_LAYOUT
+            and ids.layout == ttnn.TILE_LAYOUT
+            and not scores.is_sharded()
+            and not ids.is_sharded()
+        )
+
+    def __call__(self, scores, ids, unfinished, tok):
+        drawn = ttnn.allocate_tensor_on_device(
+            ttnn.Shape((1, 1, self.batch, 1)), ttnn.uint32, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        io = [scores, ids, unfinished, tok, drawn]
+        acc = []
+        for t in io:
+            acc += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+        size = 12 * 1024 + 128  # per RISC: scores / ids face pairs, the unfinished and drawn faces; the id row
+        fmt = ttnn.CBFormatDescriptor(buffer_index=self.CB, data_format=ttnn.uint32, page_size=size)
+        cbs = [ttnn.CBDescriptor(total_size=size, core_ranges=self.core, format_descriptors=[fmt])]
+        kernels = [
+            ttnn.KernelDescriptor(
+                kernel_source=_DRAW_TAIL_KERNEL,
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=self.core,
+                compile_time_args=[half, self.pad, self.eos, self.CB] + acc,
+                runtime_args=[((0, 0), [t.buffer_address() for t in io])],
+                config=cfg,
+            )
+            for half, cfg in ((0, ttnn.ReaderConfigDescriptor()), (1, ttnn.WriterConfigDescriptor()))
+        ]
+        ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
+        return drawn
 
 
 class VocabTopK:
@@ -719,6 +836,10 @@ class DevstralPipeline:
             )
             for _ in self.language_model.layers
         ]
+        # decode RoPE rows come from tables of every position below the KV capacity (built here, once)
+        prepare_rope = getattr(self.language_model, "prepare_decode_rope", None)
+        if prepare_rope is not None:
+            prepare_rope(self.kv_capacity, self.batch)
         self._stage = {}
         self._decode_repeats = None
         # TP > 1: each device top-k's its own lm_head vocab shard (VocabTopK, shard positions); the gathered
@@ -727,6 +848,8 @@ class DevstralPipeline:
         self._shard_base = None
         full = self.batch == 32 and self.top_k == 32
         self._noise_lookup = NoiseLookup(device, self.batch, self.top_k, NOISE_BUCKETS) if full else None
+        self._sample_tail = SampleTail(device, self.batch, self.pad_token_id, self.eos_token_id)
+        self._draw_tail = DrawTail(device, self.batch, self.pad_token_id, self.eos_token_id) if full else None
         self._last_row = LastRow(device) if self.batch == ttnn.TILE_SIZE else None
         tp = self._tp()
         if tp > 1:
@@ -906,10 +1029,20 @@ class DevstralPipeline:
             noise = ttnn.typecast(ttnn.to_layout(ttnn.reshape(noise, (1, 1, b, nb)), ttnn.TILE_LAYOUT), ttnn.float32)
             bucket = ttnn.bitwise_and(idx, nb - 1)  # token v draws noise bucket v % NB (NB is a power of two)
             scores = ttnn.add(scores, ttnn.gather(noise, dim=-1, index=bucket))
+        if self._draw_tail is not None and DrawTail.supports(scores, idx):
+            # the top-1, the select, the eos update and the next-token row in one program (DrawTail)
+            drawn = self._draw_tail(scores, idx, state["unfinished"], state["tok"])
+            ttnn.plus_one(state["step"])
+            return drawn
         # The best score and its vocab id in one op: the top-1 carries the candidates' ids as labels (no argmax +
         # index gather). Equal-score ties stay arbitrary, as the unstable candidate ordering already made them.
         _, drawn = ttnn.topk(scores, k=1, dim=-1, largest=True, sorted=True, indices_tensor=idx)  # (1, 1, B, 1)
         # generate(): finished rows emit pad; a row finishes on the step it emits eos.
+        if self._sample_tail is not None and drawn.dtype == ttnn.uint32 and drawn.layout == ttnn.TILE_LAYOUT:
+            # the select, the eos update and the next-token row in one program (SampleTail)
+            self._sample_tail(drawn, state["unfinished"], state["tok"])
+            ttnn.plus_one(state["step"])
+            return drawn
         unf = state["unfinished"]
         nxt = ttnn.add(
             ttnn.multiply(ttnn.subtract(ttnn.typecast(drawn, ttnn.float32), float(self.pad_token_id)), unf),
@@ -966,7 +1099,8 @@ class DevstralPipeline:
         # all_gather; host readers join the shards on the vocab dim (VocabShards / host_read).
         logits = self.lm_head(hidden, gather=False)
         ttnn.plus_one(state["cur_pos"])
-        ttnn.add(state["pos"], 1.0, output_tensor=state["pos"])
+        if getattr(self.language_model, "_rope_gather", None) is None:  # the gathered RoPE rows index by cur_pos
+            ttnn.add(state["pos"], 1.0, output_tensor=state["pos"])
         state["drawn"] = self.sample(logits, state)
         state["logits"] = VocabShards(logits) if self._tp() > 1 else logits
         state["position"] = state["position"] + 1

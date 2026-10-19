@@ -21,9 +21,16 @@ _KDIR = Path(__file__).resolve().parent / "kernels"
 
 class StreamDownDecode:
     NC = 2  # output columns a compute core (one a data-movement RISC)
-    RB = 16  # K rows a weight push
+    RB = 16  # K rows a weight push (bf16)
+    # K rows a push by weight dtype: 8 tiles (~9 KB block-float8, ~4.6 KB block-float4) stream fastest (bf8 down,
+    # measured: 35 KB pushes 120 us, 17 KB 117 us, 9 KB 110.5 us, 4 KB 111 us; bf4 at 8 rows gained on the trace)
+    RB_BY_DTYPE = {ttnn.bfloat8_b: 8, ttnn.bfloat4_b: 8}
     CB_BYTES = 112 * 1024  # per weight CB (DEPTH = pushes that fit)
     GRID_X = 8  # compute cores: an 8-wide rectangle (as the 1D down's 8 x 10)
+
+    @classmethod
+    def rb_for(cls, dtype) -> int:
+        return cls.RB_BY_DTYPE.get(dtype, cls.RB)
 
     @classmethod
     def supports(cls, device, k, n, dtype) -> bool:
@@ -39,17 +46,19 @@ class StreamDownDecode:
             and cls.GRID_X < g.x
             and n_cores // cls.GRID_X <= g.y
             and nt % device.dram_grid_size().x == 0
-            and kt % cls.RB == 0
+            and kt % cls.rb_for(dtype) == 0
         )
 
-    def __init__(self, device, w_down, dtype, math_fidelity, put, tp=1):
+    def __init__(self, device, w_down, dtype, math_fidelity, put, tp=1, rb=None):
         """w_down: [tp * K, N] torch weight (device d multiplies rows d * K .. (d + 1) * K); put(t, dtype) uploads a
-        torch tensor sharded over the mesh on its second-to-last dim."""
+        torch tensor sharded over the mesh on its second-to-last dim. rb: K rows a push (default: rb_for(dtype)); a
+        short K takes fewer rows a push, so each column still streams as several pushes."""
         import torch
 
         self.device = device
         k, n = int(w_down.shape[0]) // tp, int(w_down.shape[1])
         self.kt, self.nt = k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
+        self.RB = int(rb) if rb and self.kt % int(rb) == 0 else self.rb_for(dtype)
         self.nb = nb = device.dram_grid_size().x
         # one stream a column (nc = 1): stream s reads column s
         self.w = put(

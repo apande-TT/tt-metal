@@ -62,10 +62,41 @@ class TtMinistral3Model:
         self.max_seq_len = max_seq_len
         self._repl = ttnn.ReplicateTensorToMesh(device) if self.tp > 1 else None
         self.compute_cfg = self.layers[0].compute_cfg
+        # (cos, sin) tables of every decode position and the program that gathers a step's rows (prepare_decode_rope)
+        self._decode_rope = None
+        self._rope_gather = None
+        # Decode's token embedding as one program writing the fp32 residual's width shards (tt/embed_decode.py)
+        self._embed_decode = None
+        L = TtMinistral3DecoderLayer
+        if self.DECODE_EMBED_SHARDED and self.tp > 1 and L.SHARDED_DECODE_RESIDUAL and L.RESIDUAL_DTYPE == ttnn.float32:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt.embed_decode import EmbedDecode
+
+            d = self.layers[0].hidden
+            mem = self.layers[0].input_layernorm.decode_mem(d)
+            if EmbedDecode.supports(mem, d):
+                self._embed_decode = EmbedDecode(device, mem, d)
+
+    # Decode reads its RoPE rows from tables of every position below the KV capacity, built once (rope_gather.py),
+    # instead of deriving them on device each step.
+    DECODE_ROPE_TABLES = True
+    # Decode's token rows gathered, widened to fp32 and tilized straight into the first layer's width-sharded residual
+    # layout by one program (tt/embed_decode.py) instead of a one-core tiled embedding, a typecast and a reshard.
+    DECODE_EMBED_SHARDED = True
 
     @classmethod
     def build(cls, device, torch_module):
         return cls(device, torch_module)
+
+    def prepare_decode_rope(self, capacity, batch):
+        """Build the decode RoPE tables for positions 0 .. capacity - 1 (the KV capacity bounds every decode position)
+        when decode runs the fused q / k RoPE with q sharing k's tables; otherwise decode derives them per step."""
+        attn0 = self.layers[0].self_attn
+        if not (self.DECODE_ROPE_TABLES and attn0._fused_qk_rope(batch) and attn0.query_shares_rope(capacity)):
+            return
+        from models.demos.devstral_small_2_24b_instruct_2512.tt.rope_gather import RopeGather
+
+        self._decode_rope = self.rotary_emb.table(int(capacity))
+        self._rope_gather = RopeGather(self.device, batch, self.head_dim, attn0.head_grid_x())
 
     def _positions(self, position_ids, s):
         """(1, 1, S, 1) fp32 prefill positions on device (a device tensor is used as given)."""
@@ -169,20 +200,27 @@ class TtMinistral3Model:
         return ttnn.reshape(x, (b, 1, s, x.shape[-1]))
 
     def _decode(self, input_ids, inputs_embeds, position_ids, kv_caches, cur_pos):
-        if inputs_embeds is None:
+        if inputs_embeds is None and self._embed_decode is not None and self._embeds_rows(input_ids):
+            # (1, 1, B, D) fp32 in the residual's width shards (the token_embed stub runs the program)
+            x = self.embed_tokens(input_ids, decode_program=self._embed_decode)
+        elif inputs_embeds is None:
             x = self.embed_tokens(input_ids)  # (1, B, D)
             x = ttnn.reshape(x, (1, 1, x.shape[-2], x.shape[-1]))
         else:
             x = inputs_embeds
         b = x.shape[-2]
-        cos, sin = self.rotary_emb(x, position_ids=position_ids)  # (B, 1, hd)
-        cos = ttnn.reshape(cos, (1, b, 1, self.head_dim))
-        sin = ttnn.reshape(sin, (1, b, 1, self.head_dim))
         attn0 = self.layers[0].self_attn
-        # Every decode position is below the resident KV capacity (dim 2 of the cache).
-        capacity = int(kv_caches[0][0].shape[2]) if kv_caches else None
-        rope = (cos, sin) + attn0.query_rope_tables(cos, sin, position_ids, (1, b, 1, 1), max_position=capacity)
-        rope = attn0.decode_rope_tables(rope, b)
+        if self._rope_gather is not None and self._rope_gather.batch == b and cur_pos is not None:
+            # this step's rows of the resident tables, straight into the fused RoPE's shards (prepare_decode_rope)
+            rope = attn0.decode_rope_gathered(self._rope_gather, cur_pos, *self._decode_rope)
+        else:
+            cos, sin = self.rotary_emb(x, position_ids=position_ids)  # (B, 1, hd)
+            cos = ttnn.reshape(cos, (1, b, 1, self.head_dim))
+            sin = ttnn.reshape(sin, (1, b, 1, self.head_dim))
+            # Every decode position is below the resident KV capacity (dim 2 of the cache).
+            capacity = int(kv_caches[0][0].shape[2]) if kv_caches else None
+            rope = (cos, sin) + attn0.query_rope_tables(cos, sin, position_ids, (1, b, 1, 1), max_position=capacity)
+            rope = attn0.decode_rope_tables(rope, b)
         for i, layer in enumerate(self.layers):
             x = layer(
                 x,
@@ -193,6 +231,18 @@ class TtMinistral3Model:
                 mode="decode",
             )
         return self.norm.decode(x)
+
+    @staticmethod
+    def _embeds_rows(input_ids):
+        """Whether input_ids is the decode state's (1, B <= 32) uint32 row-major id row (EmbedDecode's input)."""
+        return (
+            isinstance(input_ids, ttnn.Tensor)
+            and input_ids.layout == ttnn.ROW_MAJOR_LAYOUT
+            and input_ids.dtype == ttnn.uint32
+            and len(input_ids.shape) == 2
+            and int(input_ids.shape[0]) == 1
+            and int(input_ids.shape[1]) <= ttnn.TILE_SIZE
+        )
 
     @staticmethod
     def _bf16(t):
