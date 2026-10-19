@@ -52,7 +52,7 @@ void kernel_main() {
     constexpr uint32_t inline_kv = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 5);
     constexpr uint32_t cb_kv_old = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 6);
     constexpr uint32_t cb_kv_new = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 7);
-    constexpr uint32_t cb_kv_scr = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 8);
+    [[maybe_unused]] constexpr uint32_t cb_kv_scr = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 8);
     constexpr uint32_t cb_kv_out = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 9);
     constexpr uint32_t v_col0 = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 10);
     constexpr uint32_t qkv_Nt = get_compile_time_arg_val(sm_args.next_compile_time_args_offset() + 11);
@@ -118,27 +118,30 @@ void kernel_main() {
     if constexpr (inline_kv) {
         // The KV write's operands for compute: per unit (K, then V) the Kt old position tiles and Kt tiles whose
         // row r is the new row (the rest of those tiles is not used: only row r of the result is kept).
-        const uint32_t scr = get_write_ptr(cb_kv_scr);
         kv_old_base = get_write_ptr(cb_kv_old);  // K's Kt staged tiles, then V's (the CB is filled once)
         for (uint32_t unit = 0; unit < 2; ++unit) {
             cb_reserve_back(cb_kv_old, Kt);
             cb_reserve_back(cb_kv_new, Kt);
             const uint32_t old_l1 = get_write_ptr(cb_kv_old);
             const uint32_t new_l1 = get_write_ptr(cb_kv_new);
+            // The new row: only row b of its source tile (two 32 B face rows) lands straight in row r -- every
+            // core of a KV head reads the same source tiles, so whole-tile reads made those pages hotspots.
             for (uint32_t dt = 0; dt < Kt; ++dt) {
                 const uint32_t page = (bg * Ct + last_key_tile) * Kt + dt;
+                const uint32_t src_page =
+                    unit == 0 ? (hh * G + G - 1) * Kt + dt : (b >> 5) * qkv_Nt + v_col0 + hh * Kt + dt;
                 if (unit == 0) {
                     noc_async_read_page(page, kc, old_l1 + dt * tile_bytes);
-                    noc_async_read_page((hh * G + G - 1) * Kt + dt, q, scr + dt * tile_bytes);
                 } else {
                     noc_async_read_page(page, vc, old_l1 + dt * tile_bytes);
-                    noc_async_read_page((b >> 5) * qkv_Nt + v_col0 + hh * Kt + dt, qkv, scr + dt * tile_bytes);
+                }
+                for (uint32_t half = 0; half < 2; ++half) {
+                    const uint64_t src = unit == 0 ? q.get_noc_addr(src_page, face_row_off(b & 31, half))
+                                                   : qkv.get_noc_addr(src_page, face_row_off(b & 31, half));
+                    noc_async_read(src, new_l1 + dt * tile_bytes + face_row_off(r, half), face_row_bytes_);
                 }
             }
             noc_async_read_barrier();
-            for (uint32_t dt = 0; dt < Kt; ++dt) {
-                copy_row(scr + dt * tile_bytes, b & 31, new_l1 + dt * tile_bytes, r);
-            }
             cb_push_back(cb_kv_old, Kt);
             cb_push_back(cb_kv_new, Kt);
         }
