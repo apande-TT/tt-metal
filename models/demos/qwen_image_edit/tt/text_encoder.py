@@ -63,7 +63,7 @@ PREFIX_SHARE = True
 # mesh axis the vision batch is split over (the tower's TP=4 runs on the other axis)
 VISION_DP_AXIS = 0
 # LM stack slots whose MLP down projection takes its lower-limb product at LoFi (the rest: LO_FIDELITY)
-LM_DOWN_LOFI_SLOTS = range(7, 14)
+LM_DOWN_LOFI_SLOTS = range(3, 14)
 
 
 class TextEncoderInputs:
