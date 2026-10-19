@@ -33,6 +33,9 @@ DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
 # step streams); the other layers keep DECODE_WEIGHT_DTYPE.
 DECODE_GATE_UP_BF4_DTYPE = ttnn.bfloat4_b
 DECODE_GATE_UP_BF4_LAYERS = frozenset(range(5, 36))
+# Layers whose many-row (prefill) fused gate/up computes at LoFi instead of GATE_UP_FIDELITY (LoFi on every layer:
+# prefill 1173 -> 1006 ms but PCC 0.99334 < 0.995).
+PREFILL_GATE_UP_LOFI_LAYERS = frozenset(range(18, 23))
 # K tiles per activation multicast block of the bf4 decode gate / up projections (divides K = 160 tiles).
 DECODE_GATE_UP_K_BLOCK = 8
 # Math fidelity of the bf4 decode gate / up (HiFi3 == HiFi4 bit for bit on a block-float4 weight, see __init__).
@@ -255,9 +258,10 @@ class TtMinistral3MLP:
                 packer_l1_acc=False,
             )
         # The many-row fused gate/up is compute-bound; it runs at HiFi2 (fp32 accumulation kept).
+        lofi = type(self) is TtMinistral3MLP and layer_idx is not None and layer_idx in PREFILL_GATE_UP_LOFI_LAYERS
         self.gate_up_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
-            math_fidelity=self.GATE_UP_FIDELITY,
+            math_fidelity=ttnn.MathFidelity.LoFi if lofi else self.GATE_UP_FIDELITY,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
