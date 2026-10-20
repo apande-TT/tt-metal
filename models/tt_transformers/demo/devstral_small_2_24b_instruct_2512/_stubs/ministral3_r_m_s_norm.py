@@ -46,11 +46,16 @@ class TtMinistral3RMSNorm:
     # down each column, so the same products) straight from the norm's width shards into the DRAM row the LM head
     # reads -- no row broadcast, no fp32 unshard through DRAM first.
     DECODE_GAMMA_ROWS = True
+    # Prefill with a unit canonical weight (separate or folded gamma): rms_norm runs with no weight at all instead of
+    # multiplying by the all-ones row -- the interleaved kernel then holds no 5120-wide gamma row in L1 (its static
+    # buffers ended ~27 KB under the L1 top, leaving no room for the decode all_reduce's 40-core scratch).
+    UNIT_PREFILL_NO_WEIGHT = True
 
-    def __init__(self, canonical_instance, gamma=None, gamma_rows=None) -> None:
+    def __init__(self, canonical_instance, gamma=None, gamma_rows=None, unit_weight=False) -> None:
         self._impl = canonical_instance
         self.gamma = gamma
         self.gamma_rows = gamma_rows
+        self.unit_weight = unit_weight
         self._decode_cfgs = {}
 
     @classmethod
@@ -98,7 +103,7 @@ class TtMinistral3RMSNorm:
                 device=device,
                 mesh_mapper=ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None,
             )
-        return cls(canonical, gamma if separate else None, gamma_rows)
+        return cls(canonical, gamma if separate else None, gamma_rows, unit_weight=cls.SEPARATE_GAMMA or fold_gamma)
 
     def _decode_cfg(self, d):
         if d not in self._decode_cfgs:
@@ -159,7 +164,10 @@ class TtMinistral3RMSNorm:
         shape = tuple(x.shape)
         if len(shape) != 4:
             x = ttnn.reshape(x, (1,) * (4 - len(shape)) + shape)
-        out = self._impl(x, mode="prefill")
+        if self.UNIT_PREFILL_NO_WEIGHT and self.unit_weight:
+            out = ttnn.rms_norm(x, epsilon=self._impl.eps, compute_kernel_config=self._impl.compute_kernel_config_hifi2)
+        else:
+            out = self._impl(x, mode="prefill")
         if self.gamma is not None:
             out = ttnn.multiply(out, self.gamma)
         return ttnn.reshape(out, shape)
