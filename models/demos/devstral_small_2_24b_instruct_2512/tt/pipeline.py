@@ -245,6 +245,7 @@ PLANNED_TP = 4
 #                     subblocks) and the MLP down 1 x 4 subblocks.
 #   decoder_head: the one-tile-row lm_head (decode; prefill's last prompt rows) streams bank-major copies of its
 #                     weight on both data-movement RISCs of 64 cores (tt/lm_head_decode.py), bit-identical to ttnn.linear.
+#                     The decode gate / up and the lm_head stream through 256 KB weight CBs (the down / o_proj: 112 KB).
 
 
 def kv_capacity_for(tp):
