@@ -208,7 +208,12 @@ class TtPixtralVisionModel:
             cos, sin = ttnn.pad(cos, padding=pad, value=0.0), ttnn.pad(sin, padding=pad, value=0.0)
         mask = None if (batched and sp == s) else self._mask(s, sp, grids, batched)
 
-        out = ttnn.typecast(self.transformer(x, attention_mask=mask, position_embeddings=(cos, sin)), ttnn.bfloat16)
+        # (the layers keep their fp32 residual stream in L1; the bf16 features leave it for DRAM)
+        out = ttnn.typecast(
+            self.transformer(x, attention_mask=mask, position_embeddings=(cos, sin)),
+            ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         if sp != s:
             out = ttnn.slice(out, (0, 0, 0, 0), (out.shape[0], 1, s, out.shape[-1]))
         return ttnn.reshape(out, (out.shape[0], s, out.shape[-1]))

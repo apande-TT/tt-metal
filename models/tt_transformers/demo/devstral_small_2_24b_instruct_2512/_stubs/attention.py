@@ -42,6 +42,11 @@ class TtAttention:
     # dtype the attention norm output enters the QKV in when it fits in L1 (norm output to L1, cast there, freed by
     # the QKV): bf16 halves the activation blocks the HiFi4 QKV unpacks. None: the fp32 norm output from DRAM.
     QKV_INPUT_DTYPE = ttnn.bfloat16
+    # The fp32 residual stream stays in L1 -- the residual adds write L1, read the L1 o_proj / down outputs (their
+    # OUT_L1_BYTES / DOWN_OUT_L1_BYTES) and free what they consumed -- while it takes at most this many bytes per core
+    # (8 images x 256 patches x 1024 fp32: 76 KB). The same ops on the same values, only placed in L1: each add and the
+    # norm behind it otherwise stream the 8 MB stream through DRAM. 0: DRAM.
+    RESIDUAL_L1_BYTES = 96 * 1024
 
     def __init__(self, device, torch_module, mlp_cls=None) -> None:
         self.device = device
@@ -99,17 +104,30 @@ class TtAttention:
             ttnn.deallocate(n32)
         else:
             n = self._mm_in(self.attention_norm(x))
-        h = ttnn.add(x, self.attention(n, attention_mask=mask, position_embeddings=(cos, sin)))
+        res_l1 = 0 < n_bytes <= self.RESIDUAL_L1_BYTES
+        res_mem = ttnn.L1_MEMORY_CONFIG if res_l1 else None
+        a = self.attention(n, attention_mask=mask, position_embeddings=(cos, sin))
+        h = ttnn.add(x, a, memory_config=res_mem)
+        self._free_l1(a, x)
         n = self.ffn_norm(h, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None)
         if l1 and self.GATE_UP_INPUT_DTYPE not in (None, n.dtype):
             n32, n = n, ttnn.typecast(n, self.GATE_UP_INPUT_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG)
             ttnn.deallocate(n32)
-            out = ttnn.add(h, self.feed_forward(n))
+            f = self.feed_forward(n)
         else:
-            out = ttnn.add(h, self.feed_forward(self._mm_in(n)))
+            f = self.feed_forward(self._mm_in(n))
+        out = ttnn.add(h, f, memory_config=res_mem)
+        self._free_l1(f, h)
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
         return out
+
+    @staticmethod
+    def _free_l1(*ts):
+        """Free the L1 tensors among ts (sub-block outputs and the L1 residual a layer has added from)."""
+        for t in ts:
+            if t.memory_config().buffer_type == ttnn.BufferType.L1:
+                ttnn.deallocate(t)
 
     def _mm_in(self, t):
         return t if t.dtype == self.MATMUL_INPUT_DTYPE else ttnn.typecast(t, self.MATMUL_INPUT_DTYPE)

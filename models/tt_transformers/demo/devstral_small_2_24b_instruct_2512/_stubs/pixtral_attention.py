@@ -47,6 +47,9 @@ class TtPixtralAttention:
     # The fused q/k/v output (read once, by the head split, which frees it) lands in L1 while it takes at most this many
     # bytes per core (the data-parallel 8 x 256-row batch: 114 KB).
     QKV_OUT_L1_BYTES = 128 * 1024
+    # o_proj's fp32 output (added into the vision layer's residual stream, which stays in L1, see attention.py) lands in
+    # L1 while it takes at most this many bytes per core (8 x 256 x 1024 fp32: 76 KB); 0: DRAM.
+    OUT_L1_BYTES = 96 * 1024
 
     def __init__(self, device, torch_module, in_scale=None) -> None:
         """in_scale: the attention_norm gamma, folded into q/k/v (see TtAttention.FOLD_NORM_GAMMA)."""
@@ -252,12 +255,15 @@ class TtPixtralAttention:
         # fp32 output: it is added straight into the vision layer's fp32 residual stream. minimal_matmul folds the
         # images into its rows over the full grid (ttnn.linear ran the 32 x 256-row batch on 88 cores: 360 us), with
         # N blocks no wider than each core's N range (the default 8-tile block would be half padding at 4 tiles).
+        out_l1 = (
+            self.tp == 1 and 0 < 4 * int(b) * int(s) * int(self.wo.shape[-1]) // (grid.x * grid.y) <= self.OUT_L1_BYTES
+        )
         out = ttnn.experimental.minimal_matmul(
             attn,
             self.wo,
             config=self._narrow_n_cfg(attn, self.wo),
             compute_kernel_config=self.compute_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=ttnn.L1_MEMORY_CONFIG if out_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.float32,
         )
         if self.tp > 1:

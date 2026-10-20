@@ -90,6 +90,9 @@ class TtMinistral3MLP:
     # The many-row SwiGLU product goes to the down projection through L1 (interleaved, freed right after) while it
     # takes at most this many bytes per core (the vision MLP's 8192 x 1024 bf16: 152 KB; the text MLP's is far larger).
     PREFILL_INTER_L1_BYTES = 192 * 1024
+    # The many-row down projection's output lands in L1 while it takes at most this many bytes per core (0: DRAM). The
+    # vision MLPs set it: their fp32 output is added into the L1-resident vision residual stream (see attention.py).
+    DOWN_OUT_L1_BYTES = 0
 
     def __init__(self, device, torch_module, in_scale=None, layer_idx=None, norm_eps=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up.
@@ -428,14 +431,17 @@ class TtMinistral3MLP:
                 subblock_w=4,
                 compute_with_storage_grid_size=grid,
             )
+        down_dtype = self.PREFILL_REDUCE_DTYPE if (self.PREFILL_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE
+        out_bytes = (4 if down_dtype == ttnn.float32 else 2) * rows * nt * ttnn.TILE_SIZE // (grid.x * grid.y)
+        down_l1 = self.tp == 1 and 0 < out_bytes <= self.DOWN_OUT_L1_BYTES
         # (stock op: its copy-out epilogue costs ~nothing, measured 4110 vs 4109 us through tt/minimal_mm.py)
         out = ttnn.experimental.minimal_matmul(
             m,
             self.w_down,
             config=down_cfg,
             compute_kernel_config=self.down_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=self.PREFILL_REDUCE_DTYPE if (self.PREFILL_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
+            memory_config=ttnn.L1_MEMORY_CONFIG if down_l1 else ttnn.DRAM_MEMORY_CONFIG,
+            dtype=down_dtype,
         )
         if inter_l1:
             ttnn.deallocate(m)
