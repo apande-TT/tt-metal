@@ -220,7 +220,8 @@ PLANNED_TP = 4
 #                     to bf16 (the gate/up's product fits in L1 too).
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
-#   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py);
+#   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py),
+#                     whose stats tile has exact zeros beside the row sum, so the gathered stats need no mask multiply;
 #                     the last layer's final add emits the bf16 residual for the gather directly (no fp32 copy + cast).
 #   text decoder all_reduces (o_proj, MLP down): reduce-scatter + bf16 all_gather of the reduced shard; prefill's
 #                     and decode's partials are produced and reduce-scattered in bf16 (half the bytes, no cast),

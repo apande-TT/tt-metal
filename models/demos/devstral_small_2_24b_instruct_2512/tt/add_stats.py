@@ -24,7 +24,9 @@ _CAST_COMPUTE = str(_DIR / "add_cast_compute.cpp")
 _TILE = 32
 _TILE_BYTES = {ttnn.bfloat16: 2048, ttnn.float32: 4096}
 BLK = 4  # tiles a block (fp32 DEST holds 4)
-CB_X, CB_D, CB_SCALER, CB_H, CB_X2, CB_OUT, CB_S = 0, 1, 2, 3, 4, 16, 17
+CB_X, CB_D, CB_SCALER, CB_H, CB_X2, CB_MASK, CB_OUT, CB_S, CB_SRAW = 0, 1, 2, 3, 4, 5, 16, 17, 18
+# apply()'s stats tile holds the row sum in column 0 and exact zeros in columns 1..31 (no masking needed after a gather)
+CLEAN_STATS = True
 
 
 def _accessor_args(tensor):
@@ -105,7 +107,7 @@ def _run(x, d, cast):
     cfg.math_approx_mode = False
     cfg.dst_full_sync_en = False
     modes = [ttnn.UnpackToDestMode.Default] * 64
-    for cb in (CB_H, CB_X2):  # fp32 operands of the SFPU copy / square / accurate reduce
+    for cb in (CB_H, CB_X2, CB_MASK, CB_SRAW):  # fp32 operands of the SFPU copy / square / reduce / mask multiply
         modes[cb] = ttnn.UnpackToDestMode.UnpackToDestFp32
     for cb, t in ((CB_X, x), (CB_D, d)):  # the add's operands: fp32 straight to DEST, bf16 widened exactly
         if t.dtype == ttnn.float32:
@@ -119,6 +121,7 @@ def _run(x, d, cast):
             compile_time_args=[wt, BLK] + _accessor_args(x) + _accessor_args(d),
             runtime_args=rr,
             config=ttnn.ReaderConfigDescriptor(),
+            defines=[] if cast else [("STATS_MASK", "1")],
         ),
         ttnn.KernelDescriptor(
             kernel_source=_CAST_WRITER if cast else _WRITER,
@@ -151,6 +154,8 @@ def _run(x, d, cast):
         _cb(cores, CB_X2, ttnn.float32, wt),
         _cb(cores, CB_OUT, ttnn.float32, 2 * BLK),
         _cb(cores, CB_S, ttnn.float32, 2),
+        _cb(cores, CB_MASK, ttnn.float32, 1),
+        _cb(cores, CB_SRAW, ttnn.float32, 2),
     ]
     ttnn.generic_op([x, d, h, stats], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
     return h, stats
