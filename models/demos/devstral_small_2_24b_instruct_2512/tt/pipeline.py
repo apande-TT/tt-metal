@@ -220,6 +220,8 @@ PLANNED_TP = 4
 #                     to bf16 (the gate/up's product fits in L1 too). The fp32 residual stream stays in L1 between
 #                     the layers (o_proj / down outputs and both residual adds in L1, consumed tensors freed):
 #                     adds 58 -> ~20 us, norms 36 -> 24 us, o_proj 73 -> 61 us, down 125 -> 117 us a layer.
+#                     q / k / v, the SDPA output and the head concat sit in L1 too (each freed by its reader):
+#                     SDPA 185 -> 167 us, head concat 25 -> 11 us a layer.
 #   ministral3_m_l_p many-row fused gate/up (text prefill + vision): tt/minimal_mm.py, minimal_matmul's own program
 #                     with silu * up as ONE SFPU pass (kernels/mm_compute.cpp), bit-identical.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
