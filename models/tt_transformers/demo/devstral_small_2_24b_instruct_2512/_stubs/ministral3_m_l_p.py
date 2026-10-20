@@ -50,6 +50,9 @@ DOWN_DECODE_STREAM = True
 # 15 went back to bf8 (gate PCC 0.995034 at 15-24, 0.995374 at 16-23), headroom the fixed-chunk decode SDPA
 # (ministral3_attention DECODE_SDPA_K_CHUNK, -0.22 ms for -0.00018 PCC) spends.
 DECODE_DOWN_BF4_LAYERS = frozenset(range(16, 26))
+# Many-row (prefill / vision) fused gate/up through tt/minimal_mm.py: minimal_matmul's own program with its
+# output stage regrouped -- silu * up as ONE SFPU pass (the SFPU is ~1.4 ms of the 416-row gate/up's 9.8), bit-identical.
+PREFILL_MM_PROGRAM = True
 # Decode gate / up / silu-multiply as one C++ program (tt/gate_up_decode.py).
 DECODE_GATE_UP_FUSED = True
 # ... with the post-attention RMSNorm folded into that program's prologue (tt/gate_up_decode.py NormGateUpDecode): it
@@ -368,15 +371,20 @@ class TtMinistral3MLP:
             subblock_w=4 if n_gu % 4 == 0 else 2,
             compute_with_storage_grid_size=grid,
         )
-        m = ttnn.experimental.minimal_matmul(
-            x,
-            self.w_gate_up,
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        gu_kw = dict(
             config=gu_cfg,
             compute_kernel_config=self.gate_up_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if inter_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
             fuse_swiglu=True,
         )
+        if PREFILL_MM_PROGRAM and minimal_mm.supported(x, self.w_gate_up, self.gate_up_cfg, fuse_swiglu=True):
+            # the same program with silu * up as one SFPU pass (tt/minimal_mm.py), bit-identical
+            m = minimal_mm.matmul(x, self.w_gate_up, **gu_kw)
+        else:
+            m = ttnn.experimental.minimal_matmul(x, self.w_gate_up, **gu_kw)
         if x_l1:  # the caller's norm output, read only here (see TtAttention)
             ttnn.deallocate(x)
         # Many-row down projection on the full grid as well (ttnn.linear's auto config left it at ~45 TFLOP/s). A short
@@ -420,6 +428,7 @@ class TtMinistral3MLP:
                 subblock_w=4,
                 compute_with_storage_grid_size=grid,
             )
+        # (stock op: its copy-out epilogue costs ~nothing, measured 4110 vs 4109 us through tt/minimal_mm.py)
         out = ttnn.experimental.minimal_matmul(
             m,
             self.w_down,
