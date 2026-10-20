@@ -230,7 +230,9 @@ class TtPixtralAttention:
         # Widest key chunk the sequence allows: SDPA's per-key-chunk rescale rounding biases its output level
         # upward (+0.23% at k_chunk 32, +0.02% at 512 on the text model's attention).
         k_chunk = next(c for c in (512, 256, 128, 64, 32) if s % c == 0)
-        q_chunk = 64 if s % 64 == 0 else 32
+        # Query chunk: 128 rows where the sequence allows (8 x 16 heads x 256 patches: 256 chunks over the grid's 110
+        # cores, 185 us vs 215 at 64 rows and 207 at 256 -- each chunk streams its key/value range once).
+        q_chunk = next(c for c in (128, 64, 32) if s % c == 0)
         attn = ttnn.transformer.scaled_dot_product_attention(
             q,
             k,
