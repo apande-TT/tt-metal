@@ -190,12 +190,14 @@ class TtAttention:
         self.dmm_qkv = self.dmm_o = self.dmm_o_res = None
         if _USE_DRAM_MM:
             fid = ttnn.MathFidelity.HiFi4  # as self.compute_cfg
-            self.dmm_qkv = DramMatmul(device, torch.cat(grouped + [wv]).t().contiguous(), fid, **_QKV_DMM)
+            self.dmm_qkv = DramMatmul(  # dtype experiment: bf8_b decode weights
+                device, torch.cat(grouped + [wv]).t().contiguous(), fid, dtype=ttnn.bfloat8_b, **_QKV_DMM
+            )
             wo_t = torch_module.o_proj.weight.detach().to(torch.float32).t().contiguous()
-            self.dmm_o = DramMatmul(device, wo_t, fid)
+            self.dmm_o = DramMatmul(device, wo_t, fid, dtype=ttnn.bfloat8_b)
             # ... and o_proj + the layer's residual add in one program (ttnn.add's arithmetic on helper cores).
             if _USE_DRAM_MM_RES and self.dmm_o.ok:
-                dmm = DramMatmul(device, None, fid, prebuilt=self.dmm_o, residual_add=True)
+                dmm = DramMatmul(device, None, fid, prebuilt=self.dmm_o, residual_add=True, dtype=ttnn.bfloat8_b)
                 self.dmm_o_res = dmm if dmm.ok else None
         self.dmm_qkv_norm = None  # bind_prenorm: the input norm fused into the QKV program
         self.rot = ttnn.from_torch(
@@ -756,7 +758,8 @@ class TtAttention:
         """Fuse `norm` (the layer's input RMSNorm, HiFi4 like the QKV projection) into the decode QKV program."""
         if _USE_DRAM_MM_NORM and self.dmm_qkv is not None and self.dmm_qkv.ok and hasattr(norm, "consts"):
             dmm = DramMatmul(
-                self.device, None, ttnn.MathFidelity.HiFi4, norm_prologue=norm, prebuilt=self.dmm_qkv, **_QKV_DMM
+                self.device, None, ttnn.MathFidelity.HiFi4, norm_prologue=norm, prebuilt=self.dmm_qkv,
+                dtype=ttnn.bfloat8_b, **_QKV_DMM
             )
             self.dmm_qkv_norm = dmm if dmm.ok else None
         return self.dmm_qkv_norm is not None
