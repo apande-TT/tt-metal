@@ -237,6 +237,8 @@ PLANNED_TP = 4
 #                     ttnn.add's FPU bf16 ops -- bit-identical to the rotate-half chain, no matmul) instead of
 #                     nlp_create_qkv_heads + a rotate-half matmul / multiply / multiply / add per tensor. The vision
 #                     SDPA runs 128-row query chunks (one 256-row key chunk).
+#   ministral3_m_l_p prefill fused gate/up: M blocks that tile each core's M range with the least padding (416-row
+#                     prompt: 7 tiles, not 8) and 1 x 4 subblocks -- the SwiGLU epilogue no longer runs padded rows.
 
 
 def kv_capacity_for(tp):
