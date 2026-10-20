@@ -102,6 +102,9 @@ class TtMinistral3MLP:
     # The many-row down projection's output lands in L1 while it takes at most this many bytes per core (0: DRAM). The
     # vision MLPs set it: their fp32 output is added into the L1-resident vision residual stream (see attention.py).
     DOWN_OUT_L1_BYTES = 0
+    # The many-row down projection folds a fp32 residual add into its output stage (tt/minimal_mm.py residual=,
+    # bit-identical to ttnn.add(residual, down)): __call__(x, residual=h) returns h + mlp(x). The vision MLPs set it.
+    FUSE_RESIDUAL_DOWN = False
 
     def __init__(self, device, torch_module, in_scale=None, layer_idx=None, norm_eps=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up.
@@ -299,8 +302,9 @@ class TtMinistral3MLP:
         """Whether the decode gate / up can take the residual h itself and norm it (NormGateUpDecode)."""
         return getattr(self.fused_gate_up, "accepts", None) is not None and self.fused_gate_up.accepts(h)
 
-    def __call__(self, x, *args, mode="prefill", residual_norm=False, **kwargs):
-        """residual_norm (decode, decode_norms(x)): x is the residual, normed here by the gate / up program."""
+    def __call__(self, x, *args, mode="prefill", residual_norm=False, residual=None, **kwargs):
+        """residual_norm (decode, decode_norms(x)): x is the residual, normed here by the gate / up program.
+        residual (many-row, TP = 1): return residual + mlp(x) (FUSE_RESIDUAL_DOWN: the add folded into the down)."""
         shape = tuple(x.shape)
         if len(shape) != 4:
             x = ttnn.reshape(x, (1,) * (4 - len(shape)) + shape)
@@ -313,8 +317,10 @@ class TtMinistral3MLP:
             # peak DRAM stays small (rows are independent, so the result is identical).
             parts = [self._forward(ttnn.slice(x, [i, 0, 0, 0], [min(i + step, b), 1, s, d])) for i in range(0, b, step)]
             out = ttnn.concat(parts, dim=0)
+            if residual is not None:
+                out = ttnn.add(residual, out)
             return ttnn.reshape(out, shape[:-1] + (out.shape[-1],))
-        out = self._forward(x)
+        out = self._forward(x, residual)
         return ttnn.reshape(out, shape[:-1] + (out.shape[-1],))
 
     def _forward_decode(self, x, residual_norm=False):
@@ -381,7 +387,7 @@ class TtMinistral3MLP:
         """Each core's M tile range in minimal_matmul (M splits along the grid's x axis when M > N, else along y)."""
         return -(-mt // (grid.x if mt > nt else grid.y))
 
-    def _forward(self, x):
+    def _forward(self, x, residual=None):
         grid = self.device.compute_with_storage_grid_size()
         rows = 1
         for d in tuple(int(v) for v in x.shape)[:-1]:
@@ -467,17 +473,32 @@ class TtMinistral3MLP:
         out_bytes = (4 if down_dtype == ttnn.float32 else 2) * rows * nt * ttnn.TILE_SIZE // (grid.x * grid.y)
         down_l1 = self.tp == 1 and 0 < out_bytes <= self.DOWN_OUT_L1_BYTES
         # (stock op: its copy-out epilogue costs ~nothing, measured 4110 vs 4109 us through tt/minimal_mm.py)
-        out = ttnn.experimental.minimal_matmul(
-            m,
-            self.w_down,
+        down_kw = dict(
             config=down_cfg,
             compute_kernel_config=self.down_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if down_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=down_dtype,
         )
+        if (
+            residual is not None
+            and self.FUSE_RESIDUAL_DOWN
+            and self.tp == 1
+            and down_cfg is not None
+            and minimal_mm.supported(m, self.w_down, self.down_cfg)
+            and minimal_mm.supports_residual(m, self.w_down, residual, down_dtype)
+        ):
+            # residual + down(m) in one program (tt/minimal_mm.py residual=), bit-identical to the add below
+            out = minimal_mm.matmul(m, self.w_down, residual=residual, **down_kw)
+            residual = None
+        else:
+            out = ttnn.experimental.minimal_matmul(m, self.w_down, **down_kw)
         if inter_l1:
             ttnn.deallocate(m)
-        return self._reduce(out, gather=self.prefill_gather)
+        out = self._reduce(out, gather=self.prefill_gather)
+        if residual is not None:
+            f, out = out, ttnn.add(residual, out, memory_config=out.memory_config())
+            ttnn.deallocate(f)
+        return out
 
     def _reduce(self, out, gather=True):
         if self.tp == 1:

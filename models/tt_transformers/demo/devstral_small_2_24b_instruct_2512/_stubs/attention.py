@@ -47,6 +47,9 @@ class TtAttention:
     # (8 images x 256 patches x 1024 fp32: 76 KB). The same ops on the same values, only placed in L1: each add and the
     # norm behind it otherwise stream the 8 MB stream through DRAM. 0: DRAM.
     RESIDUAL_L1_BYTES = 96 * 1024
+    # Both residual adds ride in the output stage of the matmul feeding them (o_proj, the MLP down): attention /
+    # feed_forward take residual= and return the sum, through the same SFPU add (tt/minimal_mm.py residual=).
+    FUSE_RESIDUAL_ADDS = True
 
     def __init__(self, device, torch_module, mlp_cls=None) -> None:
         self.device = device
@@ -108,18 +111,27 @@ class TtAttention:
             n = self._mm_in(self.attention_norm(x))
         res_l1 = 0 < n_bytes <= self.RESIDUAL_L1_BYTES
         res_mem = ttnn.L1_MEMORY_CONFIG if res_l1 else None
-        a = self.attention(n, attention_mask=mask, position_embeddings=(cos, sin))
-        h = ttnn.add(x, a, memory_config=res_mem)
-        self._free_l1(a, x)
+        if self.FUSE_RESIDUAL_ADDS:
+            # o_proj and the MLP down add their output into the residual themselves (tt/minimal_mm.py residual=)
+            h = self.attention(n, attention_mask=mask, position_embeddings=(cos, sin), residual=x)
+            self._free_l1(x)
+        else:
+            a = self.attention(n, attention_mask=mask, position_embeddings=(cos, sin))
+            h = ttnn.add(x, a, memory_config=res_mem)
+            self._free_l1(a, x)
         n = self.ffn_norm(h, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None)
         if l1 and self.GATE_UP_INPUT_DTYPE not in (None, n.dtype):
             n32, n = n, ttnn.typecast(n, self.GATE_UP_INPUT_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG)
             ttnn.deallocate(n32)
-            f = self.feed_forward(n)
         else:
-            f = self.feed_forward(self._mm_in(n))
-        out = ttnn.add(h, f, memory_config=res_mem)
-        self._free_l1(f, h)
+            n = self._mm_in(n)
+        if self.FUSE_RESIDUAL_ADDS:
+            out = self.feed_forward(n, residual=h)
+            self._free_l1(h)
+        else:
+            f = self.feed_forward(n)
+            out = ttnn.add(h, f, memory_config=res_mem)
+            self._free_l1(f, h)
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
         return out

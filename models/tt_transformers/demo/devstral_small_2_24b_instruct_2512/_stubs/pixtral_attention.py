@@ -276,18 +276,35 @@ class TtPixtralAttention:
         out_l1 = (
             self.tp == 1 and 0 < 4 * int(b) * int(s) * int(self.wo.shape[-1]) // (grid.x * grid.y) <= self.OUT_L1_BYTES
         )
-        out = ttnn.experimental.minimal_matmul(
-            attn,
-            self.wo,
+        o_kw = dict(
             config=self._narrow_n_cfg(attn, self.wo),
             compute_kernel_config=self.compute_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if out_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.float32,
         )
+        # residual (the layer's fp32 residual stream x): return x + o_proj(attn). With TP = 1 the add rides in o_proj's
+        # output stage (tt/minimal_mm.py residual=: the same SFPU add ttnn.add runs, bit-identical).
+        residual = kwargs.get("residual")
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        if (
+            residual is not None
+            and self.tp == 1
+            and o_kw["config"] is not None
+            and minimal_mm.supported(attn, self.wo, self.compute_cfg)
+            and minimal_mm.supports_residual(attn, self.wo, residual, ttnn.float32)
+        ):
+            out = minimal_mm.matmul(attn, self.wo, residual=residual, **o_kw)
+            residual = None
+        else:
+            out = ttnn.experimental.minimal_matmul(attn, self.wo, **o_kw)
         if attn_l1:
             ttnn.deallocate(attn)
         if self.tp > 1:
             out = ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
+        if residual is not None:
+            a, out = out, ttnn.add(residual, out, memory_config=o_kw["memory_config"])
+            ttnn.deallocate(a)
         if len(in_shape) == 3:
             return ttnn.reshape(out, (b, s, out.shape[-1]))
         return out
