@@ -280,7 +280,12 @@ class TtQwenImageEditPipeline:
 
     def vae_decode(self, up, latents):
         h, w = up.latent_hw
-        return self.vae.decode(latents, h, w)
+        # (the encoder's bit-identical hooks: the precise convs' bf16 rounding in one pass, the shortcut linears'
+        # small-weight kernel and fused product hooks)
+        with self._hook(_vae_resident, "VOTE_TAIL", self.vote_tail), self._hook(
+            _vae_resident, "ROUND_BF16", self.round_bf16
+        ), self._hook(_te_attention, "LINEAR_KERNEL", self.linear_kernel), self._fused_tail(exact_only=True):
+            return self.vae.decode(latents, h, w)
 
     # ---- the chained forward -------------------------------------------------------------------------
     def _sync_print(self, msg, t0=None):
