@@ -239,6 +239,8 @@ PLANNED_TP = 4
 #                     SDPA runs 128-row query chunks (one 256-row key chunk).
 #   ministral3_m_l_p prefill fused gate/up: M blocks that tile each core's M range with the least padding (416-row
 #                     prompt: 7 tiles, not 8) and 1 x 4 subblocks -- the SwiGLU epilogue no longer runs padded rows.
+#                     The long-prompt QKV / o_proj take N blocks of each core's narrow N range (QKV: 5 tiles, 4 x 1
+#                     subblocks) and the MLP down 1 x 4 subblocks.
 
 
 def kv_capacity_for(tp):
