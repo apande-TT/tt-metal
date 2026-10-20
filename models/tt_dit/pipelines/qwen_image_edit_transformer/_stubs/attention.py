@@ -174,6 +174,37 @@ class TtQwenJointAttention:
         return ttnn.add(ttnn.add(mm(qh, kh), mm(qh, kl)), mm(ql, kh))
 
     def _attend(self, q, kh, kl, v, mask_add):
+        g = _precise.ATTEND_ENTRIES
+        e = q.shape[0] * q.shape[1]
+        if _precise.ENABLED and g and e > g and e % g == 0:
+            o = self._attend_entries(q, kh, v, mask_add, g)
+        else:
+            o = self._attend_core(q, kh, kl, v, mask_add)
+        B, Sq = o.shape[0], o.shape[2]
+        o = ttnn.permute(o, (0, 2, 1, 3))
+        return ttnn.reshape(o, (B, Sq, self.local_heads * self.head_dim))
+
+    def _attend_entries(self, q, kh, v, mask_add, g):
+        """_attend_core over the (sample, head) entries g at a time: each group's batched products fill the grid
+        with one block per core (all 96 entries at once leave the guarded QK^T lanes on 6 cores). Every entry's
+        values are the ones the whole-batch call computes."""
+        B, H, Sq, D = q.shape
+        Sk = kh.shape[2]
+        e = B * H
+        qe, ke, ve = (ttnn.reshape(t, (e, 1, t.shape[2], D)) for t in (q, kh, v))
+        me = None
+        if mask_add is not None:  # [B, 1, 1, Sk] -> one row per entry
+            me = ttnn.reshape(ttnn.repeat(mask_add, ttnn.Shape([1, H, 1, 1])), (e, 1, 1, Sk))
+        outs = []
+        for g0 in range(0, e, g):
+            sl = lambda t: ttnn.slice(t, [g0, 0, 0, 0], [g0 + g, 1, t.shape[2], t.shape[3]])  # noqa: E731
+            outs.append(self._attend_core(sl(qe), sl(ke), None, sl(ve), None if me is None else sl(me)))
+        o = ttnn.concat(outs, dim=0)
+        for t in outs:
+            ttnn.deallocate(t)
+        return ttnn.reshape(o, (B, H, Sq, D))
+
+    def _attend_core(self, q, kh, kl, v, mask_add):
         if _precise.ENABLED:  # kh = k (float32) in precise mode
             s = _precise.exact_matmul_bt(q, kh) if _precise.EXACT_QK else _precise.matmul_bt(q, kh)
         else:
@@ -191,9 +222,7 @@ class TtQwenJointAttention:
             o = ttnn.matmul(
                 ttnn.typecast(p, ttnn.bfloat16), v, dtype=ttnn.bfloat16, compute_kernel_config=self.hifi
             )  # [B, Hl, Sq, D]
-        B, Sq = o.shape[0], o.shape[2]
-        o = ttnn.permute(o, (0, 2, 1, 3))
-        return ttnn.reshape(o, (B, Sq, self.local_heads * self.head_dim))
+        return o
 
     def _out(self, x, wb):  # row-parallel + all_reduce, bias once
         w, b = wb

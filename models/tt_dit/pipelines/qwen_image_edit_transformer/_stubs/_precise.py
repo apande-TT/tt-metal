@@ -233,11 +233,25 @@ def exact_matmul_bt(a, b):
     return _median3(*ests)
 
 
+# Joint attention run over its (sample, head) entries this many at a time (None: all at once); see the port's
+# _attend_entries. 16 entries x 4 M blocks of a 512-token stream = one block per core of the 64-core grid.
+ATTEND_ENTRIES = 16
+
+
+def _bmm_config(p, q, transpose_b=False):
+    """The text encoder's batched-product program config hook (BMM_CONFIG) for p @ q, or None (auto)."""
+    from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te
+
+    return None if _te.BMM_CONFIG is None else _te.BMM_CONFIG(p, q, transpose_b)
+
+
 def _matmul3(a, b):
     cfg = precise_config()
     ah, al = split_bf16(a)
     bh, bl = split_bf16(b)
-    mm = lambda p, q: ttnn.matmul(p, q, compute_kernel_config=cfg, dtype=ttnn.float32)  # noqa: E731
+    mm = lambda p, q: ttnn.matmul(  # noqa: E731
+        p, q, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=_bmm_config(p, q)
+    )
     return ttnn.add(ttnn.add(mm(ah, bh), mm(ah, bl)), mm(al, bh))
 
 
