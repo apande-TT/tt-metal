@@ -23,6 +23,10 @@ import torch
 import ttnn
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_attention import vision_tp
 
+# The side-by-side batch's 2 x 2 unfold as one tile-layout program (tt/patch_unfold.py) instead of untilize + reshape +
+# permute + reshape + tilize (286 -> 40 us for 8 images of 16 x 16 patches, byte-identical).
+PATCH_UNFOLD_PROGRAM = True
+
 
 class TtMistral3PatchMerger:
     def __init__(self, device, torch_module) -> None:
@@ -87,7 +91,15 @@ class TtMistral3PatchMerger:
             assert len(set(grids)) == 1, "side-by-side images must share one size"
             h, w = grids[0]
             b = x.shape[0]
-            x = ttnn.to_layout(ttnn.reshape(x, (b, 1, h * w, self.d)), ttnn.ROW_MAJOR_LAYOUT)
+            x = ttnn.reshape(x, (b, 1, h * w, self.d))
+            # (imported here: a module held on the instance would be walked by the perf harness's weight census)
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import patch_unfold
+
+            if PATCH_UNFOLD_PROGRAM and patch_unfold.supports(x, h, w, self.merge):
+                # the unfold as one tile-layout data-movement program (tt/patch_unfold.py), byte-identical
+                y = patch_unfold.apply(x, h, w)
+                return self._merge(y)
+            x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
             x = ttnn.to_layout(self._unfold(x, b, h, w), ttnn.TILE_LAYOUT)
             return self._merge(x)
 
