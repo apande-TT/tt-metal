@@ -50,6 +50,9 @@ class TtPixtralAttention:
     # o_proj's fp32 output (added into the vision layer's residual stream, which stays in L1, see attention.py) lands in
     # L1 while it takes at most this many bytes per core (8 x 256 x 1024 fp32: 76 KB); 0: DRAM.
     OUT_L1_BYTES = 96 * 1024
+    # q / k / v (head split + RoPE output), SDPA's output and the head concat stay in L1 -- each freed by its one reader
+    # -- while q, k and v together take at most this many bytes per core (3 x 8 x 256 x 1024 bf16: 114 KB); 0: DRAM.
+    ATTN_L1_BYTES = 128 * 1024
 
     def __init__(self, device, torch_module, in_scale=None) -> None:
         """in_scale: the attention_norm gamma, folded into q/k/v (see TtAttention.FOLD_NORM_GAMMA)."""
@@ -212,8 +215,15 @@ class TtPixtralAttention:
         if self.cpp_rope:
             # (imported here: a module held on the instance would be walked by the perf harness's weight census)
             from models.demos.devstral_small_2_24b_instruct_2512.tt import heads_rope
+        attn_l1 = (
+            self.tp == 1
+            and 0
+            < 3 * int(qkv.shape[0]) * int(s) * int(self.wo.shape[-2]) * 2 // (grid.x * grid.y)
+            <= self.ATTN_L1_BYTES
+        )
+        head_mem = ttnn.L1_MEMORY_CONFIG if attn_l1 else ttnn.DRAM_MEMORY_CONFIG
         if self.cpp_rope and heads_rope.supports(qkv, cos, sin, self.local_heads):
-            q, k, v = heads_rope.apply(qkv, cos, sin, self.local_heads)
+            q, k, v = heads_rope.apply(qkv, cos, sin, self.local_heads, memory_config=head_mem)
             if qkv_l1:
                 ttnn.deallocate(qkv)
         else:
@@ -228,6 +238,7 @@ class TtPixtralAttention:
                 ttnn.deallocate(qkv)
             q = self._rope(q, cos, sin)
             k = self._rope(k, cos, sin)
+            attn_l1, head_mem = False, ttnn.DRAM_MEMORY_CONFIG
         if q.dtype != ttnn.bfloat16:  # fp32 activations upstream; SDPA reads bf16
             q, k, v = (ttnn.typecast(t, ttnn.bfloat16) for t in (q, k, v))
         # Widest key chunk the sequence allows: SDPA's per-key-chunk rescale rounding biases its output level
@@ -250,8 +261,15 @@ class TtPixtralAttention:
                 exp_approx_mode=False,
             ),
             compute_kernel_config=self.compute_cfg,
+            memory_config=head_mem,
         )
-        attn = ttnn.experimental.nlp_concat_heads(attn)
+        if attn_l1:
+            for t in (q, k, v):
+                ttnn.deallocate(t)
+        heads = attn
+        attn = ttnn.experimental.nlp_concat_heads(heads, memory_config=head_mem)
+        if attn_l1:
+            ttnn.deallocate(heads)
         # fp32 output: it is added straight into the vision layer's fp32 residual stream. minimal_matmul folds the
         # images into its rows over the full grid (ttnn.linear ran the 32 x 256-row batch on 88 cores: 360 us), with
         # N blocks no wider than each core's N range (the default 8-tile block would be half padding at 4 tiles).
@@ -266,6 +284,8 @@ class TtPixtralAttention:
             memory_config=ttnn.L1_MEMORY_CONFIG if out_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.float32,
         )
+        if attn_l1:
+            ttnn.deallocate(attn)
         if self.tp > 1:
             out = ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
         if len(in_shape) == 3:
