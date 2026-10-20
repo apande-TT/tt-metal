@@ -280,6 +280,8 @@ PLANNED_TP = 4
 #                     first-column shards while the second columns stream, the residual cores sum the slots and add
 #                     the residual (all_reduce_async + ttnn.add bit for bit); the senders multicast half of x on each
 #                     NOC (one RISC's 512 KB multicast landed x ~40-60 us in). Trace decode 13.88 -> 13.61 ms.
+#   decode gate / up sender multicasts half of the gathered normed row on each NOC (NormGateUpDecode.DUAL_NOC_SENDER):
+#                     bf8 gate / up 191.5 -> ~184 us, the bf4 layers' matmul starts earlier; trace 13.61 -> 13.37 ms.
 
 
 def kv_capacity_for(tp):

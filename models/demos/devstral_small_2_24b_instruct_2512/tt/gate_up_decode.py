@@ -80,11 +80,14 @@ def bank_major_order(w: torch.Tensor, order: torch.Tensor) -> torch.Tensor:
     return tiles[order].reshape(kt, nt, 32, 32).permute(0, 2, 1, 3).reshape(k, n)
 
 
-def dual_noc_sender_kernels(device, sender, kt, x_tile, n_cores, sem_ready, sem_valid, x, rects, x_acc, defines=()):
+def dual_noc_sender_kernels(
+    device, sender, kt, x_tile, n_cores, sem_ready, sem_valid, x, rects, x_acc, defines=(), gather=None
+):
     """Two gate_up_sender.cpp X_SLICE kernels on ONE sender core: RISCV_0 multicasts K tiles [0, kt / 2) over NOC 0,
     RISCV_1 the rest over NOC 1 at the same time (a multicast of the whole row from one RISC ran at ~10-15 GB/s;
     concurrent multicasts on one NOC serialize). Both wait on the core's own ready count; the compute cores wait for
-    two valid counts (GU_NSEND 2)."""
+    two valid counts (GU_NSEND 2). gather = (norm cores, gather semaphore): X_GATHER, the row comes from the norm cores
+    (x is not read; pass None)."""
     rng = lambda c: ttnn.CoreRange(ttnn.CoreCoord(*c), ttnn.CoreCoord(*c))
     out = []
     for i, (risc, noc) in enumerate(
@@ -96,10 +99,11 @@ def dual_noc_sender_kernels(device, sender, kt, x_tile, n_cores, sem_ready, sem_
                 kernel_source=str(_KDIR / "gate_up_sender.cpp"),
                 source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=ttnn.CoreRangeSet([rng(sender)]),
-                compile_time_args=[kt, x_tile, n_cores, sem_ready, sem_valid] + x_acc,
-                runtime_args=[(sender, [x.buffer_address(), k0, k1] + list(rects))],
+                compile_time_args=[kt, x_tile, n_cores, sem_ready, sem_valid]
+                + (x_acc if gather is None else [gather[1]]),
+                runtime_args=[(sender, [0 if x is None else x.buffer_address(), k0, k1] + list(rects))],
                 config=ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc),
-                defines=[("X_SLICE", "1")] + list(defines),
+                defines=[("X_SLICE", "1")] + ([] if gather is None else [("X_GATHER", str(gather[0]))]) + list(defines),
             )
         )
     return out
@@ -283,6 +287,8 @@ class NormGateUpDecode(FusedGateUpDecode):
     SPREAD = True
     SPREAD_NORM_NC = 2
     NORM_CB_BYTES = 128 * 1024
+    # ar_norm_call: the sender multicasts half of the normed row on each NOC (gate_up_sender.cpp X_SLICE + X_GATHER)
+    DUAL_NOC_SENDER = True
 
     def _norm_xy(self):
         (ox, oy), (nx, ny) = self.NORM_ORIGIN, self.NORM_SHAPE
@@ -644,11 +650,12 @@ class NormGateUpDecode(FusedGateUpDecode):
             for v in (res_xy[i].x, res_xy[i].y, norm_xy[i].x, norm_xy[i].y)
         ]
         stream_kernels = []
+        nsend = [("GU_NSEND", "2")] if self.DUAL_NOC_SENDER else []
         for w, idx, cores, dep in groups:
             at = lambda wt_: [(self.streams[s][0], stream_rt(wt_, s)) for s in idx]
             stream_kernels += [
-                kern("gate_up_stream.cpp", cores, stream_ct(1, 0, self.wg, w, dep), at(self.wg), dm0),
-                kern("gate_up_stream.cpp", cores, stream_ct(2, 1, self.wu, w, dep), at(self.wu), dm1),
+                kern("gate_up_stream.cpp", cores, stream_ct(1, 0, self.wg, w, dep), at(self.wg), dm0, nsend),
+                kern("gate_up_stream.cpp", cores, stream_ct(2, 1, self.wu, w, dep), at(self.wu), dm1, nsend),
                 kern("gate_up_compute.cpp", cores, [kt, w, rb], [], self.cfg),
             ]
         if spread:
@@ -668,6 +675,7 @@ class NormGateUpDecode(FusedGateUpDecode):
                     stream_ct(2, 1, self.wu, nn, dep_n),
                     [(xy, stream_rt(self.wu, n_s + i)) for i, xy in enumerate(self.norm_xy_logical)],
                     dm1,
+                    nsend,
                 ),
                 kern(
                     "norm_gate_up_compute.cpp",
@@ -700,8 +708,13 @@ class NormGateUpDecode(FusedGateUpDecode):
             if d % 2 == 0:
                 fwd_n, bwd_n = bwd_n, fwd_n
             route = lambda n: [1, n, 0, 0, 0, 0]  # 1D fabric: start one hop out, reach n devices
-            kernels = (
-                [
+            if self.DUAL_NOC_SENDER:
+                senders = dual_noc_sender_kernels(
+                    self.device, self.sender, kt, x_tile, n_compute, SEM_READY, SEM_VALID, None, rects, [],
+                    gather=(self.np, SEM_GATHER),
+                )
+            else:
+                senders = [
                     kern(
                         "gate_up_sender.cpp",
                         self.sender_set,
@@ -711,6 +724,8 @@ class NormGateUpDecode(FusedGateUpDecode):
                         [("X_GATHER", str(self.np))],
                     )
                 ]
+            kernels = (
+                senders
                 + stream_kernels
                 + norm_kernels
                 + [
