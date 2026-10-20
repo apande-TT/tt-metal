@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Weight stream of tt/down_decode.py's all_reduce fold (StreamDownDecode.ar_call; one instance per data-movement
-// RISC). The core's NCOL columns stream one after the other, each by BOTH RISCs (this RISC: pushes PHASE, PHASE + 2,
-// ... of the column, its first page in the runtime args), so every core's first column is done about two thirds of
-// the way through the program and only the two-column cores' second columns finish at its end.
+// RISC). The core's NCOL columns stream one after the other, each by BOTH RISCs, so every core's first column is done
+// about two thirds of the way through the program and only the two-column cores' second columns finish at its end.
+// The first column's pushes alternate between the RISCs; the second's split into a leading run for RISCV_0 and a
+// trailing one for RISCV_1, whose NOC 1 reads ran ~25% slower once only the two-column cores stream (CNT / STEP).
 // The OWNER (RISCV_1) takes the multicast activation as gate_up_stream.cpp does, and writes each output tile into the
 // partials' width shards as soon as compute packs it (polled between pushes), then counts it on the fabric-link
 // worker that sends that tile's shard (on that worker's wave semaphore: columns below W1_COLS are wave 1).
@@ -41,7 +42,10 @@ void kernel_main() {
     constexpr uint32_t WT = get_compile_time_arg_val(16);  // tiles of a shard
     constexpr uint32_t ar_tile = get_compile_time_arg_val(17);
     constexpr uint32_t f32_tile = get_compile_time_arg_val(18);
-    constexpr auto w_args = TensorAccessorArgs<19>();
+    // this RISC's pushes of the core's first / second column: how many, and how far apart (in pushes)
+    constexpr uint32_t CNT_A = get_compile_time_arg_val(19), STEP_A = get_compile_time_arg_val(20);
+    constexpr uint32_t CNT_B = get_compile_time_arg_val(21), STEP_B = get_compile_time_arg_val(22);
+    constexpr auto w_args = TensorAccessorArgs<23>();
     constexpr auto o_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
     static_assert(Kt % (2 * RB) == 0, "down blocking");
     constexpr uint32_t cb_x = 0, cb_out = 16, cb_x0 = 11, cb_ar = 12, cb_hout = 14;
@@ -78,7 +82,8 @@ void kernel_main() {
     uint32_t push = 0;
     for (uint32_t col = 0; col < NCOL; ++col) {
         uint32_t page = get_arg_val<uint32_t>(4 + col);
-        for (uint32_t k0 = 0; k0 < Kt / 2; k0 += RB, ++push) {
+        const uint32_t count = col == 0 ? CNT_A : CNT_B, stride = RB * NB * (col == 0 ? STEP_A : STEP_B);
+        for (uint32_t i = 0; i < count; ++i, ++push) {
             if (!have_x) {
                 // compute consumes no weight before x: once cb_w is full, x must be handed over before reserving more
                 invalidate_l1_cache();
@@ -93,7 +98,7 @@ void kernel_main() {
             }
             cb_reserve_back(cb_w, RB);
             noc_async_read(w.get_noc_addr(page), get_write_ptr(cb_w), RB * w_tile);
-            page += RB * NB * 2;
+            page += stride;
             noc_async_read_barrier();
             cb_push_back(cb_w, RB);
         }

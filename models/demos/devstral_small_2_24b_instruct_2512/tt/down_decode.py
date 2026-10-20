@@ -42,6 +42,8 @@ class StreamDownDecode:
     # spread: the sender core multicasts half the activation on each NOC (gate_up_sender.cpp X_SLICE): one RISC
     # multicasting the whole 512 KB row of the down landed it ~40 us (row 9: ~60 us) into the program
     DUAL_NOC = True
+    # ar_call: RISCV_0's share of a two-column core's second column, in pushes of its Kt / RB (the rest is RISCV_1's)
+    SPLIT_B_SHARE = 18 / 32
 
     @classmethod
     def rb_for(cls, dtype) -> int:
@@ -346,18 +348,22 @@ class StreamDownDecode:
         scratch_addr, sem_addr = ar.buffer.buffer_address(), ttnn.get_global_semaphore_address(ar.sem)
         kernels = self._sender_kernels(m, SEM_READY, SEM_VALID, dm0, acc(m))
         nsend = [("GU_NSEND", str(self._n_send()))]
+        n_push = kt // rb
+        n0 = max(1, min(n_push - 1, round(n_push * self.SPLIT_B_SHARE)))
+        # (count, step) of each RISC's pushes: first column alternating, second split at n0
+        pattern = {0: (n_push // 2, 2, n0, 1), 1: (n_push // 2, 2, n_push - n0, 1)}
         for w, r, idx, cores in groups:
             ct = lambda cb, owner: [
                 kt, nb, rb, w_tile, cb, depth, owner, SEM_READY, SEM_VALID, o_tile, w, SEM_W1, SEM_W2, n_cores,
                 int(r), tp, wt, ar_tile, f32_tile,
-            ] + acc(self.w, out)
+            ] + list(pattern[owner]) + acc(self.w, out)
             tail = lambda c: [x.buffer_address(), scratch_addr, h.buffer_address(), sem_addr] if r else []
             rt = lambda f: [
                 (
                     self.core_xy[c],
                     [self.w.buffer_address(), out.buffer_address()]
                     + self.sender_xy
-                    + [self.page0s[col] + f * rb * nb for col in self.cols[c]]
+                    + [self.page0s[col] + (f if i == 0 else f * n0) * rb * nb for i, col in enumerate(self.cols[c])]
                     + [0] * (2 - w)
                     + self.cols[c]
                     + [0] * (2 - w)
@@ -366,7 +372,7 @@ class StreamDownDecode:
                 )
                 for c in idx
             ]
-            defines = [("DOWN_SEQ", str(w))] + ([("RES_TAIL", "1")] if r else [])
+            defines = [("DOWN_SEQ", str(w)), ("SPLIT_B", str(n0))] + ([("RES_TAIL", "1")] if r else [])
             kernels += [
                 self._kernel("down_ar_stream.cpp", cores, ct(1, 0), rt(0), dm0, nsend),
                 self._kernel("down_ar_stream.cpp", cores, ct(2, 1), rt(1), dm1, nsend),

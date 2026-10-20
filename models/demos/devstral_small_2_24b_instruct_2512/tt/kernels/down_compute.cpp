@@ -37,17 +37,18 @@ void kernel_main() {
     static_assert(Kt % (2 * RB) == 0, "down blocking");
     for (uint32_t col = 0; col < NCOL; ++col) {
         tile_regs_acquire();
-        for (uint32_t k0 = 0; k0 < Kt; k0 += 2 * RB) {
-            cb_wait_front(cb_w0, RB);
+        for (uint32_t p = 0; p < Kt / RB; ++p) {
+#ifdef SPLIT_B
+            // the second column: pushes 0 .. SPLIT_B - 1 from RISCV_0, the rest from RISCV_1 (down_ar_stream.cpp)
+            const uint32_t cb = (col == 0 ? p % 2 == 0 : p < SPLIT_B) ? cb_w0 : cb_w1;
+#else
+            const uint32_t cb = p % 2 == 0 ? cb_w0 : cb_w1;
+#endif
+            cb_wait_front(cb, RB);
             for (uint32_t i = 0; i < RB; ++i) {
-                matmul_block(cb_x, cb_w0, k0 + i, i, 0, 0, 1, 1, RB);
+                matmul_block(cb_x, cb, p * RB + i, i, 0, 0, 1, 1, RB);
             }
-            cb_pop_front(cb_w0, RB);
-            cb_wait_front(cb_w1, RB);
-            for (uint32_t i = 0; i < RB; ++i) {
-                matmul_block(cb_x, cb_w1, k0 + RB + i, i, 0, 0, 1, 1, RB);
-            }
-            cb_pop_front(cb_w1, RB);
+            cb_pop_front(cb, RB);
         }
         tile_regs_commit();
 
