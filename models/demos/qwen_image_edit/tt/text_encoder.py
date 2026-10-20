@@ -202,15 +202,16 @@ class TtQwenTextEncoder:
         tok = ttnn.typecast(self.text_model.embed_tokens(p.ids), ttnn.float32)  # [B, s_pad, C]
         B, s_pad, C = tok.shape[0], tok.shape[1], tok.shape[2]
         a, m = p.img_start, p.img_len
-        # HF: inputs_embeds.masked_scatter(image_mask, image_embeds)
+        # HF: inputs_embeds.masked_scatter(image_mask, image_embeds), spliced row-major: a ragged row slice of the
+        # float32 tile tensor untilized all of it on one core (~13 ms per chip); the multicore unpadding untilize
+        # takes each operand once instead, then one tilize
+        img = ttnn.typecast(img, ttnn.float32)
+        tok = ttnn.untilize_with_unpadding(tok, [B - 1, s_pad - 1, C - 1])
+        img = ttnn.untilize_with_unpadding(img, [B - 1, m - 1, C - 1])
         x = ttnn.concat(
-            [
-                ttnn.slice(tok, [0, 0, 0], [B, a, C]),
-                ttnn.typecast(img, ttnn.float32),
-                ttnn.slice(tok, [0, a + m, 0], [B, s_pad, C]),
-            ],
-            dim=1,
+            [ttnn.slice(tok, [0, 0, 0], [B, a, C]), img, ttnn.slice(tok, [0, a + m, 0], [B, s_pad, C])], dim=1
         )
+        x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
         x = ttnn.reshape(x, (B, 1, s_pad, C))
         cos3, sin3 = self.rotary(None, p.positions, dtype=ttnn.float32)
         h = self.text_model.forward_padded(x, self._mrope(cos3), self._mrope(sin3), p.mask, micro=TEXT_MICRO)
