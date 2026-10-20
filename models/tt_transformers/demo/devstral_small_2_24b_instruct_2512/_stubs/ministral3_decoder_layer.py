@@ -240,7 +240,15 @@ class TtMinistral3DecoderLayer:
             if not clean:
                 sq = ttnn.multiply(sq, self._stats_mask)
             sq = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg)
-        r = ttnn.rsqrt(ttnn.add(ttnn.multiply(sq, 1.0 / self.hidden), norm._impl.eps))
+        # rsqrt(sq / N + eps) as ONE SFPU chain: the same fp32 multiply, add and rsqrt the three separate ops ran
+        r = ttnn.unary_chain(
+            sq,
+            [
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.MUL_UNARY_SFPU, 1.0 / self.hidden),
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.ADD_UNARY_SFPU, norm._impl.eps),
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.RSQRT, 0.0),
+            ],
+        )
         return ttnn.all_gather(ttnn.multiply(x, r, dtype=ttnn.bfloat16), dim=3, **ccl)
 
     @staticmethod
