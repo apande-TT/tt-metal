@@ -421,6 +421,9 @@ LIMB_LINEAR_FN = None
 # declines; the lower limb is ~2^-8 of the value, so a lower fidelity's error on it sits below the leading product's
 # rounding); None: HiFi4 for every term
 LO_FIDELITY = None
+# split_linear's stock non-exact two-limb path: limb products of at most this many float32 bytes each are written to
+# L1 for their add (0: DRAM)
+LIMB_PRODUCTS_L1_BYTES = 0
 
 
 def _lo_config(fidelity=None):
@@ -463,10 +466,20 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
         y = LIMB_LINEAR_FN(parts[0], parts[1], w) if LIMB_LINEAR_FN is not None and len(parts) == 2 else None
         pc = _block_config(x, w) if y is None and LINEAR_BLOCK and LINEAR_CORE_GRID is not None else None
         kw = dict(program_config=pc) if pc is not None else dict(core_grid=LINEAR_CORE_GRID)
+        out_bytes = 4 * math.prod([int(d) for d in x.padded_shape][:-1]) * int(w.padded_shape[-1])
+        l1 = y is None and len(parts) == 2 and out_bytes <= LIMB_PRODUCTS_L1_BYTES
         for i, part in enumerate(parts if y is None else ()):
             c = cfg if i == 0 or (lo_fidelity or LO_FIDELITY) is None else _lo_config(lo_fidelity)
-            t = ttnn.linear(part, w, compute_kernel_config=c, dtype=ttnn.float32, **kw)
-            y = t if y is None else ttnn.add(y, t)
+            mem = dict(memory_config=ttnn.L1_MEMORY_CONFIG) if l1 else {}
+            t = ttnn.linear(part, w, compute_kernel_config=c, dtype=ttnn.float32, **kw, **mem)
+            if y is None:
+                y = t
+            else:
+                s = ttnn.add(y, t, memory_config=ttnn.DRAM_MEMORY_CONFIG) if l1 else ttnn.add(y, t)
+                if l1:
+                    ttnn.deallocate(y)
+                    ttnn.deallocate(t)
+                y = s
     # bias added separately in float32 (the fused bias add of ttnn.linear rounds: 3.1e-4 -> 5.1e-4)
     return ttnn.add(y, ttnn.typecast(bias, ttnn.float32)) if bias is not None else y
 
