@@ -75,9 +75,30 @@ def supported(x, w, compute_kernel_config=None, fuse_swiglu=False) -> bool:
     return xs[-1] == ws[-2] and all(d == 1 for d in ws[:-2])
 
 
+def supports_residual(x, w, residual, dtype) -> bool:
+    """Whether matmul(..., residual=residual) can fold the fp32 residual add in (a fp32 output of the residual's shape)."""
+    if dtype != ttnn.float32 or residual is None or residual.dtype != ttnn.float32:
+        return False
+    if residual.layout != ttnn.TILE_LAYOUT or residual.is_sharded():
+        return False
+    out = [int(d) for d in x.padded_shape][:-1] + [int(w.padded_shape[-1])]
+    return [int(d) for d in residual.padded_shape] == out
+
+
 def matmul(
-    x, w, config, compute_kernel_config, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16, fuse_swiglu=False
+    x,
+    w,
+    config,
+    compute_kernel_config,
+    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    dtype=ttnn.bfloat16,
+    fuse_swiglu=False,
+    residual=None,
 ):
+    """residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
+    residual_add_block: the stock data-movement kernels' FUSE_TERNARY read brings the residual block in on the RISC that
+    does not write the output), bit-identical to ttnn.add(residual, x @ w) on the fp32 output."""
+    assert residual is None or not fuse_swiglu
     device = x.device()
     grid = config.compute_with_storage_grid_size
     gx, gy = int(grid.x), int(grid.y)
@@ -162,8 +183,14 @@ def matmul(
         cb(2, out_written * out_bufs, out_tile, dtype),
         cb(3, out_block, interm_tile, interm_dtype),
     ]
+    if residual is not None:
+        # the stock readers' FUSE_TERNARY CBs: the residual block ("a", unpacked to DEST unrounded) and the broadcast "b"
+        # row they read with it (the residual's first row here; the compute pops it unused)
+        cbs += [cb(5, out_block, _TILE_BYTES[residual.dtype], residual.dtype)]
+        cbs += [cb(6, N_block, _TILE_BYTES[residual.dtype], residual.dtype)]
 
     acc = lambda t: list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    res_ct = [] if residual is None else acc(residual) + acc(residual)
     head = [M_tiles, padded_M, K_tiles, padded_K, N_tiles, padded_N, M_block, K_block, N_block]
     head += [M_blocks_per_core, N_blocks_per_core]
     in0_ct = lambda injector: (
@@ -172,12 +199,14 @@ def matmul(
         + [in1_tile]
         + acc(x)
         + acc(out)
+        + res_ct
     )
     in1_ct = lambda injector: (
         head
         + [in1_tile, out_tile, in1_tile, S_IN1_SEND, S_IN1_RECV, S_IN1_VALID, int(transpose), injector, 1, N_tiles]
         + acc(w)
         + acc(out)
+        + res_ct
     )
 
     k_blocks_per_core = -(-K_blocks // (in1_par if transpose else in0_par))
@@ -191,6 +220,8 @@ def matmul(
         return phys[c]
 
     x_addr, w_addr, o_addr = x.buffer_address(), w.buffer_address(), out.buffer_address()
+    # FUSE_TERNARY runtime args (before the output address): a, b (broadcast row), broadcast flag
+    tern = [] if residual is None else [residual.buffer_address(), residual.buffer_address(), 1]
     rt_in0_s, rt_in0_r, rt_in1_s, rt_in1_r, rt_c = [], [], [], [], []
     for cy in range(gy):
         for cx in range(gx):
@@ -205,15 +236,20 @@ def matmul(
             m0, m1 = M_per_core * in0_idx, M_per_core * (in0_idx + 1)
             n0, n1 = N_per_core * in1_idx, N_per_core * (in1_idx + 1)
             defer = min(cy * k_blocks_per_core, K_blocks - 1)
-            a0 = [x_addr, 0, 0, int(core == o0[-1]), *pxy(next0), *pxy(prev0), m0, m1, n0, n1, defer, max_defer, o_addr]
-            a1 = [w_addr, 0, int(core == o1[-1]), *pxy(next1), *pxy(prev1), m0, m1, n0, n1, defer, max_defer, o_addr]
+            a0 = [x_addr, 0, 0, int(core == o0[-1]), *pxy(next0), *pxy(prev0), m0, m1, n0, n1, defer, max_defer, *tern, o_addr]
+            a1 = [w_addr, 0, int(core == o1[-1]), *pxy(next1), *pxy(prev1), m0, m1, n0, n1, defer, max_defer, *tern]
+            a1 += [o_addr]
             (rt_in0_s if in1_idx == 0 else rt_in0_r).append((core, a0))
             (rt_in1_s if in0_idx == 0 else rt_in1_r).append((core, a1))
             rt_c.append((core, [m0, m1, n0, n1]))
 
     defines = [("FUSE_SWIGLU", "1")] if fuse_swiglu else []
-    cdefines = defines + [("EPI_TILES", str(EPI_TILES if N_block % EPI_TILES == 0 else 1))]
+    if residual is not None:
+        defines += [("FUSE_TERNARY", "1")]
+    cdefines = [d for d in defines if d[0] != "FUSE_TERNARY"] + [("EPI_TILES", str(EPI_TILES if N_block % EPI_TILES == 0 else 1))]
     cdefines += [("SWIGLU_PAIRS", str(SWIGLU_PAIRS))]
+    if residual is not None:
+        cdefines += [("FUSE_RESIDUAL", "1")]
 
     dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
     kern = lambda src, cores, ct, rt, cfg, d: ttnn.KernelDescriptor(
@@ -230,6 +266,10 @@ def matmul(
     ccfg.fp32_dest_acc_en = fp32_acc
     ccfg.math_approx_mode = approx
     ccfg.dst_full_sync_en = False
+    if residual is not None:
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        modes[5] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the residual, as binary_ng unpacks a fp32 add's operands
+        ccfg.unpack_to_dest_mode = modes
     c_ct = [K_blocks, M_block, K_block, N_block, M_blocks_per_core, N_blocks_per_core, sub_h, sub_w]
     kernels = [
         kern(_DM_IN0, in0_senders, in0_ct(1), rt_in0_s, dm(in0_risc, in0_noc), defines),
@@ -238,5 +278,6 @@ def matmul(
         kern(_DM_IN1, in1_receivers, in1_ct(0), rt_in1_r, dm(in1_risc, in1_noc), defines),
         kern(_COMPUTE, core_grid, c_ct, rt_c, ccfg, cdefines),
     ]
-    ttnn.generic_op([x, w, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs))
+    ios = [x, w, out] if residual is None else [x, w, residual, out]
+    ttnn.generic_op(ios, ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs))
     return out

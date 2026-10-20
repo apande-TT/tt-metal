@@ -50,6 +50,55 @@ void copy_and_pack_block(uint32_t in_cb, uint32_t out_cb, uint32_t M_block_tiles
     }
 }
 
+#ifdef FUSE_RESIDUAL
+// out = residual + the block's fp32 partials, RES_TILES tiles a DEST acquire: the residual tiles (the stock reader's
+// FUSE_TERNARY "a" block, unpacked to DEST unrounded: UnpackToDestFp32) in DEST 0.., the partials copied exactly as
+// copy_and_pack_block copies them in DEST RES_TILES.., then the SFPU add a fp32 ttnn.add(residual, out) runs
+// (binary_ng: residual in the left operand, add_binary_tile<NearestEven>) -- the same values through the same add.
+constexpr uint32_t RES_TILES = 2;
+void residual_add_block(
+    uint32_t in_cb, uint32_t res_cb, uint32_t bcast_cb, uint32_t out_cb, uint32_t M_block_tiles, uint32_t N_block_tiles) {
+    CircularBuffer cb_out(out_cb);
+    CircularBuffer cb_res(res_cb);
+    CircularBuffer cb_bcast(bcast_cb);
+    // the stock reader's broadcast "b" row (FUSE_TERNARY reads one a block); unused
+    cb_bcast.wait_front(N_block_tiles);
+    cb_bcast.pop_front(N_block_tiles);
+    pack_reconfig_data_format(out_cb);
+    add_binary_tile_init();
+    uint32_t tile_id = 0;
+    for (uint32_t m = 0; m < M_block_tiles; m++) {
+        cb_res.wait_front(N_block_tiles);
+        for (uint32_t n = 0; n < N_block_tiles; n += RES_TILES) {
+            const uint32_t nt = (N_block_tiles - n) < RES_TILES ? (N_block_tiles - n) : RES_TILES;
+            tile_regs_acquire();
+            reconfig_data_format_srca(in_cb);
+            copy_init(in_cb);
+            for (uint32_t t = 0; t < nt; t++) {
+                copy_tile(in_cb, tile_id + n + t, RES_TILES + t);
+            }
+            reconfig_data_format_srca(in_cb, res_cb);
+            copy_init(res_cb);
+            for (uint32_t t = 0; t < nt; t++) {
+                copy_tile(res_cb, n + t, t);
+            }
+            for (uint32_t t = 0; t < nt; t++) {
+                add_binary_tile<ckernel::DstRoundingMode::NearestEven>(t, RES_TILES + t, t);
+            }
+            tile_regs_commit();
+            tile_regs_wait();
+            for (uint32_t t = 0; t < nt; t++) {
+                pack_tile(t, out_cb);
+            }
+            tile_regs_release();
+        }
+        tile_id += N_block_tiles;
+        cb_res.pop_front(N_block_tiles);
+        cb_out.push_back(N_block_tiles);
+    }
+}
+#endif  // FUSE_RESIDUAL
+
 #ifdef FUSE_SWIGLU
 #ifdef TRISC_MATH
 namespace ckernel::sfpu {
@@ -266,6 +315,12 @@ void kernel_main() {
             cb_out.reserve_back(out_block_num_tiles >> 1);
             cb_intermediate.wait_front(out_block_num_tiles);
             swiglu_block(intermediate_cb, out_cb, M_block_tiles, N_block_tiles);
+            cb_intermediate.pop_front(out_block_num_tiles);
+#elif defined(FUSE_RESIDUAL)
+            cb_out.reserve_back(out_block_num_tiles);
+            cb_intermediate.wait_front(out_block_num_tiles);
+            residual_add_block(
+                intermediate_cb, tt::CBIndex::c_5, tt::CBIndex::c_6, out_cb, M_block_tiles, N_block_tiles);
             cb_intermediate.pop_front(out_block_num_tiles);
 #else
             cb_out.reserve_back(out_block_num_tiles);

@@ -222,6 +222,10 @@ PLANNED_TP = 4
 #                     adds 58 -> ~20 us, norms 36 -> 24 us, o_proj 73 -> 61 us, down 125 -> 117 us a layer.
 #                     q / k / v, the SDPA output and the head concat sit in L1 too (each freed by its reader):
 #                     SDPA 185 -> 167 us, head concat 25 -> 11 us a layer.
+#                     Both fp32 residual adds ride in the output stage of the matmul feeding them (o_proj, the MLP
+#                     down; tt/minimal_mm.py residual=: the residual block read by the stock readers' FUSE_TERNARY
+#                     path, added by the same SFPU add ttnn.add runs, bit-identical): o_proj + add 79.8 -> 67.9 us,
+#                     down + add 135.3 -> ~123 us a layer; trace encode 24.62 -> 23.72 ms.
 #   ministral3_m_l_p many-row fused gate/up (text prefill + vision): tt/minimal_mm.py, minimal_matmul's own program
 #                     with silu * up as ONE SFPU pass (kernels/mm_compute.cpp), bit-identical.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
