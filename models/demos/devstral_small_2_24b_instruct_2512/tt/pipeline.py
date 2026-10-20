@@ -266,6 +266,10 @@ PLANNED_TP = 4
 #                     streams (trace decode 15.48 -> 15.14 ms, PCC unchanged).
 #   ministral3_m_l_p: the block-float4 decode gate / up and down multiply at HiFi2 (the bf4 gate / up is compute-bound;
 #                     trace decode 15.09 -> 14.72 ms, PCC 0.995223); decode down bf4 on layers 16-26 (14.67 ms, PCC 0.995097).
+#   decode gate / up spread over 104 cores (NormGateUpDecode.SPREAD): the 40 norm cores take 2 columns each once their
+#                     norm is done and the stream cores 3 or 2 (was 4), every bank still serving 32 columns: the bf4
+#                     layers' post-prologue matmul shrinks by a quarter and the extra readers lift the bf8 stream (bf8
+#                     gate / up 214.6 -> 191.5 us; trace decode 14.67 -> 14.16 ms, bit-identical).
 
 
 def kv_capacity_for(tp):

@@ -15,33 +15,43 @@
 
 #include "api/dataflow/dataflow_api.h"
 
+// GU_CTA / GU_RTA: where this stream's compile-time / runtime args start (norm_gate_stream_dm.cpp appends a stream
+// to the norm cores' dataflow, after the norm's own args)
+#ifndef GU_CTA
+#define GU_CTA 0
+#endif
+#ifndef GU_RTA
+#define GU_RTA 0
+#endif
+
 void kernel_main() {
-    constexpr uint32_t Kt = get_compile_time_arg_val(0);  // K tiles
-    constexpr uint32_t NB = get_compile_time_arg_val(1);  // DRAM banks the weight is interleaved over
-    constexpr uint32_t NC = get_compile_time_arg_val(2);  // columns a core
-    constexpr uint32_t RB = get_compile_time_arg_val(3);  // K rows a push
-    constexpr uint32_t w_tile = get_compile_time_arg_val(4);
-    constexpr uint32_t cb_w = get_compile_time_arg_val(5);
-    constexpr uint32_t DEPTH = get_compile_time_arg_val(6);  // pushes cb_w holds
-    constexpr bool OWNER = get_compile_time_arg_val(7);
-    constexpr uint32_t sem_ready = get_compile_time_arg_val(8);
-    constexpr uint32_t sem_valid = get_compile_time_arg_val(9);
-    constexpr uint32_t out_tile = get_compile_time_arg_val(10);
-    constexpr uint32_t OUT_NC = get_compile_time_arg_val(11);  // output tiles the OWNER writes
-    constexpr auto w_args = TensorAccessorArgs<12>();
+    constexpr uint32_t Kt = get_compile_time_arg_val(GU_CTA + 0);  // K tiles
+    constexpr uint32_t NB = get_compile_time_arg_val(GU_CTA + 1);  // DRAM banks the weight is interleaved over
+    constexpr uint32_t NC = get_compile_time_arg_val(GU_CTA + 2);  // columns a core
+    constexpr uint32_t RB = get_compile_time_arg_val(GU_CTA + 3);  // K rows a push
+    constexpr uint32_t w_tile = get_compile_time_arg_val(GU_CTA + 4);
+    constexpr uint32_t cb_w = get_compile_time_arg_val(GU_CTA + 5);
+    constexpr uint32_t DEPTH = get_compile_time_arg_val(GU_CTA + 6);  // pushes cb_w holds
+    constexpr bool OWNER = get_compile_time_arg_val(GU_CTA + 7);
+    constexpr uint32_t sem_ready = get_compile_time_arg_val(GU_CTA + 8);
+    constexpr uint32_t sem_valid = get_compile_time_arg_val(GU_CTA + 9);
+    constexpr uint32_t out_tile = get_compile_time_arg_val(GU_CTA + 10);
+    constexpr uint32_t OUT_NC = get_compile_time_arg_val(GU_CTA + 11);  // output tiles the OWNER writes
+    constexpr auto w_args = TensorAccessorArgs<GU_CTA + 12>();
     constexpr auto o_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
     static_assert(Kt % RB == 0, "gate_up blocking");
 
-    const auto w = TensorAccessor(w_args, get_arg_val<uint32_t>(0));
-    const uint32_t n0 = get_arg_val<uint32_t>(1);  // this core's first output column
-    uint32_t page = get_arg_val<uint32_t>(5);      // first page of this core's first push
+    const auto w = TensorAccessor(w_args, get_arg_val<uint32_t>(GU_RTA + 0));
+    const uint32_t n0 = get_arg_val<uint32_t>(GU_RTA + 1);  // this core's first output column
+    uint32_t page = get_arg_val<uint32_t>(GU_RTA + 5);      // first page of this core's first push
     constexpr uint32_t T = RB * NC;                // tiles a push
     constexpr uint32_t cb_x = 0, cb_out = 16;
     volatile tt_l1_ptr uint32_t* valid = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_valid));
 
     bool have_x = !OWNER;
     if constexpr (OWNER) {
-        const uint32_t sx = get_arg_val<uint32_t>(3), sy = get_arg_val<uint32_t>(4);  // the sender, NOC coordinates
+        // the sender, NOC coordinates
+        const uint32_t sx = get_arg_val<uint32_t>(GU_RTA + 3), sy = get_arg_val<uint32_t>(GU_RTA + 4);
         cb_reserve_back(cb_x, Kt);
         noc_semaphore_inc(get_noc_addr(sx, sy, get_semaphore(sem_ready)), 1);
     }
@@ -69,7 +79,7 @@ void kernel_main() {
             noc_semaphore_wait(valid, 1);
             cb_push_back(cb_x, Kt);
         }
-        const auto out = TensorAccessor(o_args, get_arg_val<uint32_t>(2));
+        const auto out = TensorAccessor(o_args, get_arg_val<uint32_t>(GU_RTA + 2));
         cb_wait_front(cb_out, OUT_NC);
         const uint32_t l1 = get_read_ptr(cb_out);
         for (uint32_t c = 0; c < OUT_NC; ++c) {
