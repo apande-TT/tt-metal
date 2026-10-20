@@ -253,6 +253,10 @@ PLANNED_TP = 4
 #                     weight on both data-movement RISCs of 64 cores (tt/lm_head_decode.py), bit-identical to ttnn.linear.
 #                     The decode gate / up and the lm_head stream through 256 KB weight CBs (the down / o_proj: 112 KB);
 #                     the lm_head multiplies at HiFi4 (free under its weight stream); decode down bf4 on layers 16-25.
+#   ministral3_decoder_layer decode all_reduces (o_proj, MLP down): ONE all_reduce_async each (tt/decode_all_reduce.py)
+#                     instead of reduce-scatter + all_gather: the streamed projections write their bf16 partials into
+#                     their own 8 x 10 width shards, every device multicasts them into one shared 16 KB/core scratch,
+#                     summed in fp32 DEST and rounded once (~4 us an all_reduce; trace decode 15.99 -> 15.75 ms).
 
 
 def kv_capacity_for(tp):

@@ -100,8 +100,9 @@ class StreamDownDecode:
             config=config,
         )
 
-    def __call__(self, m):
-        """m: (1, 1, 32, K) bf16 tiles (interleaved); returns m @ W_down, (1, 1, 32, N) bf16 in L1."""
+    def __call__(self, m, memory_config=None):
+        """m: (1, 1, 32, K) bf16 tiles (interleaved); returns m @ W_down, (1, 1, 32, N) bf16 in L1 (memory_config:
+        an L1 layout to write it in instead, e.g. the width shards the decode all_reduce reads)."""
         shape = tuple(int(d) for d in m.shape)
         if shape[:-1] != (1, 1, ttnn.TILE_SIZE) or m.dtype != ttnn.bfloat16 or m.is_sharded():
             raise ValueError(f"StreamDownDecode takes one interleaved bf16 tile row, got {shape} {m.dtype}")
@@ -112,7 +113,7 @@ class StreamDownDecode:
             ttnn.bfloat16,
             ttnn.TILE_LAYOUT,
             self.device,
-            ttnn.L1_MEMORY_CONFIG,
+            memory_config or ttnn.L1_MEMORY_CONFIG,
         )
         acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
         wdt = self.w.dtype
