@@ -349,22 +349,28 @@ class TtMinistral3MLP:
             rows *= d
         x_l1 = x.memory_config().buffer_type == ttnn.BufferType.L1
         inter_l1 = 0 < 2 * rows * self.inter // (grid.x * grid.y) <= self.PREFILL_INTER_L1_BYTES
-        # M blocks no taller than each core's M range (the data-parallel vision MLP's 2048 rows give 7 tiles a core;
-        # an 8-tile block would compute a padded row of tiles)
+        # M blocks that tile each core's M range with the least padding (no taller than 8 tiles): the SwiGLU epilogue
+        # runs whole blocks, so the 416-row prompt's 42 tiles a core take six 7-tile blocks (8-tile blocks padded the
+        # last to 8 for 2 real rows), the data-parallel vision MLP's 7 one, the 128-row prompt's 13 two. Paired with
+        # 1 x 4 subblocks: 9844 vs 10166 us at HiFi2 and 5947 vs 7310 us at LoFi on the 416-row prompt (8-tile M, 2 x 2).
+        # The fp32 intermediate accumulates every output tile's K blocks in the same order whatever the blocking.
         nt_gu = int(self.w_gate_up.shape[-1]) // ttnn.TILE_SIZE
-        m_gu = min(8, self._m_range(rows // ttnn.TILE_SIZE, nt_gu, grid))
+        m_rng = self._m_range(rows // ttnn.TILE_SIZE, nt_gu, grid)
+        m_gu = min(range(min(8, m_rng), max(1, min(8, m_rng) // 2) - 1, -1), key=lambda b: -(-m_rng // b) * b - m_rng)
+        n_gu = self._gate_up_n_block(x, grid)
+        gu_cfg = ttnn.MinimalMatmulConfig(
+            M_block_size=m_gu,
+            # (an L1 fp32 input + the L1 product leave room only for half-depth activation blocks)
+            K_block_size=4 if x_l1 and inter_l1 and x.dtype == ttnn.float32 else 8,
+            N_block_size=n_gu,
+            subblock_h=1 if n_gu % 4 == 0 else 2 if m_gu % 2 == 0 else 1,
+            subblock_w=4 if n_gu % 4 == 0 else 2,
+            compute_with_storage_grid_size=grid,
+        )
         m = ttnn.experimental.minimal_matmul(
             x,
             self.w_gate_up,
-            config=ttnn.MinimalMatmulConfig(
-                M_block_size=m_gu,
-                # (an L1 fp32 input + the L1 product leave room only for half-depth activation blocks)
-                K_block_size=4 if x_l1 and inter_l1 and x.dtype == ttnn.float32 else 8,
-                N_block_size=self._gate_up_n_block(x, grid),
-                subblock_h=2 if m_gu % 2 == 0 else 1,
-                subblock_w=2 if m_gu % 2 == 0 else 4 if self._gate_up_n_block(x, grid) % 4 == 0 else 2,
-                compute_with_storage_grid_size=grid,
-            ),
+            config=gu_cfg,
             compute_kernel_config=self.gate_up_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if inter_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
