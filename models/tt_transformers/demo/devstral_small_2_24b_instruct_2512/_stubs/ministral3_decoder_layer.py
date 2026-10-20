@@ -197,7 +197,7 @@ class TtMinistral3DecoderLayer:
             # all_reduce + residual add + norm + gate / up in one program, then down + its all_reduce
             h, m = self.mlp.decode_ar(x, a)
             ttnn.deallocate(a)
-            out = self._residual_add(h, m, res_mem)
+            out = m if h is None else self._residual_add(h, m, res_mem)  # (None, new residual): the down folds it
             return ttnn.reshape(out, in_shape) if len(in_shape) == 3 else out
         if fold:
             a = self.self_attn.decode_all_reduce(a)

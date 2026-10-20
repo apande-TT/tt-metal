@@ -54,6 +54,9 @@ DOWN_DECODE_STREAM = True
 # 15 went back to bf8 (gate PCC 0.995034 at 15-24, 0.995374 at 16-23), headroom the fixed-chunk decode SDPA
 # (ministral3_attention DECODE_SDPA_K_CHUNK, -0.22 ms for -0.00018 PCC) spends.
 DECODE_DOWN_BF4_LAYERS = frozenset(range(16, 27))
+# The decode down program folds its all_reduce and the residual add in (tt/down_decode.py StreamDownDecode.ar_call):
+# its fabric-link workers send the partial shards of each core's first column while the second columns still stream.
+DECODE_DOWN_AR_FOLD = True
 # Many-row (prefill / vision) fused gate/up through tt/minimal_mm.py: minimal_matmul's own program with its
 # output stage regrouped -- silu * up as ONE SFPU pass (the SFPU is ~1.4 ms of the 416-row gate/up's 9.8), bit-identical.
 PREFILL_MM_PROGRAM = True
@@ -221,7 +224,9 @@ class TtMinistral3MLP:
                 if StreamDownDecode.supports(device, self.inter, n_out, wdt):
                     fid = DECODE_GATE_UP_BF4_FIDELITY if lowp_down else ttnn.MathFidelity.HiFi4
                     put = lambda t, dtype: _put(t, shard(-2), dtype)
-                    self.stream_down = StreamDownDecode(device, torch_module.down_proj.weight.T, wdt, fid, put, tp)
+                    self.stream_down = StreamDownDecode(
+                        device, torch_module.down_proj.weight.T, wdt, fid, put, tp, ar_fold=DECODE_DOWN_AR_FOLD
+                    )
             if self.stream_down is not None:
                 self.w_down_decode = None
             elif lowp_down:
@@ -331,8 +336,12 @@ class TtMinistral3MLP:
     def decode_ar(self, x, p):
         """Decode with the attention's o_proj all_reduce and the residual add folded into the gate / up program
         (tt/gate_up_decode.py NormGateUpDecode.ar_norm_call): x the residual, p this device's o_proj partials. Returns
-        (h, mlp(norm(h))) with h = x + all_reduce(p)."""
+        (h, mlp(norm(h))) with h = x + all_reduce(p) -- or (None, h + mlp(norm(h))) when the down program folds its own
+        all_reduce and the residual add in too (DECODE_DOWN_AR_FOLD, tt/down_decode.py StreamDownDecode.ar_call)."""
         h, m = self.fused_gate_up.ar_norm_call(x, p, self.decode_all_reduce)
+        sd = self.stream_down
+        if sd is not None and sd.ar_ok(m, h, self.decode_all_reduce):
+            return None, sd.ar_call(m, h, self.decode_all_reduce)
         return h, self._decode_down(m)
 
     def ar_folds(self, x, p) -> bool:
