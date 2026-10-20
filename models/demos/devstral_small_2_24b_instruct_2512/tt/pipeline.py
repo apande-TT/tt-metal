@@ -235,7 +235,8 @@ PLANNED_TP = 4
 #   pixtral_attention CPP_HEADS_ROPE: each vision layer's head split and q / k RoPE run as ONE C++ program
 #                     (tt/heads_rope.py: per tile, x * cos + partner * signed sin, replaying ttnn.multiply's SFPU and
 #                     ttnn.add's FPU bf16 ops -- bit-identical to the rotate-half chain, no matmul) instead of
-#                     nlp_create_qkv_heads + a rotate-half matmul / multiply / multiply / add per tensor.
+#                     nlp_create_qkv_heads + a rotate-half matmul / multiply / multiply / add per tensor. The vision
+#                     SDPA runs 128-row query chunks (one 256-row key chunk).
 
 
 def kv_capacity_for(tp):
