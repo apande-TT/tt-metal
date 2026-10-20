@@ -285,6 +285,9 @@ PLANNED_TP = 4
 #   decode down fold: a two-column core's second column split into a leading run of pushes for RISCV_0 (18, then 20
 #                     of 32) and a trailing one for RISCV_1, whose NOC 1 reads fall behind once only those cores stream
 #                     (StreamDownDecode.SPLIT_B_SHARE): down 119.7 -> 116.8 us; trace 13.37 -> 13.22 -> 13.18 ms.
+#   decode down fold: each partial tile goes straight into its link worker's send buffer and the worker sends every
+#                     shard once its tiles are in (StreamDownDecode.DIRECT_SEND, kernels/ar_send_shards.cpp), not a
+#                     wave's shards read back after the whole wave.
 
 
 def kv_capacity_for(tp):

@@ -44,6 +44,10 @@ class StreamDownDecode:
     DUAL_NOC = True
     # ar_call: RISCV_0's share of a two-column core's second column, in pushes of its Kt / RB (the rest is RISCV_1's)
     SPLIT_B_SHARE = 20 / 32
+    # ar_call: the down cores write each partial tile straight into its link worker's send buffer, and the worker sends
+    # every shard as soon as its tiles are in (kernels/ar_send_shards.cpp) instead of reading a wave's shards back
+    # once the whole wave is done (kernels/ar_send_waves.cpp)
+    DIRECT_SEND = True
 
     @classmethod
     def rb_for(cls, dtype) -> int:
@@ -311,6 +315,13 @@ class StreamDownDecode:
             for l in range(links)
         ]
         link_n1 = [sum(1 for i in ls if i < w1_shards) for ls in link_shards]
+        direct = self.DIRECT_SEND and max(len(ls) for ls in link_shards) <= 20 and wt < 8 and links == 2
+        # DIRECT_SEND: column j's tile goes to slot (s * wt + j % wt) of its link worker's buffer, counted in shard s's
+        # 3-bit field (shards 0..9 on the worker's semaphore SEM_W1, 10..19 on SEM_W2)
+        slot = {i: (l, s) for l, ls in enumerate(link_shards) for s, i in enumerate(ls)}
+        send_args = lambda col: (
+            lambda l, s: [(s * wt + col % wt) * ar_tile, int(s >= 10), 1 << (3 * (s % 10))]
+        )(*slot[col // wt])
         workers = ttnn.CoreRangeSet([one(c) for c in self.AR_WORKERS])
         link_xy = [v for c in self.AR_WORKERS for v in (phys(c).x, phys(c).y)]
         hdr_bytes = ttnn.get_tt_fabric_packet_header_size_bytes()
@@ -338,7 +349,7 @@ class StreamDownDecode:
             mk_cb(12, tp * wt, ar_tile, ttnn.bfloat16, res_set),
             mk_cb(13, wt, ar_tile, ttnn.bfloat16, res_set),
             mk_cb(14, wt, f32_tile, ttnn.float32, res_set),
-            mk_cb(17, max(len(ls) for ls in link_shards), shard_bytes, ttnn.bfloat16, workers),
+            mk_cb(17, max(len(ls) for ls in link_shards), shard_bytes, ttnn.bfloat16, everyone if direct else workers),
             mk_cb(18, 2, hdr_bytes, ttnn.uint32, workers),
         ]
         SEM_READY, SEM_VALID, SEM_W1, SEM_W2 = 0, 1, 2, 3
@@ -357,7 +368,7 @@ class StreamDownDecode:
                 kt, nb, rb, w_tile, cb, depth, owner, SEM_READY, SEM_VALID, o_tile, w, SEM_W1, SEM_W2, n_cores,
                 int(r), tp, wt, ar_tile, f32_tile,
             ] + list(pattern[owner]) + acc(self.w, out)
-            tail = lambda c: [x.buffer_address(), scratch_addr, h.buffer_address(), sem_addr] if r else []
+            tail = lambda c: [x.buffer_address(), scratch_addr, h.buffer_address(), sem_addr] if r else [0] * 4
             rt = lambda f: [
                 (
                     self.core_xy[c],
@@ -368,14 +379,16 @@ class StreamDownDecode:
                     + self.cols[c]
                     + [0] * (2 - w)
                     + link_xy
-                    + tail(c),
+                    + tail(c)
+                    + ([v for col in self.cols[c] for v in send_args(col)] if direct else []),
                 )
                 for c in idx
             ]
             defines = [("DOWN_SEQ", str(w)), ("SPLIT_B", str(n0))] + ([("RES_TAIL", "1")] if r else [])
+            dsend = [("DIRECT_SEND", "1")] if direct else []
             kernels += [
-                self._kernel("down_ar_stream.cpp", cores, ct(1, 0), rt(0), dm0, nsend),
-                self._kernel("down_ar_stream.cpp", cores, ct(2, 1), rt(1), dm1, nsend),
+                self._kernel("down_ar_stream.cpp", cores, ct(1, 0), rt(0), dm0, nsend + dsend),
+                self._kernel("down_ar_stream.cpp", cores, ct(2, 1), rt(1), dm1, nsend + dsend),
                 self._kernel("down_compute.cpp", cores, [kt, rb, tp, wt], [], self.cfg, defines),
             ]
         node = lambda d: self.device.get_fabric_node_id(ttnn.MeshCoordinate(0, d))
@@ -390,18 +403,30 @@ class StreamDownDecode:
             if d % 2 == 0:
                 fwd_n, bwd_n = bwd_n, fwd_n
             route = lambda n: [1, n, 0, 0, 0, 0]  # 1D fabric: start one hop out, reach n devices
-            link_kernels = [
-                self._kernel(
-                    "ar_send_waves.cpp",
-                    ttnn.CoreRangeSet([one(c)]),
-                    [d, 18, 17, shard_bytes, link_n1[l], len(link_shards[l]) - link_n1[l], SEM_W1, SEM_W2, wt]
-                    + route(fwd_n)
-                    + route(bwd_n),
-                    [(c, worker_rt(l))],
-                    dm0,
-                )
-                for l, c in enumerate(self.AR_WORKERS)
-            ]
+            if direct:
+                link_kernels = [
+                    self._kernel(
+                        "ar_send_shards.cpp",
+                        ttnn.CoreRangeSet([one(c)]),
+                        [d, 18, 17, shard_bytes, len(link_shards[l]), SEM_W1, SEM_W2, wt] + route(fwd_n) + route(bwd_n),
+                        [(c, worker_rt(l)[1:])],
+                        dm0,
+                    )
+                    for l, c in enumerate(self.AR_WORKERS)
+                ]
+            else:
+                link_kernels = [
+                    self._kernel(
+                        "ar_send_waves.cpp",
+                        ttnn.CoreRangeSet([one(c)]),
+                        [d, 18, 17, shard_bytes, link_n1[l], len(link_shards[l]) - link_n1[l], SEM_W1, SEM_W2, wt]
+                        + route(fwd_n)
+                        + route(bwd_n),
+                        [(c, worker_rt(l))],
+                        dm0,
+                    )
+                    for l, c in enumerate(self.AR_WORKERS)
+                ]
             sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=everyone, initial_value=0) for i in range(4)]
             pd = ttnn.ProgramDescriptor(kernels=kernels + link_kernels, cbs=cbs, semaphores=sems)
             for l, c in enumerate(self.AR_WORKERS):

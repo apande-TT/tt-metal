@@ -10,6 +10,8 @@
 // The OWNER (RISCV_1) takes the multicast activation as gate_up_stream.cpp does, and writes each output tile into the
 // partials' width shards as soon as compute packs it (polled between pushes), then counts it on the fabric-link
 // worker that sends that tile's shard (on that worker's wave semaphore: columns below W1_COLS are wave 1).
+// DIRECT_SEND: the tile goes straight into that worker's send buffer instead, counted in its shard's 3-bit field
+// (kernels/ar_send_shards.cpp sends each shard as soon as its tiles are in).
 // RES: this core holds residual shard i. After its columns the OWNER waits until all TP devices' partials of the
 // shard are in its scratch slots (TP counts on the global semaphore), hands them and the residual shard x to compute
 // (kernels/down_compute.cpp RES_TAIL: their sum, rounded once, plus x) and writes the new residual h.
@@ -47,8 +49,12 @@ void kernel_main() {
     constexpr uint32_t CNT_B = get_compile_time_arg_val(21), STEP_B = get_compile_time_arg_val(22);
     constexpr auto w_args = TensorAccessorArgs<23>();
     constexpr auto o_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
+#ifdef DIRECT_SEND
+    (void)o_args;  // the partials go to the link workers, not to the output tensor
+#endif
     static_assert(Kt % (2 * RB) == 0, "down blocking");
     constexpr uint32_t cb_x = 0, cb_out = 16, cb_x0 = 11, cb_ar = 12, cb_hout = 14;
+    constexpr uint32_t CB_SEND = 17;  // DIRECT_SEND: the link workers' send buffer (same address on every core)
 
     const auto w = TensorAccessor(w_args, get_arg_val<uint32_t>(0));
     volatile tt_l1_ptr uint32_t* valid = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_valid));
@@ -64,15 +70,28 @@ void kernel_main() {
     uint32_t written = 0;
     auto flush_out = [&](bool all) {
         if constexpr (OWNER) {
+#ifndef DIRECT_SEND
             const auto out = TensorAccessor(o_args, get_arg_val<uint32_t>(1));
+#endif
             while (written < NCOL && (all || cb_pages_available_at_front(cb_out, 1))) {
                 cb_wait_front(cb_out, 1);
                 const uint32_t col = get_arg_val<uint32_t>(6 + written);
-                noc_async_write_page(col, out, get_read_ptr(cb_out));
-                noc_async_write_barrier();
                 const uint32_t link = (col / WT) % 2;
                 const uint32_t lx = get_arg_val<uint32_t>(8 + 2 * link), ly = get_arg_val<uint32_t>(9 + 2 * link);
+#ifdef DIRECT_SEND
+                // straight into the link worker's send buffer (kernels/ar_send_shards.cpp), counted in its shard's
+                // 3-bit field: args 16 + 3 i .. 18 + 3 i = byte offset, semaphore (0: sem_w1, 1: sem_w2), increment
+                const uint32_t off = get_arg_val<uint32_t>(16 + 3 * written);
+                const uint32_t si = get_arg_val<uint32_t>(17 + 3 * written);
+                noc_async_write(get_read_ptr(cb_out), get_noc_addr(lx, ly, get_write_ptr(CB_SEND) + off), out_tile);
+                noc_async_write_barrier();
+                noc_semaphore_inc(
+                    get_noc_addr(lx, ly, get_semaphore(si ? sem_w2 : sem_w1)), get_arg_val<uint32_t>(18 + 3 * written));
+#else
+                noc_async_write_page(col, out, get_read_ptr(cb_out));
+                noc_async_write_barrier();
                 noc_semaphore_inc(get_noc_addr(lx, ly, get_semaphore(col < W1_COLS ? sem_w1 : sem_w2)), 1);
+#endif
                 cb_pop_front(cb_out, 1);
                 ++written;
             }
