@@ -56,6 +56,11 @@ def _in0_chunk(k_block):
     return 16 if k_block % 16 == 0 else k_block
 
 
+def _in1_chunk(k_block):
+    """DIRECT_OUT in1 forwarding chunk (K rows of the K_block x N_block weight block)."""
+    return 8 if k_block % 8 == 0 else k_block
+
+
 def _round_up(a, b):
     return -(-a // b) * b
 
@@ -245,7 +250,12 @@ def mm_swiglu(
     defines = (
         [("FUSE_SWIGLU", "1")]
         if fuse_swiglu
-        else [("DIRECT_OUT", "1"), ("IN0_CHUNK_TILES", str(_in0_chunk(K_block)))] + ([("KSPLIT", "1")] if K_blocks > 1 else [])
+        else [
+            ("DIRECT_OUT", "1"),
+            ("IN0_CHUNK_TILES", str(_in0_chunk(K_block))),
+            ("IN1_CHUNK_K", str(_in1_chunk(K_block))),
+        ]
+        + ([("KSPLIT", "1")] if K_blocks > 1 else [])
     )
     in0_is_output_writer = 0 if transpose else 1
     in1_is_output_writer = 1 if transpose else 0

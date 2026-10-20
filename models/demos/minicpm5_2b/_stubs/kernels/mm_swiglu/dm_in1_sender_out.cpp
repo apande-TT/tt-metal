@@ -183,6 +183,62 @@ void kernel_main() {
                     }
                 }
 
+#ifdef DIRECT_OUT
+                {
+                    // DIRECT_OUT: the in1 block moves down the column's forwarding chain in IN1_CHUNK_K-row chunks
+                    // (K_block x N_block row-major, so a chunk is contiguous), each forwarded as soon as it lands and
+                    // counted on the next core's receiver semaphore, instead of store-and-forward of the whole block.
+                    const uint32_t k_block = k_forward ? k_block_iter : (K_num_blocks - 1) - k_block_iter;
+                    constexpr uint32_t chunk_rows = IN1_CHUNK_K;
+                    constexpr uint32_t n_chunks = K_block_tiles / chunk_rows;
+                    cb_in1.reserve_back(in1_block_num_tiles);
+                    const uint32_t in1_base = cb_in1.get_write_ptr();
+                    if constexpr (!is_injector_core) {
+                        in1_receiver_semaphore.set(0);
+                        in1_sender_semaphore.up(noc, in1_sender_noc_x, in1_sender_noc_y, 1);
+                    }
+                    bool downstream_ready = false;
+                    for (uint32_t c = 0; c < n_chunks; c++) {
+                        const uint32_t chunk_addr = in1_base + c * chunk_rows * full_N_tiles_bytes;
+                        if constexpr (is_injector_core) {
+                            uint32_t addr = chunk_addr;
+                            for (uint32_t r = 0; r < chunk_rows; r++) {
+                                const uint32_t k = k_block * K_block_tiles + c * chunk_rows + r;
+                                for (uint32_t n = n_tile; n < n_tile + N_block_tiles; n++) {
+                                    if (n < in1_shape.logical_d1) {
+                                        noc.async_read(
+                                            in1_reader,
+                                            CoreLocalMem<uint32_t>(addr),
+                                            in1_tile_size,
+                                            {.page_id = k * in1_shape.logical_d1 + n},
+                                            {});
+                                    }
+                                    addr += in1_tile_size;
+                                }
+                            }
+                            noc.async_read_barrier();
+                        } else {
+                            in1_receiver_semaphore.wait_min(c + 1);
+                        }
+                        if (!is_sink_core) {
+                            if (!downstream_ready) {
+                                in1_sender_semaphore.wait(1);
+                                in1_sender_semaphore.set(0);
+                                downstream_ready = true;
+                            }
+                            noc.async_write(
+                                CoreLocalMem<uint32_t>(chunk_addr),
+                                UnicastEndpoint{},
+                                chunk_rows * full_N_tiles_bytes,
+                                {},
+                                {.noc_x = in1_dest_noc_x, .noc_y = in1_dest_noc_y, .addr = chunk_addr});
+                            noc.async_writes_flushed();
+                            in1_receiver_semaphore.up(noc, in1_dest_noc_x, in1_dest_noc_y, 1);
+                        }
+                    }
+                    cb_in1.push_back(in1_block_num_tiles);
+                }
+#else
                 uint32_t k_block = k_forward ? k_block_iter : (K_num_blocks - 1) - k_block_iter;
                 cb_in1.reserve_back(in1_block_num_tiles);
 
@@ -232,6 +288,7 @@ void kernel_main() {
 
                     in1_valid_semaphore.relay_unicast(noc, in1_receiver_semaphore, in1_dest_noc_x, in1_dest_noc_y);
                 }
+#endif  // DIRECT_OUT
             }
 
             k_forward = !k_forward;
