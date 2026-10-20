@@ -99,6 +99,7 @@ class DramMatmul:
         residual_add=False,
         silu_prologue=False,
         norm_prologue=None,
+        block_tiles=None,
     ):
         """split_n: write output columns [0, split_n) and [split_n, N) as two tensors (two projections sharing
         one activation row run as one program). norm: an r_m_s_norm.TtRMSNorm applied to x inside the program
@@ -119,7 +120,9 @@ class DramMatmul:
         if prebuilt is not None:
             w = torch.empty(prebuilt.k, prebuilt.n, device="meta")
         deep = norm is not None or self.norm_pro is not None
-        cb_blocks = cb_blocks or (_NORM_CB_BLOCKS if deep else _SLOTS)
+        # block_tiles: weight tiles per reader block (default _BLOCK_TILES); CB depths are in 16-tile units.
+        self.block_tiles = block_tiles or _BLOCK_TILES
+        cb_blocks = cb_blocks or max(_SLOTS, (_NORM_CB_BLOCKS if deep else _SLOTS) * 16 // self.block_tiles)
         self.k, self.n = w.shape
         self.split_n = split_n or self.n
         # The weight reader runs on NCRISC (ReaderConfigDescriptor: RISCV_1, its default NoC).
@@ -134,7 +137,7 @@ class DramMatmul:
         self.ok = cols % group_w == 0
         if not self.ok:
             return
-        k_block = _BLOCK_TILES // group_w
+        k_block = self.block_tiles // group_w
         self.ok = k_t % k_block == 0 and (k_t % _IN0_CHUNK == 0)
         if not self.ok:
             return
@@ -270,7 +273,7 @@ class DramMatmul:
                 format_descriptors=[ttnn.CBFormatDescriptor(_CB_IN0, ttnn.bfloat16, _TILE_BYTES)],
             ),
             ttnn.CBDescriptor(
-                total_size=cb_blocks * _BLOCK_TILES * w_tile_bytes,
+                total_size=cb_blocks * self.block_tiles * w_tile_bytes,
                 core_ranges=cores,
                 format_descriptors=[ttnn.CBFormatDescriptor(_CB_IN1, dtype, w_tile_bytes)],
             ),
@@ -280,7 +283,8 @@ class DramMatmul:
                 format_descriptors=[ttnn.CBFormatDescriptor(_CB_OUT, ttnn.bfloat16, _TILE_BYTES)],
             ),
         ]
-        self.reader_ct = [_CB_IN1, _BLOCK_TILES, _BLOCK_TILES // _TXN_TILES, _TXN_TILES * w_tile_bytes, cb_blocks]
+        bt = self.block_tiles
+        self.reader_ct = [_CB_IN1, bt, bt // _TXN_TILES, _TXN_TILES * w_tile_bytes, cb_blocks]
         if norm is not None:
             self.reader_ct += [_SEM_START, 1]
         elif self.norm_pro is not None and _NORM_PRO_READS_FIRST:
