@@ -250,17 +250,21 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
         # the exact-product split alone, op(x_hi) + op(x_lo) - b: two runs, no plain run and no vote
         ops = [to3(x)] + ([] if extra is None else [to3(extra)])
 
-        def raw(fn):
-            return run(back(fn(ops[0]), x), None if extra is None else back(fn(ops[1]), extra))
+        def raw(ts):
+            return run(back(ts[0], x), None if extra is None else back(ts[1], extra))
 
-        o_hi = raw(hi)
+        his = [hi(t) for t in ops]  # (the lo limb below reuses them: one bf16 rounding pass per operand)
+        o_hi = raw(his)
         shape, layout = list(o_hi.shape), o_hi.layout
         f_hi = _flat(o_hi)
         if f_hi is None:  # no flat view of this output: the plain run
             return run(x, extra)
-        y = ttnn.add(f_hi, _flat(raw(lo)))
+        los = [ttnn.subtract(t, h) for t, h in zip(ops, his)]
+        for h in his:
+            ttnn.deallocate(h)
+        y = ttnn.add(f_hi, _flat(raw(los)))
         b = _bias_flat(bias, shape, rows_layout=_flat_rows(o_hi))
-        b = b if b is not None else _flat(raw(lambda t: ttnn.multiply(t, 0.0)))
+        b = b if b is not None else _flat(raw([ttnn.multiply(t, 0.0) for t in ops]))
         return ttnn.reshape(ttnn.to_layout(ttnn.subtract(y, b), layout), shape)
 
     out = run(x, extra) if out is None else out
