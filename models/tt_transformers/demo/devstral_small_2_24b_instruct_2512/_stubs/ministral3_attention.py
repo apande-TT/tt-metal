@@ -506,6 +506,28 @@ class TtMinistral3Attention:
             ttnn.multiply(ttnn.matmul(x, self.rot, compute_kernel_config=self.compute_cfg), sin),
         )
 
+    def _prefill_mm_cfg(self, mt, nt):
+        """minimal_matmul config of the prefill QKV / o_proj: _one_block_cfg's single block per core for short prompts;
+        otherwise 8-tile M blocks with N blocks of exactly each core's (narrow) N range -- the 416-row QKV's 5-tile
+        range ran the default 8-tile block, computing 6 tiles for 5 -- in 4 x 1 subblocks for an odd width, 1 x 4 for a
+        multiple of 4 (QKV 994 -> 869 us). Blocking leaves each output tile's K accumulation order unchanged."""
+        cfg = self._one_block_cfg(mt, nt)
+        if cfg is not None:
+            return cfg
+        grid = self.device.compute_with_storage_grid_size()
+        n = -(-nt // (grid.y if mt > nt else grid.x))  # minimal_matmul puts N along y when M > N
+        if n > 8:
+            return None
+        sh, sw = (1, 4) if n % 4 == 0 else (4, 1) if n % 2 else (2, 2)
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=8,
+            K_block_size=8,
+            N_block_size=n,
+            subblock_h=sh,
+            subblock_w=sw,
+            compute_with_storage_grid_size=grid,
+        )
+
     def _one_block_cfg(self, mt, nt):
         """minimal_matmul config giving every core ONE output block -- its whole (M, N) tile range -- when that range
         is small (short prompts): the default 8 x 8 blocks split e.g. the 128-row QKV's 12 x 5-tile range into an 8-
@@ -717,7 +739,7 @@ class TtMinistral3Attention:
         qkv = ttnn.experimental.minimal_matmul(
             x,
             self.wqkv,
-            config=self._one_block_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE),
+            config=self._prefill_mm_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE),
             compute_kernel_config=self.prefill_proj_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if qkv_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
@@ -824,7 +846,7 @@ class TtMinistral3Attention:
         out = ttnn.experimental.minimal_matmul(
             attn,
             self.wo,
-            config=self._one_block_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wo.shape[-1]) // ttnn.TILE_SIZE),
+            config=self._prefill_mm_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wo.shape[-1]) // ttnn.TILE_SIZE),
             compute_kernel_config=self.prefill_proj_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if out_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=self.PREFILL_REDUCE_DTYPE if self.tp > 1 else self.OUT_DTYPE,

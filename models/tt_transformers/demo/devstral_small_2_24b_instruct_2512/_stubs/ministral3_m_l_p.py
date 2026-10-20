@@ -408,6 +408,17 @@ class TtMinistral3MLP:
                 subblock_w=2,
                 compute_with_storage_grid_size=grid,
             )
+        elif -(-nt // (grid.y if mt > nt else grid.x)) % 8 == 0:
+            # A wide per-core N range (the 416-row prompt's 160 output tiles over 10 cores: 16) in 8-tile blocks of 1 x 4
+            # subblocks (4142 -> 4108 us; the default config runs 2 x 2).
+            down_cfg = ttnn.MinimalMatmulConfig(
+                M_block_size=8,
+                K_block_size=8,
+                N_block_size=8,
+                subblock_h=1,
+                subblock_w=4,
+                compute_with_storage_grid_size=grid,
+            )
         out = ttnn.experimental.minimal_matmul(
             m,
             self.w_down,
