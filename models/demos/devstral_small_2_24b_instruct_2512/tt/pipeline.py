@@ -259,6 +259,11 @@ PLANNED_TP = 4
 #                     scratch, summed in fp32 DEST and rounded once, and the residual add reads the sum natively
 #                     (trace decode 15.99 -> 15.75 -> 15.48 ms). The scratch fits L1 because the prefill final norm runs
 #                     with no all-ones weight row and minimal_mm keeps one output-block buffer (vision gate / up -86 KB).
+#   decode o_proj all_reduce + residual add folded into the MLP's gate / up program (NormGateUpDecode.ar_norm_call):
+#                     two fabric-link workers (kernels/ar_send.cpp, all_reduce_async's line-multicast exchange) push the
+#                     partial shards into every device's scratch at launch, the norm cores sum the slots and add the
+#                     residual exactly as all_reduce_async + ttnn.add do, then norm -- the exchange runs under the weight
+#                     streams (trace decode 15.48 -> 15.14 ms, PCC unchanged).
 
 
 def kv_capacity_for(tp):

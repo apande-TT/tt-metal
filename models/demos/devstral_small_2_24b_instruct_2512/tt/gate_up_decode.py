@@ -378,3 +378,179 @@ class NormGateUpDecode(FusedGateUpDecode):
         ]
         ttnn.generic_op([h, self.wg, self.wu, out], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
         return out
+
+    # The attention's o_proj all_reduce folded in (ar_norm_call): one fabric-link worker core a link, on cores the
+    # program leaves free (stream cores: rows 0..5 up to column 8; norm cores: columns 0..9 of rows 6..9; the sender is
+    # the last core).
+    AR_WORKERS = ((10, 6), (10, 7))
+
+    def ar_accepts(self, x, p, ar) -> bool:
+        """Whether ar_norm_call can fold the all_reduce `ar` (tt/decode_all_reduce.py) of the partials p in here."""
+        if ar is None or ar.tp % 2 or len(self.AR_WORKERS) != ar.num_links or not self.accepts(x):
+            return False
+        g = self.device.compute_with_storage_grid_size()
+        used = {self.sender} | set(self.core_xy) | set(self.norm_xy_logical)
+        if any(c in used or c[0] >= g.x or c[1] >= g.y for c in self.AR_WORKERS):
+            return False
+        xs, ps, ss = x.memory_config().shard_spec, p.memory_config().shard_spec, ar.mem.shard_spec
+        return (
+            p.dtype == ttnn.bfloat16
+            and p.is_sharded()
+            and tuple(p.shape) == tuple(x.shape)
+            and ps is not None
+            and ps.grid == xs.grid == ss.grid
+            and tuple(ps.shape) == tuple(xs.shape) == tuple(ss.shape)
+            and len(xs.grid.ranges()) == 1
+            and xs.grid.num_cores() == self.np
+            and self.np % ar.num_links == 0
+        )
+
+    def ar_norm_call(self, x, p, ar):
+        """x: the decode residual (fp32, accepts()); p: this device's o_proj partials (bf16, in x's width shards);
+        ar: the DecodeAllReduce whose scratch and global semaphore the exchange uses (ar_accepts). Returns (h, m): the new
+        residual h = x + all_reduce(p) (fp32 in x's shards; all_reduce_async's sum + ttnn.add, bit for bit) and
+        m = silu(norm(h) W_gate) * (norm(h) W_up) as norm_call returns it.
+
+        Each device's link workers (kernels/ar_send.cpp) multicast its partial shards into slot `device` of every
+        device's scratch at program launch, so the exchange runs under the weight streams instead of before them; norm
+        core i waits for the TP slots of residual shard i, sums them, adds them to x (kernels/norm_shard_ar_*.cpp) and
+        norms the result as norm_call does."""
+        kt, nt, nc, rb, w_tile, depth, nb = self.kt, self.nt, self.NC, self.RB, self.w_tile, self.depth, self.nb
+        x_tile, o_tile, f32_tile, ar_tile = 2048, 2048, 4096, 2048
+        tp, wt, links = ar.tp, self.wt, ar.num_links
+        shard_bytes = wt * ar_tile
+        n_res = self.np // links
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape((1, 1, ttnn.TILE_SIZE, nt * ttnn.TILE_SIZE)),
+            ttnn.bfloat16,
+            ttnn.TILE_LAYOUT,
+            self.device,
+            ttnn.L1_MEMORY_CONFIG,
+        )
+        h = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(tuple(int(d) for d in x.shape)), ttnn.float32, ttnn.TILE_LAYOUT, self.device, x.memory_config()
+        )
+        acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+        wdt = self.wg.dtype
+        norm, everyone = self.norm_set, self.n_all
+        rng = lambda a, b, c, d: ttnn.CoreRange(ttnn.CoreCoord(a, b), ttnn.CoreCoord(c, d))
+        workers = ttnn.CoreRangeSet([rng(*c, *c) for c in self.AR_WORKERS])
+        hdr_bytes = ttnn.get_tt_fabric_packet_header_size_bytes()
+        cbs = [
+            self._ncb(0, kt, x_tile, ttnn.bfloat16, everyone),
+            self._ncb(3, self.np, f32_tile, ttnn.float32, norm),
+            self._ncb(1, depth * rb * nc, w_tile, wdt, self.all),
+            self._ncb(2, depth * rb * nc, w_tile, wdt, self.all),
+            self._ncb(16, nc, o_tile, ttnn.bfloat16, self.all),
+            self._ncb(4, wt, f32_tile, ttnn.float32, norm),
+            self._ncb(5, wt, f32_tile, ttnn.float32, norm),
+            self._ncb(6, wt, f32_tile, ttnn.float32, norm),
+            self._ncb(7, 1, f32_tile, ttnn.float32, norm),
+            self._ncb(8, 1, f32_tile, ttnn.float32, norm),
+            self._ncb(9, 1, f32_tile, ttnn.float32, norm),
+            self._ncb(10, wt, x_tile, ttnn.bfloat16, norm),
+            self._ncb(11, wt, f32_tile, ttnn.float32, norm),
+            self._ncb(12, tp * wt, ar_tile, ttnn.bfloat16, norm),
+            self._ncb(13, wt, ar_tile, ttnn.bfloat16, norm),
+            self._ncb(14, wt, f32_tile, ttnn.float32, norm),
+            self._ncb(17, n_res, shard_bytes, ttnn.bfloat16, workers),
+            self._ncb(18, 2, hdr_bytes, ttnn.uint32, workers),
+        ]
+        SEM_READY, SEM_VALID, SEM_PART, SEM_GATHER, SEM_R = 0, 1, 2, 3, 4
+        dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
+        dm0 = dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0)
+        dm1 = dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1)
+        stream_ct = lambda cb, owner, w: [kt, nb, nc, rb, w_tile, cb, depth, owner, SEM_READY, SEM_VALID, o_tile, nc] + acc(
+            w, out
+        )
+        page0 = lambda c: bank_major_page0(c, kt, nb, nc, rb)
+        rt = lambda w: [
+            ((cx, cy), [w.buffer_address(), c * nc, out.buffer_address()] + self.sender_xy + [page0(c)])
+            for c, (cx, cy) in enumerate(self.core_xy)
+        ]
+        # residual shard i lives on core i of x's shard grid (row-major); norm core i pairs with it
+        r0 = x.memory_config().shard_spec.grid.ranges()[0]
+        rw = r0.end.x - r0.start.x + 1
+        phys = lambda c: self.device.worker_core_from_logical_core(ttnn.CoreCoord(*c))
+        res_xy = [phys((r0.start.x + i % rw, r0.start.y + i // rw)) for i in range(self.np)]
+        norm_xy = [phys(c) for c in self.norm_xy_logical]
+        scratch_addr, sem_addr = ar.buffer.buffer_address(), ttnn.get_global_semaphore_address(ar.sem)
+        norm_rt = [
+            (
+                xy,
+                [i, res_xy[i].x, res_xy[i].y, x.buffer_address(), scratch_addr, h.buffer_address(), sem_addr]
+                + self.sender_xy
+                + self.gather_xy
+                + self.others,
+            )
+            for i, xy in enumerate(self.norm_xy_logical)
+        ]
+        kern = lambda name, cores, ct, rt_, cfg, defines=(): ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct,
+            runtime_args=rt_,
+            config=cfg,
+            defines=list(defines),
+        )
+        worker_rt = lambda l: [p.buffer_address(), scratch_addr, sem_addr] + [
+            v
+            for i in range(l * n_res, (l + 1) * n_res)
+            for v in (res_xy[i].x, res_xy[i].y, norm_xy[i].x, norm_xy[i].y)
+        ]
+        node = lambda d: self.device.get_fabric_node_id(ttnn.MeshCoordinate(0, d))
+        mpd = ttnn.MeshProgramDescriptor()
+        for d in range(tp):
+            # ring neighbours and line-multicast reach (all_reduce_async's Ring split, alternating by device parity)
+            fwd_n = -(-(tp - 1) // 2)
+            bwd_n = tp - 1 - fwd_n
+            if d % 2 == 0:
+                fwd_n, bwd_n = bwd_n, fwd_n
+            route = lambda n: [1, n, 0, 0, 0, 0]  # 1D fabric: start one hop out, reach n devices
+            kernels = [
+                kern(
+                    "gate_up_sender.cpp",
+                    self.sender_set,
+                    [kt, x_tile, len(self.core_xy), SEM_READY, SEM_VALID, SEM_GATHER],
+                    [(self.sender, [0] + self.rects)],
+                    dm0,
+                    [("X_GATHER", str(self.np))],
+                ),
+                kern("gate_up_stream.cpp", self.cores, stream_ct(1, 0, self.wg), rt(self.wg), dm0),
+                kern("gate_up_stream.cpp", self.cores, stream_ct(2, 1, self.wu), rt(self.wu), dm1),
+                kern("gate_up_compute.cpp", self.cores, [kt, nc, rb], [], self.cfg),
+                kern(
+                    "norm_shard_ar_dm.cpp",
+                    norm,
+                    [wt, self.np, x_tile, f32_tile, SEM_PART, SEM_GATHER, SEM_R, tp, ar_tile],
+                    norm_rt,
+                    dm0,
+                ),
+                kern(
+                    "norm_shard_ar_compute.cpp",
+                    norm,
+                    [wt, self.np, self.inv_n_bits, self.eps_bits, tp],
+                    [(xy, [int(i == 0)]) for i, xy in enumerate(self.norm_xy_logical)],
+                    self.ncfg,
+                ),
+                kern(
+                    "ar_send.cpp",
+                    workers,
+                    [d, 18, 17, shard_bytes, n_res] + route(fwd_n) + route(bwd_n),
+                    [(c, worker_rt(l)) for l, c in enumerate(self.AR_WORKERS)],
+                    dm0,
+                ),
+            ]
+            sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=everyone, initial_value=0) for i in range(5)]
+            pd = ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems)
+            for l, c in enumerate(self.AR_WORKERS):
+                args = pd.kernels[len(kernels) - 1].runtime_args[c[0]][c[1]]
+                for nbr, n in (((d + 1) % tp, fwd_n), ((d - 1) % tp, bwd_n)):
+                    args.append(int(n > 0))
+                    if n > 0:
+                        args.extend(ttnn.setup_fabric_connection(node(d), node(nbr), l, pd, ttnn.CoreCoord(*c)))
+            coord = ttnn.MeshCoordinate(0, d)
+            mpd[ttnn.MeshCoordinateRange(coord, coord)] = pd
+        ttnn.generic_op([x, p, ar.buffer, self.wg, self.wu, h, out], mpd)
+        return h, out
