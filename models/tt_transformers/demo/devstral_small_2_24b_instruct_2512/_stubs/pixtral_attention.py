@@ -53,6 +53,8 @@ class TtPixtralAttention:
     # q / k / v (head split + RoPE output), SDPA's output and the head concat stay in L1 -- each freed by its one reader
     # -- while q, k and v together take at most this many bytes per core (3 x 8 x 256 x 1024 bf16: 114 KB); 0: DRAM.
     ATTN_L1_BYTES = 128 * 1024
+    # o_proj reads SDPA's head outputs as their concat itself when it also folds the residual add (see __call__).
+    FOLD_CONCAT = True
 
     def __init__(self, device, torch_module, in_scale=None) -> None:
         """in_scale: the attention_norm gamma, folded into q/k/v (see TtAttention.FOLD_NORM_GAMMA)."""
@@ -121,13 +123,13 @@ class TtPixtralAttention:
             mesh_mapper=self._repl,
         )
 
-    def _narrow_n_cfg(self, x, w):
+    def _narrow_n_cfg(self, x, w, shape=None):
         """minimal_matmul config whose blocks are the per-core M / N ranges where those are under 8 tiles (M splits
         along the grid's x axis and N along y when M > N, else the other way round): the default 8-tile blocks would
         compute mostly padding (TP o_proj: 4 of 8 N tiles valid, TP QKV: 3 of 8; the data-parallel QKV's 7 x 9-tile
         range ran 8 x 16). None (the default 8 x 8 blocks) otherwise."""
         grid = self.device.compute_with_storage_grid_size()
-        shape = tuple(int(d) for d in x.shape)
+        shape = tuple(int(d) for d in (x.shape if shape is None else shape))
         mt = shape[-2] // ttnn.TILE_SIZE
         for d in shape[:-2]:
             mt *= d
@@ -267,9 +269,28 @@ class TtPixtralAttention:
             for t in (q, k, v):
                 ttnn.deallocate(t)
         heads = attn
-        attn = ttnn.experimental.nlp_concat_heads(heads, memory_config=head_mem)
-        if attn_l1:
-            ttnn.deallocate(heads)
+        # residual (the layer's fp32 residual stream x): return x + o_proj(attn). With TP = 1 the add rides in o_proj's
+        # output stage (tt/minimal_mm.py residual=: the same SFPU add ttnn.add runs, bit-identical), and FOLD_CONCAT:
+        # o_proj reads the SDPA heads as their concat itself (minimal_mm in0_heads=), no nlp_concat_heads program.
+        residual = kwargs.get("residual")
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        fused = residual is not None and self.tp == 1
+        cat_shape = (int(b), 1, int(s), int(self.wo.shape[-2]))
+        o_cfg = self._narrow_n_cfg(heads, self.wo, shape=cat_shape)
+        fold = (
+            fused
+            and self.FOLD_CONCAT
+            and o_cfg is not None
+            and minimal_mm.supports_heads(heads, self.wo)
+            and minimal_mm.supports_residual(heads, self.wo, residual, ttnn.float32, in0_heads=True)
+        )
+        if fold:
+            attn = heads
+        else:
+            attn = ttnn.experimental.nlp_concat_heads(heads, memory_config=head_mem)
+            if attn_l1:
+                ttnn.deallocate(heads)
         # fp32 output: it is added straight into the vision layer's fp32 residual stream. minimal_matmul folds the
         # images into its rows over the full grid (ttnn.linear ran the 32 x 256-row batch on 88 cores: 360 us), with
         # N blocks no wider than each core's N range (the default 8-tile block would be half padding at 4 tiles).
@@ -277,19 +298,16 @@ class TtPixtralAttention:
             self.tp == 1 and 0 < 4 * int(b) * int(s) * int(self.wo.shape[-1]) // (grid.x * grid.y) <= self.OUT_L1_BYTES
         )
         o_kw = dict(
-            config=self._narrow_n_cfg(attn, self.wo),
+            config=o_cfg,
             compute_kernel_config=self.compute_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if out_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.float32,
         )
-        # residual (the layer's fp32 residual stream x): return x + o_proj(attn). With TP = 1 the add rides in o_proj's
-        # output stage (tt/minimal_mm.py residual=: the same SFPU add ttnn.add runs, bit-identical).
-        residual = kwargs.get("residual")
-        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
-
-        if (
-            residual is not None
-            and self.tp == 1
+        if fold:
+            out = minimal_mm.matmul(attn, self.wo, residual=residual, in0_heads=True, **o_kw)
+            residual = None
+        elif (
+            fused
             and o_kw["config"] is not None
             and minimal_mm.supported(attn, self.wo, self.compute_cfg)
             and minimal_mm.supports_residual(attn, self.wo, residual, ttnn.float32)
