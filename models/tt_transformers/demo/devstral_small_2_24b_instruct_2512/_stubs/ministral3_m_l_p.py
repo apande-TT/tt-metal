@@ -72,6 +72,8 @@ class TtMinistral3MLP:
     GATHER_DTYPE = ttnn.bfloat16
     # Set by the decoder layer: the decode all_gather writes straight into its residual add's width shards.
     decode_gather_mem = None
+    # Set by the decoder layer: decode's down all_reduce as one collective (tt/decode_all_reduce.py).
+    decode_all_reduce = None
     # dtype of the many-row (prefill) down projection's partials and their reduce-scatter (None: OUT_DTYPE). The text
     # decoder reduce-scatters prefill's partials in bf16 (half the bytes, no cast before the gather).
     PREFILL_REDUCE_DTYPE = ttnn.bfloat16
@@ -321,6 +323,8 @@ class TtMinistral3MLP:
             u = ttnn.linear(x, self.w_up, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
             m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
         if self.stream_down is not None:  # one program streaming the bank-major down copy (tt/down_decode.py)
+            if self.decode_all_reduce is not None:  # partials in its width shards, one collective
+                return self.decode_all_reduce(self.stream_down(m, memory_config=self.decode_all_reduce.mem))
             return self._reduce(self.stream_down(m))
         out = ttnn.linear(
             m,

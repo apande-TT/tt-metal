@@ -142,6 +142,8 @@ class TtMinistral3Attention:
     # Set by the decoder layer: the width-sharded layout its decode residual add runs in. The decode all_gather of
     # the reduced o_proj shard writes straight into it, so the add reads two shards (no interleaved row).
     decode_gather_mem = None
+    # Set by the decoder layer: decode's o_proj all_reduce as one collective (tt/decode_all_reduce.py).
+    decode_all_reduce = None
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -952,6 +954,8 @@ class TtMinistral3Attention:
             )
             attn = ttnn.sharded_to_interleaved(attn, ttnn.L1_MEMORY_CONFIG)  # (1, 1, B, heads * head_dim)
         if self.stream_o is not None:  # one program streaming the bank-major o_proj copy (tt/down_decode.py)
+            if self.decode_all_reduce is not None:  # partials in its width shards, one collective
+                return self.decode_all_reduce(self.stream_o(attn, memory_config=self.decode_all_reduce.mem))
             return self._reduce(self.stream_o(attn))
         return self._reduce(
             ttnn.linear(

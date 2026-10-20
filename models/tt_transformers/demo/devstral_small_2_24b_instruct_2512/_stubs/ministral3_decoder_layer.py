@@ -59,6 +59,10 @@ class TtMinistral3DecoderLayer:
     # Decode's residual adds write their fp32 sum straight into the decode norms' width-sharded layout (a sharded
     # residual stream between layers), so neither norm has to re-shard its input first.
     SHARDED_DECODE_RESIDUAL = True
+    # Decode's o_proj / MLP-down all_reduces as ONE collective each (tt/decode_all_reduce.py: all_reduce_async, fp32
+    # sum) instead of a reduce-scatter + all_gather pair; the streamed projections write their partials in their own
+    # width shards, where the sum lands too and the residual add reads it.
+    DECODE_ONE_SHOT_ALL_REDUCE = True
 
     def __init__(self, device, torch_module, meta_rope=False, layer_idx=None) -> None:
         """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order).
@@ -86,6 +90,19 @@ class TtMinistral3DecoderLayer:
             self.self_attn.decode_gather_mem = self.mlp.decode_gather_mem = self.post_attention_layernorm.decode_mem(
                 self.hidden
             )
+            so, sd = self.self_attn.stream_o, self.mlp.stream_down
+            if (
+                self.DECODE_ONE_SHOT_ALL_REDUCE
+                and self.tp % 2 == 0
+                and so is not None
+                and sd is not None
+                and (so.nt, so.NC, so.GRID_X) == (sd.nt, sd.NC, sd.GRID_X)
+            ):
+                from models.demos.devstral_small_2_24b_instruct_2512.tt.decode_all_reduce import DecodeAllReduce
+
+                ccl = tp_ccl_args()
+                ar = DecodeAllReduce.shared(device, so.cores, so.NC, self.tp, ccl["topology"], ccl.get("num_links", 1))
+                self.self_attn.decode_all_reduce = self.mlp.decode_all_reduce = ar
         self._stats_mask = None
         if self.tp > 1 and self.SHARDED_PREFILL_NORM:
             # Picks column 0 of each device's sum-of-squares tile out of the gathered (.., S, 32 * TP) stats.
