@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise
+from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl, _precise
 
 
 def _replicated(t, device, dtype=ttnn.float32):
@@ -26,7 +26,19 @@ class TtQwenPatchEmbed:
         self.device = device
         w = torch_module.weight.detach().to(torch.float32)
         b = torch_module.bias.detach().to(torch.float32) if torch_module.bias is not None else None
-        self.w = _replicated(w.t(), device, ttnn.bfloat16)
+        # precise mode on a mesh: COLUMN-parallel (this chip's output features, then gathered) -- an exact linear is
+        # ~11 products, so a replicated one computes every chip's share 8 times over
+        self.cols = _precise.ENABLED and isinstance(device, ttnn.MeshDevice) and device.get_num_devices() > 1
+        if self.cols:
+            self.w = ttnn.from_torch(
+                w.t().contiguous(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1),
+            )
+        else:
+            self.w = _replicated(w.t(), device, ttnn.bfloat16)
         self.b = _replicated(b.reshape(1, -1), device) if b is not None else None
         self.hifi = ttnn.init_device_compute_kernel_config(
             device.arch(),
@@ -40,6 +52,9 @@ class TtQwenPatchEmbed:
         x = input if input is not None else kwargs.get("hidden_states")
         if not isinstance(x, ttnn.Tensor):
             x = _replicated(x.to(torch.float32), self.device, ttnn.bfloat16)
+        if self.cols:
+            y = _ccl.all_gather(_precise.linear(x, self.w), self.device, dim=-1)
+            return y if self.b is None else ttnn.add(y, self.b)
         if _precise.ENABLED:
             return _precise.linear(x, self.w, bias=self.b)
         if x.dtype != ttnn.bfloat16:
