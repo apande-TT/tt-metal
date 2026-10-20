@@ -275,6 +275,11 @@ PLANNED_TP = 4
 #                     15.3 -> 13.6 us; trace decode 14.16 -> 13.92 ms, bit-identical).
 #   lm_head stream spread over 104 cores (LMHeadDecode.SPREAD): one column a copy a pass, 5 or 4 passes a core
 #                     (419.7 -> 375.7 us, ~474 GB/s; trace decode 13.92 -> 13.88 ms, bit-identical).
+#   decode MLP down all_reduce + residual add folded into the down program (StreamDownDecode.ar_call): each core's
+#                     columns stream one at a time, the fabric-link workers (kernels/ar_send_waves.cpp) send the
+#                     first-column shards while the second columns stream, the residual cores sum the slots and add
+#                     the residual (all_reduce_async + ttnn.add bit for bit); the senders multicast half of x on each
+#                     NOC (one RISC's 512 KB multicast landed x ~40-60 us in). Trace decode 13.88 -> 13.61 ms.
 
 
 def kv_capacity_for(tp):

@@ -80,6 +80,31 @@ def bank_major_order(w: torch.Tensor, order: torch.Tensor) -> torch.Tensor:
     return tiles[order].reshape(kt, nt, 32, 32).permute(0, 2, 1, 3).reshape(k, n)
 
 
+def dual_noc_sender_kernels(device, sender, kt, x_tile, n_cores, sem_ready, sem_valid, x, rects, x_acc, defines=()):
+    """Two gate_up_sender.cpp X_SLICE kernels on ONE sender core: RISCV_0 multicasts K tiles [0, kt / 2) over NOC 0,
+    RISCV_1 the rest over NOC 1 at the same time (a multicast of the whole row from one RISC ran at ~10-15 GB/s;
+    concurrent multicasts on one NOC serialize). Both wait on the core's own ready count; the compute cores wait for
+    two valid counts (GU_NSEND 2)."""
+    rng = lambda c: ttnn.CoreRange(ttnn.CoreCoord(*c), ttnn.CoreCoord(*c))
+    out = []
+    for i, (risc, noc) in enumerate(
+        ((ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0), (ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1))
+    ):
+        k0, k1 = kt * i // 2, kt * (i + 1) // 2
+        out.append(
+            ttnn.KernelDescriptor(
+                kernel_source=str(_KDIR / "gate_up_sender.cpp"),
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=ttnn.CoreRangeSet([rng(sender)]),
+                compile_time_args=[kt, x_tile, n_cores, sem_ready, sem_valid] + x_acc,
+                runtime_args=[(sender, [x.buffer_address(), k0, k1] + list(rects))],
+                config=ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc),
+                defines=[("X_SLICE", "1")] + list(defines),
+            )
+        )
+    return out
+
+
 class FusedGateUpDecode:
     NC = 4  # output columns a compute core (gate and up each): 2 * NC tiles fill the full-sync fp32 DEST
     RB = 8  # K rows a weight push (bf16)

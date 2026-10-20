@@ -11,6 +11,11 @@
 
 #include "api/dataflow/dataflow_api.h"
 
+// GU_NSEND: senders the activation comes from (gate_up_sender.cpp X_SLICE: one valid count each)
+#ifndef GU_NSEND
+#define GU_NSEND 1
+#endif
+
 void kernel_main() {
     constexpr uint32_t Kt = get_compile_time_arg_val(0);  // K tiles
     constexpr uint32_t NB = get_compile_time_arg_val(1);  // DRAM banks the weight is interleaved over
@@ -51,8 +56,8 @@ void kernel_main() {
             if (!have_x) {
                 // compute consumes no weight before x: once cb_w is full, x must be handed over before reserving more
                 invalidate_l1_cache();
-                if (push >= DEPTH || *valid != 0) {
-                    noc_semaphore_wait(valid, 1);
+                if (push >= DEPTH || *valid >= GU_NSEND) {
+                    noc_semaphore_wait(valid, GU_NSEND);
                     cb_push_back(cb_x, Kt);
                     have_x = true;
                 }
@@ -65,7 +70,7 @@ void kernel_main() {
         }
         if constexpr (OWNER) {
             if (!have_x) {
-                noc_semaphore_wait(valid, 1);
+                noc_semaphore_wait(valid, GU_NSEND);
                 cb_push_back(cb_x, Kt);
                 have_x = true;
             }

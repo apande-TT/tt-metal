@@ -15,6 +15,11 @@
 
 #include "api/dataflow/dataflow_api.h"
 
+// GU_NSEND: senders the activation comes from (gate_up_sender.cpp X_SLICE: one valid count each)
+#ifndef GU_NSEND
+#define GU_NSEND 1
+#endif
+
 // GU_CTA / GU_RTA: where this stream's compile-time / runtime args start (norm_gate_stream_dm.cpp appends a stream
 // to the norm cores' dataflow, after the norm's own args)
 #ifndef GU_CTA
@@ -66,8 +71,8 @@ void kernel_main() {
         if (!have_x) {
             // compute consumes no weight before x: once cb_w is full, x must be handed over before reserving more
             invalidate_l1_cache();
-            if (push >= DEPTH || *valid != 0) {
-                noc_semaphore_wait(valid, 1);
+            if (push >= DEPTH || *valid >= GU_NSEND) {
+                noc_semaphore_wait(valid, GU_NSEND);
                 cb_push_back(cb_x, Kt);
                 have_x = true;
             }
@@ -81,7 +86,7 @@ void kernel_main() {
 
     if constexpr (OWNER) {
         if (!have_x) {
-            noc_semaphore_wait(valid, 1);
+            noc_semaphore_wait(valid, GU_NSEND);
             cb_push_back(cb_x, Kt);
         }
         const auto out = TensorAccessor(o_args, get_arg_val<uint32_t>(GU_RTA + 2));

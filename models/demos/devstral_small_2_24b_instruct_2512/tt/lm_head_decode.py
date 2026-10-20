@@ -23,6 +23,7 @@ from models.demos.devstral_small_2_24b_instruct_2512.tt.gate_up_decode import (
     bank_major,
     bank_major_order,
     bank_major_page0,
+    dual_noc_sender_kernels,
     stream_order,
 )
 
@@ -38,6 +39,7 @@ class LMHeadDecode:
     # KB) and as many passes as each bank's share takes -- every bank serves the same columns of each copy, from its
     # cores c % NB (passes 5 or 4 at 104 cores). More readers stream the weight faster (the decode gate / up's bf8
     # stream: 64 -> 104 cores, 415 -> 466 GB/s); every output tile still accumulates the whole K in order in fp32 DEST.
+    # The sender multicasts half of x on each NOC.
     SPREAD = True
     SPREAD_CORES = 104
     SPREAD_RB = {ttnn.bfloat8_b: 4, ttnn.bfloat4_b: 8}
@@ -167,7 +169,7 @@ class LMHeadDecode:
             for idx in [[c for c in range(n_cores) if self.core_passes[c] == np_]]
         ]
         self.sender = sender = (g.x - 1, g.y - 1)
-        self.sender_set = ttnn.CoreRangeSet([rng(*sender, *sender)])
+        self.sender_set = ttnn.CoreRangeSet([one(sender)])
         self.all = self.cores.merge(self.sender_set)
         snd = device.worker_core_from_logical_core(ttnn.CoreCoord(*sender))
         self.sender_xy = [snd.x, snd.y]
@@ -204,15 +206,11 @@ class LMHeadDecode:
         dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
         dm0 = dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0)
         dm1 = dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1)
-        kernels = [
-            self._kernel(
-                "gate_up_sender.cpp",
-                self.sender_set,
-                [kt, x_tile, len(self.core_xy), SEM_READY, SEM_VALID] + acc(x),
-                [(self.sender, [x.buffer_address()] + self.rects)],
-                dm0,
-            ),
-        ]
+        # the sender multicasts half of x on each NOC (gate_up_sender.cpp X_SLICE)
+        kernels = dual_noc_sender_kernels(
+            self.device, self.sender, kt, x_tile, len(self.core_xy), SEM_READY, SEM_VALID, x, self.rects, acc(x)
+        )
+        nsend = [("GU_NSEND", "2")]
         for passes, idx, cores in self.groups:
             ct = lambda cb, owner, w: [
                 kt, nb, 1, rb, w_tile, cb, depth, owner, SEM_READY, SEM_VALID, o_tile, passes, self.pass_pages
@@ -222,8 +220,8 @@ class LMHeadDecode:
                 for c in idx
             ]
             kernels += [
-                self._kernel("lm_head_stream.cpp", cores, ct(1, 0, self.wa), rt(self.wa), dm0),
-                self._kernel("lm_head_stream.cpp", cores, ct(2, 1, self.wb), rt(self.wb), dm1),
+                self._kernel("lm_head_stream.cpp", cores, ct(1, 0, self.wa), rt(self.wa), dm0, nsend),
+                self._kernel("lm_head_stream.cpp", cores, ct(2, 1, self.wb), rt(self.wb), dm1, nsend),
                 self._kernel("lm_head_compute.cpp", cores, [kt, 1, rb, passes], [], self.cfg),
             ]
         ttnn.generic_op([x, self.wa, self.wb, out], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
@@ -242,7 +240,7 @@ class LMHeadDecode:
         fmt = ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=page)
         return ttnn.CBDescriptor(total_size=tiles * page, core_ranges=self.all, format_descriptors=[fmt])
 
-    def _kernel(self, name, cores, ct, rt, config):
+    def _kernel(self, name, cores, ct, rt, config, defines=()):
         return ttnn.KernelDescriptor(
             kernel_source=str(_KDIR / name),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -250,6 +248,7 @@ class LMHeadDecode:
             compile_time_args=ct,
             runtime_args=rt,
             config=config,
+            defines=list(defines),
         )
 
     def __call__(self, x, memory_config=ttnn.DRAM_MEMORY_CONFIG):
