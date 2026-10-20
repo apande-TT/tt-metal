@@ -322,6 +322,21 @@ class TtMinistral3MLP:
             g = ttnn.linear(x, self.w_gate, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
             u = ttnn.linear(x, self.w_up, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
             m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
+        return self._decode_down(m)
+
+    def decode_ar(self, x, p):
+        """Decode with the attention's o_proj all_reduce and the residual add folded into the gate / up program
+        (tt/gate_up_decode.py NormGateUpDecode.ar_norm_call): x the residual, p this device's o_proj partials. Returns
+        (h, mlp(norm(h))) with h = x + all_reduce(p)."""
+        h, m = self.fused_gate_up.ar_norm_call(x, p, self.decode_all_reduce)
+        return h, self._decode_down(m)
+
+    def ar_folds(self, x, p) -> bool:
+        """Whether decode_ar can take (x, p)."""
+        fn = getattr(self.fused_gate_up, "ar_accepts", None)
+        return fn is not None and fn(x, p, self.decode_all_reduce)
+
+    def _decode_down(self, m):
         if self.stream_down is not None:  # one program streaming the bank-major down copy (tt/down_decode.py)
             if self.decode_all_reduce is not None:  # partials in its width shards, one collective
                 return self.decode_all_reduce(self.stream_down(m, memory_config=self.decode_all_reduce.mem))

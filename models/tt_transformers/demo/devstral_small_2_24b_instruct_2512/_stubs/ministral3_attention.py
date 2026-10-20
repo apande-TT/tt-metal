@@ -144,6 +144,9 @@ class TtMinistral3Attention:
     decode_gather_mem = None
     # Set by the decoder layer: decode's o_proj all_reduce as one collective (tt/decode_all_reduce.py).
     decode_all_reduce = None
+    # Set by the decoder layer (per call): decode returns o_proj's partials un-reduced, in decode_all_reduce's width
+    # shards -- the layer's gate / up program reduces them (TtMinistral3MLP.decode_ar).
+    defer_decode_reduce = False
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -955,7 +958,8 @@ class TtMinistral3Attention:
             attn = ttnn.sharded_to_interleaved(attn, ttnn.L1_MEMORY_CONFIG)  # (1, 1, B, heads * head_dim)
         if self.stream_o is not None:  # one program streaming the bank-major o_proj copy (tt/down_decode.py)
             if self.decode_all_reduce is not None:  # partials in its width shards, one collective
-                return self.decode_all_reduce(self.stream_o(attn, memory_config=self.decode_all_reduce.mem))
+                p = self.stream_o(attn, memory_config=self.decode_all_reduce.mem)
+                return p if self.defer_decode_reduce else self.decode_all_reduce(p)
             return self._reduce(self.stream_o(attn))
         return self._reduce(
             ttnn.linear(

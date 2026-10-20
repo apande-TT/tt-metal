@@ -63,6 +63,9 @@ class TtMinistral3DecoderLayer:
     # sum) instead of a reduce-scatter + all_gather pair; the streamed projections write their partials into the
     # residual's width shards, where the sum lands too, so the residual add reads it natively.
     DECODE_ONE_SHOT_ALL_REDUCE = True
+    # ... and the o_proj one folded into the MLP's gate / up program together with the residual add (its link workers
+    # exchange the partials while the gate / up weights already stream; TtMinistral3MLP.decode_ar).
+    DECODE_FOLD_OPROJ_REDUCE = True
 
     def __init__(self, device, torch_module, meta_rope=False, layer_idx=None) -> None:
         """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order).
@@ -167,18 +170,37 @@ class TtMinistral3DecoderLayer:
             n = self.input_layernorm.decode(x, keep_sharded=self.self_attn.DECODE_SHARDED_INPUT)
         else:
             n = self._bf16(self.input_layernorm(self._bf16(x)))  # rms_norm reads bf16 (fp32 input overflows L1 at 5120)
-        a = self.self_attn(
-            n,
-            position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            kv_cache=kv_cache,
-            cur_pos=cur_pos,
-            mode=mode,
+        fold = (
+            mode == "decode"
+            and self.DECODE_FOLD_OPROJ_REDUCE
+            and self.self_attn.decode_all_reduce is not None
+            and self.self_attn.decode_all_reduce is self.mlp.decode_all_reduce
+            and getattr(self.mlp.fused_gate_up, "ar_accepts", None) is not None
         )
+        self.self_attn.defer_decode_reduce = fold  # o_proj's partials come back un-reduced
+        try:
+            a = self.self_attn(
+                n,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                kv_cache=kv_cache,
+                cur_pos=cur_pos,
+                mode=mode,
+            )
+        finally:
+            self.self_attn.defer_decode_reduce = False
         res_mem = None
         if mode == "decode" and self.SHARDED_DECODE_RESIDUAL:
             res_mem = self.post_attention_layernorm.decode_mem(int(x.shape[-1]))
+        if fold and self.mlp.ar_folds(x, a):
+            # all_reduce + residual add + norm + gate / up in one program, then down + its all_reduce
+            h, m = self.mlp.decode_ar(x, a)
+            ttnn.deallocate(a)
+            out = self._residual_add(h, m, res_mem)
+            return ttnn.reshape(out, in_shape) if len(in_shape) == 3 else out
+        if fold:
+            a = self.self_attn.decode_all_reduce(a)
         h = self._residual_add(x, a, res_mem)
         if mode == "decode" and self.mlp.decode_norms(h):
             # the gate / up program norms the residual's own width shards itself (its weight streams start meanwhile)
