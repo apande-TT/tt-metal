@@ -133,6 +133,7 @@ void kernel_main() {
             bool is_last_block = (m_block_iter == M_blocks_per_core - 1) && (n_block_iter == (N_blocks_per_core - 1));
 
             for (uint32_t k_block_iter = 0; k_block_iter < K_num_blocks; k_block_iter++) {
+#ifndef DIRECT_OUT
                 if (defer_write && k_block_iter == defer_write_k_block) {
                     if constexpr (is_output_writer) {
 #ifdef FUSE_SWIGLU
@@ -192,11 +193,72 @@ void kernel_main() {
                     }
                 }
 
+#endif  // !DIRECT_OUT
                 if (reuse_block && k_block_iter == 0) {
                     // We strided an N block and this is the first k block, so we get reuse and do not need to read in0
                     reuse_block = false;
+#ifdef DIRECT_OUT
+                    goto deferred_write;
+#else
                     continue;
+#endif
                 }
+#ifdef DIRECT_OUT
+                {
+                    // DIRECT_OUT: the in0 block moves down the row's forwarding chain in IN0_CHUNK_TILES-tile chunks
+                    // (row-major within the block), each forwarded as soon as it lands and counted on the next
+                    // core's receiver semaphore, instead of store-and-forward of the whole block per hop.
+                    constexpr uint32_t chunk_tiles = IN0_CHUNK_TILES;
+                    constexpr uint32_t chunks_per_row = K_block_tiles / chunk_tiles;
+                    const uint32_t n_chunks = current_M_block_tiles * chunks_per_row;
+                    const uint32_t chunk_bytes = chunk_tiles * in0_tile_size;
+                    cb_in0.reserve_back(in0_block_num_tiles);
+                    const uint32_t in0_base = cb_in0.get_write_ptr();
+                    if constexpr (!is_injector_core) {
+                        in0_receiver_semaphore.set(0);
+                        in0_sender_semaphore.up(noc, in0_sender_noc_x, in0_sender_noc_y, 1);
+                    }
+                    bool downstream_ready = false;
+                    for (uint32_t c = 0; c < n_chunks; c++) {
+                        const uint32_t row = c / chunks_per_row;
+                        const uint32_t k0 = (c % chunks_per_row) * chunk_tiles;
+                        const uint32_t chunk_addr = in0_base + (row * K_block_tiles + k0) * in0_tile_size;
+                        if constexpr (is_injector_core) {
+                            const uint32_t m = m_tile + row;
+                            if (m < in0_shape.logical_d0) {
+                                for (uint32_t t = 0; t < chunk_tiles; t++) {
+                                    noc.async_read(
+                                        in0_reader,
+                                        CoreLocalMem<uint32_t>(chunk_addr + t * in0_tile_size),
+                                        in0_tile_size,
+                                        {.page_id = m * in0_shape.logical_d1 + k0 + t},
+                                        {});
+                                }
+                                noc.async_read_barrier();
+                            }
+                        } else {
+                            in0_receiver_semaphore.wait_min(c + 1);
+                        }
+                        if (!is_sink_core) {
+                            if (!downstream_ready) {
+                                in0_sender_semaphore.wait(1);
+                                in0_sender_semaphore.set(0);
+                                downstream_ready = true;
+                            }
+                            noc.async_write(
+                                CoreLocalMem<uint32_t>(chunk_addr),
+                                UnicastEndpoint{},
+                                chunk_bytes,
+                                {},
+                                {.noc_x = in0_dest_noc_x, .noc_y = in0_dest_noc_y, .addr = chunk_addr});
+                            noc.async_writes_flushed();
+                            in0_receiver_semaphore.up(noc, in0_dest_noc_x, in0_dest_noc_y, 1);
+                        }
+                    }
+                    cb_in0.push_back(in0_block_num_tiles);
+                }
+#else
+                {
                 uint32_t k_block = k_forward ? k_block_iter : (K_num_blocks - 1) - k_block_iter;
                 cb_in0.reserve_back(in0_block_num_tiles);
 
@@ -243,6 +305,73 @@ void kernel_main() {
 
                     in0_valid_semaphore.relay_unicast(noc, in0_receiver_semaphore, in0_dest_noc_x, in0_dest_noc_y);
                 }
+                }
+#endif  // DIRECT_OUT
+#ifdef DIRECT_OUT
+            // DIRECT_OUT: the previous block's deferred output write comes AFTER this block's in0 read / forward, so
+            // a new M block's in0 streams in while compute is still finishing the previous block (writing first
+            // blocked the read -- and the row's forwarding chain behind it -- on that block's compute).
+            deferred_write:
+                if (defer_write && k_block_iter == defer_write_k_block) {
+                    if constexpr (is_output_writer) {
+#ifdef FUSE_SWIGLU
+                        cb_out.wait_front(out_block_num_tiles_swiglu);
+                        uint32_t out_read_ptr_swiglu = cb_out.get_read_ptr();
+                        if constexpr (N_chunks == 1) {
+                            write_block_sync<M_block_tiles, out_N_block_tiles>(
+                                std::get<0>(outputs_tuple),
+                                out_shape_swiglu,
+                                out_read_ptr_swiglu,
+                                out_tile_size,
+                                defer_write_m_tile,
+                                defer_write_m_tile_end,
+                                defer_write_n_tile / 2,
+                                defer_write_n_tile_end / 2);
+                        } else {
+                            write_block_sync_split<M_block_tiles, out_N_block_tiles, N_chunks, out_N_tiles_per_chunk>(
+                                outputs_tuple,
+                                out0_shape_swiglu,
+                                out_read_ptr_swiglu,
+                                out_tile_size,
+                                defer_write_m_tile,
+                                defer_write_m_tile_end,
+                                defer_write_n_tile / 2,
+                                defer_write_n_tile_end / 2);
+                        }
+                        cb_out.pop_front(out_block_num_tiles_swiglu);
+#else
+                        cb_out.wait_front(out_block_num_tiles);
+                        uint32_t out_read_ptr = cb_out.get_read_ptr();
+
+                        // write_block_sync_split is more generic (support multiple output tensors)
+                        // But for N_chunks == 1 (non-split minimal_matmul), write_block_sync should be faster
+                        if constexpr (N_chunks == 1) {
+                            write_block_sync<M_block_tiles, N_block_tiles>(
+                                std::get<0>(outputs_tuple),
+                                out_shape,
+                                out_read_ptr,
+                                out_tile_size,
+                                defer_write_m_tile,
+                                defer_write_m_tile_end,
+                                defer_write_n_tile,
+                                defer_write_n_tile_end);
+                        } else {
+                            write_block_sync_split<M_block_tiles, N_block_tiles, N_chunks, N_tiles_per_chunk>(
+                                outputs_tuple,
+                                out0_shape,
+                                out_read_ptr,
+                                out_tile_size,
+                                defer_write_m_tile,
+                                defer_write_m_tile_end,
+                                defer_write_n_tile,
+                                defer_write_n_tile_end);
+                        }
+                        cb_out.pop_front(out_block_num_tiles);
+#endif  // FUSE_SWIGLU
+                    }
+                }
+
+#endif  // DIRECT_OUT
             }
 
             k_forward = !k_forward;
@@ -258,7 +387,9 @@ void kernel_main() {
              * of the next output block.
              */
             defer_write = !is_last_block;
+#ifndef DIRECT_OUT
             defer_write = defer_write && !is_injector_core;
+#endif
 
             if (!defer_write) {
                 if constexpr (is_output_writer) {

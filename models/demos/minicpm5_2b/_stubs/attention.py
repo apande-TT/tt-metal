@@ -27,6 +27,7 @@ import torch
 import ttnn
 from models.demos.minicpm5_2b._stubs.decode_mm import decode_linear_config
 from models.demos.minicpm5_2b._stubs.dram_mm import DramMatmul, _core_rects
+from models.demos.minicpm5_2b._stubs.mm_swiglu import mm_swiglu, mm_swiglu_supported
 from models.demos.minicpm5_2b._stubs.ttl_rope import ttl_rope_qkv, ttl_rope_supported
 
 # Decode KV-cache write as one C++ kernel via ttnn.generic_op (else: slot-read matmuls + sub/add + paged_update_cache).
@@ -253,10 +254,7 @@ class TtAttention:
             if _SPLIT_PREFILL_QKV:
                 # Q on o_proj's full-grid 2-D multicast config (same shape), K | V as a narrow second matmul: every
                 # output tile is the same full-K accumulation as in the fused-QKV matmul, on all 110 cores.
-                q_lin = ttnn.linear(
-                    x2, self.wq, memory_config=l1 if rope_kernel else dram, compute_kernel_config=self.compute_cfg,
-                    program_config=self._prefill_2d_cfg(x2, self.wq, 8, 3),
-                )
+                q_lin = self._prefill_proj(x2, self.wq, l1 if rope_kernel else dram, 8, 3)
                 kv_lin = ttnn.linear(
                     x2, self.wkv, memory_config=l1 if rope_kernel else dram, compute_kernel_config=self.compute_cfg,
                     program_config=self._prefill_2d_cfg(x2, self.wkv, 8, 2),
@@ -994,27 +992,32 @@ class TtAttention:
             fused_activation=None,
         )
 
+    def _prefill_proj(self, x, w, memory_config, in0_block_w, subblock_w):
+        """Prefill projection x [.., M, K] @ w [K, N] (HiFi4, fp32 DEST): the full-K 2x2-block C++ matmul
+        (mm_swiglu's program with fuse_swiglu=False, output packed straight from DEST, non-transposed full grid),
+        bit-identical to the full-grid 2-D multicast ttnn.linear it replaces; that linear where unsupported."""
+        if mm_swiglu_supported(x, w, fuse_swiglu=False):
+            return mm_swiglu(
+                self.device,
+                x,
+                w,
+                compute_fidelity=ttnn.MathFidelity.HiFi4,
+                memory_config=memory_config,
+                fuse_swiglu=False,
+                transpose=False,
+            )
+        return ttnn.linear(
+            x,
+            w,
+            memory_config=memory_config,
+            compute_kernel_config=self.compute_cfg,
+            program_config=self._prefill_2d_cfg(x, w, in0_block_w, subblock_w),
+        )
+
     def _prefill_o_proj(self, attn, b, seq):
         """Prefill o_proj on the merged heads [1, B * S, n * D] -> [B, S, hidden] in L1 (the residual add input)."""
-        grid = self.device.compute_with_storage_grid_size()
-        m_t, n_t = attn.padded_shape[-2] // 32, self.wo.padded_shape[-1] // 32
-        out = ttnn.linear(
-            attn,
-            self.wo,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
-            compute_kernel_config=self.compute_cfg,
-            # Full-grid 2-D multicast with 8-tile K blocks (8 K steps instead of the auto config's).
-            program_config=ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-                compute_with_storage_grid_size=(grid.x, grid.y),
-                in0_block_w=8,
-                out_subblock_h=1,
-                out_subblock_w=3,
-                per_core_M=-(-m_t // grid.y),
-                per_core_N=-(-n_t // grid.x),
-                transpose_mcast=False,
-                fused_activation=None,
-            ),
-        )
+        # Full-grid 2-D multicast with 8-tile K blocks on the fallback path.
+        out = self._prefill_proj(attn, self.wo, ttnn.L1_MEMORY_CONFIG, 8, 3)
         ttnn.deallocate(attn)
         return ttnn.reshape(out, (b, seq, out.shape[-1]))
 

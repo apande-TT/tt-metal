@@ -237,7 +237,11 @@ void kernel_main() {
     CircularBuffer cb_intermediate(intermediate_cb);
 
     // compute_kernel_hw_startup must be the first compute API call (before SFPU/op inits).
+#ifdef DIRECT_OUT
+    compute_kernel_hw_startup<SrcOrder::Reverse>(in0_cb, in1_cb, out_cb);
+#else
     compute_kernel_hw_startup<SrcOrder::Reverse>(in0_cb, in1_cb, intermediate_cb);
+#endif
 
     matmul_init(in0_cb, in1_cb);
 
@@ -264,6 +268,32 @@ void kernel_main() {
             current_N_block_tiles = n_tile_end - n_tile;
             current_subblock_w = std::min(current_N_block_tiles, subblock_w);
 
+#ifdef DIRECT_OUT
+            // Plain matmul, K in one block (host-asserted): every output tile is one full-K accumulation in the fp32
+            // DEST, packed straight to the bf16 output. Bit-identical to ttnn's 2-D multicast matmul with fp32 DEST,
+            // whose cross-K-block partial reload is exact (UnpackToDestFp32), and whose last block packs DEST to bf16.
+            matmul_block_init(
+                in0_cb, in1_cb, false /*transpose*/, current_subblock_w, current_subblock_h, K_block_tiles);
+            cb_in0.wait_front(in0_block_num_tiles);
+            cb_in1.wait_front(in1_block_num_tiles);
+            cb_out.reserve_back(out_block_num_tiles);
+            matmul_blocks(
+                in0_cb,
+                in1_cb,
+                out_cb,
+                current_M_block_tiles,
+                current_N_block_tiles,
+                N_block_tiles,
+                K_block_tiles,
+                current_subblock_h,
+                current_subblock_w);
+            cb_out.push_back(out_block_num_tiles);
+            if (n_block_iter == N_blocks_per_core - 1) {
+                cb_in0.pop_front(in0_block_num_tiles);
+            }
+            cb_in1.pop_front(in1_block_num_tiles);
+            continue;
+#endif
             // Reconfig before init: on all but the first block the unpackers are still
             // configured for the previous output stage's operands (see #55052).
             reconfig_data_format(in1_cb, in0_cb);

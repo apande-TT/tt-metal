@@ -68,7 +68,7 @@ def _dims(x, w_il):
     return vol // k, k, int(w_il.padded_shape[-1])
 
 
-def mm_swiglu_supported(x, w_il, grid=None) -> bool:
+def mm_swiglu_supported(x, w_il, grid=None, fuse_swiglu=True) -> bool:
     """Shapes / layouts this op handles (else use the gate / up / multiply path)."""
     try:
         if x.layout != ttnn.TILE_LAYOUT or w_il.layout != ttnn.TILE_LAYOUT:
@@ -82,7 +82,7 @@ def mm_swiglu_supported(x, w_il, grid=None) -> bool:
         m, k, n = _dims(x, w_il)
         if int(w_il.padded_shape[-2]) != k or list(x.shape) != list(x.padded_shape):
             return False
-        if m % _TILE or k % _TILE or n % (2 * _TILE):
+        if m % _TILE or k % _TILE or n % ((2 if fuse_swiglu else 1) * _TILE):
             return False
         # K block = all of K: the double-buffered in0 / in1 CBs take 2 * 2 * 2 * K_tiles bf16 tiles (1 MB at
         # K = 2048, the reference prefill config's footprint); do not go beyond it.
@@ -110,11 +110,23 @@ def _core_order_for_axis(core, transpose, axis_length, noc_is_0, axis_is_x_when_
     return order, index_of_current
 
 
-def mm_swiglu(device, x, w_il, compute_fidelity=ttnn.MathFidelity.HiFi2, memory_config=ttnn.DRAM_MEMORY_CONFIG):
+def mm_swiglu(
+    device,
+    x,
+    w_il,
+    compute_fidelity=ttnn.MathFidelity.HiFi2,
+    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    fuse_swiglu=True,
+    transpose=None,
+):
     """h[.., M, F] = silu(x @ W_il[:, gate tiles]) * (x @ W_il[:, up tiles]) for a [1, 1, K, 2F] tile-pair interleaved
-    W_il (bf16 TILE). Output bf16 TILE in `memory_config`."""
+    W_il (bf16 TILE). Output bf16 TILE in `memory_config`.
+
+    fuse_swiglu=False: plain y = x @ W (bf16 TILE) with the output packed straight from the fp32 DEST (DIRECT_OUT),
+    bit-identical to ttnn's 2-D multicast matmul with fp32 DEST accumulation at the same fidelity. transpose: grid
+    orientation (None = the factory's M > N rule)."""
     grid = device.compute_with_storage_grid_size()
-    assert mm_swiglu_supported(x, w_il, grid), "mm_swiglu: unsupported shapes / layouts (check mm_swiglu_supported)"
+    assert mm_swiglu_supported(x, w_il, grid, fuse_swiglu), "mm_swiglu: unsupported shapes / layouts"
     gx, gy = int(grid.x), int(grid.y)
     num_cores = gx * gy
 
@@ -135,7 +147,7 @@ def mm_swiglu(device, x, w_il, compute_fidelity=ttnn.MathFidelity.HiFi2, memory_
     # RISCV_0 / NOC_0 (preferred_noc_for_dram_read); transpose the core grid when M > N.
     small_noc, small_risc = ttnn.NOC.NOC_1, ttnn.DataMovementProcessor.RISCV_1
     large_noc, large_risc = ttnn.NOC.NOC_0, ttnn.DataMovementProcessor.RISCV_0
-    transpose = M > N
+    transpose = (M > N) if transpose is None else bool(transpose)
     in0_noc, in0_risc = (large_noc, large_risc) if transpose else (small_noc, small_risc)
     in1_noc, in1_risc = (small_noc, small_risc) if transpose else (large_noc, large_risc)
     in0_axis = gx if transpose else gy
@@ -143,16 +155,23 @@ def mm_swiglu(device, x, w_il, compute_fidelity=ttnn.MathFidelity.HiFi2, memory_
 
     padded_M_tiles = _round_up(M_tiles, in0_axis)
     padded_K_tiles = _round_up(K_tiles, K_block)
-    # fuse_swiglu: partition on gate/up PAIRS (= output tiles).
-    out_N_tiles = N_tiles // 2
-    padded_out_N_tiles = _round_up(out_N_tiles, in1_axis)
-    padded_N_tiles = 2 * padded_out_N_tiles
-    N_tiles_per_core = 2 * (padded_out_N_tiles // in1_axis)
+    if fuse_swiglu:
+        # fuse_swiglu: partition on gate/up PAIRS (= output tiles).
+        out_N_tiles = N_tiles // 2
+        padded_out_N_tiles = _round_up(out_N_tiles, in1_axis)
+        padded_N_tiles = 2 * padded_out_N_tiles
+        N_tiles_per_core = 2 * (padded_out_N_tiles // in1_axis)
+    else:
+        padded_N_tiles = _round_up(N_tiles, in1_axis)
+        N_tiles_per_core = padded_N_tiles // in1_axis
     M_tiles_per_core = padded_M_tiles // in0_axis
     K_blocks = padded_K_tiles // K_block
     M_blocks_per_core = _div_up(M_tiles_per_core, M_block)
     N_blocks_per_core = _div_up(N_tiles_per_core, N_block)
-    assert N_tiles % 2 == 0 and N_tiles_per_core % 2 == 0 and N_block % 2 == 0
+    if fuse_swiglu:
+        assert N_tiles % 2 == 0 and N_tiles_per_core % 2 == 0 and N_block % 2 == 0
+    else:
+        assert K_blocks == 1 and K_tiles % 16 == 0, "DIRECT_OUT: K one block, a multiple of the 16-tile chunk"
     assert M_block % subblock_h == 0 and N_block % subblock_w == 0 and subblock_h * subblock_w <= 4
 
     in0_block_num_tiles = M_block * K_block
@@ -160,11 +179,13 @@ def mm_swiglu(device, x, w_il, compute_fidelity=ttnn.MathFidelity.HiFi2, memory_
     out_block_num_tiles = M_block * N_block
     in0_cb_num_tiles = 2 * in0_block_num_tiles
     in1_cb_num_tiles = 2 * in1_block_num_tiles
-    out_cb_num_tiles = 2 * (out_block_num_tiles // 2)  # SwiGLU: half a block, double buffered
+    # SwiGLU: half a block, double buffered; plain: a block, double buffered.
+    out_cb_num_tiles = 2 * (out_block_num_tiles // 2) if fuse_swiglu else 2 * out_block_num_tiles
     interm_cb_num_tiles = out_block_num_tiles
 
     out = ttnn.allocate_tensor_on_device(
-        ttnn.Shape(list(x.shape)[:-1] + [N // 2]), ttnn.bfloat16, ttnn.TILE_LAYOUT, device, memory_config
+        ttnn.Shape(list(x.shape)[:-1] + [N // 2 if fuse_swiglu else N]), ttnn.bfloat16, ttnn.TILE_LAYOUT, device,
+        memory_config,
     )
 
     all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))])
@@ -197,11 +218,15 @@ def mm_swiglu(device, x, w_il, compute_fidelity=ttnn.MathFidelity.HiFi2, memory_
         cb(_CB_IN0, in0_cb_num_tiles, ttnn.bfloat16, in0_tile_size),
         cb(_CB_IN1, in1_cb_num_tiles, ttnn.bfloat16, in1_tile_size),
         cb(_CB_OUT, out_cb_num_tiles, ttnn.bfloat16, out_tile_size),
-        cb(_CB_INTERM, interm_cb_num_tiles, ttnn.float32, interm_tile_size),
-        cb(_CB_SCRATCH, out_block_num_tiles, ttnn.bfloat16, out_tile_size),  # mm_swiglu epilogue: G / U tiles
     ]
+    if fuse_swiglu:
+        cbs += [
+            cb(_CB_INTERM, interm_cb_num_tiles, ttnn.float32, interm_tile_size),
+            cb(_CB_SCRATCH, out_block_num_tiles, ttnn.bfloat16, out_tile_size),  # mm_swiglu epilogue: G / U tiles
+        ]
 
-    defines = [("FUSE_SWIGLU", "1")]
+    # DIRECT_OUT: in0 forwarded down the chain in 16-tile chunks (dm_in0_sender.cpp).
+    defines = [("FUSE_SWIGLU", "1")] if fuse_swiglu else [("DIRECT_OUT", "1"), ("IN0_CHUNK_TILES", "16")]
     in0_is_output_writer = 0 if transpose else 1
     in1_is_output_writer = 1 if transpose else 0
     shape_ct = [
