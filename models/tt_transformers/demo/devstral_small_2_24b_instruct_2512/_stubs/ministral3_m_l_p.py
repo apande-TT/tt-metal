@@ -39,8 +39,10 @@ DECODE_GATE_UP_BF4_LAYERS = frozenset(range(5, 36))
 PREFILL_GATE_UP_LOFI_LAYERS = frozenset(range(14, 26))
 # K tiles per activation multicast block of the bf4 decode gate / up projections (divides K = 160 tiles).
 DECODE_GATE_UP_K_BLOCK = 8
-# Math fidelity of the bf4 decode gate / up (HiFi3 == HiFi4 bit for bit on a block-float4 weight, see __init__).
-DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi3
+# Math fidelity of the bf4 decode gate / up and down (HiFi3 == HiFi4 bit for bit on a block-float4 weight, see __init__).
+# HiFi2: the bf4 gate / up program is compute-bound (~100 us of matmul after its prologue vs ~95 us of weight stream),
+# so the pass fewer is decode time (trace 15.09 -> 14.72 ms); not bit-exact, text logits PCC 0.995037 -> 0.995223.
+DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi2
 # K tiles per activation multicast block of the decode down projection (divides K = 256 tiles).
 DOWN_DECODE_K_BLOCK = 8
 # Decode down projection as one C++ program streaming a bank-major weight copy (tt/down_decode.py).
