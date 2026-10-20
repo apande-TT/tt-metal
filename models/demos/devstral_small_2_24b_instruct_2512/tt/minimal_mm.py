@@ -152,10 +152,14 @@ def matmul(
         f = ttnn.CBFormatDescriptor(buffer_index=index, data_format=fmt, page_size=page)
         return ttnn.CBDescriptor(total_size=tiles * page, core_ranges=core_grid, format_descriptors=[f])
 
+    # ONE output block buffer: the writer drains block i at K step `defer` (<= K_blocks - 1) of block i + 1, before it
+    # reads that K block, so compute -- which packs block i + 1 only after its last K block -- never waits on it. (The
+    # vision MLP's 7 x 12-tile SwiGLU block: 86 KB less static L1, which the decode all_reduce's scratch needs.)
+    out_bufs = 1
     cbs = [
         cb(0, M_block * K_block * 2, in0_tile, x.dtype),
         cb(1, K_block * N_block * 2, in1_tile, w.dtype),
-        cb(2, out_written * 2, out_tile, dtype),
+        cb(2, out_written * out_bufs, out_tile, dtype),
         cb(3, out_block, interm_tile, interm_dtype),
     ]
 

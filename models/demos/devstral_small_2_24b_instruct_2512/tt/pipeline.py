@@ -255,8 +255,10 @@ PLANNED_TP = 4
 #                     the lm_head multiplies at HiFi4 (free under its weight stream); decode down bf4 on layers 16-25.
 #   ministral3_decoder_layer decode all_reduces (o_proj, MLP down): ONE all_reduce_async each (tt/decode_all_reduce.py)
 #                     instead of reduce-scatter + all_gather: the streamed projections write their bf16 partials into
-#                     their own 8 x 10 width shards, every device multicasts them into one shared 16 KB/core scratch,
-#                     summed in fp32 DEST and rounded once (~4 us an all_reduce; trace decode 15.99 -> 15.75 ms).
+#                     the residual's 40-core width shards, every device multicasts them into one shared 32 KB/core
+#                     scratch, summed in fp32 DEST and rounded once, and the residual add reads the sum natively
+#                     (trace decode 15.99 -> 15.75 -> 15.48 ms). The scratch fits L1 because the prefill final norm runs
+#                     with no all-ones weight row and minimal_mm keeps one output-block buffer (vision gate / up -86 KB).
 
 
 def kv_capacity_for(tp):
