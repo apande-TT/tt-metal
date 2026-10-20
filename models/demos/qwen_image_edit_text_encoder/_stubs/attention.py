@@ -452,19 +452,25 @@ def _small_linear_config(mt, kt, nt, grid):
     """1D config for a linear too narrow for the 2D blocks (the VAE's 96 -> 192 1x1 shortcut over 16384 voxels:
     K = 3, N = 6 tiles): the weight multicast to every core, the M tiles split evenly over the whole grid, the whole
     K in one step (the K order of each output tile unchanged). The auto pick ran it on 24 of the 64 cores. None
-    unless M splits evenly and the blocks fit ~1000 KB of L1."""
+    unless M splits evenly and the blocks fit ~1000 KB of L1. A deep K (the denoiser's 3072 -> 32 shard: 96 tiles)
+    takes the largest K step whose blocks fit instead."""
     cores = grid.x * grid.y
     if mt % cores or nt > 16:
         return None
     pcm = mt // cores
-    if 2 * (pcm * kt + kt * nt) * 2048 + pcm * nt * 4096 > 1000 * 1024:
+
+    def fits(bw):
+        return 2 * (pcm * bw + bw * nt) * 2048 + pcm * nt * 4096 <= 1000 * 1024
+
+    bw = kt if fits(kt) else next((d for d in range(kt, 0, -1) if kt % d == 0 and fits(d)), 0)
+    if not bw:
         return None
     key = ("small", mt, kt, nt, grid.x, grid.y)
     if key not in _LINEAR_CONFIGS:
         sbw = _largest_divisor(nt, 4)
         _LINEAR_CONFIGS[key] = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
             compute_with_storage_grid_size=(grid.x, grid.y),
-            in0_block_w=kt,
+            in0_block_w=bw,
             out_subblock_h=_largest_divisor(pcm, max(1, 4 // sbw)),
             out_subblock_w=sbw,
             per_core_M=pcm,
