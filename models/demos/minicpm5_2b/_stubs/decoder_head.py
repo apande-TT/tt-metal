@@ -71,7 +71,7 @@ class DecoderHead:
             self.dmm = DramMatmul(
                 device,
                 w,
-                ttnn.MathFidelity.HiFi4,
+                ttnn.MathFidelity.HiFi2,
                 dtype=ttnn.bfloat8_b,
                 workers_per_bank=_DRAM_MM_WORKERS_PER_BANK,
             )
@@ -214,7 +214,7 @@ class DecoderHead:
             dmm = DramMatmul(
                 self.device,
                 None,
-                ttnn.MathFidelity.HiFi4,
+                ttnn.MathFidelity.HiFi2,
                 dtype=ttnn.bfloat8_b,
                 workers_per_bank=_DRAM_MM_WORKERS_PER_BANK,
                 prebuilt=self.dmm,
