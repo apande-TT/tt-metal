@@ -152,9 +152,10 @@ class DecoderHead:
             mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1) if self.tp > 1 else None,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+        # HiFi4: the one-row lm_head is bound by its weight stream, so the full-precision products cost nothing
         self.compute_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_fidelity=ttnn.MathFidelity.HiFi4,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=False,  # L1 accumulation made batched prefill matmuls non-repeatable
@@ -175,7 +176,7 @@ class DecoderHead:
                     mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1),
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 )
-                self.stream = LMHeadDecode(device, w, ttnn.bfloat8_b, ttnn.MathFidelity.HiFi2, put, tp=self.tp)
+                self.stream = LMHeadDecode(device, w, ttnn.bfloat8_b, ttnn.MathFidelity.HiFi4, put, tp=self.tp)
 
     STREAM_LM_HEAD = True
 
