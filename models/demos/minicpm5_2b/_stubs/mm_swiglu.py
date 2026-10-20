@@ -51,6 +51,11 @@ def interleave_gate_up(wg_t: torch.Tensor, wu_t: torch.Tensor) -> torch.Tensor:
     return torch.cat([wg, wu], dim=2).reshape(k, 2 * f)
 
 
+def _in0_chunk(k_block):
+    """DIRECT_OUT in0 forwarding chunk (tiles of one row's K block)."""
+    return 16 if k_block % 16 == 0 else k_block
+
+
 def _round_up(a, b):
     return -(-a // b) * b
 
@@ -68,7 +73,7 @@ def _dims(x, w_il):
     return vol // k, k, int(w_il.padded_shape[-1])
 
 
-def mm_swiglu_supported(x, w_il, grid=None, fuse_swiglu=True) -> bool:
+def mm_swiglu_supported(x, w_il, grid=None, fuse_swiglu=True, k_block=None) -> bool:
     """Shapes / layouts this op handles (else use the gate / up / multiply path)."""
     try:
         if x.layout != ttnn.TILE_LAYOUT or w_il.layout != ttnn.TILE_LAYOUT:
@@ -86,7 +91,7 @@ def mm_swiglu_supported(x, w_il, grid=None, fuse_swiglu=True) -> bool:
             return False
         # K block = all of K: the double-buffered in0 / in1 CBs take 2 * 2 * 2 * K_tiles bf16 tiles (1 MB at
         # K = 2048, the reference prefill config's footprint); do not go beyond it.
-        if k // _TILE > 64:
+        if k // _TILE > 64 and (fuse_swiglu or k_block is None or (k // _TILE) % k_block):
             return False
         if grid is not None and (grid.x < 1 or grid.y < 1):
             return False
@@ -118,21 +123,29 @@ def mm_swiglu(
     memory_config=ttnn.DRAM_MEMORY_CONFIG,
     fuse_swiglu=True,
     transpose=None,
+    blocks=None,
 ):
     """h[.., M, F] = silu(x @ W_il[:, gate tiles]) * (x @ W_il[:, up tiles]) for a [1, 1, K, 2F] tile-pair interleaved
     W_il (bf16 TILE). Output bf16 TILE in `memory_config`.
 
     fuse_swiglu=False: plain y = x @ W (bf16 TILE) with the output packed straight from the fp32 DEST (DIRECT_OUT),
     bit-identical to ttnn's 2-D multicast matmul with fp32 DEST accumulation at the same fidelity. transpose: grid
-    orientation (None = the factory's M > N rule)."""
+    orientation (None = the factory's M > N rule). blocks: plain mode (M_block, N_block, K_block) -- K_block < K
+    selects KSPLIT: fp32 partials between K blocks in an UnpackToDestFp32 CB (exact reload), which needs one N block
+    per core (K order stays ascending)."""
     grid = device.compute_with_storage_grid_size()
-    assert mm_swiglu_supported(x, w_il, grid, fuse_swiglu), "mm_swiglu: unsupported shapes / layouts"
+    assert mm_swiglu_supported(
+        x, w_il, grid, fuse_swiglu, k_block=blocks[2] if blocks is not None else None
+    ), "mm_swiglu: unsupported shapes / layouts"
     gx, gy = int(grid.x), int(grid.y)
     num_cores = gx * gy
 
     M, K, N = _dims(x, w_il)
     M_tiles, K_tiles, N_tiles = M // _TILE, K // _TILE, N // _TILE
     M_block, K_block, N_block = _M_BLOCK, K_tiles, _N_BLOCK
+    if blocks is not None:
+        assert not fuse_swiglu
+        M_block, N_block, K_block = blocks
     subblock_h, subblock_w = _SUBBLOCK_H, _SUBBLOCK_W
     N_chunks = 1
     N_tiles_per_chunk = N_tiles // N_chunks
@@ -171,7 +184,8 @@ def mm_swiglu(
     if fuse_swiglu:
         assert N_tiles % 2 == 0 and N_tiles_per_core % 2 == 0 and N_block % 2 == 0
     else:
-        assert K_blocks == 1 and K_tiles % 16 == 0, "DIRECT_OUT: K one block, a multiple of the 16-tile chunk"
+        assert K_blocks == 1 or N_blocks_per_core == 1, "KSPLIT needs one N block per core (ascending K order)"
+        assert K_block % _in0_chunk(K_block) == 0
     assert M_block % subblock_h == 0 and N_block % subblock_w == 0 and subblock_h * subblock_w <= 4
 
     in0_block_num_tiles = M_block * K_block
@@ -219,6 +233,8 @@ def mm_swiglu(
         cb(_CB_IN1, in1_cb_num_tiles, ttnn.bfloat16, in1_tile_size),
         cb(_CB_OUT, out_cb_num_tiles, ttnn.bfloat16, out_tile_size),
     ]
+    if not fuse_swiglu and K_blocks > 1:
+        cbs.append(cb(_CB_INTERM, out_block_num_tiles, ttnn.float32, interm_tile_size))  # KSPLIT partials, in place
     if fuse_swiglu:
         cbs += [
             cb(_CB_INTERM, interm_cb_num_tiles, ttnn.float32, interm_tile_size),
@@ -226,7 +242,11 @@ def mm_swiglu(
         ]
 
     # DIRECT_OUT: in0 forwarded down the chain in 16-tile chunks (dm_in0_sender.cpp).
-    defines = [("FUSE_SWIGLU", "1")] if fuse_swiglu else [("DIRECT_OUT", "1"), ("IN0_CHUNK_TILES", "16")]
+    defines = (
+        [("FUSE_SWIGLU", "1")]
+        if fuse_swiglu
+        else [("DIRECT_OUT", "1"), ("IN0_CHUNK_TILES", str(_in0_chunk(K_block)))] + ([("KSPLIT", "1")] if K_blocks > 1 else [])
+    )
     in0_is_output_writer = 0 if transpose else 1
     in1_is_output_writer = 1 if transpose else 0
     shape_ct = [
@@ -349,6 +369,18 @@ def mm_swiglu(
 
             rt_compute[cx][cy] = [M_start, M_end, N_start, N_end]
 
+    compute_config = ttnn.ComputeConfigDescriptor(
+        math_fidelity=compute_fidelity,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        dst_full_sync_en=False,
+    )
+    if not fuse_swiglu and K_blocks > 1:
+        # KSPLIT: the fp32 partials are reloaded straight into DEST (exact), as ttnn's 2-D multicast matmul does.
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        modes[_CB_INTERM] = ttnn.UnpackToDestMode.UnpackToDestFp32
+        compute_config.unpack_to_dest_mode = modes
+
     def dm_kernel(src, cores, ct, rt, risc, noc):
         return ttnn.KernelDescriptor(
             kernel_source=os.path.join(_KERNEL_DIR, src),
@@ -375,12 +407,7 @@ def mm_swiglu(
             # As the factory's ComputeConfig: fidelity / approx / fp32 DEST from the compute kernel config, half-sync
             # DEST, every CB unpacked to SrcA (unpack_to_dest_mode Default). No MM_THROTTLE define: the
             # reference's throttle level is the default (none).
-            config=ttnn.ComputeConfigDescriptor(
-                math_fidelity=compute_fidelity,
-                math_approx_mode=False,
-                fp32_dest_acc_en=True,
-                dst_full_sync_en=False,
-            ),
+            config=compute_config,
         ),
     ]
     assert num_cores == gx * gy

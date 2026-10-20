@@ -208,6 +208,67 @@ void matmul_blocks(
     }
 }
 
+#ifdef KSPLIT
+// KSPLIT (DIRECT_OUT with K in several blocks): one K block of every subblock of the output block. Blocks after the
+// first reload the subblock's fp32 partials from `interm_cb` straight into DEST (the CB is UnpackToDestFp32, so the
+// reload is exact) and keep accumulating; blocks before the last pack fp32 partials to `interm_cb`, the last packs the
+// bf16 output. This is the accumulation sequence of ttnn's 2-D multicast matmul with fp32 DEST and exact partial
+// reload, so every output tile is the same full-K in-order fp32 accumulation, rounded once to bf16 by the packer.
+void matmul_blocks_ksplit(
+    const uint32_t in0_cb,
+    const uint32_t in1_cb,
+    const uint32_t interm_cb,
+    const uint32_t out_cb,
+    const bool reload,
+    const bool last,
+    const uint32_t M_block_tiles,
+    const uint32_t N_block_tiles,
+    const uint32_t full_N_block_tiles,
+    const uint32_t K_block_tiles,
+    const uint32_t subblock_h,
+    const uint32_t subblock_w) {
+    const uint32_t dst_cb = last ? out_cb : interm_cb;
+    uint32_t in0_index_offset = 0;
+    for (uint32_t M_start = 0; M_start < M_block_tiles; M_start += subblock_h) {
+        uint32_t in1_index_offset = 0;
+        for (uint32_t N_start = 0; N_start < N_block_tiles; N_start += subblock_w) {
+            tile_regs_acquire();
+            if (reload) {
+                reconfig_data_format_srca(in1_cb, interm_cb);
+                copy_init(interm_cb);
+                uint32_t dst = 0;
+                for (uint32_t h = 0; h < subblock_h; h++) {
+                    for (uint32_t w = 0; w < subblock_w; w++) {
+                        copy_tile(interm_cb, (M_start + h) * full_N_block_tiles + N_start + w, dst++);
+                    }
+                }
+                reconfig_data_format_srca(interm_cb, in1_cb);
+                matmul_block_init(in0_cb, in1_cb, false /*transpose*/, subblock_w, subblock_h, K_block_tiles);
+            }
+            uint32_t in0_index = in0_index_offset;
+            uint32_t in1_index = in1_index_offset;
+            for (uint32_t inner_dim = 0; inner_dim < K_block_tiles; inner_dim++) {
+                matmul_block(
+                    in0_cb, in1_cb, in0_index, in1_index, 0, false /*transpose*/, subblock_w, subblock_h, K_block_tiles);
+                in0_index++;
+                in1_index += full_N_block_tiles;
+            }
+            tile_regs_commit();
+            tile_regs_wait();
+            uint32_t dst = 0;
+            for (uint32_t h = 0; h < subblock_h; h++) {
+                for (uint32_t w = 0; w < subblock_w; w++) {
+                    pack_tile<true>(dst++, dst_cb, (M_start + h) * full_N_block_tiles + N_start + w);
+                }
+            }
+            tile_regs_release();
+            in1_index_offset += subblock_w;
+        }
+        in0_index_offset += subblock_h * K_block_tiles;
+    }
+}
+#endif  // KSPLIT
+
 void kernel_main() {
     constexpr uint32_t K_num_blocks = get_compile_time_arg_val(0);
     constexpr uint32_t M_block_tiles = get_compile_time_arg_val(1);
@@ -268,7 +329,54 @@ void kernel_main() {
             current_N_block_tiles = n_tile_end - n_tile;
             current_subblock_w = std::min(current_N_block_tiles, subblock_w);
 
-#ifdef DIRECT_OUT
+#if defined(DIRECT_OUT) && defined(KSPLIT)
+            {
+                CircularBuffer cb_interm(intermediate_cb);
+                matmul_block_init(
+                    in0_cb, in1_cb, false /*transpose*/, current_subblock_w, current_subblock_h, K_block_tiles);
+                cb_out.reserve_back(out_block_num_tiles);
+                for (uint32_t k_block = 0; k_block < K_num_blocks; k_block++) {
+                    const bool first = k_block == 0;
+                    const bool last = k_block == K_num_blocks - 1;
+                    cb_in0.wait_front(in0_block_num_tiles);
+                    cb_in1.wait_front(in1_block_num_tiles);
+                    // The partials CB holds one block and is updated in place: each subblock's partials are
+                    // reloaded (unpacker) before the same positions are repacked (packer, through DEST).
+                    if (!first) {
+                        cb_interm.wait_front(out_block_num_tiles);
+                    } else if (!last) {
+                        cb_interm.reserve_back(out_block_num_tiles);
+                    }
+                    pack_reconfig_data_format(last ? out_cb : intermediate_cb);
+                    matmul_blocks_ksplit(
+                        in0_cb,
+                        in1_cb,
+                        intermediate_cb,
+                        out_cb,
+                        !first,
+                        last,
+                        current_M_block_tiles,
+                        current_N_block_tiles,
+                        N_block_tiles,
+                        K_block_tiles,
+                        current_subblock_h,
+                        current_subblock_w);
+                    if (!first) {
+                        cb_interm.pop_front(out_block_num_tiles);
+                    }
+                    if (!last) {
+                        if (!first) {
+                            cb_interm.reserve_back(out_block_num_tiles);
+                        }
+                        cb_interm.push_back(out_block_num_tiles);
+                    }
+                    cb_in0.pop_front(in0_block_num_tiles);
+                    cb_in1.pop_front(in1_block_num_tiles);
+                }
+                cb_out.push_back(out_block_num_tiles);
+            }
+            continue;
+#elif defined(DIRECT_OUT)
             // Plain matmul, K in one block (host-asserted): every output tile is one full-K accumulation in the fp32
             // DEST, packed straight to the bf16 output. Bit-identical to ttnn's 2-D multicast matmul with fp32 DEST,
             // whose cross-K-block partial reload is exact (UnpackToDestFp32), and whose last block packs DEST to bf16.

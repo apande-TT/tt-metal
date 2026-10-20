@@ -25,6 +25,9 @@ _USE_SILU_PROLOGUE = True
 # Prefill gate/up + silu * up as one program (kernels/mm_swiglu: minimal_matmul over the tile-pair interleaved
 # [W_gate | W_up] with a SwiGLU epilogue bit-identical to the two minimal_matmuls + ttnn.multiply).
 _PREFILL_MM_SWIGLU = True
+# Prefill down on the C++ matmul (mm_swiglu's program, plain KSPLIT mode) with this K block.
+_PREFILL_DOWN_CPP = True
+_DOWN_K_BLOCK = 16
 
 
 def _compute_cfg(device):
@@ -176,26 +179,46 @@ class TtMlp:
                 h = self._silu_mul(gate, up)
                 ttnn.deallocate(gate)
                 ttnn.deallocate(up)
-            # ttnn.linear's 2-D multicast over the full grid with 8-tile K blocks (24 K steps). Output in L1 for the
-            # residual add.
+            # Output in L1 for the residual add.
             grid = self.device.compute_with_storage_grid_size()
             m_t, n_t = h.padded_shape[-2] // 32, self.w_down.padded_shape[-1] // 32
-            out = ttnn.linear(
-                h,
-                self.w_down,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
-                compute_kernel_config=self.compute_cfg,
-                program_config=ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-                    compute_with_storage_grid_size=(grid.x, grid.y),
-                    in0_block_w=8,
-                    out_subblock_h=1,
-                    out_subblock_w=3,
-                    per_core_M=-(-m_t // grid.y),
-                    per_core_N=-(-n_t // grid.x),
-                    transpose_mcast=False,
-                    fused_activation=None,
-                ),
-            )
+            n_core = -(-n_t // grid.x)
+            if (
+                _PREFILL_DOWN_CPP
+                and n_core % 2 == 0
+                and mm_swiglu_supported(h, self.w_down, grid, fuse_swiglu=False, k_block=_DOWN_K_BLOCK)
+            ):
+                # The full-grid C++ matmul in 4-row x all-N blocks, 16-tile K blocks with exact fp32 partial reloads
+                # (mm_swiglu's program, KSPLIT): bit-identical to the 2-D multicast linear below, with half the
+                # partial spills.
+                out = mm_swiglu(
+                    self.device,
+                    h,
+                    self.w_down,
+                    compute_fidelity=ttnn.MathFidelity.HiFi2,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                    fuse_swiglu=False,
+                    transpose=False,
+                    blocks=(4, n_core, _DOWN_K_BLOCK),
+                )
+            else:
+                # ttnn.linear's 2-D multicast over the full grid with 8-tile K blocks (24 K steps).
+                out = ttnn.linear(
+                    h,
+                    self.w_down,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                    compute_kernel_config=self.compute_cfg,
+                    program_config=ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+                        compute_with_storage_grid_size=(grid.x, grid.y),
+                        in0_block_w=8,
+                        out_subblock_h=1,
+                        out_subblock_w=3,
+                        per_core_M=-(-m_t // grid.y),
+                        per_core_N=n_core,
+                        transpose_mcast=False,
+                        fused_activation=None,
+                    ),
+                )
         else:
             one_row = x.shape[0] == x.shape[1] == 1 and x.padded_shape[-2] == 32  # decode: one tile row
             cfg_up, cfg_down = (self.cfg_up, self.cfg_down) if one_row else (None, None)

@@ -208,6 +208,7 @@ void kernel_main() {
                     // DIRECT_OUT: the in0 block moves down the row's forwarding chain in IN0_CHUNK_TILES-tile chunks
                     // (row-major within the block), each forwarded as soon as it lands and counted on the next
                     // core's receiver semaphore, instead of store-and-forward of the whole block per hop.
+                    const uint32_t k_block = k_forward ? k_block_iter : (K_num_blocks - 1) - k_block_iter;
                     constexpr uint32_t chunk_tiles = IN0_CHUNK_TILES;
                     constexpr uint32_t chunks_per_row = K_block_tiles / chunk_tiles;
                     const uint32_t n_chunks = current_M_block_tiles * chunks_per_row;
@@ -231,7 +232,7 @@ void kernel_main() {
                                         in0_reader,
                                         CoreLocalMem<uint32_t>(chunk_addr + t * in0_tile_size),
                                         in0_tile_size,
-                                        {.page_id = m * in0_shape.logical_d1 + k0 + t},
+                                        {.page_id = m * in0_shape.logical_d1 + k_block * K_block_tiles + k0 + t},
                                         {});
                                 }
                                 noc.async_read_barrier();
