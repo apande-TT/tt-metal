@@ -104,8 +104,19 @@ class TtQwenJointAttention:
             b = lin.bias.detach().to(torch.float32) if lin.bias is not None else torch.zeros(w.shape[0])
             return _sharded(w.t(), device, dim=-2), _replicated(b.reshape(1, -1), device)
 
-        self.img_out = w_row(m.to_out[0])
-        self.txt_out = w_row(m.to_add_out)
+        # precise TP: the out-projections COLUMN-parallel instead (the heads gathered, this chip's output features
+        # from the whole input, then gathered): an exact row-parallel product writes a full-width float32 partial
+        # per lane product and gathers every chip's partial for the exact sum
+        self.out_cols = _precise.ENABLED and self.tp > 1
+
+        def w_col_out(lin):  # column-sharded weight; the bias whole and replicated, added after the gather
+            w = lin.weight.detach().to(torch.float32)
+            b = lin.bias.detach().to(torch.float32) if lin.bias is not None else torch.zeros(w.shape[0])
+            return _sharded(w.t(), device, dim=-1), _replicated(b.reshape(1, -1), device)
+
+        w_out = w_col_out if self.out_cols else w_row
+        self.img_out = w_out(m.to_out[0])
+        self.txt_out = w_out(m.to_add_out)
 
         scale = 1.0 / (hd**0.5)
 
@@ -224,8 +235,11 @@ class TtQwenJointAttention:
             )  # [B, Hl, Sq, D]
         return o
 
-    def _out(self, x, wb):  # row-parallel + all_reduce, bias once
+    def _out(self, x, wb):  # row-parallel + all_reduce, bias once (or column-parallel, see __init__)
         w, b = wb
+        if self.out_cols:
+            y = _precise.linear(_ccl.all_gather(x, self.device, dim=-1), w)
+            return ttnn.add(_ccl.all_gather(y, self.device, dim=-1), b)
         if _precise.ENABLED:
             y = _precise.linear(x, w)
         else:
