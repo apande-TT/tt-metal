@@ -116,6 +116,7 @@ EXACT_ROW_CHUNK = 4096
 
 
 def _row_chunked(fn, x):
+    """fn(x) over row chunks of x, concatenated (fn may return a list of outputs: each concatenated)."""
     shape = list(x.shape)
     rows = 1
     for s in shape[:-1]:
@@ -134,6 +135,12 @@ def _row_chunked(fn, x):
         hi = list(shape)
         lo[ax], hi[ax] = s0, min(shape[ax], s0 + step)
         outs.append(fn(ttnn.slice(x, lo, hi)))
+    if isinstance(outs[0], (list, tuple)):
+        ys = [ttnn.concat([o[i] for o in outs], dim=ax) for i in range(len(outs[0]))]
+        for o in outs:
+            for t in o:
+                ttnn.deallocate(t)
+        return ys
     y = ttnn.concat(outs, dim=ax)
     for o in outs:
         ttnn.deallocate(o)
@@ -163,6 +170,21 @@ def linear(x, w, bias=None, compute_kernel_config=None):
     if bias is not None:
         y = ttnn.add(y, bias if bias.dtype == ttnn.float32 else ttnn.typecast(bias, ttnn.float32))
     return y
+
+
+def linears(x, ws, biases):
+    """[linear(x, w, bias=b) for w, b in zip(ws, biases)] (the same values), the exact path's input-side work (limbs,
+    norms, lanes) done once for all the weights (the text encoder's split_linears)."""
+    if EXACT_LINEAR is not True:
+        return [linear(x, w, bias=b) for w, b in zip(ws, biases)]
+    from models.demos.qwen_image_edit_text_encoder._stubs.attention import split_linears
+
+    x = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
+    ys = _row_chunked(lambda c: split_linears(c, ws, exact=True, limbs=2), x)
+    return [
+        y if b is None else ttnn.add(y, b if b.dtype == ttnn.float32 else ttnn.typecast(b, ttnn.float32))
+        for y, b in zip(ys, biases)
+    ]
 
 
 def _lane_of(k, pattern):

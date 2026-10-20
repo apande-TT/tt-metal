@@ -149,6 +149,12 @@ class TtQwenJointAttention:
             return _precise.linear(x, w, bias=b)
         return ttnn.linear(x, w, bias=b, dtype=dtype, compute_kernel_config=self.hifi)
 
+    def _projs(self, x, wbs, dtypes):
+        """[self._proj(x, wb, dt) ...]: in precise mode the exact path's input-side work done once for all of them."""
+        if _precise.ENABLED:
+            return _precise.linears(x, [w for w, _ in wbs], [b for _, b in wbs])
+        return [self._proj(x, wb, dt) for wb, dt in zip(wbs, dtypes)]
+
     def _heads(self, x):  # [B, S, Hl*D] -> [B, Hl, S, D]
         B, S = x.shape[0], x.shape[1]
         x = ttnn.reshape(x, (B, S, self.local_heads, self.head_dim))
@@ -264,12 +270,15 @@ class TtQwenJointAttention:
         img_f, txt_f = (None, None) if image_rotary_emb is None else image_rotary_emb
         img_f, txt_f = _as_tt(img_f, d), _as_tt(txt_f, d)
 
-        qi = self._rope(self._rms(self._heads(self._proj(hs, self.img_q)), self.nw_img_q), img_f)
-        ki = self._rope(self._rms(self._heads(self._proj(hs, self.img_k)), self.nw_img_k), img_f)
-        vi = self._heads(self._proj(hs, self.img_v, vdt))
-        qt = self._rope(self._rms(self._heads(self._proj(ehs, self.txt_q)), self.nw_txt_q), txt_f)
-        kt = self._rope(self._rms(self._heads(self._proj(ehs, self.txt_k)), self.nw_txt_k), txt_f)
-        vt = self._heads(self._proj(ehs, self.txt_v, vdt))
+        f32 = ttnn.float32
+        pqi, pki, pvi = self._projs(hs, (self.img_q, self.img_k, self.img_v), (f32, f32, vdt))
+        qi = self._rope(self._rms(self._heads(pqi), self.nw_img_q), img_f)
+        ki = self._rope(self._rms(self._heads(pki), self.nw_img_k), img_f)
+        vi = self._heads(pvi)
+        pqt, pkt, pvt = self._projs(ehs, (self.txt_q, self.txt_k, self.txt_v), (f32, f32, vdt))
+        qt = self._rope(self._rms(self._heads(pqt), self.nw_txt_q), txt_f)
+        kt = self._rope(self._rms(self._heads(pkt), self.nw_txt_k), txt_f)
+        vt = self._heads(pvt)
 
         # Joint sequence order is [text, image].
         k = ttnn.concat([kt, ki], dim=2)
