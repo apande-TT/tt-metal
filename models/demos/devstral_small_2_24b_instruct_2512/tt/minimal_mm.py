@@ -20,6 +20,8 @@ _KDIR = Path(__file__).resolve().parent / "kernels"
 _COMPUTE = str(_KDIR / "mm_compute.cpp")
 _DM_DIR = "ttnn/cpp/ttnn/operations/experimental/minimal_matmul/device/kernels/"
 _DM_IN0 = _DM_DIR + "dm_in0_sender.cpp"
+# the stock in0 reader with its block read remapped to a heads-layout in0 (matmul(..., in0_heads=))
+_DM_IN0_HEADS = str(_KDIR / "mm_in0_heads.cpp")
 _DM_IN1 = _DM_DIR + "dm_in1_sender_out.cpp"
 
 _TILE_BYTES = {ttnn.bfloat16: 2048, ttnn.float32: 4096, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
@@ -75,13 +77,31 @@ def supported(x, w, compute_kernel_config=None, fuse_swiglu=False) -> bool:
     return xs[-1] == ws[-2] and all(d == 1 for d in ws[:-2])
 
 
-def supports_residual(x, w, residual, dtype) -> bool:
+def _in0_view(x, in0_heads):
+    """x's padded shape as the matmul sees it: (B, 1, S, NH * HD) for a heads-layout (B, NH, S, HD) in0."""
+    xs = [int(d) for d in x.padded_shape]
+    if in0_heads is None:
+        return xs
+    b, nh, sq, hd = xs
+    return [b, 1, sq, nh * hd]
+
+
+def supports_heads(x, w) -> bool:
+    """Whether matmul(x, w, in0_heads=...) can read x, a tiled interleaved (B, NH, S, HD) attention output, as its
+    head concat (B, 1, S, NH * HD)."""
+    if x.layout != ttnn.TILE_LAYOUT or x.is_sharded() or len(x.padded_shape) != 4:
+        return False
+    b, nh, sq, hd = (int(d) for d in x.padded_shape)
+    return sq % ttnn.TILE_SIZE == 0 and hd % ttnn.TILE_SIZE == 0 and nh * hd == int(w.padded_shape[-2])
+
+
+def supports_residual(x, w, residual, dtype, in0_heads=None) -> bool:
     """Whether matmul(..., residual=residual) can fold the fp32 residual add in (a fp32 output of the residual's shape)."""
     if dtype != ttnn.float32 or residual is None or residual.dtype != ttnn.float32:
         return False
     if residual.layout != ttnn.TILE_LAYOUT or residual.is_sharded():
         return False
-    out = [int(d) for d in x.padded_shape][:-1] + [int(w.padded_shape[-1])]
+    out = _in0_view(x, in0_heads)[:-1] + [int(w.padded_shape[-1])]
     return [int(d) for d in residual.padded_shape] == out
 
 
@@ -94,10 +114,14 @@ def matmul(
     dtype=ttnn.bfloat16,
     fuse_swiglu=False,
     residual=None,
+    in0_heads=None,
 ):
     """residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
     residual_add_block: the stock data-movement kernels' FUSE_TERNARY read brings the residual block in on the RISC that
-    does not write the output), bit-identical to ttnn.add(residual, x @ w) on the fp32 output."""
+    does not write the output), bit-identical to ttnn.add(residual, x @ w) on the fp32 output.
+    in0_heads (True, supports_heads): x is an attention output (B, NH, S, HD) multiplied as its head concat
+    (B, 1, S, NH * HD) -- the in0 reader (kernels/mm_in0_heads.cpp) fetches each tile where nlp_concat_heads would
+    have copied it from, so the concat program is not needed; same tiles, same matmul."""
     assert residual is None or not fuse_swiglu
     device = x.device()
     grid = config.compute_with_storage_grid_size
@@ -106,7 +130,7 @@ def matmul(
     fp32_acc = bool(compute_kernel_config.fp32_dest_acc_en)
     approx = bool(compute_kernel_config.math_approx_mode)
 
-    xs = [int(d) for d in x.padded_shape]
+    xs = _in0_view(x, in0_heads)
     K = xs[-1]
     M = 1
     for d in xs[:-1]:
@@ -244,6 +268,11 @@ def matmul(
             rt_c.append((core, [m0, m1, n0, n1]))
 
     defines = [("FUSE_SWIGLU", "1")] if fuse_swiglu else []
+    in0_src, in0_defines = _DM_IN0, []
+    if in0_heads is not None:
+        nh, sq, hd = [int(d) for d in x.padded_shape][1:]
+        in0_src = _DM_IN0_HEADS
+        in0_defines = [("IN0_NH", str(nh)), ("IN0_ST", str(sq // T)), ("IN0_HDT", str(hd // T))]
     if residual is not None:
         defines += [("FUSE_TERNARY", "1")]
     cdefines = [d for d in defines if d[0] != "FUSE_TERNARY"] + [("EPI_TILES", str(EPI_TILES if N_block % EPI_TILES == 0 else 1))]
@@ -272,8 +301,8 @@ def matmul(
         ccfg.unpack_to_dest_mode = modes
     c_ct = [K_blocks, M_block, K_block, N_block, M_blocks_per_core, N_blocks_per_core, sub_h, sub_w]
     kernels = [
-        kern(_DM_IN0, in0_senders, in0_ct(1), rt_in0_s, dm(in0_risc, in0_noc), defines),
-        kern(_DM_IN0, in0_receivers, in0_ct(0), rt_in0_r, dm(in0_risc, in0_noc), defines),
+        kern(in0_src, in0_senders, in0_ct(1), rt_in0_s, dm(in0_risc, in0_noc), defines + in0_defines),
+        kern(in0_src, in0_receivers, in0_ct(0), rt_in0_r, dm(in0_risc, in0_noc), defines + in0_defines),
         kern(_DM_IN1, in1_senders, in1_ct(1), rt_in1_s, dm(in1_risc, in1_noc), defines),
         kern(_DM_IN1, in1_receivers, in1_ct(0), rt_in1_r, dm(in1_risc, in1_noc), defines),
         kern(_COMPUTE, core_grid, c_ct, rt_c, ccfg, cdefines),

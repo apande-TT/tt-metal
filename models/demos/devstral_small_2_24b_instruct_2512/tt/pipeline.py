@@ -226,6 +226,9 @@ PLANNED_TP = 4
 #                     down; tt/minimal_mm.py residual=: the residual block read by the stock readers' FUSE_TERNARY
 #                     path, added by the same SFPU add ttnn.add runs, bit-identical): o_proj + add 79.8 -> 67.9 us,
 #                     down + add 135.3 -> ~123 us a layer; trace encode 24.62 -> 23.72 ms.
+#                     o_proj reads SDPA's head outputs as their concat itself (minimal_mm in0_heads=, kernels/
+#                     mm_in0_heads.cpp: the stock in0 reader with its tile index remapped): no nlp_concat_heads
+#                     program (11.4 us a layer), bit-identical.
 #   ministral3_m_l_p many-row fused gate/up (text prefill + vision): tt/minimal_mm.py, minimal_matmul's own program
 #                     with silu * up as ONE SFPU pass (kernels/mm_compute.cpp), bit-identical.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
