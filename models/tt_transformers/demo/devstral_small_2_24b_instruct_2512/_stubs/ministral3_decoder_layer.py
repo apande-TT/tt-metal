@@ -231,12 +231,23 @@ class TtMinistral3DecoderLayer:
         if total:  # bf16 parts of each row's whole-hidden sum, added back in fp32 (exact); no gather needed
             sq = ttnn.sum(ttnn.typecast(sq, ttnn.float32), dim=-1, keepdim=True, compute_kernel_config=cfg)
         else:
+            # tt/add_stats's stats carry exact zeros in columns 1..31 (add_stats.CLEAN_STATS): masking them is the
+            # identity, so only rms_norm_pre_all_gather's stats are masked
+            clean = sq is not None and self.FUSED_ADD_STATS and self._clean_stats()
             if sq is None:  # sum(x^2) in column 0
                 sq = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=cfg, dtype=ttnn.float32)
-            sq = ttnn.multiply(ttnn.all_gather(sq, dim=3, **ccl), self._stats_mask)
+            sq = ttnn.all_gather(sq, dim=3, **ccl)
+            if not clean:
+                sq = ttnn.multiply(sq, self._stats_mask)
             sq = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg)
         r = ttnn.rsqrt(ttnn.add(ttnn.multiply(sq, 1.0 / self.hidden), norm._impl.eps))
         return ttnn.all_gather(ttnn.multiply(x, r, dtype=ttnn.bfloat16), dim=3, **ccl)
+
+    @staticmethod
+    def _clean_stats():
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import add_stats
+
+        return getattr(add_stats, "CLEAN_STATS", False)
 
     def _residual_add_stats(self, x, delta):
         """(x + delta, the sum-of-squares stats of the sum or None) for the prefill residual (see FUSED_ADD_STATS)."""
