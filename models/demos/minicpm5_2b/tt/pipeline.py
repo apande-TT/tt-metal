@@ -63,6 +63,9 @@ _NEG = -1e9
 # Decode: the fused attention picks its key-mask tiles from a fixed 32-tile table (mask_table) instead of the
 # [B, 1, 32, C] mask built every step (three ops).
 _MASK_TABLE = True
+_POS_STEP_KERNEL_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_stubs", "kernels", "pos_step"
+)
 _NOISE_SEG_W = 1280  # 40 tiles: under gather's 60-tile single-row threshold; 130560 / 1280 = 102 segments
 # Candidate noise read straight from the segmented buffer by one data-movement kernel (else: per-segment gather).
 _USE_NOISE_KERNEL = True
@@ -554,9 +557,38 @@ class MiniCPM5Pipeline:
                 self.final_norm(h, memory_config=l1), memory_config=l1, segments=self._logit_segments()
             )
         self._emit(logits)
-        ttnn.add(self.pos_buf, 1.0, output_tensor=self.pos_buf)
-        ttnn.add(self.pos_i32, 1, output_tensor=self.pos_i32)
+        self._pos_step()
         return logits
+
+    def _pos_step(self):
+        """pos_buf += 1 and pos_i32 += 1 in place as one 1-core data-movement generic_op (kernels/pos_step)."""
+        core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+        tile = 4 * 32 * 32
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_POS_STEP_KERNEL_DIR, "pos_step.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=core,
+            compile_time_args=[0, 1, tile]
+            + list(ttnn.TensorAccessorArgs(self.pos_buf).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(self.pos_i32).get_compile_time_args()),
+            runtime_args=ttnn.RuntimeArgs(),
+            common_runtime_args=[self.pos_buf.buffer_address(), self.pos_i32.buffer_address()],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=tile,
+                core_ranges=core,
+                format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.float32, tile)],
+            ),
+            ttnn.CBDescriptor(
+                total_size=tile,
+                core_ranges=core,
+                format_descriptors=[ttnn.CBFormatDescriptor(1, ttnn.int32, tile)],
+            ),
+        ]
+        program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=cbs)
+        ttnn.generic_op([self.pos_buf, self.pos_i32], program)
 
     def _logit_segments(self):
         ok = self.vocab % (_LOGIT_SEGMENTS * _TILE) == 0 and self.temperature == 1.0 and self.top_k <= _SEG_K
