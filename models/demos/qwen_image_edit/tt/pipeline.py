@@ -266,8 +266,9 @@ class TtQwenImageEditPipeline:
         dt = ttnn.reshape(ttnn.slice(st.sched, [0, 1], [1, 2]), (1, 1, 1))
         x_in = ttnn.concat([st.lat, st.image_latents], dim=1)
         # (the exact all-reduces' gathered partials summed in one fused pass, bit-identical to the slice + add chain;
-        # and its exact linears -- the text encoder's split_linear -- with the bit-identical fused hooks)
-        with self._hook(_dit_ccl, "SUM_PARTS", self.sum_parts), self._fused_tail(exact_only=True):
+        # and its exact linears -- the text encoder's split_linear -- with the encoders' fused hooks: the trailing
+        # limbs' products at HiFi2 and the limb split in one pass too)
+        with self._hook(_dit_ccl, "SUM_PARTS", self.sum_parts), self._fused_tail():
             v = self.transformer(x_in, t, st.prompt, st.rotary)
         v = ttnn.slice(v, [0, 0, 0], [B, S, C])  # noise_pred[:, : latents.size(1)]
         ttnn.copy(ttnn.add(st.lat, ttnn.multiply(v, dt)), st.lat)
