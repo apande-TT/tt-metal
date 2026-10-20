@@ -273,6 +273,8 @@ PLANNED_TP = 4
 #   decode down / o_proj streams spread over 104 cores (StreamDownDecode.SPREAD): per bank 7 cores with two columns
 #                     and 6 with one, whose pushes alternate between its two RISCs (bf8 down 110.5 -> 101.4 us, o_proj
 #                     15.3 -> 13.6 us; trace decode 14.16 -> 13.92 ms, bit-identical).
+#   lm_head stream spread over 104 cores (LMHeadDecode.SPREAD): one column a copy a pass, 5 or 4 passes a core
+#                     (419.7 -> 375.7 us, ~474 GB/s; trace decode 13.92 -> 13.88 ms, bit-identical).
 
 
 def kv_capacity_for(tp):
