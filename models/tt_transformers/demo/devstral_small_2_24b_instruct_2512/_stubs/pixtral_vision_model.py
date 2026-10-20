@@ -46,6 +46,8 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtr
 
 
 class TtPixtralVisionModel:
+    # bf16 vision features (the transformer's output) stay in L1 up to this many bytes a core; 0: DRAM
+    FEATURES_L1_BYTES = 48 * 1024
     # Every layer's head split and q / k RoPE as one C++ program (pixtral_attention.CPP_HEADS_ROPE), reading a signed
     # sin table.
     CPP_HEADS_ROPE = True
@@ -208,12 +210,18 @@ class TtPixtralVisionModel:
             cos, sin = ttnn.pad(cos, padding=pad, value=0.0), ttnn.pad(sin, padding=pad, value=0.0)
         mask = None if (batched and sp == s) else self._mask(s, sp, grids, batched)
 
-        # (the layers keep their fp32 residual stream in L1; the bf16 features leave it for DRAM)
+        # (the layers keep their fp32 residual stream in L1; the bf16 features stay in L1 while they take at most
+        # FEATURES_L1_BYTES a core -- 8 x 256 x 1024: 38 KB -- for the projector's norm and unfold, else DRAM)
+        h = self.transformer(x, attention_mask=mask, position_embeddings=(cos, sin))
+        grid = self.device.compute_with_storage_grid_size()
+        f_bytes = 2 * int(h.shape[0]) * int(h.shape[-2]) * int(h.shape[-1]) // (grid.x * grid.y)
         out = ttnn.typecast(
-            self.transformer(x, attention_mask=mask, position_embeddings=(cos, sin)),
+            h,
             ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=ttnn.L1_MEMORY_CONFIG if 0 < f_bytes <= self.FEATURES_L1_BYTES else ttnn.DRAM_MEMORY_CONFIG,
         )
+        if h.memory_config().buffer_type == ttnn.BufferType.L1:
+            ttnn.deallocate(h)
         if sp != s:
             out = ttnn.slice(out, (0, 0, 0, 0), (out.shape[0], 1, s, out.shape[-1]))
         return ttnn.reshape(out, (out.shape[0], s, out.shape[-1]))

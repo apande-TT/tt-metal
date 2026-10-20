@@ -38,6 +38,9 @@ def _mesh_size(device):
 
 
 class TtMistral3MultiModalProjector:
+    # linear_1 / gelu outputs in L1 up to this many bytes a core; 0: DRAM
+    HIDDEN_L1_BYTES = 64 * 1024
+
     def __init__(self, device, torch_module) -> None:
         self.device = device
         self.tp, repl = vision_tp(device)
@@ -113,20 +116,32 @@ class TtMistral3MultiModalProjector:
 
         # linear_1 (+ its bias) on minimal_matmul over the full grid too (ttnn.linear ran the 32 x 64-row batch on 40
         # cores: 571 us), with blocks of each core's whole M x N range (6 x 4 tiles on 11 x 10 cores).
+        # linear_1's output and its gelu stay in L1 (each freed by its one reader) while they take at most
+        # HIDDEN_L1_BYTES a core (8 x 64 x 5120 bf16: 48 KB)
+        grid = self.device.compute_with_storage_grid_size()
+        rows = 1
+        for d in tuple(int(v) for v in x.shape)[:-1]:
+            rows *= d
+        h_l1 = 0 < 2 * rows * int(self.w1.shape[-1]) // (grid.x * grid.y) <= self.HIDDEN_L1_BYTES
+        h_mem = ttnn.L1_MEMORY_CONFIG if h_l1 else ttnn.DRAM_MEMORY_CONFIG
         hdn = ttnn.experimental.minimal_matmul(
             x,
             self.w1,
             bias_tensor=self.b1,
             config=self._range_cfg(x, self.w1),
             compute_kernel_config=self.compute_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=h_mem,
         )
-        hdn = ttnn.gelu(hdn, fast_and_approximate_mode=False)
+        pre, hdn = hdn, ttnn.gelu(hdn, fast_and_approximate_mode=False, memory_config=h_mem)
+        if h_l1:
+            ttnn.deallocate(pre)
         # minimal_matmul folds the images into its rows over the full grid (ttnn.linear ran the side-by-side batch
         # of 32 x 64 rows, K 1280, N 5120 as a batched matmul on 80 cores: 1.14 ms).
         out = ttnn.experimental.minimal_matmul(
             hdn, self.w2, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
         )
+        if h_l1:
+            ttnn.deallocate(hdn)
         if self.tp > 1:
             out = ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
         if self.b2 is not None:

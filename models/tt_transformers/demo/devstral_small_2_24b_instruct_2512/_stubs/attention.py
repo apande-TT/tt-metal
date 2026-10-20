@@ -93,10 +93,12 @@ class TtAttention:
         # (row norms ~1e4) around layer 13, and whether a patch row crosses that onset depends on low bits a
         # bf16 residual drops: a bf16 stream (TT's or the CPU reference's alike) moves rows away from the
         # fp32 result there. Norm outputs go to the matmuls in MATMUL_INPUT_DTYPE; the sub-blocks return fp32.
-        if x.dtype != ttnn.float32:
-            x = ttnn.typecast(x, ttnn.float32)
         grid = self.device.compute_with_storage_grid_size()
         n_bytes = 4 * int(x.shape[0]) * int(x.shape[-2]) * int(x.shape[-1]) // (grid.x * grid.y)
+        if x.dtype != ttnn.float32:  # the stack's bf16 input joins the (L1) fp32 residual stream
+            x = ttnn.typecast(
+                x, ttnn.float32, memory_config=ttnn.L1_MEMORY_CONFIG if 0 < n_bytes <= self.RESIDUAL_L1_BYTES else None
+            )
         l1 = self.FOLD_NORM_GAMMA and self.MATMUL_INPUT_DTYPE == ttnn.float32 and n_bytes <= self.FFN_NORM_L1_BYTES
         if l1 and self.QKV_INPUT_DTYPE not in (None, ttnn.float32):
             n32 = self.attention_norm(x, memory_config=ttnn.L1_MEMORY_CONFIG)
