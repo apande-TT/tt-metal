@@ -190,7 +190,7 @@ class TtAttention:
         self.dmm_qkv = self.dmm_o = self.dmm_o_res = None
         if _USE_DRAM_MM:
             fid = ttnn.MathFidelity.HiFi4  # as self.compute_cfg
-            self.dmm_qkv = DramMatmul(  # dtype experiment: bf8_b decode weights
+            self.dmm_qkv = DramMatmul(  # bf8_b weights: ~half the bytes per bank stream (passes the generate gate)
                 device, torch.cat(grouped + [wv]).t().contiguous(), fid, dtype=ttnn.bfloat8_b, **_QKV_DMM
             )
             wo_t = torch_module.o_proj.weight.detach().to(torch.float32).t().contiguous()
