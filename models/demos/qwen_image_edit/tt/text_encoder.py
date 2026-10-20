@@ -137,6 +137,8 @@ class TtQwenTextEncoder:
         _te_attention.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG)
         # the two-limb linears it declines (LM MLP down: K = 4736) take their lower-limb product at HiFi3
         _te_attention.LO_FIDELITY = ttnn.MathFidelity.HiFi3
+        # and their two limb products of a short batch (the negatives' tail: 14.7 MB each) written to L1 for the add
+        _te_attention.LIMB_PRODUCTS_L1_BYTES = 16 * 1024 * 1024
         # and at LoFi on the LM stack slots LM_DOWN_LOFI_SLOTS (slot j = layers j and n/2 + j on the two row stages):
         # LoFi on every layer fails PCC, so only part of the stack takes it
         for j, lyr in enumerate(self.text_model.layers):
