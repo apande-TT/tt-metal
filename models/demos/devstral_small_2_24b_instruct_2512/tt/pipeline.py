@@ -282,9 +282,9 @@ PLANNED_TP = 4
 #                     NOC (one RISC's 512 KB multicast landed x ~40-60 us in). Trace decode 13.88 -> 13.61 ms.
 #   decode gate / up sender multicasts half of the gathered normed row on each NOC (NormGateUpDecode.DUAL_NOC_SENDER):
 #                     bf8 gate / up 191.5 -> ~184 us, the bf4 layers' matmul starts earlier; trace 13.61 -> 13.37 ms.
-#   decode down fold: a two-column core's second column split into a leading run of pushes for RISCV_0 (18 of 32)
-#                     and a trailing one for RISCV_1, whose NOC 1 reads fall behind once only those cores stream
-#                     (StreamDownDecode.SPLIT_B_SHARE): down 119.7 -> 117.3 us; trace 13.37 -> 13.22 ms.
+#   decode down fold: a two-column core's second column split into a leading run of pushes for RISCV_0 (18, then 20
+#                     of 32) and a trailing one for RISCV_1, whose NOC 1 reads fall behind once only those cores stream
+#                     (StreamDownDecode.SPLIT_B_SHARE): down 119.7 -> 116.8 us; trace 13.37 -> 13.22 -> 13.18 ms.
 
 
 def kv_capacity_for(tp):

@@ -43,7 +43,7 @@ class StreamDownDecode:
     # multicasting the whole 512 KB row of the down landed it ~40 us (row 9: ~60 us) into the program
     DUAL_NOC = True
     # ar_call: RISCV_0's share of a two-column core's second column, in pushes of its Kt / RB (the rest is RISCV_1's)
-    SPLIT_B_SHARE = 18 / 32
+    SPLIT_B_SHARE = 20 / 32
 
     @classmethod
     def rb_for(cls, dtype) -> int:
