@@ -60,7 +60,7 @@ class FusedGateUpDecode:
     # tiles), many in flight per CB, stream faster than few large ones (bf8 gate / up, measured: 35 KB pushes 225 us,
     # 17 KB 220 us, 9 KB 218 us, 4.4 KB 216 us; the bf4 layers gained on the decode trace too)
     RB_BY_DTYPE = {ttnn.bfloat8_b: 1, ttnn.bfloat4_b: 2}
-    CB_BYTES = 112 * 1024  # per weight CB (DEPTH = pushes that fit)
+    CB_BYTES = 256 * 1024  # per weight CB (DEPTH = pushes that fit; 112 KB: 218.5 us, 256 KB: 214.7 us at bf8)
 
     @classmethod
     def rb_for(cls, dtype) -> int:

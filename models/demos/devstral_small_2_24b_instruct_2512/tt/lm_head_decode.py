@@ -27,7 +27,7 @@ class LMHeadDecode:
     NC = 4  # columns a stream a pass: 2 * NC tiles fill the full-sync fp32 DEST
     N_CORES = 64  # compute cores (a multiple of the DRAM banks)
     RB_BY_DTYPE = {ttnn.bfloat8_b: 1, ttnn.bfloat4_b: 2}  # K rows a push (~4.4 KB pushes, as the decode gate / up)
-    CB_BYTES = 112 * 1024  # per weight CB
+    CB_BYTES = 256 * 1024  # per weight CB
 
     @classmethod
     def supports(cls, device, k, n, dtype) -> bool:
