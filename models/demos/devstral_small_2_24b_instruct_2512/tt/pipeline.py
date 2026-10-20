@@ -217,7 +217,11 @@ PLANNED_TP = 4
 #                  to bf16 in L1 (full 8-tile K blocks). The down projection runs at HiFi2.
 #   attention (vision layer): each RMSNorm gamma is folded into the q/k/v and gate/up weights that read it (no separate
 #                     fp32 gamma multiply); the QKV and the gate/up read their norm outputs from L1 after an L1 cast
-#                     to bf16 (the gate/up's product fits in L1 too).
+#                     to bf16 (the gate/up's product fits in L1 too). The fp32 residual stream stays in L1 between
+#                     the layers (o_proj / down outputs and both residual adds in L1, consumed tensors freed):
+#                     adds 58 -> ~20 us, norms 36 -> 24 us, o_proj 73 -> 61 us, down 125 -> 117 us a layer.
+#   ministral3_m_l_p many-row fused gate/up (text prefill + vision): tt/minimal_mm.py, minimal_matmul's own program
+#                     with silu * up as ONE SFPU pass (kernels/mm_compute.cpp), bit-identical.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
 #   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py),
