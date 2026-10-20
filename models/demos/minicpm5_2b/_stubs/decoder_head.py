@@ -28,6 +28,7 @@ _CB_IN0, _CB_IN1, _CB_OUT = 0, 1, 16
 # Decode LM head on the DRAM-bank-local generic_op (_stubs/dram_mm.py), same arithmetic as the kernel below.
 _USE_DRAM_MM = True
 _DRAM_MM_WORKERS_PER_BANK = 6  # HiFi4 bf8: compute-bound on fewer cores
+_DRAM_MM_BLOCK_TILES = 8  # bf8 weight read in 8-tile blocks (one read each)
 # The final RMSNorm as a prologue of the decode LM head program (bind_prenorm).
 _USE_NORM_PROLOGUE = True
 
@@ -74,6 +75,7 @@ class DecoderHead:
                 ttnn.MathFidelity.HiFi2,
                 dtype=ttnn.bfloat8_b,
                 workers_per_bank=_DRAM_MM_WORKERS_PER_BANK,
+                block_tiles=_DRAM_MM_BLOCK_TILES,
             )
 
     def _build_kernel(self):
@@ -217,6 +219,7 @@ class DecoderHead:
                 ttnn.MathFidelity.HiFi2,
                 dtype=ttnn.bfloat8_b,
                 workers_per_bank=_DRAM_MM_WORKERS_PER_BANK,
+                block_tiles=_DRAM_MM_BLOCK_TILES,
                 prebuilt=self.dmm,
                 norm_prologue=norm,
             )
