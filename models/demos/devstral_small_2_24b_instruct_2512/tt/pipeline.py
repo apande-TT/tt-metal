@@ -270,6 +270,9 @@ PLANNED_TP = 4
 #                     norm is done and the stream cores 3 or 2 (was 4), every bank still serving 32 columns: the bf4
 #                     layers' post-prologue matmul shrinks by a quarter and the extra readers lift the bf8 stream (bf8
 #                     gate / up 214.6 -> 191.5 us; trace decode 14.67 -> 14.16 ms, bit-identical).
+#   decode down / o_proj streams spread over 104 cores (StreamDownDecode.SPREAD): per bank 7 cores with two columns
+#                     and 6 with one, whose pushes alternate between its two RISCs (bf8 down 110.5 -> 101.4 us, o_proj
+#                     15.3 -> 13.6 us; trace decode 14.16 -> 13.92 ms, bit-identical).
 
 
 def kv_capacity_for(tp):

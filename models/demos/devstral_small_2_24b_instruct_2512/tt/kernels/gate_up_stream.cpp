@@ -23,6 +23,11 @@
 #ifndef GU_RTA
 #define GU_RTA 0
 #endif
+// GU_PSTEP: this RISC streams every GU_PSTEP-th push of its column(s) -- the first at runtime arg 5's page, each next
+// GU_PSTEP pushes on (tt/down_decode.py's one-column cores split a column's pushes over both RISCs)
+#ifndef GU_PSTEP
+#define GU_PSTEP 1
+#endif
 
 void kernel_main() {
     constexpr uint32_t Kt = get_compile_time_arg_val(GU_CTA + 0);  // K tiles
@@ -39,7 +44,7 @@ void kernel_main() {
     constexpr uint32_t OUT_NC = get_compile_time_arg_val(GU_CTA + 11);  // output tiles the OWNER writes
     constexpr auto w_args = TensorAccessorArgs<GU_CTA + 12>();
     constexpr auto o_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
-    static_assert(Kt % RB == 0, "gate_up blocking");
+    static_assert(Kt % (RB * GU_PSTEP) == 0, "gate_up blocking");
 
     const auto w = TensorAccessor(w_args, get_arg_val<uint32_t>(GU_RTA + 0));
     const uint32_t n0 = get_arg_val<uint32_t>(GU_RTA + 1);  // this core's first output column
@@ -57,7 +62,7 @@ void kernel_main() {
     }
 
     uint32_t push = 0;
-    for (uint32_t k0 = 0; k0 < Kt; k0 += RB, ++push) {
+    for (uint32_t k0 = 0; k0 < Kt / GU_PSTEP; k0 += RB, ++push) {
         if (!have_x) {
             // compute consumes no weight before x: once cb_w is full, x must be handed over before reserving more
             invalidate_l1_cache();
@@ -69,7 +74,7 @@ void kernel_main() {
         }
         cb_reserve_back(cb_w, T);
         noc_async_read(w.get_noc_addr(page), get_write_ptr(cb_w), T * w_tile);
-        page += T * NB;
+        page += T * NB * GU_PSTEP;
         noc_async_read_barrier();
         cb_push_back(cb_w, T);
     }

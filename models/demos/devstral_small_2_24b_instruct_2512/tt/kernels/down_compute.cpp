@@ -25,6 +25,30 @@ void kernel_main() {
     cb_wait_front(cb_x, Kt);
 
     tile_regs_acquire();
+#ifdef DOWN_ONE_COL
+    // one column, its pushes alternating between the two RISCs' CBs (push 2q in cb_w0, 2q + 1 in cb_w1): still one
+    // DEST tile accumulated in K order
+    static_assert(Kt % (2 * RB) == 0, "down blocking");
+    for (uint32_t k0 = 0; k0 < Kt; k0 += 2 * RB) {
+        cb_wait_front(cb_w0, RB);
+        for (uint32_t i = 0; i < RB; ++i) {
+            matmul_block(cb_x, cb_w0, k0 + i, i, 0, 0, 1, 1, RB);
+        }
+        cb_pop_front(cb_w0, RB);
+        cb_wait_front(cb_w1, RB);
+        for (uint32_t i = 0; i < RB; ++i) {
+            matmul_block(cb_x, cb_w1, k0 + RB + i, i, 0, 0, 1, 1, RB);
+        }
+        cb_pop_front(cb_w1, RB);
+    }
+    tile_regs_commit();
+
+    cb_reserve_back(cb_out, 1);
+    tile_regs_wait();
+    pack_tile(0, cb_out);
+    tile_regs_release();
+    cb_push_back(cb_out, 1);
+#else
     for (uint32_t k0 = 0; k0 < Kt; k0 += RB) {
         cb_wait_front(cb_w0, RB);
         for (uint32_t i = 0; i < RB; ++i) {
@@ -45,5 +69,6 @@ void kernel_main() {
     pack_tile(1, cb_out);
     tile_regs_release();
     cb_push_back(cb_out, 2);
+#endif
     cb_pop_front(cb_x, Kt);
 }

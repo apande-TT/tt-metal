@@ -14,7 +14,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import ttnn
-from models.demos.devstral_small_2_24b_instruct_2512.tt.gate_up_decode import _TILE_BYTES, bank_major, bank_major_page0
+from models.demos.devstral_small_2_24b_instruct_2512.tt.gate_up_decode import (
+    _TILE_BYTES,
+    bank_major_order,
+    stream_order,
+)
 
 _KDIR = Path(__file__).resolve().parent / "kernels"
 
@@ -27,6 +31,13 @@ class StreamDownDecode:
     RB_BY_DTYPE = {ttnn.bfloat8_b: 8, ttnn.bfloat4_b: 8}
     CB_BYTES = 112 * 1024  # per weight CB (DEPTH = pushes that fit)
     GRID_X = 8  # compute cores: an 8-wide rectangle (as the 1D down's 8 x 10)
+    # SPREAD: the columns over SPREAD_CORES cores (the grid's first, row-major; the sender stays the last core) instead
+    # of NT / NC: every bank serves the same number of columns, from its cores c % NB -- as many with two columns (one
+    # a RISC) as that takes, the rest with one, whose pushes alternate between the two RISCs (GU_PSTEP 2,
+    # DOWN_ONE_COL). More readers stream the weight faster (the gate / up's bf8 stream: 64 -> 104 cores, 415 -> 466
+    # GB/s); each column still accumulates over K in order in one DEST tile: bit-identical.
+    SPREAD = True
+    SPREAD_CORES = 104
 
     @classmethod
     def rb_for(cls, dtype) -> int:
@@ -60,24 +71,55 @@ class StreamDownDecode:
         self.kt, self.nt = k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
         self.RB = int(rb) if rb and self.kt % int(rb) == 0 else self.rb_for(dtype)
         self.nb = nb = device.dram_grid_size().x
-        # one stream a column (nc = 1): stream s reads column s
-        self.w = put(
-            torch.cat([bank_major(w_down[d * k : (d + 1) * k], nb, 1, self.RB) for d in range(tp)], dim=0), dtype
-        )
-        n_cores = self.nt // self.NC
         g = device.compute_with_storage_grid_size()
-        gx, gy = self.GRID_X, n_cores // self.GRID_X
-        self.core_xy = [(c % gx, c // gx) for c in range(n_cores)]
         rng = lambda a, b, c, d: ttnn.CoreRange(ttnn.CoreCoord(a, b), ttnn.CoreCoord(c, d))
-        self.cores = ttnn.CoreRangeSet([rng(0, 0, gx - 1, gy - 1)])
+        phys = lambda x, y: device.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
+        spread = self.SPREAD and self._spread_ok(g)
+        self.spread = spread
+        if spread:
+            n_cores = self.SPREAD_CORES
+            self.core_xy = [(c % g.x, c // g.x) for c in range(n_cores)]
+            # per bank: `two` cores with two columns, the rest with one
+            per_bank, cores_bank = self.nt // nb, n_cores // nb
+            two = per_bank - cores_bank
+            self.widths = [2 if c // nb < two else 1 for c in range(n_cores)]
+            self.banks = [c % nb for c in range(n_cores)]
+            full, rem = divmod(n_cores, g.x)
+            rects = [(0, 0, g.x - 1, full - 1)] + ([(0, full, rem - 1, full)] if rem else [])
+        else:
+            n_cores = self.nt // self.NC
+            gx, gy = self.GRID_X, n_cores // self.GRID_X
+            self.core_xy = [(c % gx, c // gx) for c in range(n_cores)]
+            self.widths = [self.NC] * n_cores
+            self.banks = None
+            rects = [(0, 0, gx - 1, gy - 1)]
+        # the column streams (nc = 1): column j from bank ...; core c owns columns c0[c] .. c0[c] + widths[c] - 1
+        self.c0, streams, j = [], [], 0
+        for c, w in enumerate(self.widths):
+            self.c0.append(j)
+            for _ in range(w):
+                streams.append((j, 1, self.banks[c] if spread else j % nb))
+                j += 1
+        assert j == self.nt, (j, self.nt)
+        order, self.page0s = stream_order(self.kt, self.nt, nb, streams, self.RB)
+        self.w = put(torch.cat([bank_major_order(w_down[d * k : (d + 1) * k], order) for d in range(tp)], dim=0), dtype)
+        del order
+        self.cores = ttnn.CoreRangeSet([rng(*r) for r in rects])
+        one = lambda xy: rng(*xy, *xy)
+        self.groups = [  # (width, core indices, core set): each width's kernels are built for it
+            (w, idx, ttnn.CoreRangeSet([one(self.core_xy[c]) for c in idx]))
+            for w in sorted(set(self.widths))
+            for idx in [[c for c in range(n_cores) if self.widths[c] == w]]
+        ]
         self.sender = (g.x - 1, g.y - 1)
         self.sender_set = ttnn.CoreRangeSet([rng(*self.sender, *self.sender)])
         self.all = self.cores.merge(self.sender_set)
-        snd = device.worker_core_from_logical_core(ttnn.CoreCoord(*self.sender))
+        snd = phys(*self.sender)
         self.sender_xy = [snd.x, snd.y]
-        lo = device.worker_core_from_logical_core(ttnn.CoreCoord(0, 0))
-        hi = device.worker_core_from_logical_core(ttnn.CoreCoord(gx - 1, gy - 1))
-        self.rects = [1, lo.x, lo.y, hi.x, hi.y, n_cores]  # the sender's multicast target (NOC 0 order corners)
+        self.rects = [len(rects)]  # the sender's multicast targets (NOC 0 order corners) and core counts
+        for a, b, c, d in rects:
+            lo, hi = phys(a, b), phys(c, d)
+            self.rects += [lo.x, lo.y, hi.x, hi.y, (c - a + 1) * (d - b + 1)]
         self.w_tile = _TILE_BYTES[dtype]
         self.depth = max(2, self.CB_BYTES // (self.RB * self.w_tile))
         cfg = ttnn.ComputeConfigDescriptor()
@@ -86,11 +128,22 @@ class StreamDownDecode:
         cfg.math_approx_mode = False
         self.cfg = cfg
 
+    def _spread_ok(self, g) -> bool:
+        n, nb = self.SPREAD_CORES, self.nb
+        per_bank = self.nt // nb
+        return (
+            n < g.x * g.y  # and a spare last core for the sender
+            and n % nb == 0
+            and self.nt % nb == 0
+            and n // nb <= per_bank <= 2 * (n // nb)
+            and self.kt % (2 * self.RB) == 0
+        )
+
     def _cb(self, index, tiles, page, dtype):
         fmt = ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=page)
         return ttnn.CBDescriptor(total_size=tiles * page, core_ranges=self.all, format_descriptors=[fmt])
 
-    def _kernel(self, name, cores, ct, rt, config):
+    def _kernel(self, name, cores, ct, rt, config, defines=()):
         return ttnn.KernelDescriptor(
             kernel_source=str(_KDIR / name),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -98,6 +151,7 @@ class StreamDownDecode:
             compile_time_args=ct,
             runtime_args=rt,
             config=config,
+            defines=list(defines),
         )
 
     def __call__(self, m, memory_config=None):
@@ -128,17 +182,7 @@ class StreamDownDecode:
         dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
         dm0 = dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0)
         dm1 = dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1)
-        # one weight column a push (nc = 1); the OWNER (RISCV_1) writes the core's NC output tiles
-        stream_ct = lambda cb, owner: [kt, nb, 1, rb, w_tile, cb, depth, owner, SEM_READY, SEM_VALID, o_tile, self.NC]
-        rt = lambda j: [
-            (
-                (cx, cy),
-                [self.w.buffer_address(), c * self.NC, out.buffer_address()]
-                + self.sender_xy
-                + [bank_major_page0(c * self.NC + j, kt, nb, 1, rb)],
-            )
-            for c, (cx, cy) in enumerate(self.core_xy)
-        ]
+        # one weight column a push (nc = 1); the OWNER (RISCV_1) writes the core's output tiles
         kernels = [
             self._kernel(
                 "gate_up_sender.cpp",
@@ -147,9 +191,25 @@ class StreamDownDecode:
                 [(self.sender, [m.buffer_address()] + self.rects)],
                 dm0,
             ),
-            self._kernel("gate_up_stream.cpp", self.cores, stream_ct(1, 0) + acc(self.w, out), rt(0), dm0),
-            self._kernel("gate_up_stream.cpp", self.cores, stream_ct(2, 1) + acc(self.w, out), rt(1), dm1),
-            self._kernel("down_compute.cpp", self.cores, [kt, rb], [], self.cfg),
         ]
+        for w, idx, cores in self.groups:
+            # two columns: RISC j streams column j; one column: RISC j streams its pushes j, j + 2, ...
+            ct = lambda cb, owner: [kt, nb, 1, rb, w_tile, cb, depth, owner, SEM_READY, SEM_VALID, o_tile, w]
+            page0 = lambda c, j: self.page0s[self.c0[c] + j] if w == 2 else self.page0s[self.c0[c]] + j * rb * nb
+            rt = lambda j: [
+                (
+                    self.core_xy[c],
+                    [self.w.buffer_address(), self.c0[c], out.buffer_address()] + self.sender_xy + [page0(c, j)],
+                )
+                for c in idx
+            ]
+            one = [] if w == 2 else [("GU_PSTEP", "2")]
+            kernels += [
+                self._kernel("gate_up_stream.cpp", cores, ct(1, 0) + acc(self.w, out), rt(0), dm0, one),
+                self._kernel("gate_up_stream.cpp", cores, ct(2, 1) + acc(self.w, out), rt(1), dm1, one),
+                self._kernel(
+                    "down_compute.cpp", cores, [kt, rb], [], self.cfg, [] if w == 2 else [("DOWN_ONE_COL", "1")]
+                ),
+            ]
         ttnn.generic_op([m, self.w, out], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
         return out
