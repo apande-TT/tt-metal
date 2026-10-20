@@ -265,7 +265,7 @@ PLANNED_TP = 4
 #                     residual exactly as all_reduce_async + ttnn.add do, then norm -- the exchange runs under the weight
 #                     streams (trace decode 15.48 -> 15.14 ms, PCC unchanged).
 #   ministral3_m_l_p: the block-float4 decode gate / up and down multiply at HiFi2 (the bf4 gate / up is compute-bound;
-#                     trace decode 15.09 -> 14.72 ms, PCC 0.995223).
+#                     trace decode 15.09 -> 14.72 ms, PCC 0.995223); decode down bf4 on layers 16-26 (14.67 ms, PCC 0.995097).
 
 
 def kv_capacity_for(tp):
