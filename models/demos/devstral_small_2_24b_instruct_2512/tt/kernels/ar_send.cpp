@@ -43,27 +43,38 @@ void kernel_main() {
     ccl_routing_utils::fabric_set_line_multicast_route(hdr_fwd, fwd_route);
     ccl_routing_utils::fabric_set_line_multicast_route(hdr_bwd, bwd_route);
 
-    // this device's partial shards, all at once (N_RES x SHARD_BYTES)
+    // this device's partial shards (N_RES x SHARD_BYTES), read in batches of BATCH: the next batch's reads are in
+    // flight while the current one is sent
+    constexpr uint32_t BATCH = 4;
     cb_reserve_back(CB_BUF, N_RES);
     const uint32_t buf = get_write_ptr(CB_BUF);
-    for (uint32_t i = 0; i < N_RES; ++i) {
-        const uint32_t rx = get_arg_val<uint32_t>(xy0 + 4 * i), ry = get_arg_val<uint32_t>(xy0 + 4 * i + 1);
-        noc_async_read(get_noc_addr(rx, ry, p_addr), buf + i * SHARD_BYTES, SHARD_BYTES);
-    }
+    auto read_batch = [&](uint32_t b0) {
+        for (uint32_t i = b0; i < b0 + BATCH && i < N_RES; ++i) {
+            const uint32_t rx = get_arg_val<uint32_t>(xy0 + 4 * i), ry = get_arg_val<uint32_t>(xy0 + 4 * i + 1);
+            noc_async_read(get_noc_addr(rx, ry, p_addr), buf + i * SHARD_BYTES, SHARD_BYTES);
+        }
+    };
+    read_batch(0);
     noc_async_read_barrier();
 
     if (fabric.is_logically_connected()) {
         fabric.open_finish();
     }
     size_t l1 = buf;
-    for (uint32_t i = 0; i < N_RES; ++i) {
-        const uint32_t rx = get_arg_val<uint32_t>(xy0 + 4 * i), ry = get_arg_val<uint32_t>(xy0 + 4 * i + 1);
-        const uint32_t nx = get_arg_val<uint32_t>(xy0 + 4 * i + 2), ny = get_arg_val<uint32_t>(xy0 + 4 * i + 3);
-        const uint64_t dst = safe_get_noc_addr(rx, ry, scratch_addr + MY_CHIP * SHARD_BYTES);
-        const uint64_t sem = safe_get_noc_addr(nx, ny, sem_addr);
-        fused_write_atomic_and_advance_local_read_address_for_fabric_write(
-            dst, hdr_fwd, hdr_bwd, fabric, l1, SHARD_BYTES, sem, 1, true);
-        noc_async_writes_flushed();
+    for (uint32_t b0 = 0; b0 < N_RES; b0 += BATCH) {
+        if (b0 + BATCH < N_RES) {
+            read_batch(b0 + BATCH);
+        }
+        for (uint32_t i = b0; i < b0 + BATCH && i < N_RES; ++i) {
+            const uint32_t rx = get_arg_val<uint32_t>(xy0 + 4 * i), ry = get_arg_val<uint32_t>(xy0 + 4 * i + 1);
+            const uint32_t nx = get_arg_val<uint32_t>(xy0 + 4 * i + 2), ny = get_arg_val<uint32_t>(xy0 + 4 * i + 3);
+            const uint64_t dst = safe_get_noc_addr(rx, ry, scratch_addr + MY_CHIP * SHARD_BYTES);
+            const uint64_t sem = safe_get_noc_addr(nx, ny, sem_addr);
+            fused_write_atomic_and_advance_local_read_address_for_fabric_write(
+                dst, hdr_fwd, hdr_bwd, fabric, l1, SHARD_BYTES, sem, 1, true);
+            noc_async_writes_flushed();
+        }
+        noc_async_read_barrier();
     }
     noc_async_write_barrier();  // the local copies have landed: count them on the local norm cores
     for (uint32_t i = 0; i < N_RES; ++i) {
