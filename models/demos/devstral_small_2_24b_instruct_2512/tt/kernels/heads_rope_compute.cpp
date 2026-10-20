@@ -57,9 +57,17 @@ void kernel_main() {
 
         // the products, as BinaryNg's multiply ops write them: a_i = x_i * cos_j, b_i = x_p * signed_sin_j (bf16)
         cb_reserve_back(cb_ab, 2 * N);
+#ifdef HOIST_INITS
+        // x, cos and sin are all bf16 tiles of one shape, so one datacopy init serves the three; the SFPU init programs
+        // ADDR_MOD_6/7 only (the datacopy uses ADDR_MOD_0/2): both once a unit instead of once a DEST acquire / CB
+        copy_init(cb_x);
+        mul_binary_tile_init();
+#endif
         for (uint32_t i0 = 0; i0 < N; i0 += PER) {
             tile_regs_acquire();
+#ifndef HOIST_INITS
             copy_init(cb_x);
+#endif
             for (uint32_t q = 0; q < PER; ++q) {
                 const uint32_t i = i0 + q;
                 const uint32_t t = i / HT;
@@ -67,15 +75,21 @@ void kernel_main() {
                 copy_tile(cb_x, i, 4 * q);
                 copy_tile(cb_x, t * HT + (j + HALF) % HT, 4 * q + 2);
             }
+#ifndef HOIST_INITS
             copy_init(cb_cos);
+#endif
             for (uint32_t q = 0; q < PER; ++q) {
                 copy_tile(cb_cos, (i0 + q) % HT, 4 * q + 1);
             }
+#ifndef HOIST_INITS
             copy_init(cb_sin);
+#endif
             for (uint32_t q = 0; q < PER; ++q) {
                 copy_tile(cb_sin, (i0 + q) % HT, 4 * q + 3);
             }
+#ifndef HOIST_INITS
             mul_binary_tile_init();
+#endif
             for (uint32_t q = 0; q < PER; ++q) {
                 mul_binary_tile(4 * q, 4 * q + 1, 4 * q);
                 mul_binary_tile(4 * q + 2, 4 * q + 3, 4 * q + 2);
