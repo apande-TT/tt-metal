@@ -103,6 +103,13 @@ class TtQwenJointAttention:
         self.txt_q = w_col(m.add_q_proj, True)
         self.txt_k = w_col(m.add_k_proj, True)
         self.txt_v = w_col(m.add_v_proj, False)
+        # precise TP: each stream's q / k / v projections as ONE column-parallel linear (every chip's block is its
+        # heads' [q | k | v] columns): one exact product per lane instead of three, on a weight wide enough to fill
+        # the grid, split into heads by HEAD_SPLIT's three-part mode. Fused on device at the first call (the
+        # separate weights freed), so the resident weights allocate as before (their layout moves the other
+        # stages' buffers).
+        self.qkv_fused = _precise.ENABLED and self.tp > 1
+        self.img_qkv = self.txt_qkv = None
 
         def w_row(lin):
             w = lin.weight.detach().to(torch.float32)
@@ -153,6 +160,27 @@ class TtQwenJointAttention:
         if _precise.ENABLED:
             return _precise.linear(x, w, bias=b)
         return ttnn.linear(x, w, bias=b, dtype=dtype, compute_kernel_config=self.hifi)
+
+    @staticmethod
+    def _fuse(wbs):
+        """Three column-parallel (weight, bias) -> one: each chip's shards concatenated, [q | k | v]; frees them."""
+        w = ttnn.concat([w for w, _ in wbs], dim=-1)
+        b = ttnn.concat([b for _, b in wbs], dim=-1)
+        for wt, bt in wbs:
+            ttnn.deallocate(wt)
+            ttnn.deallocate(bt)
+        return w, b
+
+    def _qkv_heads(self, x, wb):
+        """The fused projection (see __init__) -> q, k, v [B, Hl, S, D]."""
+        w, b = wb
+        y = _precise.linear(x, w, bias=b)  # [B, S, 3 * Hl * D]
+        B, S, C = y.shape[0], y.shape[1], y.shape[2]
+        heads = None if HEAD_SPLIT is None else HEAD_SPLIT(ttnn.reshape(y, (B, 1, S, C)), self.local_heads, None)
+        if heads is not None:
+            return heads
+        c = C // 3
+        return [self._heads(ttnn.slice(y, [0, 0, i * c], [B, S, (i + 1) * c])) for i in range(3)]
 
     def _projs(self, x, wbs, dtypes):
         """[self._proj(x, wb, dt) ...]: in precise mode the exact path's input-side work done once for all of them."""
@@ -282,14 +310,22 @@ class TtQwenJointAttention:
         img_f, txt_f = _as_tt(img_f, d), _as_tt(txt_f, d)
 
         f32 = ttnn.float32
-        pqi, pki, pvi = self._projs(hs, (self.img_q, self.img_k, self.img_v), (f32, f32, vdt))
-        qi = self._rope(self._rms(self._heads(pqi), self.nw_img_q), img_f)
-        ki = self._rope(self._rms(self._heads(pki), self.nw_img_k), img_f)
-        vi = self._heads(pvi)
-        pqt, pkt, pvt = self._projs(ehs, (self.txt_q, self.txt_k, self.txt_v), (f32, f32, vdt))
-        qt = self._rope(self._rms(self._heads(pqt), self.nw_txt_q), txt_f)
-        kt = self._rope(self._rms(self._heads(pkt), self.nw_txt_k), txt_f)
-        vt = self._heads(pvt)
+        if self.qkv_fused and self.img_qkv is None:
+            self.img_qkv = self._fuse((self.img_q, self.img_k, self.img_v))
+            self.txt_qkv = self._fuse((self.txt_q, self.txt_k, self.txt_v))
+            self.img_q = self.img_k = self.img_v = self.txt_q = self.txt_k = self.txt_v = None
+        if self.qkv_fused:
+            hqi, hki, vi = self._qkv_heads(hs, self.img_qkv)
+            hqt, hkt, vt = self._qkv_heads(ehs, self.txt_qkv)
+        else:
+            pqi, pki, pvi = self._projs(hs, (self.img_q, self.img_k, self.img_v), (f32, f32, vdt))
+            hqi, hki, vi = self._heads(pqi), self._heads(pki), self._heads(pvi)
+            pqt, pkt, pvt = self._projs(ehs, (self.txt_q, self.txt_k, self.txt_v), (f32, f32, vdt))
+            hqt, hkt, vt = self._heads(pqt), self._heads(pkt), self._heads(pvt)
+        qi = self._rope(self._rms(hqi, self.nw_img_q), img_f)
+        ki = self._rope(self._rms(hki, self.nw_img_k), img_f)
+        qt = self._rope(self._rms(hqt, self.nw_txt_q), txt_f)
+        kt = self._rope(self._rms(hkt, self.nw_txt_k), txt_f)
 
         # Joint sequence order is [text, image].
         k = ttnn.concat([kt, ki], dim=2)

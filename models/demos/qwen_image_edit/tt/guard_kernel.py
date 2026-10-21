@@ -487,7 +487,7 @@ def head_split(qkv, heads, memory_config=None, parts=3, merge=False):
             return None
         out_shape = [n, logical[2], heads * d]
     else:
-        if s[1] != 1 or logical[-1] != s[-1] or s[3] % (parts * heads * TILE) or (parts == 3 and logical != s):
+        if s[1] != 1 or logical[-1] != s[-1] or s[3] % (parts * heads * TILE):
             return None
         n, sq, d = s[0], s[2], s[3] // (parts * heads)
         out_shape = [n, heads, logical[2], d]
