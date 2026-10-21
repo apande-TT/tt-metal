@@ -76,9 +76,22 @@ class TtMistral3PatchMerger:
     def _merge(self, x):
         # minimal_matmul folds the images into its rows and spreads them over the full grid; ttnn.linear's auto
         # config ran the side-by-side batch (32 x 64 rows, K 4096, N 256) as a batched matmul on 16 cores (2.8 ms).
-        out = ttnn.experimental.minimal_matmul(
-            x, self.w_merge, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        if minimal_mm.supported(x, self.w_merge, self.compute_cfg):
+            # the stock op's default blocking as minimal_mm's program, its core ranges' padding skipped (SKIP_PADDING)
+            out = minimal_mm.matmul(
+                x,
+                self.w_merge,
+                minimal_mm.default_config(self.device, self.compute_cfg, x, self.w_merge),
+                self.compute_cfg,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                dtype=x.dtype,  # the stock op's output dtype when none is given
+            )
+        else:
+            out = ttnn.experimental.minimal_matmul(
+                x, self.w_merge, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
         if self.tp > 1:
             out = ttnn.all_gather(out, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         return out

@@ -178,20 +178,29 @@ class TtPixtralVisionModel:
         # The patch projection on minimal_matmul over the full grid (ttnn.linear ran the 32 x 256-row batch on 88
         # cores: 552 us): one K block of the whole 588-wide patch (19 tiles; 8-tile blocks would pad it to 24) and
         # 4 x 4-tile output blocks (each core's N range is 4 tiles).
-        x = ttnn.experimental.minimal_matmul(
-            x,
-            self.w_patch,
-            config=ttnn.MinimalMatmulConfig(
-                M_block_size=4,
-                K_block_size=-(-int(self.w_patch.shape[-2]) // ttnn.TILE_SIZE),
-                N_block_size=4,
-                subblock_h=2,
-                subblock_w=2,
-                compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
-            ),
-            compute_kernel_config=self.compute_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        patch_cfg = ttnn.MinimalMatmulConfig(
+            M_block_size=4,
+            K_block_size=-(-int(self.w_patch.shape[-2]) // ttnn.TILE_SIZE),
+            N_block_size=4,
+            subblock_h=2,
+            subblock_w=2,
+            compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
         )
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        if minimal_mm.supported(x, self.w_patch, self.compute_cfg):
+            # the same program, its core ranges' padding skipped (tt/minimal_mm.py SKIP_PADDING), bit-identical
+            x = minimal_mm.matmul(
+                x, self.w_patch, patch_cfg, self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=x.dtype
+            )
+        else:
+            x = ttnn.experimental.minimal_matmul(
+                x,
+                self.w_patch,
+                config=patch_cfg,
+                compute_kernel_config=self.compute_cfg,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
         x = self.ln_pre(x)
         s = x.shape[-2]
 

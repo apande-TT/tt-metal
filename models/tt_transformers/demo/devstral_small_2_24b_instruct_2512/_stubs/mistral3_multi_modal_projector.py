@@ -137,9 +137,23 @@ class TtMistral3MultiModalProjector:
             ttnn.deallocate(pre)
         # minimal_matmul folds the images into its rows over the full grid (ttnn.linear ran the side-by-side batch
         # of 32 x 64 rows, K 1280, N 5120 as a batched matmul on 80 cores: 1.14 ms).
-        out = ttnn.experimental.minimal_matmul(
-            hdn, self.w2, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        if minimal_mm.supported(hdn, self.w2, self.compute_cfg):
+            # the stock op's default blocking (8 x 8 x 8, 2 x 2 subblocks with fp32 DEST) as minimal_mm's program, its
+            # core ranges' padding skipped (SKIP_PADDING: the 16 M tiles leave the last two core rows only padding)
+            out = minimal_mm.matmul(
+                hdn,
+                self.w2,
+                minimal_mm.default_config(self.device, self.compute_cfg, hdn, self.w2),
+                self.compute_cfg,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                dtype=hdn.dtype,  # the stock op's output dtype when none is given
+            )
+        else:
+            out = ttnn.experimental.minimal_matmul(
+                hdn, self.w2, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
         if h_l1:
             ttnn.deallocate(hdn)
         if self.tp > 1:
