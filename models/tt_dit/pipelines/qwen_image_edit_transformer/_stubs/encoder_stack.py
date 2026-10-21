@@ -116,11 +116,12 @@ class _TtBlock:
         txt_m = ttnn.typecast(self._modulate(txt, t_sh1, t_sc1), mdt)
         a_img, a_txt = self.attn(img_m, txt_m, attention_mask=mask, image_rotary_emb=rotary)
 
-        img = ttnn.add(img, ttnn.multiply(i_g1, a_img))
-        txt = ttnn.add(txt, ttnn.multiply(t_g1, a_txt))
+        # the gated residual updates x + g * y as one ternary pass each (the product, then the sum)
+        img = ttnn.addcmul(img, i_g1, a_img)
+        txt = ttnn.addcmul(txt, t_g1, a_txt)
 
-        img = ttnn.add(img, ttnn.multiply(i_g2, self.img_ff(self._modulate(img, i_sh2, i_sc2))))
-        txt = ttnn.add(txt, ttnn.multiply(t_g2, self.txt_ff(self._modulate(txt, t_sh2, t_sc2))))
+        img = ttnn.addcmul(img, i_g2, self.img_ff(self._modulate(img, i_sh2, i_sc2)))
+        txt = ttnn.addcmul(txt, t_g2, self.txt_ff(self._modulate(txt, t_sh2, t_sc2)))
         return img, txt
 
 
