@@ -31,6 +31,9 @@ _TILE_BYTES = 2048  # bf16
 CB_X, CB_COS, CB_SIN, CB_V, CB_OUT, CB_AB = 0, 1, 2, 3, 16, 24
 # The compute kernel's datacopy / SFPU inits once a unit (HOIST_INITS) instead of once a DEST acquire and CB.
 HOIST_INITS = True  # 57.6 -> 55.0 us a vision layer, bit-identical
+# (with HOIST_INITS) both products of a slot as one SFPU pass with the bf16 rounding constants in registers
+# (kernels/heads_rope_compute.cpp calculate_rope_products), bit-identical to the two mul_binary_tile passes
+ROPE_FUSED_MUL = True
 
 
 def _accessor_args(tensor):
@@ -120,7 +123,9 @@ def apply(qkv, cos, signed_sin, heads, memory_config=ttnn.DRAM_MEMORY_CONFIG):
             compile_time_args=ct,
             runtime_args=rc,
             config=cfg,
-            defines=[("HOIST_INITS", "1")] if HOIST_INITS else [],
+            defines=([("HOIST_INITS", "1")] + ([("ROPE_FUSED_MUL", "1")] if ROPE_FUSED_MUL else []))
+            if HOIST_INITS
+            else [],
         ),
     ]
     cbs = [

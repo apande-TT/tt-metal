@@ -21,6 +21,43 @@
 #include "api/compute/pack.h"
 #include "api/compute/tile_move_copy.h"
 
+#if defined(ROPE_FUSED_MUL) && defined(TRISC_MATH)
+#include "ckernel_sfpu_square.h"  // float32_to_bf16_rne_prgm
+namespace ckernel::sfpu {
+// The constants float32_to_bf16_rne_prgm reads (as calculate_square holds them): its 1, 0x7fff and 0xffff0000.
+inline void rope_products_init() {
+    sfpi::vConstIntPrgm0 = 1;
+    sfpi::vConstIntPrgm1 = 0x7fff;
+    sfpi::vConstIntPrgm2 = 0xffff0000;
+}
+
+// Both products of a slot in one pass over the rows: x * cos into tile base, x_p * signed_sin into tile base + 2 (x, cos,
+// x_p, sin in tiles base .. base + 3). Each is calculate_sfpu_binary_mul's 16-bit-DEST body -- the fp32 product, rounded
+// to bf16 nearest-even, zero when either operand is -- with the rounding constants in registers instead of three
+// SFPLOADIs a product, so the results are the same bits.
+template <int ITERATIONS>
+inline void calculate_rope_products(const std::uint32_t base, const std::uint32_t, const std::uint32_t) {
+    constexpr std::uint32_t T = 32;  // DEST rows a tile in sfpi addressing
+#pragma GCC unroll 8
+    for (int d = 0; d < ITERATIONS; d++) {
+        sfpi::vFloat in0 = sfpi::dst_reg[base * T];
+        sfpi::vFloat in1 = sfpi::dst_reg[(base + 1) * T];
+        sfpi::vFloat a = float32_to_bf16_rne_prgm(in0 * in1);
+        v_if(in0 == 0 || in1 == 0) { a = 0.0f; }
+        v_endif;
+        sfpi::dst_reg[base * T] = a;
+        sfpi::vFloat in2 = sfpi::dst_reg[(base + 2) * T];
+        sfpi::vFloat in3 = sfpi::dst_reg[(base + 3) * T];
+        sfpi::vFloat b = float32_to_bf16_rne_prgm(in2 * in3);
+        v_if(in2 == 0 || in3 == 0) { b = 0.0f; }
+        v_endif;
+        sfpi::dst_reg[(base + 2) * T] = b;
+        sfpi::dst_reg++;
+    }
+}
+}  // namespace ckernel::sfpu
+#endif
+
 void kernel_main() {
     const uint32_t u0 = get_arg_val<uint32_t>(0);
     const uint32_t nu = get_arg_val<uint32_t>(1);
@@ -62,6 +99,9 @@ void kernel_main() {
         // ADDR_MOD_6/7 only (the datacopy uses ADDR_MOD_0/2): both once a unit instead of once a DEST acquire / CB
         copy_init(cb_x);
         mul_binary_tile_init();
+#ifdef ROPE_FUSED_MUL
+        MATH((ckernel::sfpu::rope_products_init()));
+#endif
 #endif
         for (uint32_t i0 = 0; i0 < N; i0 += PER) {
             tile_regs_acquire();
@@ -91,8 +131,20 @@ void kernel_main() {
             mul_binary_tile_init();
 #endif
             for (uint32_t q = 0; q < PER; ++q) {
+#ifdef ROPE_FUSED_MUL
+                MATH((SFPU_BINARY_CALL(
+                    DST_SYNC_MODE,
+                    DST_ACCUM_MODE,
+                    calculate_rope_products,
+                    (8),
+                    4 * q,
+                    4 * q + 1,
+                    4 * q + 2,
+                    VectorMode::RC)));
+#else
                 mul_binary_tile(4 * q, 4 * q + 1, 4 * q);
                 mul_binary_tile(4 * q + 2, 4 * q + 3, 4 * q + 2);
+#endif
             }
             tile_regs_commit();
             tile_regs_wait();
