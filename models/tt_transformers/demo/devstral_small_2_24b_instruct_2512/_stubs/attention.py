@@ -50,6 +50,9 @@ class TtAttention:
     # Both residual adds ride in the output stage of the matmul feeding them (o_proj, the MLP down): attention /
     # feed_forward take residual= and return the sum, through the same SFPU add (tt/minimal_mm.py residual=).
     FUSE_RESIDUAL_ADDS = True
+    # The L1 casts of the norm outputs to bf16 run as tt/local_cast.py (every core casts the pages of its own L1 bank;
+    # ttnn.typecast's compute, bit-identical) instead of ttnn.typecast (one page at a time across the chip).
+    LOCAL_CAST = True
 
     def __init__(self, device, torch_module, mlp_cls=None) -> None:
         self.device = device
@@ -105,7 +108,7 @@ class TtAttention:
         l1 = self.FOLD_NORM_GAMMA and self.MATMUL_INPUT_DTYPE == ttnn.float32 and n_bytes <= self.FFN_NORM_L1_BYTES
         if l1 and self.QKV_INPUT_DTYPE not in (None, ttnn.float32):
             n32 = self.attention_norm(x, memory_config=ttnn.L1_MEMORY_CONFIG)
-            n = ttnn.typecast(n32, self.QKV_INPUT_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG)
+            n = self._l1_cast(n32, self.QKV_INPUT_DTYPE)
             ttnn.deallocate(n32)
         else:
             n = self._mm_in(self.attention_norm(x))
@@ -121,7 +124,7 @@ class TtAttention:
             self._free_l1(a, x)
         n = self.ffn_norm(h, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None)
         if l1 and self.GATE_UP_INPUT_DTYPE not in (None, n.dtype):
-            n32, n = n, ttnn.typecast(n, self.GATE_UP_INPUT_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG)
+            n32, n = n, self._l1_cast(n, self.GATE_UP_INPUT_DTYPE)
             ttnn.deallocate(n32)
         else:
             n = self._mm_in(n)
@@ -135,6 +138,17 @@ class TtAttention:
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
         return out
+
+    def _l1_cast(self, t, dtype):
+        """t (L1) cast to dtype, the result in L1."""
+        if self.LOCAL_CAST:
+            if getattr(self, "_local_cast", None) is None:
+                from models.demos.devstral_small_2_24b_instruct_2512.tt.local_cast import LocalCast
+
+                self._local_cast = LocalCast(self.device)
+            if self._local_cast.supports(t, dtype):
+                return self._local_cast(t, dtype)
+        return ttnn.typecast(t, dtype, memory_config=ttnn.L1_MEMORY_CONFIG)
 
     @staticmethod
     def _free_l1(*ts):
