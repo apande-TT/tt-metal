@@ -121,18 +121,20 @@ def _guarded_exact(x, w):
 EXACT_ROW_CHUNK = 4096
 
 
-def _row_chunked(fn, x):
-    """fn(x) over row chunks of x, concatenated (fn may return a list of outputs: each concatenated)."""
+def _row_chunked(fn, x, chunk=None):
+    """fn(x) over row chunks of x (chunk rows, default EXACT_ROW_CHUNK), concatenated (fn may return a list of
+    outputs: each concatenated)."""
+    chunk = chunk or EXACT_ROW_CHUNK
     shape = list(x.shape)
     rows = 1
     for s in shape[:-1]:
         rows *= s
-    if rows <= EXACT_ROW_CHUNK:
+    if rows <= chunk:
         return fn(x)
     # split the batch when there is one (whole samples), else the token dim in tile-aligned pieces
     ax = 0 if len(shape) >= 3 and shape[0] > 1 else len(shape) - 2
     per = rows // shape[ax]  # rows per index of `ax`
-    step = max(1, EXACT_ROW_CHUNK // per)
+    step = max(1, chunk // per)
     if ax == len(shape) - 2:
         step = max(32, step // 32 * 32)
     outs = []
@@ -154,25 +156,33 @@ def _row_chunked(fn, x):
 
 
 # Output bytes up to which an exact linear on weight-side lanes runs its rows unchunked (its float32 partials stay
-# small; the denoiser's FF up at 16384 x 1536 ran the eager e2e out of DRAM unchunked).
+# small; the denoiser's FF up at 16384 x 1536 ran the eager e2e out of DRAM unchunked), and the output bytes per
+# chunk when it does not fit.
 WHOLE_ROWS_BYTES = 80 * 1024 * 1024
+CHUNK_ROWS_BYTES = 48 * 1024 * 1024
 
 
-def _weight_lanes_whole(x, ws):
-    """Whether the exact path takes its lanes on these weights' rows over x's whole rows (the text encoder's
-    weight-lane rule: sum(N) <= rows / 2) with small outputs: then it holds no input-sized lane copies, and the rows
-    need no chunking."""
+def _weight_lane_chunk(x, ws):
+    """Rows per chunk for an exact linear whose lanes go on these weights' rows (the text encoder's weight-lane
+    rule, sum(N) <= rows / 2: no input-sized lane copies): all of them when its float32 output fits WHOLE_ROWS_BYTES,
+    else as many as fill CHUNK_ROWS_BYTES. None when the rule does not hold (the default EXACT_ROW_CHUNK then)."""
     from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te
 
     rows = 1
     for d in list(x.padded_shape)[:-1]:
         rows *= d
     n = sum(w.shape[-1] for w in ws)
-    return bool(_te.WEIGHT_LANES) and all(len(w.shape) == 2 for w in ws) and 2 * n <= rows and rows * n * 4 <= WHOLE_ROWS_BYTES
+    if not _te.WEIGHT_LANES or any(len(w.shape) != 2 for w in ws):
+        return None
+    if 4 * n * rows <= WHOLE_ROWS_BYTES:
+        chunk = rows
+    else:
+        chunk = max(EXACT_ROW_CHUNK, CHUNK_ROWS_BYTES // (4 * n) // 32 * 32)
+    return chunk if 2 * n <= min(rows, chunk) else None
 
 
 def _chunked_unless_weight_lanes(fn, x, ws):
-    return fn(x) if _weight_lanes_whole(x, ws) else _row_chunked(fn, x)
+    return _row_chunked(fn, x, _weight_lane_chunk(x, ws))
 
 
 def linear(x, w, bias=None, compute_kernel_config=None):
