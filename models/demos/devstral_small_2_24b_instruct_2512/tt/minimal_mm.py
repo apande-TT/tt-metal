@@ -31,6 +31,9 @@ _INVALID, _VALID = 0, 1
 # gate/up pairs a DEST acquire in the SwiGLU epilogue.
 EPI_TILES = 4
 SWIGLU_PAIRS = 2
+# The SwiGLU epilogue's SFPU pass (silu * up) runs on the PACK thread (kernels/mm_compute.cpp pack_silu_mul) while MATH
+# copies the next pair group's partials into the other DEST half.
+SWIGLU_PACK_SFPU = True
 
 
 def _round_up(a, b):
@@ -277,6 +280,8 @@ def matmul(
         defines += [("FUSE_TERNARY", "1")]
     cdefines = [d for d in defines if d[0] != "FUSE_TERNARY"] + [("EPI_TILES", str(EPI_TILES if N_block % EPI_TILES == 0 else 1))]
     cdefines += [("SWIGLU_PAIRS", str(SWIGLU_PAIRS))]
+    if fuse_swiglu and SWIGLU_PACK_SFPU:
+        cdefines += [("SWIGLU_PACK_SFPU", "1")]
     if residual is not None:
         cdefines += [("FUSE_RESIDUAL", "1")]
 

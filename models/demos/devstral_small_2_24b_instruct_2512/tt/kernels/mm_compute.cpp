@@ -6,7 +6,9 @@
 // compute.cpp; no bias / ternary / fused activation, fp32 DEST) with its output stage regrouped. The matmul loop is the
 // stock one. Each output block's fp32 L1 partials (intermediate_cb) leave through an epilogue that moves EPI_TILES tiles
 // (SWIGLU_PAIRS gate/up pairs) a DEST acquire with its inits run once per block; the SwiGLU pair runs silu and the up
-// multiply as ONE SFPU pass (calculate_silu_mul). Measured on the 416-row text gate/up: the SFPU is ~1.4 of its 9.8 ms,
+// multiply as ONE SFPU pass (calculate_silu_mul), issued from the PACK thread under SWIGLU_PACK_SFPU (pack_silu_mul;
+// MATH copies the next pair group meanwhile; bit-identical, A/B on the vision gate/up). Measured on the 416-row text
+// gate/up: the SFPU is ~1.4 of its 9.8 ms (vision 7 x 24-tile blocks: 98 of 232 us),
 // unpack + pack of the partials ~0.05. Every tile goes through the same unpack, datacopy, SFPU products and pack as in
 // the stock kernel, so the output is bit-identical.
 #include "api/compute/compute_kernel_api.h"
@@ -100,7 +102,7 @@ void residual_add_block(
 #endif  // FUSE_RESIDUAL
 
 #ifdef FUSE_SWIGLU
-#ifdef TRISC_MATH
+#if defined(TRISC_MATH) || defined(TRISC_PACK)
 namespace ckernel::sfpu {
 // silu_tile followed by mul_binary_tile in ONE pass over the rows (fp32 DEST): silu_tile stores x * sigmoid(x)
 // unrounded and mul_binary_tile reloads it and multiplies it by up, so keeping it in a register runs the same two
@@ -121,6 +123,22 @@ inline void calculate_silu_mul(const uint32_t gate, const uint32_t up, const uin
 }  // namespace ckernel::sfpu
 #endif
 
+#if defined(SWIGLU_PACK_SFPU) && defined(TRISC_PACK)
+// calculate_silu_mul over the four faces of the DEST half the packer owns, issued by the PACK thread: the face loop of
+// _llk_math_eltwise_binary_sfpu_params_ (16 rows a face) without its wait for the FPU (MATH committed this half; the
+// FPU is busy with the next one). The caller points DEST_TARGET_REG_CFG_MATH_Offset at the packer's half.
+inline void pack_silu_mul(const uint32_t gate, const uint32_t up, const uint32_t out) {
+    TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
+#pragma GCC unroll 0
+    for (int face = 0; face < 4; face++) {
+        ckernel::sfpu::calculate_silu_mul<DST_ACCUM_MODE, 8>(gate, up, out);
+        TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
+        TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
+    }
+    TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
+}
+#endif
+
 // out = silu(gate) * up per interleaved gate/up tile pair (column tile 2p gate, 2p + 1 up), SWIGLU_PAIRS pairs a DEST
 // acquire (pair j: gate in DEST 2j, up in 2j + 1). The copy / silu / mul inits run once per block (the stock kernel
 // re-runs them per pair): the SFPU inits program ADDR_MOD_6/7, the SFPU config and vConstFloatPrgm0 (the reciprocal's
@@ -131,8 +149,12 @@ void swiglu_block(uint32_t in_cb, uint32_t out_cb, uint32_t M_block_tiles, uint3
     pack_reconfig_data_format(out_cb);
     const uint32_t out_N_block_tiles = N_block_tiles >> 1;
     copy_init(in_cb);
+#ifdef SWIGLU_PACK_SFPU
+    silu_tile_init_pack();  // the SFPU pass runs on the PACK thread (pack_silu_mul), the datacopy stays on MATH
+#else
     silu_tile_init();
     mul_binary_tile_init();
+#endif
     for (uint32_t m = 0; m < M_block_tiles; m++) {
         const uint32_t row_base = m * N_block_tiles;
         for (uint32_t p = 0; p < out_N_block_tiles; p += SWIGLU_PAIRS) {
@@ -143,6 +165,7 @@ void swiglu_block(uint32_t in_cb, uint32_t out_cb, uint32_t M_block_tiles, uint3
                 copy_tile(in_cb, gate_tile_id, 2 * j);
                 copy_tile(in_cb, gate_tile_id + 1, 2 * j + 1);
             }
+#ifndef SWIGLU_PACK_SFPU
             for (uint32_t j = 0; j < np; j++) {
                 MATH((SFPU_BINARY_CALL(
                     DST_SYNC_MODE,
@@ -154,8 +177,23 @@ void swiglu_block(uint32_t in_cb, uint32_t out_cb, uint32_t M_block_tiles, uint3
                     2 * j,
                     VectorMode::RC)));
             }
+#endif
             tile_regs_commit();
+#ifdef SWIGLU_PACK_SFPU
+            // the moe_fused_swiglu recipe (add_silu_elementwise): wait for MATH's commit, aim the SFPU at the packer's
+            // DEST half, run the pass from PACK, wait for the SFPU before packing
+            PACK((TTI_SEMWAIT(
+                p_stall::STALL_TDMA | p_stall::STALL_CFG,
+                semaphore::t6_sem(semaphore::MATH_PACK),
+                p_stall::STALL_ON_ZERO)));
+            PACK((TT_SETC16(DEST_TARGET_REG_CFG_MATH_Offset_ADDR32, ckernel::packer::get_packer_dest_offset())));
+            for (uint32_t j = 0; j < np; j++) {
+                PACK((pack_silu_mul(2 * j, 2 * j + 1, 2 * j)));
+            }
+            PACK((TTI_STALLWAIT(p_stall::STALL_PACK, p_stall::WAIT_SFPU)));
+#else
             tile_regs_wait();
+#endif
             for (uint32_t j = 0; j < np; j++) {
                 pack_tile(2 * j, out_cb);
             }
