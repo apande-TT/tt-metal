@@ -27,7 +27,7 @@ def mesh_shape(device):
     return shape if len(shape) == 2 else (1, 1)
 
 
-def _wide_rows(t, min_width=32):
+def _wide_rows(t, min_width=256):
     """(b, 1, rows, w): t's per-entry elements in row-major pages w wide, for a row-major t whose own rows are
     narrower than min_width; None when that does not apply."""
     s = list(t.shape)
@@ -157,7 +157,8 @@ class BatchSplit:
         if pc.height_parallel.factor > 1:
             out = ccl_manager.all_gather(out, dim=2, mesh_axis=pc.height_parallel.mesh_axis, use_hyperparams=False)
         if self.axes:
-            # a narrow row-major output (the decoder's 3-channel image: 12-byte pages) is gathered as wide pages
+            # a narrow row-major output (the decoder's 3-channel image: 12-byte pages; the encoder's 32-channel
+            # moments: 128-byte pages) is gathered as wide pages
             # of the same per-image elements, then viewed back: a pure relayout, far fewer CCL pages
             shape = list(out.shape)
             wide = _wide_rows(out)
