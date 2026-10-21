@@ -249,22 +249,29 @@ class TtPixtralAttention:
         # Query chunk: 128 rows where the sequence allows (8 x 16 heads x 256 patches: 256 chunks over the grid's 110
         # cores, 185 us vs 215 at 64 rows and 207 at 256 -- each chunk streams its key/value range once).
         q_chunk = next(c for c in (128, 64, 32) if s % c == 0)
-        attn = ttnn.transformer.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            is_causal=False,
-            attn_mask=mask,
-            scale=self.scale,
-            program_config=ttnn.SDPAProgramConfig(
-                compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
-                q_chunk_size=q_chunk,
-                k_chunk_size=k_chunk,
-                exp_approx_mode=False,
-            ),
-            compute_kernel_config=self.compute_cfg,
-            memory_config=head_mem,
+        sdpa_cfg = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
+            q_chunk_size=q_chunk,
+            k_chunk_size=k_chunk,
+            exp_approx_mode=False,
         )
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import sdpa_prefill
+
+        if sdpa_prefill.supported(q, k, v, False, mask, self.compute_cfg):
+            # the same program with the softmax's scale + exp as one SFPU pass (tt/sdpa_prefill.py), bit-identical
+            attn = sdpa_prefill.sdpa(q, k, v, False, self.scale, sdpa_cfg, self.compute_cfg, head_mem)
+        else:
+            attn = ttnn.transformer.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=False,
+                attn_mask=mask,
+                scale=self.scale,
+                program_config=sdpa_cfg,
+                compute_kernel_config=self.compute_cfg,
+                memory_config=head_mem,
+            )
         if attn_l1:
             for t in (q, k, v):
                 ttnn.deallocate(t)

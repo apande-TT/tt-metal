@@ -810,22 +810,30 @@ class TtMinistral3Attention:
         attn_core_bytes = (qkv_bytes * 2 // 3) // (grid.x * grid.y)
         concat_l1 = self.tp > 1 and 0 < attn_core_bytes <= self.PREFILL_HEADS_L1_BYTES
         sdpa_l1 = concat_l1 and attn_core_bytes <= self.PREFILL_SDPA_OUT_L1_BYTES
-        attn = ttnn.transformer.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            is_causal=mask is None,
-            attn_mask=mask,
-            scale=self.scale,
-            program_config=ttnn.SDPAProgramConfig(
-                compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
-                q_chunk_size=q_chunk,
-                k_chunk_size=k_chunk,
-                exp_approx_mode=False,
-            ),
-            compute_kernel_config=self.prefill_sdpa_cfg,
-            memory_config=ttnn.L1_MEMORY_CONFIG if sdpa_l1 else ttnn.DRAM_MEMORY_CONFIG,
+        sdpa_cfg = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
+            q_chunk_size=q_chunk,
+            k_chunk_size=k_chunk,
+            exp_approx_mode=False,
         )
+        sdpa_mem = ttnn.L1_MEMORY_CONFIG if sdpa_l1 else ttnn.DRAM_MEMORY_CONFIG
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import sdpa_prefill
+
+        if sdpa_prefill.supported(q, k, v, mask is None, mask, self.prefill_sdpa_cfg):
+            # the same program with the softmax's scale + exp as one SFPU pass (tt/sdpa_prefill.py), bit-identical
+            attn = sdpa_prefill.sdpa(q, k, v, True, self.scale, sdpa_cfg, self.prefill_sdpa_cfg, sdpa_mem)
+        else:
+            attn = ttnn.transformer.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=mask is None,
+                attn_mask=mask,
+                scale=self.scale,
+                program_config=sdpa_cfg,
+                compute_kernel_config=self.prefill_sdpa_cfg,
+                memory_config=sdpa_mem,
+            )
         heads = attn
         concat_mem = ttnn.L1_MEMORY_CONFIG if concat_l1 else None
         if self.concat_heads is not None and self.concat_heads.supports(attn):
