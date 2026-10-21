@@ -153,6 +153,28 @@ def _row_chunked(fn, x):
     return y
 
 
+# Output bytes up to which an exact linear on weight-side lanes runs its rows unchunked (its float32 partials stay
+# small; the denoiser's FF up at 16384 x 1536 ran the eager e2e out of DRAM unchunked).
+WHOLE_ROWS_BYTES = 80 * 1024 * 1024
+
+
+def _weight_lanes_whole(x, ws):
+    """Whether the exact path takes its lanes on these weights' rows over x's whole rows (the text encoder's
+    weight-lane rule: sum(N) <= rows / 2) with small outputs: then it holds no input-sized lane copies, and the rows
+    need no chunking."""
+    from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te
+
+    rows = 1
+    for d in list(x.padded_shape)[:-1]:
+        rows *= d
+    n = sum(w.shape[-1] for w in ws)
+    return bool(_te.WEIGHT_LANES) and all(len(w.shape) == 2 for w in ws) and 2 * n <= rows and rows * n * 4 <= WHOLE_ROWS_BYTES
+
+
+def _chunked_unless_weight_lanes(fn, x, ws):
+    return fn(x) if _weight_lanes_whole(x, ws) else _row_chunked(fn, x)
+
+
 def linear(x, w, bias=None, compute_kernel_config=None):
     """float32 x @ bf16 w -> float32, x as bf16 hi + lo; bias (float32) added separately."""
     x = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
@@ -161,7 +183,7 @@ def linear(x, w, bias=None, compute_kernel_config=None):
     elif EXACT_LINEAR:
         from models.demos.qwen_image_edit_text_encoder._stubs.attention import split_linear
 
-        y = _row_chunked(lambda c: split_linear(c, w, exact=True, limbs=2), x)
+        y = _chunked_unless_weight_lanes(lambda c: split_linear(c, w, exact=True, limbs=2), x, [w])
     else:
         y = None
     if y is not None:
@@ -186,7 +208,7 @@ def linears(x, ws, biases):
     from models.demos.qwen_image_edit_text_encoder._stubs.attention import split_linears
 
     x = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
-    ys = _row_chunked(lambda c: split_linears(c, ws, exact=True, limbs=2), x)
+    ys = _chunked_unless_weight_lanes(lambda c: split_linears(c, ws, exact=True, limbs=2), x, ws)
     return [
         y if b is None else ttnn.add(y, b if b.dtype == ttnn.float32 else ttnn.typecast(b, ttnn.float32))
         for y, b in zip(ys, biases)
