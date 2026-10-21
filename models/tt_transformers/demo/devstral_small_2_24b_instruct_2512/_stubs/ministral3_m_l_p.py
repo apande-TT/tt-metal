@@ -490,6 +490,9 @@ class TtMinistral3MLP:
             # residual + down(m) in one program (tt/minimal_mm.py residual=), bit-identical to the add below
             out = minimal_mm.matmul(m, self.w_down, residual=residual, **down_kw)
             residual = None
+        elif down_cfg is not None and minimal_mm.supported(m, self.w_down, self.down_cfg):
+            # the same program, its core ranges' padding skipped (tt/minimal_mm.py SKIP_PADDING), bit-identical
+            out = minimal_mm.matmul(m, self.w_down, **down_kw)
         else:
             out = ttnn.experimental.minimal_matmul(m, self.w_down, **down_kw)
         if inter_l1:

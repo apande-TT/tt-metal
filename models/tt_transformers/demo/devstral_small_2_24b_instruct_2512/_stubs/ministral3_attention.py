@@ -741,7 +741,10 @@ class TtMinistral3Attention:
         heads_l1 = self.meta_rope and 0 < qkv_bytes // (grid.x * grid.y) <= self.PREFILL_HEADS_L1_BYTES
         qkv_l1 = heads_l1 and qkv_bytes // (grid.x * grid.y) <= self.PREFILL_QKV_L1_BYTES
         # Prefill QKV on the full grid (ttnn.linear's auto config left this many-row projection on a partial one).
-        qkv = ttnn.experimental.minimal_matmul(
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        qkv = self._prefill_mm(
+            minimal_mm,
             x,
             self.wqkv,
             config=self._prefill_mm_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE),
@@ -856,7 +859,10 @@ class TtMinistral3Attention:
             and not self.prefill_gather
             and 2 * int(b) * int(s) * int(self.wo.shape[-1]) // (grid.x * grid.y) <= self.PREFILL_OPROJ_OUT_L1_BYTES
         )
-        out = ttnn.experimental.minimal_matmul(
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        out = self._prefill_mm(
+            minimal_mm,
             attn,
             self.wo,
             config=self._prefill_mm_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wo.shape[-1]) // ttnn.TILE_SIZE),
@@ -869,6 +875,14 @@ class TtMinistral3Attention:
         if in_rank == 3:
             return ttnn.reshape(out, (b, s, out.shape[-1]))
         return out
+
+    @staticmethod
+    def _prefill_mm(minimal_mm, x, w, config, compute_kernel_config, **kw):
+        """ttnn.experimental.minimal_matmul, as tt/minimal_mm.py's program when it covers the call: the same arithmetic,
+        the core ranges' padding skipped (SKIP_PADDING), which the power-capped prefill turns into speed."""
+        if config is not None and minimal_mm.supported(x, w, compute_kernel_config):
+            return minimal_mm.matmul(x, w, config, compute_kernel_config, **kw)
+        return ttnn.experimental.minimal_matmul(x, w, config=config, compute_kernel_config=compute_kernel_config, **kw)
 
     def _decode(self, x, position_embeddings, position_ids, kv_cache, cur_pos):
         """x (1, 1, B, D) -> (1, 1, B, D); cos/sin (1, B, 1, hd); cur_pos int32 [B]; position_ids (B, 1, 1, 1) fp32."""
