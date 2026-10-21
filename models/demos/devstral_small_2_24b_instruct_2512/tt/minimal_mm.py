@@ -37,6 +37,10 @@ SWIGLU_PACK_SFPU = True
 # ... with the exp polynomial's constants held in registers across the rows (mm_compute.cpp
 # calculate_silu_mul_hoisted: 42 instead of 52 SFPU instructions a row, the same arithmetic)
 SWIGLU_HOIST = True
+# The fused SwiGLU skips the padding of the core ranges (the last core row's M rows past M_tiles, the last core
+# column's N tiles past N_tiles): no matmul subblocks or epilogue pairs for tiles the writer never stores (identical
+# real tiles; less FPU / SFPU energy, which is what the power-capped prefill runs on).
+SKIP_PADDING = True
 
 
 def _round_up(a, b):
@@ -239,6 +243,7 @@ def matmul(
         + res_ct
     )
 
+    skip_padding = fuse_swiglu and SKIP_PADDING
     k_blocks_per_core = -(-K_blocks // (in1_par if transpose else in0_par))
     max_defer = max(min(y * k_blocks_per_core, K_blocks - 1) for y in range(gy))
     phys = {}
@@ -271,7 +276,7 @@ def matmul(
             a1 += [o_addr]
             (rt_in0_s if in1_idx == 0 else rt_in0_r).append((core, a0))
             (rt_in1_s if in0_idx == 0 else rt_in1_r).append((core, a1))
-            rt_c.append((core, [m0, m1, n0, n1]))
+            rt_c.append((core, [m0, m1, n0, n1] + ([M_tiles, N_tiles] if skip_padding else [])))
 
     defines = [("FUSE_SWIGLU", "1")] if fuse_swiglu else []
     in0_src, in0_defines = _DM_IN0, []
@@ -287,6 +292,8 @@ def matmul(
         cdefines += [("SWIGLU_PACK_SFPU", "1")]
         if SWIGLU_HOIST:
             cdefines += [("SWIGLU_HOIST", "1")]
+    if skip_padding:
+        cdefines += [("SKIP_PADDING", "1")]
     if residual is not None:
         cdefines += [("FUSE_RESIDUAL", "1")]
 

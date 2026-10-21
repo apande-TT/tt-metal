@@ -202,7 +202,15 @@ inline void pack_silu_mul(const uint32_t gate, const uint32_t up, const uint32_t
 // acquire (pair j: gate in DEST 2j, up in 2j + 1). The copy / silu / mul inits run once per block (the stock kernel
 // re-runs them per pair): the SFPU inits program ADDR_MOD_6/7, the SFPU config and vConstFloatPrgm0 (the reciprocal's
 // 2.0) only, the datacopy uses ADDR_MOD_0/2, and the mul init sets no constant, so re-running them changes nothing.
-void swiglu_block(uint32_t in_cb, uint32_t out_cb, uint32_t M_block_tiles, uint32_t N_block_tiles) {
+// Only the first real_M rows and real_pairs pairs a row are computed (the rest is the padding of the M / N ranges the
+// core was handed, which the writer never stores); every row is still pushed whole.
+void swiglu_block(
+    uint32_t in_cb,
+    uint32_t out_cb,
+    uint32_t M_block_tiles,
+    uint32_t N_block_tiles,
+    uint32_t real_M,
+    uint32_t real_pairs) {
     CircularBuffer cb_out(out_cb);
     reconfig_data_format_srca(in_cb);
     pack_reconfig_data_format(out_cb);
@@ -219,8 +227,9 @@ void swiglu_block(uint32_t in_cb, uint32_t out_cb, uint32_t M_block_tiles, uint3
 #endif
     for (uint32_t m = 0; m < M_block_tiles; m++) {
         const uint32_t row_base = m * N_block_tiles;
-        for (uint32_t p = 0; p < out_N_block_tiles; p += SWIGLU_PAIRS) {
-            const uint32_t np = (out_N_block_tiles - p) < SWIGLU_PAIRS ? (out_N_block_tiles - p) : SWIGLU_PAIRS;
+        const uint32_t row_pairs = m < real_M ? real_pairs : 0;
+        for (uint32_t p = 0; p < row_pairs; p += SWIGLU_PAIRS) {
+            const uint32_t np = (row_pairs - p) < SWIGLU_PAIRS ? (row_pairs - p) : SWIGLU_PAIRS;
             tile_regs_acquire();
             for (uint32_t j = 0; j < np; j++) {
                 const uint32_t gate_tile_id = row_base + ((p + j) << 1);
@@ -336,6 +345,11 @@ void kernel_main() {
     const uint32_t M_end_tile = get_arg_val<uint32_t>(argidx++);
     const uint32_t N_start_tile = get_arg_val<uint32_t>(argidx++);
     const uint32_t N_end_tile = get_arg_val<uint32_t>(argidx++);
+#ifdef SKIP_PADDING
+    // the real (unpadded) M / N extents: tiles past them are padding of the core's range, never stored
+    const uint32_t M_real_end = get_arg_val<uint32_t>(argidx++);
+    const uint32_t N_real_end = get_arg_val<uint32_t>(argidx++);
+#endif
 
     constexpr uint32_t in0_cb = tt::CBIndex::c_0;
     constexpr uint32_t in1_cb = tt::CBIndex::c_1;
@@ -367,6 +381,21 @@ void kernel_main() {
             uint32_t n_tile_end = std::min(n_tile + N_block_tiles, N_end_tile);
             uint32_t current_N_block_tiles = n_tile_end - n_tile;
             uint32_t current_subblock_w = std::min(current_N_block_tiles, subblock_w);
+            // the tiles the block computes: SKIP_PADDING drops its rows / columns past the real extents
+            uint32_t mm_M = current_M_block_tiles;
+            uint32_t mm_N = current_N_block_tiles;
+#ifdef SKIP_PADDING
+            {
+                const uint32_t m_real = std::min(m_tile_end, M_real_end);
+                const uint32_t n_real = std::min(n_tile_end, N_real_end);
+                const uint32_t rm = m_real > m_tile ? m_real - m_tile : 0;
+                const uint32_t rn = n_real > n_tile ? n_real - n_tile : 0;
+                if (rm % current_subblock_h == 0 && rn % current_subblock_w == 0) {
+                    mm_M = rm;
+                    mm_N = rn;
+                }
+            }
+#endif
 
             reconfig_data_format(in1_cb, in0_cb);
             pack_reconfig_data_format(intermediate_cb);
@@ -382,16 +411,18 @@ void kernel_main() {
                 cb_in0.wait_front(in0_block_num_tiles);
                 cb_in1.wait_front(in1_block_num_tiles);
 
-                matmul_blocks(
-                    in0_cb,
-                    in1_cb,
-                    intermediate_cb,
-                    current_M_block_tiles,
-                    current_N_block_tiles,
-                    N_block_tiles,
-                    K_block_tiles,
-                    current_subblock_h,
-                    current_subblock_w);
+                if (mm_M > 0 && mm_N > 0) {
+                    matmul_blocks(
+                        in0_cb,
+                        in1_cb,
+                        intermediate_cb,
+                        mm_M,
+                        mm_N,
+                        N_block_tiles,
+                        K_block_tiles,
+                        current_subblock_h,
+                        current_subblock_w);
+                }
 
                 if (k_block == K_num_blocks - 1) {
                     if (n_block_iter < N_blocks_per_core - 1) {
@@ -414,7 +445,11 @@ void kernel_main() {
 #ifdef FUSE_SWIGLU
             cb_out.reserve_back(out_block_num_tiles >> 1);
             cb_intermediate.wait_front(out_block_num_tiles);
-            swiglu_block(intermediate_cb, out_cb, M_block_tiles, N_block_tiles);
+#ifdef SKIP_PADDING
+            swiglu_block(intermediate_cb, out_cb, M_block_tiles, N_block_tiles, mm_M, mm_N >> 1);
+#else
+            swiglu_block(intermediate_cb, out_cb, M_block_tiles, N_block_tiles, M_block_tiles, N_block_tiles >> 1);
+#endif
             cb_intermediate.pop_front(out_block_num_tiles);
 #elif defined(FUSE_RESIDUAL)
             cb_out.reserve_back(out_block_num_tiles);
