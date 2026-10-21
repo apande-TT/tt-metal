@@ -471,9 +471,12 @@ class TtMinistral3MLP:
             )
         elif n_rng_dn % 8 == 0:
             # A wide per-core N range (the 416-row prompt's 160 output tiles over 10 cores: 16) in 8-tile blocks of 1 x 4
-            # subblocks (4142 -> 4108 us; the default config runs 2 x 2).
+            # subblocks (4142 -> 4108 us; the default config runs 2 x 2), and M blocks of a third of each core's M range
+            # (38 rows: 13, 13, 12): the weight blocks are re-read once per M block, 3 times instead of 5 (LoFi: 2.51 ->
+            # 2.42 ms a call; the per-tile K order depends only on the N block, so bit-identical).
+            m_rng = -(-mt // (grid.x if mt > nt else grid.y))
             down_cfg = ttnn.MinimalMatmulConfig(
-                M_block_size=8,
+                M_block_size=-(-m_rng // 3),
                 K_block_size=8,
                 N_block_size=8,
                 subblock_h=1,
