@@ -229,6 +229,9 @@ PLANNED_TP = 4
 #                     o_proj reads SDPA's head outputs as their concat itself (minimal_mm in0_heads=, kernels/
 #                     mm_in0_heads.cpp: the stock in0 reader with its tile index remapped): no nlp_concat_heads
 #                     program (11.4 us a layer), bit-identical.
+#                     The L1 casts of both norm outputs to bf16 run as tt/local_cast.py (LOCAL_CAST: every core casts
+#                     the pages of its own L1 bank with ttnn.typecast's compute, rounding loop unrolled; bit-identical):
+#                     10.3 -> 7.2 us a cast, 48 an encode.
 #   ministral3_m_l_p many-row fused gate/up (text prefill + vision): tt/minimal_mm.py, minimal_matmul's own program
 #                     with silu * up as ONE SFPU pass (kernels/mm_compute.cpp), bit-identical.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
