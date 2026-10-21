@@ -294,9 +294,10 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
     neg = [ttnn.UnaryWithParam(ttnn.UnaryOpType.NEG)]
     e_neg = ttnn.add(run_on(ttnn.neg), ttnn.multiply(b, 2.0), input_tensor_a_activations=neg)
     if mode == "exact":
-        from models.demos.qwen_image_edit_text_encoder._stubs.attention import EXACT_MODE
+        from models.demos.qwen_image_edit_text_encoder._stubs.attention import EXACT_MODE, _LaneAcc
 
-        acc, n = None, 0
+        # the runs summed left to right (with the text encoder's LANE_SUM hook: several per fused pass)
+        acc, n = _LaneAcc(), 0
         c = x.shape[-1]
         # "guarded" (the text-encoder ports' switch): exact lanes on the hi limb only -- the lo limb is
         # ~2^-8 of it, so its dense accumulation error is at float32's level -- and no run for a lane that
@@ -312,25 +313,29 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
                     w_r = ttnn.multiply(weight, wm)
                     y = _flat(run_w(h_rm, w_r))
                     ttnn.deallocate(w_r)
-                    acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
+                    acc.push(y)
+                    n += 1
                 ttnn.deallocate(h_rm)
             else:
                 for m in masks:
-                    y = run_on(lambda t, m=m: ttnn.multiply(t, m), his)
-                    acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
+                    acc.push(run_on(lambda t, m=m: ttnn.multiply(t, m), his))
+                    n += 1
             los = [ttnn.subtract(t, h) for t, h in zip(shared, his)]
             free(his)
             free(shared, [x, extra])
             shared = None
-            acc, n = ttnn.add(acc, run_on(lambda t: t, los)), n + 1
+            acc.push(run_on(lambda t: t, los))
+            n += 1
             free(los)
         else:
             for m in masks:
                 for limb in (hi,) if guarded else (hi, lo):
-                    y = run_on(lambda t, m=m, limb=limb: ttnn.multiply(limb(t), m))
-                    acc, n = (y if acc is None else ttnn.add(acc, y)), n + 1
+                    acc.push(run_on(lambda t, m=m, limb=limb: ttnn.multiply(limb(t), m)))
+                    n += 1
             if guarded:
-                acc, n = ttnn.add(acc, run_on(lo)), n + 1
+                acc.push(run_on(lo))
+                n += 1
+        acc = acc.value()
         bn = ttnn.multiply(b, float(n - 1))  # each run added the bias once
         tol = ttnn.add(ttnn.multiply(ttnn.abs(e_neg), 3e-3), 1e-3)
         res = None if VOTE_TAIL is None else VOTE_TAIL(acc, bn, f0, e_neg, tol)
