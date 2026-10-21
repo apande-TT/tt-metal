@@ -268,6 +268,10 @@ PLANNED_TP = 4
 #                     whichever hands each core >= 5% fewer output tiles (stock: M > N). Flips only the vision gate/up
 #                     (168 -> 156 tiles a core), o_proj and the patch projection (24 -> 21); the stubs size their blocks to
 #                     the chosen ranges and the MLP down keeps the stock split. Trace encode 21.30 -> 21.00 ms.
+#   decode vocab top-k (VocabTopK.FUSED): every level sorts packed [bf16 | u16] 32-bit keys (the stock topk's fused-key
+#                     mode) instead of value + index tiles: 67.9 -> 54.3 us a step; equal logits rank by position.
+#   ministral3_m_l_p prefill MLP down at LoFi on every text layer (PREFILL_DOWN_LOFI; the op is FPU-bound at 608 x 256
+#                     tile products a core): trace prefill 1028 -> 937 ms; PCC 0.995097 -> 0.995002 (threshold 0.995).
 #   decoder_head: the one-tile-row lm_head (decode; prefill's last prompt rows) streams bank-major copies of its
 #                     weight on both data-movement RISCs of 64 cores (tt/lm_head_decode.py), bit-identical to ttnn.linear.
 #                     The decode gate / up and the lm_head stream through 256 KB weight CBs (the down / o_proj: 112 KB);
