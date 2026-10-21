@@ -28,6 +28,8 @@ _PREFILL_MM_SWIGLU = True
 # Prefill down on the C++ matmul (mm_swiglu's program, plain KSPLIT mode) with this K block.
 _PREFILL_DOWN_CPP = True
 _DOWN_K_BLOCK = 16
+# Rows per M block: 13 rows per core as 7 + 6 (2 weight passes, not 4 + 4 + 4 + 1).
+_DOWN_M_BLOCK = 7
 
 
 def _compute_cfg(device):
@@ -188,7 +190,7 @@ class TtMLP:
                 and n_core % 2 == 0
                 and mm_swiglu_supported(h, self.w_down, grid, fuse_swiglu=False, k_block=_DOWN_K_BLOCK)
             ):
-                # The full-grid C++ matmul in 4-row x all-N blocks, 16-tile K blocks with exact fp32 partial reloads
+                # The full-grid C++ matmul in _DOWN_M_BLOCK-row x all-N blocks, 16-tile K blocks with exact fp32 partial reloads
                 # (mm_swiglu's program, KSPLIT): bit-identical to the 2-D multicast linear below, with half the
                 # partial spills.
                 out = mm_swiglu(
@@ -199,7 +201,7 @@ class TtMLP:
                     memory_config=ttnn.L1_MEMORY_CONFIG,
                     fuse_swiglu=False,
                     transpose=False,
-                    blocks=(4, n_core, _DOWN_K_BLOCK),
+                    blocks=(_DOWN_M_BLOCK, n_core, _DOWN_K_BLOCK),
                 )
             else:
                 # ttnn.linear's 2-D multicast over the full grid with 8-tile K blocks (24 K steps).

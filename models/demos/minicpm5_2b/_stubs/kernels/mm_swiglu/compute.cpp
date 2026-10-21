@@ -106,15 +106,62 @@ void copy_and_pack_block(uint32_t in_cb, uint32_t out_cb, uint32_t M_block_tiles
 //
 // N_block_tiles must be even (enforced host-side). Like the reference's swiglu_block / copy_and_pack_block, the
 // full M_block_tiles x N_block_tiles block is processed even when it is partial (the writer skips padding).
+// silu16(G) * U in ONE SFPU pass with the bodies of calculate_silu<false> (exp_21f_bf16 + reciprocal iter<1>) and
+// calculate_sfpu_binary_mul<false>, same operations in the same order, minus redundant instructions only:
+// (-x) * (1/ln2) is computed as x * (-1/ln2) (the same product), and the exp_21f polynomial coefficients are loaded
+// once per face instead of once per row group (the _sfpu_exp_21f_bf16_unsafe_ c0..c2 overload, after the same clamp).
+#ifdef TRISC_MATH
+namespace ckernel::sfpu {
+inline void swiglu_exact_pass(const uint32_t g_idx, const uint32_t u_idx, const uint32_t out_idx) {
+    constexpr uint32_t dst_tile_size_sfpi = 32;
+    constexpr float NEG_ONE_LN2 = -1.4426950216293334961f;
+    const sfpi::vFloat c0 = EXP_21F_BF16_C0;
+    const sfpi::vFloat c1 = EXP_21F_BF16_C1;
+    const sfpi::vFloat c2 = EXP_21F_BF16_C2;
+#pragma GCC unroll 8
+    for (int d = 0; d < 8; d++) {
+        const sfpi::vFloat g = sfpi::dst_reg[g_idx * dst_tile_size_sfpi];
+        // _sfpu_exp_21f_bf16_<true>(-g)
+        sfpi::vFloat xlog2 = g * NEG_ONE_LN2 + 127.f;
+        xlog2 = sfpi::clamp(xlog2, 0.0f, 255.0f);
+        sfpi::vFloat z = sfpi::as<sfpi::vFloat>(_float_to_int32_for_exp_21f_(xlog2));
+        sfpi::vInt exponential_part = sfpi::exexp(z, sfpi::ExponentMode::Biased);
+        sfpi::vMag fractional_part = sfpi::exman(z);
+        sfpi::vFloat frac = sfpi::convert<sfpi::vFloat>(fractional_part, sfpi::RoundMode::Nearest);
+        frac = PolynomialEvaluator::eval(frac, c0, c1, c2);
+        // (_sfpu_sigmoid_<false> calls _sfpu_exp_21f_bf16_<true>: no bf16 rounding of the exp here)
+        const sfpi::vFloat e = sfpi::setexp(frac, exponential_part);
+        // _sfpu_sigmoid_<false>, then calculate_silu<false>
+        sfpi::vFloat s = g * sfpu_reciprocal_iter<1>(1.0f + e);
+        s = sfpi::convert<sfpi::vFloat16b>(s, sfpi::RoundMode::Nearest);
+        // calculate_sfpu_binary_mul<false>(silu(G), U)
+        const sfpi::vFloat u = sfpi::dst_reg[u_idx * dst_tile_size_sfpi];
+        sfpi::vFloat result = float32_to_bf16_rne(s * u);
+        v_if(s == 0 || u == 0) { result = 0.0f; }
+        v_endif;
+        sfpi::dst_reg[out_idx * dst_tile_size_sfpi] = result;
+        sfpi::dst_reg++;
+    }
+}
+}  // namespace ckernel::sfpu
+#endif
+
+// Rows m >= valid_M_tiles of a partial M block are padding the writer never stores: their output slots are pushed
+// without computing them (the reference computes and drops them; the stored tiles are unchanged).
 void swiglu_block_exact(
-    uint32_t in_cb, uint32_t scratch_cb, uint32_t out_cb, uint32_t M_block_tiles, uint32_t N_block_tiles) {
+    uint32_t in_cb,
+    uint32_t scratch_cb,
+    uint32_t out_cb,
+    uint32_t M_block_tiles,
+    uint32_t valid_M_tiles,
+    uint32_t N_block_tiles) {
     CircularBuffer cb_scratch(scratch_cb);
     CircularBuffer cb_out(out_cb);
-    const uint32_t block_tiles = M_block_tiles * N_block_tiles;
+    const uint32_t block_tiles = valid_M_tiles * N_block_tiles;
 
     // Step 1: G / U tiles through the reference output stage, into the bf16 scratch CB.
     cb_scratch.reserve_back(block_tiles);
-    copy_and_pack_block(in_cb, scratch_cb, M_block_tiles, N_block_tiles);
+    copy_and_pack_block(in_cb, scratch_cb, valid_M_tiles, N_block_tiles);
     cb_scratch.wait_front(block_tiles);
 
     // Step 2: silu16(G) * U per pair.
@@ -126,6 +173,10 @@ void swiglu_block_exact(
     const uint32_t out_N_block_tiles = N_block_tiles >> 1;
 
     for (uint32_t m = 0; m < M_block_tiles; m++) {
+        if (m >= valid_M_tiles) {
+            cb_out.push_back(out_N_block_tiles);
+            continue;
+        }
         const uint32_t row_base = m * N_block_tiles;
         for (uint32_t p = 0; p < out_N_block_tiles; p++) {
             const uint32_t gate_tile_id = row_base + (p << 1);
@@ -135,10 +186,9 @@ void swiglu_block_exact(
             copy_init(scratch_cb);
             copy_tile(scratch_cb, gate_tile_id, GATE_DST);
             copy_tile(scratch_cb, up_tile_id, UP_DST);
-            silu_tile_init();
-            silu_tile<false>(GATE_DST);  // 16-bit-DEST instantiation: binary_ng's LHS activation
-            mul_binary_tile_init();
-            mul_binary_tile<false>(GATE_DST, UP_DST, GATE_DST);  // 16-bit-DEST instantiation: RNE + 0*x = 0
+            MATH((SFPU_BINARY_INIT_FN(unused, sfpu::silu_init, (APPROX))));
+            MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
+                DST_SYNC_MODE, false, swiglu_exact_pass, GATE_DST, UP_DST, GATE_DST, VectorMode::RC)));
             tile_regs_commit();
 
             tile_regs_wait();
@@ -230,6 +280,11 @@ void matmul_blocks_ksplit(
     const uint32_t dst_cb = last ? out_cb : interm_cb;
     uint32_t in0_index_offset = 0;
     for (uint32_t M_start = 0; M_start < M_block_tiles; M_start += subblock_h) {
+        // An odd M block ends in a 1-row subblock row (same per-tile arithmetic, only the tile grouping differs).
+        const uint32_t sh = std::min(subblock_h, M_block_tiles - M_start);
+        if (sh != subblock_h) {
+            matmul_block_init(in0_cb, in1_cb, false /*transpose*/, subblock_w, sh, K_block_tiles);
+        }
         uint32_t in1_index_offset = 0;
         for (uint32_t N_start = 0; N_start < N_block_tiles; N_start += subblock_w) {
             tile_regs_acquire();
@@ -237,26 +292,25 @@ void matmul_blocks_ksplit(
                 reconfig_data_format_srca(in1_cb, interm_cb);
                 copy_init(interm_cb);
                 uint32_t dst = 0;
-                for (uint32_t h = 0; h < subblock_h; h++) {
+                for (uint32_t h = 0; h < sh; h++) {
                     for (uint32_t w = 0; w < subblock_w; w++) {
                         copy_tile(interm_cb, (M_start + h) * full_N_block_tiles + N_start + w, dst++);
                     }
                 }
                 reconfig_data_format_srca(interm_cb, in1_cb);
-                matmul_block_init(in0_cb, in1_cb, false /*transpose*/, subblock_w, subblock_h, K_block_tiles);
+                matmul_block_init(in0_cb, in1_cb, false /*transpose*/, subblock_w, sh, K_block_tiles);
             }
             uint32_t in0_index = in0_index_offset;
             uint32_t in1_index = in1_index_offset;
             for (uint32_t inner_dim = 0; inner_dim < K_block_tiles; inner_dim++) {
-                matmul_block(
-                    in0_cb, in1_cb, in0_index, in1_index, 0, false /*transpose*/, subblock_w, subblock_h, K_block_tiles);
+                matmul_block(in0_cb, in1_cb, in0_index, in1_index, 0, false /*transpose*/, subblock_w, sh, K_block_tiles);
                 in0_index++;
                 in1_index += full_N_block_tiles;
             }
             tile_regs_commit();
             tile_regs_wait();
             uint32_t dst = 0;
-            for (uint32_t h = 0; h < subblock_h; h++) {
+            for (uint32_t h = 0; h < sh; h++) {
                 for (uint32_t w = 0; w < subblock_w; w++) {
                     pack_tile<true>(dst++, dst_cb, (M_start + h) * full_N_block_tiles + N_start + w);
                 }
@@ -264,7 +318,10 @@ void matmul_blocks_ksplit(
             tile_regs_release();
             in1_index_offset += subblock_w;
         }
-        in0_index_offset += subblock_h * K_block_tiles;
+        if (sh != subblock_h) {
+            matmul_block_init(in0_cb, in1_cb, false /*transpose*/, subblock_w, subblock_h, K_block_tiles);
+        }
+        in0_index_offset += sh * K_block_tiles;
     }
 }
 #endif  // KSPLIT
@@ -334,10 +391,12 @@ void kernel_main() {
                 CircularBuffer cb_interm(intermediate_cb);
                 matmul_block_init(
                     in0_cb, in1_cb, false /*transpose*/, current_subblock_w, current_subblock_h, K_block_tiles);
-                cb_out.reserve_back(out_block_num_tiles);
                 for (uint32_t k_block = 0; k_block < K_num_blocks; k_block++) {
                     const bool first = k_block == 0;
                     const bool last = k_block == K_num_blocks - 1;
+                    if (last) {
+                        cb_out.reserve_back(out_block_num_tiles);  // single-buffered: only the last block packs to it
+                    }
                     cb_in0.wait_front(in0_block_num_tiles);
                     cb_in1.wait_front(in1_block_num_tiles);
                     // The partials CB holds one block and is updated in place: each subblock's partials are
@@ -457,7 +516,8 @@ void kernel_main() {
             // SwiGLU collapses the interleaved gate/up block to half its N width.
             cb_out.reserve_back(out_block_num_tiles >> 1);
             cb_intermediate.wait_front(out_block_num_tiles);
-            swiglu_block_exact(intermediate_cb, scratch_cb, out_cb, M_block_tiles, N_block_tiles);
+            swiglu_block_exact(
+                intermediate_cb, scratch_cb, out_cb, M_block_tiles, current_M_block_tiles, N_block_tiles);
             cb_intermediate.pop_front(out_block_num_tiles);
 #else
             cb_out.reserve_back(out_block_num_tiles);

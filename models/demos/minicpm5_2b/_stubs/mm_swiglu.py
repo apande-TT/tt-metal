@@ -30,6 +30,9 @@ _TILE = 32
 # Block config of the reference prefill minimal_matmul (mlp.py _mm): K block = all of K.
 _M_BLOCK = 2
 _N_BLOCK = 2
+# SwiGLU: 4-row M blocks with in0 single-buffered (reused across all N blocks of an M block): the weight is re-read
+# 4x per core instead of 7x.
+_SWIGLU_M_BLOCK = 4
 _SUBBLOCK_H = 2
 _SUBBLOCK_W = 2
 
@@ -148,6 +151,8 @@ def mm_swiglu(
     M, K, N = _dims(x, w_il)
     M_tiles, K_tiles, N_tiles = M // _TILE, K // _TILE, N // _TILE
     M_block, K_block, N_block = _M_BLOCK, K_tiles, _N_BLOCK
+    if fuse_swiglu:
+        M_block = _SWIGLU_M_BLOCK
     if blocks is not None:
         assert not fuse_swiglu
         M_block, N_block, K_block = blocks
@@ -191,15 +196,19 @@ def mm_swiglu(
     else:
         assert K_blocks == 1 or N_blocks_per_core == 1, "KSPLIT needs one N block per core (ascending K order)"
         assert K_block % _in0_chunk(K_block) == 0
-    assert M_block % subblock_h == 0 and N_block % subblock_w == 0 and subblock_h * subblock_w <= 4
+    # KSPLIT's compute handles an odd M block (a 1-row last subblock row); the other modes need whole subblocks.
+    assert (M_block % subblock_h == 0 or K_blocks > 1) and N_block % subblock_w == 0 and subblock_h * subblock_w <= 4
 
     in0_block_num_tiles = M_block * K_block
     in1_block_num_tiles = K_block * N_block
     out_block_num_tiles = M_block * N_block
-    in0_cb_num_tiles = 2 * in0_block_num_tiles
+    in0_cb_num_tiles = in0_block_num_tiles if fuse_swiglu else 2 * in0_block_num_tiles
     in1_cb_num_tiles = 2 * in1_block_num_tiles
     # SwiGLU: half a block, double buffered; plain: a block, double buffered.
     out_cb_num_tiles = 2 * (out_block_num_tiles // 2) if fuse_swiglu else 2 * out_block_num_tiles
+    if not fuse_swiglu and K_blocks > 1:
+        # KSPLIT: one block, reserved only for the last K block (the writer drains it during the next block's K loop).
+        out_cb_num_tiles = out_block_num_tiles
     interm_cb_num_tiles = out_block_num_tiles
 
     out = ttnn.allocate_tensor_on_device(
