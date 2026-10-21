@@ -37,6 +37,10 @@ DECODE_GATE_UP_BF4_LAYERS = frozenset(range(5, 36))
 # prefill 1173 -> 1006 ms but PCC 0.99334 < 0.995; layers 18-22: 1153 ms, PCC 0.995137; 16-24: 1134 ms, 0.995147;
 # 8-31: 1073 ms, PCC 0.99509 and 12-27: 1107 ms, PCC 0.995806 fail test_e2e_text_generation's token agreement).
 PREFILL_GATE_UP_LOFI_LAYERS = frozenset(range(14, 26))
+# The text layers' many-row (prefill) down projection at LoFi: it is FPU-bound (608 x 256 tile products a core on the
+# 416-row prompt), LoFi runs one fidelity phase instead of HiFi2's two -- trace prefill 1028 -> 937 ms; PCC 0.995097 ->
+# 0.995002 (threshold 0.995; layers 18-21 alone: 0.995039). The vision MLPs (subclasses) keep PREFILL_DOWN_FIDELITY.
+PREFILL_DOWN_LOFI = True
 # K tiles per activation multicast block of the bf4 decode gate / up projections (divides K = 160 tiles).
 DECODE_GATE_UP_K_BLOCK = 8
 # Math fidelity of the bf4 decode gate / up and down (HiFi3 == HiFi4 bit for bit on a block-float4 weight, see __init__).
@@ -271,10 +275,11 @@ class TtMinistral3MLP:
         )
         # The many-row down projection is compute-bound as well (fp32 accumulation kept).
         self.down_cfg = self.compute_cfg
-        if self.PREFILL_DOWN_FIDELITY is not None:
+        down_lofi = PREFILL_DOWN_LOFI and type(self) is TtMinistral3MLP and layer_idx is not None
+        if self.PREFILL_DOWN_FIDELITY is not None or down_lofi:
             self.down_cfg = ttnn.init_device_compute_kernel_config(
                 device.arch(),
-                math_fidelity=self.PREFILL_DOWN_FIDELITY,
+                math_fidelity=ttnn.MathFidelity.LoFi if down_lofi else self.PREFILL_DOWN_FIDELITY,
                 math_approx_mode=False,
                 fp32_dest_acc_en=True,
                 packer_l1_acc=False,
