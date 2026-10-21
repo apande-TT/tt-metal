@@ -53,6 +53,28 @@ EPI_DONE_FRAC = 0.5
 SWIGLU_OVERLAP_L1_BYTES = 1_240_000
 
 
+# minimal_matmul splits M along the grid's x axis and N along y when M > N, else the other way round. ORIENT_MIN_WORK
+# takes the other orientation where it hands each core at least ORIENT_MIN_GAIN fewer output tiles (ceil splits,
+# SwiGLU pairs kept whole; the vision MLP / attention: 64 M tiles against 32-96 N tiles) -- the same tiles, each
+# accumulated over K in the same order. Callers that size blocks to the per-core ranges use transposed() too.
+ORIENT_MIN_WORK = True
+ORIENT_MIN_GAIN = 0.05
+
+
+def transposed(m_tiles, n_tiles, gx, gy, swiglu=False):
+    """Whether minimal_matmul (this module's program) splits M along the grid's x axis (and N along y)."""
+    stock = m_tiles > n_tiles
+    if not ORIENT_MIN_WORK:
+        return stock
+
+    def work(t):
+        mp, np_ = (gx, gy) if t else (gy, gx)
+        n = 2 * -(-(n_tiles // 2) // np_) if swiglu else -(-n_tiles // np_)
+        return -(-m_tiles // mp) * n
+
+    return (not stock) if work(not stock) <= (1 - ORIENT_MIN_GAIN) * work(stock) else stock
+
+
 def _round_up(a, b):
     return -(-a // b) * b
 
@@ -156,6 +178,7 @@ def matmul(
     fuse_swiglu=False,
     residual=None,
     in0_heads=None,
+    stock_orient=False,
 ):
     """residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
     residual_add_block: the stock data-movement kernels' FUSE_TERNARY read brings the residual block in on the RISC that
@@ -183,7 +206,8 @@ def matmul(
     M_block, K_block, N_block = int(config.M_block_size), int(config.K_block_size), int(config.N_block_size)
     sub_h, sub_w = int(config.subblock_h), int(config.subblock_w)
 
-    transpose = M > N
+    # stock_orient: the stock M > N split (the vision MLP down measured no better transposed)
+    transpose = M_tiles > N_tiles if stock_orient else transposed(M_tiles, N_tiles, gx, gy, fuse_swiglu)
     dram_read, dram_write = ttnn.NOC.NOC_0, ttnn.NOC.NOC_1  # Blackhole preferred NOCs
     small_noc, small_risc = dram_write, ttnn.DataMovementProcessor.RISCV_1
     large_noc, large_risc = dram_read, ttnn.DataMovementProcessor.RISCV_0

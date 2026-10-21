@@ -264,6 +264,10 @@ PLANNED_TP = 4
 #                     a two-block fp32 intermediate and every writer (injectors too, kernels/mm_dm_in*.cpp) deferring
 #                     its block write to K step K_blocks / 2 or later: 416-row gate/up 9.57 -> 9.21 ms/layer,
 #                     bit-identical (DRAM in / out only: the vision MLP's L1 tensors leave no room for the second block).
+#   minimal_mm grid split by per-core work (tt/minimal_mm.py transposed): M along x / N along y or the other way round,
+#                     whichever hands each core >= 5% fewer output tiles (stock: M > N). Flips only the vision gate/up
+#                     (168 -> 156 tiles a core), o_proj and the patch projection (24 -> 21); the stubs size their blocks to
+#                     the chosen ranges and the MLP down keeps the stock split. Trace encode 21.30 -> 21.00 ms.
 #   decoder_head: the one-tile-row lm_head (decode; prefill's last prompt rows) streams bank-major copies of its
 #                     weight on both data-movement RISCs of 64 cores (tt/lm_head_decode.py), bit-identical to ttnn.linear.
 #                     The decode gate / up and the lm_head stream through 256 KB weight CBs (the down / o_proj: 112 KB);
