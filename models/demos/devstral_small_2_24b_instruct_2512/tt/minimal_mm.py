@@ -87,6 +87,27 @@ def supported(x, w, compute_kernel_config=None, fuse_swiglu=False) -> bool:
     return xs[-1] == ws[-2] and all(d == 1 for d in ws[:-2])
 
 
+def default_config(device, compute_kernel_config=None, x=None, w=None):
+    """The blocking ttnn.experimental.minimal_matmul runs when given no config (minimal_matmul_program_factory.cpp
+    determine_default_block_sizes): 8 x 8 x 8 blocks on the device's compute grid, 2 x 2 subblocks with fp32 DEST
+    (else 2 x 4 when N >= M, 4 x 2 when M > N; x, w needed then)."""
+    sub_h, sub_w = 2, 2
+    if compute_kernel_config is not None and not compute_kernel_config.fp32_dest_acc_en:
+        xs = [int(d) for d in x.padded_shape]
+        m = 1
+        for d in xs[:-1]:
+            m *= d
+        sub_h, sub_w = (2, 4) if int(w.padded_shape[-1]) >= m else (4, 2)
+    return ttnn.MinimalMatmulConfig(
+        M_block_size=8,
+        K_block_size=8,
+        N_block_size=8,
+        subblock_h=sub_h,
+        subblock_w=sub_w,
+        compute_with_storage_grid_size=device.compute_with_storage_grid_size(),
+    )
+
+
 def _in0_view(x, in0_heads):
     """x's padded shape as the matmul sees it: (B, 1, S, NH * HD) for a heads-layout (B, NH, S, HD) in0."""
     xs = [int(d) for d in x.padded_shape]
