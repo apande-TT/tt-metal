@@ -114,6 +114,8 @@ class TtQwenTextEncoder:
         _te_attention.BMM_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         # with M split over the grid too (full K per block): one batch per core left most of the grid idle
         _te_attention.BMM_SPLIT_M = True
+        # as one product over the limbs concatenated along K ([ah | ah | al] @ [bh ; bl ; bh]), not three + two adds
+        _te_attention.BMM_CONCAT_K = True
         # and its exact-lane linears on the full core grid (ttnn's own pick: 30-48 cores)
         _te_attention.EXACT_LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         # with their weight and activation limbs (vision qkv / proj / MLP: <= 4 MB per chip) staged in L1 once
