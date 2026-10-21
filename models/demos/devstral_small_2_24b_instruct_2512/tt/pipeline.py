@@ -259,6 +259,11 @@ PLANNED_TP = 4
 #                     prompt: 7 tiles, not 8) and 1 x 4 subblocks -- the SwiGLU epilogue no longer runs padded rows.
 #                     The long-prompt QKV / o_proj take N blocks of each core's narrow N range (QKV: 5 tiles, 4 x 1
 #                     subblocks) and the MLP down 1 x 4 subblocks.
+#   prefill fused gate/up (tt/minimal_mm.py SWIGLU_OVERLAP): each output block's SwiGLU epilogue runs during the next
+#                     block's matmul, one gate/up pair between its subblocks (the PACK thread's SFPU beside the FPU), with
+#                     a two-block fp32 intermediate and every writer (injectors too, kernels/mm_dm_in*.cpp) deferring
+#                     its block write to K step K_blocks / 2 or later: 416-row gate/up 9.57 -> 9.21 ms/layer,
+#                     bit-identical (DRAM in / out only: the vision MLP's L1 tensors leave no room for the second block).
 #   decoder_head: the one-tile-row lm_head (decode; prefill's last prompt rows) streams bank-major copies of its
 #                     weight on both data-movement RISCs of 64 cores (tt/lm_head_decode.py), bit-identical to ttnn.linear.
 #                     The decode gate / up and the lm_head stream through 256 KB weight CBs (the down / o_proj: 112 KB);
