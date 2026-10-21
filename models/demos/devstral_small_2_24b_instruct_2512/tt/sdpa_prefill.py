@@ -33,6 +33,10 @@ T = 32
 
 # The SDPA programs ride generic_op (off: the stock op).
 ENABLED = True
+# A causal prefill whose keys are one K chunk computes each Q chunk's key columns only up to its diagonal (kernels/
+# sdpa_compute.cpp SDPA_CAUSAL_SKIP): the skipped tiles are all -inf before the softmax, exp to exact zeros, and leave
+# every output bit as it was.
+CAUSAL_SKIP = True
 
 
 def _subblock(h, w, dst_size, max_h=None):
@@ -133,6 +137,7 @@ def sdpa(q, k, v, is_causal, scale, program_config, compute_kernel_config, memor
         ("REDUCE_GRANULARITY", str(_granularity(Sq_chunk_t, dst_size // 2))),
         ("EXP_APPROX_MODE", "1" if program_config.exp_approx_mode else "0"),
     ]
+    compute_defines = defines + ([("SDPA_CAUSAL_SKIP", "1")] if is_causal and CAUSAL_SKIP else [])
     packed_identity = 0x3F803F80  # two bf16 1.0
     scale_packed = struct.unpack("<I", struct.pack("<f", float(scale)))[0]
     zigzag = int(bool(is_causal))
@@ -220,19 +225,19 @@ def sdpa(q, k, v, is_causal, scale, program_config, compute_kernel_config, memor
     ccfg.dst_full_sync_en = bool(getattr(compute_kernel_config, "dst_full_sync_en", False))
     ccfg.math_approx_mode = bool(getattr(compute_kernel_config, "math_approx_mode", False))
 
-    kern = lambda src, ct, rt, cfg: ttnn.KernelDescriptor(
+    kern = lambda src, ct, rt, cfg, d: ttnn.KernelDescriptor(
         kernel_source=src,
         source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
         core_ranges=core_grid,
         compile_time_args=ct,
         runtime_args=rt,
         config=cfg,
-        defines=defines,
+        defines=d,
     )
     kernels = [
-        kern(_READER, reader_ct, rt_r, ttnn.ReaderConfigDescriptor()),
-        kern(_WRITER, writer_ct, rt_w, ttnn.WriterConfigDescriptor()),
-        kern(_COMPUTE, compute_ct, rt_c, ccfg),
+        kern(_READER, reader_ct, rt_r, ttnn.ReaderConfigDescriptor(), defines),
+        kern(_WRITER, writer_ct, rt_w, ttnn.WriterConfigDescriptor(), defines),
+        kern(_COMPUTE, compute_ct, rt_c, ccfg, compute_defines),
     ]
     ttnn.generic_op([q, k, v, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs))
     return out
