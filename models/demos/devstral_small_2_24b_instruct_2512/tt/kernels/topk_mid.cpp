@@ -16,6 +16,9 @@
 //   * its sort direction comes from the runtime arg direction_init, alternating across middle cores
 //     exactly as the stock op alternates its local cores, so that consecutive inputs of the final merge
 //     form bitonic pairs.
+// Compile-time arg 13 (FUSED) selects the stock fused-key mode (topk_local.cpp / topk_final.cpp ct arg 15): the
+// candidates arrive as packed [bf16 value | u16 index] 32-bit keys, merge as one word each, and leave packed;
+// there is no index stream.
 
 #include <cstdint>
 #include "api/compute/compute_kernel_api.h"
@@ -42,6 +45,7 @@ void kernel_main() {
     constexpr std::uint32_t logk = get_compile_time_arg_val(10);
     constexpr std::uint32_t logWt = get_compile_time_arg_val(11);
     constexpr bool largest = get_compile_time_arg_val(12) == 1;
+    constexpr bool fused = get_compile_time_arg_val(13) == 1;
 
     const std::uint32_t direction_init = get_arg_val<std::uint32_t>(0);
 
@@ -56,7 +60,7 @@ void kernel_main() {
 
     compute_kernel_hw_startup(input_dfb_index, values_dfb_index);
     copy_init(input_dfb_index);
-    ckernel::topk_tile_init<false>();
+    ckernel::topk_tile_init<fused>();
     constexpr auto tie_order = ckernel::topk_tie_order_from_global_direction(largest);
 
     DataflowBuffer input_dfb(input_dfb_index);
@@ -68,7 +72,9 @@ void kernel_main() {
 
     for (std::uint32_t ht = 0; ht < Ht; ++ht) {
         input_dfb.wait_front(Wt);
-        index_dfb.wait_front(Wt);
+        if constexpr (!fused) {
+            index_dfb.wait_front(Wt);
+        }
 
         // Stage the gathered candidates in the in-place merge workspaces (as topk_final.cpp).
         reconfig_data_format_srca(input_dfb_index);
@@ -87,27 +93,29 @@ void kernel_main() {
         input_transposed_dfb.wait_front(Wt);
         input_dfb.pop_front(Wt);
 
-        reconfig_data_format_srca(input_dfb_index, index_dfb_index);
-        copy_init(index_dfb_index);
-        pack_reconfig_data_format(index_transposed_dfb_index);
-        for (std::uint32_t wt = 0; wt < Wt; wt++) {
-            tile_regs_acquire();
-            copy_tile(index_dfb_index, wt, 0);
-            tile_regs_commit();
-            index_transposed_dfb.reserve_back(1);
-            tile_regs_wait();
-            pack_tile(0, index_transposed_dfb_index);
-            tile_regs_release();
-            index_transposed_dfb.push_back(1);
+        if constexpr (!fused) {
+            reconfig_data_format_srca(input_dfb_index, index_dfb_index);
+            copy_init(index_dfb_index);
+            pack_reconfig_data_format(index_transposed_dfb_index);
+            for (std::uint32_t wt = 0; wt < Wt; wt++) {
+                tile_regs_acquire();
+                copy_tile(index_dfb_index, wt, 0);
+                tile_regs_commit();
+                index_transposed_dfb.reserve_back(1);
+                tile_regs_wait();
+                pack_tile(0, index_transposed_dfb_index);
+                tile_regs_release();
+                index_transposed_dfb.push_back(1);
+            }
+            index_transposed_dfb.wait_front(Wt);
+            index_dfb.pop_front(Wt);
         }
-        index_transposed_dfb.wait_front(Wt);
-        index_dfb.pop_front(Wt);
 
         std::uint32_t num_k_sequences = (Wt * 32) / K;
         for (std::uint32_t m_iter = 0; m_iter < logWt; ++m_iter) {
             // Merge direction follows the global `largest`; the rebuild direction (and so this core's
             // output order) follows direction_init, as on the stock local cores.
-            process_iteration<false, false, tie_order>(
+            process_iteration<false, fused, tie_order>(
                 m_iter,
                 K,
                 Wt,
@@ -144,21 +152,23 @@ void kernel_main() {
         input_transposed_dfb.wait_front(Wt);
         input_transposed_dfb.pop_front(Wt);
 
-        reconfig_data_format_srca(index_transposed_dfb_index);
-        copy_init(index_transposed_dfb_index);
-        pack_reconfig_data_format(index_transposed_dfb_index);
-        index_transposed_dfb.wait_front(Kt);
-        for (std::uint32_t i = 0; i < Kt; ++i) {
-            tile_regs_acquire();
-            copy_tile(index_transposed_dfb_index, i, 0);
-            tile_regs_commit();
-            output_ind_dfb.reserve_back(1);
-            tile_regs_wait();
-            pack_tile(0, output_ind_dfb_index);
-            tile_regs_release();
-            output_ind_dfb.push_back(1);
+        if constexpr (!fused) {
+            reconfig_data_format_srca(index_transposed_dfb_index);
+            copy_init(index_transposed_dfb_index);
+            pack_reconfig_data_format(index_transposed_dfb_index);
+            index_transposed_dfb.wait_front(Kt);
+            for (std::uint32_t i = 0; i < Kt; ++i) {
+                tile_regs_acquire();
+                copy_tile(index_transposed_dfb_index, i, 0);
+                tile_regs_commit();
+                output_ind_dfb.reserve_back(1);
+                tile_regs_wait();
+                pack_tile(0, output_ind_dfb_index);
+                tile_regs_release();
+                output_ind_dfb.push_back(1);
+            }
+            index_transposed_dfb.wait_front(Wt);
+            index_transposed_dfb.pop_front(Wt);
         }
-        index_transposed_dfb.wait_front(Wt);
-        index_transposed_dfb.pop_front(Wt);
     }
 }

@@ -502,6 +502,12 @@ class VocabTopK:
     LOCALS = 8  # local cores per middle core
     VAL, IDX = ttnn.bfloat16, ttnn.uint16
     TILE_BYTES = 2048  # bf16 and uint16 tiles
+    # The stock op's fused-key mode at every level (topk_local.cpp / topk_final.cpp ct arg 15, kernels/topk_mid.cpp
+    # ct arg 13): right after the local transposes each value and its position become one packed [bf16 | u16] 32-bit
+    # key that sorts, merges and travels as a single word (raw float32 tiles, 32-bit DEST); the final core splits them
+    # back into the value and position outputs. Equal values then rank by position (the stock stable order).
+    FUSED = True
+    PACKED, PACKED_BYTES = ttnn.float32, 4096
 
     def __init__(self, device, k):
         assert k == 32, "the stock kernels' K=32 layout (one candidate tile per core) is assumed"
@@ -518,13 +524,11 @@ class VocabTopK:
         self.all_set = self.local_set.merge(self.mid_final_set)
         self.phys = lambda x, y: device.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
 
-    def _cb(self, index, tiles, dtype, cores):
+    def _cb(self, index, tiles, dtype, cores, tile_bytes=TILE_BYTES):
         return ttnn.CBDescriptor(
-            total_size=tiles * self.TILE_BYTES,
+            total_size=tiles * tile_bytes,
             core_ranges=cores,
-            format_descriptors=[
-                ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=self.TILE_BYTES)
-            ],
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=tile_bytes)],
         )
 
     def __call__(self, x):
@@ -547,23 +551,48 @@ class VocabTopK:
         # address after its own gather wrapped the buffer, so the buffer holds exactly one gather (g == n).
         assert g == n
         IN, IN_IDX, LT_VAL, LT_IDX, G_VAL, G_IDX, M_VAL, M_IDX, OUT_VAL, OUT_IDX = range(10)
-        cbs = [
-            self._cb(G_VAL, n * kt, self.VAL, self.all_set),
-            self._cb(G_IDX, n * kt, self.IDX, self.all_set),
-            self._cb(OUT_VAL, 2, self.VAL, self.all_set),
-            self._cb(OUT_IDX, 2, self.IDX, self.all_set),
-            self._cb(IN, 4, self.VAL, self.local_set),
-            self._cb(IN_IDX, 4, self.IDX, self.local_set),
-            self._cb(LT_VAL, wt_local, self.VAL, self.local_set),
-            self._cb(LT_IDX, wt_local, self.IDX, self.local_set),
-            self._cb(M_VAL, g * kt, self.VAL, self.mid_final_set),
-            self._cb(M_IDX, g * kt, self.IDX, self.mid_final_set),
-        ]
+        fused = self.FUSED
+        P, PB = self.PACKED, self.PACKED_BYTES
+        if fused:
+            # G_IDX / M_IDX are the final core's staging for the split values (bf16) / positions (u16)
+            sending = self.local_set.merge(self.mid_set)
+            cbs = [
+                self._cb(G_VAL, n * kt, P, self.all_set, PB),
+                self._cb(G_IDX, n * kt, self.VAL, self.all_set),
+                self._cb(OUT_VAL, 2, P, sending, PB),
+                self._cb(OUT_VAL, 2, self.VAL, self.final_set),
+                self._cb(OUT_IDX, 2, self.IDX, self.all_set),
+                self._cb(IN, 4, self.VAL, self.local_set),
+                self._cb(IN_IDX, 4, self.IDX, self.local_set),
+                self._cb(LT_VAL, wt_local, P, self.local_set, PB),
+                self._cb(M_VAL, g * kt, P, self.mid_final_set, PB),
+                self._cb(M_IDX, g * kt, self.IDX, self.mid_final_set),
+            ]
+        else:
+            cbs = [
+                self._cb(G_VAL, n * kt, self.VAL, self.all_set),
+                self._cb(G_IDX, n * kt, self.IDX, self.all_set),
+                self._cb(OUT_VAL, 2, self.VAL, self.all_set),
+                self._cb(OUT_IDX, 2, self.IDX, self.all_set),
+                self._cb(IN, 4, self.VAL, self.local_set),
+                self._cb(IN_IDX, 4, self.IDX, self.local_set),
+                self._cb(LT_VAL, wt_local, self.VAL, self.local_set),
+                self._cb(LT_IDX, wt_local, self.IDX, self.local_set),
+                self._cb(M_VAL, g * kt, self.VAL, self.mid_final_set),
+                self._cb(M_IDX, g * kt, self.IDX, self.mid_final_set),
+            ]
         # Semaphores 0/1: local -> middle hand-off; 2/3: middle -> final (a middle core runs both protocols).
         sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=self.all_set, initial_value=0) for i in range(4)]
 
         compute_cfg = ttnn.ComputeConfigDescriptor()
-        compute_cfg.fp32_dest_acc_en = False
+        compute_cfg.fp32_dest_acc_en = fused  # packed 32-bit keys need 32-bit DEST
+        if fused:
+            # packed keys unpack straight to DEST (the 16-bit source registers would truncate them)
+            modes = [ttnn.UnpackToDestMode.Default] * 64
+            for i in (LT_VAL, G_VAL, M_VAL):
+                modes[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
+            compute_cfg.unpack_to_dest_mode = modes
+        fdefs = [("TOPK_FUSED_STABLE_KEYS", "1")] if fused else []
         logk = int(math.log2(k))
         sort_ct = lambda width_tiles, a, b, c, d: [a, b, c, d, OUT_VAL, OUT_IDX, ht, width_tiles, k, kt, logk]
         kern = lambda src, cores, ct, rt, cfg, **kw: ttnn.KernelDescriptor(
@@ -588,14 +617,14 @@ class VocabTopK:
             kern(
                 f"{_TOPK_KERNELS}/compute/topk_local.cpp",
                 self.local_set,
-                sort_ct(wt_local, IN, IN_IDX, LT_VAL, LT_IDX) + [int(math.log2(wt_local)), 1, 1, 0, 0],
+                sort_ct(wt_local, IN, IN_IDX, LT_VAL, LT_IDX) + [int(math.log2(wt_local)), 1, 1, int(fused), int(fused)],
                 [((cx, cy), [i % 2]) for i, (cx, cy) in enumerate(locals_)],
                 compute_cfg,
             ),
             kern(
                 _TOPK_MID_KERNEL,
                 self.mid_set,
-                sort_ct(n * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(n * kt)), 1],
+                sort_ct(n * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(n * kt)), 1, int(fused)],
                 [((gx, n), [gx % 2]) for gx in range(g)],
                 compute_cfg,
                 compiler_include_paths=[f"{_TOPK_KERNELS}/compute"],
@@ -607,6 +636,7 @@ class VocabTopK:
                 + [OUT_VAL, OUT_IDX, G_VAL, G_IDX],
                 [((gx, n), [gx]) for gx in range(g)],
                 ttnn.WriterConfigDescriptor(),
+                defines=fdefs,
             ),
             kern(
                 f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
@@ -615,11 +645,12 @@ class VocabTopK:
                 + [ht, g * kt, g, G_VAL, G_IDX],
                 [],
                 ttnn.ReaderConfigDescriptor(),
+                defines=fdefs,
             ),
             kern(
                 f"{_TOPK_KERNELS}/compute/topk_final.cpp",
                 self.final_set,
-                sort_ct(g * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(g * kt)), 1, 1, 0, 0],
+                sort_ct(g * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(g * kt)), 1, 1, int(fused), int(fused)],
                 [],
                 compute_cfg,
             ),
@@ -644,6 +675,7 @@ class VocabTopK:
                     [0, 1, mid.x, mid.y, ht, k, kt, OUT_VAL, OUT_IDX, G_VAL, G_IDX],
                     [((gx, ly), [ly]) for ly in range(n)],
                     ttnn.WriterConfigDescriptor(),
+                    defines=fdefs,
                 )
             )
             # ... which releases them (multicast over the column) and collects n * kt tiles.
@@ -654,6 +686,7 @@ class VocabTopK:
                     [0, 1, top.x, top.y, bottom.x, bottom.y, ht, n * kt, n, G_VAL, G_IDX],
                     [],
                     ttnn.ReaderConfigDescriptor(),
+                    defines=fdefs,
                 )
             )
         ttnn.generic_op([x, vals, ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
