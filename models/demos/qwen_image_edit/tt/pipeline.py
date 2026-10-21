@@ -29,6 +29,7 @@ from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import (
     batched_matmul,
     guard_tail,
+    head_split,
     row_gather,
     small_weight_linear,
     split_limbs,
@@ -229,7 +230,7 @@ class TtQwenImageEditPipeline:
         # (and the merged rows' unpermutation as an exact row gather, not one-hot products)
         with self._hook(_te_attention, "B_LANE_SPLIT", self.weight_lane_split), self._hook(
             _vision_tower, "ROW_GATHER", row_gather if self.linear_kernel else None
-        ), self._fused_tail():
+        ), self._hook(_te_attention, "HEADS_KERNEL", head_split if self.linear_kernel else None), self._fused_tail():
             return self.text_encoder.encode_vision(up.te)
 
     def text_encode(self, up, image_embeds):

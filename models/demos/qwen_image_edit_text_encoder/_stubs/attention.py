@@ -633,6 +633,9 @@ def rotate_half_padded(t, d):
 BMM_CONFIG = None
 # Optional kernel for split_matmul's batched products: BMM_KERNEL(p, q, transpose_b) -> p @ q in float32, or None.
 BMM_KERNEL = None
+# Optional kernel for the vision head split: HEADS_KERNEL(qkv, heads, memory_config) -> (q, k, v) as
+# nlp_create_qkv_heads (num_kv_heads = heads, no k transpose) returns them, or None.
+HEADS_KERNEL = None
 _BMM_CONFIGS = {}
 
 
@@ -967,8 +970,13 @@ class TtVisionAttention:
         cfg = self.compute_cfg
         L = getattr(self, "limbs", 2)
         qkv = split_linear(x, self.wqkv_p, bias=self.bqkv_p, compute_kernel_config=cfg, limbs=L)
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv, num_heads=hp, num_kv_heads=hp, transpose_k_heads=False, memory_config=ttnn.L1_MEMORY_CONFIG
+        heads = None if HEADS_KERNEL is None else HEADS_KERNEL(qkv, hp, ttnn.L1_MEMORY_CONFIG)
+        q, k, v = (
+            heads
+            if heads is not None
+            else ttnn.experimental.nlp_create_qkv_heads(
+                qkv, num_heads=hp, num_kv_heads=hp, transpose_k_heads=False, memory_config=ttnn.L1_MEMORY_CONFIG
+            )
         )  # (the heads into L1: the rope reads them there)
         ttnn.deallocate(qkv)
         cos, sin = self._padded_tables(tt_cos, tt_sin)
