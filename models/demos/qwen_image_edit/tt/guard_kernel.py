@@ -131,19 +131,21 @@ def _plain(t, s):
 
 def guard_tail(ex, dn, nn, tol, lo_fn, lo2_fn=None):
     """where(|ex - dn| <= tol, ex, median(ex, dn, -nn)) + lo_fn() [+ lo2_fn()] for same-shape interleaved float32
-    tile tensors [..., M, N] (M and N tile-aligned). Consumes (deallocates) ex, dn, nn, tol and the lo_fn() /
-    lo2_fn() tensors. Returns None for a shape it does not take, before calling lo_fn."""
+    tile tensors [..., M, N] (a ragged M or N -- the denoiser's 622 keys -- runs over the padded tiles: the same
+    shape pads alike, and the padding's values are never read). Consumes (deallocates) ex, dn, nn, tol and the
+    lo_fn() / lo2_fn() tensors. Returns None for a shape it does not take, before calling lo_fn."""
     s = list(ex.shape)
-    if len(s) < 2 or s[-2] % TILE or s[-1] % TILE or not all(_plain(t, s) for t in (ex, dn, nn, tol)):
+    if len(s) < 2 or not all(_plain(t, s) for t in (ex, dn, nn, tol)):
         return None
     lo = lo_fn()
     if not _plain(lo, s):  # not expected: the trailing product has the leading one's shape and dtype
         ttnn.deallocate(lo)
         return None
+    ps = list(ex.padded_shape)
     n_tiles = 1
-    for d in s[:-2]:
+    for d in ps[:-2]:
         n_tiles *= d
-    n_tiles *= (s[-2] // TILE) * (s[-1] // TILE)
+    n_tiles *= (ps[-2] // TILE) * (ps[-1] // TILE)
     ins = [ex, dn, nn, tol, lo]
     if lo2_fn is not None:
         lo2 = lo2_fn()
