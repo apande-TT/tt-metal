@@ -5,8 +5,9 @@
 // nlp_create_qkv_heads (num_kv_heads = num_heads, no k transpose) for a float32 tile tensor, as tile copies:
 // qkv [N, 1, S, 3 * H * D] -> q, k, v [N, H, S, D]. Output page i of q / k / v (tile (d, s, e = n * H + h)) is
 // tile column (w * H + h) * D/32 + d of qkv's tile row n * S/32 + s, for w = 0 / 1 / 2; the three are read into
-// c_16 / c_17 / c_18 for the three-output writer, which stores page i of each.
-// Compile-time: qkv's accessor args, then H (heads), dt (D / 32), st (S / 32).
+// c_16 / c_17 / c_18 for the three-output writer, which stores page i of each. parts = 1: one projection
+// [N, 1, S, H * D] -> [N, H, S, D] (the reshape + permute of a head split), its tiles into c_16 alone.
+// Compile-time: qkv's accessor args, then H (heads), dt (D / 32), st (S / 32), parts (3 or 1).
 // Runtime: qkv addr, first output page, page count.
 
 #include <cstdint>
@@ -26,7 +27,8 @@ void kernel_main() {
     constexpr uint32_t heads = get_compile_time_arg_val(base);
     constexpr uint32_t dt = get_compile_time_arg_val(base + 1);
     constexpr uint32_t st = get_compile_time_arg_val(base + 2);
-    constexpr uint32_t ct = 3 * heads * dt;  // qkv tile columns
+    constexpr uint32_t parts = get_compile_time_arg_val(base + 3);
+    constexpr uint32_t ct = parts * heads * dt;  // source tile columns
     const auto src = TensorAccessor(src_args, src_addr);
     const uint32_t bytes = get_local_cb_interface(16).fifo_page_size;
 
@@ -40,14 +42,18 @@ void kernel_main() {
         const uint32_t n = e / heads, h = e % heads;
         const uint32_t row = (n * st + s) * ct + h * dt + d;  // q's source page; k and v are heads * dt further
         cb_q.reserve_back(1);
-        cb_k.reserve_back(1);
-        cb_v.reserve_back(1);
         noc.async_read(src, cb_q, bytes, {.page_id = row}, {.offset_bytes = 0});
-        noc.async_read(src, cb_k, bytes, {.page_id = row + heads * dt}, {.offset_bytes = 0});
-        noc.async_read(src, cb_v, bytes, {.page_id = row + 2 * heads * dt}, {.offset_bytes = 0});
+        if constexpr (parts == 3) {
+            cb_k.reserve_back(1);
+            cb_v.reserve_back(1);
+            noc.async_read(src, cb_k, bytes, {.page_id = row + heads * dt}, {.offset_bytes = 0});
+            noc.async_read(src, cb_v, bytes, {.page_id = row + 2 * heads * dt}, {.offset_bytes = 0});
+        }
         noc.async_read_barrier();
         cb_q.push_back(1);
-        cb_k.push_back(1);
-        cb_v.push_back(1);
+        if constexpr (parts == 3) {
+            cb_k.push_back(1);
+            cb_v.push_back(1);
+        }
     }
 }

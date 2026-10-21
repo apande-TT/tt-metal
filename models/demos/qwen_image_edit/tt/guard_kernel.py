@@ -466,21 +466,26 @@ def batched_matmul(a, b, transpose_b=False, b_rep=1):
 _HS_READER = f"{_DIR}/head_split_reader.cpp"
 
 
-def head_split(qkv, heads, memory_config=None):
+def head_split(qkv, heads, memory_config=None, parts=3):
     """nlp_create_qkv_heads(qkv, num_heads=heads, num_kv_heads=heads, transpose_k_heads=False) for a float32 tile
     tensor qkv [N, 1, S, 3 * heads * D] -> (q, k, v) [N, heads, S, D], as tile copies (each output tile read from
-    its qkv page, the three written by the three-output writer). None for a tensor it does not take."""
+    its qkv page, the three written by the three-output writer). parts=1: one projection x [N, S, heads * D] (or
+    [N, 1, S, heads * D]) -> [N, heads, S, D], the reshape + permute of a head split. None for a tensor it does not
+    take."""
     s = list(qkv.padded_shape)
+    if len(s) == 3 and parts == 1:
+        s = [s[0], 1, s[1], s[2]]
     if qkv.dtype != ttnn.float32 or qkv.layout != ttnn.TILE_LAYOUT or qkv.is_sharded() or len(s) != 4 or s[1] != 1:
         return None
-    if list(qkv.shape) != s or s[2] % TILE or s[3] % (3 * heads * TILE):
+    logical = list(qkv.shape)
+    if logical[-2:] != s[-2:] or s[2] % TILE or s[3] % (parts * heads * TILE):
         return None
-    n, sq, d = s[0], s[2], s[3] // (3 * heads)
+    n, sq, d = s[0], s[2], s[3] // (parts * heads)
     dt, st = d // TILE, sq // TILE
     mc = memory_config or qkv.memory_config()
     ys = [
         ttnn.empty([n, heads, sq, d], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=qkv.device(), memory_config=mc)
-        for _ in range(3)
+        for _ in range(parts)
     ]
     pages = n * heads * st * dt
     grid = qkv.device().compute_with_storage_grid_size()
@@ -494,32 +499,39 @@ def head_split(qkv, heads, memory_config=None):
                 ttnn.CBFormatDescriptor(buffer_index=_OUT_CB + k, data_format=ttnn.float32, page_size=_FP32_TILE_BYTES)
             ],
         )
-        for k in range(3)
+        for k in range(parts)
     ]
     rd, wr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     for c, start, count in work:
         rd[c.x][c.y] = [qkv.buffer_address(), start, count]
-        wr[c.x][c.y] = [t.buffer_address() for t in ys] + [count, start]
+        wr[c.x][c.y] = (
+            [ys[0].buffer_address(), count, start] if parts == 1 else [t.buffer_address() for t in ys] + [count, start]
+        )
+    writer_cta = (
+        [_OUT_CB] + ttnn.TensorAccessorArgs(ys[0]).get_compile_time_args()
+        if parts == 1
+        else [3] + [a for t in ys for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+    )
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=_HS_READER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=ttnn.TensorAccessorArgs(qkv).get_compile_time_args() + [heads, dt, st],
+            compile_time_args=ttnn.TensorAccessorArgs(qkv).get_compile_time_args() + [heads, dt, st, parts],
             runtime_args=rd,
             config=ttnn.ReaderConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
-            kernel_source=_TWO_OUT_WRITER,
+            kernel_source=_WRITER if parts == 1 else _TWO_OUT_WRITER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[3] + [a for t in ys for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            compile_time_args=writer_cta,
             runtime_args=wr,
             config=ttnn.WriterConfigDescriptor(),
         ),
     ]
     ttnn.generic_op([qkv] + ys, ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
-    return tuple(ys)
+    return tuple(ys) if parts == 3 else ys[0]
 
 
 _RG_READER = f"{_DIR}/row_gather_reader.cpp"

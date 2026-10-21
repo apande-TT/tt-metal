@@ -39,6 +39,11 @@ import ttnn
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl, _precise
 
 
+# Optional kernel for the head split of one projection: HEAD_SPLIT(x, heads, None, parts=1) -> x [B, S, H * D] as
+# [B, H, S, D] (the reshape + permute below), or None for a tensor it does not take.
+HEAD_SPLIT = None
+
+
 def _is_mesh(device):
     return isinstance(device, ttnn.MeshDevice) and device.get_num_devices() > 1
 
@@ -156,6 +161,9 @@ class TtQwenJointAttention:
         return [self._proj(x, wb, dt) for wb, dt in zip(wbs, dtypes)]
 
     def _heads(self, x):  # [B, S, Hl*D] -> [B, Hl, S, D]
+        y = None if HEAD_SPLIT is None else HEAD_SPLIT(x, self.local_heads, None, parts=1)
+        if y is not None:
+            return y
         B, S = x.shape[0], x.shape[1]
         x = ttnn.reshape(x, (B, S, self.local_heads, self.head_dim))
         return ttnn.permute(x, (0, 2, 1, 3))
