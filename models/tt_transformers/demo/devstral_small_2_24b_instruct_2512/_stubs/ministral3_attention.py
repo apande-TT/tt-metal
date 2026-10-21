@@ -520,7 +520,9 @@ class TtMinistral3Attention:
         if cfg is not None:
             return cfg
         grid = self.device.compute_with_storage_grid_size()
-        n = -(-nt // (grid.y if mt > nt else grid.x))  # minimal_matmul puts N along y when M > N
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        n = -(-nt // (grid.y if minimal_mm.transposed(mt, nt, grid.x, grid.y) else grid.x))  # the split minimal_mm runs
         if n > 8:
             return None
         sh, sw = (1, 4) if n % 4 == 0 else (4, 1) if n % 2 else (2, 2)
@@ -538,7 +540,9 @@ class TtMinistral3Attention:
         is small (short prompts): the default 8 x 8 blocks split e.g. the 128-row QKV's 12 x 5-tile range into an 8-
         and a 4-row block, streaming the weight columns twice. None (the default config) otherwise."""
         grid = self.device.compute_with_storage_grid_size()
-        gm, gn = (grid.x, grid.y) if mt > nt else (grid.y, grid.x)  # minimal_matmul puts M along x when M > N
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        gm, gn = (grid.x, grid.y) if minimal_mm.transposed(mt, nt, grid.x, grid.y) else (grid.y, grid.x)
         m, n = -(-mt // gm), -(-nt // gn)
         if m * n > 64 or m <= 8:
             return None

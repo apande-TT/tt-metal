@@ -178,15 +178,27 @@ class TtPixtralVisionModel:
         # The patch projection on minimal_matmul over the full grid (ttnn.linear ran the 32 x 256-row batch on 88
         # cores: 552 us): one K block of the whole 588-wide patch (19 tiles; 8-tile blocks would pad it to 24) and
         # 4 x 4-tile output blocks (each core's N range is 4 tiles).
-        patch_cfg = ttnn.MinimalMatmulConfig(
-            M_block_size=4,
-            K_block_size=-(-int(self.w_patch.shape[-2]) // ttnn.TILE_SIZE),
-            N_block_size=4,
-            subblock_h=2,
-            subblock_w=2,
-            compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
-        )
+        # Blocks of each core's whole M / N range in the orientation minimal_mm splits (tt/minimal_mm.py transposed:
+        # 64 x 32 output tiles -> 7 x 3 a core over the grid's 10 rows / 11 columns, not 6 x 4).
         from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        grid = self.device.compute_with_storage_grid_size()
+        mt = int(x.shape[-2]) // ttnn.TILE_SIZE
+        for d in tuple(int(v) for v in x.shape)[:-2]:
+            mt *= d
+        nt = int(self.w_patch.shape[-1]) // ttnn.TILE_SIZE
+        t = minimal_mm.transposed(mt, nt, grid.x, grid.y)
+        pm = min(8, -(-mt // (grid.x if t else grid.y)))
+        pn = min(8, -(-nt // (grid.y if t else grid.x)))
+        psh, psw = (2, 2) if pm % 2 == 0 and pn % 2 == 0 else (1, pn if pn <= 4 else 1)
+        patch_cfg = ttnn.MinimalMatmulConfig(
+            M_block_size=pm,
+            K_block_size=-(-int(self.w_patch.shape[-2]) // ttnn.TILE_SIZE),
+            N_block_size=pn,
+            subblock_h=psh,
+            subblock_w=psw,
+            compute_with_storage_grid_size=grid,
+        )
 
         if minimal_mm.supported(x, self.w_patch, self.compute_cfg):
             # the same program, its core ranges' padding skipped (tt/minimal_mm.py SKIP_PADDING), bit-identical

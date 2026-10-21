@@ -134,8 +134,11 @@ class TtPixtralAttention:
         for d in shape[:-2]:
             mt *= d
         nt = int(w.shape[-1]) // ttnn.TILE_SIZE
-        m = min(8, -(-mt // (grid.x if mt > nt else grid.y)))
-        n = -(-nt // (grid.y if mt > nt else grid.x))
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        t = minimal_mm.transposed(mt, nt, grid.x, grid.y)  # the split minimal_mm will run
+        m = min(8, -(-mt // (grid.x if t else grid.y)))
+        n = -(-nt // (grid.y if t else grid.x))
         if (n >= 8 and m == 8) or n > 12 or (n % 2 and n > 4 and n % 3):
             return None
         if m % 2 == 0 and n % 2 == 0:
