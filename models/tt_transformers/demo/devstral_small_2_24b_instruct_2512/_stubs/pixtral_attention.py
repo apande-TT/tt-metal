@@ -204,14 +204,19 @@ class TtPixtralAttention:
         # rows as a batched matmul on 64 cores: 816 us).
         grid = self.device.compute_with_storage_grid_size()
         qkv_l1 = 2 * int(b) * int(s) * int(self.wqkv.shape[-1]) // (grid.x * grid.y) <= self.QKV_OUT_L1_BYTES
-        qkv = ttnn.experimental.minimal_matmul(
-            x,
-            self.wqkv,
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        qkv_kw = dict(
             config=self._narrow_n_cfg(x, self.wqkv),
             compute_kernel_config=self.compute_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if qkv_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,  # q / k / v in bf16 also when x is the fp32 norm output
         )
+        if qkv_kw["config"] is not None and minimal_mm.supported(x, self.wqkv, self.compute_cfg):
+            # the same program, its core ranges' padding skipped (tt/minimal_mm.py SKIP_PADDING), bit-identical
+            qkv = minimal_mm.matmul(x, self.wqkv, **qkv_kw)
+        else:
+            qkv = ttnn.experimental.minimal_matmul(x, self.wqkv, **qkv_kw)
         if len(in_shape) == 4 and x.memory_config().buffer_type == ttnn.BufferType.L1:
             ttnn.deallocate(x)  # the caller's L1 norm output, read only here (see TtAttention)
         if self.cpp_rope:
