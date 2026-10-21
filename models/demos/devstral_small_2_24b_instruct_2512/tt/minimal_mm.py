@@ -37,9 +37,9 @@ SWIGLU_PACK_SFPU = True
 # ... with the exp polynomial's constants held in registers across the rows (mm_compute.cpp
 # calculate_silu_mul_hoisted: 42 instead of 52 SFPU instructions a row, the same arithmetic)
 SWIGLU_HOIST = True
-# The fused SwiGLU skips the padding of the core ranges (the last core row's M rows past M_tiles, the last core
-# column's N tiles past N_tiles): no matmul subblocks or epilogue pairs for tiles the writer never stores (identical
-# real tiles; less FPU / SFPU energy, which is what the power-capped prefill runs on).
+# Skip the padding of the core ranges (the last core row's M rows past M_tiles, the last core column's N tiles past
+# N_tiles): no matmul subblocks or epilogue work for tiles the writer never stores (identical real tiles; less FPU /
+# SFPU energy, which is what the power-capped prefill and encode run on).
 SKIP_PADDING = True
 
 
@@ -243,7 +243,7 @@ def matmul(
         + res_ct
     )
 
-    skip_padding = fuse_swiglu and SKIP_PADDING
+    skip_padding = SKIP_PADDING
     k_blocks_per_core = -(-K_blocks // (in1_par if transpose else in0_par))
     max_defer = max(min(y * k_blocks_per_core, K_blocks - 1) for y in range(gy))
     phys = {}

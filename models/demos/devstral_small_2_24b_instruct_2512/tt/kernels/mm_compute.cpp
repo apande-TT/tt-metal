@@ -27,26 +27,29 @@
 #define SWIGLU_PAIRS 1
 #endif
 
-// Copy the block's fp32 partials out, EPI_TILES tiles a DEST acquire (EPI_TILES divides N_block_tiles).
-void copy_and_pack_block(uint32_t in_cb, uint32_t out_cb, uint32_t M_block_tiles, uint32_t N_block_tiles) {
+// Copy the block's fp32 partials out, EPI_TILES tiles a DEST acquire (EPI_TILES divides N_block_tiles); only the first
+// real_M rows / real_N columns (the rest is range padding the writer never stores), every row pushed whole.
+void copy_and_pack_block(
+    uint32_t in_cb, uint32_t out_cb, uint32_t M_block_tiles, uint32_t N_block_tiles, uint32_t real_M, uint32_t real_N) {
     CircularBuffer cb_out(out_cb);
     reconfig_data_format_srca(in_cb);
     pack_reconfig_data_format(out_cb);
     copy_init(in_cb);
-    uint32_t tile_id = 0;
     for (uint32_t m = 0; m < M_block_tiles; m++) {
-        for (uint32_t n = 0; n < N_block_tiles; n += EPI_TILES) {
+        const uint32_t row_n = m < real_M ? real_N : 0;
+        const uint32_t row_base = m * N_block_tiles;
+        for (uint32_t n = 0; n < row_n; n += EPI_TILES) {
+            const uint32_t nt = (row_n - n) < EPI_TILES ? (row_n - n) : EPI_TILES;
             tile_regs_acquire();
-            for (uint32_t t = 0; t < EPI_TILES; t++) {
-                copy_tile(in_cb, tile_id + t, t);
+            for (uint32_t t = 0; t < nt; t++) {
+                copy_tile(in_cb, row_base + n + t, t);
             }
             tile_regs_commit();
             tile_regs_wait();
-            for (uint32_t t = 0; t < EPI_TILES; t++) {
+            for (uint32_t t = 0; t < nt; t++) {
                 pack_tile(t, out_cb);
             }
             tile_regs_release();
-            tile_id += EPI_TILES;
         }
         cb_out.push_back(N_block_tiles);
     }
@@ -59,7 +62,14 @@ void copy_and_pack_block(uint32_t in_cb, uint32_t out_cb, uint32_t M_block_tiles
 // (binary_ng: residual in the left operand, add_binary_tile<NearestEven>) -- the same values through the same add.
 constexpr uint32_t RES_TILES = 2;
 void residual_add_block(
-    uint32_t in_cb, uint32_t res_cb, uint32_t bcast_cb, uint32_t out_cb, uint32_t M_block_tiles, uint32_t N_block_tiles) {
+    uint32_t in_cb,
+    uint32_t res_cb,
+    uint32_t bcast_cb,
+    uint32_t out_cb,
+    uint32_t M_block_tiles,
+    uint32_t N_block_tiles,
+    uint32_t real_M,
+    uint32_t real_N) {
     CircularBuffer cb_out(out_cb);
     CircularBuffer cb_res(res_cb);
     CircularBuffer cb_bcast(bcast_cb);
@@ -71,8 +81,9 @@ void residual_add_block(
     uint32_t tile_id = 0;
     for (uint32_t m = 0; m < M_block_tiles; m++) {
         cb_res.wait_front(N_block_tiles);
-        for (uint32_t n = 0; n < N_block_tiles; n += RES_TILES) {
-            const uint32_t nt = (N_block_tiles - n) < RES_TILES ? (N_block_tiles - n) : RES_TILES;
+        const uint32_t row_n = m < real_M ? real_N : 0;  // real tiles only (range padding is never stored)
+        for (uint32_t n = 0; n < row_n; n += RES_TILES) {
+            const uint32_t nt = (row_n - n) < RES_TILES ? (row_n - n) : RES_TILES;
             tile_regs_acquire();
             reconfig_data_format_srca(in_cb);
             copy_init(in_cb);
@@ -455,12 +466,12 @@ void kernel_main() {
             cb_out.reserve_back(out_block_num_tiles);
             cb_intermediate.wait_front(out_block_num_tiles);
             residual_add_block(
-                intermediate_cb, tt::CBIndex::c_5, tt::CBIndex::c_6, out_cb, M_block_tiles, N_block_tiles);
+                intermediate_cb, tt::CBIndex::c_5, tt::CBIndex::c_6, out_cb, M_block_tiles, N_block_tiles, mm_M, mm_N);
             cb_intermediate.pop_front(out_block_num_tiles);
 #else
             cb_out.reserve_back(out_block_num_tiles);
             cb_intermediate.wait_front(out_block_num_tiles);
-            copy_and_pack_block(intermediate_cb, out_cb, M_block_tiles, N_block_tiles);
+            copy_and_pack_block(intermediate_cb, out_cb, M_block_tiles, N_block_tiles, mm_M, mm_N);
             cb_intermediate.pop_front(out_block_num_tiles);
 #endif
         }
