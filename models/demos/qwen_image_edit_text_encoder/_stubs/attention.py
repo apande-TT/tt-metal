@@ -311,6 +311,9 @@ EXACT_CORE_GRID = None
 # split_matmul's plain (exact=False) limb products on this core grid (None: ttnn picks its own)
 BMM_CORE_GRID = None
 # the vision attention's logit scale applied as the mask add's input activation (False: multiply + add)
+# fn(qkv, off, heads, head_dim, mem) -> [N, heads, S, head_dim] head-major (the column block off + h * head_dim per
+# head) or None; the vision attention's q / k / v heads in one call instead of slice + reshape + permute
+VISION_HEADS_FN = None
 VISION_FUSED_SCALE_MASK = False
 # core grid for split_linear's exact-lane products (None: ttnn.linear picks its own)
 EXACT_LINEAR_CORE_GRID = None
@@ -713,6 +716,10 @@ class TtVisionAttention:
         qkv = split_linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=cfg, exact=ex, limbs=L)
 
         def _heads(i):
+            if VISION_HEADS_FN is not None:
+                t = VISION_HEADS_FN(qkv, i * loc, hp, D, ttnn.DRAM_MEMORY_CONFIG)
+                if t is not None:
+                    return t
             t = ttnn.slice(qkv, [0, 0, 0, i * loc], [n, 1, s_pad, (i + 1) * loc])
             t = ttnn.reshape(t, (n, s_pad, hp, D))
             return ttnn.permute(t, (0, 2, 1, 3))
